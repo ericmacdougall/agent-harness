@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent
 START = "<!-- agent-harness:start -->"
 END = "<!-- agent-harness:end -->"
 AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
-HOOKS = ("wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py")
+HOOKS = ("process.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py")
 TOOLS = ("watch-tests.py",)
 
 
@@ -49,15 +49,19 @@ def merged_settings(current: dict, claude: Path) -> dict:
     for event, entry in managed_hooks(claude).items():
         entries = hooks.setdefault(event, [])
         script = str(claude / "hooks" / "wal.py")
-        entries[:] = [
-            item for item in entries
-            if not any(
-                hook.get("type") == "command"
-                and hook.get("command") == "python3"
-                and hook.get("args", [None])[0] == script
-                for hook in item.get("hooks", [])
-            )
-        ]
+        preserved = []
+        for item in entries:
+            remaining = [
+                hook for hook in item.get("hooks", [])
+                if not (hook.get("type") == "command"
+                        and hook.get("command") == "python3"
+                        and (hook.get("args") or [None])[0] == script)
+            ]
+            if remaining == item.get("hooks", []):
+                preserved.append(item)
+            elif remaining:
+                preserved.append({**item, "hooks": remaining})
+        entries[:] = preserved
         entries.append(entry)
     allowed = settings.setdefault("permissions", {}).setdefault("allow", [])
     for name in ("wal_note.py", "publish_feature.py", "integrate_local.py"):
@@ -98,8 +102,9 @@ def install(home: Path, apply: bool) -> list[str]:
           for name in names),
     ]
     managed = [destination for _, destination in files] + [claude / "CLAUDE.md", claude / "settings.json"]
-    if any(path.is_symlink() for path in managed):
-        raise ValueError("Refusing to replace a symlinked destination; inspect the user directory first")
+    directories = {claude, claude / "agent-harness-backups", *(path.parent for path in managed)}
+    if any(path.is_symlink() for path in [*managed, *directories]):
+        raise ValueError("Refusing a symlinked destination or directory; inspect the user directory first")
     current_text = (claude / "CLAUDE.md").read_text() if (claude / "CLAUDE.md").exists() else ""
     instructions = merged_instructions(current_text, (ROOT / "HARNESS.md").read_text())
     settings_path = claude / "settings.json"
@@ -110,8 +115,12 @@ def install(home: Path, apply: bool) -> list[str]:
     changes = [str(path) for path in managed]
     if not apply:
         return changes
-    backups = claude / "agent-harness-backups" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    backups.mkdir(parents=True, mode=0o700)
+    backup_root = claude / "agent-harness-backups"
+    backups = backup_root / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    claude.mkdir(parents=True, exist_ok=True)
+    backup_root.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(backup_root, 0o700)  # backups hold settings.json, which may carry env values
+    backups.mkdir(mode=0o700)
     for path in managed:
         if path.exists():
             saved = backups / path.relative_to(claude)

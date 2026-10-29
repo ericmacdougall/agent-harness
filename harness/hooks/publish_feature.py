@@ -3,14 +3,19 @@
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
+from process import run
 
-def git(repo, *args):
-    return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True)
+
+def git(repo, *args, timeout=None):
+    # Headless use: a missing credential must fail the push, not wait on a terminal prompt.
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    return run(["git", "-C", str(repo), *args], env=env, timeout=timeout)
 
 
 def report(status, message, **extra):
@@ -30,7 +35,10 @@ def main():
     parser.add_argument("--branch", required=True)
     parser.add_argument("--original-branch", required=True)
     parser.add_argument("--expected-head", required=True)
+    parser.add_argument("--timeout", type=int, default=600, help="Seconds to wait for the push before reporting BLOCKED_REMOTE")
     args = parser.parse_args()
+    if args.timeout <= 0:
+        parser.error("--timeout must be a positive number of seconds")
     repo = args.repo.resolve()
     if not repo.is_dir() or git(repo, "rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
         report("BLOCKED_POLICY", "Source is not a Git worktree")
@@ -55,8 +63,31 @@ def main():
     if remote not in git(repo, "remote").stdout.splitlines():
         report("BLOCKED_REMOTE", "Configured remote is unavailable", branch=args.branch, remote=remote)
         return 4
+    # A repository may call its default branch trunk, release, or something else.
+    # Refuse publication when the remote does not reveal a default branch.
+    try:
+        default = git(repo, "ls-remote", "--symref", remote, "HEAD", timeout=min(args.timeout, 30))
+    except subprocess.TimeoutExpired:
+        report("BLOCKED_REMOTE", "Could not determine the remote default branch in time; continue local integration", branch=args.branch, remote=remote)
+        return 4
+    if default.returncode:
+        report("BLOCKED_REMOTE", "Could not determine the remote default branch; continue local integration",
+               branch=args.branch, remote=remote, detail=scrub(default.stderr or default.stdout))
+        return 4
+    match = re.search(r"^ref: refs/heads/(\S+)\s+HEAD$", default.stdout, re.MULTILINE)
+    if match is None:
+        report("BLOCKED_REMOTE", "Remote default branch is not advertised; continue local integration",
+               branch=args.branch, remote=remote)
+        return 4
+    if args.branch == match.group(1):
+        report("BLOCKED_POLICY", "Refusing to publish the remote default branch", branch=args.branch, remote=remote)
+        return 2
     ref = f"refs/heads/{args.branch}"
-    result = git(repo, "push", "--porcelain", remote, f"{ref}:{ref}")
+    try:
+        result = git(repo, "push", "--porcelain", remote, f"{ref}:{ref}", timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        report("BLOCKED_REMOTE", f"Push did not finish within {args.timeout} seconds; continue local integration", branch=args.branch, remote=remote)
+        return 4
     if result.returncode:
         detail = scrub(result.stderr or result.stdout)
         report("BLOCKED_REMOTE", "Feature branch could not be published; continue local integration", branch=args.branch, remote=remote, detail=detail)

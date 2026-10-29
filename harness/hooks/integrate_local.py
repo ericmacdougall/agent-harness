@@ -9,11 +9,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+from process import run as run_process
 
-def run(repo, command):
+
+def run(repo, command, *, timeout=None):
     # Python test runners otherwise leave untracked __pycache__ after an aborted merge.
-    return subprocess.run(command, cwd=repo, text=True, capture_output=True,
-                          env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    return run_process(command, cwd=repo, timeout=timeout,
+                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
 
 
 def git(repo, *args):
@@ -22,6 +24,16 @@ def git(repo, *args):
 
 def report(status, message, **extra):
     print(json.dumps({"status": status, "message": message, **extra}))
+
+
+def abort_merge(repo, message, **extra):
+    result = git(repo, "merge", "--abort")
+    if result.returncode:
+        message += "; merge abort failed; inspect the checkout before retrying"
+    else:
+        message += "; source merge aborted"
+    report("BLOCKED_LOCAL", message, merge_aborted=result.returncode == 0, **extra)
+    return 3
 
 
 def approved_check(argv):
@@ -66,15 +78,24 @@ def main():
     parser.add_argument("--expected-source-head", required=True)
     parser.add_argument("--prepare", action="append", default=[], help="Lockfile install after merge, before checks")
     parser.add_argument("--check", action="append", required=True, help="One argv command, quoted as a single argument; no shell")
+    parser.add_argument("--timeout", type=int, default=600, help="Seconds allowed for each preparation or check")
     args = parser.parse_args()
-    preparations = [shlex.split(command) for command in args.prepare]
-    checks = [shlex.split(command) for command in args.check]
+    if args.timeout <= 0:
+        parser.error("--timeout must be a positive number of seconds")
+    try:
+        preparations = [shlex.split(command) for command in args.prepare]
+        checks = [shlex.split(command) for command in args.check]
+    except ValueError as error:
+        report("BLOCKED_POLICY", f"Verification command is not a parseable argv: {error}")
+        return 2
     if not all(approved_prepare(argv) for argv in preparations) or not all(approved_check(argv) for argv in checks):
         report("BLOCKED_POLICY", "Verification command is outside the approved test/build set")
         return 2
     repo = args.repo.resolve()
-    if not repo.is_dir() or git(repo, "rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
-        report("BLOCKED_POLICY", "Original checkout is not a Git worktree")
+    toplevel = git(repo, "rev-parse", "--show-toplevel") if repo.is_dir() else None
+    # Checks run with cwd=repo, so a subdirectory would merge first and then fail them misleadingly.
+    if toplevel is None or toplevel.returncode or Path(toplevel.stdout.strip()).resolve() != repo:
+        report("BLOCKED_POLICY", "Original checkout must be the root of a Git worktree")
         return 2
     branch = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
     head = git(repo, "rev-parse", "HEAD")
@@ -96,26 +117,21 @@ def main():
         return 0
     merge = git(repo, "merge", "--no-ff", "--no-commit", source.stdout.strip())
     if merge.returncode:
-        git(repo, "merge", "--abort")
-        report("BLOCKED_LOCAL", "Merge conflict; original checkout restored", detail=merge.stderr.strip()[-1200:])
-        return 3
-    for argv in preparations:
-        result = run(repo, argv)
-        if result.returncode:
-            git(repo, "merge", "--abort")
-            report("BLOCKED_LOCAL", "Dependency preparation failed; source merge aborted", prepare=argv, detail=(result.stderr or result.stdout)[-1200:])
-            return 3
-    for argv in checks:
-        result = run(repo, argv)
-        if result.returncode:
-            git(repo, "merge", "--abort")
-            report("BLOCKED_LOCAL", "Post-merge verification failed; original checkout restored", check=argv, detail=(result.stderr or result.stdout)[-1200:])
-            return 3
+        return abort_merge(repo, "Merge failed", detail=merge.stderr.strip()[-1200:])
+    for kind, commands in (("prepare", preparations), ("check", checks)):
+        for argv in commands:
+            try:
+                result = run(repo, argv, timeout=args.timeout)
+            except subprocess.TimeoutExpired:
+                return abort_merge(repo, f"{kind.capitalize()} exceeded {args.timeout} seconds", **{kind: argv})
+            except OSError:
+                return abort_merge(repo, f"{kind.capitalize()} could not start", **{kind: argv})
+            if result.returncode:
+                return abort_merge(repo, f"{kind.capitalize()} failed", **{kind: argv},
+                                   detail=(result.stderr or result.stdout)[-1200:])
     committed = git(repo, "commit", "-m", f"Merge {args.source} into {args.original_branch}")
     if committed.returncode:
-        git(repo, "merge", "--abort")
-        report("BLOCKED_LOCAL", "Merge commit failed", detail=committed.stderr.strip()[-1200:])
-        return 3
+        return abort_merge(repo, "Merge commit failed", detail=committed.stderr.strip()[-1200:])
     final_head = git(repo, "rev-parse", "HEAD").stdout.strip()
     report("INTEGRATED", "Verified feature merged into original checkout", original_branch=args.original_branch, source=args.source, head=final_head, preparations=args.prepare, checks=args.check)
     return 0
