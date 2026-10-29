@@ -6,6 +6,8 @@ import json
 import os
 import re
 import sys
+import stat
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,19 +15,42 @@ from pathlib import Path
 def safe_id(value: object) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", str(value or "unknown"))[:120]
     # "." and "..", which pass the character filter, would resolve outside the WAL directory.
-    return cleaned if cleaned.strip(".") else "_" + cleaned
+    return cleaned if cleaned.strip(".") else ("_" + cleaned)[:120]
 
 
 def append(path: Path, record: dict) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
+    root = Path.home() / ".claude" / "wals"
+    if (path.parent.parent != root or path.suffix != ".jsonl"
+            or not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", path.parent.name)
+            or path.parent.name in {".", ".."}):
+        raise ValueError("WAL path must be a per-session JSONL under ~/.claude/wals")
     payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        os.write(fd, payload)
+    root.parent.mkdir(mode=0o700, exist_ok=True)
+    # Pin each directory with an fd: never follow a redirected session or WAL path.
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with ExitStack() as stack:
+        directory = os.open(root.parent, flags)
+        stack.callback(os.close, directory)
+        for name in ("wals", path.parent.name):
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=directory)
+            except FileExistsError:
+                pass
+            directory = os.open(name, flags, dir_fd=directory)
+            stack.callback(os.close, directory)
+            os.fchmod(directory, 0o700)
+        fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     0o600, dir_fd=directory)
+        stack.callback(os.close, fd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("WAL must be a regular file with no hard links")
+        os.fchmod(fd, 0o600)
+        # A short write must not silently report a complete record.
+        with os.fdopen(fd, "ab", closefd=False) as handle:
+            handle.write(payload)
+            handle.flush()
         os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def main() -> None:

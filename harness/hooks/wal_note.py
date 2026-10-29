@@ -9,6 +9,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from wal import append
+
 
 EVENTS = {'intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker', 'status', 'handoff', 'result'}
 
@@ -19,8 +21,8 @@ def main():
     parser.add_argument('--event', choices=sorted(EVENTS), required=True)
     parser.add_argument('--note', required=True)
     args = parser.parse_args()
-    root = (Path.home() / '.claude' / 'wals').resolve()
-    path = args.wal.resolve()
+    root = Path.home() / '.claude' / 'wals'
+    path = args.wal.absolute()
     if path.parent.parent != root or path.suffix != '.jsonl' or not re.fullmatch(r'[A-Za-z0-9._-]{1,120}', path.parent.name):
         parser.error('WAL path must be a per-session JSONL under ~/.claude/wals')
     note = args.note.strip()
@@ -28,15 +30,8 @@ def main():
         parser.error('note must be 1 to 4000 characters')
     if re.search(r'(?i)\b(gh[pousr]_|github_pat_|sk-[A-Za-z0-9]{12}|AKIA[A-Z0-9]{12})', note):
         parser.error('note appears to contain a credential; redact it first')
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
     record = {'at': datetime.now(timezone.utc).isoformat(), 'event': args.event, 'cwd': os.getcwd(), 'note': note}
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        os.write(fd, (json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n').encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    append(path, record)
     print(json.dumps({'status': 'WROTE', 'event': args.event, 'wal': str(path)}))
 
 
