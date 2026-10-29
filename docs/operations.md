@@ -45,7 +45,7 @@ python3 ~/.claude/hooks/integrate_local.py --repo /absolute/original-checkout --
 
 The publication helper pushes only `refs/heads/feat/example` to the same ref on `origin`; it does not create a PR. The main agent creates or updates the PR separately when available. On missing/auth-failed remote, the helper returns `BLOCKED_REMOTE` (exit 4); continue local verification and integration.
 
-The integration helper allows a small fixed set of test/build commands and lockfile installs, parsed as argv without a shell. It merges into a clean, unchanged original checkout and aborts on conflict or failing checks. It does **not** validate reviewer reports or decide whether a check command is sufficient; that belongs to the main agent. It does not push the original branch. If the original checkout is dirty or changed, preserve it and resolve the conflict with the user.
+The integration helper allows a small fixed set of test/build commands and lockfile installs, parsed as argv without a shell. It merges into a clean, unchanged original checkout and aborts on conflict or failing checks. Python bytecode generation is disabled during checks. Other test or build commands may create untracked artifacts that Git cannot undo; inspect the checkout after a failed check before retrying. It does **not** validate reviewer reports or decide whether a check command is sufficient; that belongs to the main agent. It does not push the original branch. If the original checkout is dirty or changed, preserve it and resolve the conflict with the user.
 
 ## Test watcher
 

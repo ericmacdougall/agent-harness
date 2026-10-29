@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -10,7 +11,9 @@ from pathlib import Path
 
 
 def run(repo, command):
-    return subprocess.run(command, cwd=repo, text=True, capture_output=True)
+    # Python test runners otherwise leave untracked __pycache__ after an aborted merge.
+    return subprocess.run(command, cwd=repo, text=True, capture_output=True,
+                          env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
 
 
 def git(repo, *args):
