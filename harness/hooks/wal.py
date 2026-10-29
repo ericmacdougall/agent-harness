@@ -11,7 +11,9 @@ from pathlib import Path
 
 
 def safe_id(value: object) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]", "_", str(value or "unknown"))[:120]
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", str(value or "unknown"))[:120]
+    # "." and "..", which pass the character filter, would resolve outside the WAL directory.
+    return cleaned if cleaned.strip(".") else "_" + cleaned
 
 
 def append(path: Path, record: dict) -> None:
