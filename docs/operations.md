@@ -13,7 +13,7 @@
 | `integrate_local.py` | Guarded local merge into the starting checkout. |
 | `watch-tests.py` | Polling test runner for source edits. |
 
-No background process is installed. Claude Code runs hooks, and the main agent invokes the other helpers when appropriate.
+No background process is installed. Claude Code runs hooks, and the main agent invokes the other helpers when appropriate. The installer refuses symlinked managed files and directories, including its backup directory, before reading settings or writing files. Reinstallation preserves unrelated hooks even when they share an entry with a managed hook. Installation uses per-file atomic replacement and backups; it is not a transaction across all files. Do not run it concurrently with another installer or settings editor.
 
 ## WAL behavior
 
@@ -23,7 +23,7 @@ The `SessionStart` hook creates a private session log. Session and agent identif
 python3 ~/.claude/hooks/wal_note.py --wal ~/.claude/wals/SESSION_ID/main.jsonl --event intent --note 'Brief intent without secrets'
 ```
 
-WALs may still contain sensitive information if an agent writes it despite the policy. Keep `~/.claude/wals` private, review it before sharing, and do not commit it.
+Both WAL writers refuse symlinks from `.claude` down to the log, hardlinked logs, and non-regular files such as FIFOs. They open directories without following links, enforce mode `0700` on the WAL root and session directory, and mode `0600` on new and existing log files. A rejected path fails the hook rather than writing elsewhere. WALs may still contain sensitive information if an agent writes it despite the policy. Keep `~/.claude/wals` private, review it before sharing, and do not commit it.
 
 ## Review and rescue
 
@@ -43,9 +43,9 @@ python3 ~/.claude/hooks/publish_feature.py --repo /absolute/feature-worktree --b
 python3 ~/.claude/hooks/integrate_local.py --repo /absolute/original-checkout --original-branch main --expected-head FULL_ORIGINAL_SHA --source feat/example --expected-source-head FULL_FEATURE_SHA --check 'python3 -m unittest discover -s tests -v'
 ```
 
-The publication helper pushes only `refs/heads/feat/example` to the same ref on `origin`; it does not create a PR. The main agent creates or updates the PR separately when available. On missing/auth-failed remote, the helper returns `BLOCKED_REMOTE` (exit 4); continue local verification and integration. Git terminal prompts are disabled during the push, so a missing credential fails immediately instead of waiting for input that no one can type, and the push is abandoned after `--timeout` seconds (default 600) with the same status.
+The publication helper pushes only `refs/heads/feat/example` to the same ref on `origin`; it does not create a PR. The main agent creates or updates the PR separately when available. On missing/auth-failed remote, the helper returns `BLOCKED_REMOTE` (exit 4); continue local verification and integration. Git terminal credential prompts are disabled during the push. Credential helpers and SSH can still stall; `--timeout` (default 600 seconds) bounds the push and returns the same status. On timeout, the helper kills Git and descendants in its process group before reporting. A timeout does not prove that the remote ref was unchanged: verify it before retrying.
 
-The integration helper allows a small fixed set of test/build commands and lockfile installs, parsed as argv without a shell; an unparseable or unapproved command returns `BLOCKED_POLICY` (exit 2) before anything is touched, and `--repo` must be the root of the original worktree because checks run from that directory. It merges into a clean, unchanged original checkout and aborts on conflict or failing checks. Python bytecode generation is disabled during checks. Other test or build commands may create untracked artifacts that Git cannot undo; inspect the checkout after a failed check before retrying. It does **not** validate reviewer reports or decide whether a check command is sufficient; that belongs to the main agent. It does not push the original branch. If the original checkout is dirty or changed, preserve it and resolve the conflict with the user.
+The integration helper allows a small fixed set of test/build commands and lockfile installs, parsed as argv without a shell; an unparseable or unapproved command returns `BLOCKED_POLICY` (exit 2) before anything is touched, and `--repo` must be the root of the original worktree because checks run from that directory. It merges into a clean, unchanged original checkout. Each dependency preparation and check has a `--timeout` in positive seconds (default 600 per command). A timeout kills that command’s process group before attempting to abort the merge; a missing executable or nonzero exit also triggers an abort and `BLOCKED_LOCAL` (exit 3). Failure reports include `merge_aborted`; if it is false, inspect and recover the checkout before retrying. The helper never uses a hard reset to force rollback. Python bytecode generation is disabled during checks. The command allowlist is not a sandbox: test scripts and package lifecycle hooks execute repository code. Other test or build commands may modify tracked files or create untracked artifacts that Git cannot undo; inspect the checkout after a failed check before retrying. It does **not** validate reviewer reports or decide whether a check command is sufficient; that belongs to the main agent. The preparation/check timeout does not bound local Git operations, Git hooks, or signing during the merge and commit. Descendants that deliberately detach into another process group are outside timeout cleanup. It does not push the original branch. If the original checkout is dirty or changed, preserve it and resolve the conflict with the user.
 
 ## Test watcher
 
