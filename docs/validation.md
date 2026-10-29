@@ -22,7 +22,7 @@ The review environment has macOS, Python 3.9.6, and Git 2.54.0. Python 3.9 is be
 
 The main reviewer inspected the PR body, imported Astra's commit bundle, and reran its 32-test suite with exit 0. GitHub's push and PR checks for Astra head `1b86ca9` passed on Ubuntu and macOS with Python 3.10 and latest 3.x.
 
-The final review found that a nonstandard remote default branch such as `trunk` could still be pushed. A new disposable-remote regression first failed with `PUSHED` where `BLOCKED_POLICY` was expected. The publish helper now asks `origin` for its advertised default branch and refuses a matching name. If the remote does not advertise a default, publication returns `BLOCKED_REMOTE` and local work can continue. The revised local suite has **34 passing tests**, and compilation and whitespace checks pass. CI for this final commit remains the merge gate.
+The final review found that a nonstandard remote default branch such as `trunk` could still be pushed. A new disposable-remote regression first failed with `PUSHED` where `BLOCKED_POLICY` was expected. The publish helper now asks `origin` for its advertised default branch and refuses a matching name. If the remote does not advertise a default, publication returns `BLOCKED_REMOTE` and local work can continue. The revised local suite has **34 passing tests**, and compilation and whitespace checks pass. Final PR head `29c5270` passed the Ubuntu/macOS × Python 3.10/latest matrix in both the [push run](https://github.com/ericmacdougall/agent-harness/actions/runs/40969652290) and [PR run](https://github.com/ericmacdougall/agent-harness/actions/runs/40969658661) before merge commit `214bacf`.
 
 ## Earlier live exercise, 2026-10-29
 
