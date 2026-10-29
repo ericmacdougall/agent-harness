@@ -49,15 +49,19 @@ def merged_settings(current: dict, claude: Path) -> dict:
     for event, entry in managed_hooks(claude).items():
         entries = hooks.setdefault(event, [])
         script = str(claude / "hooks" / "wal.py")
-        entries[:] = [
-            item for item in entries
-            if not any(
-                hook.get("type") == "command"
-                and hook.get("command") == "python3"
-                and (hook.get("args") or [None])[0] == script
-                for hook in item.get("hooks", [])
-            )
-        ]
+        preserved = []
+        for item in entries:
+            remaining = [
+                hook for hook in item.get("hooks", [])
+                if not (hook.get("type") == "command"
+                        and hook.get("command") == "python3"
+                        and (hook.get("args") or [None])[0] == script)
+            ]
+            if remaining == item.get("hooks", []):
+                preserved.append(item)
+            elif remaining:
+                preserved.append({**item, "hooks": remaining})
+        entries[:] = preserved
         entries.append(entry)
     allowed = settings.setdefault("permissions", {}).setdefault("allow", [])
     for name in ("wal_note.py", "publish_feature.py", "integrate_local.py"):
@@ -98,8 +102,9 @@ def install(home: Path, apply: bool) -> list[str]:
           for name in names),
     ]
     managed = [destination for _, destination in files] + [claude / "CLAUDE.md", claude / "settings.json"]
-    if any(path.is_symlink() for path in managed):
-        raise ValueError("Refusing to replace a symlinked destination; inspect the user directory first")
+    directories = {claude, claude / "agent-harness-backups", *(path.parent for path in managed)}
+    if any(path.is_symlink() for path in [*managed, *directories]):
+        raise ValueError("Refusing a symlinked destination or directory; inspect the user directory first")
     current_text = (claude / "CLAUDE.md").read_text() if (claude / "CLAUDE.md").exists() else ""
     instructions = merged_instructions(current_text, (ROOT / "HARNESS.md").read_text())
     settings_path = claude / "settings.json"
