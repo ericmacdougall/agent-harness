@@ -54,7 +54,7 @@ def merged_settings(current: dict, claude: Path) -> dict:
             if not any(
                 hook.get("type") == "command"
                 and hook.get("command") == "python3"
-                and hook.get("args", [None])[0] == script
+                and (hook.get("args") or [None])[0] == script
                 for hook in item.get("hooks", [])
             )
         ]
@@ -110,8 +110,12 @@ def install(home: Path, apply: bool) -> list[str]:
     changes = [str(path) for path in managed]
     if not apply:
         return changes
-    backups = claude / "agent-harness-backups" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    backups.mkdir(parents=True, mode=0o700)
+    backup_root = claude / "agent-harness-backups"
+    backups = backup_root / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    claude.mkdir(parents=True, exist_ok=True)
+    backup_root.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(backup_root, 0o700)  # backups hold settings.json, which may carry env values
+    backups.mkdir(mode=0o700)
     for path in managed:
         if path.exists():
             saved = backups / path.relative_to(claude)
