@@ -101,6 +101,15 @@ class InstallerTests(unittest.TestCase):
                     self.assertEqual(sentinel.read_text(), "unchanged")
                     self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o755)
 
+    def test_installed_delivery_helpers_can_start(self):
+        import subprocess
+        import sys
+        install(self.home, apply=True)
+        for name in ("publish_feature.py", "integrate_local.py"):
+            result = subprocess.run([sys.executable, str(self.claude / "hooks" / name), "--help"],
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rejects_bad_markers_before_writing(self):
         (self.claude / "CLAUDE.md").write_text(END)
         with self.assertRaises(ValueError):

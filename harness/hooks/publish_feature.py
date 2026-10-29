@@ -9,11 +9,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+from process import run
+
 
 def git(repo, *args, timeout=None):
     # Headless use: a missing credential must fail the push, not wait on a terminal prompt.
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, env=env, timeout=timeout)
+    return run(["git", "-C", str(repo), *args], env=env, timeout=timeout)
 
 
 def report(status, message, **extra):
