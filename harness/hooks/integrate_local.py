@@ -67,14 +67,20 @@ def main():
     parser.add_argument("--prepare", action="append", default=[], help="Lockfile install after merge, before checks")
     parser.add_argument("--check", action="append", required=True, help="One argv command, quoted as a single argument; no shell")
     args = parser.parse_args()
-    preparations = [shlex.split(command) for command in args.prepare]
-    checks = [shlex.split(command) for command in args.check]
+    try:
+        preparations = [shlex.split(command) for command in args.prepare]
+        checks = [shlex.split(command) for command in args.check]
+    except ValueError as error:
+        report("BLOCKED_POLICY", f"Verification command is not a parseable argv: {error}")
+        return 2
     if not all(approved_prepare(argv) for argv in preparations) or not all(approved_check(argv) for argv in checks):
         report("BLOCKED_POLICY", "Verification command is outside the approved test/build set")
         return 2
     repo = args.repo.resolve()
-    if not repo.is_dir() or git(repo, "rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
-        report("BLOCKED_POLICY", "Original checkout is not a Git worktree")
+    toplevel = git(repo, "rev-parse", "--show-toplevel") if repo.is_dir() else None
+    # Checks run with cwd=repo, so a subdirectory would merge first and then fail them misleadingly.
+    if toplevel is None or toplevel.returncode or Path(toplevel.stdout.strip()).resolve() != repo:
+        report("BLOCKED_POLICY", "Original checkout must be the root of a Git worktree")
         return 2
     branch = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
     head = git(repo, "rev-parse", "HEAD")
