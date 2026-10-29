@@ -4,7 +4,7 @@ This page separates observed behavior from intended workflow. Source fixtures an
 
 ## Automated checks in this repository
 
-Run `python3 -m unittest discover -s tests -v` and `python3 -m compileall -q install.py harness tests`. The tests exercise guarded feature publication, rejected protected/stale pushes, merge conflict and failed-check rollback, dirty-checkout preservation, installer preservation/idempotence/symlink refusal, and private WAL metadata. These are deterministic helper checks, not proof that an autonomous agent follows the whole workflow.
+Run `python3 -m unittest discover -s tests -v` and `python3 -m compileall -q install.py harness tests`. The tests exercise guarded feature publication, rejected protected/stale pushes, a credential prompt under a real pseudo-terminal and a stalled remote (both must return `BLOCKED_REMOTE` instead of hanging), merge conflict and failed-check rollback, dirty-checkout preservation, rejection of a subdirectory or unparseable check before any merge, installer preservation/idempotence/symlink refusal, tolerance of foreign hooks with empty `args`, private backup directories, and private WAL metadata including `.`/`..` session identifiers. The tests isolate Git from user and system configuration. CI runs them on Ubuntu and macOS with Python 3.10 and the latest 3.x. These are deterministic helper checks, not proof that an autonomous agent follows the whole workflow.
 
 ## Earlier live exercise, 2026-10-29
 
