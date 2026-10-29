@@ -63,6 +63,25 @@ def main():
     if remote not in git(repo, "remote").stdout.splitlines():
         report("BLOCKED_REMOTE", "Configured remote is unavailable", branch=args.branch, remote=remote)
         return 4
+    # A repository may call its default branch trunk, release, or something else.
+    # Refuse publication when the remote does not reveal a default branch.
+    try:
+        default = git(repo, "ls-remote", "--symref", remote, "HEAD", timeout=min(args.timeout, 30))
+    except subprocess.TimeoutExpired:
+        report("BLOCKED_REMOTE", "Could not determine the remote default branch in time; continue local integration", branch=args.branch, remote=remote)
+        return 4
+    if default.returncode:
+        report("BLOCKED_REMOTE", "Could not determine the remote default branch; continue local integration",
+               branch=args.branch, remote=remote, detail=scrub(default.stderr or default.stdout))
+        return 4
+    match = re.search(r"^ref: refs/heads/(\S+)\s+HEAD$", default.stdout, re.MULTILINE)
+    if match is None:
+        report("BLOCKED_REMOTE", "Remote default branch is not advertised; continue local integration",
+               branch=args.branch, remote=remote)
+        return 4
+    if args.branch == match.group(1):
+        report("BLOCKED_POLICY", "Refusing to publish the remote default branch", branch=args.branch, remote=remote)
+        return 2
     ref = f"refs/heads/{args.branch}"
     try:
         result = git(repo, "push", "--porcelain", remote, f"{ref}:{ref}", timeout=args.timeout)

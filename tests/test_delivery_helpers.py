@@ -115,12 +115,35 @@ class DeliveryHelpers(unittest.TestCase):
         remote = self.root / 'origin.git'
         cmd('git', 'init', '-q', '--bare', str(remote))
         cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
         p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app', '--original-branch', 'main', '--expected-head', self.feature_head)
         self.assertEqual((p.returncode, data['status']), (0, 'PUSHED'))
         self.assertEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app', cwd=remote).returncode, 0)
-        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/main', cwd=remote, check=False).returncode, 0)
+        self.assertEqual(cmd('git', 'rev-parse', 'main', cwd=remote).stdout.strip(), self.base)
         p, data = self.invoke(PUBLISH, '--repo', str(self.repo), '--branch', 'main', '--original-branch', 'main', '--expected-head', self.base)
         self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'))
+
+    def test_publish_refuses_remote_default_with_nonstandard_name(self):
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:trunk', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/trunk', cwd=remote)
+        cmd('git', 'branch', '-m', 'trunk', cwd=self.feature)
+        p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'trunk',
+                              '--original-branch', 'main', '--expected-head', self.feature_head)
+        self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'))
+        self.assertEqual(cmd('git', 'rev-parse', 'trunk', cwd=remote).stdout.strip(), self.base)
+
+    def test_publish_reports_unadvertised_default_without_pushing(self):
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', self.feature_head)
+        self.assertEqual((p.returncode, data['status']), (4, 'BLOCKED_REMOTE'))
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app', cwd=remote, check=False).returncode, 0)
 
     def test_failed_check_restores_original(self):
         tests = self.feature / 'tests'
@@ -294,10 +317,15 @@ class PublishRemoteFailures(unittest.TestCase):
     def publish_args(self, *extra):
         return [sys.executable, str(PUBLISH), '--repo', str(self.repo), '--branch', 'feat/remote', '--original-branch', 'main', '--expected-head', self.head, *extra]
 
-    def test_credential_prompt_fails_fast_even_with_a_terminal(self):
+    def add_seeded_origin(self):
         remote = Path(self.temp.name) / 'remote.git'
         cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'push', '-q', str(remote), 'HEAD:refs/heads/main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
         cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+
+    def test_credential_prompt_fails_fast_even_with_a_terminal(self):
+        self.add_seeded_origin()
         # Real Git credential prompting without an HTTP listener or a thread at fork.
         hook = self.repo / '.git/hooks/pre-push'
         hook.write_text('#!/bin/sh\nprintf "protocol=https\\nhost=example.invalid\\n\\n" | git -c credential.helper= credential fill\nexit 1\n')
@@ -318,9 +346,7 @@ class PublishRemoteFailures(unittest.TestCase):
         self.assertIn('terminal prompts disabled', data['detail'])
 
     def test_stalled_push_kills_child_before_reporting_timeout(self):
-        remote = Path(self.temp.name) / 'remote.git'
-        cmd('git', 'init', '-q', '--bare', str(remote))
-        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        self.add_seeded_origin()
         marker = Path(self.temp.name) / 'late-write'
         child_pid = Path(self.temp.name) / 'child.pid'
         hook = self.repo / '.git/hooks/pre-push'

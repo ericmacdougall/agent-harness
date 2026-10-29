@@ -18,6 +18,12 @@ A process-exit/output-read race in the original PTY loop is confirmed with a con
 
 The review environment has macOS, Python 3.9.6, and Git 2.54.0. Python 3.9 is below the supported minimum and is only supplemental evidence. GitHub API and web access were unavailable, so the public PR body, original failure-first logs, and hosted CI outcomes could not be independently inspected. The main reviewer must check the supported Python/OS CI matrix before merging.
 
+## Main reviewer follow-up
+
+The main reviewer inspected the PR body, imported Astra's commit bundle, and reran its 32-test suite with exit 0. GitHub's push and PR checks for Astra head `1b86ca9` passed on Ubuntu and macOS with Python 3.10 and latest 3.x.
+
+The final review found that a nonstandard remote default branch such as `trunk` could still be pushed. A new disposable-remote regression first failed with `PUSHED` where `BLOCKED_POLICY` was expected. The publish helper now asks `origin` for its advertised default branch and refuses a matching name. If the remote does not advertise a default, publication returns `BLOCKED_REMOTE` and local work can continue. The revised local suite has **34 passing tests**, and compilation and whitespace checks pass. CI for this final commit remains the merge gate.
+
 ## Earlier live exercise, 2026-10-29
 
 The precursor user-wide harness was exercised through fresh Claude Code sessions and nine small-to-medium app builds: three TypeScript, three Go, and three Python. All nine reached passing independent checks and were merged into their original local fixture checkouts. The fixtures had no `origin`; publication failed as designed while local delivery continued. One fresh background session on a Go inventory app reported the remote failure, reran Go checks, exercised its live API, merged locally and supplied a usable run kit.
