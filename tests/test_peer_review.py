@@ -1,9 +1,11 @@
+import importlib.util
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REVIEW = Path(__file__).resolve().parents[1] / 'harness/hooks/peer_review.py'
@@ -29,6 +31,14 @@ capture = os.environ.get('CAPTURE_CODEX_PROMPT')
 if capture: Path(capture).write_text(prompt)
 last = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 last.write_text(os.environ.get('CODEX_VERDICT', 'VERDICT: PASS\\nReviewed.'))
+race = os.environ.get('RACE_OUTPUT')
+if race: Path(race).write_text('independent file created during review')
+relocated = os.environ.get('RACE_DIRECTORY_OUTPUT')
+if relocated:
+    parent = Path(relocated).parent
+    parent.rename(parent.with_name(parent.name + '-moved'))
+    parent.mkdir()
+    Path(relocated).write_text('VERDICT: PASS\\nstale path')
 sys.exit(int(os.environ.get('CODEX_EXIT', '0')))
 ''')
         self.fake('claude', '''import os, sys
@@ -71,17 +81,78 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertIn('Reviewer: Blind Claude Opus fallback', self.output.read_text())
         self.assertNotIn('Untrusted prior opinion', captured.read_text())
 
-    def test_both_reviewers_failing_remove_old_pass(self):
+    def test_existing_report_is_preserved_and_review_does_not_run(self):
         self.output.write_text('VERDICT: PASS\nstale')
+        capture = self.root / 'model.capture'
+        result = self.invoke(env={'CAPTURE_CODEX_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.output.read_text(), 'VERDICT: PASS\nstale')
+        self.assertFalse(capture.exists())
+
+    def test_both_reviewers_failing_leave_fresh_path_absent(self):
         result = self.invoke(env={'CODEX_EXIT': '7', 'CLAUDE_EXIT': '8'})
         self.assertEqual(result.returncode, 2)
         self.assertFalse(self.output.exists())
 
-    def test_invalid_packet_removes_old_pass(self):
-        self.output.write_text('VERDICT: PASS\nstale')
+    def test_invalid_packet_never_creates_a_report(self):
         result = self.invoke(packet=self.root / 'missing.md')
         self.assertEqual(result.returncode, 2)
-        self.assertFalse(self.output.exists(), 'an invalid rerun left an old sign-off in place')
+        self.assertFalse(self.output.exists())
+
+    def test_existing_unrelated_file_outside_repo_is_not_deleted(self):
+        important = self.root / 'ssh-config'
+        important.write_text('important configuration\n')
+        result = self.invoke(output=important)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(important.read_text(), 'important configuration\n')
+
+    def test_file_created_during_review_is_not_overwritten(self):
+        result = self.invoke(env={'RACE_OUTPUT': str(self.output)})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(self.output.read_text(), 'independent file created during review')
+
+    def test_relocated_report_directory_cannot_yield_false_signoff(self):
+        reports = self.root / 'reports'
+        reports.mkdir()
+        output = reports / 'review.md'
+        result = self.invoke(output=output, env={'RACE_DIRECTORY_OUTPUT': str(output)})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(output.read_text(), 'VERDICT: PASS\nstale path')
+        self.assertFalse((self.root / 'reports-moved/review.md').exists())
+
+    def test_directory_relocated_just_after_link_never_unlinks_destination(self):
+        spec = importlib.util.spec_from_file_location('report_file_under_test', REVIEW.parent / 'report_file.py')
+        report_file = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(report_file)
+        reports = self.root / 'reports'
+        reports.mkdir()
+        output = reports / 'review.md'
+        target = report_file.ReportTarget(output, self.repo, self.packet)
+        target.require_fresh()
+        original_link = os.link
+        original_unlink = os.unlink
+
+        def link_then_move(*args, **kwargs):
+            original_link(*args, **kwargs)
+            reports.rename(self.root / 'reports-moved')
+            reports.mkdir()
+            output.write_text('VERDICT: PASS\nstale path')
+
+        def unlink_only_temporary(path, *args, **kwargs):
+            if path == output.name:
+                raise AssertionError('public report destination must never be unlinked')
+            return original_unlink(path, *args, **kwargs)
+
+        try:
+            with patch.object(report_file.os, 'link', side_effect=link_then_move), \
+                 patch.object(report_file.os, 'unlink', side_effect=unlink_only_temporary):
+                with self.assertRaises(OSError):
+                    target.write_text('Reviewer: Sol\nVERDICT: BLOCK\n')
+        finally:
+            target.close()
+        self.assertEqual(output.read_text(), 'VERDICT: PASS\nstale path')
+        self.assertEqual((self.root / 'reports-moved/review.md').read_text(),
+                         'Reviewer: Sol\nVERDICT: BLOCK\n')
 
     def test_output_symlink_never_changes_target(self):
         target = self.root / 'important.txt'

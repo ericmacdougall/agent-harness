@@ -50,6 +50,14 @@ action = os.environ.get('CODEX_ACTION', '')
 if action: Path('app.txt').write_text(action + '\\n')
 last = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 last.write_text('Fixture handoff')
+race = os.environ.get('RACE_OUTPUT')
+if race: Path(race).write_text('independent file created during rescue')
+relocated = os.environ.get('RACE_DIRECTORY_OUTPUT')
+if relocated:
+    parent = Path(relocated).parent
+    parent.rename(parent.with_name(parent.name + '-moved'))
+    parent.mkdir()
+    Path(relocated).write_text('stale rescue report')
 sys.exit(int(os.environ.get('CODEX_EXIT', '0')))
 ''')
         self.fake('claude', '''import os, sys
@@ -117,6 +125,34 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertEqual(target.read_text(), 'preserve')
         self.assertEqual(git(self.repo, 'rev-parse', 'HEAD'), self.base)
+
+    def test_existing_unrelated_file_outside_repo_is_not_deleted(self):
+        important = self.root / 'ssh-config'
+        important.write_text('important configuration\n')
+        capture = self.root / 'model.capture'
+        result = self.invoke(output=important, env={'CAPTURE_CODEX_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(important.read_text(), 'important configuration\n')
+        self.assertFalse(capture.exists())
+
+    def test_file_created_during_rescue_is_not_overwritten(self):
+        result = self.invoke(env={'RACE_OUTPUT': str(self.output), 'CODEX_ACTION': 'updated'})
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertEqual(self.output.read_text(), 'independent file created during rescue')
+        self.assertIn('inspect the worktree', result.stderr)
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'updated\n')
+
+    def test_relocated_report_directory_preserves_replacement_after_rescue_edits(self):
+        reports = self.root / 'reports'
+        reports.mkdir()
+        output = reports / 'report.json'
+        result = self.invoke(output=output, env={'RACE_DIRECTORY_OUTPUT': str(output),
+                                                 'CODEX_ACTION': 'updated'})
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertEqual(output.read_text(), 'stale rescue report')
+        self.assertFalse((self.root / 'reports-moved/report.json').exists())
+        self.assertIn('inspect the worktree', result.stderr)
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'updated\n')
 
     def test_packet_symlink_is_not_sent_to_model(self):
         private = self.root / 'private.txt'

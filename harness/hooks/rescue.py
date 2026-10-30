@@ -121,7 +121,7 @@ def main() -> int:
         parser.error("rescue worktree must be at its root, on a named branch, and clean")
     try:
         target = ReportTarget(output_arg, repo, packet)
-        target.clear()
+        target.require_fresh()
     except (OSError, ValueError) as error:
         parser.error(f'output must be a writable file path: {error}')
     output = target.path
@@ -188,10 +188,16 @@ def main() -> int:
         "stderr_tail": stderr[-4000:],
         "status": "needs-main-verification" if code == 0 and head != base and not dirty_after else "blocked",
     }
-    target.write_text(json.dumps(report, indent=2) + "\n")
-    target.close()
-    log(wal, {"event": "rescue_result", "branch": branch, "base": base, "head": head, "source": source, "status": report["status"], "report": str(output)})
-    print(f"{source}: {report['status']} | {output}")
+    try:
+        target.write_text(json.dumps(report, indent=2) + "\n")
+        log(wal, {"event": "rescue_result", "branch": branch, "base": base, "head": head, "source": source, "status": report["status"], "report": str(output)})
+        target.verify_current()
+        print(f"{source}: {report['status']} | {output}")
+    except (OSError, ValueError) as error:
+        print(f"Rescue finished but report could not be finalized: {error}; inspect the worktree and retry with a fresh path.", file=sys.stderr)
+        return 3
+    finally:
+        target.close()
     return 0 if report["status"] == "needs-main-verification" else 3
 
 
