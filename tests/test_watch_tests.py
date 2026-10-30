@@ -28,13 +28,14 @@ class WatchTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self._watch_output = {}
 
     def invoke(self, *args, timeout=12):
         return subprocess.run([sys.executable, str(WATCH), '--root', str(self.root), *args],
                               capture_output=True, text=True, timeout=timeout)
 
     def wait_for_runs(self, process, count, timeout=6):
-        output = b''
+        output = self._watch_output.setdefault(process.pid, bytearray())
         deadline = time.monotonic() + timeout
         while output.count(b'[watch] exit ') < count:
             remaining = deadline - time.monotonic()
@@ -43,8 +44,8 @@ class WatchTests(unittest.TestCase):
             self.assertTrue(ready, output.decode(errors='replace'))
             chunk = os.read(process.stdout.fileno(), 4096)
             self.assertTrue(chunk, output.decode(errors='replace'))
-            output += chunk
-        return output
+            output.extend(chunk)
+        return bytes(output)
 
     def test_once_preserves_test_failure_and_success_exits(self):
         for code in (0, 7):
@@ -116,6 +117,25 @@ class WatchTests(unittest.TestCase):
         self.assertNotEqual(source.stat().st_ino, original.st_ino)
         self.assertEqual(source.stat().st_mtime_ns, original.st_mtime_ns)
         self.assertEqual(source.stat().st_size, original.st_size)
+        self.assertNotEqual(watcher.snapshot(self.root, watcher.DEFAULT_EXTENSIONS), before)
+
+    def test_same_inode_edit_with_restored_mtime_changes_snapshot(self):
+        watcher = load_watcher()
+        source = self.root / 'app.py'
+        source.write_text('first\n')
+        before = watcher.snapshot(self.root, watcher.DEFAULT_EXTENSIONS)
+        original = source.stat()
+        source.write_text('other\n')
+        os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
+        deadline = time.monotonic() + 1.5
+        while source.stat().st_ctime_ns == original.st_ctime_ns and time.monotonic() < deadline:
+            time.sleep(0.02)
+            os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
+        updated = source.stat()
+        self.assertEqual(updated.st_ino, original.st_ino)
+        self.assertEqual(updated.st_size, original.st_size)
+        self.assertEqual(updated.st_mtime_ns, original.st_mtime_ns)
+        self.assertNotEqual(updated.st_ctime_ns, original.st_ctime_ns)
         self.assertNotEqual(watcher.snapshot(self.root, watcher.DEFAULT_EXTENSIONS), before)
 
     def test_scan_errors_are_loud_and_path_free(self):
@@ -280,26 +300,34 @@ class WatchTests(unittest.TestCase):
             time.sleep(0.5)
             self.assertEqual(marker.read_text(), 'x')
             original = source.stat()
-            source.write_text('other\n')
-            os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
+            replacement = self.root / '.source-replacement'
+            replacement.write_text('other\n')
+            os.utime(replacement, ns=(original.st_atime_ns, original.st_mtime_ns))
+            os.replace(replacement, source)
+            self.assertNotEqual(source.stat().st_ino, original.st_ino)
             self.assertEqual(source.stat().st_size, original.st_size)
             self.assertEqual(source.stat().st_mtime_ns, original.st_mtime_ns)
-            deadline = time.monotonic() + 1.5
-            while source.stat().st_ctime_ns == original.st_ctime_ns and time.monotonic() < deadline:
-                time.sleep(0.02)
-                os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
-            self.assertNotEqual(source.stat().st_ctime_ns, original.st_ctime_ns)
             deadline = time.monotonic() + 5
             while marker.read_text() != 'xx' and time.monotonic() < deadline:
                 time.sleep(0.05)
             self.assertEqual(marker.read_text(), 'xx')
-            self.wait_for_runs(process, 1)
-            lockfile.write_text('other\n')
+            self.wait_for_runs(process, 2)
+            time.sleep(0.5)
+            self.assertEqual(marker.read_text(), 'xx', 'source edit caused extra runs')
+            lock_original = lockfile.stat()
+            replacement = self.root / '.lock-replacement'
+            replacement.write_text('other\n')
+            os.utime(replacement, ns=(lock_original.st_atime_ns, lock_original.st_mtime_ns))
+            os.replace(replacement, lockfile)
+            self.assertNotEqual(lockfile.stat().st_ino, lock_original.st_ino)
+            self.assertEqual(lockfile.stat().st_mtime_ns, lock_original.st_mtime_ns)
             deadline = time.monotonic() + 5
             while marker.read_text() != 'xxx' and time.monotonic() < deadline:
                 time.sleep(0.05)
             self.assertEqual(marker.read_text(), 'xxx')
-            self.wait_for_runs(process, 1)
+            self.wait_for_runs(process, 3)
+            time.sleep(0.5)
+            self.assertEqual(marker.read_text(), 'xxx', 'lockfile edit caused extra runs')
         finally:
             os.killpg(process.pid, signal.SIGTERM)
             process.communicate(timeout=5)
