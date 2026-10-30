@@ -23,6 +23,8 @@ The `SessionStart` hook creates a private session log. Session and agent identif
 python3 ~/.claude/hooks/wal_note.py --wal ~/.claude/wals/SESSION_ID/main.jsonl --event intent --note 'Brief intent without secrets'
 ```
 
+Claude Code's `--safe-mode` disables customizations, including these hooks and `CLAUDE.md`. A safe-mode session therefore has no automatic WAL gate. A fresh normal headless session was smoke-tested after installation: it created `session` and `prompt` entries in a mode `0600` WAL.
+
 Both WAL writers refuse symlinks from `.claude` down to the log, hardlinked logs, and non-regular files such as FIFOs. They open directories without following links, enforce mode `0700` on the WAL root and session directory, and mode `0600` on new and existing log files. A rejected path fails the hook rather than writing elsewhere. WALs may still contain sensitive information if an agent writes it despite the policy. Keep `~/.claude/wals` private, review it before sharing, and do not commit it.
 
 ## Review and rescue

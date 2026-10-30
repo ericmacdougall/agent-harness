@@ -27,6 +27,8 @@ python3 -m unittest discover -s tests -v
 
 The installer copies the agents and helpers into `~/.claude`, places a marked block in `~/.claude/CLAUDE.md`, and **merges** its hooks and three narrow helper permission rules into `settings.json`. Existing model, theme, deny rules, and unrelated hooks are preserved. It backs up files it replaces under `~/.claude/agent-harness-backups`. It validates payloads before writing and attempts to restore replaced files if a write fails; an incomplete rollback reports the affected paths and backup location. Crash recovery still requires the backups. The installer does not enable dangerous permission bypass or set a model. Inspect the preview and start a **new Claude Code session** after installation.
 
+Claude Code's `--safe-mode` disables `CLAUDE.md` and hooks, including the WAL gate. Use a normal session when relying on harness enforcement.
+
 To uninstall, remove the marked block from `CLAUDE.md`, remove the four hook entries pointing at `~/.claude/hooks/wal.py` and the three harness permission rules from `settings.json`, then remove the copied agents and helper scripts. Restore a backup if you want the exact earlier state.
 
 ## Operating model
