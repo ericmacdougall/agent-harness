@@ -19,6 +19,7 @@ END = "<!-- agent-harness:end -->"
 AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "report_file.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py")
 TOOLS = ("watch-tests.py",)
+NO_TARGET_CHECK = object()
 
 
 def managed_hooks(claude: Path) -> dict[str, dict]:
@@ -117,6 +118,7 @@ class DirectoryPins:
 
     def __init__(self):
         self.fds = {}
+        self.file_fds = []
 
     def capture(self, path: Path) -> None:
         try:
@@ -156,41 +158,67 @@ class DirectoryPins:
         self.verify(path)
 
     def close(self) -> None:
+        for file_fd in self.file_fds:
+            os.close(file_fd)
         for directory in self.fds.values():
             if directory is not None:
                 os.close(directory)
         self.fds.clear()
+        self.file_fds.clear()
 
 
-def atomic_write(path: Path, data: bytes, mode: int = 0o600, *, pinned_parent=None) -> None:
+def target_identity(directory: int, name: str):
+    try:
+        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+def require_target(path: Path, directory: int, expected) -> None:
+    if expected is not NO_TARGET_CHECK and target_identity(directory, path.name) != expected:
+        raise OSError(f'Managed file changed since snapshot: {path.name}')
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600, *, pinned_parent=None,
+                 expected_target=NO_TARGET_CHECK):
     with parent_fd(path) as directory:
         require_pinned_parent(path, directory, pinned_parent)
+        require_target(path, directory, expected_target)
         temporary = ".agent-harness-" + secrets.token_hex(12)
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o600, dir_fd=directory)
         try:
-            with os.fdopen(fd, "wb") as handle:
+            with os.fdopen(fd, "wb", closefd=False) as handle:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
                 os.fchmod(handle.fileno(), mode)
+            written = os.fstat(fd)
             require_pinned_parent(path, directory, pinned_parent)
+            require_target(path, directory, expected_target)
             os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
             os.fsync(directory)
             require_pinned_parent(path, directory, pinned_parent)
+            identity = written.st_dev, written.st_ino
+            if target_identity(directory, path.name) != identity:
+                raise OSError(f'Managed file changed after replacement: {path.name}')
+            return identity
         finally:
+            os.close(fd)
             try:
                 os.unlink(temporary, dir_fd=directory)
             except FileNotFoundError:
                 pass
 
 
-def safe_unlink(path: Path, *, pinned_parent=None) -> None:
+def safe_unlink(path: Path, *, pinned_parent=None, expected_target=NO_TARGET_CHECK) -> None:
     opened_parent = False
     try:
         with parent_fd(path) as directory:
             opened_parent = True
             require_pinned_parent(path, directory, pinned_parent)
+            require_target(path, directory, expected_target)
             try:
                 os.unlink(path.name, dir_fd=directory)
             except FileNotFoundError:
@@ -201,7 +229,7 @@ def safe_unlink(path: Path, *, pinned_parent=None) -> None:
             raise
 
 
-def read_regular(path: Path, *, pinned_parent=None):
+def read_regular(path: Path, *, pinned_parent=None, retain_fd=None):
     """Return file bytes and mode, or None if absent; never follow a late symlink/FIFO."""
     opened_parent = False
     try:
@@ -221,7 +249,9 @@ def read_regular(path: Path, *, pinned_parent=None):
                     raise ValueError(f'{path.name} must remain a regular file')
                 contents = handle.read()
                 require_pinned_parent(path, directory, pinned_parent)
-                return contents, stat.S_IMODE(info.st_mode)
+                if retain_fd is not None:
+                    retain_fd.append(os.dup(handle.fileno()))
+                return contents, stat.S_IMODE(info.st_mode), (info.st_dev, info.st_ino)
     except FileNotFoundError:
         if opened_parent:
             raise
@@ -250,11 +280,13 @@ def install(home: Path, apply: bool) -> list[str]:
                           claude / 'tools', backup_root):
             pins.capture(directory)
         instructions_path = claude / "CLAUDE.md"
-        existing_instructions = read_regular(instructions_path, pinned_parent=pins.fd(claude))
+        existing_instructions = read_regular(instructions_path, pinned_parent=pins.fd(claude),
+                                             retain_fd=pins.file_fds)
         current_text = existing_instructions[0].decode() if existing_instructions else ""
         instructions = merged_instructions(current_text, (ROOT / "HARNESS.md").read_text())
         settings_path = claude / "settings.json"
-        existing_settings = read_regular(settings_path, pinned_parent=pins.fd(claude))
+        existing_settings = read_regular(settings_path, pinned_parent=pins.fd(claude),
+                                         retain_fd=pins.file_fds)
         current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
         if not isinstance(current_settings, dict):
             raise ValueError("settings.json must contain an object")
@@ -266,7 +298,8 @@ def install(home: Path, apply: bool) -> list[str]:
         changes = [str(path) for path in managed]
         if not apply:
             return changes
-        originals = {path: read_regular(path, pinned_parent=pins.fd(path.parent))
+        originals = {path: read_regular(path, pinned_parent=pins.fd(path.parent),
+                                        retain_fd=pins.file_fds)
                      for path in managed}
         if originals[instructions_path] != existing_instructions or originals[settings_path] != existing_settings:
             raise OSError('User settings or instructions changed during installation preflight; retry')
@@ -285,21 +318,28 @@ def install(home: Path, apply: bool) -> list[str]:
                 saved = backups / path.relative_to(claude)
                 if saved.parent != backups:
                     pins.create(saved.parent)
-                atomic_write(saved, originals[path][0], pinned_parent=pins.fd(saved.parent))
+                atomic_write(saved, originals[path][0], pinned_parent=pins.fd(saved.parent),
+                             expected_target=None)
         attempted = []
+        installed = {}
         try:
             for destination, data in payloads:
                 attempted.append(destination)
-                atomic_write(destination, data, pinned_parent=pins.fd(destination.parent))
+                expected = originals[destination][2] if originals[destination] else None
+                installed[destination] = atomic_write(destination, data,
+                                                       pinned_parent=pins.fd(destination.parent),
+                                                       expected_target=expected)
         except BaseException as error:
             failures = []
             for path in reversed(attempted):
                 try:
                     original = originals[path]
+                    expected = installed.get(path, original[2] if original else None)
                     if original is None:
-                        safe_unlink(path, pinned_parent=pins.fd(path.parent))
+                        safe_unlink(path, pinned_parent=pins.fd(path.parent), expected_target=expected)
                     else:
-                        atomic_write(path, *original, pinned_parent=pins.fd(path.parent))
+                        atomic_write(path, original[0], original[1], pinned_parent=pins.fd(path.parent),
+                                     expected_target=expected)
                 except OSError:
                     failures.append(str(path.relative_to(claude)))
             if failures:

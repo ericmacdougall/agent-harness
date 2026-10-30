@@ -202,6 +202,72 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual((self.claude / 'agents/task-owner.md').read_text(), 'unrelated owner')
         self.assertFalse((self.claude / 'agents/click-tester.md').exists())
 
+    def test_real_file_replacement_after_snapshot_is_not_overwritten(self):
+        self.seed_existing_installation()
+        outsider = self.home / 'unrelated-owner.md'
+        outsider.write_text('unrelated leaf')
+        from install import atomic_write
+        swapped = False
+
+        def swap_leaf_before_write(path, data, mode=0o600, **kwargs):
+            nonlocal swapped
+            if not swapped and path == self.claude / 'agents/task-owner.md':
+                swapped = True
+                path.rename(path.with_name('old-owner.md'))
+                outsider.rename(path)
+            return atomic_write(path, data, mode, **kwargs)
+
+        with patch('install.atomic_write', side_effect=swap_leaf_before_write):
+            with self.assertRaises((OSError, RuntimeError)):
+                install(self.home, apply=True)
+        self.assertTrue(swapped)
+        self.assertEqual((self.claude / 'agents/task-owner.md').read_text(), 'unrelated leaf')
+
+    def test_rollback_refuses_a_new_leaf_replacing_an_installed_file(self):
+        self.seed_existing_installation()
+        outsider = self.home / 'unrelated-owner.md'
+        outsider.write_text('unrelated rollback leaf')
+        from install import atomic_write
+        swapped = False
+
+        def swap_leaf_before_failure(path, data, mode=0o600, **kwargs):
+            nonlocal swapped
+            if not swapped and path == self.claude / 'agents/click-tester.md':
+                swapped = True
+                owner = self.claude / 'agents/task-owner.md'
+                owner.rename(owner.with_name('installed-owner.md'))
+                outsider.rename(owner)
+                raise OSError('fixture: interrupt after leaf swap')
+            return atomic_write(path, data, mode, **kwargs)
+
+        with patch('install.atomic_write', side_effect=swap_leaf_before_failure):
+            with self.assertRaisesRegex(RuntimeError, 'rollback incomplete'):
+                install(self.home, apply=True)
+        self.assertTrue(swapped)
+        self.assertEqual((self.claude / 'agents/task-owner.md').read_text(), 'unrelated rollback leaf')
+
+    def test_file_replacement_during_final_publish_cannot_report_success(self):
+        outsider = self.home / 'unrelated-owner.md'
+        outsider.write_text('unrelated final leaf')
+        replace = os.replace
+        swapped = False
+
+        def swap_after_replace(source, destination, **kwargs):
+            nonlocal swapped
+            result = replace(source, destination, **kwargs)
+            if destination == 'task-owner.md' and not swapped:
+                swapped = True
+                owner = self.claude / 'agents/task-owner.md'
+                owner.rename(owner.with_name('installed-owner.md'))
+                outsider.rename(owner)
+            return result
+
+        with patch('install.os.replace', side_effect=swap_after_replace):
+            with self.assertRaisesRegex(RuntimeError, 'rollback incomplete'):
+                install(self.home, apply=True)
+        self.assertTrue(swapped)
+        self.assertEqual((self.claude / 'agents/task-owner.md').read_text(), 'unrelated final leaf')
+
     def test_installed_delivery_helpers_can_start(self):
         import subprocess
         import sys
