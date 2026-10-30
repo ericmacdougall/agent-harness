@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 from process import run as run_process
+from report_file import ReportTarget
 
 
 REVIEW_SYSTEM = (
@@ -68,19 +69,12 @@ def main() -> int:
         parser.error("repo Git inspection failed or timed out")
     if git_check.returncode or Path(git_check.stdout.strip()).resolve() != repo:
         parser.error("repo must be a git worktree root")
-    if output_arg.is_symlink():
-        parser.error('output must not be a symlink')
-    output = output_arg.parent.resolve() / output_arg.name
-    if output == repo or repo in output.parents:
-        parser.error('output must be outside the review worktree')
-    if output == packet.parent.resolve() / packet.name:
-        parser.error('output must differ from packet')
-    # Clear a previous verdict after confirming it cannot be a repository file
-    # or the packet, but before rejecting an invalid packet.
     try:
-        output.unlink(missing_ok=True)
-    except OSError as error:
+        target = ReportTarget(output_arg, repo, packet)
+        target.clear()
+    except (OSError, ValueError) as error:
         parser.error(f'output must be a writable file path: {error}')
+    output = target.path
     try:
         content = read_packet(packet)
     except (OSError, ValueError) as error:
@@ -113,24 +107,18 @@ def main() -> int:
         source = "Blind Claude Opus fallback"
         if not shutil.which("claude"):
             print(f"{failure} Claude executable unavailable too.", file=sys.stderr)
+            target.close()
             return 2
         cmd = ["claude", "--print", "--safe-mode", "--restricted", "--model", "opus", "--no-session-persistence", "--system-prompt", REVIEW_SYSTEM, "-"]
         code, stdout, stderr = run(cmd, f"{stage_rules}\nStage: {args.stage}. Repository: {repo}. Inspect the repository and packet; prior reviewers' opinions are withheld.\n\n{content}", repo)
         report = stdout
         if code != 0 or not re.match(r"^VERDICT: (PASS|BLOCK)\b", report.strip()):
             print(f"{failure} Opus review failed or returned no verdict (exit {code}).", file=sys.stderr)
+            target.close()
             return 2
-    output.parent.mkdir(parents=True, exist_ok=True)
     note = f"Fallback reason: {failure}\n" if failure else ""
-    fd, temporary_name = tempfile.mkstemp(prefix=".review-", dir=output.parent, text=True)
-    try:
-        with os.fdopen(fd, "w") as handle:
-            handle.write(f"Reviewer: {source}\nStage: {args.stage}\n{note}\n{report.strip()}\n")
-        os.chmod(temporary_name, 0o600)
-        os.replace(temporary_name, output)
-    finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
+    target.write_text(f"Reviewer: {source}\nStage: {args.stage}\n{note}\n{report.strip()}\n")
+    target.close()
     print(f"{source}: {report.splitlines()[0].strip()} | {output}")
     return 0 if report.lstrip().startswith("VERDICT: PASS") else 3
 

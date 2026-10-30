@@ -19,6 +19,7 @@ from pathlib import Path
 
 from wal import append as append_wal
 from process import run as run_process
+from report_file import ReportTarget
 
 
 SNAPSHOT_GIT_TIMEOUT = 30
@@ -118,15 +119,12 @@ def main() -> int:
         parser.error("repo must be a Git worktree")
     if root != repo or not branch or dirty:
         parser.error("rescue worktree must be at its root, on a named branch, and clean")
-    if output_arg.is_symlink():
-        parser.error('output must not be a symlink')
-    output = output_arg.parent.resolve() / output_arg.name
-    if output == packet.parent.resolve() / packet.name or output == repo or repo in output.parents:
-        parser.error("output must be outside the rescue worktree and differ from packet")
     try:
-        output.unlink(missing_ok=True)
-    except OSError as error:
+        target = ReportTarget(output_arg, repo, packet)
+        target.clear()
+    except (OSError, ValueError) as error:
         parser.error(f'output must be a writable file path: {error}')
+    output = target.path
     try:
         content = read_packet(packet)
     except (OSError, ValueError) as error:
@@ -190,17 +188,8 @@ def main() -> int:
         "stderr_tail": stderr[-4000:],
         "status": "needs-main-verification" if code == 0 and head != base and not dirty_after else "blocked",
     }
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".rescue-", dir=output.parent, text=True)
-    try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(report, handle, indent=2)
-            handle.write("\n")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, output)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    target.write_text(json.dumps(report, indent=2) + "\n")
+    target.close()
     log(wal, {"event": "rescue_result", "branch": branch, "base": base, "head": head, "source": source, "status": report["status"], "report": str(output)})
     print(f"{source}: {report['status']} | {output}")
     return 0 if report["status"] == "needs-main-verification" else 3

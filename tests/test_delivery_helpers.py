@@ -280,6 +280,32 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (0, 'PUSHED'), p.stdout + p.stderr)
         self.assertEqual(cmd('git', 'rev-parse', 'feat/hash', cwd=remote).stdout.strip(), reviewed)
 
+    def test_colon_after_slash_in_relative_url_is_still_a_local_destination(self):
+        project = self.root / 'colon-project'
+        source = project / 'feature'
+        source.mkdir(parents=True)
+        cmd('git', 'init', '-q', '-b', 'feat/relative', str(source))
+        cmd('git', 'config', 'user.email', 'test@example.invalid', cwd=source)
+        cmd('git', 'config', 'user.name', 'Harness test', cwd=source)
+        cmd('git', 'commit', '-q', '--allow-empty', '-m', 'reviewed', cwd=source)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=source).stdout.strip()
+        safe = project / 'real:repo.git'
+        hostile = self.root / 'real:repo.git'
+        for remote in (safe, hostile):
+            cmd('git', 'init', '-q', '--bare', str(remote))
+            cmd('git', 'push', '-q', str(remote), 'HEAD:refs/heads/main', cwd=source)
+            cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        cmd('git', 'remote', 'add', 'origin', '../real:repo.git', cwd=source)
+        env = isolated_env()
+        env['TMPDIR'] = str(self.root)
+        p = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(source), '--branch', 'feat/relative',
+                            '--original-branch', 'main', '--expected-head', reviewed],
+                           env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (0, 'PUSHED'), p.stdout + p.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'feat/relative', cwd=safe).stdout.strip(), reviewed)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/relative', cwd=hostile,
+                                check=False).returncode, 0)
+
     def test_publish_refuses_remote_default_with_nonstandard_name(self):
         remote = self.root / 'origin.git'
         cmd('git', 'init', '-q', '--bare', str(remote))

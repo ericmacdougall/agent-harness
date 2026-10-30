@@ -37,7 +37,9 @@ def scrub(value):
 def pinned_url(url, repo):
     # Git resolves a local relative remote against the current -C directory.
     # The isolated transport uses another directory, so make that target stable.
-    if '://' not in url and ':' not in url:
+    colon = url.find(':')
+    slash = url.find('/')
+    if colon < 0 or (slash >= 0 and slash < colon):
         return str((repo / Path(url).expanduser()).resolve())
     return url
 

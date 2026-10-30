@@ -169,6 +169,26 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertEqual(self.packet.read_text(), 'A disposable rescue packet.')
 
+    def test_case_aliases_cannot_delete_repo_file_or_packet(self):
+        alias_repo = self.repo.parent / self.repo.name.upper()
+        alias_packet = self.packet.with_name(self.packet.name.upper())
+        if not alias_repo.exists() or not alias_repo.samefile(self.repo) or not alias_packet.exists():
+            self.skipTest('filesystem is case-sensitive')
+        first = self.invoke(output=alias_repo / 'app.txt')
+        self.assertEqual(first.returncode, 2, first.stdout)
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'baseline\n')
+        second = self.invoke(output=alias_packet)
+        self.assertEqual(second.returncode, 2, second.stdout)
+        self.assertEqual(self.packet.read_text(), 'A disposable rescue packet.')
+
+    def test_hardlinked_packet_cannot_be_unlinked_as_output(self):
+        alias = self.root / 'packet-hardlink.md'
+        os.link(self.packet, alias)
+        result = self.invoke(output=alias)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertTrue(alias.exists())
+        self.assertTrue(self.packet.exists())
+
     def test_wal_symlink_and_hardlink_do_not_modify_outside_file(self):
         with patch.dict(os.environ, {'HOME': str(self.root)}):
             directory = self.root / '.claude/wals/session-1'
