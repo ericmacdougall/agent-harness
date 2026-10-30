@@ -119,12 +119,13 @@ def main() -> int:
     note = f"Fallback reason: {failure}\n" if failure else ""
     try:
         target.write_text(f"Reviewer: {source}\nStage: {args.stage}\n{note}\n{report.strip()}\n")
+        target.verify_current()
+        print(f"{source}: {report.splitlines()[0].strip()} | {output}")
     except OSError as error:
         print(f"Review completed but report could not be created exclusively: {error}; inspect output and retry with a fresh path.", file=sys.stderr)
         return 2
     finally:
         target.close()
-    print(f"{source}: {report.splitlines()[0].strip()} | {output}")
     return 0 if report.lstrip().startswith("VERDICT: PASS") else 3
 
 

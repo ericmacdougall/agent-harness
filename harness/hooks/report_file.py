@@ -22,6 +22,7 @@ def inside_worktree(parent: Path, repo: Path) -> bool:
 class ReportTarget:
     def __init__(self, output: Path, repo: Path, packet: Path):
         self.fd = None
+        self.report_fd = None
         if output.is_symlink():
             raise ValueError('output must not be a symlink')
         parent = output.parent.resolve()
@@ -50,6 +51,9 @@ class ReportTarget:
         return (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
 
     def close(self):
+        if self.report_fd is not None:
+            os.close(self.report_fd)
+            self.report_fd = None
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
@@ -68,6 +72,8 @@ class ReportTarget:
         raise ValueError('output already exists; choose a fresh report path')
 
     def write_text(self, content: str):
+        if self.report_fd is not None:
+            raise OSError('report target is single-use')
         if not self.directory_is_current():
             raise OSError('output directory changed before report write')
         temporary = '.report-' + secrets.token_hex(12)
@@ -79,6 +85,9 @@ class ReportTarget:
                 handle.flush()
                 os.fsync(handle.fileno())
                 written = os.fstat(handle.fileno())
+                # Keep the inode alive through cleanup and caller WAL work so
+                # an unlinked report inode cannot be recycled for a replacement.
+                self.report_fd = os.dup(handle.fileno())
             if not self.directory_is_current():
                 raise OSError('output directory changed before report publication')
             temporary_info = os.stat(temporary, dir_fd=self.fd, follow_symlinks=False)
@@ -90,13 +99,6 @@ class ReportTarget:
             os.link(temporary, self.path.name, src_dir_fd=self.fd, dst_dir_fd=self.fd,
                     follow_symlinks=False)
             os.fsync(self.fd)
-            if not self.directory_is_current():
-                raise OSError('output directory changed during report publication')
-            visible = os.stat(self.path, follow_symlinks=False)
-            published = os.stat(self.path.name, dir_fd=self.fd, follow_symlinks=False)
-            if ((visible.st_dev, visible.st_ino) != (written.st_dev, written.st_ino)
-                    or (published.st_dev, published.st_ino) != (written.st_dev, written.st_ino)):
-                raise OSError('output path changed during report publication')
         finally:
             # Never remove the public destination: an inode check followed by
             # unlink is not atomic, so another writer's replacement could vanish.
@@ -104,3 +106,16 @@ class ReportTarget:
                 os.unlink(temporary, dir_fd=self.fd)
             except FileNotFoundError:
                 pass
+        self.verify_current()
+
+    def verify_current(self):
+        """Recheck after cleanup and any caller work, immediately before announcing."""
+        if self.report_fd is None or self.fd is None or not self.directory_is_current():
+            raise OSError('output directory changed or report was not published')
+        visible = os.stat(self.path, follow_symlinks=False)
+        published = os.stat(self.path.name, dir_fd=self.fd, follow_symlinks=False)
+        written = os.fstat(self.report_fd)
+        identity = (written.st_dev, written.st_ino)
+        if ((visible.st_dev, visible.st_ino) != identity
+                or (published.st_dev, published.st_ino) != identity):
+            raise OSError('output path changed during report publication')

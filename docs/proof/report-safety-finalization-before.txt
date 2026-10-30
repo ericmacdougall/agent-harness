@@ -1,0 +1,214 @@
+test_rescue_cleanup_races (test_report_finalization.ReportFinalizationTests.test_rescue_cleanup_races) ...
+  test_rescue_cleanup_races (test_report_finalization.ReportFinalizationTests.test_rescue_cleanup_races) (mutation='directory') ... FAIL
+  test_rescue_cleanup_races (test_report_finalization.ReportFinalizationTests.test_rescue_cleanup_races) (mutation='file') ... FAIL
+  test_rescue_cleanup_races (test_report_finalization.ReportFinalizationTests.test_rescue_cleanup_races) (mutation='symlink') ... FAIL
+  test_rescue_cleanup_races (test_report_finalization.ReportFinalizationTests.test_rescue_cleanup_races) (mutation='missing') ... FAIL
+test_rescue_wal_races (test_report_finalization.ReportFinalizationTests.test_rescue_wal_races) ...
+  test_rescue_wal_races (test_report_finalization.ReportFinalizationTests.test_rescue_wal_races) (mutation='directory') ... FAIL
+  test_rescue_wal_races (test_report_finalization.ReportFinalizationTests.test_rescue_wal_races) (mutation='file') ... FAIL
+  test_rescue_wal_races (test_report_finalization.ReportFinalizationTests.test_rescue_wal_races) (mutation='symlink') ... FAIL
+  test_rescue_wal_races (test_report_finalization.ReportFinalizationTests.test_rescue_wal_races) (mutation='missing') ... FAIL
+  test_rescue_wal_races (test_report_finalization.ReportFinalizationTests.test_rescue_wal_races) (mutation='error') ... ERROR
+test_review_cleanup_races (test_report_finalization.ReportFinalizationTests.test_review_cleanup_races) ...
+  test_review_cleanup_races (test_report_finalization.ReportFinalizationTests.test_review_cleanup_races) (mutation='directory') ... FAIL
+  test_review_cleanup_races (test_report_finalization.ReportFinalizationTests.test_review_cleanup_races) (mutation='file') ... FAIL
+  test_review_cleanup_races (test_report_finalization.ReportFinalizationTests.test_review_cleanup_races) (mutation='symlink') ... FAIL
+  test_review_cleanup_races (test_report_finalization.ReportFinalizationTests.test_review_cleanup_races) (mutation='missing') ... FAIL
+test_writer_checks_after_cleanup (test_report_finalization.ReportFinalizationTests.test_writer_checks_after_cleanup) ... FAIL
+
+======================================================================
+ERROR: test_rescue_wal_races (test_report_finalization.ReportFinalizationTests.test_rescue_wal_races) (mutation='error')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 161, in test_rescue_wal_races
+    self.exercise('rescue', 'wal', mutation)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/tests/test_report_finalization.py", line 102, in exercise
+    code = module.main()
+  File "<base-snapshot>/harness/hooks/rescue.py", line 198, in main
+    log(wal, {"event": "rescue_result", "branch": branch, "base": base, "head": head, "source": source, "status": report["status"], "report": str(output)})
+    ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/harness/hooks/rescue.py", line 45, in log
+    append_wal(wal, {"at": datetime.now(timezone.utc).isoformat(), **record})
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/mock.py", line 1176, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/mock.py", line 1180, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/mock.py", line 1247, in _execute_mock_call
+    result = effect(*args, **kwargs)
+  File "<base-snapshot>/tests/test_report_finalization.py", line 79, in append
+    raise OSError('fixture WAL failure')
+OSError: fixture WAL failure
+
+======================================================================
+FAIL: test_rescue_cleanup_races (test_report_finalization.ReportFinalizationTests.test_rescue_cleanup_races) (mutation='directory')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 156, in test_rescue_cleanup_races
+    self.exercise('rescue', 'cleanup', mutation)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/tests/test_report_finalization.py", line 116, in exercise
+    self.assertEqual(code, 2 if helper == 'peer_review' else 3, stdout.getvalue())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 3 : Codex gpt-6-astra: needs-main-verification | <fixture>/reports/report.txt
+
+
+======================================================================
+FAIL: test_rescue_cleanup_races (test_report_finalization.ReportFinalizationTests.test_rescue_cleanup_races) (mutation='file')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 156, in test_rescue_cleanup_races
+    self.exercise('rescue', 'cleanup', mutation)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/tests/test_report_finalization.py", line 116, in exercise
+    self.assertEqual(code, 2 if helper == 'peer_review' else 3, stdout.getvalue())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 3 : Codex gpt-6-astra: needs-main-verification | <fixture>/reports/report.txt
+
+
+======================================================================
+FAIL: test_rescue_cleanup_races (test_report_finalization.ReportFinalizationTests.test_rescue_cleanup_races) (mutation='symlink')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 156, in test_rescue_cleanup_races
+    self.exercise('rescue', 'cleanup', mutation)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/tests/test_report_finalization.py", line 116, in exercise
+    self.assertEqual(code, 2 if helper == 'peer_review' else 3, stdout.getvalue())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 3 : Codex gpt-6-astra: needs-main-verification | <fixture>/reports/report.txt
+
+
+======================================================================
+FAIL: test_rescue_cleanup_races (test_report_finalization.ReportFinalizationTests.test_rescue_cleanup_races) (mutation='missing')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 156, in test_rescue_cleanup_races
+    self.exercise('rescue', 'cleanup', mutation)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/tests/test_report_finalization.py", line 116, in exercise
+    self.assertEqual(code, 2 if helper == 'peer_review' else 3, stdout.getvalue())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 3 : Codex gpt-6-astra: needs-main-verification | <fixture>/reports/report.txt
+
+
+======================================================================
+FAIL: test_rescue_wal_races (test_report_finalization.ReportFinalizationTests.test_rescue_wal_races) (mutation='directory')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 161, in test_rescue_wal_races
+    self.exercise('rescue', 'wal', mutation)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/tests/test_report_finalization.py", line 116, in exercise
+    self.assertEqual(code, 2 if helper == 'peer_review' else 3, stdout.getvalue())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 3 : Codex gpt-6-astra: needs-main-verification | <fixture>/reports/report.txt
+
+
+======================================================================
+FAIL: test_rescue_wal_races (test_report_finalization.ReportFinalizationTests.test_rescue_wal_races) (mutation='file')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 161, in test_rescue_wal_races
+    self.exercise('rescue', 'wal', mutation)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/tests/test_report_finalization.py", line 116, in exercise
+    self.assertEqual(code, 2 if helper == 'peer_review' else 3, stdout.getvalue())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 3 : Codex gpt-6-astra: needs-main-verification | <fixture>/reports/report.txt
+
+
+======================================================================
+FAIL: test_rescue_wal_races (test_report_finalization.ReportFinalizationTests.test_rescue_wal_races) (mutation='symlink')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 161, in test_rescue_wal_races
+    self.exercise('rescue', 'wal', mutation)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/tests/test_report_finalization.py", line 116, in exercise
+    self.assertEqual(code, 2 if helper == 'peer_review' else 3, stdout.getvalue())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 3 : Codex gpt-6-astra: needs-main-verification | <fixture>/reports/report.txt
+
+
+======================================================================
+FAIL: test_rescue_wal_races (test_report_finalization.ReportFinalizationTests.test_rescue_wal_races) (mutation='missing')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 161, in test_rescue_wal_races
+    self.exercise('rescue', 'wal', mutation)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/tests/test_report_finalization.py", line 116, in exercise
+    self.assertEqual(code, 2 if helper == 'peer_review' else 3, stdout.getvalue())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 3 : Codex gpt-6-astra: needs-main-verification | <fixture>/reports/report.txt
+
+
+======================================================================
+FAIL: test_review_cleanup_races (test_report_finalization.ReportFinalizationTests.test_review_cleanup_races) (mutation='directory')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 151, in test_review_cleanup_races
+    self.exercise('peer_review', 'cleanup', mutation)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/tests/test_report_finalization.py", line 116, in exercise
+    self.assertEqual(code, 2 if helper == 'peer_review' else 3, stdout.getvalue())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 2 : Codex gpt-6.1-sol: VERDICT: PASS | <fixture>/reports/report.txt
+
+
+======================================================================
+FAIL: test_review_cleanup_races (test_report_finalization.ReportFinalizationTests.test_review_cleanup_races) (mutation='file')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 151, in test_review_cleanup_races
+    self.exercise('peer_review', 'cleanup', mutation)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/tests/test_report_finalization.py", line 116, in exercise
+    self.assertEqual(code, 2 if helper == 'peer_review' else 3, stdout.getvalue())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 2 : Codex gpt-6.1-sol: VERDICT: PASS | <fixture>/reports/report.txt
+
+
+======================================================================
+FAIL: test_review_cleanup_races (test_report_finalization.ReportFinalizationTests.test_review_cleanup_races) (mutation='symlink')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 151, in test_review_cleanup_races
+    self.exercise('peer_review', 'cleanup', mutation)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/tests/test_report_finalization.py", line 116, in exercise
+    self.assertEqual(code, 2 if helper == 'peer_review' else 3, stdout.getvalue())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 2 : Codex gpt-6.1-sol: VERDICT: PASS | <fixture>/reports/report.txt
+
+
+======================================================================
+FAIL: test_review_cleanup_races (test_report_finalization.ReportFinalizationTests.test_review_cleanup_races) (mutation='missing')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 151, in test_review_cleanup_races
+    self.exercise('peer_review', 'cleanup', mutation)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<base-snapshot>/tests/test_report_finalization.py", line 116, in exercise
+    self.assertEqual(code, 2 if helper == 'peer_review' else 3, stdout.getvalue())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 2 : Codex gpt-6.1-sol: VERDICT: PASS | <fixture>/reports/report.txt
+
+
+======================================================================
+FAIL: test_writer_checks_after_cleanup (test_report_finalization.ReportFinalizationTests.test_writer_checks_after_cleanup)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<base-snapshot>/tests/test_report_finalization.py", line 141, in test_writer_checks_after_cleanup
+    with self.assertRaises(OSError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^
+AssertionError: OSError not raised
+
+----------------------------------------------------------------------
+Ran 4 tests in 4.531s
+
+FAILED (failures=13, errors=1)

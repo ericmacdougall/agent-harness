@@ -33,6 +33,9 @@ class InstallerTests(unittest.TestCase):
         (self.claude / "settings.json").write_text(json.dumps(original))
         (self.claude / "CLAUDE.md").write_text("My existing instructions.\n")
         install(self.home, apply=True)
+        for name in ('report_file.py', 'peer_review.py', 'rescue.py'):
+            self.assertEqual((self.claude / 'hooks' / name).read_bytes(),
+                             (ROOT / 'harness/hooks' / name).read_bytes())
         first = json.loads((self.claude / "settings.json").read_text())
         self.assertEqual(first["model"], "sonnet")
         self.assertEqual(first["permissions"]["deny"], ["Read(**/.env)"])

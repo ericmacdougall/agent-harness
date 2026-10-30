@@ -1,0 +1,58 @@
+test_block_verdict_is_not_signoff (test_peer_review.PeerReviewTests.test_block_verdict_is_not_signoff) ... ok
+test_both_reviewers_failing_leave_fresh_path_absent (test_peer_review.PeerReviewTests.test_both_reviewers_failing_leave_fresh_path_absent) ... ok
+test_case_aliases_cannot_delete_repo_file_or_packet (test_peer_review.PeerReviewTests.test_case_aliases_cannot_delete_repo_file_or_packet) ... ok
+test_directory_relocated_just_after_link_never_unlinks_destination (test_peer_review.PeerReviewTests.test_directory_relocated_just_after_link_never_unlinks_destination) ... ok
+test_existing_output_directory_is_reported_without_model_call (test_peer_review.PeerReviewTests.test_existing_output_directory_is_reported_without_model_call) ... ok
+test_existing_report_is_preserved_and_review_does_not_run (test_peer_review.PeerReviewTests.test_existing_report_is_preserved_and_review_does_not_run) ... ok
+test_existing_unrelated_file_outside_repo_is_not_deleted (test_peer_review.PeerReviewTests.test_existing_unrelated_file_outside_repo_is_not_deleted) ... ok
+test_file_created_during_review_is_not_overwritten (test_peer_review.PeerReviewTests.test_file_created_during_review_is_not_overwritten) ... ok
+test_hardlinked_packet_cannot_be_unlinked_as_output (test_peer_review.PeerReviewTests.test_hardlinked_packet_cannot_be_unlinked_as_output) ... ok
+test_invalid_packet_never_creates_a_report (test_peer_review.PeerReviewTests.test_invalid_packet_never_creates_a_report) ... ok
+test_invalid_sol_result_uses_blind_opus_fallback (test_peer_review.PeerReviewTests.test_invalid_sol_result_uses_blind_opus_fallback) ... ok
+test_invalid_subdirectory_repo_cannot_delete_tracked_output (test_peer_review.PeerReviewTests.test_invalid_subdirectory_repo_cannot_delete_tracked_output) ... ok
+test_output_inside_checkout_is_refused (test_peer_review.PeerReviewTests.test_output_inside_checkout_is_refused) ... ok
+test_output_symlink_never_changes_target (test_peer_review.PeerReviewTests.test_output_symlink_never_changes_target) ... ok
+test_packet_hardlink_fifo_and_oversize_are_refused_without_model_call (test_peer_review.PeerReviewTests.test_packet_hardlink_fifo_and_oversize_are_refused_without_model_call) ... ok
+test_packet_parent_alias_cannot_be_deleted_as_output (test_peer_review.PeerReviewTests.test_packet_parent_alias_cannot_be_deleted_as_output) ... ok
+test_packet_symlink_is_refused_before_model_call (test_peer_review.PeerReviewTests.test_packet_symlink_is_refused_before_model_call) ... ok
+test_relocated_report_directory_cannot_yield_false_signoff (test_peer_review.PeerReviewTests.test_relocated_report_directory_cannot_yield_false_signoff) ... ok
+test_repo_subdirectory_is_refused_before_model_call (test_peer_review.PeerReviewTests.test_repo_subdirectory_is_refused_before_model_call) ... ok
+test_valid_sol_pass_is_private_and_identified (test_peer_review.PeerReviewTests.test_valid_sol_pass_is_private_and_identified) ... ok
+
+----------------------------------------------------------------------
+Ran 20 tests in 5.872s
+
+OK
+test_case_aliases_cannot_delete_repo_file_or_packet (test_rescue.RescueTests.test_case_aliases_cannot_delete_repo_file_or_packet) ... ok
+test_existing_output_directory_is_reported_without_model_call (test_rescue.RescueTests.test_existing_output_directory_is_reported_without_model_call) ... ok
+test_existing_unrelated_file_outside_repo_is_not_deleted (test_rescue.RescueTests.test_existing_unrelated_file_outside_repo_is_not_deleted) ... ok
+test_failed_model_after_edits_does_not_fallback_or_commit (test_rescue.RescueTests.test_failed_model_after_edits_does_not_fallback_or_commit) ... ok
+test_fallback_before_edits_is_blind_and_snapshotted (test_rescue.RescueTests.test_fallback_before_edits_is_blind_and_snapshotted) ... ok
+test_file_created_during_rescue_is_not_overwritten (test_rescue.RescueTests.test_file_created_during_rescue_is_not_overwritten) ... ok
+test_hardlinked_packet_cannot_be_unlinked_as_output (test_rescue.RescueTests.test_hardlinked_packet_cannot_be_unlinked_as_output) ... ok
+test_invalid_subdirectory_repo_cannot_delete_tracked_output (test_rescue.RescueTests.test_invalid_subdirectory_repo_cannot_delete_tracked_output) ... ok
+test_output_symlink_does_not_delete_target (test_rescue.RescueTests.test_output_symlink_does_not_delete_target) ... ok
+test_packet_hardlink_fifo_and_oversize_are_refused_before_model_call (test_rescue.RescueTests.test_packet_hardlink_fifo_and_oversize_are_refused_before_model_call) ... ok
+test_packet_parent_alias_cannot_be_deleted_as_output (test_rescue.RescueTests.test_packet_parent_alias_cannot_be_deleted_as_output) ... ok
+test_packet_symlink_is_not_sent_to_model (test_rescue.RescueTests.test_packet_symlink_is_not_sent_to_model) ... ok
+test_private_report_and_snapshot_on_successful_model_edit (test_rescue.RescueTests.test_private_report_and_snapshot_on_successful_model_edit) ... ok
+test_relocated_report_directory_preserves_replacement_after_rescue_edits (test_rescue.RescueTests.test_relocated_report_directory_preserves_replacement_after_rescue_edits) ... ok
+test_snapshot_refuses_hardlinked_external_content (test_rescue.RescueTests.test_snapshot_refuses_hardlinked_external_content) ... ok
+test_snapshot_refuses_sensitive_paths (test_rescue.RescueTests.test_snapshot_refuses_sensitive_paths) ... ok
+test_stalled_snapshot_commit_hook_is_bounded_and_child_cannot_write_late (test_rescue.RescueTests.test_stalled_snapshot_commit_hook_is_bounded_and_child_cannot_write_late) ... ok
+test_wal_outside_private_root_is_rejected (test_rescue.RescueTests.test_wal_outside_private_root_is_rejected) ... ok
+test_wal_symlink_and_hardlink_do_not_modify_outside_file (test_rescue.RescueTests.test_wal_symlink_and_hardlink_do_not_modify_outside_file) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 9.493s
+
+OK
+test_rescue_cleanup_races (test_report_finalization.ReportFinalizationTests.test_rescue_cleanup_races) ... ok
+test_rescue_wal_races (test_report_finalization.ReportFinalizationTests.test_rescue_wal_races) ... ok
+test_review_cleanup_races (test_report_finalization.ReportFinalizationTests.test_review_cleanup_races) ... ok
+test_writer_checks_after_cleanup (test_report_finalization.ReportFinalizationTests.test_writer_checks_after_cleanup) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 4.606s
+
+OK

@@ -190,13 +190,14 @@ def main() -> int:
     }
     try:
         target.write_text(json.dumps(report, indent=2) + "\n")
-    except OSError as error:
-        print(f"Rescue finished but report could not be created exclusively: {error}; inspect the worktree and retry with a fresh path.", file=sys.stderr)
+        log(wal, {"event": "rescue_result", "branch": branch, "base": base, "head": head, "source": source, "status": report["status"], "report": str(output)})
+        target.verify_current()
+        print(f"{source}: {report['status']} | {output}")
+    except (OSError, ValueError) as error:
+        print(f"Rescue finished but report could not be finalized: {error}; inspect the worktree and retry with a fresh path.", file=sys.stderr)
         return 3
     finally:
         target.close()
-    log(wal, {"event": "rescue_result", "branch": branch, "base": base, "head": head, "source": source, "status": report["status"], "report": str(output)})
-    print(f"{source}: {report['status']} | {output}")
     return 0 if report["status"] == "needs-main-verification" else 3
 
 
