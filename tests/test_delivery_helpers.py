@@ -109,21 +109,119 @@ class ProcessRunner(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def test_discard_output_routes_both_streams_to_devnull(self):
-        with patch.object(self.process.subprocess, 'Popen') as popen:
-            popen.return_value.returncode = 0
-            popen.return_value.communicate.return_value = (None, None)
-            result = self.process.run(['fixture'], timeout=2, discard_output=True)
-        self.assertEqual(popen.call_args.kwargs['stdout'], subprocess.DEVNULL)
-        self.assertEqual(popen.call_args.kwargs['stderr'], subprocess.DEVNULL)
-        self.assertTrue(popen.call_args.kwargs['start_new_session'])
+    def test_discard_output_uses_one_pipe_without_retaining_bytes(self):
+        real_popen = self.process.subprocess.Popen
+        destinations = []
+
+        def start(*args, **kwargs):
+            destinations.append((kwargs['stdout'], kwargs['stderr'], kwargs['start_new_session']))
+            return real_popen(*args, **kwargs)
+
+        with patch.object(self.process.subprocess, 'Popen', side_effect=start):
+            result = self.process.run([sys.executable, '-c', 'print("synthetic-output")'],
+                                      timeout=2, discard_output=True)
+        self.assertEqual(destinations, [(subprocess.PIPE, subprocess.STDOUT, True)])
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, None, None))
+
+    def test_discard_waits_for_child_holding_output_after_parent_exits(self):
+        marker = self.root / 'child-complete'
+        child = ('import time; from pathlib import Path; '
+                 f'time.sleep(0.7); Path({str(marker)!r}).write_text("done")')
+        parent = ('import subprocess, sys; '
+                  f'subprocess.Popen([sys.executable, "-c", {child!r}])')
+        started = time.monotonic()
+        result = self.process.run([sys.executable, '-c', parent], timeout=3,
+                                  discard_output=True)
+        elapsed = time.monotonic() - started
+        finished_at_return = marker.exists()
+        deadline = time.monotonic() + 2
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(marker.exists(), 'descendant fixture never completed')
+        self.assertTrue(finished_at_return, 'descendant still ran after successful return')
+        self.assertGreater(elapsed, 0.5)
 
     def test_stream_and_discard_are_rejected_before_start(self):
         with patch.object(self.process.subprocess, 'Popen') as popen:
             with self.assertRaises(ValueError):
                 self.process.run(['fixture'], stream=True, discard_output=True)
         popen.assert_not_called()
+
+    def test_input_and_discard_are_rejected_before_start(self):
+        with patch.object(self.process.subprocess, 'Popen') as popen:
+            with self.assertRaises(ValueError):
+                self.process.run(['fixture'], input='synthetic', discard_output=True)
+        popen.assert_not_called()
+
+    def test_discard_waits_for_leader_after_output_closes(self):
+        marker = self.root / 'leader-complete'
+        code = ('import os, time; from pathlib import Path; '
+                'os.close(1); os.close(2); time.sleep(0.5); '
+                f'Path({str(marker)!r}).write_text("done")')
+        result = self.process.run([sys.executable, '-c', code], timeout=3,
+                                  discard_output=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(marker.read_text(), 'done')
+
+    def test_discard_output_free_timeout_cleans_up(self):
+        with self.assertRaises(subprocess.TimeoutExpired) as raised:
+            self.process.run([sys.executable, '-c', 'import time; time.sleep(30)'],
+                             timeout=0.5, discard_output=True)
+        self.assertIsNone(raised.exception.output)
+
+    def test_discard_cleanup_failure_preserves_timeout_and_marks_incomplete(self):
+        real_cleanup = self.process.cleanup_discarded
+
+        def fail_after_cleanup(process):
+            real_cleanup(process)
+            raise OSError('synthetic_cleanup_failure')
+
+        with patch.object(self.process, 'cleanup_discarded', side_effect=fail_after_cleanup):
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                self.process.run([sys.executable, '-c', 'import time; time.sleep(30)'],
+                                 timeout=0.5, discard_output=True)
+        self.assertTrue(getattr(raised.exception, 'cleanup_incomplete', False))
+
+    def test_discard_flood_bounds_reads_through_timeout_cleanup(self):
+        pid_file = self.root / 'flood-child.pid'
+        child = ('import os, signal, time; from pathlib import Path\n'
+                 'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                 f'Path({str(pid_file)!r}).write_text(str(os.getpid()))\n'
+                 'while True:\n'
+                 '    os.write(1, b"x" * 16384)\n'
+                 '    os.write(2, b"\\xff" * 16384)\n'
+                 '    time.sleep(0.001)\n')
+        parent = ('import subprocess, sys, time; '
+                  f'subprocess.Popen([sys.executable, "-c", {child!r}]); time.sleep(30)')
+        real_read = os.read
+        read_count = 0
+        largest_request = 0
+
+        def record_read(fd, size):
+            nonlocal read_count, largest_request
+            read_count += 1
+            largest_request = max(largest_request, size)
+            return real_read(fd, size)
+
+        with patch.object(self.process.os, 'read', side_effect=record_read):
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                self.process.run([sys.executable, '-c', parent], timeout=1,
+                                 discard_output=True)
+        self.assertIsNone(raised.exception.output)
+        self.assertGreater(read_count, 0)
+        self.assertLessEqual(largest_request, self.process.DISCARD_CHUNK_BYTES)
+        self.assertTrue(pid_file.exists(), 'flooding descendant never started')
+        pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail('flooding descendant survived process-group cleanup')
 
     def test_discarded_output_timeout_preserves_descendant_term_grace(self):
         marker = self.root / 'term-complete'
@@ -1057,6 +1155,65 @@ class DeliveryHelpers(unittest.TestCase):
         time.sleep(5)
         self.assertFalse(marker.exists(), 'verification descendant survived the timeout')
 
+    def test_check_descendant_edit_before_pipe_eof_blocks_integration(self):
+        marker = self.root / 'late-check-complete'
+        child = ('import time; from pathlib import Path; '
+                 'time.sleep(0.8); Path("app.txt").write_text("late unverified edit\\n"); '
+                 f'Path({str(marker)!r}).write_text("done")')
+        self.add_feature_test('import subprocess, sys, unittest\n'
+                              'class Check(unittest.TestCase):\n'
+                              '    def test_late_child(self):\n'
+                              f'        subprocess.Popen([sys.executable, "-c", {child!r}])\n')
+        result = subprocess.run(self.integrate_args('--timeout', '5'),
+                                text=True, capture_output=True, env=isolated_env(), timeout=15)
+        finished_at_return = marker.exists()
+        deadline = time.monotonic() + 2
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(marker.exists(), 'the delayed tracked-file edit did not run')
+        data = json.loads(result.stdout)
+        self.assertTrue(finished_at_return, 'integration returned before the check descendant finished')
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        state_at_return = (self.repo / 'app.txt').read_text()
+        time.sleep(0.3)
+        self.assertEqual((self.repo / 'app.txt').read_text(), state_at_return,
+                         'a descendant changed tracked content after integration returned')
+
+    def test_incomplete_check_cleanup_leaves_merge_for_inspection(self):
+        self.add_feature_test()
+        spec = importlib.util.spec_from_file_location('integration_cleanup_incomplete', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        real_run = module.run
+        check = ['python3', '-m', 'unittest', 'discover', '-s', 'tests']
+        abort_attempts = []
+
+        def fail_check(repo, command, **kwargs):
+            if command == check:
+                error = subprocess.TimeoutExpired(command, kwargs['timeout'])
+                error.cleanup_incomplete = True
+                raise error
+            if command == ['git', 'merge', '--abort']:
+                abort_attempts.append(True)
+            return real_run(repo, command, **kwargs)
+
+        with patch.object(sys, 'argv', self.integrate_args('--timeout', '10')[1:]), \
+             patch.object(module, 'run', side_effect=fail_check), \
+             patch('sys.stdout', new_callable=io.StringIO) as output, \
+             patch.dict(os.environ, isolated_env(), clear=True):
+            code = module.main()
+        data = json.loads(output.getvalue())
+        self.assertEqual((code, data['status'], data['merge_aborted']),
+                         (3, 'BLOCKED_LOCAL', False), output.getvalue())
+        self.assertEqual(data['phase'], 'check')
+        self.assertIn('cleanup incomplete', data['message'])
+        self.assertFalse(abort_attempts)
+        self.assertEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD', cwd=self.repo).stdout.strip(),
+                         self.feature_head)
+        cmd('git', 'merge', '--abort', cwd=self.repo)
+
     def test_missing_preparation_executable_aborts_merge(self):
         # Simulate an unavailable package manager without depending on the host PATH.
         spec = importlib.util.spec_from_file_location('integration', INTEGRATE)
@@ -1083,15 +1240,15 @@ class DeliveryHelpers(unittest.TestCase):
         parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
         self.assertEqual(parents[1:], [self.base, self.feature_head])
 
-    def test_check_uses_devnull_descriptors_and_reports_only_status(self):
+    def test_check_uses_merged_pipe_descriptors_and_reports_only_status(self):
         self.add_feature_test('import os, unittest\n'
+                              'import stat\n'
                               'class Check(unittest.TestCase):\n'
                               '    def test_output_destination(self):\n'
-                              '        expected = os.stat(os.devnull)\n'
-                              '        for fd in (1, 2):\n'
-                              '            actual = os.fstat(fd)\n'
-                              '            self.assertEqual((actual.st_dev, actual.st_ino),\n'
-                              '                             (expected.st_dev, expected.st_ino))\n'
+                              '        out, err = os.fstat(1), os.fstat(2)\n'
+                              '        self.assertTrue(stat.S_ISFIFO(out.st_mode))\n'
+                              '        self.assertEqual((out.st_dev, out.st_ino),\n'
+                              '                         (err.st_dev, err.st_ino))\n'
                               '        os.write(1, b"synthetic_check_stdout" + b"x" * 1000000)\n'
                               '        os.write(2, b"synthetic_check_stderr" + b"y" * 1000000)\n')
         result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
@@ -1100,17 +1257,17 @@ class DeliveryHelpers(unittest.TestCase):
                          (0, 'INTEGRATED'), result.stdout + result.stderr)
         self.assertNotIn('synthetic_check_', result.stdout + result.stderr)
 
-    def test_prepare_uses_devnull_descriptors_and_reports_only_status(self):
+    def test_prepare_uses_merged_pipe_descriptors_and_reports_only_status(self):
         self.add_feature_test()
         bin_dir = self.root / 'bin'
         bin_dir.mkdir()
         marker = self.root / 'prepare-fds-ok'
         npm = bin_dir / 'npm'
         npm.write_text(f'#!{sys.executable}\n'
-                       'import os, sys\nfrom pathlib import Path\n'
-                       'expected = os.stat(os.devnull)\n'
-                       'ok = all((os.fstat(fd).st_dev, os.fstat(fd).st_ino) == '
-                       '(expected.st_dev, expected.st_ino) for fd in (1, 2))\n'
+                       'import os, stat, sys\nfrom pathlib import Path\n'
+                       'out, err = os.fstat(1), os.fstat(2)\n'
+                       'ok = stat.S_ISFIFO(out.st_mode) and '
+                       '(out.st_dev, out.st_ino) == (err.st_dev, err.st_ino)\n'
                        'os.write(1, b"synthetic_prepare_stdout")\n'
                        'os.write(2, b"synthetic_prepare_stderr")\n'
                        f'Path({str(marker)!r}).write_text("ok") if ok else None\n'

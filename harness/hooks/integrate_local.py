@@ -143,10 +143,18 @@ def integrate(args, preparations, checks):
             for argv in commands:
                 try:
                     result = run(repo, argv, timeout=args.timeout, discard_output=True)
-                except subprocess.TimeoutExpired:
+                except subprocess.TimeoutExpired as error:
+                    if getattr(error, 'cleanup_incomplete', False):
+                        report("BLOCKED_LOCAL", f"{kind.capitalize()} cleanup incomplete; inspect processes and checkout",
+                               phase=kind, merge_aborted=False, **{kind: argv})
+                        return 3
                     return abort(repo, f"{kind.capitalize()} exceeded {args.timeout} seconds", phase=kind,
                                  **{kind: argv})
-                except OSError:
+                except OSError as error:
+                    if getattr(error, 'cleanup_incomplete', False):
+                        report("BLOCKED_LOCAL", f"{kind.capitalize()} cleanup incomplete; inspect processes and checkout",
+                               phase=kind, merge_aborted=False, **{kind: argv})
+                        return 3
                     return abort(repo, f"{kind.capitalize()} could not start", phase=kind,
                                  **{kind: argv})
                 if result.returncode:
