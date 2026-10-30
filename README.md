@@ -1,6 +1,8 @@
-# Agent Harness for Claude Code
+# Agent Harness for Claude Code and Codex
 
-A user-wide Claude Code workflow for parallel software tasks with recoverable work, independent review, live testing, and local delivery. It is opinionated instruction text plus small Python helpers. It is **not** a daemon, scheduler, CI service, or guarantee that an agent will obey every instruction. The hooks enforce WAL metadata before matched write tools; the remaining process gates require the main agent to follow the instructions and report evidence.
+The repo includes a Codex-native edition: global `AGENTS.md` guidance, a focused skill, custom subagent roles, private lifecycle-hook WALs, and a narrow permission profile for WAL writes and local Git commits. Install it with `python3 install_codex.py --apply` after previewing `python3 install_codex.py`. Start a new Codex session and use `/hooks` to review and trust the installed hook definition. See [Codex setup and limits](docs/codex.md).
+
+A user-wide Claude Code workflow for parallel software tasks with recoverable work, independent review, live testing, and local delivery. Both editions are instruction text plus small Python helpers. Neither is a daemon, scheduler, CI service, or guarantee that an agent will obey every instruction. Claude's hooks enforce WAL metadata before matched write tools; Codex's hooks record supported lifecycle and tool metadata. The remaining process gates require the main agent to follow the instructions and report evidence.
 
 ## What it does
 
