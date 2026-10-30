@@ -27,7 +27,9 @@ SECRET_PATTERN = re.compile(
     r'access[_-]?key|private[_-]?key|credentials?)(?:[_-]value)?[\x22\x27]?\s*[:=]\s*[\x22\x27]?\S+|'
     r'\b[a-z][a-z0-9]*(?:Secret|Token|Password|ApiKey|AccessKey|PrivateKey|Credentials?)'
     r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?\S+|'
-    r'\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s/@:]+:[^\s/@]+@|'
+    # Any userinfo in a URL authority may contain a credential or private user.
+    # The authority ends at /, ?, or #, so ordinary path/query @ signs are safe.
+    r'\b[a-z][a-z0-9+.-]*://[^\s/?#@]+@[^\s/?#]+|'
     r'-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)'
 )
 

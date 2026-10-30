@@ -35,6 +35,10 @@ class HumanWalNoteGuards(unittest.TestCase):
         '{"clientSecret": "synthetic_value"}',
         '{"accessToken": "synthetic_value"}',
         'secretAccessKey=synthetic_value',
+        'https://fixture:syntheticpassword@example.invalid/path',
+        'http://fixture@example.invalid/path',
+        'ssh://fixture:syntheticpassword@example.invalid/repo',
+        'git+https://fixture%3Aencoded%40user@example.invalid/repo',
     )
     ORDINARY_NOTES = (
         'Review token validation flow',
@@ -42,6 +46,10 @@ class HumanWalNoteGuards(unittest.TestCase):
         'token_budget=1000',
         'credential_check=passed',
         'secret_scanning=enabled',
+        'https://example.invalid/path',
+        'https://example.invalid/@team',
+        'https://example.invalid/search?q=team@example.invalid',
+        'Contact team@example.invalid',
     )
 
     def test_claude_rejects_compound_credential_names_before_writing(self):
