@@ -24,40 +24,44 @@ DEFAULT_FILENAMES = {'pyproject.toml', 'requirements.txt', 'poetry.lock', 'uv.lo
 
 def snapshot(root, extensions):
     found = {}
-    def fail_scan(error):
-        raise OSError('source scan failed') from error
-
-    for folder, dirs, files in os.walk(root, followlinks=False, onerror=fail_scan):
-        retained = []
-        for name in dirs:
-            if name in SKIP:
-                continue
-            try:
-                info = os.stat(Path(folder) / name, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            if stat.S_ISDIR(info.st_mode):
-                retained.append(name)
-        dirs[:] = retained
-        for name in files:
-            path = Path(folder) / name
-            if path.suffix not in extensions and name not in DEFAULT_FILENAMES:
-                continue
-            try:
-                info = os.stat(path, follow_symlinks=False)
-                if not stat.S_ISREG(info.st_mode):
-                    continue
-                found[str(path.relative_to(root))] = (
-                    info.st_dev, info.st_ino, info.st_mode, info.st_size,
-                    info.st_mtime_ns, info.st_ctime_ns)
-            except FileNotFoundError:
-                continue
+    pending = [root]
+    while pending:
+        folder = pending.pop()
+        try:
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if entry.name in SKIP:
+                        continue
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    path = folder / entry.name
+                    if is_dir:
+                        pending.append(path)
+                    elif path.suffix in extensions or entry.name in DEFAULT_FILENAMES:
+                        try:
+                            info = entry.stat(follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        if not stat.S_ISREG(info.st_mode):
+                            continue
+                        found[str(path.relative_to(root))] = (
+                            info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                            info.st_mtime_ns, info.st_ctime_ns)
+        except FileNotFoundError as error:
+            if folder == root:
+                raise OSError('source scan failed') from error
+            # A child directory can disappear between classification and traversal.
+            continue
+        except OSError as error:
+            raise OSError('source scan failed') from error
     return found
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--root', type=Path, default=Path.cwd(), help='project checkout to watch')
+    parser.add_argument('--root', type=Path, default=Path('.'), help='project checkout to watch')
     parser.add_argument('--extensions', default=','.join(sorted(DEFAULT_EXTENSIONS)),
                         help='comma-separated suffixes; core dependency filenames are always watched')
     parser.add_argument('--interval', type=float, default=0.75)
@@ -66,8 +70,13 @@ def main():
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
-    root = args.root.resolve()
-    if not root.is_dir() or not command or args.interval < 0.1 or args.timeout <= 0:
+    try:
+        root = args.root.resolve()
+        valid_root = root.is_dir()
+    except (OSError, RuntimeError):
+        print('[watch] project root unavailable', file=sys.stderr, flush=True)
+        return 2
+    if not valid_root or not command or args.interval < 0.1 or args.timeout <= 0:
         parser.error('provide an existing --root, a test command after --, interval >= 0.1, and timeout > 0')
     extensions = {item.strip() for item in args.extensions.split(',') if item.strip()}
     try:

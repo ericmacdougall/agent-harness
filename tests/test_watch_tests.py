@@ -122,23 +122,75 @@ class WatchTests(unittest.TestCase):
         watcher = load_watcher()
         private = 'fixture-private-source-path'
 
-        def walk_error(*args, **kwargs):
-            kwargs['onerror'](OSError(private))
-            yield from ()
+        class UnclassifiableEntry:
+            name = 'src'
 
-        with patch.object(watcher.os, 'walk', side_effect=walk_error):
+            def is_dir(self, **_kwargs):
+                raise PermissionError(private)
+
+            def stat(self, **_kwargs):
+                raise PermissionError(private)
+
+        class Scan:
+            def __enter__(self):
+                return iter((UnclassifiableEntry(),))
+
+            def __exit__(self, *_args):
+                return False
+
+        with patch.object(watcher.os, 'scandir', return_value=Scan()):
             with self.assertRaises(OSError) as raised:
                 watcher.snapshot(self.root, watcher.DEFAULT_EXTENSIONS)
         self.assertNotIn(private, str(raised.exception))
-        for sequence in ((OSError(private),), ({}, OSError(private))):
-            with self.subTest(sequence=sequence), \
-                 patch.object(watcher, 'snapshot', side_effect=sequence), \
-                 patch.object(watcher, 'run_process', return_value=subprocess.CompletedProcess([], 0)), \
-                 patch.object(sys, 'argv', [str(WATCH), '--root', str(self.root), '--', 'fixture']), \
+        with patch.object(watcher.os, 'scandir', return_value=Scan()), \
+             patch.object(watcher, 'run_process',
+                          return_value=subprocess.CompletedProcess([], 0)) as run, \
+             patch.object(sys, 'argv', [str(WATCH), '--root', str(self.root), '--once',
+                                       '--', 'fixture']), \
+             contextlib.redirect_stdout(io.StringIO()) as stdout, \
+             contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(watcher.main(), 2)
+            run.assert_not_called()
+            self.assertNotIn(private, stdout.getvalue() + stderr.getvalue())
+
+    def test_startup_resolution_errors_are_generic(self):
+        watcher = load_watcher()
+        private = 'fixture-private-checkout-path'
+        for error in (PermissionError(13, 'Permission denied', private),
+                      RuntimeError(private)):
+            with self.subTest(error=type(error).__name__), \
+                 patch.object(Path, 'resolve', side_effect=error), \
+                 patch.object(watcher, 'run_process') as run, \
+                 patch.object(sys, 'argv', [str(WATCH), '--root', str(self.root), '--once',
+                                           '--', 'fixture']), \
                  contextlib.redirect_stdout(io.StringIO()) as stdout, \
                  contextlib.redirect_stderr(io.StringIO()) as stderr:
                 self.assertEqual(watcher.main(), 2)
+                run.assert_not_called()
                 self.assertNotIn(private, stdout.getvalue() + stderr.getvalue())
+
+    def test_disappearing_child_is_tolerated_but_missing_root_is_not(self):
+        watcher = load_watcher()
+
+        class VanishingDirectory:
+            name = 'src'
+
+            def is_dir(self, **_kwargs):
+                return True
+
+        class Scan:
+            def __enter__(self):
+                return iter((VanishingDirectory(),))
+
+            def __exit__(self, *_args):
+                return False
+
+        with patch.object(watcher.os, 'scandir', side_effect=(Scan(), FileNotFoundError())):
+            self.assertEqual(watcher.snapshot(self.root, watcher.DEFAULT_EXTENSIONS), {})
+        with patch.object(watcher.os, 'scandir', side_effect=FileNotFoundError('private-root')):
+            with self.assertRaises(OSError) as raised:
+                watcher.snapshot(self.root, watcher.DEFAULT_EXTENSIONS)
+        self.assertNotIn('private-root', str(raised.exception))
 
     def test_file_metadata_errors_are_loud_and_path_free(self):
         watcher = load_watcher()
@@ -149,18 +201,31 @@ class WatchTests(unittest.TestCase):
         for fail_on, expected_runs in ((1, 0), (2, 1)):
             seen = 0
 
-            def fail_stat(path, *args, **kwargs):
-                nonlocal seen
-                if Path(path) == source:
+            class FileEntry:
+                name = 'app.py'
+
+                def is_dir(self, **_kwargs):
+                    return False
+
+                def stat(self, **_kwargs):
+                    nonlocal seen
                     seen += 1
                     if seen == fail_on:
                         raise PermissionError(private)
-                return original_stat(path, *args, **kwargs)
+                    return original_stat(source, follow_symlinks=False)
+
+            class Scan:
+                def __enter__(self):
+                    return iter((FileEntry(),))
+
+                def __exit__(self, *_args):
+                    return False
 
             with self.subTest(fail_on=fail_on), \
-                 patch.object(watcher.os, 'stat', side_effect=fail_stat), \
+                 patch.object(watcher.os, 'scandir', return_value=Scan()), \
                  patch.object(watcher, 'run_process',
                               return_value=subprocess.CompletedProcess([], 0)) as run, \
+                 patch.object(watcher.time, 'sleep', side_effect=KeyboardInterrupt), \
                  patch.object(sys, 'argv', [str(WATCH), '--root', str(self.root), '--', 'fixture']), \
                  contextlib.redirect_stdout(io.StringIO()) as stdout, \
                  contextlib.redirect_stderr(io.StringIO()) as stderr:
