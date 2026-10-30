@@ -4,6 +4,7 @@ import io
 import json
 import os
 import pty
+import random
 import select
 import signal
 import shlex
@@ -194,6 +195,35 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(cmd('git', 'rev-parse', 'main', cwd=remote).stdout.strip(), self.base)
         p, data = self.invoke(PUBLISH, '--repo', str(self.repo), '--branch', 'main', '--original-branch', 'main', '--expected-head', self.base)
         self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'))
+
+    def test_seeded_publication_matrix_preserves_default_and_exact_reviewed_commits(self):
+        randomizer = random.Random(0x5EED)
+        remote = self.root / 'remote with spaces' / 'origin.git'
+        remote.parent.mkdir()
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        published = {}
+        for index in range(8):
+            branch = f'feat/chaos/{index}-{randomizer.getrandbits(32):08x}'
+            with self.subTest(branch=branch):
+                cmd('git', 'switch', '-q', 'feat/app', cwd=self.feature)
+                cmd('git', 'switch', '-q', '-c', branch, cwd=self.feature)
+                payload = bytes(randomizer.getrandbits(8) for _ in range(256 + index * 31))
+                (self.feature / 'variant.bin').write_bytes(payload)
+                cmd('git', 'add', 'variant.bin', cwd=self.feature)
+                cmd('git', 'commit', '-qm', f'chaos case {index}', cwd=self.feature)
+                reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+                result, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', branch,
+                                           '--original-branch', 'main', '--expected-head', reviewed)
+                self.assertEqual((result.returncode, data['status']), (0, 'PUSHED'), result.stderr)
+                self.assertEqual(data['head'], reviewed)
+                self.assertEqual(cmd('git', 'rev-parse', f'refs/heads/{branch}', cwd=remote).stdout.strip(), reviewed)
+                self.assertEqual(cmd('git', 'rev-parse', 'refs/heads/main', cwd=remote).stdout.strip(), self.base)
+                published[branch] = reviewed
+        refs = cmd('git', 'for-each-ref', '--format=%(refname)', 'refs/heads', cwd=remote).stdout.splitlines()
+        self.assertEqual(set(refs), {'refs/heads/main', *(f'refs/heads/{branch}' for branch in published)})
 
     def test_lfs_pointer_cannot_be_published_without_its_content(self):
         remote = self.root / 'lfs-origin.git'

@@ -67,7 +67,7 @@ def append(path: Path, record: dict) -> None:
                 return False
             return True
 
-        file_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+        file_flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
         for attempt in range(4):
             if not current_directory():
                 raise ValueError("WAL session directory changed")
@@ -102,6 +102,18 @@ def append(path: Path, record: dict) -> None:
         fcntl.flock(fd, fcntl.LOCK_EX)
         if not current_target():
             raise ValueError("WAL target changed before append")
+        # A killed writer may leave a partial final record. Under the file lock,
+        # remove only that unterminated suffix before adding the next JSONL line.
+        end = os.lseek(fd, 0, os.SEEK_END)
+        if end and os.pread(fd, 1, end - 1) != b"\n":
+            scan = min(end, 65_536)
+            tail = os.pread(fd, scan, end - scan)
+            last_newline = tail.rfind(b"\n")
+            if last_newline < 0 and end > scan:
+                raise ValueError("WAL crash tail exceeds recovery budget")
+            os.ftruncate(fd, end - scan + last_newline + 1)
+            if not current_target():
+                raise ValueError("WAL target changed during crash recovery")
         # A short write must not silently report a complete record.
         with os.fdopen(fd, "ab", closefd=False) as handle:
             handle.write(payload)

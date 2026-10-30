@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
-import shutil
+import secrets
 import stat
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -81,18 +81,94 @@ def merged_instructions(existing: str, instructions: str) -> str:
     return existing.rstrip() + ("\n\n" if existing.strip() else "") + block + "\n"
 
 
-def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".agent-harness-", dir=path.parent)
+@contextlib.contextmanager
+def parent_fd(path: Path, *, create: bool = False):
+    """Pin each parent directory without following a swapped symlink."""
+    parts = path.absolute().parts
+    directory = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, mode)
-        os.replace(temporary, path)
+        for name in parts[1:-1]:
+            if create:
+                try:
+                    os.mkdir(name, dir_fd=directory)
+                except FileExistsError:
+                    pass
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=directory)
+            os.close(directory)
+            directory = child
+        yield directory
     finally:
-        Path(temporary).unlink(missing_ok=True)
+        os.close(directory)
+
+
+def require_current_parent(path: Path, pinned: int) -> None:
+    with parent_fd(path) as current:
+        opened, named = os.fstat(pinned), os.fstat(current)
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise OSError(f'Parent directory changed for {path.name}')
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    with parent_fd(path, create=True) as directory:
+        temporary = ".agent-harness-" + secrets.token_hex(12)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+                os.fchmod(handle.fileno(), mode)
+            require_current_parent(path, directory)
+            os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+            os.fsync(directory)
+            require_current_parent(path, directory)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+
+
+def safe_unlink(path: Path) -> None:
+    opened_parent = False
+    try:
+        with parent_fd(path) as directory:
+            opened_parent = True
+            require_current_parent(path, directory)
+            try:
+                os.unlink(path.name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+            require_current_parent(path, directory)
+    except FileNotFoundError:
+        if opened_parent:
+            raise
+
+
+def read_regular(path: Path):
+    """Return file bytes and mode, or None if absent; never follow a late symlink/FIFO."""
+    opened_parent = False
+    try:
+        with parent_fd(path) as directory:
+            opened_parent = True
+            try:
+                fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=directory)
+            except FileNotFoundError:
+                return None
+            with os.fdopen(fd, 'rb') as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError(f'{path.name} must remain a regular file')
+                contents = handle.read()
+                require_current_parent(path, directory)
+                return contents, stat.S_IMODE(info.st_mode)
+    except FileNotFoundError:
+        if opened_parent:
+            raise
+        return None
 
 
 def install(home: Path, apply: bool) -> list[str]:
@@ -110,10 +186,12 @@ def install(home: Path, apply: bool) -> list[str]:
         raise ValueError("Each managed destination must be a regular file")
     if any(path.exists() and not path.is_dir() for path in directories):
         raise ValueError("Each managed directory must be a directory")
-    current_text = (claude / "CLAUDE.md").read_text() if (claude / "CLAUDE.md").exists() else ""
+    existing_instructions = read_regular(claude / "CLAUDE.md")
+    current_text = existing_instructions[0].decode() if existing_instructions else ""
     instructions = merged_instructions(current_text, (ROOT / "HARNESS.md").read_text())
     settings_path = claude / "settings.json"
-    current_settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    existing_settings = read_regular(settings_path)
+    current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
     if not isinstance(current_settings, dict):
         raise ValueError("settings.json must contain an object")
     settings = merged_settings(current_settings, claude)
@@ -124,20 +202,19 @@ def install(home: Path, apply: bool) -> list[str]:
     changes = [str(path) for path in managed]
     if not apply:
         return changes
-    originals = {path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode)) if path.exists() else None
-                 for path in managed}
+    originals = {path: read_regular(path) for path in managed}
     backup_root = claude / "agent-harness-backups"
-    backups = backup_root / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    claude.mkdir(parents=True, exist_ok=True)
-    backup_root.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(backup_root, 0o700)  # backups hold settings.json, which may carry env values
-    backups.mkdir(mode=0o700)
+    backups = backup_root / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                             + '-' + secrets.token_hex(4))
+    with parent_fd(backup_root / '.anchor', create=True) as directory:
+        os.fchmod(directory, 0o700)  # backups hold settings.json, which may carry env values
+        os.mkdir(backups.name, mode=0o700, dir_fd=directory)
+    with parent_fd(backups / '.anchor') as directory:
+        os.fchmod(directory, 0o700)
     for path in managed:
-        if path.exists():
+        if originals[path] is not None:
             saved = backups / path.relative_to(claude)
-            saved.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, saved)
-            os.chmod(saved, 0o600)
+            atomic_write(saved, originals[path][0])
     attempted = []
     try:
         for destination, data in payloads:
@@ -149,7 +226,7 @@ def install(home: Path, apply: bool) -> list[str]:
             try:
                 original = originals[path]
                 if original is None:
-                    path.unlink(missing_ok=True)
+                    safe_unlink(path)
                 else:
                     atomic_write(path, *original)
             except OSError:

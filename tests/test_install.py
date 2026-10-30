@@ -107,6 +107,54 @@ class InstallerTests(unittest.TestCase):
                     self.assertEqual(sentinel.read_text(), "unchanged")
                     self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o755)
 
+    def test_directory_swap_after_preflight_never_writes_or_removes_outside_files(self):
+        outside = self.home / 'outside'
+        outside.mkdir()
+        (self.claude / 'agents').mkdir()
+        sentinel = outside / 'task-owner.md'
+        sentinel.write_text('outside fixture')
+        from install import atomic_write
+        swapped = False
+
+        def swap_before_first_write(path, data, mode=0o600):
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                (self.claude / 'agents').rename(self.claude / 'agents-moved')
+                (self.claude / 'agents').symlink_to(outside, target_is_directory=True)
+            return atomic_write(path, data, mode)
+
+        with patch('install.atomic_write', side_effect=swap_before_first_write):
+            with self.assertRaises((OSError, ValueError, RuntimeError)):
+                install(self.home, apply=True)
+        self.assertTrue(swapped)
+        self.assertEqual(sentinel.read_text(), 'outside fixture')
+        self.assertEqual(list(outside.iterdir()), [sentinel])
+
+    def test_backup_uses_original_snapshot_when_parent_is_swapped(self):
+        self.seed_existing_installation()
+        outside = self.home / 'outside'
+        outside.mkdir()
+        sentinel = outside / 'task-owner.md'
+        sentinel.write_text('outside private fixture')
+        from shutil import copy2
+        swapped = False
+
+        def swap_before_backup(source, destination, *args, **kwargs):
+            nonlocal swapped
+            if not swapped and Path(source) == self.claude / 'agents/task-owner.md':
+                swapped = True
+                (self.claude / 'agents').rename(self.claude / 'agents-moved')
+                (self.claude / 'agents').symlink_to(outside, target_is_directory=True)
+            return copy2(source, destination, *args, **kwargs)
+
+        with patch('shutil.copy2', side_effect=swap_before_backup):
+            install(self.home, apply=True)
+        self.assertFalse(swapped, 'backup must use the pinned original snapshot')
+        self.assertEqual(sentinel.read_text(), 'outside private fixture')
+        saved, = (self.claude / 'agent-harness-backups').rglob('task-owner.md')
+        self.assertEqual(saved.read_text(), 'old owner\n')
+
     def test_installed_delivery_helpers_can_start(self):
         import subprocess
         import sys
@@ -184,12 +232,13 @@ class InstallerTests(unittest.TestCase):
         before = self.managed_snapshot()
         replace = os.replace
         failed = False
-        def fail_once(source, destination):
+        def fail_once(source, destination, **kwargs):
             nonlocal failed
-            if Path(destination) == self.claude / 'settings.json' and not failed:
+            in_claude = os.fstat(kwargs['dst_dir_fd']).st_ino == self.claude.stat().st_ino
+            if destination == 'settings.json' and in_claude and not failed:
                 failed = True
                 raise OSError('fixture: settings replacement failed')
-            return replace(source, destination)
+            return replace(source, destination, **kwargs)
         with patch('install.os.replace', side_effect=fail_once), self.assertRaisesRegex(OSError, 'fixture'):
             install(self.home, apply=True)
         self.assertTrue(failed)
@@ -199,20 +248,133 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(saved.read_bytes(), before['settings.json'][0])
         self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
 
+    def test_every_managed_write_boundary_rolls_back_to_exact_originals(self):
+        from install import atomic_write, AGENTS, HOOKS, TOOLS
+        total = len(AGENTS) + len(HOOKS) + len(TOOLS) + 2
+        for boundary in range(total):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve()
+                claude = home / '.claude'
+                claude.mkdir()
+                (claude / 'CLAUDE.md').write_text('existing instructions\n')
+                (claude / 'settings.json').write_text('{"model":"keep"}\n')
+                before = {path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                          for path in (claude / 'CLAUDE.md', claude / 'settings.json')}
+                writes = 0
+                fired = False
+
+                def fail_at_boundary(path, data, mode=0o600):
+                    nonlocal writes, fired
+                    if 'agent-harness-backups' not in path.parts and not fired:
+                        if writes == boundary and not fired:
+                            fired = True
+                            raise OSError('fixture: interrupted managed write')
+                        writes += 1
+                    return atomic_write(path, data, mode)
+
+                with patch('install.atomic_write', side_effect=fail_at_boundary):
+                    with self.assertRaisesRegex(OSError, 'interrupted managed write'):
+                        install(home, apply=True)
+                self.assertEqual(writes, boundary)
+                self.assertEqual({path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                                  for path in (claude / 'CLAUDE.md', claude / 'settings.json')}, before)
+                for folder in ('agents', 'hooks', 'tools'):
+                    self.assertEqual(list((claude / folder).iterdir()) if (claude / folder).exists() else [], [])
+                self.assertFalse(list(claude.rglob('.agent-harness-*')))
+
+    def test_swapped_ancestor_at_each_write_stage_cannot_redirect_install(self):
+        from install import atomic_write
+        for name in ('agents', 'hooks', 'tools', '.claude'):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve()
+                claude = home / '.claude'
+                claude.mkdir()
+                for folder in ('agents', 'hooks', 'tools'):
+                    (claude / folder).mkdir()
+                outside = home / 'outside'
+                outside.mkdir()
+                marker = outside / 'marker'
+                marker.write_text('unchanged')
+                swapped = False
+
+                def swap_before_target(path, data, mode=0o600):
+                    nonlocal swapped
+                    target = claude if name == '.claude' else claude / name
+                    if not swapped and (name == '.claude' or path.parent == target):
+                        swapped = True
+                        target.rename(target.with_name(target.name + '-moved'))
+                        target.symlink_to(outside, target_is_directory=True)
+                    return atomic_write(path, data, mode)
+
+                with patch('install.atomic_write', side_effect=swap_before_target):
+                    with self.assertRaises((OSError, RuntimeError)):
+                        install(home, apply=True)
+                self.assertTrue(swapped)
+                self.assertEqual(list(outside.iterdir()), [marker])
+                self.assertEqual(marker.read_text(), 'unchanged')
+
+    def test_final_parent_swap_during_replace_cannot_report_installed(self):
+        outside = self.home / 'outside'
+        outside.mkdir()
+        marker = outside / 'marker'
+        marker.write_text('unchanged')
+        replace = os.replace
+        swapped = False
+
+        def swap_during_last_replace(source, destination, **kwargs):
+            nonlocal swapped
+            if Path(destination).name == 'settings.json' and not swapped:
+                swapped = True
+                self.claude.rename(self.home / 'claude-moved')
+                self.claude.symlink_to(outside, target_is_directory=True)
+            return replace(source, destination, **kwargs)
+
+        with patch('install.os.replace', side_effect=swap_during_last_replace):
+            with self.assertRaises((OSError, RuntimeError)):
+                install(self.home, apply=True)
+        self.assertTrue(swapped)
+        self.assertEqual(list(outside.iterdir()), [marker])
+
+    def test_backup_directory_swap_cannot_redirect_private_snapshot(self):
+        self.seed_existing_installation()
+        outside = self.home / 'outside'
+        outside.mkdir()
+        marker = outside / 'marker'
+        marker.write_text('unchanged')
+        from install import atomic_write
+        swapped = False
+
+        def swap_before_backup(path, data, mode=0o600):
+            nonlocal swapped
+            backup_root = self.claude / 'agent-harness-backups'
+            if not swapped and backup_root in path.parents:
+                swapped = True
+                backup_root.rename(self.claude / 'backups-moved')
+                backup_root.symlink_to(outside, target_is_directory=True)
+            return atomic_write(path, data, mode)
+
+        with patch('install.atomic_write', side_effect=swap_before_backup):
+            with self.assertRaises(OSError):
+                install(self.home, apply=True)
+        self.assertTrue(swapped)
+        self.assertEqual(list(outside.iterdir()), [marker])
+        self.assertEqual(marker.read_text(), 'unchanged')
+
     def test_rollback_failure_is_reported_and_other_files_are_still_restored(self):
         self.seed_existing_installation()
         before = self.managed_snapshot()
         replace = os.replace
         failed = False
-        def fail_install_and_one_restore(source, destination):
+        def fail_install_and_one_restore(source, destination, **kwargs):
             nonlocal failed
-            path = Path(destination)
-            if path == self.claude / 'settings.json':
+            in_claude = os.fstat(kwargs['dst_dir_fd']).st_ino == self.claude.stat().st_ino
+            in_agents = os.fstat(kwargs['dst_dir_fd']).st_ino == (self.claude / 'agents').stat().st_ino
+            if destination == 'settings.json' and in_claude:
                 failed = True
                 raise OSError('fixture: write failure')
-            if failed and path == self.claude / 'agents/task-owner.md':
+            if failed and destination == 'task-owner.md' and in_agents:
                 raise OSError('fixture: restore failure')
-            return replace(source, destination)
+            return replace(source, destination, **kwargs)
         with patch('install.os.replace', side_effect=fail_install_and_one_restore):
             with self.assertRaisesRegex(RuntimeError, 'rollback incomplete') as raised:
                 install(self.home, apply=True)

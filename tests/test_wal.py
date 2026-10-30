@@ -208,6 +208,31 @@ class WalTests(unittest.TestCase):
         self.assertEqual(len(records), 200)
         self.assertEqual(len({(row['worker'], row['index']) for row in records}), 200)
 
+    def test_append_recovers_only_an_unterminated_crash_tail(self):
+        spec = importlib.util.spec_from_file_location('wal_crash_test', WAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = self.home / '.claude/wals/crash/main.jsonl'
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b'{"event":"complete"}\n{"event":"interrupted"')
+        with patch.dict(os.environ, {'HOME': str(self.home)}):
+            module.append(target, {'event': 'after-restart'})
+        self.assertEqual([json.loads(line) for line in target.read_text().splitlines()],
+                         [{'event': 'complete'}, {'event': 'after-restart'}])
+
+    def test_oversized_crash_tail_is_left_for_manual_inspection(self):
+        spec = importlib.util.spec_from_file_location('wal_crash_budget_test', WAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = self.home / '.claude/wals/crash/main.jsonl'
+        target.parent.mkdir(parents=True)
+        original = b'x' * 65_537
+        target.write_bytes(original)
+        with patch.dict(os.environ, {'HOME': str(self.home)}):
+            with self.assertRaisesRegex(ValueError, 'recovery budget'):
+                module.append(target, {'event': 'after-restart'})
+        self.assertEqual(target.read_bytes(), original)
+
     def test_transient_missing_file_during_create_retries_without_losing_record(self):
         spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
         module = importlib.util.module_from_spec(spec)
