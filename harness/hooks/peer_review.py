@@ -2,6 +2,7 @@
 """Independent read-only Codex review, with a blind Opus CLI fallback."""
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -51,12 +52,29 @@ def read_packet(path: Path) -> str:
         os.close(fd)
 
 
+def repo_state(repo: Path) -> tuple[str, str, str]:
+    """Capture the reviewed commit and tracked worktree state."""
+    commands = (
+        ['rev-parse', '--verify', 'HEAD^{commit}'],
+        ['status', '--porcelain=v1', '--untracked-files=all'],
+        ['diff', '--binary', 'HEAD', '--'],
+    )
+    values = []
+    for args in commands:
+        result = run_process(['git', '-C', str(repo), *args], timeout=30)
+        if result.returncode:
+            raise OSError(f'Git state inspection failed: {" ".join(args)}')
+        values.append(result.stdout)
+    return values[0].strip(), values[1], hashlib.sha256(values[2].encode()).hexdigest()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("plan", "pr"))
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--packet", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--expected-head", help="full reviewed commit SHA; required for PR review")
     args = parser.parse_args()
     repo = args.repo.resolve()
     packet = args.packet.expanduser().absolute()
@@ -79,6 +97,21 @@ def main() -> int:
         content = read_packet(packet)
     except (OSError, ValueError) as error:
         parser.error(f'invalid packet: {error}')
+    if args.stage == 'pr' and not args.expected_head:
+        target.close()
+        parser.error('--expected-head is required for PR review')
+    try:
+        before = repo_state(repo)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        target.close()
+        parser.error(f'repo state inspection failed: {error}')
+    if args.expected_head and (not re.fullmatch(r'[0-9a-fA-F]{40,64}', args.expected_head)
+                               or before[0] != args.expected_head.lower()):
+        target.close()
+        parser.error('repo HEAD differs from --expected-head')
+    if args.stage == 'pr' and before[1]:
+        target.close()
+        parser.error('PR review requires a clean worktree')
     stage_rules = (
         "Planning gate: judge the proposed design, acceptance criteria, edge cases, test strategy, "
         "and rollout/rollback plan. You may read repository context. Do not BLOCK solely for an "
@@ -88,7 +121,8 @@ def main() -> int:
         "PR gate: inspect the actual changed code and supplied evidence against scope. BLOCK on "
         "material implementation defects, missing tests, insecure behavior, or unverifiable claims."
     )
-    prompt = f"{REVIEW_SYSTEM}\n\n{stage_rules}\nStage: {args.stage}. Repository: {repo}.\n\nReview packet:\n{content}"
+    prompt = (f"{REVIEW_SYSTEM}\n\n{stage_rules}\nStage: {args.stage}. Repository: {repo}. "
+              f"Expected HEAD: {before[0]}.\n\nReview packet:\n{content}")
     source = "Codex gpt-6.1-sol"
     report = ""
     failure = ""
@@ -118,7 +152,12 @@ def main() -> int:
             return 2
     note = f"Fallback reason: {failure}\n" if failure else ""
     try:
-        target.write_text(f"Reviewer: {source}\nStage: {args.stage}\n{note}\n{report.strip()}\n")
+        after = repo_state(repo)
+        if after != before:
+            print('Repository HEAD or worktree changed during review; no signoff published.', file=sys.stderr)
+            return 2
+        target.write_text(f"Reviewer: {source}\nStage: {args.stage}\nReviewed HEAD: {before[0]}\n"
+                          f"Worktree status: {'clean' if not before[1] else 'dirty'}\n{note}\n{report.strip()}\n")
         target.verify_current()
         print(f"{source}: {report.splitlines()[0].strip()} | {output}")
     except OSError as error:

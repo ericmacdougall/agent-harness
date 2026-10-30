@@ -19,6 +19,11 @@ class PeerReviewTests(unittest.TestCase):
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         subprocess.run(['git', 'init', '-q', '-b', 'main', str(self.repo)], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'config', 'user.name', 'Fixture'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'config', 'user.email', 'fixture@example.invalid'], check=True)
+        (self.repo / 'app.txt').write_text('baseline\n')
+        subprocess.run(['git', '-C', str(self.repo), 'add', 'app.txt'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', 'baseline'], check=True)
         self.packet = self.root / 'packet.md'
         self.packet.write_text('Scope and evidence for a disposable review.')
         self.output = self.root / 'review.md'
@@ -33,6 +38,13 @@ last = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 last.write_text(os.environ.get('CODEX_VERDICT', 'VERDICT: PASS\\nReviewed.'))
 race = os.environ.get('RACE_OUTPUT')
 if race: Path(race).write_text('independent file created during review')
+if os.environ.get('RACE_HEAD'):
+    import subprocess
+    repo = sys.argv[sys.argv.index('--cd') + 1]
+    subprocess.run(['git', '-C', repo, 'commit', '--allow-empty', '-qm', 'concurrent commit'], check=True)
+if os.environ.get('RACE_WORKTREE'):
+    repo = sys.argv[sys.argv.index('--cd') + 1]
+    (Path(repo) / 'app.txt').write_text('concurrent worktree edit\\n')
 relocated = os.environ.get('RACE_DIRECTORY_OUTPUT')
 if relocated:
     parent = Path(relocated).parent
@@ -55,10 +67,15 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         path.write_text(f'#!{sys.executable}\n{body}')
         path.chmod(0o700)
 
-    def invoke(self, *, packet=None, output=None, env=None):
+    def invoke(self, *, packet=None, output=None, env=None, expected_head=None, stage='pr'):
         environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin', **(env or {})}
-        return subprocess.run([sys.executable, str(REVIEW), 'pr', '--repo', str(self.repo),
-                               '--packet', str(packet or self.packet), '--output', str(output or self.output)],
+        if expected_head is None:
+            expected_head = subprocess.run(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'],
+                                           check=True, capture_output=True, text=True).stdout.strip()
+        command = [sys.executable, str(REVIEW), stage, '--repo', str(self.repo),
+                               '--packet', str(packet or self.packet), '--output', str(output or self.output),
+                               *(['--expected-head', expected_head] if stage == 'pr' else [])]
+        return subprocess.run(command,
                               text=True, capture_output=True, env=environment, timeout=15)
 
     def test_valid_sol_pass_is_private_and_identified(self):
@@ -66,7 +83,29 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Reviewer: Codex gpt-6.1-sol', self.output.read_text())
         self.assertIn('VERDICT: PASS', self.output.read_text())
+        self.assertIn('Reviewed HEAD: ', self.output.read_text())
         self.assertEqual(self.output.stat().st_mode & 0o777, 0o600)
+
+    def test_plan_review_pins_observed_commit_without_explicit_head(self):
+        result = self.invoke(stage='plan')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Reviewed HEAD: ', self.output.read_text())
+
+    def test_concurrent_commit_blocks_pass_and_report(self):
+        result = self.invoke(env={'RACE_HEAD': '1'})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertFalse(self.output.exists())
+
+    def test_concurrent_worktree_edit_blocks_pass_and_report(self):
+        result = self.invoke(env={'RACE_WORKTREE': '1'})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertFalse(self.output.exists())
+
+    def test_stale_expected_commit_blocks_before_reviewer(self):
+        capture = self.root / 'model.capture'
+        result = self.invoke(env={'CAPTURE_CODEX_PROMPT': str(capture)}, expected_head='0' * 40)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertFalse(capture.exists())
 
     def test_block_verdict_is_not_signoff(self):
         result = self.invoke(env={'CODEX_VERDICT': 'VERDICT: BLOCK\nMissing proof.'})

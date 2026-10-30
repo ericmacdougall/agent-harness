@@ -86,6 +86,8 @@ class ReportFinalizationTests(unittest.TestCase):
 
             argv = [helper, *(['pr'] if helper == 'peer_review' else []),
                     '--repo', str(repo), '--packet', str(packet), '--output', str(output)]
+            if helper == 'peer_review':
+                argv += ['--expected-head', base]
             if phase == 'wal':
                 argv += ['--wal', str(root / 'fixture-wal')]
             stdout, stderr = io.StringIO(), io.StringIO()
