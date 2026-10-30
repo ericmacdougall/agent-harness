@@ -104,6 +104,7 @@ def integrate(args, preparations, checks):
     git = partial(run_git, timeout=args.timeout)
     abort = partial(abort_merge, timeout=args.timeout)
     merge_attempted = False
+    commit_returned = False
     try:
         toplevel = git(repo, "rev-parse", "--show-toplevel") if repo.is_dir() else None
         # Checks run with cwd=repo, so a subdirectory would merge first and then fail them misleadingly.
@@ -146,16 +147,31 @@ def integrate(args, preparations, checks):
         committed = git(repo, "commit", "-m", f"Merge {args.source} into {args.original_branch}")
         if committed.returncode:
             return abort(repo, "Merge commit failed", detail=committed.stderr.strip()[-1200:])
+        commit_returned = True
         final = git(repo, "rev-parse", "HEAD")
-        if final.returncode:
+        if final.returncode or not final.stdout.strip():
             report("BLOCKED_LOCAL", "Merge commit returned success but final HEAD could not be read; inspect the checkout")
             return 3
         final_head = final.stdout.strip()
+        parents = git(repo, "rev-list", "--parents", "-n", "1", "HEAD")
+        if parents.returncode or parents.stdout.split() != [final_head, head.stdout.strip(), source.stdout.strip()]:
+            report("BLOCKED_LOCAL", "Final HEAD is not the verified two-parent merge; inspect the checkout",
+                   head=final_head, merge_aborted=False)
+            return 3
+        final_status = git(repo, "status", "--porcelain")
+        if final_status.returncode or final_status.stdout.strip():
+            report("BLOCKED_LOCAL", "Merge commit exists but final checkout is dirty or could not be inspected",
+                   head=final_head, merge_aborted=False)
+            return 3
         report("INTEGRATED", "Verified feature merged into original checkout", original_branch=args.original_branch, source=args.source, head=final_head, preparations=args.prepare, checks=args.check)
         return 0
     except (subprocess.TimeoutExpired, OSError) as error:
         message = (f"Git command exceeded {args.timeout} seconds" if isinstance(error, subprocess.TimeoutExpired)
                    else "Git command could not start")
+        if commit_returned:
+            report("BLOCKED_LOCAL", message + "; merge commit may exist; inspect HEAD and checkout",
+                   merge_aborted=False)
+            return 3
         if merge_attempted:
             return abort(repo, message)
         report("BLOCKED_LOCAL", message + "; no merge attempted")

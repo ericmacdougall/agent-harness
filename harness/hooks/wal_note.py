@@ -13,6 +13,14 @@ from wal import append
 
 
 EVENTS = {'intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker', 'status', 'handoff', 'result'}
+SECRET_PATTERN = re.compile(
+    r'(?i)(?:\bgh[pousr]_[A-Za-z0-9_]+|\bgithub_pat_[A-Za-z0-9_]+|'
+    r'\bsk-[A-Za-z0-9-]{12,}|\bAKIA[A-Z0-9]{12}|'
+    r'\bBearer\s+\S+|\bxox[baprs]-[A-Za-z0-9-]{6,}|'
+    r'\b(?:password|passwd|api[_-]?key|secret|token)\s*[:=]\s*\S+|'
+    r'\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s/@:]+:[^\s/@]+@|'
+    r'-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)'
+)
 
 
 def main():
@@ -28,7 +36,7 @@ def main():
     note = args.note.strip()
     if not note or len(note) > 4000:
         parser.error('note must be 1 to 4000 characters')
-    if re.search(r'(?i)\b(gh[pousr]_|github_pat_|sk-[A-Za-z0-9]{12}|AKIA[A-Z0-9]{12})', note):
+    if SECRET_PATTERN.search(note):
         parser.error('note appears to contain a credential; redact it first')
     record = {'at': datetime.now(timezone.utc).isoformat(), 'event': args.event, 'cwd': os.getcwd(), 'note': note}
     append(path, record)

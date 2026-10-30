@@ -5,17 +5,21 @@ import argparse
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
+import tempfile
 from functools import partial
 from pathlib import Path
 
 from process import run
 
 
-def run_git(repo, *args, timeout=600):
+def run_git(repo, *args, timeout=600, env_extra=None):
     # Headless use: a missing credential must fail the push, not wait on a terminal prompt.
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    if env_extra:
+        env.update(env_extra)
     return run(["git", "-C", str(repo), *args], env=env, timeout=timeout)
 
 
@@ -85,9 +89,19 @@ def publish(args):
     if len(urls) != 1:
         report("BLOCKED_POLICY", "Publication requires exactly one push destination", branch=args.branch, remote=remote)
         return 2
+    # Keep credential-bearing URLs out of process arguments. The temporary
+    # remote exists only in this command's environment and is never persisted.
+    pinned_remote = "harness-push-" + secrets.token_hex(12)
+    pinned_env = {
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": f"remote.{pinned_remote}.url",
+        "GIT_CONFIG_VALUE_0": urls[0],
+        "GIT_CONFIG_KEY_1": f"remote.{pinned_remote}.pushurl",
+        "GIT_CONFIG_VALUE_1": urls[0],
+    }
     # get-url already expanded rewrites. Refuse a second expansion that would make
     # ls-remote inspect a different repository from the one `push origin` uses.
-    inspected = git(repo, "ls-remote", "--get-url", "--", urls[0])
+    inspected = git(repo, "ls-remote", "--get-url", "--", pinned_remote, env_extra=pinned_env)
     if inspected.returncode or inspected.stdout.strip() != urls[0]:
         report("BLOCKED_POLICY", "Push destination cannot be inspected without another URL rewrite",
                branch=args.branch, remote=remote)
@@ -95,7 +109,7 @@ def publish(args):
     # A repository may call its default branch trunk, release, or something else.
     # Refuse publication when the remote does not reveal a default branch.
     try:
-        default = git(repo, "ls-remote", "--symref", "--", urls[0], "HEAD", timeout=min(args.timeout, 30))
+        default = git(repo, "ls-remote", "--symref", "--", pinned_remote, "HEAD", timeout=min(args.timeout, 30), env_extra=pinned_env)
     except subprocess.TimeoutExpired:
         report("BLOCKED_REMOTE", "Could not determine the remote default branch in time; continue local integration", branch=args.branch, remote=remote)
         return 4
@@ -112,16 +126,51 @@ def publish(args):
         report("BLOCKED_POLICY", "Refusing to publish the remote default branch", branch=args.branch, remote=remote)
         return 2
     ref = f"refs/heads/{args.branch}"
+    # A concurrent edit to origin.pushurl must not redirect the push.
     try:
-        result = git(repo, "push", "--porcelain", remote, f"{ref}:{ref}", timeout=args.timeout)
+        # Source-local Git URL rewrites can change after inspection. Push from
+        # an isolated bare repository that reads the source object store through
+        # alternates; this avoids a second copy of the project's history and
+        # avoids executing source-worktree pre-push hooks during delivery.
+        with tempfile.TemporaryDirectory(prefix='harness-publish-') as temporary:
+            transport = Path(temporary) / 'transport.git'
+            template = Path(temporary) / 'empty-template'
+            template.mkdir()
+            initialized = git(temporary, 'init', '--bare', '--template', str(template), str(transport))
+            if initialized.returncode:
+                report('BLOCKED_REMOTE', 'Could not prepare isolated publication transport', branch=args.branch, remote=remote)
+                return 4
+            object_store = git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'objects')
+            object_path = Path(object_store.stdout.rstrip('\n'))
+            if object_store.returncode or not object_path.is_dir() or '\n' in str(object_path):
+                report('BLOCKED_REMOTE', 'Could not locate source objects for publication', branch=args.branch, remote=remote)
+                return 4
+            (transport / 'objects/info/alternates').write_text(str(object_path) + '\n')
+            commit_type = git(transport, 'cat-file', '-t', head)
+            if commit_type.returncode or commit_type.stdout.strip() != 'commit':
+                report('BLOCKED_REMOTE', 'Could not load verified commit for publication', branch=args.branch, remote=remote)
+                return 4
+            resolved = git(transport, 'ls-remote', '--get-url', '--', pinned_remote, env_extra=pinned_env)
+            if resolved.returncode or resolved.stdout.strip() != urls[0]:
+                report('BLOCKED_POLICY', 'Isolated transport would rewrite the inspected destination', branch=args.branch, remote=remote)
+                return 2
+            result = git(transport, 'push', '--porcelain', pinned_remote,
+                         f"{head}:{ref}", timeout=args.timeout, env_extra=pinned_env)
     except subprocess.TimeoutExpired:
-        report("BLOCKED_REMOTE", f"Push did not finish within {args.timeout} seconds; continue local integration", branch=args.branch, remote=remote)
+        report("BLOCKED_REMOTE", f"Publication command exceeded {args.timeout} seconds; continue local integration", branch=args.branch, remote=remote)
         return 4
     if result.returncode:
         detail = scrub(result.stderr or result.stdout)
         report("BLOCKED_REMOTE", "Feature branch could not be published; continue local integration", branch=args.branch, remote=remote, detail=detail)
         return 4
-    report("PUSHED", "Feature branch published", branch=args.branch, remote=remote, head=head)
+    try:
+        after = git(repo, "rev-parse", "HEAD", timeout=min(args.timeout, 30))
+        source_changed = after.returncode != 0 or after.stdout.strip() != head
+    except (subprocess.TimeoutExpired, OSError):
+        source_changed = True
+    message = ("Verified feature commit published; source branch changed or could not be rechecked"
+               if source_changed else "Feature branch published")
+    report("PUSHED", message, branch=args.branch, remote=remote, head=head, source_changed=source_changed)
     return 0
 
 

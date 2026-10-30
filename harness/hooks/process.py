@@ -11,17 +11,21 @@ TERMINATION_GRACE_SECONDS = 2
 def signal_group(pid, signum):
     try:
         os.killpg(pid, signum)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
+        # A group can disappear or become inaccessible between TERM and KILL.
+        # The caller still reaps the leader and bounds pipe cleanup below.
         pass
 
 
-def run(command, *, cwd=None, env=None, timeout=None):
+def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True, stream=False):
     # Git and test runners spawn children that subprocess.run(timeout=...) leaves alive.
-    process = subprocess.Popen(command, cwd=cwd, env=env, text=True,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    process = subprocess.Popen(command, cwd=cwd, env=env, text=text,
+                               stdin=subprocess.PIPE if input is not None else None,
+                               stdout=None if stream else subprocess.PIPE,
+                               stderr=None if stream else subprocess.PIPE,
                                start_new_session=True)
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
+        stdout, stderr = process.communicate(input=input, timeout=timeout)
     except BaseException:
         signal_group(process.pid, signal.SIGTERM)
         try:
@@ -32,10 +36,17 @@ def run(command, *, cwd=None, env=None, timeout=None):
         signal_group(process.pid, signal.SIGKILL)
         # Even a child that deliberately escaped the group must not hold us on a pipe.
         try:
-            process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.stdout.close()
-            process.stderr.close()
-            process.wait(timeout=5)
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                if process.stdout:
+                    process.stdout.close()
+                if process.stderr:
+                    process.stderr.close()
+                process.wait(timeout=5)
+        finally:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream and not stream.closed:
+                    stream.close()
         raise
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
