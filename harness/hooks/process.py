@@ -18,15 +18,19 @@ def signal_group(pid, signum):
         pass
 
 
-def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True, stream=False):
+def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True,
+        stream=False, discard_output=False):
     # Git and test runners spawn children that subprocess.run(timeout=...) leaves alive.
     # Malformed output from a child must not bypass a caller's rollback path.
     # Keep binary mode exact for callers that inspect Git object bytes.
+    if stream and discard_output:
+        raise ValueError('stream and discard_output are mutually exclusive')
     decoding = {'errors': 'replace'} if text else {}
+    # Discarded output cannot accumulate in communicate()'s captured buffers.
+    output = None if stream else (subprocess.DEVNULL if discard_output else subprocess.PIPE)
     process = subprocess.Popen(command, cwd=cwd, env=env, text=text,
                                stdin=subprocess.PIPE if input is not None else None,
-                               stdout=None if stream else subprocess.PIPE,
-                               stderr=None if stream else subprocess.PIPE,
+                               stdout=output, stderr=output,
                                start_new_session=True, **decoding)
     try:
         stdout, stderr = process.communicate(input=input, timeout=timeout)

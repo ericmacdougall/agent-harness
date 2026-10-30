@@ -109,6 +109,59 @@ class ProcessRunner(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
+    def test_discard_output_routes_both_streams_to_devnull(self):
+        with patch.object(self.process.subprocess, 'Popen') as popen:
+            popen.return_value.returncode = 0
+            popen.return_value.communicate.return_value = (None, None)
+            result = self.process.run(['fixture'], timeout=2, discard_output=True)
+        self.assertEqual(popen.call_args.kwargs['stdout'], subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs['stderr'], subprocess.DEVNULL)
+        self.assertTrue(popen.call_args.kwargs['start_new_session'])
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, None, None))
+
+    def test_stream_and_discard_are_rejected_before_start(self):
+        with patch.object(self.process.subprocess, 'Popen') as popen:
+            with self.assertRaises(ValueError):
+                self.process.run(['fixture'], stream=True, discard_output=True)
+        popen.assert_not_called()
+
+    def test_discarded_output_timeout_preserves_descendant_term_grace(self):
+        marker = self.root / 'term-complete'
+        child = ('import signal, sys, time; from pathlib import Path\n'
+                 f'path=Path({str(marker)!r})\n'
+                 'def finish(*_):\n    time.sleep(0.3)\n    path.write_text("done")\n    sys.exit(0)\n'
+                 'signal.signal(signal.SIGTERM, finish)\n'
+                 'time.sleep(30)\n')
+        parent = ('import os, subprocess, sys, time; '
+                  'os.write(1, b"synthetic_stdout"); os.write(2, b"synthetic_stderr"); '
+                  f'subprocess.Popen([sys.executable, "-c", {child!r}]); time.sleep(30)')
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.process.run([sys.executable, '-c', parent], timeout=2, discard_output=True)
+        self.assertEqual(marker.read_text(), 'done')
+
+    def test_discarded_output_timeout_kills_term_ignoring_descendant(self):
+        pid_file = self.root / 'ignoring.pid'
+        child = ('import os, signal, time; from pathlib import Path\n'
+                 'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                 f'Path({str(pid_file)!r}).write_text(str(os.getpid()))\n'
+                 'time.sleep(30)\n')
+        parent = ('import os, subprocess, sys, time; '
+                  'os.write(1, b"synthetic_stdout"); os.write(2, b"synthetic_stderr"); '
+                  f'subprocess.Popen([sys.executable, "-c", {child!r}]); time.sleep(30)')
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.process.run([sys.executable, '-c', parent], timeout=2, discard_output=True)
+        self.assertTrue(pid_file.exists(), 'the descendant must start before timeout')
+        pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail('TERM-ignoring descendant survived process-group cleanup')
+
     def test_deadline_lets_a_child_handle_sigterm_before_it_is_killed(self):
         cleaned = self.root / 'cleaned'
         child = ('import signal, sys, time\nfrom pathlib import Path\n'
@@ -988,7 +1041,9 @@ class DeliveryHelpers(unittest.TestCase):
     def test_check_timeout_kills_descendants_and_aborts_merge(self):
         marker = self.root / 'late-write'
         started = self.root / 'started'
-        self.add_feature_test('import subprocess, sys, time\n'
+        self.add_feature_test('import os, subprocess, sys, time\n'
+                              'os.write(1, b"synthetic_timeout_stdout" + b"x" * 1000000)\n'
+                              'os.write(2, b"synthetic_timeout_stderr" + b"y" * 1000000)\n'
                               'subprocess.Popen([sys.executable, "-c", '
                               + repr(f"import time; from pathlib import Path; Path({str(started)!r}).touch(); time.sleep(4); Path({str(marker)!r}).write_text('survived')")
                               + '])\ntime.sleep(8)\n')
@@ -996,6 +1051,7 @@ class DeliveryHelpers(unittest.TestCase):
                            env=isolated_env(), timeout=15)
         self.assertEqual(p.returncode, 3, p.stderr)
         self.assertEqual(json.loads(p.stdout)['status'], 'BLOCKED_LOCAL')
+        self.assertNotIn('synthetic_timeout_', p.stdout + p.stderr)
         self.assert_restored()
         self.assertTrue(started.exists(), 'the fixture child must actually start')
         time.sleep(5)
@@ -1026,6 +1082,84 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertFalse(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
         parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
         self.assertEqual(parents[1:], [self.base, self.feature_head])
+
+    def test_check_uses_devnull_descriptors_and_reports_only_status(self):
+        self.add_feature_test('import os, unittest\n'
+                              'class Check(unittest.TestCase):\n'
+                              '    def test_output_destination(self):\n'
+                              '        expected = os.stat(os.devnull)\n'
+                              '        for fd in (1, 2):\n'
+                              '            actual = os.fstat(fd)\n'
+                              '            self.assertEqual((actual.st_dev, actual.st_ino),\n'
+                              '                             (expected.st_dev, expected.st_ino))\n'
+                              '        os.write(1, b"synthetic_check_stdout" + b"x" * 1000000)\n'
+                              '        os.write(2, b"synthetic_check_stderr" + b"y" * 1000000)\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (0, 'INTEGRATED'), result.stdout + result.stderr)
+        self.assertNotIn('synthetic_check_', result.stdout + result.stderr)
+
+    def test_prepare_uses_devnull_descriptors_and_reports_only_status(self):
+        self.add_feature_test()
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        marker = self.root / 'prepare-fds-ok'
+        npm = bin_dir / 'npm'
+        npm.write_text(f'#!{sys.executable}\n'
+                       'import os, sys\nfrom pathlib import Path\n'
+                       'expected = os.stat(os.devnull)\n'
+                       'ok = all((os.fstat(fd).st_dev, os.fstat(fd).st_ino) == '
+                       '(expected.st_dev, expected.st_ino) for fd in (1, 2))\n'
+                       'os.write(1, b"synthetic_prepare_stdout")\n'
+                       'os.write(2, b"synthetic_prepare_stderr")\n'
+                       f'Path({str(marker)!r}).write_text("ok") if ok else None\n'
+                       'sys.exit(0 if ok else 7)\n')
+        npm.chmod(0o700)
+        env = isolated_env()
+        env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
+        result = subprocess.run(self.integrate_args('--prepare', 'npm ci --prefer-offline'),
+                                text=True, capture_output=True, env=env, timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (0, 'INTEGRATED'), result.stdout + result.stderr)
+        self.assertEqual(marker.read_text(), 'ok')
+        self.assertNotIn('synthetic_prepare_', result.stdout + result.stderr)
+
+    def test_only_prepare_and_check_select_discard_mode(self):
+        self.add_feature_test()
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        npm = bin_dir / 'npm'
+        npm.write_text('#!/bin/sh\nexit 0\n')
+        npm.chmod(0o700)
+        env = isolated_env()
+        env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
+        spec = importlib.util.spec_from_file_location('integration_output_mode', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        real_run_process = module.run_process
+        calls = []
+
+        def record(command, **kwargs):
+            calls.append((command, kwargs))
+            return real_run_process(command, **kwargs)
+
+        with patch.object(module, 'run_process', side_effect=record), \
+             patch.object(sys, 'argv', self.integrate_args('--prepare', 'npm ci --prefer-offline')[1:]), \
+             patch('sys.stdout', new_callable=io.StringIO) as output, \
+             patch.dict(os.environ, env, clear=True):
+            code = module.main()
+        self.assertEqual((code, json.loads(output.getvalue())['status']),
+                         (0, 'INTEGRATED'), output.getvalue())
+        git_calls = [kwargs for command, kwargs in calls if command[0] == 'git']
+        verification_calls = [kwargs for command, kwargs in calls if command[0] in {'npm', 'python3'}]
+        self.assertTrue(git_calls)
+        self.assertEqual(len(verification_calls), 2)
+        self.assertTrue(all('discard_output' not in kwargs for kwargs in git_calls))
+        self.assertTrue(all(kwargs.get('discard_output') is True for kwargs in verification_calls))
+        self.assertEqual(module.run_git(self.repo, 'rev-parse', 'HEAD').stdout.strip(),
+                         cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip())
 
     def test_check_side_effect_cannot_report_clean_integration(self):
         self.add_feature_test('import unittest\nfrom pathlib import Path\n'

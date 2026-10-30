@@ -13,10 +13,12 @@ from pathlib import Path
 from process import run as run_process
 
 
-def run(repo, command, *, timeout=None):
+def run(repo, command, *, timeout=None, discard_output=False):
     # Python test runners otherwise leave untracked __pycache__ after an aborted merge.
+    output_options = {'discard_output': True} if discard_output else {}
     return run_process(command, cwd=repo, timeout=timeout,
-                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                       **output_options)
 
 
 def run_git(repo, *args, timeout=600):
@@ -140,7 +142,7 @@ def integrate(args, preparations, checks):
         for kind, commands in (("prepare", preparations), ("check", checks)):
             for argv in commands:
                 try:
-                    result = run(repo, argv, timeout=args.timeout)
+                    result = run(repo, argv, timeout=args.timeout, discard_output=True)
                 except subprocess.TimeoutExpired:
                     return abort(repo, f"{kind.capitalize()} exceeded {args.timeout} seconds", phase=kind,
                                  **{kind: argv})
