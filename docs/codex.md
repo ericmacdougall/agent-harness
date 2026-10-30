@@ -4,12 +4,12 @@ This edition uses Codex's [global `AGENTS.md`](https://learn.chatgpt.com/docs/ag
 
 ## Install
 
-Requirements: current local Codex with custom agents and hooks, Git, Python 3.10+, and macOS or Linux. Python 3.9 is checked as supplemental compatibility. From a clone of this repo:
+Requirements: current local Codex with custom agents and hooks, Git, Python 3.11+, and macOS or Linux. The installer parses the existing and generated TOML before any write. On Python 3.10 and older, the Codex installer refuses to run; the unrelated Claude installer still supports Python 3.10. From a clone of this repo:
 
 ```sh
-python3 install_codex.py                  # preview managed paths
-python3 install_codex.py --apply          # merge and install
-python3 -m unittest tests.test_install_codex -v
+python3.11 install_codex.py                  # preview managed paths
+python3.11 install_codex.py --apply          # merge and install
+python3.11 -m unittest tests.test_install_codex -v
 ```
 
 The installer puts a marked block in `~/.codex/AGENTS.md`, the skill in `~/.codex/skills/agent-harness`, role profiles in `~/.codex/agents`, the WAL writer in `~/.codex/agent-harness/wal.py`, and four managed entries in `~/.codex/hooks.json`. It also creates a private `~/.agent-harness/codex-wals` directory and selects a custom `agent-harness` permission profile in `~/.codex/config.toml`. That profile extends Codex's workspace policy and adds write access only for the private WAL path and workspace `.git` metadata, so agents can make recoverable local commits. It leaves unrelated model, plugin, and hook settings intact. If a different default permission profile or legacy sandbox configuration is already set, the installer stops before writing; merge the policy manually. The profile does not grant network access for pushing.
@@ -32,6 +32,6 @@ If the hook is unavailable, `python3 ~/.codex/agent-harness/wal.py start-manual`
 
 ## Checks and recovery
 
-The Codex-specific tests use disposable homes, failure injection at all 14 managed writes, symlink refusal, eight concurrent WAL writers, crash-tail recovery, metadata privacy, idempotent merge of foreign hooks and config, and refusal to override an existing permission policy. Run the full repo suite with `python3 -m unittest discover -s tests -v`. The installer uses the same pinned-directory, pinned-file, and rollback primitives as the Claude installer. Current validation results are in [validation.md](validation.md).
+The Codex-specific tests use disposable homes, failure injection at all 14 managed writes, symlink refusal, eight concurrent WAL writers, crash-tail recovery, metadata privacy, idempotent merge of foreign hooks and config, and refusal to override an existing permission policy. Run the full repo suite with `python3.11 -m unittest discover -s tests -v`. The installer uses the same pinned-directory, pinned-file, and rollback primitives as the Claude installer. Current validation results are in [validation.md](validation.md).
 
 To uninstall, remove the marked block from `~/.codex/AGENTS.md`, the four entries invoking `~/.codex/agent-harness/wal.py hook` from `hooks.json`, and the copied role/skill files. Remove the `agent-harness` profile block and its `default_permissions` line from `config.toml`, then select your preferred default. Preserve other hook groups and config. The private WALs and backups can be retained for recovery or removed after reviewing them. Restore an appropriate backup when you need the exact previous content.

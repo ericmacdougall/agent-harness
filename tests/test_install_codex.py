@@ -13,12 +13,13 @@ from unittest.mock import patch
 
 from codex.hooks import wal
 from install_codex import (AGENTS, HOOK_EVENTS, SKILL_FILES, SOURCE, install,
-                           managed_command, merge_config)
+                           managed_command, merge_config, tomllib)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@unittest.skipUnless(tomllib is not None, 'Codex installer requires Python 3.11+')
 class CodexInstallerTests(unittest.TestCase):
     def test_preview_apply_idempotence_and_foreign_settings(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -51,6 +52,7 @@ class CodexInstallerTests(unittest.TestCase):
             self.assertEqual((codex_home / 'agent-harness' / 'wal.py').read_bytes(),
                              (SOURCE / 'hooks' / 'wal.py').read_bytes())
             config = (codex_home / 'config.toml').read_text()
+            self.assertEqual(tomllib.loads(config)['default_permissions'], 'agent-harness')
             self.assertIn('model = "gpt-6-sol"', config)
             self.assertIn('example = true', config)
             self.assertEqual(config.count('default_permissions = "agent-harness"'), 1)
@@ -82,6 +84,29 @@ class CodexInstallerTests(unittest.TestCase):
             self.assertEqual((codex_home / 'config.toml').read_text(), 'default_permissions = "custom"\n')
         with self.assertRaisesRegex(ValueError, 'legacy sandbox'):
             merge_config('sandbox_mode = "read-only"\n', Path('/tmp/example'))
+        for legacy in ('"sandbox_mode" = "danger-full-access"\n',
+                       '[profiles.locked]\nsandbox_mode = "read-only"\n',
+                       '[profiles.locked.sandbox_workspace_write]\nwritable_roots = []\n'):
+            with self.subTest(legacy=legacy), self.assertRaisesRegex(ValueError, 'legacy sandbox'):
+                merge_config(legacy, Path('/tmp/example'))
+        with self.assertRaisesRegex(ValueError, 'different permission profile'):
+            merge_config('"default_permissions" = "custom"\n', Path('/tmp/example'))
+        with self.assertRaisesRegex(ValueError, 'selects a profile'):
+            merge_config('profile = "locked"\n', Path('/tmp/example'))
+
+    def test_reinstall_preserves_settings_appended_after_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            (home / '.codex').mkdir()
+            install(home, apply=True)
+            config_path = home / '.codex' / 'config.toml'
+            with config_path.open('a') as handle:
+                handle.write('\n[features]\nforeign_feature = true\n')
+            install(home, apply=True)
+            parsed = tomllib.loads(config_path.read_text())
+            self.assertEqual(parsed['features']['foreign_feature'], True)
+            self.assertEqual(parsed['default_permissions'], 'agent-harness')
+            self.assertIn('agent-harness', parsed['permissions'])
 
     def test_symlinked_destination_is_refused_without_touching_outside(self):
         with tempfile.TemporaryDirectory() as temporary:

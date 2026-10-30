@@ -6,11 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import secrets
 import shlex
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Codex installer requires Python 3.11+.
+    tomllib = None
 
 from install import DirectoryPins, atomic_write, read_regular, safe_unlink
 
@@ -69,22 +73,29 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
 
 def merge_config(existing: str, wal_dir: Path) -> str:
     """Add a narrow default profile without silently replacing a user's policy."""
+    if tomllib is None:
+        raise RuntimeError('Codex installer requires Python 3.11+ for TOML validation')
+    tomllib.loads(existing)
     if CONFIG_START in existing or CONFIG_END in existing:
         if existing.count(CONFIG_START) != 1 or existing.count(CONFIG_END) != 1:
             raise ValueError('config.toml has malformed Agent Harness markers')
-        start, end = existing.index(CONFIG_START), existing.index(CONFIG_END) + len(CONFIG_END)
-        if start > end:
+        start, end_start = existing.index(CONFIG_START), existing.index(CONFIG_END)
+        if start > end_start:
             raise ValueError('config.toml has malformed Agent Harness markers')
-        existing = existing[:start].rstrip() + existing[end:].lstrip('\n')
-    top_level = re.split(r'^\s*\[', existing, maxsplit=1, flags=re.M)[0]
-    defaults = re.findall(r'^\s*default_permissions\s*=\s*(.+)$', top_level, re.M)
-    if defaults and defaults not in (['"agent-harness" # agent-harness-codex'], ['"agent-harness"'], ["'agent-harness'"]):
+        existing = existing[:start].rstrip('\n') + '\n' + existing[end_start + len(CONFIG_END):].lstrip('\n')
+    parsed = tomllib.loads(existing)
+    if 'default_permissions' in parsed and parsed['default_permissions'] != 'agent-harness':
         raise ValueError('config.toml already selects a different permission profile; merge manually')
-    if re.search(r'^\s*sandbox_mode\s*=', top_level, re.M) or re.search(r'^\s*\[sandbox_workspace_write\]', existing, re.M):
+    if 'sandbox_mode' in parsed or 'sandbox_workspace_write' in parsed:
         raise ValueError('config.toml uses legacy sandbox settings; merge manually')
-    if re.search(r'^\s*\[permissions\.agent-harness(?:\.|\])', existing, re.M):
+    if 'profile' in parsed:
+        raise ValueError('config.toml selects a profile that may override sandbox settings; merge manually')
+    for settings in parsed.get('profiles', {}).values():
+        if isinstance(settings, dict) and ('sandbox_mode' in settings or 'sandbox_workspace_write' in settings):
+            raise ValueError('config.toml has a profile with legacy sandbox settings; merge manually')
+    if 'agent-harness' in parsed.get('permissions', {}):
         raise ValueError('config.toml already defines the agent-harness profile outside managed markers')
-    if not defaults:
+    if 'default_permissions' not in parsed:
         existing = 'default_permissions = "agent-harness" # agent-harness-codex\n' + existing
     profile = ('[permissions.agent-harness]\n'
                'description = "Workspace with private Agent Harness WAL and Git commits"\n'
@@ -93,7 +104,9 @@ def merge_config(existing: str, wal_dir: Path) -> str:
                f'{json.dumps(str(wal_dir))} = "write"\n\n'
                '[permissions.agent-harness.filesystem.":workspace_roots"]\n'
                '".git" = "write"')
-    return existing.rstrip() + '\n\n' + CONFIG_START + '\n' + profile + '\n' + CONFIG_END + '\n'
+    result = existing.rstrip() + '\n\n' + CONFIG_START + '\n' + profile + '\n' + CONFIG_END + '\n'
+    tomllib.loads(result)
+    return result
 
 
 def install(home: Path, apply: bool) -> list[str]:
@@ -196,7 +209,10 @@ def main() -> None:
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--home', type=Path, default=Path.home())
     args = parser.parse_args()
-    changes = install(args.home, args.apply)
+    try:
+        changes = install(args.home, args.apply)
+    except (ValueError, RuntimeError) as error:
+        parser.exit(2, f'error: {error}\n')
     print(('Installed' if args.apply else 'Would install') + f' Codex Agent Harness in {args.home / ".codex"}')
     for path in changes:
         print(f'  {path}')
