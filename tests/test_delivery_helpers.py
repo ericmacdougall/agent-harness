@@ -949,11 +949,37 @@ class DeliveryHelpers(unittest.TestCase):
 
     def test_abort_git_deadline_reports_incomplete_recovery(self):
         self.add_feature_test('raise RuntimeError("fixture failure")\n')
-        env = self.git_fault_env(['merge', '--abort'], 'time.sleep(3)')
-        p = subprocess.run(self.integrate_args('--timeout', '1'), text=True, capture_output=True,
-                           env=env, timeout=12)
-        data = json.loads(p.stdout)
-        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'))
+        started = self.root / 'abort-started'
+        finished = self.root / 'abort-finished'
+        env = self.git_fault_env(['merge', '--abort'],
+                                 f'Path({str(started)!r}).touch()\n'
+                                 'time.sleep(3)\n'
+                                 f'Path({str(finished)!r}).touch()')
+        spec = importlib.util.spec_from_file_location('integration_abort_deadline', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        real_run_git = module.run_git
+        abort_deadlines = []
+
+        def deadline_only_for_abort(repo, *args, timeout=600):
+            # The real stalled abort gets one second; preflight and check get
+            # a normal deadline, so load cannot move the fault to Git status.
+            if args == ('merge', '--abort'):
+                abort_deadlines.append(timeout)
+                timeout = 1
+            return real_run_git(repo, *args, timeout=timeout)
+
+        with patch.object(sys, 'argv', self.integrate_args('--timeout', '30')[1:]), \
+             patch.object(module, 'run_git', side_effect=deadline_only_for_abort), \
+             patch('sys.stdout', new_callable=io.StringIO) as output, \
+             patch.dict(os.environ, env, clear=True):
+            code = module.main()
+        data = json.loads(output.getvalue())
+        self.assertEqual(abort_deadlines, [30], 'abort deadline fault was not exercised')
+        self.assertTrue(started.exists(), 'stalled Git abort did not start')
+        self.assertFalse(finished.exists(), 'stalled Git abort survived its deadline')
+        self.assertEqual((code, data['status']), (3, 'BLOCKED_LOCAL'), output.getvalue())
         self.assertIs(data['merge_aborted'], False)
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
         self.assertEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD', cwd=self.repo).stdout.strip(),
