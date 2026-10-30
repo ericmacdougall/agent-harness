@@ -743,24 +743,46 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertIs(data['merge_aborted'], True)
         self.assert_restored()
 
-    def test_timeout_and_malformed_abort_output_stay_out_of_diagnostics(self):
-        self.add_feature_test('import os, time\n'
-                              'os.write(2, b"synthetic_timeout_marker")\n'
-                              'time.sleep(6)\n')
-        p = subprocess.run(self.integrate_args('--timeout', '1'), text=True, capture_output=True,
-                           env=isolated_env(), timeout=12)
-        data = json.loads(p.stdout)
-        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
-        self.assertNotIn('synthetic_timeout_marker', p.stdout + p.stderr)
+    def test_check_timeout_output_stays_out_of_diagnostics(self):
+        self.add_feature_test()
+        spec = importlib.util.spec_from_file_location('integration_check_timeout', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        real_run = module.run
+        check = ['python3', '-m', 'unittest', 'discover', '-s', 'tests']
+        check_started = []
+
+        # A one-second global deadline can expire during Git preflight; inject
+        # the fault only after the merge reaches its approved check command.
+        def timeout_only_at_check(repo, command, **kwargs):
+            if command == check:
+                check_started.append(True)
+                raise subprocess.TimeoutExpired(command, kwargs['timeout'],
+                                                output=b'synthetic_timeout_marker',
+                                                stderr=b'synthetic_timeout_stderr')
+            return real_run(repo, command, **kwargs)
+
+        with patch.object(sys, 'argv', self.integrate_args('--timeout', '10')[1:]), \
+             patch.object(module, 'run', side_effect=timeout_only_at_check), \
+             patch('sys.stdout', new_callable=io.StringIO) as output, \
+             patch.dict(os.environ, isolated_env(), clear=True):
+            code = module.main()
+        data = json.loads(output.getvalue())
+        self.assertEqual(check_started, [True], 'check-phase fault was never exercised')
+        self.assertEqual((code, data['status']), (3, 'BLOCKED_LOCAL'), output.getvalue())
+        self.assertNotIn('synthetic_timeout_', output.getvalue())
         self.assertEqual(data['phase'], 'check')
         self.assertNotIn('exit_code', data)
         self.assertIs(data['merge_aborted'], True)
         self.assert_restored()
 
+    def test_malformed_abort_output_stays_out_of_diagnostics(self):
+        self.add_feature_test('raise RuntimeError("fixture failure")\n')
         env = self.git_fault_env(['merge', '--abort'],
                                  'os.write(2, b"\\xffsynthetic_abort_marker")\nsys.exit(7)')
-        p = subprocess.run(self.integrate_args('--timeout', '2'), text=True, capture_output=True,
-                           env=env, timeout=12)
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                           env=env, timeout=20)
         data = json.loads(p.stdout)
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
         self.assertNotIn('synthetic_abort_marker', p.stdout + p.stderr)
