@@ -16,12 +16,15 @@ from pathlib import Path
 def safe_id(value: object) -> str:
     original = str(value or "unknown")
     cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", original)
-    if cleaned == original and len(cleaned) <= 120 and cleaned.strip(".") and not cleaned.startswith("z-"):
+    # Only lowercase unescaped IDs use their original spelling. Escaping every
+    # uppercase ID keeps Foo and foo distinct on case-insensitive filesystems.
+    if (cleaned == original and cleaned == cleaned.lower() and len(cleaned) <= 120
+            and cleaned.strip(".") and not cleaned.startswith("z-")):
         return cleaned
     # Escaped IDs live in a reserved namespace. An ordinary ID equal to an
     # escaped result is escaped again, so direct alias construction fails.
     digest = hashlib.sha256(original.encode(errors="replace")).hexdigest()[:20]
-    stem = cleaned[:97].strip(".") or "_"
+    stem = cleaned.lower()[:97].strip(".") or "_"
     return f"z-{stem}-{digest}"
 
 

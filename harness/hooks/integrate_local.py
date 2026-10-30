@@ -154,6 +154,9 @@ def integrate(args, preparations, checks):
         if (checked_tree.returncode or checked_tree.stdout.strip() != intended_tree
                 or unstaged.returncode or untracked.returncode or untracked.stdout.strip()):
             return abort(repo, "Preparation or checks changed the intended merge; inspect and rerun from a clean checkout")
+        before_commit_branch = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+        if before_commit_branch.returncode or before_commit_branch.stdout.strip() != args.original_branch:
+            return abort(repo, "Original branch changed during checks")
         committed = git(repo, "commit", "-m", f"Merge {args.source} into {args.original_branch}")
         if committed.returncode:
             return abort(repo, "Merge commit failed", detail=committed.stderr.strip()[-1200:])
@@ -171,6 +174,13 @@ def integrate(args, preparations, checks):
         final_tree = git(repo, "rev-parse", "HEAD^{tree}")
         if final_tree.returncode or final_tree.stdout.strip() != intended_tree:
             report("BLOCKED_LOCAL", "Merge commit contains changes outside the verified merge tree; inspect the checkout",
+                   head=final_head, merge_aborted=False)
+            return 3
+        final_branch = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+        original_ref = git(repo, "rev-parse", "--verify", f"refs/heads/{args.original_branch}")
+        if (final_branch.returncode or final_branch.stdout.strip() != args.original_branch
+                or original_ref.returncode or original_ref.stdout.strip() != final_head):
+            report("BLOCKED_LOCAL", "Merge commit is not on the original branch; inspect branch refs",
                    head=final_head, merge_aborted=False)
             return 3
         final_status = git(repo, "status", "--porcelain")

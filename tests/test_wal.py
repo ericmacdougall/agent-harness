@@ -164,6 +164,23 @@ class WalTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(len(list((self.home / '.claude/wals').iterdir())), 2)
 
+    def test_case_variants_and_uppercase_escape_cannot_alias_on_casefolded_disks(self):
+        for session_id in ('Foo', 'foo', 'a/b'):
+            result = self.invoke('session', {'session_id': session_id})
+            self.assertEqual(result.returncode, 0, result.stderr)
+        directories = list((self.home / '.claude/wals').iterdir())
+        self.assertEqual(len(directories), 3)
+        escaped = next(path.name for path in directories if path.name.startswith('z-a_b-'))
+        result = self.invoke('session', {'session_id': escaped.upper()})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        names = [path.name.casefold() for path in (self.home / '.claude/wals').iterdir()]
+        self.assertEqual(len(set(names)), 4)
+        for agent_id in ('Task', 'task'):
+            result = self.invoke('subagent', {'session_id': 'agents', 'agent_id': agent_id})
+            self.assertEqual(result.returncode, 0, result.stderr)
+        files = list((self.home / '.claude/wals/agents').glob('agent-*.jsonl'))
+        self.assertEqual(len({path.name.casefold() for path in files}), 2)
+
     def test_agent_named_main_cannot_alias_the_main_wal(self):
         result = self.invoke('subagent', {'session_id': 'session', 'agent_id': 'main', 'agent_type': 'task-owner'})
         self.assertEqual(result.returncode, 0, result.stderr)

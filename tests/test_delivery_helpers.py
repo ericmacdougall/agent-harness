@@ -705,6 +705,23 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
 
+    def test_post_commit_hook_diverting_merge_to_other_branch_cannot_report_integration(self):
+        self.add_feature_test()
+        hook = self.repo / '.git/hooks/post-commit'
+        hook.write_text('#!/bin/sh\n'
+                        'merged=$(git rev-parse HEAD)\n'
+                        'base=$(git rev-parse HEAD^1)\n'
+                        'git branch -f diverted "$merged"\n'
+                        'git symbolic-ref HEAD refs/heads/diverted\n'
+                        'git update-ref refs/heads/main "$base"\n')
+        hook.chmod(0o700)
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                           env=isolated_env(), timeout=20)
+        data = json.loads(p.stdout)
+        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'refs/heads/main', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual(cmd('git', 'rev-parse', 'refs/heads/diverted', cwd=self.repo).stdout.strip(), data['head'])
+
     def test_nonpositive_timeout_rejected_before_merge(self):
         for value in ('0', '-1'):
             result = subprocess.run(self.integrate_args('--timeout', value), text=True, capture_output=True,
