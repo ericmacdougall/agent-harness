@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,7 +81,7 @@ def merged_instructions(existing: str, instructions: str) -> str:
     return existing.rstrip() + ("\n\n" if existing.strip() else "") + block + "\n"
 
 
-def atomic_write(path: Path, data: bytes) -> None:
+def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".agent-harness-", dir=path.parent)
     try:
@@ -88,7 +89,7 @@ def atomic_write(path: Path, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
+        os.chmod(temporary, mode)
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
@@ -105,6 +106,10 @@ def install(home: Path, apply: bool) -> list[str]:
     directories = {claude, claude / "agent-harness-backups", *(path.parent for path in managed)}
     if any(path.is_symlink() for path in [*managed, *directories]):
         raise ValueError("Refusing a symlinked destination or directory; inspect the user directory first")
+    if any(path.exists() and not path.is_file() for path in managed):
+        raise ValueError("Each managed destination must be a regular file")
+    if any(path.exists() and not path.is_dir() for path in directories):
+        raise ValueError("Each managed directory must be a directory")
     current_text = (claude / "CLAUDE.md").read_text() if (claude / "CLAUDE.md").exists() else ""
     instructions = merged_instructions(current_text, (ROOT / "HARNESS.md").read_text())
     settings_path = claude / "settings.json"
@@ -112,9 +117,15 @@ def install(home: Path, apply: bool) -> list[str]:
     if not isinstance(current_settings, dict):
         raise ValueError("settings.json must contain an object")
     settings = merged_settings(current_settings, claude)
+    # Read every payload before any managed write (also validate the payload in preview).
+    payloads = [(destination, source.read_bytes()) for source, destination in files]
+    payloads += [(claude / "CLAUDE.md", instructions.encode()),
+                 (settings_path, (json.dumps(settings, indent=2) + "\n").encode())]
     changes = [str(path) for path in managed]
     if not apply:
         return changes
+    originals = {path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode)) if path.exists() else None
+                 for path in managed}
     backup_root = claude / "agent-harness-backups"
     backups = backup_root / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     claude.mkdir(parents=True, exist_ok=True)
@@ -127,10 +138,26 @@ def install(home: Path, apply: bool) -> list[str]:
             saved.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, saved)
             os.chmod(saved, 0o600)
-    for source, destination in files:
-        atomic_write(destination, source.read_bytes())
-    atomic_write(claude / "CLAUDE.md", instructions.encode())
-    atomic_write(settings_path, (json.dumps(settings, indent=2) + "\n").encode())
+    attempted = []
+    try:
+        for destination, data in payloads:
+            attempted.append(destination)
+            atomic_write(destination, data)
+    except BaseException as error:
+        failures = []
+        for path in reversed(attempted):
+            try:
+                original = originals[path]
+                if original is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    atomic_write(path, *original)
+            except OSError:
+                failures.append(str(path.relative_to(claude)))
+        if failures:
+            raise RuntimeError(f"Installation failed; rollback incomplete for {', '.join(failures)}; "
+                               f"restore from {backups}") from error
+        raise
     return changes
 
 
