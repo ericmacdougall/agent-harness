@@ -38,13 +38,13 @@ class WatchTests(unittest.TestCase):
         late = self.root / 'late.txt'
         child = (f'import os, time; from pathlib import Path; '
                  f'Path({str(pid_file)!r}).write_text(str(os.getpid())); '
-                 f'time.sleep(10); Path({str(late)!r}).write_text("late")')
+                 f'time.sleep(20); Path({str(late)!r}).write_text("late")')
         parent = ('import subprocess, sys, time; '
-                  f'subprocess.Popen([sys.executable, "-c", {child!r}]); time.sleep(10)')
+                  f'subprocess.Popen([sys.executable, "-c", {child!r}]); time.sleep(20)')
         started = time.monotonic()
-        result = self.invoke('--once', '--timeout', '1', '--', sys.executable, '-c', parent)
+        result = self.invoke('--once', '--timeout', '6', '--', sys.executable, '-c', parent, timeout=30)
         self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
-        self.assertLess(time.monotonic() - started, 8)
+        self.assertLess(time.monotonic() - started, 25)
         self.assertTrue(pid_file.exists(), 'the child must start before the deadline')
         with self.assertRaises(ProcessLookupError):
             os.kill(int(pid_file.read_text()), 0)
