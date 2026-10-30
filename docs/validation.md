@@ -60,6 +60,17 @@ The earlier local helper suite had five passing cases. The version in this repos
 
 One TypeScript app's final Sol review and browser retest passed for the changed flows. Its hidden-tab timing comparison was inconclusive because the browser did not throttle either run. Screen reader behavior and actual audio playback were not tested. The nine-app exercise is evidence of breadth and real agent use, not a statistically representative reliability estimate.
 
+## Evidence workflow probes, 2026-10-30
+
+Three disposable Claude Code 2.1.314 sessions on macOS tested ideas from the supplied course transcripts before changing the installed harness:
+
+- A small Python slug fix used a project-level candidate instruction to write `PENDING_REAL_TEST V1` before editing. The existing one-case regression failed on the baseline (`'-hello-world-' != 'hello-world'`, exit 1), then passed after a one-line fix (one test, exit 0). The session wrote a matching `REALLY_TESTED V1` note with the command and results. An independent test rerun and diff check passed. This supports the evidence-note workflow in one real task; it is not a measured compliance rate.
+- An experimental `Stop` hook fired on a simple arithmetic answer. When configured to demand a test, it forced a second model continuation and turned a requested one-number answer into a test report. The global Stop gate was rejected because it adds friction to informational requests. The harness retains proportionate checks for actual work rather than a test requirement on every turn.
+
+The course also suggested calibrating reviewers with planted defects and estimating hidden issues from the catch rate. The harness adopts disposable seeded probes only for high-risk review and requires concrete reproductions for findings. A tiny seed set is not a statistically defensible estimate of undiscovered defects, so no numeric extrapolation was added.
+
+A separate blind Sol review used a disposable Python transfer fixture with one happy-path test and two planted cases. It found the unchecked destination tenant and provided a reproducer that changed another tenant's balance. It also noticed that the unused `request_id` lets a retry debit twice, correctly marking this finding conditional on the intended idempotency contract. Independent reproductions confirmed balances of `(75, 25)` across tenants and `(50, 50)` after two identical requests. This **2/2 fixture result** checks that review path on these examples only; it is not a reviewer sensitivity estimate. The shipping repository was never seeded with defects.
+
 ## Claims to verify in each installation
 
 - Run `claude doctor` and start a new session after installing.
