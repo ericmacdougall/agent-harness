@@ -38,7 +38,7 @@ An additional live CLI scenario installed into a disposable home, checked previe
 
 A separate process probe confirmed the deferred detached-child limit: with a 0.25-second deadline, a child using a new session survived and wrote its marker; the helper returned `TimeoutExpired` after roughly 1.23 seconds when the inherited pipe closed. Process-group cleanup is not process containment. Installation rollback likewise does not cover crashes, concurrent edits, or persistent storage failures.
 
-Author environment: macOS, Python 3.9.6, Git 2.54.0. This Python is below the supported minimum; supported-version Linux/macOS CI and independent Fable/main review remain required. GitHub API access failed. The author's filesystem policy also rejected `.git/index.lock` creation, so these results describe the working-tree changes, not a new committed HEAD or hosted PR.
+Author environment: macOS, Python 3.9.6, Git 2.54.0. Python 3.9 is below the supported minimum. At Astra's original handoff, GitHub API access and Git index writes were unavailable in its sandbox. The main agent reviewed and committed those files as `2a14f71`, `b1b4cbb`, and `2326f57`, then opened PR #2. The supported-version CI and independent review results appear below.
 
 ## Independent review and improvement, 2026-10-29
 
