@@ -19,6 +19,9 @@ from unittest.mock import patch
 
 PUBLISH = Path(__file__).resolve().parents[1] / 'harness/hooks/publish_feature.py'
 INTEGRATE = Path(__file__).resolve().parents[1] / 'harness/hooks/integrate_local.py'
+# Python 3.12+ unittest exits 5 when no test ran, so a check fixture needs a real passing test.
+PASSING_CHECK = ('import unittest\n\nclass Check(unittest.TestCase):\n'
+                 '    def test_ok(self):\n        self.assertEqual(2 + 2, 4)\n')
 
 
 def isolated_env():
@@ -217,7 +220,7 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
         self.assertFalse(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
 
-    def add_feature_test(self, body):
+    def add_feature_test(self, body=PASSING_CHECK):
         tests = self.feature / 'tests'
         tests.mkdir()
         (tests / 'test_check.py').write_text(body)
@@ -253,7 +256,7 @@ class DeliveryHelpers(unittest.TestCase):
         return env
 
     def test_local_git_preflight_deadline_in_both_helpers(self):
-        self.add_feature_test('import unittest\n')
+        self.add_feature_test()
         marker = self.root / 'status-started'
         late = self.root / 'status-finished'
         env = self.git_fault_env(['status', '--porcelain'],
@@ -275,14 +278,14 @@ class DeliveryHelpers(unittest.TestCase):
                 self.assert_restored()
 
     def test_failed_git_status_refuses_integration(self):
-        self.add_feature_test('import unittest\n')
+        self.add_feature_test()
         env = self.git_fault_env(['status', '--porcelain'], 'sys.exit(128)')
         p = subprocess.run(self.integrate_args(), text=True, capture_output=True, env=env, timeout=12)
         self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (3, 'BLOCKED_LOCAL'))
         self.assert_restored()
 
     def test_failed_final_head_inspection_does_not_report_integration_success(self):
-        self.add_feature_test('import unittest\n')
+        self.add_feature_test()
         seen = self.root / 'head-read'
         env = self.git_fault_env(['rev-parse', 'HEAD'],
                                  f'path = Path({str(seen)!r})\nif path.exists(): sys.exit(128)\npath.touch()')
@@ -292,7 +295,7 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(parents[1:], [self.base, self.feature_head])
 
     def test_post_commit_hook_timeout_reports_committed_but_not_aborted(self):
-        self.add_feature_test('import unittest\n')
+        self.add_feature_test()
         marker = self.root / 'post-commit-started'
         hook = self.repo / '.git/hooks/post-commit'
         hook.write_text('#!/bin/sh\n' + shlex.join([sys.executable, '-c',
@@ -308,7 +311,7 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(parents[1:], [self.base, self.feature_head])
 
     def test_merge_git_deadline_reports_failed_abort_when_no_merge_started(self):
-        self.add_feature_test('import unittest\n')
+        self.add_feature_test()
         env = self.git_fault_env(['merge', '--no-ff', '--no-commit', self.feature_head], 'time.sleep(3)')
         p = subprocess.run(self.integrate_args('--timeout', '1'), text=True, capture_output=True,
                            env=env, timeout=12)
@@ -317,7 +320,7 @@ class DeliveryHelpers(unittest.TestCase):
         self.assert_restored()
 
     def test_commit_hook_deadline_kills_child_and_preserves_original_head(self):
-        self.add_feature_test('import unittest\n')
+        self.add_feature_test()
         started = self.root / 'hook-started'
         late = self.root / 'hook-survived'
         hook = self.repo / '.git/hooks/pre-commit'
