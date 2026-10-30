@@ -36,6 +36,13 @@ class InstallerTests(unittest.TestCase):
         self.assertIn(example, merged)
         self.assertIn('Managed instructions.', merged)
 
+    def test_replacement_preserves_end_marker_newline_and_suffix(self):
+        existing = (f'{START}\n# Agent Harness engineering workflow\nOld.\n{END}\n'
+                    'User instructions after block.\n')
+        merged = merged_instructions(existing, '# Agent Harness engineering workflow\nNew.')
+        self.assertIn(f'{END}\nUser instructions after block.\n', merged)
+        self.assertEqual(merged_instructions(merged, '# Agent Harness engineering workflow\nNew.'), merged)
+
     def test_same_inode_edit_during_backup_is_preserved(self):
         target = self.claude / 'CLAUDE.md'
         target.write_text('original\n')

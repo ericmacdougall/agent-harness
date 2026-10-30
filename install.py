@@ -85,7 +85,8 @@ def merged_instructions(existing: str, instructions: str) -> str:
         managed = ''.join(lines[starts[0] + 1:ends[0]]).lstrip()
         if not managed.startswith('# Agent Harness engineering workflow\n'):
             raise ValueError('CLAUDE.md markers do not enclose a known Agent Harness block; resolve manually')
-        return ''.join(lines[:starts[0]]) + block + ''.join(lines[ends[0] + 1:])
+        ending = lines[ends[0]][len(END):]
+        return ''.join(lines[:starts[0]]) + block + ending + ''.join(lines[ends[0] + 1:])
     return existing.rstrip() + ("\n\n" if existing.strip() else "") + block + "\n"
 
 

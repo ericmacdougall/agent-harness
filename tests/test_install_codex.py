@@ -33,6 +33,15 @@ class CodexInstallerTests(unittest.TestCase):
         self.assertIn(example, merged)
         self.assertIn('Managed.', merged)
 
+    def test_replacement_preserves_end_marker_newline_and_suffix(self):
+        start = '<!-- agent-harness-codex:start -->'
+        end = '<!-- agent-harness-codex:end -->'
+        existing = (f'{start}\n# Agent Harness for Codex\nOld.\n{end}\n'
+                    'User instructions after block.\n')
+        merged = merge_marked(existing, '# Agent Harness for Codex\nNew.')
+        self.assertIn(f'{end}\nUser instructions after block.\n', merged)
+        self.assertEqual(merge_marked(merged, '# Agent Harness for Codex\nNew.'), merged)
+
     def test_toml_multiline_marker_text_is_preserved(self):
         original = 'note = """literal # agent-harness-codex:profile-start data # agent-harness-codex:profile-end retained"""\n'
         merged = merge_config(original, Path('/tmp/private-wals'))
