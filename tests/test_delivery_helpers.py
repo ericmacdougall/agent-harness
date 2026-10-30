@@ -284,6 +284,47 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'), p.stdout)
         self.assert_lfs_ref_absent(remote)
 
+    def test_shallow_boundary_cannot_hide_retained_lfs_history(self):
+        remote = self.lfs_remote()
+        (self.feature / 'asset.bin').write_text('version https://git-lfs.github.com/spec/v1\n'
+                                              'oid sha256:' + 'a' * 64 + '\nsize 123\n')
+        cmd('git', 'add', 'asset.bin', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'historical pointer', cwd=self.feature)
+        pointer_commit = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        pointer_oid = cmd('git', 'rev-parse', 'HEAD:asset.bin', cwd=self.feature).stdout.strip()
+        (self.feature / 'asset.bin').unlink()
+        cmd('git', 'commit', '-qam', 'remove pointer before shallow boundary', cwd=self.feature)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        (self.repo / '.git/shallow').write_text(reviewed + '\n')
+        self.assertEqual(cmd('git', 'rev-list', 'HEAD', cwd=self.feature).stdout.splitlines(), [reviewed])
+        self.assertEqual(cmd('git', 'cat-file', '-t', pointer_oid, cwd=self.feature).stdout.strip(), 'blob')
+        self.assertNotEqual(cmd('git', 'cat-file', '-t', pointer_commit, cwd=remote, check=False).returncode, 0)
+        p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', reviewed)
+        self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'), p.stdout)
+        self.assert_lfs_ref_absent(remote)
+        self.assertNotEqual(cmd('git', 'cat-file', '-t', pointer_commit, cwd=remote, check=False).returncode, 0)
+
+    def test_shallow_source_with_complete_non_lfs_objects_can_publish(self):
+        remote = self.lfs_remote()
+        (self.repo / '.git/shallow').write_text(self.feature_head + '\n')
+        p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', self.feature_head)
+        self.assertEqual((p.returncode, data['status']), (0, 'PUSHED'), p.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'feat/app', cwd=remote).stdout.strip(), self.feature_head)
+
+    def test_shallow_source_missing_ancestors_refuses_publication(self):
+        remote = self.lfs_remote()
+        shallow = self.root / 'shallow-clone'
+        cmd('git', 'clone', '-q', '--depth=1', '--branch', 'feat/app', self.repo.as_uri(), str(shallow))
+        self.assertEqual(cmd('git', 'rev-parse', '--is-shallow-repository', cwd=shallow).stdout.strip(), 'true')
+        self.assertNotEqual(cmd('git', 'cat-file', '-t', self.base, cwd=shallow, check=False).returncode, 0)
+        cmd('git', 'remote', 'set-url', 'origin', str(remote), cwd=shallow)
+        p, data = self.invoke(PUBLISH, '--repo', str(shallow), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', self.feature_head)
+        self.assertEqual((p.returncode, data['status']), (4, 'BLOCKED_REMOTE'), p.stdout)
+        self.assert_lfs_ref_absent(remote)
+
     def test_lfs_object_budget_blocks_real_publication(self):
         remote = self.lfs_remote()
         spec = importlib.util.spec_from_file_location('publish_budget', PUBLISH)

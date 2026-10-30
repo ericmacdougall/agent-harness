@@ -250,18 +250,6 @@ def publish(args):
     if args.branch == match.group(1):
         report("BLOCKED_POLICY", "Refusing to publish the remote default branch", branch=args.branch, remote=remote)
         return 2
-    # The isolated transport omits source pre-push hooks. Git LFS uploads in
-    # that hook, so reject any pointer in reachable history before pushing.
-    try:
-        contains_lfs = has_reachable_lfs_pointer(repo, head, git, timeout=args.timeout)
-    except ValueError:
-        report("BLOCKED_REMOTE", "Could not verify whether Git LFS content needs uploading; continue local integration",
-               branch=args.branch, remote=remote)
-        return 4
-    if contains_lfs:
-        report("BLOCKED_POLICY", "Git LFS pointer found; publish with an LFS-aware workflow",
-               branch=args.branch, remote=remote)
-        return 2
     ref = f"refs/heads/{args.branch}"
     # A concurrent edit to origin.pushurl must not redirect the push.
     try:
@@ -295,6 +283,20 @@ def publish(args):
             resolved = git(transport, 'ls-remote', '--get-url', '--', pinned_remote, env_extra=pinned_env)
             if resolved.returncode or resolved.stdout.strip() != destination:
                 report('BLOCKED_POLICY', 'Isolated transport would rewrite the inspected destination', branch=args.branch, remote=remote)
+                return 2
+            # Scan the same graph the push will traverse. Source shallow boundaries
+            # and grafts are not inherited by this transport, even when their hidden
+            # ancestor objects remain available through alternates. The source LFS
+            # upload hook is bypassed, so refuse every pointer in this graph.
+            try:
+                contains_lfs = has_reachable_lfs_pointer(transport, head, git, timeout=args.timeout)
+            except ValueError:
+                report("BLOCKED_REMOTE", "Could not verify whether Git LFS content needs uploading; continue local integration",
+                       branch=args.branch, remote=remote)
+                return 4
+            if contains_lfs:
+                report("BLOCKED_POLICY", "Git LFS pointer found; publish with an LFS-aware workflow",
+                       branch=args.branch, remote=remote)
                 return 2
             result = git(transport, 'push', '--porcelain', pinned_remote,
                          f"{head}:{ref}", timeout=args.timeout, env_extra=pinned_env)
