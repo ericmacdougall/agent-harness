@@ -20,11 +20,14 @@ def signal_group(pid, signum):
 
 def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True, stream=False):
     # Git and test runners spawn children that subprocess.run(timeout=...) leaves alive.
+    # Malformed output from a child must not bypass a caller's rollback path.
+    # Keep binary mode exact for callers that inspect Git object bytes.
+    decoding = {'errors': 'replace'} if text else {}
     process = subprocess.Popen(command, cwd=cwd, env=env, text=text,
                                stdin=subprocess.PIPE if input is not None else None,
                                stdout=None if stream else subprocess.PIPE,
                                stderr=None if stream else subprocess.PIPE,
-                               start_new_session=True)
+                               start_new_session=True, **decoding)
     try:
         stdout, stderr = process.communicate(input=input, timeout=timeout)
     except BaseException:

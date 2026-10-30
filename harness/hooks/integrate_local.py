@@ -132,7 +132,7 @@ def integrate(args, preparations, checks):
         merge_attempted = True
         merge = git(repo, "merge", "--no-ff", "--no-commit", source.stdout.strip())
         if merge.returncode:
-            return abort(repo, "Merge failed", detail=merge.stderr.strip()[-1200:])
+            return abort(repo, "Merge failed", phase="merge", exit_code=merge.returncode)
         intended = git(repo, "write-tree")
         if intended.returncode or not intended.stdout.strip():
             return abort(repo, "Could not record intended merge tree")
@@ -142,12 +142,16 @@ def integrate(args, preparations, checks):
                 try:
                     result = run(repo, argv, timeout=args.timeout)
                 except subprocess.TimeoutExpired:
-                    return abort(repo, f"{kind.capitalize()} exceeded {args.timeout} seconds", **{kind: argv})
+                    return abort(repo, f"{kind.capitalize()} exceeded {args.timeout} seconds", phase=kind,
+                                 **{kind: argv})
                 except OSError:
-                    return abort(repo, f"{kind.capitalize()} could not start", **{kind: argv})
+                    return abort(repo, f"{kind.capitalize()} could not start", phase=kind,
+                                 **{kind: argv})
                 if result.returncode:
-                    return abort(repo, f"{kind.capitalize()} failed", **{kind: argv},
-                                       detail=(result.stderr or result.stdout)[-1200:])
+                    # Child output can contain arbitrary credentials. The approved argv
+                    # and exit code tell the user which command to run locally.
+                    return abort(repo, f"{kind.capitalize()} failed", phase=kind,
+                                 exit_code=result.returncode, **{kind: argv})
         checked_tree = git(repo, "write-tree")
         unstaged = git(repo, "diff", "--quiet", "--exit-code")
         untracked = git(repo, "ls-files", "--others", "--exclude-standard")
@@ -159,7 +163,7 @@ def integrate(args, preparations, checks):
             return abort(repo, "Original branch changed during checks")
         committed = git(repo, "commit", "-m", f"Merge {args.source} into {args.original_branch}")
         if committed.returncode:
-            return abort(repo, "Merge commit failed", detail=committed.stderr.strip()[-1200:])
+            return abort(repo, "Merge commit failed", phase="commit", exit_code=committed.returncode)
         commit_returned = True
         final = git(repo, "rev-parse", "HEAD")
         if final.returncode or not final.stdout.strip():
