@@ -50,6 +50,8 @@ Fable reviewed PR #2 at Astra's head `2326f57` against `6d6e0ba` and reran the s
 
 Final local validation at `51e90e2`: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests` ran **54 tests**, OK, on both 3.9.6 and 3.15.0; `python3 -m compileall -q install.py harness tests` and `git diff --check` pass. Failure-path time now adds the termination grace: a command group that ignores SIGTERM costs up to two extra seconds before the kill.
 
+Head `3a4c6e8` (these three commits plus this section) passed all eight jobs of the Ubuntu/macOS × Python 3.10/3.x matrix in both the [push run](https://github.com/ericmacdougall/agent-harness/actions/runs/40994833408) and the [PR run](https://github.com/ericmacdougall/agent-harness/actions/runs/40994839746); the latest-Python jobs used Python 3.15.1 and Git 2.56.0.
+
 ## Earlier live exercise, 2026-10-29
 
 The precursor user-wide harness was exercised through fresh Claude Code sessions and nine small-to-medium app builds: three TypeScript, three Go, and three Python. All nine reached passing independent checks and were merged into their original local fixture checkouts. The fixtures had no `origin`; publication failed as designed while local delivery continued. One fresh background session on a Go inventory app reported the remote failure, reran Go checks, exercised its live API, merged locally and supplied a usable run kit.
