@@ -1,11 +1,14 @@
 import json
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from install import END, START, install
+from install import END, START, ROOT, install
 
 
 class InstallerTests(unittest.TestCase):
@@ -115,6 +118,103 @@ class InstallerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             install(self.home, apply=True)
         self.assertFalse((self.claude / "settings.json").exists())
+
+    def managed_snapshot(self):
+        return {str(path.relative_to(self.claude)): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                for path in self.claude.rglob('*')
+                if path.is_file() and 'agent-harness-backups' not in path.parts}
+
+    def seed_existing_installation(self):
+        (self.claude / 'agents').mkdir()
+        (self.claude / 'agents/task-owner.md').write_text('old owner\n')
+        (self.claude / 'agents/task-owner.md').chmod(0o640)
+        (self.claude / 'CLAUDE.md').write_text('user instructions\n')
+        (self.claude / 'settings.json').write_text('{"model": "keep-me"}\n')
+
+    def test_missing_payload_is_detected_before_any_installation_write(self):
+        self.seed_existing_installation()
+        before = self.managed_snapshot()
+        read_bytes = Path.read_bytes
+        def missing_payload(path):
+            if path == ROOT / 'harness/tools/watch-tests.py':
+                raise FileNotFoundError('fixture: final payload missing')
+            return read_bytes(path)
+        with patch.object(Path, 'read_bytes', missing_payload), self.assertRaises(FileNotFoundError):
+            install(self.home, apply=True)
+        self.assertEqual(self.managed_snapshot(), before)
+        self.assertFalse((self.claude / 'agent-harness-backups').exists())
+
+    def test_fifo_destinations_are_rejected_without_opening_them(self):
+        for name in ('settings.json', 'agents/task-owner.md'):
+            for apply in (False, True):
+                with self.subTest(name=name, apply=apply):
+                    path = self.claude / name
+                    path.parent.mkdir(exist_ok=True)
+                    os.mkfifo(path)
+                    try:
+                        try:
+                            result = subprocess.run([sys.executable, str(ROOT / 'install.py'),
+                                                     '--home', str(self.home), *(['--apply'] if apply else [])],
+                                                    text=True, capture_output=True, timeout=2)
+                        except subprocess.TimeoutExpired:
+                            self.fail('installer blocked opening a FIFO')
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn('regular file', result.stderr)
+                        self.assertFalse((self.claude / 'agent-harness-backups').exists())
+                    finally:
+                        path.unlink()
+
+    def test_file_in_place_of_managed_directory_is_rejected_before_writing(self):
+        (self.claude / 'hooks').write_text('preserve this file')
+        before = self.managed_snapshot()
+        with self.assertRaisesRegex(ValueError, 'directory'):
+            install(self.home, apply=True)
+        self.assertEqual(self.managed_snapshot(), before)
+        self.assertFalse((self.claude / 'agent-harness-backups').exists())
+
+    def test_failed_replacement_restores_existing_files_and_removes_new_files(self):
+        self.seed_existing_installation()
+        before = self.managed_snapshot()
+        replace = os.replace
+        failed = False
+        def fail_once(source, destination):
+            nonlocal failed
+            if Path(destination) == self.claude / 'settings.json' and not failed:
+                failed = True
+                raise OSError('fixture: settings replacement failed')
+            return replace(source, destination)
+        with patch('install.os.replace', side_effect=fail_once), self.assertRaisesRegex(OSError, 'fixture'):
+            install(self.home, apply=True)
+        self.assertTrue(failed)
+        self.assertEqual(self.managed_snapshot(), before)
+        self.assertFalse(list(self.claude.rglob('.agent-harness-*')))
+        saved, = (self.claude / 'agent-harness-backups').rglob('settings.json')
+        self.assertEqual(saved.read_bytes(), before['settings.json'][0])
+        self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
+
+    def test_rollback_failure_is_reported_and_other_files_are_still_restored(self):
+        self.seed_existing_installation()
+        before = self.managed_snapshot()
+        replace = os.replace
+        failed = False
+        def fail_install_and_one_restore(source, destination):
+            nonlocal failed
+            path = Path(destination)
+            if path == self.claude / 'settings.json':
+                failed = True
+                raise OSError('fixture: write failure')
+            if failed and path == self.claude / 'agents/task-owner.md':
+                raise OSError('fixture: restore failure')
+            return replace(source, destination)
+        with patch('install.os.replace', side_effect=fail_install_and_one_restore):
+            with self.assertRaisesRegex(RuntimeError, 'rollback incomplete') as raised:
+                install(self.home, apply=True)
+        self.assertIn('agents/task-owner.md', str(raised.exception))
+        self.assertIn('agent-harness-backups', str(raised.exception))
+        after = self.managed_snapshot()
+        self.assertEqual(after.pop('CLAUDE.md'), before['CLAUDE.md'])
+        self.assertEqual(after.pop('settings.json'), before['settings.json'])
+        self.assertEqual(set(after), {'agents/task-owner.md'})
 
 
 if __name__ == "__main__":

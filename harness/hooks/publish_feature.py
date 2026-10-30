@@ -7,12 +7,13 @@ import os
 import re
 import subprocess
 import sys
+from functools import partial
 from pathlib import Path
 
 from process import run
 
 
-def git(repo, *args, timeout=None):
+def run_git(repo, *args, timeout=600):
     # Headless use: a missing credential must fail the push, not wait on a terminal prompt.
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     return run(["git", "-C", str(repo), *args], env=env, timeout=timeout)
@@ -35,10 +36,22 @@ def main():
     parser.add_argument("--branch", required=True)
     parser.add_argument("--original-branch", required=True)
     parser.add_argument("--expected-head", required=True)
-    parser.add_argument("--timeout", type=int, default=600, help="Seconds to wait for the push before reporting BLOCKED_REMOTE")
+    parser.add_argument("--timeout", type=int, default=600, help="Seconds allowed for each Git command, including the push")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be a positive number of seconds")
+    try:
+        return publish(args)
+    except subprocess.TimeoutExpired:
+        report("BLOCKED_REMOTE", f"Local Git inspection exceeded {args.timeout} seconds; no push attempted")
+        return 4
+    except OSError:
+        report("BLOCKED_REMOTE", "Git command could not start; publication incomplete")
+        return 4
+
+
+def publish(args):
+    git = partial(run_git, timeout=args.timeout)
     repo = args.repo.resolve()
     if not repo.is_dir() or git(repo, "rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
         report("BLOCKED_POLICY", "Source is not a Git worktree")
@@ -63,10 +76,26 @@ def main():
     if remote not in git(repo, "remote").stdout.splitlines():
         report("BLOCKED_REMOTE", "Configured remote is unavailable", branch=args.branch, remote=remote)
         return 4
+    # Fetch and push can target different repositories (including pushInsteadOf rewrites).
+    destinations = git(repo, "remote", "get-url", "--push", "--all", remote)
+    urls = destinations.stdout.splitlines()
+    if destinations.returncode or not urls:
+        report("BLOCKED_REMOTE", "Could not resolve the push destination", branch=args.branch, remote=remote)
+        return 4
+    if len(urls) != 1:
+        report("BLOCKED_POLICY", "Publication requires exactly one push destination", branch=args.branch, remote=remote)
+        return 2
+    # get-url already expanded rewrites. Refuse a second expansion that would make
+    # ls-remote inspect a different repository from the one `push origin` uses.
+    inspected = git(repo, "ls-remote", "--get-url", "--", urls[0])
+    if inspected.returncode or inspected.stdout.strip() != urls[0]:
+        report("BLOCKED_POLICY", "Push destination cannot be inspected without another URL rewrite",
+               branch=args.branch, remote=remote)
+        return 2
     # A repository may call its default branch trunk, release, or something else.
     # Refuse publication when the remote does not reveal a default branch.
     try:
-        default = git(repo, "ls-remote", "--symref", remote, "HEAD", timeout=min(args.timeout, 30))
+        default = git(repo, "ls-remote", "--symref", "--", urls[0], "HEAD", timeout=min(args.timeout, 30))
     except subprocess.TimeoutExpired:
         report("BLOCKED_REMOTE", "Could not determine the remote default branch in time; continue local integration", branch=args.branch, remote=remote)
         return 4
