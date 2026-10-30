@@ -1,3 +1,5 @@
+import errno
+import importlib.util
 import json
 import hashlib
 import os
@@ -6,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 WAL = Path(__file__).resolve().parents[1] / "harness/hooks/wal.py"
@@ -204,6 +207,68 @@ class WalTests(unittest.TestCase):
         records = [json.loads(line) for line in lines]
         self.assertEqual(len(records), 200)
         self.assertEqual(len({(row['worker'], row['index']) for row in records}), 200)
+
+    def test_transient_missing_file_during_create_retries_without_losing_record(self):
+        spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = self.home / '.claude/wals/concurrent/main.jsonl'
+        original_open = os.open
+        attempts = []
+
+        def fail_once(path, flags, *args, **kwargs):
+            if path == 'main.jsonl':
+                attempts.append(path)
+                if len(attempts) == 1:
+                    raise FileNotFoundError(errno.ENOENT, 'transient create race', path)
+            return original_open(path, flags, *args, **kwargs)
+
+        with patch.dict(os.environ, {'HOME': str(self.home)}), patch.object(module.os, 'open', side_effect=fail_once):
+            module.append(target, {'event': 'fixture'})
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(json.loads(target.read_text()), {'event': 'fixture'})
+
+    def test_retry_refuses_replaced_session_directory(self):
+        spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        session = self.home / '.claude/wals/concurrent'
+        session.mkdir(parents=True)
+        target = session / 'main.jsonl'
+        original_open = os.open
+
+        def replace_directory(path, flags, *args, **kwargs):
+            if path == 'main.jsonl':
+                session.rename(session.with_name('moved'))
+                session.mkdir()
+                raise FileNotFoundError(errno.ENOENT, 'directory replaced', path)
+            return original_open(path, flags, *args, **kwargs)
+
+        with patch.dict(os.environ, {'HOME': str(self.home)}), patch.object(module.os, 'open', side_effect=replace_directory):
+            with self.assertRaises(FileNotFoundError):
+                module.append(target, {'event': 'fixture'})
+        self.assertFalse(target.exists())
+        self.assertFalse((session.with_name('moved') / 'main.jsonl').exists())
+
+    def test_repeated_missing_file_is_bounded(self):
+        spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        target = self.home / '.claude/wals/concurrent/main.jsonl'
+        original_open = os.open
+        attempts = []
+
+        def never_create(path, flags, *args, **kwargs):
+            if path == 'main.jsonl':
+                attempts.append(path)
+                raise FileNotFoundError(errno.ENOENT, 'persistent create failure', path)
+            return original_open(path, flags, *args, **kwargs)
+
+        with patch.dict(os.environ, {'HOME': str(self.home)}), patch.object(module.os, 'open', side_effect=never_create):
+            with self.assertRaises(FileNotFoundError):
+                module.append(target, {'event': 'fixture'})
+        self.assertEqual(len(attempts), 4)
+        self.assertFalse(target.exists())
 
     def test_common_secret_formats_are_rejected_in_human_notes(self):
         path = self.home / '.claude/wals/test-session/main.jsonl'
