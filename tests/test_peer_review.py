@@ -41,7 +41,7 @@ if race: Path(race).write_text('independent file created during review')
 if os.environ.get('RACE_HEAD'):
     import subprocess
     repo = sys.argv[sys.argv.index('--cd') + 1]
-    subprocess.run(['git', '-C', repo, 'commit', '--allow-empty', '-qm', 'concurrent commit'], check=True)
+    subprocess.run(['git', '-C', os.environ.get('RACE_SOURCE_HEAD', repo), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'concurrent commit'], check=True)
 if os.environ.get('RACE_WORKTREE'):
     repo = sys.argv[sys.argv.index('--cd') + 1]
     (Path(repo) / 'app.txt').write_text('concurrent worktree edit\\n')
@@ -79,6 +79,138 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
                                *(['--expected-head', expected_head] if stage == 'pr' else [])]
         return subprocess.run(command,
                               text=True, capture_output=True, env=environment, timeout=15)
+
+    def test_both_reviewers_use_committed_snapshot_without_ignored_content(self):
+        (self.repo / '.gitignore').write_text('private.txt\nnode_modules/\n')
+        subprocess.run(['git', '-C', str(self.repo), 'add', '.gitignore'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', 'ignore fixtures'], check=True)
+        secret = self.repo / 'private.txt'
+        secret.write_text('synthetic ignored fixture')
+        vendor = self.repo / 'node_modules'
+        vendor.mkdir()
+        os.mkfifo(vendor / 'pipe')
+        head = subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], text=True).strip()
+        body = """import json, os, subprocess, sys
+from pathlib import Path
+prompt = sys.stdin.read()
+cwd = Path.cwd()
+seen = cwd / 'private.txt'
+exposed = seen.exists()
+ignored_read = seen.read_text() if exposed else None
+if exposed: seen.write_text('synthetic mutation')
+record = {'ignored_read': ignored_read, 'diff': subprocess.check_output(['git', 'diff', 'HEAD^', 'HEAD', '--'], text=True), 'config': (cwd / '.git/config').read_text(), 'cwd': str(cwd), 'exposed': exposed, 'vendor': (cwd / 'node_modules').exists(),
+          'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+          'history': subprocess.check_output(['git', 'log', '--format=%s'], text=True), 'prompt': prompt}
+Path(os.environ['ISOLATION_CAPTURE']).write_text(json.dumps(record))
+if '--cd' in sys.argv:
+    assert Path(sys.argv[sys.argv.index('--cd') + 1]) == cwd
+    Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT: PASS')
+else: print('VERDICT: PASS')
+"""
+        import json
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                secret.write_text('synthetic ignored fixture')
+                self.fake('codex', 'import sys; sys.exit(7)' if fallback else body)
+                self.fake('claude', body)
+                capture = self.root / 'isolation.json'
+                result = self.invoke(stage='plan', output=self.root / f'review-{fallback}.md',
+                                     env={'ISOLATION_CAPTURE': str(capture)})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                record = json.loads(capture.read_text())
+                self.assertFalse(record['exposed'])
+                self.assertIsNone(record['ignored_read'])
+                self.assertNotEqual(Path(record['cwd']).resolve(), self.repo.resolve())
+                self.assertFalse(record['vendor'])
+                self.assertEqual(record['head'], head)
+                self.assertIn('baseline', record['history'])
+                self.assertIn('private.txt', record['diff'])
+                self.assertNotIn(str(self.repo), record['config'])
+                self.assertIn(head, record['prompt'])
+                self.assertFalse(Path(record['cwd']).exists(), 'snapshot cleanup before return')
+                self.assertEqual(secret.read_text(), 'synthetic ignored fixture')
+
+    def test_snapshot_rejects_committed_symlink_before_model(self):
+        (self.repo / 'entry').symlink_to(self.packet)
+        subprocess.run(['git', '-C', str(self.repo), 'add', 'entry'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', 'link'], check=True)
+        capture = self.root / 'model.capture'
+        result = self.invoke(env={'CAPTURE_CODEX_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertFalse(capture.exists())
+        self.assertFalse(self.output.exists())
+
+    def test_source_config_and_inherited_git_routing_are_not_review_context(self):
+        marker = self.root / 'hook-fired'
+        hook = self.root / 'hook'
+        hook.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\nexit 1\n')
+        hook.chmod(0o700)
+        for key, value in (('core.hooksPath', str(self.root)),
+                           ('uploadpack.packObjectsHook', str(hook)),
+                           ('remote.private.url', 'synthetic-private-config')):
+            subprocess.run(['git', '-C', str(self.repo), 'config', key, value], check=True)
+        capture = self.root / 'config-capture'
+        self.fake('codex', """import os, subprocess, sys
+from pathlib import Path
+sys.stdin.read()
+assert 'synthetic-private-config' not in Path('.git/config').read_text()
+assert 'GIT_DIR' not in os.environ and 'GIT_WORK_TREE' not in os.environ
+assert subprocess.check_output(['git', 'status', '--porcelain'], text=True) == ''
+Path(os.environ['CONFIG_CAPTURE']).write_text(str(Path.cwd()))
+Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT: PASS')
+""")
+        result = self.invoke(env={'GIT_DIR': '/nonexistent-fixture', 'GIT_WORK_TREE': str(self.root),
+                                  'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'uploadpack.packObjectsHook',
+                                  'GIT_CONFIG_VALUE_0': str(hook), 'CONFIG_CAPTURE': str(capture)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertFalse(Path(capture.read_text()).exists())
+
+    def test_isolation_failures_cleanup_without_publishing(self):
+        import contextlib
+        import io
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_isolation_test', REVIEW)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        real_snapshot = module.make_snapshot
+        for failure in ('review', 'timeout', 'validation', 'source-race', 'cleanup'):
+            with self.subTest(failure=failure):
+                seen = []
+                output = self.root / f'{failure}.report'
+                def snapshot(repo, destination, head):
+                    seen.append(destination)
+                    real_snapshot(repo, destination, head)
+                    if failure == 'validation':
+                        raise OSError('synthetic validation failure')
+                    if failure == 'source-race':
+                        (repo / 'app.txt').write_text('changed source')
+                def review(*args):
+                    if failure == 'timeout':
+                        raise subprocess.TimeoutExpired('fixture', 1)
+                    if failure == 'review':
+                        raise OSError('synthetic reviewer failure')
+                    return 'fixture', 'VERDICT: PASS', ''
+                real_cleanup = module.tempfile.TemporaryDirectory.cleanup
+                def cleanup(directory):
+                    real_cleanup(directory)
+                    if failure == 'cleanup':
+                        raise OSError('synthetic cleanup failure')
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
+                                       '--packet', str(self.packet), '--output', str(output)]))
+                    stack.enter_context(patch.object(module, 'make_snapshot', side_effect=snapshot))
+                    model = stack.enter_context(patch.object(module, 'review_snapshot', side_effect=review))
+                    stack.enter_context(patch.object(module.tempfile.TemporaryDirectory, 'cleanup', cleanup))
+                    stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                    self.assertEqual(module.main(), 2)
+                self.assertTrue(seen)
+                self.assertFalse(seen[0].exists())
+                self.assertFalse(output.exists())
+                if failure in ('validation', 'source-race'):
+                    model.assert_not_called()
+                (self.repo / 'app.txt').write_text('baseline\n')
 
     def test_valid_sol_pass_is_private_and_identified(self):
         result = self.invoke()
@@ -168,12 +300,23 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('VERDICT: PASS', self.output.read_text())
 
-    def test_concurrent_commit_blocks_pass_and_report(self):
+    def test_snapshot_commit_blocks_pass_and_report(self):
         result = self.invoke(env={'RACE_HEAD': '1'})
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertFalse(self.output.exists())
 
-    def test_concurrent_worktree_edit_blocks_pass_and_report(self):
+    def test_concurrent_source_commit_blocks_pass_and_report(self):
+        result = self.invoke(env={'RACE_HEAD': '1', 'RACE_SOURCE_HEAD': str(self.repo)})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertFalse(self.output.exists())
+
+    def test_concurrent_source_edit_blocks_pass_and_preserves_edit(self):
+        result = self.invoke(env={'RACE_UNTRACKED': str(self.repo / 'app.txt')})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertFalse(self.output.exists())
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'changed during review\n')
+
+    def test_snapshot_worktree_edit_blocks_pass_and_report(self):
         result = self.invoke(env={'RACE_WORKTREE': '1'})
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertFalse(self.output.exists())
