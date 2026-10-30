@@ -1,7 +1,7 @@
 """Run a POSIX command with a deadline and clean up its process group on failure."""
 
 import os
-import select
+import selectors
 import signal
 import subprocess
 import time
@@ -23,15 +23,16 @@ def signal_group(pid, signum):
 
 def drain_discarded(pipe, deadline):
     """Discard fixed-size chunks until every inherited writer closes or time runs out."""
-    while True:
-        remaining = None if deadline is None else deadline - time.monotonic()
-        if remaining is not None and remaining <= 0:
-            return False
-        ready, _, _ = select.select([pipe], [], [], remaining)
-        if not ready:
-            return False
-        if not os.read(pipe.fileno(), DISCARD_CHUNK_BYTES):
-            return True
+    with selectors.DefaultSelector() as poller:
+        poller.register(pipe, selectors.EVENT_READ)
+        while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            if not poller.select(remaining):
+                return False
+            if not os.read(pipe.fileno(), DISCARD_CHUNK_BYTES):
+                return True
 
 
 def cleanup_discarded(process):

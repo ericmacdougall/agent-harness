@@ -1,3 +1,4 @@
+import contextlib
 import errno
 import importlib.util
 import io
@@ -5,6 +6,7 @@ import json
 import os
 import pty
 import random
+import resource
 import select
 import signal
 import shlex
@@ -83,6 +85,39 @@ def collect_pty(pid, fd, timeout=15):
             os.waitpid(pid, 0)
 
 
+@contextlib.contextmanager
+def high_numbered_fds():
+    """Force the next pipe above select()'s 1023-fd ceiling, then restore state."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target_limit = 1120
+    if hard != resource.RLIM_INFINITY and hard < target_limit:
+        raise unittest.SkipTest('host hard descriptor limit is below high-fd fixture')
+    raised_limit = soft < target_limit
+    if raised_limit:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target_limit, hard))
+        except OSError as error:
+            raise unittest.SkipTest('cannot raise descriptor limit for fixture') from error
+    opened = []
+    try:
+        while not opened or opened[-1] < 1050:
+            opened.append(os.open(os.devnull, os.O_RDONLY))
+        yield
+    finally:
+        close_error = None
+        try:
+            for fd in reversed(opened):
+                try:
+                    os.close(fd)
+                except OSError as error:
+                    close_error = close_error or error
+        finally:
+            if raised_limit:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+        if close_error:
+            raise close_error
+
+
 class TerminalCollection(unittest.TestCase):
     def test_drains_output_that_arrives_after_exit_is_observed(self):
         with patch('os.waitpid', return_value=(123, 4 << 8)), \
@@ -122,6 +157,18 @@ class ProcessRunner(unittest.TestCase):
                                       timeout=2, discard_output=True)
         self.assertEqual(destinations, [(subprocess.PIPE, subprocess.STDOUT, True)])
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, None, None))
+
+    def test_discard_output_handles_high_numbered_pipe(self):
+        with high_numbered_fds():
+            result = self.process.run([sys.executable, '-c', 'print("synthetic-output")'],
+                                      timeout=5, discard_output=True)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, None, None))
+
+    def test_discard_high_numbered_pipe_timeout_cleans_up(self):
+        with high_numbered_fds():
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.process.run([sys.executable, '-c', 'import time; time.sleep(30)'],
+                                 timeout=0.5, discard_output=True)
 
     def test_discard_waits_for_child_holding_output_after_parent_exits(self):
         marker = self.root / 'child-complete'
@@ -1213,6 +1260,42 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD', cwd=self.repo).stdout.strip(),
                          self.feature_head)
         cmd('git', 'merge', '--abort', cwd=self.repo)
+
+    def test_high_fd_check_failure_reports_and_aborts_merge(self):
+        self.add_feature_test('import unittest\nclass Check(unittest.TestCase):\n'
+                              '    def test_failure(self):\n'
+                              '        self.fail("synthetic check failure")\n')
+        spec = importlib.util.spec_from_file_location('integration_high_fd', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        real_run = module.run
+        check = ['python3', '-m', 'unittest', 'discover', '-s', 'tests']
+        exercised = []
+
+        def high_fd_check(repo, command, **kwargs):
+            if command == check:
+                exercised.append(True)
+                with high_numbered_fds():
+                    return real_run(repo, command, **kwargs)
+            return real_run(repo, command, **kwargs)
+
+        try:
+            with patch.object(sys, 'argv', self.integrate_args('--timeout', '10')[1:]), \
+                 patch.object(module, 'run', side_effect=high_fd_check), \
+                 patch('sys.stdout', new_callable=io.StringIO) as output, \
+                 patch.dict(os.environ, isolated_env(), clear=True):
+                code = module.main()
+                report_text = output.getvalue()
+        finally:
+            # The old uncaught ValueError leaves MERGE_HEAD behind; restore the fixture.
+            cmd('git', 'merge', '--abort', cwd=self.repo, check=False)
+        data = json.loads(report_text)
+        self.assertEqual(exercised, [True])
+        self.assertEqual((code, data['status'], data.get('phase'), data['merge_aborted']),
+                         (3, 'BLOCKED_LOCAL', 'check', True), report_text)
+        self.assertNotIn('synthetic check failure', report_text)
+        self.assert_restored()
 
     def test_missing_preparation_executable_aborts_merge(self):
         # Simulate an unavailable package manager without depending on the host PATH.
