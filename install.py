@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import secrets
 import stat
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "report_file.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py")
 TOOLS = ("watch-tests.py",)
 NO_TARGET_CHECK = object()
+NO_CONTENT_CHECK = object()
 
 
 def managed_hooks(claude: Path) -> dict[str, dict]:
@@ -75,11 +77,39 @@ def merged_settings(current: dict, claude: Path) -> dict:
 
 def merged_instructions(existing: str, instructions: str) -> str:
     block = f"{START}\n{instructions.rstrip()}\n{END}"
-    if START in existing or END in existing:
-        if existing.count(START) != 1 or existing.count(END) != 1 or existing.index(START) > existing.index(END):
+    lines = existing.splitlines(keepends=True)
+    starts, ends = markdown_marker_lines(lines, START, END)
+    if starts or ends:
+        if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
             raise ValueError("CLAUDE.md has malformed Agent Harness markers; resolve manually")
-        return existing[: existing.index(START)] + block + existing[existing.index(END) + len(END):]
+        managed = ''.join(lines[starts[0] + 1:ends[0]]).lstrip()
+        if not managed.startswith('# Agent Harness engineering workflow\n'):
+            raise ValueError('CLAUDE.md markers do not enclose a known Agent Harness block; resolve manually')
+        return ''.join(lines[:starts[0]]) + block + ''.join(lines[ends[0] + 1:])
     return existing.rstrip() + ("\n\n" if existing.strip() else "") + block + "\n"
+
+
+def markdown_marker_lines(lines: list[str], start: str, end: str) -> tuple[list[int], list[int]]:
+    """Find managed marker lines outside Markdown fenced examples."""
+    starts, ends = [], []
+    fence = None
+    for i, line in enumerate(lines):
+        plain = line.rstrip('\r\n')
+        opening = re.match(r'^ {0,3}(`{3,}|~{3,})', plain)
+        if opening:
+            run = opening.group(1)
+            if fence is None:
+                fence = (run[0], len(run))
+            elif (run[0] == fence[0] and len(run) >= fence[1]
+                  and not plain[opening.end():].strip()):
+                fence = None
+            continue
+        if fence is None:
+            if plain == start:
+                starts.append(i)
+            elif plain == end:
+                ends.append(i)
+    return starts, ends
 
 
 @contextlib.contextmanager
@@ -204,16 +234,41 @@ def target_identity(directory: int, name: str):
     return info.st_dev, info.st_ino
 
 
-def require_target(path: Path, directory: int, expected) -> None:
+def require_target(path: Path, directory: int, expected,
+                   expected_data=NO_CONTENT_CHECK, expected_mode=None) -> None:
     if expected is not NO_TARGET_CHECK and target_identity(directory, path.name) != expected:
         raise OSError(f'Managed file changed since snapshot: {path.name}')
+    if expected_data is NO_CONTENT_CHECK:
+        return
+    if expected is None:
+        if expected_data is not None:
+            raise ValueError('Absent targets require an absent content expectation')
+        return
+    fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                 dir_fd=directory)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or (before.st_dev, before.st_ino) != expected:
+            raise OSError(f'Managed file changed since snapshot: {path.name}')
+        with os.fdopen(fd, 'rb', closefd=False) as handle:
+            current = handle.read()
+        after = os.fstat(fd)
+        if (current != expected_data or stat.S_IMODE(after.st_mode) != expected_mode
+                or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise OSError(f'Managed file contents or mode changed since snapshot: {path.name}')
+        if target_identity(directory, path.name) != expected:
+            raise OSError(f'Managed file changed since snapshot: {path.name}')
+    finally:
+        os.close(fd)
 
 
 def atomic_write(path: Path, data: bytes, mode: int = 0o600, *, pinned_parent=None,
-                 expected_target=NO_TARGET_CHECK, published=None, retain_published_fd=None):
+                 expected_target=NO_TARGET_CHECK, expected_data=NO_CONTENT_CHECK,
+                 expected_mode=None, published=None, retain_published_fd=None):
     with parent_fd(path) as directory:
         require_pinned_parent(path, directory, pinned_parent)
-        require_target(path, directory, expected_target)
+        require_target(path, directory, expected_target, expected_data, expected_mode)
         temporary = ".agent-harness-" + secrets.token_hex(12)
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o600, dir_fd=directory)
@@ -225,7 +280,7 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600, *, pinned_parent=No
                 os.fchmod(handle.fileno(), mode)
             written = os.fstat(fd)
             require_pinned_parent(path, directory, pinned_parent)
-            require_target(path, directory, expected_target)
+            require_target(path, directory, expected_target, expected_data, expected_mode)
             # Pin the inode before publication, including when a later fsync
             # fails. A closed inode number can be recycled before rollback.
             if retain_published_fd is not None:
@@ -238,6 +293,7 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600, *, pinned_parent=No
             require_pinned_parent(path, directory, pinned_parent)
             if target_identity(directory, path.name) != identity:
                 raise OSError(f'Managed file changed after replacement: {path.name}')
+            require_target(path, directory, identity, data, mode)
             return identity
         finally:
             os.close(fd)
@@ -247,13 +303,14 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600, *, pinned_parent=No
                 pass
 
 
-def safe_unlink(path: Path, *, pinned_parent=None, expected_target=NO_TARGET_CHECK) -> None:
+def safe_unlink(path: Path, *, pinned_parent=None, expected_target=NO_TARGET_CHECK,
+                expected_data=NO_CONTENT_CHECK, expected_mode=None) -> None:
     opened_parent = False
     try:
         with parent_fd(path) as directory:
             opened_parent = True
             require_pinned_parent(path, directory, pinned_parent)
-            require_target(path, directory, expected_target)
+            require_target(path, directory, expected_target, expected_data, expected_mode)
             try:
                 os.unlink(path.name, dir_fd=directory)
             except FileNotFoundError:
@@ -355,27 +412,32 @@ def install(home: Path, apply: bool) -> list[str]:
                     pins.create(saved.parent)
                 atomic_write(saved, originals[path][0], pinned_parent=pins.fd(saved.parent),
                              expected_target=None)
-        attempted = []
         installed = {}
+        payload_by_path = dict(payloads)
         try:
             for destination, data in payloads:
-                attempted.append(destination)
-                expected = originals[destination][2] if originals[destination] else None
+                original = originals[destination]
+                expected = original[2] if original else None
                 installed[destination] = atomic_write(destination, data,
                                                        pinned_parent=pins.fd(destination.parent),
-                                                       expected_target=expected, published=installed,
+                                                       expected_target=expected,
+                                                       expected_data=original[0] if original else None,
+                                                       expected_mode=original[1] if original else None,
+                                                       published=installed,
                                                        retain_published_fd=pins.file_fds)
         except BaseException as error:
             failures = []
-            for path in reversed(attempted):
+            for path in reversed(installed):
                 try:
                     original = originals[path]
-                    expected = installed.get(path, original[2] if original else None)
+                    expected = installed[path]
                     if original is None:
-                        safe_unlink(path, pinned_parent=pins.fd(path.parent), expected_target=expected)
+                        safe_unlink(path, pinned_parent=pins.fd(path.parent), expected_target=expected,
+                                    expected_data=payload_by_path[path], expected_mode=0o600)
                     else:
                         atomic_write(path, original[0], original[1], pinned_parent=pins.fd(path.parent),
-                                     expected_target=expected)
+                                     expected_target=expected, expected_data=payload_by_path[path],
+                                     expected_mode=0o600)
                 except OSError:
                     failures.append(str(path.relative_to(claude)))
             if failures:

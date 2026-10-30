@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import secrets
@@ -16,7 +17,7 @@ try:
 except ModuleNotFoundError:  # Codex installer requires Python 3.11+.
     tomllib = None
 
-from install import DirectoryPins, atomic_write, read_regular, safe_unlink
+from install import DirectoryPins, atomic_write, markdown_marker_lines, read_regular, safe_unlink
 
 
 ROOT = Path(__file__).resolve().parent
@@ -34,10 +35,15 @@ HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart'
 
 def merge_marked(existing: str, addition: str) -> str:
     block = f'{START}\n{addition.rstrip()}\n{END}'
-    if START in existing or END in existing:
-        if existing.count(START) != 1 or existing.count(END) != 1 or existing.index(START) > existing.index(END):
+    lines = existing.splitlines(keepends=True)
+    starts, ends = markdown_marker_lines(lines, START, END)
+    if starts or ends:
+        if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
             raise ValueError('AGENTS.md has malformed Agent Harness markers')
-        return existing[:existing.index(START)] + block + existing[existing.index(END) + len(END):]
+        managed = ''.join(lines[starts[0] + 1:ends[0]]).lstrip()
+        if not managed.startswith('# Agent Harness for Codex\n'):
+            raise ValueError('AGENTS.md markers do not enclose a known Agent Harness block; resolve manually')
+        return ''.join(lines[:starts[0]]) + block + ''.join(lines[ends[0] + 1:])
     return existing.rstrip() + ('\n\n' if existing.strip() else '') + block + '\n'
 
 
@@ -75,14 +81,49 @@ def merge_config(existing: str, wal_dir: Path) -> str:
     """Add a narrow default profile without silently replacing a user's policy."""
     if tomllib is None:
         raise RuntimeError('Codex installer requires Python 3.11+ for TOML validation')
-    tomllib.loads(existing)
-    if CONFIG_START in existing or CONFIG_END in existing:
-        if existing.count(CONFIG_START) != 1 or existing.count(CONFIG_END) != 1:
-            raise ValueError('config.toml has malformed Agent Harness markers')
-        start, end_start = existing.index(CONFIG_START), existing.index(CONFIG_END)
-        if start > end_start:
-            raise ValueError('config.toml has malformed Agent Harness markers')
-        existing = existing[:start].rstrip('\n') + '\n' + existing[end_start + len(CONFIG_END):].lstrip('\n')
+    profile = ('[permissions.agent-harness]\n'
+               'description = "Workspace with private Agent Harness WAL and Git commits"\n'
+               'extends = ":workspace"\n\n'
+               '[permissions.agent-harness.filesystem]\n'
+               f'{json.dumps(str(wal_dir))} = "write"\n\n'
+               '[permissions.agent-harness.filesystem.":workspace_roots"]\n'
+               '".git" = "write"')
+    original_parsed = tomllib.loads(existing)
+    lines = existing.splitlines(keepends=True)
+    # A standalone-looking marker can be literal text inside a multiline
+    # string. Removing a real TOML comment leaves parsed values unchanged.
+    def comment_marker_indices(marker: str) -> list[int]:
+        indices = []
+        for i, line in enumerate(lines):
+            if line.rstrip('\r\n') != marker:
+                continue
+            try:
+                without_line = tomllib.loads(''.join(lines[:i] + lines[i + 1:]))
+            except tomllib.TOMLDecodeError:
+                continue
+            if without_line == original_parsed:
+                indices.append(i)
+        return indices
+
+    starts = comment_marker_indices(CONFIG_START)
+    ends = comment_marker_indices(CONFIG_END)
+    managed_profile = original_parsed.get('permissions', {}).get('agent-harness')
+    if managed_profile is not None:
+        if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+            raise ValueError('config.toml has ambiguous or malformed Agent Harness markers')
+        if ''.join(lines[starts[0] + 1:ends[0]]).strip('\r\n') != profile:
+            raise ValueError('config.toml managed profile was edited; resolve manually')
+        expected = copy.deepcopy(original_parsed)
+        del expected['permissions']['agent-harness']
+        if not expected['permissions']:
+            del expected['permissions']
+        candidate = (''.join(lines[:starts[0]]).rstrip('\n') + '\n'
+                     + ''.join(lines[ends[0] + 1:]).lstrip('\n'))
+        if tomllib.loads(candidate) != expected:
+            raise ValueError('config.toml managed profile collides with user data; resolve manually')
+        existing = candidate
+    elif starts or ends:
+        raise ValueError('config.toml has stray Agent Harness comment markers; resolve manually')
     parsed = tomllib.loads(existing)
     if 'default_permissions' in parsed and parsed['default_permissions'] != 'agent-harness':
         raise ValueError('config.toml already selects a different permission profile; merge manually')
@@ -97,13 +138,6 @@ def merge_config(existing: str, wal_dir: Path) -> str:
         raise ValueError('config.toml already defines the agent-harness profile outside managed markers')
     if 'default_permissions' not in parsed:
         existing = 'default_permissions = "agent-harness" # agent-harness-codex\n' + existing
-    profile = ('[permissions.agent-harness]\n'
-               'description = "Workspace with private Agent Harness WAL and Git commits"\n'
-               'extends = ":workspace"\n\n'
-               '[permissions.agent-harness.filesystem]\n'
-               f'{json.dumps(str(wal_dir))} = "write"\n\n'
-               '[permissions.agent-harness.filesystem.":workspace_roots"]\n'
-               '".git" = "write"')
     result = existing.rstrip() + '\n\n' + CONFIG_START + '\n' + profile + '\n' + CONFIG_END + '\n'
     tomllib.loads(result)
     return result
@@ -171,28 +205,32 @@ def install(home: Path, apply: bool) -> list[str]:
                 manifest.append({'path': str(path), 'backup': saved.name, 'mode': original[1]})
         atomic_write(backups / 'manifest.json', (json.dumps(manifest, indent=2) + '\n').encode(),
                      pinned_parent=pins.fd(backups), expected_target=None)
-        attempted = []
         published = {}
+        payload_by_path = dict(payloads)
         try:
             for destination, data in payloads:
-                attempted.append(destination)
                 original = originals[destination]
                 published[destination] = atomic_write(
                     destination, data, original[1] if original else 0o600,
                     pinned_parent=pins.fd(destination.parent),
                     expected_target=original[2] if original else None,
+                    expected_data=original[0] if original else None,
+                    expected_mode=original[1] if original else None,
                     published=published, retain_published_fd=pins.file_fds)
         except BaseException as error:
             failures = []
-            for path in reversed(attempted):
+            for path in reversed(published):
                 try:
                     original = originals[path]
-                    expected = published.get(path, original[2] if original else None)
+                    expected = published[path]
+                    published_mode = original[1] if original else 0o600
                     if original is None:
-                        safe_unlink(path, pinned_parent=pins.fd(path.parent), expected_target=expected)
+                        safe_unlink(path, pinned_parent=pins.fd(path.parent), expected_target=expected,
+                                    expected_data=payload_by_path[path], expected_mode=published_mode)
                     else:
                         atomic_write(path, original[0], original[1],
-                                     pinned_parent=pins.fd(path.parent), expected_target=expected)
+                                     pinned_parent=pins.fd(path.parent), expected_target=expected,
+                                     expected_data=payload_by_path[path], expected_mode=published_mode)
                 except OSError:
                     failures.append(str(path.relative_to(codex_home)))
             if failures:
