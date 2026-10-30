@@ -1,5 +1,6 @@
 """Private report target pinned to a validated directory inode."""
 
+import hashlib
 import os
 import secrets
 import stat
@@ -23,6 +24,8 @@ class ReportTarget:
     def __init__(self, output: Path, repo: Path, packet: Path):
         self.fd = None
         self.report_fd = None
+        self.expected_size = None
+        self.expected_digest = None
         if output.is_symlink():
             raise ValueError('output must not be a symlink')
         parent = output.parent.resolve()
@@ -77,14 +80,18 @@ class ReportTarget:
         if not self.directory_is_current():
             raise OSError('output directory changed before report write')
         temporary = '.report-' + secrets.token_hex(12)
+        encoded = content.encode('utf-8')
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o600, dir_fd=self.fd)
         try:
-            with os.fdopen(fd, 'w') as handle:
-                handle.write(content)
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(encoded)
                 handle.flush()
+                os.fchmod(handle.fileno(), 0o600)
                 os.fsync(handle.fileno())
                 written = os.fstat(handle.fileno())
+                self.expected_size = len(encoded)
+                self.expected_digest = hashlib.sha256(encoded).digest()
                 # Keep the inode alive through cleanup and caller WAL work so
                 # an unlinked report inode cannot be recycled for a replacement.
                 self.report_fd = os.dup(handle.fileno())
@@ -110,7 +117,8 @@ class ReportTarget:
 
     def verify_current(self):
         """Recheck after cleanup and any caller work, immediately before announcing."""
-        if self.report_fd is None or self.fd is None or not self.directory_is_current():
+        if (self.report_fd is None or self.fd is None or self.expected_digest is None
+                or not self.directory_is_current()):
             raise OSError('output directory changed or report was not published')
         visible = os.stat(self.path, follow_symlinks=False)
         published = os.stat(self.path.name, dir_fd=self.fd, follow_symlinks=False)
@@ -119,3 +127,36 @@ class ReportTarget:
         if ((visible.st_dev, visible.st_ino) != identity
                 or (published.st_dev, published.st_ino) != identity):
             raise OSError('output path changed during report publication')
+        reader = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=self.fd)
+        try:
+            before = os.fstat(reader)
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                    or (before.st_dev, before.st_ino) != identity
+                    or before.st_size != self.expected_size
+                    or stat.S_IMODE(before.st_mode) != 0o600):
+                raise OSError('report changed during final verification')
+            digest = hashlib.sha256()
+            remaining = self.expected_size
+            while remaining:
+                chunk = os.read(reader, min(65536, remaining))
+                if not chunk:
+                    raise OSError('report changed during final verification')
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if os.read(reader, 1) or digest.digest() != self.expected_digest:
+                raise OSError('report changed during final verification')
+            after = os.fstat(reader)
+            final_path = os.stat(self.path.name, dir_fd=self.fd, follow_symlinks=False)
+            if (not self.directory_is_current()
+                    or (final_path.st_dev, final_path.st_ino) != identity
+                    or after.st_nlink != 1 or final_path.st_nlink != 1
+                    or final_path.st_size != self.expected_size
+                    or stat.S_IMODE(final_path.st_mode) != 0o600
+                    or (final_path.st_mtime_ns, final_path.st_ctime_ns)
+                    != (after.st_mtime_ns, after.st_ctime_ns)
+                    or (before.st_size, before.st_mtime_ns, before.st_ctime_ns, before.st_mode)
+                    != (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_mode)):
+                raise OSError('report changed during final verification')
+        finally:
+            os.close(reader)

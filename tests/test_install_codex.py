@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from codex.hooks import wal
 from install_codex import (AGENTS, HOOK_EVENTS, SKILL_FILES, SOURCE, install,
-                           managed_command, merge_config, tomllib)
+                           managed_command, merge_config, merge_marked, tomllib)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +21,99 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(tomllib is not None, 'Codex installer requires Python 3.11+')
 class CodexInstallerTests(unittest.TestCase):
+    def test_inline_marker_text_is_preserved(self):
+        original = 'Keep <!-- agent-harness-codex:start --> this example <!-- agent-harness-codex:end --> intact.\n'
+        merged = merge_marked(original, 'Managed.')
+        self.assertIn(original.rstrip(), merged)
+
+    def test_fenced_marker_example_is_preserved(self):
+        example = ('```md\n<!-- agent-harness-codex:start -->\n'
+                   '# Agent Harness for Codex\nExample.\n<!-- agent-harness-codex:end -->\n```\n')
+        merged = merge_marked(example, 'Managed.')
+        self.assertIn(example, merged)
+        self.assertIn('Managed.', merged)
+
+    def test_replacement_preserves_end_marker_newline_and_suffix(self):
+        start = '<!-- agent-harness-codex:start -->'
+        end = '<!-- agent-harness-codex:end -->'
+        existing = (f'{start}\n# Agent Harness for Codex\nOld.\n{end}\n'
+                    'User instructions after block.\n')
+        merged = merge_marked(existing, '# Agent Harness for Codex\nNew.')
+        self.assertIn(f'{end}\nUser instructions after block.\n', merged)
+        self.assertEqual(merge_marked(merged, '# Agent Harness for Codex\nNew.'), merged)
+
+    def test_toml_multiline_marker_text_is_preserved(self):
+        original = 'note = """literal # agent-harness-codex:profile-start data # agent-harness-codex:profile-end retained"""\n'
+        merged = merge_config(original, Path('/tmp/private-wals'))
+        self.assertEqual(tomllib.loads(merged)['note'], tomllib.loads(original)['note'])
+
+    def test_toml_marker_lines_inside_value_survive_reinstallation(self):
+        original = ('note = """before\n# agent-harness-codex:profile-start\n'
+                    'user value\n# agent-harness-codex:profile-end\nafter"""\n')
+        first = merge_config(original, Path('/tmp/private-wals'))
+        second = merge_config(first, Path('/tmp/private-wals'))
+        self.assertEqual(tomllib.loads(first)['note'], tomllib.loads(original)['note'])
+        self.assertEqual(tomllib.loads(second)['note'], tomllib.loads(original)['note'])
+        self.assertEqual(first, second)
+
+    def test_toml_profile_comment_collision_refuses_without_erasure(self):
+        original = merge_config('note = "preserve"\n', Path('/tmp/private-wals'))
+        modified = original.replace('[permissions.agent-harness]\n',
+                                    '[permissions.agent-harness]\n# user comment that must survive\n')
+        with self.assertRaisesRegex(ValueError, 'managed profile was edited'):
+            merge_config(modified, Path('/tmp/private-wals'))
+        extra_marker = original + '\n# agent-harness-codex:profile-start\n'
+        with self.assertRaisesRegex(ValueError, 'ambiguous or malformed'):
+            merge_config(extra_marker, Path('/tmp/private-wals'))
+
+    def test_same_inode_edit_during_backup_is_preserved(self):
+        from install_codex import atomic_write
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            codex_home = home / '.codex'
+            codex_home.mkdir()
+            target = codex_home / 'AGENTS.md'
+            target.write_text('original\n')
+            changed = False
+
+            def edit_during_backup(path, data, mode=0o600, **kwargs):
+                nonlocal changed
+                if not changed and 'backups' in path.parts:
+                    changed = True
+                    target.write_text('concurrent user edit\n')
+                return atomic_write(path, data, mode, **kwargs)
+
+            with patch('install_codex.atomic_write', side_effect=edit_during_backup):
+                with self.assertRaises(OSError):
+                    install(home, apply=True)
+            self.assertTrue(changed)
+            self.assertEqual(target.read_text(), 'concurrent user edit\n')
+
+    def test_rollback_preserves_same_inode_edit_to_published_file(self):
+        from install_codex import atomic_write
+        for existed in (False, True):
+            with self.subTest(existed=existed), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve()
+                agents = home / '.codex' / 'agents'
+                agents.mkdir(parents=True)
+                owner = agents / 'harness_owner.toml'
+                if existed:
+                    owner.write_text('original owner\n')
+                changed = False
+
+                def edit_then_fail(path, data, mode=0o600, **kwargs):
+                    nonlocal changed
+                    if path == agents / 'harness_reviewer.toml' and not changed:
+                        changed = True
+                        owner.write_text('concurrent published edit\n')
+                        raise OSError('fixture: stop after edit')
+                    return atomic_write(path, data, mode, **kwargs)
+
+                with patch('install_codex.atomic_write', side_effect=edit_then_fail):
+                    with self.assertRaisesRegex(RuntimeError, 'rollback incomplete'):
+                        install(home, apply=True)
+                self.assertTrue(changed)
+                self.assertEqual(owner.read_text(), 'concurrent published edit\n')
     def test_preview_apply_idempotence_and_foreign_settings(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary).resolve()

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from install import END, START, ROOT, install
+from install import END, START, ROOT, install, merged_instructions
 
 
 class InstallerTests(unittest.TestCase):
@@ -23,6 +23,70 @@ class InstallerTests(unittest.TestCase):
         paths = install(self.home, apply=False)
         self.assertGreater(len(paths), 10)
         self.assertEqual(list(self.claude.iterdir()), [])
+
+    def test_inline_marker_text_is_preserved(self):
+        original = f'Keep this example: {START} user text {END} forever.\n'
+        merged = merged_instructions(original, 'Managed instructions.')
+        self.assertIn(original.rstrip(), merged)
+        self.assertIn('Managed instructions.', merged)
+
+    def test_fenced_marker_example_is_preserved(self):
+        example = f'```md\n{START}\n# Agent Harness engineering workflow\nExample.\n{END}\n```\n'
+        merged = merged_instructions(example, 'Managed instructions.')
+        self.assertIn(example, merged)
+        self.assertIn('Managed instructions.', merged)
+
+    def test_replacement_preserves_end_marker_newline_and_suffix(self):
+        existing = (f'{START}\n# Agent Harness engineering workflow\nOld.\n{END}\n'
+                    'User instructions after block.\n')
+        merged = merged_instructions(existing, '# Agent Harness engineering workflow\nNew.')
+        self.assertIn(f'{END}\nUser instructions after block.\n', merged)
+        self.assertEqual(merged_instructions(merged, '# Agent Harness engineering workflow\nNew.'), merged)
+
+    def test_same_inode_edit_during_backup_is_preserved(self):
+        target = self.claude / 'CLAUDE.md'
+        target.write_text('original\n')
+        from install import atomic_write
+        changed = False
+
+        def edit_during_backup(path, data, mode=0o600, **kwargs):
+            nonlocal changed
+            if not changed and 'agent-harness-backups' in path.parts:
+                changed = True
+                target.write_text('concurrent user edit\n')
+            return atomic_write(path, data, mode, **kwargs)
+
+        with patch('install.atomic_write', side_effect=edit_during_backup):
+            with self.assertRaises(OSError):
+                install(self.home, apply=True)
+        self.assertTrue(changed)
+        self.assertEqual(target.read_text(), 'concurrent user edit\n')
+
+    def test_rollback_preserves_same_inode_edit_to_published_file(self):
+        from install import atomic_write
+        for existed in (False, True):
+            with self.subTest(existed=existed), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve()
+                agents = home / '.claude' / 'agents'
+                agents.mkdir(parents=True)
+                owner = agents / 'task-owner.md'
+                if existed:
+                    owner.write_text('original owner\n')
+                changed = False
+
+                def edit_then_fail(path, data, mode=0o600, **kwargs):
+                    nonlocal changed
+                    if path == agents / 'click-tester.md' and not changed:
+                        changed = True
+                        owner.write_text('concurrent published edit\n')
+                        raise OSError('fixture: stop after edit')
+                    return atomic_write(path, data, mode, **kwargs)
+
+                with patch('install.atomic_write', side_effect=edit_then_fail):
+                    with self.assertRaisesRegex(RuntimeError, 'rollback incomplete'):
+                        install(home, apply=True)
+                self.assertTrue(changed)
+                self.assertEqual(owner.read_text(), 'concurrent published edit\n')
 
     def test_preserves_settings_and_is_idempotent(self):
         original = {

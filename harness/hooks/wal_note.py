@@ -17,8 +17,15 @@ SECRET_PATTERN = re.compile(
     r'(?i)(?:\bgh[pousr]_[A-Za-z0-9_]+|\bgithub_pat_[A-Za-z0-9_]+|'
     r'\bsk-[A-Za-z0-9-]{12,}|\bAKIA[A-Z0-9]{12}|'
     r'\bBearer\s+\S+|\bxox[baprs]-[A-Za-z0-9-]{6,}|'
-    r'\b(?:password|passwd|api[_-]?key|secret|token)\s*[:=]\s*\S+|'
-    r'\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s/@:]+:[^\s/@]+@|'
+    # Match credential names at the end of snake/kebab keys, including quoted
+    # JSON keys. Do not mistake metrics such as token_count for credentials.
+    r'\b(?:[a-z0-9]+[_-])*(?:password|passwd|secret|token|api[_-]?key|'
+    r'access[_-]?key|private[_-]?key|credentials?)(?:[_-]value)?[\x22\x27]?\s*[:=]\s*[\x22\x27]?\S+|'
+    r'\b[a-z][a-z0-9]*(?:Secret|Token|Password|ApiKey|AccessKey|PrivateKey|Credentials?)'
+    r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?\S+|'
+    # Any userinfo in a URL authority may contain a credential or private user.
+    # The authority ends at /, ?, or #, so ordinary path/query @ signs are safe.
+    r'\b[a-z][a-z0-9+.-]*://[^\s/?#@]+@[^\s/?#]+|'
     r'-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)'
 )
 
