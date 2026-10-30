@@ -50,7 +50,8 @@ class ChaosProcesses(unittest.TestCase):
                     self.assertEqual(code, 1, streams)
                     self.assertTrue(any(reason in streams[1] for reason in
                                         ('Directory appeared during installation', 'Directory replaced during installation',
-                                         'Unexpected parent directory', 'User settings or instructions changed',
+                                         'Parent directory replaced', 'Unexpected parent directory',
+                                         'User settings or instructions changed',
                                          'Managed file changed since snapshot', 'FileExistsError')), streams)
                     retry = subprocess.run([sys.executable, str(ROOT / 'install.py'), '--apply', '--home', str(home)],
                                            capture_output=True, text=True, timeout=20)
