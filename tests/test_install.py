@@ -246,6 +246,49 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(swapped)
         self.assertEqual((self.claude / 'agents/task-owner.md').read_text(), 'unrelated rollback leaf')
 
+    def test_rollback_pins_published_inode_after_unlink_and_recreation(self):
+        from install import atomic_write
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve()
+                claude = home / '.claude'
+                agents = claude / 'agents'
+                agents.mkdir(parents=True)
+                owner = agents / 'task-owner.md'
+                if existing:
+                    owner.write_text('original owner\n')
+                original = owner.read_bytes() if existing else None
+                retained = False
+                injected = False
+
+                def replace_then_fail(path, data, mode=0o600, **kwargs):
+                    nonlocal retained, injected
+                    if path == agents / 'click-tester.md' and not injected:
+                        injected = True
+                        published = owner.stat()
+                        for name in os.listdir('/dev/fd'):
+                            if not name.isdigit():
+                                continue
+                            try:
+                                opened = os.fstat(int(name))
+                            except OSError:
+                                continue
+                            if (opened.st_dev, opened.st_ino) == (published.st_dev, published.st_ino):
+                                retained = True
+                                break
+                        owner.unlink()
+                        owner.write_text('unrelated recreated owner\n')
+                        raise OSError('fixture: interrupt after unlink and recreation')
+                    return atomic_write(path, data, mode, **kwargs)
+
+                with patch('install.atomic_write', side_effect=replace_then_fail):
+                    with self.assertRaisesRegex(RuntimeError, 'rollback incomplete'):
+                        install(home, apply=True)
+                self.assertTrue(injected)
+                self.assertTrue(retained, 'the published inode must remain open through rollback')
+                self.assertEqual(owner.read_text(), 'unrelated recreated owner\n')
+                self.assertEqual(original, b'original owner\n' if existing else None)
+
     def test_file_replacement_during_final_publish_cannot_report_success(self):
         outsider = self.home / 'unrelated-owner.md'
         outsider.write_text('unrelated final leaf')

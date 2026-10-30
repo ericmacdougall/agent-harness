@@ -210,7 +210,7 @@ def require_target(path: Path, directory: int, expected) -> None:
 
 
 def atomic_write(path: Path, data: bytes, mode: int = 0o600, *, pinned_parent=None,
-                 expected_target=NO_TARGET_CHECK, published=None):
+                 expected_target=NO_TARGET_CHECK, published=None, retain_published_fd=None):
     with parent_fd(path) as directory:
         require_pinned_parent(path, directory, pinned_parent)
         require_target(path, directory, expected_target)
@@ -226,6 +226,10 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600, *, pinned_parent=No
             written = os.fstat(fd)
             require_pinned_parent(path, directory, pinned_parent)
             require_target(path, directory, expected_target)
+            # Pin the inode before publication, including when a later fsync
+            # fails. A closed inode number can be recycled before rollback.
+            if retain_published_fd is not None:
+                retain_published_fd.append(os.dup(fd))
             os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
             identity = written.st_dev, written.st_ino
             if published is not None:
@@ -359,7 +363,8 @@ def install(home: Path, apply: bool) -> list[str]:
                 expected = originals[destination][2] if originals[destination] else None
                 installed[destination] = atomic_write(destination, data,
                                                        pinned_parent=pins.fd(destination.parent),
-                                                       expected_target=expected, published=installed)
+                                                       expected_target=expected, published=installed,
+                                                       retain_published_fd=pins.file_fds)
         except BaseException as error:
             failures = []
             for path in reversed(attempted):
