@@ -120,7 +120,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(output.read_text(), 'VERDICT: PASS\nstale path')
         self.assertFalse((self.root / 'reports-moved/review.md').exists())
 
-    def test_directory_relocated_just_after_link_removes_unadvertised_report(self):
+    def test_directory_relocated_just_after_link_never_unlinks_destination(self):
         spec = importlib.util.spec_from_file_location('report_file_under_test', REVIEW.parent / 'report_file.py')
         report_file = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(report_file)
@@ -130,6 +130,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         target = report_file.ReportTarget(output, self.repo, self.packet)
         target.require_fresh()
         original_link = os.link
+        original_unlink = os.unlink
 
         def link_then_move(*args, **kwargs):
             original_link(*args, **kwargs)
@@ -137,14 +138,21 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
             reports.mkdir()
             output.write_text('VERDICT: PASS\nstale path')
 
+        def unlink_only_temporary(path, *args, **kwargs):
+            if path == output.name:
+                raise AssertionError('public report destination must never be unlinked')
+            return original_unlink(path, *args, **kwargs)
+
         try:
-            with patch.object(report_file.os, 'link', side_effect=link_then_move):
+            with patch.object(report_file.os, 'link', side_effect=link_then_move), \
+                 patch.object(report_file.os, 'unlink', side_effect=unlink_only_temporary):
                 with self.assertRaises(OSError):
                     target.write_text('Reviewer: Sol\nVERDICT: BLOCK\n')
         finally:
             target.close()
         self.assertEqual(output.read_text(), 'VERDICT: PASS\nstale path')
-        self.assertFalse((self.root / 'reports-moved/review.md').exists())
+        self.assertEqual((self.root / 'reports-moved/review.md').read_text(),
+                         'Reviewer: Sol\nVERDICT: BLOCK\n')
 
     def test_output_symlink_never_changes_target(self):
         target = self.root / 'important.txt'

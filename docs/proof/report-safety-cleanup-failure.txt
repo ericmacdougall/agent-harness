@@ -1,0 +1,35 @@
+test_directory_relocated_just_after_link_never_unlinks_destination (tests.test_peer_review.PeerReviewTests.test_directory_relocated_just_after_link_never_unlinks_destination) ... FAIL
+
+======================================================================
+FAIL: test_directory_relocated_just_after_link_never_unlinks_destination (tests.test_peer_review.PeerReviewTests.test_directory_relocated_just_after_link_never_unlinks_destination)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<pre-fix-snapshot>/harness/hooks/report_file.py", line 97, in write_text
+    raise OSError('output directory changed during report publication')
+OSError: output directory changed during report publication
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<pre-fix-snapshot>/tests/test_peer_review.py", line 150, in test_directory_relocated_just_after_link_never_unlinks_destination
+    target.write_text('Reviewer: Sol\nVERDICT: BLOCK\n')
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<pre-fix-snapshot>/harness/hooks/report_file.py", line 109, in write_text
+    os.unlink(self.path.name, dir_fd=self.fd)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/mock.py", line 1176, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/mock.py", line 1180, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/mock.py", line 1247, in _execute_mock_call
+    result = effect(*args, **kwargs)
+  File "<pre-fix-snapshot>/tests/test_peer_review.py", line 143, in unlink_only_temporary
+    raise AssertionError('public report destination must never be unlinked')
+AssertionError: public report destination must never be unlinked
+
+----------------------------------------------------------------------
+Ran 1 test in 0.054s
+
+FAILED (failures=1)

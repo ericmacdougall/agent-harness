@@ -71,7 +71,7 @@ test_tolerates_user_hook_with_empty_args (test_install.InstallerTests.test_toler
 test_block_verdict_is_not_signoff (test_peer_review.PeerReviewTests.test_block_verdict_is_not_signoff) ... ok
 test_both_reviewers_failing_leave_fresh_path_absent (test_peer_review.PeerReviewTests.test_both_reviewers_failing_leave_fresh_path_absent) ... ok
 test_case_aliases_cannot_delete_repo_file_or_packet (test_peer_review.PeerReviewTests.test_case_aliases_cannot_delete_repo_file_or_packet) ... ok
-test_directory_relocated_just_after_link_removes_unadvertised_report (test_peer_review.PeerReviewTests.test_directory_relocated_just_after_link_removes_unadvertised_report) ... ok
+test_directory_relocated_just_after_link_never_unlinks_destination (test_peer_review.PeerReviewTests.test_directory_relocated_just_after_link_never_unlinks_destination) ... ok
 test_existing_output_directory_is_reported_without_model_call (test_peer_review.PeerReviewTests.test_existing_output_directory_is_reported_without_model_call) ... ok
 test_existing_report_is_preserved_and_review_does_not_run (test_peer_review.PeerReviewTests.test_existing_report_is_preserved_and_review_does_not_run) ... ok
 test_existing_unrelated_file_outside_repo_is_not_deleted (test_peer_review.PeerReviewTests.test_existing_unrelated_file_outside_repo_is_not_deleted) ... ok
@@ -129,6 +129,6 @@ test_stalled_test_and_child_are_terminated (test_watch_tests.WatchTests.test_sta
 test_watch_reruns_after_a_source_edit_and_ignores_vendor_edit (test_watch_tests.WatchTests.test_watch_reruns_after_a_source_edit_and_ignores_vendor_edit) ... ok
 
 ----------------------------------------------------------------------
-Ran 129 tests in 111.082s
+Ran 129 tests in 116.064s
 
 OK
