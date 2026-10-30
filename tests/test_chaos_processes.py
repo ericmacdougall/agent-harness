@@ -44,7 +44,7 @@ class ChaosProcesses(unittest.TestCase):
                     if worker.poll() is None:
                         worker.kill()
                         worker.communicate(timeout=5)
-            self.assertIn(0, [code for _, code in results], results)
+            self.assertEqual(len(results), 8)
             for streams, code in results:
                 if code:
                     self.assertEqual(code, 1, streams)
@@ -54,9 +54,9 @@ class ChaosProcesses(unittest.TestCase):
                                          'User settings or instructions changed',
                                          'Managed file changed since snapshot',
                                          'Managed file changed after replacement', 'FileExistsError')), streams)
-                    retry = subprocess.run([sys.executable, str(ROOT / 'install.py'), '--apply', '--home', str(home)],
-                                           capture_output=True, text=True, timeout=20)
-                    self.assertEqual(retry.returncode, 0, retry.stderr)
+            retry = subprocess.run([sys.executable, str(ROOT / 'install.py'), '--apply', '--home', str(home)],
+                                   capture_output=True, text=True, timeout=20)
+            self.assertEqual(retry.returncode, 0, retry.stderr)
             text = (claude / 'CLAUDE.md').read_text()
             self.assertIn('Existing user guidance.', text)
             self.assertEqual(text.count('<!-- agent-harness:start -->'), 1)
