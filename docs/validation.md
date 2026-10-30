@@ -105,11 +105,20 @@ Failure-first replay used the final delivery tests with `eb5f070`'s publication 
 
 Local full validation: `/opt/homebrew/bin/python3 -W error::ResourceWarning -m unittest discover -s tests -v` passes **118/118 tests** in 116.780 seconds. Compilation with a temporary bytecode cache and `git diff --check` both pass. Environment: macOS, Python 3.15.0, Git 2.54.0. Hosted CI and independent review of this rescue remain pending; no network publication is part of these tests.
 
-
-### Shallow-history follow-up after Sol's sixth pass
+## Shallow-history follow-up after Sol's sixth pass
 
 At `63262c6`, a real Git fixture retained an ancestor containing an LFS pointer, removed the pointer, then marked the clean feature tip shallow. Source `rev-list` saw only that tip; the historical pointer blob remained readable locally and its commit was absent from the bare destination. Publication incorrectly returned `PUSHED`. The failure-first three-case shallow run produced one assertion failure; controls for complete non-LFS shallow history and genuinely missing ancestry passed.
 
 The bounded scan now runs inside the prepared isolated transport immediately before push. It therefore traverses the same graph as pack transfer, without source shallow boundaries or graft metadata. The regression requires `BLOCKED_POLICY`, no destination feature ref, and no historical pointer commit transferred. Complete non-LFS shallow history remains publishable. Missing ancestry returns `BLOCKED_REMOTE` without publication, conservatively even when a remote could supply the missing history. Existing pointer variants, replacement-object and streaming-budget protections remain in force.
 
 Local verification on macOS/Python 3.15.0: all **56 delivery-helper tests pass** (91.579 seconds), then the full suite passes **121/121** (96.577 seconds), both with `ResourceWarning` treated as an error. Compilation with a temporary bytecode cache and `git diff --check` pass. Hosted CI and independent review of this follow-up remain pending.
+
+## Final red-team verification and installation, 2026-10-30
+
+A real shallow-history fixture first returned `PUSHED` against `63262c6` while a historical LFS pointer remained available through object alternates. Commit `ea59f58` moved the LFS scan into the prepared transport immediately before push. The pointer case now blocks; controls show a complete non-LFS shallow source still publishes and a source with missing ancestry refuses publication. Astra ran **121/121 tests** on macOS Python 3.15 with resource warnings treated as errors. The main reviewer independently reran the focused shallow and LFS cases, then ran **121/121 tests** under Python 3.9 with resource warnings treated as errors; Python 3.9 is supplemental to the supported 3.10+ range. Compilation and whitespace checks passed.
+
+Independent Sol review returned **PASS** for exact PR head `ea59f58`, finding no material unresolved issue in the inspected code and evidence. The [push CI run](https://github.com/ericmacdougall/agent-harness/actions/runs/41005643346) and [PR CI run](https://github.com/ericmacdougall/agent-harness/actions/runs/41005646702) each passed Ubuntu and macOS jobs with Python 3.10 and latest 3.x before [PR #4](https://github.com/ericmacdougall/agent-harness/pull/4) merged as `5f62f6f`.
+
+After merge, the original `main` checkout fast-forwarded to `5f62f6f`, and the installer applied the update to the user-wide Claude Code configuration. Installed helper payloads matched the merged source; one managed WAL hook per event and one policy marker were verified. `claude doctor` reported no installation issues. A fresh normal Claude Code 2.1.314 session created a mode `0600` WAL with session and prompt events, without prompt text or an unkeyed prompt digest. An end-to-end disposable run through the **installed** publication and integration helpers pushed the verified feature commit to a bare remote, left its `main` ref unchanged, passed a real content test, and produced the expected clean two-parent local merge.
+
+These observations support the tested helper paths. Model stubs do not establish real reviewer quality or browser click accuracy; remote authentication and external routing were not exercised in the disposable run. LFS pointer history requires an LFS-aware publication path because this helper deliberately bypasses source pre-push hooks.
