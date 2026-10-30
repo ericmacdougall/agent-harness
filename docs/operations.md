@@ -27,6 +27,8 @@ Claude Code's `--safe-mode` disables customizations, including these hooks and `
 
 Both WAL writers refuse symlinks from `.claude` down to the log, hardlinked logs, and non-regular files such as FIFOs. They open directories without following links, enforce mode `0700` on the WAL root and session directory, and mode `0600` on new and existing log files. A rejected path fails the hook rather than writing elsewhere. WALs may still contain sensitive information if an agent writes it despite the policy. Keep `~/.claude/wals` private, review it before sharing, and do not commit it.
 
+For behavior changes, use matching `PENDING_REAL_TEST <id>:` and `REALLY_TESTED <id>:` notes through `wal_note.py` before editing and after observation. Use `status` for the pending note and `check` for the verified note. The latter names the command or live steps, result, and applicable commit; any unmatched pending ID stays visible in the handoff. This is a concise audit trail, not an automated Stop gate. A disposable live slug-fix trial recorded `V1` before the edit, observed the baseline test fail, reran it successfully after the edit, and recorded the matched proof. A separate Stop-hook probe showed why the global gate was rejected: it ran on a simple arithmetic answer and forced an unnecessary second turn when configured to demand a test.
+
 ## Review and rescue
 
 ```sh
