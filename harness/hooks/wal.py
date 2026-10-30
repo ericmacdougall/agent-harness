@@ -2,6 +2,7 @@
 """Claude Code hook: private, append-only write-ahead logs per session and agent."""
 
 import hashlib
+import fcntl
 import json
 import os
 import re
@@ -13,9 +14,18 @@ from pathlib import Path
 
 
 def safe_id(value: object) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", str(value or "unknown"))[:120]
-    # "." and "..", which pass the character filter, would resolve outside the WAL directory.
-    return cleaned if cleaned.strip(".") else ("_" + cleaned)[:120]
+    original = str(value or "unknown")
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", original)
+    # Only lowercase unescaped IDs use their original spelling. Escaping every
+    # uppercase ID keeps Foo and foo distinct on case-insensitive filesystems.
+    if (cleaned == original and cleaned == cleaned.lower() and len(cleaned) <= 120
+            and cleaned.strip(".") and not cleaned.startswith("z-")):
+        return cleaned
+    # Escaped IDs live in a reserved namespace. An ordinary ID equal to an
+    # escaped result is escaped again, so direct alias construction fails.
+    digest = hashlib.sha256(original.encode(errors="replace")).hexdigest()[:20]
+    stem = cleaned.lower()[:97].strip(".") or "_"
+    return f"z-{stem}-{digest}"
 
 
 def append(path: Path, record: dict) -> None:
@@ -46,6 +56,7 @@ def append(path: Path, record: dict) -> None:
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise ValueError("WAL must be a regular file with no hard links")
         os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
         # A short write must not silently report a complete record.
         with os.fdopen(fd, "ab", closefd=False) as handle:
             handle.write(payload)
@@ -72,28 +83,27 @@ def main() -> None:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": f"Session WAL: {main_wal}. Record task ownership, decisions, changes, checks, commits and handoffs; omit secrets and PII."}}))
     elif event == "prompt":
         prompt = str(data.get("prompt", ""))
-        record["prompt_sha256"] = hashlib.sha256(prompt.encode()).hexdigest()
         record["prompt_chars"] = len(prompt)
         append(main_wal, record)
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": f"Session WAL: {main_wal}. Follow Agent Harness triage. Record a human-readable intent before edits; the hook metadata alone is insufficient. Use the fast path for small fixes. For substantive work, brief and reuse a background owner, then review, test, publish the feature branch and integrate locally. Ask about material ambiguity and keep the user updated. Never log secrets or PII."}}))
     elif event == "subagent":
         agent_id = safe_id(data.get("agent_id"))
         agent_type = safe_id(data.get("agent_type"))
-        agent_wal = root / f"{agent_id}.jsonl"
+        agent_wal = root / f"agent-{agent_id}.jsonl"
         record.update({"agent_id": agent_id, "agent_type": agent_type})
         append(main_wal, record)
         append(agent_wal, record)
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": f"Your private WAL: {agent_wal}. Read the main scope brief and decision log in {main_wal}; challenge omissions and harmful shortcuts. Before editing, record intent, assumptions, domain invariants, a risk table and negative acceptance cases. Then log decisions, tests, commits, blockers and handoff. Do not log secrets or PII."}}))
     elif event == "pretool":
         agent_id = data.get("agent_id")
-        wal = root / f"{safe_id(agent_id)}.jsonl" if agent_id else main_wal
+        wal = root / f"agent-{safe_id(agent_id)}.jsonl" if agent_id else main_wal
         tool_input = data.get("tool_input") or {}
         target = tool_input.get("file_path") or tool_input.get("command") or ""
         record.update({
             "agent_id": safe_id(agent_id) if agent_id else None,
             "tool": data.get("tool_name", ""),
             "tool_use_id": data.get("tool_use_id", ""),
-            "target_sha256": hashlib.sha256(str(target).encode()).hexdigest() if target else None,
+            "target_chars": len(str(target)),
         })
         append(wal, record)
     else:

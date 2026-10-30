@@ -5,7 +5,7 @@ A user-wide Claude Code workflow for parallel software tasks with recoverable wo
 ## What it does
 
 - Sends small, reversible fixes through a fast path. Substantive work gets one background task owner per related scope, an isolated Git worktree, a scope brief, a decision log, and periodic user updates.
-- Creates private per-session and per-agent write-ahead logs under `~/.claude/wals`. Hook records contain timestamps, tool names and hashes, not prompt text or tool arguments. Agents add human-readable intent, decisions, evidence and handoffs.
+- Creates private per-session and per-agent write-ahead logs under `~/.claude/wals`. Hook records contain timestamps, tool names and lengths, not prompt text, tool arguments, or reversible hashes of them. Agents add human-readable intent, decisions, evidence and handoffs.
 - Runs a read-only Codex Sol review of the plan and final PR packet. If Codex is unavailable, a fresh Claude Opus review is attempted. Repeated material blockers can be escalated by the main agent to Astra, then Fable if Astra fails before editing.
 - Requires relevant failure-first tests, adversarial review, and a real click/API pass for runnable work before the main agent accepts it. Test depth follows risk; statistical eval gates apply to stochastic systems, not every bug fix.
 - Publishes a verified feature branch to `origin` when possible, then guardedly merges into the user's original checkout after approved checks. A remote outage is reported and does not prevent local delivery.

@@ -134,6 +134,29 @@ class ProcessRunner(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(int(pid_file.read_text()), 0)
 
+    def test_timeout_while_streaming_large_prompt_closes_child(self):
+        pid_file = self.root / 'model.pid'
+        child = (f'import os, time; from pathlib import Path; '
+                 f'Path({str(pid_file)!r}).write_text(str(os.getpid())); time.sleep(30)')
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.process.run([sys.executable, '-c', child], input='x' * 1_000_000, timeout=1)
+        self.assertTrue(pid_file.exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)
+
+    def test_streamed_timeout_preserves_descendant_term_grace(self):
+        marker = self.root / 'grace-complete'
+        child = ('import signal, sys, time; from pathlib import Path\n'
+                 f'path=Path({str(marker)!r})\n'
+                 'def finish(*_):\n    time.sleep(0.5)\n    path.write_text("done")\n    sys.exit(0)\n'
+                 'signal.signal(signal.SIGTERM, finish)\n'
+                 'time.sleep(30)\n')
+        parent = ('import subprocess, sys, time; '
+                  f'subprocess.Popen([sys.executable, "-c", {child!r}]); time.sleep(30)')
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.process.run([sys.executable, '-c', parent], timeout=1, stream=True)
+        self.assertEqual(marker.read_text(), 'done')
+
 
 class DeliveryHelpers(unittest.TestCase):
     def setUp(self):
@@ -171,6 +194,295 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(cmd('git', 'rev-parse', 'main', cwd=remote).stdout.strip(), self.base)
         p, data = self.invoke(PUBLISH, '--repo', str(self.repo), '--branch', 'main', '--original-branch', 'main', '--expected-head', self.base)
         self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'))
+
+    def test_lfs_pointer_cannot_be_published_without_its_content(self):
+        remote = self.root / 'lfs-origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        pointer = ('version https://git-lfs.github.com/spec/v1\n'
+                   'oid sha256:' + 'a' * 64 + '\nsize 123\n')
+        (self.feature / 'asset.bin').write_text(pointer)
+        cmd('git', 'add', 'asset.bin', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'add LFS pointer without uploaded content', cwd=self.feature)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', reviewed)
+        self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'), p.stdout + p.stderr)
+        self.assertIn('Git LFS', data['message'])
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app', cwd=remote,
+                                check=False).returncode, 0)
+
+    def test_historical_lfs_pointer_is_blocked_even_if_removed_from_head(self):
+        remote = self.root / 'lfs-history.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        (self.feature / 'asset.bin').write_text('version https://git-lfs.github.com/spec/v1\n'
+                                                'oid sha256:' + 'a' * 64 + '\nsize 123\n')
+        cmd('git', 'add', 'asset.bin', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'historical pointer', cwd=self.feature)
+        (self.feature / 'asset.bin').unlink()
+        cmd('git', 'commit', '-qam', 'remove pointer from tip', cwd=self.feature)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', reviewed)
+        self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'), p.stdout + p.stderr)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app', cwd=remote,
+                                check=False).returncode, 0)
+
+    def lfs_remote(self):
+        remote = self.root / 'lfs-regression.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        return remote
+
+    def assert_lfs_ref_absent(self, remote):
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
+                                cwd=remote, check=False).returncode, 0)
+
+    def test_accepted_lfs_pointer_variants_block_publication(self):
+        remote = self.lfs_remote()
+        variants = [b'ext-0-test sha256:' + b'b' * 64 + b'\nversion https://git-lfs.github.com/spec/v1\n',
+                    b'version https://git-lfs.github.com/spec/v1\r\n',
+                    b' \t\nversion https://git-lfs.github.com/spec/v1\n',
+                    '\u2003version https://git-lfs.github.com/spec/v1\n'.encode(),
+                    b'version http://git-media.io/v/2\n',
+                    b'version https://hawser.github.com/spec/v1\r\n']
+        for prefix in variants:
+            with self.subTest(prefix=prefix):
+                # Reset each history so a previous canonical pointer cannot mask a bypass.
+                cmd('git', 'reset', '--hard', self.feature_head, cwd=self.feature)
+                (self.feature / 'asset.bin').write_bytes(prefix + b'oid sha256:' + b'a' * 64 + b'\nsize 123\n')
+                cmd('git', 'add', 'asset.bin', cwd=self.feature)
+                cmd('git', 'commit', '-qm', 'pointer variant', cwd=self.feature)
+                reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+                p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                                      '--original-branch', 'main', '--expected-head', reviewed)
+                self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'), p.stdout)
+                self.assert_lfs_ref_absent(remote)
+
+    def test_replacement_blob_cannot_hide_historical_lfs_pointer(self):
+        remote = self.lfs_remote()
+        (self.feature / 'asset.bin').write_text('version https://git-lfs.github.com/spec/v1\n'
+                                              'oid sha256:' + 'a' * 64 + '\nsize 123\n')
+        cmd('git', 'add', 'asset.bin', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'pointer history', cwd=self.feature)
+        oid = cmd('git', 'rev-parse', 'HEAD:asset.bin', cwd=self.feature).stdout.strip()
+        (self.feature / 'asset.bin').unlink()
+        cmd('git', 'commit', '-qam', 'remove pointer', cwd=self.feature)
+        harmless = cmd('git', 'rev-parse', 'HEAD:app.txt', cwd=self.feature).stdout.strip()
+        cmd('git', 'replace', oid, harmless, cwd=self.feature)
+        self.assertEqual(cmd('git', 'cat-file', '-p', oid, cwd=self.feature).stdout, 'feature\n')
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', reviewed)
+        self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'), p.stdout)
+        self.assert_lfs_ref_absent(remote)
+
+    def test_shallow_boundary_cannot_hide_retained_lfs_history(self):
+        remote = self.lfs_remote()
+        (self.feature / 'asset.bin').write_text('version https://git-lfs.github.com/spec/v1\n'
+                                              'oid sha256:' + 'a' * 64 + '\nsize 123\n')
+        cmd('git', 'add', 'asset.bin', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'historical pointer', cwd=self.feature)
+        pointer_commit = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        pointer_oid = cmd('git', 'rev-parse', 'HEAD:asset.bin', cwd=self.feature).stdout.strip()
+        (self.feature / 'asset.bin').unlink()
+        cmd('git', 'commit', '-qam', 'remove pointer before shallow boundary', cwd=self.feature)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        (self.repo / '.git/shallow').write_text(reviewed + '\n')
+        self.assertEqual(cmd('git', 'rev-list', 'HEAD', cwd=self.feature).stdout.splitlines(), [reviewed])
+        self.assertEqual(cmd('git', 'cat-file', '-t', pointer_oid, cwd=self.feature).stdout.strip(), 'blob')
+        self.assertNotEqual(cmd('git', 'cat-file', '-t', pointer_commit, cwd=remote, check=False).returncode, 0)
+        p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', reviewed)
+        self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'), p.stdout)
+        self.assert_lfs_ref_absent(remote)
+        self.assertNotEqual(cmd('git', 'cat-file', '-t', pointer_commit, cwd=remote, check=False).returncode, 0)
+
+    def test_shallow_source_with_complete_non_lfs_objects_can_publish(self):
+        remote = self.lfs_remote()
+        (self.repo / '.git/shallow').write_text(self.feature_head + '\n')
+        p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', self.feature_head)
+        self.assertEqual((p.returncode, data['status']), (0, 'PUSHED'), p.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'feat/app', cwd=remote).stdout.strip(), self.feature_head)
+
+    def test_shallow_source_missing_ancestors_refuses_publication(self):
+        remote = self.lfs_remote()
+        shallow = self.root / 'shallow-clone'
+        cmd('git', 'clone', '-q', '--depth=1', '--branch', 'feat/app', self.repo.as_uri(), str(shallow))
+        self.assertEqual(cmd('git', 'rev-parse', '--is-shallow-repository', cwd=shallow).stdout.strip(), 'true')
+        self.assertNotEqual(cmd('git', 'cat-file', '-t', self.base, cwd=shallow, check=False).returncode, 0)
+        cmd('git', 'remote', 'set-url', 'origin', str(remote), cwd=shallow)
+        p, data = self.invoke(PUBLISH, '--repo', str(shallow), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', self.feature_head)
+        self.assertEqual((p.returncode, data['status']), (4, 'BLOCKED_REMOTE'), p.stdout)
+        self.assert_lfs_ref_absent(remote)
+
+    def test_lfs_object_budget_blocks_real_publication(self):
+        remote = self.lfs_remote()
+        spec = importlib.util.spec_from_file_location('publish_budget', PUBLISH)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(PUBLISH.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        argv = [str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head]
+        with patch.object(module, 'LFS_OBJECT_LIMIT', 1, create=True), \
+             patch.object(sys, 'argv', argv), patch.dict(os.environ, isolated_env(), clear=True), \
+             patch('sys.stdout', new_callable=io.StringIO) as output:
+            result = module.main()
+        self.assertEqual((result, json.loads(output.getvalue())['status']), (4, 'BLOCKED_REMOTE'))
+        self.assert_lfs_ref_absent(remote)
+
+    def test_lfs_stream_refusal_terminates_producer_before_it_finishes(self):
+        remote = self.lfs_remote()
+        spec = importlib.util.spec_from_file_location('publish_stream', PUBLISH)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(PUBLISH.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        marker = self.root / 'producer-finished'
+        bin_dir = self.root / 'stream-bin'
+        bin_dir.mkdir()
+        wrapper = bin_dir / 'git'
+        wrapper.write_text(f'#!{sys.executable}\nimport os, sys, time\nfrom pathlib import Path\n'
+                           'if "rev-list" in sys.argv:\n'
+                           '    os.write(1, b"a" * 4096)\n'
+                           '    time.sleep(3)\n'
+                           f'    Path({str(marker)!r}).touch()\n'
+                           '    sys.exit(0)\n'
+                           f'os.execv({shutil.which("git")!r}, ["git", *sys.argv[1:]])\n')
+        wrapper.chmod(0o700)
+        env = isolated_env()
+        env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
+        argv = [str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head, '--timeout', '10']
+        with patch.object(module, 'LFS_ENUMERATION_BYTE_LIMIT', 100, create=True), \
+             patch.object(sys, 'argv', argv), patch.dict(os.environ, env, clear=True), \
+             patch('sys.stdout', new_callable=io.StringIO) as output:
+            started = time.monotonic()
+            result = module.main()
+        self.assertEqual((result, json.loads(output.getvalue())['status']), (4, 'BLOCKED_REMOTE'))
+        self.assertLess(time.monotonic() - started, 3)
+        time.sleep(3)
+        self.assertFalse(marker.exists(), 'enumeration producer survived refusal')
+        self.assert_lfs_ref_absent(remote)
+
+    def test_source_pre_push_hook_cannot_change_verified_commit_or_block_delivery(self):
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        marker = self.root / 'untrusted-hook-ran'
+        hook = self.repo / '.git/hooks/pre-push'
+        hook.write_text(f'#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n')
+        hook.chmod(0o700)
+        p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', self.feature_head)
+        self.assertEqual((p.returncode, data['status']), (0, 'PUSHED'), p.stdout + p.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual(cmd('git', 'rev-parse', 'feat/app', cwd=remote).stdout.strip(), self.feature_head)
+
+    def test_publication_never_places_destination_url_in_git_arguments(self):
+        remote = self.root / 'sensitive-url-marker.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        real_git = shutil.which('git')
+        capture = self.root / 'git-argv.jsonl'
+        wrapper = bin_dir / 'git'
+        wrapper.write_text(f'#!{sys.executable}\nimport json, os, sys\n'
+                           f'with open({str(capture)!r}, "a") as handle: handle.write(json.dumps(sys.argv[1:])+"\\n")\n'
+                           f'os.execv({real_git!r}, ["git", *sys.argv[1:]])\n')
+        wrapper.chmod(0o700)
+        env = isolated_env()
+        env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
+        p = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                            '--original-branch', 'main', '--expected-head', self.feature_head],
+                           env=env, text=True, capture_output=True, timeout=20)
+        self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (0, 'PUSHED'), p.stdout + p.stderr)
+        self.assertNotIn('sensitive-url-marker', capture.read_text())
+
+    def test_relative_push_url_targets_source_relative_repository(self):
+        project = self.root / 'nested'
+        source = project / 'feature'
+        source.mkdir(parents=True)
+        cmd('git', 'init', '-q', '-b', 'feat/relative', str(source))
+        cmd('git', 'config', 'user.email', 'test@example.invalid', cwd=source)
+        cmd('git', 'config', 'user.name', 'Harness test', cwd=source)
+        cmd('git', 'commit', '-q', '--allow-empty', '-m', 'reviewed', cwd=source)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=source).stdout.strip()
+        safe = project / 'real.git'
+        hostile = self.root / 'real.git'
+        for remote in (safe, hostile):
+            cmd('git', 'init', '-q', '--bare', str(remote))
+            cmd('git', 'push', '-q', str(remote), 'HEAD:refs/heads/main', cwd=source)
+            cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        cmd('git', 'remote', 'add', 'origin', '../real.git', cwd=source)
+        env = isolated_env()
+        env['TMPDIR'] = str(self.root)
+        p = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(source), '--branch', 'feat/relative',
+                            '--original-branch', 'main', '--expected-head', reviewed],
+                           env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (0, 'PUSHED'), p.stdout + p.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'feat/relative', cwd=safe).stdout.strip(), reviewed)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/relative', cwd=hostile,
+                                check=False).returncode, 0)
+
+    def test_sha256_repository_can_publish_through_isolated_transport(self):
+        source = self.root / 'sha256-source'
+        created = cmd('git', 'init', '-q', '--object-format=sha256', '-b', 'feat/hash', str(source), check=False)
+        if created.returncode:
+            self.skipTest('Git lacks SHA-256 repository support')
+        cmd('git', 'config', 'user.email', 'test@example.invalid', cwd=source)
+        cmd('git', 'config', 'user.name', 'Harness test', cwd=source)
+        cmd('git', 'commit', '-q', '--allow-empty', '-m', 'reviewed', cwd=source)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=source).stdout.strip()
+        remote = self.root / 'sha256-remote.git'
+        cmd('git', 'init', '-q', '--bare', '--object-format=sha256', str(remote))
+        cmd('git', 'push', '-q', str(remote), 'HEAD:refs/heads/main', cwd=source)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=source)
+        p = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(source), '--branch', 'feat/hash',
+                            '--original-branch', 'main', '--expected-head', reviewed],
+                           env=isolated_env(), capture_output=True, text=True, timeout=20)
+        self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (0, 'PUSHED'), p.stdout + p.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'feat/hash', cwd=remote).stdout.strip(), reviewed)
+
+    def test_colon_after_slash_in_relative_url_is_still_a_local_destination(self):
+        project = self.root / 'colon-project'
+        source = project / 'feature'
+        source.mkdir(parents=True)
+        cmd('git', 'init', '-q', '-b', 'feat/relative', str(source))
+        cmd('git', 'config', 'user.email', 'test@example.invalid', cwd=source)
+        cmd('git', 'config', 'user.name', 'Harness test', cwd=source)
+        cmd('git', 'commit', '-q', '--allow-empty', '-m', 'reviewed', cwd=source)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=source).stdout.strip()
+        safe = project / 'real:repo.git'
+        hostile = self.root / 'real:repo.git'
+        for remote in (safe, hostile):
+            cmd('git', 'init', '-q', '--bare', str(remote))
+            cmd('git', 'push', '-q', str(remote), 'HEAD:refs/heads/main', cwd=source)
+            cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        cmd('git', 'remote', 'add', 'origin', '../real:repo.git', cwd=source)
+        env = isolated_env()
+        env['TMPDIR'] = str(self.root)
+        p = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(source), '--branch', 'feat/relative',
+                            '--original-branch', 'main', '--expected-head', reviewed],
+                           env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (0, 'PUSHED'), p.stdout + p.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'feat/relative', cwd=safe).stdout.strip(), reviewed)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/relative', cwd=hostile,
+                                check=False).returncode, 0)
 
     def test_publish_refuses_remote_default_with_nonstandard_name(self):
         remote = self.root / 'origin.git'
@@ -250,6 +562,62 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(cmd('git', 'rev-parse', 'trunk', cwd=push).stdout.strip(), self.base)
         self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
                                 cwd=fetch, check=False).returncode, 0)
+
+    def test_publish_sends_verified_commit_when_branch_moves_during_push(self):
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        original = self.feature_head
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        real_git = shutil.which('git')
+        wrapper = bin_dir / 'git'
+        wrapper.write_text(f'#!{sys.executable}\nimport os, subprocess, sys\nfrom pathlib import Path\n'
+                           'args = sys.argv[1:]\nif args[:1] == ["-C"]: args = args[2:]\n'
+                           f'if args[:1] == ["push"]:\n'
+                           f'    Path({str(self.feature / "app.txt")!r}).write_text("unreviewed\\n")\n'
+                           f'    subprocess.run([{real_git!r}, "-C", {str(self.feature)!r}, "commit", "-qam", "unreviewed"], check=True)\n'
+                           f'os.execv({real_git!r}, ["git", *sys.argv[1:]])\n')
+        wrapper.chmod(0o700)
+        env = isolated_env()
+        env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
+        p = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                            '--original-branch', 'main', '--expected-head', original],
+                           env=env, text=True, capture_output=True, timeout=20)
+        data = json.loads(p.stdout)
+        self.assertEqual((p.returncode, data['status']), (0, 'PUSHED'), p.stdout + p.stderr)
+        self.assertNotEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip(), original)
+        self.assertEqual(cmd('git', 'rev-parse', 'feat/app', cwd=remote).stdout.strip(), original)
+        self.assertIs(data['source_changed'], True)
+
+    def test_publish_uses_inspected_destination_if_origin_changes_before_push(self):
+        _, safe = self.configure_split_origin(push_default='trunk')
+        hostile = self.root / 'hostile.git'
+        cmd('git', 'init', '-q', '--bare', str(hostile))
+        cmd('git', 'push', '-q', str(hostile), 'main:refs/heads/feat/app', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/feat/app', cwd=hostile)
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        real_git = shutil.which('git')
+        wrapper = bin_dir / 'git'
+        wrapper.write_text(f'#!{sys.executable}\nimport os, subprocess, sys\n'
+                           'args = sys.argv[1:]\n'
+                           f'if "push" in args:\n'
+                           f'    subprocess.run([{real_git!r}, "-C", {str(self.repo)!r}, "config", "remote.origin.pushurl", {str(hostile)!r}], check=True)\n'
+                           f'    subprocess.run([{real_git!r}, "-C", {str(self.repo)!r}, "config", "url.{hostile}.insteadOf", {str(safe)!r}], check=True)\n'
+                           f'os.execv({real_git!r}, ["git", *sys.argv[1:]])\n')
+        wrapper.chmod(0o700)
+        env = isolated_env()
+        env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
+        p = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                            '--original-branch', 'main', '--expected-head', self.feature_head],
+                           env=env, text=True, capture_output=True, timeout=20)
+        data = json.loads(p.stdout)
+        self.assertEqual((p.returncode, data['status']), (0, 'PUSHED'), p.stdout + p.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'feat/app', cwd=safe).stdout.strip(), self.feature_head)
+        self.assertEqual(cmd('git', 'rev-parse', 'feat/app', cwd=hostile).stdout.strip(), self.base)
 
     def test_failed_check_restores_original(self):
         tests = self.feature / 'tests'
@@ -467,6 +835,71 @@ class DeliveryHelpers(unittest.TestCase):
         parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
         self.assertEqual(parents[1:], [self.base, self.feature_head])
 
+    def test_check_side_effect_cannot_report_clean_integration(self):
+        self.add_feature_test('import unittest\nfrom pathlib import Path\n'
+                              'class Check(unittest.TestCase):\n'
+                              '    def test_side_effect(self):\n'
+                              '        Path("app.txt").write_text("unverified edit\\n")\n'
+                              '        self.assertTrue(True)\n')
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                           env=isolated_env(), timeout=20)
+        data = json.loads(p.stdout)
+        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
+        self.assertNotEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.feature_head)
+        self.assertNotEqual(data['status'], 'INTEGRATED')
+
+    def test_staged_check_side_effect_cannot_enter_merge_commit(self):
+        self.add_feature_test('import subprocess, unittest\nfrom pathlib import Path\n'
+                              'class Check(unittest.TestCase):\n'
+                              '    def test_staged_side_effect(self):\n'
+                              '        Path("app.txt").write_text("unreviewed staged edit\\n")\n'
+                              '        subprocess.run(["git", "add", "app.txt"], check=True)\n')
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                           env=isolated_env(), timeout=20)
+        data = json.loads(p.stdout)
+        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+
+    def test_precommit_hook_tree_mutation_cannot_report_integration(self):
+        self.add_feature_test()
+        hook = self.repo / '.git/hooks/pre-commit'
+        hook.write_text('#!/bin/sh\nprintf "hook change\\n" > app.txt\ngit add app.txt\n')
+        hook.chmod(0o700)
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                           env=isolated_env(), timeout=20)
+        data = json.loads(p.stdout)
+        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
+        self.assertIn('verified merge tree', data['message'])
+        self.assertNotEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+
+    def test_post_commit_hook_moving_head_cannot_report_integration(self):
+        self.add_feature_test()
+        hook = self.repo / '.git/hooks/post-commit'
+        hook.write_text('#!/bin/sh\ngit reset --hard HEAD~1 >/dev/null\n')
+        hook.chmod(0o700)
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                           env=isolated_env(), timeout=20)
+        data = json.loads(p.stdout)
+        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+
+    def test_post_commit_hook_diverting_merge_to_other_branch_cannot_report_integration(self):
+        self.add_feature_test()
+        hook = self.repo / '.git/hooks/post-commit'
+        hook.write_text('#!/bin/sh\n'
+                        'merged=$(git rev-parse HEAD)\n'
+                        'base=$(git rev-parse HEAD^1)\n'
+                        'git branch -f diverted "$merged"\n'
+                        'git symbolic-ref HEAD refs/heads/diverted\n'
+                        'git update-ref refs/heads/main "$base"\n')
+        hook.chmod(0o700)
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                           env=isolated_env(), timeout=20)
+        data = json.loads(p.stdout)
+        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'refs/heads/main', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual(cmd('git', 'rev-parse', 'refs/heads/diverted', cwd=self.repo).stdout.strip(), data['head'])
+
     def test_nonpositive_timeout_rejected_before_merge(self):
         for value in ('0', '-1'):
             result = subprocess.run(self.integrate_args('--timeout', value), text=True, capture_output=True,
@@ -572,11 +1005,12 @@ class PublishRemoteFailures(unittest.TestCase):
         cmd('git', 'push', '-q', str(remote), 'HEAD:refs/heads/main', cwd=self.repo)
         cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
         cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        return remote
 
     def test_credential_prompt_fails_fast_even_with_a_terminal(self):
-        self.add_seeded_origin()
+        remote = self.add_seeded_origin()
         # Real Git credential prompting without an HTTP listener or a thread at fork.
-        hook = self.repo / '.git/hooks/pre-push'
+        hook = remote / 'hooks/pre-receive'
         hook.write_text('#!/bin/sh\nprintf "protocol=https\\nhost=example.invalid\\n\\n" | git -c credential.helper= credential fill\nexit 1\n')
         hook.chmod(0o700)
         pid, fd = pty.fork()
@@ -595,10 +1029,10 @@ class PublishRemoteFailures(unittest.TestCase):
         self.assertIn('terminal prompts disabled', data['detail'])
 
     def test_stalled_push_kills_child_before_reporting_timeout(self):
-        self.add_seeded_origin()
+        remote = self.add_seeded_origin()
         marker = Path(self.temp.name) / 'late-write'
         child_pid = Path(self.temp.name) / 'child.pid'
-        hook = self.repo / '.git/hooks/pre-push'
+        hook = remote / 'hooks/pre-receive'
         child = (f"import os, time; from pathlib import Path; Path({str(child_pid)!r}).write_text(str(os.getpid())); "
                  f"time.sleep(4); Path({str(marker)!r}).write_text('survived')")
         hook.write_text('#!/bin/sh\n' + shlex.join([sys.executable, '-c', child]) + '\n')

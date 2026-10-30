@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent
 START = "<!-- agent-harness:start -->"
 END = "<!-- agent-harness:end -->"
 AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
-HOOKS = ("process.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py")
+HOOKS = ("process.py", "report_file.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py")
 TOOLS = ("watch-tests.py",)
 
 

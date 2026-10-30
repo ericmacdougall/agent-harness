@@ -5,10 +5,14 @@ import argparse
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+from process import run as run_process
+from report_file import ReportTarget
 
 
 REVIEW_SYSTEM = (
@@ -25,10 +29,26 @@ REVIEW_SYSTEM = (
 
 def run(cmd: list[str], prompt: str, cwd: Path) -> tuple[int, str, str]:
     try:
-        result = subprocess.run(cmd, input=prompt, text=True, cwd=cwd, capture_output=True, timeout=720)
+        result = run_process(cmd, input=prompt, text=True, cwd=cwd, timeout=720)
         return result.returncode, result.stdout, result.stderr
     except (OSError, subprocess.TimeoutExpired) as error:
         return 125, "", str(error)
+
+
+def read_packet(path: Path) -> str:
+    # Opening the leaf without following links also closes the check/read race.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 150_000:
+            raise ValueError('packet must be one regular file no larger than 150 KB')
+        with os.fdopen(fd, 'rb', closefd=False) as handle:
+            data = handle.read(150_001)
+        if len(data) > 150_000:
+            raise ValueError('packet must be no larger than 150 KB')
+        return data.decode(errors='replace')
+    finally:
+        os.close(fd)
 
 
 def main() -> int:
@@ -39,16 +59,26 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     repo = args.repo.resolve()
-    packet = args.packet.resolve()
-    output = args.output.resolve()
-    if not repo.is_dir() or not packet.is_file() or packet.stat().st_size > 150_000:
-        parser.error("repo must exist and packet must be an existing file no larger than 150 KB")
-    if subprocess.run(["git", "-C", str(repo), "rev-parse", "--is-inside-work-tree"], capture_output=True).returncode:
-        parser.error("repo must be a git worktree")
-    content = packet.read_text(errors="replace")
-    if output == packet:
-        parser.error("output must differ from packet")
-    output.unlink(missing_ok=True)  # A failed rerun must never leave a stale PASS report.
+    packet = args.packet.expanduser().absolute()
+    output_arg = args.output.expanduser().absolute()
+    if not repo.is_dir():
+        parser.error('repo must exist')
+    try:
+        git_check = run_process(["git", "-C", str(repo), "rev-parse", "--show-toplevel"], timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        parser.error("repo Git inspection failed or timed out")
+    if git_check.returncode or Path(git_check.stdout.strip()).resolve() != repo:
+        parser.error("repo must be a git worktree root")
+    try:
+        target = ReportTarget(output_arg, repo, packet)
+        target.clear()
+    except (OSError, ValueError) as error:
+        parser.error(f'output must be a writable file path: {error}')
+    output = target.path
+    try:
+        content = read_packet(packet)
+    except (OSError, ValueError) as error:
+        parser.error(f'invalid packet: {error}')
     stage_rules = (
         "Planning gate: judge the proposed design, acceptance criteria, edge cases, test strategy, "
         "and rollout/rollback plan. You may read repository context. Do not BLOCK solely for an "
@@ -77,24 +107,18 @@ def main() -> int:
         source = "Blind Claude Opus fallback"
         if not shutil.which("claude"):
             print(f"{failure} Claude executable unavailable too.", file=sys.stderr)
+            target.close()
             return 2
         cmd = ["claude", "--print", "--safe-mode", "--restricted", "--model", "opus", "--no-session-persistence", "--system-prompt", REVIEW_SYSTEM, "-"]
         code, stdout, stderr = run(cmd, f"{stage_rules}\nStage: {args.stage}. Repository: {repo}. Inspect the repository and packet; prior reviewers' opinions are withheld.\n\n{content}", repo)
         report = stdout
         if code != 0 or not re.match(r"^VERDICT: (PASS|BLOCK)\b", report.strip()):
             print(f"{failure} Opus review failed or returned no verdict (exit {code}).", file=sys.stderr)
+            target.close()
             return 2
-    output.parent.mkdir(parents=True, exist_ok=True)
     note = f"Fallback reason: {failure}\n" if failure else ""
-    fd, temporary_name = tempfile.mkstemp(prefix=".review-", dir=output.parent, text=True)
-    try:
-        with os.fdopen(fd, "w") as handle:
-            handle.write(f"Reviewer: {source}\nStage: {args.stage}\n{note}\n{report.strip()}\n")
-        os.chmod(temporary_name, 0o600)
-        os.replace(temporary_name, output)
-    finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
+    target.write_text(f"Reviewer: {source}\nStage: {args.stage}\n{note}\n{report.strip()}\n")
+    target.close()
     print(f"{source}: {report.splitlines()[0].strip()} | {output}")
     return 0 if report.lstrip().startswith("VERDICT: PASS") else 3
 

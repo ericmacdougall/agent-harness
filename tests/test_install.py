@@ -108,10 +108,14 @@ class InstallerTests(unittest.TestCase):
         import subprocess
         import sys
         install(self.home, apply=True)
-        for name in ("publish_feature.py", "integrate_local.py"):
+        for name in ("publish_feature.py", "integrate_local.py", "peer_review.py", "rescue.py"):
             result = subprocess.run([sys.executable, str(self.claude / "hooks" / name), "--help"],
                                     text=True, capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
+        watched = subprocess.run([sys.executable, str(self.claude / 'tools/watch-tests.py'),
+                                  '--root', str(self.home), '--once', '--', sys.executable, '-c', 'pass'],
+                                 text=True, capture_output=True, timeout=10)
+        self.assertEqual(watched.returncode, 0, watched.stdout + watched.stderr)
 
     def test_rejects_bad_markers_before_writing(self):
         (self.claude / "CLAUDE.md").write_text(END)
