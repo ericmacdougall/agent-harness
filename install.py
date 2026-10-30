@@ -152,9 +152,38 @@ class DirectoryPins:
             return
         with parent_fd(path) as parent:
             require_pinned_parent(path, parent, self.fds[path.parent])
-            os.mkdir(path.name, mode=mode, dir_fd=parent)
-            self.fds[path] = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                     dir_fd=parent)
+            # Build under a fresh unpredictable name, pin that inode, then
+            # publish it. Never open the final name to infer which directory
+            # our earlier mkdir created: another process can replace it.
+            staged = '.agent-harness-dir-' + secrets.token_hex(12)
+            os.mkdir(staged, mode=mode, dir_fd=parent)
+            directory = os.open(staged, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=parent)
+            try:
+                named, opened = os.stat(staged, dir_fd=parent, follow_symlinks=False), os.fstat(directory)
+                if ((named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+                        or os.listdir(directory)):
+                    raise OSError(f'New directory changed before publication: {path}')
+                try:
+                    os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise OSError(f'Directory appeared during installation: {path}')
+                require_pinned_parent(path, parent, self.fds[path.parent])
+                os.rename(staged, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+                self.fds[path] = directory
+            except BaseException:
+                if self.fds[path] is None:
+                    try:
+                        named, opened = os.stat(staged, dir_fd=parent, follow_symlinks=False), os.fstat(directory)
+                        if ((named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino)
+                                and not os.listdir(directory)):
+                            os.rmdir(staged, dir_fd=parent)
+                    except OSError:
+                        pass  # An unrelated or moved directory must be left for inspection.
+                    os.close(directory)
+                raise
         self.verify(path)
 
     def close(self) -> None:
@@ -181,7 +210,7 @@ def require_target(path: Path, directory: int, expected) -> None:
 
 
 def atomic_write(path: Path, data: bytes, mode: int = 0o600, *, pinned_parent=None,
-                 expected_target=NO_TARGET_CHECK):
+                 expected_target=NO_TARGET_CHECK, published=None):
     with parent_fd(path) as directory:
         require_pinned_parent(path, directory, pinned_parent)
         require_target(path, directory, expected_target)
@@ -198,9 +227,11 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600, *, pinned_parent=No
             require_pinned_parent(path, directory, pinned_parent)
             require_target(path, directory, expected_target)
             os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+            identity = written.st_dev, written.st_ino
+            if published is not None:
+                published[path] = identity
             os.fsync(directory)
             require_pinned_parent(path, directory, pinned_parent)
-            identity = written.st_dev, written.st_ino
             if target_identity(directory, path.name) != identity:
                 raise OSError(f'Managed file changed after replacement: {path.name}')
             return identity
@@ -328,7 +359,7 @@ def install(home: Path, apply: bool) -> list[str]:
                 expected = originals[destination][2] if originals[destination] else None
                 installed[destination] = atomic_write(destination, data,
                                                        pinned_parent=pins.fd(destination.parent),
-                                                       expected_target=expected)
+                                                       expected_target=expected, published=installed)
         except BaseException as error:
             failures = []
             for path in reversed(attempted):

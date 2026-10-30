@@ -268,6 +268,100 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(swapped)
         self.assertEqual((self.claude / 'agents/task-owner.md').read_text(), 'unrelated final leaf')
 
+    def test_new_directory_swap_between_creation_and_open_is_refused(self):
+        from install import DirectoryPins
+        for name in ('agents', 'agent-harness-backups'):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve()
+                claude = home / '.claude'
+                claude.mkdir()
+                (claude / 'settings.json').write_text('{"model":"keep"}\n')
+                outside = home / 'outside'
+                outside.mkdir(mode=0o755)
+                (outside / 'marker').write_text('unrelated')
+                if name == 'agents':
+                    (outside / 'task-owner.md').write_text('unrelated owner')
+                outside_mode = stat.S_IMODE(outside.stat().st_mode)
+                original_create = DirectoryPins.create
+                original_mkdir = os.mkdir
+                active = None
+                swapped = False
+                injected_path = None
+
+                def track_create(pins, path, **kwargs):
+                    nonlocal active
+                    active = path
+                    try:
+                        return original_create(pins, path, **kwargs)
+                    finally:
+                        active = None
+
+                def swap_created(name_to_make, *args, **kwargs):
+                    nonlocal swapped, injected_path
+                    result = original_mkdir(name_to_make, *args, **kwargs)
+                    if active == claude / name and not swapped:
+                        created = active.parent / name_to_make
+                        created.rename(created.with_name(created.name + '-moved'))
+                        outside.rename(created)
+                        swapped = True
+                        injected_path = created
+                    return result
+
+                with patch('install.DirectoryPins.create', track_create), \
+                     patch('install.os.mkdir', side_effect=swap_created):
+                    with self.assertRaises((OSError, RuntimeError)):
+                        install(home, apply=True)
+                self.assertTrue(swapped)
+                replacement = injected_path
+                self.assertEqual((replacement / 'marker').read_text(), 'unrelated')
+                self.assertEqual(stat.S_IMODE(replacement.stat().st_mode), outside_mode)
+                if name == 'agents':
+                    self.assertEqual((replacement / 'task-owner.md').read_text(), 'unrelated owner')
+                else:
+                    self.assertEqual([path.name for path in replacement.iterdir()], ['marker'])
+
+    def test_post_replace_fsync_error_rolls_back_the_published_file(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve()
+                claude = home / '.claude'
+                claude.mkdir()
+                if existing:
+                    agents = claude / 'agents'
+                    agents.mkdir()
+                    (agents / 'task-owner.md').write_text('original owner\n')
+                    (agents / 'task-owner.md').chmod(0o640)
+                before = {str(path.relative_to(claude)): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                          for path in claude.rglob('*') if path.is_file()}
+                replace = os.replace
+                fsync = os.fsync
+                published = False
+                failed = False
+
+                def record_replace(source, destination, **kwargs):
+                    nonlocal published
+                    result = replace(source, destination, **kwargs)
+                    if destination == 'task-owner.md' and not published:
+                        published = True
+                    return result
+
+                def fail_directory_fsync(fd):
+                    nonlocal failed
+                    if published and not failed and stat.S_ISDIR(os.fstat(fd).st_mode):
+                        failed = True
+                        raise OSError('fixture: directory fsync failed after replace')
+                    return fsync(fd)
+
+                with patch('install.os.replace', side_effect=record_replace), \
+                     patch('install.os.fsync', side_effect=fail_directory_fsync):
+                    with self.assertRaisesRegex(OSError, 'fixture: directory fsync failed'):
+                        install(home, apply=True)
+                self.assertTrue(published)
+                self.assertTrue(failed)
+                after = {str(path.relative_to(claude)): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                         for path in claude.rglob('*') if path.is_file() and 'agent-harness-backups' not in path.parts}
+                self.assertEqual(after, before)
+
     def test_installed_delivery_helpers_can_start(self):
         import subprocess
         import sys
