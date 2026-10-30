@@ -233,6 +233,105 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app', cwd=remote,
                                 check=False).returncode, 0)
 
+    def lfs_remote(self):
+        remote = self.root / 'lfs-regression.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        return remote
+
+    def assert_lfs_ref_absent(self, remote):
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
+                                cwd=remote, check=False).returncode, 0)
+
+    def test_accepted_lfs_pointer_variants_block_publication(self):
+        remote = self.lfs_remote()
+        variants = [b'ext-0-test sha256:' + b'b' * 64 + b'\nversion https://git-lfs.github.com/spec/v1\n',
+                    b'version https://git-lfs.github.com/spec/v1\r\n',
+                    b' \t\nversion https://git-lfs.github.com/spec/v1\n',
+                    '\u2003version https://git-lfs.github.com/spec/v1\n'.encode(),
+                    b'version http://git-media.io/v/2\n',
+                    b'version https://hawser.github.com/spec/v1\r\n']
+        for prefix in variants:
+            with self.subTest(prefix=prefix):
+                # Reset each history so a previous canonical pointer cannot mask a bypass.
+                cmd('git', 'reset', '--hard', self.feature_head, cwd=self.feature)
+                (self.feature / 'asset.bin').write_bytes(prefix + b'oid sha256:' + b'a' * 64 + b'\nsize 123\n')
+                cmd('git', 'add', 'asset.bin', cwd=self.feature)
+                cmd('git', 'commit', '-qm', 'pointer variant', cwd=self.feature)
+                reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+                p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                                      '--original-branch', 'main', '--expected-head', reviewed)
+                self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'), p.stdout)
+                self.assert_lfs_ref_absent(remote)
+
+    def test_replacement_blob_cannot_hide_historical_lfs_pointer(self):
+        remote = self.lfs_remote()
+        (self.feature / 'asset.bin').write_text('version https://git-lfs.github.com/spec/v1\n'
+                                              'oid sha256:' + 'a' * 64 + '\nsize 123\n')
+        cmd('git', 'add', 'asset.bin', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'pointer history', cwd=self.feature)
+        oid = cmd('git', 'rev-parse', 'HEAD:asset.bin', cwd=self.feature).stdout.strip()
+        (self.feature / 'asset.bin').unlink()
+        cmd('git', 'commit', '-qam', 'remove pointer', cwd=self.feature)
+        harmless = cmd('git', 'rev-parse', 'HEAD:app.txt', cwd=self.feature).stdout.strip()
+        cmd('git', 'replace', oid, harmless, cwd=self.feature)
+        self.assertEqual(cmd('git', 'cat-file', '-p', oid, cwd=self.feature).stdout, 'feature\n')
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', reviewed)
+        self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'), p.stdout)
+        self.assert_lfs_ref_absent(remote)
+
+    def test_lfs_object_budget_blocks_real_publication(self):
+        remote = self.lfs_remote()
+        spec = importlib.util.spec_from_file_location('publish_budget', PUBLISH)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(PUBLISH.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        argv = [str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head]
+        with patch.object(module, 'LFS_OBJECT_LIMIT', 1, create=True), \
+             patch.object(sys, 'argv', argv), patch.dict(os.environ, isolated_env(), clear=True), \
+             patch('sys.stdout', new_callable=io.StringIO) as output:
+            result = module.main()
+        self.assertEqual((result, json.loads(output.getvalue())['status']), (4, 'BLOCKED_REMOTE'))
+        self.assert_lfs_ref_absent(remote)
+
+    def test_lfs_stream_refusal_terminates_producer_before_it_finishes(self):
+        remote = self.lfs_remote()
+        spec = importlib.util.spec_from_file_location('publish_stream', PUBLISH)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(PUBLISH.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        marker = self.root / 'producer-finished'
+        bin_dir = self.root / 'stream-bin'
+        bin_dir.mkdir()
+        wrapper = bin_dir / 'git'
+        wrapper.write_text(f'#!{sys.executable}\nimport os, sys, time\nfrom pathlib import Path\n'
+                           'if "rev-list" in sys.argv:\n'
+                           '    os.write(1, b"a" * 4096)\n'
+                           '    time.sleep(3)\n'
+                           f'    Path({str(marker)!r}).touch()\n'
+                           '    sys.exit(0)\n'
+                           f'os.execv({shutil.which("git")!r}, ["git", *sys.argv[1:]])\n')
+        wrapper.chmod(0o700)
+        env = isolated_env()
+        env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
+        argv = [str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head, '--timeout', '10']
+        with patch.object(module, 'LFS_ENUMERATION_BYTE_LIMIT', 100, create=True), \
+             patch.object(sys, 'argv', argv), patch.dict(os.environ, env, clear=True), \
+             patch('sys.stdout', new_callable=io.StringIO) as output:
+            started = time.monotonic()
+            result = module.main()
+        self.assertEqual((result, json.loads(output.getvalue())['status']), (4, 'BLOCKED_REMOTE'))
+        self.assertLess(time.monotonic() - started, 3)
+        time.sleep(3)
+        self.assertFalse(marker.exists(), 'enumeration producer survived refusal')
+        self.assert_lfs_ref_absent(remote)
+
     def test_source_pre_push_hook_cannot_change_verified_commit_or_block_delivery(self):
         remote = self.root / 'origin.git'
         cmd('git', 'init', '-q', '--bare', str(remote))

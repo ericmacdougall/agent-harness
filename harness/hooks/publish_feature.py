@@ -6,13 +6,16 @@ import json
 import os
 import re
 import secrets
+import selectors
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from functools import partial
 from pathlib import Path
 
-from process import run
+from process import run, signal_group
 
 
 def run_git(repo, *args, timeout=600, env_extra=None, text=True, input=None):
@@ -20,6 +23,7 @@ def run_git(repo, *args, timeout=600, env_extra=None, text=True, input=None):
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     if env_extra:
         env.update(env_extra)
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
     return run(["git", "-C", str(repo), *args], env=env, timeout=timeout, text=text, input=input)
 
 
@@ -44,18 +48,63 @@ def pinned_url(url, repo):
     return url
 
 
-def has_reachable_lfs_pointer(repo, head, git):
+LFS_OBJECT_LIMIT = 300_000
+LFS_ENUMERATION_BYTE_LIMIT = 19_500_000  # 300,000 SHA-256 IDs plus newlines
+
+
+def reachable_oids(repo, head, timeout):
+    """Read fixed-size ID records; never buffer unbounded rev-list output or paths."""
+    command = ['git', '-C', str(repo), 'rev-list', '--objects', '--no-object-names',
+               '--filter=blob:limit=1024', head]
+    env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GIT_NO_REPLACE_OBJECTS': '1'}
+    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.monotonic() + timeout
+    oids, pending, total = [], b'', 0
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                if not selector.select(remaining):
+                    raise subprocess.TimeoutExpired(command, timeout)
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > LFS_ENUMERATION_BYTE_LIMIT:
+                    raise ValueError('LFS enumeration byte budget exceeded')
+                lines = (pending + chunk).split(b'\n')
+                pending = lines.pop()
+                for oid in lines:
+                    if not re.fullmatch(rb'(?:[0-9a-f]{40}|[0-9a-f]{64})', oid):
+                        raise ValueError('malformed reachable object ID')
+                    if len(oids) >= LFS_OBJECT_LIMIT:
+                        raise ValueError('LFS scan object budget exceeded')
+                    oids.append(oid)
+                if len(pending) > 64:
+                    raise ValueError('oversized reachable object record')
+        if pending:
+            raise ValueError('truncated reachable object ID')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, timeout)
+        if process.wait(timeout=remaining):
+            raise ValueError('cannot enumerate reachable objects')
+        return oids
+    finally:
+        # Enumeration is read-only: stop immediately on refusal, including writers
+        # blocked on the pipe. Never call communicate(), which would buffer output.
+        signal_group(process.pid, signal.SIGKILL)
+        process.stdout.close()
+        process.wait()
+
+
+def has_reachable_lfs_pointer(repo, head, git, timeout=600):
     """Scan small blobs in all history being published, with bounded work."""
-    objects = git(repo, 'rev-list', '--objects', '--filter=blob:limit=1024', head, text=False)
-    if objects.returncode:
-        raise ValueError('cannot enumerate reachable objects')
-    oids = []
-    for line in objects.stdout.splitlines():
-        oid = line.split(b' ', 1)[0]
-        if re.fullmatch(rb'(?:[0-9a-f]{40}|[0-9a-f]{64})', oid):
-            oids.append(oid)
-    if len(oids) > 300_000:
-        raise ValueError('LFS scan object budget exceeded')
+    oids = reachable_oids(repo, head, timeout)
     if not oids:
         raise ValueError('no reachable objects')
     oid_set = set(oids)
@@ -83,8 +132,9 @@ def has_reachable_lfs_pointer(repo, head, git):
     scanned = git(repo, 'cat-file', '--batch', input=b'\n'.join(blobs) + b'\n', text=False)
     if scanned.returncode:
         raise ValueError('cannot read candidate blobs')
-    versions = (b'version https://git-lfs.github.com/spec/v1\n',
-                b'version https://hawser.github.com/spec/v1\n')
+    versions = {'version https://git-lfs.github.com/spec/v1',
+                'version https://hawser.github.com/spec/v1',
+                'version http://git-media.io/v/2'}
     position = 0
     for oid in blobs:
         end = scanned.stdout.find(b'\n', position)
@@ -98,7 +148,11 @@ def has_reachable_lfs_pointer(repo, head, git):
         finish = start + size
         if scanned.stdout[finish:finish + 1] != b'\n':
             raise ValueError('truncated blob content')
-        if scanned.stdout[start:finish].startswith(versions):
+        # Git LFS trims Unicode whitespace, accepts CRLF and legacy aliases,
+        # and permits extension records before version. Conservatively refuse
+        # any matching version line, even if the rest is not a valid pointer.
+        content = scanned.stdout[start:finish].decode('utf-8', errors='replace').strip()
+        if any(line in versions for line in content.splitlines()):
             return True
         position = finish + 1
     return False
@@ -199,7 +253,7 @@ def publish(args):
     # The isolated transport omits source pre-push hooks. Git LFS uploads in
     # that hook, so reject any pointer in reachable history before pushing.
     try:
-        contains_lfs = has_reachable_lfs_pointer(repo, head, git)
+        contains_lfs = has_reachable_lfs_pointer(repo, head, git, timeout=args.timeout)
     except ValueError:
         report("BLOCKED_REMOTE", "Could not verify whether Git LFS content needs uploading; continue local integration",
                branch=args.branch, remote=remote)
