@@ -109,19 +109,37 @@ def merge_config(existing: str, wal_dir: Path) -> str:
     starts = comment_marker_indices(CONFIG_START)
     ends = comment_marker_indices(CONFIG_END)
     managed_profile = original_parsed.get('permissions', {}).get('agent-harness')
+    managed_result = None
     if managed_profile is not None:
         if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
             raise ValueError('config.toml has ambiguous or malformed Agent Harness markers')
-        if ''.join(lines[starts[0] + 1:ends[0]]).strip('\r\n') != profile:
+        inside = ''.join(lines[starts[0] + 1:ends[0]])
+        generated = profile + '\n'
+        if not inside.startswith(generated):
             raise ValueError('config.toml managed profile was edited; resolve manually')
+        extra = inside[len(generated):]
+        if extra.strip():
+            first = next((line.strip() for line in extra.splitlines()
+                          if line.strip() and not line.lstrip().startswith('#')), '')
+            if not first.startswith('['):
+                raise ValueError('config.toml has ambiguous text after the managed profile')
+            extra_parsed = tomllib.loads(extra)
+            if not extra_parsed or 'permissions' in extra_parsed:
+                raise ValueError('config.toml has unsafe sections after the managed profile')
+        elif extra:
+            raise ValueError('config.toml has ambiguous text after the managed profile')
+        prefix = ''.join(lines[:starts[0]])
+        suffix = ''.join(lines[ends[0] + 1:])
         expected = copy.deepcopy(original_parsed)
         del expected['permissions']['agent-harness']
         if not expected['permissions']:
             del expected['permissions']
-        candidate = (''.join(lines[:starts[0]]).rstrip('\n') + '\n'
-                     + ''.join(lines[ends[0] + 1:]).lstrip('\n'))
+        candidate = prefix + extra + suffix
         if tomllib.loads(candidate) != expected:
             raise ValueError('config.toml managed profile collides with user data; resolve manually')
+        managed_result = prefix + extra + lines[starts[0]] + generated + lines[ends[0]] + suffix
+        if tomllib.loads(managed_result) != original_parsed:
+            raise ValueError('config.toml unrelated sections would change meaning; resolve manually')
         existing = candidate
     elif starts or ends:
         raise ValueError('config.toml has stray Agent Harness comment markers; resolve manually')
@@ -139,7 +157,10 @@ def merge_config(existing: str, wal_dir: Path) -> str:
         raise ValueError('config.toml already defines the agent-harness profile outside managed markers')
     if 'default_permissions' not in parsed:
         existing = 'default_permissions = "agent-harness" # agent-harness-codex\n' + existing
-    result = existing.rstrip() + '\n\n' + CONFIG_START + '\n' + profile + '\n' + CONFIG_END + '\n'
+        if managed_result is not None:
+            managed_result = 'default_permissions = "agent-harness" # agent-harness-codex\n' + managed_result
+    result = (managed_result if managed_result is not None else
+              existing.rstrip() + '\n\n' + CONFIG_START + '\n' + profile + '\n' + CONFIG_END + '\n')
     tomllib.loads(result)
     return result
 

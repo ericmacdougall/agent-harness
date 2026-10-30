@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codex.hooks import wal
-from install_codex import (AGENTS, HOOK_EVENTS, SKILL_FILES, SOURCE, install,
+from install_codex import (AGENTS, CONFIG_END, CONFIG_START, HOOK_EVENTS, SKILL_FILES, SOURCE, install,
                            managed_command, merge_config, merge_marked, tomllib)
 
 
@@ -65,6 +65,111 @@ class CodexInstallerTests(unittest.TestCase):
         extra_marker = original + '\n# agent-harness-codex:profile-start\n'
         with self.assertRaisesRegex(ValueError, 'ambiguous or malformed'):
             merge_config(extra_marker, Path('/tmp/private-wals'))
+
+    def test_reinstall_moves_unrelated_sections_out_of_managed_profile(self):
+        wal_dir = Path('/tmp/private-wals')
+        original = merge_config('model = "gpt-6-sol"\n', wal_dir)
+        extra = ('\n[tui]\nanimations = false\n\n[hooks.state]\n'
+                 'trusted_hash = "synthetic-value"  # retained spaces  \n\n')
+        with_inside = original.replace(CONFIG_END, extra + CONFIG_END, 1)
+        merged = merge_config(with_inside, wal_dir)
+        self.assertEqual(tomllib.loads(merged), tomllib.loads(with_inside))
+        self.assertIn(extra, merged)
+        self.assertLess(merged.index(extra), merged.index(CONFIG_START))
+        self.assertEqual(merged.count(CONFIG_START), 1)
+        self.assertEqual(merged.count(CONFIG_END), 1)
+        self.assertEqual(merge_config(merged, wal_dir), merged)
+
+    def test_reinstall_preserves_mixed_endings_and_multiline_user_value(self):
+        wal_dir = Path('/tmp/private-wals')
+        original = merge_config('model = "gpt-6-sol"\n', wal_dir)
+        extra = ('\r\n[tui]\r\nnote = """before\n'
+                 '# agent-harness-codex:profile-end\n[permissions.agent-harness]\n'
+                 'after"""\r\n\r\n[[hooks.plugins]]\r\nname = "synthetic"\r\n')
+        with_inside = original.replace(CONFIG_END, extra + CONFIG_END, 1)
+        merged = merge_config(with_inside, wal_dir)
+        self.assertIn(extra, merged)
+        self.assertEqual(tomllib.loads(merged), tomllib.loads(with_inside))
+        self.assertEqual(merge_config(merged, wal_dir), merged)
+
+    def test_reinstall_preserves_quoted_unrelated_tables_and_outer_suffix(self):
+        wal_dir = Path('/tmp/private-wals')
+        original = merge_config('model = "gpt-6-sol"\n', wal_dir)
+        extra = ('\n["hooks"."state.v2"]\ntrusted_hash = "synthetic"\n'
+                 '\n[permissionsExtra]\nflag = true\n')
+        outside = '\n[features]\nforeign = true\n'
+        with_inside = original.replace(CONFIG_END, extra + CONFIG_END, 1) + outside
+        merged = merge_config(with_inside, wal_dir)
+        self.assertIn(extra, merged)
+        self.assertTrue(merged.endswith(outside))
+        self.assertEqual(tomllib.loads(merged), tomllib.loads(with_inside))
+        self.assertEqual(merge_config(merged, wal_dir), merged)
+
+    def test_reinstall_refuses_managed_edits_and_ambiguous_suffix(self):
+        wal_dir = Path('/tmp/private-wals')
+        original = merge_config('model = "gpt-6-sol"\n', wal_dir)
+        extra = '\n[tui]\nanimations = false\n'
+        with_inside = original.replace(CONFIG_END, extra + CONFIG_END, 1)
+        cases = (
+            with_inside.replace('extends = ":workspace"', 'extends = ":unsafe"'),
+            original.replace(CONFIG_END, '\n# ambiguous\nrogue = true\n' + CONFIG_END, 1),
+            original.replace(CONFIG_END, '\n[permissions.other]\nrogue = true\n' + CONFIG_END, 1),
+            original.replace(CONFIG_END, '\n["permis\\u0073ions".other]\nrogue = true\n' + CONFIG_END, 1),
+            original.replace('".git" = "write"', '".git" = "write" # changed'),
+            original.replace('\n', '\r\n'),
+            with_inside + 'late_key = "binds to prior table"\n',
+        )
+        for text in cases:
+            with self.subTest(text=text[:35]), self.assertRaises(ValueError):
+                merge_config(text, wal_dir)
+
+    def test_reinstall_adds_missing_root_default_without_changing_unrelated(self):
+        wal_dir = Path('/tmp/private-wals')
+        original = merge_config('model = "gpt-6-sol"\n', wal_dir)
+        without_default = original.replace('default_permissions = "agent-harness" # agent-harness-codex\n', '', 1)
+        extra = '\n[tui]\nanimations = false\n'
+        with_inside = without_default.replace(CONFIG_END, extra + CONFIG_END, 1)
+        merged = merge_config(with_inside, wal_dir)
+        parsed = tomllib.loads(merged)
+        self.assertEqual(parsed['default_permissions'], 'agent-harness')
+        self.assertEqual(parsed['tui']['animations'], False)
+        self.assertEqual(merged.count('default_permissions = "agent-harness"'), 1)
+        self.assertEqual(merge_config(merged, wal_dir), merged)
+
+    def test_rejected_apply_leaves_synthetic_config_unchanged(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            codex_home = home / '.codex'
+            codex_home.mkdir()
+            wal_dir = home / '.agent-harness' / 'codex-wals'
+            original = merge_config('model = "gpt-6-sol"\n', wal_dir)
+            tampered = original.replace('extends = ":workspace"', 'extends = ":unsafe"')
+            config_path = codex_home / 'config.toml'
+            config_path.write_text(tampered)
+            with self.assertRaisesRegex(ValueError, 'managed profile was edited'):
+                install(home, apply=True)
+            self.assertEqual(config_path.read_text(), tampered)
+            self.assertFalse((codex_home / 'agent-harness').exists())
+
+    def test_apply_preserves_extra_sections_and_exact_backup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            codex_home = home / '.codex'
+            codex_home.mkdir()
+            wal_dir = home / '.agent-harness' / 'codex-wals'
+            original = merge_config('model = "gpt-6-sol"\n', wal_dir)
+            extra = '\n[tui]\nanimations = false\n\n[hooks.state]\ntrusted_hash = "synthetic"\n'
+            with_inside = original.replace(CONFIG_END, extra + CONFIG_END, 1)
+            config_path = codex_home / 'config.toml'
+            config_path.write_text(with_inside)
+            install(home, apply=True)
+            self.assertEqual(tomllib.loads(config_path.read_text()), tomllib.loads(with_inside))
+            self.assertIn(extra, config_path.read_text())
+            backup = next((codex_home / 'agent-harness' / 'backups').rglob('*-config.toml'))
+            self.assertEqual(backup.read_bytes(), with_inside.encode())
+            first = config_path.read_bytes()
+            install(home, apply=True)
+            self.assertEqual(config_path.read_bytes(), first)
 
     def test_same_inode_edit_during_backup_is_preserved(self):
         from install_codex import atomic_write
