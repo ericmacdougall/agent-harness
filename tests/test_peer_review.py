@@ -1,9 +1,11 @@
+import importlib.util
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REVIEW = Path(__file__).resolve().parents[1] / 'harness/hooks/peer_review.py'
@@ -31,6 +33,12 @@ last = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 last.write_text(os.environ.get('CODEX_VERDICT', 'VERDICT: PASS\\nReviewed.'))
 race = os.environ.get('RACE_OUTPUT')
 if race: Path(race).write_text('independent file created during review')
+relocated = os.environ.get('RACE_DIRECTORY_OUTPUT')
+if relocated:
+    parent = Path(relocated).parent
+    parent.rename(parent.with_name(parent.name + '-moved'))
+    parent.mkdir()
+    Path(relocated).write_text('VERDICT: PASS\\nstale path')
 sys.exit(int(os.environ.get('CODEX_EXIT', '0')))
 ''')
         self.fake('claude', '''import os, sys
@@ -102,6 +110,41 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         result = self.invoke(env={'RACE_OUTPUT': str(self.output)})
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertEqual(self.output.read_text(), 'independent file created during review')
+
+    def test_relocated_report_directory_cannot_yield_false_signoff(self):
+        reports = self.root / 'reports'
+        reports.mkdir()
+        output = reports / 'review.md'
+        result = self.invoke(output=output, env={'RACE_DIRECTORY_OUTPUT': str(output)})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(output.read_text(), 'VERDICT: PASS\nstale path')
+        self.assertFalse((self.root / 'reports-moved/review.md').exists())
+
+    def test_directory_relocated_just_after_link_removes_unadvertised_report(self):
+        spec = importlib.util.spec_from_file_location('report_file_under_test', REVIEW.parent / 'report_file.py')
+        report_file = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(report_file)
+        reports = self.root / 'reports'
+        reports.mkdir()
+        output = reports / 'review.md'
+        target = report_file.ReportTarget(output, self.repo, self.packet)
+        target.require_fresh()
+        original_link = os.link
+
+        def link_then_move(*args, **kwargs):
+            original_link(*args, **kwargs)
+            reports.rename(self.root / 'reports-moved')
+            reports.mkdir()
+            output.write_text('VERDICT: PASS\nstale path')
+
+        try:
+            with patch.object(report_file.os, 'link', side_effect=link_then_move):
+                with self.assertRaises(OSError):
+                    target.write_text('Reviewer: Sol\nVERDICT: BLOCK\n')
+        finally:
+            target.close()
+        self.assertEqual(output.read_text(), 'VERDICT: PASS\nstale path')
+        self.assertFalse((self.root / 'reports-moved/review.md').exists())
 
     def test_output_symlink_never_changes_target(self):
         target = self.root / 'important.txt'
