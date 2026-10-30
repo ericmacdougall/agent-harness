@@ -283,7 +283,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         hook = self.repo / '.git/hooks/pre-commit'
         hook.write_text('#!/bin/sh\n' + shlex.join([sys.executable, '-c', child]) + '\n')
         hook.chmod(0o700)
-        with patch.object(rescue, 'SNAPSHOT_GIT_TIMEOUT', 1), self.assertRaises(subprocess.TimeoutExpired):
+        with patch.object(rescue, 'SNAPSHOT_GIT_TIMEOUT', 4), self.assertRaises(subprocess.TimeoutExpired):
             rescue.snapshot_commit(self.repo, 'fixture')
         self.assertTrue(child_pid.exists())
         with self.assertRaises(ProcessLookupError):

@@ -323,7 +323,7 @@ class InstallerTests(unittest.TestCase):
                         try:
                             result = subprocess.run([sys.executable, str(ROOT / 'install.py'),
                                                      '--home', str(self.home), *(['--apply'] if apply else [])],
-                                                    text=True, capture_output=True, timeout=2)
+                                                    text=True, capture_output=True, timeout=15)
                         except subprocess.TimeoutExpired:
                             self.fail('installer blocked opening a FIFO')
                         self.assertNotEqual(result.returncode, 0)

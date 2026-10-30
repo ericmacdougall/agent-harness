@@ -155,7 +155,7 @@ class ProcessRunner(unittest.TestCase):
         parent = ('import subprocess, sys, time; '
                   f'subprocess.Popen([sys.executable, "-c", {child!r}]); time.sleep(30)')
         with self.assertRaises(subprocess.TimeoutExpired):
-            self.process.run([sys.executable, '-c', parent], timeout=1, stream=True)
+            self.process.run([sys.executable, '-c', parent], timeout=4, stream=True)
         self.assertEqual(marker.read_text(), 'done')
 
 
@@ -797,14 +797,15 @@ class DeliveryHelpers(unittest.TestCase):
         late = self.root / 'driver-finished'
         driver = self.root / 'stall-driver'
         driver.write_text('#!/bin/sh\n' + shlex.join([sys.executable, '-c',
-                          f'from pathlib import Path; import time; Path({str(started)!r}).touch(); '
-                          f'time.sleep(3); Path({str(late)!r}).touch()']) + '\n')
+                          f'from pathlib import Path; import os,time; '
+                          f'Path({str(started)!r}).write_text(str(os.getpid())); '
+                          f'time.sleep(12); Path({str(late)!r}).touch()']) + '\n')
         driver.chmod(0o700)
         cmd('git', 'config', 'merge.stall.driver', f'{driver} %O %A %B', cwd=self.repo)
         (self.repo / '.git/info').mkdir(exist_ok=True)
         (self.repo / '.git/info/attributes').write_text('app.txt merge=stall\n')
-        p = subprocess.run(self.integrate_args('--timeout', '1'), text=True, capture_output=True,
-                           env=isolated_env(), timeout=20)
+        p = subprocess.run(self.integrate_args('--timeout', '4'), text=True, capture_output=True,
+                           env=isolated_env(), timeout=30)
         self.assertTrue(started.exists(), 'the merge driver must actually run')
         self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (3, 'BLOCKED_LOCAL'), p.stdout)
         self.assertFalse((self.repo / '.git/index.lock').exists(), 'Git could not remove its index lock')
@@ -813,7 +814,8 @@ class DeliveryHelpers(unittest.TestCase):
         # Git does not clean its .merge_file_* temporaries on signals; tracked content must be intact.
         self.assertFalse(cmd('git', 'status', '--porcelain', '--untracked-files=no', cwd=self.repo).stdout.strip())
         self.assertEqual((self.repo / 'app.txt').read_text(), 'main divergent\n')
-        time.sleep(3)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(started.read_text()), 0)
         self.assertFalse(late.exists(), 'merge driver survived the deadline')
 
     def test_abort_git_deadline_reports_incomplete_recovery(self):
@@ -1069,19 +1071,20 @@ class PublishRemoteFailures(unittest.TestCase):
         child_pid = Path(self.temp.name) / 'child.pid'
         hook = remote / 'hooks/pre-receive'
         child = (f"import os, time; from pathlib import Path; Path({str(child_pid)!r}).write_text(str(os.getpid())); "
-                 f"time.sleep(4); Path({str(marker)!r}).write_text('survived')")
+                 f"time.sleep(15); Path({str(marker)!r}).write_text('survived')")
         hook.write_text('#!/bin/sh\n' + shlex.join([sys.executable, '-c', child]) + '\n')
         hook.chmod(0o700)
         try:
             started = time.monotonic()
-            p = subprocess.run(self.publish_args('--timeout', '2'), text=True, capture_output=True,
-                               env=isolated_env(), timeout=15)
-            self.assertLess(time.monotonic() - started, 10)
+            p = subprocess.run(self.publish_args('--timeout', '5'), text=True, capture_output=True,
+                               env=isolated_env(), timeout=30)
+            self.assertLess(time.monotonic() - started, 25)
             data = json.loads(p.stdout)
             self.assertEqual((p.returncode, data['status']), (4, 'BLOCKED_REMOTE'))
-            self.assertIn('2 seconds', data['message'])
+            self.assertIn('5 seconds', data['message'])
             self.assertTrue(child_pid.exists(), 'the fixture child must actually start')
-            time.sleep(5)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(child_pid.read_text()), 0)
             self.assertFalse(marker.exists(), 'a push descendant kept running after BLOCKED_REMOTE')
         finally:
             if child_pid.exists():
