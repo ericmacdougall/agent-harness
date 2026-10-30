@@ -270,6 +270,128 @@ class WalTests(unittest.TestCase):
         self.assertEqual(len(attempts), 4)
         self.assertFalse(target.exists())
 
+    def test_retry_refuses_directory_moved_during_backoff(self):
+        spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        session = self.home / '.claude/wals/concurrent'
+        session.mkdir(parents=True)
+        target = session / 'main.jsonl'
+        moved = session.with_name('moved')
+        original_open = os.open
+        attempts = []
+
+        def fail_first(path, flags, *args, **kwargs):
+            if path == 'main.jsonl':
+                attempts.append(path)
+                if len(attempts) == 1:
+                    raise FileNotFoundError(errno.ENOENT, 'transient create race', path)
+            return original_open(path, flags, *args, **kwargs)
+
+        def move_during_sleep(_):
+            session.rename(moved)
+            session.mkdir()
+
+        with patch.dict(os.environ, {'HOME': str(self.home)}), \
+             patch.object(module.os, 'open', side_effect=fail_first), \
+             patch.object(module.time, 'sleep', side_effect=move_during_sleep):
+            with self.assertRaises((OSError, ValueError)):
+                module.append(target, {'event': 'fixture'})
+        self.assertFalse(target.exists())
+        self.assertFalse((moved / 'main.jsonl').exists())
+
+    def test_open_refuses_directory_moved_before_write(self):
+        spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        session = self.home / '.claude/wals/concurrent'
+        session.mkdir(parents=True)
+        target = session / 'main.jsonl'
+        moved = session.with_name('moved')
+        original_open = os.open
+
+        def move_after_open(path, flags, *args, **kwargs):
+            fd = original_open(path, flags, *args, **kwargs)
+            if path == 'main.jsonl':
+                session.rename(moved)
+                session.mkdir()
+            return fd
+
+        with patch.dict(os.environ, {'HOME': str(self.home)}), \
+             patch.object(module.os, 'open', side_effect=move_after_open):
+            with self.assertRaises((OSError, ValueError)):
+                module.append(target, {'event': 'fixture'})
+        self.assertFalse(target.exists())
+        self.assertEqual((moved / 'main.jsonl').read_text(), '')
+
+    def test_write_refuses_directory_moved_before_success(self):
+        spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        session = self.home / '.claude/wals/concurrent'
+        session.mkdir(parents=True)
+        target = session / 'main.jsonl'
+        moved = session.with_name('moved')
+        original_fsync = os.fsync
+
+        def move_after_fsync(fd):
+            original_fsync(fd)
+            session.rename(moved)
+            session.mkdir()
+
+        with patch.dict(os.environ, {'HOME': str(self.home)}), \
+             patch.object(module.os, 'fsync', side_effect=move_after_fsync):
+            with self.assertRaises((OSError, ValueError)):
+                module.append(target, {'event': 'fixture'})
+        self.assertFalse(target.exists())
+        self.assertEqual(json.loads((moved / 'main.jsonl').read_text()), {'event': 'fixture'})
+
+    def test_open_refuses_log_file_replacement_before_write(self):
+        spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        session = self.home / '.claude/wals/concurrent'
+        session.mkdir(parents=True)
+        target = session / 'main.jsonl'
+        moved = session / 'moved.jsonl'
+        original_open = os.open
+
+        def replace_after_open(path, flags, *args, **kwargs):
+            fd = original_open(path, flags, *args, **kwargs)
+            if path == 'main.jsonl':
+                target.rename(moved)
+                target.write_text('replacement')
+            return fd
+
+        with patch.dict(os.environ, {'HOME': str(self.home)}), \
+             patch.object(module.os, 'open', side_effect=replace_after_open):
+            with self.assertRaises((OSError, ValueError)):
+                module.append(target, {'event': 'fixture'})
+        self.assertEqual(target.read_text(), 'replacement')
+        self.assertEqual(moved.read_text(), '')
+
+    def test_write_refuses_log_file_replacement_before_success(self):
+        spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        session = self.home / '.claude/wals/concurrent'
+        session.mkdir(parents=True)
+        target = session / 'main.jsonl'
+        moved = session / 'moved.jsonl'
+        original_fsync = os.fsync
+
+        def replace_after_fsync(fd):
+            original_fsync(fd)
+            target.rename(moved)
+            target.write_text('replacement')
+
+        with patch.dict(os.environ, {'HOME': str(self.home)}), \
+             patch.object(module.os, 'fsync', side_effect=replace_after_fsync):
+            with self.assertRaises((OSError, ValueError)):
+                module.append(target, {'event': 'fixture'})
+        self.assertEqual(target.read_text(), 'replacement')
+        self.assertEqual(json.loads(moved.read_text()), {'event': 'fixture'})
+
     def test_common_secret_formats_are_rejected_in_human_notes(self):
         path = self.home / '.claude/wals/test-session/main.jsonl'
         examples = ('Authorization: Bearer abc123', 'postgres://alice:hunter2@example.invalid/db',

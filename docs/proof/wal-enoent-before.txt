@@ -1,0 +1,28 @@
+test_transient_missing_file_during_create_retries_without_losing_record (tests.test_wal.WalTests.test_transient_missing_file_during_create_retries_without_losing_record) ... ERROR
+
+======================================================================
+ERROR: test_transient_missing_file_during_create_retries_without_losing_record (tests.test_wal.WalTests.test_transient_missing_file_during_create_retries_without_losing_record)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<baseline-snapshot>/tests/test_wal.py", line 227, in test_transient_missing_file_during_create_retries_without_losing_record
+    module.append(target, {'event': 'fixture'})
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<baseline-snapshot>/harness/hooks/wal.py", line 52, in append
+    fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK,
+                 0o600, dir_fd=directory)
+  File "/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/mock.py", line 1176, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/mock.py", line 1180, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/mock.py", line 1247, in _execute_mock_call
+    result = effect(*args, **kwargs)
+  File "<baseline-snapshot>/tests/test_wal.py", line 223, in fail_once
+    raise FileNotFoundError(errno.ENOENT, 'transient create race', path)
+FileNotFoundError: [Errno 2] transient create race: 'main.jsonl'
+
+----------------------------------------------------------------------
+Ran 1 test in 0.004s
+
+FAILED (errors=1)

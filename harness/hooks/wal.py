@@ -50,8 +50,20 @@ def append(path: Path, record: dict) -> None:
             directory = os.open(name, flags, dir_fd=directory)
             stack.callback(os.close, directory)
             os.fchmod(directory, 0o700)
+
+        def current_directory():
+            try:
+                named = os.stat(path.parent, follow_symlinks=False)
+                opened = os.fstat(directory)
+            except OSError:
+                return False
+            return (stat.S_ISDIR(named.st_mode)
+                    and (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino))
+
         file_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
         for attempt in range(4):
+            if not current_directory():
+                raise ValueError("WAL session directory changed")
             try:
                 fd = os.open(path.name, file_flags, 0o600, dir_fd=directory)
                 break
@@ -60,25 +72,36 @@ def append(path: Path, record: dict) -> None:
                 # macOS despite O_CREAT. Retry only while the named session
                 # directory still resolves to the pinned inode, never after a
                 # directory replacement or removal.
-                if attempt == 3:
-                    raise
-                current = os.stat(path.parent, follow_symlinks=False)
-                opened = os.fstat(directory)
-                if (not stat.S_ISDIR(current.st_mode)
-                        or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)):
+                if attempt == 3 or not current_directory():
                     raise
                 time.sleep(0.01 * (attempt + 1))
         stack.callback(os.close, fd)
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise ValueError("WAL must be a regular file with no hard links")
+
+        def current_target():
+            if not current_directory():
+                return False
+            try:
+                named = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                opened = os.fstat(fd)
+            except OSError:
+                return False
+            return (stat.S_ISREG(named.st_mode) and named.st_nlink == 1
+                    and (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino))
+
         os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
+        if not current_target():
+            raise ValueError("WAL target changed before append")
         # A short write must not silently report a complete record.
         with os.fdopen(fd, "ab", closefd=False) as handle:
             handle.write(payload)
             handle.flush()
         os.fsync(fd)
+        if not current_target():
+            raise ValueError("WAL target changed during append")
 
 
 def main() -> None:
