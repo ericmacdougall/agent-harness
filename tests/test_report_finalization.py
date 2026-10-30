@@ -22,6 +22,53 @@ def load(name):
 
 
 class ReportFinalizationTests(unittest.TestCase):
+    def test_report_rejects_same_inode_content_and_mode_changes(self):
+        module = load('report_file')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for mutation in ('same_size', 'mode'):
+                with self.subTest(mutation=mutation):
+                    output = root / f'{mutation}.txt'
+                    target = module.ReportTarget(output, root / 'repo', root / 'packet')
+                    try:
+                        target.write_text('private')
+                        if mutation == 'same_size':
+                            output.write_text('changed')
+                        else:
+                            output.chmod(0o644)
+                        with self.assertRaises(OSError) as raised:
+                            target.verify_current()
+                        self.assertNotIn('private', str(raised.exception))
+                    finally:
+                        target.close()
+
+    def test_report_rejects_hardlink_added_during_final_read(self):
+        module = load('report_file')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / 'report.txt'
+            alias = root / 'alias.txt'
+            target = module.ReportTarget(output, root / 'repo', root / 'packet')
+            try:
+                target.write_text('private')
+                original_read = os.read
+                linked = False
+
+                def link_during_read(fd, size):
+                    nonlocal linked
+                    if not linked:
+                        linked = True
+                        os.link(output, alias)
+                    return original_read(fd, size)
+
+                with patch.object(module.os, 'read', side_effect=link_during_read):
+                    with self.assertRaises(OSError):
+                        target.verify_current()
+                self.assertTrue(linked)
+                self.assertEqual(alias.read_text(), 'private')
+            finally:
+                target.close()
+
     def exercise(self, helper, phase, mutation):
         module = load(helper)
         with tempfile.TemporaryDirectory() as temp:
@@ -54,7 +101,9 @@ class ReportFinalizationTests(unittest.TestCase):
             def mutate():
                 self.assertTrue(output.is_file(), 'race must occur after publication')
                 fired.append(True)
-                if mutation == 'directory':
+                if mutation == 'same_inode':
+                    output.write_text('unrelated replacement')
+                elif mutation == 'directory':
                     reports.rename(root / 'moved')
                     reports.mkdir(mode=0o700)
                     output.write_text('unrelated replacement')
@@ -148,16 +197,16 @@ class ReportFinalizationTests(unittest.TestCase):
                 target.close()
 
     def test_review_cleanup_races(self):
-        for mutation in ('directory', 'file', 'symlink', 'missing'):
+        for mutation in ('directory', 'file', 'symlink', 'missing', 'same_inode'):
             with self.subTest(mutation=mutation):
                 self.exercise('peer_review', 'cleanup', mutation)
 
     def test_rescue_cleanup_races(self):
-        for mutation in ('directory', 'file', 'symlink', 'missing'):
+        for mutation in ('directory', 'file', 'symlink', 'missing', 'same_inode'):
             with self.subTest(mutation=mutation):
                 self.exercise('rescue', 'cleanup', mutation)
 
     def test_rescue_wal_races(self):
-        for mutation in ('directory', 'file', 'symlink', 'missing', 'error'):
+        for mutation in ('directory', 'file', 'symlink', 'missing', 'same_inode', 'error'):
             with self.subTest(mutation=mutation):
                 self.exercise('rescue', 'wal', mutation)

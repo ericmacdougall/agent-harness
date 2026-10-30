@@ -117,6 +117,7 @@ def repo_state(repo: Path) -> tuple[str, str]:
         values.append(result.stdout)
     if values[1]:
         return values[0].strip(), values[1]
+    require_unflagged_index(repo)
     require_no_special_entries(repo)
     diff = run_process(['git', '-C', str(repo), 'diff', '--binary', 'HEAD', '--'], env=git_environment(), timeout=30)
     if diff.returncode or diff.stdout:
@@ -165,10 +166,9 @@ def require_no_special_entries(repo: Path) -> None:
         raise OSError('worktree metadata scan refused a special or unstable entry') from error
 
 
-def ignored_directory_prefixes(repo: Path, deadline: float) -> set[tuple[str, ...]]:
-    """List ignored directory roots with a bounded Git response; never read contents."""
-    command = ['git', '-C', str(repo), 'ls-files', '--others', '--ignored',
-               '--exclude-standard', '--directory', '-z']
+def bounded_git_listing(repo: Path, args: list[str], deadline: float, limit: int) -> bytes:
+    """Read a Git path listing under byte and time budgets without logging paths."""
+    command = ['git', '-C', str(repo), *args]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                start_new_session=True, env=git_environment())
     data = bytearray()
@@ -176,24 +176,47 @@ def ignored_directory_prefixes(repo: Path, deadline: float) -> set[tuple[str, ..
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
-                raise OSError('ignored-directory listing exceeded time budget')
-            chunk = os.read(process.stdout.fileno(), min(65536, 1_000_001 - len(data)))
+                raise OSError('Git listing exceeded time budget')
+            chunk = os.read(process.stdout.fileno(), min(65536, limit + 1 - len(data)))
             if not chunk:
                 break
             data.extend(chunk)
-            if len(data) > 1_000_000:
-                raise OSError('ignored-directory listing exceeded size budget')
+            if len(data) > limit:
+                raise OSError('Git listing exceeded size budget')
         if process.wait(timeout=max(0.1, deadline - time.monotonic())):
-            raise OSError('ignored-directory listing failed')
+            raise OSError('Git listing failed')
     finally:
         if process.poll() is None:
             signal_group(process.pid, signal.SIGKILL)
             process.wait(timeout=2)
         process.stdout.close()
     if data and data[-1] != 0:
-        raise OSError('ignored-directory listing was malformed')
+        raise OSError('Git listing was malformed')
+    return bytes(data)
+
+
+def require_unflagged_index(repo: Path) -> None:
+    """Reject index flags that make status and diff hide tracked edits."""
+    deadline = time.monotonic() + 5
+    records = bounded_git_listing(repo, ['ls-files', '-v', '-z'], deadline, 40_000_000)
+    count = 0
+    for record in records.split(b'\0'):
+        if not record:
+            continue
+        count += 1
+        if count > 250_000 or time.monotonic() > deadline:
+            raise OSError('Git index listing exceeded limits')
+        if len(record) < 3 or record[:2] != b'H ':
+            raise OSError('Git index contains a hidden or unsupported entry flag')
+
+
+def ignored_directory_prefixes(repo: Path, deadline: float) -> set[tuple[str, ...]]:
+    """List ignored directory roots with a bounded Git response; never read contents."""
+    data = bounded_git_listing(repo, ['ls-files', '--others', '--ignored',
+                                      '--exclude-standard', '--directory', '-z'],
+                               deadline, 1_000_000)
     prefixes = set()
-    for item in bytes(data).split(b'\0'):
+    for item in data.split(b'\0'):
         if not item or not item.endswith(b'/'):
             continue
         parts = tuple(os.fsdecode(part) for part in item[:-1].split(b'/'))

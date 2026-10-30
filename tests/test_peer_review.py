@@ -47,6 +47,11 @@ if os.environ.get('RACE_WORKTREE'):
     (Path(repo) / 'app.txt').write_text('concurrent worktree edit\\n')
 if os.environ.get('RACE_UNTRACKED'):
     Path(os.environ['RACE_UNTRACKED']).write_text('changed during review\\n')
+if os.environ.get('RACE_HIDDEN_INDEX'):
+    import subprocess
+    repo = os.environ['RACE_HIDDEN_INDEX']
+    subprocess.run(['git', '-C', repo, 'update-index', '--assume-unchanged', 'app.txt'], check=True)
+    (Path(repo) / 'app.txt').write_text('hidden edit during review\\n')
 relocated = os.environ.get('RACE_DIRECTORY_OUTPUT')
 if relocated:
     parent = Path(relocated).parent
@@ -243,6 +248,28 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         result = self.invoke(stage='plan', env={'CAPTURE_CODEX_PROMPT': str(capture)})
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertFalse(capture.exists())
+        self.assertFalse(self.output.exists())
+
+    def test_plan_refuses_hidden_index_flags_before_model(self):
+        for flag in ('--assume-unchanged', '--skip-worktree'):
+            with self.subTest(flag=flag):
+                subprocess.run(['git', '-C', str(self.repo), 'update-index', flag, 'app.txt'], check=True)
+                (self.repo / 'app.txt').write_text('hidden private edit\n')
+                capture = self.root / f'{flag}.capture'
+                output = self.root / f'{flag}.review.md'
+                result = self.invoke(stage='plan', output=output,
+                                     env={'CAPTURE_CODEX_PROMPT': str(capture)})
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertFalse(capture.exists())
+                self.assertFalse(output.exists())
+                self.assertNotIn('hidden private edit', result.stderr + result.stdout)
+                (self.repo / 'app.txt').write_text('baseline\n')
+                subprocess.run(['git', '-C', str(self.repo), 'update-index', '--no-assume-unchanged',
+                                '--no-skip-worktree', 'app.txt'], check=True)
+
+    def test_plan_refuses_index_flag_set_during_review(self):
+        result = self.invoke(stage='plan', env={'RACE_HIDDEN_INDEX': str(self.repo)})
+        self.assertEqual(result.returncode, 2, result.stdout)
         self.assertFalse(self.output.exists())
 
     def test_plan_refuses_untracked_symlink_fifo_and_large_file_without_reading(self):
