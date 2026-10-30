@@ -4,7 +4,7 @@
 
 The main agent gives one owner a branch and isolated Git worktree for a coherent feature. Keep vendor directories, virtual environments, build output, credentials, and caches out of copies and commits. Use shared package-manager content caches; install from the lockfile in the worktree when needed. Reuse the owner for related follow-ups. The owner records a WAL intent, assumptions, risk table, planned checks, and rollback before editing.
 
-For the plan review, give `harness_reviewer` the brief, relevant repo paths, proposed design, negative cases, and an exact question. Ask it to challenge scope, failure modes, and unsafe assumptions, then reconcile findings. A second cooperative round is useful for disputed architecture. Do not loop on the same unchanged packet. If the only gap is missing live evidence, obtain it instead of asking the reviewer again.
+For the plan review, use a clean feature worktree and give `harness_reviewer` the brief, relevant repo paths, proposed design, negative cases, and an exact question. Keep plan notes outside the worktree or commit them first if using `peer_review.py`, which requires clean status for both plan and PR. Ask the reviewer to challenge scope, failure modes, and unsafe assumptions, then reconcile findings. A second cooperative round is useful for disputed architecture. Do not loop on the same unchanged packet. If the only gap is missing live evidence, obtain it instead of asking the reviewer again.
 
 ## Implementation and handoff
 

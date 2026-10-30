@@ -45,6 +45,8 @@ if os.environ.get('RACE_HEAD'):
 if os.environ.get('RACE_WORKTREE'):
     repo = sys.argv[sys.argv.index('--cd') + 1]
     (Path(repo) / 'app.txt').write_text('concurrent worktree edit\\n')
+if os.environ.get('RACE_UNTRACKED'):
+    Path(os.environ['RACE_UNTRACKED']).write_text('changed during review\\n')
 relocated = os.environ.get('RACE_DIRECTORY_OUTPUT')
 if relocated:
     parent = Path(relocated).parent
@@ -90,6 +92,81 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         result = self.invoke(stage='plan')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Reviewed HEAD: ', self.output.read_text())
+
+    def test_plan_refuses_dirty_untracked_file_before_model(self):
+        untracked = self.repo / 'untracked.txt'
+        untracked.write_text('sparse private note\n')
+        capture = self.root / 'model.capture'
+        result = self.invoke(stage='plan', env={'CAPTURE_CODEX_PROMPT': str(capture),
+                                                'RACE_UNTRACKED': str(untracked)})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(untracked.read_text(), 'sparse private note\n')
+        self.assertFalse(capture.exists())
+        self.assertFalse(self.output.exists())
+        self.assertNotIn('sparse private note', result.stderr + result.stdout)
+
+    def test_plan_refuses_dirty_tracked_file_before_model(self):
+        (self.repo / 'app.txt').write_text('dirty tracked content\n')
+        capture = self.root / 'model.capture'
+        result = self.invoke(stage='plan', env={'CAPTURE_CODEX_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertFalse(capture.exists())
+        self.assertFalse(self.output.exists())
+
+    def test_plan_refuses_untracked_symlink_fifo_and_large_file_without_reading(self):
+        outside = self.root / 'outside-private.txt'
+        outside.write_text('never disclose this fixture value\n')
+        for kind in ('symlink', 'fifo', 'large'):
+            with self.subTest(kind=kind):
+                path = self.repo / f'{kind}.dat'
+                if kind == 'symlink':
+                    path.symlink_to(outside)
+                elif kind == 'fifo':
+                    os.mkfifo(path)
+                else:
+                    path.write_bytes(b'x' * 4_000_000)
+                capture = self.root / f'{kind}.capture'
+                output = self.root / f'{kind}.review.md'
+                result = self.invoke(stage='plan', output=output,
+                                     env={'CAPTURE_CODEX_PROMPT': str(capture)})
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertFalse(capture.exists())
+                self.assertFalse(output.exists())
+                self.assertNotIn('never disclose this fixture value', result.stderr + result.stdout)
+                path.unlink()
+        self.assertEqual(outside.read_text(), 'never disclose this fixture value\n')
+
+    def test_plan_skips_large_ignored_vendor_tree_but_rejects_visible_fifo(self):
+        ignore = self.repo / '.gitignore'
+        ignore.write_text('node_modules/\n')
+        subprocess.run(['git', '-C', str(self.repo), 'add', '.gitignore'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', 'ignore vendor'], check=True)
+        vendor = self.repo / 'node_modules'
+        vendor.mkdir()
+        for index in range(2000):
+            (vendor / f'fixture-{index}.js').write_text('ignored\n')
+        os.mkfifo(vendor / 'ignored-pipe')
+        accepted = self.invoke(stage='plan', output=self.root / 'ignored-review.md')
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        visible = self.repo / 'visible-pipe'
+        os.mkfifo(visible)
+        capture = self.root / 'model.capture'
+        refused = self.invoke(stage='plan', output=self.root / 'visible-review.md',
+                              env={'CAPTURE_CODEX_PROMPT': str(capture)})
+        self.assertEqual(refused.returncode, 2, refused.stdout)
+        self.assertFalse(capture.exists())
+        self.assertFalse((self.root / 'visible-review.md').exists())
+
+    def test_plan_accepts_substantial_clean_tracked_tree(self):
+        source = self.repo / 'src'
+        source.mkdir()
+        for index in range(1000):
+            (source / f'fixture-{index}.txt').write_text('tracked\n')
+        subprocess.run(['git', '-C', str(self.repo), 'add', 'src'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', 'tracked fixtures'], check=True)
+        result = self.invoke(stage='plan')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('VERDICT: PASS', self.output.read_text())
 
     def test_concurrent_commit_blocks_pass_and_report(self):
         result = self.invoke(env={'RACE_HEAD': '1'})

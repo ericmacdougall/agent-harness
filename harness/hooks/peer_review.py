@@ -2,17 +2,19 @@
 """Independent read-only Codex review, with a blind Opus CLI fallback."""
 
 import argparse
-import hashlib
 import os
 import re
+import select
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
-from process import run as run_process
+from process import run as run_process, signal_group
 from report_file import ReportTarget
 
 
@@ -52,20 +54,101 @@ def read_packet(path: Path) -> str:
         os.close(fd)
 
 
-def repo_state(repo: Path) -> tuple[str, str, str]:
-    """Capture the reviewed commit and tracked worktree state."""
-    commands = (
-        ['rev-parse', '--verify', 'HEAD^{commit}'],
-        ['status', '--porcelain=v1', '--untracked-files=all'],
-        ['diff', '--binary', 'HEAD', '--'],
-    )
+def repo_state(repo: Path) -> tuple[str, str]:
+    """Capture a clean reviewed commit without reading untracked content."""
     values = []
-    for args in commands:
+    for args in (['rev-parse', '--verify', 'HEAD^{commit}'],
+                 ['status', '--porcelain=v1', '--untracked-files=all']):
         result = run_process(['git', '-C', str(repo), *args], timeout=30)
         if result.returncode:
             raise OSError(f'Git state inspection failed: {" ".join(args)}')
         values.append(result.stdout)
-    return values[0].strip(), values[1], hashlib.sha256(values[2].encode()).hexdigest()
+    if values[1]:
+        return values[0].strip(), values[1]
+    require_no_special_entries(repo)
+    diff = run_process(['git', '-C', str(repo), 'diff', '--binary', 'HEAD', '--'], timeout=30)
+    if diff.returncode or diff.stdout:
+        raise OSError('worktree changed during state inspection')
+    return values[0].strip(), values[1]
+
+
+def require_no_special_entries(repo: Path) -> None:
+    """Git status omits FIFOs and sockets; reject them with bounded metadata reads."""
+    inspected = [0]
+    deadline = time.monotonic() + 5
+    ignored = ignored_directory_prefixes(repo, deadline)
+
+    def visit(directory: int, depth: int, relative: tuple[str, ...]) -> None:
+        if depth > 64:
+            raise OSError('worktree metadata scan exceeded limits')
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name == '.git':
+                    continue
+                inspected[0] += 1
+                if inspected[0] > 250_000 or time.monotonic() > deadline:
+                    raise OSError('worktree metadata scan exceeded limits')
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    child_relative = (*relative, entry.name)
+                    if child_relative in ignored:
+                        continue
+                    child = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=directory)
+                    try:
+                        visit(child, depth + 1, child_relative)
+                    finally:
+                        os.close(child)
+                elif not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+                    raise OSError('worktree contains an unsafe special file')
+
+    try:
+        root = os.open(repo, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            visit(root, 0, ())
+        finally:
+            os.close(root)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        # Do not include filenames or private file contents in diagnostics.
+        raise OSError('worktree metadata scan refused a special or unstable entry') from error
+
+
+def ignored_directory_prefixes(repo: Path, deadline: float) -> set[tuple[str, ...]]:
+    """List ignored directory roots with a bounded Git response; never read contents."""
+    command = ['git', '-C', str(repo), 'ls-files', '--others', '--ignored',
+               '--exclude-standard', '--directory', '-z']
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               start_new_session=True)
+    data = bytearray()
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                raise OSError('ignored-directory listing exceeded time budget')
+            chunk = os.read(process.stdout.fileno(), min(65536, 1_000_001 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > 1_000_000:
+                raise OSError('ignored-directory listing exceeded size budget')
+        if process.wait(timeout=max(0.1, deadline - time.monotonic())):
+            raise OSError('ignored-directory listing failed')
+    finally:
+        if process.poll() is None:
+            signal_group(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+        process.stdout.close()
+    if data and data[-1] != 0:
+        raise OSError('ignored-directory listing was malformed')
+    prefixes = set()
+    for item in bytes(data).split(b'\0'):
+        if not item or not item.endswith(b'/'):
+            continue
+        parts = tuple(os.fsdecode(part) for part in item[:-1].split(b'/'))
+        if not parts or any(part in ('', '.', '..') for part in parts):
+            raise OSError('ignored-directory listing was malformed')
+        prefixes.add(parts)
+    return prefixes
 
 
 def main() -> int:
@@ -109,9 +192,9 @@ def main() -> int:
                                or before[0] != args.expected_head.lower()):
         target.close()
         parser.error('repo HEAD differs from --expected-head')
-    if args.stage == 'pr' and before[1]:
+    if before[1]:
         target.close()
-        parser.error('PR review requires a clean worktree')
+        parser.error('plan and PR review require a clean worktree')
     stage_rules = (
         "Planning gate: judge the proposed design, acceptance criteria, edge cases, test strategy, "
         "and rollout/rollback plan. You may read repository context. Do not BLOCK solely for an "
