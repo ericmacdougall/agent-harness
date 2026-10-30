@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import stat
+import time
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,27 +42,73 @@ def append(path: Path, record: dict) -> None:
     with ExitStack() as stack:
         directory = os.open(root.parent, flags)
         stack.callback(os.close, directory)
+        pinned = [(root.parent, None, directory)]
         for name in ("wals", path.parent.name):
             try:
                 os.mkdir(name, mode=0o700, dir_fd=directory)
             except FileExistsError:
                 pass
+            parent_fd = directory
             directory = os.open(name, flags, dir_fd=directory)
             stack.callback(os.close, directory)
+            pinned.append((name, parent_fd, directory))
             os.fchmod(directory, 0o700)
-        fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK,
-                     0o600, dir_fd=directory)
+
+        def current_directory():
+            try:
+                for name, parent_fd, opened_fd in pinned:
+                    named = (os.stat(name, follow_symlinks=False) if parent_fd is None
+                             else os.stat(name, dir_fd=parent_fd, follow_symlinks=False))
+                    opened = os.fstat(opened_fd)
+                    if (not stat.S_ISDIR(named.st_mode)
+                            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)):
+                        return False
+            except OSError:
+                return False
+            return True
+
+        file_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+        for attempt in range(4):
+            if not current_directory():
+                raise ValueError("WAL session directory changed")
+            try:
+                fd = os.open(path.name, file_flags, 0o600, dir_fd=directory)
+                break
+            except FileNotFoundError:
+                # A concurrent first write has occasionally observed ENOENT on
+                # macOS despite O_CREAT. Retry only while the named session
+                # directory still resolves to the pinned inode, never after a
+                # directory replacement or removal.
+                if attempt == 3 or not current_directory():
+                    raise
+                time.sleep(0.01 * (attempt + 1))
         stack.callback(os.close, fd)
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise ValueError("WAL must be a regular file with no hard links")
+
+        def current_target():
+            if not current_directory():
+                return False
+            try:
+                named = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                opened = os.fstat(fd)
+            except OSError:
+                return False
+            return (stat.S_ISREG(named.st_mode) and named.st_nlink == 1
+                    and (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino))
+
         os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
+        if not current_target():
+            raise ValueError("WAL target changed before append")
         # A short write must not silently report a complete record.
         with os.fdopen(fd, "ab", closefd=False) as handle:
             handle.write(payload)
             handle.flush()
         os.fsync(fd)
+        if not current_target():
+            raise ValueError("WAL target changed during append")
 
 
 def main() -> None:

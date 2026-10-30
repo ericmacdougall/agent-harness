@@ -1,0 +1,55 @@
+test_retry_refuses_directory_moved_during_backoff (tests.test_wal.WalTests.test_retry_refuses_directory_moved_during_backoff) ... FAIL
+test_open_refuses_directory_moved_before_write (tests.test_wal.WalTests.test_open_refuses_directory_moved_before_write) ... FAIL
+test_write_refuses_directory_moved_before_success (tests.test_wal.WalTests.test_write_refuses_directory_moved_before_success) ... FAIL
+test_open_refuses_log_file_replacement_before_write (tests.test_wal.WalTests.test_open_refuses_log_file_replacement_before_write) ... FAIL
+test_write_refuses_log_file_replacement_before_success (tests.test_wal.WalTests.test_write_refuses_log_file_replacement_before_success) ... FAIL
+
+======================================================================
+FAIL: test_retry_refuses_directory_moved_during_backoff (tests.test_wal.WalTests.test_retry_refuses_directory_moved_during_backoff)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<intermediate-snapshot>/tests/test_wal.py", line 298, in test_retry_refuses_directory_moved_during_backoff
+    with self.assertRaises((OSError, ValueError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'OSError'>, <class 'ValueError'>) not raised
+
+======================================================================
+FAIL: test_open_refuses_directory_moved_before_write (tests.test_wal.WalTests.test_open_refuses_directory_moved_before_write)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<intermediate-snapshot>/tests/test_wal.py", line 322, in test_open_refuses_directory_moved_before_write
+    with self.assertRaises((OSError, ValueError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'OSError'>, <class 'ValueError'>) not raised
+
+======================================================================
+FAIL: test_write_refuses_directory_moved_before_success (tests.test_wal.WalTests.test_write_refuses_directory_moved_before_success)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<intermediate-snapshot>/tests/test_wal.py", line 344, in test_write_refuses_directory_moved_before_success
+    with self.assertRaises((OSError, ValueError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'OSError'>, <class 'ValueError'>) not raised
+
+======================================================================
+FAIL: test_open_refuses_log_file_replacement_before_write (tests.test_wal.WalTests.test_open_refuses_log_file_replacement_before_write)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<intermediate-snapshot>/tests/test_wal.py", line 368, in test_open_refuses_log_file_replacement_before_write
+    with self.assertRaises((OSError, ValueError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'OSError'>, <class 'ValueError'>) not raised
+
+======================================================================
+FAIL: test_write_refuses_log_file_replacement_before_success (tests.test_wal.WalTests.test_write_refuses_log_file_replacement_before_success)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<intermediate-snapshot>/tests/test_wal.py", line 390, in test_write_refuses_log_file_replacement_before_success
+    with self.assertRaises((OSError, ValueError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'OSError'>, <class 'ValueError'>) not raised
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.014s
+
+FAILED (failures=5)
