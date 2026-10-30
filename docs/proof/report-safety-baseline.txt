@@ -1,0 +1,71 @@
+test_existing_unrelated_file_outside_repo_is_not_deleted (tests.test_peer_review.PeerReviewTests.test_existing_unrelated_file_outside_repo_is_not_deleted) ... FAIL
+test_file_created_during_review_is_not_overwritten (tests.test_peer_review.PeerReviewTests.test_file_created_during_review_is_not_overwritten) ... FAIL
+test_relocated_report_directory_cannot_yield_false_signoff (tests.test_peer_review.PeerReviewTests.test_relocated_report_directory_cannot_yield_false_signoff) ... FAIL
+test_existing_unrelated_file_outside_repo_is_not_deleted (tests.test_rescue.RescueTests.test_existing_unrelated_file_outside_repo_is_not_deleted) ... FAIL
+test_file_created_during_rescue_is_not_overwritten (tests.test_rescue.RescueTests.test_file_created_during_rescue_is_not_overwritten) ... FAIL
+test_relocated_report_directory_preserves_replacement_after_rescue_edits (tests.test_rescue.RescueTests.test_relocated_report_directory_preserves_replacement_after_rescue_edits) ... FAIL
+
+======================================================================
+FAIL: test_existing_unrelated_file_outside_repo_is_not_deleted (tests.test_peer_review.PeerReviewTests.test_existing_unrelated_file_outside_repo_is_not_deleted)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<baseline-snapshot>/tests/test_peer_review.py", line 106, in test_existing_unrelated_file_outside_repo_is_not_deleted
+    self.assertEqual(result.returncode, 2, result.stdout)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 2 : Codex gpt-6.1-sol: VERDICT: PASS | <fixture>/ssh-config
+
+
+======================================================================
+FAIL: test_file_created_during_review_is_not_overwritten (tests.test_peer_review.PeerReviewTests.test_file_created_during_review_is_not_overwritten)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<baseline-snapshot>/tests/test_peer_review.py", line 111, in test_file_created_during_review_is_not_overwritten
+    self.assertEqual(result.returncode, 2, result.stdout)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 2 : Codex gpt-6.1-sol: VERDICT: PASS | <fixture>/review.md
+
+
+======================================================================
+FAIL: test_relocated_report_directory_cannot_yield_false_signoff (tests.test_peer_review.PeerReviewTests.test_relocated_report_directory_cannot_yield_false_signoff)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<baseline-snapshot>/tests/test_peer_review.py", line 119, in test_relocated_report_directory_cannot_yield_false_signoff
+    self.assertEqual(result.returncode, 2, result.stdout)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 2 : Codex gpt-6.1-sol: VERDICT: PASS | <fixture>/reports/review.md
+
+
+======================================================================
+FAIL: test_existing_unrelated_file_outside_repo_is_not_deleted (tests.test_rescue.RescueTests.test_existing_unrelated_file_outside_repo_is_not_deleted)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<baseline-snapshot>/tests/test_rescue.py", line 134, in test_existing_unrelated_file_outside_repo_is_not_deleted
+    self.assertEqual(result.returncode, 2, result.stdout)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 3 != 2 : Codex gpt-6-astra: blocked | <fixture>/ssh-config
+
+
+======================================================================
+FAIL: test_file_created_during_rescue_is_not_overwritten (tests.test_rescue.RescueTests.test_file_created_during_rescue_is_not_overwritten)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<baseline-snapshot>/tests/test_rescue.py", line 140, in test_file_created_during_rescue_is_not_overwritten
+    self.assertEqual(result.returncode, 3, result.stdout)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 3 : Codex gpt-6-astra: needs-main-verification | <fixture>/report.json
+
+
+======================================================================
+FAIL: test_relocated_report_directory_preserves_replacement_after_rescue_edits (tests.test_rescue.RescueTests.test_relocated_report_directory_preserves_replacement_after_rescue_edits)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<baseline-snapshot>/tests/test_rescue.py", line 151, in test_relocated_report_directory_preserves_replacement_after_rescue_edits
+    self.assertEqual(result.returncode, 3, result.stdout)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 3 : Codex gpt-6-astra: needs-main-verification | <fixture>/reports/report.json
+
+
+----------------------------------------------------------------------
+Ran 6 tests in 3.092s
+
+FAILED (failures=6)
