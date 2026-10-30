@@ -120,18 +120,21 @@ test_escaped_id_cannot_alias_an_explicit_identifier (test_wal.WalTests.test_esca
 test_existing_wal_and_directories_become_private (test_wal.WalTests.test_existing_wal_and_directories_become_private) ... ok
 test_long_dot_id_can_receive_a_note (test_wal.WalTests.test_long_dot_id_can_receive_a_note) ... ok
 test_missing_session_refuses_shared_wal (test_wal.WalTests.test_missing_session_refuses_shared_wal) ... ok
+test_open_refuses_claude_ancestor_symlink_before_write (test_wal.WalTests.test_open_refuses_claude_ancestor_symlink_before_write) ... ok
 test_open_refuses_directory_moved_before_write (test_wal.WalTests.test_open_refuses_directory_moved_before_write) ... ok
 test_open_refuses_log_file_replacement_before_write (test_wal.WalTests.test_open_refuses_log_file_replacement_before_write) ... ok
 test_prompt_writes_length_without_prompt (test_wal.WalTests.test_prompt_writes_length_without_prompt) ... ok
 test_repeated_missing_file_is_bounded (test_wal.WalTests.test_repeated_missing_file_is_bounded) ... ok
 test_retry_refuses_directory_moved_during_backoff (test_wal.WalTests.test_retry_refuses_directory_moved_during_backoff) ... ok
 test_retry_refuses_replaced_session_directory (test_wal.WalTests.test_retry_refuses_replaced_session_directory) ... ok
+test_retry_refuses_wals_ancestor_symlink_during_backoff (test_wal.WalTests.test_retry_refuses_wals_ancestor_symlink_during_backoff) ... ok
 test_sanitized_ids_do_not_alias_distinct_sessions (test_wal.WalTests.test_sanitized_ids_do_not_alias_distinct_sessions) ... ok
 test_short_prompt_has_no_dictionary_reversible_digest (test_wal.WalTests.test_short_prompt_has_no_dictionary_reversible_digest) ... ok
 test_short_tool_target_has_no_dictionary_reversible_digest (test_wal.WalTests.test_short_tool_target_has_no_dictionary_reversible_digest) ... ok
 test_transient_missing_file_during_create_retries_without_losing_record (test_wal.WalTests.test_transient_missing_file_during_create_retries_without_losing_record) ... ok
 test_write_refuses_directory_moved_before_success (test_wal.WalTests.test_write_refuses_directory_moved_before_success) ... ok
 test_write_refuses_log_file_replacement_before_success (test_wal.WalTests.test_write_refuses_log_file_replacement_before_success) ... ok
+test_write_refuses_wals_ancestor_symlink_before_success (test_wal.WalTests.test_write_refuses_wals_ancestor_symlink_before_success) ... ok
 test_writers_refuse_hardlinks_and_fifos (test_wal.WalTests.test_writers_refuse_hardlinks_and_fifos) ... ok
 test_writers_refuse_symlinked_directories_and_files (test_wal.WalTests.test_writers_refuse_symlinked_directories_and_files) ... ok
 test_ctrl_c_during_test_run_stops_child_without_traceback (test_watch_tests.WatchTests.test_ctrl_c_during_test_run_stops_child_without_traceback) ... ok
@@ -141,6 +144,6 @@ test_stalled_test_and_child_are_terminated (test_watch_tests.WatchTests.test_sta
 test_watch_reruns_after_a_source_edit_and_ignores_vendor_edit (test_watch_tests.WatchTests.test_watch_reruns_after_a_source_edit_and_ignores_vendor_edit) ... ok
 
 ----------------------------------------------------------------------
-Ran 141 tests in 111.220s
+Ran 144 tests in 102.189s
 
 OK

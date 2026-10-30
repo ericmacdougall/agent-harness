@@ -42,23 +42,30 @@ def append(path: Path, record: dict) -> None:
     with ExitStack() as stack:
         directory = os.open(root.parent, flags)
         stack.callback(os.close, directory)
+        pinned = [(root.parent, None, directory)]
         for name in ("wals", path.parent.name):
             try:
                 os.mkdir(name, mode=0o700, dir_fd=directory)
             except FileExistsError:
                 pass
+            parent_fd = directory
             directory = os.open(name, flags, dir_fd=directory)
             stack.callback(os.close, directory)
+            pinned.append((name, parent_fd, directory))
             os.fchmod(directory, 0o700)
 
         def current_directory():
             try:
-                named = os.stat(path.parent, follow_symlinks=False)
-                opened = os.fstat(directory)
+                for name, parent_fd, opened_fd in pinned:
+                    named = (os.stat(name, follow_symlinks=False) if parent_fd is None
+                             else os.stat(name, dir_fd=parent_fd, follow_symlinks=False))
+                    opened = os.fstat(opened_fd)
+                    if (not stat.S_ISDIR(named.st_mode)
+                            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)):
+                        return False
             except OSError:
                 return False
-            return (stat.S_ISDIR(named.st_mode)
-                    and (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino))
+            return True
 
         file_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
         for attempt in range(4):

@@ -392,6 +392,83 @@ class WalTests(unittest.TestCase):
         self.assertEqual(target.read_text(), 'replacement')
         self.assertEqual(json.loads(moved.read_text()), {'event': 'fixture'})
 
+    def test_retry_refuses_wals_ancestor_symlink_during_backoff(self):
+        spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        wals = self.home / '.claude/wals'
+        session = wals / 'concurrent'
+        session.mkdir(parents=True)
+        target = session / 'main.jsonl'
+        moved = wals.with_name('wals-moved')
+        original_open = os.open
+        attempts = []
+
+        def fail_first(path, flags, *args, **kwargs):
+            if path == 'main.jsonl':
+                attempts.append(path)
+                if len(attempts) == 1:
+                    raise FileNotFoundError(errno.ENOENT, 'transient create race', path)
+            return original_open(path, flags, *args, **kwargs)
+
+        def redirect_during_sleep(_):
+            wals.rename(moved)
+            wals.symlink_to(moved, target_is_directory=True)
+
+        with patch.dict(os.environ, {'HOME': str(self.home)}), \
+             patch.object(module.os, 'open', side_effect=fail_first), \
+             patch.object(module.time, 'sleep', side_effect=redirect_during_sleep):
+            with self.assertRaises((OSError, ValueError)):
+                module.append(target, {'event': 'fixture'})
+        self.assertFalse((moved / 'concurrent/main.jsonl').exists())
+
+    def test_open_refuses_claude_ancestor_symlink_before_write(self):
+        spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        claude = self.home / '.claude'
+        session = claude / 'wals/concurrent'
+        session.mkdir(parents=True)
+        target = session / 'main.jsonl'
+        moved = self.home / '.claude-moved'
+        original_open = os.open
+
+        def redirect_after_open(path, flags, *args, **kwargs):
+            fd = original_open(path, flags, *args, **kwargs)
+            if path == 'main.jsonl':
+                claude.rename(moved)
+                claude.symlink_to(moved, target_is_directory=True)
+            return fd
+
+        with patch.dict(os.environ, {'HOME': str(self.home)}), \
+             patch.object(module.os, 'open', side_effect=redirect_after_open):
+            with self.assertRaises((OSError, ValueError)):
+                module.append(target, {'event': 'fixture'})
+        self.assertEqual((moved / 'wals/concurrent/main.jsonl').read_text(), '')
+
+    def test_write_refuses_wals_ancestor_symlink_before_success(self):
+        spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        wals = self.home / '.claude/wals'
+        session = wals / 'concurrent'
+        session.mkdir(parents=True)
+        target = session / 'main.jsonl'
+        moved = wals.with_name('wals-moved')
+        original_fsync = os.fsync
+
+        def redirect_after_fsync(fd):
+            original_fsync(fd)
+            wals.rename(moved)
+            wals.symlink_to(moved, target_is_directory=True)
+
+        with patch.dict(os.environ, {'HOME': str(self.home)}), \
+             patch.object(module.os, 'fsync', side_effect=redirect_after_fsync):
+            with self.assertRaises((OSError, ValueError)):
+                module.append(target, {'event': 'fixture'})
+        self.assertEqual(json.loads((moved / 'concurrent/main.jsonl').read_text()),
+                         {'event': 'fixture'})
+
     def test_common_secret_formats_are_rejected_in_human_notes(self):
         path = self.home / '.claude/wals/test-session/main.jsonl'
         examples = ('Authorization: Bearer abc123', 'postgres://alice:hunter2@example.invalid/db',

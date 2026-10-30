@@ -1,0 +1,35 @@
+test_retry_refuses_wals_ancestor_symlink_during_backoff (tests.test_wal.WalTests.test_retry_refuses_wals_ancestor_symlink_during_backoff) ... FAIL
+test_open_refuses_claude_ancestor_symlink_before_write (tests.test_wal.WalTests.test_open_refuses_claude_ancestor_symlink_before_write) ... FAIL
+test_write_refuses_wals_ancestor_symlink_before_success (tests.test_wal.WalTests.test_write_refuses_wals_ancestor_symlink_before_success) ... FAIL
+
+======================================================================
+FAIL: test_retry_refuses_wals_ancestor_symlink_during_backoff (tests.test_wal.WalTests.test_retry_refuses_wals_ancestor_symlink_during_backoff)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<intermediate-snapshot>/tests/test_wal.py", line 421, in test_retry_refuses_wals_ancestor_symlink_during_backoff
+    with self.assertRaises((OSError, ValueError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'OSError'>, <class 'ValueError'>) not raised
+
+======================================================================
+FAIL: test_open_refuses_claude_ancestor_symlink_before_write (tests.test_wal.WalTests.test_open_refuses_claude_ancestor_symlink_before_write)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<intermediate-snapshot>/tests/test_wal.py", line 445, in test_open_refuses_claude_ancestor_symlink_before_write
+    with self.assertRaises((OSError, ValueError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'OSError'>, <class 'ValueError'>) not raised
+
+======================================================================
+FAIL: test_write_refuses_wals_ancestor_symlink_before_success (tests.test_wal.WalTests.test_write_refuses_wals_ancestor_symlink_before_success)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<intermediate-snapshot>/tests/test_wal.py", line 467, in test_write_refuses_wals_ancestor_symlink_before_success
+    with self.assertRaises((OSError, ValueError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'OSError'>, <class 'ValueError'>) not raised
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.007s
+
+FAILED (failures=3)

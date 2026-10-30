@@ -27,7 +27,19 @@ cp tests/test_wal.py "$INTERMEDIATE_DIR/tests/"
 
 The repaired writer retries only while the named session directory matches its pinned descriptor. It checks the directory and log file identity before writing and after `fsync`. A replacement during a write can leave a record in the moved file, but the hook returns an error rather than claiming that the advertised WAL contains it. External mutation after the final check remains possible.
 
-The focused WAL suite passed **23/23**. Thirty separate process-level trials of the original concurrency scenario each launched eight writers and verified 200 parseable, unique records: **6,000 records** total, exit **0**. The stress command from the repaired checkout was:
+Sol's next review found that checking the session path alone follows symlinks in its `.claude` and `wals` ancestors. Three new tests replace either ancestor with a symlink during backoff, after open, or during `fsync`; all three failed against `f528b371443a6e826497a429e0076401c38416b5` (exit **1**): [ancestor failure transcript](wal-ancestors-before.txt). The writer now retains directory descriptors for `.claude`, `wals`, and the session, and checks each component through its pinned parent descriptor without following links. Reproduce the failure-first cases from a checkout with the new tests:
+
+```sh
+ANCESTOR_DIR=$(mktemp -d)
+git archive f528b371443a6e826497a429e0076401c38416b5 | tar -x -C "$ANCESTOR_DIR"
+cp tests/test_wal.py "$ANCESTOR_DIR/tests/"
+(cd "$ANCESTOR_DIR" && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  tests.test_wal.WalTests.test_retry_refuses_wals_ancestor_symlink_during_backoff \
+  tests.test_wal.WalTests.test_open_refuses_claude_ancestor_symlink_before_write \
+  tests.test_wal.WalTests.test_write_refuses_wals_ancestor_symlink_before_success -v)
+```
+
+The focused WAL suite passed **26/26**. Thirty separate process-level trials of the original concurrency scenario each launched eight writers and verified 200 parseable, unique records: **6,000 records** total, exit **0**. The stress command from the repaired checkout was:
 
 ```sh
 python3 - <<'PY'
@@ -43,7 +55,7 @@ print('30/30 trials passed; 6,000 records verified')
 PY
 ```
 
-The full suite passed **141/141** on macOS Python 3.15.0 in **111.220 seconds** and Python 3.9.6 in **95.703 seconds**, both with resource warnings treated as errors: [Python 3.15 transcript](wal-python315.txt), [Python 3.9 transcript](wal-python39.txt). Commands:
+The full suite passed **144/144** on macOS Python 3.15.0 in **102.189 seconds** and Python 3.9.6 in **88.761 seconds**, both with resource warnings treated as errors: [Python 3.15 transcript](wal-python315.txt), [Python 3.9 transcript](wal-python39.txt). Commands:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3 -W error::ResourceWarning -m unittest discover -s tests -v
