@@ -71,7 +71,7 @@ def main() -> int:
         parser.error("repo must be a git worktree root")
     try:
         target = ReportTarget(output_arg, repo, packet)
-        target.clear()
+        target.require_fresh()
     except (OSError, ValueError) as error:
         parser.error(f'output must be a writable file path: {error}')
     output = target.path
@@ -117,8 +117,13 @@ def main() -> int:
             target.close()
             return 2
     note = f"Fallback reason: {failure}\n" if failure else ""
-    target.write_text(f"Reviewer: {source}\nStage: {args.stage}\n{note}\n{report.strip()}\n")
-    target.close()
+    try:
+        target.write_text(f"Reviewer: {source}\nStage: {args.stage}\n{note}\n{report.strip()}\n")
+    except OSError as error:
+        print(f"Review completed but report could not be created exclusively: {error}; inspect output and retry with a fresh path.", file=sys.stderr)
+        return 2
+    finally:
+        target.close()
     print(f"{source}: {report.splitlines()[0].strip()} | {output}")
     return 0 if report.lstrip().startswith("VERDICT: PASS") else 3
 

@@ -2,7 +2,6 @@
 
 import os
 import secrets
-import stat
 from pathlib import Path
 
 
@@ -51,20 +50,13 @@ class ReportTarget:
     def __del__(self):
         self.close()
 
-    def clear(self):
+    def require_fresh(self):
+        """A report path is single-use; never remove an unrelated existing file."""
         try:
-            info = os.stat(self.path.name, dir_fd=self.fd, follow_symlinks=False)
+            os.stat(self.path.name, dir_fd=self.fd, follow_symlinks=False)
         except FileNotFoundError:
             return
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise ValueError('existing output must be one regular file')
-        try:
-            packet_info = self.packet.stat()
-        except FileNotFoundError:
-            packet_info = None
-        if packet_info and (info.st_dev, info.st_ino) == (packet_info.st_dev, packet_info.st_ino):
-            raise ValueError('output must differ from packet')
-        os.unlink(self.path.name, dir_fd=self.fd)
+        raise ValueError('output already exists; choose a fresh report path')
 
     def write_text(self, content: str):
         temporary = '.report-' + secrets.token_hex(12)
@@ -75,7 +67,10 @@ class ReportTarget:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.path.name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            # An independent file may appear after require_fresh(). Link is
+            # atomic and refuses to replace it; unlink the temporary afterward.
+            os.link(temporary, self.path.name, src_dir_fd=self.fd, dst_dir_fd=self.fd,
+                    follow_symlinks=False)
             os.fsync(self.fd)
         finally:
             try:

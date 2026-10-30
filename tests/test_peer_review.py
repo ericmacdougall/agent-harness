@@ -29,6 +29,8 @@ capture = os.environ.get('CAPTURE_CODEX_PROMPT')
 if capture: Path(capture).write_text(prompt)
 last = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 last.write_text(os.environ.get('CODEX_VERDICT', 'VERDICT: PASS\\nReviewed.'))
+race = os.environ.get('RACE_OUTPUT')
+if race: Path(race).write_text('independent file created during review')
 sys.exit(int(os.environ.get('CODEX_EXIT', '0')))
 ''')
         self.fake('claude', '''import os, sys
@@ -71,17 +73,35 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertIn('Reviewer: Blind Claude Opus fallback', self.output.read_text())
         self.assertNotIn('Untrusted prior opinion', captured.read_text())
 
-    def test_both_reviewers_failing_remove_old_pass(self):
+    def test_existing_report_is_preserved_and_review_does_not_run(self):
         self.output.write_text('VERDICT: PASS\nstale')
+        capture = self.root / 'model.capture'
+        result = self.invoke(env={'CAPTURE_CODEX_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.output.read_text(), 'VERDICT: PASS\nstale')
+        self.assertFalse(capture.exists())
+
+    def test_both_reviewers_failing_leave_fresh_path_absent(self):
         result = self.invoke(env={'CODEX_EXIT': '7', 'CLAUDE_EXIT': '8'})
         self.assertEqual(result.returncode, 2)
         self.assertFalse(self.output.exists())
 
-    def test_invalid_packet_removes_old_pass(self):
-        self.output.write_text('VERDICT: PASS\nstale')
+    def test_invalid_packet_never_creates_a_report(self):
         result = self.invoke(packet=self.root / 'missing.md')
         self.assertEqual(result.returncode, 2)
-        self.assertFalse(self.output.exists(), 'an invalid rerun left an old sign-off in place')
+        self.assertFalse(self.output.exists())
+
+    def test_existing_unrelated_file_outside_repo_is_not_deleted(self):
+        important = self.root / 'ssh-config'
+        important.write_text('important configuration\n')
+        result = self.invoke(output=important)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(important.read_text(), 'important configuration\n')
+
+    def test_file_created_during_review_is_not_overwritten(self):
+        result = self.invoke(env={'RACE_OUTPUT': str(self.output)})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(self.output.read_text(), 'independent file created during review')
 
     def test_output_symlink_never_changes_target(self):
         target = self.root / 'important.txt'
