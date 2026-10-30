@@ -15,12 +15,12 @@ from pathlib import Path
 from process import run
 
 
-def run_git(repo, *args, timeout=600, env_extra=None):
+def run_git(repo, *args, timeout=600, env_extra=None, text=True, input=None):
     # Headless use: a missing credential must fail the push, not wait on a terminal prompt.
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     if env_extra:
         env.update(env_extra)
-    return run(["git", "-C", str(repo), *args], env=env, timeout=timeout)
+    return run(["git", "-C", str(repo), *args], env=env, timeout=timeout, text=text, input=input)
 
 
 def report(status, message, **extra):
@@ -42,6 +42,66 @@ def pinned_url(url, repo):
     if colon < 0 or (slash >= 0 and slash < colon):
         return str((repo / Path(url).expanduser()).resolve())
     return url
+
+
+def has_reachable_lfs_pointer(repo, head, git):
+    """Scan small blobs in all history being published, with bounded work."""
+    objects = git(repo, 'rev-list', '--objects', '--filter=blob:limit=1024', head, text=False)
+    if objects.returncode:
+        raise ValueError('cannot enumerate reachable objects')
+    oids = []
+    for line in objects.stdout.splitlines():
+        oid = line.split(b' ', 1)[0]
+        if re.fullmatch(rb'(?:[0-9a-f]{40}|[0-9a-f]{64})', oid):
+            oids.append(oid)
+    if len(oids) > 300_000:
+        raise ValueError('LFS scan object budget exceeded')
+    if not oids:
+        raise ValueError('no reachable objects')
+    oid_set = set(oids)
+    checked = git(repo, 'cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)',
+                  input=b'\n'.join(oids) + b'\n', text=False)
+    if checked.returncode:
+        raise ValueError('cannot inspect object sizes')
+    blobs = []
+    total = 0
+    metadata = checked.stdout.splitlines()
+    if len(metadata) != len(oids):
+        raise ValueError('incomplete object metadata')
+    for line in metadata:
+        parts = line.split()
+        if len(parts) != 3 or parts[0] not in oid_set or not parts[2].isdigit():
+            raise ValueError('malformed object metadata')
+        size = int(parts[2])
+        if parts[1] == b'blob' and 0 < size < 1024:
+            blobs.append(parts[0])
+            total += size
+    if total > 30_000_000:
+        raise ValueError('LFS scan byte budget exceeded')
+    if not blobs:
+        return False
+    scanned = git(repo, 'cat-file', '--batch', input=b'\n'.join(blobs) + b'\n', text=False)
+    if scanned.returncode:
+        raise ValueError('cannot read candidate blobs')
+    versions = (b'version https://git-lfs.github.com/spec/v1\n',
+                b'version https://hawser.github.com/spec/v1\n')
+    position = 0
+    for oid in blobs:
+        end = scanned.stdout.find(b'\n', position)
+        if end < 0:
+            raise ValueError('truncated blob stream')
+        header = scanned.stdout[position:end].split()
+        if len(header) != 3 or header[:2] != [oid, b'blob'] or not header[2].isdigit():
+            raise ValueError('malformed blob stream')
+        size = int(header[2])
+        start = end + 1
+        finish = start + size
+        if scanned.stdout[finish:finish + 1] != b'\n':
+            raise ValueError('truncated blob content')
+        if scanned.stdout[start:finish].startswith(versions):
+            return True
+        position = finish + 1
+    return False
 
 
 def main():
@@ -135,6 +195,18 @@ def publish(args):
         return 4
     if args.branch == match.group(1):
         report("BLOCKED_POLICY", "Refusing to publish the remote default branch", branch=args.branch, remote=remote)
+        return 2
+    # The isolated transport omits source pre-push hooks. Git LFS uploads in
+    # that hook, so reject any pointer in reachable history before pushing.
+    try:
+        contains_lfs = has_reachable_lfs_pointer(repo, head, git)
+    except ValueError:
+        report("BLOCKED_REMOTE", "Could not verify whether Git LFS content needs uploading; continue local integration",
+               branch=args.branch, remote=remote)
+        return 4
+    if contains_lfs:
+        report("BLOCKED_POLICY", "Git LFS pointer found; publish with an LFS-aware workflow",
+               branch=args.branch, remote=remote)
         return 2
     ref = f"refs/heads/{args.branch}"
     # A concurrent edit to origin.pushurl must not redirect the push.

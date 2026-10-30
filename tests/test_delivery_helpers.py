@@ -195,6 +195,44 @@ class DeliveryHelpers(unittest.TestCase):
         p, data = self.invoke(PUBLISH, '--repo', str(self.repo), '--branch', 'main', '--original-branch', 'main', '--expected-head', self.base)
         self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'))
 
+    def test_lfs_pointer_cannot_be_published_without_its_content(self):
+        remote = self.root / 'lfs-origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        pointer = ('version https://git-lfs.github.com/spec/v1\n'
+                   'oid sha256:' + 'a' * 64 + '\nsize 123\n')
+        (self.feature / 'asset.bin').write_text(pointer)
+        cmd('git', 'add', 'asset.bin', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'add LFS pointer without uploaded content', cwd=self.feature)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', reviewed)
+        self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'), p.stdout + p.stderr)
+        self.assertIn('Git LFS', data['message'])
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app', cwd=remote,
+                                check=False).returncode, 0)
+
+    def test_historical_lfs_pointer_is_blocked_even_if_removed_from_head(self):
+        remote = self.root / 'lfs-history.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        (self.feature / 'asset.bin').write_text('version https://git-lfs.github.com/spec/v1\n'
+                                                'oid sha256:' + 'a' * 64 + '\nsize 123\n')
+        cmd('git', 'add', 'asset.bin', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'historical pointer', cwd=self.feature)
+        (self.feature / 'asset.bin').unlink()
+        cmd('git', 'commit', '-qam', 'remove pointer from tip', cwd=self.feature)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app',
+                              '--original-branch', 'main', '--expected-head', reviewed)
+        self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'), p.stdout + p.stderr)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app', cwd=remote,
+                                check=False).returncode, 0)
+
     def test_source_pre_push_hook_cannot_change_verified_commit_or_block_delivery(self):
         remote = self.root / 'origin.git'
         cmd('git', 'init', '-q', '--bare', str(remote))
