@@ -32,6 +32,16 @@ class HumanWalNoteGuards(unittest.TestCase):
         'ToKeN=synthetic_value',
         'Password: synthetic_value',
         '{"client_secret": "synthetic_value"}',
+        '{"clientSecret": "synthetic_value"}',
+        '{"accessToken": "synthetic_value"}',
+        'secretAccessKey=synthetic_value',
+    )
+    ORDINARY_NOTES = (
+        'Review token validation flow',
+        'token_count=178',
+        'token_budget=1000',
+        'credential_check=passed',
+        'secret_scanning=enabled',
     )
 
     def test_claude_rejects_compound_credential_names_before_writing(self):
@@ -57,12 +67,15 @@ class HumanWalNoteGuards(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(fresh.exists())
             accepted = home / '.claude' / 'wals' / 'accepted' / 'main.jsonl'
-            result = subprocess.run([sys.executable, str(CLAUDE_NOTE), '--wal', str(accepted),
-                                     '--event', 'intent', '--note', 'Review token validation flow'],
-                                    env={**os.environ, 'HOME': str(home)},
-                                    text=True, capture_output=True, timeout=5)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('Review token validation flow', accepted.read_text())
+            for note in self.ORDINARY_NOTES:
+                with self.subTest(accepted=note):
+                    result = subprocess.run([sys.executable, str(CLAUDE_NOTE), '--wal', str(accepted),
+                                             '--event', 'intent', '--note', note],
+                                            env={**os.environ, 'HOME': str(home)},
+                                            text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual([json.loads(line)['note'] for line in accepted.read_text().splitlines()],
+                             list(self.ORDINARY_NOTES))
 
     def test_codex_rejects_compound_credential_names_before_writing(self):
         wal = load(CODEX_WAL, 'redaction_codex_wal')
@@ -80,9 +93,11 @@ class HumanWalNoteGuards(unittest.TestCase):
                 wal.note(fresh, 'intent', self.NOTES[0])
             self.assertFalse(fresh.exists())
             accepted = wal.wal_root() / 'accepted' / 'main.jsonl'
-            with patch.object(wal.sys, 'stdout', new_callable=io.StringIO):
-                wal.note(accepted, 'intent', 'Review token validation flow')
-            self.assertEqual(json.loads(accepted.read_text())['note'], 'Review token validation flow')
+            for note in self.ORDINARY_NOTES:
+                with self.subTest(accepted=note), patch.object(wal.sys, 'stdout', new_callable=io.StringIO):
+                    wal.note(accepted, 'intent', note)
+            self.assertEqual([json.loads(line)['note'] for line in accepted.read_text().splitlines()],
+                             list(self.ORDINARY_NOTES))
 
 
 class ProcessTextDecoding(unittest.TestCase):
