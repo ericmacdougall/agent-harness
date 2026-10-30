@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 PUBLISH = Path(__file__).resolve().parents[1] / 'harness/hooks/publish_feature.py'
 INTEGRATE = Path(__file__).resolve().parents[1] / 'harness/hooks/integrate_local.py'
+PROCESS = Path(__file__).resolve().parents[1] / 'harness/hooks/process.py'
 # Python 3.12+ unittest exits 5 when no test ran, so a check fixture needs a real passing test.
 PASSING_CHECK = ('import unittest\n\nclass Check(unittest.TestCase):\n'
                  '    def test_ok(self):\n        self.assertEqual(2 + 2, 4)\n')
@@ -89,6 +90,49 @@ class TerminalCollection(unittest.TestCase):
             output, code = collect_pty(123, 7)
         self.assertEqual(json.loads(output)['status'], 'BLOCKED_REMOTE')
         self.assertEqual(code, 4)
+
+
+def load_process_module():
+    spec = importlib.util.spec_from_file_location('harness_process', PROCESS)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ProcessRunner(unittest.TestCase):
+    """A deadline terminates the process group first; whatever survives the grace is killed."""
+
+    def setUp(self):
+        self.process = load_process_module()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_deadline_lets_a_child_handle_sigterm_before_it_is_killed(self):
+        cleaned = self.root / 'cleaned'
+        child = ('import signal, sys, time\nfrom pathlib import Path\n'
+                 f'signal.signal(signal.SIGTERM, lambda *_: (Path({str(cleaned)!r}).touch(), sys.exit(0)))\n'
+                 'time.sleep(10)\n')
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.process.run([sys.executable, '-c', child], timeout=2)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertTrue(cleaned.exists(), 'child was killed without a chance to clean up')
+
+    def test_child_ignoring_sigterm_is_killed_after_the_grace(self):
+        pid_file = self.root / 'child.pid'
+        child = ('import os, signal, time\nfrom pathlib import Path\n'
+                 'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                 f'Path({str(pid_file)!r}).write_text(str(os.getpid()))\n'
+                 'time.sleep(30)\n')
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.process.run([sys.executable, '-c', child], timeout=2)
+        elapsed = time.monotonic() - started
+        self.assertTrue(pid_file.exists(), 'the fixture child must actually start')
+        self.assertLess(elapsed, self.process.TERMINATION_GRACE_SECONDS + 10)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)
 
 
 class DeliveryHelpers(unittest.TestCase):
@@ -338,6 +382,36 @@ class DeliveryHelpers(unittest.TestCase):
             self.assertIs(json.loads(p.stdout)['merge_aborted'], False)
         time.sleep(3)
         self.assertFalse(late.exists(), 'Git hook child survived the deadline')
+
+    def test_stalled_merge_driver_deadline_leaves_no_stale_index_lock(self):
+        # Git holds index.lock while an external merge driver runs and removes it only from its
+        # SIGTERM handler; a stranded lock would block every later Git mutation in the checkout.
+        self.add_feature_test()
+        (self.repo / 'app.txt').write_text('main divergent\n')
+        cmd('git', 'commit', '-qam', 'diverge', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        started = self.root / 'driver-started'
+        late = self.root / 'driver-finished'
+        driver = self.root / 'stall-driver'
+        driver.write_text('#!/bin/sh\n' + shlex.join([sys.executable, '-c',
+                          f'from pathlib import Path; import time; Path({str(started)!r}).touch(); '
+                          f'time.sleep(3); Path({str(late)!r}).touch()']) + '\n')
+        driver.chmod(0o700)
+        cmd('git', 'config', 'merge.stall.driver', f'{driver} %O %A %B', cwd=self.repo)
+        (self.repo / '.git/info').mkdir(exist_ok=True)
+        (self.repo / '.git/info/attributes').write_text('app.txt merge=stall\n')
+        p = subprocess.run(self.integrate_args('--timeout', '1'), text=True, capture_output=True,
+                           env=isolated_env(), timeout=20)
+        self.assertTrue(started.exists(), 'the merge driver must actually run')
+        self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (3, 'BLOCKED_LOCAL'), p.stdout)
+        self.assertFalse((self.repo / '.git/index.lock').exists(), 'Git could not remove its index lock')
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertNotEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD', cwd=self.repo, check=False).returncode, 0)
+        # Git does not clean its .merge_file_* temporaries on signals; tracked content must be intact.
+        self.assertFalse(cmd('git', 'status', '--porcelain', '--untracked-files=no', cwd=self.repo).stdout.strip())
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'main divergent\n')
+        time.sleep(3)
+        self.assertFalse(late.exists(), 'merge driver survived the deadline')
 
     def test_abort_git_deadline_reports_incomplete_recovery(self):
         self.add_feature_test('raise RuntimeError("fixture failure")\n')
