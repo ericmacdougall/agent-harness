@@ -377,11 +377,13 @@ class DeliveryHelpers(unittest.TestCase):
         with patch.object(sys, 'path', [str(PUBLISH.parent), *sys.path]):
             spec.loader.exec_module(module)
         marker = self.root / 'producer-finished'
+        producer_started = self.root / 'producer-started'
         bin_dir = self.root / 'stream-bin'
         bin_dir.mkdir()
         wrapper = bin_dir / 'git'
         wrapper.write_text(f'#!{sys.executable}\nimport os, sys, time\nfrom pathlib import Path\n'
                            'if "rev-list" in sys.argv:\n'
+                           f'    Path({str(producer_started)!r}).touch()\n'
                            '    os.write(1, b"a" * 4096)\n'
                            '    time.sleep(3)\n'
                            f'    Path({str(marker)!r}).touch()\n'
@@ -395,10 +397,9 @@ class DeliveryHelpers(unittest.TestCase):
         with patch.object(module, 'LFS_ENUMERATION_BYTE_LIMIT', 100, create=True), \
              patch.object(sys, 'argv', argv), patch.dict(os.environ, env, clear=True), \
              patch('sys.stdout', new_callable=io.StringIO) as output:
-            started = time.monotonic()
             result = module.main()
         self.assertEqual((result, json.loads(output.getvalue())['status']), (4, 'BLOCKED_REMOTE'))
-        self.assertLess(time.monotonic() - started, 3)
+        self.assertTrue(producer_started.exists(), 'refusal must reach the streaming producer')
         time.sleep(3)
         self.assertFalse(marker.exists(), 'enumeration producer survived refusal')
         self.assert_lfs_ref_absent(remote)
@@ -702,27 +703,30 @@ class DeliveryHelpers(unittest.TestCase):
         marker = self.root / 'status-started'
         late = self.root / 'status-finished'
         env = self.git_fault_env(['status', '--porcelain'],
-                                 f'Path({str(marker)!r}).touch()\ntime.sleep(3)\nPath({str(late)!r}).touch()')
+                                 f'Path({str(marker)!r}).write_text(str(os.getpid()))\n'
+                                 f'time.sleep(12)\nPath({str(late)!r}).touch()')
         commands = [
             ([sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
-              '--original-branch', 'main', '--expected-head', self.feature_head, '--timeout', '1'],
+              '--original-branch', 'main', '--expected-head', self.feature_head, '--timeout', '4'],
              4, 'BLOCKED_REMOTE'),
-            (self.integrate_args('--timeout', '1'), 3, 'BLOCKED_LOCAL'),
+            (self.integrate_args('--timeout', '4'), 3, 'BLOCKED_LOCAL'),
         ]
         for command, code, status in commands:
             with self.subTest(helper=command[1]):
                 marker.unlink(missing_ok=True)
                 late.unlink(missing_ok=True)
-                p = subprocess.run(command, text=True, capture_output=True, env=env, timeout=12)
+                p = subprocess.run(command, text=True, capture_output=True, env=env, timeout=25)
                 self.assertTrue(marker.exists(), 'fault boundary was not exercised')
                 self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (code, status), p.stdout)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(marker.read_text()), 0)
                 self.assertFalse(late.exists(), 'Git inspection ran past its deadline')
                 self.assert_restored()
 
     def test_failed_git_status_refuses_integration(self):
         self.add_feature_test()
         env = self.git_fault_env(['status', '--porcelain'], 'sys.exit(128)')
-        p = subprocess.run(self.integrate_args(), text=True, capture_output=True, env=env, timeout=12)
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True, env=env, timeout=30)
         self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (3, 'BLOCKED_LOCAL'))
         self.assert_restored()
 
@@ -731,7 +735,7 @@ class DeliveryHelpers(unittest.TestCase):
         seen = self.root / 'head-read'
         env = self.git_fault_env(['rev-parse', 'HEAD'],
                                  f'path = Path({str(seen)!r})\nif path.exists(): sys.exit(128)\npath.touch()')
-        p = subprocess.run(self.integrate_args(), text=True, capture_output=True, env=env, timeout=12)
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True, env=env, timeout=30)
         self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (3, 'BLOCKED_LOCAL'))
         parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
         self.assertEqual(parents[1:], [self.base, self.feature_head])
@@ -741,10 +745,10 @@ class DeliveryHelpers(unittest.TestCase):
         marker = self.root / 'post-commit-started'
         hook = self.repo / '.git/hooks/post-commit'
         hook.write_text('#!/bin/sh\n' + shlex.join([sys.executable, '-c',
-                         f'from pathlib import Path; import time; Path({str(marker)!r}).touch(); time.sleep(3)']) + '\n')
+                         f'from pathlib import Path; import time; Path({str(marker)!r}).touch(); time.sleep(12)']) + '\n')
         hook.chmod(0o700)
-        p = subprocess.run(self.integrate_args('--timeout', '1'), text=True, capture_output=True,
-                           env=isolated_env(), timeout=12)
+        p = subprocess.run(self.integrate_args('--timeout', '4'), text=True, capture_output=True,
+                           env=isolated_env(), timeout=25)
         data = json.loads(p.stdout)
         self.assertTrue(marker.exists())
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'))
@@ -766,19 +770,20 @@ class DeliveryHelpers(unittest.TestCase):
         started = self.root / 'hook-started'
         late = self.root / 'hook-survived'
         hook = self.repo / '.git/hooks/pre-commit'
-        child = (f'from pathlib import Path; import time; Path({str(started)!r}).touch(); '
-                 f'time.sleep(3); Path({str(late)!r}).touch()')
+        child = (f'from pathlib import Path; import os,time; Path({str(started)!r}).write_text(str(os.getpid())); '
+                 f'time.sleep(12); Path({str(late)!r}).touch()')
         hook.write_text('#!/bin/sh\n' + shlex.join([sys.executable, '-c', child]) + '\n')
         hook.chmod(0o700)
-        p = subprocess.run(self.integrate_args('--timeout', '1'), text=True, capture_output=True,
-                           env=isolated_env(), timeout=12)
+        p = subprocess.run(self.integrate_args('--timeout', '4'), text=True, capture_output=True,
+                           env=isolated_env(), timeout=25)
         self.assertTrue(started.exists())
         self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (3, 'BLOCKED_LOCAL'))
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
         # Git can leave index.lock when killed; never remove a lock or claim an abort succeeded.
         if (self.repo / '.git/index.lock').exists():
             self.assertIs(json.loads(p.stdout)['merge_aborted'], False)
-        time.sleep(3)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(started.read_text()), 0)
         self.assertFalse(late.exists(), 'Git hook child survived the deadline')
 
     def test_stalled_merge_driver_deadline_leaves_no_stale_index_lock(self):

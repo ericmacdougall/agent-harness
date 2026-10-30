@@ -116,13 +116,13 @@ class InstallerTests(unittest.TestCase):
         from install import atomic_write
         swapped = False
 
-        def swap_before_first_write(path, data, mode=0o600):
+        def swap_before_first_write(path, data, mode=0o600, **kwargs):
             nonlocal swapped
             if not swapped:
                 swapped = True
                 (self.claude / 'agents').rename(self.claude / 'agents-moved')
                 (self.claude / 'agents').symlink_to(outside, target_is_directory=True)
-            return atomic_write(path, data, mode)
+            return atomic_write(path, data, mode, **kwargs)
 
         with patch('install.atomic_write', side_effect=swap_before_first_write):
             with self.assertRaises((OSError, ValueError, RuntimeError)):
@@ -137,23 +137,70 @@ class InstallerTests(unittest.TestCase):
         outside.mkdir()
         sentinel = outside / 'task-owner.md'
         sentinel.write_text('outside private fixture')
-        from shutil import copy2
+        from install import atomic_write
         swapped = False
 
-        def swap_before_backup(source, destination, *args, **kwargs):
+        def swap_before_backup(path, data, mode=0o600, **kwargs):
             nonlocal swapped
-            if not swapped and Path(source) == self.claude / 'agents/task-owner.md':
+            if not swapped and 'agent-harness-backups' in path.parts:
                 swapped = True
                 (self.claude / 'agents').rename(self.claude / 'agents-moved')
-                (self.claude / 'agents').symlink_to(outside, target_is_directory=True)
-            return copy2(source, destination, *args, **kwargs)
+                outside.rename(self.claude / 'agents')
+            return atomic_write(path, data, mode, **kwargs)
 
-        with patch('shutil.copy2', side_effect=swap_before_backup):
-            install(self.home, apply=True)
-        self.assertFalse(swapped, 'backup must use the pinned original snapshot')
-        self.assertEqual(sentinel.read_text(), 'outside private fixture')
+        with patch('install.atomic_write', side_effect=swap_before_backup):
+            with self.assertRaises((OSError, RuntimeError)):
+                install(self.home, apply=True)
+        self.assertTrue(swapped, 'backup mutation must actually run')
+        self.assertEqual((self.claude / 'agents/task-owner.md').read_text(), 'outside private fixture')
         saved, = (self.claude / 'agent-harness-backups').rglob('task-owner.md')
         self.assertEqual(saved.read_text(), 'old owner\n')
+
+    def test_real_directory_replacement_after_backups_never_overwrites_unrelated_files(self):
+        self.seed_existing_installation()
+        outside = self.home / 'outside'
+        outside.mkdir()
+        sentinel = outside / 'task-owner.md'
+        sentinel.write_text('unrelated outside file')
+        from install import atomic_write
+        swapped = False
+
+        def swap_after_backups(path, data, mode=0o600, **kwargs):
+            nonlocal swapped
+            if not swapped and path == self.claude / 'agents/task-owner.md':
+                swapped = True
+                (self.claude / 'agents').rename(self.claude / 'agents-moved')
+                outside.rename(self.claude / 'agents')
+            return atomic_write(path, data, mode, **kwargs)
+
+        with patch('install.atomic_write', side_effect=swap_after_backups):
+            with self.assertRaises((OSError, RuntimeError)):
+                install(self.home, apply=True)
+        self.assertTrue(swapped)
+        self.assertEqual((self.claude / 'agents/task-owner.md').read_text(), 'unrelated outside file')
+
+    def test_rollback_refuses_a_real_directory_replacement_after_one_write(self):
+        self.seed_existing_installation()
+        outside = self.home / 'outside'
+        outside.mkdir()
+        (outside / 'task-owner.md').write_text('unrelated owner')
+        from install import atomic_write
+        swapped = False
+
+        def swap_on_second_managed_write(path, data, mode=0o600, **kwargs):
+            nonlocal swapped
+            if not swapped and path == self.claude / 'agents/click-tester.md':
+                swapped = True
+                (self.claude / 'agents').rename(self.claude / 'agents-moved')
+                outside.rename(self.claude / 'agents')
+            return atomic_write(path, data, mode, **kwargs)
+
+        with patch('install.atomic_write', side_effect=swap_on_second_managed_write):
+            with self.assertRaisesRegex(RuntimeError, 'rollback incomplete'):
+                install(self.home, apply=True)
+        self.assertTrue(swapped)
+        self.assertEqual((self.claude / 'agents/task-owner.md').read_text(), 'unrelated owner')
+        self.assertFalse((self.claude / 'agents/click-tester.md').exists())
 
     def test_installed_delivery_helpers_can_start(self):
         import subprocess
@@ -263,14 +310,14 @@ class InstallerTests(unittest.TestCase):
                 writes = 0
                 fired = False
 
-                def fail_at_boundary(path, data, mode=0o600):
+                def fail_at_boundary(path, data, mode=0o600, **kwargs):
                     nonlocal writes, fired
                     if 'agent-harness-backups' not in path.parts and not fired:
                         if writes == boundary and not fired:
                             fired = True
                             raise OSError('fixture: interrupted managed write')
                         writes += 1
-                    return atomic_write(path, data, mode)
+                    return atomic_write(path, data, mode, **kwargs)
 
                 with patch('install.atomic_write', side_effect=fail_at_boundary):
                     with self.assertRaisesRegex(OSError, 'interrupted managed write'):
@@ -297,14 +344,14 @@ class InstallerTests(unittest.TestCase):
                 marker.write_text('unchanged')
                 swapped = False
 
-                def swap_before_target(path, data, mode=0o600):
+                def swap_before_target(path, data, mode=0o600, **kwargs):
                     nonlocal swapped
                     target = claude if name == '.claude' else claude / name
                     if not swapped and (name == '.claude' or path.parent == target):
                         swapped = True
                         target.rename(target.with_name(target.name + '-moved'))
                         target.symlink_to(outside, target_is_directory=True)
-                    return atomic_write(path, data, mode)
+                    return atomic_write(path, data, mode, **kwargs)
 
                 with patch('install.atomic_write', side_effect=swap_before_target):
                     with self.assertRaises((OSError, RuntimeError)):
@@ -344,14 +391,14 @@ class InstallerTests(unittest.TestCase):
         from install import atomic_write
         swapped = False
 
-        def swap_before_backup(path, data, mode=0o600):
+        def swap_before_backup(path, data, mode=0o600, **kwargs):
             nonlocal swapped
             backup_root = self.claude / 'agent-harness-backups'
             if not swapped and backup_root in path.parents:
                 swapped = True
                 backup_root.rename(self.claude / 'backups-moved')
                 backup_root.symlink_to(outside, target_is_directory=True)
-            return atomic_write(path, data, mode)
+            return atomic_write(path, data, mode, **kwargs)
 
         with patch('install.atomic_write', side_effect=swap_before_backup):
             with self.assertRaises(OSError):

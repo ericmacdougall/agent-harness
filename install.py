@@ -82,17 +82,12 @@ def merged_instructions(existing: str, instructions: str) -> str:
 
 
 @contextlib.contextmanager
-def parent_fd(path: Path, *, create: bool = False):
+def parent_fd(path: Path):
     """Pin each parent directory without following a swapped symlink."""
     parts = path.absolute().parts
     directory = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for name in parts[1:-1]:
-            if create:
-                try:
-                    os.mkdir(name, dir_fd=directory)
-                except FileExistsError:
-                    pass
             child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                             dir_fd=directory)
             os.close(directory)
@@ -109,8 +104,67 @@ def require_current_parent(path: Path, pinned: int) -> None:
             raise OSError(f'Parent directory changed for {path.name}')
 
 
-def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
-    with parent_fd(path, create=True) as directory:
+def require_pinned_parent(path: Path, directory: int, pinned_parent) -> None:
+    if pinned_parent is not None:
+        opened, pinned = os.fstat(directory), os.fstat(pinned_parent)
+        if (opened.st_dev, opened.st_ino) != (pinned.st_dev, pinned.st_ino):
+            raise OSError(f'Parent directory replaced for {path.name}')
+    require_current_parent(path, directory)
+
+
+class DirectoryPins:
+    """Keep original directory inodes alive until install or rollback finishes."""
+
+    def __init__(self):
+        self.fds = {}
+
+    def capture(self, path: Path) -> None:
+        try:
+            with parent_fd(path / '.anchor') as directory:
+                self.fds[path] = os.dup(directory)
+        except FileNotFoundError:
+            self.fds[path] = None
+
+    def fd(self, path: Path):
+        return self.fds.get(path)
+
+    def verify(self, path: Path) -> None:
+        pinned = self.fds[path]
+        if pinned is None:
+            try:
+                with parent_fd(path) as parent:
+                    os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            raise OSError(f'Directory appeared during installation: {path}')
+        with parent_fd(path / '.anchor') as current:
+            opened, named = os.fstat(pinned), os.fstat(current)
+            if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+                raise OSError(f'Directory replaced during installation: {path}')
+
+    def create(self, path: Path, *, mode: int = 0o700) -> None:
+        if path not in self.fds:
+            self.fds[path] = None
+        if self.fds[path] is not None:
+            self.verify(path)
+            return
+        with parent_fd(path) as parent:
+            require_pinned_parent(path, parent, self.fds[path.parent])
+            os.mkdir(path.name, mode=mode, dir_fd=parent)
+            self.fds[path] = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                     dir_fd=parent)
+        self.verify(path)
+
+    def close(self) -> None:
+        for directory in self.fds.values():
+            if directory is not None:
+                os.close(directory)
+        self.fds.clear()
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600, *, pinned_parent=None) -> None:
+    with parent_fd(path) as directory:
+        require_pinned_parent(path, directory, pinned_parent)
         temporary = ".agent-harness-" + secrets.token_hex(12)
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o600, dir_fd=directory)
@@ -120,10 +174,10 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
                 handle.flush()
                 os.fsync(handle.fileno())
                 os.fchmod(handle.fileno(), mode)
-            require_current_parent(path, directory)
+            require_pinned_parent(path, directory, pinned_parent)
             os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
             os.fsync(directory)
-            require_current_parent(path, directory)
+            require_pinned_parent(path, directory, pinned_parent)
         finally:
             try:
                 os.unlink(temporary, dir_fd=directory)
@@ -131,28 +185,31 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
                 pass
 
 
-def safe_unlink(path: Path) -> None:
+def safe_unlink(path: Path, *, pinned_parent=None) -> None:
     opened_parent = False
     try:
         with parent_fd(path) as directory:
             opened_parent = True
-            require_current_parent(path, directory)
+            require_pinned_parent(path, directory, pinned_parent)
             try:
                 os.unlink(path.name, dir_fd=directory)
             except FileNotFoundError:
                 pass
-            require_current_parent(path, directory)
+            require_pinned_parent(path, directory, pinned_parent)
     except FileNotFoundError:
         if opened_parent:
             raise
 
 
-def read_regular(path: Path):
+def read_regular(path: Path, *, pinned_parent=None):
     """Return file bytes and mode, or None if absent; never follow a late symlink/FIFO."""
     opened_parent = False
     try:
         with parent_fd(path) as directory:
             opened_parent = True
+            if pinned_parent is None:
+                raise OSError(f'Unexpected parent directory for {path.name}')
+            require_pinned_parent(path, directory, pinned_parent)
             try:
                 fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
                              dir_fd=directory)
@@ -163,7 +220,7 @@ def read_regular(path: Path):
                 if not stat.S_ISREG(info.st_mode):
                     raise ValueError(f'{path.name} must remain a regular file')
                 contents = handle.read()
-                require_current_parent(path, directory)
+                require_pinned_parent(path, directory, pinned_parent)
                 return contents, stat.S_IMODE(info.st_mode)
     except FileNotFoundError:
         if opened_parent:
@@ -186,56 +243,72 @@ def install(home: Path, apply: bool) -> list[str]:
         raise ValueError("Each managed destination must be a regular file")
     if any(path.exists() and not path.is_dir() for path in directories):
         raise ValueError("Each managed directory must be a directory")
-    existing_instructions = read_regular(claude / "CLAUDE.md")
-    current_text = existing_instructions[0].decode() if existing_instructions else ""
-    instructions = merged_instructions(current_text, (ROOT / "HARNESS.md").read_text())
-    settings_path = claude / "settings.json"
-    existing_settings = read_regular(settings_path)
-    current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
-    if not isinstance(current_settings, dict):
-        raise ValueError("settings.json must contain an object")
-    settings = merged_settings(current_settings, claude)
-    # Read every payload before any managed write (also validate the payload in preview).
-    payloads = [(destination, source.read_bytes()) for source, destination in files]
-    payloads += [(claude / "CLAUDE.md", instructions.encode()),
-                 (settings_path, (json.dumps(settings, indent=2) + "\n").encode())]
-    changes = [str(path) for path in managed]
-    if not apply:
-        return changes
-    originals = {path: read_regular(path) for path in managed}
     backup_root = claude / "agent-harness-backups"
-    backups = backup_root / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-                             + '-' + secrets.token_hex(4))
-    with parent_fd(backup_root / '.anchor', create=True) as directory:
-        os.fchmod(directory, 0o700)  # backups hold settings.json, which may carry env values
-        os.mkdir(backups.name, mode=0o700, dir_fd=directory)
-    with parent_fd(backups / '.anchor') as directory:
-        os.fchmod(directory, 0o700)
-    for path in managed:
-        if originals[path] is not None:
-            saved = backups / path.relative_to(claude)
-            atomic_write(saved, originals[path][0])
-    attempted = []
+    pins = DirectoryPins()
     try:
-        for destination, data in payloads:
-            attempted.append(destination)
-            atomic_write(destination, data)
-    except BaseException as error:
-        failures = []
-        for path in reversed(attempted):
-            try:
-                original = originals[path]
-                if original is None:
-                    safe_unlink(path)
-                else:
-                    atomic_write(path, *original)
-            except OSError:
-                failures.append(str(path.relative_to(claude)))
-        if failures:
-            raise RuntimeError(f"Installation failed; rollback incomplete for {', '.join(failures)}; "
-                               f"restore from {backups}") from error
-        raise
-    return changes
+        for directory in (claude.parent, claude, claude / 'agents', claude / 'hooks',
+                          claude / 'tools', backup_root):
+            pins.capture(directory)
+        instructions_path = claude / "CLAUDE.md"
+        existing_instructions = read_regular(instructions_path, pinned_parent=pins.fd(claude))
+        current_text = existing_instructions[0].decode() if existing_instructions else ""
+        instructions = merged_instructions(current_text, (ROOT / "HARNESS.md").read_text())
+        settings_path = claude / "settings.json"
+        existing_settings = read_regular(settings_path, pinned_parent=pins.fd(claude))
+        current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
+        if not isinstance(current_settings, dict):
+            raise ValueError("settings.json must contain an object")
+        settings = merged_settings(current_settings, claude)
+        # Read every payload before any managed write (also validate it in preview).
+        payloads = [(destination, source.read_bytes()) for source, destination in files]
+        payloads += [(instructions_path, instructions.encode()),
+                     (settings_path, (json.dumps(settings, indent=2) + "\n").encode())]
+        changes = [str(path) for path in managed]
+        if not apply:
+            return changes
+        originals = {path: read_regular(path, pinned_parent=pins.fd(path.parent))
+                     for path in managed}
+        if originals[instructions_path] != existing_instructions or originals[settings_path] != existing_settings:
+            raise OSError('User settings or instructions changed during installation preflight; retry')
+        # Exclusive creation rejects a real directory that appears after snapshot.
+        for directory in (claude, claude / 'agents', claude / 'hooks', claude / 'tools', backup_root):
+            pins.create(directory)
+        os.fchmod(pins.fd(backup_root), 0o700)  # backups can include env values
+        pins.verify(backup_root)
+        backups = backup_root / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                                 + '-' + secrets.token_hex(4))
+        pins.create(backups)
+        os.fchmod(pins.fd(backups), 0o700)
+        pins.verify(backups)
+        for path in managed:
+            if originals[path] is not None:
+                saved = backups / path.relative_to(claude)
+                if saved.parent != backups:
+                    pins.create(saved.parent)
+                atomic_write(saved, originals[path][0], pinned_parent=pins.fd(saved.parent))
+        attempted = []
+        try:
+            for destination, data in payloads:
+                attempted.append(destination)
+                atomic_write(destination, data, pinned_parent=pins.fd(destination.parent))
+        except BaseException as error:
+            failures = []
+            for path in reversed(attempted):
+                try:
+                    original = originals[path]
+                    if original is None:
+                        safe_unlink(path, pinned_parent=pins.fd(path.parent))
+                    else:
+                        atomic_write(path, *original, pinned_parent=pins.fd(path.parent))
+                except OSError:
+                    failures.append(str(path.relative_to(claude)))
+            if failures:
+                raise RuntimeError(f"Installation failed; rollback incomplete for {', '.join(failures)}; "
+                                   f"restore from {backups}") from error
+            raise
+        return changes
+    finally:
+        pins.close()
 
 
 def main() -> None:

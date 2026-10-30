@@ -27,8 +27,10 @@ class ChaosProcesses(unittest.TestCase):
                     'gate=Path(sys.argv[1]); deadline=time.monotonic()+10\n'
                     'while not gate.exists() and time.monotonic()<deadline: time.sleep(.005)\n'
                     'if not gate.exists(): raise SystemExit(9)\n'
-                    'raise SystemExit(subprocess.call([sys.executable,sys.argv[2],"--apply","--home",sys.argv[3]],'
-                    'stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))\n')
+                    'result=subprocess.run([sys.executable,sys.argv[2],"--apply","--home",sys.argv[3]],'
+                    'capture_output=True,text=True)\n'
+                    'if result.returncode: sys.stderr.write(result.stderr)\n'
+                    'raise SystemExit(result.returncode)\n')
             workers = []
             try:
                 for _ in range(8):
@@ -42,7 +44,17 @@ class ChaosProcesses(unittest.TestCase):
                     if worker.poll() is None:
                         worker.kill()
                         worker.communicate(timeout=5)
-            self.assertEqual([code for _, code in results], [0] * 8, results)
+            self.assertIn(0, [code for _, code in results], results)
+            for streams, code in results:
+                if code:
+                    self.assertEqual(code, 1, streams)
+                    self.assertTrue(any(reason in streams[1] for reason in
+                                        ('Directory appeared during installation', 'Directory replaced during installation',
+                                         'Unexpected parent directory', 'User settings or instructions changed',
+                                         'FileExistsError')), streams)
+                    retry = subprocess.run([sys.executable, str(ROOT / 'install.py'), '--apply', '--home', str(home)],
+                                           capture_output=True, text=True, timeout=20)
+                    self.assertEqual(retry.returncode, 0, retry.stderr)
             text = (claude / 'CLAUDE.md').read_text()
             self.assertIn('Existing user guidance.', text)
             self.assertEqual(text.count('<!-- agent-harness:start -->'), 1)
