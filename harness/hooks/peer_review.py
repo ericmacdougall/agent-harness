@@ -60,30 +60,31 @@ def main() -> int:
     repo = args.repo.resolve()
     packet = args.packet.expanduser().absolute()
     output_arg = args.output.expanduser().absolute()
-    if output_arg.is_symlink():
-        parser.error('output must not be a symlink')
-    output = output_arg.parent.resolve() / output_arg.name
-    if output == repo or repo in output.parents:
-        parser.error('output must be outside the review worktree')
-    if output == packet:
-        parser.error('output must differ from packet')
-    # Clear a previous verdict even when this run rejects the packet or repository.
-    try:
-        output.unlink(missing_ok=True)
-    except OSError as error:
-        parser.error(f'output must be a writable file path: {error}')
     if not repo.is_dir():
         parser.error('repo must exist')
-    try:
-        content = read_packet(packet)
-    except (OSError, ValueError) as error:
-        parser.error(f'invalid packet: {error}')
     try:
         git_check = run_process(["git", "-C", str(repo), "rev-parse", "--show-toplevel"], timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         parser.error("repo Git inspection failed or timed out")
     if git_check.returncode or Path(git_check.stdout.strip()).resolve() != repo:
         parser.error("repo must be a git worktree root")
+    if output_arg.is_symlink():
+        parser.error('output must not be a symlink')
+    output = output_arg.parent.resolve() / output_arg.name
+    if output == repo or repo in output.parents:
+        parser.error('output must be outside the review worktree')
+    if output == packet.parent.resolve() / packet.name:
+        parser.error('output must differ from packet')
+    # Clear a previous verdict after confirming it cannot be a repository file
+    # or the packet, but before rejecting an invalid packet.
+    try:
+        output.unlink(missing_ok=True)
+    except OSError as error:
+        parser.error(f'output must be a writable file path: {error}')
+    try:
+        content = read_packet(packet)
+    except (OSError, ValueError) as error:
+        parser.error(f'invalid packet: {error}')
     stage_rules = (
         "Planning gate: judge the proposed design, acceptance criteria, edge cases, test strategy, "
         "and rollout/rollback plan. You may read repository context. Do not BLOCK solely for an "

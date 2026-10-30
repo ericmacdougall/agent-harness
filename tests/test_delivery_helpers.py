@@ -144,6 +144,19 @@ class ProcessRunner(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(int(pid_file.read_text()), 0)
 
+    def test_streamed_timeout_preserves_descendant_term_grace(self):
+        marker = self.root / 'grace-complete'
+        child = ('import signal, sys, time; from pathlib import Path\n'
+                 f'path=Path({str(marker)!r})\n'
+                 'def finish(*_):\n    time.sleep(0.5)\n    path.write_text("done")\n    sys.exit(0)\n'
+                 'signal.signal(signal.SIGTERM, finish)\n'
+                 'time.sleep(30)\n')
+        parent = ('import subprocess, sys, time; '
+                  f'subprocess.Popen([sys.executable, "-c", {child!r}]); time.sleep(30)')
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.process.run([sys.executable, '-c', parent], timeout=1, stream=True)
+        self.assertEqual(marker.read_text(), 'done')
+
 
 class DeliveryHelpers(unittest.TestCase):
     def setUp(self):
@@ -220,6 +233,52 @@ class DeliveryHelpers(unittest.TestCase):
                            env=env, text=True, capture_output=True, timeout=20)
         self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (0, 'PUSHED'), p.stdout + p.stderr)
         self.assertNotIn('sensitive-url-marker', capture.read_text())
+
+    def test_relative_push_url_targets_source_relative_repository(self):
+        project = self.root / 'nested'
+        source = project / 'feature'
+        source.mkdir(parents=True)
+        cmd('git', 'init', '-q', '-b', 'feat/relative', str(source))
+        cmd('git', 'config', 'user.email', 'test@example.invalid', cwd=source)
+        cmd('git', 'config', 'user.name', 'Harness test', cwd=source)
+        cmd('git', 'commit', '-q', '--allow-empty', '-m', 'reviewed', cwd=source)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=source).stdout.strip()
+        safe = project / 'real.git'
+        hostile = self.root / 'real.git'
+        for remote in (safe, hostile):
+            cmd('git', 'init', '-q', '--bare', str(remote))
+            cmd('git', 'push', '-q', str(remote), 'HEAD:refs/heads/main', cwd=source)
+            cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        cmd('git', 'remote', 'add', 'origin', '../real.git', cwd=source)
+        env = isolated_env()
+        env['TMPDIR'] = str(self.root)
+        p = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(source), '--branch', 'feat/relative',
+                            '--original-branch', 'main', '--expected-head', reviewed],
+                           env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (0, 'PUSHED'), p.stdout + p.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'feat/relative', cwd=safe).stdout.strip(), reviewed)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/relative', cwd=hostile,
+                                check=False).returncode, 0)
+
+    def test_sha256_repository_can_publish_through_isolated_transport(self):
+        source = self.root / 'sha256-source'
+        created = cmd('git', 'init', '-q', '--object-format=sha256', '-b', 'feat/hash', str(source), check=False)
+        if created.returncode:
+            self.skipTest('Git lacks SHA-256 repository support')
+        cmd('git', 'config', 'user.email', 'test@example.invalid', cwd=source)
+        cmd('git', 'config', 'user.name', 'Harness test', cwd=source)
+        cmd('git', 'commit', '-q', '--allow-empty', '-m', 'reviewed', cwd=source)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=source).stdout.strip()
+        remote = self.root / 'sha256-remote.git'
+        cmd('git', 'init', '-q', '--bare', '--object-format=sha256', str(remote))
+        cmd('git', 'push', '-q', str(remote), 'HEAD:refs/heads/main', cwd=source)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=source)
+        p = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(source), '--branch', 'feat/hash',
+                            '--original-branch', 'main', '--expected-head', reviewed],
+                           env=isolated_env(), capture_output=True, text=True, timeout=20)
+        self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (0, 'PUSHED'), p.stdout + p.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'feat/hash', cwd=remote).stdout.strip(), reviewed)
 
     def test_publish_refuses_remote_default_with_nonstandard_name(self):
         remote = self.root / 'origin.git'
@@ -582,9 +641,32 @@ class DeliveryHelpers(unittest.TestCase):
                            env=isolated_env(), timeout=20)
         data = json.loads(p.stdout)
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
-        self.assertTrue(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
-        parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
-        self.assertEqual(parents[1:], [self.base, self.feature_head])
+        self.assertNotEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.feature_head)
+        self.assertNotEqual(data['status'], 'INTEGRATED')
+
+    def test_staged_check_side_effect_cannot_enter_merge_commit(self):
+        self.add_feature_test('import subprocess, unittest\nfrom pathlib import Path\n'
+                              'class Check(unittest.TestCase):\n'
+                              '    def test_staged_side_effect(self):\n'
+                              '        Path("app.txt").write_text("unreviewed staged edit\\n")\n'
+                              '        subprocess.run(["git", "add", "app.txt"], check=True)\n')
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                           env=isolated_env(), timeout=20)
+        data = json.loads(p.stdout)
+        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+
+    def test_precommit_hook_tree_mutation_cannot_report_integration(self):
+        self.add_feature_test()
+        hook = self.repo / '.git/hooks/pre-commit'
+        hook.write_text('#!/bin/sh\nprintf "hook change\\n" > app.txt\ngit add app.txt\n')
+        hook.chmod(0o700)
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                           env=isolated_env(), timeout=20)
+        data = json.loads(p.stdout)
+        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
+        self.assertIn('verified merge tree', data['message'])
+        self.assertNotEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
 
     def test_post_commit_hook_moving_head_cannot_report_integration(self):
         self.add_feature_test()

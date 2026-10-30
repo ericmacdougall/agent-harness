@@ -34,6 +34,14 @@ def scrub(value):
     return value.strip()[:1200]
 
 
+def pinned_url(url, repo):
+    # Git resolves a local relative remote against the current -C directory.
+    # The isolated transport uses another directory, so make that target stable.
+    if '://' not in url and ':' not in url:
+        return str((repo / Path(url).expanduser()).resolve())
+    return url
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, required=True)
@@ -89,20 +97,21 @@ def publish(args):
     if len(urls) != 1:
         report("BLOCKED_POLICY", "Publication requires exactly one push destination", branch=args.branch, remote=remote)
         return 2
+    destination = pinned_url(urls[0], repo)
     # Keep credential-bearing URLs out of process arguments. The temporary
     # remote exists only in this command's environment and is never persisted.
     pinned_remote = "harness-push-" + secrets.token_hex(12)
     pinned_env = {
         "GIT_CONFIG_COUNT": "2",
         "GIT_CONFIG_KEY_0": f"remote.{pinned_remote}.url",
-        "GIT_CONFIG_VALUE_0": urls[0],
+        "GIT_CONFIG_VALUE_0": destination,
         "GIT_CONFIG_KEY_1": f"remote.{pinned_remote}.pushurl",
-        "GIT_CONFIG_VALUE_1": urls[0],
+        "GIT_CONFIG_VALUE_1": destination,
     }
     # get-url already expanded rewrites. Refuse a second expansion that would make
     # ls-remote inspect a different repository from the one `push origin` uses.
     inspected = git(repo, "ls-remote", "--get-url", "--", pinned_remote, env_extra=pinned_env)
-    if inspected.returncode or inspected.stdout.strip() != urls[0]:
+    if inspected.returncode or inspected.stdout.strip() != destination:
         report("BLOCKED_POLICY", "Push destination cannot be inspected without another URL rewrite",
                branch=args.branch, remote=remote)
         return 2
@@ -136,7 +145,12 @@ def publish(args):
             transport = Path(temporary) / 'transport.git'
             template = Path(temporary) / 'empty-template'
             template.mkdir()
-            initialized = git(temporary, 'init', '--bare', '--template', str(template), str(transport))
+            object_format = git(repo, 'rev-parse', '--show-object-format=storage')
+            format_name = object_format.stdout.strip()
+            if object_format.returncode or format_name not in {'sha1', 'sha256'}:
+                report('BLOCKED_REMOTE', 'Could not determine source object format', branch=args.branch, remote=remote)
+                return 4
+            initialized = git(temporary, 'init', '--bare', f'--object-format={format_name}', '--template', str(template), str(transport))
             if initialized.returncode:
                 report('BLOCKED_REMOTE', 'Could not prepare isolated publication transport', branch=args.branch, remote=remote)
                 return 4
@@ -151,7 +165,7 @@ def publish(args):
                 report('BLOCKED_REMOTE', 'Could not load verified commit for publication', branch=args.branch, remote=remote)
                 return 4
             resolved = git(transport, 'ls-remote', '--get-url', '--', pinned_remote, env_extra=pinned_env)
-            if resolved.returncode or resolved.stdout.strip() != urls[0]:
+            if resolved.returncode or resolved.stdout.strip() != destination:
                 report('BLOCKED_POLICY', 'Isolated transport would rewrite the inspected destination', branch=args.branch, remote=remote)
                 return 2
             result = git(transport, 'push', '--porcelain', pinned_remote,

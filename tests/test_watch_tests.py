@@ -80,6 +80,31 @@ class WatchTests(unittest.TestCase):
             os.killpg(process.pid, signal.SIGTERM)
             process.communicate(timeout=5)
 
+    def test_ctrl_c_during_test_run_stops_child_without_traceback(self):
+        child_pid = self.root / 'test.pid'
+        code = (f'import os, time; from pathlib import Path; '
+                f'Path({str(child_pid)!r}).write_text(str(os.getpid())); time.sleep(30)')
+        process = subprocess.Popen([sys.executable, str(WATCH), '--root', str(self.root), '--once',
+                                    '--', sys.executable, '-c', code],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not child_pid.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(child_pid.exists())
+            os.kill(process.pid, signal.SIGINT)
+            output, errors = process.communicate(timeout=8)
+            self.assertEqual(process.returncode, 130, output + errors)
+            self.assertIn('[watch] stopped during test run', output)
+            self.assertNotIn('Traceback', errors)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(child_pid.read_text()), 0)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=5)
+
 
 if __name__ == '__main__':
     unittest.main()

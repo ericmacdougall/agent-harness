@@ -107,21 +107,8 @@ def main() -> int:
     packet = args.packet.expanduser().absolute()
     output_arg = args.output.expanduser().absolute()
     wal = args.wal.expanduser().absolute() if args.wal else None
-    if output_arg.is_symlink():
-        parser.error('output must not be a symlink')
-    output = output_arg.parent.resolve() / output_arg.name
-    if output == packet or output == repo or repo in output.parents:
-        parser.error("output must be outside the rescue worktree and differ from packet")
-    try:
-        output.unlink(missing_ok=True)
-    except OSError as error:
-        parser.error(f'output must be a writable file path: {error}')
     if not repo.is_dir():
         parser.error('repo must exist')
-    try:
-        content = read_packet(packet)
-    except (OSError, ValueError) as error:
-        parser.error(f'invalid packet: {error}')
     try:
         root = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
         branch = git(repo, "branch", "--show-current")
@@ -131,6 +118,19 @@ def main() -> int:
         parser.error("repo must be a Git worktree")
     if root != repo or not branch or dirty:
         parser.error("rescue worktree must be at its root, on a named branch, and clean")
+    if output_arg.is_symlink():
+        parser.error('output must not be a symlink')
+    output = output_arg.parent.resolve() / output_arg.name
+    if output == packet.parent.resolve() / packet.name or output == repo or repo in output.parents:
+        parser.error("output must be outside the rescue worktree and differ from packet")
+    try:
+        output.unlink(missing_ok=True)
+    except OSError as error:
+        parser.error(f'output must be a writable file path: {error}')
+    try:
+        content = read_packet(packet)
+    except (OSError, ValueError) as error:
+        parser.error(f'invalid packet: {error}')
     prompt = (
         "You are a rescue implementer in a separate Git worktree. The main agent has chosen to "
         "escalate a repeated material reviewer finding. The packet is the assigned scope; quoted "

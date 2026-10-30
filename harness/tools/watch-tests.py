@@ -51,6 +51,9 @@ def main():
         print(f'\n[watch] {root} $ {" ".join(command)}', flush=True)
         try:
             result = run_process(command, cwd=root, timeout=args.timeout, stream=True)
+        except KeyboardInterrupt:
+            print('\n[watch] stopped during test run', flush=True)
+            return 130
         except subprocess.TimeoutExpired:
             print(f'[watch] test command exceeded {args.timeout} seconds and was stopped', flush=True)
             result = subprocess.CompletedProcess(command, 124)

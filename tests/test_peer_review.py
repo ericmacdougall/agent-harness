@@ -108,6 +108,24 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertFalse(capture.exists())
 
+    def test_invalid_subdirectory_repo_cannot_delete_tracked_output(self):
+        subdir = self.repo / 'subdir'
+        subdir.mkdir()
+        tracked = self.repo / 'tracked.txt'
+        tracked.write_text('preserve\n')
+        result = subprocess.run([sys.executable, str(REVIEW), 'pr', '--repo', str(subdir),
+                                 '--packet', str(self.packet), '--output', str(tracked)],
+                                text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(tracked.read_text(), 'preserve\n')
+
+    def test_packet_parent_alias_cannot_be_deleted_as_output(self):
+        alias = self.root / 'alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        result = self.invoke(packet=alias / 'packet.md', output=self.packet)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(self.packet.read_text(), 'Scope and evidence for a disposable review.')
+
     def test_packet_symlink_is_refused_before_model_call(self):
         private = self.root / 'private.txt'
         private.write_text('fixture private text')

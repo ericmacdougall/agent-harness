@@ -3,6 +3,7 @@
 import os
 import signal
 import subprocess
+import time
 
 # Git removes its lock files from its SIGTERM handler; SIGKILL skips that cleanup.
 TERMINATION_GRACE_SECONDS = 2
@@ -27,11 +28,22 @@ def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True, str
     try:
         stdout, stderr = process.communicate(input=input, timeout=timeout)
     except BaseException:
+        deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
         signal_group(process.pid, signal.SIGTERM)
         try:
             process.communicate(timeout=TERMINATION_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             pass
+        # With streamed output the leader can exit while descendants are still
+        # handling TERM. Give the entire group the promised grace period.
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                break
+            except PermissionError:
+                pass
+            time.sleep(min(0.05, deadline - time.monotonic()))
         # Anything that ignored SIGTERM, or kept running after the leader exited, is killed.
         signal_group(process.pid, signal.SIGKILL)
         # Even a child that deliberately escaped the group must not hold us on a pipe.

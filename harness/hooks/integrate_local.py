@@ -133,6 +133,10 @@ def integrate(args, preparations, checks):
         merge = git(repo, "merge", "--no-ff", "--no-commit", source.stdout.strip())
         if merge.returncode:
             return abort(repo, "Merge failed", detail=merge.stderr.strip()[-1200:])
+        intended = git(repo, "write-tree")
+        if intended.returncode or not intended.stdout.strip():
+            return abort(repo, "Could not record intended merge tree")
+        intended_tree = intended.stdout.strip()
         for kind, commands in (("prepare", preparations), ("check", checks)):
             for argv in commands:
                 try:
@@ -144,6 +148,12 @@ def integrate(args, preparations, checks):
                 if result.returncode:
                     return abort(repo, f"{kind.capitalize()} failed", **{kind: argv},
                                        detail=(result.stderr or result.stdout)[-1200:])
+        checked_tree = git(repo, "write-tree")
+        unstaged = git(repo, "diff", "--quiet", "--exit-code")
+        untracked = git(repo, "ls-files", "--others", "--exclude-standard")
+        if (checked_tree.returncode or checked_tree.stdout.strip() != intended_tree
+                or unstaged.returncode or untracked.returncode or untracked.stdout.strip()):
+            return abort(repo, "Preparation or checks changed the intended merge; inspect and rerun from a clean checkout")
         committed = git(repo, "commit", "-m", f"Merge {args.source} into {args.original_branch}")
         if committed.returncode:
             return abort(repo, "Merge commit failed", detail=committed.stderr.strip()[-1200:])
@@ -156,6 +166,11 @@ def integrate(args, preparations, checks):
         parents = git(repo, "rev-list", "--parents", "-n", "1", "HEAD")
         if parents.returncode or parents.stdout.split() != [final_head, head.stdout.strip(), source.stdout.strip()]:
             report("BLOCKED_LOCAL", "Final HEAD is not the verified two-parent merge; inspect the checkout",
+                   head=final_head, merge_aborted=False)
+            return 3
+        final_tree = git(repo, "rev-parse", "HEAD^{tree}")
+        if final_tree.returncode or final_tree.stdout.strip() != intended_tree:
+            report("BLOCKED_LOCAL", "Merge commit contains changes outside the verified merge tree; inspect the checkout",
                    head=final_head, merge_aborted=False)
             return 3
         final_status = git(repo, "status", "--porcelain")

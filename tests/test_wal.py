@@ -156,6 +156,14 @@ class WalTests(unittest.TestCase):
         paths = list((self.home / '.claude/wals').glob('*/main.jsonl'))
         self.assertEqual(len(paths), 4, 'different session IDs were merged into one WAL')
 
+    def test_escaped_id_cannot_alias_an_explicit_identifier(self):
+        first = self.invoke('session', {'session_id': 'a/b'})
+        self.assertEqual(first.returncode, 0, first.stderr)
+        encoded, = (self.home / '.claude/wals').iterdir()
+        second = self.invoke('session', {'session_id': encoded.name})
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(len(list((self.home / '.claude/wals').iterdir())), 2)
+
     def test_agent_named_main_cannot_alias_the_main_wal(self):
         result = self.invoke('subagent', {'session_id': 'session', 'agent_id': 'main', 'agent_type': 'task-owner'})
         self.assertEqual(result.returncode, 0, result.stderr)

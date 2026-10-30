@@ -152,6 +152,23 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertFalse(capture.exists())
         self.assertTrue(self.output.is_dir())
 
+    def test_invalid_subdirectory_repo_cannot_delete_tracked_output(self):
+        subdir = self.repo / 'subdir'
+        subdir.mkdir()
+        tracked = self.repo / 'app.txt'
+        result = subprocess.run([sys.executable, str(RESCUE), '--repo', str(subdir),
+                                 '--packet', str(self.packet), '--output', str(tracked)],
+                                text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(tracked.read_text(), 'baseline\n')
+
+    def test_packet_parent_alias_cannot_be_deleted_as_output(self):
+        alias = self.root / 'alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        result = self.invoke(packet=alias / 'packet.md', output=self.packet)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(self.packet.read_text(), 'A disposable rescue packet.')
+
     def test_wal_symlink_and_hardlink_do_not_modify_outside_file(self):
         with patch.dict(os.environ, {'HOME': str(self.root)}):
             directory = self.root / '.claude/wals/session-1'
