@@ -29,6 +29,7 @@ INDEX_MAX_BYTES = 40_000_000
 INDEX_MAX_ENTRIES = 250_000
 INDEX_MAX_RECORD_BYTES = 1_000_000
 INDEX_MAX_SECONDS = 30
+INDEX_HEADER_BYTES = 9  # tag, space, six-digit mode, space
 
 
 class IndexInspectionError(Exception):
@@ -39,7 +40,7 @@ class IndexInspectionError(Exception):
 
 def index_unflagged(repo, timeout):
     """Check NUL records without retaining paths or trusting Git's fsmonitor cache."""
-    command = ['git', *INSPECTION_CONFIG, 'ls-files', '-v', '-z']
+    command = ['git', *INSPECTION_CONFIG, 'ls-files', '-v', '-s', '-z']
     deadline = time.monotonic() + min(timeout, INDEX_MAX_SECONDS)
     try:
         process = subprocess.Popen(command, cwd=repo, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
@@ -70,11 +71,15 @@ def index_unflagged(repo, timeout):
                     record_bytes += len(segment)
                     if record_bytes > INDEX_MAX_RECORD_BYTES:
                         raise IndexInspectionError()
-                    if len(prefix) < 2:
-                        prefix += segment[:2 - len(prefix)]
+                    if len(prefix) < INDEX_HEADER_BYTES:
+                        prefix += segment[:INDEX_HEADER_BYTES - len(prefix)]
                     if end < 0:
                         break
-                    if prefix != b'H ' or record_bytes <= 2:
+                    if (len(prefix) != INDEX_HEADER_BYTES or prefix[:2] != b'H '
+                            or prefix[2:8] not in {b'100644', b'100755', b'120000'}
+                            or prefix[8:] != b' '):
+                        # A gitlink has its own index, where hidden flags can
+                        # conceal child edits from the superproject's status.
                         raise IndexInspectionError()
                     entries += 1
                     if entries > INDEX_MAX_ENTRIES:

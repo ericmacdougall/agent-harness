@@ -1803,7 +1803,7 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
         self.assertEqual(child_file.read_text(), 'private submodule edit\n')
 
-    def test_check_cannot_hide_dirty_submodule_with_ignore_config(self):
+    def test_submodule_is_refused_before_check_even_with_ignore_config(self):
         child_file = self.add_hidden_submodule()
         self.add_feature_test('import unittest\nfrom pathlib import Path\n'
                               'class Check(unittest.TestCase):\n'
@@ -1814,7 +1814,22 @@ class DeliveryHelpers(unittest.TestCase):
         data = json.loads(result.stdout)
         self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
-        self.assertEqual(child_file.read_text(), 'private check edit\n')
+        self.assertEqual(child_file.read_text(), 'original\n', 'check ran after gitlink refusal')
+
+    def test_child_index_flag_cannot_hide_submodule_edit(self):
+        self.add_feature_test()
+        child_file = self.add_hidden_submodule()
+        cmd('git', 'update-index', '--assume-unchanged', 'entry.txt', cwd=child_file.parent)
+        child_file.write_text('private child edit\n')
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=child_file.parent).stdout, '')
+        self.assertEqual(cmd('git', '-c', 'diff.ignoreSubmodules=none', 'status', '--porcelain',
+                             '--ignore-submodules=none', cwd=self.repo).stdout, '')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual(child_file.read_text(), 'private child edit\n')
 
     def test_git_routing_environment_is_rejected_before_git(self):
         bin_dir = self.root / 'bin'
@@ -1845,13 +1860,14 @@ class DeliveryHelpers(unittest.TestCase):
             ('partial', 'os.write(1, b"H private_path")\nsys.exit(0)', {}),
             ('malformed', 'os.write(1, b"X private_path\\x00")\nsys.exit(0)', {}),
             ('stderr flood', 'os.write(2, b"private_output" * 200)\nsys.exit(0)', {'INDEX_MAX_BYTES': 512}),
-            ('entry budget', 'os.write(1, b"H first\\x00H second\\x00")\nsys.exit(0)',
+            ('entry budget', 'os.write(1, b"H 100644 " + b"a" * 40 + b" 0\\tfirst\\x00"'
+             ' + b"H 100644 " + b"b" * 40 + b" 0\\tsecond\\x00")\nsys.exit(0)',
              {'INDEX_MAX_ENTRIES': 1}),
             ('timeout', 'time.sleep(3)', {}),
         )
         for label, action, limits in cases:
             with self.subTest(label=label):
-                env = self.git_fault_env(['ls-files', '-v', '-z'], action)
+                env = self.git_fault_env(['ls-files', '-v', '-s', '-z'], action)
                 with patch.dict(os.environ, env, clear=True), \
                      contextlib.ExitStack() as stack:
                     for key, value in limits.items():
@@ -1874,7 +1890,7 @@ class DeliveryHelpers(unittest.TestCase):
                   'if count == 2:\n'
                   '    os.write(1, b"H partial_private_path")\n'
                   '    sys.exit(0)')
-        env = self.git_fault_env(['ls-files', '-v', '-z'], action)
+        env = self.git_fault_env(['ls-files', '-v', '-s', '-z'], action)
         result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
                                 env=env, timeout=20)
         data = json.loads(result.stdout)
@@ -1893,7 +1909,7 @@ class DeliveryHelpers(unittest.TestCase):
                   'if count == 3:\n'
                   '    os.write(2, b"private_output" * 200)\n'
                   '    sys.exit(0)')
-        env = self.git_fault_env(['ls-files', '-v', '-z'], action)
+        env = self.git_fault_env(['ls-files', '-v', '-s', '-z'], action)
         spec = importlib.util.spec_from_file_location('integration_index_budget', INTEGRATE)
         module = importlib.util.module_from_spec(spec)
         with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
