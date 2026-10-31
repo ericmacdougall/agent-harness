@@ -129,6 +129,16 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertFalse(marker.exists())
         self.assertFalse(self.output.exists())
 
+    def test_rescue_refuses_untracked_file_hidden_by_status_config(self):
+        git(self.repo, 'config', 'status.showUntrackedFiles', 'no')
+        (self.repo / 'unreviewed.txt').write_text('unreviewed\n')
+        self.assertEqual(git(self.repo, 'status', '--porcelain'), '')
+        capture = self.root / 'model-prompt'
+        result = self.invoke(env={'CAPTURE_CODEX_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse(capture.exists())
+        self.assertFalse(self.output.exists())
+
     def test_rescue_blocks_if_model_adds_local_filter_before_postcheck(self):
         (self.repo / '.gitattributes').write_text('app.txt filter=fixture\n')
         git(self.repo, 'add', '.gitattributes')

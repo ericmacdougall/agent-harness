@@ -199,7 +199,7 @@ def publish(args):
     except OSError:
         report("BLOCKED_POLICY", "Source Git metadata has executable local filters, submodules, or could not be inspected safely")
         return 2
-    status = git(repo, "status", "--porcelain")
+    status = git(repo, "status", "--porcelain", "--untracked-files=all")
     if status.returncode or status.stdout.strip():
         report("BLOCKED_POLICY", "Commit or discard source changes before publishing")
         return 2

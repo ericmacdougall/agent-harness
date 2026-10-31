@@ -122,7 +122,7 @@ def main() -> int:
         root = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
         branch = git(repo, "branch", "--show-current")
         base = git(repo, "rev-parse", "HEAD")
-        dirty = git(repo, "status", "--porcelain")
+        dirty = git(repo, "status", "--porcelain", "--untracked-files=all")
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         parser.error("repo Git state could not be inspected safely")
     if root != repo or not branch or dirty:
@@ -162,7 +162,7 @@ def main() -> int:
     try:
         if code != 0:
             changed = (git(repo, "rev-parse", "HEAD") != base
-                       or bool(git(repo, "status", "--porcelain"))
+                       or bool(git(repo, "status", "--porcelain", "--untracked-files=all"))
                        or git(repo, "branch", "--show-current") != branch)
             if changed:
                 fallback_reason = "Astra failed after modifying the worktree; preserve it for main-agent inspection."
@@ -176,13 +176,13 @@ def main() -> int:
                     stderr = "Claude executable unavailable"
         snapshot = False
         snapshot_error = ""
-        if code == 0 and git(repo, "branch", "--show-current") == branch and git(repo, "status", "--porcelain"):
+        if code == 0 and git(repo, "branch", "--show-current") == branch and git(repo, "status", "--porcelain", "--untracked-files=all"):
             try:
                 snapshot, snapshot_error = snapshot_commit(repo, source)
             except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
                 snapshot_error = f"Snapshot Git operation failed or timed out: {type(error).__name__}"
         head = git(repo, "rev-parse", "HEAD")
-        dirty_after = bool(git(repo, "status", "--porcelain"))
+        dirty_after = bool(git(repo, "status", "--porcelain", "--untracked-files=all"))
         actual_branch = git(repo, "branch", "--show-current")
         branch_head = git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
         report = {
