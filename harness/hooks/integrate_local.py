@@ -214,7 +214,8 @@ def integrate(args, preparations, checks):
         branch = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
         head = git(repo, "rev-parse", "HEAD")
         index_unflagged(repo, args.timeout)
-        status = inspect(repo, "status", "--porcelain")
+        status = inspect(repo, "status", "--porcelain", "--untracked-files=all",
+                         "--ignore-submodules=none")
         if branch.returncode or head.returncode or status.returncode or branch.stdout.strip() != args.original_branch or head.stdout.strip() != args.expected_head or status.stdout.strip():
             report("BLOCKED_LOCAL", "Original checkout branch, HEAD, or cleanliness changed; no merge attempted")
             return 3
@@ -263,7 +264,7 @@ def integrate(args, preparations, checks):
                                  exit_code=result.returncode, **{kind: argv})
         index_unflagged(repo, args.timeout)
         checked_tree = git(repo, "write-tree")
-        unstaged = inspect(repo, "diff", "--quiet", "--exit-code")
+        unstaged = inspect(repo, "diff", "--quiet", "--exit-code", "--ignore-submodules=none")
         untracked = inspect(repo, "ls-files", "--others", "--exclude-standard")
         if (checked_tree.returncode or checked_tree.stdout.strip() != intended_tree
                 or unstaged.returncode or untracked.returncode or untracked.stdout.strip()):
@@ -298,7 +299,8 @@ def integrate(args, preparations, checks):
                    head=final_head, merge_aborted=False)
             return 3
         index_unflagged(repo, args.timeout)
-        final_status = inspect(repo, "status", "--porcelain")
+        final_status = inspect(repo, "status", "--porcelain", "--untracked-files=all",
+                               "--ignore-submodules=none")
         if final_status.returncode or final_status.stdout.strip():
             report("BLOCKED_LOCAL", "Merge commit exists but final checkout is dirty or could not be inspected",
                    head=final_head, merge_aborted=False)

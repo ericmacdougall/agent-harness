@@ -1219,6 +1219,9 @@ class DeliveryHelpers(unittest.TestCase):
                            'args = sys.argv[1:]\n'
                            'if args[:1] == ["-C"]: args = args[2:]\n'
                            'while len(args) >= 3 and args[0] == "-c": args = args[2:]\n'
+                           'if args[:2] == ["status", "--porcelain"]:\n'
+                           '    args = [item for item in args if item not in '
+                           '{"--untracked-files=all", "--ignore-submodules=none"}]\n'
                            f'if args == {arguments!r}:\n'
                            + ''.join(f'    {line}\n' for line in action.splitlines())
                            + f'os.execv({shutil.which("git")!r}, ["git", *sys.argv[1:]])\n')
@@ -1755,6 +1758,63 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
         self.assertEqual(hidden.stat().st_mode & 0o111, 0o111)
+
+    def test_post_commit_untracked_artifact_cannot_hide_behind_status_config(self):
+        self.add_feature_test()
+        cmd('git', 'config', 'status.showUntrackedFiles', 'no', cwd=self.repo)
+        hook = self.repo / '.git/hooks/post-commit'
+        hook.write_text('#!/bin/sh\nprintf "private artifact\\n" > artifact.txt\n')
+        hook.chmod(0o700)
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('merge_aborted')),
+                         (3, 'BLOCKED_LOCAL', False), result.stdout)
+        self.assertEqual((self.repo / 'artifact.txt').read_text(), 'private artifact\n')
+        self.assertEqual(cmd('git', '-c', 'status.showUntrackedFiles=all',
+                             'status', '--porcelain', cwd=self.repo).stdout, '?? artifact.txt\n')
+
+    def add_hidden_submodule(self):
+        child_repo = self.root / 'child-source'
+        child_repo.mkdir()
+        cmd('git', 'init', '-q', str(child_repo))
+        cmd('git', 'config', 'user.email', 'test@example.invalid', cwd=child_repo)
+        cmd('git', 'config', 'user.name', 'Harness test', cwd=child_repo)
+        (child_repo / 'entry.txt').write_text('original\n')
+        cmd('git', 'add', 'entry.txt', cwd=child_repo)
+        cmd('git', 'commit', '-qm', 'child base', cwd=child_repo)
+        cmd('git', '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q',
+            str(child_repo), 'modules/child', cwd=self.repo)
+        cmd('git', 'commit', '-qam', 'add child', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        cmd('git', 'config', 'diff.ignoreSubmodules', 'all', cwd=self.repo)
+        cmd('git', 'config', 'submodule.modules/child.ignore', 'all', cwd=self.repo)
+        return self.repo / 'modules/child/entry.txt'
+
+    def test_dirty_submodule_cannot_hide_behind_ignore_config_before_merge(self):
+        self.add_feature_test()
+        child_file = self.add_hidden_submodule()
+        child_file.write_text('private submodule edit\n')
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout, '')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual(child_file.read_text(), 'private submodule edit\n')
+
+    def test_check_cannot_hide_dirty_submodule_with_ignore_config(self):
+        child_file = self.add_hidden_submodule()
+        self.add_feature_test('import unittest\nfrom pathlib import Path\n'
+                              'class Check(unittest.TestCase):\n'
+                              '    def test_dirty_child(self):\n'
+                              '        Path("modules/child/entry.txt").write_text("private check edit\\n")\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual(child_file.read_text(), 'private check edit\n')
 
     def test_git_routing_environment_is_rejected_before_git(self):
         bin_dir = self.root / 'bin'
