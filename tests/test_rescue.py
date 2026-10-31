@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 
 RESCUE = Path(__file__).resolve().parents[1] / 'harness/hooks/rescue.py'
+# Outer test watchdog for a functional two-model fallback, not a product deadline.
+FUNCTIONAL_HELPER_WATCHDOG_SECONDS = 90
 sys.path.insert(0, str(RESCUE.parent))
 SPEC = importlib.util.spec_from_file_location('rescue_under_test', RESCUE)
 rescue = importlib.util.module_from_spec(SPEC)
@@ -86,13 +88,14 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         path.write_text(f'#!{sys.executable}\n{body}')
         path.chmod(0o700)
 
-    def invoke(self, *, output=None, packet=None, wal=None, env=None):
+    def invoke(self, *, output=None, packet=None, wal=None, env=None, watchdog_seconds=15):
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(packet or self.packet),
                    '--output', str(output or self.output)]
         if wal is not None:
             command += ['--wal', str(wal)]
         environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin', **(env or {})}
-        return subprocess.run(command, text=True, capture_output=True, env=environment, timeout=15)
+        return subprocess.run(command, text=True, capture_output=True, env=environment,
+                              timeout=watchdog_seconds)
 
     def test_private_report_and_snapshot_on_successful_model_edit(self):
         result = self.invoke(env={'CODEX_ACTION': 'updated'})
@@ -167,7 +170,8 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
     def test_fallback_before_edits_is_blind_and_snapshotted(self):
         capture = self.root / 'fallback-prompt.txt'
         result = self.invoke(env={'CODEX_EXIT': '7', 'CLAUDE_ACTION': 'fallback',
-                                  'CAPTURE_CLAUDE_PROMPT': str(capture)})
+                                  'CAPTURE_CLAUDE_PROMPT': str(capture)},
+                             watchdog_seconds=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['source'], 'Claude Fable fallback')
