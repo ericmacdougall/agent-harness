@@ -1287,11 +1287,29 @@ class DeliveryHelpers(unittest.TestCase):
 
     def test_merge_git_deadline_reports_failed_abort_when_no_merge_started(self):
         self.add_feature_test()
-        env = self.git_fault_env(['merge', '--no-ff', '--no-commit', self.feature_head], 'time.sleep(3)')
-        p = subprocess.run(self.integrate_args('--timeout', '1'), text=True, capture_output=True,
-                           env=env, timeout=12)
-        self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (3, 'BLOCKED_LOCAL'))
-        self.assertIs(json.loads(p.stdout)['merge_aborted'], False)
+        marker = self.root / 'merge-started'
+        env = self.git_fault_env(['merge', '--no-ff', '--no-commit', self.feature_head],
+                                 f'Path({str(marker)!r}).touch()\ntime.sleep(3)')
+        spec = importlib.util.spec_from_file_location('integration_merge_deadline', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        real_run_git = module.run_git
+
+        def deadline_only_for_merge(repo, *args, timeout=600):
+            if args == ('merge', '--no-ff', '--no-commit', self.feature_head):
+                timeout = 1
+            return real_run_git(repo, *args, timeout=timeout)
+
+        with patch.object(sys, 'argv', self.integrate_args('--timeout', '10')[1:]), \
+             patch.object(module, 'run_git', side_effect=deadline_only_for_merge), \
+             patch('sys.stdout', new_callable=io.StringIO) as output, \
+             patch.dict(os.environ, env, clear=True):
+            code = module.main()
+        data = json.loads(output.getvalue())
+        self.assertTrue(marker.exists(), 'injected merge stall was never reached')
+        self.assertEqual((code, data['status'], data['merge_aborted']),
+                         (3, 'BLOCKED_LOCAL', False), output.getvalue())
         self.assert_restored()
 
     def test_commit_hook_deadline_kills_child_and_preserves_original_head(self):
