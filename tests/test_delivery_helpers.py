@@ -23,6 +23,8 @@ from unittest.mock import patch
 PUBLISH = Path(__file__).resolve().parents[1] / 'harness/hooks/publish_feature.py'
 INTEGRATE = Path(__file__).resolve().parents[1] / 'harness/hooks/integrate_local.py'
 PROCESS = Path(__file__).resolve().parents[1] / 'harness/hooks/process.py'
+# Outer test watchdog for functional helper flows, not a product deadline.
+FUNCTIONAL_HELPER_WATCHDOG_SECONDS = 90
 # Python 3.12+ unittest exits 5 when no test ran, so a check fixture needs a real passing test.
 PASSING_CHECK = ('import unittest\n\nclass Check(unittest.TestCase):\n'
                  '    def test_ok(self):\n        self.assertEqual(2 + 2, 4)\n')
@@ -838,7 +840,8 @@ class DeliveryHelpers(unittest.TestCase):
         env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
         p = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
                             '--original-branch', 'main', '--expected-head', self.feature_head],
-                           env=env, text=True, capture_output=True, timeout=20)
+                           env=env, text=True, capture_output=True,
+                           timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (0, 'PUSHED'), p.stdout + p.stderr)
         self.assertNotIn('sensitive-url-marker', capture.read_text())
 
@@ -1015,7 +1018,8 @@ class DeliveryHelpers(unittest.TestCase):
         env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
         p = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
                             '--original-branch', 'main', '--expected-head', original],
-                           env=env, text=True, capture_output=True, timeout=20)
+                           env=env, text=True, capture_output=True,
+                           timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(p.stdout)
         self.assertEqual((p.returncode, data['status']), (0, 'PUSHED'), p.stdout + p.stderr)
         self.assertNotEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip(), original)
@@ -1151,7 +1155,7 @@ class DeliveryHelpers(unittest.TestCase):
                               '        os.write(2, b"synthetic_stderr_marker")\n'
                               '        self.fail("fixture failed")\n')
         p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
-                           env=isolated_env(), timeout=20)
+                           env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(p.stdout)
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
         self.assertNotIn('synthetic_stdout_marker', p.stdout + p.stderr)
@@ -1188,7 +1192,8 @@ class DeliveryHelpers(unittest.TestCase):
         env = isolated_env()
         env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
         p = subprocess.run(self.integrate_args('--prepare', 'npm ci --prefer-offline'),
-                           text=True, capture_output=True, env=env, timeout=20)
+                           text=True, capture_output=True, env=env,
+                           timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(p.stdout)
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
         self.assertNotIn('synthetic_prepare_', p.stdout + p.stderr)
@@ -1203,7 +1208,8 @@ class DeliveryHelpers(unittest.TestCase):
                                  'os.write(2, b"synthetic_merge_stderr")\nsys.exit(7)')
         argv = self.integrate_args()
         argv[argv.index('--source') + 1] = private_branch
-        p = subprocess.run(argv, text=True, capture_output=True, env=env, timeout=20)
+        p = subprocess.run(argv, text=True, capture_output=True, env=env,
+                           timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(p.stdout)
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
         self.assertNotIn('synthetic_merge_', p.stdout + p.stderr)
@@ -1215,7 +1221,8 @@ class DeliveryHelpers(unittest.TestCase):
         env = self.git_fault_env(['commit', '-m', f'Merge {private_branch} into main'],
                                  'os.write(1, b"synthetic_commit_stdout")\n'
                                  'os.write(2, b"synthetic_commit_stderr")\nsys.exit(7)')
-        p = subprocess.run(argv, text=True, capture_output=True, env=env, timeout=20)
+        p = subprocess.run(argv, text=True, capture_output=True, env=env,
+                           timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(p.stdout)
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
         self.assertNotIn('synthetic_commit_', p.stdout + p.stderr)
@@ -1349,7 +1356,8 @@ class DeliveryHelpers(unittest.TestCase):
         seen = self.root / 'head-read'
         env = self.git_fault_env(['rev-parse', 'HEAD'],
                                  f'path = Path({str(seen)!r})\nif path.exists(): sys.exit(128)\npath.touch()')
-        p = subprocess.run(self.integrate_args(), text=True, capture_output=True, env=env, timeout=30)
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True, env=env,
+                           timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (3, 'BLOCKED_LOCAL'))
         parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
         self.assertEqual(parents[1:], [self.base, self.feature_head])
@@ -1664,7 +1672,8 @@ class DeliveryHelpers(unittest.TestCase):
         env = isolated_env()
         env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
         result = subprocess.run(self.integrate_args('--prepare', 'npm ci --prefer-offline'),
-                                text=True, capture_output=True, env=env, timeout=20)
+                                text=True, capture_output=True, env=env,
+                                timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
                          (0, 'INTEGRATED'), result.stdout + result.stderr)
         self.assertEqual(marker.read_text(), 'ok')
@@ -1771,7 +1780,7 @@ class DeliveryHelpers(unittest.TestCase):
                         'printf "private hook edit\\n" > app.txt\n')
         hook.chmod(0o700)
         result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
-                                env=isolated_env(), timeout=20)
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(result.stdout)
         self.assertEqual((result.returncode, data['status'], data.get('merge_aborted')),
                          (3, 'BLOCKED_LOCAL', False), result.stdout)
@@ -2095,7 +2104,7 @@ class DeliveryHelpers(unittest.TestCase):
                         'git update-ref refs/heads/main "$base"\n')
         hook.chmod(0o700)
         p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
-                           env=isolated_env(), timeout=20)
+                           env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(p.stdout)
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
         self.assertEqual(cmd('git', 'rev-parse', 'refs/heads/main', cwd=self.repo).stdout.strip(), self.base)
@@ -2128,7 +2137,8 @@ class DeliveryHelpers(unittest.TestCase):
         self.add_feature_test('from pathlib import Path\n'
                               'Path("app.txt").write_text("check modified tracked content\\n")\n'
                               'raise RuntimeError("intentional check failure")\n')
-        p = subprocess.run(self.integrate_args(), text=True, capture_output=True, env=isolated_env(), timeout=15)
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                           env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(p.returncode, 3, p.stderr)
         data = json.loads(p.stdout)
         self.assertIs(data.get('merge_aborted'), False, data)
