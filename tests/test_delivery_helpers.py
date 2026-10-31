@@ -420,6 +420,23 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
                                 cwd=remote, check=False).returncode, 0)
 
+    def test_publish_rejects_hidden_tracked_edit_before_push(self):
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        cmd('git', 'update-index', '--assume-unchanged', 'app.txt', cwd=self.feature)
+        (self.feature / 'app.txt').write_text('unreviewed hidden value\n')
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.feature).stdout, '')
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head]
+        result = subprocess.run(args, text=True, capture_output=True, env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (2, 'BLOCKED_POLICY'), result.stderr)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
+                                cwd=remote, check=False).returncode, 0)
+
     def test_publish_remote_inspection_does_not_run_source_ssh_command(self):
         marker = self.root / 'source-ssh-ran'
         ssh = self.root / 'source-ssh'

@@ -79,7 +79,7 @@ def _bounded_git(repo: Path, args: list[str], env: dict[str, str], *, timeout: i
 
 
 def require_safe_source(repo: Path, env: dict[str, str], *, timeout: int = 5) -> None:
-    """Refuse submodules and executable local filters before status/diff/add.
+    """Refuse hidden index state, submodules and local filters before status/diff/add.
 
     Source configuration can still change after this preflight. Caller must repeat
     the guard at later worktree inspection boundaries and disclose that race.
@@ -97,6 +97,17 @@ def require_safe_source(repo: Path, env: dict[str, str], *, timeout: int = 5) ->
             raise OSError('source Git index is malformed or exceeds limits')
         if record.startswith(b'160000 '):
             raise OSError('source Git index contains a submodule')
+    code, flags = _bounded_git(repo, ['ls-files', '-v', '-z'], env,
+                               timeout=timeout, limit=40_000_000)
+    if code or (flags and not flags.endswith(b'\0')):
+        raise OSError('source Git index flags could not be inspected safely')
+    count = 0
+    for record in flags.split(b'\0'):
+        if not record:
+            continue
+        count += 1
+        if count > 250_000 or len(record) < 3 or record[:2] != b'H ':
+            raise OSError('source Git index has hidden or unsupported flags')
     code, config = _bounded_git(repo, ['config', '--includes', '--show-scope',
                                       '--name-only', '--null', '--get-regexp', FILTER_PATTERN],
                                 env, timeout=timeout, limit=1_000_000)
