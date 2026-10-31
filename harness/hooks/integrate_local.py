@@ -24,7 +24,7 @@ ALLOWED_GIT_ENV = {
 }
 INSPECTION_CONFIG = ('-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false',
                      '-c', 'core.trustctime=true', '-c', 'core.checkStat=default',
-                     '-c', 'core.filemode=true')
+                     '-c', 'core.filemode=true', '-c', 'core.symlinks=true')
 INDEX_MAX_BYTES = 40_000_000
 INDEX_MAX_ENTRIES = 250_000
 INDEX_MAX_RECORD_BYTES = 1_000_000

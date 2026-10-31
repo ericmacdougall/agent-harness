@@ -1831,6 +1831,46 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
         self.assertEqual(child_file.read_text(), 'private child edit\n')
 
+    def add_symlink_fixture(self):
+        (self.repo / 'target.txt').write_text('target content\n')
+        link = self.repo / 'link'
+        link.symlink_to('target.txt')
+        cmd('git', 'add', 'target.txt', 'link', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'add link', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        cmd('git', 'config', 'core.symlinks', 'false', cwd=self.repo)
+        return link
+
+    def test_symlink_substitution_cannot_hide_behind_config_before_merge(self):
+        self.add_feature_test()
+        link = self.add_symlink_fixture()
+        link.unlink()
+        link.write_text('target.txt')
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout, '')
+        self.assertIn(' T link', cmd('git', '-c', 'core.symlinks=true', 'status',
+                                    '--porcelain', cwd=self.repo).stdout)
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(link.read_text(), 'target.txt')
+
+    def test_post_commit_symlink_substitution_blocks_success(self):
+        self.add_feature_test()
+        link = self.add_symlink_fixture()
+        hook = self.repo / '.git/hooks/post-commit'
+        hook.write_text('#!/bin/sh\nrm link\nprintf target.txt > link\n')
+        hook.chmod(0o700)
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('merge_aborted')),
+                         (3, 'BLOCKED_LOCAL', False), result.stdout)
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(link.read_text(), 'target.txt')
+
     def test_git_routing_environment_is_rejected_before_git(self):
         bin_dir = self.root / 'bin'
         bin_dir.mkdir()
