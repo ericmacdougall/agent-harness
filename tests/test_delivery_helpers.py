@@ -1018,7 +1018,8 @@ class DeliveryHelpers(unittest.TestCase):
         env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
         p = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
                             '--original-branch', 'main', '--expected-head', original],
-                           env=env, text=True, capture_output=True, timeout=20)
+                           env=env, text=True, capture_output=True,
+                           timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(p.stdout)
         self.assertEqual((p.returncode, data['status']), (0, 'PUSHED'), p.stdout + p.stderr)
         self.assertNotEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip(), original)
