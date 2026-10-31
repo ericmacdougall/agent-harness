@@ -1062,6 +1062,25 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
         self.assertFalse(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
 
+    def test_integrate_refuses_local_clean_filter_before_status(self):
+        (self.repo / '.gitattributes').write_text('app.txt filter=fixture\n')
+        cmd('git', 'add', '.gitattributes', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'mark filter', cwd=self.repo)
+        head = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        marker = self.root / 'integration-filter-ran'
+        cmd('git', 'config', 'filter.fixture.clean',
+            f"sh -c 'touch {shlex.quote(str(marker))}; cat'", cwd=self.repo)
+        tracked = self.repo / 'app.txt'
+        info = tracked.stat()
+        os.utime(tracked, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+        p, data = self.invoke(INTEGRATE, '--repo', str(self.repo), '--original-branch', 'main',
+                              '--expected-head', head, '--source', 'feat/app',
+                              '--expected-source-head', self.feature_head,
+                              '--check', 'python3 -m unittest discover -s tests -v')
+        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
+        self.assertFalse(marker.exists(), 'integration status executed a repository-local clean filter')
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), head)
+
     def test_failed_check_keeps_arbitrary_output_out_of_diagnostics(self):
         self.add_feature_test('import os, unittest\nclass Check(unittest.TestCase):\n'
                               '    def test_failure(self):\n'

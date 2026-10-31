@@ -12,6 +12,7 @@ import time
 from functools import partial
 from pathlib import Path
 
+from git_safety import git_environment, require_safe_source
 from process import cleanup_discarded, run as run_process
 
 
@@ -43,7 +44,8 @@ def index_unflagged(repo, timeout):
     command = ['git', *INSPECTION_CONFIG, 'ls-files', '-v', '-s', '-z']
     deadline = time.monotonic() + min(timeout, INDEX_MAX_SECONDS)
     try:
-        process = subprocess.Popen(command, cwd=repo, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
+        process = subprocess.Popen(command, cwd=repo,
+                                   env={**git_environment(), 'PYTHONDONTWRITEBYTECODE': '1'},
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    start_new_session=True)
     except OSError as error:
@@ -112,16 +114,24 @@ def inspect_git(repo, *args, timeout=600):
     return run_git(repo, *INSPECTION_CONFIG, *args, timeout=timeout)
 
 
-def run(repo, command, *, timeout=None, discard_output=False):
+def run(repo, command, *, timeout=None, discard_output=False, env=None):
     # Python test runners otherwise leave untracked __pycache__ after an aborted merge.
     output_options = {'discard_output': True} if discard_output else {}
     return run_process(command, cwd=repo, timeout=timeout,
-                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                       env={**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"},
                        **output_options)
 
 
 def run_git(repo, *args, timeout=600):
-    return run(repo, ["git", *args], timeout=timeout)
+    return run(repo, ["git", *args], timeout=timeout,
+               env=git_environment(allow_hooks=True))
+
+
+def safe_source(repo, timeout):
+    try:
+        require_safe_source(repo, git_environment(), timeout=min(timeout, INDEX_MAX_SECONDS))
+    except OSError:
+        raise IndexInspectionError() from None
 
 
 def report(status, message, **extra):
@@ -216,6 +226,7 @@ def integrate(args, preparations, checks):
         if toplevel is None or toplevel.returncode or Path(toplevel.stdout.strip()).resolve() != repo:
             report("BLOCKED_POLICY", "Original checkout must be the root of a Git worktree")
             return 2
+        safe_source(repo, args.timeout)
         branch = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
         head = git(repo, "rev-parse", "HEAD")
         index_unflagged(repo, args.timeout)
@@ -267,6 +278,7 @@ def integrate(args, preparations, checks):
                     # and exit code tell the user which command to run locally.
                     return abort(repo, f"{kind.capitalize()} failed", phase=kind,
                                  exit_code=result.returncode, **{kind: argv})
+        safe_source(repo, args.timeout)
         index_unflagged(repo, args.timeout)
         checked_tree = git(repo, "write-tree")
         unstaged = inspect(repo, "diff", "--quiet", "--exit-code", "--ignore-submodules=none")
@@ -303,6 +315,7 @@ def integrate(args, preparations, checks):
             report("BLOCKED_LOCAL", "Merge commit is not on the original branch; inspect branch refs",
                    head=final_head, merge_aborted=False)
             return 3
+        safe_source(repo, args.timeout)
         index_unflagged(repo, args.timeout)
         final_status = inspect(repo, "status", "--porcelain", "--untracked-files=all",
                                "--ignore-submodules=none")

@@ -25,8 +25,12 @@ BASE_SETTINGS = (('core.hooksPath', os.devnull), ('core.fsmonitor', 'false'),
 FILTER_PATTERN = r'^filter\..*\.(clean|process|smudge)$'
 
 
-def git_environment(*, isolated=False, settings=()):
-    """Drop ambient Git routing/index state while composing deliberate settings."""
+def git_environment(*, isolated=False, allow_hooks=False, settings=()):
+    """Drop ambient Git routing/index state while composing deliberate settings.
+
+    Local integration intentionally executes checkout hooks under a deadline;
+    read-only and publication callers keep hooks disabled.
+    """
     retained = set() if isolated else AUTH_GIT_ENV
     env = {key: value for key, value in os.environ.items()
            if not key.startswith('GIT_') or key in retained}
@@ -36,7 +40,8 @@ def git_environment(*, isolated=False, settings=()):
     if isolated:
         env['GIT_CONFIG_NOSYSTEM'] = '1'
         env['GIT_CONFIG_GLOBAL'] = os.devnull
-    configured = (*BASE_SETTINGS, *settings)
+    configured = (*(item for item in BASE_SETTINGS if not allow_hooks or item[0] != 'core.hooksPath'),
+                  *settings)
     env['GIT_CONFIG_COUNT'] = str(len(configured))
     for index, (key, value) in enumerate(configured):
         env[f'GIT_CONFIG_KEY_{index}'] = key
