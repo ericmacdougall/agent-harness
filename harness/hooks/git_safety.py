@@ -86,11 +86,13 @@ def _bounded_git(repo: Path, args: list[str], env: dict[str, str], *, timeout: i
         process.stdout.close()
 
 
-def require_safe_source(repo: Path, env: dict[str, str], *, timeout: int = 5) -> None:
+def require_safe_source(repo: Path, env: dict[str, str], *, timeout: int = 5,
+                        allow_unmerged: bool = False) -> None:
     """Refuse hidden index state, submodules and local filters before status/diff/add.
 
     Source configuration can still change after this preflight. Caller must repeat
     the guard at later worktree inspection boundaries and disclose that race.
+    An abort may inspect unmerged (M-tagged) index entries after a failed merge.
     """
     code, index = _bounded_git(repo, ['ls-files', '--stage', '-z'], env,
                                timeout=timeout, limit=40_000_000)
@@ -114,7 +116,8 @@ def require_safe_source(repo: Path, env: dict[str, str], *, timeout: int = 5) ->
         if not record:
             continue
         count += 1
-        if count > 250_000 or len(record) < 3 or record[:2] != b'H ':
+        if (count > 250_000 or len(record) < 3
+                or record[:2] not in ((b'H ', b'M ') if allow_unmerged else (b'H ',))):
             raise OSError('source Git index has hidden or unsupported flags')
     code, config = _bounded_git(repo, ['config', '--includes', '--show-scope',
                                       '--name-only', '--null', '--get-regexp', FILTER_PATTERN],

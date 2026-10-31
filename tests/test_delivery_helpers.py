@@ -1081,6 +1081,37 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertFalse(marker.exists(), 'integration status executed a repository-local clean filter')
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), head)
 
+    def _check_that_introduces_local_filter(self, *, fails):
+        (self.repo / '.gitattributes').write_text('app.txt filter=fixture\n')
+        cmd('git', 'add', '.gitattributes', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'mark filter', cwd=self.repo)
+        head = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        marker = self.root / 'abort-filter-ran'
+        filter_command = f"sh -c 'touch {shlex.quote(str(marker))}; cat'"
+        body = ('import subprocess, unittest\n'
+                'class Check(unittest.TestCase):\n'
+                '    def test_writes_filter(self):\n'
+                f'        subprocess.run(["git", "config", "filter.fixture.clean", {filter_command!r}], check=True)\n'
+                f'        subprocess.run(["git", "config", "filter.fixture.smudge", {filter_command!r}], check=True)\n'
+                + ('        self.fail("synthetic check failure")\n' if fails else '        self.assertTrue(True)\n'))
+        self.add_feature_test(body)
+        p, data = self.invoke(INTEGRATE, '--repo', str(self.repo), '--original-branch', 'main',
+                              '--expected-head', head, '--source', 'feat/app',
+                              '--expected-source-head', self.feature_head,
+                              '--check', 'python3 -m unittest discover -s tests -v')
+        self.assertEqual((p.returncode, data['status'], data.get('merge_aborted')),
+                         (3, 'BLOCKED_LOCAL', False), p.stdout + p.stderr)
+        self.assertFalse(marker.exists(), 'merge abort executed newly configured local filter')
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), head)
+        self.assertEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD', cwd=self.repo).stdout.strip(),
+                         self.feature_head)
+
+    def test_failed_check_filter_blocks_unsafe_abort(self):
+        self._check_that_introduces_local_filter(fails=True)
+
+    def test_post_check_filter_blocks_unsafe_abort(self):
+        self._check_that_introduces_local_filter(fails=False)
+
     def test_failed_check_keeps_arbitrary_output_out_of_diagnostics(self):
         self.add_feature_test('import os, unittest\nclass Check(unittest.TestCase):\n'
                               '    def test_failure(self):\n'

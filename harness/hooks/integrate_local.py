@@ -127,9 +127,10 @@ def run_git(repo, *args, timeout=600):
                env=git_environment(allow_hooks=True))
 
 
-def safe_source(repo, timeout):
+def safe_source(repo, timeout, *, allow_unmerged=False):
     try:
-        require_safe_source(repo, git_environment(), timeout=min(timeout, INDEX_MAX_SECONDS))
+        require_safe_source(repo, git_environment(), timeout=min(timeout, INDEX_MAX_SECONDS),
+                            allow_unmerged=allow_unmerged)
     except OSError:
         raise IndexInspectionError() from None
 
@@ -139,6 +140,12 @@ def report(status, message, **extra):
 
 
 def abort_merge(repo, message, *, timeout=600, **extra):
+    try:
+        safe_source(repo, timeout, allow_unmerged=True)
+    except IndexInspectionError:
+        report("BLOCKED_LOCAL", message + "; source Git state is unsafe or unverifiable; inspect merge without automatic abort",
+               merge_aborted=False, **extra)
+        return 3
     try:
         result = run_git(repo, "merge", "--abort", timeout=timeout)
         aborted = result.returncode == 0
