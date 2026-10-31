@@ -1112,6 +1112,38 @@ class DeliveryHelpers(unittest.TestCase):
     def test_post_check_filter_blocks_unsafe_abort(self):
         self._check_that_introduces_local_filter(fails=False)
 
+    def _integrate_with_environment_identity(self, *, remove_config):
+        self.add_feature_test()
+        if remove_config:
+            cmd('git', 'config', '--unset', 'user.name', cwd=self.repo)
+            cmd('git', 'config', '--unset', 'user.email', cwd=self.repo)
+        identity = {
+            'GIT_AUTHOR_NAME': 'Environment Author',
+            'GIT_AUTHOR_EMAIL': 'author@example.invalid',
+            'GIT_AUTHOR_DATE': '2001-01-02T03:04:05 +0000',
+            'GIT_COMMITTER_NAME': 'Environment Committer',
+            'GIT_COMMITTER_EMAIL': 'committer@example.invalid',
+            'GIT_COMMITTER_DATE': '2002-02-03T04:05:06 +0000',
+        }
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                           env={**isolated_env(), **identity}, timeout=30)
+        data = json.loads(p.stdout)
+        self.assertEqual((p.returncode, data['status']), (0, 'INTEGRATED'), p.stdout + p.stderr)
+        observed = cmd('git', 'log', '-1', '--format=%an%n%ae%n%aI%n%cn%n%ce%n%cI',
+                       cwd=self.repo).stdout.splitlines()
+        observed = [value.replace('Z', '+00:00') if index in (2, 5) else value
+                    for index, value in enumerate(observed)]
+        self.assertEqual(observed, [
+            'Environment Author', 'author@example.invalid', '2001-01-02T03:04:05+00:00',
+            'Environment Committer', 'committer@example.invalid', '2002-02-03T04:05:06+00:00',
+        ])
+
+    def test_integrate_uses_environment_only_identity(self):
+        self._integrate_with_environment_identity(remove_config=True)
+
+    def test_integrate_environment_identity_overrides_config(self):
+        self._integrate_with_environment_identity(remove_config=False)
+
     def test_failed_check_keeps_arbitrary_output_out_of_diagnostics(self):
         self.add_feature_test('import os, unittest\nclass Check(unittest.TestCase):\n'
                               '    def test_failure(self):\n'

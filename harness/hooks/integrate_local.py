@@ -124,7 +124,7 @@ def run(repo, command, *, timeout=None, discard_output=False, env=None):
 
 def run_git(repo, *args, timeout=600):
     return run(repo, ["git", *args], timeout=timeout,
-               env=git_environment(allow_hooks=True))
+               env=git_environment(allow_hooks=True, preserve_identity=True))
 
 
 def safe_source(repo, timeout, *, allow_unmerged=False):

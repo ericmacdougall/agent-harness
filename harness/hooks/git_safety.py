@@ -17,6 +17,8 @@ from process import signal_group
 
 AUTH_GIT_ENV = {'GIT_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_SSH_VARIANT',
                 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM'}
+IDENTITY_GIT_ENV = {'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_AUTHOR_DATE',
+                    'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_DATE'}
 BASE_SETTINGS = (('core.hooksPath', os.devnull), ('core.fsmonitor', 'false'),
                  ('core.filemode', 'true'), ('core.symlinks', 'true'),
                  ('core.untrackedCache', 'false'),
@@ -25,13 +27,14 @@ BASE_SETTINGS = (('core.hooksPath', os.devnull), ('core.fsmonitor', 'false'),
 FILTER_PATTERN = r'^filter\..*\.(clean|process|smudge)$'
 
 
-def git_environment(*, isolated=False, allow_hooks=False, settings=()):
+def git_environment(*, isolated=False, allow_hooks=False, preserve_identity=False,
+                    settings=()):
     """Drop ambient Git routing/index state while composing deliberate settings.
 
-    Local integration intentionally executes checkout hooks under a deadline;
-    read-only and publication callers keep hooks disabled.
+    Local integration intentionally executes checkout hooks under a deadline
+    and honors caller-provided commit identity; other callers keep hooks disabled.
     """
-    retained = set() if isolated else AUTH_GIT_ENV
+    retained = set() if isolated else AUTH_GIT_ENV | (IDENTITY_GIT_ENV if preserve_identity else set())
     env = {key: value for key, value in os.environ.items()
            if not key.startswith('GIT_') or key in retained}
     env['GIT_TERMINAL_PROMPT'] = '0'
