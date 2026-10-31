@@ -50,6 +50,14 @@ capture = os.environ.get('CAPTURE_CODEX_PROMPT')
 if capture: Path(capture).write_text(prompt)
 action = os.environ.get('CODEX_ACTION', '')
 if action: Path('app.txt').write_text(action + '\\n')
+outside = os.environ.get('CODEX_LINK_OUTSIDE')
+if outside:
+    Path('app.txt').unlink()
+    os.link(outside, 'app.txt')
+if os.environ.get('CODEX_COMMIT'):
+    import subprocess
+    subprocess.run(['git', 'add', 'app.txt'], check=True)
+    subprocess.run(['git', 'commit', '-qm', 'model commit'], check=True)
 if os.environ.get('CODEX_SWITCH_BRANCH'):
     import subprocess
     subprocess.run(['git', 'switch', '-q', '-c', 'feat/wrong'], check=True)
@@ -97,16 +105,31 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         return subprocess.run(command, text=True, capture_output=True, env=environment,
                               timeout=watchdog_seconds)
 
-    def test_private_report_and_snapshot_on_successful_model_edit(self):
+    def test_successful_model_edit_requires_main_commit_without_index_mutation(self):
+        index_before = (self.repo / '.git/index').read_bytes()
         result = self.invoke(env={'CODEX_ACTION': 'updated'})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'needs-main-commit')
+        self.assertFalse(report['snapshot_commit_by_wrapper'])
+        self.assertEqual(report['snapshot_error'], '')
+        self.assertEqual(report['exit'], 0)
+        self.assertEqual(report['commits'], 0)
+        self.assertTrue(report['dirty'])
+        self.assertEqual(report['head'], self.base)
+        self.assertEqual((self.repo / '.git/index').read_bytes(), index_before)
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'updated\n')
+        self.assertEqual(self.output.stat().st_mode & 0o777, 0o600)
+
+    def test_model_committed_clean_worktree_still_needs_main_verification(self):
+        result = self.invoke(env={'CODEX_ACTION': 'updated', 'CODEX_COMMIT': '1'})
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'needs-main-verification')
-        self.assertTrue(report['snapshot_commit_by_wrapper'])
         self.assertEqual(report['commits'], 1)
         self.assertFalse(report['dirty'])
-        self.assertEqual((self.repo / 'app.txt').read_text(), 'updated\n')
-        self.assertEqual(self.output.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(report['snapshot_commit_by_wrapper'])
+        self.assertEqual(git(self.repo, 'show', 'HEAD:app.txt'), 'updated')
 
     def test_rescue_refuses_clean_commit_on_a_different_branch(self):
         result = self.invoke(env={'CODEX_SWITCH_BRANCH': '1', 'CAPTURE_CLAUDE_PROMPT': str(self.root / 'fallback')})
@@ -167,15 +190,17 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertTrue(report['dirty'])
         self.assertFalse(capture.exists())
 
-    def test_fallback_before_edits_is_blind_and_snapshotted(self):
+    def test_fallback_before_edits_is_blind_and_handed_off(self):
         capture = self.root / 'fallback-prompt.txt'
         result = self.invoke(env={'CODEX_EXIT': '7', 'CLAUDE_ACTION': 'fallback',
                                   'CAPTURE_CLAUDE_PROMPT': str(capture)},
                              watchdog_seconds=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['source'], 'Claude Fable fallback')
-        self.assertEqual(report['status'], 'needs-main-verification')
+        self.assertEqual(report['status'], 'needs-main-commit')
+        self.assertEqual(report['head'], self.base)
+        self.assertTrue(report['dirty'])
         self.assertIn('A disposable rescue packet', capture.read_text())
         self.assertNotIn('Fixture handoff', capture.read_text())
 
@@ -312,51 +337,50 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
                 rescue.log(outside, {'event': 'probe'})
         self.assertFalse(outside.exists())
 
-    def test_snapshot_refuses_hardlinked_external_content(self):
-        outside = self.root / 'outside-secret.txt'
-        outside.write_text('private fixture\n')
-        link = self.repo / 'config.py'
-        os.link(outside, link)
-        success, detail = rescue.snapshot_commit(self.repo, 'fixture')
-        self.assertFalse(success, detail)
-        self.assertEqual(git(self.repo, 'rev-parse', 'HEAD'), self.base)
-        self.assertEqual(outside.read_text(), 'private fixture\n')
+    def test_model_hardlink_is_left_for_main_without_committing_outside_bytes(self):
+        outside = self.root / 'outside-private.txt'
+        outside.write_text('private fixture bytes\n')
+        index_before = (self.repo / '.git/index').read_bytes()
+        result = self.invoke(env={'CODEX_LINK_OUTSIDE': str(outside)})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'needs-main-commit')
+        self.assertEqual(report['head'], self.base)
+        self.assertTrue(report['dirty'])
+        self.assertEqual((self.repo / '.git/index').read_bytes(), index_before)
+        self.assertEqual(git(self.repo, 'show', 'HEAD:app.txt'), 'baseline')
+        self.assertEqual(outside.read_text(), 'private fixture bytes\n')
 
-    def test_snapshot_refuses_sensitive_paths(self):
-        for name in ('.env', 'src/credentials.txt', 'node_modules/pkg/index.js', 'keys/private.pem'):
-            with self.subTest(name=name):
-                git(self.repo, 'reset', '--hard', self.base)
-                git(self.repo, 'clean', '-fdq')
-                path = self.repo / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text('fixture')
-                success, _ = rescue.snapshot_commit(self.repo, 'fixture')
-                self.assertFalse(success)
-                self.assertEqual(git(self.repo, 'rev-parse', 'HEAD'), self.base)
+    def test_failure_first_swap_boundary_has_no_wrapper_commit(self):
+        # On the old wrapper, this hook swaps after validation at git add and
+        # the baseline control committed outside bytes. The new wrapper never
+        # reaches that path-read boundary and leaves the model edit for main.
+        outside = self.root / 'outside-private.txt'
+        outside.write_text('private fixture bytes\n')
+        original_snapshot_git = getattr(rescue, 'snapshot_git', None)
+
+        def swap_before_add(repo, *args, **kwargs):
+            if args and args[0] == 'add':
+                path = self.repo / 'app.txt'
                 path.unlink()
+                os.link(outside, path)
+            return original_snapshot_git(repo, *args, **kwargs)
 
-    def test_wrapper_snapshot_commit_does_not_run_source_hook(self):
-        (self.repo / 'app.txt').write_text('updated\n')
-        marker = self.root / 'hook-ran'
-        hook = self.repo / '.git/hooks/pre-commit'
-        hook.write_text(f'#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n')
-        hook.chmod(0o700)
-        committed, detail = rescue.snapshot_commit(self.repo, 'fixture')
-        self.assertTrue(committed, detail)
-        self.assertFalse(marker.exists())
-        self.assertNotEqual(git(self.repo, 'rev-parse', 'HEAD'), self.base)
-
-    def test_wrapper_snapshot_commit_does_not_run_signing_program(self):
-        (self.repo / 'app.txt').write_text('updated\n')
-        marker = self.root / 'signing-ran'
-        signer = self.root / 'signer'
-        signer.write_text(f'#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n')
-        signer.chmod(0o700)
-        git(self.repo, 'config', 'commit.gpgsign', 'true')
-        git(self.repo, 'config', 'gpg.program', str(signer))
-        committed, detail = rescue.snapshot_commit(self.repo, 'fixture')
-        self.assertTrue(committed, detail)
-        self.assertFalse(marker.exists())
+        hook = patch.object(rescue, 'snapshot_git', side_effect=swap_before_add) if original_snapshot_git else None
+        if hook:
+            hook.start()
+            self.addCleanup(hook.stop)
+        with (patch.object(sys, 'argv', [str(RESCUE), '--repo', str(self.repo),
+                                       '--packet', str(self.packet), '--output', str(self.output)]),
+              patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+                                      'CODEX_ACTION': 'reviewed'})):
+            exit_code = rescue.main()
+        self.assertNotEqual(git(self.repo, 'show', 'HEAD:app.txt'), 'private fixture bytes')
+        self.assertEqual(git(self.repo, 'rev-parse', 'HEAD'), self.base)
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(json.loads(self.output.read_text())['status'], 'needs-main-commit')
+        self.assertEqual(git(self.repo, 'show', 'HEAD:app.txt'), 'baseline')
+        self.assertEqual(outside.read_text(), 'private fixture bytes\n')
 
 
 if __name__ == '__main__':

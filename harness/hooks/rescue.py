@@ -23,19 +23,6 @@ from report_file import ReportTarget
 from git_safety import git_environment, require_safe_source
 
 
-SNAPSHOT_GIT_TIMEOUT = 30
-
-
-def snapshot_git(repo: Path, *args: str, text: bool = True):
-    env = git_environment()
-    require_safe_source(repo, env)
-    result = run_process(["git", "-C", str(repo), *args], text=text,
-                         env=env, timeout=SNAPSHOT_GIT_TIMEOUT)
-    if result.returncode:
-        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
-    return result
-
-
 def git(repo: Path, *args: str) -> str:
     env = git_environment()
     require_safe_source(repo, env)
@@ -73,36 +60,6 @@ def run(cmd: list[str], prompt: str, repo: Path) -> tuple[int, str, str]:
         return result.returncode, result.stdout, result.stderr
     except (OSError, subprocess.TimeoutExpired) as error:
         return 125, "", str(error)
-
-
-def snapshot_commit(repo: Path, source: str) -> tuple[bool, str]:
-    """Preserve a successful model's uncommitted files for main-agent review."""
-    raw = snapshot_git(repo, "ls-files", "--modified", "--others", "--deleted", "--exclude-standard", "-z", text=False).stdout
-    raw += snapshot_git(repo, "diff", "--no-ext-diff", "--no-textconv",
-                        "--cached", "--name-only", "-z", text=False).stdout
-    paths = list(dict.fromkeys(part.decode(errors="surrogateescape") for part in raw.split(b"\0") if part))
-    if not paths:
-        return False, "no changed files to commit"
-    banned = {".git", ".claude", "node_modules", ".venv", "venv", "vendor", "dist", "build", "__pycache__", "secrets", "credentials"}
-    for name in paths:
-        path = repo / name
-        components = {part.lower() for part in Path(name).parts}
-        stems = {Path(part).stem.lower() for part in components}
-        if (components & banned or stems & {"credential", "credentials", "secret", "secrets"}
-                or any(part.startswith(".env") for part in components)
-                or path.suffix.lower() in {".pem", ".key", ".p12"}):
-            return False, f"refusing to snapshot sensitive or generated path: {name}"
-        if path.is_symlink():
-            return False, f"refusing to snapshot symlink: {name}"
-        if path.exists():
-            info = path.stat()
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 5_000_000:
-                return False, f"refusing to snapshot non-regular, hardlinked or large path: {name}"
-    snapshot_git(repo, "add", "-A", "--", *paths)
-    snapshot_git(repo, "diff", "--no-ext-diff", "--no-textconv", "--cached", "--check")
-    message = f"Rescue snapshot: {source} changes pending main verification"
-    snapshot_git(repo, "-c", "user.name=Claude Rescue Snapshot", "-c", "user.email=claude-rescue@localhost", "commit", "-m", message)
-    return True, ""
 
 
 def main() -> int:
@@ -174,17 +131,16 @@ def main() -> int:
                     code, handoff, stderr = run(cmd, prompt, repo)
                 else:
                     stderr = "Claude executable unavailable"
-        snapshot = False
-        snapshot_error = ""
-        if code == 0 and git(repo, "branch", "--show-current") == branch and git(repo, "status", "--porcelain", "--untracked-files=all"):
-            try:
-                snapshot, snapshot_error = snapshot_commit(repo, source)
-            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-                snapshot_error = f"Snapshot Git operation failed or timed out: {type(error).__name__}"
         head = git(repo, "rev-parse", "HEAD")
         dirty_after = bool(git(repo, "status", "--porcelain", "--untracked-files=all"))
         actual_branch = git(repo, "branch", "--show-current")
         branch_head = git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
+        status = "blocked"
+        if code == 0 and actual_branch == branch and branch_head == head:
+            if dirty_after:
+                status = "needs-main-commit"
+            elif head != base:
+                status = "needs-main-verification"
         report = {
             "source": source,
             "fallback_reason": fallback_reason,
@@ -195,13 +151,12 @@ def main() -> int:
             "head": head,
             "commits": int(git(repo, "rev-list", "--count", f"{base}..HEAD")),
             "dirty": dirty_after,
-            "snapshot_commit_by_wrapper": snapshot,
-            "snapshot_error": snapshot_error,
+            "snapshot_commit_by_wrapper": False,
+            "snapshot_error": "",
             "exit": code,
             "handoff": handoff[-30000:],
             "stderr_tail": stderr[-4000:],
-            "status": ("needs-main-verification" if code == 0 and head != base and not dirty_after
-                       and actual_branch == branch and branch_head == head else "blocked"),
+            "status": status,
         }
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         print("Rescue worktree could not be inspected safely after model; inspect it before retrying.", file=sys.stderr)

@@ -51,6 +51,8 @@ Exit 0 means a reviewer returned PASS, 3 means BLOCK, and 2 means no valid revie
 
 The main agent can invoke `rescue.py` after repeated material findings, only in a clean rescue worktree and with a self-contained packet. A successful rescue still needs main-agent verification and final review.
 
+The rescue wrapper does not stage or commit leftover model edits. If the model exits successfully on the approved branch but leaves a dirty worktree, the report says `needs-main-commit` and the helper exits 3. The isolated worktree and its existing Git index remain in place. Main must inspect file types and content, run the relevant checks, then make the commit before cleanup or integration. A model-made commit with a clean worktree still reports `needs-main-verification` and exits 0. A failed model after edits does not trigger the blind fallback; inspect its worktree. Keep the report's `exit` field distinct from the helper exit: it records the model's exit code.
+
 ## Publication and local integration
 
 ```sh
