@@ -18,7 +18,8 @@ from process import signal_group
 AUTH_GIT_ENV = {'GIT_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_SSH_VARIANT',
                 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM'}
 BASE_SETTINGS = (('core.hooksPath', os.devnull), ('core.fsmonitor', 'false'),
-                 ('core.filemode', 'true'), ('core.untrackedCache', 'false'),
+                 ('core.filemode', 'true'), ('core.symlinks', 'true'),
+                 ('core.untrackedCache', 'false'),
                  ('core.trustctime', 'true'), ('core.checkStat', 'default'),
                  ('commit.gpgsign', 'false'), ('tag.gpgsign', 'false'))
 FILTER_PATTERN = r'^filter\..*\.(clean|process|smudge)$'

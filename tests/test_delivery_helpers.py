@@ -472,6 +472,30 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
                                 cwd=remote, check=False).returncode, 0)
 
+    def test_publish_rejects_regular_file_disguised_as_tracked_symlink(self):
+        tracked = self.feature / 'app.txt'
+        tracked.unlink()
+        tracked.symlink_to('target.txt')
+        cmd('git', 'add', 'app.txt', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'track symlink', cwd=self.feature)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        tracked.unlink()
+        tracked.write_text('target.txt')
+        cmd('git', 'config', 'core.symlinks', 'false', cwd=self.feature)
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.feature).stdout, '')
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', reviewed]
+        result = subprocess.run(args, text=True, capture_output=True, env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (2, 'BLOCKED_POLICY'), result.stderr)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
+                                cwd=remote, check=False).returncode, 0)
+
     def test_publish_remote_inspection_does_not_run_source_ssh_command(self):
         marker = self.root / 'source-ssh-ran'
         ssh = self.root / 'source-ssh'
