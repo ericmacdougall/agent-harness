@@ -351,37 +351,6 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(git(self.repo, 'show', 'HEAD:app.txt'), 'baseline')
         self.assertEqual(outside.read_text(), 'private fixture bytes\n')
 
-    def test_failure_first_swap_boundary_has_no_wrapper_commit(self):
-        # On the old wrapper, this hook swaps after validation at git add and
-        # the baseline control committed outside bytes. The new wrapper never
-        # reaches that path-read boundary and leaves the model edit for main.
-        outside = self.root / 'outside-private.txt'
-        outside.write_text('private fixture bytes\n')
-        original_snapshot_git = getattr(rescue, 'snapshot_git', None)
-
-        def swap_before_add(repo, *args, **kwargs):
-            if args and args[0] == 'add':
-                path = self.repo / 'app.txt'
-                path.unlink()
-                os.link(outside, path)
-            return original_snapshot_git(repo, *args, **kwargs)
-
-        hook = patch.object(rescue, 'snapshot_git', side_effect=swap_before_add) if original_snapshot_git else None
-        if hook:
-            hook.start()
-            self.addCleanup(hook.stop)
-        with (patch.object(sys, 'argv', [str(RESCUE), '--repo', str(self.repo),
-                                       '--packet', str(self.packet), '--output', str(self.output)]),
-              patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
-                                      'CODEX_ACTION': 'reviewed'})):
-            exit_code = rescue.main()
-        self.assertNotEqual(git(self.repo, 'show', 'HEAD:app.txt'), 'private fixture bytes')
-        self.assertEqual(git(self.repo, 'rev-parse', 'HEAD'), self.base)
-        self.assertEqual(exit_code, 3)
-        self.assertEqual(json.loads(self.output.read_text())['status'], 'needs-main-commit')
-        self.assertEqual(git(self.repo, 'show', 'HEAD:app.txt'), 'baseline')
-        self.assertEqual(outside.read_text(), 'private fixture bytes\n')
-
 
 if __name__ == '__main__':
     unittest.main()

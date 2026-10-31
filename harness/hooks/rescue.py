@@ -151,6 +151,7 @@ def main() -> int:
             "head": head,
             "commits": int(git(repo, "rev-list", "--count", f"{base}..HEAD")),
             "dirty": dirty_after,
+            # Preserve these report keys for existing consumers of rescue reports.
             "snapshot_commit_by_wrapper": False,
             "snapshot_error": "",
             "exit": code,
