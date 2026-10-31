@@ -78,8 +78,32 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
     return result
 
 
-def merge_config(existing: str, wal_dir: Path) -> str:
-    """Add a narrow default profile without silently replacing a user's policy."""
+def owned_root_line(text: str, key: str, value: str) -> int | None:
+    """Locate an exact generated root assignment, never marker text in a TOML value."""
+    parsed = tomllib.loads(text)
+    if parsed.get(key) != value:
+        return None
+    expected = copy.deepcopy(parsed)
+    del expected[key]
+    generated = f'{key} = {json.dumps(value)} # agent-harness-codex'
+    lines = text.splitlines(keepends=True)
+    matches = []
+    for index, line in enumerate(lines):
+        if line.rstrip('\r\n') != generated:
+            continue
+        try:
+            candidate = tomllib.loads(''.join(lines[:index] + lines[index + 1:]))
+        except tomllib.TOMLDecodeError:
+            continue
+        if candidate == expected:
+            matches.append(index)
+    if len(matches) > 1:
+        raise ValueError(f'config.toml has ambiguous managed {key} lines')
+    return matches[0] if matches else None
+
+
+def merge_config(existing: str, wal_dir: Path, *, default_full_access: bool = False) -> str:
+    """Install the optional profile; change the default only on a fresh or opted-in install."""
     if tomllib is None:
         raise RuntimeError('Codex installer requires Python 3.11+ for TOML validation')
     profile = ('[permissions.agent-harness]\n'
@@ -144,8 +168,6 @@ def merge_config(existing: str, wal_dir: Path) -> str:
     elif starts or ends:
         raise ValueError('config.toml has stray Agent Harness comment markers; resolve manually')
     parsed = tomllib.loads(existing)
-    if 'default_permissions' in parsed and parsed['default_permissions'] != 'agent-harness':
-        raise ValueError('config.toml already selects a different permission profile; merge manually')
     if 'sandbox_mode' in parsed or 'sandbox_workspace_write' in parsed:
         raise ValueError('config.toml uses legacy sandbox settings; merge manually')
     if 'profile' in parsed:
@@ -155,17 +177,34 @@ def merge_config(existing: str, wal_dir: Path) -> str:
             raise ValueError('config.toml has a profile with legacy sandbox settings; merge manually')
     if 'agent-harness' in parsed.get('permissions', {}):
         raise ValueError('config.toml already defines the agent-harness profile outside managed markers')
-    if 'default_permissions' not in parsed:
-        existing = 'default_permissions = "agent-harness" # agent-harness-codex\n' + existing
-        if managed_result is not None:
-            managed_result = 'default_permissions = "agent-harness" # agent-harness-codex\n' + managed_result
     result = (managed_result if managed_result is not None else
               existing.rstrip() + '\n\n' + CONFIG_START + '\n' + profile + '\n' + CONFIG_END + '\n')
+    current = tomllib.loads(result)
+    owned_default = owned_root_line(result, 'default_permissions', 'agent-harness')
+    if default_full_access:
+        selected = current.get('default_permissions')
+        if (selected not in (None, ':danger-full-access')
+                and not (selected == 'agent-harness' and owned_default is not None)):
+            raise ValueError('config.toml selects a user-owned permission default; resolve manually')
+        if current.get('approval_policy') not in (None, 'never'):
+            raise ValueError('config.toml selects a user-owned approval policy; resolve manually')
+        if owned_default is not None:
+            lines = result.splitlines(keepends=True)
+            lines[owned_default] = 'default_permissions = ":danger-full-access" # agent-harness-codex\n'
+            result = ''.join(lines)
+        elif selected is None:
+            result = 'default_permissions = ":danger-full-access" # agent-harness-codex\n' + result
+        if 'approval_policy' not in current:
+            result = 'approval_policy = "never" # agent-harness-codex\n' + result
+    elif 'default_permissions' not in current and managed_profile is None:
+        result = 'default_permissions = "agent-harness" # agent-harness-codex\n' + result
+    # A normal reinstall keeps explicit defaults and approval choices. Missing
+    # root settings in an existing install are intentional.
     tomllib.loads(result)
     return result
 
 
-def install(home: Path, apply: bool) -> list[str]:
+def install(home: Path, apply: bool, *, default_full_access: bool = False) -> list[str]:
     home = home.expanduser().resolve()
     codex_home = home / '.codex'
     skill_dir = codex_home / 'skills' / 'agent-harness'
@@ -199,7 +238,7 @@ def install(home: Path, apply: bool) -> list[str]:
         existing_config = originals[config_path][0].decode() if originals[config_path] else ''
         instructions = merge_marked(existing_instructions, (SOURCE / 'AGENTS.md').read_text())
         hooks = merge_hooks(existing_hooks, codex_home)
-        config = merge_config(existing_config, wal_dir)
+        config = merge_config(existing_config, wal_dir, default_full_access=default_full_access)
         payloads = [(destination, source.read_bytes()) for source, destination in files]
         payloads += [(instructions_path, instructions.encode()),
                      (hooks_path, (json.dumps(hooks, indent=2) + '\n').encode()),
@@ -267,13 +306,17 @@ def install(home: Path, apply: bool) -> list[str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--default-full-access', action='store_true',
+                        help='Explicitly select built-in Full Access and no approval prompts for new sessions')
     parser.add_argument('--home', type=Path, default=Path.home())
     args = parser.parse_args()
     try:
-        changes = install(args.home, args.apply)
+        changes = install(args.home, args.apply, default_full_access=args.default_full_access)
     except (ValueError, RuntimeError) as error:
         parser.exit(2, f'error: {error}\n')
     print(('Installed' if args.apply else 'Would install') + f' Codex Agent Harness in {args.home / ".codex"}')
+    if args.default_full_access:
+        print('Full Access default requested: unrestricted local filesystem and network; approval prompts disabled.')
     for path in changes:
         print(f'  {path}')
     if args.apply:

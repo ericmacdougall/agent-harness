@@ -20,20 +20,26 @@ from pathlib import Path
 from wal import append as append_wal
 from process import run as run_process
 from report_file import ReportTarget
+from git_safety import git_environment, require_safe_source
 
 
 SNAPSHOT_GIT_TIMEOUT = 30
 
 
 def snapshot_git(repo: Path, *args: str, text: bool = True):
-    result = run_process(["git", "-C", str(repo), *args], text=text, timeout=SNAPSHOT_GIT_TIMEOUT)
+    env = git_environment()
+    require_safe_source(repo, env)
+    result = run_process(["git", "-C", str(repo), *args], text=text,
+                         env=env, timeout=SNAPSHOT_GIT_TIMEOUT)
     if result.returncode:
         raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
     return result
 
 
 def git(repo: Path, *args: str) -> str:
-    result = run_process(["git", "-C", str(repo), *args], text=True, timeout=30)
+    env = git_environment()
+    require_safe_source(repo, env)
+    result = run_process(["git", "-C", str(repo), *args], text=True, env=env, timeout=30)
     if result.returncode:
         raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
     return result.stdout.strip()
@@ -62,7 +68,8 @@ def read_packet(path: Path) -> str:
 
 def run(cmd: list[str], prompt: str, repo: Path) -> tuple[int, str, str]:
     try:
-        result = run_process(cmd, input=prompt, text=True, cwd=repo, timeout=3600)
+        result = run_process(cmd, input=prompt, text=True, cwd=repo,
+                             env=git_environment(), timeout=3600)
         return result.returncode, result.stdout, result.stderr
     except (OSError, subprocess.TimeoutExpired) as error:
         return 125, "", str(error)
@@ -71,7 +78,8 @@ def run(cmd: list[str], prompt: str, repo: Path) -> tuple[int, str, str]:
 def snapshot_commit(repo: Path, source: str) -> tuple[bool, str]:
     """Preserve a successful model's uncommitted files for main-agent review."""
     raw = snapshot_git(repo, "ls-files", "--modified", "--others", "--deleted", "--exclude-standard", "-z", text=False).stdout
-    raw += snapshot_git(repo, "diff", "--cached", "--name-only", "-z", text=False).stdout
+    raw += snapshot_git(repo, "diff", "--no-ext-diff", "--no-textconv",
+                        "--cached", "--name-only", "-z", text=False).stdout
     paths = list(dict.fromkeys(part.decode(errors="surrogateescape") for part in raw.split(b"\0") if part))
     if not paths:
         return False, "no changed files to commit"
@@ -91,7 +99,7 @@ def snapshot_commit(repo: Path, source: str) -> tuple[bool, str]:
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 5_000_000:
                 return False, f"refusing to snapshot non-regular, hardlinked or large path: {name}"
     snapshot_git(repo, "add", "-A", "--", *paths)
-    snapshot_git(repo, "diff", "--cached", "--check")
+    snapshot_git(repo, "diff", "--no-ext-diff", "--no-textconv", "--cached", "--check")
     message = f"Rescue snapshot: {source} changes pending main verification"
     snapshot_git(repo, "-c", "user.name=Claude Rescue Snapshot", "-c", "user.email=claude-rescue@localhost", "commit", "-m", message)
     return True, ""
@@ -114,9 +122,9 @@ def main() -> int:
         root = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
         branch = git(repo, "branch", "--show-current")
         base = git(repo, "rev-parse", "HEAD")
-        dirty = git(repo, "status", "--porcelain")
+        dirty = git(repo, "status", "--porcelain", "--untracked-files=all")
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        parser.error("repo must be a Git worktree")
+        parser.error("repo Git state could not be inspected safely")
     if root != repo or not branch or dirty:
         parser.error("rescue worktree must be at its root, on a named branch, and clean")
     try:
@@ -151,43 +159,54 @@ def main() -> int:
             handoff = last.read_text(errors="replace") if last.exists() else stdout
     else:
         code, handoff, stderr = 125, "", "Codex executable unavailable"
-    if code != 0:
-        changed = git(repo, "rev-parse", "HEAD") != base or bool(git(repo, "status", "--porcelain"))
-        if changed:
-            fallback_reason = "Astra failed after modifying the worktree; preserve it for main-agent inspection."
-        else:
-            fallback_reason = f"Astra unavailable or failed before edits (exit {code}); trying Fable."
-            if shutil.which("claude"):
-                source = "Claude Fable fallback"
-                cmd = ["claude", "--safe-mode", "--print", "--model", "fable", "--permission-mode", "auto", "--output-format", "text", "--"]
-                code, handoff, stderr = run(cmd, prompt, repo)
+    try:
+        if code != 0:
+            changed = (git(repo, "rev-parse", "HEAD") != base
+                       or bool(git(repo, "status", "--porcelain", "--untracked-files=all"))
+                       or git(repo, "branch", "--show-current") != branch)
+            if changed:
+                fallback_reason = "Astra failed after modifying the worktree; preserve it for main-agent inspection."
             else:
-                stderr = "Claude executable unavailable"
-    snapshot = False
-    snapshot_error = ""
-    if code == 0 and git(repo, "status", "--porcelain"):
-        try:
-            snapshot, snapshot_error = snapshot_commit(repo, source)
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-            snapshot_error = f"Snapshot Git operation failed or timed out: {type(error).__name__}"
-    head = git(repo, "rev-parse", "HEAD")
-    dirty_after = bool(git(repo, "status", "--porcelain"))
-    report = {
-        "source": source,
-        "fallback_reason": fallback_reason,
-        "repo": str(repo),
-        "branch": branch,
-        "base": base,
-        "head": head,
-        "commits": int(git(repo, "rev-list", "--count", f"{base}..HEAD")),
-        "dirty": dirty_after,
-        "snapshot_commit_by_wrapper": snapshot,
-        "snapshot_error": snapshot_error,
-        "exit": code,
-        "handoff": handoff[-30000:],
-        "stderr_tail": stderr[-4000:],
-        "status": "needs-main-verification" if code == 0 and head != base and not dirty_after else "blocked",
-    }
+                fallback_reason = f"Astra unavailable or failed before edits (exit {code}); trying Fable."
+                if shutil.which("claude"):
+                    source = "Claude Fable fallback"
+                    cmd = ["claude", "--safe-mode", "--print", "--model", "fable", "--permission-mode", "auto", "--output-format", "text", "--"]
+                    code, handoff, stderr = run(cmd, prompt, repo)
+                else:
+                    stderr = "Claude executable unavailable"
+        snapshot = False
+        snapshot_error = ""
+        if code == 0 and git(repo, "branch", "--show-current") == branch and git(repo, "status", "--porcelain", "--untracked-files=all"):
+            try:
+                snapshot, snapshot_error = snapshot_commit(repo, source)
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                snapshot_error = f"Snapshot Git operation failed or timed out: {type(error).__name__}"
+        head = git(repo, "rev-parse", "HEAD")
+        dirty_after = bool(git(repo, "status", "--porcelain", "--untracked-files=all"))
+        actual_branch = git(repo, "branch", "--show-current")
+        branch_head = git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
+        report = {
+            "source": source,
+            "fallback_reason": fallback_reason,
+            "repo": str(repo),
+            "branch": branch,
+            "actual_branch": actual_branch,
+            "base": base,
+            "head": head,
+            "commits": int(git(repo, "rev-list", "--count", f"{base}..HEAD")),
+            "dirty": dirty_after,
+            "snapshot_commit_by_wrapper": snapshot,
+            "snapshot_error": snapshot_error,
+            "exit": code,
+            "handoff": handoff[-30000:],
+            "stderr_tail": stderr[-4000:],
+            "status": ("needs-main-verification" if code == 0 and head != base and not dirty_after
+                       and actual_branch == branch and branch_head == head else "blocked"),
+        }
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        print("Rescue worktree could not be inspected safely after model; inspect it before retrying.", file=sys.stderr)
+        target.close()
+        return 3
     try:
         target.write_text(json.dumps(report, indent=2) + "\n")
         log(wal, {"event": "rescue_result", "branch": branch, "base": base, "head": head, "source": source, "status": report["status"], "report": str(output)})

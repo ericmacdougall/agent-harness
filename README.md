@@ -1,6 +1,6 @@
 # Agent Harness for Claude Code and Codex
 
-The repo includes a Codex-native edition: global `AGENTS.md` guidance, a focused skill, custom subagent roles, private lifecycle-hook WALs, and a narrow permission profile for WAL writes and local Git commits. With Python 3.11 or newer, install it with `python3.11 install_codex.py --apply` after previewing `python3.11 install_codex.py`. Start a new Codex session and use `/hooks` to review and trust the installed hook definition. See [Codex setup and limits](docs/codex.md).
+The repo includes a Codex-native edition: global `AGENTS.md` guidance, a focused skill, custom subagent roles, private lifecycle-hook WALs, and a narrow permission profile for WAL writes and local Git commits. With Python 3.11 or newer, install it with `python3.11 install_codex.py --apply` after previewing `python3.11 install_codex.py`. To explicitly make Codex's built-in Full Access the default for new chats, use `python3.11 install_codex.py --apply --default-full-access`; this keeps the harness guidance and hooks, and requires legacy sandbox settings to be removed first. Start a new Codex session and use `/hooks` to review and trust the installed hook definition. Browser site permissions are separate from local command permissions. See [Codex setup and limits](docs/codex.md).
 
 A user-wide Claude Code workflow for parallel software tasks with recoverable work, independent review, live testing, and local delivery. Both editions are instruction text plus small Python helpers. Neither is a daemon, scheduler, CI service, or guarantee that an agent will obey every instruction. Claude's hooks enforce WAL metadata before matched write tools; Codex's hooks record supported lifecycle and tool metadata. The remaining process gates require the main agent to follow the instructions and report evidence.
 
@@ -40,7 +40,7 @@ To uninstall, remove the marked block from `CLAUDE.md`, remove the four hook ent
 3. An independent reviewer and click tester inspect the actual branch. The owner or fixer addresses findings and retests. The main agent checks scope, test quality, final HEAD and documentation.
 4. The main agent attempts a feature branch push and PR, then merges a verified commit into the recorded local checkout. If publication fails, local work continues and the user receives the remote error.
 
-The `publish_feature.py` helper never force-pushes or pushes the original branch. The `integrate_local.py` helper checks expected source and destination commits, requires a clean checkout, runs allowlisted dependency preparation and checks, and aborts failed merges. See [docs/operations.md](docs/operations.md) for exact commands and limits.
+The `publish_feature.py` helper never force-pushes or pushes the original branch. The `integrate_local.py` helper checks expected source and destination commits, requires a clean checkout, runs allowlisted dependency preparation and checks, and aborts failed merges when source Git state can be verified safe for an automatic abort. See [docs/operations.md](docs/operations.md) for exact commands and limits.
 
 ## Evidence and limits
 

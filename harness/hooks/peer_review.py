@@ -4,7 +4,7 @@
 import argparse
 import os
 import re
-import select
+import selectors
 import shutil
 import signal
 import stat
@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from process import run as run_process, signal_group
+from git_safety import git_environment as safe_git_environment, require_safe_source
 from report_file import ReportTarget
 
 
@@ -33,16 +34,9 @@ REVIEW_SYSTEM = (
 
 def git_environment() -> dict[str, str]:
     """Ignore inherited Git routing and user configuration in all child processes."""
-    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
-    env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
-               GIT_NO_REPLACE_OBJECTS='1', GIT_NO_LAZY_FETCH='1', GIT_TERMINAL_PROMPT='0')
-    settings = {'core.hooksPath': os.devnull, 'core.fsmonitor': 'false',
-                'core.autocrlf': 'false', 'protocol.allow': 'never'}
-    env['GIT_CONFIG_COUNT'] = str(len(settings))
-    for index, (key, value) in enumerate(settings.items()):
-        env[f'GIT_CONFIG_KEY_{index}'] = key
-        env[f'GIT_CONFIG_VALUE_{index}'] = value
-    return env
+    return safe_git_environment(isolated=True,
+                                settings=(('core.autocrlf', 'false'),
+                                          ('protocol.allow', 'never')))
 
 
 def git(repo: Path, *args: str) -> str:
@@ -108,21 +102,24 @@ def read_packet(path: Path) -> str:
 
 def repo_state(repo: Path) -> tuple[str, str]:
     """Capture a clean reviewed commit without reading untracked content."""
-    values = []
-    for args in (['rev-parse', '--verify', 'HEAD^{commit}'],
-                 ['status', '--porcelain=v1', '--untracked-files=all']):
-        result = run_process(['git', '-C', str(repo), *args], env=git_environment(), timeout=30)
-        if result.returncode:
-            raise OSError(f'Git state inspection failed: {" ".join(args)}')
-        values.append(result.stdout)
-    if values[1]:
-        return values[0].strip(), values[1]
+    head = run_process(['git', '-C', str(repo), 'rev-parse', '--verify', 'HEAD^{commit}'],
+                       env=git_environment(), timeout=30)
+    if head.returncode:
+        raise OSError('Git HEAD inspection failed')
+    require_safe_source(repo, git_environment())
+    status = run_process(['git', '-C', str(repo), 'status', '--porcelain=v1',
+                          '--untracked-files=all'], env=git_environment(), timeout=30)
+    if status.returncode:
+        raise OSError('Git status inspection failed')
+    if status.stdout:
+        return head.stdout.strip(), status.stdout
     require_unflagged_index(repo)
     require_no_special_entries(repo)
-    diff = run_process(['git', '-C', str(repo), 'diff', '--binary', 'HEAD', '--'], env=git_environment(), timeout=30)
+    diff = run_process(['git', '-C', str(repo), 'diff', '--no-ext-diff', '--no-textconv',
+                        '--binary', 'HEAD', '--'], env=git_environment(), timeout=30)
     if diff.returncode or diff.stdout:
         raise OSError('worktree changed during state inspection')
-    return values[0].strip(), values[1]
+    return head.stdout.strip(), status.stdout
 
 
 def require_no_special_entries(repo: Path) -> None:
@@ -173,16 +170,18 @@ def bounded_git_listing(repo: Path, args: list[str], deadline: float, limit: int
                                start_new_session=True, env=git_environment())
     data = bytearray()
     try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
-                raise OSError('Git listing exceeded time budget')
-            chunk = os.read(process.stdout.fileno(), min(65536, limit + 1 - len(data)))
-            if not chunk:
-                break
-            data.extend(chunk)
-            if len(data) > limit:
-                raise OSError('Git listing exceeded size budget')
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise OSError('Git listing exceeded time budget')
+                chunk = os.read(process.stdout.fileno(), min(65536, limit + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > limit:
+                    raise OSError('Git listing exceeded size budget')
         if process.wait(timeout=max(0.1, deadline - time.monotonic())):
             raise OSError('Git listing failed')
     finally:

@@ -1,8 +1,11 @@
 import importlib.util
 import os
+import resource
+import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -83,7 +86,126 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
                                '--packet', str(packet or self.packet), '--output', str(output or self.output),
                                *(['--expected-head', expected_head] if stage == 'pr' else [])]
         return subprocess.run(command,
-                              text=True, capture_output=True, env=environment, timeout=15)
+                              text=True, capture_output=True, env=environment, timeout=45)
+
+    def test_source_local_clean_filter_is_refused_before_execution(self):
+        (self.repo / '.gitattributes').write_text('app.txt filter=fixture\n')
+        subprocess.run(['git', '-C', str(self.repo), 'add', '.gitattributes'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', 'mark fixture filter'], check=True)
+        marker = self.root / 'filter-ran'
+        command = f"sh -c 'touch {shlex.quote(str(marker))}; cat'"
+        subprocess.run(['git', '-C', str(self.repo), 'config', 'filter.fixture.clean', command], check=True)
+        tracked = self.repo / 'app.txt'
+        stat_info = tracked.stat()
+        os.utime(tracked, ns=(stat_info.st_atime_ns, stat_info.st_mtime_ns + 2_000_000_000))
+
+        result = self.invoke(stage='plan')
+        self.assertFalse(marker.exists(), 'source status executed a repository-local clean filter')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_conditional_local_include_filter_is_refused(self):
+        (self.repo / '.gitattributes').write_text('app.txt filter=fixture\n')
+        subprocess.run(['git', '-C', str(self.repo), 'add', '.gitattributes'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', 'mark fixture filter'], check=True)
+        marker = self.root / 'included-filter-ran'
+        included = self.root / 'local-filter-config'
+        included.write_text('[filter "fixture"]\n'
+                            f' clean = sh -c "touch {marker}; cat"\n')
+        gitdir = subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse',
+                                          '--absolute-git-dir'], text=True).strip()
+        with (Path(gitdir) / 'config').open('a') as config:
+            config.write(f'\n[includeIf "gitdir:{gitdir}"]\n path = {included}\n')
+        tracked = self.repo / 'app.txt'
+        info = tracked.stat()
+        os.utime(tracked, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+        result = self.invoke(stage='plan')
+        self.assertFalse(marker.exists())
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_worktree_scoped_filter_is_refused(self):
+        (self.repo / '.gitattributes').write_text('app.txt filter=fixture\n')
+        subprocess.run(['git', '-C', str(self.repo), 'add', '.gitattributes'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', 'mark fixture filter'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'config', 'extensions.worktreeConfig', 'true'], check=True)
+        marker = self.root / 'worktree-filter-ran'
+        subprocess.run(['git', '-C', str(self.repo), 'config', '--worktree',
+                        'filter.fixture.clean', f"sh -c 'touch {shlex.quote(str(marker))}; cat'"], check=True)
+        tracked = self.repo / 'app.txt'
+        info = tracked.stat()
+        os.utime(tracked, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+        result = self.invoke(stage='plan')
+        self.assertFalse(marker.exists())
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_populated_submodule_filter_is_not_executed(self):
+        child = self.root / 'child'
+        subprocess.run(['git', 'init', '-q', '-b', 'main', str(child)], check=True)
+        subprocess.run(['git', '-C', str(child), 'config', 'user.name', 'Fixture'], check=True)
+        subprocess.run(['git', '-C', str(child), 'config', 'user.email', 'fixture@example.invalid'], check=True)
+        (child / '.gitattributes').write_text('child.txt filter=fixture\n')
+        (child / 'child.txt').write_text('child\n')
+        subprocess.run(['git', '-C', str(child), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(child), 'commit', '-qm', 'child'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), '-c', 'protocol.file.allow=always',
+                        'submodule', 'add', '-q', str(child.resolve()), 'module'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-qam', 'add submodule'], check=True)
+        module = self.repo / 'module'
+        marker = self.root / 'submodule-filter-ran'
+        subprocess.run(['git', '-C', str(module), 'config', 'filter.fixture.clean',
+                        f"sh -c 'touch {shlex.quote(str(marker))}; cat'"], check=True)
+        tracked = module / 'child.txt'
+        info = tracked.stat()
+        os.utime(tracked, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+        subprocess.run(['git', '-C', str(self.repo), 'status', '--porcelain'],
+                       check=True, capture_output=True)
+        self.assertTrue(marker.exists(), 'control must exercise Git submodule filter')
+        marker.unlink()
+        result = self.invoke(stage='plan')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_index_listing_works_with_pipe_descriptor_above_1023(self):
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard < 1100:
+            self.skipTest('host descriptor limit below high-FD fixture')
+        raised = soft < 1100
+        if raised:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (1100, hard))
+            except OSError as error:
+                self.skipTest(f'cannot raise descriptor limit: {error}')
+        opened = []
+        try:
+            while not opened or opened[-1] < 1050:
+                opened.append(os.open(os.devnull, os.O_RDONLY))
+            sys.path.insert(0, str(REVIEW.parent))
+            try:
+                spec = importlib.util.spec_from_file_location('peer_review_high_fd', REVIEW)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                module.require_unflagged_index(self.repo)
+            finally:
+                sys.path.pop(0)
+        finally:
+            for descriptor in reversed(opened):
+                os.close(descriptor)
+            if raised:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    def test_blocked_config_include_fails_within_metadata_deadline(self):
+        include = self.root / 'stalled-config'
+        os.mkfifo(include)
+        subprocess.run(['git', '-C', str(self.repo), 'config', 'include.path', str(include)], check=True)
+        sys.path.insert(0, str(REVIEW.parent))
+        try:
+            from git_safety import git_environment, require_safe_source
+            started = time.monotonic()
+            with self.assertRaises(OSError):
+                require_safe_source(self.repo, git_environment(isolated=True), timeout=1)
+            self.assertLess(time.monotonic() - started, 4)
+        finally:
+            sys.path.pop(0)
 
     def test_both_reviewers_use_committed_snapshot_without_ignored_content(self):
         (self.repo / '.gitignore').write_text('private.txt\nnode_modules/\n')

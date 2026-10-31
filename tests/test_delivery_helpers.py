@@ -394,6 +394,207 @@ class DeliveryHelpers(unittest.TestCase):
         p, data = self.invoke(PUBLISH, '--repo', str(self.repo), '--branch', 'main', '--original-branch', 'main', '--expected-head', self.base)
         self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'))
 
+    def test_publish_rejects_ambient_alternate_index_before_push(self):
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        index_name = cmd('git', 'rev-parse', '--git-path', 'index', cwd=self.feature).stdout.strip()
+        index_path = Path(index_name)
+        if not index_path.is_absolute():
+            index_path = self.feature / index_path
+        alternate = self.root / 'alternate-index'
+        shutil.copyfile(index_path, alternate)
+        (self.feature / 'app.txt').write_text('unreviewed staged value\n')
+        cmd('git', 'add', 'app.txt', cwd=self.feature)
+        (self.feature / 'app.txt').write_text('feature\n')
+        self.assertIn('MM app.txt', cmd('git', 'status', '--porcelain', cwd=self.feature).stdout)
+
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head]
+        result = subprocess.run(args, text=True, capture_output=True,
+                                env={**isolated_env(), 'GIT_INDEX_FILE': str(alternate)}, timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (2, 'BLOCKED_POLICY'), result.stderr)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
+                                cwd=remote, check=False).returncode, 0)
+
+    def test_publish_rejects_hidden_tracked_edit_before_push(self):
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        cmd('git', 'update-index', '--assume-unchanged', 'app.txt', cwd=self.feature)
+        (self.feature / 'app.txt').write_text('unreviewed hidden value\n')
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.feature).stdout, '')
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head]
+        result = subprocess.run(args, text=True, capture_output=True, env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (2, 'BLOCKED_POLICY'), result.stderr)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
+                                cwd=remote, check=False).returncode, 0)
+
+    def test_publish_rejects_untracked_file_hidden_by_local_status_config(self):
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        cmd('git', 'config', 'status.showUntrackedFiles', 'no', cwd=self.feature)
+        (self.feature / 'unreviewed.txt').write_text('unreviewed\n')
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.feature).stdout, '')
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head]
+        result = subprocess.run(args, text=True, capture_output=True, env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (2, 'BLOCKED_POLICY'), result.stderr)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
+                                cwd=remote, check=False).returncode, 0)
+
+    def test_publish_rejects_mode_change_hidden_by_local_git_config(self):
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        cmd('git', 'config', 'core.filemode', 'false', cwd=self.feature)
+        tracked = self.feature / 'app.txt'
+        tracked.chmod(tracked.stat().st_mode | 0o111)
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.feature).stdout, '')
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head]
+        result = subprocess.run(args, text=True, capture_output=True, env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (2, 'BLOCKED_POLICY'), result.stderr)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
+                                cwd=remote, check=False).returncode, 0)
+
+    def test_publish_rejects_regular_file_disguised_as_tracked_symlink(self):
+        tracked = self.feature / 'app.txt'
+        tracked.unlink()
+        tracked.symlink_to('target.txt')
+        cmd('git', 'add', 'app.txt', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'track symlink', cwd=self.feature)
+        reviewed = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        tracked.unlink()
+        tracked.write_text('target.txt')
+        cmd('git', 'config', 'core.symlinks', 'false', cwd=self.feature)
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.feature).stdout, '')
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', reviewed]
+        result = subprocess.run(args, text=True, capture_output=True, env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (2, 'BLOCKED_POLICY'), result.stderr)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
+                                cwd=remote, check=False).returncode, 0)
+
+    def test_publish_remote_inspection_does_not_run_source_ssh_command(self):
+        marker = self.root / 'source-ssh-ran'
+        ssh = self.root / 'source-ssh'
+        ssh.write_text(f'#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n')
+        ssh.chmod(0o700)
+        cmd('git', 'config', 'core.sshCommand', str(ssh), cwd=self.feature)
+        cmd('git', 'remote', 'add', 'origin', 'ssh://127.0.0.1/missing.git', cwd=self.repo)
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head, '--timeout', '5']
+        result = subprocess.run(args, text=True, capture_output=True, env=isolated_env(), timeout=15)
+        self.assertEqual(json.loads(result.stdout)['status'], 'BLOCKED_REMOTE', result.stderr)
+        self.assertFalse(marker.exists(), 'source-local SSH command ran during remote inspection')
+
+    def test_publish_refuses_source_local_filter_before_status(self):
+        (self.feature / '.gitattributes').write_text('app.txt filter=fixture\n')
+        cmd('git', 'add', '.gitattributes', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'mark filter', cwd=self.feature)
+        head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        marker = self.root / 'filter-ran'
+        cmd('git', 'config', 'filter.fixture.clean',
+            f"sh -c 'touch {shlex.quote(str(marker))}; cat'", cwd=self.feature)
+        tracked = self.feature / 'app.txt'
+        info = tracked.stat()
+        os.utime(tracked, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', head]
+        result = subprocess.run(args, text=True, capture_output=True, env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (2, 'BLOCKED_POLICY'), result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_publish_disables_source_filesystem_monitor(self):
+        marker = self.root / 'fsmonitor-ran'
+        monitor = self.root / 'monitor'
+        monitor.write_text(f'#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n')
+        monitor.chmod(0o700)
+        cmd('git', 'config', 'core.fsmonitor', str(monitor), cwd=self.feature)
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        marker.unlink(missing_ok=True)  # fixture Git setup may query status
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head]
+        result = subprocess.run(args, text=True, capture_output=True, env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (0, 'PUSHED'), result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_publish_allows_unselected_trusted_global_filter(self):
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        global_config = self.root / 'trusted-global-gitconfig'
+        global_config.write_text('[filter "lfs"]\n clean = sh -c "exit 7"\n')
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head]
+        result = subprocess.run(args, text=True, capture_output=True,
+                                env={**isolated_env(), 'GIT_CONFIG_GLOBAL': str(global_config)}, timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (0, 'PUSHED'), result.stderr)
+
+    def test_publication_git_env_does_not_lazy_fetch_from_source_repo(self):
+        source = self.root / 'promisor-source'
+        remote = self.root / 'promisor-origin.git'
+        partial = self.root / 'partial'
+        cmd('git', 'init', '-q', '-b', 'main', str(source))
+        cmd('git', 'config', 'user.name', 'Fixture', cwd=source)
+        cmd('git', 'config', 'user.email', 'fixture@example.invalid', cwd=source)
+        (source / 'base.txt').write_text('base\n')
+        cmd('git', 'add', '.', cwd=source)
+        cmd('git', 'commit', '-qm', 'base', cwd=source)
+        cmd('git', 'clone', '-q', '--bare', str(source), str(remote))
+        cmd('git', 'config', 'uploadpack.allowFilter', 'true', cwd=remote)
+        cmd('git', 'clone', '-q', '--filter=blob:none', 'file://' + str(remote), str(partial))
+        (source / 'missing.txt').write_text('missing blob\n')
+        cmd('git', 'add', 'missing.txt', cwd=source)
+        cmd('git', 'commit', '-qm', 'later', cwd=source)
+        cmd('git', 'push', '-q', str(remote), 'main', cwd=source)
+        cmd('git', 'fetch', '-q', '--filter=blob:none', 'origin', 'main', cwd=partial)
+        missing_oid = cmd('git', 'rev-parse', 'FETCH_HEAD:missing.txt', cwd=partial).stdout.strip()
+        marker = self.root / 'lazy-fetch-ssh-ran'
+        ssh = self.root / 'lazy-fetch-ssh'
+        ssh.write_text(f'#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n')
+        ssh.chmod(0o700)
+        cmd('git', 'remote', 'set-url', 'origin', 'ssh://127.0.0.1/missing', cwd=partial)
+        cmd('git', 'config', 'core.sshCommand', str(ssh), cwd=partial)
+
+        spec = importlib.util.spec_from_file_location('publish_no_lazy_fetch', PUBLISH)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(PUBLISH.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        result = module.run_git(partial, 'cat-file', '-p', missing_oid, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(marker.exists(), 'source Git lazily fetched through its local SSH command')
+
     def test_seeded_publication_matrix_preserves_default_and_exact_reviewed_commits(self):
         randomizer = random.Random(0x5EED)
         remote = self.root / 'remote with spaces' / 'origin.git'
@@ -861,6 +1062,88 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
         self.assertFalse(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
 
+    def test_integrate_refuses_local_clean_filter_before_status(self):
+        (self.repo / '.gitattributes').write_text('app.txt filter=fixture\n')
+        cmd('git', 'add', '.gitattributes', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'mark filter', cwd=self.repo)
+        head = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        marker = self.root / 'integration-filter-ran'
+        cmd('git', 'config', 'filter.fixture.clean',
+            f"sh -c 'touch {shlex.quote(str(marker))}; cat'", cwd=self.repo)
+        tracked = self.repo / 'app.txt'
+        info = tracked.stat()
+        os.utime(tracked, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+        p, data = self.invoke(INTEGRATE, '--repo', str(self.repo), '--original-branch', 'main',
+                              '--expected-head', head, '--source', 'feat/app',
+                              '--expected-source-head', self.feature_head,
+                              '--check', 'python3 -m unittest discover -s tests -v')
+        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
+        self.assertFalse(marker.exists(), 'integration status executed a repository-local clean filter')
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), head)
+
+    def _check_that_introduces_local_filter(self, *, fails):
+        (self.repo / '.gitattributes').write_text('app.txt filter=fixture\n')
+        cmd('git', 'add', '.gitattributes', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'mark filter', cwd=self.repo)
+        head = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        marker = self.root / 'abort-filter-ran'
+        filter_command = f"sh -c 'touch {shlex.quote(str(marker))}; cat'"
+        body = ('import subprocess, unittest\n'
+                'class Check(unittest.TestCase):\n'
+                '    def test_writes_filter(self):\n'
+                f'        subprocess.run(["git", "config", "filter.fixture.clean", {filter_command!r}], check=True)\n'
+                f'        subprocess.run(["git", "config", "filter.fixture.smudge", {filter_command!r}], check=True)\n'
+                + ('        self.fail("synthetic check failure")\n' if fails else '        self.assertTrue(True)\n'))
+        self.add_feature_test(body)
+        p, data = self.invoke(INTEGRATE, '--repo', str(self.repo), '--original-branch', 'main',
+                              '--expected-head', head, '--source', 'feat/app',
+                              '--expected-source-head', self.feature_head,
+                              '--check', 'python3 -m unittest discover -s tests -v')
+        self.assertEqual((p.returncode, data['status'], data.get('merge_aborted')),
+                         (3, 'BLOCKED_LOCAL', False), p.stdout + p.stderr)
+        self.assertFalse(marker.exists(), 'merge abort executed newly configured local filter')
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), head)
+        self.assertEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD', cwd=self.repo).stdout.strip(),
+                         self.feature_head)
+
+    def test_failed_check_filter_blocks_unsafe_abort(self):
+        self._check_that_introduces_local_filter(fails=True)
+
+    def test_post_check_filter_blocks_unsafe_abort(self):
+        self._check_that_introduces_local_filter(fails=False)
+
+    def _integrate_with_environment_identity(self, *, remove_config):
+        self.add_feature_test()
+        if remove_config:
+            cmd('git', 'config', '--unset', 'user.name', cwd=self.repo)
+            cmd('git', 'config', '--unset', 'user.email', cwd=self.repo)
+        identity = {
+            'GIT_AUTHOR_NAME': 'Environment Author',
+            'GIT_AUTHOR_EMAIL': 'author@example.invalid',
+            'GIT_AUTHOR_DATE': '2001-01-02T03:04:05 +0000',
+            'GIT_COMMITTER_NAME': 'Environment Committer',
+            'GIT_COMMITTER_EMAIL': 'committer@example.invalid',
+            'GIT_COMMITTER_DATE': '2002-02-03T04:05:06 +0000',
+        }
+        p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                           env={**isolated_env(), **identity}, timeout=30)
+        data = json.loads(p.stdout)
+        self.assertEqual((p.returncode, data['status']), (0, 'INTEGRATED'), p.stdout + p.stderr)
+        observed = cmd('git', 'log', '-1', '--format=%an%n%ae%n%aI%n%cn%n%ce%n%cI',
+                       cwd=self.repo).stdout.splitlines()
+        observed = [value.replace('Z', '+00:00') if index in (2, 5) else value
+                    for index, value in enumerate(observed)]
+        self.assertEqual(observed, [
+            'Environment Author', 'author@example.invalid', '2001-01-02T03:04:05+00:00',
+            'Environment Committer', 'committer@example.invalid', '2002-02-03T04:05:06+00:00',
+        ])
+
+    def test_integrate_uses_environment_only_identity(self):
+        self._integrate_with_environment_identity(remove_config=True)
+
+    def test_integrate_environment_identity_overrides_config(self):
+        self._integrate_with_environment_identity(remove_config=False)
+
     def test_failed_check_keeps_arbitrary_output_out_of_diagnostics(self):
         self.add_feature_test('import os, unittest\nclass Check(unittest.TestCase):\n'
                               '    def test_failure(self):\n'
@@ -1017,6 +1300,10 @@ class DeliveryHelpers(unittest.TestCase):
                            'import os, sys, time\nfrom pathlib import Path\n'
                            'args = sys.argv[1:]\n'
                            'if args[:1] == ["-C"]: args = args[2:]\n'
+                           'while len(args) >= 3 and args[0] == "-c": args = args[2:]\n'
+                           'if args[:2] == ["status", "--porcelain"]:\n'
+                           '    args = [item for item in args if item not in '
+                           '{"--untracked-files=all", "--ignore-submodules=none"}]\n'
                            f'if args == {arguments!r}:\n'
                            + ''.join(f'    {line}\n' for line in action.splitlines())
                            + f'os.execv({shutil.which("git")!r}, ["git", *sys.argv[1:]])\n')
@@ -1085,11 +1372,29 @@ class DeliveryHelpers(unittest.TestCase):
 
     def test_merge_git_deadline_reports_failed_abort_when_no_merge_started(self):
         self.add_feature_test()
-        env = self.git_fault_env(['merge', '--no-ff', '--no-commit', self.feature_head], 'time.sleep(3)')
-        p = subprocess.run(self.integrate_args('--timeout', '1'), text=True, capture_output=True,
-                           env=env, timeout=12)
-        self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (3, 'BLOCKED_LOCAL'))
-        self.assertIs(json.loads(p.stdout)['merge_aborted'], False)
+        marker = self.root / 'merge-started'
+        env = self.git_fault_env(['merge', '--no-ff', '--no-commit', self.feature_head],
+                                 f'Path({str(marker)!r}).touch()\ntime.sleep(3)')
+        spec = importlib.util.spec_from_file_location('integration_merge_deadline', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        real_run_git = module.run_git
+
+        def deadline_only_for_merge(repo, *args, timeout=600):
+            if args == ('merge', '--no-ff', '--no-commit', self.feature_head):
+                timeout = 1
+            return real_run_git(repo, *args, timeout=timeout)
+
+        with patch.object(sys, 'argv', self.integrate_args('--timeout', '10')[1:]), \
+             patch.object(module, 'run_git', side_effect=deadline_only_for_merge), \
+             patch('sys.stdout', new_callable=io.StringIO) as output, \
+             patch.dict(os.environ, env, clear=True):
+            code = module.main()
+        data = json.loads(output.getvalue())
+        self.assertTrue(marker.exists(), 'injected merge stall was never reached')
+        self.assertEqual((code, data['status'], data['merge_aborted']),
+                         (3, 'BLOCKED_LOCAL', False), output.getvalue())
         self.assert_restored()
 
     def test_commit_hook_deadline_kills_child_and_preserves_original_head(self):
@@ -1413,6 +1718,336 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
         self.assertNotEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.feature_head)
         self.assertNotEqual(data['status'], 'INTEGRATED')
+
+    def test_hidden_index_edit_cannot_report_clean_integration(self):
+        self.add_feature_test()
+        hidden = self.repo / 'hidden.txt'
+        hidden.write_text('original\n')
+        cmd('git', 'add', 'hidden.txt', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'add hidden fixture', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        cmd('git', 'update-index', '--assume-unchanged', 'hidden.txt', cwd=self.repo)
+        hidden.write_text('private working edit\n')
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout, '')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual(hidden.read_text(), 'private working edit\n')
+
+    def test_skip_worktree_index_entry_refuses_integration(self):
+        self.add_feature_test()
+        cmd('git', 'update-index', '--skip-worktree', 'app.txt', cwd=self.repo)
+        self.assertIn('S app.txt', cmd('git', 'ls-files', '-v', cwd=self.repo).stdout)
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+
+    def test_check_cannot_hide_its_edit_with_index_flag(self):
+        hidden = self.repo / 'hidden.txt'
+        hidden.write_text('original\n')
+        cmd('git', 'add', 'hidden.txt', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'add hidden fixture', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        self.add_feature_test('import subprocess, unittest\nfrom pathlib import Path\n'
+                              'class Check(unittest.TestCase):\n'
+                              '    def test_hide_edit(self):\n'
+                              '        subprocess.run(["git", "update-index", "--assume-unchanged", "hidden.txt"], check=True)\n'
+                              '        Path("hidden.txt").write_text("private check edit\\n")\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual(hidden.read_text(), 'private check edit\n')
+
+    def test_post_commit_hook_index_flag_blocks_success(self):
+        self.add_feature_test()
+        hook = self.repo / '.git/hooks/post-commit'
+        hook.write_text('#!/bin/sh\ngit update-index --assume-unchanged app.txt\n'
+                        'printf "private hook edit\\n" > app.txt\n')
+        hook.chmod(0o700)
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('merge_aborted')),
+                         (3, 'BLOCKED_LOCAL', False), result.stdout)
+        parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
+        self.assertEqual(parents[1:], [self.base, self.feature_head])
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'private hook edit\n')
+
+    def test_ambient_alternate_index_cannot_report_clean_integration(self):
+        self.add_feature_test()
+        alternate = self.root / 'alternate-index'
+        shutil.copyfile(self.repo / '.git/index', alternate)
+        (self.repo / 'app.txt').write_text('staged but private\n')
+        cmd('git', 'add', 'app.txt', cwd=self.repo)
+        (self.repo / 'app.txt').write_text('base\n')
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout, 'MM app.txt\n')
+        env = isolated_env()
+        env['GIT_INDEX_FILE'] = str(alternate)
+        self.assertEqual(subprocess.run(['git', 'status', '--porcelain'], cwd=self.repo,
+                                        env=env, text=True, capture_output=True, check=True).stdout, '')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=env, timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (2, 'BLOCKED_POLICY'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'base\n')
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout, 'MM app.txt\n')
+
+    def test_stale_fsmonitor_cannot_hide_tracked_edit(self):
+        self.add_feature_test()
+        hidden = self.repo / 'hidden.txt'
+        hidden.write_text('original\n')
+        cmd('git', 'add', 'hidden.txt', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'add hidden fixture', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        monitor = self.root / 'stale-monitor'
+        monitor.write_text(f'#!{sys.executable}\nimport os\nos.write(1, b"version 2\\x00token\\x00")\n')
+        monitor.chmod(0o700)
+        cmd('git', 'config', 'core.fsmonitor', str(monitor), cwd=self.repo)
+        cmd('git', 'config', 'core.fsmonitorHookVersion', '2', cwd=self.repo)
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout, '')
+        hidden.write_text('private working edit\n')
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout, '',
+                         'fixture monitor did not cause a false-clean status')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual(hidden.read_text(), 'private working edit\n')
+
+    def test_filemode_configuration_cannot_hide_executable_bit_edit(self):
+        self.add_feature_test()
+        hidden = self.repo / 'hidden.txt'
+        hidden.write_text('original\n')
+        cmd('git', 'add', 'hidden.txt', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'add hidden fixture', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        cmd('git', 'config', 'core.filemode', 'false', cwd=self.repo)
+        hidden.chmod(0o755)
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout, '')
+        self.assertIn(' M hidden.txt', cmd('git', '-c', 'core.filemode=true',
+                                           'status', '--porcelain', cwd=self.repo).stdout)
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual(hidden.stat().st_mode & 0o111, 0o111)
+
+    def test_post_commit_untracked_artifact_cannot_hide_behind_status_config(self):
+        self.add_feature_test()
+        cmd('git', 'config', 'status.showUntrackedFiles', 'no', cwd=self.repo)
+        hook = self.repo / '.git/hooks/post-commit'
+        hook.write_text('#!/bin/sh\nprintf "private artifact\\n" > artifact.txt\n')
+        hook.chmod(0o700)
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('merge_aborted')),
+                         (3, 'BLOCKED_LOCAL', False), result.stdout)
+        self.assertEqual((self.repo / 'artifact.txt').read_text(), 'private artifact\n')
+        self.assertEqual(cmd('git', '-c', 'status.showUntrackedFiles=all',
+                             'status', '--porcelain', cwd=self.repo).stdout, '?? artifact.txt\n')
+
+    def add_hidden_submodule(self):
+        child_repo = self.root / 'child-source'
+        child_repo.mkdir()
+        cmd('git', 'init', '-q', str(child_repo))
+        cmd('git', 'config', 'user.email', 'test@example.invalid', cwd=child_repo)
+        cmd('git', 'config', 'user.name', 'Harness test', cwd=child_repo)
+        (child_repo / 'entry.txt').write_text('original\n')
+        cmd('git', 'add', 'entry.txt', cwd=child_repo)
+        cmd('git', 'commit', '-qm', 'child base', cwd=child_repo)
+        cmd('git', '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q',
+            str(child_repo), 'modules/child', cwd=self.repo)
+        cmd('git', 'commit', '-qam', 'add child', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        cmd('git', 'config', 'diff.ignoreSubmodules', 'all', cwd=self.repo)
+        cmd('git', 'config', 'submodule.modules/child.ignore', 'all', cwd=self.repo)
+        return self.repo / 'modules/child/entry.txt'
+
+    def test_dirty_submodule_cannot_hide_behind_ignore_config_before_merge(self):
+        self.add_feature_test()
+        child_file = self.add_hidden_submodule()
+        child_file.write_text('private submodule edit\n')
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout, '')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual(child_file.read_text(), 'private submodule edit\n')
+
+    def test_submodule_is_refused_before_check_even_with_ignore_config(self):
+        child_file = self.add_hidden_submodule()
+        self.add_feature_test('import unittest\nfrom pathlib import Path\n'
+                              'class Check(unittest.TestCase):\n'
+                              '    def test_dirty_child(self):\n'
+                              '        Path("modules/child/entry.txt").write_text("private check edit\\n")\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual(child_file.read_text(), 'original\n', 'check ran after gitlink refusal')
+
+    def test_child_index_flag_cannot_hide_submodule_edit(self):
+        self.add_feature_test()
+        child_file = self.add_hidden_submodule()
+        cmd('git', 'update-index', '--assume-unchanged', 'entry.txt', cwd=child_file.parent)
+        child_file.write_text('private child edit\n')
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=child_file.parent).stdout, '')
+        self.assertEqual(cmd('git', '-c', 'diff.ignoreSubmodules=none', 'status', '--porcelain',
+                             '--ignore-submodules=none', cwd=self.repo).stdout, '')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual(child_file.read_text(), 'private child edit\n')
+
+    def add_symlink_fixture(self):
+        (self.repo / 'target.txt').write_text('target content\n')
+        link = self.repo / 'link'
+        link.symlink_to('target.txt')
+        cmd('git', 'add', 'target.txt', 'link', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'add link', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        cmd('git', 'config', 'core.symlinks', 'false', cwd=self.repo)
+        return link
+
+    def test_symlink_substitution_cannot_hide_behind_config_before_merge(self):
+        self.add_feature_test()
+        link = self.add_symlink_fixture()
+        link.unlink()
+        link.write_text('target.txt')
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout, '')
+        self.assertIn(' T link', cmd('git', '-c', 'core.symlinks=true', 'status',
+                                    '--porcelain', cwd=self.repo).stdout)
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(link.read_text(), 'target.txt')
+
+    def test_post_commit_symlink_substitution_blocks_success(self):
+        self.add_feature_test()
+        link = self.add_symlink_fixture()
+        hook = self.repo / '.git/hooks/post-commit'
+        hook.write_text('#!/bin/sh\nrm link\nprintf target.txt > link\n')
+        hook.chmod(0o700)
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('merge_aborted')),
+                         (3, 'BLOCKED_LOCAL', False), result.stdout)
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(link.read_text(), 'target.txt')
+
+    def test_git_routing_environment_is_rejected_before_git(self):
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        marker = self.root / 'git-started'
+        wrapper = bin_dir / 'git'
+        wrapper.write_text(f'#!{sys.executable}\nfrom pathlib import Path\n'
+                           f'Path({str(marker)!r}).touch()\n')
+        wrapper.chmod(0o700)
+        for name, value in (('GIT_INDEX_FILE', ''), ('GIT_DIR', ''),
+                            ('GIT_CONFIG_COUNT', '0'), ('GIT_CONFIG_VALUE_0', '')):
+            with self.subTest(name=name):
+                env = isolated_env()
+                env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
+                env[name] = value
+                result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                        env=env, timeout=10)
+                self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                                 (2, 'BLOCKED_POLICY'), result.stdout + result.stderr)
+                self.assertFalse(marker.exists(), 'Git started before environment refusal')
+
+    def test_index_scanner_rejects_malformed_budget_and_timeout_without_paths(self):
+        spec = importlib.util.spec_from_file_location('integration_index_scanner', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        cases = (
+            ('partial', 'os.write(1, b"H private_path")\nsys.exit(0)', {}),
+            ('malformed', 'os.write(1, b"X private_path\\x00")\nsys.exit(0)', {}),
+            ('stderr flood', 'os.write(2, b"private_output" * 200)\nsys.exit(0)', {'INDEX_MAX_BYTES': 512}),
+            ('entry budget', 'os.write(1, b"H 100644 " + b"a" * 40 + b" 0\\tfirst\\x00"'
+             ' + b"H 100644 " + b"b" * 40 + b" 0\\tsecond\\x00")\nsys.exit(0)',
+             {'INDEX_MAX_ENTRIES': 1}),
+            ('timeout', 'time.sleep(3)', {}),
+        )
+        for label, action, limits in cases:
+            with self.subTest(label=label):
+                env = self.git_fault_env(['ls-files', '-v', '-s', '-z'], action)
+                with patch.dict(os.environ, env, clear=True), \
+                     contextlib.ExitStack() as stack:
+                    for key, value in limits.items():
+                        stack.enter_context(patch.object(module, key, value))
+                    started = time.monotonic()
+                    with self.assertRaises(module.IndexInspectionError) as raised:
+                        module.index_unflagged(self.repo, 1 if label == 'timeout' else 5)
+                    self.assertLess(time.monotonic() - started, 9)
+                    self.assertNotIn('private', str(raised.exception))
+        with high_numbered_fds():
+            with patch.dict(os.environ, isolated_env(), clear=True):
+                module.index_unflagged(self.repo, 10)
+
+    def test_index_scanner_failure_after_check_aborts_before_commit(self):
+        self.add_feature_test()
+        counter = self.root / 'scan-count'
+        action = (f'counter = Path({str(counter)!r})\n'
+                  'count = int(counter.read_text()) + 1 if counter.exists() else 1\n'
+                  'counter.write_text(str(count))\n'
+                  'if count == 2:\n'
+                  '    os.write(1, b"H partial_private_path")\n'
+                  '    sys.exit(0)')
+        env = self.git_fault_env(['ls-files', '-v', '-s', '-z'], action)
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=env, timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual(counter.read_text(), '2')
+        self.assertEqual((result.returncode, data['status'], data['merge_aborted']),
+                         (3, 'BLOCKED_LOCAL', True), result.stdout)
+        self.assertNotIn('private_path', result.stdout + result.stderr)
+        self.assert_restored()
+
+    def test_index_scanner_failure_after_commit_refuses_success(self):
+        self.add_feature_test()
+        counter = self.root / 'scan-count'
+        action = (f'counter = Path({str(counter)!r})\n'
+                  'count = int(counter.read_text()) + 1 if counter.exists() else 1\n'
+                  'counter.write_text(str(count))\n'
+                  'if count == 3:\n'
+                  '    os.write(2, b"private_output" * 200)\n'
+                  '    sys.exit(0)')
+        env = self.git_fault_env(['ls-files', '-v', '-s', '-z'], action)
+        spec = importlib.util.spec_from_file_location('integration_index_budget', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        with patch.object(module, 'INDEX_MAX_BYTES', 512), \
+             patch.object(sys, 'argv', self.integrate_args()[1:]), \
+             patch('sys.stdout', new_callable=io.StringIO) as output, \
+             patch.dict(os.environ, env, clear=True):
+            code = module.main()
+        data = json.loads(output.getvalue())
+        self.assertEqual(counter.read_text(), '3')
+        self.assertEqual((code, data['status'], data['merge_aborted']),
+                         (3, 'BLOCKED_LOCAL', False), output.getvalue())
+        self.assertNotIn('private_output', output.getvalue())
+        parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
+        self.assertEqual(parents[1:], [self.base, self.feature_head])
 
     def test_staged_check_side_effect_cannot_enter_merge_commit(self):
         self.add_feature_test('import subprocess, unittest\nfrom pathlib import Path\n'

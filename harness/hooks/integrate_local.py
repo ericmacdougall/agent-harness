@@ -4,25 +4,135 @@
 import argparse
 import json
 import os
+import selectors
 import shlex
 import subprocess
 import sys
+import time
 from functools import partial
 from pathlib import Path
 
-from process import run as run_process
+from git_safety import git_environment, require_safe_source
+from process import cleanup_discarded, run as run_process
 
 
-def run(repo, command, *, timeout=None, discard_output=False):
+# Git environment variables can redirect commands away from the named worktree
+# or its normal index. Identity and test-isolation settings do not do that.
+ALLOWED_GIT_ENV = {
+    'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_AUTHOR_DATE',
+    'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_DATE',
+    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT',
+}
+INSPECTION_CONFIG = ('-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false',
+                     '-c', 'core.trustctime=true', '-c', 'core.checkStat=default',
+                     '-c', 'core.filemode=true', '-c', 'core.symlinks=true')
+INDEX_MAX_BYTES = 40_000_000
+INDEX_MAX_ENTRIES = 250_000
+INDEX_MAX_RECORD_BYTES = 1_000_000
+INDEX_MAX_SECONDS = 30
+INDEX_HEADER_BYTES = 9  # tag, space, six-digit mode, space
+
+
+class IndexInspectionError(Exception):
+    def __init__(self, *, cleanup_incomplete=False):
+        super().__init__('Index could not be verified')
+        self.cleanup_incomplete = cleanup_incomplete
+
+
+def index_unflagged(repo, timeout):
+    """Check NUL records without retaining paths or trusting Git's fsmonitor cache."""
+    command = ['git', *INSPECTION_CONFIG, 'ls-files', '-v', '-s', '-z']
+    deadline = time.monotonic() + min(timeout, INDEX_MAX_SECONDS)
+    try:
+        process = subprocess.Popen(command, cwd=repo,
+                                   env={**git_environment(), 'PYTHONDONTWRITEBYTECODE': '1'},
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+    except OSError as error:
+        raise IndexInspectionError() from error
+    bytes_seen = entries = record_bytes = 0
+    prefix = b''
+    reaped = False
+    try:
+        with selectors.DefaultSelector() as poller:
+            poller.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not poller.select(remaining):
+                    raise IndexInspectionError()
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                bytes_seen += len(chunk)
+                if bytes_seen > INDEX_MAX_BYTES:
+                    raise IndexInspectionError()
+                offset = 0
+                while offset < len(chunk):
+                    end = chunk.find(b'\0', offset)
+                    segment = chunk[offset:] if end < 0 else chunk[offset:end]
+                    record_bytes += len(segment)
+                    if record_bytes > INDEX_MAX_RECORD_BYTES:
+                        raise IndexInspectionError()
+                    if len(prefix) < INDEX_HEADER_BYTES:
+                        prefix += segment[:INDEX_HEADER_BYTES - len(prefix)]
+                    if end < 0:
+                        break
+                    if (len(prefix) != INDEX_HEADER_BYTES or prefix[:2] != b'H '
+                            or prefix[2:8] not in {b'100644', b'100755', b'120000'}
+                            or prefix[8:] != b' '):
+                        # A gitlink has its own index, where hidden flags can
+                        # conceal child edits from the superproject's status.
+                        raise IndexInspectionError()
+                    entries += 1
+                    if entries > INDEX_MAX_ENTRIES:
+                        raise IndexInspectionError()
+                    prefix = b''
+                    record_bytes = 0
+                    offset = end + 1
+        if record_bytes:
+            raise IndexInspectionError()
+        process.wait(timeout=max(0, deadline - time.monotonic()))
+        reaped = True
+        if process.returncode:
+            raise IndexInspectionError()
+    except BaseException as error:
+        cleanup_incomplete = False
+        if not reaped:
+            try:
+                cleanup_discarded(process)
+            except (OSError, subprocess.TimeoutExpired):
+                cleanup_incomplete = True
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise IndexInspectionError(cleanup_incomplete=cleanup_incomplete) from None
+    finally:
+        if process.stdout and not process.stdout.closed:
+            process.stdout.close()
+
+
+def inspect_git(repo, *args, timeout=600):
+    return run_git(repo, *INSPECTION_CONFIG, *args, timeout=timeout)
+
+
+def run(repo, command, *, timeout=None, discard_output=False, env=None):
     # Python test runners otherwise leave untracked __pycache__ after an aborted merge.
     output_options = {'discard_output': True} if discard_output else {}
     return run_process(command, cwd=repo, timeout=timeout,
-                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                       env={**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"},
                        **output_options)
 
 
 def run_git(repo, *args, timeout=600):
-    return run(repo, ["git", *args], timeout=timeout)
+    return run(repo, ["git", *args], timeout=timeout,
+               env=git_environment(allow_hooks=True, preserve_identity=True))
+
+
+def safe_source(repo, timeout, *, allow_unmerged=False):
+    try:
+        require_safe_source(repo, git_environment(), timeout=min(timeout, INDEX_MAX_SECONDS),
+                            allow_unmerged=allow_unmerged)
+    except OSError:
+        raise IndexInspectionError() from None
 
 
 def report(status, message, **extra):
@@ -30,6 +140,12 @@ def report(status, message, **extra):
 
 
 def abort_merge(repo, message, *, timeout=600, **extra):
+    try:
+        safe_source(repo, timeout, allow_unmerged=True)
+    except IndexInspectionError:
+        report("BLOCKED_LOCAL", message + "; source Git state is unsafe or unverifiable; inspect merge without automatic abort",
+               merge_aborted=False, **extra)
+        return 3
     try:
         result = run_git(repo, "merge", "--abort", timeout=timeout)
         aborted = result.returncode == 0
@@ -102,8 +218,12 @@ def main():
 
 
 def integrate(args, preparations, checks):
+    if any(name.startswith('GIT_') and name not in ALLOWED_GIT_ENV for name in os.environ):
+        report('BLOCKED_POLICY', 'Inherited Git routing or configuration override is unsupported')
+        return 2
     repo = args.repo.resolve()
     git = partial(run_git, timeout=args.timeout)
+    inspect = partial(inspect_git, timeout=args.timeout)
     abort = partial(abort_merge, timeout=args.timeout)
     merge_attempted = False
     commit_returned = False
@@ -113,9 +233,12 @@ def integrate(args, preparations, checks):
         if toplevel is None or toplevel.returncode or Path(toplevel.stdout.strip()).resolve() != repo:
             report("BLOCKED_POLICY", "Original checkout must be the root of a Git worktree")
             return 2
+        safe_source(repo, args.timeout)
         branch = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
         head = git(repo, "rev-parse", "HEAD")
-        status = git(repo, "status", "--porcelain")
+        index_unflagged(repo, args.timeout)
+        status = inspect(repo, "status", "--porcelain", "--untracked-files=all",
+                         "--ignore-submodules=none")
         if branch.returncode or head.returncode or status.returncode or branch.stdout.strip() != args.original_branch or head.stdout.strip() != args.expected_head or status.stdout.strip():
             report("BLOCKED_LOCAL", "Original checkout branch, HEAD, or cleanliness changed; no merge attempted")
             return 3
@@ -162,9 +285,11 @@ def integrate(args, preparations, checks):
                     # and exit code tell the user which command to run locally.
                     return abort(repo, f"{kind.capitalize()} failed", phase=kind,
                                  exit_code=result.returncode, **{kind: argv})
+        safe_source(repo, args.timeout)
+        index_unflagged(repo, args.timeout)
         checked_tree = git(repo, "write-tree")
-        unstaged = git(repo, "diff", "--quiet", "--exit-code")
-        untracked = git(repo, "ls-files", "--others", "--exclude-standard")
+        unstaged = inspect(repo, "diff", "--quiet", "--exit-code", "--ignore-submodules=none")
+        untracked = inspect(repo, "ls-files", "--others", "--exclude-standard")
         if (checked_tree.returncode or checked_tree.stdout.strip() != intended_tree
                 or unstaged.returncode or untracked.returncode or untracked.stdout.strip()):
             return abort(repo, "Preparation or checks changed the intended merge; inspect and rerun from a clean checkout")
@@ -197,13 +322,30 @@ def integrate(args, preparations, checks):
             report("BLOCKED_LOCAL", "Merge commit is not on the original branch; inspect branch refs",
                    head=final_head, merge_aborted=False)
             return 3
-        final_status = git(repo, "status", "--porcelain")
+        safe_source(repo, args.timeout)
+        index_unflagged(repo, args.timeout)
+        final_status = inspect(repo, "status", "--porcelain", "--untracked-files=all",
+                               "--ignore-submodules=none")
         if final_status.returncode or final_status.stdout.strip():
             report("BLOCKED_LOCAL", "Merge commit exists but final checkout is dirty or could not be inspected",
                    head=final_head, merge_aborted=False)
             return 3
         report("INTEGRATED", "Verified feature merged into original checkout", original_branch=args.original_branch, source=args.source, head=final_head, preparations=args.prepare, checks=args.check)
         return 0
+    except IndexInspectionError as error:
+        message = 'Index could not be verified'
+        if error.cleanup_incomplete:
+            report('BLOCKED_LOCAL', message + '; inspection cleanup incomplete; inspect processes and checkout',
+                   merge_aborted=False)
+            return 3
+        if commit_returned:
+            report('BLOCKED_LOCAL', message + '; merge commit may exist; inspect HEAD and checkout',
+                   merge_aborted=False)
+            return 3
+        if merge_attempted:
+            return abort(repo, message)
+        report('BLOCKED_LOCAL', message + '; no merge attempted')
+        return 3
     except (subprocess.TimeoutExpired, OSError) as error:
         message = (f"Git command exceeded {args.timeout} seconds" if isinstance(error, subprocess.TimeoutExpired)
                    else "Git command could not start")
