@@ -161,8 +161,9 @@ class ReportFinalizationTests(unittest.TestCase):
             if phase == 'wal':
                 self.assertEqual(events, ['rescue_start', 'rescue_result'])
             if helper == 'rescue':
-                self.assertNotEqual(git('rev-parse', 'HEAD'), base)
-                self.assertEqual(git('status', '--porcelain'), '')
+                self.assertEqual(git('rev-parse', 'HEAD'), base)
+                self.assertEqual(git('diff', '--cached', '--name-only'), '')
+                self.assertEqual(git('status', '--porcelain'), 'M app.txt')
                 self.assertEqual((repo / 'app.txt').read_text(), 'after')
             self.assertEqual(code, 2 if helper == 'peer_review' else 3, stdout.getvalue())
             self.assertEqual(stdout.getvalue(), '', 'must not announce PASS or report success')
