@@ -454,6 +454,24 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
                                 cwd=remote, check=False).returncode, 0)
 
+    def test_publish_rejects_mode_change_hidden_by_local_git_config(self):
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        cmd('git', 'config', 'core.filemode', 'false', cwd=self.feature)
+        tracked = self.feature / 'app.txt'
+        tracked.chmod(tracked.stat().st_mode | 0o111)
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=self.feature).stdout, '')
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head]
+        result = subprocess.run(args, text=True, capture_output=True, env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (2, 'BLOCKED_POLICY'), result.stderr)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
+                                cwd=remote, check=False).returncode, 0)
+
     def test_publish_remote_inspection_does_not_run_source_ssh_command(self):
         marker = self.root / 'source-ssh-ran'
         ssh = self.root / 'source-ssh'
@@ -518,6 +536,40 @@ class DeliveryHelpers(unittest.TestCase):
                                 env={**isolated_env(), 'GIT_CONFIG_GLOBAL': str(global_config)}, timeout=20)
         self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
                          (0, 'PUSHED'), result.stderr)
+
+    def test_publication_git_env_does_not_lazy_fetch_from_source_repo(self):
+        source = self.root / 'promisor-source'
+        remote = self.root / 'promisor-origin.git'
+        partial = self.root / 'partial'
+        cmd('git', 'init', '-q', '-b', 'main', str(source))
+        cmd('git', 'config', 'user.name', 'Fixture', cwd=source)
+        cmd('git', 'config', 'user.email', 'fixture@example.invalid', cwd=source)
+        (source / 'base.txt').write_text('base\n')
+        cmd('git', 'add', '.', cwd=source)
+        cmd('git', 'commit', '-qm', 'base', cwd=source)
+        cmd('git', 'clone', '-q', '--bare', str(source), str(remote))
+        cmd('git', 'config', 'uploadpack.allowFilter', 'true', cwd=remote)
+        cmd('git', 'clone', '-q', '--filter=blob:none', 'file://' + str(remote), str(partial))
+        (source / 'missing.txt').write_text('missing blob\n')
+        cmd('git', 'add', 'missing.txt', cwd=source)
+        cmd('git', 'commit', '-qm', 'later', cwd=source)
+        cmd('git', 'push', '-q', str(remote), 'main', cwd=source)
+        cmd('git', 'fetch', '-q', '--filter=blob:none', 'origin', 'main', cwd=partial)
+        missing_oid = cmd('git', 'rev-parse', 'FETCH_HEAD:missing.txt', cwd=partial).stdout.strip()
+        marker = self.root / 'lazy-fetch-ssh-ran'
+        ssh = self.root / 'lazy-fetch-ssh'
+        ssh.write_text(f'#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n')
+        ssh.chmod(0o700)
+        cmd('git', 'remote', 'set-url', 'origin', 'ssh://127.0.0.1/missing', cwd=partial)
+        cmd('git', 'config', 'core.sshCommand', str(ssh), cwd=partial)
+
+        spec = importlib.util.spec_from_file_location('publish_no_lazy_fetch', PUBLISH)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(PUBLISH.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        result = module.run_git(partial, 'cat-file', '-p', missing_oid, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(marker.exists(), 'source Git lazily fetched through its local SSH command')
 
     def test_seeded_publication_matrix_preserves_default_and_exact_reviewed_commits(self):
         randomizer = random.Random(0x5EED)

@@ -18,6 +18,8 @@ from process import signal_group
 AUTH_GIT_ENV = {'GIT_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_SSH_VARIANT',
                 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM'}
 BASE_SETTINGS = (('core.hooksPath', os.devnull), ('core.fsmonitor', 'false'),
+                 ('core.filemode', 'true'), ('core.untrackedCache', 'false'),
+                 ('core.trustctime', 'true'), ('core.checkStat', 'default'),
                  ('commit.gpgsign', 'false'), ('tag.gpgsign', 'false'))
 FILTER_PATTERN = r'^filter\..*\.(clean|process|smudge)$'
 
@@ -29,10 +31,10 @@ def git_environment(*, isolated=False, settings=()):
            if not key.startswith('GIT_') or key in retained}
     env['GIT_TERMINAL_PROMPT'] = '0'
     env['GIT_NO_REPLACE_OBJECTS'] = '1'
+    env['GIT_NO_LAZY_FETCH'] = '1'
     if isolated:
         env['GIT_CONFIG_NOSYSTEM'] = '1'
         env['GIT_CONFIG_GLOBAL'] = os.devnull
-        env['GIT_NO_LAZY_FETCH'] = '1'
     configured = (*BASE_SETTINGS, *settings)
     env['GIT_CONFIG_COUNT'] = str(len(configured))
     for index, (key, value) in enumerate(configured):
