@@ -394,6 +394,97 @@ class DeliveryHelpers(unittest.TestCase):
         p, data = self.invoke(PUBLISH, '--repo', str(self.repo), '--branch', 'main', '--original-branch', 'main', '--expected-head', self.base)
         self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'))
 
+    def test_publish_rejects_ambient_alternate_index_before_push(self):
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        index_name = cmd('git', 'rev-parse', '--git-path', 'index', cwd=self.feature).stdout.strip()
+        index_path = Path(index_name)
+        if not index_path.is_absolute():
+            index_path = self.feature / index_path
+        alternate = self.root / 'alternate-index'
+        shutil.copyfile(index_path, alternate)
+        (self.feature / 'app.txt').write_text('unreviewed staged value\n')
+        cmd('git', 'add', 'app.txt', cwd=self.feature)
+        (self.feature / 'app.txt').write_text('feature\n')
+        self.assertIn('MM app.txt', cmd('git', 'status', '--porcelain', cwd=self.feature).stdout)
+
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head]
+        result = subprocess.run(args, text=True, capture_output=True,
+                                env={**isolated_env(), 'GIT_INDEX_FILE': str(alternate)}, timeout=20)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (2, 'BLOCKED_POLICY'), result.stderr)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
+                                cwd=remote, check=False).returncode, 0)
+
+    def test_publish_remote_inspection_does_not_run_source_ssh_command(self):
+        marker = self.root / 'source-ssh-ran'
+        ssh = self.root / 'source-ssh'
+        ssh.write_text(f'#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n')
+        ssh.chmod(0o700)
+        cmd('git', 'config', 'core.sshCommand', str(ssh), cwd=self.feature)
+        cmd('git', 'remote', 'add', 'origin', 'ssh://127.0.0.1/missing.git', cwd=self.repo)
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head, '--timeout', '5']
+        result = subprocess.run(args, text=True, capture_output=True, env=isolated_env(), timeout=15)
+        self.assertEqual(json.loads(result.stdout)['status'], 'BLOCKED_REMOTE', result.stderr)
+        self.assertFalse(marker.exists(), 'source-local SSH command ran during remote inspection')
+
+    def test_publish_refuses_source_local_filter_before_status(self):
+        (self.feature / '.gitattributes').write_text('app.txt filter=fixture\n')
+        cmd('git', 'add', '.gitattributes', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'mark filter', cwd=self.feature)
+        head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        marker = self.root / 'filter-ran'
+        cmd('git', 'config', 'filter.fixture.clean',
+            f"sh -c 'touch {shlex.quote(str(marker))}; cat'", cwd=self.feature)
+        tracked = self.feature / 'app.txt'
+        info = tracked.stat()
+        os.utime(tracked, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', head]
+        result = subprocess.run(args, text=True, capture_output=True, env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (2, 'BLOCKED_POLICY'), result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_publish_disables_source_filesystem_monitor(self):
+        marker = self.root / 'fsmonitor-ran'
+        monitor = self.root / 'monitor'
+        monitor.write_text(f'#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n')
+        monitor.chmod(0o700)
+        cmd('git', 'config', 'core.fsmonitor', str(monitor), cwd=self.feature)
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        marker.unlink(missing_ok=True)  # fixture Git setup may query status
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head]
+        result = subprocess.run(args, text=True, capture_output=True, env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (0, 'PUSHED'), result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_publish_allows_unselected_trusted_global_filter(self):
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        global_config = self.root / 'trusted-global-gitconfig'
+        global_config.write_text('[filter "lfs"]\n clean = sh -c "exit 7"\n')
+        args = [sys.executable, str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', self.feature_head]
+        result = subprocess.run(args, text=True, capture_output=True,
+                                env={**isolated_env(), 'GIT_CONFIG_GLOBAL': str(global_config)}, timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (0, 'PUSHED'), result.stderr)
+
     def test_seeded_publication_matrix_preserves_default_and_exact_reviewed_commits(self):
         randomizer = random.Random(0x5EED)
         remote = self.root / 'remote with spaces' / 'origin.git'

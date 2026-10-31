@@ -48,6 +48,16 @@ capture = os.environ.get('CAPTURE_CODEX_PROMPT')
 if capture: Path(capture).write_text(prompt)
 action = os.environ.get('CODEX_ACTION', '')
 if action: Path('app.txt').write_text(action + '\\n')
+if os.environ.get('CODEX_SWITCH_BRANCH'):
+    import subprocess
+    subprocess.run(['git', 'switch', '-q', '-c', 'feat/wrong'], check=True)
+    subprocess.run(['git', 'commit', '--allow-empty', '-qm', 'wrong branch'], check=True)
+if os.environ.get('CODEX_LOCAL_FILTER'):
+    import shlex, subprocess
+    marker = os.environ['CODEX_LOCAL_FILTER']
+    subprocess.run(['git', 'config', 'filter.fixture.clean',
+                    "sh -c 'touch " + shlex.quote(marker) + "; cat'"], check=True)
+    Path('app.txt').write_text('updated\\n')
 last = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 last.write_text('Fixture handoff')
 race = os.environ.get('RACE_OUTPUT')
@@ -94,6 +104,44 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertFalse(report['dirty'])
         self.assertEqual((self.repo / 'app.txt').read_text(), 'updated\n')
         self.assertEqual(self.output.stat().st_mode & 0o777, 0o600)
+
+    def test_rescue_refuses_clean_commit_on_a_different_branch(self):
+        result = self.invoke(env={'CODEX_SWITCH_BRANCH': '1', 'CAPTURE_CLAUDE_PROMPT': str(self.root / 'fallback')})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['branch'], 'feat/rescue')
+        self.assertEqual(report['actual_branch'], 'feat/wrong')
+        self.assertFalse((self.root / 'fallback').exists())
+
+    def test_rescue_refuses_local_filter_before_status_executes_it(self):
+        (self.repo / '.gitattributes').write_text('app.txt filter=fixture\n')
+        git(self.repo, 'add', '.gitattributes')
+        git(self.repo, 'commit', '-qm', 'mark filter')
+        marker = self.root / 'filter-ran'
+        git(self.repo, 'config', 'filter.fixture.clean',
+            f"sh -c 'touch {shlex.quote(str(marker))}; cat'")
+        tracked = self.repo / 'app.txt'
+        info = tracked.stat()
+        os.utime(tracked, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+        result = self.invoke()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertFalse(self.output.exists())
+
+    def test_rescue_blocks_if_model_adds_local_filter_before_postcheck(self):
+        (self.repo / '.gitattributes').write_text('app.txt filter=fixture\n')
+        git(self.repo, 'add', '.gitattributes')
+        git(self.repo, 'commit', '-qm', 'mark filter')
+        marker = self.root / 'post-model-filter-ran'
+        fallback = self.root / 'fallback'
+        result = self.invoke(env={'CODEX_LOCAL_FILTER': str(marker),
+                                  'CAPTURE_CLAUDE_PROMPT': str(fallback)})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn('inspect it before retrying', result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertFalse(self.output.exists())
+        self.assertFalse(fallback.exists())
 
     def test_failed_model_after_edits_does_not_fallback_or_commit(self):
         capture = self.root / 'fallback-prompt.txt'
@@ -273,23 +321,28 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
                 self.assertEqual(git(self.repo, 'rev-parse', 'HEAD'), self.base)
                 path.unlink()
 
-    def test_stalled_snapshot_commit_hook_is_bounded_and_child_cannot_write_late(self):
+    def test_wrapper_snapshot_commit_does_not_run_source_hook(self):
         (self.repo / 'app.txt').write_text('updated\n')
-        child_pid = self.root / 'child.pid'
-        late = self.root / 'late.txt'
-        child = (f'import os, time; from pathlib import Path; '
-                 f'Path({str(child_pid)!r}).write_text(str(os.getpid())); '
-                 f'time.sleep(10); Path({str(late)!r}).write_text("late")')
+        marker = self.root / 'hook-ran'
         hook = self.repo / '.git/hooks/pre-commit'
-        hook.write_text('#!/bin/sh\n' + shlex.join([sys.executable, '-c', child]) + '\n')
+        hook.write_text(f'#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n')
         hook.chmod(0o700)
-        with patch.object(rescue, 'SNAPSHOT_GIT_TIMEOUT', 4), self.assertRaises(subprocess.TimeoutExpired):
-            rescue.snapshot_commit(self.repo, 'fixture')
-        self.assertTrue(child_pid.exists())
-        with self.assertRaises(ProcessLookupError):
-            os.kill(int(child_pid.read_text()), 0)
-        self.assertFalse(late.exists())
-        self.assertEqual(git(self.repo, 'rev-parse', 'HEAD'), self.base)
+        committed, detail = rescue.snapshot_commit(self.repo, 'fixture')
+        self.assertTrue(committed, detail)
+        self.assertFalse(marker.exists())
+        self.assertNotEqual(git(self.repo, 'rev-parse', 'HEAD'), self.base)
+
+    def test_wrapper_snapshot_commit_does_not_run_signing_program(self):
+        (self.repo / 'app.txt').write_text('updated\n')
+        marker = self.root / 'signing-ran'
+        signer = self.root / 'signer'
+        signer.write_text(f'#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n')
+        signer.chmod(0o700)
+        git(self.repo, 'config', 'commit.gpgsign', 'true')
+        git(self.repo, 'config', 'gpg.program', str(signer))
+        committed, detail = rescue.snapshot_commit(self.repo, 'fixture')
+        self.assertTrue(committed, detail)
+        self.assertFalse(marker.exists())
 
 
 if __name__ == '__main__':

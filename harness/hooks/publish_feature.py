@@ -16,14 +16,12 @@ from functools import partial
 from pathlib import Path
 
 from process import run, signal_group
+from git_safety import git_environment, require_safe_source
 
 
-def run_git(repo, *args, timeout=600, env_extra=None, text=True, input=None):
+def run_git(repo, *args, timeout=600, config_extra=(), text=True, input=None):
     # Headless use: a missing credential must fail the push, not wait on a terminal prompt.
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    if env_extra:
-        env.update(env_extra)
-    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env = git_environment(settings=config_extra)
     return run(["git", "-C", str(repo), *args], env=env, timeout=timeout, text=text, input=input)
 
 
@@ -56,7 +54,7 @@ def reachable_oids(repo, head, timeout):
     """Read fixed-size ID records; never buffer unbounded rev-list output or paths."""
     command = ['git', '-C', str(repo), 'rev-list', '--objects', '--no-object-names',
                '--filter=blob:limit=1024', head]
-    env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GIT_NO_REPLACE_OBJECTS': '1'}
+    env = git_environment()
     process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, start_new_session=True)
     deadline = time.monotonic() + timeout
@@ -196,6 +194,11 @@ def publish(args):
     if head != args.expected_head:
         report("BLOCKED_POLICY", "Source HEAD changed since final verification")
         return 2
+    try:
+        require_safe_source(repo, git_environment(), timeout=min(args.timeout, 5))
+    except OSError:
+        report("BLOCKED_POLICY", "Source Git metadata has executable local filters, submodules, or could not be inspected safely")
+        return 2
     status = git(repo, "status", "--porcelain")
     if status.returncode or status.stdout.strip():
         report("BLOCKED_POLICY", "Commit or discard source changes before publishing")
@@ -217,39 +220,8 @@ def publish(args):
     # Keep credential-bearing URLs out of process arguments. The temporary
     # remote exists only in this command's environment and is never persisted.
     pinned_remote = "harness-push-" + secrets.token_hex(12)
-    pinned_env = {
-        "GIT_CONFIG_COUNT": "2",
-        "GIT_CONFIG_KEY_0": f"remote.{pinned_remote}.url",
-        "GIT_CONFIG_VALUE_0": destination,
-        "GIT_CONFIG_KEY_1": f"remote.{pinned_remote}.pushurl",
-        "GIT_CONFIG_VALUE_1": destination,
-    }
-    # get-url already expanded rewrites. Refuse a second expansion that would make
-    # ls-remote inspect a different repository from the one `push origin` uses.
-    inspected = git(repo, "ls-remote", "--get-url", "--", pinned_remote, env_extra=pinned_env)
-    if inspected.returncode or inspected.stdout.strip() != destination:
-        report("BLOCKED_POLICY", "Push destination cannot be inspected without another URL rewrite",
-               branch=args.branch, remote=remote)
-        return 2
-    # A repository may call its default branch trunk, release, or something else.
-    # Refuse publication when the remote does not reveal a default branch.
-    try:
-        default = git(repo, "ls-remote", "--symref", "--", pinned_remote, "HEAD", timeout=min(args.timeout, 30), env_extra=pinned_env)
-    except subprocess.TimeoutExpired:
-        report("BLOCKED_REMOTE", "Could not determine the remote default branch in time; continue local integration", branch=args.branch, remote=remote)
-        return 4
-    if default.returncode:
-        report("BLOCKED_REMOTE", "Could not determine the remote default branch; continue local integration",
-               branch=args.branch, remote=remote, detail=scrub(default.stderr or default.stdout))
-        return 4
-    match = re.search(r"^ref: refs/heads/(\S+)\s+HEAD$", default.stdout, re.MULTILINE)
-    if match is None:
-        report("BLOCKED_REMOTE", "Remote default branch is not advertised; continue local integration",
-               branch=args.branch, remote=remote)
-        return 4
-    if args.branch == match.group(1):
-        report("BLOCKED_POLICY", "Refusing to publish the remote default branch", branch=args.branch, remote=remote)
-        return 2
+    pinned_config = ((f"remote.{pinned_remote}.url", destination),
+                     (f"remote.{pinned_remote}.pushurl", destination))
     ref = f"refs/heads/{args.branch}"
     # A concurrent edit to origin.pushurl must not redirect the push.
     try:
@@ -280,9 +252,32 @@ def publish(args):
             if commit_type.returncode or commit_type.stdout.strip() != 'commit':
                 report('BLOCKED_REMOTE', 'Could not load verified commit for publication', branch=args.branch, remote=remote)
                 return 4
-            resolved = git(transport, 'ls-remote', '--get-url', '--', pinned_remote, env_extra=pinned_env)
-            if resolved.returncode or resolved.stdout.strip() != destination:
-                report('BLOCKED_POLICY', 'Isolated transport would rewrite the inspected destination', branch=args.branch, remote=remote)
+            # Only the isolated transport may contact the destination. Source-local
+            # sshCommand and credential helpers must not run during inspection.
+            inspected = git(transport, 'ls-remote', '--get-url', '--', pinned_remote,
+                            config_extra=pinned_config)
+            if inspected.returncode or inspected.stdout.strip() != destination:
+                report('BLOCKED_POLICY', 'Push destination cannot be inspected without another URL rewrite',
+                       branch=args.branch, remote=remote)
+                return 2
+            try:
+                default = git(transport, 'ls-remote', '--symref', '--', pinned_remote, 'HEAD',
+                              timeout=min(args.timeout, 30), config_extra=pinned_config)
+            except subprocess.TimeoutExpired:
+                report('BLOCKED_REMOTE', 'Could not determine the remote default branch in time; continue local integration',
+                       branch=args.branch, remote=remote)
+                return 4
+            if default.returncode:
+                report('BLOCKED_REMOTE', 'Could not determine the remote default branch; continue local integration',
+                       branch=args.branch, remote=remote, detail=scrub(default.stderr or default.stdout))
+                return 4
+            match = re.search(r'^ref: refs/heads/(\S+)\s+HEAD$', default.stdout, re.MULTILINE)
+            if match is None:
+                report('BLOCKED_REMOTE', 'Remote default branch is not advertised; continue local integration',
+                       branch=args.branch, remote=remote)
+                return 4
+            if args.branch == match.group(1):
+                report('BLOCKED_POLICY', 'Refusing to publish the remote default branch', branch=args.branch, remote=remote)
                 return 2
             # Scan the same graph the push will traverse. Source shallow boundaries
             # and grafts are not inherited by this transport, even when their hidden
@@ -299,7 +294,7 @@ def publish(args):
                        branch=args.branch, remote=remote)
                 return 2
             result = git(transport, 'push', '--porcelain', pinned_remote,
-                         f"{head}:{ref}", timeout=args.timeout, env_extra=pinned_env)
+                         f"{head}:{ref}", timeout=args.timeout, config_extra=pinned_config)
     except subprocess.TimeoutExpired:
         report("BLOCKED_REMOTE", f"Publication command exceeded {args.timeout} seconds; continue local integration", branch=args.branch, remote=remote)
         return 4
