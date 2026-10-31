@@ -55,6 +55,6 @@ To remove the harness while preserving unrelated Codex settings:
 1. Remove the marked Agent Harness block from `~/.codex/AGENTS.md`.
 2. Remove the four hook entries invoking `~/.codex/agent-harness/wal.py hook` from `~/.codex/hooks.json`, keeping other hook groups.
 3. Remove the six copied role files from `~/.codex/agents`, the copied files in `~/.codex/skills/agent-harness`, and the installed `~/.codex/agent-harness/wal.py` writer.
-4. Remove the marked `agent-harness` profile block and any harness-owned root permission/approval lines from `~/.codex/config.toml`, keeping user-owned settings.
+4. Inspect the marked profile span in `~/.codex/config.toml` before deleting it: user-added TOML tables may appear between the markers. Preserve those tables and values outside the span, then remove only the generated `[permissions.agent-harness]` tables, the marker comments, and any harness-owned root permission/approval lines. If the TOML scope is unclear, restore a private backup and merge manually.
 
 The private WALs under `~/.agent-harness/codex-wals` and backups under `~/.codex/agent-harness/backups` can be retained for recovery or removed after review. Restore a private backup if you need the exact previous content. Start a new Codex session after uninstalling.
