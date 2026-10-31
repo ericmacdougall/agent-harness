@@ -1,31 +1,46 @@
 # Agent Harness for Claude Code and Codex
 
-The repo includes a Codex-native edition: global `AGENTS.md` guidance, a focused skill, custom subagent roles, private lifecycle-hook WALs, and a narrow permission profile for WAL writes and local Git commits. With Python 3.11 or newer, install it with `python3.11 install_codex.py --apply` after previewing `python3.11 install_codex.py`. To explicitly make Codex's built-in Full Access the default for new chats, use `python3.11 install_codex.py --apply --default-full-access`; this keeps the harness guidance and hooks, and requires legacy sandbox settings to be removed first. Start a new Codex session and use `/hooks` to review and trust the installed hook definition. Browser site permissions are separate from local command permissions. See [Codex setup and limits](docs/codex.md).
+Agent Harness installs user-wide guidance for scoped software work, recoverable commits, independent review, testing, and local delivery. Both editions use instructions and small Python helpers; neither is a daemon, CI service, or guarantee that an agent follows every step.
 
-A user-wide Claude Code workflow for parallel software tasks with recoverable work, independent review, live testing, and local delivery. Both editions are instruction text plus small Python helpers. Neither is a daemon, scheduler, CI service, or guarantee that an agent will obey every instruction. Claude's hooks enforce WAL metadata before matched write tools; Codex's hooks record supported lifecycle and tool metadata. The remaining process gates require the main agent to follow the instructions and report evidence.
+## Quick start
 
-## What it does
-
-- Sends small, reversible fixes through a fast path. Substantive work gets one background task owner per related scope, an isolated Git worktree, a scope brief, a decision log, and periodic user updates.
-- Creates private per-session and per-agent write-ahead logs under `~/.claude/wals`. Hook records contain timestamps, tool names and lengths, not prompt text, tool arguments, or reversible hashes of them. Agents add human-readable intent, decisions, evidence and handoffs.
-- Runs a read-only Codex Sol review of the plan and final PR packet. If Codex is unavailable, a fresh Claude Opus review is attempted. Repeated material blockers can be escalated by the main agent to Astra, then Fable if Astra fails before editing.
-- Requires relevant failure-first tests, adversarial review, and a real click/API pass for runnable work before the main agent accepts it. Test depth follows risk; statistical eval gates apply to stochastic systems, not every bug fix.
-- Publishes a verified feature branch to `origin` when possible, then guardedly merges into the user's original checkout after approved checks. A remote outage is reported and does not prevent local delivery.
-- Includes a dependency-free test watcher and asks for an immediately usable run/test/watch/log/stop handoff.
-
-The detailed policy is in [HARNESS.md](HARNESS.md); agent roles are in [harness/agents](harness/agents), and the small CLI helpers are in [harness/hooks](harness/hooks).
-
-## Install
-
-Requirements: Claude Code **2.1.295+**, Python **3.10+**, Git, macOS or Linux. Codex CLI and access to `gpt-6.1-sol`/`gpt-6-astra` enable the preferred review path. Claude Opus and Fable access enable the fallbacks. Review and rescue calls can incur model charges. Windows behavior has not been tested.
+Clone this repository, then choose the edition for your agent:
 
 ```sh
 git clone https://github.com/ericmacdougall/agent-harness.git
 cd agent-harness
-python3 install.py           # preview
-python3 install.py --apply   # install
-python3 -m unittest discover -s tests -v
 ```
+
+**Claude Code** requires version **2.1.295+**, Python **3.10+**, and Git on macOS or Linux. Preview, install, then start a new Claude Code session:
+
+```sh
+python3 install.py
+python3 install.py --apply
+```
+
+**Codex** requires a current local Codex with custom agents and hooks, Python **3.11+**, and Git on macOS or Linux. Preview, install, then start a new Codex session and use `/hooks` to review and trust the installed hooks:
+
+```sh
+python3.11 install_codex.py
+python3.11 install_codex.py --apply
+```
+
+Replace `python3.11` with your available Python 3.11+ executable if needed. The Codex installer adds a narrow permission profile for private WAL writes and local Git commits. To explicitly select built-in Full Access for new chats, preview and apply with `--default-full-access`; [Codex setup and limits](docs/codex.md) explains the effect, legacy sandbox conflicts, and separate Browser site permissions. Windows behavior has not been tested.
+
+## Capabilities by edition
+
+| | Claude Code | Codex |
+| --- | --- | --- |
+| Guidance and roles | `~/.claude/CLAUDE.md` and four task roles | `~/.codex/AGENTS.md`, one skill, and six custom roles |
+| Private WAL | `~/.claude/wals`; matched write-tool hooks can block on WAL failure | `~/.agent-harness/codex-wals`; hooks record supported lifecycle and tool metadata after trust |
+| Review | Claude helper calls Codex Sol when available, with a Claude Opus fallback | Native subagents use the reviewer role; rescue is available for repeated blockers |
+| Delivery | Installed `publish_feature.py`, `integrate_local.py`, and `watch-tests.py` helpers | Main agent uses native tools and Git to publish and integrate; no Claude delivery helpers are installed |
+
+Both editions send small, reversible fixes through a fast path. Substantive work gets an owner per related scope, a separate worktree, semantic WAL notes, relevant failure-first tests, independent review, and live UI/API checks when applicable. Hook records omit prompt text and tool arguments; the main agent still has to inspect evidence. Publication failures do not prevent verified local delivery. Claude's detailed policy is in [HARNESS.md](HARNESS.md), with roles in [harness/agents](harness/agents) and helpers in [harness/hooks](harness/hooks). Codex's workflow is in its [skill](codex/skills/agent-harness/SKILL.md).
+
+## Claude Code install details
+
+Codex CLI and access to `gpt-6.1-sol`/`gpt-6-astra` enable the preferred Claude review path. Claude Opus and Fable access enable fallbacks. Review and rescue calls can incur model charges.
 
 The installer copies the agents and helpers into `~/.claude`, places a marked block in `~/.claude/CLAUDE.md`, and **merges** its hooks and three narrow helper permission rules into `settings.json`. Existing model, theme, deny rules, and unrelated hooks are preserved. It backs up files it replaces under `~/.claude/agent-harness-backups`. It validates payloads before writing and attempts to restore replaced files if a write fails; an incomplete rollback reports the affected paths and backup location. Crash recovery still requires the backups. The installer does not enable dangerous permission bypass or set a model. Inspect the preview and start a **new Claude Code session** after installation.
 
@@ -40,7 +55,7 @@ To uninstall, remove the marked block from `CLAUDE.md`, remove the four hook ent
 3. An independent reviewer and click tester inspect the actual branch. The owner or fixer addresses findings and retests. The main agent checks scope, test quality, final HEAD and documentation.
 4. The main agent attempts a feature branch push and PR, then merges a verified commit into the recorded local checkout. If publication fails, local work continues and the user receives the remote error.
 
-The `publish_feature.py` helper never force-pushes or pushes the original branch. The `integrate_local.py` helper checks expected source and destination commits, requires a clean checkout, runs allowlisted dependency preparation and checks, and aborts failed merges when source Git state can be verified safe for an automatic abort. See [docs/operations.md](docs/operations.md) for exact commands and limits.
+For Claude Code, the `publish_feature.py` helper never force-pushes or pushes the original branch. The `integrate_local.py` helper checks expected source and destination commits, requires a clean checkout, runs allowlisted dependency preparation and checks, and aborts failed merges when source Git state can be verified safe for an automatic abort. See [docs/operations.md](docs/operations.md) for exact commands and limits. Codex uses its [native delivery workflow](codex/skills/agent-harness/references/delivery.md).
 
 ## Evidence and limits
 
@@ -50,4 +65,4 @@ This repository contains no account credentials, session logs, app fixtures, or 
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs should include a reproducible failure, the affected Claude Code version, and evidence that a fix works without breaking the fast path or local delivery.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs should include a reproducible failure, the affected agent edition and version, and evidence that a fix works without breaking the fast path or local delivery.
