@@ -569,6 +569,51 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertEqual(json.loads(finals[0].read_text())['review'],
                          {'stage': 'CODE_INSPECTION', 'verdict': 'ACCEPT', 'findings': []})
 
+    def test_post_final_packet_mutation_cannot_authorize_full_validation(self):
+        import contextlib
+        import io
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_post_final_packet_race', REVIEW)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        import usage_guard
+        manifest = self.root / 'inputs.json'
+        manifest.write_text(json.dumps({'schema': 1, 'files': [], 'revisions': {},
+            'complete': True, 'deterministic': True, 'target': 'fixture',
+            'toolchain': {'fixture': {'path': str(self.bin / 'codex'), 'public': True,
+                'sha256': hashlib.sha256((self.bin / 'codex').read_bytes()).hexdigest()}}}))
+        manifest.chmod(0o600)
+        head = subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], text=True).strip()
+        observed = {}
+        real_finish = usage_guard.Run.finish
+
+        def finish_then_mutate(run, **arguments):
+            reference = real_finish(run, **arguments)
+            observed.update(reference=reference, subject=run.subject,
+                            invocation=run.start['invocation'], store=run.store)
+            self.packet.write_text('Changed after the successful FINAL was persisted.')
+            return reference
+
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(sys, 'argv', ['review', 'code-inspection', '--repo', str(self.repo),
+                '--packet', str(self.packet), '--output', str(self.output),
+                '--expected-head', head, '--input-manifest', str(manifest)]), \
+             patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin'}), \
+             patch.object(module, 'review_snapshot', return_value=('fixture', 'CODE_INSPECTION_RESULT: ACCEPT', '')), \
+             patch.object(usage_guard.Run, 'finish', finish_then_mutate), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = module.main()
+        self.assertEqual(result, 2, errors.getvalue())
+        self.assertEqual(output.getvalue(), '')
+        self.assertTrue(observed['subject']['reusable'])
+        historical = observed['store'].load_ref(observed['reference'])
+        self.assertEqual((historical['result'], historical['reason']), ('CHECK_OK', 'NONE'))
+        with self.assertRaises(usage_guard.GuardError):
+            observed['store'].check_gate(observed['subject'], observed['reference'])
+        self.assertFalse(observed['store'].reuse(observed['subject'], observed['invocation'],
+                                               observed['reference'])['eligible'])
+
     def test_wrong_stage_provider_result_refuses_without_fallback(self):
         capture = self.root / 'fallback.capture'
         result = self.invoke(env={'CODEX_VERDICT': 'PLAN_RESULT: ACCEPT',
