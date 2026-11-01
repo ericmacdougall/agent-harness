@@ -282,6 +282,28 @@ class SubjectIdentity(unittest.TestCase):
 
 
 class ResultContracts(unittest.TestCase):
+    def test_c1_prior_or_nonterminal_summaries_cannot_satisfy_current_run(self):
+        cases = [
+            ('unittest', 'Ran 2 tests in 0.01s\n\nOK\nRan 0 tests in 0.01s\n\nOK'),
+            ('pytest', 'Previous run: 3 passed in 0.01s\n\nno tests ran in 0.01s'),
+            ('go-json', '\n'.join(json.dumps(event) for event in (
+                {'Action': 'start', 'Package': 'done'},
+                {'Action': 'run', 'Package': 'done', 'Test': 'TestReady'},
+                {'Action': 'pass', 'Package': 'done', 'Test': 'TestReady'},
+                {'Action': 'pass', 'Package': 'done'},
+                {'Action': 'start', 'Package': 'unfinished'}))),
+        ]
+        for adapter, output in cases:
+            with self.subTest(adapter=adapter):
+                self.assertEqual(guard.command_result(adapter, 0, output)[0], 'NO_RESULT')
+
+    def test_c2_pytest_errors_and_interruption_are_not_code_findings(self):
+        for code, output in (
+                (1, '================ 1 passed, 1 error in 0.01s ================'),
+                (2, '1 passed in 0.01s\n!!!!!!!! KeyboardInterrupt !!!!!!!!')):
+            with self.subTest(code=code):
+                self.assertEqual(guard.command_result('pytest', code, output)[0:2], ('NO_RESULT', 'UNKNOWN'))
+
     def test_vacuous_and_false_success_controls(self):
         self.assertEqual(guard.command_result('unittest', 0, '', 'Ran 0 tests in 0.01s\n\nOK')[0], 'NO_RESULT')
         self.assertEqual(guard.command_result('unittest', 0, '', 'Ran 1 test in 0.01s\n\nFAILED (failures=1)')[0], 'NO_RESULT')
