@@ -3,7 +3,6 @@
 
 import argparse
 import json
-import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -45,7 +44,7 @@ def main():
         parser.error('note must be 1 to 4000 characters')
     if SECRET_PATTERN.search(note):
         parser.error('note appears to contain a credential; redact it first')
-    record = {'at': datetime.now(timezone.utc).isoformat(), 'event': args.event, 'cwd': os.getcwd(), 'note': note}
+    record = {'at': datetime.now(timezone.utc).isoformat(), 'event': args.event, 'note': note}
     append(path, record)
     print(json.dumps({'status': 'WROTE', 'event': args.event, 'wal': str(path)}))
 
