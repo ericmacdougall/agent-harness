@@ -24,7 +24,8 @@ from git_safety import _bounded_git, git_environment, require_safe_source
 
 
 GIT_INSPECTION_OPTIONS = ("-c", "core.commitGraph=false",
-                          "-c", "core.splitIndex=false")
+                          "-c", "core.splitIndex=false",
+                          "-c", "core.ignoreCase=false")
 GIT_OUTPUT_LIMIT = 40_000_000
 
 
@@ -163,10 +164,13 @@ def main() -> int:
         base = git(repo, "rev-parse", "HEAD")
         dirty = dirty_state(repo, base)
         git_identity = git_repository_identity(repo)
+        grafts_before = has_grafts(repo)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         parser.error("repo Git state could not be inspected safely")
     if root != repo or not branch or dirty:
         parser.error("rescue worktree must be at its root, on a named branch, and clean")
+    if grafts_before:
+        parser.error("rescue worktree has untrusted grafted history")
     try:
         target = ReportTarget(output_arg, repo, packet)
         target.require_fresh()
@@ -204,7 +208,8 @@ def main() -> int:
             changed = (git(repo, "rev-parse", "HEAD") != base
                        or dirty_state(repo, base)
                        or git(repo, "branch", "--show-current") != branch
-                       or git_repository_identity(repo) != git_identity)
+                       or git_repository_identity(repo) != git_identity
+                       or has_grafts(repo))
             if changed:
                 fallback_reason = "Astra failed after modifying the worktree; preserve it for main-agent inspection."
             else:

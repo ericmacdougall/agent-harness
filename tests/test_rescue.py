@@ -64,6 +64,11 @@ if os.environ.get('CODEX_COMMIT'):
     if os.environ.get('CODEX_STAGE_AFTER_COMMIT'):
         Path('app.txt').write_text('staged after commit\\n')
         subprocess.run(['git', 'add', 'app.txt'], check=True)
+if os.environ.get('CODEX_SET_IGNORECASE') or os.environ.get('CODEX_ADD_CASE_VARIANT'):
+    import subprocess
+    subprocess.run(['git', 'config', 'core.ignoreCase', 'true'], check=True)
+if os.environ.get('CODEX_ADD_CASE_VARIANT'):
+    Path('APP.TXT').write_text('distinct addition\\n')
 reset = os.environ.get('CODEX_RESET_TO')
 if reset:
     import subprocess
@@ -80,6 +85,12 @@ if reset:
                                     capture_output=True, text=True, check=True).stdout.strip())
         graft.parent.mkdir(parents=True, exist_ok=True)
         graft.write_text(graft_base + '\\n' + reset + ' ' + graft_base + '\\n')
+if os.environ.get('CODEX_GRAFT_ONLY'):
+    import subprocess
+    graft = Path(subprocess.run(['git', 'rev-parse', '--git-path', 'info/grafts'],
+                                capture_output=True, text=True, check=True).stdout.strip())
+    graft.parent.mkdir(parents=True, exist_ok=True)
+    graft.write_text('# synthetic graft marker\\n')
 if os.environ.get('CODEX_SWITCH_BRANCH'):
     import subprocess
     subprocess.run(['git', 'switch', '-q', '-c', 'feat/wrong'], check=True)
@@ -239,6 +250,39 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertFalse(report['snapshot_commit_by_wrapper'])
         self.assertEqual(git(self.repo, 'show', 'HEAD:app.txt'), 'updated')
 
+    def test_clean_descendant_with_ignorecase_config_still_needs_verification(self):
+        result = self.invoke(env={'CODEX_ACTION': 'updated', 'CODEX_COMMIT': '1',
+                                  'CODEX_SET_IGNORECASE': '1'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'needs-main-verification')
+        self.assertFalse(report['dirty'])
+
+    def test_case_variant_addition_cannot_hide_dirty_descendant(self):
+        if (self.repo / 'APP.TXT').exists():
+            self.skipTest('requires a case-sensitive filesystem')
+        result = self.invoke(env={'CODEX_ACTION': 'updated', 'CODEX_COMMIT': '1',
+                                  'CODEX_ADD_CASE_VARIANT': '1'})
+        self.assertEqual(git(self.repo, 'status', '--porcelain'), '')
+        self.assertEqual(git(self.repo, '-c', 'core.ignoreCase=false',
+                             'status', '--porcelain'), '?? APP.TXT')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'needs-main-commit')
+        self.assertTrue(report['dirty'])
+
+    def test_case_variant_after_failed_model_suppresses_fallback(self):
+        if (self.repo / 'APP.TXT').exists():
+            self.skipTest('requires a case-sensitive filesystem')
+        capture = self.root / 'fallback-prompt.txt'
+        result = self.invoke(env={'CODEX_ADD_CASE_VARIANT': '1', 'CODEX_EXIT': '7',
+                                  'CAPTURE_CLAUDE_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertFalse(capture.exists())
+
     def two_commit_base(self):
         ancestor = self.base
         git(self.repo, 'commit', '--allow-empty', '-qm', 'approved base')
@@ -295,6 +339,28 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(report['status'], 'blocked')
         self.assertEqual(report['commits'], 0)
         self.assertEqual(report['head'], ancestor)
+
+    def test_initial_graft_refuses_model_launch(self):
+        graft = Path(git(self.repo, 'rev-parse', '--git-path', 'info/grafts'))
+        if not graft.is_absolute():
+            graft = self.repo / graft
+        graft.parent.mkdir(parents=True, exist_ok=True)
+        graft.write_text('# synthetic graft marker\n')
+        capture = self.root / 'model-prompt.txt'
+        result = self.invoke(env={'CAPTURE_CODEX_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(capture.exists())
+        self.assertFalse(self.output.exists())
+
+    def test_failed_model_graft_only_suppresses_fallback(self):
+        capture = self.root / 'fallback-prompt.txt'
+        result = self.invoke(env={'CODEX_GRAFT_ONLY': '1', 'CODEX_EXIT': '7',
+                                  'CAPTURE_CLAUDE_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertFalse(capture.exists())
 
     def test_graft_added_after_presence_check_cannot_spoof_history(self):
         ancestor = self.two_commit_base()
