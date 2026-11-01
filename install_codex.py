@@ -219,6 +219,7 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False) -> li
     files += [(SOURCE / 'hooks' / 'wal.py', harness_dir / 'wal.py')]
     files += [(ROOT / 'harness' / 'hooks' / name, harness_dir / name)
               for name in DELIVERY_HELPERS]
+    files += [(ROOT / 'harness' / 'tools' / 'watch-tests.py', harness_dir / 'watch-tests.py')]
     instructions_path = codex_home / 'AGENTS.md'
     hooks_path = codex_home / 'hooks.json'
     config_path = codex_home / 'config.toml'
