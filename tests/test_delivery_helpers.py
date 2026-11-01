@@ -392,9 +392,69 @@ class DeliveryHelpers(unittest.TestCase):
         p, data = self.invoke(PUBLISH, '--repo', str(self.feature), '--branch', 'feat/app', '--original-branch', 'main', '--expected-head', self.feature_head)
         self.assertEqual((p.returncode, data['status']), (0, 'PUSHED'))
         self.assertEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app', cwd=remote).returncode, 0)
+        self.assertEqual(cmd('git', 'rev-parse', 'feat/app', cwd=remote).stdout.strip(), self.feature_head)
         self.assertEqual(cmd('git', 'rev-parse', 'main', cwd=remote).stdout.strip(), self.base)
         p, data = self.invoke(PUBLISH, '--repo', str(self.repo), '--branch', 'main', '--original-branch', 'main', '--expected-head', self.base)
         self.assertEqual((p.returncode, data['status']), (2, 'BLOCKED_POLICY'))
+
+    def test_publish_rejects_nested_repo_with_hidden_root_edit(self):
+        nested = self.feature / 'nested'
+        nested.mkdir()
+        (nested / 'module.txt').write_text('feature module\n')
+        cmd('git', 'add', 'nested/module.txt', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'add nested module', cwd=self.feature)
+        self.feature_head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        remote = self.root / 'origin.git'
+        cmd('git', 'init', '-q', '--bare', str(remote))
+        cmd('git', 'remote', 'add', 'origin', str(remote), cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'main:main', cwd=self.repo)
+        cmd('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=remote)
+        cmd('git', 'update-index', '--assume-unchanged', 'app.txt', cwd=self.feature)
+        (self.feature / 'app.txt').write_text('hidden unreviewed edit\n')
+        self.assertTrue(cmd('git', 'ls-files', '-v', 'app.txt', cwd=self.feature).stdout.startswith('h '))
+        self.assertNotIn('app.txt', cmd('git', 'ls-files', '-v', '-z', cwd=nested).stdout)
+        self.assertEqual(cmd('git', 'status', '--porcelain', cwd=nested).stdout, '')
+        remote_refs = cmd('git', 'for-each-ref', '--format=%(refname) %(objectname)',
+                          cwd=remote).stdout
+        result = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(nested),
+                                 '--branch', 'feat/app', '--original-branch', 'main',
+                                 '--expected-head', self.feature_head],
+                                text=True, capture_output=True, env=isolated_env(),
+                                timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (2, 'BLOCKED_POLICY'),
+                         result.stdout + result.stderr)
+        self.assertIn('root of a Git worktree', data['message'])
+        self.assertEqual(cmd('git', 'for-each-ref', '--format=%(refname) %(objectname)',
+                             cwd=remote).stdout, remote_refs)
+        self.assertNotEqual(cmd('git', 'show-ref', '--verify', 'refs/heads/feat/app',
+                                cwd=remote, check=False).returncode, 0)
+        self.assertEqual(cmd('git', 'rev-parse', 'main', cwd=remote).stdout.strip(), self.base)
+        self.assertEqual((self.feature / 'app.txt').read_text(), 'hidden unreviewed edit\n')
+        self.assertTrue(cmd('git', 'ls-files', '-v', 'app.txt', cwd=self.feature).stdout.startswith('h '))
+
+    def test_publish_root_inspection_failure_never_reaches_remote(self):
+        spec = importlib.util.spec_from_file_location('publication_root_check', PUBLISH)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(PUBLISH.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        for returncode, output in ((1, str(self.feature)), (0, ''), (0, str(self.repo))):
+            with self.subTest(returncode=returncode, output=bool(output)):
+                calls = []
+
+                def fake_git(repo, *args, **kwargs):
+                    calls.append(args)
+                    return subprocess.CompletedProcess(args, returncode, output, '')
+
+                argv = [str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                        '--original-branch', 'main', '--expected-head', self.feature_head]
+                with patch.object(sys, 'argv', argv), \
+                     patch.object(module, 'run_git', side_effect=fake_git), \
+                     patch('sys.stdout', new_callable=io.StringIO) as printed:
+                    code = module.main()
+                data = json.loads(printed.getvalue())
+                self.assertEqual((code, data['status']), (2, 'BLOCKED_POLICY'))
+                self.assertEqual(calls, [('rev-parse', '--show-toplevel')])
 
     def test_publish_rejects_ambient_alternate_index_before_push(self):
         remote = self.root / 'origin.git'
@@ -1635,6 +1695,86 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertFalse(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
         parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
         self.assertEqual(parents[1:], [self.base, self.feature_head])
+
+    def test_empty_unittest_discovery_cannot_merge_on_old_python(self):
+        self.add_feature_test('import unittest\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('phase'),
+                          data.get('merge_aborted')), (3, 'BLOCKED_LOCAL', 'check', True),
+                         result.stdout + result.stderr)
+        self.assert_restored()
+
+    def test_all_approved_unittest_discovery_forms_run_real_test(self):
+        self.add_feature_test()
+        (self.feature / 'tests' / '__init__.py').write_text('')
+        cmd('git', 'add', 'tests/__init__.py', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'make tests importable with explicit top level', cwd=self.feature)
+        self.feature_head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        bin_dir = self.root / 'python-bin'
+        bin_dir.mkdir()
+        for name in ('python', 'python3'):
+            (bin_dir / name).symlink_to(sys.executable)
+        checks = [' '.join([executable, '-m', 'unittest', 'discover', '-s', 'tests',
+                            *(['-t', '.'] if top else []), *(['-v'] if verbose else [])])
+                  for executable in ('python', 'python3')
+                  for top in (False, True) for verbose in (False, True)]
+        argv = self.integrate_args()
+        argv[-1] = checks[0]
+        for check in checks[1:]:
+            argv.extend(['--check', check])
+        env = isolated_env()
+        env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
+        result = subprocess.run(argv, text=True, capture_output=True, env=env,
+                                timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'),
+                         result.stdout + result.stderr)
+        self.assertEqual(data['checks'], checks)
+
+    def test_unittest_discovery_import_error_aborts_without_output(self):
+        self.add_feature_test('raise RuntimeError("synthetic_import_marker")\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('phase')),
+                         (3, 'BLOCKED_LOCAL', 'check'), result.stdout + result.stderr)
+        self.assertNotIn('synthetic_import_marker', result.stdout + result.stderr)
+        self.assert_restored()
+
+    def test_inherited_git_pager_allows_verified_merge(self):
+        self.add_feature_test()
+        env = {**isolated_env(), 'GIT_PAGER': 'cat'}
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=env, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'),
+                         result.stdout + result.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), data['head'])
+
+    def test_inherited_git_pager_cannot_run_in_helper_git(self):
+        self.add_feature_test()
+        pager = self.root / 'pager'
+        marker = self.root / 'pager-ran'
+        pager.write_text(f'#!{sys.executable}\nfrom pathlib import Path\n'
+                         f'Path({str(marker)!r}).write_text("ran")\n')
+        pager.chmod(0o700)
+        # Prove the sentinel is executable before relying on its absence.
+        subprocess.run([str(pager)], check=True)
+        self.assertTrue(marker.exists())
+        marker.unlink()
+        env = {**isolated_env(), 'GIT_PAGER': str(pager)}
+        blocked = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                 env={**env, 'GIT_INDEX_FILE': str(self.root / 'alternate-index')},
+                                 timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual((blocked.returncode, json.loads(blocked.stdout)['status']),
+                         (2, 'BLOCKED_POLICY'), blocked.stdout + blocked.stderr)
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=env, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (0, 'INTEGRATED'), result.stdout + result.stderr)
+        self.assertFalse(marker.exists(), 'a helper-owned Git command executed inherited GIT_PAGER')
 
     def test_check_uses_merged_pipe_descriptors_and_reports_only_status(self):
         self.add_feature_test('import os, unittest\n'

@@ -18,10 +18,12 @@ from process import cleanup_discarded, run as run_process
 
 # Git environment variables can redirect commands away from the named worktree
 # or its normal index. Identity and test-isolation settings do not do that.
+# GIT_PAGER is stripped from helper-owned Git processes by git_environment().
 ALLOWED_GIT_ENV = {
     'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_AUTHOR_DATE',
     'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_DATE',
     'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT',
+    'GIT_PAGER',
 }
 INSPECTION_CONFIG = ('-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false',
                      '-c', 'core.trustctime=true', '-c', 'core.checkStat=default',
@@ -31,6 +33,11 @@ INDEX_MAX_ENTRIES = 250_000
 INDEX_MAX_RECORD_BYTES = 1_000_000
 INDEX_MAX_SECONDS = 30
 INDEX_HEADER_BYTES = 9  # tag, space, six-digit mode, space
+NONEMPTY_UNITTEST = (
+    'import sys, unittest\n'
+    "program = unittest.main(module=None, argv=['unittest', *sys.argv[1:]], exit=False)\n"
+    'sys.exit(0 if program.result.testsRun > 0 and program.result.wasSuccessful() else 1)\n'
+)
 
 
 class IndexInspectionError(Exception):
@@ -117,7 +124,13 @@ def inspect_git(repo, *args, timeout=600):
 def run(repo, command, *, timeout=None, discard_output=False, env=None):
     # Python test runners otherwise leave untracked __pycache__ after an aborted merge.
     output_options = {'discard_output': True} if discard_output else {}
-    return run_process(command, cwd=repo, timeout=timeout,
+    executed = command
+    if (discard_output and len(command) >= 4 and command[0] in {'python', 'python3'}
+            and command[1:4] == ['-m', 'unittest', 'discover']):
+        # Python before 3.12 exits zero when discovery finds no tests. Invoke
+        # the same CLI parser once, then require its result to be nonempty.
+        executed = [command[0], '-c', NONEMPTY_UNITTEST, *command[3:]]
+    return run_process(executed, cwd=repo, timeout=timeout,
                        env={**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"},
                        **output_options)
 

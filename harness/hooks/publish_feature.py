@@ -179,8 +179,13 @@ def main():
 def publish(args):
     git = partial(run_git, timeout=args.timeout)
     repo = args.repo.resolve()
-    if not repo.is_dir() or git(repo, "rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
-        report("BLOCKED_POLICY", "Source is not a Git worktree")
+    if not repo.is_dir():
+        report("BLOCKED_POLICY", "Source must be the root of a Git worktree")
+        return 2
+    toplevel = git(repo, "rev-parse", "--show-toplevel")
+    if (toplevel.returncode or not toplevel.stdout.strip()
+            or Path(toplevel.stdout.strip()).resolve() != repo):
+        report("BLOCKED_POLICY", "Source must be the root of a Git worktree")
         return 2
     valid = git(repo, "check-ref-format", "--branch", args.branch)
     if valid.returncode or args.branch in {"main", "master", "develop", args.original_branch}:
