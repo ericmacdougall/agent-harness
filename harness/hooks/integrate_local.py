@@ -331,6 +331,16 @@ def checkout_identity(repo):
     return info.st_dev, info.st_ino
 
 
+def valid_identity_text(value):
+    if not isinstance(value, str) or '\0' in value:
+        return False
+    try:
+        value.encode('utf-8')
+    except UnicodeError:
+        return False
+    return True
+
+
 def journal_key(identity, branch, base, source_branch, source):
     payload = '\0'.join((str(identity[0]), str(identity[1]), branch, base,
                          source_branch, source)).encode()
@@ -494,6 +504,11 @@ def read_journal(directory):
             or record.get('schema') not in (1, 2)
             or record.get('key') != directory.name or not isinstance(record.get('phase'), str)):
         raise OSError('scratch journal is invalid')
+    text_fields = ('key', 'phase', 'original', 'branch', 'base', 'source_branch', 'source',
+                   'scratch', 'container', 'ref', 'attempt', 'previous_phase',
+                   'resolved_head', 'candidate', 'tree')
+    if any(name in record and not valid_identity_text(record[name]) for name in text_fields):
+        raise OSError('scratch journal text identity is invalid')
     if (('ref' in record and not isinstance(record['ref'], str))
             or ('cleanup_pending' in record and type(record['cleanup_pending']) is not bool)
             or any(name in record and not full_oid(record[name]) for name in ('candidate', 'tree'))):
@@ -832,6 +847,12 @@ def common_state_is_current(repo, identity, common, common_info, root, root_info
 def integrate_scratch(args, preparations, checks):
     if any(name.startswith('GIT_') and name not in ALLOWED_GIT_ENV for name in os.environ):
         report('BLOCKED_POLICY', 'Inherited Git routing or configuration override is unsupported')
+        return 2
+    identities = [str(args.repo), args.original_branch, args.expected_head]
+    identities.extend(value for value in (args.source, args.expected_source_head,
+                                          getattr(args, 'resolve_journal', None)) if value is not None)
+    if not all(valid_identity_text(value) for value in identities):
+        report('BLOCKED_POLICY', 'Checkout, ref, or journal identity text is invalid')
         return 2
     repo = args.repo.resolve()
     directory = None

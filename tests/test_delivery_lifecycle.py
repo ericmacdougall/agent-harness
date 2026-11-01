@@ -347,7 +347,11 @@ class DeliveryLifecycle(unittest.TestCase):
                                                     'main', self.base, 'feat/recovery', self.feature_head)
         self.addCleanup(lambda: Path(record['container']).rmdir())
         for field, value in (('container', None), ('container', 7), ('phase', []),
-                             ('phase', True), ('key', 7), ('ref', False), ('schema', True)):
+                             ('phase', True), ('key', 7), ('ref', False), ('schema', True),
+                             ('source_branch', 'bad\ud800'), ('branch', 'bad\ud800'),
+                             ('container', '/tmp/bad\ud800'), ('ref', 'bad\ud800'),
+                             ('phase', 'bad\ud800'), ('source_branch', 'bad\0name'),
+                             ('container', '/tmp/bad\0name'), ('ref', 'bad\0name')):
             with self.subTest(field=field):
                 module.write_journal(directory, {**record, field: value})
                 result, data = self.invoke()
@@ -402,6 +406,19 @@ class DeliveryLifecycle(unittest.TestCase):
             with self.assertRaises(OSError):
                 module.scan_journals(root, self.original, module.checkout_identity(self.original), 'main', key, 30)
         self.assertEqual(self.head(self.original), self.base)
+
+    def test_valid_utf8_feature_branch_remains_supported(self):
+        branch = 'feat/café-🦆'
+        fixtures.command('git', 'branch', '-m', 'feat/recovery', branch,
+                         cwd=self.feature, env=self.env)
+        result = fixtures.command(sys.executable, str(fixtures.INTEGRATE), '--repo', str(self.original),
+                                  '--original-branch', 'main', '--expected-head', self.base,
+                                  '--source', branch, '--expected-source-head', self.feature_head,
+                                  '--check', fixtures.CHECK, env=self.env, check=False)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'), result.stdout + result.stderr)
+        self.assertEqual((self.original / 'app.txt').read_text(), 'feature\n')
+        self.assertTrue(self.module().valid_identity_text('/tmp/café-🦆'))
 
 
 if __name__ == '__main__':
