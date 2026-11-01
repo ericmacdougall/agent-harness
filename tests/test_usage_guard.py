@@ -312,11 +312,29 @@ class ResultContracts(unittest.TestCase):
 
     def test_compile_error_is_not_automatically_a_code_repair_failure(self):
         self.assertEqual(guard.command_result('go-json', 1, '{"Action":"fail","Package":"fixture"}')[0], 'NO_RESULT')
-        mixed = ('{"Action":"pass","Package":"good","Test":"TestGood"}\n'
-                 '{"Action":"fail","Package":"build-error"}')
+        mixed = '\n'.join(json.dumps(event) for event in (
+            {'Action': 'start', 'Package': 'good'},
+            {'Action': 'run', 'Package': 'good', 'Test': 'TestGood'},
+            {'Action': 'pass', 'Package': 'good', 'Test': 'TestGood'},
+            {'Action': 'pass', 'Package': 'good'},
+            {'Action': 'start', 'Package': 'build-error'},
+            {'Action': 'fail', 'Package': 'build-error'}))
         self.assertEqual(guard.command_result('go-json', 1, mixed)[0:2], ('NO_RESULT', 'UNKNOWN'))
         self.assertEqual(guard.command_result('unittest', 1, '', 'Ran 1 test in 0.01s\n\nFAILED (errors=1)')[0:2],
                          ('NO_RESULT', 'UNKNOWN'))
+
+    def test_terminal_positive_and_actual_failure_contracts_remain_supported(self):
+        self.assertEqual(guard.command_result('pytest', 0, '=== 2 passed in 0.01s ==='), ('CHECK_OK', 'NONE', 2))
+        self.assertEqual(guard.command_result('pytest', 1, '=== 1 passed, 1 failed in 0.01s ==='),
+                         ('CHECK_FAILED', 'CODE_FINDINGS', 2))
+        for failed in (False, True):
+            events = [{'Action': 'start', 'Package': 'fixture'},
+                      {'Action': 'run', 'Package': 'fixture', 'Test': 'TestReady'},
+                      {'Action': 'fail' if failed else 'pass', 'Package': 'fixture', 'Test': 'TestReady'},
+                      {'Action': 'fail' if failed else 'pass', 'Package': 'fixture'}]
+            text = '\n'.join(json.dumps(event) for event in events)
+            expected = ('CHECK_FAILED', 'CODE_FINDINGS', 1) if failed else ('CHECK_OK', 'NONE', 1)
+            self.assertEqual(guard.command_result('go-json', int(failed), text), expected)
 
 
 class LiveReceipts(unittest.TestCase):

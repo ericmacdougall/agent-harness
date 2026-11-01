@@ -703,44 +703,93 @@ class Run:
 def command_result(adapter, code, stdout, stderr='', success_exit=None):
     """A zero exit is insufficient for tests; require a recognized terminal count."""
     text = stdout + '\n' + stderr
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
     count, outcome = None, None
     if adapter == 'unittest':
-        found = re.search(r'^Ran (\d+) tests? in [^\n]+$', text, re.M)
-        terminal = re.search(r'^(OK|FAILED)(?:\s*\(([^\n]*)\))?\s*$', text, re.M)
-        if found and terminal:
+        summaries = [(at, re.fullmatch(r'Ran (\d+) tests? in [0-9.]+s', line))
+                     for at, line in enumerate(lines)]
+        summaries = [(at, match) for at, match in summaries if match]
+        terminals = [(at, re.fullmatch(r'(OK|FAILED)(?:\s*\(([^\n]*)\))?', line))
+                     for at, line in enumerate(lines)]
+        terminals = [(at, match) for at, match in terminals if match]
+        if (len(summaries) == len(terminals) == 1 and summaries[0][0] == len(lines) - 2
+                and terminals[0][0] == len(lines) - 1):
+            found, terminal = summaries[0][1], terminals[0][1]
             skipped = re.search(r'skipped=(\d+)', terminal.group(2) or '')
             count = int(found.group(1)) - (int(skipped.group(1)) if skipped else 0)
             outcome = terminal.group(1)
             if re.search(r'errors=[1-9][0-9]*', terminal.group(2) or ''):
                 return 'NO_RESULT', 'UNKNOWN', count
     elif adapter == 'pytest':
-        passed = re.search(r'(\d+) passed', text)
-        failed = re.search(r'(\d+) failed', text)
-        if passed or failed:
-            count = int(passed.group(1)) if passed else 0
-            count += int(failed.group(1)) if failed else 0
-            outcome = 'OK' if code == 0 and passed and not failed else 'FAILED'
+        # Pytest exits2/3/4/5 are interruption/internal/usage/no-collection,
+        # independently of any earlier partial success printed by the process.
+        if code not in {0, 1} or re.search(r'KeyboardInterrupt|INTERNALERROR', text):
+            return 'NO_RESULT', 'UNKNOWN', None
+        summary = re.compile(r'=*\s*((?:\d+ (?:passed|failed|errors?|skipped|deselected|xfailed|xpassed|warnings?)(?:, )?)+)'
+                             r'\s+in\s+[0-9.]+s\s*=*')
+        summaries = [(at, summary.fullmatch(line)) for at, line in enumerate(lines)]
+        summaries = [(at, match) for at, match in summaries if match]
+        if len(summaries) == 1 and summaries[0][0] == len(lines) - 1:
+            counts = {name: int(number) for number, name in re.findall(r'(\d+) ([a-z]+)', summaries[0][1].group(1))}
+            count = counts.get('passed', 0) + counts.get('failed', 0)
+            if counts.get('error', 0) or counts.get('errors', 0):
+                return 'NO_RESULT', 'UNKNOWN', count
+            if code == 0 and counts.get('failed', 0) == 0: outcome = 'OK'
+            elif code == 1 and counts.get('failed', 0) > 0: outcome = 'FAILED'
     elif adapter == 'go-json':
-        completed, failed_tests, failed_packages = set(), set(), set()
+        packages, completed, failed_tests = {}, set(), set()
         try:
             for line in text.splitlines():
                 if not line.strip(): continue
                 event = json.loads(line)
-                if event.get('Action') in {'pass', 'fail'} and event.get('Test'):
-                    completed.add((event.get('Package'), event['Test']))
-                    if event['Action'] == 'fail': failed_tests.add(event.get('Package'))
-                elif event.get('Action') in {'fail', 'build-fail'}:
-                    failed_packages.add(event.get('Package'))
+                if not isinstance(event, dict): raise ValueError
+                action, package, test = event.get('Action'), event.get('Package'), event.get('Test')
+                if action in {'build-fail', 'build-output'}:
+                    return 'NO_RESULT', 'UNKNOWN', len(completed)
+                if not isinstance(package, str) or not package: raise ValueError
+                if action == 'start':
+                    if package in packages: raise ValueError
+                    packages[package] = {'terminal': None, 'tests': {}}
+                    continue
+                if package not in packages:
+                    if action == 'fail': return 'NO_RESULT', 'UNKNOWN', len(completed)
+                    raise ValueError
+                current = packages[package]
+                if current['terminal'] is not None: raise ValueError
+                if action == 'output': continue
+                if test is not None:
+                    if not isinstance(test, str) or not test: raise ValueError
+                    tests = current['tests']
+                    if action == 'run':
+                        if test in tests: raise ValueError
+                        tests[test] = 'running'
+                    elif action in {'pause', 'cont'}:
+                        expected = 'running' if action == 'pause' else 'paused'
+                        if tests.get(test) != expected: raise ValueError
+                        tests[test] = 'paused' if action == 'pause' else 'running'
+                    elif action in {'pass', 'fail', 'skip'}:
+                        if tests.get(test) != 'running': raise ValueError
+                        tests[test] = action
+                        if action != 'skip': completed.add((package, test))
+                        if action == 'fail': failed_tests.add(package)
+                    else: raise ValueError
+                elif action in {'pass', 'fail', 'skip'}:
+                    if any(state in {'running', 'paused'} for state in current['tests'].values()): raise ValueError
+                    if action == 'fail' and package not in failed_tests:
+                        return 'NO_RESULT', 'UNKNOWN', len(completed)
+                    if action != 'fail' and package in failed_tests: raise ValueError
+                    current['terminal'] = action
+                else: raise ValueError
             count = len(completed)
-            if failed_packages - failed_tests:
+            if not packages or any(value['terminal'] is None for value in packages.values()):
                 return 'NO_RESULT', 'UNKNOWN', count
             outcome = 'FAILED' if failed_tests else 'OK'
-        except (ValueError, AttributeError):
-            pass
+        except (ValueError, TypeError):
+            return 'NO_RESULT', 'INVALID_OUTPUT', len(completed)
     elif adapter == 'command' and type(success_exit) is int:
         return ('CHECK_OK', 'NONE', None) if code == success_exit else ('NO_RESULT', 'UNKNOWN', None)
-    if not count or outcome is None:
-        return 'NO_RESULT', 'INVALID_OUTPUT', count
+    if not count or count < 0 or outcome is None:
+        return 'NO_RESULT', 'UNKNOWN' if code else 'INVALID_OUTPUT', count
     if code == 0 and outcome == 'OK': return 'CHECK_OK', 'NONE', count
     if outcome == 'FAILED' and code != 0: return 'CHECK_FAILED', 'CODE_FINDINGS', count
     return 'NO_RESULT', 'UNKNOWN', count
