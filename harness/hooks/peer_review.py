@@ -711,6 +711,8 @@ def main() -> int:
         raise
     note = f"Fallback reason: {failure}\n" if failure else ""
     finalized = False
+    reference = None
+    announced = False
     try:
         after = repo_state(repo)
         if after != before:
@@ -733,10 +735,16 @@ def main() -> int:
         final = store.load_ref(reference)
         if final['result'] != ('CHECK_OK' if passed else 'CHECK_FAILED') or final['reason'] != ('NONE' if passed else 'CODE_FINDINGS'):
             raise OSError('runtime inputs changed; receipt cannot satisfy the requested review')
+        if (subject.probe()['fingerprint'] != subject['fingerprint']
+                or invocation.probe()['fingerprint'] != invocation['fingerprint']):
+            raise OSError('runtime inputs changed after review finalization')
         target.verify_current()
         evidence.verify()
-        print(f"{source}: {report.splitlines()[0].strip()} | {output}")
-        print('Usage receipt: ' + json.dumps(reference, sort_keys=True))
+        # FINAL preserves execution history; only settled publication is usable.
+        store.settle_review(reference)
+        print(f"{source}: {report.splitlines()[0].strip()} | {output}\n"
+              'Usage receipt: ' + json.dumps(reference, sort_keys=True), flush=True)
+        announced = True
     except (OSError, subprocess.TimeoutExpired, GuardError) as error:
         if run_record is not None and not finalized:
             try:
@@ -747,8 +755,18 @@ def main() -> int:
               "A digest-bound historical report may remain at the output path.", file=sys.stderr)
         return 2
     finally:
-        target.close()
-        evidence.close()
+        try:
+            target.close()
+            evidence.close()
+        except BaseException:
+            announced = False
+            raise
+        finally:
+            if reference is not None and not announced:
+                try:
+                    store.invalidate_review(reference, reason='Review publication did not complete')
+                except (OSError, GuardError):
+                    print('Review settlement could not be invalidated; reconciliation is required.', file=sys.stderr)
     return 0 if re.match(r'^(?:VERDICT: PASS|(?:PLAN|CODE_INSPECTION)_RESULT: ACCEPT)\b', report.lstrip()) else 3
 
 

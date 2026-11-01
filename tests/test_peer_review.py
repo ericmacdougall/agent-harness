@@ -569,12 +569,12 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertEqual(json.loads(finals[0].read_text())['review'],
                          {'stage': 'CODE_INSPECTION', 'verdict': 'ACCEPT', 'findings': []})
 
-    def test_post_final_packet_mutation_cannot_authorize_full_validation(self):
+    def finalization_fixture(self, after_finish=None, *, fail_announcement=False):
         import contextlib
         import io
         sys.path.insert(0, str(REVIEW.parent))
         self.addCleanup(sys.path.remove, str(REVIEW.parent))
-        spec = importlib.util.spec_from_file_location('peer_post_final_packet_race', REVIEW)
+        spec = importlib.util.spec_from_file_location('peer_finalization_fixture', REVIEW)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         import usage_guard
@@ -588,12 +588,19 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         observed = {}
         real_finish = usage_guard.Run.finish
 
-        def finish_then_mutate(run, **arguments):
+        def finish_with_hook(run, **arguments):
             reference = real_finish(run, **arguments)
             observed.update(reference=reference, subject=run.subject,
-                            invocation=run.start['invocation'], store=run.store)
-            self.packet.write_text('Changed after the successful FINAL was persisted.')
+                            invocation=run.start['invocation'], store=run.store,
+                            guard_error=usage_guard.GuardError)
+            if after_finish is not None:
+                after_finish(observed)
             return reference
+
+        def announce(*arguments, **keywords):
+            if fail_announcement and arguments and str(arguments[0]).startswith('fixture:'):
+                raise OSError('synthetic stdout failure')
+            print(*arguments, **keywords)
 
         output, errors = io.StringIO(), io.StringIO()
         with patch.object(sys, 'argv', ['review', 'code-inspection', '--repo', str(self.repo),
@@ -601,18 +608,53 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                 '--expected-head', head, '--input-manifest', str(manifest)]), \
              patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin'}), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'CODE_INSPECTION_RESULT: ACCEPT', '')), \
-             patch.object(usage_guard.Run, 'finish', finish_then_mutate), \
+             patch.object(usage_guard.Run, 'finish', finish_with_hook), \
+             patch.object(module, 'print', side_effect=announce, create=True), \
              contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             result = module.main()
-        self.assertEqual(result, 2, errors.getvalue())
-        self.assertEqual(output.getvalue(), '')
+        observed.update(result=result, stdout=output.getvalue(), stderr=errors.getvalue())
         self.assertTrue(observed['subject']['reusable'])
+        return observed
+
+    def assert_review_cannot_authorize(self, observed):
         historical = observed['store'].load_ref(observed['reference'])
         self.assertEqual((historical['result'], historical['reason']), ('CHECK_OK', 'NONE'))
-        with self.assertRaises(usage_guard.GuardError):
+        with self.assertRaises(observed['guard_error']):
             observed['store'].check_gate(observed['subject'], observed['reference'])
         self.assertFalse(observed['store'].reuse(observed['subject'], observed['invocation'],
                                                observed['reference'])['eligible'])
+
+    def test_post_final_packet_mutation_cannot_authorize_full_validation(self):
+        def mutate(_):
+            self.packet.write_text('Changed after the successful FINAL was persisted.')
+
+        observed = self.finalization_fixture(mutate)
+        self.assertEqual(observed['result'], 2, observed['stderr'])
+        self.assertEqual(observed['stdout'], '')
+        self.assert_review_cannot_authorize(observed)
+
+    def test_provisional_review_is_ineligible_until_final_publication_settles(self):
+        provisional = []
+
+        def inspect(observed):
+            self.assert_review_cannot_authorize(observed)
+            provisional.append(True)
+
+        observed = self.finalization_fixture(inspect)
+        self.assertEqual(provisional, [True])
+        self.assertEqual(observed['result'], 0, observed['stderr'])
+        self.assertIn('CODE_INSPECTION_RESULT: ACCEPT', observed['stdout'])
+        self.assertEqual(observed['store'].check_gate(observed['subject'], observed['reference'])['result'],
+                         'CHECK_OK')
+        self.assertTrue(observed['store'].reuse(observed['subject'], observed['invocation'],
+                                              observed['reference'])['eligible'])
+
+    def test_announcement_error_invalidates_settled_review_without_rewriting_final(self):
+        observed = self.finalization_fixture(fail_announcement=True)
+        self.assertEqual(observed['result'], 2, observed['stderr'])
+        self.assertEqual(observed['stdout'], '')
+        self.assertIn('synthetic stdout failure', observed['stderr'])
+        self.assert_review_cannot_authorize(observed)
 
     def test_wrong_stage_provider_result_refuses_without_fallback(self):
         capture = self.root / 'fallback.capture'
