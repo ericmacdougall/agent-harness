@@ -307,36 +307,42 @@ class ExecutorProvenance(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='harness-executor-')
         self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name)
-        workflow.command('git', 'init', '-q', '-b', 'main', str(self.repo))
-        workflow.command('git', '-C', str(self.repo), 'config', 'user.name', 'Fixture')
-        workflow.command('git', '-C', str(self.repo), 'config', 'user.email', 'fixture@example.invalid')
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        self.env.update(HOME=str(self.repo), GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
+        self.git('init', '-q', '-b', 'main')
+        self.git('config', 'user.name', 'Fixture')
+        self.git('config', 'user.email', 'fixture@example.invalid')
         (self.repo / 'README.md').write_text('Owned provenance fixture\n')
         self.hooks = self.repo / 'harness' / 'hooks'
         self.hooks.mkdir(parents=True)
         for name in ('deliver.py', 'integrate_local.py', 'process.py', 'git_safety.py'):
             (self.hooks / name).write_bytes((workflow.DELIVER.parent / name).read_bytes())
-        workflow.command('git', 'add', 'README.md', cwd=self.repo)
-        workflow.command('git', 'commit', '-qm', 'fixture baseline', cwd=self.repo)
+        self.git('add', 'README.md')
+        self.git('commit', '-qm', 'fixture baseline')
         spec = importlib.util.spec_from_file_location('provenance_fixture', workflow.DELIVER)
         self.module = importlib.util.module_from_spec(spec)
         with mock.patch.object(sys, 'path', [str(workflow.DELIVER.parent), *sys.path]):
             spec.loader.exec_module(self.module)
 
     def identity(self):
-        with mock.patch.object(self.module, '__file__', str(self.hooks / 'deliver.py')):
+        with mock.patch.object(self.module, '__file__', str(self.hooks / 'deliver.py')), \
+             mock.patch.dict(os.environ, self.env, clear=True):
             return self.module.resume_executor()
+
+    def git(self, *args):
+        return workflow.command('git', *args, cwd=self.repo, env=self.env)
 
     def test_untracked_and_ignored_helpers_cannot_claim_revision(self):
         self.assertIsNone(self.identity()['revision'])
         (self.repo / '.gitignore').write_text('harness/\n')
-        workflow.command('git', 'add', '.gitignore', cwd=self.repo)
-        workflow.command('git', 'commit', '-qm', 'ignore owned fixture helpers', cwd=self.repo)
+        self.git('add', '.gitignore')
+        self.git('commit', '-qm', 'ignore owned fixture helpers')
         self.assertIsNone(self.identity()['revision'])
 
     def test_clean_tracked_helpers_bind_revision_but_dirty_bytes_do_not(self):
-        workflow.command('git', 'add', 'harness', cwd=self.repo)
-        workflow.command('git', 'commit', '-qm', 'track fixture helpers', cwd=self.repo)
-        head = workflow.command('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        self.git('add', 'harness')
+        self.git('commit', '-qm', 'track fixture helpers')
+        head = self.git('rev-parse', 'HEAD').stdout.strip()
         clean = self.identity()
         self.assertEqual(clean['revision'], head)
         with (self.hooks / 'deliver.py').open('ab') as changed:
@@ -344,3 +350,17 @@ class ExecutorProvenance(unittest.TestCase):
         dirty = self.identity()
         self.assertIsNone(dirty['revision'])
         self.assertNotEqual(dirty['helpers_sha256'], clean['helpers_sha256'])
+
+    def test_index_flags_cannot_hide_dirty_executor_bytes(self):
+        self.git('add', 'harness')
+        self.git('commit', '-qm', 'track fixture helpers')
+        path = self.hooks / 'deliver.py'
+        before = path.read_bytes()
+        for flag in ('assume-unchanged', 'skip-worktree'):
+            with self.subTest(flag=flag):
+                self.git('update-index', '--' + flag, 'harness/hooks/deliver.py')
+                path.write_bytes(before + b'\n# hidden fixture edit\n')
+                self.assertEqual(self.git('status', '--porcelain').stdout, '')
+                self.assertIsNone(self.identity()['revision'])
+                path.write_bytes(before)
+                self.git('update-index', '--no-' + flag, 'harness/hooks/deliver.py')

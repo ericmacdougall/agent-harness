@@ -911,15 +911,35 @@ def resume_binding(flow):
 def resume_executor():
     """Record the followup executor without rewriting historical source bindings."""
     hooks = Path(__file__).resolve().parent
+    names = ("deliver.py", "integrate_local.py", "process.py", "git_safety.py")
+    observed = {name: (hooks / name).read_bytes() for name in names}
     revision = None
     if hooks.name == "hooks" and hooks.parent.name == "harness":
         repo = hooks.parent.parent
         code, top = git(repo, "rev-parse", "--show-toplevel")
         if code == 0 and Path(top.strip()).resolve() == repo:
-            revision = git_value(repo, "rev-parse", "HEAD")
+            head = git_value(repo, "rev-parse", "--verify", "HEAD^{commit}")
+            storage = git_value(repo, "rev-parse", "--show-object-format")
+            code, tree = git(repo, "ls-tree", "-z", head, "--", *("harness/hooks/" + name for name in names))
+            tracked = {}
+            for entry in tree.split("\0"):
+                if entry:
+                    metadata, path = entry.split("\t", 1)
+                    mode, kind, oid = metadata.split()
+                    if mode in {"100644", "100755"} and kind == "blob":
+                        tracked[path] = oid
+            algorithm = {"sha1": hashlib.sha1, "sha256": hashlib.sha256}.get(storage)
+            # Git blob IDs bind raw bytes, independently of index flags or
+            # repository clean/textconv filters. HEAD alone proves no content.
+            if (code == 0 and algorithm is not None and all(
+                    stat.S_ISREG((hooks / name).lstat().st_mode)
+                    and tracked.get("harness/hooks/" + name) == algorithm(
+                        b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
+                    and (hooks / name).read_bytes() == data for name, data in observed.items())
+                    and git_value(repo, "rev-parse", "--verify", "HEAD^{commit}") == head):
+                revision = head
     return {"protocol": "remote-resume-v1", "revision": revision,
-            "helpers_sha256": {name: hashlib.sha256((hooks / name).read_bytes()).hexdigest()
-                               for name in ("deliver.py", "integrate_local.py", "process.py", "git_safety.py")}}
+            "helpers_sha256": {name: hashlib.sha256(data).hexdigest() for name, data in observed.items()}}
 
 
 def resume_remote_finish(flow, preparations, checks):
@@ -932,7 +952,7 @@ def resume_remote_finish(flow, preparations, checks):
         raise recovery_error(flow, "Resume requires the exact pending remote transaction",
                              state["apply_base"] or state["baseline"])
     with OriginalScope(flow.original, flow.branch, args.timeout) as scope:
-        guard = scope.load_external(state["guard_key"], task_generation_digest(flow))
+        guard = scope.load_external(state["guard_key"], task_generation_digest(flow), create=False)
         if (guard.record["phase"] not in {"reserved", "applying"}
                 or guard.target != state["target"] or guard.base != state["apply_base"]
                 or not ancestry(flow.original, state["baseline"], guard.base)):
