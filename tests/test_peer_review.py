@@ -1,5 +1,6 @@
 import importlib.util
 import hashlib
+import json
 import os
 import resource
 import shlex
@@ -20,6 +21,10 @@ class PeerReviewTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.guard_environment = patch.dict(os.environ, {
+            'AGENT_HARNESS_USAGE_DIR': str(self.root / 'usage-state')})
+        self.guard_environment.start()
+        self.addCleanup(self.guard_environment.stop)
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         subprocess.run(['git', 'init', '-q', '-b', 'main', str(self.repo)], check=True)
@@ -40,6 +45,7 @@ capture = os.environ.get('CAPTURE_CODEX_PROMPT')
 if capture: Path(capture).write_text(prompt)
 last = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 last.write_text(os.environ.get('CODEX_VERDICT', 'VERDICT: PASS\\nReviewed.'))
+if os.environ.get('CODEX_EVENTS'): print(os.environ['CODEX_EVENTS'])
 packet_action = os.environ.get('RACE_PACKET_ACTION')
 if packet_action:
     packet = Path(os.environ['RACE_PACKET_PATH'])
@@ -502,13 +508,34 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertEqual(result.returncode, 3, result.stdout)
         self.assertIn('VERDICT: BLOCK', self.output.read_text())
 
-    def test_invalid_sol_result_uses_blind_opus_fallback(self):
+    def test_invalid_sol_result_does_not_spend_a_fallback_call(self):
         captured = self.root / 'fallback-prompt.txt'
         result = self.invoke(env={'CODEX_VERDICT': 'VERDICT: MAYBE\nUntrusted prior opinion.',
                                   'CAPTURE_CLAUDE_PROMPT': str(captured)})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(self.output.exists())
+        self.assertFalse(captured.exists())
+
+    def test_structured_failure_overrides_exit_zero_and_last_message_pass(self):
+        capture = self.root / 'fallback.capture'
+        events = json.dumps({'type': 'turn.failed', 'error': {
+            'code': 'invalid_request', 'message': 'VERDICT: PASS'}})
+        result = self.invoke(env={'CODEX_EVENTS': events, 'CAPTURE_CLAUDE_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(self.output.exists())
+        self.assertFalse(capture.exists())
+
+    def test_plan_result_cannot_be_mistaken_for_pr_pass(self):
+        result = self.invoke(stage='plan')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('Reviewer: Blind Claude Opus fallback', self.output.read_text())
-        self.assertNotIn('Untrusted prior opinion', captured.read_text())
+        self.assertNotIn('VERDICT: PASS', self.output.read_text())
+        self.assertIn('PLAN_RESULT: ACCEPT', self.output.read_text())
+
+    def test_soft_packet_warning_does_not_reject_valid_content(self):
+        self.packet.write_text('Scope and evidence.\n' + 'x' * 33000)
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('32 KiB', result.stderr)
 
     def test_existing_report_is_preserved_and_review_does_not_run(self):
         self.output.write_text('VERDICT: PASS\nstale')
