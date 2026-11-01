@@ -267,7 +267,7 @@ record = {'ignored_read': ignored_read, 'diff': subprocess.check_output(['git', 
           'history': subprocess.check_output(['git', 'log', '--format=%s'], text=True), 'prompt': prompt}
 Path(os.environ['ISOLATION_CAPTURE']).write_text(json.dumps(record))
 if '--cd' in sys.argv:
-    assert Path(sys.argv[sys.argv.index('--cd') + 1]) == cwd
+    assert Path(sys.argv[sys.argv.index('--cd') + 1]).resolve() == cwd.resolve()
     Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('PLAN_RESULT: ACCEPT')
 else: print('PLAN_RESULT: ACCEPT')
 """
@@ -684,6 +684,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                 result = self.invoke(output=output, env={
                     'RACE_PACKET_ACTION': action, 'RACE_PACKET_PATH': str(self.packet),
                     'CAPTURE_CODEX_PROMPT': str(capture),
+                    'AGENT_HARNESS_USAGE_DIR': str(self.root / ('usage-packet-' + action)),
                 })
                 self.assertIn('Tests: pending.', capture.read_text())
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
@@ -743,8 +744,9 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
 
         def link_then_mutate(*args, **kwargs):
             real_link(*args, **kwargs)
-            self.packet.write_text('Tests: pass. Mutated just after report publication.')
-            linked.append(True)
+            if args[1] == self.output.name:
+                self.packet.write_text('Tests: pass. Mutated just after report publication.')
+                linked.append(True)
 
         output = io.StringIO()
         errors = io.StringIO()
