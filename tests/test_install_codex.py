@@ -351,9 +351,16 @@ class CodexInstallerTests(unittest.TestCase):
             install(home, apply=True)
             self.assertEqual(watcher.read_bytes(), (ROOT / 'harness' / 'tools' / 'watch-tests.py').read_bytes())
             self.assertFalse((home / '.claude').exists())
+            poison_marker = root / 'foreign-process-imported'
+            poison = (f'from pathlib import Path; Path({str(poison_marker)!r}).touch(); '
+                      'raise RuntimeError("foreign watcher helper imported")\n')
+            foreign_hooks = home / '.codex' / 'hooks'
+            foreign_hooks.mkdir()
+            (foreign_hooks / 'process.py').write_text(poison)
+            (elsewhere / 'process.py').write_text(poison)
             environment = {key: value for key, value in os.environ.items()
                            if key not in ('PYTHONPATH', 'PYTHONHOME')}
-            environment.update(HOME=str(home), PYTHONNOUSERSITE='1')
+            environment.update(HOME=str(home), PYTHONNOUSERSITE='1', PYTHONPATH=str(elsewhere))
             help_result = subprocess.run([sys.executable, str(watcher), '--help'],
                                          cwd=elsewhere, env=environment, text=True,
                                          capture_output=True, timeout=10)
@@ -373,6 +380,7 @@ class CodexInstallerTests(unittest.TestCase):
                     self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
                     self.assertIn(f'[watch] exit {exit_code}', result.stdout)
                     self.assertEqual(json.loads(marker.read_text()), {'cwd': str(project), 'home': str(home)})
+            self.assertFalse(poison_marker.exists(), 'watcher imported a foreign process helper')
             self.assertFalse((home / '.claude').exists())
 
     def test_existing_policy_is_not_overridden(self):

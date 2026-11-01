@@ -54,6 +54,65 @@ class WatchTests(unittest.TestCase):
                 self.assertEqual(result.returncode, code)
                 self.assertIn(f'[watch] exit {code}', result.stdout)
 
+    def test_tools_layout_uses_its_hooks_helper_despite_ambient_process(self):
+        for layout in ('source/harness', 'home/.claude'):
+            with self.subTest(layout=layout):
+                base = self.root / layout
+                tools = base / 'tools'
+                hooks = base / 'hooks'
+                tools.mkdir(parents=True)
+                hooks.mkdir()
+                watcher = tools / 'watch-tests.py'
+                watcher.write_bytes(WATCH.read_bytes())
+                (hooks / 'process.py').write_bytes((WATCH.parents[1] / 'hooks' / 'process.py').read_bytes())
+                marker = base / 'foreign-process-imported'
+                poison = (f'from pathlib import Path; Path({str(marker)!r}).touch(); '
+                          'raise RuntimeError("foreign watcher helper imported")\n')
+                (tools / 'process.py').write_text(poison)
+                ambient = base / 'ambient'
+                ambient.mkdir()
+                (ambient / 'process.py').write_text(poison)
+                environment = {**os.environ, 'PYTHONPATH': str(ambient), 'PYTHONNOUSERSITE': '1'}
+                for arguments, expected in ((['--help'], 0),
+                                            (['--root', str(base), '--once', '--', sys.executable,
+                                              '-c', 'raise SystemExit(7)'], 7)):
+                    result = subprocess.run([sys.executable, str(watcher), *arguments],
+                                            cwd=ambient, env=environment, capture_output=True,
+                                            text=True, timeout=10)
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    self.assertFalse(marker.exists(), 'watcher imported a foreign process helper')
+
+    def test_missing_intended_helper_never_imports_another_layout_or_ambient_helper(self):
+        for layout in ('agent-harness', 'tools'):
+            with self.subTest(layout=layout):
+                base = self.root / layout
+                watcher_dir = base / layout
+                watcher_dir.mkdir(parents=True)
+                watcher = watcher_dir / 'watch-tests.py'
+                watcher.write_bytes(WATCH.read_bytes())
+                marker = base / 'foreign-process-imported'
+                poison = (f'from pathlib import Path; Path({str(marker)!r}).touch(); '
+                          'raise RuntimeError("foreign watcher helper imported")\n')
+                # Codex must not look in sibling hooks; tools must not use its
+                # script directory when the intended hooks helper is absent.
+                foreign = base / 'hooks' if layout == 'agent-harness' else watcher_dir
+                foreign.mkdir(exist_ok=True)
+                (foreign / 'process.py').write_text(poison)
+                ambient = base / 'ambient'
+                ambient.mkdir()
+                (ambient / 'process.py').write_text(poison)
+                result = subprocess.run([sys.executable, str(watcher), '--help'], cwd=ambient,
+                                        env={**os.environ, 'PYTHONPATH': str(ambient), 'PYTHONNOUSERSITE': '1'},
+                                        capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(marker.exists(), 'missing intended helper triggered foreign fallback')
+
+    def test_preloaded_process_module_cannot_override_the_watcher_helper(self):
+        foreign_run = object()
+        with patch.dict(sys.modules, {'process': type('ForeignProcess', (), {'run': foreign_run})()}):
+            watcher = load_watcher()
+        self.assertIsNot(watcher.run_process, foreign_run)
+
     def test_missing_command_and_bad_timeout_are_configuration_errors(self):
         self.assertEqual(self.invoke('--once').returncode, 2)
         self.assertEqual(self.invoke('--timeout', '0', '--once', '--', sys.executable, '-c', 'pass').returncode, 2)
