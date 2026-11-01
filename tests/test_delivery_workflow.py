@@ -1,6 +1,9 @@
 """End-to-end delivery phase controls in disposable repositories."""
 
 import json
+import importlib.util
+import contextlib
+import io
 import os
 import shutil
 import subprocess
@@ -8,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 DELIVER = Path(__file__).resolve().parents[1] / 'harness/hooks/deliver.py'
@@ -40,13 +44,19 @@ class DeliveryWorkflow(unittest.TestCase):
         command('git', 'config', 'user.name', 'Harness Test', cwd=self.original, env=self.env)
         command('git', 'config', 'user.email', 'test@example.invalid', cwd=self.original, env=self.env)
         (self.original / 'app.txt').write_text('base\n')
-        command('git', 'add', 'app.txt', cwd=self.original, env=self.env)
+        baseline_tests = self.original / 'tests'
+        baseline_tests.mkdir()
+        (baseline_tests / 'test_format.py').write_text('import unittest\nfrom pathlib import Path\n'
+            'class Format(unittest.TestCase):\n'
+            '    def test_record_is_one_line(self):\n'
+            '        self.assertEqual(Path("app.txt").read_text().count("\\n"), 1)\n')
+        command('git', 'add', 'app.txt', 'tests', cwd=self.original, env=self.env)
         command('git', 'commit', '-qm', 'base', cwd=self.original, env=self.env)
         self.base = command('git', 'rev-parse', 'HEAD', cwd=self.original, env=self.env).stdout.strip()
         self.source = self.root / 'source'
         command('git', 'worktree', 'add', '-qb', 'codex/feature', str(self.source), cwd=self.original, env=self.env)
         tests = self.source / 'tests'
-        tests.mkdir()
+        tests.mkdir(exist_ok=True)
         (tests / 'test_change.py').write_text('import unittest\n'
                                                'class Change(unittest.TestCase):\n'
                                                '    def test_value(self):\n'
@@ -147,8 +157,11 @@ if a[:2]==['pr','list']:
     print(json.dumps(s.get('listing',([s['pr']] if s['created'] else []))))
 elif a[:2]==['pr','create']:
     s['creates']+=1;s['created']=not s.get('create_absent',False);p.write_text(json.dumps(s))
+    if s.get('fail_list_after_create'):s['list_fail']=True;p.write_text(json.dumps(s))
     print('https://github.com/fixture/project/pull/1');sys.exit(s.get('create_exit',0))
-elif a[:2]==['pr','view']:print(json.dumps(s['pr']))
+elif a[:2]==['pr','view']:
+    if s.get('view_fail'):sys.exit(1)
+    print(json.dumps(s['pr']))
 elif a[0]=='api':print(json.dumps({'object':{'type':'commit','sha':s['target']}}))
 else:sys.exit(79)
 '''
@@ -186,6 +199,32 @@ else:sys.exit(79)
         state['pr'].update(state='MERGED', mergeCommit={'oid': target}, isDraft=False)
         self.write_github(state)
         return target
+
+    def direct_finish(self, patch_factory, arguments=None):
+        """Inject a precise process/write boundary without shipping fault flags."""
+        hooks = DELIVER.parent
+        spec = importlib.util.spec_from_file_location('workflow_fixture_target', DELIVER)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, 'path', [str(hooks), *sys.path]):
+            spec.loader.exec_module(module)
+        captured = io.StringIO()
+        with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(captured):
+            with mock.patch.object(sys, 'argv', [str(DELIVER), *(arguments or self.finish_args())]):
+                with patch_factory(module):
+                    code = module.main()
+        return code, json.loads(captured.getvalue())
+
+    def baseline_args(self, head):
+        return ['finish', '--task', 'fixture', '--original', str(self.original),
+                '--original-branch', 'main', '--resolve-baseline', head, '--check', CHECK]
+
+    def replace_feature_tests(self, body):
+        for path in (self.source / 'tests').glob('*.py'):
+            path.unlink()
+        (self.source / 'tests' / 'test_change.py').write_text(body)
+        command('git', 'add', '-A', 'tests', cwd=self.source, env=self.env)
+        command('git', 'commit', '-qm', 'Test failure scenario', cwd=self.source, env=self.env)
+        self.head = command('git', 'rev-parse', 'HEAD', cwd=self.source, env=self.env).stdout.strip()
 
     def invoke(self, *args):
         result = command(sys.executable, str(DELIVER), *args, env=self.env, check=False)
@@ -269,6 +308,117 @@ else:sys.exit(79)
         self.assertEqual((repeated.returncode, data['status'], data['head'], data['current_head']),
                          (0, 'ALREADY_DELIVERED', target, later), repeated.stdout)
         self.assertEqual(Path(outcome['receipt']).read_bytes(), before)
+
+    def test_post_fast_forward_failure_reports_actual_head_and_blocks_other_tools(self):
+        self.configure_github()
+        prepared, _ = self.invoke(*self.prepare_args())
+        self.assertEqual(prepared.returncode, 0, prepared.stdout)
+        target = self.merge_remote()
+        self.change_github(ff_nonzero=True)
+        result, outcome = self.invoke(*self.finish_args())
+        self.assertEqual((result.returncode, outcome['status'], outcome.get('head'), outcome.get('original_advanced')),
+                         (3, 'RECOVERY_REQUIRED', target, True), result.stdout)
+        helper = command(sys.executable, str(DELIVER.with_name('integrate_local.py')),
+                         '--repo', str(self.original), '--original-branch', 'main', '--expected-head', target,
+                         '--source', 'codex/feature', '--expected-source-head', self.head, '--check', CHECK,
+                         env=self.env, check=False)
+        self.assertEqual((helper.returncode, json.loads(helper.stdout)['status']), (3, 'RECOVERY_REQUIRED'), helper.stdout)
+        self.assertFalse(list((self.original / '.git' / 'agent-harness' / 'delivery-workflows').glob('*/**/receipt/journal.json')))
+
+    def test_dirty_edit_race_cannot_autostash_or_advance_original(self):
+        self.configure_github()
+        prepared, _ = self.invoke(*self.prepare_args())
+        self.assertEqual(prepared.returncode, 0, prepared.stdout)
+        self.merge_remote()
+        command('git', 'config', 'merge.autoStash', 'true', cwd=self.original, env=self.env)
+        self.change_github(inject_dirty=True, original=str(self.original))
+        result, outcome = self.invoke(*self.finish_args())
+        self.assertEqual((result.returncode, outcome['status'], outcome.get('head'), outcome.get('original_advanced')),
+                         (3, 'RECOVERY_REQUIRED', self.base, False), result.stdout)
+        self.assertEqual((self.original / 'app.txt').read_text(), 'user edit during preflight\n')
+        self.assertEqual(command('git', 'stash', 'list', cwd=self.original, env=self.env).stdout, '')
+
+    def assert_bad_checks_refuse_delivery(self, body):
+        self.replace_feature_tests(body)
+        self.configure_github()
+        prepared, _ = self.invoke(*self.prepare_args())
+        self.assertEqual(prepared.returncode, 0, prepared.stdout)
+        target = self.merge_remote()
+        result, outcome = self.invoke(*self.finish_args())
+        self.assertEqual((result.returncode, outcome['status'], outcome.get('head')),
+                         (3, 'RECOVERY_REQUIRED', target), result.stdout)
+        self.assertEqual(outcome.get('cause'), 'DELIVERED_CHECK_FAILED')
+        active = list((self.original / '.git' / 'agent-harness' / 'delivery-scratch').glob('scopes/*/active/*/journal.json'))
+        self.assertEqual(len(active), 1)
+        self.assertEqual(json.loads(active[0].read_text())['phase'], 'applying')
+
+    def test_failed_real_check_cannot_claim_delivery(self):
+        self.assert_bad_checks_refuse_delivery('import unittest\nclass Failure(unittest.TestCase):\n'
+                                               '    def test_dependency(self): self.fail("fixture failure")\n')
+
+    def test_all_skipped_check_cannot_claim_delivery(self):
+        self.assert_bad_checks_refuse_delivery('import unittest\n@unittest.skip("fixture")\n'
+            'class Skipped(unittest.TestCase):\n    def test_dependency(self): pass\n')
+
+    def test_zero_case_check_cannot_claim_delivery(self):
+        self.assert_bad_checks_refuse_delivery('# Deliberate empty discovery control.\n')
+
+    def test_guard_resolved_before_receipt_is_rechecked_without_second_fast_forward(self):
+        self.configure_github()
+        prepared, _ = self.invoke(*self.prepare_args())
+        self.assertEqual(prepared.returncode, 0, prepared.stdout)
+        target = self.merge_remote()
+        code, failed = self.direct_finish(lambda module: mock.patch.object(module.Workflow, 'complete',
+                                                                           side_effect=OSError('fixture receipt fault')))
+        self.assertEqual((code, failed['status'], failed.get('head')), (3, 'RECOVERY_REQUIRED', target))
+        before = [json.loads(line) for line in self.events.read_text().splitlines()]
+        ff_before = sum('merge' in event and '--ff-only' in event for event in before)
+        command('git', 'worktree', 'remove', str(self.source), cwd=self.original, env=self.env)
+        result, completed = self.invoke(*self.finish_args())
+        self.assertEqual((result.returncode, completed['status'], completed.get('head')), (0, 'DELIVERED', target), result.stdout)
+        after = [json.loads(line) for line in self.events.read_text().splitlines()]
+        self.assertEqual(sum('merge' in event and '--ff-only' in event for event in after), ff_before)
+
+    def test_unbound_apply_needs_tested_baseline_and_new_generation(self):
+        self.configure_github()
+        prepared, data = self.invoke(*self.prepare_args())
+        self.assertEqual(prepared.returncode, 0, prepared.stdout)
+        self.merge_remote()
+        code, failed = self.direct_finish(lambda module: mock.patch.object(module.OriginalScope, 'reserve_external',
+                                                                           side_effect=OSError('fixture reserve fault')))
+        self.assertEqual((code, failed['status'], failed.get('head')), (3, 'RECOVERY_REQUIRED', self.base))
+        blocked, _ = self.invoke(*self.prepare_args(), '--new-generation')
+        self.assertEqual(blocked.returncode, 3)
+        resolved, outcome = self.invoke(*self.baseline_args(self.base))
+        self.assertEqual((resolved.returncode, outcome['status']), (0, 'RESOLVED_BASELINE'), resolved.stdout)
+        self.assertFalse(list(Path(data['state']).parent.glob('receipt/journal.json')))
+        pending, _ = self.invoke(*self.finish_args())
+        self.assertEqual(pending.returncode, 3)
+        fresh, new = self.invoke(*self.prepare_args(), '--new-generation')
+        self.assertEqual((fresh.returncode, new['status']), (0, 'PR_READY'), fresh.stdout)
+        self.assertNotEqual(new['generation'], data['generation'])
+        stale, old = self.invoke(*self.finish_args(generation=data['generation']))
+        self.assertEqual((stale.returncode, old['status']), (3, 'STALE_GENERATION'))
+
+    def test_publication_uncertainty_cannot_become_a_baseline_resolution(self):
+        self.configure_github()
+        self.change_github(fail_list_after_create=True)
+        result, data = self.invoke(*self.prepare_args())
+        self.assertEqual((result.returncode, data['status']), (4, 'REMOTE_UNCERTAIN'), result.stdout)
+        state = Path(data['state'])
+        before = state.read_bytes()
+        rejected, outcome = self.invoke(*self.baseline_args(self.base))
+        self.assertEqual((rejected.returncode, outcome['status']), (2, 'BLOCKED_POLICY'), rejected.stdout)
+        self.assertEqual(state.read_bytes(), before)
+        self.change_github(list_fail=False)
+        (self.source / 'later.txt').write_text('next reviewed scope\n')
+        command('git', 'add', 'later.txt', cwd=self.source, env=self.env)
+        command('git', 'commit', '-qm', 'Next scope', cwd=self.source, env=self.env)
+        reconciled, old = self.invoke('prepare', '--task', 'fixture', '--original', str(self.original),
+                                     '--original-branch', 'main', '--reconcile-only')
+        self.assertEqual((reconciled.returncode, old['status']), (0, 'PR_READY'), reconciled.stdout)
+        self.assertEqual(json.loads(self.github_state.read_text())['creates'], 1)
+        self.assertEqual(json.loads(state.read_text())['source_head'], self.head)
 
 
 if __name__ == '__main__':
