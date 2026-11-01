@@ -188,6 +188,8 @@ class EvidenceStore(unittest.TestCase):
                                kind='review', minimum_bytes=0)
         reference = run.finish(execution='COMPLETED', result='CHECK_OK', reason='NONE', exit_code=0,
                                review={'stage': 'CODE_INSPECTION', 'verdict': 'ACCEPT', 'findings': []})
+        with self.assertRaises(guard.GuardError): self.store.check_gate(self.subject, reference)
+        self.store.settle_review(reference)
         full = self.store.begin(self.subject, self.identity, owner='fixture', label='full', timeout=10,
                                 kind='full', gate=reference, minimum_bytes=0)
         self.assertEqual(full.start['gate'], reference)

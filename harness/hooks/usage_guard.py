@@ -453,11 +453,54 @@ class UsageStore:
             return {'execution': 'UNKNOWN', 'result': 'NO_RESULT', 'reference': reference,
                     'historical_start': record,
                     'note': 'START records intent; inspect a separately referenced FINAL to establish completion'}
+        if record.get('review') is not None:
+            return {**record, 'review_finalization': self._review_finalization(reference)}
         return record
+
+    def _review_finalization(self, reference):
+        directory = self._run_directory(reference['run_id'])
+        for name, kind, state in (('invalidated.json', 'review_invalidation', 'INVALIDATED'),
+                                  ('settled.json', 'review_settlement', 'SETTLED')):
+            if not os.path.lexists(directory / name): continue
+            value = read_json(directory / name)
+            expected = {'schema', 'kind', 'reference', 'at'} | ({'reason'} if state == 'INVALIDATED' else set())
+            if (set(value) != expected or type(value.get('schema')) is not int or value['schema'] != SCHEMA
+                    or value.get('kind') != kind or value.get('reference') != reference):
+                raise GuardError('UNKNOWN', 'Review finalization evidence is malformed', reference)
+            return state
+        return 'PENDING'
+
+    def settle_review(self, reference):
+        """Publish review eligibility only after the caller's final invariants pass."""
+        with self._lock():
+            record = self.load_ref(reference)
+            if reference['record'] != 'final' or record.get('review') is None or record['execution'] != 'COMPLETED':
+                raise GuardError('UNKNOWN', 'Only a completed typed review can be settled', reference)
+            state = self._review_finalization(reference)
+            if state == 'INVALIDATED':
+                raise GuardError('UNKNOWN', 'An invalidated review cannot be settled', reference)
+            if state == 'PENDING':
+                self._publish(self._run_directory(reference['run_id']), 'settled.json',
+                              {'schema': SCHEMA, 'kind': 'review_settlement', 'reference': reference,
+                               'at': datetime.now(timezone.utc).isoformat()})
+        return reference
+
+    def invalidate_review(self, reference, *, reason):
+        """Retain FINAL history while permanently revoking its gate/reuse eligibility."""
+        safe_text(reason)
+        with self._lock():
+            self.load_ref(reference)
+            if self._review_finalization(reference) != 'INVALIDATED':
+                self._publish(self._run_directory(reference['run_id']), 'invalidated.json',
+                              {'schema': SCHEMA, 'kind': 'review_invalidation', 'reference': reference,
+                               'reason': reason, 'at': datetime.now(timezone.utc).isoformat()})
+        return reference
 
     def check_gate(self, subject, reference):
         record = self.load_ref(reference)
-        review = record.get('review', {})
+        review = record.get('review') or {}
+        if record.get('review') is not None and self._review_finalization(reference) != 'SETTLED':
+            raise GuardError('UNKNOWN', 'Review FINAL is provisional or invalidated', reference)
         if (not subject['reusable'] or record.get('subject', {}).get('fingerprint') != subject['fingerprint']
                 or record.get('execution') != 'COMPLETED' or record.get('result') != 'CHECK_OK'
                 or record.get('reason') != 'NONE' or review.get('stage') != 'CODE_INSPECTION'
@@ -471,9 +514,56 @@ class UsageStore:
                     and record.get('invocation', {}).get('fingerprint') == invocation['fingerprint']
                     and record.get('execution') == 'COMPLETED' and record.get('result') == 'CHECK_OK'
                     and record.get('reason') == 'NONE')
+        if record.get('review') is not None:
+            eligible = eligible and self._review_finalization(reference) == 'SETTLED'
         return {'evidence': 'REUSED', 'eligible': bool(eligible), 'reference': reference,
                 'original_timestamp': record.get('ended_at'), 'original_result': record.get('result'),
                 'scope': record.get('subject'), 'note': 'Historical evidence; no new check result or PR signoff'}
+
+    def _attempt_start(self, entry):
+        if (set(entry) != {'schema', 'run_id', 'start', 'timeout', 'aggregate_timeout'}
+                or type(entry.get('schema')) is not int or entry['schema'] != SCHEMA):
+            raise GuardError('UNKNOWN', 'Attempt history is malformed')
+        reference = entry['start']
+        started = self.load_ref(reference)
+        if (reference['record'] != 'start' or entry['run_id'] != started['run_id']
+                or entry['timeout'] != started.get('timeout')
+                or entry['aggregate_timeout'] != started.get('aggregate_timeout')
+                or not isinstance(started.get('subject'), dict)
+                or not isinstance(started.get('invocation'), dict)):
+            raise GuardError('UNKNOWN', 'Attempt index does not match its referenced START')
+        finite_seconds(started['timeout']); finite_seconds(started['aggregate_timeout'])
+        return started
+
+    def _owned_start(self, run_id):
+        directory = self._run_directory(run_id)
+        raw = read_json(directory / 'start.json')
+        identity = raw.get('invocation', {}).get('fingerprint') if isinstance(raw.get('invocation'), dict) else None
+        if not isinstance(identity, str) or not HEX.fullmatch(identity):
+            raise GuardError('UNKNOWN', 'Run START has no bounded invocation identity')
+        purpose = self.root / 'purposes' / identity
+        self._directory(purpose, create=False)
+        matches = []
+        for number in (1, 2):
+            path = purpose / ('attempt-' + str(number) + '.json')
+            if os.path.lexists(path):
+                entry = read_json(path)
+                if entry.get('run_id') == run_id: matches.append(self._attempt_start(entry))
+        if len(matches) != 1 or matches[0] != raw:
+            raise GuardError('UNKNOWN', 'Run START is not bound to exactly one attempt')
+        return matches[0]
+
+    def _reconciliation(self, directory, run_id):
+        path = directory / 'reconciled.json'
+        if not os.path.lexists(path): return False
+        value = read_json(path)
+        if (set(value) != {'schema', 'kind', 'run_id', 'actor', 'reason', 'evidence', 'at', 'execution', 'result'}
+                or type(value.get('schema')) is not int or value['schema'] != SCHEMA
+                or value.get('kind') != 'manual_reconciliation' or value.get('run_id') != run_id
+                or value.get('execution') != 'UNKNOWN' or value.get('result') != 'NO_RESULT'):
+            raise GuardError('UNKNOWN', 'Manual reconciliation is malformed or belongs to another run')
+        for field in ('actor', 'reason', 'evidence', 'at'): safe_text(value[field])
+        return True
 
     def begin(self, subject, invocation, *, owner, label, timeout, kind='review', repeat_reason=None,
               gate=None, ungated_reason=None, minimum_bytes=None, aggregate_timeout=None):
@@ -509,27 +599,30 @@ class UsageStore:
                 path = purpose / ('attempt-' + str(number) + '.json')
                 if not os.path.lexists(path): break
                 entry = read_json(path)
-                if (set(entry) != {'schema', 'run_id', 'start', 'timeout', 'aggregate_timeout'} or entry.get('schema') != SCHEMA
-                        or type(entry.get('schema')) is not int):
-                    raise GuardError('UNKNOWN', 'Attempt history is malformed')
-                finite_seconds(entry.get('timeout'))
-                original_budget = finite_seconds(entry.get('aggregate_timeout'))
+                started = self._attempt_start(entry)
+                if (started['subject'] != dict(subject) or started['invocation'] != dict(invocation)
+                        or started.get('command_kind') != kind):
+                    raise GuardError('UNKNOWN', 'Prior START belongs to different execution inputs')
+                original_budget = started['aggregate_timeout']
                 if aggregate_timeout > original_budget:
                     raise GuardError('BUDGET_EXHAUSTED', 'A repeat cannot enlarge its original aggregate budget')
                 previous.append(entry)
                 directory = self._run_directory(entry['run_id'])
-                reconciled = os.path.lexists(directory / 'reconciled.json')
+                reconciled = self._reconciliation(directory, entry['run_id'])
                 completion = directory / 'completion.json'
                 if not os.path.lexists(completion):
                     if not reconciled:
                         raise GuardError('UNKNOWN', 'Prior reservation has no final receipt; reconcile before retry', entry['start'])
-                    read_json(directory / 'reconciled.json')
-                    spent += entry['timeout']
+                    spent += started['timeout']
                 else:
                     completed = read_json(completion)
                     if set(completed) != {'schema', 'reference'} or completed.get('schema') != SCHEMA:
                         raise GuardError('UNKNOWN', 'Completion reference is malformed')
                     record = self.load_ref(completed['reference'])
+                    if (completed['reference']['record'] != 'final' or record['run_id'] != started['run_id']
+                            or record['subject'] != started['subject'] or record['invocation'] != started['invocation']
+                            or record.get('started_at') != started.get('started_at')):
+                        raise GuardError('UNKNOWN', 'Completion does not match its referenced START')
                     if record.get('reason') in {'UNKNOWN', 'TIMEOUT'} and not reconciled:
                         raise GuardError('UNKNOWN', 'Uncertain prior result requires recorded reconciliation', entry['start'])
                     elapsed = record.get('elapsed_seconds')
@@ -572,26 +665,37 @@ class UsageStore:
                 raise GuardError('UNKNOWN', 'Pool history has no current index; reconcile before use')
             return directory, {'provider': provider, 'pool': pool, 'active': None,
                                'cooldown': False, 'reason': 'NONE', 'reset_at': None}
-        ref = read_json(index)
+        state = self._read_pool_state(directory)
+        if state['provider'] != provider or state['pool'] != pool:
+            raise GuardError('UNKNOWN', 'Pool reference belongs to another provider or alias')
+        return directory, state
+
+    def _read_pool_state(self, directory):
+        """The single trusted current-history reader, including operator recovery."""
+        self._directory(directory, create=False)
+        self._directory(directory / 'events', create=False)
+        ref = read_json(directory / 'head.json')
         if (set(ref) != {'event', 'sha256'} or not isinstance(ref.get('event'), str)
                 or not RUN_ID.fullmatch(ref['event']) or not isinstance(ref.get('sha256'), str)
                 or not HEX.fullmatch(ref['sha256'])):
             raise GuardError('UNKNOWN', 'Pool index is corrupt')
         body = file_bytes(directory / 'events' / (ref['event'] + '.json'))
         value = json.loads(body)
-        if (hashlib.sha256(body).hexdigest() != ref['sha256'] or value.get('schema') != SCHEMA
+        if (hashlib.sha256(body).hexdigest() != ref['sha256'] or not isinstance(value, dict) or value.get('schema') != SCHEMA
                 or type(value.get('schema')) is not int or not isinstance(value.get('state'), dict)):
             raise GuardError('UNKNOWN', 'Pool history digest is invalid')
         state = value['state']
         if (set(state) != {'provider', 'pool', 'active', 'cooldown', 'reason', 'reset_at'}
-                or state['provider'] != provider or state['pool'] != pool
                 or type(state['cooldown']) is not bool or not isinstance(state['reason'], str)
                 or state['reason'] not in REASONS
                 or state['active'] is not None and (not isinstance(state['active'], str) or not RUN_ID.fullmatch(state['active']))
                 or state['reset_at'] is not None and (type(state['reset_at']) not in (int, float)
                     or not math.isfinite(state['reset_at']))):
             raise GuardError('UNKNOWN', 'Pool state is malformed')
-        return directory, state
+        safe_label(state['provider']); safe_label(state['pool'])
+        if directory.name != digest([state['provider'], state['pool']]):
+            raise GuardError('UNKNOWN', 'Pool directory does not match its referenced identity')
+        return state
 
     def _pool_event(self, directory, state, action, **facts):
         event = secrets.token_hex(16)
@@ -601,11 +705,8 @@ class UsageStore:
         self._publish(directory, 'head.json', {'event': event, 'sha256': sha}, replace=True)
 
     def acquire_pool(self, provider, pool, run_id):
-        directory = self._run_directory(run_id)
-        start = read_json(directory / 'start.json')
-        if start.get('run_id') != run_id or start.get('kind') != 'start' or start.get('schema') != SCHEMA:
-            raise GuardError('UNKNOWN', 'Provider lease needs its own durable START')
         with self._lock():
+            self._owned_start(run_id)
             directory, state = self._pool(provider, pool)
             if state['active'] is not None:
                 raise GuardError('UNKNOWN' if state['reason'] in {'UNKNOWN', 'TIMEOUT'} else 'TRANSIENT_INFRA',
@@ -634,18 +735,20 @@ class UsageStore:
         for value in (actor, reason, evidence): safe_text(value)
         with self._lock():
             directory = self._run_directory(run_id)
-            if not directory.is_dir(): raise GuardError('UNKNOWN', 'Run to reconcile does not exist')
+            self._owned_start(run_id)
+            affected = []
+            # Validate every referenced current pool before publishing any
+            # manual marker or deriving a replacement index from its state.
+            for number, pool in enumerate((self.root / 'pools').iterdir()):
+                if number >= 4096: raise GuardError('UNKNOWN', 'Pool reconciliation scan exceeded limit')
+                state = self._read_pool_state(pool)
+                if state['active'] == run_id: affected.append((pool, state))
             self._publish(directory, 'reconciled.json', {'schema': SCHEMA, 'kind': 'manual_reconciliation',
                           'run_id': run_id, 'actor': actor, 'reason': reason, 'evidence': evidence,
                           'at': datetime.now(timezone.utc).isoformat(), 'execution': 'UNKNOWN', 'result': 'NO_RESULT'})
-            # A bounded scan visits only current pool indices, never old event history.
-            for number, pool in enumerate((self.root / 'pools').iterdir()):
-                if number >= 4096: raise GuardError('UNKNOWN', 'Pool reconciliation scan exceeded limit')
-                index = read_json(pool / 'head.json')
-                event = read_json(pool / 'events' / (index['event'] + '.json'))
-                if event['state']['active'] == run_id:
-                    self._pool_event(pool, {**event['state'], 'active': None}, 'RECONCILED', actor=actor,
-                                     reason=reason, evidence=evidence)
+            for pool, state in affected:
+                self._pool_event(pool, {**state, 'active': None}, 'RECONCILED', actor=actor,
+                                 reason=reason, evidence=evidence)
 
     def ack_pool(self, provider, pool, *, actor, reason, evidence):
         for value in (actor, reason, evidence): safe_text(value)
