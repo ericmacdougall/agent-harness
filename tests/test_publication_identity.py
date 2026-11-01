@@ -100,6 +100,11 @@ class PublicationDestination(unittest.TestCase):
             code = module.publish(args)
         return code, json.loads(output.getvalue())
 
+    def publish_command(self, *extra):
+        return [sys.executable, str(PUBLISH), '--repo', str(self.source),
+                '--branch', 'feat/identity', '--original-branch', 'main',
+                '--expected-head', self.head, '--expected-repository', 'owner/expected', *extra]
+
     def assert_unpublished(self):
         for bare in self.destinations.values():
             result = self.command('show-ref', '--verify', 'refs/heads/feat/identity', cwd=bare, check=False)
@@ -111,6 +116,7 @@ class PublicationDestination(unittest.TestCase):
         self.command('remote', 'set-url', 'origin', 'https://github.com/owner/changed.git', cwd=self.source)
         code, data = self.direct_publish()
         self.assertEqual((code, data['status']), (2, 'BLOCKED_POLICY'), data)
+        self.assertIs(data['push_attempted'], False)
         self.assertFalse(self.marker.exists(), 'mismatched origin was contacted')
         self.assert_unpublished()
 
@@ -118,9 +124,95 @@ class PublicationDestination(unittest.TestCase):
         code, data = self.direct_publish()
         self.assertEqual((code, data['status']), (0, 'PUSHED'), data)
         self.assertEqual(data['repository'], 'owner/expected')
+        self.assertIs(data['push_attempted'], True)
         self.assertEqual(self.command('rev-parse', 'refs/heads/feat/identity',
                                       cwd=self.destinations['https://github.com/owner/expected.git']).stdout.strip(), self.head)
         self.assertTrue(self.marker.is_file(), 'the positive fixture never exercised transport')
+
+    def test_cli_preflight_timeout_reports_no_push_attempt(self):
+        wrapper = self.root / 'bin/git'
+        original = wrapper.with_name('git-fixture-original')
+        wrapper.rename(original)
+        stalled = self.root / 'preflight-stalled'
+        wrapper.write_text(
+            f'#!{sys.executable}\n'
+            'import os, sys, time\nfrom pathlib import Path\n'
+            'if "check-ref-format" in sys.argv[1:]:\n'
+            f'    Path({str(stalled)!r}).write_text("reached")\n'
+            '    time.sleep(30)\n'
+            f'os.execv({str(original)!r}, [{str(original)!r}, *sys.argv[1:]])\n')
+        wrapper.chmod(0o700)
+        result = subprocess.run(self.publish_command('--timeout', '3'), env=self.env,
+                                text=True, capture_output=True, timeout=30)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (4, 'BLOCKED_REMOTE'), data)
+        self.assertTrue(stalled.exists(), 'the fixture never reached the preflight timeout')
+        self.assertFalse(self.marker.exists(), 'preflight failure contacted a remote')
+        self.assert_unpublished()
+        self.assertIs(data.get('push_attempted'), False, data)
+
+    def test_cli_preflight_oserror_reports_no_push_attempt(self):
+        empty_bin = self.root / 'empty-bin'
+        empty_bin.mkdir()
+        result = subprocess.run(self.publish_command(), env={**self.env, 'PATH': str(empty_bin)},
+                                text=True, capture_output=True, timeout=30)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (4, 'BLOCKED_REMOTE'), data)
+        self.assertFalse(self.marker.exists(), 'preflight failure contacted a remote')
+        self.assert_unpublished()
+        self.assertIs(data.get('push_attempted'), False, data)
+
+    def test_cleanup_oserror_after_real_push_retains_attempt(self):
+        module = load_module('publication_cleanup_error', PUBLISH)
+
+        class CleanupError(tempfile.TemporaryDirectory):
+            def __exit__(self, *args):
+                super().__exit__(*args)
+                raise OSError('fixture cleanup failure after push')
+
+        output = io.StringIO()
+        with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(output), \
+             patch.object(sys, 'argv', self.publish_command()[1:]), \
+             patch.object(module.tempfile, 'TemporaryDirectory', CleanupError):
+            code = module.main()
+        data = json.loads(output.getvalue())
+        self.assertEqual((code, data['status']), (4, 'BLOCKED_REMOTE'), data)
+        self.assertEqual(self.command('rev-parse', 'refs/heads/feat/identity',
+                                      cwd=self.destinations['https://github.com/owner/expected.git']).stdout.strip(), self.head)
+        self.assertIs(data.get('push_attempted'), True, data)
+        self.assertNotIn('push_rejected', data)
+
+    def test_interruption_after_real_push_is_not_reported_as_no_attempt(self):
+        module = load_module('publication_interrupted', PUBLISH)
+        real_run_git = module.run_git
+
+        def interrupted_push(repo, *args, **kwargs):
+            result = real_run_git(repo, *args, **kwargs)
+            if args[0] == 'push':
+                raise KeyboardInterrupt()
+            return result
+
+        output = io.StringIO()
+        with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(output), \
+             patch.object(sys, 'argv', self.publish_command()[1:]), \
+             patch.object(module, 'run_git', interrupted_push):
+            with self.assertRaises(KeyboardInterrupt):
+                module.main()
+        self.assertEqual(output.getvalue(), '')
+        self.assertEqual(self.command('rev-parse', 'refs/heads/feat/identity',
+                                      cwd=self.destinations['https://github.com/owner/expected.git']).stdout.strip(), self.head)
+
+    def test_definite_push_rejection_retains_attempt_and_rejection(self):
+        remote = self.destinations['https://github.com/owner/expected.git']
+        divergent = self.command('commit-tree', 'HEAD^{tree}', '-p', 'main', '-m',
+                                 'conflicting remote feature', cwd=self.source).stdout.strip()
+        self.command('push', '-q', remote, f'{divergent}:refs/heads/feat/identity', cwd=self.source)
+        code, data = self.direct_publish()
+        self.assertEqual((code, data['status']), (4, 'BLOCKED_REMOTE'), data)
+        self.assertIs(data['push_attempted'], True)
+        self.assertIs(data['push_rejected'], True)
+        self.assertEqual(self.command('rev-parse', 'refs/heads/feat/identity', cwd=remote).stdout.strip(),
+                         divergent)
 
     def test_expected_option_is_enforced_by_cli(self):
         result = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(self.source),

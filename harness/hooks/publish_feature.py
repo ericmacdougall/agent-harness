@@ -168,26 +168,33 @@ def main():
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be a positive number of seconds")
-    try:
-        return publish(args)
-    except subprocess.TimeoutExpired:
-        report("BLOCKED_REMOTE", f"Local Git inspection exceeded {args.timeout} seconds; no push attempted")
-        return 4
-    except OSError:
-        report("BLOCKED_REMOTE", "Git command could not start; publication incomplete")
-        return 4
+    return publish(args)
 
 
 def publish(args):
-    expected_repository = getattr(args, 'expected_repository', None)
-    push_attempted = False
+    # Share one monotonic attempt fact across the body and its exception exits.
+    # In particular, transport cleanup can fail after the push already succeeded.
+    attempt = {'push_attempted': False}
 
     def reply(status, message, **facts):
-        # The workflow can distinguish a refused preflight from an unknown push.
-        if expected_repository is not None:
-            facts['push_attempted'] = push_attempted
+        if getattr(args, 'expected_repository', None) is not None:
+            facts.update(attempt)
         report(status, message, **facts)
 
+    try:
+        return _publish(args, attempt, reply)
+    except subprocess.TimeoutExpired:
+        phase = 'Publication command' if attempt['push_attempted'] else 'Local Git inspection'
+        outcome = 'publication incomplete' if attempt['push_attempted'] else 'no push attempted'
+        reply("BLOCKED_REMOTE", f"{phase} exceeded {args.timeout} seconds; {outcome}")
+        return 4
+    except OSError:
+        reply("BLOCKED_REMOTE", "Publication could not complete because of a local operating-system error")
+        return 4
+
+
+def _publish(args, attempt, reply):
+    expected_repository = getattr(args, 'expected_repository', None)
     if expected_repository is not None:
         try:
             expected_repository = repository_name(expected_repository)
@@ -333,7 +340,7 @@ def publish(args):
                 reply("BLOCKED_POLICY", "Git LFS pointer found; publish with an LFS-aware workflow",
                        branch=args.branch, remote=remote)
                 return 2
-            push_attempted = True
+            attempt['push_attempted'] = True
             result = git(transport, 'push', '--porcelain', pinned_remote,
                          f"{head}:{ref}", timeout=args.timeout, config_extra=pinned_config)
     except subprocess.TimeoutExpired:
