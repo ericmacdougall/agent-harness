@@ -117,6 +117,44 @@ class EvidenceStore(unittest.TestCase):
         with self.assertRaises(guard.GuardError):
             self.begin(repeat_reason='environment changed', aggregate_timeout=1)
 
+    def test_ar_ug_01_missing_start_cannot_authorize_repeat(self):
+        run = self.begin(); self.finish(run)
+        path = self.store.root / 'runs' / run.run_id / 'start.json'
+        path.rename(path.with_name('preserved-start.json'))
+        with self.assertRaises(guard.GuardError): self.begin(repeat_reason='owned diagnostic repeat')
+        self.assertEqual(len(list((self.store.root / 'runs').iterdir())), 1)
+
+    def test_ar_ug_01_attempt_budget_must_match_immutable_start(self):
+        run = self.begin(aggregate_timeout=10)
+        with mock.patch.object(guard.time, 'monotonic', return_value=run.began + 11):
+            run.finish(execution='INTERRUPTED', result='NO_RESULT', reason='TIMEOUT')
+        self.store.reconcile(run.run_id, actor='fixture', reason='owned child is gone', evidence='owned receipt checked')
+        path = next((self.store.root / 'purposes').glob('*/attempt-1.json'))
+        value = json.loads(path.read_text()); value['aggregate_timeout'] = 20
+        path.write_text(json.dumps(value))
+        with self.assertRaises(guard.GuardError): self.begin(repeat_reason='owned repeat', aggregate_timeout=20)
+        self.assertEqual(len(list((self.store.root / 'runs').iterdir())), 1)
+
+    def test_ar_ug_01_malformed_reconciliation_cannot_authorize_repeat(self):
+        run = self.begin()
+        path = self.store.root / 'runs' / run.run_id / 'reconciled.json'
+        path.write_text('{}'); path.chmod(0o600)
+        with self.assertRaises(guard.GuardError): self.begin(repeat_reason='owned repeat')
+
+    def test_ar_ug_02_corrupt_pool_history_cannot_be_blessed_by_reconcile(self):
+        run = self.begin()
+        self.store.acquire_pool('codex', 'fixture-pool', run.run_id)
+        pool = next((self.store.root / 'pools').iterdir())
+        index_before = (pool / 'head.json').read_bytes()
+        index = json.loads(index_before)
+        event = pool / 'events' / (index['event'] + '.json')
+        value = json.loads(event.read_text()); value['at'] = 'changed timestamp'
+        event.write_text(json.dumps(value))
+        with self.assertRaises(guard.GuardError):
+            self.store.reconcile(run.run_id, actor='fixture', reason='owned process ended', evidence='owned inspection')
+        self.assertEqual((pool / 'head.json').read_bytes(), index_before)
+        self.assertFalse((self.store.root / 'runs' / run.run_id / 'reconciled.json').exists())
+
     def test_missing_referenced_run_is_not_recreated(self):
         reference = {'run_id': 'd' * 32, 'record': 'final', 'sha256': 'e' * 64}
         with self.assertRaises(guard.GuardError): self.store.load_ref(reference)
