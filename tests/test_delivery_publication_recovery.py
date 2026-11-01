@@ -1,6 +1,7 @@
 """Publication recovery contracts using real Git and a local-only GitHub shim."""
 
 import json
+import sys
 import unittest
 from unittest import mock
 
@@ -85,6 +86,40 @@ class PublicationRecovery(unittest.TestCase):
         result, data = self.fixture.invoke(*self.fixture.prepare_args(), '--timeout', '2')
         self.assertTrue(json.loads(self.fixture.github_state.read_text()).get('create_pending'))
         self.assert_uncertain_until_positive(result, data)
+
+    def test_publisher_preflight_timeout_allows_definite_local_fallback(self):
+        fixture = self.fixture
+        launcher = fixture.bin / 'git'
+        original = fixture.bin / 'git-fixture-original'
+        launcher.rename(original)
+        marker = fixture.root / 'publisher-preflight-reached'
+        # Keep actual Git and the existing owned transport shim; stall only the
+        # publisher's local inspection, before it can invoke any push command.
+        launcher.write_text('#!' + sys.executable + '\n' + f'''import os,subprocess,sys,time
+args=sys.argv[1:]
+parent=subprocess.check_output(['ps','-p',str(os.getppid()),'-o','command='],text=True)
+if 'check-ref-format' in args and 'publish_feature.py' in parent:
+    open({str(marker)!r},'w').write('publisher-only preflight reached')
+    time.sleep(4)
+os.execv({str(original)!r},[{str(original)!r},*args])
+''')
+        launcher.chmod(0o700)
+        result, data = fixture.invoke(*fixture.prepare_args(), '--timeout', '1')
+        self.assertTrue(marker.exists(), 'The real publisher preflight must be exercised')
+        self.assertEqual((result.returncode, data['status']), (4, 'REMOTE_BLOCKED'), result.stdout)
+        self.assertEqual(self.current_state()['phase'], 'REMOTE_BLOCKED')
+        self.assert_original_untouched()
+        remote = workflow.command(fixture.env['FIXTURE_REAL_GIT'], '-C', str(fixture.remote),
+                                  'show-ref', '--verify', 'refs/heads/codex/feature',
+                                  env=fixture.env, check=False)
+        self.assertNotEqual(remote.returncode, 0)
+        self.assertEqual(json.loads(fixture.github_state.read_text())['creates'], 0)
+        delivered, completion = fixture.invoke(*fixture.finish_args('local'))
+        self.assertEqual((delivered.returncode, completion['status']), (0, 'LOCAL_DELIVERED'),
+                         delivered.stdout)
+        self.assertEqual((fixture.original / 'app.txt').read_text(), 'feature\n')
+        self.assertEqual(workflow.command('git', 'status', '--porcelain', cwd=fixture.original,
+                                          env=fixture.env).stdout, '')
 
     def test_output_overrun_create_absence_stays_uncertain_until_positive(self):
         self.install_uncertain_create('output')
