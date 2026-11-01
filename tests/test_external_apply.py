@@ -167,6 +167,13 @@ class ExternalApply(unittest.TestCase):
             self.assertEqual(integration.read_journal(second.journal.parent)['phase'], 'applying')
             self.assertEqual(fixtures.command('git', 'rev-parse', second.ref,
                                              cwd=self.original, env=self.env).stdout.strip(), target)
+            resolved = self.resolve(second.key)
+            self.assertEqual(resolved.returncode, 0, resolved.stderr)
+            with self.scope() as scope:
+                loaded = scope.load_external(first.key, TASK)
+                replayed = scope.complete_external(loaded)
+                self.assertEqual(replayed.record, loaded.record)
+                self.assertEqual(replayed.journal, loaded.journal)
 
     def test_completion_preserves_legacy_and_malformed_root_barriers(self):
         target = self.target()
