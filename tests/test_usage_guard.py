@@ -4,10 +4,14 @@ import hashlib
 import importlib.util
 import json
 import os
+import fcntl
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
+import shutil
+import signal
 import unittest
 from unittest import mock
 
@@ -28,8 +32,12 @@ class EvidenceStore(unittest.TestCase):
                                      head='b' * 40, tree='c' * 40)
         self.subject.repo, self.subject.manifest = self.repo, {}
         self.subject.probe = lambda: self.subject
+        self.tool = self.root / 'tool'; self.tool.write_bytes(b'public fixture tool')
+        self.tool.chmod(0o700)
+        self.toolchain = {'fixture': {'path': str(self.tool), 'public': True,
+                                     'sha256': hashlib.sha256(self.tool.read_bytes()).hexdigest()}}
         self.identity = guard.invocation_identity(self.subject, purpose='focused', argv=['public-command'],
-                                                  cwd=self.repo, toolchain={'fixture': 'v1'})
+                                                  cwd=self.repo, toolchain=self.toolchain)
 
     def begin(self, **options):
         return self.store.begin(self.subject, self.identity, owner='fixture', label='focused',
@@ -46,11 +54,12 @@ class EvidenceStore(unittest.TestCase):
         self.assertEqual((self.store.root / 'runs' / run.run_id / 'final.json').stat().st_mode & 0o777, 0o600)
         reused = self.store.reuse(self.subject, self.identity, reference)
         self.assertEqual((reused['evidence'], reused['reference']), ('REUSED', reference))
+        self.assertTrue(reused['eligible'])
         self.assertNotIn('result', reused)
         self.assertNotIn('VERDICT: PASS', json.dumps(reused))
 
     def test_duplicate_and_missing_final_require_explicit_reconciliation(self):
-        run = self.begin()
+        run = self.begin(aggregate_timeout=30)
         with self.assertRaises(guard.GuardError) as refused: self.begin(repeat_reason='investigate environment')
         self.assertEqual(refused.exception.reason, 'UNKNOWN')
         self.store.reconcile(run.run_id, actor='fixture', reason='owned process ended', evidence='owned log checked')
@@ -58,6 +67,40 @@ class EvidenceStore(unittest.TestCase):
         self.finish(repeated)
         with self.assertRaises(guard.GuardError): self.begin(repeat_reason='third attempt', aggregate_timeout=30)
         self.assertFalse((self.store.root / 'runs' / run.run_id / 'final.json').exists())
+
+    def test_repeat_cannot_enlarge_first_aggregate_declaration(self):
+        run = self.begin(aggregate_timeout=10); self.finish(run)
+        with self.assertRaises(guard.GuardError) as refused:
+            self.begin(repeat_reason='fresh evidence required', aggregate_timeout=20)
+        self.assertEqual(refused.exception.reason, 'BUDGET_EXHAUSTED')
+
+    def test_metadata_lock_wait_is_finite(self):
+        fd = os.open(self.store.root / '.lock', os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            started = time.monotonic()
+            with mock.patch.object(guard, 'LOCK_SECONDS', .05), self.assertRaises(guard.GuardError) as refused:
+                self.begin()
+            self.assertEqual(refused.exception.reason, 'TRANSIENT_INFRA')
+            self.assertLess(time.monotonic() - started, 1)
+        finally:
+            os.close(fd)
+
+    def test_missing_final_inspection_is_unknown_and_read_does_not_restore_namespace(self):
+        run = self.begin()
+        self.assertEqual(self.store.inspect(run.start_ref)['execution'], 'UNKNOWN')
+        runs = self.store.root / 'runs'
+        moved = self.store.root / 'held-runs'; runs.rename(moved)
+        with self.assertRaises(guard.GuardError): self.store.load_ref(run.start_ref)
+        self.assertFalse(runs.exists())
+        moved.rename(runs)
+
+    def test_runtime_drift_invalidates_finished_invocation(self):
+        run = self.begin()
+        self.tool.write_bytes(b'changed tool')
+        reference = self.finish(run)
+        value = self.store.load_ref(reference)
+        self.assertEqual((value['result'], value['reason']), ('NO_RESULT', 'INPUT_CHANGED'))
 
     def test_completed_duplicate_is_refused_before_any_new_run(self):
         run = self.begin(); self.finish(run)
@@ -120,19 +163,49 @@ class EvidenceStore(unittest.TestCase):
                                   timeout=10, kind='focused', minimum_bytes=1)
         final = self.store.load_ref(refused.exception.reference)
         self.assertEqual((final['execution'], final['reason']), ('NOT_STARTED', 'LOW_DISK'))
+        other = guard.invocation_identity(self.subject, purpose='probe', argv=['public-command'], cwd=self.repo)
+        with mock.patch.object(guard.shutil, 'disk_usage', side_effect=OSError('owned probe failure')):
+            with self.assertRaises(guard.GuardError) as refused:
+                self.store.begin(self.subject, other, owner='fixture', label='probe', timeout=10,
+                                  kind='focused', minimum_bytes=1)
+        self.assertEqual(self.store.load_ref(refused.exception.reference)['execution'], 'NOT_STARTED')
 
     def test_pool_quota_shared_across_models_and_ack_preserves_history(self):
         run = self.begin()
         self.store.acquire_pool('codex', 'fixture-pool', run.run_id)
         self.store.release_pool('codex', 'fixture-pool', run.run_id, reason='QUOTA', account_cooldown=True)
+        other = guard.invocation_identity(self.subject, purpose='other-model', argv=['other-model'], cwd=self.repo)
+        next_run = self.store.begin(self.subject, other, owner='fixture', label='other', timeout=10, minimum_bytes=0)
         with self.assertRaises(guard.GuardError) as refused:
-            self.store.acquire_pool('codex', 'fixture-pool', 'f' * 32)
+            self.store.acquire_pool('codex', 'fixture-pool', next_run.run_id)
         self.assertEqual(refused.exception.reason, 'QUOTA')
         before = list((self.store.root / 'pools').glob('*/events/*.json'))
         self.store.ack_pool('codex', 'fixture-pool', actor='fixture', reason='availability changed', evidence='owned check')
         after = list((self.store.root / 'pools').glob('*/events/*.json'))
         self.assertTrue(set(before) < set(after))
-        self.store.acquire_pool('codex', 'fixture-pool', 'f' * 32)
+        self.store.acquire_pool('codex', 'fixture-pool', next_run.run_id)
+
+    def test_parallel_processes_cannot_duplicate_one_reservation(self):
+        script = ('import sys\nfrom pathlib import Path\n'
+                  f'sys.path.insert(0,{str(HOOKS)!r})\nimport usage_guard as g\n'
+                  f's=g.Subject(schema=1,fingerprint={"a"*64!r},reusable=True)\n'
+                  f's.repo=Path({str(self.repo)!r});s.manifest={{}};s.probe=lambda:s\n'
+                  'i=g.invocation_identity(s,purpose="simultaneous",argv=["same"],cwd=s.repo)\n'
+                  f'store=g.UsageStore({str(self.store.root)!r})\n'
+                  'try:\n    run=store.begin(s,i,owner="fixture",label="parallel",timeout=10,minimum_bytes=0)\n'
+                  'except g.GuardError: raise SystemExit(2)\n'
+                  'raise SystemExit(0)\n')
+        children = [subprocess.Popen([sys.executable, '-c', script], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    for _ in range(2)]
+        outcomes = []
+        try:
+            for child in children:
+                child.communicate(timeout=10); outcomes.append(child.returncode)
+        finally:
+            for child in children:
+                if child.poll() is None: child.kill(); child.communicate(timeout=5)
+        self.assertEqual(sorted(outcomes), [0, 2])
+        self.assertEqual(len(list((self.store.root / 'runs').iterdir())), 1)
 
 
 class SubjectIdentity(unittest.TestCase):
@@ -147,6 +220,7 @@ class SubjectIdentity(unittest.TestCase):
         self.git('add', 'app.txt'); self.git('commit', '-qm', 'baseline')
         self.tool = self.repo.parent / (self.repo.name + '-tool')
         self.tool.write_bytes(b'owned tool v1'); self.addCleanup(self.tool.unlink)
+        self.tool.chmod(0o700)
         self.manifest = {'schema': 1, 'files': [], 'revisions': {'config': 'fixture-v1'},
                          'complete': True, 'deterministic': True, 'public_arguments': True,
                          'toolchain': {'fixture': {'path': str(self.tool), 'public': True,
@@ -166,7 +240,7 @@ class SubjectIdentity(unittest.TestCase):
                 self.git('update-index', '--' + flag, 'app.txt')
                 (self.repo / 'app.txt').write_text('hidden edit\n')
                 self.assertEqual(self.git('status', '--porcelain').stdout, '')
-                self.assertFalse(self.subject()['reusable'])
+                with self.assertRaises(guard.GuardError): self.subject()
                 (self.repo / 'app.txt').write_text('tracked fixture\n')
                 self.git('update-index', '--no-' + flag, 'app.txt')
 
@@ -178,6 +252,34 @@ class SubjectIdentity(unittest.TestCase):
         self.assertNotEqual(before['fingerprint'], after['fingerprint'])
         self.assertFalse(after['reusable'])
 
+    def test_declared_instruction_fixture_config_and_head_changes_invalidate(self):
+        declared = self.repo.parent / (self.repo.name + '-instructions')
+        declared.write_text('public fixture input1'); self.addCleanup(declared.unlink)
+        self.manifest['files'] = [{'label': 'instructions-config-fixture', 'path': str(declared), 'public': True}]
+        before = self.subject(); declared.write_text('public fixture input2')
+        after = self.subject(); self.assertNotEqual(before['fingerprint'], after['fingerprint'])
+        self.git('commit', '--allow-empty', '-qm', 'new reviewed head')
+        self.assertNotEqual(after['fingerprint'], self.subject()['fingerprint'])
+
+    def test_nonpublic_input_is_not_read_or_hashed(self):
+        private = self.repo.parent / (self.repo.name + '-private')
+        self.manifest['files'] = [{'label': 'secret-dependent', 'path': str(private), 'public': False}]
+        self.assertFalse(self.subject()['reusable'])
+        self.assertFalse(private.exists())
+
+    def test_declared_environment_and_manifest_file_are_reprobed(self):
+        self.manifest['environment'] = {'LANG': 'C'}
+        path = self.repo.parent / (self.repo.name + '-manifest')
+        path.write_text(json.dumps(self.manifest)); path.chmod(0o600); self.addCleanup(path.unlink)
+        with mock.patch.dict(os.environ, {**self.env, 'LANG': 'C'}, clear=True):
+            subject = guard.capture_subject(self.repo, path)
+            self.assertTrue(subject['reusable'])
+            with mock.patch.dict(os.environ, {'LANG': 'fr'}):
+                self.assertNotEqual(subject['fingerprint'], subject.probe()['fingerprint'])
+            value = json.loads(path.read_text()); value['revisions']['config'] = 'v2'
+            path.write_text(json.dumps(value))
+            self.assertNotEqual(subject['fingerprint'], subject.probe()['fingerprint'])
+
 
 class ResultContracts(unittest.TestCase):
     def test_vacuous_and_false_success_controls(self):
@@ -188,4 +290,92 @@ class ResultContracts(unittest.TestCase):
 
     def test_compile_error_is_not_automatically_a_code_repair_failure(self):
         self.assertEqual(guard.command_result('go-json', 1, '{"Action":"fail","Package":"fixture"}')[0], 'NO_RESULT')
+        mixed = ('{"Action":"pass","Package":"good","Test":"TestGood"}\n'
+                 '{"Action":"fail","Package":"build-error"}')
+        self.assertEqual(guard.command_result('go-json', 1, mixed)[0:2], ('NO_RESULT', 'UNKNOWN'))
+        self.assertEqual(guard.command_result('unittest', 1, '', 'Ran 1 test in 0.01s\n\nFAILED (errors=1)')[0:2],
+                         ('NO_RESULT', 'UNKNOWN'))
+
+
+class LiveReceipts(unittest.TestCase):
+    def setUp(self):
+        self.fixture = SubjectIdentity('test_declared_toolchain_mutation_invalidates_identity')
+        self.fixture.setUp(); self.addCleanup(self.fixture.doCleanups)
+        self.repo = self.fixture.repo
+        self.runtime = self.repo.parent / (self.repo.name + '-runtime')
+        self.runtime.mkdir(mode=0o700); self.addCleanup(shutil.rmtree, self.runtime)
+        for name in ('usage_guard.py', 'git_safety.py', 'process.py', 'peer_review.py', 'report_file.py'):
+            shutil.copyfile(HOOKS / name, self.runtime / name)
+        self.store_path = self.repo.parent / (self.repo.name + '-state')
+        self.addCleanup(lambda: shutil.rmtree(self.store_path) if self.store_path.exists() else None)
+        self.manifest = self.repo.parent / (self.repo.name + '-manifest.json')
+        data = {**self.fixture.manifest, 'public_arguments': False, 'command_revision': 'fixture-v1'}
+        self.manifest.write_text(json.dumps(data)); self.manifest.chmod(0o600)
+        self.addCleanup(self.manifest.unlink)
+        self.env = {**self.fixture.env, 'PYTHONDONTWRITEBYTECODE': '1', 'PYTHONNOUSERSITE': '1',
+                    'AGENT_HARNESS_USAGE_DIR': str(self.store_path)}
+
+    def command(self, *arguments):
+        return [sys.executable, str(self.runtime / 'usage_guard.py'), *arguments]
+
+    def arguments(self, purpose, command, *, adapter='command', kind='command', timeout=5):
+        return ['check', '--repo', str(self.repo), '--manifest', str(self.manifest),
+                '--purpose', purpose, '--owner', 'fixture', '--label', purpose,
+                '--timeout', str(timeout), '--minimum-free-bytes', '0', '--kind', kind,
+                '--adapter', adapter, '--success-exit', '0', '--', *command]
+
+    def invoke(self, *arguments):
+        result = subprocess.run(self.command(*arguments), env=self.env, capture_output=True, text=True, timeout=20)
+        return result, json.loads(result.stdout)
+
+    def test_actual_success_and_fresh_process_inspection_do_not_store_output_or_argv(self):
+        sensitive = 'fixture_sensitive_output_58'
+        result, value = self.invoke(*self.arguments('privacy', [sys.executable, '-c', f'print({sensitive!r})']))
+        self.assertEqual((result.returncode, value['execution'], value['result']), (0, 'COMPLETED', 'CHECK_OK'))
+        reference = value['reference']
+        token = ':'.join(reference[key] for key in ('run_id', 'record', 'sha256'))
+        inspected, current = self.invoke('inspect', '--reference', token)
+        self.assertEqual((inspected.returncode, current['run_id']), (0, reference['run_id']))
+        for path in self.store_path.rglob('*.json'):
+            self.assertNotIn(sensitive, path.read_text())
+            self.assertNotIn(f'print({sensitive!r})', path.read_text())
+
+    def test_actual_test_failure_and_timeout_have_typed_final_receipts(self):
+        tests = self.repo / 'tests'; tests.mkdir()
+        (tests / 'test_fixture.py').write_text('import unittest\nclass Failure(unittest.TestCase):\n'
+                                              '    def test_failure(self): self.assertTrue(False)\n')
+        self.fixture.git('add', 'tests'); self.fixture.git('commit', '-qm', 'owned failing test')
+        result, value = self.invoke(*self.arguments('failed-test', [sys.executable, '-m', 'unittest', 'discover', '-s', 'tests'],
+                                                    adapter='unittest', kind='focused'))
+        self.assertEqual((result.returncode, value['execution'], value['result'], value['reason'], value['observed_count']),
+                         (3, 'COMPLETED', 'CHECK_FAILED', 'CODE_FINDINGS', 1))
+        result, timed = self.invoke(*self.arguments('timeout', [sys.executable, '-c', 'import time;time.sleep(30)'], timeout=.1))
+        self.assertEqual((result.returncode, timed['execution'], timed['result'], timed['reason']),
+                         (3, 'INTERRUPTED', 'NO_RESULT', 'TIMEOUT'))
+
+    def test_killed_supervisor_missing_final_is_unknown_and_blocks_duplicate(self):
+        marker = self.repo.parent / (self.repo.name + '-child.json')
+        self.addCleanup(lambda: marker.unlink() if marker.exists() else None)
+        program = ('import json,os,time\nfrom pathlib import Path\n'
+                   f'Path({str(marker)!r}).write_text(json.dumps({{"group":os.getpgrp()}}))\n'
+                   'time.sleep(30)\n')
+        arguments = self.arguments('interrupted-owner', [sys.executable, '-c', program], timeout=40)
+        process = subprocess.Popen(self.command(*arguments), env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            while not marker.exists() and process.poll() is None and time.monotonic() < deadline: time.sleep(.02)
+            self.assertTrue(marker.exists())
+            process.kill(); process.communicate(timeout=5)
+            entry = json.loads(next((self.store_path / 'purposes').glob('*/attempt-1.json')).read_text())
+            reference = entry['start']; token = ':'.join(reference[key] for key in ('run_id', 'record', 'sha256'))
+            inspected, value = self.invoke('inspect', '--reference', token)
+            self.assertEqual((inspected.returncode, value['execution'], value['result']), (0, 'UNKNOWN', 'NO_RESULT'))
+            repeated, refused = self.invoke(*arguments)
+            self.assertEqual((repeated.returncode, refused['reason']), (2, 'UNKNOWN'))
+            self.assertFalse((self.store_path / 'runs' / reference['run_id'] / 'final.json').exists())
+        finally:
+            if process.poll() is None: process.kill(); process.communicate(timeout=5)
+            if marker.exists():
+                try: os.killpg(json.loads(marker.read_text())['group'], signal.SIGKILL)
+                except ProcessLookupError: pass
 

@@ -33,11 +33,13 @@ SCHEMA = 1
 MAX_JSON = 65536
 MAX_MANIFEST = 32768
 MAX_FILE = 2 * 1024 * 1024
+LOCK_SECONDS = 2
 EXECUTIONS = {'NOT_STARTED', 'RUNNING', 'COMPLETED', 'INTERRUPTED', 'UNKNOWN'}
 RESULTS = {'CHECK_OK', 'CHECK_FAILED', 'NO_RESULT'}
 REASONS = {'NONE', 'CODE_FINDINGS', 'QUOTA', 'AUTH', 'TRANSIENT_INFRA', 'LOW_DISK',
            'TIMEOUT', 'INVALID_OUTPUT', 'INPUT_CHANGED', 'BUDGET_EXHAUSTED', 'UNKNOWN'}
 STAGES = {'PLAN', 'CODE_INSPECTION', 'PR'}
+ENVIRONMENT_KEYS = {'CI', 'LANG', 'LC_ALL', 'TZ', 'PYTHONHASHSEED', 'NODE_ENV'}
 HEX = re.compile(r'[0-9a-f]{64}\Z')
 RUN_ID = re.compile(r'[0-9a-f]{32}\Z')
 LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}\Z')
@@ -109,7 +111,7 @@ def file_bytes(path, limit=MAX_JSON, *, private=True):
 
 def read_json(path, *, limit=MAX_JSON):
     try:
-        value = json.loads(file_bytes(path, limit))
+        value = json.loads(file_bytes(path, limit), parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
         if not isinstance(value, dict):
             raise ValueError
         return value
@@ -128,20 +130,73 @@ def load_manifest(value=None):
                               'public_arguments', 'target', 'unknown_inputs', 'toolchain', 'environment',
                               'command_revision'}):
         raise GuardError('INVALID_OUTPUT', 'Input manifest is unsupported or oversized')
-    return value
+    return json.loads(encoded(value))
 
 
 class Subject(dict):
     """Serializable metadata, with private in-memory inputs for a final reprobe."""
     def probe(self):
-        return capture_subject(self.repo, self.manifest)
+        return capture_subject(self.repo, self.manifest_source)
+
+
+def runtime_identity(toolchain=None, environment=None):
+    """Probe only explicitly declared public executables and non-secret settings."""
+    if not isinstance(toolchain or {}, dict) or not isinstance(environment or {}, dict):
+        raise GuardError('INVALID_OUTPUT', 'Runtime declarations must be objects')
+    tools, settings, unknown = {}, {}, []
+    if not toolchain: unknown.append('toolchain')
+    for label, specification in (toolchain or {}).items():
+        safe_label(label)
+        if (not isinstance(specification, dict) or specification.get('public') is not True
+                or set(specification) - {'path', 'executable', 'sha256', 'public'}):
+            unknown.append('toolchain/' + label); continue
+        selected = specification.get('path') or shutil.which(specification.get('executable', ''))
+        try:
+            path = Path(selected).resolve(strict=True)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                before = os.fstat(fd)
+                if (not stat.S_ISREG(before.st_mode) or not before.st_mode & 0o111
+                        or before.st_size > 256 * 1024**2):
+                    raise OSError
+                sha = hashlib.sha256()
+                consumed = 0
+                while True:
+                    body = os.read(fd, 65536)
+                    if not body: break
+                    consumed += len(body)
+                    if consumed > 256 * 1024**2: raise OSError
+                    sha.update(body)
+                after = os.fstat(fd)
+                named = path.stat()
+                signature = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                if signature(before) != signature(after) or signature(after) != signature(named): raise OSError
+            finally:
+                os.close(fd)
+            tools[label] = {'resolved_path_digest': digest(str(path)), 'sha256': sha.hexdigest()}
+            if specification.get('sha256') != sha.hexdigest(): unknown.append('toolchain/' + label)
+        except (OSError, TypeError, ValueError):
+            unknown.append('toolchain/' + label)
+    for key, expected in (environment or {}).items():
+        if key not in ENVIRONMENT_KEYS:
+            raise GuardError('INVALID_OUTPUT', 'Environment names must be explicitly allowlisted')
+        if expected is not None: safe_text(expected, maximum=128)
+        actual = os.environ.get(key)
+        if actual is not None: safe_text(actual, maximum=128)
+        settings[key] = actual
+        if actual != expected: unknown.append('environment/' + key)
+    return {'toolchain': tools, 'environment': settings}, unknown
 
 
 def capture_subject(repo, manifest=None):
     repo = Path(repo).resolve()
+    source = manifest
     manifest = load_manifest(manifest)
     environment = git_environment(isolated=True)
-    require_safe_source(repo, environment)
+    try:
+        require_safe_source(repo, environment)
+    except (OSError, subprocess.TimeoutExpired):
+        raise GuardError('UNKNOWN', 'Subject Git safety could not be verified') from None
     def inspect(*args):
         result = run_process(['git', '-C', str(repo), *args], env=environment, timeout=30)
         if result.returncode:
@@ -179,20 +234,30 @@ def capture_subject(repo, manifest=None):
             known['runtime/' + name] = hashlib.sha256(file_bytes(path, MAX_FILE, private=False)).hexdigest()
     for label, value in revisions.items():
         safe_label(label); safe_text(value)
+    runtime, runtime_unknown = runtime_identity(manifest.get('toolchain'), manifest.get('environment'))
+    unknown.extend(runtime_unknown)
     unknown = sorted({safe_label(value) for value in unknown})
     data = {'schema': SCHEMA, 'repository': digest([str(repo), info.st_dev, info.st_ino]),
             'head': head, 'tree': tree, 'dirty': dirty, 'files': known, 'revisions': revisions,
             'unknown_inputs': unknown, 'complete': manifest.get('complete') is True,
-            'deterministic': manifest.get('deterministic') is True}
+            'deterministic': manifest.get('deterministic') is True, 'runtime': runtime,
+            'target': safe_label(manifest.get('target', 'local'))}
     data['reusable'] = data['complete'] and data['deterministic'] and not dirty and not unknown
     data['fingerprint'] = digest(data)
     subject = Subject(data)
     subject.repo, subject.manifest = repo, manifest
+    subject.manifest_source = Path(source) if isinstance(source, (str, Path)) else load_manifest(manifest)
     return subject
 
 
+class Invocation(dict):
+    def probe(self):
+        return invocation_identity(self.subject, **self.arguments)
+
+
 def invocation_identity(subject, *, purpose, argv, cwd, stage=None, packet_digest=None,
-                        provider=None, model=None, pool=None, toolchain=None, environment=None, reusable=True):
+                        provider=None, model=None, pool=None, toolchain=None, environment=None,
+                        reusable=True, execution_executable=None):
     safe_label(purpose)
     if stage is not None and stage not in STAGES:
         raise GuardError('INVALID_OUTPUT', 'Unknown review stage')
@@ -202,16 +267,30 @@ def invocation_identity(subject, *, purpose, argv, cwd, stage=None, packet_diges
         raise GuardError('INVALID_OUTPUT', 'Invocation arguments are unsafe or oversized')
     for value in (provider, model, pool):
         if value is not None: safe_label(value)
+    runtime, unknown = runtime_identity(toolchain, environment)
+    selected = None
+    if execution_executable is not None:
+        selected_path = shutil.which(execution_executable)
+        if selected_path is not None:
+            selected = digest(str(Path(selected_path).resolve()))
+        if selected is None or not any(tool['resolved_path_digest'] == selected for tool in runtime['toolchain'].values()):
+            unknown.append('selected-executable')
     metadata = {'purpose': purpose, 'stage': stage, 'subject': subject['fingerprint'],
                 'argv_digest': digest(argv), 'cwd_digest': digest(str(Path(cwd).resolve())),
                 'packet_digest': packet_digest, 'provider': provider, 'model': model, 'pool': pool,
-                'toolchain': toolchain or {}, 'environment': environment or {},
+                'runtime': runtime,
+                'selected_executable': selected,
                 'platform': sys.platform, 'target': getattr(subject, 'manifest', {}).get('target', 'local'),
-                'reusable': subject['reusable'] and reusable}
+                'reusable': subject['reusable'] and reusable and not unknown}
     if len(encoded(metadata)) > MAX_MANIFEST or SECRET.search(encoded(metadata).decode()):
         raise GuardError('INVALID_OUTPUT', 'Invocation metadata is unsafe or oversized')
     metadata['fingerprint'] = digest(metadata)
-    return metadata
+    invocation = Invocation(metadata)
+    invocation.subject = subject
+    invocation.arguments = dict(purpose=purpose, argv=argv, cwd=cwd, stage=stage, packet_digest=packet_digest,
+                                provider=provider, model=model, pool=pool, toolchain=toolchain,
+                                environment=environment, reusable=reusable, execution_executable=execution_executable)
+    return invocation
 
 
 class UsageStore:
@@ -224,31 +303,48 @@ class UsageStore:
         self.root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._directory(self.root)
         self.identity = self._signature(self.root)
+        self.namespaces = {}
+        established = os.path.lexists(self.root / 'store.json')
+        if not established and any(self.root.iterdir()):
+            raise GuardError('UNKNOWN', 'Uninitialized nonempty state requires diagnosis')
+        if established and read_json(self.root / 'store.json') != {'schema': SCHEMA, 'kind': 'usage_store'}:
+            raise GuardError('UNKNOWN', 'Usage store schema is unsupported')
         for name in ('runs', 'purposes', 'pools'):
-            self._directory(self.root / name)
+            self._directory(self.root / name, create=not established)
+            self.namespaces[name] = self._signature(self.root / name)
+        if not established:
+            self._publish(self.root, 'store.json', {'schema': SCHEMA, 'kind': 'usage_store'})
 
     @staticmethod
     def _signature(path):
         info = os.stat(path, follow_symlinks=False)
         return info.st_dev, info.st_ino
 
-    def _directory(self, path):
-        try:
-            path.mkdir(mode=0o700)
-            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try: os.fsync(parent)
-            finally: os.close(parent)
-        except FileExistsError:
-            pass
+    def _directory(self, path, *, create=True):
+        if create:
+            try:
+                path.mkdir(mode=0o700)
+                parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try: os.fsync(parent)
+                finally: os.close(parent)
+            except FileExistsError:
+                pass
         info = os.stat(path, follow_symlinks=False)
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
             raise GuardError('UNKNOWN', 'Usage directory ownership or permissions are unsafe')
         return path
 
     def _current(self):
-        self._directory(self.root)
-        if self._signature(self.root) != self.identity:
-            raise GuardError('UNKNOWN', 'Usage directory identity changed')
+        try:
+            self._directory(self.root, create=False)
+            if self._signature(self.root) != self.identity:
+                raise GuardError('UNKNOWN', 'Usage directory identity changed')
+            for name, identity in getattr(self, 'namespaces', {}).items():
+                self._directory(self.root / name, create=False)
+                if self._signature(self.root / name) != identity:
+                    raise GuardError('UNKNOWN', 'Usage namespace identity changed')
+        except OSError:
+            raise GuardError('UNKNOWN', 'Usage namespace is missing or unsafe') from None
 
     @contextmanager
     def _lock(self):
@@ -259,7 +355,15 @@ class UsageStore:
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1
                     or stat.S_IMODE(info.st_mode) != 0o600):
                 raise GuardError('UNKNOWN', 'Usage lock is unsafe')
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            deadline = time.monotonic() + LOCK_SECONDS
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise GuardError('TRANSIENT_INFRA', 'Metadata lock is busy; no command was launched') from None
+                    time.sleep(min(.02, max(0, deadline - time.monotonic())))
             self._current()
             if self._signature(self.root / '.lock') != (info.st_dev, info.st_ino):
                 raise GuardError('UNKNOWN', 'Usage lock changed')
@@ -273,14 +377,25 @@ class UsageStore:
         if len(body) > MAX_JSON:
             raise GuardError('INVALID_OUTPUT', 'Receipt metadata is oversized')
         fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directory_identity = (os.fstat(fd).st_dev, os.fstat(fd).st_ino)
         temporary = '.stage-' + secrets.token_hex(16)
+        prior = None
+        if replace and os.path.lexists(directory / name):
+            previous = file_bytes(directory / name)
+            info = os.stat(directory / name, follow_symlinks=False)
+            prior = ((info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns), previous)
         try:
             target = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
             with os.fdopen(target, 'wb') as output:
                 output.write(body); output.flush(); os.fsync(output.fileno())
-            if self._signature(directory) != (os.fstat(fd).st_dev, os.fstat(fd).st_ino):
+                written = os.fstat(output.fileno())
+            if self._signature(directory) != directory_identity:
                 raise GuardError('UNKNOWN', 'Receipt directory changed')
-            if replace:
+            if replace and prior is not None:
+                info = os.stat(directory / name, follow_symlinks=False)
+                if ((info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns) != prior[0]
+                        or file_bytes(directory / name) != prior[1]):
+                    raise GuardError('UNKNOWN', 'Current state index changed')
                 os.replace(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
             else:
                 os.link(temporary, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
@@ -289,6 +404,12 @@ class UsageStore:
             try: os.unlink(temporary, dir_fd=fd)
             except FileNotFoundError: pass
             os.close(fd)
+        self._current()
+        if self._signature(directory) != directory_identity:
+            raise GuardError('UNKNOWN', 'Receipt directory changed during publication')
+        visible = os.stat(directory / name, follow_symlinks=False)
+        if (visible.st_dev, visible.st_ino) != (written.st_dev, written.st_ino):
+            raise GuardError('UNKNOWN', 'Published receipt identity changed')
         actual = file_bytes(directory / name)
         if actual != body:
             raise GuardError('UNKNOWN', 'Receipt changed during publication')
@@ -301,12 +422,14 @@ class UsageStore:
 
     def load_ref(self, reference):
         if (not isinstance(reference, dict) or set(reference) != {'run_id', 'record', 'sha256'}
-                or reference['record'] not in {'start', 'final'} or not HEX.fullmatch(reference['sha256'])):
+                or reference['record'] not in {'start', 'final'}
+                or not isinstance(reference.get('sha256'), str) or not HEX.fullmatch(reference['sha256'])):
             raise GuardError('UNKNOWN', 'Invalid receipt reference')
         self._current()
-        directory = self._run_directory(reference['run_id']); self._directory(directory)
+        directory = self._run_directory(reference['run_id'])
         path = directory / (reference['record'] + '.json')
         try:
+            self._directory(directory, create=False)
             body = file_bytes(path)
             value = json.loads(body)
         except (OSError, ValueError, UnicodeError):
@@ -315,7 +438,22 @@ class UsageStore:
                 or type(value.get('schema')) is not int or value['schema'] != SCHEMA
                 or value.get('kind') != reference['record'] or value.get('run_id') != reference['run_id']):
             raise GuardError('UNKNOWN', 'Evidence digest or schema does not match')
+        if reference['record'] == 'final' and (
+                not isinstance(value.get('execution'), str) or value['execution'] not in EXECUTIONS
+                or not isinstance(value.get('result'), str) or value['result'] not in RESULTS
+                or not isinstance(value.get('reason'), str) or value['reason'] not in REASONS
+                or value.get('evidence') != 'EXECUTED' or not isinstance(value.get('subject'), dict)
+                or not isinstance(value.get('invocation'), dict)):
+            raise GuardError('UNKNOWN', 'Final evidence result schema is invalid')
         return value
+
+    def inspect(self, reference):
+        record = self.load_ref(reference)
+        if reference['record'] == 'start':
+            return {'execution': 'UNKNOWN', 'result': 'NO_RESULT', 'reference': reference,
+                    'historical_start': record,
+                    'note': 'START records intent; inspect a separately referenced FINAL to establish completion'}
+        return record
 
     def check_gate(self, subject, reference):
         record = self.load_ref(reference)
@@ -344,9 +482,11 @@ class UsageStore:
             raise GuardError('INVALID_OUTPUT', 'Unsupported guarded command kind')
         if repeat_reason is not None: safe_text(repeat_reason)
         if ungated_reason is not None: safe_text(ungated_reason)
-        aggregate_timeout = finite_seconds(aggregate_timeout or timeout * 2)
+        aggregate_timeout = finite_seconds(timeout * 2 if aggregate_timeout is None else aggregate_timeout)
         if kind == 'full' and gate is None and not ungated_reason:
             raise GuardError('INPUT_CHANGED', 'Full validation needs a gate or explicit investigation/native reason')
+        if kind == 'full' and gate is not None and not invocation['reusable']:
+            raise GuardError('INPUT_CHANGED', 'Full gate requires verified declared execution inputs')
         if gate is not None: self.check_gate(subject, gate)
         repo = getattr(subject, 'repo', None)
         if repo and (self.root == repo or repo in self.root.parents):
@@ -369,20 +509,33 @@ class UsageStore:
                 path = purpose / ('attempt-' + str(number) + '.json')
                 if not os.path.lexists(path): break
                 entry = read_json(path)
+                if (set(entry) != {'schema', 'run_id', 'start', 'timeout', 'aggregate_timeout'} or entry.get('schema') != SCHEMA
+                        or type(entry.get('schema')) is not int):
+                    raise GuardError('UNKNOWN', 'Attempt history is malformed')
+                finite_seconds(entry.get('timeout'))
+                original_budget = finite_seconds(entry.get('aggregate_timeout'))
+                if aggregate_timeout > original_budget:
+                    raise GuardError('BUDGET_EXHAUSTED', 'A repeat cannot enlarge its original aggregate budget')
                 previous.append(entry)
                 directory = self._run_directory(entry['run_id'])
                 reconciled = os.path.lexists(directory / 'reconciled.json')
-                final = directory / 'final.json'
-                if not os.path.lexists(final):
+                completion = directory / 'completion.json'
+                if not os.path.lexists(completion):
                     if not reconciled:
                         raise GuardError('UNKNOWN', 'Prior reservation has no final receipt; reconcile before retry', entry['start'])
                     read_json(directory / 'reconciled.json')
                     spent += entry['timeout']
                 else:
-                    record = read_json(final)
+                    completed = read_json(completion)
+                    if set(completed) != {'schema', 'reference'} or completed.get('schema') != SCHEMA:
+                        raise GuardError('UNKNOWN', 'Completion reference is malformed')
+                    record = self.load_ref(completed['reference'])
                     if record.get('reason') in {'UNKNOWN', 'TIMEOUT'} and not reconciled:
                         raise GuardError('UNKNOWN', 'Uncertain prior result requires recorded reconciliation', entry['start'])
-                    spent += record.get('elapsed_seconds', entry['timeout'])
+                    elapsed = record.get('elapsed_seconds')
+                    if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
+                        raise GuardError('UNKNOWN', 'Elapsed execution budget is invalid')
+                    spent += elapsed
             if previous and (repeat_reason is None or len(previous) >= 2):
                 raise GuardError('BUDGET_EXHAUSTED', 'Identical invocation already reserved; use evidence or one justified repeat', previous[-1]['start'])
             remaining = aggregate_timeout - spent
@@ -398,7 +551,8 @@ class UsageStore:
                        'ungated_reason': ungated_reason, 'execution': 'RUNNING'}
             reference = {'run_id': run_id, 'record': 'start', 'sha256': hashlib.sha256(encoded(started)).hexdigest()}
             self._publish(purpose, 'attempt-' + str(len(previous) + 1) + '.json',
-                          {'schema': SCHEMA, 'run_id': run_id, 'start': reference, 'timeout': min(timeout, remaining)})
+                          {'schema': SCHEMA, 'run_id': run_id, 'start': reference,
+                           'timeout': min(timeout, remaining), 'aggregate_timeout': aggregate_timeout})
             self._publish(directory, 'start.json', started)
         run = Run(self, subject, started, reference)
         if resource_reason != 'NONE':
@@ -408,20 +562,36 @@ class UsageStore:
 
     def _pool(self, provider, pool):
         safe_label(provider); safe_label(pool)
-        directory = self._directory(self.root / 'pools' / digest([provider, pool]))
-        self._directory(directory / 'events')
+        directory = self.root / 'pools' / digest([provider, pool])
+        new = not os.path.lexists(directory)
+        self._directory(directory, create=new)
+        self._directory(directory / 'events', create=new)
         index = directory / 'head.json'
         if not os.path.lexists(index):
+            if any((directory / 'events').iterdir()):
+                raise GuardError('UNKNOWN', 'Pool history has no current index; reconcile before use')
             return directory, {'provider': provider, 'pool': pool, 'active': None,
                                'cooldown': False, 'reason': 'NONE', 'reset_at': None}
         ref = read_json(index)
-        if set(ref) != {'event', 'sha256'} or not RUN_ID.fullmatch(ref['event']):
+        if (set(ref) != {'event', 'sha256'} or not isinstance(ref.get('event'), str)
+                or not RUN_ID.fullmatch(ref['event']) or not isinstance(ref.get('sha256'), str)
+                or not HEX.fullmatch(ref['sha256'])):
             raise GuardError('UNKNOWN', 'Pool index is corrupt')
         body = file_bytes(directory / 'events' / (ref['event'] + '.json'))
         value = json.loads(body)
-        if hashlib.sha256(body).hexdigest() != ref['sha256'] or value.get('schema') != SCHEMA:
+        if (hashlib.sha256(body).hexdigest() != ref['sha256'] or value.get('schema') != SCHEMA
+                or type(value.get('schema')) is not int or not isinstance(value.get('state'), dict)):
             raise GuardError('UNKNOWN', 'Pool history digest is invalid')
-        return directory, value['state']
+        state = value['state']
+        if (set(state) != {'provider', 'pool', 'active', 'cooldown', 'reason', 'reset_at'}
+                or state['provider'] != provider or state['pool'] != pool
+                or type(state['cooldown']) is not bool or not isinstance(state['reason'], str)
+                or state['reason'] not in REASONS
+                or state['active'] is not None and (not isinstance(state['active'], str) or not RUN_ID.fullmatch(state['active']))
+                or state['reset_at'] is not None and (type(state['reset_at']) not in (int, float)
+                    or not math.isfinite(state['reset_at']))):
+            raise GuardError('UNKNOWN', 'Pool state is malformed')
+        return directory, state
 
     def _pool_event(self, directory, state, action, **facts):
         event = secrets.token_hex(16)
@@ -431,11 +601,15 @@ class UsageStore:
         self._publish(directory, 'head.json', {'event': event, 'sha256': sha}, replace=True)
 
     def acquire_pool(self, provider, pool, run_id):
-        self._run_directory(run_id)
+        directory = self._run_directory(run_id)
+        start = read_json(directory / 'start.json')
+        if start.get('run_id') != run_id or start.get('kind') != 'start' or start.get('schema') != SCHEMA:
+            raise GuardError('UNKNOWN', 'Provider lease needs its own durable START')
         with self._lock():
             directory, state = self._pool(provider, pool)
             if state['active'] is not None:
-                raise GuardError('UNKNOWN', 'Provider pool has an active or unreconciled owner')
+                raise GuardError('UNKNOWN' if state['reason'] in {'UNKNOWN', 'TIMEOUT'} else 'TRANSIENT_INFRA',
+                                 'Provider pool has an active or unreconciled owner; no provider was launched')
             if state['cooldown'] and (state['reset_at'] is None or time.time() < state['reset_at']):
                 raise GuardError(state['reason'], 'Provider pool requires availability evidence or its reliable reset')
             state = {**state, 'active': run_id, 'cooldown': False, 'reason': 'NONE', 'reset_at': None}
@@ -444,15 +618,16 @@ class UsageStore:
     def release_pool(self, provider, pool, run_id, *, reason='NONE', account_cooldown=False, reset_at=None):
         if reason not in REASONS:
             raise GuardError('INVALID_OUTPUT', 'Unknown provider result reason')
-        if reset_at is not None and (type(reset_at) not in (int, float) or not math.isfinite(reset_at)):
+        if reset_at is not None and (type(reset_at) not in (int, float) or not math.isfinite(reset_at) or reset_at <= time.time()):
             reset_at = None
         with self._lock():
             directory, state = self._pool(provider, pool)
             if state['active'] != run_id:
                 raise GuardError('UNKNOWN', 'Provider pool ownership changed')
             cooldown = account_cooldown is True and reason in {'QUOTA', 'AUTH'}
-            state = {**state, 'active': None, 'cooldown': cooldown,
-                     'reason': reason if cooldown else 'NONE', 'reset_at': reset_at if cooldown else None}
+            uncertain = reason in {'TIMEOUT', 'UNKNOWN'}
+            state = {**state, 'active': run_id if uncertain else None, 'cooldown': cooldown,
+                     'reason': reason if cooldown or uncertain else 'NONE', 'reset_at': reset_at if cooldown else None}
             self._pool_event(directory, state, 'FINISHED')
 
     def reconcile(self, run_id, *, actor, reason, evidence):
@@ -495,6 +670,9 @@ class Run:
         if current_subject is None: current_subject = self.subject.probe()
         if current_subject['fingerprint'] != self.subject['fingerprint']:
             result, reason = 'NO_RESULT', 'INPUT_CHANGED'
+        invocation = self.start['invocation']
+        if isinstance(invocation, Invocation) and invocation.probe()['fingerprint'] != invocation['fingerprint']:
+            result, reason = 'NO_RESULT', 'INPUT_CHANGED'
         if result == 'CHECK_OK' and (execution != 'COMPLETED' or reason != 'NONE' or exit_code != 0):
             raise GuardError('INVALID_OUTPUT', 'Success requires completed validated evidence')
         if self.start['command_kind'] in {'focused', 'full'} and result == 'CHECK_OK' and (type(count) is not int or count < 1):
@@ -505,6 +683,8 @@ class Run:
                     or not isinstance(review['findings'], list) or len(review['findings']) > 128):
                 raise GuardError('INVALID_OUTPUT', 'Review metadata is malformed')
             for finding in review['findings']: safe_label(finding)
+            if result == 'CHECK_OK' and (review['verdict'] != 'ACCEPT' or review['findings']):
+                raise GuardError('INVALID_OUTPUT', 'Blocked review findings cannot be successful evidence')
         value = {'schema': SCHEMA, 'kind': 'final', 'run_id': self.run_id, 'evidence': 'EXECUTED',
                  'subject': dict(self.subject), 'invocation': self.start['invocation'],
                  'started_at': self.start['started_at'], 'ended_at': datetime.now(timezone.utc).isoformat(),
@@ -514,7 +694,10 @@ class Run:
         with self.store._lock():
             self.store.load_ref(self.start_ref)
             sha = self.store._publish(self.store._run_directory(self.run_id), 'final.json', value)
-        return {'run_id': self.run_id, 'record': 'final', 'sha256': sha}
+            reference = {'run_id': self.run_id, 'record': 'final', 'sha256': sha}
+            self.store._publish(self.store._run_directory(self.run_id), 'completion.json',
+                                {'schema': SCHEMA, 'reference': reference})
+        return reference
 
 
 def command_result(adapter, code, stdout, stderr='', success_exit=None):
@@ -528,6 +711,8 @@ def command_result(adapter, code, stdout, stderr='', success_exit=None):
             skipped = re.search(r'skipped=(\d+)', terminal.group(2) or '')
             count = int(found.group(1)) - (int(skipped.group(1)) if skipped else 0)
             outcome = terminal.group(1)
+            if re.search(r'errors=[1-9][0-9]*', terminal.group(2) or ''):
+                return 'NO_RESULT', 'UNKNOWN', count
     elif adapter == 'pytest':
         passed = re.search(r'(\d+) passed', text)
         failed = re.search(r'(\d+) failed', text)
@@ -536,15 +721,20 @@ def command_result(adapter, code, stdout, stderr='', success_exit=None):
             count += int(failed.group(1)) if failed else 0
             outcome = 'OK' if code == 0 and passed and not failed else 'FAILED'
     elif adapter == 'go-json':
-        completed = set(); failed = False
+        completed, failed_tests, failed_packages = set(), set(), set()
         try:
             for line in text.splitlines():
                 if not line.strip(): continue
                 event = json.loads(line)
-                if event.get('Action') == 'pass' and event.get('Test'):
+                if event.get('Action') in {'pass', 'fail'} and event.get('Test'):
                     completed.add((event.get('Package'), event['Test']))
-                if event.get('Action') == 'fail': failed = True
-            count, outcome = len(completed), 'FAILED' if failed else 'OK'
+                    if event['Action'] == 'fail': failed_tests.add(event.get('Package'))
+                elif event.get('Action') in {'fail', 'build-fail'}:
+                    failed_packages.add(event.get('Package'))
+            count = len(completed)
+            if failed_packages - failed_tests:
+                return 'NO_RESULT', 'UNKNOWN', count
+            outcome = 'FAILED' if failed_tests else 'OK'
         except (ValueError, AttributeError):
             pass
     elif adapter == 'command' and type(success_exit) is int:
@@ -592,9 +782,10 @@ def main():
     for part in (reconcile, ack):
         for flag in ('actor', 'reason', 'evidence'): part.add_argument('--' + flag, required=True)
     args = parser.parse_args()
+    run = None
     try:
         store = UsageStore(args.state_dir)
-        if args.action == 'inspect': value = store.load_ref(args.reference)
+        if args.action == 'inspect': value = store.inspect(args.reference)
         elif args.action == 'reconcile':
             store.reconcile(args.run, actor=args.actor, reason=args.reason, evidence=args.evidence)
             value = {'execution': 'UNKNOWN', 'result': 'NO_RESULT', 'manual_reconciliation': args.run}
@@ -603,22 +794,27 @@ def main():
             value = {'availability_acknowledged': True, 'result': 'NO_RESULT'}
         else:
             manifest = load_manifest(args.manifest)
-            subject = capture_subject(args.repo, manifest)
+            subject = capture_subject(args.repo, args.manifest)
             if args.action == 'gate': value = store.check_gate(subject, args.reference)
             else:
                 command = args.command[1:] if args.command[:1] == ['--'] else args.command
                 if not command: raise GuardError('INVALID_OUTPUT', 'A command is required')
+                if args.adapter == 'command' and args.success_exit != 0:
+                    raise GuardError('INVALID_OUTPUT', 'Non-test commands require the explicit supported --success-exit 0 predicate')
                 public = manifest.get('public_arguments') is True
                 declared = command if public else ['opaque-command', manifest.get('command_revision', 'unknown')]
-                invocation = invocation_identity(subject, purpose=args.purpose, argv=declared, cwd=args.repo,
+                invocation = invocation_identity(subject, purpose=args.purpose,
+                                                 argv=['guard-contract', args.kind, args.adapter, str(args.success_exit), *declared], cwd=args.repo,
                                                  toolchain=manifest.get('toolchain'), environment=manifest.get('environment'),
-                                                 reusable=public and bool(manifest.get('toolchain')))
+                                                 reusable=public and bool(manifest.get('toolchain')),
+                                                 execution_executable=command[0])
                 if args.action == 'reuse': value = store.reuse(subject, invocation, args.reference)
                 else:
                     run = store.begin(subject, invocation, owner=args.owner, label=args.label,
                                       timeout=args.timeout, kind=args.kind, repeat_reason=args.repeat_reason,
                                       aggregate_timeout=args.aggregate_timeout, gate=args.gate,
                                       ungated_reason=args.ungated_reason, minimum_bytes=args.minimum_free_bytes)
+                    print(json.dumps({'event': 'START', 'reference': run.start_ref}, sort_keys=True), file=sys.stderr, flush=True)
                     try:
                         completed = run_process(command, cwd=args.repo, timeout=run.timeout)
                         result, reason, count = command_result(args.adapter, completed.returncode,
@@ -636,7 +832,11 @@ def main():
         return 0 if value.get('result') == 'CHECK_OK' or args.action in {'inspect', 'reuse', 'reconcile', 'ack-pool', 'gate'} else 3
     except (GuardError, OSError, ValueError, TypeError, UnicodeError) as error:
         facts = {'reason': error.reason, 'reference': error.reference} if isinstance(error, GuardError) else {'reason': 'UNKNOWN'}
-        print(json.dumps({'execution': 'NOT_STARTED', 'result': 'NO_RESULT', **facts}, sort_keys=True))
+        if run is not None and facts.get('reference') is None:
+            facts['reference'] = run.start_ref
+        print(json.dumps({'execution': 'UNKNOWN' if run is not None else 'NOT_STARTED', 'result': 'NO_RESULT',
+                          'message': error.message if isinstance(error, GuardError) else 'Guard state or input could not be verified',
+                          **facts}, sort_keys=True))
         return 2
 
 
