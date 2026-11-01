@@ -2,17 +2,19 @@
 """Merge a reviewed feature commit into the original clean checkout, with checks."""
 
 import argparse
+import hashlib
 import json
 import os
+import secrets
 import selectors
 import shlex
+import stat
 import subprocess
 import sys
 import time
-from functools import partial
 from pathlib import Path
 
-from git_safety import git_environment, require_safe_source
+from git_safety import _bounded_git, git_environment, require_safe_source
 from process import cleanup_discarded, run as run_process
 
 
@@ -179,6 +181,12 @@ def run_git(repo, *args, timeout=600):
                env=git_environment(allow_hooks=True, preserve_identity=True))
 
 
+def run_git_discard(repo, *args, timeout=600):
+    # Merge drivers and hooks are repository code. Never retain their output.
+    return run(repo, ["git", *args], timeout=timeout, discard_output=True,
+               env=git_environment(allow_hooks=True, preserve_identity=True))
+
+
 def safe_source(repo, timeout, *, allow_unmerged=False):
     try:
         require_safe_source(repo, git_environment(), timeout=min(timeout, INDEX_MAX_SECONDS),
@@ -189,26 +197,6 @@ def safe_source(repo, timeout, *, allow_unmerged=False):
 
 def report(status, message, **extra):
     print(json.dumps({"status": status, "message": message, **extra}))
-
-
-def abort_merge(repo, message, *, timeout=600, **extra):
-    try:
-        safe_source(repo, timeout, allow_unmerged=True)
-    except IndexInspectionError:
-        report("BLOCKED_LOCAL", message + "; source Git state is unsafe or unverifiable; inspect merge without automatic abort",
-               merge_aborted=False, **extra)
-        return 3
-    try:
-        result = run_git(repo, "merge", "--abort", timeout=timeout)
-        aborted = result.returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
-        aborted = False
-    if not aborted:
-        message += "; merge abort failed; inspect the checkout before retrying"
-    else:
-        message += "; source merge aborted"
-    report("BLOCKED_LOCAL", message, merge_aborted=aborted, **extra)
-    return 3
 
 
 def approved_check(argv):
@@ -266,149 +254,389 @@ def main():
     if not all(approved_prepare(argv) for argv in preparations) or not all(approved_check(argv) for argv in checks):
         report("BLOCKED_POLICY", "Verification command is outside the approved test/build set")
         return 2
-    return integrate(args, preparations, checks)
+    return integrate_scratch(args, preparations, checks)
 
 
-def integrate(args, preparations, checks):
+def scratch_journal_root():
+    parent = Path.home() / '.agent-harness'
+    root = parent / 'delivery-scratch'
+    for path in (parent, root):
+        if path.is_symlink():
+            raise OSError('private scratch path is a symlink')
+        path.mkdir(mode=0o700, exist_ok=True)
+        if not path.is_dir() or stat.S_IMODE(path.stat().st_mode) != 0o700:
+            raise OSError('private scratch path is not owner-only')
+    return root
+
+
+def journal_key(repo, branch, base, source_branch, source):
+    payload = '\0'.join((str(repo), branch, base, source_branch, source)).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def write_journal(directory, record, *, first=False):
+    """Write only bounded metadata; fsync before any original-checkout apply."""
+    path = directory / 'journal.json'
+    data = (json.dumps(record, sort_keys=True, separators=(',', ':')) + '\n').encode()
+    if len(data) > 8192:
+        raise OSError('scratch journal exceeded size limit')
+    temporary = directory / ('.journal-' + secrets.token_hex(8))
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if first:
+            os.link(temporary, path, follow_symlinks=False)
+        else:
+            if path.is_symlink() or not path.is_file():
+                raise OSError('scratch journal changed')
+            os.replace(temporary, path)
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def reserve_scratch(repo, branch, base, source_branch, source):
+    root = scratch_journal_root()
+    key = journal_key(repo, branch, base, source_branch, source)
+    directory = root / key
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        return directory, None
+    scratch = directory / 'worktree'
+    record = {'schema': 1, 'phase': 'started', 'original': str(repo), 'branch': branch,
+              'base': base, 'source_branch': source_branch, 'source': source,
+              'scratch': str(scratch), 'key': key}
+    write_journal(directory, record, first=True)
+    return directory, record
+
+
+def observed_head(repo):
+    try:
+        result = inspect_git(repo, 'rev-parse', 'HEAD', timeout=30)
+        return result.stdout.strip() if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def scratch_failure(repo, scratch, journal, message, *, phase, merge_aborted=None,
+                    candidate=None, recovery_ref=None, original_head=None,
+                    status='BLOCKED_LOCAL', exit_code=None, command=None):
+    details = {'phase': phase, 'scratch': str(scratch), 'journal': str(journal),
+               'recovery_required': True}
+    if merge_aborted is not None:
+        details['merge_aborted'] = merge_aborted
+    if candidate:
+        details['candidate'] = candidate
+    if recovery_ref:
+        details['recovery_ref'] = recovery_ref
+    if original_head:
+        details['head'] = original_head
+    if exit_code is not None:
+        details['exit_code'] = exit_code
+    if command is not None:
+        details[phase] = command
+    report(status, message, **details)
+    return 3
+
+
+def scratch_abort(repo, scratch, journal, message, *, phase, exit_code=None,
+                  command=None, timeout=30):
+    # A check can install a local filter/driver. Refuse to let Git's abort
+    # execute it in the scratch checkout when the source guard cannot prove it safe.
+    try:
+        safe_source(scratch, timeout, allow_unmerged=True)
+    except IndexInspectionError:
+        return scratch_failure(repo, scratch, journal,
+                               message + '; scratch Git state is unsafe for automatic abort',
+                               phase=phase, merge_aborted=False, exit_code=exit_code,
+                               command=command, original_head=observed_head(repo))
+    try:
+        result = run_git_discard(scratch, 'merge', '--abort', timeout=timeout)
+        aborted = result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        aborted = False
+    if not aborted:
+        message += '; scratch abort failed, inspect retained worktree'
+    return scratch_failure(repo, scratch, journal, message, phase=phase,
+                           merge_aborted=aborted, exit_code=exit_code, command=command,
+                           original_head=observed_head(repo))
+
+
+def checked_original(repo, branch, base, timeout):
+    safe_source(repo, timeout)
+    index_unflagged(repo, timeout)
+    current_branch = inspect_git(repo, 'symbolic-ref', '--quiet', '--short', 'HEAD', timeout=timeout)
+    current_head = inspect_git(repo, 'rev-parse', 'HEAD', timeout=timeout)
+    status = inspect_git(repo, 'status', '--porcelain', '--untracked-files=all',
+                         '--ignore-submodules=none', timeout=timeout)
+    return (current_branch.returncode == 0 and current_branch.stdout.strip() == branch
+            and current_head.returncode == 0 and current_head.stdout.strip() == base
+            and status.returncode == 0 and not status.stdout.strip())
+
+
+def scratch_has_extra_files(scratch, timeout):
+    for flags in (['ls-files', '--others', '--exclude-standard', '-z'],
+                  ['ls-files', '--others', '--ignored', '--exclude-standard', '-z']):
+        code, data = _bounded_git(scratch, flags, git_environment(),
+                                  timeout=min(timeout, INDEX_MAX_SECONDS), limit=INDEX_MAX_BYTES)
+        if code or data:
+            return True
+    return False
+
+
+def scratch_is_clean_for_cleanup(scratch, candidate, timeout):
+    """Do not let status config or hidden index flags hide scratch data."""
+    safe_source(scratch, timeout)
+    index_unflagged(scratch, timeout)
+    head = inspect_git(scratch, 'rev-parse', 'HEAD', timeout=timeout)
+    status = inspect_git(scratch, 'status', '--porcelain', '--untracked-files=all',
+                         '--ignore-submodules=none', timeout=timeout)
+    return (head.returncode == 0 and head.stdout.strip() == candidate
+            and status.returncode == 0 and not status.stdout.strip()
+            and not scratch_has_extra_files(scratch, timeout))
+
+
+def scratch_identity(scratch, expected):
+    observed = os.stat(scratch, follow_symlinks=False)
+    return (stat.S_ISDIR(observed.st_mode)
+            and (observed.st_dev, observed.st_ino) == (expected.st_dev, expected.st_ino))
+
+
+def integrate_scratch(args, preparations, checks):
     if any(name.startswith('GIT_') and name not in ALLOWED_GIT_ENV for name in os.environ):
         report('BLOCKED_POLICY', 'Inherited Git routing or configuration override is unsupported')
         return 2
     repo = args.repo.resolve()
-    git = partial(run_git, timeout=args.timeout)
-    inspect = partial(inspect_git, timeout=args.timeout)
-    abort = partial(abort_merge, timeout=args.timeout)
-    merge_attempted = False
-    commit_returned = False
+    directory = None
+    phase = 'preflight'
+    applied_candidate = None
     try:
-        toplevel = git(repo, "rev-parse", "--show-toplevel") if repo.is_dir() else None
-        # Checks run with cwd=repo, so a subdirectory would merge first and then fail them misleadingly.
+        toplevel = inspect_git(repo, 'rev-parse', '--show-toplevel', timeout=args.timeout) if repo.is_dir() else None
         if toplevel is None or toplevel.returncode or Path(toplevel.stdout.strip()).resolve() != repo:
-            report("BLOCKED_POLICY", "Original checkout must be the root of a Git worktree")
+            report('BLOCKED_POLICY', 'Original checkout must be the root of a Git worktree')
             return 2
-        safe_source(repo, args.timeout)
-        branch = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
-        head = git(repo, "rev-parse", "HEAD")
-        index_unflagged(repo, args.timeout)
-        status = inspect(repo, "status", "--porcelain", "--untracked-files=all",
-                         "--ignore-submodules=none")
-        if branch.returncode or head.returncode or status.returncode or branch.stdout.strip() != args.original_branch or head.stdout.strip() != args.expected_head or status.stdout.strip():
-            report("BLOCKED_LOCAL", "Original checkout branch, HEAD, or cleanliness changed; no merge attempted")
+        if args.source.startswith('-') or inspect_git(repo, 'check-ref-format', '--branch', args.source,
+                                                       timeout=args.timeout).returncode:
+            report('BLOCKED_POLICY', 'Source must be a valid local feature branch')
+            return 2
+        # An unresolved attempt takes precedence even if its candidate already
+        # advanced original HEAD or its source branch moved. Never silently
+        # create a second merge/check.
+        key = journal_key(repo, args.original_branch, args.expected_head,
+                          args.source, args.expected_source_head)
+        existing = scratch_journal_root() / key
+        if os.path.lexists(existing):
+            report('RECOVERY_REQUIRED', 'Existing scratch journal requires inspection before retry',
+                   journal=str(existing / 'journal.json'), scratch=str(existing / 'worktree'),
+                   head=observed_head(repo))
             return 3
-        # Resolve an actual local branch, not an arbitrary revision supplied through --source.
-        if args.source.startswith("-") or git(repo, "check-ref-format", "--branch", args.source).returncode:
-            report("BLOCKED_POLICY", "Source must be a valid local feature branch")
+        source = inspect_git(repo, 'rev-parse', '--verify', f'refs/heads/{args.source}^{{commit}}',
+                             timeout=args.timeout)
+        if (source.returncode or source.stdout.strip() != args.expected_source_head
+                or source.stdout.strip() == args.expected_head or args.source == args.original_branch):
+            report('BLOCKED_POLICY', 'Source commit or branch is invalid')
             return 2
-        source = git(repo, "rev-parse", "--verify", f"refs/heads/{args.source}^{{commit}}")
-        if source.returncode or source.stdout.strip() != args.expected_source_head or source.stdout.strip() == head.stdout.strip() or args.source == args.original_branch:
-            report("BLOCKED_POLICY", "Source commit or branch is invalid")
-            return 2
-        ancestor = git(repo, "merge-base", "--is-ancestor", source.stdout.strip(), "HEAD")
-        if ancestor.returncode == 0:
-            report("ALREADY_INTEGRATED", "Source is already in the original checkout", head=head.stdout.strip())
+        if not checked_original(repo, args.original_branch, args.expected_head, args.timeout):
+            report('BLOCKED_LOCAL', 'Original checkout branch, HEAD, or cleanliness changed; no merge attempted')
+            return 3
+        already = inspect_git(repo, 'merge-base', '--is-ancestor', args.expected_source_head,
+                              args.expected_head, timeout=args.timeout)
+        if already.returncode == 0:
+            report('ALREADY_INTEGRATED', 'Source is already in original checkout',
+                   head=args.expected_head)
             return 0
-        merge_attempted = True
-        merge = git(repo, "merge", "--no-ff", "--no-commit", source.stdout.strip())
-        if merge.returncode:
-            return abort(repo, "Merge failed", phase="merge", exit_code=merge.returncode)
-        intended = git(repo, "write-tree")
+        if already.returncode != 1:
+            report('BLOCKED_LOCAL', 'Source ancestry could not be verified; no merge attempted')
+            return 3
+        directory, record = reserve_scratch(repo, args.original_branch, args.expected_head,
+                                            args.source, args.expected_source_head)
+        scratch = directory / 'worktree'
+        if record is None:
+            report('RECOVERY_REQUIRED', 'Existing scratch journal requires inspection before retry',
+                   journal=str(directory / 'journal.json'), scratch=str(scratch), head=args.expected_head)
+            return 3
+        phase = 'scratch'
+        # The journal exists before Git can run a merge driver, hook or test.
+        added = run_process(['git', '-C', str(repo), 'worktree', 'add', '--detach', str(scratch),
+                             args.expected_head], env=git_environment(), timeout=args.timeout,
+                            discard_output=True)
+        if added.returncode:
+            return scratch_failure(repo, scratch, directory / 'journal.json',
+                                   'Scratch worktree could not be created; inspect reservation',
+                                   phase='scratch', original_head=args.expected_head)
+        scratch_info = os.stat(scratch, follow_symlinks=False)
+        record.update({'phase': 'scratch', 'scratch_dev': scratch_info.st_dev,
+                       'scratch_ino': scratch_info.st_ino})
+        write_journal(directory, record)
+        phase = 'merge'
+        merged = run_git_discard(scratch, 'merge', '--no-ff', '--no-commit',
+                                 args.expected_source_head, timeout=args.timeout)
+        if merged.returncode:
+            return scratch_abort(repo, scratch, directory / 'journal.json', 'Scratch merge failed',
+                                 phase='merge', exit_code=merged.returncode)
+        intended = run_git(scratch, 'write-tree', timeout=args.timeout)
         if intended.returncode or not intended.stdout.strip():
-            return abort(repo, "Could not record intended merge tree")
+            return scratch_abort(repo, scratch, directory / 'journal.json',
+                                 'Scratch merge tree could not be recorded', phase='merge')
         intended_tree = intended.stdout.strip()
-        for kind, commands in (("prepare", preparations), ("check", checks)):
-            for argv in commands:
+        for kind, commands in (('prepare', preparations), ('check', checks)):
+            for command in commands:
+                phase = kind
                 try:
-                    result = run(repo, argv, timeout=args.timeout, discard_output=True)
-                except subprocess.TimeoutExpired as error:
+                    result = run(scratch, command, timeout=args.timeout, discard_output=True)
+                except (OSError, subprocess.TimeoutExpired) as error:
                     if getattr(error, 'cleanup_incomplete', False):
-                        report("BLOCKED_LOCAL", f"{kind.capitalize()} cleanup incomplete; inspect processes and checkout",
-                               phase=kind, merge_aborted=False, **{kind: argv})
-                        return 3
-                    return abort(repo, f"{kind.capitalize()} exceeded {args.timeout} seconds", phase=kind,
-                                 **{kind: argv})
-                except OSError as error:
-                    if getattr(error, 'cleanup_incomplete', False):
-                        report("BLOCKED_LOCAL", f"{kind.capitalize()} cleanup incomplete; inspect processes and checkout",
-                               phase=kind, merge_aborted=False, **{kind: argv})
-                        return 3
-                    return abort(repo, f"{kind.capitalize()} could not start", phase=kind,
-                                 **{kind: argv})
+                        return scratch_failure(repo, scratch, directory / 'journal.json',
+                                               f'Scratch {kind} cleanup incomplete', phase=kind,
+                                               merge_aborted=False, original_head=observed_head(repo),
+                                               command=command)
+                    reason = (f'Scratch {kind} exceeded {args.timeout} seconds'
+                              if isinstance(error, subprocess.TimeoutExpired)
+                              else f'Scratch {kind} could not start')
+                    return scratch_abort(repo, scratch, directory / 'journal.json',
+                                         reason, phase=kind, command=command, timeout=args.timeout)
                 if result.returncode:
-                    # Child output can contain arbitrary credentials. The approved argv
-                    # and exit code tell the user which command to run locally.
-                    return abort(repo, f"{kind.capitalize()} failed", phase=kind,
-                                 exit_code=result.returncode, **{kind: argv})
-        safe_source(repo, args.timeout)
-        index_unflagged(repo, args.timeout)
-        checked_tree = git(repo, "write-tree")
-        unstaged = inspect(repo, "diff", "--quiet", "--exit-code", "--ignore-submodules=none")
-        untracked = inspect(repo, "ls-files", "--others", "--exclude-standard")
+                    return scratch_abort(repo, scratch, directory / 'journal.json',
+                                         f'Scratch {kind} failed', phase=kind,
+                                         exit_code=result.returncode, command=command,
+                                         timeout=args.timeout)
+        try:
+            safe_source(scratch, args.timeout)
+            index_unflagged(scratch, args.timeout)
+        except IndexInspectionError:
+            return scratch_failure(repo, scratch, directory / 'journal.json',
+                                   'Scratch index could not be verified safely', phase='check',
+                                   merge_aborted=False, original_head=observed_head(repo))
+        checked_tree = run_git(scratch, 'write-tree', timeout=args.timeout)
+        unstaged = inspect_git(scratch, 'diff', '--quiet', '--exit-code', '--ignore-submodules=none',
+                               timeout=args.timeout)
+        untracked = inspect_git(scratch, 'ls-files', '--others', '--exclude-standard', timeout=args.timeout)
         if (checked_tree.returncode or checked_tree.stdout.strip() != intended_tree
                 or unstaged.returncode or untracked.returncode or untracked.stdout.strip()):
-            return abort(repo, "Preparation or checks changed the intended merge; inspect and rerun from a clean checkout")
-        before_commit_branch = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
-        if before_commit_branch.returncode or before_commit_branch.stdout.strip() != args.original_branch:
-            return abort(repo, "Original branch changed during checks")
-        committed = git(repo, "commit", "-m", f"Merge {args.source} into {args.original_branch}")
+            return scratch_abort(repo, scratch, directory / 'journal.json',
+                                 'Scratch checks changed intended merge tree', phase='check',
+                                 timeout=args.timeout)
+        phase = 'commit'
+        committed = run_git_discard(scratch, 'commit', '-m',
+                                    f'Merge {args.source} into {args.original_branch}',
+                                    timeout=args.timeout)
         if committed.returncode:
-            return abort(repo, "Merge commit failed", phase="commit", exit_code=committed.returncode)
-        commit_returned = True
-        final = git(repo, "rev-parse", "HEAD")
-        if final.returncode or not final.stdout.strip():
-            report("BLOCKED_LOCAL", "Merge commit returned success but final HEAD could not be read; inspect the checkout")
-            return 3
-        final_head = final.stdout.strip()
-        parents = git(repo, "rev-list", "--parents", "-n", "1", "HEAD")
-        if parents.returncode or parents.stdout.split() != [final_head, head.stdout.strip(), source.stdout.strip()]:
-            report("BLOCKED_LOCAL", "Final HEAD is not the verified two-parent merge; inspect the checkout",
-                   head=final_head, merge_aborted=False)
-            return 3
-        final_tree = git(repo, "rev-parse", "HEAD^{tree}")
-        if final_tree.returncode or final_tree.stdout.strip() != intended_tree:
-            report("BLOCKED_LOCAL", "Merge commit contains changes outside the verified merge tree; inspect the checkout",
-                   head=final_head, merge_aborted=False)
-            return 3
-        final_branch = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
-        original_ref = git(repo, "rev-parse", "--verify", f"refs/heads/{args.original_branch}")
-        if (final_branch.returncode or final_branch.stdout.strip() != args.original_branch
-                or original_ref.returncode or original_ref.stdout.strip() != final_head):
-            report("BLOCKED_LOCAL", "Merge commit is not on the original branch; inspect branch refs",
-                   head=final_head, merge_aborted=False)
-            return 3
-        safe_source(repo, args.timeout)
-        index_unflagged(repo, args.timeout)
-        final_status = inspect(repo, "status", "--porcelain", "--untracked-files=all",
-                               "--ignore-submodules=none")
-        if final_status.returncode or final_status.stdout.strip():
-            report("BLOCKED_LOCAL", "Merge commit exists but final checkout is dirty or could not be inspected",
-                   head=final_head, merge_aborted=False)
-            return 3
-        report("INTEGRATED", "Verified feature merged into original checkout", original_branch=args.original_branch, source=args.source, head=final_head, preparations=args.prepare, checks=args.check)
+            return scratch_abort(repo, scratch, directory / 'journal.json',
+                                 'Scratch merge commit failed', phase='commit',
+                                 exit_code=committed.returncode, timeout=args.timeout)
+        candidate = inspect_git(scratch, 'rev-parse', 'HEAD', timeout=args.timeout).stdout.strip()
+        parents = inspect_git(scratch, 'rev-list', '--parents', '-n', '1', 'HEAD', timeout=args.timeout)
+        tree = inspect_git(scratch, 'rev-parse', 'HEAD^{tree}', timeout=args.timeout)
+        if (parents.returncode or parents.stdout.split() != [candidate, args.expected_head, args.expected_source_head]
+                or tree.returncode or tree.stdout.strip() != intended_tree):
+            return scratch_failure(repo, scratch, directory / 'journal.json',
+                                   'Scratch candidate differs from verified merge tree or parents',
+                                   phase='candidate', merge_aborted=False, candidate=candidate,
+                                   original_head=observed_head(repo))
+        ref = f'refs/agent-harness/delivery/{record["key"]}'
+        zeros = '0' * len(candidate)
+        pinned = run_git(repo, 'update-ref', ref, candidate, zeros, timeout=args.timeout)
+        if pinned.returncode:
+            return scratch_failure(repo, scratch, directory / 'journal.json',
+                                   'Candidate ref could not be pinned', phase='candidate',
+                                   candidate=candidate, original_head=args.expected_head)
+        record.update({'phase': 'candidate', 'candidate': candidate, 'tree': intended_tree, 'ref': ref})
+        write_journal(directory, record)
+        phase = 'apply'
+        if (not checked_original(repo, args.original_branch, args.expected_head, args.timeout)
+                or inspect_git(repo, 'rev-parse', '--verify', f'refs/heads/{args.source}',
+                               timeout=args.timeout).stdout.strip() != args.expected_source_head
+                or inspect_git(repo, 'rev-parse', ref, timeout=args.timeout).stdout.strip() != candidate
+                or not scratch_identity(scratch, scratch_info)):
+            return scratch_failure(repo, scratch, directory / 'journal.json',
+                                   'Original or candidate changed before apply', phase='apply',
+                                   candidate=candidate, recovery_ref=ref,
+                                   original_head=inspect_git(repo, 'rev-parse', 'HEAD', timeout=30).stdout.strip())
+        advanced = run_git_discard(repo, 'merge', '--ff-only', '--no-overwrite-ignore',
+                                   '--no-autostash', candidate, timeout=args.timeout)
+        observed = inspect_git(repo, 'rev-parse', 'HEAD', timeout=30).stdout.strip()
+        if advanced.returncode or observed != candidate:
+            return scratch_failure(repo, scratch, directory / 'journal.json',
+                                   'Protected fast-forward refused or changed state; inspect checkout',
+                                   phase='apply', candidate=candidate, recovery_ref=ref,
+                                   original_head=observed)
+        applied_candidate = candidate
+        phase = 'verify'
+        if not checked_original(repo, args.original_branch, candidate, args.timeout):
+            return scratch_failure(repo, scratch, directory / 'journal.json',
+                                   'Original checkout advanced but is dirty or unverifiable',
+                                   phase='verify', candidate=candidate, recovery_ref=ref,
+                                   original_head=observed, status='DELIVERED_CHECK_FAILED')
+        for kind, commands in (('prepare', preparations), ('check', checks)):
+            for command in commands:
+                phase = kind
+                try:
+                    result = run(repo, command, timeout=args.timeout, discard_output=True)
+                except (OSError, subprocess.TimeoutExpired):
+                    return scratch_failure(repo, scratch, directory / 'journal.json',
+                                           'Delivered checkout check could not complete; HEAD advanced',
+                                           phase=kind, candidate=candidate, recovery_ref=ref,
+                                           original_head=observed_head(repo),
+                                           status='DELIVERED_CHECK_FAILED', command=command)
+                if result.returncode:
+                    return scratch_failure(repo, scratch, directory / 'journal.json',
+                                           'Delivered checkout check failed; HEAD advanced',
+                                           phase=kind, candidate=candidate, recovery_ref=ref,
+                                           original_head=observed_head(repo),
+                                           status='DELIVERED_CHECK_FAILED', exit_code=result.returncode,
+                                           command=command)
+        if not checked_original(repo, args.original_branch, candidate, args.timeout):
+            return scratch_failure(repo, scratch, directory / 'journal.json',
+                                   'Delivered checkout changed during checks; HEAD advanced',
+                                   phase='verify', candidate=candidate, recovery_ref=ref,
+                                   original_head=observed_head(repo),
+                                   status='DELIVERED_CHECK_FAILED')
+        phase = 'finalize'
+        record['phase'] = 'delivered'
+        write_journal(directory, record)
+        cleanup_pending = True
+        try:
+            if (scratch_identity(scratch, scratch_info)
+                    and scratch_is_clean_for_cleanup(scratch, candidate, args.timeout)):
+                removed = run_process(['git', '-C', str(repo), 'worktree', 'remove', str(scratch)],
+                                      env=git_environment(), timeout=args.timeout, discard_output=True)
+                if removed.returncode == 0:
+                    deleted = run_git(repo, 'update-ref', '-d', ref, candidate, timeout=args.timeout)
+                    cleanup_pending = deleted.returncode != 0
+        except (IndexInspectionError, OSError, subprocess.TimeoutExpired):
+            pass  # Keep the candidate and scratch for later inspection.
+        report('INTEGRATED', 'Verified feature merged into original checkout',
+               original_branch=args.original_branch, source=args.source, head=candidate,
+               preparations=args.prepare, checks=args.check, cleanup_pending=cleanup_pending,
+               journal=str(directory / 'journal.json'))
         return 0
-    except IndexInspectionError as error:
-        message = 'Index could not be verified'
-        if error.cleanup_incomplete:
-            report('BLOCKED_LOCAL', message + '; inspection cleanup incomplete; inspect processes and checkout',
-                   merge_aborted=False)
+    except (IndexInspectionError, OSError, subprocess.TimeoutExpired) as error:
+        message = ('Git inspection could not complete' if isinstance(error, IndexInspectionError)
+                   else 'Delivery operation could not complete')
+        if getattr(error, 'cleanup_incomplete', False):
+            message += '; child process cleanup is incomplete'
+        if directory is None:
+            report('BLOCKED_LOCAL', message + '; no merge attempted', head=observed_head(repo))
             return 3
-        if commit_returned:
-            report('BLOCKED_LOCAL', message + '; merge commit may exist; inspect HEAD and checkout',
-                   merge_aborted=False)
-            return 3
-        if merge_attempted:
-            return abort(repo, message)
-        report('BLOCKED_LOCAL', message + '; no merge attempted')
-        return 3
-    except (subprocess.TimeoutExpired, OSError) as error:
-        message = (f"Git command exceeded {args.timeout} seconds" if isinstance(error, subprocess.TimeoutExpired)
-                   else "Git command could not start")
-        if commit_returned:
-            report("BLOCKED_LOCAL", message + "; merge commit may exist; inspect HEAD and checkout",
-                   merge_aborted=False)
-            return 3
-        if merge_attempted:
-            return abort(repo, message)
-        report("BLOCKED_LOCAL", message + "; no merge attempted")
-        return 3
+        # The journal reserved before scratch work prevents an automatic
+        # second merge after an uncertain timeout or interrupted hook.
+        return scratch_failure(repo, directory / 'worktree', directory / 'journal.json',
+                               message, phase=phase, merge_aborted=False,
+                               original_head=observed_head(repo),
+                               status=('DELIVERED_CHECK_FAILED' if applied_candidate and phase == 'verify'
+                                       else 'RECOVERY_REQUIRED' if applied_candidate else 'BLOCKED_LOCAL'),
+                               candidate=applied_candidate)
 
 
 if __name__ == "__main__":

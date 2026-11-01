@@ -384,6 +384,13 @@ class DeliveryHelpers(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        # The delivery helper retains recovery journals under HOME. Keep test
+        # reservations and worktrees inside this disposable fixture.
+        self.test_home = self.root / 'home'
+        self.test_home.mkdir()
+        home_override = patch.dict(os.environ, {'HOME': str(self.test_home)})
+        home_override.start()
+        self.addCleanup(home_override.stop)
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         cmd('git', 'init', '-q', '-b', 'main', str(self.repo))
@@ -1187,7 +1194,8 @@ class DeliveryHelpers(unittest.TestCase):
                          (3, 'BLOCKED_LOCAL', False), p.stdout + p.stderr)
         self.assertFalse(marker.exists(), 'merge abort executed newly configured local filter')
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), head)
-        self.assertEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD', cwd=self.repo).stdout.strip(),
+        self.assertEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD',
+                             cwd=Path(data['scratch'])).stdout.strip(),
                          self.feature_head)
 
     def test_failed_check_filter_blocks_unsafe_abort(self):
@@ -1301,6 +1309,12 @@ class DeliveryHelpers(unittest.TestCase):
         env = self.git_fault_env(['commit', '-m', f'Merge {private_branch} into main'],
                                  'os.write(1, b"synthetic_commit_stdout")\n'
                                  'os.write(2, b"synthetic_commit_stderr")\nsys.exit(7)')
+        # The previous failed merge has a durable recovery journal. Use a
+        # separate disposable HOME to exercise the commit fault as a new task,
+        # rather than bypassing that journal in production.
+        commit_home = self.root / 'commit-fault-home'
+        commit_home.mkdir()
+        env['HOME'] = str(commit_home)
         p = subprocess.run(argv, text=True, capture_output=True, env=env,
                            timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(p.stdout)
@@ -1357,7 +1371,8 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(data['phase'], 'check')
         self.assertIs(data['merge_aborted'], False)
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
-        self.assertEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD', cwd=self.repo).stdout.strip(),
+        self.assertEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD',
+                             cwd=Path(data['scratch'])).stdout.strip(),
                          self.feature_head)
 
     def add_feature_test(self, body=PASSING_CHECK):
@@ -1377,6 +1392,197 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
         self.assertFalse(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
         self.assertNotEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD', cwd=self.repo, check=False).returncode, 0)
+
+    def test_integration_preserves_ignored_user_file_at_new_tracked_path(self):
+        (self.repo / '.gitignore').write_text('cache.txt\n')
+        cmd('git', 'add', '.gitignore', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'ignore local cache', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        self.add_feature_test()
+        (self.feature / 'cache.txt').write_text('tracked source\n')
+        cmd('git', 'add', 'cache.txt', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'track cache', cwd=self.feature)
+        self.feature_head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        (self.repo / 'cache.txt').write_text('user ignored data\n')
+        self.assertFalse(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual((self.repo / 'cache.txt').read_text(), 'user ignored data\n')
+        self.assert_restored()
+
+    def test_integration_preserves_ignored_nested_user_file(self):
+        (self.repo / '.gitignore').write_text('out/\n')
+        cmd('git', 'add', '.gitignore', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'ignore local output', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        self.add_feature_test()
+        (self.feature / 'out').mkdir()
+        (self.feature / 'out' / 'report.txt').write_text('tracked source\n')
+        cmd('git', 'add', 'out/report.txt', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'track report', cwd=self.feature)
+        self.feature_head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        (self.repo / 'out').mkdir()
+        (self.repo / 'out' / 'report.txt').write_text('user ignored data\n')
+        self.assertFalse(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual((self.repo / 'out' / 'report.txt').read_text(), 'user ignored data\n')
+        self.assert_restored()
+
+    def test_integration_preserves_ignored_rename_destination(self):
+        (self.repo / '.gitignore').write_text('cache.txt\n')
+        cmd('git', 'add', '.gitignore', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'ignore local cache', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        self.add_feature_test()
+        cmd('git', 'mv', 'app.txt', 'cache.txt', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'rename app to cache', cwd=self.feature)
+        self.feature_head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        (self.repo / 'cache.txt').write_text('user ignored data\n')
+        self.assertFalse(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual((self.repo / 'cache.txt').read_text(), 'user ignored data\n')
+        self.assert_restored()
+
+    def test_integration_allows_tracked_file_replaced_by_directory(self):
+        self.add_feature_test()
+        cmd('git', 'rm', 'app.txt', cwd=self.feature)
+        (self.feature / 'app.txt').mkdir()
+        (self.feature / 'app.txt' / 'child.txt').write_text('verified child\n')
+        cmd('git', 'add', 'app.txt/child.txt', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'replace tracked file with directory', cwd=self.feature)
+        self.feature_head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'), result.stdout)
+        self.assertEqual((self.repo / 'app.txt' / 'child.txt').read_text(), 'verified child\n')
+
+    def test_integration_preserves_ignored_directory_rename_destination(self):
+        (self.repo / '.gitignore').write_text('b/new.txt\n')
+        (self.repo / 'a').mkdir()
+        (self.repo / 'a' / 'one.txt').write_text('one\n')
+        (self.repo / 'a' / 'two.txt').write_text('two\n')
+        cmd('git', 'add', '.gitignore', 'a', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'tracked directory and ignored destination', cwd=self.repo)
+        cmd('git', 'merge', '-q', 'main', cwd=self.feature)
+        self.add_feature_test()
+        (self.feature / 'a' / 'new.txt').write_text('tracked source\n')
+        cmd('git', 'add', 'a/new.txt', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'add inside directory', cwd=self.feature)
+        self.feature_head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        cmd('git', 'mv', 'a', 'b', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'rename directory', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        (self.repo / 'b' / 'new.txt').write_text('user ignored data\n')
+        # Force Git's directory-rename resolution to create the relocated path
+        # in scratch. The protected fast-forward must then refuse the collision.
+        cmd('git', 'config', 'merge.directoryRenames', 'true', cwd=self.repo)
+        self.assertFalse(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertEqual(data['phase'], 'apply', result.stdout)
+        self.assertTrue(data['recovery_required'])
+        self.assertTrue(Path(data['journal']).is_file())
+        self.assertTrue(data.get('candidate'))
+        self.assertTrue((self.repo / 'b' / 'new.txt').is_file(), 'ignored user file disappeared')
+        self.assertEqual((self.repo / 'b' / 'new.txt').read_text(), 'user ignored data\n')
+        self.assert_restored()
+
+    def test_already_integrated_source_returns_without_scratch_journal(self):
+        cmd('git', 'merge', '--ff-only', 'feat/app', cwd=self.repo)
+        (self.repo / 'later.txt').write_text('later main work\n')
+        cmd('git', 'add', 'later.txt', cwd=self.repo)
+        cmd('git', 'commit', '-qm', 'later main commit', cwd=self.repo)
+        self.base = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (0, 'ALREADY_INTEGRATED'), result.stdout)
+        self.assertFalse(list((self.test_home / '.agent-harness' / 'delivery-scratch').glob('*/journal.json')))
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+
+    def test_failed_scratch_retry_reports_recovery_even_after_source_moves(self):
+        self.add_feature_test('raise RuntimeError("fixture failure")\n')
+        original_args = self.integrate_args()
+        first = subprocess.run(original_args, text=True, capture_output=True,
+                               env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        first_data = json.loads(first.stdout)
+        self.assertEqual((first.returncode, first_data['status']), (3, 'BLOCKED_LOCAL'), first.stdout)
+        self.assertTrue(first_data['recovery_required'])
+        self.assertTrue(Path(first_data['journal']).is_file())
+        self.assert_restored()
+        (self.feature / 'later.txt').write_text('branch moved\n')
+        cmd('git', 'add', 'later.txt', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'advance source', cwd=self.feature)
+        second = subprocess.run(original_args, text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        second_data = json.loads(second.stdout)
+        self.assertEqual((second.returncode, second_data['status']), (3, 'RECOVERY_REQUIRED'), second.stdout)
+        self.assertEqual(second_data['journal'], first_data['journal'])
+        self.assert_restored()
+
+    def test_post_fast_forward_check_failure_reports_advanced_head_and_recovery(self):
+        self.add_feature_test('import unittest\nfrom pathlib import Path\n'
+                              'class Check(unittest.TestCase):\n'
+                              '    def test_location(self):\n'
+                              '        self.assertIn("delivery-scratch", str(Path.cwd()))\n')
+        original_args = self.integrate_args()
+        first = subprocess.run(original_args, text=True, capture_output=True,
+                               env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(first.stdout)
+        self.assertEqual((first.returncode, data['status']), (3, 'DELIVERED_CHECK_FAILED'), first.stdout)
+        self.assertEqual(data['phase'], 'check')
+        self.assertEqual(data['exit_code'], 1)
+        self.assertTrue(data['recovery_required'])
+        head = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        self.assertEqual(data['head'], head)
+        self.assertNotEqual(head, self.base)
+        self.assertEqual(cmd('git', 'rev-list', '--parents', '-n', '1', head,
+                             cwd=self.repo).stdout.split()[1:], [self.base, self.feature_head])
+        retry = subprocess.run(original_args, text=True, capture_output=True,
+                               env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual(json.loads(retry.stdout)['status'], 'RECOVERY_REQUIRED')
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), head)
+
+    def test_post_fast_forward_inspection_error_reports_advanced_head(self):
+        self.add_feature_test()
+        spec = importlib.util.spec_from_file_location('integration_after_fast_forward', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        real_check = module.checked_original
+        advanced_checks = []
+
+        def fail_only_after_apply(repo, branch, expected, timeout):
+            if expected != self.base:
+                advanced_checks.append(expected)
+                raise module.IndexInspectionError()
+            return real_check(repo, branch, expected, timeout)
+
+        with patch.object(module, 'checked_original', side_effect=fail_only_after_apply), \
+             patch.object(sys, 'argv', self.integrate_args()[1:]), \
+             patch('sys.stdout', new_callable=io.StringIO) as output, \
+             patch.dict(os.environ, isolated_env(), clear=True):
+            code = module.main()
+        data = json.loads(output.getvalue())
+        self.assertEqual(len(advanced_checks), 1, 'fault did not reach post-FF inspection')
+        self.assertEqual((code, data['status']), (3, 'DELIVERED_CHECK_FAILED'), output.getvalue())
+        self.assertTrue(data['recovery_required'])
+        self.assertEqual(data['phase'], 'verify')
+        self.assertEqual(data['head'], cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip())
+        self.assertEqual(data['head'], advanced_checks[0])
+        self.assertNotEqual(data['head'], self.base)
+        self.assertTrue(Path(data['journal']).is_file())
 
     def git_fault_env(self, arguments, action):
         """Inject a stall or error at one Git boundary; all other operations use real Git."""
@@ -1435,12 +1641,16 @@ class DeliveryHelpers(unittest.TestCase):
         self.add_feature_test()
         seen = self.root / 'head-read'
         env = self.git_fault_env(['rev-parse', 'HEAD'],
-                                 f'path = Path({str(seen)!r})\nif path.exists(): sys.exit(128)\npath.touch()')
+                                 f'path = Path({str(seen)!r})\n'
+                                 'count = int(path.read_text()) if path.exists() else 0\n'
+                                 'path.write_text(str(count + 1))\n'
+                                 'if count >= 2: sys.exit(128)')
         p = subprocess.run(self.integrate_args(), text=True, capture_output=True, env=env,
                            timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
-        self.assertEqual((p.returncode, json.loads(p.stdout)['status']), (3, 'BLOCKED_LOCAL'))
-        parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
-        self.assertEqual(parents[1:], [self.base, self.feature_head])
+        data = json.loads(p.stdout)
+        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertTrue(Path(data['journal']).is_file())
 
     def test_post_commit_hook_timeout_reports_committed_but_not_aborted(self):
         self.add_feature_test()
@@ -1455,8 +1665,8 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertTrue(marker.exists())
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'))
         self.assertIs(data['merge_aborted'], False)
-        parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
-        self.assertEqual(parents[1:], [self.base, self.feature_head])
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertTrue(Path(data['journal']).is_file())
 
     def test_merge_git_deadline_reports_failed_abort_when_no_merge_started(self):
         self.add_feature_test()
@@ -1467,7 +1677,7 @@ class DeliveryHelpers(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
             spec.loader.exec_module(module)
-        real_run_git = module.run_git
+        real_run_git = module.run_git_discard
 
         def deadline_only_for_merge(repo, *args, timeout=600):
             if args == ('merge', '--no-ff', '--no-commit', self.feature_head):
@@ -1475,7 +1685,7 @@ class DeliveryHelpers(unittest.TestCase):
             return real_run_git(repo, *args, timeout=timeout)
 
         with patch.object(sys, 'argv', self.integrate_args('--timeout', '10')[1:]), \
-             patch.object(module, 'run_git', side_effect=deadline_only_for_merge), \
+             patch.object(module, 'run_git_discard', side_effect=deadline_only_for_merge), \
              patch('sys.stdout', new_callable=io.StringIO) as output, \
              patch.dict(os.environ, env, clear=True):
             code = module.main()
@@ -1550,7 +1760,7 @@ class DeliveryHelpers(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
             spec.loader.exec_module(module)
-        real_run_git = module.run_git
+        real_run_git = module.run_git_discard
         abort_deadlines = []
 
         def deadline_only_for_abort(repo, *args, timeout=600):
@@ -1562,7 +1772,7 @@ class DeliveryHelpers(unittest.TestCase):
             return real_run_git(repo, *args, timeout=timeout)
 
         with patch.object(sys, 'argv', self.integrate_args('--timeout', '30')[1:]), \
-             patch.object(module, 'run_git', side_effect=deadline_only_for_abort), \
+             patch.object(module, 'run_git_discard', side_effect=deadline_only_for_abort), \
              patch('sys.stdout', new_callable=io.StringIO) as output, \
              patch.dict(os.environ, env, clear=True):
             code = module.main()
@@ -1573,7 +1783,8 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual((code, data['status']), (3, 'BLOCKED_LOCAL'), output.getvalue())
         self.assertIs(data['merge_aborted'], False)
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
-        self.assertEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD', cwd=self.repo).stdout.strip(),
+        self.assertEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD',
+                             cwd=Path(data['scratch'])).stdout.strip(),
                          self.feature_head)
 
     def test_check_timeout_kills_descendants_and_aborts_merge(self):
@@ -1650,9 +1861,10 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(data['phase'], 'check')
         self.assertIn('cleanup incomplete', data['message'])
         self.assertFalse(abort_attempts)
-        self.assertEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD', cwd=self.repo).stdout.strip(),
+        scratch = Path(data['scratch'])
+        self.assertEqual(cmd('git', 'rev-parse', '--verify', 'MERGE_HEAD', cwd=scratch).stdout.strip(),
                          self.feature_head)
-        cmd('git', 'merge', '--abort', cwd=self.repo)
+        cmd('git', 'merge', '--abort', cwd=scratch)
 
     def test_high_fd_check_failure_reports_and_aborts_merge(self):
         self.add_feature_test('import unittest\nclass Check(unittest.TestCase):\n'
@@ -2019,8 +2231,9 @@ class DeliveryHelpers(unittest.TestCase):
         git_calls = [kwargs for command, kwargs in calls if command[0] == 'git']
         verification_calls = [kwargs for command, kwargs in calls if command[0] in {'npm', 'python3'}]
         self.assertTrue(git_calls)
-        self.assertEqual(len(verification_calls), 2)
-        self.assertTrue(all('discard_output' not in kwargs for kwargs in git_calls))
+        self.assertEqual(len(verification_calls), 4, 'prepare and check must run in scratch and original')
+        self.assertTrue(any(kwargs.get('discard_output') is True for kwargs in git_calls),
+                        'merge, commit, and fast-forward hook output must be discarded')
         self.assertTrue(all(kwargs.get('discard_output') is True for kwargs in verification_calls))
         self.assertEqual(module.run_git(self.repo, 'rev-parse', 'HEAD').stdout.strip(),
                          cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip())
@@ -2081,9 +2294,11 @@ class DeliveryHelpers(unittest.TestCase):
         data = json.loads(result.stdout)
         self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
-        self.assertEqual(hidden.read_text(), 'private check edit\n')
+        self.assertEqual(hidden.read_text(), 'original\n')
+        self.assertEqual((Path(data['scratch']) / 'hidden.txt').read_text(),
+                         'private check edit\n')
 
-    def test_post_commit_hook_index_flag_blocks_success(self):
+    def test_post_commit_hook_index_flag_stays_in_retained_scratch(self):
         self.add_feature_test()
         hook = self.repo / '.git/hooks/post-commit'
         hook.write_text('#!/bin/sh\ngit update-index --assume-unchanged app.txt\n'
@@ -2092,11 +2307,14 @@ class DeliveryHelpers(unittest.TestCase):
         result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
                                 env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(result.stdout)
-        self.assertEqual((result.returncode, data['status'], data.get('merge_aborted')),
-                         (3, 'BLOCKED_LOCAL', False), result.stdout)
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'), result.stdout)
+        self.assertTrue(data['cleanup_pending'], 'hidden scratch edit must not be deleted')
         parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
         self.assertEqual(parents[1:], [self.base, self.feature_head])
-        self.assertEqual((self.repo / 'app.txt').read_text(), 'private hook edit\n')
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'feature\n')
+        self.assertEqual((Path(data['journal']).parent / 'worktree' / 'app.txt').read_text(),
+                         'private hook edit\n')
+        self.assertFalse(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
 
     def test_ambient_alternate_index_cannot_report_clean_integration(self):
         self.add_feature_test()
@@ -2160,7 +2378,7 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
         self.assertEqual(hidden.stat().st_mode & 0o111, 0o111)
 
-    def test_post_commit_untracked_artifact_cannot_hide_behind_status_config(self):
+    def test_post_commit_untracked_artifact_is_retained_only_in_scratch(self):
         self.add_feature_test()
         cmd('git', 'config', 'status.showUntrackedFiles', 'no', cwd=self.repo)
         hook = self.repo / '.git/hooks/post-commit'
@@ -2169,11 +2387,13 @@ class DeliveryHelpers(unittest.TestCase):
         result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
                                 env=isolated_env(), timeout=20)
         data = json.loads(result.stdout)
-        self.assertEqual((result.returncode, data['status'], data.get('merge_aborted')),
-                         (3, 'BLOCKED_LOCAL', False), result.stdout)
-        self.assertEqual((self.repo / 'artifact.txt').read_text(), 'private artifact\n')
-        self.assertEqual(cmd('git', '-c', 'status.showUntrackedFiles=all',
-                             'status', '--porcelain', cwd=self.repo).stdout, '?? artifact.txt\n')
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'), result.stdout)
+        self.assertTrue(data['cleanup_pending'])
+        self.assertFalse((self.repo / 'artifact.txt').exists())
+        self.assertEqual((Path(data['journal']).parent / 'worktree' / 'artifact.txt').read_text(),
+                         'private artifact\n')
+        self.assertFalse(cmd('git', '-c', 'status.showUntrackedFiles=all',
+                             'status', '--porcelain', cwd=self.repo).stdout)
 
     def add_hidden_submodule(self):
         child_repo = self.root / 'child-source'
@@ -2258,7 +2478,7 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertFalse(link.is_symlink())
         self.assertEqual(link.read_text(), 'target.txt')
 
-    def test_post_commit_symlink_substitution_blocks_success(self):
+    def test_post_commit_symlink_substitution_stays_in_retained_scratch(self):
         self.add_feature_test()
         link = self.add_symlink_fixture()
         hook = self.repo / '.git/hooks/post-commit'
@@ -2267,10 +2487,13 @@ class DeliveryHelpers(unittest.TestCase):
         result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
                                 env=isolated_env(), timeout=20)
         data = json.loads(result.stdout)
-        self.assertEqual((result.returncode, data['status'], data.get('merge_aborted')),
-                         (3, 'BLOCKED_LOCAL', False), result.stdout)
-        self.assertFalse(link.is_symlink())
-        self.assertEqual(link.read_text(), 'target.txt')
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'), result.stdout)
+        self.assertTrue(data['cleanup_pending'])
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.read_text(), 'target content\n')
+        scratch_link = Path(data['journal']).parent / 'worktree' / 'link'
+        self.assertFalse(scratch_link.is_symlink())
+        self.assertEqual(scratch_link.read_text(), 'target.txt')
 
     def test_git_routing_environment_is_rejected_before_git(self):
         bin_dir = self.root / 'bin'
@@ -2337,7 +2560,7 @@ class DeliveryHelpers(unittest.TestCase):
         data = json.loads(result.stdout)
         self.assertEqual(counter.read_text(), '2')
         self.assertEqual((result.returncode, data['status'], data['merge_aborted']),
-                         (3, 'BLOCKED_LOCAL', True), result.stdout)
+                         (3, 'BLOCKED_LOCAL', False), result.stdout)
         self.assertNotIn('private_path', result.stdout + result.stderr)
         self.assert_restored()
 
@@ -2365,8 +2588,8 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual((code, data['status'], data['merge_aborted']),
                          (3, 'BLOCKED_LOCAL', False), output.getvalue())
         self.assertNotIn('private_output', output.getvalue())
-        parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
-        self.assertEqual(parents[1:], [self.base, self.feature_head])
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertTrue(Path(data['journal']).is_file())
 
     def test_staged_check_side_effect_cannot_enter_merge_commit(self):
         self.add_feature_test('import subprocess, unittest\nfrom pathlib import Path\n'
@@ -2390,7 +2613,8 @@ class DeliveryHelpers(unittest.TestCase):
         data = json.loads(p.stdout)
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
         self.assertIn('verified merge tree', data['message'])
-        self.assertNotEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
+        self.assertTrue(Path(data['scratch']).exists())
 
     def test_post_commit_hook_moving_head_cannot_report_integration(self):
         self.add_feature_test()
@@ -2403,7 +2627,7 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
 
-    def test_post_commit_hook_diverting_merge_to_other_branch_cannot_report_integration(self):
+    def test_post_commit_hook_diversion_in_scratch_does_not_move_original_branch(self):
         self.add_feature_test()
         hook = self.repo / '.git/hooks/post-commit'
         hook.write_text('#!/bin/sh\n'
@@ -2416,8 +2640,9 @@ class DeliveryHelpers(unittest.TestCase):
         p = subprocess.run(self.integrate_args(), text=True, capture_output=True,
                            env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(p.stdout)
-        self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'), p.stdout + p.stderr)
-        self.assertEqual(cmd('git', 'rev-parse', 'refs/heads/main', cwd=self.repo).stdout.strip(), self.base)
+        self.assertEqual((p.returncode, data['status']), (0, 'INTEGRATED'), p.stdout + p.stderr)
+        self.assertEqual(cmd('git', 'symbolic-ref', '--short', 'HEAD', cwd=self.repo).stdout.strip(), 'main')
+        self.assertEqual(cmd('git', 'rev-parse', 'refs/heads/main', cwd=self.repo).stdout.strip(), data['head'])
         self.assertEqual(cmd('git', 'rev-parse', 'refs/heads/diverted', cwd=self.repo).stdout.strip(), data['head'])
 
     def test_nonpositive_timeout_rejected_before_merge(self):
@@ -2440,7 +2665,7 @@ class DeliveryHelpers(unittest.TestCase):
         result = subprocess.run(self.integrate_args('--prepare', 'npm ci --prefer-offline', '--timeout', '2'),
                                 text=True, capture_output=True, env=env, timeout=15)
         self.assertEqual(result.returncode, 3, result.stderr)
-        self.assertIn('Prepare exceeded 2 seconds', json.loads(result.stdout)['message'])
+        self.assertIn('prepare exceeded 2 seconds', json.loads(result.stdout)['message'])
         self.assert_restored()
 
     def test_failed_abort_is_reported_without_claiming_restoration(self):
@@ -2453,7 +2678,9 @@ class DeliveryHelpers(unittest.TestCase):
         data = json.loads(p.stdout)
         self.assertIs(data.get('merge_aborted'), False, data)
         self.assertIn('abort failed', data['message'])
-        self.assertEqual((self.repo / 'app.txt').read_text(), 'check modified tracked content\n')
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'base\n')
+        self.assertEqual((Path(data['scratch']) / 'app.txt').read_text(),
+                         'check modified tracked content\n')
 
     def test_conflict_restores_original(self):
         (self.repo / 'app.txt').write_text('main divergent\n')
