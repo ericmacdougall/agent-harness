@@ -47,6 +47,28 @@ class ExternalApply(unittest.TestCase):
                                 '--resolve-journal', key, '--check', fixtures.CHECK, '--timeout', '15',
                                 env=self.env, check=False)
 
+    def test_prevalidation_preserves_settled_and_pending_journal_placement(self):
+        target = self.target()
+        with patch.dict(os.environ, self.env, clear=True), self.scope() as scope:
+            settled = scope.reserve_external(base=self.base, target=self.base, task_digest='b' * 64)
+            settled = scope.complete_external(settled)
+            guard = scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+            self.ff(target)
+            # Model the durable resolved-write / archive boundary of another
+            # attempt. A preflight must leave even settled active state in place.
+            active = settled.journal.parent.parent.parent / 'active' / settled.key
+            settled.journal.parent.rename(active)
+            before = {str(path.relative_to(scope.root)): path.read_bytes()
+                      for path in scope.root.rglob('journal.json')}
+            # This old-API control exposes the unsafe implementation shortcut:
+            # completion validates, but it also resolves and archives evidence.
+            validator = getattr(scope, 'validate_external', scope.complete_external)
+            validator(guard)
+            after = {str(path.relative_to(scope.root)): path.read_bytes()
+                     for path in scope.root.rglob('journal.json')}
+            self.assertEqual(before, after)
+            self.assertEqual(integration.read_journal(guard.journal.parent)['phase'], 'applying')
+
     def test_unprotected_failed_check_control_can_claim_already_integrated(self):
         # This is the control: clean advanced HEAD alone cannot prove a passed check.
         target = self.target()
