@@ -44,9 +44,9 @@ MAX_PRIVATE = 32_768
 GH_FIELDS = "number,state,headRefOid,headRefName,baseRefName,url,isDraft,mergeCommit,isCrossRepository,headRepository,headRepositoryOwner"
 PHASES = {"INITIAL", "PUBLISHING", "PR_LOOKUP", "PR_CREATING", "PR_READY", "REMOTE_BLOCKED",
           "REMOTE_UNCERTAIN", "LOCAL_READY", "REMOTE_APPLYING", "LOCAL_APPLYING",
-          "RESOLVED_BASELINE", "DELIVERED", "LOCAL_DELIVERED"}
+          "RESOLVED_BASELINE", "DELIVERED", "LOCAL_DELIVERED", "POLICY_BLOCKED"}
 SETTLED = {"PR_READY", "REMOTE_BLOCKED", "LOCAL_READY", "RESOLVED_BASELINE",
-           "DELIVERED", "LOCAL_DELIVERED"}
+           "DELIVERED", "LOCAL_DELIVERED", "POLICY_BLOCKED"}
 
 
 class DeliveryError(Exception):
@@ -503,6 +503,15 @@ def matching_pr(state, timeout):
         raise DeliveryError("BLOCKED_POLICY", "PR enumeration is invalid or exceeds its bounded page", code=2)
     matches = []
     for pr in listing:
+        if isinstance(pr, dict):
+            owner, name = state["repository"].split("/")
+            head_repo, head_owner = pr.get("headRepository"), pr.get("headRepositoryOwner")
+            if (pr.get("isCrossRepository") is True
+                    or isinstance(head_repo, dict) and isinstance(head_repo.get("name"), str)
+                    and head_repo["name"].lower() != name
+                    or isinstance(head_owner, dict) and isinstance(head_owner.get("login"), str)
+                    and head_owner["login"].lower() != owner):
+                continue  # Same-name fork branches cannot be this reviewed head.
         if (not isinstance(pr, dict) or not isinstance(pr.get("state"), str)
                 or pr["state"] not in {"OPEN", "MERGED", "CLOSED"}
                 or not pr_identity(pr, state["repository"], state["source_branch"])):
@@ -532,7 +541,7 @@ def checked_body(path):
     return body
 
 
-def transport(original, url, repository, arguments, timeout, *, objects=None):
+def transport(original, url, repository, arguments, timeout, *, objects=None, negotiation_tips=()):
     """Use a private bare transport, preserving normal global auth but no repo config."""
     try:
         with tempfile.TemporaryDirectory(prefix="agent-harness-transport-") as raw:
@@ -550,7 +559,9 @@ def transport(original, url, repository, arguments, timeout, *, objects=None):
                 raise DeliveryError("REMOTE_BLOCKED", "Isolated remote transport could not be prepared", code=4)
             remote = "harness-" + secrets.token_hex(8)
             prefix = ["git", "-C", str(bare), "-c", f"remote.{remote}.url={url}",
-                      "-c", "fetch.fsckObjects=true", "-c", "transfer.fsckObjects=true"]
+                      "-c", "fetch.fsckObjects=true", "-c", "transfer.fsckObjects=true",
+                      "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+                      "-c", "fetch.writeCommitGraph=false"]
             code, effective = bounded([*prefix, "ls-remote", "--get-url", "--", remote], env=env, timeout=timeout)
             if code or effective.removesuffix("\n") != url or github_repository(url) != repository:
                 raise DeliveryError("BLOCKED_POLICY", "Isolated transport destination changed", code=2)
@@ -563,7 +574,21 @@ def transport(original, url, repository, arguments, timeout, *, objects=None):
                     raise DeliveryError("RECOVERY_REQUIRED", "Original object store is unsafe")
                 pinned = (info.st_dev, info.st_ino)
                 env["GIT_OBJECT_DIRECTORY"] = str(objects)
-            code, output = bounded([*prefix, *arguments[:1], remote, *arguments[1:]], env=env, timeout=timeout)
+                if arguments[0] != "fetch":
+                    raise DeliveryError("BLOCKED_POLICY", "Borrowed object storage is restricted to fetching", code=2)
+                current = valid_oid(git_value(original, "rev-parse", "HEAD"))
+                tips = []
+                for tip in dict.fromkeys((current, *negotiation_tips)):
+                    valid_oid(tip)
+                    status, kind = git(original, "cat-file", "-t", tip, timeout=timeout)
+                    if status == 0 and kind.removesuffix("\n") == "commit":
+                        tips.append("--negotiation-tip=" + tip)
+                # No refs in this temporary repository describe the original's
+                # other branches. Maintenance must never inspect its real store.
+                command = [*prefix, "fetch", "--no-auto-maintenance", *tips, remote, *arguments[1:]]
+            else:
+                command = [*prefix, *arguments[:1], remote, *arguments[1:]]
+            code, output = bounded(command, env=env, timeout=timeout)
             if objects is not None and (objects.stat().st_dev, objects.stat().st_ino) != pinned:
                 raise DeliveryError("RECOVERY_REQUIRED", "Original object store changed during fetch")
             return code, output
@@ -580,8 +605,13 @@ def published_ref(original, url, state, timeout):
     if not rows:
         return None
     expected_ref = "refs/heads/" + state["source_branch"]
-    if len(rows) != 1 or rows[0].split() != [state["source_head"], expected_ref]:
-        raise DeliveryError("BLOCKED_POLICY", "Published branch no longer matches the reviewed source", code=2)
+    fields = rows[0].split() if len(rows) == 1 else []
+    if (len(fields) != 2 or fields[1] != expected_ref or not OID.fullmatch(fields[0])
+            or len(fields[0]) != len(state["source_head"])):
+        raise DeliveryError("BLOCKED_POLICY", "Published branch identity is invalid", code=2)
+    if fields[0] != state["source_head"]:
+        raise DeliveryError("BLOCKED_POLICY", "Remote feature tip differs; review a new branch generation",
+                            code=2, observed_remote_head=fields[0])
     return state["source_head"]
 
 
@@ -619,16 +649,18 @@ def prepare_pr(flow, title, body):
     try:
         existing = matching_pr(flow.state, flow.args.timeout)
     except DeliveryError as error:
-        if flow.state["phase"] == "PR_LOOKUP" and error.status == "REMOTE_BLOCKED":
+        if error.status == "BLOCKED_POLICY":
+            flow.save(phase="POLICY_BLOCKED")
+        elif flow.state["phase"] == "PR_LOOKUP" and error.status == "REMOTE_BLOCKED":
             flow.save(phase="REMOTE_BLOCKED")
-        else:
+        elif flow.state["phase"] != "PR_LOOKUP":
             flow.save(phase="REMOTE_UNCERTAIN")
         raise
     if existing:
         return record_pr(flow, existing)
     if flow.state["phase"] in {"PR_CREATING", "REMOTE_UNCERTAIN"}:
-        flow.save(phase="REMOTE_BLOCKED")
-        raise DeliveryError("REMOTE_BLOCKED", "Prior PR attempt is reconciled absent; local delivery can continue",
+        flow.save(phase="REMOTE_UNCERTAIN")
+        raise DeliveryError("REMOTE_UNCERTAIN", "An in-flight create cannot be disproved by temporary PR absence",
                             code=4, **flow.facts())
     staged = flow.directory / (".pr-body-" + secrets.token_hex(12))
     fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -643,7 +675,9 @@ def prepare_pr(flow, title, body):
                "--base", flow.branch, "--draft", "--title", title, "--body-file", str(staged),
                timeout=flow.args.timeout)
         except DeliveryError:
-            pass
+            flow.save(phase="REMOTE_UNCERTAIN")
+            raise DeliveryError("REMOTE_UNCERTAIN", "PR creation outcome requires later positive reconciliation",
+                                code=4, **flow.facts()) from None
     finally:
         staged.unlink(missing_ok=True)
     try:
@@ -653,8 +687,8 @@ def prepare_pr(flow, title, body):
         raise DeliveryError("REMOTE_UNCERTAIN", "PR creation outcome requires exact remote reconciliation",
                             code=4, **flow.facts()) from None
     if not found:
-        flow.save(phase="REMOTE_BLOCKED")
-        raise DeliveryError("REMOTE_BLOCKED", "Draft PR is verified absent; local delivery can continue",
+        flow.save(phase="REMOTE_UNCERTAIN")
+        raise DeliveryError("REMOTE_UNCERTAIN", "PR creation is not yet visible; local fallback remains blocked",
                             code=4, **flow.facts())
     return record_pr(flow, found)
 
@@ -697,6 +731,9 @@ def prepare(args):
         if state["phase"] == "REMOTE_BLOCKED":
             report("REMOTE_BLOCKED", "Remote publication blocked; reviewed local delivery remains available", **flow.facts())
             return 4
+        if state["phase"] == "POLICY_BLOCKED":
+            raise DeliveryError("BLOCKED_POLICY", "Prior policy refusal requires a new reviewed generation",
+                                code=2, **flow.facts())
         if state["phase"] in {"DELIVERED", "LOCAL_DELIVERED"}:
             raise DeliveryError("ALREADY_PREPARED", "Generation is delivered; use finish for its receipt or start a new generation")
         if state["phase"] == "PR_READY":
@@ -713,7 +750,9 @@ def prepare(args):
                                         "--repo", str(source), "--branch", branch,
                                         "--original-branch", flow.branch, "--expected-head", head,
                                         "--expected-repository", repository, "--timeout", str(args.timeout)],
-                                       timeout=args.timeout + 15)
+                                       # At most 24 sequential bounded Git waits,
+                                       # including source guards and both LFS passes.
+                                       timeout=24 * args.timeout + 30)
                 published = json.loads(output)
                 if not isinstance(published, dict):
                     raise ValueError
@@ -721,23 +760,40 @@ def prepare(args):
                 pass  # Durable PUBLISHING intent requires exact reconciliation.
             else:
                 if (code == 0 and published.get("status") == "PUSHED"
-                        and published.get("source_changed") is False and published.get("repository") == repository):
+                        and published.get("repository") == repository):
                     flow.save(phase="PR_LOOKUP")
                 elif published.get("status") == "BLOCKED_POLICY":
-                    flow.save(phase="INITIAL")
+                    flow.save(phase="POLICY_BLOCKED")
                     raise DeliveryError("BLOCKED_POLICY", "Publisher refused the pinned repository or source policy", code=2)
+                elif code == 4 and published.get("push_rejected") is True:
+                    flow.save(phase="POLICY_BLOCKED")
+                    try:
+                        published_ref(flow.original, url, flow.state, args.timeout)
+                    except DeliveryError as error:
+                        if error.status == "BLOCKED_POLICY":
+                            raise
+                    raise DeliveryError("BLOCKED_POLICY", "Remote refused the push; review a new branch generation",
+                                        code=2, **flow.facts())
+                elif code == 4 and published.get("push_attempted") is False:
+                    flow.save(phase="REMOTE_BLOCKED")
+                    raise DeliveryError("REMOTE_BLOCKED", "Publisher preflight failed before any push attempt",
+                                        code=4, **flow.facts())
                 else:
                     pass  # A failed push can still have reached the remote.
         if flow.state["phase"] in {"PUBLISHING", "REMOTE_UNCERTAIN"}:
-            if published_ref(flow.original, url, flow.state, args.timeout) is None:
-                flow.save(phase="REMOTE_BLOCKED")
-                raise DeliveryError("REMOTE_BLOCKED", "Feature publication is verified absent; local delivery can continue",
+            try:
+                published = published_ref(flow.original, url, flow.state, args.timeout)
+            except DeliveryError as error:
+                if error.status == "BLOCKED_POLICY":
+                    flow.save(phase="POLICY_BLOCKED")
+                raise
+            if published is None:
+                raise DeliveryError("REMOTE_UNCERTAIN", "An in-flight remote write cannot be disproved by temporary absence",
                                     code=4, **flow.facts())
             # Exact publication reconciled; any previous create is queried before another is attempted.
             if flow.state["phase"] == "PUBLISHING":
                 flow.save(phase="PR_LOOKUP")
         if snapshot(source, branch) != head or snapshot(flow.original, flow.branch) != baseline:
-            flow.save(phase="REMOTE_UNCERTAIN")
             raise DeliveryError("RECHECK_REQUIRED", "Checkout moved during publication; inspect its remote outcome", **flow.facts())
         matching_origins(source, flow.original, repository)
         return prepare_pr(flow, title, body)
@@ -772,7 +828,8 @@ def fetch_target(flow, url, target):
     objects = named.resolve(strict=True)
     code, _ = transport(flow.original, url, flow.state["repository"],
                         ["fetch", "--no-tags", "--no-write-fetch-head", valid_oid(target)],
-                        flow.args.timeout, objects=objects)
+                        flow.args.timeout, objects=objects,
+                        negotiation_tips=(flow.state["baseline"], flow.state["source_head"]))
     if code or git_value(flow.original, "cat-file", "-t", target) != "commit":
         raise DeliveryError("REMOTE_BLOCKED", "Exact verified target could not be fetched", code=4)
     flow.assert_context()
@@ -976,8 +1033,11 @@ def local_finish(flow, preparations, checks):
         raise recovery_error(flow, "Original changed before local delivery; inspect its prior attempt", state["baseline"])
     flow.save(phase="LOCAL_APPLYING", local_key=key, apply_base=current,
               checks_digest=checks_digest(preparations, checks))
-    if local_completion(flow, preparations, checks):
-        return 0
+    if ancestry(flow.original, state["source_head"], state["baseline"]):
+        if local_completion(flow, preparations, checks):
+            return 0
+    # A fresh generation must let the child retire an older resolved tuple.
+    # Only resumed generations interpret their resolved journal as acceptance.
     # The child owns the original scope lock; the parent holds only its task lock.
     command = [sys.executable, str(Path(__file__).with_name("integrate_local.py")), "--repo", str(flow.original),
                "--original-branch", flow.branch, "--expected-head", current, "--source", state["source_branch"],
@@ -1076,6 +1136,8 @@ def reconcile(args):
         try:
             found = verify_remote_pr(flow) if state["pr_number"] is not None else matching_pr(state, args.timeout)
         except DeliveryError as error:
+            if error.status == "BLOCKED_POLICY":
+                flow.save(phase="POLICY_BLOCKED")
             if error.status == "REMOTE_BLOCKED":
                 raise DeliveryError("REMOTE_UNCERTAIN", "Remote PR visibility cannot yet be reconciled",
                                     code=4, **flow.facts()) from None
@@ -1084,11 +1146,22 @@ def reconcile(args):
             if found["state"] == "CLOSED":
                 raise DeliveryError("BLOCKED_POLICY", "Known PR is closed; it cannot become local fallback", code=2)
             return record_pr(flow, found)
-        published_ref(flow.original, url, state, args.timeout)
-        flow.save(phase="REMOTE_BLOCKED")
-        report("REMOTE_BLOCKED", "Exact PR is verified absent; local delivery or a new reviewed generation can continue",
-               **flow.facts())
-        return 4
+        try:
+            observed = published_ref(flow.original, url, state, args.timeout)
+        except DeliveryError as error:
+            if error.status == "BLOCKED_POLICY":
+                flow.save(phase="POLICY_BLOCKED")
+            raise
+        if state["phase"] in {"PUBLISHING", "PR_LOOKUP"} and observed is not None:
+            # These durable phases precede any PR-create call. Positive push
+            # completion plus a complete lookup settles only that known stage.
+            flow.save(phase="REMOTE_BLOCKED")
+            report("REMOTE_BLOCKED", "Feature push is present and no PR create was attempted; local delivery remains available",
+                   **flow.facts())
+            return 4
+        flow.save(phase="REMOTE_UNCERTAIN")
+        raise DeliveryError("REMOTE_UNCERTAIN", "No positive remote completion is visible; fallback remains blocked",
+                            code=4, **flow.facts())
 
 
 def parse_args():

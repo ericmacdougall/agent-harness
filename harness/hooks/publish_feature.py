@@ -180,55 +180,63 @@ def main():
 
 def publish(args):
     expected_repository = getattr(args, 'expected_repository', None)
+    push_attempted = False
+
+    def reply(status, message, **facts):
+        # The workflow can distinguish a refused preflight from an unknown push.
+        if expected_repository is not None:
+            facts['push_attempted'] = push_attempted
+        report(status, message, **facts)
+
     if expected_repository is not None:
         try:
             expected_repository = repository_name(expected_repository)
         except ValueError:
-            report('BLOCKED_POLICY', 'Expected GitHub repository identity is invalid')
+            reply('BLOCKED_POLICY', 'Expected GitHub repository identity is invalid')
             return 2
     git = partial(run_git, timeout=args.timeout)
     repo = args.repo.resolve()
     if not repo.is_dir():
-        report("BLOCKED_POLICY", "Source must be the root of a Git worktree")
+        reply("BLOCKED_POLICY", "Source must be the root of a Git worktree")
         return 2
     toplevel = git(repo, "rev-parse", "--show-toplevel")
     if (toplevel.returncode or not toplevel.stdout.strip()
             or Path(toplevel.stdout.strip()).resolve() != repo):
-        report("BLOCKED_POLICY", "Source must be the root of a Git worktree")
+        reply("BLOCKED_POLICY", "Source must be the root of a Git worktree")
         return 2
     valid = git(repo, "check-ref-format", "--branch", args.branch)
     if valid.returncode or args.branch in {"main", "master", "develop", args.original_branch}:
-        report("BLOCKED_POLICY", "Refusing to publish a protected or invalid branch")
+        reply("BLOCKED_POLICY", "Refusing to publish a protected or invalid branch")
         return 2
     current = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
     if current.returncode or current.stdout.strip() != args.branch:
-        report("BLOCKED_POLICY", "Source worktree is not on the requested branch")
+        reply("BLOCKED_POLICY", "Source worktree is not on the requested branch")
         return 2
     head = git(repo, "rev-parse", "HEAD").stdout.strip()
     if head != args.expected_head:
-        report("BLOCKED_POLICY", "Source HEAD changed since final verification")
+        reply("BLOCKED_POLICY", "Source HEAD changed since final verification")
         return 2
     try:
         require_safe_source(repo, git_environment(), timeout=min(args.timeout, 5))
     except OSError:
-        report("BLOCKED_POLICY", "Source Git metadata has executable local filters, submodules, or could not be inspected safely")
+        reply("BLOCKED_POLICY", "Source Git metadata has executable local filters, submodules, or could not be inspected safely")
         return 2
     status = git(repo, "status", "--porcelain", "--untracked-files=all")
     if status.returncode or status.stdout.strip():
-        report("BLOCKED_POLICY", "Commit or discard source changes before publishing")
+        reply("BLOCKED_POLICY", "Commit or discard source changes before publishing")
         return 2
     remote = "origin"
     if remote not in git(repo, "remote").stdout.splitlines():
-        report("BLOCKED_REMOTE", "Configured remote is unavailable", branch=args.branch, remote=remote)
+        reply("BLOCKED_REMOTE", "Configured remote is unavailable", branch=args.branch, remote=remote)
         return 4
     # Fetch and push can target different repositories (including pushInsteadOf rewrites).
     destinations = git(repo, "remote", "get-url", "--push", "--all", remote)
     urls = destinations.stdout.splitlines()
     if destinations.returncode or not urls:
-        report("BLOCKED_REMOTE", "Could not resolve the push destination", branch=args.branch, remote=remote)
+        reply("BLOCKED_REMOTE", "Could not resolve the push destination", branch=args.branch, remote=remote)
         return 4
     if len(urls) != 1:
-        report("BLOCKED_POLICY", "Publication requires exactly one push destination", branch=args.branch, remote=remote)
+        reply("BLOCKED_POLICY", "Publication requires exactly one push destination", branch=args.branch, remote=remote)
         return 2
     destination = pinned_url(urls[0], repo)
     if expected_repository is not None:
@@ -237,7 +245,7 @@ def publish(args):
         except ValueError:
             matches = False
         if not matches:
-            report('BLOCKED_POLICY', 'Pinned push destination does not match the expected GitHub repository',
+            reply('BLOCKED_POLICY', 'Pinned push destination does not match the expected GitHub repository',
                    branch=args.branch, remote=remote)
             return 2
     # Keep credential-bearing URLs out of process arguments. The temporary
@@ -259,28 +267,28 @@ def publish(args):
             object_format = git(repo, 'rev-parse', '--show-object-format=storage')
             format_name = object_format.stdout.strip()
             if object_format.returncode or format_name not in {'sha1', 'sha256'}:
-                report('BLOCKED_REMOTE', 'Could not determine source object format', branch=args.branch, remote=remote)
+                reply('BLOCKED_REMOTE', 'Could not determine source object format', branch=args.branch, remote=remote)
                 return 4
             initialized = git(temporary, 'init', '--bare', f'--object-format={format_name}', '--template', str(template), str(transport))
             if initialized.returncode:
-                report('BLOCKED_REMOTE', 'Could not prepare isolated publication transport', branch=args.branch, remote=remote)
+                reply('BLOCKED_REMOTE', 'Could not prepare isolated publication transport', branch=args.branch, remote=remote)
                 return 4
             object_store = git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'objects')
             object_path = Path(object_store.stdout.rstrip('\n'))
             if object_store.returncode or not object_path.is_dir() or '\n' in str(object_path):
-                report('BLOCKED_REMOTE', 'Could not locate source objects for publication', branch=args.branch, remote=remote)
+                reply('BLOCKED_REMOTE', 'Could not locate source objects for publication', branch=args.branch, remote=remote)
                 return 4
             (transport / 'objects/info/alternates').write_text(str(object_path) + '\n')
             commit_type = git(transport, 'cat-file', '-t', head)
             if commit_type.returncode or commit_type.stdout.strip() != 'commit':
-                report('BLOCKED_REMOTE', 'Could not load verified commit for publication', branch=args.branch, remote=remote)
+                reply('BLOCKED_REMOTE', 'Could not load verified commit for publication', branch=args.branch, remote=remote)
                 return 4
             # Only the isolated transport may contact the destination. Source-local
             # sshCommand and credential helpers must not run during inspection.
             inspected = git(transport, 'ls-remote', '--get-url', '--', pinned_remote,
                             config_extra=pinned_config)
             if inspected.returncode or inspected.stdout.strip() != destination:
-                report('BLOCKED_POLICY', 'Push destination cannot be inspected without another URL rewrite',
+                reply('BLOCKED_POLICY', 'Push destination cannot be inspected without another URL rewrite',
                        branch=args.branch, remote=remote)
                 return 2
             if expected_repository is not None:
@@ -289,27 +297,27 @@ def publish(args):
                 except ValueError:
                     matches = False
                 if not matches:
-                    report('BLOCKED_POLICY', 'Isolated transport does not match the expected GitHub repository',
+                    reply('BLOCKED_POLICY', 'Isolated transport does not match the expected GitHub repository',
                            branch=args.branch, remote=remote)
                     return 2
             try:
                 default = git(transport, 'ls-remote', '--symref', '--', pinned_remote, 'HEAD',
                               timeout=min(args.timeout, 30), config_extra=pinned_config)
             except subprocess.TimeoutExpired:
-                report('BLOCKED_REMOTE', 'Could not determine the remote default branch in time; continue local integration',
+                reply('BLOCKED_REMOTE', 'Could not determine the remote default branch in time; continue local integration',
                        branch=args.branch, remote=remote)
                 return 4
             if default.returncode:
-                report('BLOCKED_REMOTE', 'Could not determine the remote default branch; continue local integration',
+                reply('BLOCKED_REMOTE', 'Could not determine the remote default branch; continue local integration',
                        branch=args.branch, remote=remote, detail=scrub(default.stderr or default.stdout))
                 return 4
             match = re.search(r'^ref: refs/heads/(\S+)\s+HEAD$', default.stdout, re.MULTILINE)
             if match is None:
-                report('BLOCKED_REMOTE', 'Remote default branch is not advertised; continue local integration',
+                reply('BLOCKED_REMOTE', 'Remote default branch is not advertised; continue local integration',
                        branch=args.branch, remote=remote)
                 return 4
             if args.branch == match.group(1):
-                report('BLOCKED_POLICY', 'Refusing to publish the remote default branch', branch=args.branch, remote=remote)
+                reply('BLOCKED_POLICY', 'Refusing to publish the remote default branch', branch=args.branch, remote=remote)
                 return 2
             # Scan the same graph the push will traverse. Source shallow boundaries
             # and grafts are not inherited by this transport, even when their hidden
@@ -318,21 +326,28 @@ def publish(args):
             try:
                 contains_lfs = has_reachable_lfs_pointer(transport, head, git, timeout=args.timeout)
             except ValueError:
-                report("BLOCKED_REMOTE", "Could not verify whether Git LFS content needs uploading; continue local integration",
+                reply("BLOCKED_REMOTE", "Could not verify whether Git LFS content needs uploading; continue local integration",
                        branch=args.branch, remote=remote)
                 return 4
             if contains_lfs:
-                report("BLOCKED_POLICY", "Git LFS pointer found; publish with an LFS-aware workflow",
+                reply("BLOCKED_POLICY", "Git LFS pointer found; publish with an LFS-aware workflow",
                        branch=args.branch, remote=remote)
                 return 2
+            push_attempted = True
             result = git(transport, 'push', '--porcelain', pinned_remote,
                          f"{head}:{ref}", timeout=args.timeout, config_extra=pinned_config)
     except subprocess.TimeoutExpired:
-        report("BLOCKED_REMOTE", f"Publication command exceeded {args.timeout} seconds; continue local integration", branch=args.branch, remote=remote)
+        reply("BLOCKED_REMOTE", f"Publication command exceeded {args.timeout} seconds; continue local integration", branch=args.branch, remote=remote)
         return 4
     if result.returncode:
         detail = scrub(result.stderr or result.stdout)
-        report("BLOCKED_REMOTE", "Feature branch could not be published; continue local integration", branch=args.branch, remote=remote, detail=detail)
+        rejected = any(len(fields := line.split('\t')) == 3 and fields[0] == '!'
+                       and fields[1] == f"{head}:{ref}"
+                       and fields[2].startswith(('[rejected]', '[remote rejected]'))
+                       for line in result.stdout.splitlines())
+        facts = {'push_rejected': rejected} if expected_repository is not None else {}
+        reply("BLOCKED_REMOTE", "Feature branch could not be published; continue local integration",
+              branch=args.branch, remote=remote, detail=detail, **facts)
         return 4
     try:
         after = git(repo, "rev-parse", "HEAD", timeout=min(args.timeout, 30))
@@ -342,7 +357,7 @@ def publish(args):
     message = ("Verified feature commit published; source branch changed or could not be rechecked"
                if source_changed else "Feature branch published")
     identity = {} if expected_repository is None else {'repository': expected_repository}
-    report("PUSHED", message, branch=args.branch, remote=remote, head=head,
+    reply("PUSHED", message, branch=args.branch, remote=remote, head=head,
            source_changed=source_changed, **identity)
     return 0
 
