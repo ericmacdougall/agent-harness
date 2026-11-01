@@ -32,6 +32,27 @@ def git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def base_is_ancestor(repo: Path, base: str, head: str) -> bool:
+    """Treat a real divergent history as blocked, but surface Git errors."""
+    env = git_environment()
+    require_safe_source(repo, env)
+    result = run_process(["git", "-C", str(repo), "merge-base", "--is-ancestor",
+                          base, head], text=True, env=env, timeout=30)
+    if result.returncode not in (0, 1):
+        raise subprocess.CalledProcessError(result.returncode, result.args,
+                                            result.stdout, result.stderr)
+    return result.returncode == 0
+
+
+def has_grafts(repo: Path) -> bool:
+    """Refuse source-local history rewriting before trusting ancestry checks."""
+    raw = git(repo, "rev-parse", "--git-path", "info/grafts")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = repo / path
+    return os.path.lexists(path)
+
+
 def log(wal: Path | None, record: dict) -> None:
     if wal is None:
         return
@@ -135,11 +156,14 @@ def main() -> int:
         dirty_after = bool(git(repo, "status", "--porcelain", "--untracked-files=all"))
         actual_branch = git(repo, "branch", "--show-current")
         branch_head = git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
+        grafts_present = has_grafts(repo)
+        commits = 0 if grafts_present else int(git(repo, "rev-list", "--count", f"{base}..{head}"))
+        history_ok = not grafts_present and base_is_ancestor(repo, base, head)
         status = "blocked"
-        if code == 0 and actual_branch == branch and branch_head == head:
+        if code == 0 and actual_branch == branch and branch_head == head and history_ok:
             if dirty_after:
                 status = "needs-main-commit"
-            elif head != base:
+            elif commits > 0:
                 status = "needs-main-verification"
         report = {
             "source": source,
@@ -149,7 +173,7 @@ def main() -> int:
             "actual_branch": actual_branch,
             "base": base,
             "head": head,
-            "commits": int(git(repo, "rev-list", "--count", f"{base}..HEAD")),
+            "commits": commits,
             "dirty": dirty_after,
             # Preserve these report keys for existing consumers of rescue reports.
             "snapshot_commit_by_wrapper": False,

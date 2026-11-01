@@ -58,6 +58,22 @@ if os.environ.get('CODEX_COMMIT'):
     import subprocess
     subprocess.run(['git', 'add', 'app.txt'], check=True)
     subprocess.run(['git', 'commit', '-qm', 'model commit'], check=True)
+    if os.environ.get('CODEX_DIRTY_AFTER_COMMIT'):
+        Path('app.txt').write_text('new dirty edit\\n')
+reset = os.environ.get('CODEX_RESET_TO')
+if reset:
+    import subprocess
+    subprocess.run(['git', 'reset', '--hard', '-q', reset], check=True)
+    if os.environ.get('CODEX_DIVERGE'):
+        subprocess.run(['git', 'commit', '--allow-empty', '-qm', 'sibling commit'], check=True)
+    if os.environ.get('CODEX_DIRTY_AFTER_RESET'):
+        Path('app.txt').write_text('unfinished after reset\\n')
+    graft_base = os.environ.get('CODEX_GRAFT_BASE')
+    if graft_base:
+        graft = Path(subprocess.run(['git', 'rev-parse', '--git-path', 'info/grafts'],
+                                    capture_output=True, text=True, check=True).stdout.strip())
+        graft.parent.mkdir(parents=True, exist_ok=True)
+        graft.write_text(graft_base + '\\n' + reset + ' ' + graft_base + '\\n')
 if os.environ.get('CODEX_SWITCH_BRANCH'):
     import subprocess
     subprocess.run(['git', 'switch', '-q', '-c', 'feat/wrong'], check=True)
@@ -130,6 +146,89 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertFalse(report['dirty'])
         self.assertFalse(report['snapshot_commit_by_wrapper'])
         self.assertEqual(git(self.repo, 'show', 'HEAD:app.txt'), 'updated')
+
+    def two_commit_base(self):
+        ancestor = self.base
+        git(self.repo, 'commit', '--allow-empty', '-qm', 'approved base')
+        self.base = git(self.repo, 'rev-parse', 'HEAD')
+        return ancestor
+
+    def test_clean_reset_to_ancestor_is_blocked(self):
+        ancestor = self.two_commit_base()
+        result = self.invoke(env={'CODEX_RESET_TO': ancestor})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['base'], self.base)
+        self.assertEqual(report['head'], ancestor)
+        self.assertEqual(report['commits'], 0)
+        self.assertFalse(report['dirty'])
+
+    def test_divergent_sibling_commit_is_blocked(self):
+        ancestor = self.two_commit_base()
+        result = self.invoke(env={'CODEX_RESET_TO': ancestor, 'CODEX_DIVERGE': '1'})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['commits'], 1)
+        self.assertFalse(report['dirty'])
+        self.assertNotEqual(report['head'], self.base)
+
+    def test_dirty_reset_to_ancestor_is_blocked(self):
+        ancestor = self.two_commit_base()
+        result = self.invoke(env={'CODEX_RESET_TO': ancestor, 'CODEX_DIRTY_AFTER_RESET': '1'})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertTrue(report['dirty'])
+        self.assertEqual(report['head'], ancestor)
+
+    def test_failed_model_reset_does_not_invoke_fallback(self):
+        ancestor = self.two_commit_base()
+        capture = self.root / 'fallback-prompt.txt'
+        result = self.invoke(env={'CODEX_RESET_TO': ancestor, 'CODEX_EXIT': '7',
+                                  'CAPTURE_CLAUDE_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['head'], ancestor)
+        self.assertFalse(capture.exists())
+
+    def test_graft_spoofed_ancestor_reset_is_blocked(self):
+        ancestor = self.two_commit_base()
+        result = self.invoke(env={'CODEX_RESET_TO': ancestor, 'CODEX_GRAFT_BASE': self.base})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['commits'], 0)
+        self.assertEqual(report['head'], ancestor)
+
+    def test_dirty_descendant_commit_still_needs_main_commit(self):
+        result = self.invoke(env={'CODEX_ACTION': 'updated', 'CODEX_COMMIT': '1',
+                                  'CODEX_DIRTY_AFTER_COMMIT': '1'})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'needs-main-commit')
+        self.assertEqual(report['commits'], 1)
+        self.assertTrue(report['dirty'])
+        self.assertEqual(report['exit'], 0)
+
+    def test_ancestry_inspection_error_is_not_divergence(self):
+        with patch.object(rescue, 'run_process', return_value=subprocess.CompletedProcess(
+                ['git'], 128, '', 'fixture error')):
+            with self.assertRaises(subprocess.CalledProcessError):
+                rescue.base_is_ancestor(self.repo, self.base, self.base)
+
+    def test_linked_worktree_uses_common_git_graft_path(self):
+        linked = self.root / 'linked'
+        git(self.repo, 'worktree', 'add', '-q', '-b', 'linked', str(linked))
+        graft = Path(git(linked, 'rev-parse', '--git-path', 'info/grafts'))
+        if not graft.is_absolute():
+            graft = linked / graft
+        graft.parent.mkdir(parents=True, exist_ok=True)
+        graft.write_text('fixture\n')
+        self.assertTrue(rescue.has_grafts(linked))
 
     def test_rescue_refuses_clean_commit_on_a_different_branch(self):
         result = self.invoke(env={'CODEX_SWITCH_BRANCH': '1', 'CAPTURE_CLAUDE_PROMPT': str(self.root / 'fallback')})
