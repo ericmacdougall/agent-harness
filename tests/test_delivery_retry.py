@@ -18,7 +18,7 @@ class LocalGenerationRetry(unittest.TestCase):
 
     def cleanup_preserved_history(self):
         root = self.fixture.original / '.git' / 'agent-harness' / 'delivery-scratch'
-        for journal in root.glob('scopes/*/history/*/*/journal.json'):
+        for journal in root.glob('scopes/*/archive/history/*/*/journal.json'):
             record = json.loads(journal.read_text())
             if record.get('schema') != 2 or 'container' not in record:
                 continue
@@ -61,7 +61,7 @@ class LocalGenerationRetry(unittest.TestCase):
         self.assertEqual((fixture.original / 'app.txt').read_text(), 'feature\n')
         self.assertEqual(workflow.command('git', 'status', '--porcelain', cwd=fixture.original,
                                           env=fixture.env).stdout, '')
-        retained = [path.read_bytes() for path in root.glob('scopes/*/history/' + key + '/*/journal.json')]
+        retained = [path.read_bytes() for path in root.glob('scopes/*/archive/history/*/' + key + '/journal.json')]
         self.assertIn(old_record, retained)
 
 
