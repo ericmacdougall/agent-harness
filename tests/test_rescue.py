@@ -60,9 +60,14 @@ if os.environ.get('CODEX_COMMIT'):
     subprocess.run(['git', 'commit', '-qm', 'model commit'], check=True)
     if os.environ.get('CODEX_DIRTY_AFTER_COMMIT'):
         Path('app.txt').write_text('new dirty edit\\n')
+    if os.environ.get('CODEX_STAGE_AFTER_COMMIT'):
+        Path('app.txt').write_text('staged after commit\\n')
+        subprocess.run(['git', 'add', 'app.txt'], check=True)
 reset = os.environ.get('CODEX_RESET_TO')
 if reset:
     import subprocess
+    if os.environ.get('CODEX_FORGE_GRAPH_PARENT'):
+        subprocess.run(['git', 'branch', 'keep-approved-base'], check=True)
     subprocess.run(['git', 'reset', '--hard', '-q', reset], check=True)
     if os.environ.get('CODEX_DIVERGE'):
         subprocess.run(['git', 'commit', '--allow-empty', '-qm', 'sibling commit'], check=True)
@@ -84,6 +89,37 @@ if os.environ.get('CODEX_LOCAL_FILTER'):
     subprocess.run(['git', 'config', 'filter.fixture.clean',
                     "sh -c 'touch " + shlex.quote(marker) + "; cat'"], check=True)
     Path('app.txt').write_text('updated\\n')
+if os.environ.get('CODEX_FORGE_GRAPH_PARENT') or os.environ.get('CODEX_FORGE_GRAPH_TREE'):
+    import hashlib, subprocess
+    subprocess.run(['git', 'commit-graph', 'write', '--reachable'], check=True)
+    graph_path = subprocess.run(['git', 'rev-parse', '--git-path',
+                                 'objects/info/commit-graph'],
+                                capture_output=True, text=True, check=True).stdout.strip()
+    graph = Path(graph_path)
+    if not graph.is_absolute():
+        graph = Path.cwd() / graph
+    data = bytearray(graph.read_bytes())
+    hash_size = {1: 20, 2: 32}[data[5]]
+    chunks = {bytes(data[8 + i * 12:12 + i * 12]):
+              int.from_bytes(data[12 + i * 12:20 + i * 12], 'big')
+              for i in range(data[6])}
+    count = int.from_bytes(data[chunks[b'OIDF'] + 1020:chunks[b'OIDF'] + 1024], 'big')
+    oids = [data[chunks[b'OIDL'] + i * hash_size:
+                 chunks[b'OIDL'] + (i + 1) * hash_size].hex() for i in range(count)]
+    head = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True,
+                          text=True, check=True).stdout.strip()
+    entry = chunks[b'CDAT'] + oids.index(head) * (hash_size + 16)
+    parent = os.environ.get('CODEX_FORGE_GRAPH_PARENT')
+    if parent:
+        data[entry + hash_size:entry + hash_size + 4] = oids.index(parent).to_bytes(4, 'big')
+    else:
+        tree = subprocess.run(['git', 'write-tree'], capture_output=True,
+                              text=True, check=True).stdout.strip()
+        data[entry:entry + hash_size] = bytes.fromhex(tree)
+    digest = hashlib.sha1 if hash_size == 20 else hashlib.sha256
+    data[-hash_size:] = digest(data[:-hash_size]).digest()
+    graph.chmod(0o600)
+    graph.write_bytes(data)
 last = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 last.write_text('Fixture handoff')
 race = os.environ.get('RACE_OUTPUT')
@@ -203,6 +239,50 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(report['status'], 'blocked')
         self.assertEqual(report['commits'], 0)
         self.assertEqual(report['head'], ancestor)
+
+    def test_forged_commit_graph_parent_does_not_accept_sibling(self):
+        ancestor = self.two_commit_base()
+        result = self.invoke(env={'CODEX_RESET_TO': ancestor, 'CODEX_DIVERGE': '1',
+                                  'CODEX_FORGE_GRAPH_PARENT': self.base})
+        head = git(self.repo, 'rev-parse', 'HEAD')
+        self.assertEqual(subprocess.run(
+            ['git', '-C', str(self.repo), 'merge-base', '--is-ancestor', self.base, head]
+        ).returncode, 0)
+        self.assertEqual(subprocess.run(
+            ['git', '-C', str(self.repo), '-c', 'core.commitGraph=false',
+             'merge-base', '--is-ancestor', self.base, head]
+        ).returncode, 1)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['commits'], 1)
+
+    def test_forged_commit_graph_tree_does_not_hide_staged_edit(self):
+        result = self.invoke(env={'CODEX_ACTION': 'updated', 'CODEX_COMMIT': '1',
+                                  'CODEX_STAGE_AFTER_COMMIT': '1',
+                                  'CODEX_FORGE_GRAPH_TREE': '1'})
+        self.assertEqual(git(self.repo, 'status', '--porcelain'), '')
+        self.assertEqual(git(self.repo, '-c', 'core.commitGraph=false',
+                             'status', '--porcelain'), 'M  app.txt')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'needs-main-commit')
+        self.assertTrue(report['dirty'])
+        self.assertEqual(report['commits'], 1)
+
+    def test_linked_worktree_forged_commit_graph_is_ignored(self):
+        ancestor = self.two_commit_base()
+        linked = self.root / 'linked'
+        git(self.repo, 'worktree', 'add', '-q', '-b', 'linked', str(linked), self.base)
+        self.repo = linked
+        result = self.invoke(env={'CODEX_RESET_TO': ancestor, 'CODEX_DIVERGE': '1',
+                                  'CODEX_FORGE_GRAPH_PARENT': self.base})
+        graph = Path(git(linked, 'rev-parse', '--git-path', 'objects/info/commit-graph'))
+        if not graph.is_absolute():
+            graph = linked / graph
+        self.assertTrue(graph.is_file())
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(self.output.read_text())['status'], 'blocked')
 
     def test_dirty_descendant_commit_still_needs_main_commit(self):
         result = self.invoke(env={'CODEX_ACTION': 'updated', 'CODEX_COMMIT': '1',

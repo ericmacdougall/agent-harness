@@ -26,7 +26,9 @@ from git_safety import git_environment, require_safe_source
 def git(repo: Path, *args: str) -> str:
     env = git_environment()
     require_safe_source(repo, env)
-    result = run_process(["git", "-C", str(repo), *args], text=True, env=env, timeout=30)
+    # A rescue model can forge cached commit parents or trees without changing objects.
+    result = run_process(["git", "-C", str(repo), "-c", "core.commitGraph=false", *args],
+                         text=True, env=env, timeout=30)
     if result.returncode:
         raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
     return result.stdout.strip()
@@ -36,7 +38,8 @@ def base_is_ancestor(repo: Path, base: str, head: str) -> bool:
     """Treat a real divergent history as blocked, but surface Git errors."""
     env = git_environment()
     require_safe_source(repo, env)
-    result = run_process(["git", "-C", str(repo), "merge-base", "--is-ancestor",
+    result = run_process(["git", "-C", str(repo), "-c", "core.commitGraph=false",
+                          "merge-base", "--is-ancestor",
                           base, head], text=True, env=env, timeout=30)
     if result.returncode not in (0, 1):
         raise subprocess.CalledProcessError(result.returncode, result.args,
