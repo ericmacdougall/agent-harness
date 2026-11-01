@@ -30,6 +30,8 @@ AGENTS = ('harness_owner.toml', 'harness_reviewer.toml', 'harness_red_team.toml'
           'harness_click_tester.toml', 'harness_fixer.toml', 'harness_rescue.toml')
 SKILL_FILES = ('SKILL.md', 'references/owner-workflow.md',
                'references/testing-and-evals.md', 'references/delivery.md')
+DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report_file.py',
+                    'publish_feature.py', 'integrate_local.py', 'deliver.py')
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart')
 
 
@@ -215,6 +217,9 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False) -> li
     files = [(SOURCE / 'agents' / name, codex_home / 'agents' / name) for name in AGENTS]
     files += [(SOURCE / 'skills' / 'agent-harness' / name, skill_dir / name) for name in SKILL_FILES]
     files += [(SOURCE / 'hooks' / 'wal.py', harness_dir / 'wal.py')]
+    files += [(ROOT / 'harness' / 'hooks' / name, harness_dir / name)
+              for name in DELIVERY_HELPERS]
+    files += [(ROOT / 'harness' / 'tools' / 'watch-tests.py', harness_dir / 'watch-tests.py')]
     instructions_path = codex_home / 'AGENTS.md'
     hooks_path = codex_home / 'hooks.json'
     config_path = codex_home / 'config.toml'

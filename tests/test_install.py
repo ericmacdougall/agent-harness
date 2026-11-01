@@ -488,6 +488,22 @@ class InstallerTests(unittest.TestCase):
             install(self.home, apply=True)
         self.assertFalse((self.claude / "settings.json").exists())
 
+    def test_delivery_workflow_dependency_closure_starts_without_source_imports(self):
+        install(self.home, apply=True)
+        required = ('deliver.py', 'github_identity.py', 'process.py', 'git_safety.py',
+                    'report_file.py', 'publish_feature.py', 'integrate_local.py')
+        for name in required:
+            target = self.claude / 'hooks' / name
+            self.assertTrue(target.is_file(), f'{name} was not installed')
+            self.assertEqual(target.read_bytes(), (ROOT / 'harness' / 'hooks' / name).read_bytes())
+        environment = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+        environment.update(HOME=str(self.home), PYTHONNOUSERSITE='1')
+        result = subprocess.run([sys.executable, str(self.claude / 'hooks' / 'deliver.py'), '--help'],
+                                cwd=self.home, env=environment, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('prepare', result.stdout)
+        self.assertIn('finish', result.stdout)
+
     def managed_snapshot(self):
         return {str(path.relative_to(self.claude)): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
                 for path in self.claude.rglob('*')

@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codex.hooks import wal
-from install_codex import (AGENTS, CONFIG_END, CONFIG_START, HOOK_EVENTS, SKILL_FILES, SOURCE, install,
+from install_codex import (AGENTS, CONFIG_END, CONFIG_START, DELIVERY_HELPERS, HOOK_EVENTS, SKILL_FILES, SOURCE, install,
                            managed_command, merge_config, merge_marked, tomllib)
 
 
@@ -278,7 +278,8 @@ class CodexInstallerTests(unittest.TestCase):
                           'Stop': [{'hooks': [foreign]}]},
             }))
             preview = install(home, apply=False)
-            self.assertEqual(len(preview), len(AGENTS) + len(SKILL_FILES) + 4)
+            self.assertEqual(len(preview), len(set(preview)))
+            self.assertTrue({str(codex_home / 'agent-harness' / name) for name in DELIVERY_HELPERS} <= set(preview))
             self.assertFalse((codex_home / 'agent-harness').exists())
             self.assertEqual((codex_home / 'AGENTS.md').read_text(), 'Existing user instructions.\n')
             install(home, apply=True)
@@ -315,6 +316,72 @@ class CodexInstallerTests(unittest.TestCase):
             self.assertTrue(all(stat.S_IMODE(path.stat().st_mode) == 0o700 for path in backups))
             first = json.loads((backups[0] / 'manifest.json').read_text())
             self.assertEqual({Path(item['path']).name for item in first}, {'AGENTS.md', 'hooks.json', 'config.toml'})
+
+    def test_delivery_workflow_dependency_closure_starts_without_claude_or_source_imports(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            install(home, apply=True)
+            harness = home / '.codex' / 'agent-harness'
+            required = ('deliver.py', 'github_identity.py', 'process.py', 'git_safety.py',
+                        'report_file.py', 'publish_feature.py', 'integrate_local.py')
+            for name in required:
+                target = harness / name
+                self.assertTrue(target.is_file(), f'{name} was not installed')
+                self.assertEqual(target.read_bytes(), (ROOT / 'harness' / 'hooks' / name).read_bytes())
+            self.assertFalse((home / '.claude').exists())
+            environment = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+            environment.update(HOME=str(home), PYTHONNOUSERSITE='1')
+            result = subprocess.run([sys.executable, str(harness / 'deliver.py'), '--help'],
+                                    cwd=home, env=environment, text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('prepare', result.stdout)
+            self.assertIn('finish', result.stdout)
+
+    def test_installed_watcher_runs_without_claude_or_source_imports(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            home = root / 'home'
+            project = root / 'project'
+            elsewhere = root / 'elsewhere'
+            for directory in (home, project, elsewhere):
+                directory.mkdir()
+            watcher = home / '.codex' / 'agent-harness' / 'watch-tests.py'
+            self.assertIn(str(watcher), install(home, apply=False))
+            self.assertFalse(watcher.exists())
+            install(home, apply=True)
+            self.assertEqual(watcher.read_bytes(), (ROOT / 'harness' / 'tools' / 'watch-tests.py').read_bytes())
+            self.assertFalse((home / '.claude').exists())
+            poison_marker = root / 'foreign-process-imported'
+            poison = (f'from pathlib import Path; Path({str(poison_marker)!r}).touch(); '
+                      'raise RuntimeError("foreign watcher helper imported")\n')
+            foreign_hooks = home / '.codex' / 'hooks'
+            foreign_hooks.mkdir()
+            (foreign_hooks / 'process.py').write_text(poison)
+            (elsewhere / 'process.py').write_text(poison)
+            environment = {key: value for key, value in os.environ.items()
+                           if key not in ('PYTHONPATH', 'PYTHONHOME')}
+            environment.update(HOME=str(home), PYTHONNOUSERSITE='1', PYTHONPATH=str(elsewhere))
+            help_result = subprocess.run([sys.executable, str(watcher), '--help'],
+                                         cwd=elsewhere, env=environment, text=True,
+                                         capture_output=True, timeout=10)
+            self.assertEqual(help_result.returncode, 0, help_result.stdout + help_result.stderr)
+            self.assertIn('--once', help_result.stdout)
+            self.assertIn('--root', help_result.stdout)
+            command = ('import json, os, sys; from pathlib import Path; '
+                       'Path(sys.argv[1]).write_text(json.dumps({"cwd": str(Path.cwd()), "home": os.environ["HOME"]})); '
+                       'raise SystemExit(int(sys.argv[2]))')
+            for exit_code in (0, 7):
+                with self.subTest(exit_code=exit_code):
+                    marker = project / f'run-{exit_code}.json'
+                    result = subprocess.run(
+                        [sys.executable, str(watcher), '--root', str(project), '--once', '--',
+                         sys.executable, '-c', command, str(marker), str(exit_code)],
+                        cwd=elsewhere, env=environment, text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
+                    self.assertIn(f'[watch] exit {exit_code}', result.stdout)
+                    self.assertEqual(json.loads(marker.read_text()), {'cwd': str(project), 'home': str(home)})
+            self.assertFalse(poison_marker.exists(), 'watcher imported a foreign process helper')
+            self.assertFalse((home / '.claude').exists())
 
     def test_existing_policy_is_not_overridden(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -415,35 +482,77 @@ class CodexInstallerTests(unittest.TestCase):
 
     def test_each_managed_write_failure_rolls_back_existing_files(self):
         from install_codex import atomic_write
-        for boundary in range(len(AGENTS) + len(SKILL_FILES) + 4):
-            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
-                home = Path(temporary).resolve()
-                codex_home = home / '.codex'
-                codex_home.mkdir()
-                (codex_home / 'AGENTS.md').write_text('Original instructions.\n')
-                (codex_home / 'hooks.json').write_text('{"hooks":{}}\n')
-                (codex_home / 'config.toml').write_text('model = "gpt-6-sol"\n')
-                original = {name: (codex_home / name).read_bytes() for name in ('AGENTS.md', 'hooks.json', 'config.toml')}
-                writes = 0
-                fired = False
 
-                def fail_once(path, data, mode=0o600, **kwargs):
-                    nonlocal writes, fired
-                    if 'backups' not in path.parts and not fired:
-                        if writes == boundary:
-                            fired = True
-                            raise OSError('fixture: managed write interrupted')
-                        writes += 1
-                    return atomic_write(path, data, mode, **kwargs)
+        # Observe the real payload publication sequence, not an arithmetic
+        # estimate that can silently miss writes when helper closure grows.
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            codex_home = home / '.codex'
+            codex_home.mkdir()
+            planned = [Path(path) for path in install(home, apply=False)]
+            observed = []
 
-                with patch('install_codex.atomic_write', side_effect=fail_once):
-                    with self.assertRaisesRegex(OSError, 'managed write interrupted'):
-                        install(home, apply=True)
-                self.assertTrue(fired)
-                for name, contents in original.items():
-                    self.assertEqual((codex_home / name).read_bytes(), contents)
-                self.assertEqual(list((codex_home / 'agents').glob('harness_*.toml')), [])
-                self.assertFalse((codex_home / 'skills' / 'agent-harness' / 'SKILL.md').exists())
+            def record_write(path, data, mode=0o600, **kwargs):
+                if 'backups' not in path.relative_to(codex_home).parts:
+                    observed.append(path)
+                return atomic_write(path, data, mode, **kwargs)
+
+            with patch('install_codex.atomic_write', side_effect=record_write):
+                install(home, apply=True)
+            self.assertEqual(observed, planned)
+            self.assertEqual(len(observed), len(set(observed)))
+            relative_plan = [path.relative_to(codex_home) for path in observed]
+        fired_boundaries = set()
+        for existing in (False, True):
+            for boundary, failed_destination in enumerate(relative_plan):
+                with self.subTest(existing=existing, boundary=boundary, destination=str(failed_destination)), \
+                        tempfile.TemporaryDirectory() as temporary:
+                    home = Path(temporary).resolve()
+                    codex_home = home / '.codex'
+                    codex_home.mkdir()
+                    if existing:
+                        for index, relative in enumerate(relative_plan):
+                            path = codex_home / relative
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_text('Original managed file: ' + str(relative) + '\n')
+                            path.chmod(0o600 if index % 2 else 0o640)
+                    (codex_home / 'AGENTS.md').write_text('Original instructions.\n')
+                    (codex_home / 'hooks.json').write_text('{"hooks":{}}\n')
+                    (codex_home / 'config.toml').write_text('model = "gpt-6-sol"\n')
+                    foreign = codex_home / 'foreign.txt'
+                    foreign.write_text('unrelated user data\n')
+                    foreign.chmod(0o640)
+
+                    def snapshot():
+                        return {str(path.relative_to(codex_home)):
+                                (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                                for path in codex_home.rglob('*')
+                                if path.is_file() and 'backups' not in path.relative_to(codex_home).parts}
+
+                    before = snapshot()
+                    writes = []
+                    fired = False
+
+                    def fail_once(path, data, mode=0o600, **kwargs):
+                        nonlocal fired
+                        if 'backups' not in path.relative_to(codex_home).parts and not fired:
+                            relative = path.relative_to(codex_home)
+                            self.assertEqual(relative, relative_plan[len(writes)])
+                            if len(writes) == boundary:
+                                fired = True
+                                fired_boundaries.add((existing, relative))
+                                raise OSError('fixture: managed write interrupted')
+                            writes.append(relative)
+                        return atomic_write(path, data, mode, **kwargs)
+
+                    with patch('install_codex.atomic_write', side_effect=fail_once):
+                        with self.assertRaisesRegex(OSError, 'managed write interrupted'):
+                            install(home, apply=True)
+                    self.assertTrue(fired, 'planned failure boundary never executed')
+                    self.assertEqual(len(writes), boundary)
+                    self.assertEqual(snapshot(), before)
+        self.assertEqual(fired_boundaries,
+                         {(existing, relative) for existing in (False, True) for relative in relative_plan})
 
 
 class CodexWalTests(unittest.TestCase):

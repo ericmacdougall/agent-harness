@@ -10,6 +10,7 @@
 | `peer_review.py`, `report_file.py` | Read-only Sol plan/PR review with blind Opus fallback and inode-checked private reports. |
 | `git_safety.py` | Bounded Git source preflight and controlled subprocess environment shared by review, rescue, publication, and integration. |
 | `rescue.py` | Main-approved Astra rescue with Fable fallback on a clean worktree. |
+| `deliver.py` | Durable prepare/finish workflow for a draft PR and checked original checkout. |
 | `publish_feature.py` | Guarded feature branch push to `origin`. |
 | `integrate_local.py` | Checked scratch merge and protected fast-forward into the starting checkout. |
 | `watch-tests.py` | Polling test runner for source edits. |
@@ -55,7 +56,47 @@ The main agent can invoke `rescue.py` after repeated material findings, only in 
 
 The rescue wrapper does not stage or commit leftover model edits. It always exits 3 after a valid model attempt, including a clean committed descendant reported as `needs-main-verification`; exit 0 is never a rescue success signal. The isolated worktree and its existing Git index remain in place. Main must independently inspect the preserved worktree, branch, commit ancestry, file types and contents, and test evidence, then obtain final review before integration. If the model leaves a dirty worktree, the report says `needs-main-commit`; main must test and commit the preserved work. Any failed Astra invocation preserves the worktree for main inspection instead of triggering Fable. Fable is used only when the Astra executable is unavailable and the worktree remains unchanged under Git inspection; the main agent must give this worktree exclusive ownership. The wrapper compares `.git/info/attributes`, `.git/info/exclude`, and repository-local configuration values for their alternate paths while selecting fallback and reporting status. It does not pin the alternate files' contents or worktree-scoped configuration, nor attest to raw file bytes under every pre-existing attribute or stat-cache combination; a `needs-main-verification` report is only a handoff. Keep the report's `exit` field distinct from the helper exit: it records the model's exit code.
 
-## Publication and local integration
+## Delivery workflow
+
+Both editions install the same delivery implementation and dependencies. Claude uses `~/.claude/hooks/deliver.py`; Codex uses `~/.codex/agent-harness/deliver.py` and needs no Claude installation. Remote delivery also needs an authenticated Git transport and GitHub CLI (`gh`). The helper never merges a remote PR. Repository review, authorization and scope checks remain the main agent's responsibility.
+
+Create private mode-0600 input files outside the worktree. A run kit records real commands; its text is validated but never executed by this helper. For example, replace these with the repository's actual verified instructions:
+
+```json
+{"run":"python3 -m app","test":"python3 -m unittest discover -s tests -v","watch":"python3 ~/.codex/agent-harness/watch-tests.py --root /absolute/original -- python3 -m unittest discover -s tests -v","logs":"Read the terminal test output","stop":"Ctrl-C"}
+```
+
+After final source review and tests, prepare the feature and draft PR:
+
+```sh
+python3 ~/.codex/agent-harness/deliver.py prepare --task OWNER_TASK --source /absolute/feature --original /absolute/original --original-branch main --expected-source-head FULL_REVIEWED_SHA --expected-original-head FULL_CAPTURED_SHA --kit-file /private/kit.json --pr-title 'Reviewed scope' --pr-body-file /private/pr-body.md
+```
+
+The effective fetch and push identities of both checkouts must be the same supported GitHub repository. Publication binds that identity inside the publisher before network effects; a policy refusal cannot become local fallback. `PR_READY` records the reviewed source, run-kit digest, PR number, generation and state path. It leaves the original checkout unchanged. Once the normal repository process has merged the PR:
+
+```sh
+python3 ~/.codex/agent-harness/deliver.py finish --task OWNER_TASK --generation GENERATION --original /absolute/original --original-branch main --mode remote --check 'python3 -m unittest discover -s tests -v'
+```
+
+Remote finish verifies the PR's repository, branch, source SHA and merge commit. It fetches the exact advertised target through private bare transport, using the original object store without reading source-local routing configuration. The borrowed-store context explicitly disables automatic maintenance/GC and fetch commit-graph writing, and advertises available original/baseline/source negotiation tips. A real-Git regression uses aggressive maintenance and split packs to verify all prior objects survive; another verifies incremental object transfer, including cached feature history. It accepts only clean original history between the captured baseline and pinned target, reserves a shared recovery barrier and target ref, then uses hook-disabled `--ff-only --no-overwrite-ignore --no-autostash`. After exact merged-PR proof, the feature worktree may be removed or reused. Checks run in the actual original checkout. Concurrent remote advancement is accepted only after fetching the observed tip and proving the pinned target is its ancestor. The checkout and receipt stay at the pinned tested target; `remote_observed_head` identifies the later observation without claiming its code was delivered. Failed commands report observed HEAD even if Git advanced before returning an error; recovery evidence remains and blocks other tools on that original scope.
+
+A saved `REMOTE_BLOCKED` generation permits `finish --mode local`; not every network-error response settles the generation. Explicit local-only work uses `prepare --local-only` (PR title/body are then optional) before local finish. Local delivery requires worktrees of the same repository, uses the scratch helper below, and leaves remote publication outstanding. `REMOTE_UNCERTAIN`, unsupported origins and policy refusals cannot silently unlock fallback. Missing origin is a definite remote blocker. Continue independent local work when remote access is unavailable.
+
+Publication/create intents survive process loss. Query-only `prepare --reconcile-only --task OWNER_TASK --original /absolute/original --original-branch main` verifies an exact remote outcome without push, PR creation or checkout mutation, even when the source checkout has moved. Known PR numbers are queried exactly; inaccessible/ambiguous outcomes stay uncertain. A possible create is never disproved by a temporary empty list, malformed response or missing feature ref: it needs positive matching PR evidence. Durable `PUBLISHING` and `PR_LOOKUP` phases distinguish a push from a not-yet-attempted PR create. Explicit preflight failure before any push can settle `REMOTE_BLOCKED`; a definite push rejection or pre-create policy refusal settles `POLICY_BLOCKED`, permitting a new reviewed generation without local fallback. Fork/foreign PRs with the same branch name are excluded from owned matches. PR enumeration is capped at 101 records, rejecting more than 100, with bounded output and API deadlines. Publisher parent time is bounded to cover its fixed sequential per-command budgets; its deadline test uses a synthetic two-stage elapsed-time model, separate from real Git behavior tests. New reviewed source/run-kit inputs use `--new-generation` only after the prior generation is settled; older generations are stale and cannot mutate the current task.
+
+Workflow state is private metadata beneath `<git-common-dir>/agent-harness/delivery-workflows`, separated from scratch journals and independent of HOME/session. One task lock serializes workflow receipt changes; the existing original-checkout lock serializes actual applies across tools. The local child owns that original lock itself so parent/child do not deadlock. A fresh local generation can retry a previously resolved identical baseline/source tuple; the child preserves the prior attempt in archive history. Only the guard API's explicit `reservation_started is False` proof permits returning a failed pre-reservation attempt to `PR_READY`; unknown or partially written own attempts retain recovery. A remote target remains reachable through an owned ref. Successful receipts are immutable and written only after checks; `ALREADY_DELIVERED` validates the historical delivered commit in a clean current original without silently syncing newer remote work. Full run-kit/body text and check-command text are not persisted in workflow receipts.
+
+A failed apply requires inspection. Resolve actual shared journals using the lower-level helper's explicit `--resolve-journal KEY` below, at a full confirmed clean HEAD with real passing checks. `RESOLVED` accepts a baseline while retaining artifacts and actual pin-state facts; it proves no delivery. If the workflow stopped before binding its child/guard result, after all actual barriers are resolved use:
+
+```sh
+python3 ~/.codex/agent-harness/deliver.py finish --task OWNER_TASK --original /absolute/original --original-branch main --resolve-baseline FULL_CONFIRMED_SHA --check 'python3 -m unittest discover -s tests -v'
+```
+
+Only known interrupted apply phases can make this transition. Exact clean HEAD, passing nonvacuous checks, unchanged generation/state and no shared unresolved barriers are required. `RESOLVED_BASELINE` preserves every record/ref and writes no delivery receipt; start a new reviewed generation and finish with fresh proof. It cannot settle unknown push/PR outcomes.
+
+No global Stop hook claims these steps occurred or blocks ordinary questions/background work. The main agent must call the helper and inspect the actual result. The run kit also needs useful user-facing instructions: verify a repository-native watcher or the installed dependency-free watcher (`~/.codex/agent-harness/watch-tests.py` or `~/.claude/tools/watch-tests.py`). Use `--once` to verify setup, omit it for continuous testing and Ctrl-C to stop. The helper cannot judge whether those commands are useful. Local scratch and remote checks execute repository code and are not an OS sandbox; same-user external mutations and changes reverted entirely between guards remain outside the guarantee.
+
+## Lower-level publication and local integration
 
 ```sh
 python3 ~/.claude/hooks/publish_feature.py --repo /absolute/feature-worktree --branch feat/example --original-branch main --expected-head FULL_FEATURE_SHA
