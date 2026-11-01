@@ -163,6 +163,22 @@ class ExternalApply(unittest.TestCase):
             self.assertFalse(archive.exists())
             self.assertEqual(guard.journal.read_bytes(), before)
 
+    def test_read_only_load_refuses_missing_archive_without_recreating_it(self):
+        target = self.target()
+        with patch.dict(os.environ, self.env, clear=True), self.scope() as scope:
+            guard = scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+            archive = guard.journal.parent.parent.parent / 'archive'
+            archive.rmdir()
+            before = guard.journal.read_bytes()
+            with self.assertRaises(integration.ExternalApplyError):
+                scope.load_external(guard.key, TASK, create=False)
+            self.assertFalse(archive.exists())
+            self.assertEqual(guard.journal.read_bytes(), before)
+            loaded = scope.load_external(guard.key, TASK)
+            self.assertTrue(archive.is_dir())
+            self.assertEqual(loaded.record, guard.record)
+            self.assertEqual(guard.journal.read_bytes(), before)
+
     def test_unprotected_failed_check_control_can_claim_already_integrated(self):
         # This is the control: clean advanced HEAD alone cannot prove a passed check.
         target = self.target()

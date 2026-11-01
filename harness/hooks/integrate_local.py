@@ -1166,13 +1166,14 @@ class OriginalScope:
                                      target=record.get('target') if record else None,
                                      reservation_started=reservation_started) from None
 
-    def load_external(self, key, task_digest):
+    def load_external(self, key, task_digest, *, create=True):
+        """Load a guard, optionally refusing missing namespaces without repair."""
         directory = None
         try:
             self._assert_current()
             if not hex_identity(key, 64) or not hex_identity(task_digest, 64):
                 raise OSError('invalid guard selection')
-            scope = scope_directory(self.root, self.identity, self.branch)
+            scope = scope_directory(self.root, self.identity, self.branch, create=create)
             found = [scope / area / key for area in ('active', 'archive')
                      if os.path.lexists(scope / area / key)]
             if len(found) != 1:
