@@ -282,11 +282,18 @@ def main():
 def private_directory(path):
     if path.is_symlink():
         raise OSError('private scratch path is a symlink')
-    path.mkdir(mode=0o700, exist_ok=True)
+    created = False
+    try:
+        path.mkdir(mode=0o700)
+        created = True
+    except FileExistsError:
+        pass
     info = os.stat(path, follow_symlinks=False)
     if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
             or stat.S_IMODE(info.st_mode) != 0o700):
         raise OSError('private scratch path is not owner-only')
+    if created:
+        fsync_directory(path.parent)
     return info
 
 
@@ -328,6 +335,12 @@ def journal_key(identity, branch, base, source_branch, source):
     payload = '\0'.join((str(identity[0]), str(identity[1]), branch, base,
                          source_branch, source)).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def candidate_ref(record):
+    attempt = record.get('attempt')
+    suffix = record['key'] + ('-' + attempt if attempt is not None else '')
+    return 'refs/agent-harness/delivery/' + suffix
 
 
 def scope_directory(root, identity, branch):
@@ -418,6 +431,7 @@ def reserve_scratch(root, repo, identity, branch, base, source_branch, source):
         directory.mkdir(mode=0o700)
     except FileExistsError:
         return directory, None
+    fsync_directory(directory.parent)
     container = Path(tempfile.mkdtemp(prefix='agent-harness-delivery-scratch-')).resolve()
     if set(container.parts) & {'.git', '.hg', '.sl'}:
         container.rmdir()
@@ -428,7 +442,8 @@ def reserve_scratch(root, repo, identity, branch, base, source_branch, source):
               'original_dev': identity[0], 'original_ino': identity[1], 'branch': branch,
               'base': base, 'source_branch': source_branch, 'source': source,
               'scratch': str(scratch), 'key': key, 'container': str(container),
-              'container_dev': container_info.st_dev, 'container_ino': container_info.st_ino}
+              'container_dev': container_info.st_dev, 'container_ino': container_info.st_ino,
+              'attempt': secrets.token_hex(16)}
     write_journal(directory, record, first=True)
     return directory, record
 
@@ -483,6 +498,9 @@ def read_journal(directory):
             or ('cleanup_pending' in record and type(record['cleanup_pending']) is not bool)
             or any(name in record and not full_oid(record[name]) for name in ('candidate', 'tree'))):
         raise OSError('scratch journal fields are invalid')
+    if ('attempt' in record and (not isinstance(record['attempt'], str) or len(record['attempt']) != 32
+                                or any(char not in '0123456789abcdef' for char in record['attempt']))):
+        raise OSError('scratch attempt identity is invalid')
     identity = (record.get('original_dev'), record.get('original_ino'))
     if record.get('reservation_only') is True:
         if (record['schema'] != 2 or record.get('phase') != 'resolved'
@@ -542,7 +560,7 @@ def completed_journal_is_verified(repo, identity, branch, directory, record, tim
             or actual_tree.returncode or actual_tree.stdout.strip() != tree
             or ancestor.returncode != 0):
         return False
-    ref = f'refs/agent-harness/delivery/{directory.name}'
+    ref = candidate_ref(record)
     if record.get('ref') != ref:
         return False
     pin = inspect('show-ref', '--verify', '--quiet', ref)
@@ -611,6 +629,7 @@ def scan_journals(root, repo, identity, branch, key, timeout):
     if exact is None and os.path.lexists(archived):
         remaining_budget(deadline, timeout)
         record = read_journal(archived)
+        remaining_budget(deadline, timeout)
         if ((record.get('original_dev'), record.get('original_ino')) != identity
                 or record.get('branch') != branch
                 or record.get('phase') not in {'delivered', 'resolved'}):
@@ -975,7 +994,7 @@ def integrate_scratch(args, preparations, checks):
                                    'Scratch candidate differs from verified merge tree or parents',
                                    phase='candidate', merge_aborted=False, candidate=candidate,
                                    original_head=observed_head(repo))
-        ref = f'refs/agent-harness/delivery/{record["key"]}'
+        ref = candidate_ref(record)
         zeros = '0' * len(candidate)
         pinned = run_git_nohooks(repo, 'update-ref', ref, candidate, zeros, timeout=args.timeout)
         if pinned.returncode:

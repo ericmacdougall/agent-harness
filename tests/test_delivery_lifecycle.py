@@ -356,6 +356,53 @@ class DeliveryLifecycle(unittest.TestCase):
                 self.assertNotIn('Traceback', result.stderr)
                 self.assertEqual(self.head(self.original), self.base)
 
+    def test_resolved_pinned_attempt_retries_without_reusing_or_deleting_old_ref(self):
+        (self.original / '.gitignore').write_text('cache.txt\n')
+        fixtures.command('git', 'add', '.gitignore', cwd=self.original, env=self.env)
+        fixtures.command('git', 'commit', '-qm', 'ignore cache', cwd=self.original, env=self.env)
+        self.base = self.head(self.original)
+        (self.feature / 'cache.txt').write_text('tracked feature cache')
+        fixtures.command('git', 'add', 'cache.txt', cwd=self.feature, env=self.env)
+        fixtures.command('git', 'commit', '-qm', 'track cache', cwd=self.feature, env=self.env)
+        self.feature_head = self.head(self.feature)
+        cache = self.original / 'cache.txt'
+        cache.write_text('ignored user cache')
+        failed, data = self.invoke()
+        self.assertEqual((failed.returncode, data['phase']), (3, 'apply'), failed.stdout)
+        record = json.loads(Path(data['journal']).read_text())
+        old_candidate = data['candidate']
+        legacy_ref = 'refs/agent-harness/delivery/' + record['key']
+        fixtures.command('git', 'update-ref', legacy_ref, old_candidate, cwd=self.original, env=self.env)
+        resolved, resolution = self.resolve(record['key'])
+        self.assertEqual((resolved.returncode, resolution['status']), (0, 'RESOLVED'), resolved.stdout)
+        cache.unlink()  # User has preserved and removed the known collision.
+        retried, delivered = self.invoke()
+        self.assertEqual((retried.returncode, delivered['status']), (0, 'INTEGRATED'), retried.stdout)
+        for ref in {record['ref'], legacy_ref}:
+            self.assertEqual(fixtures.command('git', 'rev-parse', ref, cwd=self.original,
+                                             env=self.env).stdout.strip(), old_candidate)
+        self.assertEqual(self.head(self.original), delivered['head'])
+
+    def test_resolved_archive_read_cannot_exceed_scan_deadline(self):
+        self.commit_feature('feature\n', test='import unittest\nclass Check(unittest.TestCase):\n def test_fail(self): self.fail("control")\n')
+        _, failed = self.invoke()
+        key = json.loads(Path(failed['journal']).read_text())['key']
+        resolved, data = self.resolve(key)
+        self.assertEqual(resolved.returncode, 0, resolved.stdout)
+        module = self.module()
+        root, _, _, _ = module.scratch_journal_root(self.original, 30)
+        clock = [0.0]
+        real_read = module.read_journal
+        def slow_read(directory):
+            record = real_read(directory)
+            clock[0] = 31
+            return record
+        with mock.patch.object(module.time, 'monotonic', side_effect=lambda: clock[0]), \
+                mock.patch.object(module, 'read_journal', side_effect=slow_read):
+            with self.assertRaises(OSError):
+                module.scan_journals(root, self.original, module.checkout_identity(self.original), 'main', key, 30)
+        self.assertEqual(self.head(self.original), self.base)
+
 
 if __name__ == '__main__':
     unittest.main()
