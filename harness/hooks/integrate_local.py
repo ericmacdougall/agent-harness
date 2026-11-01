@@ -35,8 +35,30 @@ INDEX_MAX_SECONDS = 30
 INDEX_HEADER_BYTES = 9  # tag, space, six-digit mode, space
 NONEMPTY_UNITTEST = (
     'import sys, unittest\n'
-    "program = unittest.main(module=None, argv=['unittest', *sys.argv[1:]], exit=False)\n"
-    'sys.exit(0 if program.result.testsRun > 0 and program.result.wasSuccessful() else 1)\n'
+    'class NonemptyResult(unittest.TextTestResult):\n'
+    '    def __init__(self, *args, **kwargs):\n'
+    '        super().__init__(*args, **kwargs)\n'
+    '        self.non_skipped = 0\n'
+    '        self.active_test = None\n'
+    '        self.active_skipped = False\n'
+    '    def startTest(self, test):\n'
+    '        self.active_test = test\n'
+    '        self.active_skipped = False\n'
+    '        self.non_skipped += 1\n'
+    '        super().startTest(test)\n'
+    '    def addSkip(self, test, reason):\n'
+    '        if test is self.active_test and not self.active_skipped:\n'
+    '            self.non_skipped -= 1\n'
+    '            self.active_skipped = True\n'
+    '        super().addSkip(test, reason)\n'
+    '    def stopTest(self, test):\n'
+    '        super().stopTest(test)\n'
+    '        self.active_test = None\n'
+    'class NonemptyRunner(unittest.TextTestRunner):\n'
+    '    resultclass = NonemptyResult\n'
+    "program = unittest.main(module=None, argv=['unittest', *sys.argv[1:]], "
+    'testRunner=NonemptyRunner, exit=False)\n'
+    'sys.exit(0 if program.result.non_skipped > 0 and program.result.wasSuccessful() else 1)\n'
 )
 
 
