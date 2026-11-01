@@ -17,7 +17,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 PUBLISH = Path(__file__).resolve().parents[1] / 'harness/hooks/publish_feature.py'
@@ -145,6 +145,26 @@ class ProcessRunner(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+
+    def test_discard_cleanup_does_not_sleep_past_grace_deadline(self):
+        child = Mock(pid=123)
+        clock = Mock()
+        clock.monotonic.side_effect = [100.0, 101.0, 102.01, 103.0]
+
+        def sleep(seconds):
+            if seconds < 0:
+                raise ValueError('sleep length must be non-negative')
+
+        clock.sleep.side_effect = sleep
+        with patch.object(self.process, 'time', clock), \
+             patch.object(self.process, 'drain_discarded', return_value=True), \
+             patch.object(self.process, 'signal_group') as signal_child, \
+             patch.object(self.process.os, 'killpg'):
+            self.process.cleanup_discarded(child)
+
+        clock.sleep.assert_not_called()
+        self.assertEqual(signal_child.call_count, 2)
+        child.wait.assert_called_once_with(timeout=self.process.DISCARD_CLEANUP_SECONDS)
 
     def test_discard_output_uses_one_pipe_without_retaining_bytes(self):
         real_popen = self.process.subprocess.Popen
