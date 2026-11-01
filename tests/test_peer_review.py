@@ -604,6 +604,9 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Reviewed packet SHA-256: ' + hashlib.sha256(raw).hexdigest(),
                       self.output.read_text())
+        self.packet.write_bytes(b'changed after successful review')
+        self.assertNotIn('Reviewed packet SHA-256: ' + hashlib.sha256(self.packet.read_bytes()).hexdigest(),
+                         self.output.read_text())
 
     def test_packet_changed_during_report_staging_blocks_publication(self):
         import contextlib
