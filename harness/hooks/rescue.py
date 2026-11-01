@@ -191,6 +191,30 @@ def read_packet(path: Path) -> str:
         os.close(fd)
 
 
+def read_handoff(path: Path) -> str | None:
+    """Read a bounded regular handoff without following links or blocking on pipes."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 1_000_000:
+            raise OSError("rescue handoff file is unsupported")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            data = handle.read(1_000_001)
+        after = os.fstat(fd)
+        current = os.stat(path, follow_symlinks=False)
+        stable = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if (len(data) > 1_000_000 or any(getattr(before, key) != getattr(after, key)
+                                           or getattr(before, key) != getattr(current, key)
+                                           for key in stable)):
+            raise OSError("rescue handoff file changed during inspection")
+        return data.decode(errors="replace")
+    finally:
+        os.close(fd)
+
+
 def run(cmd: list[str], prompt: str, repo: Path) -> tuple[int, str, str]:
     try:
         result = run_process(cmd, input=prompt, text=True, cwd=repo,
@@ -251,20 +275,29 @@ def main() -> int:
     log(wal, {"event": "rescue_start", "branch": branch, "base": base, "repo": str(repo)})
     source = "Codex gpt-6-astra"
     fallback_reason = ""
+    handoff_ok = True
     astra_available = shutil.which("codex") is not None
     if astra_available:
         with tempfile.TemporaryDirectory() as temp:
             last = Path(temp) / "last.txt"
             cmd = ["codex", "exec", "--ephemeral", "--model", "gpt-6-astra", "--sandbox", "workspace-write", "--cd", str(repo), "--output-last-message", str(last), "-"]
             code, stdout, stderr = run(cmd, prompt, repo)
-            handoff = last.read_text(errors="replace") if last.exists() else stdout
+            try:
+                model_handoff = read_handoff(last)
+                handoff = model_handoff if model_handoff is not None else stdout
+            except OSError:
+                handoff_ok = False
+                handoff = stdout[-30000:]
+                stderr = (stderr + "\nAstra handoff file unsafe or oversized.").strip()
     else:
         code, handoff, stderr = 125, "", "Codex executable unavailable"
     try:
         # A launched model may have edited bytes that Git normalizes away under
         # pre-existing attributes or stat metadata. Never launch a second model
         # after any Astra invocation, even when Git reports a clean worktree.
-        if astra_available and code != 0:
+        if astra_available and not handoff_ok:
+            fallback_reason = "Astra handoff file invalid; preserve the worktree for main-agent inspection."
+        elif astra_available and code != 0:
             fallback_reason = f"Astra invocation failed (exit {code}); preserve the worktree for main-agent inspection."
         elif not astra_available:
             changed = (git(repo, "rev-parse", "HEAD") != base
@@ -293,7 +326,7 @@ def main() -> int:
         history_ok = not grafts_present and base_is_ancestor(repo, base, head)
         identity_ok = git_repository_identity(repo) == git_identity
         status = "blocked"
-        if (code == 0 and policy_ok and identity_ok and actual_branch == branch
+        if (code == 0 and handoff_ok and policy_ok and identity_ok and actual_branch == branch
                 and branch_head == head and history_ok):
             if dirty_after:
                 status = "needs-main-commit"

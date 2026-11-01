@@ -213,7 +213,12 @@ if os.environ.get('CODEX_FORGE_INDEX_STAT'):
     data[-hash_size:] = digest(data[:-hash_size]).digest()
     index.write_bytes(data)
 last = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
-last.write_text('Fixture handoff')
+if os.environ.get('CODEX_HANDOFF_FIFO'):
+    os.mkfifo(last)
+elif os.environ.get('CODEX_HANDOFF_OVERSIZE'):
+    last.write_bytes(b'x' * 1_000_001)
+else:
+    last.write_text('Fixture handoff')
 race = os.environ.get('RACE_OUTPUT')
 if race: Path(race).write_text('independent file created during rescue')
 relocated = os.environ.get('RACE_DIRECTORY_OUTPUT')
@@ -783,6 +788,22 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(report['status'], 'blocked')
         self.assertEqual(report['source'], 'Codex gpt-6-astra')
         self.assertFalse(capture.exists())
+
+    def test_fifo_handoff_does_not_block_post_model_inspection(self):
+        result = self.invoke(env={'CODEX_HANDOFF_FIFO': '1', 'CODEX_EXIT': '7'},
+                             watchdog_seconds=8)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+
+    def test_oversized_handoff_is_rejected_before_reading_it_all(self):
+        result = self.invoke(env={'CODEX_HANDOFF_OVERSIZE': '1',
+                                  'CODEX_EMPTY_COMMIT': '1'})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['source'], 'Codex gpt-6-astra')
 
     def test_fallback_when_astra_executable_unavailable_is_blind_and_handed_off(self):
         (self.bin / 'codex').unlink()
