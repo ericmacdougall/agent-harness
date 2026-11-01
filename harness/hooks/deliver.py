@@ -17,7 +17,6 @@ import re
 import secrets
 import selectors
 import shlex
-import signal
 import stat
 import subprocess
 import sys
@@ -32,7 +31,7 @@ from integrate_local import (ALLOWED_GIT_ENV, ExternalApplyError, OriginalScope,
                              checkout_identity, git_common_directory, journal_key,
                              private_directory, read_journal, run as run_check,
                              scope_key, valid_identity_text, write_journal)
-from process import signal_group
+from process import cleanup_discarded
 
 
 OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -64,7 +63,7 @@ def bounded(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT):
     process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                start_new_session=True)
-    data, deadline, reaped = bytearray(), time.monotonic() + timeout, False
+    data, deadline = bytearray(), time.monotonic() + timeout
     try:
         with selectors.DefaultSelector() as poller:
             poller.register(process.stdout, selectors.EVENT_READ)
@@ -81,19 +80,20 @@ def bounded(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise DeliveryError("BLOCKED_LOCAL", "Delivery command timed out")
-        code = process.wait(timeout=remaining)
-        reaped = True
+        try:
+            code = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            raise DeliveryError("BLOCKED_LOCAL", "Delivery command timed out") from None
         return code, bytes(data).decode("utf-8", "replace")
-    except subprocess.TimeoutExpired:
-        raise DeliveryError("BLOCKED_LOCAL", "Delivery command timed out") from None
+    except BaseException as failure:
+        # A reaped leader says nothing about descendants that still hold stdout.
+        # Reuse the shared bounded TERM/grace/KILL and discarded-output cleanup.
+        try:
+            cleanup_discarded(process)
+        except (OSError, subprocess.TimeoutExpired):
+            failure.cleanup_incomplete = True
+        raise
     finally:
-        if not reaped:
-            signal_group(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                signal_group(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
         process.stdout.close()
 
 
