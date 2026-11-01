@@ -188,6 +188,7 @@ class RemoteResume(unittest.TestCase):
 
     def test_kit_mutation_at_completion_cannot_record_delivery(self):
         self.pending()
+        kit = self.fixture.kit.read_bytes()
         def mutate(module):
             complete = module.OriginalScope.complete_external
             def changed(scope, guard):
@@ -200,6 +201,13 @@ class RemoteResume(unittest.TestCase):
         self.assertEqual(self.counter.read_text(), '1')
         self.assertEqual(json.loads(self.state_path.read_text())['phase'], 'REMOTE_APPLYING')
         self.assertFalse((self.state_path.parent / 'receipt' / 'journal.json').exists())
+        self.fixture.kit.write_bytes(kit)
+        code, result = self.fixture.direct_finish(
+            lambda module: mock.patch.object(module, 'run_checks',
+                side_effect=AssertionError('A new resume must not reinterpret partial completion')),
+            arguments=self.resume_args())
+        self.assertEqual((code, result['status']), (3, 'RECOVERY_REQUIRED'))
+        self.assertEqual(self.counter.read_text(), '1')
 
     def test_resume_requires_remote_mode_generation_kit_and_bounded_reason(self):
         self.generation = 'a' * 32

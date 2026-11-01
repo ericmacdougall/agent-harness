@@ -902,7 +902,7 @@ def resume_binding(flow):
     flow.assert_state()
     directories = (flow.root / "generations", flow.directory)
     files = (flow.root / "journal.json", flow.directory / "journal.json")
-    return (tuple((path.lstat().st_dev, path.lstat().st_ino) for path in directories),
+    return (tuple((info.st_dev, info.st_ino) for info in (path.lstat() for path in directories)),
             tuple((info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink,
                    info.st_size, info.st_mtime_ns, info.st_ctime_ns)
                   for info in (path.lstat() for path in files)))
@@ -929,7 +929,8 @@ def resume_remote_finish(flow, preparations, checks):
     if (state["phase"] != "REMOTE_APPLYING" or state["guard_key"] is None
             or state["checks_digest"] != digest or state["local_key"] is not None
             or any(state[name] is None for name in ("target", "merge_head", "apply_base", "pr_number"))):
-        raise recovery_error(flow, "Resume requires the exact pending remote transaction", state["apply_base"])
+        raise recovery_error(flow, "Resume requires the exact pending remote transaction",
+                             state["apply_base"] or state["baseline"])
     with OriginalScope(flow.original, flow.branch, args.timeout) as scope:
         guard = scope.load_external(state["guard_key"], task_generation_digest(flow))
         if (guard.record["phase"] not in {"reserved", "applying"}
@@ -984,7 +985,7 @@ def resume_remote_finish(flow, preparations, checks):
             observed = verify_remote_descendant(flow, url, state["target"])
             revalidate()
             guard = scope.complete_external(guard)
-            flow.assert_state()
+            revalidate()
             flow.complete("remote", state["target"], digest)
         except (DeliveryError, ExternalApplyError, OSError, subprocess.TimeoutExpired):
             # An incomplete attempt is evidence for diagnosis, never cached success.
