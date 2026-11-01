@@ -790,12 +790,29 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertFalse(capture.exists())
 
     def test_fifo_handoff_does_not_block_post_model_inspection(self):
-        result = self.invoke(env={'CODEX_HANDOFF_FIFO': '1', 'CODEX_EXIT': '7'},
-                             watchdog_seconds=8)
+        result = self.invoke(env={'CODEX_HANDOFF_FIFO': '1', 'CODEX_EXIT': '7'})
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
         self.assertEqual(report['source'], 'Codex gpt-6-astra')
+
+    def test_fifo_handoff_reader_refuses_pipe_without_waiting_for_writer(self):
+        # Bound the actual FIFO reader separately from Git/model preflight.
+        # Whole-workflow timing is covered by the standard functional watchdog.
+        fifo = self.root / 'handoff.fifo'
+        os.mkfifo(fifo)
+        program = (
+            'import importlib.util, sys\nfrom pathlib import Path\n'
+            'source=Path(sys.argv[1])\n'
+            'sys.path.insert(0,str(source.parent))\n'
+            'spec=importlib.util.spec_from_file_location("fifo_reader_control",source)\n'
+            'module=importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\n'
+            'try:\n    module.read_handoff(Path(sys.argv[2]))\n'
+            'except OSError:\n    sys.exit(0)\n'
+            'sys.exit(5)\n')
+        result = subprocess.run([sys.executable, '-c', program, str(RESCUE), str(fifo)],
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_oversized_handoff_is_rejected_before_reading_it_all(self):
         result = self.invoke(env={'CODEX_HANDOFF_OVERSIZE': '1',
