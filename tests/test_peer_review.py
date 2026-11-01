@@ -519,6 +519,17 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertEqual(result.returncode, 3, result.stdout)
         self.assertIn('VERDICT: BLOCK', self.output.read_text())
 
+    def test_block_receipt_preserves_named_finding_ids_without_fallback(self):
+        launches = self.root / 'launches'
+        result = self.invoke(env={'CODEX_VERDICT': 'VERDICT: BLOCK\nF1: missing negative case\n## F2 security issue',
+                                  'PROVIDER_LAUNCH_LOG': str(launches)})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(launches.read_text().splitlines(), ['codex'])
+        finals = list((self.root / 'usage-state' / 'runs').glob('*/final.json'))
+        self.assertEqual(len(finals), 1)
+        value = json.loads(finals[0].read_text())
+        self.assertEqual((value['reason'], value['review']['findings']), ('CODE_FINDINGS', ['F1', 'F2']))
+
     def test_invalid_sol_result_does_not_spend_a_fallback_call(self):
         captured = self.root / 'fallback-prompt.txt'
         result = self.invoke(env={'CODEX_VERDICT': 'VERDICT: MAYBE\nUntrusted prior opinion.',

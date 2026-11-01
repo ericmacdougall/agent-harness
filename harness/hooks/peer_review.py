@@ -216,7 +216,8 @@ REVIEW_SYSTEM = (
     "the supplied test logs and source, and flag missing evidence. Use the requested "
     "stage-specific first-line result. Acceptance means no material "
     "unresolved issue in the evidence you could inspect. Give concrete findings with severity, "
-    "file/path when available, and an actionable correction. State what you could not verify."
+    "file/path when available, and an actionable correction. Label unresolved findings with "
+    "stable IDs such as F1 and F2. State what you could not verify."
 )
 
 
@@ -571,6 +572,13 @@ def provider_toolchains():
     return specifications
 
 
+def finding_ids(report):
+    """Preserve explicit finding headings; legacy unlabelled BLOCK stays unknown."""
+    values = re.findall(r'(?m)^\s*(?:#{1,6}\s+|[-*]\s+)?(?:Finding\s+)?'
+                        r'((?:F|R)[0-9]+(?:[-_.][A-Za-z0-9]+)*)\b', report)
+    return sorted(set(values))[:128] or ['UNSPECIFIED']
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("plan", "code-inspection", "pr"))
@@ -719,7 +727,7 @@ def main() -> int:
         reference = run_record.finish(execution='COMPLETED', result='CHECK_OK' if passed else 'CHECK_FAILED',
             reason='NONE' if passed else 'CODE_FINDINGS', exit_code=0,
             review={'stage': args.stage.upper().replace('-', '_'), 'verdict': 'ACCEPT' if passed else 'BLOCK',
-                    'findings': [] if passed else ['MATERIAL_FINDING']},
+                    'findings': [] if passed else finding_ids(report)},
             usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', [])})
         finalized = True
         final = store.load_ref(reference)
