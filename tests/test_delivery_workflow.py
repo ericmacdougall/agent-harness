@@ -46,10 +46,12 @@ class DeliveryWorkflow(unittest.TestCase):
         (self.original / 'app.txt').write_text('base\n')
         baseline_tests = self.original / 'tests'
         baseline_tests.mkdir()
-        (baseline_tests / 'test_format.py').write_text('import unittest\nfrom pathlib import Path\n'
+        (baseline_tests / 'test_format.py').write_text('import os,unittest\nfrom pathlib import Path\n'
             'class Format(unittest.TestCase):\n'
             '    def test_record_is_one_line(self):\n'
-            '        self.assertEqual(Path("app.txt").read_text().count("\\n"), 1)\n')
+            '        self.assertEqual(Path("app.txt").read_text().count("\\n"), 1)\n'
+            '    def test_dependency_ready(self):\n'
+            '        self.assertNotEqual(os.environ.get("FIXTURE_DEPENDENCY"), "unavailable")\n')
         command('git', 'add', 'app.txt', 'tests', cwd=self.original, env=self.env)
         command('git', 'commit', '-qm', 'base', cwd=self.original, env=self.env)
         self.base = command('git', 'rev-parse', 'HEAD', cwd=self.original, env=self.env).stdout.strip()
@@ -70,11 +72,6 @@ class DeliveryWorkflow(unittest.TestCase):
         command('git', 'remote', 'add', 'origin', str(self.remote), cwd=self.original, env=self.env)
         command('git', 'push', '-q', 'origin', 'main:main', cwd=self.original, env=self.env)
         command('git', 'symbolic-ref', 'HEAD', 'refs/heads/main', cwd=self.remote, env=self.env)
-        wal_dir = self.home / '.claude' / 'wals' / 'fixture-session'
-        wal_dir.mkdir(parents=True, mode=0o700)
-        self.wal = wal_dir / 'main.jsonl'
-        self.wal.write_text('{}\n')
-        self.wal.chmod(0o600)
         self.kit = self.root / 'kit.json'
         self.kit.write_text(json.dumps({'run': 'python3 app.py', 'test': CHECK,
                                         'watch': 'watch-tests -- python3 -m unittest discover -s tests'}))
@@ -136,7 +133,7 @@ if network and '--get-url' not in a:
     replaced=False
     for i in range(start,len(a)):
         if a[i] in remotes:
-            if remotes[a[i]]!='https://github.com/fixture/project.git':sys.exit(78)
+            if remotes[a[i]].lower()!='https://github.com/fixture/project.git':sys.exit(78)
             a[i]=os.environ['FIXTURE_REMOTE'];replaced=True;break
     if not replaced and not any(x==os.environ['FIXTURE_REMOTE'] for x in a[start:]):sys.exit(78)
 if 'merge' in a and '--ff-only' in a:
@@ -165,15 +162,27 @@ elif a[:2]==['pr','view']:
 elif a[0]=='api':print(json.dumps({'object':{'type':'commit','sha':s['target']}}))
 else:sys.exit(79)
 '''
-        for name, source in (('git', shim), ('gh', gh)):
+        driver = self.bin / 'git-driver.py'
+        driver.write_text(shim)
+        driver.chmod(0o600)
+        launcher = '''#!/bin/sh
+for argument do
+    case "$argument" in
+        push|fetch|ls-remote|merge) exec "$FIXTURE_PYTHON" "$FIXTURE_GIT_DRIVER" "$@" ;;
+    esac
+done
+exec "$FIXTURE_REAL_GIT" "$@"
+'''
+        for name, source in (('git', launcher), ('gh', '#!' + sys.executable + '\n' + gh)):
             path = self.bin / name
-            path.write_text('#!' + sys.executable + '\n' + source)
+            path.write_text(source)
             path.chmod(0o755)
         command('git', 'remote', 'set-url', 'origin', 'https://github.com/fixture/project.git',
                 cwd=self.original, env=self.env)
         self.env.update({'PATH': str(self.bin) + os.pathsep + self.env['PATH'],
                          'FIXTURE_REAL_GIT': real_git, 'FIXTURE_REMOTE': str(self.remote),
-                         'FIXTURE_GITHUB_STATE': str(self.github_state), 'FIXTURE_EVENTS': str(self.events)})
+                         'FIXTURE_GITHUB_STATE': str(self.github_state), 'FIXTURE_EVENTS': str(self.events),
+                         'FIXTURE_PYTHON': sys.executable, 'FIXTURE_GIT_DRIVER': str(driver)})
 
     def write_github(self, data):
         self.github_state.write_text(json.dumps(data))
@@ -232,7 +241,7 @@ else:sys.exit(79)
         return result, json.loads(result.stdout)
 
     def prepare_args(self):
-        return ('prepare', '--wal', str(self.wal), '--task', 'fixture',
+        return ('prepare', '--task', 'fixture',
                 '--source', str(self.source), '--original', str(self.original),
                 '--original-branch', 'main', '--expected-source-head', self.head,
                 '--expected-original-head', self.base, '--pr-title', 'Feature fixture',
@@ -399,6 +408,8 @@ else:sys.exit(79)
         self.assertNotEqual(new['generation'], data['generation'])
         stale, old = self.invoke(*self.finish_args(generation=data['generation']))
         self.assertEqual((stale.returncode, old['status']), (3, 'STALE_GENERATION'))
+        finished, current = self.invoke(*self.finish_args(generation=new['generation']))
+        self.assertEqual((finished.returncode, current['status']), (0, 'DELIVERED'), finished.stdout)
 
     def test_publication_uncertainty_cannot_become_a_baseline_resolution(self):
         self.configure_github()
@@ -419,6 +430,125 @@ else:sys.exit(79)
         self.assertEqual((reconciled.returncode, old['status']), (0, 'PR_READY'), reconciled.stdout)
         self.assertEqual(json.loads(self.github_state.read_text())['creates'], 1)
         self.assertEqual(json.loads(state.read_text())['source_head'], self.head)
+
+    def test_known_pr_access_failure_is_not_absence_or_local_fallback(self):
+        self.configure_github()
+        result, data = self.invoke(*self.prepare_args())
+        self.assertEqual(result.returncode, 0, result.stdout)
+        state = Path(data['state'])
+        before = state.read_bytes()
+        self.change_github(view_fail=True, listing=[])
+        result, failed = self.invoke('prepare', '--task', 'fixture', '--original', str(self.original),
+                                     '--original-branch', 'main', '--reconcile-only')
+        self.assertEqual((result.returncode, failed['status']), (4, 'REMOTE_UNCERTAIN'), result.stdout)
+        self.assertEqual(state.read_bytes(), before)
+        local, response = self.invoke(*self.finish_args('local'))
+        self.assertEqual((local.returncode, response['status']), (2, 'BLOCKED_POLICY'), local.stdout)
+
+    def test_ambiguous_bounded_pr_lookup_cannot_unlock_local_fallback(self):
+        self.configure_github()
+        record = json.loads(self.github_state.read_text())['pr']
+        second = {**record, 'number': 2, 'url': 'https://github.com/fixture/project/pull/2'}
+        for listing in ([record, second], [record] * 101, [record] * 4000):
+            with self.subTest(records=len(listing)):
+                self.change_github(listing=listing)
+                result, data = self.invoke(*self.prepare_args())
+                expected = 'REMOTE_UNCERTAIN' if len(listing) == 4000 else 'BLOCKED_POLICY'
+                self.assertEqual(data['status'], expected, result.stdout)
+                self.assertNotEqual(result.returncode, 0)
+                local, failed = self.invoke(*self.finish_args('local'))
+                self.assertEqual((local.returncode, failed['status']), (2, 'BLOCKED_POLICY'), local.stdout)
+        self.assertEqual(json.loads(self.github_state.read_text())['creates'], 0)
+
+    def test_case_aliases_of_github_identity_are_supported(self):
+        self.configure_github()
+        command('git', 'remote', 'set-url', 'origin', 'https://github.com/Fixture/Project.git',
+                cwd=self.original, env=self.env)
+        state = json.loads(self.github_state.read_text())
+        state['pr'].update(url='https://github.com/Fixture/Project/pull/1',
+                            headRepository={'name': 'Project'}, headRepositoryOwner={'login': 'Fixture'})
+        self.write_github(state)
+        result, data = self.invoke(*self.prepare_args())
+        self.assertEqual((result.returncode, data['status']), (0, 'PR_READY'), result.stdout)
+
+    def test_malformed_private_workflow_fields_fail_closed_without_echo(self):
+        result, data = self.invoke(*self.prepare_args(), '--local-only')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        state = Path(data['state'])
+        before = state.read_bytes()
+        mutations = [('phase', []), ('schema', True), ('source_head', 'secret_fixture'),
+                     ('source', 'bad\ud800'), ('kit_digest', None), ('target', False),
+                     ('pr_number', True), ('guard_key', {'untrusted': 'secret_fixture'})]
+        for name, value in mutations:
+            with self.subTest(field=name):
+                record = json.loads(before)
+                record[name] = value
+                state.write_text(json.dumps(record))
+                response, error = self.invoke(*self.finish_args('local'))
+                self.assertEqual((response.returncode, error['status']), (3, 'RECOVERY_REQUIRED'), response.stdout)
+                self.assertNotIn('Traceback', response.stderr)
+                self.assertNotIn('secret_fixture', response.stdout)
+                self.assertEqual(json.loads(state.read_text()), record)
+        state.write_bytes(before)
+        self.assertEqual(command('git', 'rev-parse', 'HEAD', cwd=self.original, env=self.env).stdout.strip(), self.base)
+
+    def test_baseline_negative_checks_and_transition_crashes_preserve_no_delivery(self):
+        self.configure_github()
+        result, data = self.invoke(*self.prepare_args())
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.merge_remote()
+        code, _ = self.direct_finish(lambda module: mock.patch.object(module.OriginalScope, 'reserve_external',
+                                                                      side_effect=OSError('fixture reserve fault')))
+        self.assertEqual(code, 3)
+        state = Path(data['state'])
+        before = state.read_bytes()
+        for value in ('HEAD', self.base[:8], 'a' * 64):
+            with self.subTest(oid=value):
+                rejected, error = self.invoke(*self.baseline_args(value))
+                self.assertEqual((rejected.returncode, error['status']), (2, 'BLOCKED_POLICY'), rejected.stdout)
+                self.assertEqual(state.read_bytes(), before)
+        self.env['FIXTURE_DEPENDENCY'] = 'unavailable'
+        failed, error = self.invoke(*self.baseline_args(self.base))
+        self.env.pop('FIXTURE_DEPENDENCY')
+        self.assertEqual((failed.returncode, error['status']), (3, 'RECOVERY_REQUIRED'), failed.stdout)
+        self.assertEqual(state.read_bytes(), before)
+        code, _ = self.direct_finish(lambda module: mock.patch.object(module.Workflow, 'save',
+                            side_effect=OSError('fixture write fault')), self.baseline_args(self.base))
+        self.assertEqual(code, 3)
+        self.assertEqual(state.read_bytes(), before)
+        def changed_generation(module):
+            def mutate(*unused):
+                value = json.loads(state.read_text())
+                value['checks_digest'] = '0' * 64
+                state.write_text(json.dumps(value))
+            return mock.patch.object(module, 'run_checks', side_effect=mutate)
+        code, _ = self.direct_finish(changed_generation, self.baseline_args(self.base))
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(state.read_text())['phase'], 'REMOTE_APPLYING')
+        state.write_bytes(before)
+        def moved_head(module):
+            def advance(*unused):
+                (self.original / 'user.txt').write_text('user-owned advance\n')
+                command('git', 'add', 'user.txt', cwd=self.original, env=self.env)
+                command('git', 'commit', '-qm', 'User advance', cwd=self.original, env=self.env)
+            return mock.patch.object(module, 'run_checks', side_effect=advance)
+        code, _ = self.direct_finish(moved_head, self.baseline_args(self.base))
+        self.assertEqual(code, 3)
+        self.assertEqual(state.read_bytes(), before)
+        current = command('git', 'rev-parse', 'HEAD', cwd=self.original, env=self.env).stdout.strip()
+        self.assertNotEqual(current, self.base)
+        def crash_after_write(module):
+            save = module.Workflow.save
+            def crash(workflow, **changes):
+                save(workflow, **changes)
+                raise OSError('fixture interruption after durable write')
+            return mock.patch.object(module.Workflow, 'save', crash)
+        code, error = self.direct_finish(crash_after_write, self.baseline_args(current))
+        self.assertEqual((code, error['status']), (3, 'RECOVERY_REQUIRED'))
+        self.assertEqual(json.loads(state.read_text())['phase'], 'RESOLVED_BASELINE')
+        self.assertFalse(list(state.parent.glob('receipt/journal.json')))
+        pending, error = self.invoke(*self.finish_args())
+        self.assertEqual((pending.returncode, error['status']), (3, 'RESOLVED_BASELINE'))
 
 
 if __name__ == '__main__':

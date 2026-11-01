@@ -463,8 +463,10 @@ def gh(*args, timeout=30):
     env.update({"GH_PROMPT_DISABLED": "1", "GH_HOST": "github.com", "GIT_TERMINAL_PROMPT": "0"})
     try:
         return bounded(["gh", *args], env=env, timeout=min(timeout, 30))
-    except (OSError, DeliveryError):
+    except OSError:
         raise DeliveryError("REMOTE_BLOCKED", "GitHub command could not complete", code=4) from None
+    except DeliveryError:
+        raise DeliveryError("REMOTE_UNCERTAIN", "GitHub command exceeded its output or time budget", code=4) from None
 
 
 def gh_json(*args, timeout=30):
@@ -474,7 +476,7 @@ def gh_json(*args, timeout=30):
     try:
         return json.loads(output)
     except (ValueError, UnicodeError):
-        raise DeliveryError("REMOTE_BLOCKED", "GitHub returned an invalid response", code=4) from None
+        raise DeliveryError("REMOTE_UNCERTAIN", "GitHub returned an invalid response", code=4) from None
 
 
 def pr_identity(pr, repository, branch):
@@ -490,7 +492,8 @@ def pr_identity(pr, repository, branch):
             and isinstance(head_owner, dict) and isinstance(head_owner.get("login"), str)
             and head_owner["login"].lower() == owner
             and pr.get("headRefName") == branch
-            and pr.get("url") == f"https://github.com/{repository}/pull/{number}")
+            and isinstance(pr.get("url"), str)
+            and pr["url"].lower() == f"https://github.com/{repository}/pull/{number}")
 
 
 def matching_pr(state, timeout):
@@ -1005,6 +1008,8 @@ def finish(args):
             raise DeliveryError("BLOCKED_POLICY", "Prepared generation is missing", code=2)
         if args.kit_file is not None and kit_digest(args.kit_file) != state["kit_digest"]:
             raise DeliveryError("BLOCKED_POLICY", "Run kit changed since prepare", code=2)
+        if args.resolve_baseline is not None:
+            return resolve_baseline(flow, preparations, checks)
         old = flow.completed()
         if old is not None:
             if old["mode"] != args.mode:
@@ -1017,6 +1022,35 @@ def finish(args):
             raise DeliveryError("RESOLVED_BASELINE", "Baseline accepted; review and prepare a new generation", **flow.facts())
         return remote_finish(flow, preparations, checks) if args.mode == "remote" else local_finish(flow, preparations, checks)
 
+
+
+def resolve_baseline(flow, preparations, checks):
+    """Settle an interrupted workflow after actual shared barriers are resolved."""
+    from integrate_local import scan_journals
+    if flow.state["phase"] not in {"REMOTE_APPLYING", "LOCAL_APPLYING"}:
+        raise DeliveryError("BLOCKED_POLICY", "Only an interrupted apply can accept a new baseline", code=2)
+    confirmed = valid_oid(flow.args.resolve_baseline)
+    if len(confirmed) != len(flow.state["baseline"]):
+        raise DeliveryError("BLOCKED_POLICY", "Baseline object format differs from the reviewed scope", code=2)
+    with OriginalScope(flow.original, flow.branch, flow.args.timeout) as scope:
+        blocked, _, _ = scan_journals(scope.root, flow.original, scope.identity, flow.branch,
+                                      "0" * 64, flow.args.timeout)
+        if blocked is not None:
+            raise recovery_error(flow, "Resolve actual shared recovery journals before accepting this workflow baseline",
+                                 flow.state["baseline"], journal=blocked / "journal.json")
+        if snapshot(flow.original, flow.branch) != confirmed:
+            raise DeliveryError("RECOVERY_REQUIRED", "Confirmed baseline HEAD changed")
+        try:
+            run_checks(flow.original, preparations, checks, flow.args.timeout)
+        except DeliveryError:
+            raise DeliveryError("RECOVERY_REQUIRED", "Baseline checks did not validate the confirmed checkout") from None
+        if snapshot(flow.original, flow.branch) != confirmed:
+            raise DeliveryError("RECOVERY_REQUIRED", "Baseline checks changed the confirmed checkout")
+        # save rereads both the exact generation pointer and loaded state.
+        flow.save(phase="RESOLVED_BASELINE")
+    report("RESOLVED_BASELINE", "Tested baseline accepted; review and prepare a new generation before delivery",
+           head=confirmed, **flow.facts())
+    return 0
 
 
 def reconcile(args):
@@ -1039,7 +1073,13 @@ def reconcile(args):
         repository, url = origin_destination(flow.original)
         if repository != state["repository"]:
             raise DeliveryError("BLOCKED_POLICY", "Original repository changed before reconciliation", code=2)
-        found = verify_remote_pr(flow) if state["pr_number"] is not None else matching_pr(state, args.timeout)
+        try:
+            found = verify_remote_pr(flow) if state["pr_number"] is not None else matching_pr(state, args.timeout)
+        except DeliveryError as error:
+            if error.status == "REMOTE_BLOCKED":
+                raise DeliveryError("REMOTE_UNCERTAIN", "Remote PR visibility cannot yet be reconciled",
+                                    code=4, **flow.facts()) from None
+            raise
         if found is not None:
             if found["state"] == "CLOSED":
                 raise DeliveryError("BLOCKED_POLICY", "Known PR is closed; it cannot become local fallback", code=2)
@@ -1062,7 +1102,6 @@ def parse_args():
         part.add_argument("--generation", help="Require this exact current generation")
         part.add_argument("--kit-file", type=Path)
         part.add_argument("--timeout", type=int, default=120)
-        part.add_argument("--wal", type=Path, help=argparse.SUPPRESS)
     prep = sub.choices["prepare"]
     prep.add_argument("--source", type=Path)
     prep.add_argument("--expected-source-head")
@@ -1073,7 +1112,9 @@ def parse_args():
     prep.add_argument("--local-only", action="store_true", help="Explicitly choose guarded local delivery")
     prep.add_argument("--new-generation", action="store_true", help="Supersede only a settled generation")
     end = sub.choices["finish"]
-    end.add_argument("--mode", choices=("remote", "local"), required=True)
+    finish_mode = end.add_mutually_exclusive_group(required=True)
+    finish_mode.add_argument("--mode", choices=("remote", "local"))
+    finish_mode.add_argument("--resolve-baseline", help="Accept only this full clean tested HEAD; never delivery")
     end.add_argument("--check", action="append", default=[])
     end.add_argument("--prepare", action="append", default=[])
     args = parser.parse_args()
