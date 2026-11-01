@@ -928,6 +928,23 @@ class ProviderEnvelopeTests(unittest.TestCase):
                 self.assertIn('_RESULT: ACCEPT', rendered)
         self.assertEqual(self.module.stage_report('pr', 'VERDICT: PASS'), 'VERDICT: PASS')
 
+    def test_inspection_and_plan_acceptance_cannot_become_pr_pass(self):
+        for marker in ('PLAN_RESULT: ACCEPT', 'CODE_INSPECTION_RESULT: ACCEPT'):
+            with self.subTest(marker=marker), self.assertRaises(OSError):
+                self.module.stage_report('pr', marker)
+
+    def test_pr_pass_cannot_become_plan_or_inspection_acceptance(self):
+        for stage in ('plan', 'code-inspection'):
+            with self.subTest(stage=stage), self.assertRaises(OSError):
+                self.module.stage_report(stage, 'VERDICT: PASS')
+
+    def test_claude_provider_error_before_success_still_wins(self):
+        records = [{'type': 'error', 'error': {'code': 'quota_exceeded'}},
+                   {'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'VERDICT: PASS'}]
+        result = self.module.normalize_provider('claude', 0, '\n'.join(map(json.dumps, records)))
+        self.assertEqual((result['result'], result['reason'], result['account_cooldown']),
+                         ('NO_RESULT', 'QUOTA', True))
+
     def test_duplicate_packet_blocks_are_warning_only(self):
         block = '```python\nprint("fixture")\n```\n'
         warnings = self.module.packet_warnings(block * 2)
