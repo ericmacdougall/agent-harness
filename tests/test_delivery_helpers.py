@@ -1726,6 +1726,71 @@ class DeliveryHelpers(unittest.TestCase):
                          result.stdout + result.stderr)
         self.assert_restored()
 
+    def test_all_skipped_unittest_discovery_aborts_and_restores(self):
+        self.add_feature_test('import unittest\n'
+                              'class Skipped(unittest.TestCase):\n'
+                              '    @unittest.skip("fixture")\n'
+                              '    def test_never_runs(self):\n'
+                              '        self.fail("skipped body ran")\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('phase'),
+                          data.get('merge_aborted')), (3, 'BLOCKED_LOCAL', 'check', True),
+                         result.stdout + result.stderr)
+        self.assert_restored()
+
+    def test_skipped_class_fixture_does_not_cancel_separate_real_test(self):
+        self.add_feature_test('import unittest\n'
+                              'class SkippedFixture(unittest.TestCase):\n'
+                              '    @classmethod\n'
+                              '    def setUpClass(cls):\n'
+                              '        raise unittest.SkipTest("fixture")\n'
+                              '    def test_never_runs(self):\n'
+                              '        self.fail("skipped body ran")\n'
+                              'class Real(unittest.TestCase):\n'
+                              '    def test_assertion(self):\n'
+                              '        self.assertEqual(2 + 2, 4)\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'),
+                         result.stdout + result.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), data['head'])
+
+    def test_skipped_subtest_does_not_cancel_asserted_subtest(self):
+        self.add_feature_test('import unittest\n'
+                              'class Mixed(unittest.TestCase):\n'
+                              '    def test_subtests(self):\n'
+                              '        with self.subTest(number=1):\n'
+                              '            self.skipTest("fixture")\n'
+                              '        with self.subTest(number=2):\n'
+                              '            self.assertEqual(2 + 2, 4)\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'),
+                         result.stdout + result.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), data['head'])
+
+    def test_duplicate_skip_callbacks_cannot_cancel_separate_real_test(self):
+        self.add_feature_test('import unittest\n'
+                              'class SkippedTwice(unittest.TestCase):\n'
+                              '    def test_cleanup_skip(self):\n'
+                              '        def cleanup():\n'
+                              '            raise unittest.SkipTest("cleanup")\n'
+                              '        self.addCleanup(cleanup)\n'
+                              '        self.skipTest("body")\n'
+                              'class Real(unittest.TestCase):\n'
+                              '    def test_assertion(self):\n'
+                              '        self.assertEqual(2 + 2, 4)\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'),
+                         result.stdout + result.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), data['head'])
+
     def test_all_approved_unittest_discovery_forms_run_real_test(self):
         self.add_feature_test()
         (self.feature / 'tests' / '__init__.py').write_text('')
