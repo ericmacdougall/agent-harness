@@ -671,6 +671,11 @@ def completed_journal_is_verified(repo, identity, branch, directory, record, tim
 
 
 def scan_journals(root, repo, identity, branch, key, timeout):
+    """Recovery scans never exempt an active journal for ordinary callers."""
+    return _scan_journals(root, repo, identity, branch, key, timeout)
+
+
+def _scan_journals(root, repo, identity, branch, key, timeout, *, completing_guard=None):
     """Inspect bounded active state; archived history is an exact-key lookup."""
     deadline = time.monotonic() + min(timeout, JOURNAL_SCAN_SECONDS)
     scope = scope_directory(root, identity, branch)
@@ -689,6 +694,12 @@ def scan_journals(root, repo, identity, branch, key, timeout):
                 remaining_budget(deadline, timeout)
             except OSError:
                 return entry, None, None
+            if completing_guard is not None and entry == completing_guard.journal.parent:
+                # Only complete_external supplies this capability, after full
+                # ownership validation. Reread before excluding its own barrier.
+                if record != completing_guard.record:
+                    return entry, record, None
+                continue
             same_scope = ((record.get('original_dev'), record.get('original_ino')) == identity
                           and record.get('branch') == branch)
             if not same_scope:
@@ -707,6 +718,10 @@ def scan_journals(root, repo, identity, branch, key, timeout):
         remaining_budget(deadline, timeout)
         record = read_journal(archived)
         remaining_budget(deadline, timeout)
+        if completing_guard is not None and archived == completing_guard.journal.parent:
+            if record != completing_guard.record:
+                return archived, record, None
+            return None, None, None
         if ((record.get('original_dev'), record.get('original_ino')) != identity
                 or record.get('branch') != branch
                 or record.get('phase') not in {'delivered', 'resolved'}):
@@ -1164,13 +1179,26 @@ class OriginalScope:
                     or not checked_original(self.repo, self.branch, guard.target, self.timeout)
                     or external_pin_state(self.repo, record, self.timeout) != ('matches_target', True)):
                 raise OSError('external apply completion state changed')
+            blocking, blocked, _ = _scan_journals(self.root, self.repo, self.identity,
+                                                self.branch, guard.key, self.timeout,
+                                                completing_guard=guard)
+            if blocking is not None:
+                raise ExternalApplyError('Another original recovery barrier requires inspection',
+                                         journal=blocking / 'journal.json',
+                                         ref=blocked.get('ref') if blocked else None,
+                                         target=blocked.get('target') if blocked else None)
             self._assert_current()
+            if (not checked_original(self.repo, self.branch, guard.target, self.timeout)
+                    or external_pin_state(self.repo, record, self.timeout) != ('matches_target', True)):
+                raise OSError('external apply changed during recovery scan')
             if record['phase'] != 'resolved':
                 record.update(phase='resolved', previous_phase=record['phase'],
                               resolved_by='workflow', resolved_head=guard.target)
                 write_journal(directory, record)
             directory = archive_journal(directory)
             return ExternalApplyGuard(self, directory, record)
+        except ExternalApplyError:
+            raise
         except (IndexInspectionError, OSError, subprocess.TimeoutExpired):
             raise ExternalApplyError('External apply remains subject to recovery inspection',
                                      journal=directory / 'journal.json', ref=guard.ref,

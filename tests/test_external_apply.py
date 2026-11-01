@@ -159,8 +159,9 @@ class ExternalApply(unittest.TestCase):
             unchanged = second.journal.read_bytes()
             with self.scope() as scope:
                 loaded = scope.load_external(first.key, TASK)
-                with self.assertRaises(integration.ExternalApplyError):
+                with self.assertRaises(integration.ExternalApplyError) as caught:
                     scope.complete_external(loaded)
+                self.assertEqual(caught.exception.journal, second.journal)
             self.assertEqual(self.head(self.original), target)
             self.assertEqual(second.journal.read_bytes(), unchanged)
             self.assertEqual(integration.read_journal(second.journal.parent)['phase'], 'applying')
