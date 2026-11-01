@@ -50,7 +50,10 @@ def cleanup_discarded(process):
             break
         except PermissionError:
             pass
-        time.sleep(min(0.05, grace_deadline - time.monotonic()))
+        remaining = grace_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
     signal_group(process.pid, signal.SIGKILL)
     try:
         drain_discarded(process.stdout, time.monotonic() + DISCARD_CLEANUP_SECONDS)
