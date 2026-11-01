@@ -44,11 +44,12 @@ def git(repo: Path, *args: str, index_file: Path | None = None) -> str:
     require_safe_source(repo, env)
     # A rescue model can forge cached commit parents or trees without changing objects.
     result = run_process(["git", "-C", str(repo), *GIT_INSPECTION_OPTIONS, *args],
-                         text=True, env=env, timeout=30)
+                         text=False, env=env, timeout=30)
     if result.returncode:
         raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
-    # Git prints one record terminator. Paths may themselves end in whitespace.
-    return result.stdout.removesuffix("\n")
+    # Decode after removing Git's record terminator. Text mode normalizes CRLF,
+    # which can alias a path ending in carriage return to its parent directory.
+    return os.fsdecode(result.stdout.removesuffix(b"\n"))
 
 
 def git_bytes(repo: Path, *args: str, index_file: Path | None = None) -> bytes:
@@ -144,12 +145,18 @@ def policy_file_snapshot(path: Path) -> tuple[int, int, bytes] | None:
 
 
 def git_policy_state(repo: Path) -> tuple[object, ...]:
-    """Pin mutable local attribute/exclusion policy before model and fallback."""
+    """Snapshot Git info policy files and repository-local alternate path settings."""
     common = Path(git(repo, "rev-parse", "--git-common-dir"))
     if not common.is_absolute():
         common = repo / common
     info = common / "info"
-    if not stat.S_ISDIR(info.lstat().st_mode):
+    try:
+        info_stat = info.lstat()
+    except FileNotFoundError:
+        if os.path.lexists(info):
+            raise OSError("rescue Git info directory changed during inspection")
+        info_stat = None
+    if info_stat is not None and not stat.S_ISDIR(info_stat.st_mode):
         raise OSError("rescue Git info directory is unsupported")
     env = git_inspection_environment()
     command = [*GIT_INSPECTION_OPTIONS, "config", "--local", "--includes", "--null",
@@ -157,8 +164,10 @@ def git_policy_state(repo: Path) -> tuple[object, ...]:
     code, config = _bounded_git(repo, command, env, timeout=30, limit=1_000_000)
     if code not in (0, 1) or (code == 1 and config):
         raise OSError("rescue Git policy configuration could not be inspected")
-    return (policy_file_snapshot(info / "attributes"),
-            policy_file_snapshot(info / "exclude"), config)
+    info_identity = None if info_stat is None else (info_stat.st_dev, info_stat.st_ino)
+    attributes = None if info_stat is None else policy_file_snapshot(info / "attributes")
+    exclude = None if info_stat is None else policy_file_snapshot(info / "exclude")
+    return info_identity, attributes, exclude, config
 
 
 def log(wal: Path | None, record: dict) -> None:
@@ -242,7 +251,8 @@ def main() -> int:
     log(wal, {"event": "rescue_start", "branch": branch, "base": base, "repo": str(repo)})
     source = "Codex gpt-6-astra"
     fallback_reason = ""
-    if shutil.which("codex"):
+    astra_available = shutil.which("codex") is not None
+    if astra_available:
         with tempfile.TemporaryDirectory() as temp:
             last = Path(temp) / "last.txt"
             cmd = ["codex", "exec", "--ephemeral", "--model", "gpt-6-astra", "--sandbox", "workspace-write", "--cd", str(repo), "--output-last-message", str(last), "-"]
@@ -251,7 +261,12 @@ def main() -> int:
     else:
         code, handoff, stderr = 125, "", "Codex executable unavailable"
     try:
-        if code != 0:
+        # A launched model may have edited bytes that Git normalizes away under
+        # pre-existing attributes or stat metadata. Never launch a second model
+        # after any Astra invocation, even when Git reports a clean worktree.
+        if astra_available and code != 0:
+            fallback_reason = f"Astra invocation failed (exit {code}); preserve the worktree for main-agent inspection."
+        elif not astra_available:
             changed = (git(repo, "rev-parse", "HEAD") != base
                        or git_policy_state(repo) != policy_before
                        or dirty_state(repo, base)
@@ -259,9 +274,9 @@ def main() -> int:
                        or git_repository_identity(repo) != git_identity
                        or has_grafts(repo))
             if changed:
-                fallback_reason = "Astra failed after modifying the worktree; preserve it for main-agent inspection."
+                fallback_reason = "Worktree changed before fallback; preserve it for main-agent inspection."
             else:
-                fallback_reason = f"Astra unavailable or failed before edits (exit {code}); trying Fable."
+                fallback_reason = "Astra executable unavailable; trying Fable."
                 if shutil.which("claude"):
                     source = "Claude Fable fallback"
                     cmd = ["claude", "--safe-mode", "--print", "--model", "fable", "--permission-mode", "auto", "--output-format", "text", "--"]
