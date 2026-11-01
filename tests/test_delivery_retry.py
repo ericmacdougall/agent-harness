@@ -191,6 +191,20 @@ class RemoteLifecycleRetry(unittest.TestCase):
                                             cwd=fixture.remote, env=fixture.env, check=False).returncode, 0)
         local, refusal = fixture.invoke(*fixture.finish_args('local'))
         self.assertEqual((local.returncode, refusal['status']), (2, 'BLOCKED_POLICY'))
+        workflow.command('git', 'update-ref', 'refs/heads/codex/feature', fixture.base,
+                         cwd=fixture.remote, env=fixture.env)
+        waiting, unknown = fixture.invoke('prepare', '--task', 'fixture', '--original', str(fixture.original),
+                                         '--original-branch', 'main', '--reconcile-only')
+        self.assertEqual((waiting.returncode, unknown['status']), (4, 'REMOTE_UNCERTAIN'), waiting.stdout)
+        superseded, blocked = fixture.invoke(*fixture.prepare_args(), '--new-generation')
+        self.assertEqual((superseded.returncode, blocked['status']), (3, 'RECOVERY_REQUIRED'), superseded.stdout)
+        # A later positive branch update settles the push; the durable phase
+        # proves this invocation had not started any PR create.
+        workflow.command('git', 'push', '-q', str(fixture.remote),
+                         fixture.head + ':refs/heads/codex/feature', cwd=fixture.source, env=fixture.env)
+        resumed, ready = fixture.invoke(*fixture.prepare_args())
+        self.assertEqual((resumed.returncode, ready['status']), (0, 'PR_READY'), resumed.stdout)
+        self.assertEqual(json.loads(fixture.github_state.read_text())['creates'], 1)
 
 
 if __name__ == '__main__':

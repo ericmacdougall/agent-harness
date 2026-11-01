@@ -452,9 +452,8 @@ exec "$FIXTURE_REAL_GIT" "$@"
         for listing in ([record, second], [record] * 101, [record] * 4000):
             with self.subTest(records=len(listing)):
                 self.change_github(listing=listing)
-                result, data = self.invoke(*self.prepare_args())
-                expected = 'REMOTE_UNCERTAIN' if len(listing) == 4000 else 'BLOCKED_POLICY'
-                self.assertEqual(data['status'], expected, result.stdout)
+                result, data = self.invoke(*self.prepare_args(), '--new-generation')
+                self.assertEqual(data['status'], 'BLOCKED_POLICY', result.stdout)
                 self.assertNotEqual(result.returncode, 0)
                 local, failed = self.invoke(*self.finish_args('local'))
                 self.assertEqual((local.returncode, failed['status']), (2, 'BLOCKED_POLICY'), local.stdout)

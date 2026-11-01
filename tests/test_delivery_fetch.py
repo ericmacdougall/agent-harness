@@ -90,11 +90,11 @@ os.execv(os.environ['FIXTURE_REAL_GIT'],[os.environ['FIXTURE_REAL_GIT'],*a])
     def object_ids(self, repo):
         return [line.split()[0] for line in self.git(repo, 'rev-list', '--objects', 'HEAD').splitlines()]
 
-    def fetch(self):
+    def fetch(self, *, negotiation_tips=()):
         with mock.patch.dict(os.environ, self.environment, clear=True):
             code, _ = self.delivery.transport(self.original, 'https://github.com/fixture/fetch.git',
                 'fixture/fetch', ['fetch', '--no-tags', '--no-write-fetch-head', self.target], 30,
-                objects=(self.original / '.git' / 'objects').resolve())
+                objects=(self.original / '.git' / 'objects').resolve(), negotiation_tips=negotiation_tips)
         self.assertEqual(code, 0)
 
     def assert_preserved(self):
@@ -107,6 +107,13 @@ os.execv(os.environ['FIXTURE_REAL_GIT'],[os.environ['FIXTURE_REAL_GIT'],*a])
         self.assertEqual(self.git(self.original, 'cat-file', '-t', self.target).strip(), 'commit')
 
     def test_fetch_cannot_maintain_or_delete_preexisting_original_objects(self):
+        content, message = b'unrelated user branch\n', b'Preserve another original branch\n'
+        stream = (f'blob\nmark :1\ndata {len(content)}\n'.encode() + content + b'\n'
+                  + b'commit refs/heads/another-user-feature\ncommitter Fixture <fixture@example.invalid> 1700000500 +0000\n'
+                  + f'data {len(message)}\n'.encode() + message
+                  + f'from {self.baseline}\nM 100644 :1 other.txt\n\n'.encode())
+        self.git(self.original, '-c', 'gc.auto=0', 'fast-import', '--quiet', data=stream)
+        self.old_objects = [line.split()[0] for line in self.git(self.original, 'rev-list', '--objects', '--all').splitlines()]
         pack = self.original / '.git' / 'objects' / 'pack'
         before = set(pack.iterdir())
         # Preserve the old pack until every baseline object has a new home.
@@ -136,6 +143,30 @@ os.execv(os.environ['FIXTURE_REAL_GIT'],[os.environ['FIXTURE_REAL_GIT'],*a])
                 if re.match(r'^[a-f0-9]{40} ', line):
                     received.add(line.split()[0])
         self.assertEqual(received, self.new_objects)
+        self.assert_preserved()
+
+    def test_cached_feature_tip_is_not_downloaded_again(self):
+        self.config.write_text('[gc]\n auto = 0\n[fetch]\n unpackLimit = 1\n'
+                               '[protocol "file"]\n allow = always\n')
+        feature = self.target
+        self.git(self.original, 'fetch', '--no-auto-maintenance', 'file://' + str(self.producer),
+                 feature + ':refs/heads/cached-feature')
+        prior_fetch_head = (self.original / '.git' / 'FETCH_HEAD').read_bytes()
+        message = b'One later remote commit\n'
+        stream = (b'commit refs/heads/main\ncommitter Fixture <fixture@example.invalid> 1700002000 +0000\n'
+                  + f'data {len(message)}\n'.encode() + message + f'from {feature}\n\n'.encode())
+        self.git(self.producer, '-c', 'gc.auto=0', 'fast-import', '--quiet', data=stream)
+        self.target = self.git(self.producer, 'rev-parse', 'HEAD').strip()
+        pack = self.original / '.git' / 'objects' / 'pack'
+        before = set(pack.glob('*.idx'))
+        self.fetch(negotiation_tips=(feature,))
+        received = set()
+        for path in set(pack.glob('*.idx')) - before:
+            for line in self.git(self.original, 'verify-pack', '-v', str(path)).splitlines():
+                if re.match(r'^[a-f0-9]{40} ', line):
+                    received.add(line.split()[0])
+        self.assertEqual(received, {self.target})
+        self.assertEqual((self.original / '.git' / 'FETCH_HEAD').read_bytes(), prior_fetch_head)
         self.assert_preserved()
 
 

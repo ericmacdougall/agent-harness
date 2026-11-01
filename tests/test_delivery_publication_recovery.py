@@ -133,6 +133,31 @@ class PublicationRecovery(unittest.TestCase):
         result, data = self.reconcile()
         self.assert_uncertain_until_positive(result, data)
 
+    def test_malformed_lookup_cannot_settle_unknown_create(self):
+        fixture = self.fixture
+        def fail_create(module):
+            gh = module.gh
+            def uncertain(*args, **kwargs):
+                if args[:2] == ('pr', 'create'):
+                    fixture.change_github(creates=1, create_pending=True)
+                    raise module.DeliveryError('REMOTE_UNCERTAIN', 'Fixture uncertain create', code=4)
+                return gh(*args, **kwargs)
+            return mock.patch.object(module, 'gh', side_effect=uncertain)
+        code, data = fixture.direct_finish(fail_create, fixture.prepare_args())
+        self.assertEqual((code, data['status']), (4, 'REMOTE_UNCERTAIN'))
+        fixture.change_github(listing=[{'state': 'malformed'}])
+        result, unknown = self.reconcile()
+        self.assertEqual((result.returncode, unknown['status']), (4, 'REMOTE_UNCERTAIN'), result.stdout)
+        self.assertEqual(self.current_state()['phase'], 'REMOTE_UNCERTAIN')
+        self.assert_local_refused()
+        fresh, blocked = fixture.invoke(*fixture.prepare_args(), '--new-generation')
+        self.assertEqual((fresh.returncode, blocked['status']), (3, 'RECOVERY_REQUIRED'), fresh.stdout)
+        state = fixture.change_github(created=True)
+        state.pop('listing')
+        fixture.write_github(state)
+        result, ready = self.reconcile()
+        self.assertEqual((result.returncode, ready['status']), (0, 'PR_READY'), result.stdout)
+
     def test_foreign_same_name_prs_do_not_hide_exact_owned_pr(self):
         fixture = self.fixture
         owned = json.loads(fixture.github_state.read_text())['pr']
