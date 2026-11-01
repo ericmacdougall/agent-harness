@@ -263,6 +263,79 @@ class ExternalApply(unittest.TestCase):
             self.assertEqual(list(integration.scope_directory(scope.root, scope.identity,
                                                               scope.branch).joinpath('active').iterdir()), [])
 
+    def test_reservation_flag_false_for_foreign_applying_barrier(self):
+        target = self.target()
+        with patch.dict(os.environ, self.env, clear=True):
+            with self.scope() as scope:
+                foreign = scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+                self.ff(target)
+            unchanged = foreign.journal.read_bytes()
+            refs = fixtures.command('git', 'for-each-ref', '--format=%(refname) %(objectname)',
+                                    'refs/agent-harness/external-apply',
+                                    cwd=self.original, env=self.env).stdout
+            with self.scope() as scope:
+                active = foreign.journal.parent.parent
+                before = list(active.iterdir())
+                with self.assertRaises(integration.ExternalApplyError) as caught:
+                    scope.reserve_external(base=target, target=target, task_digest='b' * 64)
+                self.assertIs(getattr(caught.exception, 'reservation_started', None), False)
+                self.assertEqual(caught.exception.journal, foreign.journal)
+                self.assertEqual(list(active.iterdir()), before)
+            self.assertEqual(foreign.journal.read_bytes(), unchanged)
+            self.assertEqual(self.head(self.original), target)
+            self.assertEqual(fixtures.command('git', 'for-each-ref', '--format=%(refname) %(objectname)',
+                                             'refs/agent-harness/external-apply', cwd=self.original,
+                                             env=self.env).stdout, refs)
+
+    def test_reservation_flag_false_for_input_dirty_and_closed_prechecks(self):
+        target = self.target()
+        self.assertIs(getattr(integration.ExternalApplyError('fixed message'), 'reservation_started', None), None)
+        with patch.dict(os.environ, self.env, clear=True):
+            with self.scope() as scope:
+                with self.assertRaises(integration.ExternalApplyError) as other_api:
+                    scope.load_external('not-a-key', TASK)
+                self.assertIs(getattr(other_api.exception, 'reservation_started', None), None)
+                for failure in ('input', 'dirty'):
+                    with self.subTest(failure=failure):
+                        if failure == 'dirty':
+                            (self.original / 'app.txt').write_text('uncommitted user change\n')
+                        try:
+                            with self.assertRaises(integration.ExternalApplyError) as caught:
+                                scope.reserve_external(base=self.base, target=target,
+                                                       task_digest=None if failure == 'input' else TASK)
+                            self.assertIs(getattr(caught.exception, 'reservation_started', None), False)
+                        finally:
+                            (self.original / 'app.txt').write_text('base\n')
+                active = integration.scope_directory(scope.root, scope.identity, 'main') / 'active'
+                self.assertEqual(list(active.iterdir()), [])
+            with self.assertRaises(integration.ExternalApplyError) as caught:
+                scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+            self.assertIs(getattr(caught.exception, 'reservation_started', None), False)
+            self.assertEqual(fixtures.command('git', 'for-each-ref', 'refs/agent-harness/external-apply',
+                                             cwd=self.original, env=self.env).stdout, '')
+
+    def test_reservation_flag_true_for_ambiguous_attempt_mkdir_errors(self):
+        target = self.target()
+        mkdir = Path.mkdir
+        with patch.dict(os.environ, self.env, clear=True), self.scope() as scope:
+            for created in (False, True):
+                with self.subTest(directory_created_before_error=created):
+                    def fail(path, *args, **kwargs):
+                        if path.parent.name == 'active' and len(path.name) == 64:
+                            if created:
+                                mkdir(path, *args, **kwargs)
+                            raise OSError('injected ambiguous mkdir failure')
+                        return mkdir(path, *args, **kwargs)
+                    with patch.object(Path, 'mkdir', new=fail):
+                        with self.assertRaises(integration.ExternalApplyError) as caught:
+                            scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+                    error = caught.exception
+                    self.assertIs(getattr(error, 'reservation_started', None), True)
+                    self.assertEqual(error.journal.parent.exists(), created)
+                    self.assertFalse(error.journal.exists())
+                    self.assertNotEqual(fixtures.command('git', 'show-ref', '--verify', error.ref,
+                                             cwd=self.original, env=self.env, check=False).returncode, 0)
+
     def test_wrong_record_format_cannot_be_resolved_using_other_format_head(self):
         target = self.target()
         with patch.dict(os.environ, self.env, clear=True), self.scope() as scope:
@@ -316,6 +389,7 @@ class ExternalApply(unittest.TestCase):
                 with self.assertRaises(integration.ExternalApplyError) as caught:
                     scope.reserve_external(base=self.base, target=target, task_digest=TASK)
             journal = caught.exception.journal
+            self.assertIs(getattr(caught.exception, 'reservation_started', None), True)
             saved = integration.read_journal(journal.parent)
             self.assertEqual(saved['phase'], 'reserved')
         result, report = self.invoke()
@@ -380,6 +454,7 @@ class ExternalApply(unittest.TestCase):
                     with self.assertRaises(integration.ExternalApplyError) as caught:
                         scope.reserve_external(base=self.base, target=target, task_digest=TASK)
                 self.assertEqual(self.head(self.original), self.base)
+                self.assertIs(getattr(caught.exception, 'reservation_started', None), True)
                 self.assertTrue(caught.exception.journal.parent.is_dir())
                 result, report = self.invoke()
                 self.assertEqual((result.returncode, report['status']), (3, 'RECOVERY_REQUIRED'))
