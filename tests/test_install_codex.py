@@ -337,6 +337,44 @@ class CodexInstallerTests(unittest.TestCase):
             self.assertIn('prepare', result.stdout)
             self.assertIn('finish', result.stdout)
 
+    def test_installed_watcher_runs_without_claude_or_source_imports(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            home = root / 'home'
+            project = root / 'project'
+            elsewhere = root / 'elsewhere'
+            for directory in (home, project, elsewhere):
+                directory.mkdir()
+            watcher = home / '.codex' / 'agent-harness' / 'watch-tests.py'
+            self.assertIn(str(watcher), install(home, apply=False))
+            self.assertFalse(watcher.exists())
+            install(home, apply=True)
+            self.assertEqual(watcher.read_bytes(), (ROOT / 'harness' / 'tools' / 'watch-tests.py').read_bytes())
+            self.assertFalse((home / '.claude').exists())
+            environment = {key: value for key, value in os.environ.items()
+                           if key not in ('PYTHONPATH', 'PYTHONHOME')}
+            environment.update(HOME=str(home), PYTHONNOUSERSITE='1')
+            help_result = subprocess.run([sys.executable, str(watcher), '--help'],
+                                         cwd=elsewhere, env=environment, text=True,
+                                         capture_output=True, timeout=10)
+            self.assertEqual(help_result.returncode, 0, help_result.stdout + help_result.stderr)
+            self.assertIn('--once', help_result.stdout)
+            self.assertIn('--root', help_result.stdout)
+            command = ('import json, os, sys; from pathlib import Path; '
+                       'Path(sys.argv[1]).write_text(json.dumps({"cwd": str(Path.cwd()), "home": os.environ["HOME"]})); '
+                       'raise SystemExit(int(sys.argv[2]))')
+            for exit_code in (0, 7):
+                with self.subTest(exit_code=exit_code):
+                    marker = project / f'run-{exit_code}.json'
+                    result = subprocess.run(
+                        [sys.executable, str(watcher), '--root', str(project), '--once', '--',
+                         sys.executable, '-c', command, str(marker), str(exit_code)],
+                        cwd=elsewhere, env=environment, text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
+                    self.assertIn(f'[watch] exit {exit_code}', result.stdout)
+                    self.assertEqual(json.loads(marker.read_text()), {'cwd': str(project), 'home': str(home)})
+            self.assertFalse((home / '.claude').exists())
+
     def test_existing_policy_is_not_overridden(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary).resolve()
