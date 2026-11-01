@@ -384,8 +384,8 @@ class DeliveryHelpers(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        # The delivery helper retains recovery journals under HOME. Keep test
-        # reservations and worktrees inside this disposable fixture.
+        # The delivery helper retains recovery journals in this disposable
+        # repo's Git common directory; HOME isolates any user-level config.
         self.test_home = self.root / 'home'
         self.test_home.mkdir()
         home_override = patch.dict(os.environ, {'HOME': str(self.test_home)})
@@ -1267,7 +1267,7 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertIs(data['merge_aborted'], True)
         self.assert_restored()
 
-    def test_prepare_merge_and_commit_errors_omit_subprocess_output(self):
+    def test_prepare_error_omits_subprocess_output(self):
         self.add_feature_test()
         bin_dir = self.root / 'bin'
         bin_dir.mkdir()
@@ -1289,6 +1289,8 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertIs(data['merge_aborted'], True)
         self.assert_restored()
 
+    def test_merge_error_omits_subprocess_output(self):
+        self.add_feature_test()
         private_branch = 'feat/synthetic_private_branch_marker'
         cmd('git', 'branch', '-m', 'feat/app', private_branch, cwd=self.feature)
         env = self.git_fault_env(['merge', '--no-ff', '--no-commit', self.feature_head],
@@ -1306,15 +1308,15 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertIs(data['merge_aborted'], False)
         self.assert_restored()
 
+    def test_commit_error_omits_subprocess_output(self):
+        self.add_feature_test()
+        private_branch = 'feat/synthetic_private_branch_marker'
+        cmd('git', 'branch', '-m', 'feat/app', private_branch, cwd=self.feature)
         env = self.git_fault_env(['commit', '-m', f'Merge {private_branch} into main'],
                                  'os.write(1, b"synthetic_commit_stdout")\n'
                                  'os.write(2, b"synthetic_commit_stderr")\nsys.exit(7)')
-        # The previous failed merge has a durable recovery journal. Use a
-        # separate disposable HOME to exercise the commit fault as a new task,
-        # rather than bypassing that journal in production.
-        commit_home = self.root / 'commit-fault-home'
-        commit_home.mkdir()
-        env['HOME'] = str(commit_home)
+        argv = self.integrate_args()
+        argv[argv.index('--source') + 1] = private_branch
         p = subprocess.run(argv, text=True, capture_output=True, env=env,
                            timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(p.stdout)
@@ -1508,7 +1510,8 @@ class DeliveryHelpers(unittest.TestCase):
                                 env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(result.stdout)
         self.assertEqual((result.returncode, data['status']), (0, 'ALREADY_INTEGRATED'), result.stdout)
-        self.assertFalse(list((self.test_home / '.agent-harness' / 'delivery-scratch').glob('*/journal.json')))
+        self.assertFalse(list((self.repo / '.git' / 'agent-harness' /
+                               'delivery-scratch').glob('*/journal.json')))
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
 
     def test_failed_scratch_retry_reports_recovery_even_after_source_moves(self):
@@ -1553,6 +1556,95 @@ class DeliveryHelpers(unittest.TestCase):
                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(json.loads(retry.stdout)['status'], 'RECOVERY_REQUIRED')
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), head)
+        # A caller can refresh its expected baseline after the failed check.
+        # That must not turn the source-ancestor check into false completion.
+        refreshed = original_args.copy()
+        refreshed[refreshed.index('--expected-head') + 1] = head
+        alternate_home = self.root / 'alternate-home'
+        alternate_home.mkdir()
+        moved_home_env = {**isolated_env(), 'HOME': str(alternate_home)}
+        bypass = subprocess.run(refreshed, text=True, capture_output=True,
+                                env=moved_home_env, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual((bypass.returncode, json.loads(bypass.stdout)['status']),
+                         (3, 'RECOVERY_REQUIRED'), bypass.stdout)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), head)
+        alias = self.repo.with_name(self.repo.name.upper())
+        if alias.exists() and os.path.samefile(alias, self.repo):
+            alias_argv = refreshed.copy()
+            alias_argv[alias_argv.index('--repo') + 1] = str(alias)
+            alias_retry = subprocess.run(alias_argv, text=True, capture_output=True,
+                                         env=moved_home_env, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+            self.assertEqual((alias_retry.returncode, json.loads(alias_retry.stdout)['status']),
+                             (3, 'RECOVERY_REQUIRED'), alias_retry.stdout)
+
+    def test_completed_delivery_repeat_is_read_only_and_idempotent(self):
+        self.add_feature_test()
+        arguments = self.integrate_args()
+        first = subprocess.run(arguments, text=True, capture_output=True,
+                               env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        delivered = json.loads(first.stdout)
+        self.assertEqual((first.returncode, delivered['status']), (0, 'INTEGRATED'), first.stdout)
+        second = subprocess.run(arguments, text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        repeated = json.loads(second.stdout)
+        self.assertEqual((second.returncode, repeated['status']), (0, 'ALREADY_INTEGRATED'), second.stdout)
+        self.assertEqual(repeated['head'], delivered['head'])
+        self.assertEqual(repeated['cleanup_pending'], delivered['cleanup_pending'])
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), delivered['head'])
+        self.assertFalse(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
+
+    def test_concurrent_same_original_branch_is_serialized_before_merge(self):
+        spec = importlib.util.spec_from_file_location('integration_lock_control', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        repo = self.repo.resolve()
+        root, _, _, _ = module.scratch_journal_root(repo, 10)
+        fd = module.acquire_scope_lock(root, module.checkout_identity(repo), 'main')
+        self.assertIsNotNone(fd)
+        try:
+            alternate_home = self.root / 'lock-alternate-home'
+            alternate_home.mkdir()
+            environment = {**isolated_env(), 'HOME': str(alternate_home)}
+            result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                    env=environment, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        finally:
+            os.close(fd)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
+        self.assertIn('Another integration', data['message'])
+        self.assertFalse(list(root.glob('*/journal.json')))
+        self.assert_restored()
+
+    def test_completed_journal_allows_next_reviewed_feature(self):
+        self.add_feature_test()
+        first = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                               env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        first_data = json.loads(first.stdout)
+        self.assertEqual((first.returncode, first_data['status']), (0, 'INTEGRATED'), first.stdout)
+        baseline = first_data['head']
+        second = self.root / 'second-feature'
+        cmd('git', 'worktree', 'add', '-qb', 'feat/second', str(second), cwd=self.repo)
+        (second / 'app.txt').write_text('second feature\n')
+        cmd('git', 'commit', '-qam', 'second feature', cwd=second)
+        second_head = cmd('git', 'rev-parse', 'HEAD', cwd=second).stdout.strip()
+        argv = self.integrate_args()
+        argv[argv.index('--expected-head') + 1] = baseline
+        argv[argv.index('--source') + 1] = 'feat/second'
+        argv[argv.index('--expected-source-head') + 1] = second_head
+        delivered = subprocess.run(argv, text=True, capture_output=True,
+                                   env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(delivered.stdout)
+        self.assertEqual((delivered.returncode, data['status']), (0, 'INTEGRATED'), delivered.stdout)
+        self.assertEqual(cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD',
+                             cwd=self.repo).stdout.split()[1:], [baseline, second_head])
+        old_repeat = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                    env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        old_data = json.loads(old_repeat.stdout)
+        self.assertEqual((old_repeat.returncode, old_data['status']),
+                         (0, 'ALREADY_INTEGRATED'), old_repeat.stdout)
+        self.assertEqual(old_data['candidate'], baseline)
+        self.assertEqual(old_data['head'], data['head'])
 
     def test_post_fast_forward_inspection_error_reports_advanced_head(self):
         self.add_feature_test()
@@ -1583,6 +1675,69 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual(data['head'], advanced_checks[0])
         self.assertNotEqual(data['head'], self.base)
         self.assertTrue(Path(data['journal']).is_file())
+
+    def test_fast_forward_error_after_ref_move_reports_recovery_and_actual_head(self):
+        self.add_feature_test()
+        spec = importlib.util.spec_from_file_location('integration_late_ff_error', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        real_git = module.run_git_discard_nohooks
+        advanced = []
+
+        def fail_after_real_fast_forward(repo, *args, timeout=600):
+            result = real_git(repo, *args, timeout=timeout)
+            if args[:2] == ('merge', '--ff-only'):
+                self.assertEqual(result.returncode, 0)
+                advanced.append(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip())
+                raise subprocess.TimeoutExpired(['git', *args], timeout)
+            return result
+
+        with patch.object(module, 'run_git_discard_nohooks', side_effect=fail_after_real_fast_forward), \
+             patch.object(sys, 'argv', self.integrate_args()[1:]), \
+             patch('sys.stdout', new_callable=io.StringIO) as output, \
+             patch.dict(os.environ, isolated_env(), clear=True):
+            code = module.main()
+        data = json.loads(output.getvalue())
+        self.assertEqual(len(advanced), 1, 'fault did not reach the protected fast-forward')
+        self.assertEqual((code, data['status']), (3, 'RECOVERY_REQUIRED'), output.getvalue())
+        self.assertEqual(data['phase'], 'apply')
+        self.assertTrue(data['recovery_required'])
+        self.assertEqual(data['head'], advanced[0])
+        self.assertEqual(data['candidate'], advanced[0])
+        self.assertTrue(Path(data['journal']).is_file())
+
+    def test_final_journal_write_failure_blocks_new_baseline_tuple(self):
+        self.add_feature_test()
+        spec = importlib.util.spec_from_file_location('integration_final_journal_error', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        real_write = module.write_journal
+
+        def fail_terminal_write(directory, record, **kwargs):
+            if record['phase'] == 'delivered':
+                raise OSError('synthetic final journal failure')
+            return real_write(directory, record, **kwargs)
+
+        with patch.object(module, 'write_journal', side_effect=fail_terminal_write), \
+             patch.object(sys, 'argv', self.integrate_args()[1:]), \
+             patch('sys.stdout', new_callable=io.StringIO) as output, \
+             patch.dict(os.environ, isolated_env(), clear=True):
+            code = module.main()
+        data = json.loads(output.getvalue())
+        self.assertEqual((code, data['status']), (3, 'RECOVERY_REQUIRED'), output.getvalue())
+        self.assertEqual(data['phase'], 'finalize')
+        self.assertEqual(json.loads(Path(data['journal']).read_text())['phase'], 'finalizing')
+        head = cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        self.assertEqual(data['head'], head)
+        self.assertNotEqual(head, self.base)
+        refreshed = self.integrate_args()
+        refreshed[refreshed.index('--expected-head') + 1] = head
+        retry = subprocess.run(refreshed, text=True, capture_output=True,
+                               env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual((retry.returncode, json.loads(retry.stdout)['status']),
+                         (3, 'RECOVERY_REQUIRED'), retry.stdout)
 
     def git_fault_env(self, arguments, action):
         """Inject a stall or error at one Git boundary; all other operations use real Git."""

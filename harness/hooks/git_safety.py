@@ -31,8 +31,9 @@ def git_environment(*, isolated=False, allow_hooks=False, preserve_identity=Fals
                     settings=()):
     """Drop ambient Git routing/index state while composing deliberate settings.
 
-    Local integration intentionally executes checkout hooks under a deadline
-    and honors caller-provided commit identity; other callers keep hooks disabled.
+    Scratch integration executes merge and commit hooks under a deadline and
+    honors caller-provided commit identity. The original fast-forward and
+    helper metadata updates keep hooks disabled.
     """
     retained = set() if isolated else AUTH_GIT_ENV | (IDENTITY_GIT_ENV if preserve_identity else set())
     env = {key: value for key, value in os.environ.items()

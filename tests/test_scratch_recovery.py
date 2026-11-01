@@ -177,6 +177,59 @@ class ScratchRecovery(unittest.TestCase):
         self.assertEqual(command('git', 'status', '--porcelain', cwd=self.original,
                                  env=self.env).stdout, '')
 
+    def test_helper_metadata_ref_cleanup_cannot_run_repo_hook_after_final_check(self):
+        marker = self.root / 'ref-cleanup-hook-ran'
+        hook = self.original / '.git' / 'hooks' / 'reference-transaction'
+        hook.write_text(
+            '#!/bin/sh\n'
+            '[ "$1" = committed ] || exit 0\n'
+            'while read old new ref; do\n'
+            '  case "$ref" in\n'
+            '    refs/agent-harness/delivery/*)\n'
+            '      case "$new" in\n'
+            '        *[!0]*) ;;\n'
+            f'        *) printf "hook mutation\\n" > {shlex.quote(str(self.original / "app.txt"))}; '
+            f'touch {shlex.quote(str(marker))} ;;\n'
+            '      esac ;;\n'
+            '  esac\n'
+            'done\n')
+        hook.chmod(0o700)
+
+        result, data = self.invoke()
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'),
+                         result.stdout + result.stderr)
+        self.assertFalse(marker.exists(), 'helper-owned ref deletion ran a repository hook')
+        self.assertEqual((self.original / 'app.txt').read_text(), 'feature\n')
+        self.assertEqual(command('git', 'status', '--porcelain', cwd=self.original,
+                                 env=self.env).stdout, '')
+        self.assertEqual(self.head(self.original), data['head'])
+
+    def test_original_fast_forward_does_not_run_hook_that_deletes_ignored_user_data(self):
+        (self.original / '.gitignore').write_text('cache.txt\n')
+        command('git', 'add', '.gitignore', cwd=self.original, env=self.env)
+        command('git', 'commit', '-qm', 'ignore local cache', cwd=self.original, env=self.env)
+        self.base = self.head(self.original)
+        cache = self.original / 'cache.txt'
+        cache.write_text('user ignored data\n')
+        marker = self.root / 'original-post-merge-ran'
+        hook = self.original / '.git' / 'hooks' / 'post-merge'
+        hook.write_text(
+            '#!/bin/sh\n'
+            f'if [ "$(pwd -P)" = {shlex.quote(str(self.original.resolve()))} ]; then\n'
+            f'  rm -f -- {shlex.quote(str(cache))}\n'
+            f'  touch {shlex.quote(str(marker))}\n'
+            'fi\n')
+        hook.chmod(0o700)
+
+        result, data = self.invoke()
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'),
+                         result.stdout + result.stderr)
+        self.assertFalse(marker.exists(), 'original fast-forward ran a destructive repository hook')
+        self.assertEqual(cache.read_text(), 'user ignored data\n')
+        self.assertEqual(self.head(self.original), data['head'])
+        self.assertEqual(command('git', 'status', '--porcelain', cwd=self.original,
+                                 env=self.env).stdout, '')
+
     def test_concurrent_dirty_original_never_autostashes_or_overwrites(self):
         command('git', 'config', 'merge.autostash', 'true', cwd=self.original, env=self.env)
         before_stash = command('git', 'stash', 'list', cwd=self.original, env=self.env).stdout

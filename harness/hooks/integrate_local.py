@@ -2,6 +2,7 @@
 """Merge a reviewed feature commit into the original clean checkout, with checks."""
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -187,6 +188,19 @@ def run_git_discard(repo, *args, timeout=600):
                env=git_environment(allow_hooks=True, preserve_identity=True))
 
 
+def run_git_nohooks(repo, *args, timeout=600):
+    # Harness bookkeeping must not run a repository reference-transaction
+    # hook after the final delivered-check gate.
+    return run(repo, ["git", *args], timeout=timeout, env=git_environment())
+
+
+def run_git_discard_nohooks(repo, *args, timeout=600):
+    # Scratch has already run merge/commit hooks. The original fast-forward
+    # must not run post-merge hooks that can alter ignored user data.
+    return run(repo, ["git", *args], timeout=timeout, discard_output=True,
+               env=git_environment())
+
+
 def safe_source(repo, timeout, *, allow_unmerged=False):
     try:
         require_safe_source(repo, git_environment(), timeout=min(timeout, INDEX_MAX_SECONDS),
@@ -257,20 +271,54 @@ def main():
     return integrate_scratch(args, preparations, checks)
 
 
-def scratch_journal_root():
-    parent = Path.home() / '.agent-harness'
-    root = parent / 'delivery-scratch'
-    for path in (parent, root):
-        if path.is_symlink():
-            raise OSError('private scratch path is a symlink')
-        path.mkdir(mode=0o700, exist_ok=True)
-        if not path.is_dir() or stat.S_IMODE(path.stat().st_mode) != 0o700:
-            raise OSError('private scratch path is not owner-only')
-    return root
+def private_directory(path):
+    if path.is_symlink():
+        raise OSError('private scratch path is a symlink')
+    path.mkdir(mode=0o700, exist_ok=True)
+    info = os.stat(path, follow_symlinks=False)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise OSError('private scratch path is not owner-only')
+    return info
 
 
-def journal_key(repo, branch, base, source_branch, source):
-    payload = '\0'.join((str(repo), branch, base, source_branch, source)).encode()
+def git_common_directory(repo, timeout):
+    result = inspect_git(repo, 'rev-parse', '--git-common-dir', timeout=timeout)
+    value = result.stdout.strip()
+    if result.returncode or not value or '\n' in value or '\0' in value:
+        raise OSError('Git common directory is ambiguous')
+    named = Path(value)
+    if not named.is_absolute():
+        named = repo / named
+    if named.is_symlink():
+        raise OSError('Git common directory is a symlink')
+    common = named.resolve(strict=True)
+    info = os.stat(common, follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError('Git common directory is invalid')
+    return common, info
+
+
+def scratch_journal_root(repo, timeout):
+    # Git's common directory is independent of HOME and shared by linked
+    # worktrees. An owner-only child keeps journals out of Git publications.
+    common, common_info = git_common_directory(repo, timeout)
+    private_directory(common / 'agent-harness')
+    root = common / 'agent-harness' / 'delivery-scratch'
+    root_info = private_directory(root)
+    return root, common, common_info, root_info
+
+
+def checkout_identity(repo):
+    info = os.stat(repo, follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError('original checkout is not a directory')
+    return info.st_dev, info.st_ino
+
+
+def journal_key(identity, branch, base, source_branch, source):
+    payload = '\0'.join((str(identity[0]), str(identity[1]), branch, base,
+                         source_branch, source)).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -305,20 +353,151 @@ def write_journal(directory, record, *, first=False):
             pass
 
 
-def reserve_scratch(repo, branch, base, source_branch, source):
-    root = scratch_journal_root()
-    key = journal_key(repo, branch, base, source_branch, source)
+def reserve_scratch(root, repo, identity, branch, base, source_branch, source):
+    key = journal_key(identity, branch, base, source_branch, source)
     directory = root / key
     try:
         directory.mkdir(mode=0o700)
     except FileExistsError:
         return directory, None
     scratch = directory / 'worktree'
-    record = {'schema': 1, 'phase': 'started', 'original': str(repo), 'branch': branch,
+    record = {'schema': 1, 'phase': 'started', 'original': str(repo),
+              'original_dev': identity[0], 'original_ino': identity[1], 'branch': branch,
               'base': base, 'source_branch': source_branch, 'source': source,
               'scratch': str(scratch), 'key': key}
     write_journal(directory, record, first=True)
     return directory, record
+
+
+def acquire_scope_lock(root, identity, branch):
+    locks = root / 'locks'
+    private_directory(locks)
+    key = hashlib.sha256(f'{identity[0]}\0{identity[1]}\0{branch}'.encode()).hexdigest()
+    fd = os.open(locks / key, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise OSError('private integration lock is unsafe')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_journal(directory):
+    info = os.stat(directory, follow_symlinks=False)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise OSError('scratch journal directory is unsafe')
+    fd = os.open(directory / 'journal.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size > 8192):
+            raise OSError('scratch journal is unsafe')
+        data = os.read(fd, 8193)
+        if len(data) > 8192:
+            raise OSError('scratch journal exceeds size limit')
+    finally:
+        os.close(fd)
+    try:
+        record = json.loads(data)
+    except (ValueError, UnicodeDecodeError) as error:
+        raise OSError('scratch journal is invalid') from error
+    if not isinstance(record, dict) or record.get('schema') != 1 or record.get('key') != directory.name:
+        raise OSError('scratch journal is invalid')
+    identity = (record.get('original_dev'), record.get('original_ino'))
+    if (not all(isinstance(value, int) and value > 0 for value in identity)
+            or not all(isinstance(record.get(name), str) for name in ('branch', 'base',
+                                                                     'source_branch', 'source'))
+            or record.get('scratch') != str(directory / 'worktree')
+            or journal_key(identity, record['branch'], record['base'],
+                           record['source_branch'], record['source']) != directory.name):
+        raise OSError('scratch journal identity is invalid')
+    return record
+
+
+def full_oid(value):
+    return (isinstance(value, str) and len(value) in (40, 64)
+            and all(char in '0123456789abcdef' for char in value))
+
+
+def completed_journal_is_verified(repo, identity, branch, directory, record, timeout):
+    """A completed journal is safe to skip only while its delivery remains real."""
+    candidate, base, source, tree = (record.get('candidate'), record.get('base'),
+                                     record.get('source'), record.get('tree'))
+    if (record.get('original_dev'), record.get('original_ino')) != identity or record.get('branch') != branch:
+        return False
+    if not all(full_oid(value) for value in (candidate, base, source, tree)):
+        return False
+    current = observed_head(repo)
+    if not current or not checked_original(repo, branch, current, timeout):
+        return False
+    parents = inspect_git(repo, 'rev-list', '--parents', '-n', '1', candidate, timeout=timeout)
+    actual_tree = inspect_git(repo, 'rev-parse', f'{candidate}^{{tree}}', timeout=timeout)
+    ancestor = inspect_git(repo, 'merge-base', '--is-ancestor', candidate, current, timeout=timeout)
+    if (parents.returncode or parents.stdout.split() != [candidate, base, source]
+            or actual_tree.returncode or actual_tree.stdout.strip() != tree
+            or ancestor.returncode != 0):
+        return False
+    ref = f'refs/agent-harness/delivery/{directory.name}'
+    if record.get('ref') != ref or record.get('scratch') != str(directory / 'worktree'):
+        return False
+    pin = inspect_git(repo, 'show-ref', '--verify', '--quiet', ref, timeout=timeout)
+    if pin.returncode not in (0, 1):
+        return False
+    if pin.returncode == 0 and inspect_git(repo, 'rev-parse', ref, timeout=timeout).stdout.strip() != candidate:
+        return False
+    scratch = directory / 'worktree'
+    present = os.path.lexists(scratch)
+    if present:
+        info = os.stat(scratch, follow_symlinks=False)
+        if (not stat.S_ISDIR(info.st_mode)
+                or (info.st_dev, info.st_ino) != (record.get('scratch_dev'), record.get('scratch_ino'))
+                or pin.returncode != 0):
+            return False
+        scratch_head = inspect_git(scratch, 'rev-parse', 'HEAD', timeout=timeout)
+        if scratch_head.returncode or scratch_head.stdout.strip() != candidate:
+            return False
+    return (isinstance(record.get('cleanup_pending'), bool)
+            and record['cleanup_pending'] == (present or pin.returncode == 0))
+
+
+def scan_journals(root, repo, identity, branch, key, timeout):
+    """Fail closed on a damaged reservation; find unresolved state across tuples."""
+    exact = None
+    count = 0
+    for entry in root.iterdir():
+        if entry.name == 'locks':
+            continue
+        count += 1
+        if count > 4096 or len(entry.name) != 64 or any(char not in '0123456789abcdef' for char in entry.name):
+            return entry, None, None
+        try:
+            record = read_journal(entry)
+        except OSError:
+            return entry, None, None
+        same_scope = ((record.get('original_dev'), record.get('original_ino')) == identity
+                      and record.get('branch') == branch)
+        if not same_scope:
+            continue
+        try:
+            completed = (record.get('phase') == 'delivered'
+                         and completed_journal_is_verified(repo, identity, branch, entry, record, timeout))
+        except (IndexInspectionError, OSError, subprocess.TimeoutExpired):
+            completed = False
+        if not completed:
+            return entry, record, None
+        if entry.name == key:
+            exact = record
+    return None, None, exact
 
 
 def observed_head(repo):
@@ -413,34 +592,70 @@ def scratch_identity(scratch, expected):
             and (observed.st_dev, observed.st_ino) == (expected.st_dev, expected.st_ino))
 
 
+def common_state_is_current(repo, identity, common, common_info, root, root_info, timeout):
+    if checkout_identity(repo) != identity:
+        return False
+    current, current_info = git_common_directory(repo, timeout)
+    observed_root = os.stat(root, follow_symlinks=False)
+    return (current == common
+            and (current_info.st_dev, current_info.st_ino) == (common_info.st_dev, common_info.st_ino)
+            and stat.S_ISDIR(observed_root.st_mode)
+            and observed_root.st_uid == os.geteuid()
+            and stat.S_IMODE(observed_root.st_mode) == 0o700
+            and (observed_root.st_dev, observed_root.st_ino) == (root_info.st_dev, root_info.st_ino))
+
+
 def integrate_scratch(args, preparations, checks):
     if any(name.startswith('GIT_') and name not in ALLOWED_GIT_ENV for name in os.environ):
         report('BLOCKED_POLICY', 'Inherited Git routing or configuration override is unsupported')
         return 2
     repo = args.repo.resolve()
     directory = None
+    record = None
     phase = 'preflight'
     applied_candidate = None
+    lock_fd = None
     try:
         toplevel = inspect_git(repo, 'rev-parse', '--show-toplevel', timeout=args.timeout) if repo.is_dir() else None
-        if toplevel is None or toplevel.returncode or Path(toplevel.stdout.strip()).resolve() != repo:
+        if (toplevel is None or toplevel.returncode or not toplevel.stdout.strip()
+                or not os.path.samefile(Path(toplevel.stdout.strip()).resolve(), repo)):
             report('BLOCKED_POLICY', 'Original checkout must be the root of a Git worktree')
             return 2
         if args.source.startswith('-') or inspect_git(repo, 'check-ref-format', '--branch', args.source,
                                                        timeout=args.timeout).returncode:
             report('BLOCKED_POLICY', 'Source must be a valid local feature branch')
             return 2
+        identity = checkout_identity(repo)
+        root, common, common_info, root_info = scratch_journal_root(repo, args.timeout)
+        lock_fd = acquire_scope_lock(root, identity, args.original_branch)
+        if lock_fd is None:
+            report('BLOCKED_LOCAL', 'Another integration is active for this checkout and branch')
+            return 3
         # An unresolved attempt takes precedence even if its candidate already
-        # advanced original HEAD or its source branch moved. Never silently
-        # create a second merge/check.
-        key = journal_key(repo, args.original_branch, args.expected_head,
+        # advanced original HEAD, source branch moved, or HOME changed.
+        key = journal_key(identity, args.original_branch, args.expected_head,
                           args.source, args.expected_source_head)
-        existing = scratch_journal_root() / key
-        if os.path.lexists(existing):
-            report('RECOVERY_REQUIRED', 'Existing scratch journal requires inspection before retry',
-                   journal=str(existing / 'journal.json'), scratch=str(existing / 'worktree'),
+        blocking, _, completed = scan_journals(root, repo, identity,
+                                               args.original_branch, key, args.timeout)
+        if blocking is not None:
+            report('RECOVERY_REQUIRED', 'Unresolved scratch journal requires inspection before new work',
+                   journal=str(blocking / 'journal.json'), scratch=str(blocking / 'worktree'),
                    head=observed_head(repo))
             return 3
+        if completed is not None:
+            candidate = completed['candidate']
+            current = observed_head(repo)
+            if (not current or not checked_original(repo, args.original_branch, current, args.timeout)
+                    or inspect_git(repo, 'merge-base', '--is-ancestor', candidate,
+                                   current, timeout=args.timeout).returncode != 0):
+                report('RECOVERY_REQUIRED', 'Completed delivery changed during recheck',
+                       journal=str(root / key / 'journal.json'), head=current)
+                return 3
+            report('ALREADY_INTEGRATED', 'Completed local delivery remains verified',
+                   head=current, candidate=candidate,
+                   cleanup_pending=completed['cleanup_pending'],
+                   journal=str(root / key / 'journal.json'))
+            return 0
         source = inspect_git(repo, 'rev-parse', '--verify', f'refs/heads/{args.source}^{{commit}}',
                              timeout=args.timeout)
         if (source.returncode or source.stdout.strip() != args.expected_source_head
@@ -459,7 +674,7 @@ def integrate_scratch(args, preparations, checks):
         if already.returncode != 1:
             report('BLOCKED_LOCAL', 'Source ancestry could not be verified; no merge attempted')
             return 3
-        directory, record = reserve_scratch(repo, args.original_branch, args.expected_head,
+        directory, record = reserve_scratch(root, repo, identity, args.original_branch, args.expected_head,
                                             args.source, args.expected_source_head)
         scratch = directory / 'worktree'
         if record is None:
@@ -546,7 +761,7 @@ def integrate_scratch(args, preparations, checks):
                                    original_head=observed_head(repo))
         ref = f'refs/agent-harness/delivery/{record["key"]}'
         zeros = '0' * len(candidate)
-        pinned = run_git(repo, 'update-ref', ref, candidate, zeros, timeout=args.timeout)
+        pinned = run_git_nohooks(repo, 'update-ref', ref, candidate, zeros, timeout=args.timeout)
         if pinned.returncode:
             return scratch_failure(repo, scratch, directory / 'journal.json',
                                    'Candidate ref could not be pinned', phase='candidate',
@@ -554,7 +769,8 @@ def integrate_scratch(args, preparations, checks):
         record.update({'phase': 'candidate', 'candidate': candidate, 'tree': intended_tree, 'ref': ref})
         write_journal(directory, record)
         phase = 'apply'
-        if (not checked_original(repo, args.original_branch, args.expected_head, args.timeout)
+        if (not common_state_is_current(repo, identity, common, common_info, root, root_info, args.timeout)
+                or not checked_original(repo, args.original_branch, args.expected_head, args.timeout)
                 or inspect_git(repo, 'rev-parse', '--verify', f'refs/heads/{args.source}',
                                timeout=args.timeout).stdout.strip() != args.expected_source_head
                 or inspect_git(repo, 'rev-parse', ref, timeout=args.timeout).stdout.strip() != candidate
@@ -563,14 +779,16 @@ def integrate_scratch(args, preparations, checks):
                                    'Original or candidate changed before apply', phase='apply',
                                    candidate=candidate, recovery_ref=ref,
                                    original_head=inspect_git(repo, 'rev-parse', 'HEAD', timeout=30).stdout.strip())
-        advanced = run_git_discard(repo, 'merge', '--ff-only', '--no-overwrite-ignore',
-                                   '--no-autostash', candidate, timeout=args.timeout)
-        observed = inspect_git(repo, 'rev-parse', 'HEAD', timeout=30).stdout.strip()
+        advanced = run_git_discard_nohooks(repo, 'merge', '--ff-only', '--no-overwrite-ignore',
+                                           '--no-autostash', candidate, timeout=args.timeout)
+        observed = observed_head(repo)
         if advanced.returncode or observed != candidate:
             return scratch_failure(repo, scratch, directory / 'journal.json',
                                    'Protected fast-forward refused or changed state; inspect checkout',
                                    phase='apply', candidate=candidate, recovery_ref=ref,
-                                   original_head=observed)
+                                   original_head=observed,
+                                   status=('BLOCKED_LOCAL' if observed == args.expected_head
+                                           else 'RECOVERY_REQUIRED'))
         applied_candidate = candidate
         phase = 'verify'
         if not checked_original(repo, args.original_branch, candidate, args.timeout):
@@ -603,7 +821,7 @@ def integrate_scratch(args, preparations, checks):
                                    original_head=observed_head(repo),
                                    status='DELIVERED_CHECK_FAILED')
         phase = 'finalize'
-        record['phase'] = 'delivered'
+        record['phase'] = 'finalizing'
         write_journal(directory, record)
         cleanup_pending = True
         try:
@@ -612,10 +830,19 @@ def integrate_scratch(args, preparations, checks):
                 removed = run_process(['git', '-C', str(repo), 'worktree', 'remove', str(scratch)],
                                       env=git_environment(), timeout=args.timeout, discard_output=True)
                 if removed.returncode == 0:
-                    deleted = run_git(repo, 'update-ref', '-d', ref, candidate, timeout=args.timeout)
+                    deleted = run_git_nohooks(repo, 'update-ref', '-d', ref, candidate,
+                                              timeout=args.timeout)
                     cleanup_pending = deleted.returncode != 0
         except (IndexInspectionError, OSError, subprocess.TimeoutExpired):
             pass  # Keep the candidate and scratch for later inspection.
+        if (not common_state_is_current(repo, identity, common, common_info, root, root_info, args.timeout)
+                or not checked_original(repo, args.original_branch, candidate, args.timeout)):
+            return scratch_failure(repo, scratch, directory / 'journal.json',
+                                   'Original checkout changed during cleanup; HEAD advanced',
+                                   phase='finalize', candidate=candidate,
+                                   original_head=observed_head(repo), status='RECOVERY_REQUIRED')
+        record.update({'phase': 'delivered', 'cleanup_pending': cleanup_pending})
+        write_journal(directory, record)
         report('INTEGRATED', 'Verified feature merged into original checkout',
                original_branch=args.original_branch, source=args.source, head=candidate,
                preparations=args.prepare, checks=args.check, cleanup_pending=cleanup_pending,
@@ -631,12 +858,19 @@ def integrate_scratch(args, preparations, checks):
             return 3
         # The journal reserved before scratch work prevents an automatic
         # second merge after an uncertain timeout or interrupted hook.
+        current_head = observed_head(repo)
+        candidate = record.get('candidate') if isinstance(record, dict) else None
+        uncertain_apply = phase == 'apply' and (not current_head or current_head != args.expected_head)
         return scratch_failure(repo, directory / 'worktree', directory / 'journal.json',
                                message, phase=phase, merge_aborted=False,
-                               original_head=observed_head(repo),
+                               original_head=current_head,
                                status=('DELIVERED_CHECK_FAILED' if applied_candidate and phase == 'verify'
-                                       else 'RECOVERY_REQUIRED' if applied_candidate else 'BLOCKED_LOCAL'),
-                               candidate=applied_candidate)
+                                       else 'RECOVERY_REQUIRED' if applied_candidate or uncertain_apply
+                                       else 'BLOCKED_LOCAL'),
+                               candidate=candidate)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
 
 
 if __name__ == "__main__":
