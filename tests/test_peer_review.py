@@ -41,10 +41,15 @@ class PeerReviewTests(unittest.TestCase):
         self.fake('codex', '''import os, sys
 from pathlib import Path
 prompt = sys.stdin.read()
+launches = os.environ.get('PROVIDER_LAUNCH_LOG')
+if launches:
+    with open(launches,'a') as stream: stream.write('codex\\n')
 capture = os.environ.get('CAPTURE_CODEX_PROMPT')
 if capture: Path(capture).write_text(prompt)
 last = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
-last.write_text(os.environ.get('CODEX_VERDICT', 'VERDICT: PASS\\nReviewed.'))
+default = ('PLAN_RESULT: ACCEPT' if 'Stage: plan.' in prompt else
+           'CODE_INSPECTION_RESULT: ACCEPT' if 'Stage: code-inspection.' in prompt else 'VERDICT: PASS')
+last.write_text(os.environ.get('CODEX_VERDICT', default + '\\nReviewed.'))
 if os.environ.get('CODEX_EVENTS'): print(os.environ['CODEX_EVENTS'])
 packet_action = os.environ.get('RACE_PACKET_ACTION')
 if packet_action:
@@ -93,9 +98,14 @@ sys.exit(int(os.environ.get('CODEX_EXIT', '0')))
         self.fake('claude', '''import os, sys
 from pathlib import Path
 prompt = sys.stdin.read()
+launches = os.environ.get('PROVIDER_LAUNCH_LOG')
+if launches:
+    with open(launches,'a') as stream: stream.write('claude\\n')
 capture = os.environ.get('CAPTURE_CLAUDE_PROMPT')
 if capture: Path(capture).write_text(prompt)
-print(os.environ.get('CLAUDE_VERDICT', 'VERDICT: PASS\\nFallback reviewed.'))
+default = ('PLAN_RESULT: ACCEPT' if 'Stage: plan.' in prompt else
+           'CODE_INSPECTION_RESULT: ACCEPT' if 'Stage: code-inspection.' in prompt else 'VERDICT: PASS')
+print(os.environ.get('CLAUDE_VERDICT', default + '\\nFallback reviewed.'))
 sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
 ''')
 
@@ -104,14 +114,14 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         path.write_text(f'#!{sys.executable}\n{body}')
         path.chmod(0o700)
 
-    def invoke(self, *, packet=None, output=None, env=None, expected_head=None, stage='pr'):
+    def invoke(self, *, packet=None, output=None, env=None, expected_head=None, stage='pr', extra=()):
         environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin', **(env or {})}
         if expected_head is None:
             expected_head = subprocess.run(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'],
                                            check=True, capture_output=True, text=True).stdout.strip()
         command = [sys.executable, str(REVIEW), stage, '--repo', str(self.repo),
                                '--packet', str(packet or self.packet), '--output', str(output or self.output),
-                               *(['--expected-head', expected_head] if stage == 'pr' else [])]
+                               *(['--expected-head', expected_head] if stage in {'pr', 'code-inspection'} else []), *extra]
         return subprocess.run(command,
                               text=True, capture_output=True, env=environment, timeout=45)
 
@@ -258,14 +268,14 @@ record = {'ignored_read': ignored_read, 'diff': subprocess.check_output(['git', 
 Path(os.environ['ISOLATION_CAPTURE']).write_text(json.dumps(record))
 if '--cd' in sys.argv:
     assert Path(sys.argv[sys.argv.index('--cd') + 1]) == cwd
-    Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT: PASS')
-else: print('VERDICT: PASS')
+    Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('PLAN_RESULT: ACCEPT')
+else: print('PLAN_RESULT: ACCEPT')
 """
         import json
         for fallback in (False, True):
             with self.subTest(fallback=fallback):
                 secret.write_text('synthetic ignored fixture')
-                self.fake('codex', 'import sys; sys.exit(7)' if fallback else body)
+                self.fake('codex', 'import json,sys; print(json.dumps({"type":"turn.failed","error":{"code":"model_not_found"}}));sys.exit(7)' if fallback else body)
                 self.fake('claude', body)
                 capture = self.root / 'isolation.json'
                 result = self.invoke(stage='plan', output=self.root / f'review-{fallback}.md',
@@ -345,13 +355,14 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                         raise subprocess.TimeoutExpired('fixture', 1)
                     if failure == 'review':
                         raise OSError('synthetic reviewer failure')
-                    return 'fixture', 'VERDICT: PASS', ''
+                    return 'fixture', 'PLAN_RESULT: ACCEPT', ''
                 real_cleanup = module.tempfile.TemporaryDirectory.cleanup
                 def cleanup(directory):
                     real_cleanup(directory)
                     if failure == 'cleanup':
                         raise OSError('synthetic cleanup failure')
                 with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.dict(os.environ, {'AGENT_HARNESS_USAGE_DIR': str(self.root / ('usage-' + failure))}))
                     stack.enter_context(patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(output)]))
                     stack.enter_context(patch.object(module, 'make_snapshot', side_effect=snapshot))
@@ -474,7 +485,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', 'tracked fixtures'], check=True)
         result = self.invoke(stage='plan')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('VERDICT: PASS', self.output.read_text())
+        self.assertIn('PLAN_RESULT: ACCEPT', self.output.read_text())
 
     def test_snapshot_commit_blocks_pass_and_report(self):
         result = self.invoke(env={'RACE_HEAD': '1'})
@@ -536,6 +547,60 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('32 KiB', result.stderr)
+
+    def test_code_inspection_has_no_pr_marker_and_persists_its_stage(self):
+        result = self.invoke(stage='code-inspection')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('CODE_INSPECTION_RESULT: ACCEPT', self.output.read_text())
+        self.assertNotIn('VERDICT: PASS', self.output.read_text())
+        finals = list((self.root / 'usage-state' / 'runs').glob('*/final.json'))
+        self.assertEqual(len(finals), 1)
+        self.assertEqual(json.loads(finals[0].read_text())['review'],
+                         {'stage': 'CODE_INSPECTION', 'verdict': 'ACCEPT', 'findings': []})
+
+    def test_wrong_stage_provider_result_refuses_without_fallback(self):
+        capture = self.root / 'fallback.capture'
+        result = self.invoke(env={'CODEX_VERDICT': 'PLAN_RESULT: ACCEPT',
+                                  'CAPTURE_CLAUDE_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(self.output.exists())
+        self.assertFalse(capture.exists())
+
+    def test_identical_completed_invocation_is_not_launched_again(self):
+        launches = self.root / 'launches'
+        first = self.invoke(env={'PROVIDER_LAUNCH_LOG': str(launches)})
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self.invoke(output=self.root / 'second.report', env={'PROVIDER_LAUNCH_LOG': str(launches)})
+        self.assertEqual(second.returncode, 2, second.stderr)
+        self.assertEqual(launches.read_text().splitlines(), ['codex'])
+        self.assertFalse((self.root / 'second.report').exists())
+
+    def test_quota_pools_remain_shared_across_new_run_and_model(self):
+        launches = self.root / 'launches'
+        environment = {'PROVIDER_LAUNCH_LOG': str(launches),
+            'CODEX_EVENTS': json.dumps({'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}}),
+            'CLAUDE_VERDICT': json.dumps({'type': 'result', 'subtype': 'error_during_execution',
+                'is_error': True, 'error': {'code': 'insufficient_quota'}, 'result': 'VERDICT: PASS'})}
+        first = self.invoke(env=environment)
+        self.assertEqual(first.returncode, 2, first.stderr)
+        self.assertEqual(launches.read_text().splitlines(), ['codex', 'claude'])
+        self.packet.write_text('Changed evidence remains subject to the same provider pools.')
+        environment['CODEX_REVIEW_MODEL'] = 'alternate-fixture-model'
+        second = self.invoke(output=self.root / 'second.report', env=environment)
+        self.assertEqual(second.returncode, 2, second.stderr)
+        self.assertEqual(launches.read_text().splitlines(), ['codex', 'claude'])
+
+    def test_packet_budget_refuses_before_model_and_duplication_is_advisory(self):
+        launches = self.root / 'launches'
+        refused = self.invoke(env={'PROVIDER_LAUNCH_LOG': str(launches)}, extra=['--packet-budget-bytes', '10'])
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertFalse(launches.exists())
+        block = '```text\nRepeated relevant fixture\n```\n'
+        self.packet.write_text(block * 2)
+        accepted = self.invoke(env={'PROVIDER_LAUNCH_LOG': str(launches)})
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn('warning only', accepted.stderr)
+        self.assertEqual(launches.read_text().splitlines(), ['codex'])
 
     def test_existing_report_is_preserved_and_review_does_not_run(self):
         self.output.write_text('VERDICT: PASS\nstale')
@@ -655,7 +720,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         errors = io.StringIO()
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
-             patch.object(module, 'review_snapshot', return_value=('fixture', 'VERDICT: PASS', '')), \
+             patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'fsync', side_effect=fsync_then_mutate), \
              contextlib.redirect_stderr(errors):
             result = module.main()
@@ -685,7 +750,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         errors = io.StringIO()
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
-             patch.object(module, 'review_snapshot', return_value=('fixture', 'VERDICT: PASS', '')), \
+             patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'link', side_effect=link_then_mutate), \
              contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             result = module.main()
@@ -919,10 +984,29 @@ class ProviderEnvelopeTests(unittest.TestCase):
         self.assertEqual((result['result'], result['reason'], result['fallback_allowed']),
                          ('CHECK_FAILED', 'CODE_FINDINGS', False))
 
+    def test_malformed_terminal_field_types_are_invalid_not_tracebacks(self):
+        cases = [('codex', {'type': []}),
+                 ('codex', {'type': 'turn.failed', 'error': {'code': 'quota_exceeded', 'scope': []}}),
+                 ('codex', {'type': 'turn.completed', 'status': []}),
+                 ('codex', {'type': 'turn.completed', 'is_error': []}),
+                 ('claude', {'type': 'result', 'subtype': 'success', 'is_error': False,
+                             'stop_reason': [], 'result': 'VERDICT: PASS'}),
+                 ('claude', {'type': 'result', 'subtype': 'success', 'is_error': False,
+                             'result': 'VERDICT: PASS\ud800'}),
+                 ('claude', {'type': 'result', 'subtype': 'success', 'is_error': False,
+                             'error': {'code': 'invalid_request'}, 'result': 'VERDICT: PASS'})]
+        for provider, record in cases:
+            with self.subTest(provider=provider, record=record):
+                result = self.module.normalize_provider(provider, 0, json.dumps(record))
+                self.assertEqual(result['result'], 'NO_RESULT')
+                self.assertFalse(result['account_cooldown'])
+        nested = '[' * 2000 + '0' + ']' * 2000
+        self.assertEqual(self.module.normalize_provider('codex', 0, nested)['result'], 'NO_RESULT')
+
     def test_non_pr_stage_removes_all_generic_pass_markers(self):
-        report = 'VERDICT: PASS\nEvidence quoted VERDICT: PASS and still needs full checks.'
         for stage in ('plan', 'code-inspection'):
             with self.subTest(stage=stage):
+                report = ('PLAN' if stage == 'plan' else 'CODE_INSPECTION') + '_RESULT: ACCEPT\nEvidence quoted VERDICT: PASS.'
                 rendered = self.module.stage_report(stage, report)
                 self.assertNotIn('VERDICT: PASS', rendered)
                 self.assertIn('_RESULT: ACCEPT', rendered)
@@ -962,7 +1046,7 @@ class ProviderEnvelopeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, \
              patch.object(self.module.shutil, 'which', return_value='fixture'), \
              patch.object(self.module, 'run', side_effect=run), \
-             patch.object(self.module.time, 'monotonic', side_effect=[0, 0, 721]):
+             patch.object(self.module.time, 'monotonic', side_effect=[0, 0, 0, 721, 721]):
             source, report, reason = self.module.review_snapshot(Path(temporary), 'a' * 40, 'pr', 'Review', 'Evidence')
         self.assertEqual(calls, [('codex', 720), ('claude', 719)])
         self.assertEqual(report, 'VERDICT: PASS')
