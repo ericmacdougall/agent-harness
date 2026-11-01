@@ -20,14 +20,86 @@ class WalTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
 
-    def invoke(self, event, data):
+    def invoke(self, event, data, cwd=None):
         return subprocess.run(
             [sys.executable, str(WAL), event],
             input=json.dumps(data),
             text=True,
             capture_output=True,
+            cwd=cwd,
             env={**os.environ, "HOME": str(self.home)},
         )
+
+    def test_hook_records_omit_working_directory_for_every_event(self):
+        sensitive = self.home / 'ConfidentialClientOmega'
+        sensitive.mkdir()
+        events = (
+            ('session', {'source': 'startup'}),
+            ('prompt', {'prompt': 'fixture'}),
+            ('subagent', {'agent_id': 'owner-1', 'agent_type': 'worker'}),
+            ('pretool', {'tool_name': 'Bash', 'tool_use_id': 'call-1',
+                         'tool_input': {'command': 'true'}}),
+        )
+        for event, fields in events:
+            with self.subTest(event=event):
+                result = self.invoke(event, {'session_id': 'privacy', 'cwd': str(sensitive),
+                                             **fields}, cwd=sensitive)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if event != 'pretool':
+                    self.assertEqual(json.loads(result.stdout)['hookSpecificOutput']['hookEventName'],
+                                     {'session': 'SessionStart', 'prompt': 'UserPromptSubmit',
+                                      'subagent': 'SubagentStart'}[event])
+        agent_tool = self.invoke('pretool', {'session_id': 'privacy', 'cwd': str(sensitive),
+                                             'agent_id': 'owner-1', 'tool_name': 'Read',
+                                             'tool_use_id': 'call-2',
+                                             'tool_input': {'file_path': 'fixture.txt'}},
+                                 cwd=sensitive)
+        self.assertEqual(agent_tool.returncode, 0, agent_tool.stderr)
+        root = self.home / '.claude/wals/privacy'
+        main = root / 'main.jsonl'
+        records = [json.loads(line) for line in main.read_text().splitlines()]
+        self.assertEqual([record['event'] for record in records],
+                         ['session', 'prompt', 'subagent', 'pretool'])
+        self.assertEqual(records[0]['source'], 'startup')
+        self.assertEqual(records[1]['prompt_chars'], len('fixture'))
+        self.assertEqual((records[2]['agent_id'], records[2]['agent_type']),
+                         ('owner-1', 'worker'))
+        self.assertEqual((records[3]['tool'], records[3]['tool_use_id'],
+                          records[3]['target_chars']), ('Bash', 'call-1', len('true')))
+        agent = root / 'agent-owner-1.jsonl'
+        agent_records = [json.loads(line) for line in agent.read_text().splitlines()]
+        self.assertEqual(agent_records[0], records[2])
+        self.assertEqual((agent_records[1]['event'], agent_records[1]['tool'],
+                          agent_records[1]['target_chars']),
+                         ('pretool', 'Read', len('fixture.txt')))
+        for path in (main, agent):
+            self.assertNotIn(str(sensitive), path.read_text())
+            self.assertNotIn(sensitive.name, path.read_text())
+            self.assertNotIn(hashlib.sha256(str(sensitive).encode()).hexdigest(),
+                             path.read_text())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        for record in records + agent_records:
+            self.assertNotIn('cwd', record)
+
+    def test_human_note_omits_process_working_directory(self):
+        sensitive = self.home / 'ConfidentialClientOmega'
+        sensitive.mkdir()
+        path = self.home / '.claude/wals/privacy/main.jsonl'
+        first = self.invoke('prompt', {'session_id': 'privacy', 'prompt': 'fixture'},
+                            cwd=sensitive)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        result = subprocess.run([sys.executable, str(WAL.with_name('wal_note.py')),
+                                 '--wal', str(path), '--event', 'intent',
+                                 '--note', 'Review input boundaries'],
+                                cwd=sensitive, env={**os.environ, 'HOME': str(self.home)},
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual([record['event'] for record in records], ['prompt', 'intent'])
+        self.assertEqual(records[1]['note'], 'Review input boundaries')
+        self.assertNotIn('cwd', records[1])
+        self.assertNotIn(str(sensitive), path.read_text())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_prompt_writes_length_without_prompt(self):
         data = {"session_id": "test-session", "cwd": "/tmp/project", "prompt": "private request"}

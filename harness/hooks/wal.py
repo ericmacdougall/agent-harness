@@ -134,7 +134,6 @@ def main() -> None:
     record = {
         "at": datetime.now(timezone.utc).isoformat(),
         "event": event,
-        "cwd": data.get("cwd", ""),
     }
     if event == "session":
         record["source"] = data.get("source", "")
