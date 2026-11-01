@@ -1053,6 +1053,10 @@ class OriginalScope:
         except (IndexInspectionError, OSError, subprocess.TimeoutExpired):
             self.__exit__(None, None, None)
             raise ExternalApplyError('Original scope could not be safely acquired') from None
+        except BaseException:
+            # __exit__ is not called when __enter__ itself is interrupted.
+            self.__exit__(None, None, None)
+            raise
 
     def __exit__(self, exc_type, exc_value, traceback):
         if self._lock_fd is not None:

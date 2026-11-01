@@ -148,6 +148,21 @@ class ExternalApply(unittest.TestCase):
                 with self.assertRaises(integration.ExternalApplyError):
                     second.complete_external(loaded)  # Original is still base, not target.
 
+    def test_interrupted_context_entry_releases_its_lock(self):
+        inspect = integration.inspect_git
+        def interrupted(repo, *args, **kwargs):
+            if args == ('rev-parse', '--show-object-format'):
+                raise KeyboardInterrupt
+            return inspect(repo, *args, **kwargs)
+        with patch.dict(os.environ, self.env, clear=True):
+            with patch.object(integration, 'inspect_git', side_effect=interrupted):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.scope().__enter__()
+            # The context never became live; its acquired descriptor must not
+            # leave subsequent work permanently blocked in this process.
+            with self.scope():
+                pass
+
     def test_wrong_object_format_rejected_before_reservation(self):
         with patch.dict(os.environ, self.env, clear=True), self.scope() as scope:
             with self.assertRaises(integration.ExternalApplyError):
