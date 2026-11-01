@@ -31,8 +31,9 @@ def git_environment(*, isolated=False, allow_hooks=False, preserve_identity=Fals
                     settings=()):
     """Drop ambient Git routing/index state while composing deliberate settings.
 
-    Local integration intentionally executes checkout hooks under a deadline
-    and honors caller-provided commit identity; other callers keep hooks disabled.
+    Scratch integration executes merge and commit hooks under a deadline and
+    honors caller-provided commit identity. The original fast-forward and
+    helper metadata updates keep hooks disabled.
     """
     retained = set() if isolated else AUTH_GIT_ENV | (IDENTITY_GIT_ENV if preserve_identity else set())
     env = {key: value for key, value in os.environ.items()
@@ -90,15 +91,20 @@ def _bounded_git(repo: Path, args: list[str], env: dict[str, str], *, timeout: i
 
 
 def require_safe_source(repo: Path, env: dict[str, str], *, timeout: int = 5,
-                        allow_unmerged: bool = False) -> None:
+                        allow_unmerged: bool = False, deadline=None) -> None:
     """Refuse hidden index state, submodules and local filters before status/diff/add.
 
     Source configuration can still change after this preflight. Caller must repeat
     the guard at later worktree inspection boundaries and disclose that race.
     An abort may inspect unmerged (M-tagged) index entries after a failed merge.
     """
+    def budget():
+        remaining = timeout if deadline is None else min(timeout, deadline - time.monotonic())
+        if remaining <= 0:
+            raise OSError('source Git metadata inspection deadline exceeded')
+        return remaining
     code, index = _bounded_git(repo, ['ls-files', '--stage', '-z'], env,
-                               timeout=timeout, limit=40_000_000)
+                               timeout=budget(), limit=40_000_000)
     if code or (index and not index.endswith(b'\0')):
         raise OSError('source Git index could not be inspected safely')
     count = 0
@@ -106,12 +112,14 @@ def require_safe_source(repo: Path, env: dict[str, str], *, timeout: int = 5,
         if not record:
             continue
         count += 1
+        if count % 1024 == 0:
+            budget()
         if count > 250_000 or not re.match(rb'^[0-9]{6} [0-9a-f]{40,64} [0-3]\t', record):
             raise OSError('source Git index is malformed or exceeds limits')
         if record.startswith(b'160000 '):
             raise OSError('source Git index contains a submodule')
     code, flags = _bounded_git(repo, ['ls-files', '-v', '-z'], env,
-                               timeout=timeout, limit=40_000_000)
+                               timeout=budget(), limit=40_000_000)
     if code or (flags and not flags.endswith(b'\0')):
         raise OSError('source Git index flags could not be inspected safely')
     count = 0
@@ -119,19 +127,23 @@ def require_safe_source(repo: Path, env: dict[str, str], *, timeout: int = 5,
         if not record:
             continue
         count += 1
+        if count % 1024 == 0:
+            budget()
         if (count > 250_000 or len(record) < 3
                 or record[:2] not in ((b'H ', b'M ') if allow_unmerged else (b'H ',))):
             raise OSError('source Git index has hidden or unsupported flags')
     code, config = _bounded_git(repo, ['config', '--includes', '--show-scope',
                                       '--name-only', '--null', '--get-regexp', FILTER_PATTERN],
-                                env, timeout=timeout, limit=1_000_000)
+                                env, timeout=budget(), limit=1_000_000)
     if code not in (0, 1) or (code == 1 and config) or (config and not config.endswith(b'\0')):
         raise OSError('source Git filter configuration could not be inspected safely')
     fields = config.split(b'\0')[:-1] if config else []
     if len(fields) % 2:
         raise OSError('source Git filter configuration was malformed')
     for scope, key in zip(fields[::2], fields[1::2]):
+        budget()
         if not key.startswith(b'filter.'):
             raise OSError('source Git filter configuration was malformed')
         if scope in (b'local', b'worktree'):
             raise OSError('source Git has an executable local filter')
+    budget()
