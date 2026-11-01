@@ -935,11 +935,12 @@ def common_state_is_current(repo, identity, common, common_info, root, root_info
 class ExternalApplyError(OSError):
     """Safe recovery information without Git output or caller-provided text."""
 
-    def __init__(self, message, *, journal=None, ref=None, target=None):
+    def __init__(self, message, *, journal=None, ref=None, target=None, reservation_started=None):
         super().__init__(message)
         self.journal = journal
         self.ref = ref
         self.target = target
+        self.reservation_started = reservation_started
 
 
 class ExternalApplyGuard:
@@ -1095,6 +1096,7 @@ class OriginalScope:
     def reserve_external(self, *, base, target, task_digest):
         directory = None
         record = None
+        reservation_started = False
         try:
             self._assert_current()
             length = 40 if self.object_format == 'sha1' else 64
@@ -1107,7 +1109,8 @@ class OriginalScope:
                 raise ExternalApplyError('Unresolved original recovery state requires inspection',
                                          journal=blocking / 'journal.json',
                                          ref=blocked.get('ref') if blocked else None,
-                                         target=blocked.get('target') if blocked else None)
+                                         target=blocked.get('target') if blocked else None,
+                                         reservation_started=False)
             commit = inspect_git(self.repo, 'cat-file', '-t', target, timeout=self.timeout)
             ancestry = inspect_git(self.repo, 'merge-base', '--is-ancestor', base, target,
                                    timeout=self.timeout)
@@ -1123,6 +1126,9 @@ class OriginalScope:
             record['key'] = external_key(record)
             record['ref'] = external_ref(record)
             directory = scope_directory(self.root, self.identity, self.branch) / 'active' / record['key']
+            # Even mkdir failure may be ambiguous. Never derive this proof
+            # from an absent path or a journal belonging to another attempt.
+            reservation_started = True
             directory.mkdir(mode=0o700)
             fsync_directory(directory.parent)
             write_journal(directory, record, first=True)
@@ -1133,13 +1139,15 @@ class OriginalScope:
             record['phase'] = 'applying'
             write_journal(directory, record)
             return ExternalApplyGuard(self, directory, record)
-        except ExternalApplyError:
+        except ExternalApplyError as error:
+            error.reservation_started = reservation_started
             raise
         except (IndexInspectionError, OSError, subprocess.TimeoutExpired):
             raise ExternalApplyError('External apply could not be reserved; inspect recovery state',
                                      journal=directory / 'journal.json' if directory else None,
                                      ref=record.get('ref') if record else None,
-                                     target=record.get('target') if record else None) from None
+                                     target=record.get('target') if record else None,
+                                     reservation_started=reservation_started) from None
 
     def load_external(self, key, task_digest):
         directory = None
