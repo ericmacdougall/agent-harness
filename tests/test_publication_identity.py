@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -31,7 +32,7 @@ class PublicationDestination(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='publication-identity-')
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.real_git = shutil.which('git')
         self.env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
         self.env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
@@ -74,9 +75,11 @@ class PublicationDestination(unittest.TestCase):
             '    configured={os.environ.get(f"GIT_CONFIG_KEY_{i}"):os.environ.get(f"GIT_CONFIG_VALUE_{i}")\n'
             '                for i in range(int(os.environ.get("GIT_CONFIG_COUNT","0")))}\n'
             '    url=configured.get(f"remote.{remote}.url",remote)\n'
-            '    if url not in mapping: sys.exit(97)\n'
+            '    if url in mapping: target=mapping[url]\n'
+            '    elif url in mapping.values(): target=url\n'
+            '    else: sys.exit(97)\n'
             '    with marker.open("a") as handle: handle.write(json.dumps({"verb":verb,"url":url})+"\\n")\n'
-            '    args[remote_index]=mapping[url]\n'
+            '    args[remote_index]=target\n'
             'os.execv(real_git,[real_git,*args])\n')
         wrapper.chmod(0o700)
         self.env['PATH'] = str(bin_dir) + os.pathsep + self.env.get('PATH', '')
@@ -114,9 +117,110 @@ class PublicationDestination(unittest.TestCase):
     def test_matching_repository_publishes_exact_commit(self):
         code, data = self.direct_publish()
         self.assertEqual((code, data['status']), (0, 'PUSHED'), data)
+        self.assertEqual(data['repository'], 'owner/expected')
         self.assertEqual(self.command('rev-parse', 'refs/heads/feat/identity',
                                       cwd=self.destinations['https://github.com/owner/expected.git']).stdout.strip(), self.head)
         self.assertTrue(self.marker.is_file(), 'the positive fixture never exercised transport')
+
+    def test_expected_option_is_enforced_by_cli(self):
+        result = subprocess.run([sys.executable, str(PUBLISH), '--repo', str(self.source),
+                                 '--branch', 'feat/identity', '--original-branch', 'main',
+                                 '--expected-head', self.head, '--expected-repository', 'OwNeR/EXPECTED'],
+                                env=self.env, text=True, capture_output=True, timeout=30)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']), (0, 'PUSHED'),
+                         result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)['repository'], 'owner/expected')
+        self.assertEqual(self.command('rev-parse', 'refs/heads/feat/identity',
+                                      cwd=self.destinations['https://github.com/owner/expected.git']).stdout.strip(), self.head)
+
+    def test_local_origin_with_expected_identity_has_no_network_effect(self):
+        self.command('remote', 'set-url', 'origin', self.destinations['https://github.com/owner/expected.git'],
+                     cwd=self.source)
+        code, data = self.direct_publish()
+        self.assertEqual((code, data['status']), (2, 'BLOCKED_POLICY'), data)
+        self.assertFalse(self.marker.exists())
+        self.assert_unpublished()
+
+    def test_legacy_local_origin_still_publishes_without_expected_option(self):
+        self.command('remote', 'set-url', 'origin', self.destinations['https://github.com/owner/expected.git'],
+                     cwd=self.source)
+        code, data = self.direct_publish(expected=None)
+        self.assertEqual((code, data['status']), (0, 'PUSHED'), data)
+        self.assertNotIn('repository', data)
+        self.assertEqual(self.command('rev-parse', 'refs/heads/feat/identity',
+                                      cwd=self.destinations['https://github.com/owner/expected.git']).stdout.strip(), self.head)
+
+    def test_credentials_are_refused_without_contact_or_echo(self):
+        credential = 'fixture-do-not-echo'
+        self.command('remote', 'set-url', 'origin', f'https://{credential}@github.com/owner/expected.git',
+                     cwd=self.source)
+        code, data = self.direct_publish()
+        self.assertEqual((code, data['status']), (2, 'BLOCKED_POLICY'), data)
+        self.assertNotIn(credential, json.dumps(data))
+        self.assertFalse(self.marker.exists())
+        self.assert_unpublished()
+
+    def test_invalid_expected_argument_does_not_contact_remote(self):
+        code, data = self.direct_publish(expected='owner/../changed')
+        self.assertEqual((code, data['status']), (2, 'BLOCKED_POLICY'), data)
+        self.assertFalse(self.marker.exists())
+        self.assert_unpublished()
+
+
+class GitHubIdentity(unittest.TestCase):
+    def setUp(self):
+        self.identity = load_module('github_identity_control', HOOKS / 'github_identity.py')
+
+    def test_standard_transports_canonicalize_the_same_repository(self):
+        urls = ['https://GitHub.com/Owner/Repo.git', 'https://github.com:443/Owner/Repo.git/',
+                'git@GitHub.com:Owner/Repo.git', 'ssh://git@github.com/Owner/Repo.git',
+                'ssh://git@github.com:22/Owner/Repo.git']
+        for value in urls:
+            with self.subTest(url=value):
+                self.assertEqual(self.identity.github_repository(value), 'owner/repo')
+        self.assertEqual(self.identity.github_repository('https://github.com/org-code/repo.git.git'),
+                         'org-code/repo.git')
+        self.assertEqual(self.identity.repository_name('OWNER/REPO.git'), 'owner/repo.git')
+        self.assertEqual(self.identity.repository_name('managed_code/repo_name'), 'managed_code/repo_name')
+
+    def test_ambiguous_or_unsupported_url_text_is_rejected(self):
+        values = [None, True, 3, '', '/tmp/owner/repo.git', 'file:///tmp/repo.git',
+                  'http://github.com/owner/repo.git', 'git://github.com/owner/repo.git',
+                  'https://github.com.evil.invalid/owner/repo.git', 'https://github.com./owner/repo.git',
+                  'https://user:password@github.com/owner/repo.git', 'https://@github.com/owner/repo.git',
+                  'ssh://root@github.com/owner/repo.git', 'ssh://git:password@github.com/owner/repo.git',
+                  'ssh://git@github.com:443/owner/repo.git', 'https://github.com:22/owner/repo.git',
+                  'https://github.com:bad/owner/repo.git', 'git@evil.invalid:owner/repo.git',
+                  'https://github.com/owner/../repo', 'https://github.com/../repo.git',
+                  'https://github.com/owner/repo.git?token=x', 'https://github.com/owner/repo.git?',
+                  'git@github.com:owner/repo.git#fragment', 'https://github.com/owner%2fother/repo.git',
+                  'https://github.com/owner/repo%2fgit', 'https://github.com//owner/repo.git',
+                  'https://github.com/owner/repo.git//', 'https://github.com/owner/.git',
+                  'https://github.com/owner/repo\n.git', 'https://github.com/owner/repo\0.git',
+                  'https://github.com/owner/repo\ud800.git', ' https://github.com/owner/repo.git']
+        for value in values:
+            with self.subTest(value=repr(value)):
+                with self.assertRaisesRegex(ValueError, '^Unsupported GitHub repository identity$'):
+                    self.identity.github_repository(value)
+
+    def test_repository_argument_is_bounded_without_url_interpretation(self):
+        values = ['owner', 'owner/repo/extra', '../repo', 'owner/..', 'owner/.',
+                  'https://github.com/owner/repo', 'owner/repo?token=x',
+                  'o' * 40 + '/repo', 'owner/' + 'r' * 101, 'owner/repo\0', 'owner/repo\ud800']
+        for value in values:
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(ValueError):
+                    self.identity.repository_name(value)
+
+    def test_parser_tracebacks_do_not_echo_untrusted_port_text(self):
+        sensitive = 'fixture-secret-port'
+        try:
+            self.identity.github_repository('https://github.com:' + sensitive + '/owner/repo.git')
+        except ValueError as error:
+            rendered = ''.join(traceback.format_exception(type(error), error, error.__traceback__))
+        else:
+            self.fail('invalid port was accepted')
+        self.assertNotIn(sensitive, rendered)
 
 
 if __name__ == '__main__':

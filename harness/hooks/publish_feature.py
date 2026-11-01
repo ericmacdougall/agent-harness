@@ -17,6 +17,7 @@ from pathlib import Path
 
 from process import run, signal_group
 from git_safety import git_environment, require_safe_source
+from github_identity import github_repository, repository_name
 
 
 def run_git(repo, *args, timeout=600, config_extra=(), text=True, input=None):
@@ -162,6 +163,7 @@ def main():
     parser.add_argument("--branch", required=True)
     parser.add_argument("--original-branch", required=True)
     parser.add_argument("--expected-head", required=True)
+    parser.add_argument("--expected-repository", help="Require the pinned GitHub destination to match OWNER/REPO")
     parser.add_argument("--timeout", type=int, default=600, help="Seconds allowed for each Git command, including the push")
     args = parser.parse_args()
     if args.timeout <= 0:
@@ -177,6 +179,13 @@ def main():
 
 
 def publish(args):
+    expected_repository = getattr(args, 'expected_repository', None)
+    if expected_repository is not None:
+        try:
+            expected_repository = repository_name(expected_repository)
+        except ValueError:
+            report('BLOCKED_POLICY', 'Expected GitHub repository identity is invalid')
+            return 2
     git = partial(run_git, timeout=args.timeout)
     repo = args.repo.resolve()
     if not repo.is_dir():
@@ -222,6 +231,15 @@ def publish(args):
         report("BLOCKED_POLICY", "Publication requires exactly one push destination", branch=args.branch, remote=remote)
         return 2
     destination = pinned_url(urls[0], repo)
+    if expected_repository is not None:
+        try:
+            matches = github_repository(destination) == expected_repository
+        except ValueError:
+            matches = False
+        if not matches:
+            report('BLOCKED_POLICY', 'Pinned push destination does not match the expected GitHub repository',
+                   branch=args.branch, remote=remote)
+            return 2
     # Keep credential-bearing URLs out of process arguments. The temporary
     # remote exists only in this command's environment and is never persisted.
     pinned_remote = "harness-push-" + secrets.token_hex(12)
@@ -265,6 +283,15 @@ def publish(args):
                 report('BLOCKED_POLICY', 'Push destination cannot be inspected without another URL rewrite',
                        branch=args.branch, remote=remote)
                 return 2
+            if expected_repository is not None:
+                try:
+                    matches = github_repository(inspected.stdout.strip()) == expected_repository
+                except ValueError:
+                    matches = False
+                if not matches:
+                    report('BLOCKED_POLICY', 'Isolated transport does not match the expected GitHub repository',
+                           branch=args.branch, remote=remote)
+                    return 2
             try:
                 default = git(transport, 'ls-remote', '--symref', '--', pinned_remote, 'HEAD',
                               timeout=min(args.timeout, 30), config_extra=pinned_config)
@@ -314,7 +341,9 @@ def publish(args):
         source_changed = True
     message = ("Verified feature commit published; source branch changed or could not be rechecked"
                if source_changed else "Feature branch published")
-    report("PUSHED", message, branch=args.branch, remote=remote, head=head, source_changed=source_changed)
+    identity = {} if expected_repository is None else {'repository': expected_repository}
+    report("PUSHED", message, branch=args.branch, remote=remote, head=head,
+           source_changed=source_changed, **identity)
     return 0
 
 
