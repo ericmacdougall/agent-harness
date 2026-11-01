@@ -5,6 +5,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import secrets
 import selectors
@@ -353,10 +354,14 @@ def candidate_ref(record):
     return 'refs/agent-harness/delivery/' + suffix
 
 
+def scope_key(identity, branch):
+    return hashlib.sha256(f'{identity[0]}\0{identity[1]}\0{branch}'.encode()).hexdigest()
+
+
 def scope_directory(root, identity, branch):
     scopes = root / 'scopes'
     private_directory(scopes)
-    key = hashlib.sha256(f'{identity[0]}\0{identity[1]}\0{branch}'.encode()).hexdigest()
+    key = scope_key(identity, branch)
     scope = scopes / key
     private_directory(scope)
     for name in ('active', 'archive'):
@@ -461,7 +466,7 @@ def reserve_scratch(root, repo, identity, branch, base, source_branch, source):
 def acquire_scope_lock(root, identity, branch):
     locks = root / 'locks'
     private_directory(locks)
-    key = hashlib.sha256(f'{identity[0]}\0{identity[1]}\0{branch}'.encode()).hexdigest()
+    key = scope_key(identity, branch)
     fd = os.open(locks / key, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
         info = os.fstat(fd)
@@ -477,6 +482,61 @@ def acquire_scope_lock(root, identity, branch):
     except BaseException:
         os.close(fd)
         raise
+
+
+def hex_identity(value, length):
+    return (isinstance(value, str) and len(value) == length
+            and all(char in '0123456789abcdef' for char in value))
+
+
+def external_key(record):
+    values = ('external-apply', str(record['original_dev']), str(record['original_ino']),
+              record['branch'], record['base'], record['target'], record['object_format'],
+              record['task_digest'], record['attempt'])
+    return hashlib.sha256('\0'.join(values).encode('utf-8')).hexdigest()
+
+
+def external_ref(record):
+    return 'refs/agent-harness/external-apply/' + record['key'] + '-' + record['attempt']
+
+
+def validate_external_record(directory, record):
+    """Schema3 is a baseline barrier, never a scratch merge delivery proof."""
+    required = {'schema', 'kind', 'phase', 'key', 'original', 'original_dev', 'original_ino',
+                'branch', 'base', 'target', 'object_format', 'task_digest', 'attempt', 'ref'}
+    phase = record.get('phase')
+    if not isinstance(phase, str) or phase not in {'reserved', 'applying', 'resolved'}:
+        raise OSError('external apply phase is invalid')
+    if phase == 'resolved':
+        required |= {'resolved_head', 'resolved_by', 'previous_phase'}
+    if set(record) != required or record.get('kind') != 'external_apply':
+        raise OSError('external apply fields are invalid')
+    if (any(not valid_identity_text(record[name]) for name in required
+            if name not in {'schema', 'original_dev', 'original_ino'})
+            or not all(type(record[name]) is int and record[name] > 0
+                       for name in ('original_dev', 'original_ino'))
+            or not Path(record['original']).is_absolute()
+            or not record['branch'] or record['branch'].startswith('-')
+            or record['object_format'] not in {'sha1', 'sha256'}
+            or not hex_identity(record['task_digest'], 64)
+            or not hex_identity(record['attempt'], 32)
+            or not hex_identity(record['key'], 64)):
+        raise OSError('external apply identity is invalid')
+    oid_length = 40 if record['object_format'] == 'sha1' else 64
+    if (not all(hex_identity(record[name], oid_length) for name in ('base', 'target'))
+            or record['key'] != external_key(record) or record['ref'] != external_ref(record)):
+        raise OSError('external apply target binding is invalid')
+    if phase == 'resolved' and (not hex_identity(record['resolved_head'], oid_length)
+            or record['resolved_by'] not in {'workflow', 'operator'}
+            or record['previous_phase'] not in {'reserved', 'applying', 'resolved'}
+            or record['resolved_by'] == 'workflow' and record['resolved_head'] != record['target']):
+        raise OSError('external apply resolution is invalid')
+    identity = (record['original_dev'], record['original_ino'])
+    if (directory.parent.name not in {'active', 'archive'}
+            or directory.parent.parent.parent.name != 'scopes'
+            or directory.parent.parent.name != scope_key(identity, record['branch'])):
+        raise OSError('external apply journal placement is invalid')
+    return record
 
 
 def read_journal(directory):
@@ -501,9 +561,11 @@ def read_journal(directory):
     except (ValueError, UnicodeDecodeError) as error:
         raise OSError('scratch journal is invalid') from error
     if (not isinstance(record, dict) or type(record.get('schema')) is not int
-            or record.get('schema') not in (1, 2)
+            or record.get('schema') not in (1, 2, 3)
             or record.get('key') != directory.name or not isinstance(record.get('phase'), str)):
         raise OSError('scratch journal is invalid')
+    if record['schema'] == 3:
+        return validate_external_record(directory, record)
     text_fields = ('key', 'phase', 'original', 'branch', 'base', 'source_branch', 'source',
                    'scratch', 'container', 'ref', 'attempt', 'previous_phase',
                    'resolved_head', 'candidate', 'tree')
@@ -635,7 +697,7 @@ def scan_journals(root, repo, identity, branch, key, timeout):
                 return entry, record, None
             if entry.name == key and record['phase'] == 'delivered':
                 exact = (entry, record)
-            if record['schema'] == 2:
+            if record['schema'] in (2, 3):
                 archived = archive_journal(entry)
                 if exact is not None and exact[0] == entry:
                     exact = (archived, record)
@@ -651,7 +713,7 @@ def scan_journals(root, repo, identity, branch, key, timeout):
             return archived, record, None
         if record['phase'] == 'delivered':
             exact = (archived, record)
-        else:
+        elif record['schema'] != 3:
             record['_resolved_journal'] = str(archived)
             return None, None, record
     if exact is not None:
@@ -804,6 +866,12 @@ def resolve_journal(args, repo, identity, root, common, common_info, root_info, 
             or record['branch'] != args.original_branch):
         report('BLOCKED_POLICY', 'Journal belongs to another original checkout or branch')
         return 2
+    if record['schema'] == 3:
+        storage = inspect_git(repo, 'rev-parse', '--show-object-format', timeout=args.timeout)
+        if storage.returncode or storage.stdout.strip() != record['object_format']:
+            report('RECOVERY_REQUIRED', 'External recovery journal object format does not match checkout',
+                   journal=str(directory / 'journal.json'))
+            return 3
     if not checked_original(repo, args.original_branch, args.expected_head, args.timeout):
         report('RECOVERY_REQUIRED', 'Confirmed recovery checkout is changed or dirty',
                journal=str(directory / 'journal.json'), head=observed_head(repo))
@@ -822,12 +890,17 @@ def resolve_journal(args, repo, identity, root, common, common_info, root_info, 
         return 3
     record.update({'previous_phase': record.get('phase'), 'phase': 'resolved',
                    'resolved_head': args.expected_head})
+    pin_details = {}
+    if record['schema'] == 3:
+        record['resolved_by'] = 'operator'
+        pin_state, verified = external_pin_state(repo, record, args.timeout)
+        pin_details = {'pin_state': pin_state, 'target_pin_verified': verified}
     write_journal(directory, record, first=missing_record)
     directory = archive_journal(directory)
     report('RESOLVED', 'Tested current checkout accepted as recovery baseline; artifacts retained',
            head=args.expected_head, journal=str(directory / 'journal.json'),
            scratch=record.get('scratch'), recovery_ref=record.get('ref'),
-           artifacts_unknown=missing_record)
+           artifacts_unknown=missing_record, **pin_details)
     return 0
 
 
@@ -842,6 +915,262 @@ def common_state_is_current(repo, identity, common, common_info, root, root_info
             and observed_root.st_uid == os.geteuid()
             and stat.S_IMODE(observed_root.st_mode) == 0o700
             and (observed_root.st_dev, observed_root.st_ino) == (root_info.st_dev, root_info.st_ino))
+
+
+class ExternalApplyError(OSError):
+    """Safe recovery information without Git output or caller-provided text."""
+
+    def __init__(self, message, *, journal=None, ref=None, target=None):
+        super().__init__(message)
+        self.journal = journal
+        self.ref = ref
+        self.target = target
+
+
+class ExternalApplyGuard:
+    """An immutable snapshot owned by one live OriginalScope context."""
+
+    def __init__(self, owner, directory, record):
+        self._owner = owner
+        self._directory = directory
+        self._record = dict(record)
+
+    @property
+    def key(self):
+        return self._record['key']
+
+    @property
+    def journal(self):
+        return self._directory / 'journal.json'
+
+    @property
+    def ref(self):
+        return self._record['ref']
+
+    @property
+    def target(self):
+        return self._record['target']
+
+    @property
+    def base(self):
+        return self._record['base']
+
+    @property
+    def record(self):
+        return dict(self._record)
+
+
+def external_pin_state(repo, record, timeout):
+    """Resolution preserves even missing/moved refs and reports observed truth."""
+    try:
+        present = inspect_git(repo, 'show-ref', '--verify', '--quiet', record['ref'], timeout=timeout)
+        if present.returncode == 1:
+            return 'missing', False
+        if present.returncode != 0:
+            return 'unverifiable', False
+        value = inspect_git(repo, 'rev-parse', '--verify', record['ref'], timeout=timeout)
+        length = 40 if record['object_format'] == 'sha1' else 64
+        actual = value.stdout.strip()
+        if value.returncode or not hex_identity(actual, length):
+            return 'unverifiable', False
+        return ('matches_target', True) if actual == record['target'] else ('moved', False)
+    except (IndexInspectionError, OSError, subprocess.TimeoutExpired):
+        return 'unverifiable', False
+
+
+class OriginalScope:
+    """Serialize external apply with the local helper's original-checkout lock.
+
+    Callers retain the context through their durable workflow receipt. This API
+    accepts a tested baseline; it cannot prove the caller's PR or checks passed.
+    """
+
+    def __init__(self, repo, branch, timeout=30):
+        try:
+            named = Path(repo)
+        except (TypeError, ValueError):
+            raise ExternalApplyError('Original checkout identity is invalid') from None
+        if (not valid_identity_text(str(named)) or not valid_identity_text(branch)
+                or not branch or branch.startswith('-') or type(timeout) not in (int, float)
+                or not math.isfinite(timeout) or timeout <= 0):
+            raise ExternalApplyError('Original scope arguments are invalid')
+        self._repo = named.resolve()
+        self._branch = branch
+        self._timeout = timeout
+        self._lock_fd = None
+        self._entered = False
+
+    @property
+    def repo(self):
+        return self._repo
+
+    @property
+    def branch(self):
+        return self._branch
+
+    @property
+    def timeout(self):
+        return self._timeout
+
+    @property
+    def root(self):
+        return self._root
+
+    @property
+    def identity(self):
+        return self._identity
+
+    @property
+    def object_format(self):
+        return self._object_format
+
+    def __enter__(self):
+        if self._entered:
+            raise ExternalApplyError('Original scope context cannot be reused')
+        self._entered = True
+        try:
+            if any(name.startswith('GIT_') and name not in ALLOWED_GIT_ENV for name in os.environ):
+                raise OSError('unsupported Git routing environment')
+            top = inspect_git(self.repo, 'rev-parse', '--show-toplevel', timeout=self.timeout)
+            if (top.returncode or not top.stdout.strip()
+                    or not os.path.samefile(Path(top.stdout.strip()).resolve(), self.repo)
+                    or inspect_git(self.repo, 'check-ref-format', 'refs/heads/' + self.branch,
+                                   timeout=self.timeout).returncode):
+                raise OSError('original checkout or branch is invalid')
+            self._identity = checkout_identity(self.repo)
+            self._root, self._common, self._common_info, self._root_info = scratch_journal_root(
+                self.repo, self.timeout)
+            self._lock_fd = acquire_scope_lock(self.root, self.identity, self.branch)
+            if self._lock_fd is None:
+                raise OSError('original scope is busy')
+            self._lock_info = os.fstat(self._lock_fd)
+            storage = inspect_git(self.repo, 'rev-parse', '--show-object-format', timeout=self.timeout)
+            self._object_format = storage.stdout.strip()
+            if storage.returncode or self.object_format not in {'sha1', 'sha256'}:
+                raise OSError('unsupported object format')
+            self._assert_current()
+            return self
+        except (IndexInspectionError, OSError, subprocess.TimeoutExpired):
+            self.__exit__(None, None, None)
+            raise ExternalApplyError('Original scope could not be safely acquired') from None
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
+
+    def _assert_current(self):
+        if self._lock_fd is None:
+            raise ExternalApplyError('Original scope context is closed')
+        lock = self.root / 'locks' / scope_key(self.identity, self.branch)
+        info = os.stat(lock, follow_symlinks=False)
+        descriptor = os.fstat(self._lock_fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or (info.st_dev, info.st_ino) != (self._lock_info.st_dev, self._lock_info.st_ino)
+                or (descriptor.st_dev, descriptor.st_ino) != (info.st_dev, info.st_ino)
+                or not common_state_is_current(self.repo, self.identity, self._common,
+                      self._common_info, self.root, self._root_info, self.timeout)):
+            raise ExternalApplyError('Original scope identity changed')
+
+    def reserve_external(self, *, base, target, task_digest):
+        directory = None
+        record = None
+        try:
+            self._assert_current()
+            length = 40 if self.object_format == 'sha1' else 64
+            if (not hex_identity(base, length) or not hex_identity(target, length)
+                    or not hex_identity(task_digest, 64)):
+                raise OSError('invalid external apply inputs')
+            blocking, blocked, _ = scan_journals(self.root, self.repo, self.identity,
+                                                self.branch, '0' * 64, self.timeout)
+            if blocking is not None:
+                raise ExternalApplyError('Unresolved original recovery state requires inspection',
+                                         journal=blocking / 'journal.json',
+                                         ref=blocked.get('ref') if blocked else None,
+                                         target=blocked.get('target') if blocked else None)
+            commit = inspect_git(self.repo, 'cat-file', '-t', target, timeout=self.timeout)
+            ancestry = inspect_git(self.repo, 'merge-base', '--is-ancestor', base, target,
+                                   timeout=self.timeout)
+            if (commit.returncode or commit.stdout.strip() != 'commit' or ancestry.returncode
+                    or not checked_original(self.repo, self.branch, base, self.timeout)):
+                raise OSError('external apply baseline or target is invalid')
+            self._assert_current()
+            record = {'schema': 3, 'kind': 'external_apply', 'phase': 'reserved',
+                      'original': str(self.repo), 'original_dev': self.identity[0],
+                      'original_ino': self.identity[1], 'branch': self.branch, 'base': base,
+                      'target': target, 'object_format': self.object_format,
+                      'task_digest': task_digest, 'attempt': secrets.token_hex(16)}
+            record['key'] = external_key(record)
+            record['ref'] = external_ref(record)
+            directory = scope_directory(self.root, self.identity, self.branch) / 'active' / record['key']
+            directory.mkdir(mode=0o700)
+            fsync_directory(directory.parent)
+            write_journal(directory, record, first=True)
+            pinned = run_git_nohooks(self.repo, 'update-ref', record['ref'], target,
+                                     '0' * length, timeout=self.timeout)
+            if pinned.returncode:
+                raise OSError('external target pin failed')
+            record['phase'] = 'applying'
+            write_journal(directory, record)
+            return ExternalApplyGuard(self, directory, record)
+        except ExternalApplyError:
+            raise
+        except (IndexInspectionError, OSError, subprocess.TimeoutExpired):
+            raise ExternalApplyError('External apply could not be reserved; inspect recovery state',
+                                     journal=directory / 'journal.json' if directory else None,
+                                     ref=record.get('ref') if record else None,
+                                     target=record.get('target') if record else None) from None
+
+    def load_external(self, key, task_digest):
+        directory = None
+        try:
+            self._assert_current()
+            if not hex_identity(key, 64) or not hex_identity(task_digest, 64):
+                raise OSError('invalid guard selection')
+            scope = scope_directory(self.root, self.identity, self.branch)
+            found = [scope / area / key for area in ('active', 'archive')
+                     if os.path.lexists(scope / area / key)]
+            if len(found) != 1:
+                raise OSError('external apply selection is missing or ambiguous')
+            directory = found[0]
+            record = read_journal(directory)
+            if (record['schema'] != 3 or record['task_digest'] != task_digest
+                    or (record['original_dev'], record['original_ino']) != self.identity
+                    or record['branch'] != self.branch or record['object_format'] != self.object_format):
+                raise OSError('external apply belongs to another scope or task')
+            return ExternalApplyGuard(self, directory, record)
+        except (IndexInspectionError, OSError, subprocess.TimeoutExpired):
+            raise ExternalApplyError('External apply guard could not be verified',
+                                     journal=directory / 'journal.json' if directory else None) from None
+
+    def complete_external(self, guard):
+        if not isinstance(guard, ExternalApplyGuard) or guard._owner is not self:
+            raise ExternalApplyError('External apply guard belongs to another context')
+        directory = guard.journal.parent
+        try:
+            self._assert_current()
+            record = read_journal(directory)
+            scope = scope_directory(self.root, self.identity, self.branch)
+            if (record != guard.record or record.get('schema') != 3
+                    or directory.parent not in {scope / 'active', scope / 'archive'}
+                    or (record['original_dev'], record['original_ino']) != self.identity
+                    or record['branch'] != self.branch or record['object_format'] != self.object_format
+                    or record.get('phase') == 'resolved' and record.get('resolved_by') != 'workflow'
+                    or not checked_original(self.repo, self.branch, guard.target, self.timeout)
+                    or external_pin_state(self.repo, record, self.timeout) != ('matches_target', True)):
+                raise OSError('external apply completion state changed')
+            self._assert_current()
+            if record['phase'] != 'resolved':
+                record.update(phase='resolved', previous_phase=record['phase'],
+                              resolved_by='workflow', resolved_head=guard.target)
+                write_journal(directory, record)
+            directory = archive_journal(directory)
+            return ExternalApplyGuard(self, directory, record)
+        except (IndexInspectionError, OSError, subprocess.TimeoutExpired):
+            raise ExternalApplyError('External apply remains subject to recovery inspection',
+                                     journal=directory / 'journal.json', ref=guard.ref,
+                                     target=guard.target) from None
 
 
 def integrate_scratch(args, preparations, checks):
