@@ -129,6 +129,91 @@ class ExternalApply(unittest.TestCase):
             loaded = scope.load_external(complete.key, TASK)
             self.assertEqual(loaded.record, complete.record)
 
+    def test_resumed_completion_cannot_bypass_newer_failed_noop_apply(self):
+        marker = self.root / 'external-check-fails'
+        (self.feature / 'tests/test_external_condition.py').write_text(
+            'import unittest\nfrom pathlib import Path\n'
+            'class ExternalCondition(unittest.TestCase):\n'
+            '    def test_external_condition(self):\n'
+            f'        self.assertFalse(Path({str(marker)!r}).exists())\n')
+        fixtures.command('git', 'add', 'tests/test_external_condition.py', cwd=self.feature, env=self.env)
+        fixtures.command('git', 'commit', '-qm', 'external condition check', cwd=self.feature, env=self.env)
+        self.feature_head = self.head(self.feature)
+        target = self.target()
+        with patch.dict(os.environ, self.env, clear=True):
+            with self.scope() as scope:
+                first = scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+                self.ff(target)
+                fixtures.command(sys.executable, '-m', 'unittest', 'discover', '-s', 'tests',
+                                 cwd=self.original, env=self.env)
+                first = scope.complete_external(first)
+            with self.scope() as scope:
+                second = scope.reserve_external(base=target, target=target, task_digest='b' * 64)
+                self.ff(target)  # Real Git no-op, while the external condition changed.
+                marker.touch()
+                failed = fixtures.command(sys.executable, '-m', 'unittest', 'discover', '-s', 'tests',
+                                          cwd=self.original, env=self.env, check=False)
+                self.assertEqual(failed.returncode, 1)
+                self.assertIn('FAILED (failures=1)', failed.stderr)
+            marker.unlink()
+            unchanged = second.journal.read_bytes()
+            with self.scope() as scope:
+                loaded = scope.load_external(first.key, TASK)
+                with self.assertRaises(integration.ExternalApplyError):
+                    scope.complete_external(loaded)
+            self.assertEqual(self.head(self.original), target)
+            self.assertEqual(second.journal.read_bytes(), unchanged)
+            self.assertEqual(integration.read_journal(second.journal.parent)['phase'], 'applying')
+            self.assertEqual(fixtures.command('git', 'rev-parse', second.ref,
+                                             cwd=self.original, env=self.env).stdout.strip(), target)
+
+    def test_completion_preserves_legacy_and_malformed_root_barriers(self):
+        target = self.target()
+        with patch.dict(os.environ, self.env, clear=True), self.scope() as scope:
+            guard = scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+            self.ff(target)
+            guard = scope.complete_external(guard)
+            key = integration.journal_key(scope.identity, 'main', target, 'feat/recovery', self.feature_head)
+            legacy = scope.root / key
+            legacy.mkdir(mode=0o700)
+            record = {'schema': 1, 'phase': 'started', 'key': key, 'original': str(self.original),
+                      'original_dev': scope.identity[0], 'original_ino': scope.identity[1],
+                      'branch': 'main', 'base': target, 'source_branch': 'feat/recovery',
+                      'source': self.feature_head, 'scratch': str(legacy / 'worktree')}
+            for state in ('valid_unresolved_legacy', 'malformed'):
+                with self.subTest(state=state):
+                    contents = record if state == 'valid_unresolved_legacy' else {'schema': False}
+                    integration.write_journal(legacy, contents, first=not (legacy / 'journal.json').exists())
+                    unchanged = (legacy / 'journal.json').read_bytes()
+                    with self.assertRaises(integration.ExternalApplyError):
+                        scope.complete_external(guard)
+                    self.assertEqual((legacy / 'journal.json').read_bytes(), unchanged)
+            self.assertEqual(self.head(self.original), target)
+            self.assertEqual(guard.record['phase'], 'resolved')
+
+    def test_completion_scan_budget_includes_excluded_current_guard_read(self):
+        target = self.target()
+        with patch.dict(os.environ, self.env, clear=True), self.scope() as scope:
+            guard = scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+            self.ff(target)
+            read = integration.read_journal
+            clock = [0.0]
+            reads = [0]
+            def slow_read(directory):
+                record = read(directory)
+                if directory == guard.journal.parent:
+                    reads[0] += 1
+                    if reads[0] > 1:
+                        clock[0] += 31.0
+                return record
+            with patch.object(integration.time, 'monotonic', side_effect=lambda: clock[0]), \
+                    patch.object(integration, 'read_journal', side_effect=slow_read):
+                with self.assertRaises(integration.ExternalApplyError):
+                    scope.complete_external(guard)
+            self.assertGreaterEqual(reads[0], 2)
+            self.assertEqual(read(guard.journal.parent)['phase'], 'applying')
+            self.assertEqual(self.head(self.original), target)
+
     def test_closed_wrong_and_concurrent_scope_are_rejected(self):
         target = self.target()
         with patch.dict(os.environ, self.env, clear=True):
