@@ -1726,6 +1726,156 @@ class DeliveryHelpers(unittest.TestCase):
                          result.stdout + result.stderr)
         self.assert_restored()
 
+    def test_all_skipped_unittest_discovery_aborts_and_restores(self):
+        self.add_feature_test('import unittest\n'
+                              'class Skipped(unittest.TestCase):\n'
+                              '    @unittest.skip("fixture")\n'
+                              '    def test_never_runs(self):\n'
+                              '        self.fail("skipped body ran")\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('phase'),
+                          data.get('merge_aborted')), (3, 'BLOCKED_LOCAL', 'check', True),
+                         result.stdout + result.stderr)
+        self.assert_restored()
+
+    def test_skipped_class_fixture_does_not_cancel_separate_real_test(self):
+        self.add_feature_test('import unittest\n'
+                              'class SkippedFixture(unittest.TestCase):\n'
+                              '    @classmethod\n'
+                              '    def setUpClass(cls):\n'
+                              '        raise unittest.SkipTest("fixture")\n'
+                              '    def test_never_runs(self):\n'
+                              '        self.fail("skipped body ran")\n'
+                              'class Real(unittest.TestCase):\n'
+                              '    def test_assertion(self):\n'
+                              '        self.assertEqual(2 + 2, 4)\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'),
+                         result.stdout + result.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), data['head'])
+
+    def test_skipped_subtest_does_not_cancel_asserted_subtest(self):
+        self.add_feature_test('import unittest\n'
+                              'class Mixed(unittest.TestCase):\n'
+                              '    def test_subtests(self):\n'
+                              '        with self.subTest(number=1):\n'
+                              '            self.skipTest("fixture")\n'
+                              '        with self.subTest(number=2):\n'
+                              '            self.assertEqual(2 + 2, 4)\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'),
+                         result.stdout + result.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), data['head'])
+
+    def test_duplicate_skip_callbacks_cannot_cancel_separate_real_test(self):
+        self.add_feature_test('import unittest\n'
+                              'class SkippedTwice(unittest.TestCase):\n'
+                              '    def test_cleanup_skip(self):\n'
+                              '        def cleanup():\n'
+                              '            raise unittest.SkipTest("cleanup")\n'
+                              '        self.addCleanup(cleanup)\n'
+                              '        self.skipTest("body")\n'
+                              'class Real(unittest.TestCase):\n'
+                              '    def test_assertion(self):\n'
+                              '        self.assertEqual(2 + 2, 4)\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'),
+                         result.stdout + result.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), data['head'])
+
+    def test_parallel_all_skipped_discovery_aborts_and_restores(self):
+        witness = self.root / 'parallel-skips.json'
+        self.add_feature_test('import json, threading, unittest\n'
+                              'from pathlib import Path\n'
+                              'barrier = threading.Barrier(2)\n'
+                              'class Skipped(unittest.TestCase):\n'
+                              '    def test_one(self):\n'
+                              '        barrier.wait(timeout=5)\n'
+                              '        self.skipTest("one")\n'
+                              '    def test_two(self):\n'
+                              '        barrier.wait(timeout=5)\n'
+                              '        self.skipTest("two")\n'
+                              'class ParallelSuite(unittest.TestSuite):\n'
+                              '    def run(self, result, debug=False):\n'
+                              '        threads = [threading.Thread(target=case.run, args=(result,), daemon=True)\n'
+                              '                   for case in self]\n'
+                              '        for thread in threads: thread.start()\n'
+                              '        for thread in threads: thread.join(timeout=10)\n'
+                              '        if any(thread.is_alive() for thread in threads):\n'
+                              '            raise RuntimeError("parallel fixture did not complete")\n'
+                              f'        Path({str(witness)!r}).write_text(json.dumps('
+                              '{"started": result.testsRun, "skipped": len(result.skipped), '
+                              '"successful": result.wasSuccessful()}))\n'
+                              '        return result\n'
+                              'def load_tests(loader, tests, pattern):\n'
+                              '    return ParallelSuite([Skipped("test_one"), Skipped("test_two")])\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual(json.loads(witness.read_text()),
+                         {'started': 2, 'skipped': 2, 'successful': True})
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('phase'),
+                          data.get('merge_aborted')), (3, 'BLOCKED_LOCAL', 'check', True),
+                         result.stdout + result.stderr)
+        self.assert_restored()
+
+    def test_nested_all_skipped_discovery_aborts_and_restores(self):
+        witness = self.root / 'nested-skips.json'
+        self.add_feature_test('import json, unittest\n'
+                              'from pathlib import Path\n'
+                              'class Inner(unittest.TestCase):\n'
+                              '    def test_inner(self):\n'
+                              '        self.skipTest("inner")\n'
+                              'class Outer(unittest.TestCase):\n'
+                              '    def run(self, result):\n'
+                              '        self.shared_result = result\n'
+                              '        finished = super().run(result)\n'
+                              f'        Path({str(witness)!r}).write_text(json.dumps('
+                              '{"started": result.testsRun, "skipped": len(result.skipped), '
+                              '"successful": result.wasSuccessful()}))\n'
+                              '        return finished\n'
+                              '    def test_outer(self):\n'
+                              '        Inner("test_inner").run(self.shared_result)\n'
+                              '        self.skipTest("outer")\n'
+                              'def load_tests(loader, tests, pattern):\n'
+                              '    return unittest.TestSuite([Outer("test_outer")])\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual(json.loads(witness.read_text()),
+                         {'started': 2, 'skipped': 2, 'successful': True})
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('phase'),
+                          data.get('merge_aborted')), (3, 'BLOCKED_LOCAL', 'check', True),
+                         result.stdout + result.stderr)
+        self.assert_restored()
+
+    def test_same_test_instance_can_skip_then_run_assertion(self):
+        self.add_feature_test('import unittest\n'
+                              'class Repeated(unittest.TestCase):\n'
+                              '    calls = 0\n'
+                              '    def test_repeated(self):\n'
+                              '        type(self).calls += 1\n'
+                              '        if type(self).calls == 1:\n'
+                              '            self.skipTest("first invocation")\n'
+                              '        self.assertEqual(2 + 2, 4)\n'
+                              'def load_tests(loader, tests, pattern):\n'
+                              '    case = Repeated("test_repeated")\n'
+                              '    return unittest.TestSuite([case, case])\n')
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'),
+                         result.stdout + result.stderr)
+        self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), data['head'])
+
     def test_all_approved_unittest_discovery_forms_run_real_test(self):
         self.add_feature_test()
         (self.feature / 'tests' / '__init__.py').write_text('')
