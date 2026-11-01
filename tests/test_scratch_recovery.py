@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -27,10 +28,13 @@ class ScratchRecovery(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix='harness-scratch-')
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        tempdir_override = patch.object(tempfile, 'tempdir', str(self.root))
+        tempdir_override.start()
+        self.addCleanup(tempdir_override.stop)
         home = self.root / 'home'
         home.mkdir()
         self.env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
-        self.env.update(HOME=str(home), GIT_CONFIG_GLOBAL=os.devnull,
+        self.env.update(HOME=str(home), TMPDIR=str(self.root), GIT_CONFIG_GLOBAL=os.devnull,
                         GIT_CONFIG_NOSYSTEM='1', PYTHONDONTWRITEBYTECODE='1')
         self.original = self.root / 'original'
         command('git', 'init', '-q', '-b', 'main', str(self.original), env=self.env)

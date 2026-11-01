@@ -388,7 +388,10 @@ class DeliveryHelpers(unittest.TestCase):
         # repo's Git common directory; HOME isolates any user-level config.
         self.test_home = self.root / 'home'
         self.test_home.mkdir()
-        home_override = patch.dict(os.environ, {'HOME': str(self.test_home)})
+        tempdir_override = patch.object(tempfile, 'tempdir', str(self.root))
+        tempdir_override.start()
+        self.addCleanup(tempdir_override.stop)
+        home_override = patch.dict(os.environ, {'HOME': str(self.test_home), 'TMPDIR': str(self.root)})
         home_override.start()
         self.addCleanup(home_override.stop)
         self.repo = self.root / 'repo'
@@ -1510,8 +1513,9 @@ class DeliveryHelpers(unittest.TestCase):
                                 env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(result.stdout)
         self.assertEqual((result.returncode, data['status']), (0, 'ALREADY_INTEGRATED'), result.stdout)
-        self.assertFalse(list((self.repo / '.git' / 'agent-harness' /
-                               'delivery-scratch').glob('*/journal.json')))
+        journal_root = self.repo / '.git' / 'agent-harness' / 'delivery-scratch'
+        self.assertTrue(journal_root.is_dir())
+        self.assertFalse(list(journal_root.rglob('journal.json')))
         self.assertEqual(cmd('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip(), self.base)
 
     def test_failed_scratch_retry_reports_recovery_even_after_source_moves(self):
@@ -1613,7 +1617,7 @@ class DeliveryHelpers(unittest.TestCase):
         data = json.loads(result.stdout)
         self.assertEqual((result.returncode, data['status']), (3, 'BLOCKED_LOCAL'), result.stdout)
         self.assertIn('Another integration', data['message'])
-        self.assertFalse(list(root.glob('*/journal.json')))
+        self.assertFalse(list(root.rglob('journal.json')))
         self.assert_restored()
 
     def test_completed_journal_allows_next_reviewed_feature(self):
@@ -2467,7 +2471,7 @@ class DeliveryHelpers(unittest.TestCase):
         parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
         self.assertEqual(parents[1:], [self.base, self.feature_head])
         self.assertEqual((self.repo / 'app.txt').read_text(), 'feature\n')
-        self.assertEqual((Path(data['journal']).parent / 'worktree' / 'app.txt').read_text(),
+        self.assertEqual((Path(json.loads(Path(data['journal']).read_text())['scratch']) / 'app.txt').read_text(),
                          'private hook edit\n')
         self.assertFalse(cmd('git', 'status', '--porcelain', cwd=self.repo).stdout.strip())
 
@@ -2545,7 +2549,7 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual((result.returncode, data['status']), (0, 'INTEGRATED'), result.stdout)
         self.assertTrue(data['cleanup_pending'])
         self.assertFalse((self.repo / 'artifact.txt').exists())
-        self.assertEqual((Path(data['journal']).parent / 'worktree' / 'artifact.txt').read_text(),
+        self.assertEqual((Path(json.loads(Path(data['journal']).read_text())['scratch']) / 'artifact.txt').read_text(),
                          'private artifact\n')
         self.assertFalse(cmd('git', '-c', 'status.showUntrackedFiles=all',
                              'status', '--porcelain', cwd=self.repo).stdout)
@@ -2646,7 +2650,7 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertTrue(data['cleanup_pending'])
         self.assertTrue(link.is_symlink())
         self.assertEqual(link.read_text(), 'target content\n')
-        scratch_link = Path(data['journal']).parent / 'worktree' / 'link'
+        scratch_link = Path(json.loads(Path(data['journal']).read_text())['scratch']) / 'link'
         self.assertFalse(scratch_link.is_symlink())
         self.assertEqual(scratch_link.read_text(), 'target.txt')
 
