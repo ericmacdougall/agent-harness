@@ -22,6 +22,29 @@ def load(name):
 
 
 class ReportFinalizationTests(unittest.TestCase):
+    def test_prepublication_check_runs_after_staging_and_blocks_public_link(self):
+        module = load('report_file')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / 'report.txt'
+            target = module.ReportTarget(output, root / 'repo', root / 'packet')
+            checked = []
+
+            def reject_changed_evidence():
+                self.assertFalse(output.exists())
+                self.assertEqual(len(list(root.glob('.report-*'))), 1)
+                checked.append(True)
+                raise OSError('evidence changed')
+
+            try:
+                with self.assertRaisesRegex(OSError, 'evidence changed'):
+                    target.write_text('VERDICT: PASS', before_publish=reject_changed_evidence)
+                self.assertEqual(checked, [True])
+                self.assertFalse(output.exists())
+                self.assertEqual(list(root.glob('.report-*')), [])
+            finally:
+                target.close()
+
     def test_report_rejects_same_inode_content_and_mode_changes(self):
         module = load('report_file')
         with tempfile.TemporaryDirectory() as temp:

@@ -2,6 +2,7 @@
 """Independent read-only Codex review, with a blind Opus CLI fallback."""
 
 import argparse
+import hashlib
 import os
 import re
 import selectors
@@ -84,20 +85,75 @@ def run(cmd: list[str], prompt: str, cwd: Path) -> tuple[int, str, str]:
         return 125, "", str(error)
 
 
-def read_packet(path: Path) -> str:
-    # Opening the leaf without following links also closes the check/read race.
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+def packet_signature(info: os.stat_result) -> tuple[int, ...]:
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def packet_bytes(fd: int) -> bytes:
+    data = bytearray()
+    while len(data) <= 150_000:
+        chunk = os.read(fd, min(65_536, 150_001 - len(data)))
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+    raise ValueError('packet must be no larger than 150 KB')
+
+
+class PacketEvidence:
+    """Pin the reviewed inode and bind a report to the exact packet bytes read."""
+
+    def __init__(self, path: Path, fd: int, signature: tuple[int, ...], data: bytes):
+        self.path = path
+        self.fd = fd
+        self.signature = signature
+        self.sha256 = hashlib.sha256(data).hexdigest()
+        self.content = data.decode(errors='replace')
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+    def verify(self) -> None:
+        """Reject changed bytes or identity without exposing packet data or path."""
+        try:
+            if packet_signature(os.fstat(self.fd)) != self.signature:
+                raise OSError
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                before = os.fstat(fd)
+                if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                        or packet_signature(before) != self.signature):
+                    raise OSError
+                data = packet_bytes(fd)
+                if (packet_signature(os.fstat(fd)) != self.signature
+                        or hashlib.sha256(data).hexdigest() != self.sha256
+                        or packet_signature(os.stat(self.path, follow_symlinks=False)) != self.signature):
+                    raise OSError
+            finally:
+                os.close(fd)
+        except (OSError, ValueError):
+            raise OSError('review packet changed; no current signoff') from None
+
+
+def read_packet(path: Path) -> PacketEvidence:
+    # Keep the opened inode alive until final publication verification.
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 150_000:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        raise ValueError('packet could not be opened as a regular file') from None
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 150_000:
             raise ValueError('packet must be one regular file no larger than 150 KB')
-        with os.fdopen(fd, 'rb', closefd=False) as handle:
-            data = handle.read(150_001)
-        if len(data) > 150_000:
-            raise ValueError('packet must be no larger than 150 KB')
-        return data.decode(errors='replace')
-    finally:
+        data = packet_bytes(fd)
+        after = os.fstat(fd)
+        if (len(data) != before.st_size or packet_signature(before) != packet_signature(after)
+                or packet_signature(os.stat(path, follow_symlinks=False)) != packet_signature(before)):
+            raise ValueError('packet changed while being read')
+        return PacketEvidence(path, fd, packet_signature(after), data)
+    except (OSError, ValueError):
         os.close(fd)
+        raise ValueError('packet invalid or changed while being read') from None
 
 
 def repo_state(repo: Path) -> tuple[str, str]:
@@ -282,23 +338,28 @@ def main() -> int:
         parser.error(f'output must be a writable file path: {error}')
     output = target.path
     try:
-        content = read_packet(packet)
+        evidence = read_packet(packet)
     except (OSError, ValueError) as error:
+        target.close()
         parser.error(f'invalid packet: {error}')
     if args.stage == 'pr' and not args.expected_head:
         target.close()
+        evidence.close()
         parser.error('--expected-head is required for PR review')
     try:
         before = repo_state(repo)
     except (OSError, subprocess.TimeoutExpired) as error:
         target.close()
+        evidence.close()
         parser.error(f'repo state inspection failed: {error}')
     if args.expected_head and (not re.fullmatch(r'[0-9a-fA-F]{40,64}', args.expected_head)
                                or before[0] != args.expected_head.lower()):
         target.close()
+        evidence.close()
         parser.error('repo HEAD differs from --expected-head')
     if before[1]:
         target.close()
+        evidence.close()
         parser.error('plan and PR review require a clean worktree')
     stage_rules = (
         "Planning gate: judge the proposed design, acceptance criteria, edge cases, test strategy, "
@@ -316,13 +377,14 @@ def main() -> int:
             if repo_state(repo) != before:
                 raise OSError('source changed while preparing review')
             source, report, failure = review_snapshot(snapshot, before[0], args.stage,
-                                                       stage_rules, content)
+                                                       stage_rules, evidence.content)
             if repo_state(snapshot) != (before[0], ''):
                 raise OSError('snapshot changed during review')
         # Cleanup must succeed before any report is published.
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f'Review isolation failed: {error}; no signoff published.', file=sys.stderr)
         target.close()
+        evidence.close()
         return 2
     note = f"Fallback reason: {failure}\n" if failure else ""
     try:
@@ -330,16 +392,22 @@ def main() -> int:
         if after != before:
             print('Repository HEAD or worktree changed during review; no signoff published.', file=sys.stderr)
             return 2
+        evidence.verify()
         target.write_text(f"Reviewer: {source}\nStage: {args.stage}\nReviewed HEAD: {before[0]}\n"
+                          f"Reviewed packet SHA-256: {evidence.sha256}\n"
                           f"Review input: isolated committed snapshot (ancestor history available)\n"
-                          f"Worktree status: {'clean' if not before[1] else 'dirty'}\n{note}\n{report.strip()}\n")
+                          f"Worktree status: {'clean' if not before[1] else 'dirty'}\n{note}\n{report.strip()}\n",
+                          before_publish=evidence.verify)
         target.verify_current()
+        evidence.verify()
         print(f"{source}: {report.splitlines()[0].strip()} | {output}")
     except (OSError, subprocess.TimeoutExpired) as error:
-        print(f"Review completed but report could not be created exclusively: {error}; inspect output and retry with a fresh path.", file=sys.stderr)
+        print(f"Review failed final publication check: {error}; no current signoff. "
+              "A digest-bound historical report may remain at the output path.", file=sys.stderr)
         return 2
     finally:
         target.close()
+        evidence.close()
     return 0 if report.lstrip().startswith("VERDICT: PASS") else 3
 
 
