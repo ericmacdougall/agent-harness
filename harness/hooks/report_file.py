@@ -5,6 +5,7 @@ import os
 import secrets
 import stat
 from pathlib import Path
+from typing import Callable, Optional
 
 
 def same_existing(left: Path, right: Path) -> bool:
@@ -74,7 +75,7 @@ class ReportTarget:
             return
         raise ValueError('output already exists; choose a fresh report path')
 
-    def write_text(self, content: str):
+    def write_text(self, content: str, *, before_publish: Optional[Callable[[], None]] = None):
         if self.report_fd is not None:
             raise OSError('report target is single-use')
         if not self.directory_is_current():
@@ -101,6 +102,10 @@ class ReportTarget:
             if (not stat.S_ISREG(temporary_info.st_mode) or temporary_info.st_nlink != 1
                     or (temporary_info.st_dev, temporary_info.st_ino) != (written.st_dev, written.st_ino)):
                 raise OSError('temporary report changed before publication')
+            # The caller can revalidate mutable evidence after report staging,
+            # immediately before the public link. It must raise on a change.
+            if before_publish is not None:
+                before_publish()
             # An independent file may appear after require_fresh(). Link is
             # atomic and refuses to replace it; unlink the temporary afterward.
             os.link(temporary, self.path.name, src_dir_fd=self.fd, dst_dir_fd=self.fd,

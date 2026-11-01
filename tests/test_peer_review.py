@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import os
 import resource
 import shlex
@@ -39,6 +40,26 @@ capture = os.environ.get('CAPTURE_CODEX_PROMPT')
 if capture: Path(capture).write_text(prompt)
 last = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 last.write_text(os.environ.get('CODEX_VERDICT', 'VERDICT: PASS\\nReviewed.'))
+packet_action = os.environ.get('RACE_PACKET_ACTION')
+if packet_action:
+    packet = Path(os.environ['RACE_PACKET_PATH'])
+    if packet_action == 'rewrite':
+        packet.write_text('Tests: pass. Rewritten after reviewer read the old packet.')
+    elif packet_action == 'replace':
+        replacement = packet.with_name('replacement.md')
+        replacement.write_text('Tests: pass. Replaced after reviewer read the old packet.')
+        replacement.replace(packet)
+    elif packet_action == 'symlink':
+        replacement = packet.with_name('replacement.md')
+        replacement.write_text('Tests: pass. Symlinked after reviewer read the old packet.')
+        packet.unlink()
+        packet.symlink_to(replacement)
+    elif packet_action == 'hardlink':
+        os.link(packet, packet.with_name('packet-hardlink.md'))
+    elif packet_action == 'delete':
+        packet.unlink()
+    elif packet_action == 'oversize':
+        packet.write_bytes(b'x' * 150001)
 race = os.environ.get('RACE_OUTPUT')
 if race: Path(race).write_text('independent file created during review')
 if os.environ.get('RACE_HEAD'):
@@ -506,6 +527,145 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         result = self.invoke(packet=self.root / 'missing.md')
         self.assertEqual(result.returncode, 2)
         self.assertFalse(self.output.exists())
+
+    def test_packet_read_error_paths_close_open_descriptor(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_packet_descriptor_test', REVIEW)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        oversized = self.root / 'oversized.md'
+        oversized.write_bytes(b'x' * 150001)
+        fifo = self.root / 'packet-fifo'
+        os.mkfifo(fifo)
+        linked = self.root / 'packet-linked.md'
+        os.link(self.packet, linked)
+        for packet in (oversized, fifo, linked):
+            with self.subTest(packet=packet.name):
+                before = set(os.listdir('/dev/fd'))
+                with self.assertRaises(ValueError):
+                    module.read_packet(packet)
+                self.assertEqual(set(os.listdir('/dev/fd')), before)
+        linked.unlink()
+        before = set(os.listdir('/dev/fd'))
+        with patch.object(module, 'packet_bytes', side_effect=ValueError('changed')) as read:
+            with self.assertRaises(ValueError):
+                module.read_packet(self.packet)
+        read.assert_called_once()
+        self.assertEqual(set(os.listdir('/dev/fd')), before)
+
+    def test_main_early_exit_closes_packet_descriptor(self):
+        import contextlib
+        import io
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_main_descriptor_test', REVIEW)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for failure in ('stale-head', 'repo-inspection'):
+            with self.subTest(failure=failure):
+                args = ['review', 'pr', '--repo', str(self.repo), '--packet', str(self.packet),
+                        '--output', str(self.root / f'{failure}.md'), '--expected-head', '0' * 40]
+                before = set(os.listdir('/dev/fd'))
+                with patch.object(sys, 'argv', args), contextlib.redirect_stderr(io.StringIO()):
+                    if failure == 'repo-inspection':
+                        with patch.object(module, 'repo_state', side_effect=OSError('fixture')):
+                            with self.assertRaises(SystemExit) as raised:
+                                module.main()
+                    else:
+                        with self.assertRaises(SystemExit) as raised:
+                            module.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertEqual(set(os.listdir('/dev/fd')), before)
+
+    def test_packet_changed_by_reviewer_cannot_publish_pass(self):
+        for action in ('rewrite', 'replace', 'symlink', 'hardlink', 'delete', 'oversize'):
+            with self.subTest(action=action):
+                if self.packet.is_symlink() or self.packet.exists():
+                    self.packet.unlink()
+                hardlink = self.root / 'packet-hardlink.md'
+                if hardlink.exists():
+                    hardlink.unlink()
+                self.packet.write_text('Tests: pending. Reviewer saw this evidence.')
+                output = self.root / f'{action}.review.md'
+                capture = self.root / f'{action}.prompt'
+                result = self.invoke(output=output, env={
+                    'RACE_PACKET_ACTION': action, 'RACE_PACKET_PATH': str(self.packet),
+                    'CAPTURE_CODEX_PROMPT': str(capture),
+                })
+                self.assertIn('Tests: pending.', capture.read_text())
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertFalse(output.exists())
+
+    def test_report_names_raw_packet_bytes_digest(self):
+        raw = b'Scope with non-UTF8 byte: \xff'
+        self.packet.write_bytes(raw)
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Reviewed packet SHA-256: ' + hashlib.sha256(raw).hexdigest(),
+                      self.output.read_text())
+
+    def test_packet_changed_during_report_staging_blocks_publication(self):
+        import contextlib
+        import io
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_staging_packet_race', REVIEW)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        real_fsync = os.fsync
+        changed = []
+
+        def fsync_then_mutate(fd):
+            real_fsync(fd)
+            if not changed and list(self.root.glob('.report-*')):
+                self.packet.write_text('Tests: pass. Mutated during report staging.')
+                changed.append(True)
+
+        errors = io.StringIO()
+        with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
+                                       '--packet', str(self.packet), '--output', str(self.output)]), \
+             patch.object(module, 'review_snapshot', return_value=('fixture', 'VERDICT: PASS', '')), \
+             patch.object(os, 'fsync', side_effect=fsync_then_mutate), \
+             contextlib.redirect_stderr(errors):
+            result = module.main()
+        self.assertEqual(result, 2, errors.getvalue())
+        self.assertEqual(changed, [True])
+        self.assertFalse(self.output.exists())
+        self.assertEqual(list(self.root.glob('.report-*')), [])
+
+    def test_packet_changed_just_after_link_cannot_announce_current_signoff(self):
+        import contextlib
+        import io
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_late_packet_race', REVIEW)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        original = self.packet.read_bytes()
+        real_link = os.link
+        linked = []
+
+        def link_then_mutate(*args, **kwargs):
+            real_link(*args, **kwargs)
+            self.packet.write_text('Tests: pass. Mutated just after report publication.')
+            linked.append(True)
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
+                                       '--packet', str(self.packet), '--output', str(self.output)]), \
+             patch.object(module, 'review_snapshot', return_value=('fixture', 'VERDICT: PASS', '')), \
+             patch.object(os, 'link', side_effect=link_then_mutate), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = module.main()
+        self.assertEqual(result, 2, errors.getvalue())
+        self.assertEqual(linked, [True])
+        self.assertEqual(output.getvalue(), '')
+        self.assertIn('A digest-bound historical report may remain', errors.getvalue())
+        self.assertIn('Reviewed packet SHA-256: ' + hashlib.sha256(original).hexdigest(),
+                      self.output.read_text())
+        self.assertNotIn('Tests: pass.', self.output.read_text())
 
     def test_existing_unrelated_file_outside_repo_is_not_deleted(self):
         important = self.root / 'ssh-config'
