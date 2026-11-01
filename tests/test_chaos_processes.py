@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 HOOKS = Path(__file__).resolve().parents[1] / 'harness/hooks'
@@ -15,6 +16,65 @@ ROOT = HOOKS.parents[1]
 
 
 class ChaosProcesses(unittest.TestCase):
+    def test_competing_directory_at_publish_is_never_replaced(self):
+        from install import install, rename_directory_exclusive
+
+        for populated in (False, True):
+            with self.subTest(populated=populated), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve()
+                claude = home / '.claude'
+                claude.mkdir()
+                winner = None
+
+                def compete(parent, source, destination):
+                    nonlocal winner
+                    if destination == 'agents' and winner is None:
+                        os.mkdir(destination, dir_fd=parent)
+                        winner = os.stat(destination, dir_fd=parent, follow_symlinks=False)
+                        if populated:
+                            (claude / 'agents' / 'winner').write_text('keep')
+                    return rename_directory_exclusive(parent, source, destination)
+
+                with patch('install.rename_directory_exclusive', side_effect=compete):
+                    with self.assertRaisesRegex(OSError, 'Directory appeared during installation'):
+                        install(home, apply=True)
+                self.assertIsNotNone(winner)
+                current = (claude / 'agents').stat()
+                self.assertEqual((current.st_dev, current.st_ino),
+                                 (winner.st_dev, winner.st_ino))
+                if populated:
+                    self.assertEqual((claude / 'agents' / 'winner').read_text(), 'keep')
+                self.assertFalse(list(claude.glob('.agent-harness-dir-*')))
+                install(home, apply=True)  # A new snapshot may accept the existing winner.
+                retried = (claude / 'agents').stat()
+                self.assertEqual((retried.st_dev, retried.st_ino),
+                                 (winner.st_dev, winner.st_ino))
+                if populated:
+                    self.assertEqual((claude / 'agents' / 'winner').read_text(), 'keep')
+
+    def test_unsupported_exclusive_publish_fails_without_a_raw_traceback(self):
+        from install import DirectoryPublicationError, main, rename_directory_exclusive
+        from contextlib import redirect_stderr
+        from io import StringIO
+
+        with patch('install.sys.platform', 'unsupported'):
+            with self.assertRaisesRegex(DirectoryPublicationError, 'unavailable'):
+                rename_directory_exclusive(-1, 'staged', 'agents')
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            (home / '.claude').mkdir()
+            errors = StringIO()
+            with patch('install.sys.argv', ['install.py', '--apply', '--home', str(home)]), \
+                 patch('install.rename_directory_exclusive',
+                       side_effect=DirectoryPublicationError('Exclusive directory publication is unavailable')), \
+                 redirect_stderr(errors):
+                with self.assertRaises(SystemExit) as stopped:
+                    main()
+            self.assertEqual(stopped.exception.code, 1)
+            self.assertIn('Exclusive directory publication is unavailable', errors.getvalue())
+            self.assertNotIn('Traceback', errors.getvalue())
+            self.assertFalse(list((home / '.claude').glob('.agent-harness-dir-*')))
+
     def test_eight_simultaneous_installs_keep_one_policy_block_and_valid_settings(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary).resolve()
