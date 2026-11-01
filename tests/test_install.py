@@ -504,6 +504,20 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('prepare', result.stdout)
         self.assertIn('finish', result.stdout)
 
+    def test_installed_usage_guard_starts_without_source_imports(self):
+        install(self.home, apply=True)
+        helper = self.claude / 'hooks' / 'usage_guard.py'
+        self.assertTrue(helper.is_file(), 'Usage guard was not installed')
+        self.assertEqual(helper.read_bytes(), (ROOT / 'harness/hooks/usage_guard.py').read_bytes())
+        state = self.home / 'owned-usage-state'
+        environment = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+        environment.update(HOME=str(self.home), PYTHONNOUSERSITE='1', AGENT_HARNESS_USAGE_DIR=str(state))
+        result = subprocess.run([sys.executable, str(helper), '--help'], cwd=self.home,
+                                env=environment, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('reconcile', result.stdout)
+        self.assertFalse(state.exists(), 'Help must not create usage state')
+
     def managed_snapshot(self):
         return {str(path.relative_to(self.claude)): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
                 for path in self.claude.rglob('*')
