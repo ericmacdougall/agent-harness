@@ -458,4 +458,3 @@ class LiveReceipts(unittest.TestCase):
             if marker.exists():
                 try: os.killpg(json.loads(marker.read_text())['group'], signal.SIGKILL)
                 except ProcessLookupError: pass
-
