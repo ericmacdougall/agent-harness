@@ -1,10 +1,12 @@
 """Explicit interrupted-delivery resume in owned disposable repositories."""
 
 import json
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -150,6 +152,22 @@ class RemoteResume(unittest.TestCase):
         changed[changed.index(workflow.CHECK)] = 'python3 -m pytest'
         self.refused_without_check(changed)
 
+    def test_missing_resume_namespace_is_not_recreated_or_checked(self):
+        self.pending()
+        archive = self.guard_path.parent.parent.parent / 'archive'
+        archive.rmdir()
+        calls = []
+        def stop_check(module):
+            def costly(*args):
+                calls.append('check')
+                raise module.DeliveryError('DELIVERED_CHECK_FAILED', 'Fixture reached a costly check')
+            return mock.patch.object(module, 'run_checks', side_effect=costly)
+        code, data = self.fixture.direct_finish(stop_check, arguments=self.resume_args())
+        self.assertEqual((code, data['status']), (3, 'RECOVERY_REQUIRED'))
+        self.assertEqual((archive.exists(), calls), (False, []),
+                         'Missing namespace must remain missing and refuse before checks')
+        self.assertFalse(self.counter.exists())
+
     def test_proof_boundary_mutation_prevents_test_launch(self):
         self.pending()
         def mutate(module):
@@ -282,3 +300,47 @@ class RemoteResume(unittest.TestCase):
         self.assertEqual(process.returncode, 0, stdout + stderr)
         self.assertEqual(json.loads(stdout)['status'], 'DELIVERED')
         self.assertEqual(self.counter.read_text(), '1')
+
+
+class ExecutorProvenance(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='harness-executor-')
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name)
+        workflow.command('git', 'init', '-q', '-b', 'main', str(self.repo))
+        workflow.command('git', '-C', str(self.repo), 'config', 'user.name', 'Fixture')
+        workflow.command('git', '-C', str(self.repo), 'config', 'user.email', 'fixture@example.invalid')
+        (self.repo / 'README.md').write_text('Owned provenance fixture\n')
+        self.hooks = self.repo / 'harness' / 'hooks'
+        self.hooks.mkdir(parents=True)
+        for name in ('deliver.py', 'integrate_local.py', 'process.py', 'git_safety.py'):
+            (self.hooks / name).write_bytes((workflow.DELIVER.parent / name).read_bytes())
+        workflow.command('git', 'add', 'README.md', cwd=self.repo)
+        workflow.command('git', 'commit', '-qm', 'fixture baseline', cwd=self.repo)
+        spec = importlib.util.spec_from_file_location('provenance_fixture', workflow.DELIVER)
+        self.module = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, 'path', [str(workflow.DELIVER.parent), *sys.path]):
+            spec.loader.exec_module(self.module)
+
+    def identity(self):
+        with mock.patch.object(self.module, '__file__', str(self.hooks / 'deliver.py')):
+            return self.module.resume_executor()
+
+    def test_untracked_and_ignored_helpers_cannot_claim_revision(self):
+        self.assertIsNone(self.identity()['revision'])
+        (self.repo / '.gitignore').write_text('harness/\n')
+        workflow.command('git', 'add', '.gitignore', cwd=self.repo)
+        workflow.command('git', 'commit', '-qm', 'ignore owned fixture helpers', cwd=self.repo)
+        self.assertIsNone(self.identity()['revision'])
+
+    def test_clean_tracked_helpers_bind_revision_but_dirty_bytes_do_not(self):
+        workflow.command('git', 'add', 'harness', cwd=self.repo)
+        workflow.command('git', 'commit', '-qm', 'track fixture helpers', cwd=self.repo)
+        head = workflow.command('git', 'rev-parse', 'HEAD', cwd=self.repo).stdout.strip()
+        clean = self.identity()
+        self.assertEqual(clean['revision'], head)
+        with (self.hooks / 'deliver.py').open('ab') as changed:
+            changed.write(b'\n# modified fixture executor\n')
+        dirty = self.identity()
+        self.assertIsNone(dirty['revision'])
+        self.assertNotEqual(dirty['helpers_sha256'], clean['helpers_sha256'])
