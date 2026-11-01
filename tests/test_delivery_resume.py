@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -19,11 +20,16 @@ class RemoteResume(unittest.TestCase):
         self.counter = self.fixture.root / 'checks-executed'
         self.fixture.env['FIXTURE_RESUME_COUNTER'] = str(self.counter)
         self.fixture.replace_feature_tests(
-            'import os,unittest\nfrom pathlib import Path\n'
+            'import os,time,unittest\nfrom pathlib import Path\n'
             'class ResumeCheck(unittest.TestCase):\n'
             '    def test_feature(self):\n'
             '        p=Path(os.environ["FIXTURE_RESUME_COUNTER"])\n'
             '        p.write_text(str(int(p.read_text())+1) if p.exists() else "1")\n'
+            '        if os.environ.get("FIXTURE_RESUME_RELEASE"):\n'
+            '            release=Path(os.environ["FIXTURE_RESUME_RELEASE"]);deadline=time.monotonic()+20\n'
+            '            while not release.exists() and time.monotonic()<deadline: time.sleep(.02)\n'
+            '            self.assertTrue(release.exists())\n'
+            '        self.assertFalse(os.environ.get("FIXTURE_RESUME_FAIL"))\n'
             '        self.assertEqual(Path("app.txt").read_text(), "feature\\n")\n')
         self.fixture.configure_github()
 
@@ -73,3 +79,198 @@ class RemoteResume(unittest.TestCase):
                                           env=fixture.env).stdout, '')
         self.assertEqual(json.loads(self.state_path.read_text())['source_head'], fixture.head)
         self.assertTrue(Path(outcome['resume_record']).is_file())
+
+    def refused_without_check(self, arguments=None):
+        code, data = self.fixture.direct_finish(
+            lambda module: mock.patch.object(module, 'run_checks',
+                side_effect=AssertionError('Invalid resume launched a costly check')),
+            arguments=arguments or self.resume_args())
+        self.assertNotEqual(code, 0, data)
+        self.assertNotEqual(data['status'], 'DELIVERED')
+        self.assertFalse(self.counter.exists())
+
+    def test_invalid_saved_tuple_cannot_launch_checks(self):
+        self.pending()
+        before = self.state_path.read_bytes()
+        state = json.loads(before)
+        mutations = [('phase', 'PR_READY'), ('source_head', self.fixture.base),
+                     ('source_branch', 'codex/other'), ('repository', 'fixture/elsewhere'),
+                     ('pr_number', 27), ('merge_head', self.fixture.base),
+                     ('target', self.fixture.base), ('apply_base', self.target),
+                     ('baseline', self.target), ('checks_digest', '0' * 64),
+                     ('kit_digest', '0' * 64), ('guard_key', '0' * 64)]
+        try:
+            for name, value in mutations:
+                with self.subTest(field=name):
+                    self.state_path.write_text(json.dumps({**state, name: value}))
+                    self.refused_without_check()
+                    self.assertEqual(json.loads(self.state_path.read_text()), {**state, name: value})
+        finally:
+            self.state_path.write_bytes(before)
+
+    def test_invalid_guard_pin_barrier_dirty_target_kit_and_checks_refuse(self):
+        self.pending()
+        fixture = self.fixture
+        guard = json.loads(self.guard_path.read_text())
+        before = self.guard_path.read_bytes()
+        try:
+            for updates in ({'schema': 99}, {'task_digest': '0' * 64},
+                            {'phase': 'resolved', 'resolved_by': 'operator',
+                             'resolved_head': self.target, 'previous_phase': 'applying'},
+                            {'phase': 'resolved', 'resolved_by': 'workflow',
+                             'resolved_head': self.target, 'previous_phase': 'applying'}):
+                with self.subTest(guard=updates):
+                    self.guard_path.write_text(json.dumps({**guard, **updates}))
+                    self.refused_without_check()
+        finally:
+            self.guard_path.write_bytes(before)
+        for pin in (None, fixture.base):
+            with self.subTest(pin=pin):
+                if pin is None:
+                    workflow.command('git', 'update-ref', '-d', guard['ref'], cwd=fixture.original, env=fixture.env)
+                else:
+                    workflow.command('git', 'update-ref', guard['ref'], pin, cwd=fixture.original, env=fixture.env)
+                self.refused_without_check()
+        workflow.command('git', 'update-ref', guard['ref'], self.target, cwd=fixture.original, env=fixture.env)
+        barrier = self.guard_path.parent.parent / ('0' * 64)
+        barrier.mkdir(mode=0o700)
+        try:
+            self.refused_without_check()
+            self.assertTrue(barrier.is_dir(), 'Prevalidation must preserve other recovery state')
+        finally:
+            barrier.rmdir()
+        (fixture.original / 'app.txt').write_text('dirty\n')
+        self.refused_without_check()
+        (fixture.original / 'app.txt').write_text('feature\n')
+        kit = fixture.kit.read_bytes()
+        fixture.kit.write_text(json.dumps({'run': 'changed', 'test': 'changed', 'watch': 'changed'}))
+        self.refused_without_check()
+        fixture.kit.write_bytes(kit)
+        changed = self.resume_args()
+        changed[changed.index(workflow.CHECK)] = 'python3 -m pytest'
+        self.refused_without_check(changed)
+
+    def test_proof_boundary_mutation_prevents_test_launch(self):
+        self.pending()
+        def mutate(module):
+            fetch = module.fetch_target
+            def changed(*args):
+                fetch(*args)
+                self.fixture.kit.write_text('{}')
+            return mock.patch.object(module, 'fetch_target', side_effect=changed)
+        code, data = self.fixture.direct_finish(mutate, arguments=self.resume_args())
+        self.assertNotEqual(code, 0, data)
+        self.assertFalse(self.counter.exists())
+        self.assertEqual(json.loads(self.guard_path.read_text())['phase'], 'applying')
+
+    def test_state_mutation_after_checks_and_interruption_never_deliver(self):
+        self.pending()
+        def mutate(module):
+            check = module.run_checks
+            def changed(*args):
+                check(*args)
+                state = json.loads(self.state_path.read_text())
+                self.state_path.write_text(json.dumps({**state, 'source_head': self.fixture.base}))
+            return mock.patch.object(module, 'run_checks', side_effect=changed)
+        code, result = self.fixture.direct_finish(mutate, arguments=self.resume_args())
+        self.assertEqual((code, result['status']), (3, 'RECOVERY_REQUIRED'))
+        self.assertEqual(self.counter.read_text(), '1')
+        self.assertEqual(json.loads(self.guard_path.read_text())['phase'], 'applying')
+
+    def test_failed_check_preserves_pending_guard(self):
+        self.pending()
+        self.fixture.env['FIXTURE_RESUME_FAIL'] = '1'
+        result, data = self.fixture.invoke(*self.resume_args())
+        self.assertEqual((result.returncode, data['status']), (3, 'RECOVERY_REQUIRED'))
+        self.assertEqual(self.counter.read_text(), '1')
+        self.assertEqual(json.loads(self.guard_path.read_text())['phase'], 'applying')
+        self.assertEqual(json.loads(self.state_path.read_text())['phase'], 'REMOTE_APPLYING')
+
+    def test_kit_mutation_at_completion_cannot_record_delivery(self):
+        self.pending()
+        def mutate(module):
+            complete = module.OriginalScope.complete_external
+            def changed(scope, guard):
+                result = complete(scope, guard)
+                self.fixture.kit.write_text('{}')
+                return result
+            return mock.patch.object(module.OriginalScope, 'complete_external', changed)
+        code, result = self.fixture.direct_finish(mutate, arguments=self.resume_args())
+        self.assertEqual((code, result['status']), (3, 'RECOVERY_REQUIRED'))
+        self.assertEqual(self.counter.read_text(), '1')
+        self.assertEqual(json.loads(self.state_path.read_text())['phase'], 'REMOTE_APPLYING')
+        self.assertFalse((self.state_path.parent / 'receipt' / 'journal.json').exists())
+
+    def test_resume_requires_remote_mode_generation_kit_and_bounded_reason(self):
+        self.generation = 'a' * 32
+        valid = self.resume_args()
+        invalid = []
+        for flag in ('--generation', '--kit-file', '--resume-reason'):
+            args = valid.copy()
+            at = args.index(flag)
+            del args[at:at + 2]
+            invalid.append(args)
+        local = valid.copy()
+        local[local.index('remote')] = 'local'
+        invalid.append(local)
+        for reason in ('', 'x' * 513, 'bad\nreason'):
+            args = valid.copy()
+            args[args.index('--resume-reason') + 1] = reason
+            invalid.append(args)
+        for args in invalid:
+            with self.subTest(arguments=args):
+                result = workflow.command(sys.executable, str(workflow.DELIVER), *args,
+                                          env=self.fixture.env, check=False)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertFalse(self.counter.exists())
+
+    def test_interruption_preserves_pending_guard_and_unknown_attempt(self):
+        self.pending()
+        with self.assertRaises(KeyboardInterrupt):
+            self.fixture.direct_finish(lambda module: mock.patch.object(module, 'run_checks',
+                                       side_effect=KeyboardInterrupt), arguments=self.resume_args())
+        self.assertEqual(json.loads(self.guard_path.read_text())['phase'], 'applying')
+        self.assertEqual(json.loads(self.state_path.read_text())['phase'], 'REMOTE_APPLYING')
+        self.assertFalse(self.counter.exists())
+        self.assertTrue(list(self.state_path.parent.glob('resumes/*/start/journal.json')))
+        self.assertFalse(list(self.state_path.parent.glob('resumes/*/final/journal.json')))
+
+    def test_failed_declared_prerequisite_stops_before_test_child(self):
+        self.pending(preparations=('npm ci --prefer-offline',))
+        marker = self.fixture.root / 'prerequisite-ran'
+        npm = self.fixture.bin / 'npm'
+        npm.write_text('#!' + sys.executable + '\nfrom pathlib import Path\n'
+                       f'Path({str(marker)!r}).write_text("failed prerequisite")\nraise SystemExit(17)\n')
+        npm.chmod(0o700)
+        result, data = self.fixture.invoke(*self.resume_args(), '--prepare', 'npm ci --prefer-offline')
+        self.assertEqual((result.returncode, data['status']), (3, 'RECOVERY_REQUIRED'))
+        self.assertTrue(marker.exists())
+        self.assertFalse(self.counter.exists())
+        self.assertEqual(json.loads(self.guard_path.read_text())['phase'], 'applying')
+
+    def test_live_resume_holds_scope_against_another_process(self):
+        self.pending()
+        fixture = self.fixture
+        release = fixture.root / 'release-check'
+        fixture.env['FIXTURE_RESUME_RELEASE'] = str(release)
+        process = subprocess.Popen([sys.executable, str(workflow.DELIVER), *self.resume_args()],
+                                   env=fixture.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 45
+            while not self.counter.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(.05)
+            self.assertTrue(self.counter.exists(), 'Actual check must be running before the concurrent attempt')
+            probe = ('import sys\n'
+                     f'sys.path.insert(0,{str(workflow.DELIVER.parent)!r})\n'
+                     'from integrate_local import OriginalScope,ExternalApplyError\n'
+                     'try:\n'
+                     f'    with OriginalScope({str(fixture.original)!r},"main",15): raise SystemExit(7)\n'
+                     'except ExternalApplyError: raise SystemExit(0)\n')
+            blocked = workflow.command(sys.executable, '-c', probe, env=fixture.env, check=False)
+            self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        finally:
+            release.touch()
+            stdout, stderr = process.communicate(timeout=35)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertEqual(json.loads(stdout)['status'], 'DELIVERED')
+        self.assertEqual(self.counter.read_text(), '1')
