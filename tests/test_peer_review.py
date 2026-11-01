@@ -852,5 +852,105 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertTrue(self.output.is_dir())
 
 
+class ProviderEnvelopeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location('peer_envelope_unit', REVIEW)
+        cls.module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(REVIEW.parent), *sys.path]):
+            spec.loader.exec_module(cls.module)
+
+    def codex(self, message='VERDICT: PASS\nReviewed.', extra=()):
+        return '\n'.join(json.dumps(value) for value in [
+            {'type': 'thread.started', 'thread_id': 'fixture'}, {'type': 'turn.started'},
+            *extra, {'type': 'item.completed', 'item': {'id': '1', 'type': 'agent_message', 'text': message}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 4}}])
+
+    def test_supported_codex_and_claude_envelopes_require_terminal_success(self):
+        codex = self.module.normalize_provider('codex', 0, self.codex(), last_message='VERDICT: PASS\nReviewed.')
+        self.assertEqual((codex['result'], codex['reason'], codex['usage']),
+                         ('CHECK_OK', 'NONE', {'input_tokens': 10, 'output_tokens': 4}))
+        record = {'type': 'result', 'subtype': 'success', 'is_error': False,
+                  'result': 'VERDICT: PASS\nReviewed.', 'usage': {'input_tokens': 3}, 'total_cost_usd': .01}
+        for data in (json.dumps(record, indent=2), json.dumps({'type': 'system'}) + '\n' + json.dumps(record)):
+            result = self.module.normalize_provider('claude', 0, data)
+            self.assertEqual(result['result'], 'CHECK_OK')
+            self.assertEqual(result['usage'], {'input_tokens': 3, 'cost_usd': .01})
+
+    def test_errors_truncation_and_nonzero_exit_cannot_be_pass(self):
+        cases = [('claude', 0, json.dumps({'type': 'result', 'subtype': 'error_during_execution',
+                                          'is_error': True, 'result': 'VERDICT: PASS'})),
+                 ('claude', 0, json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False,
+                                          'result': {}, 'usage': {}})),
+                 ('codex', 0, '{"type":"turn.completed"'),
+                 ('codex', 0, json.dumps({'type': 'item.completed', 'item': {
+                     'type': 'agent_message', 'text': 'VERDICT: PASS'}})),
+                 ('codex', 0, self.codex().replace('"type": "turn.completed"',
+                                                 '"type": "turn.completed", "is_error": true')),
+                 ('codex', 1, self.codex()),
+                 ('codex', 0, json.dumps({'unexpected': 'VERDICT: PASS'}))]
+        for provider, code, data in cases:
+            with self.subTest(provider=provider, data=data):
+                result = self.module.normalize_provider(provider, code, data, last_message='VERDICT: PASS')
+                self.assertEqual(result['result'], 'NO_RESULT')
+                self.assertFalse(result['fallback_allowed'])
+
+    def test_account_errors_are_distinct_from_model_credit_and_tool_content(self):
+        quota = self.module.normalize_provider('codex', 0, json.dumps({
+            'type': 'turn.failed', 'error': {'code': 'insufficient_quota', 'reset_at': 2000000000}}))
+        self.assertEqual((quota['reason'], quota['account_cooldown'], quota['fallback_allowed']),
+                         ('QUOTA', True, True))
+        for error in ({'code': 'insufficient_credits', 'scope': 'model'},
+                      {'code': 'quota_exceeded', 'scope': 'model'},
+                      {'code': 'model_not_found'}, {'message': 'credit limit reached'}):
+            with self.subTest(error=error):
+                result = self.module.normalize_provider('codex', 1, json.dumps({'type': 'turn.failed', 'error': error}))
+                self.assertFalse(result['account_cooldown'])
+        tool = {'type': 'item.completed', 'item': {'type': 'command_execution',
+                'aggregated_output': 'ERROR: ACCOUNT_QUOTA_EXCEEDED', 'exit_code': 1}}
+        result = self.module.normalize_provider('codex', 0, self.codex(extra=[tool]))
+        self.assertEqual(result['result'], 'CHECK_OK')
+        self.assertFalse(result['account_cooldown'])
+        vague = self.module.normalize_provider('codex', 1, 'Credit balance too low')
+        self.assertFalse(vague['account_cooldown'])
+
+    def test_block_is_code_findings_without_fallback(self):
+        result = self.module.normalize_provider('codex', 0, self.codex('VERDICT: BLOCK\nF1 material defect'))
+        self.assertEqual((result['result'], result['reason'], result['fallback_allowed']),
+                         ('CHECK_FAILED', 'CODE_FINDINGS', False))
+
+    def test_non_pr_stage_removes_all_generic_pass_markers(self):
+        report = 'VERDICT: PASS\nEvidence quoted VERDICT: PASS and still needs full checks.'
+        for stage in ('plan', 'code-inspection'):
+            with self.subTest(stage=stage):
+                rendered = self.module.stage_report(stage, report)
+                self.assertNotIn('VERDICT: PASS', rendered)
+                self.assertIn('_RESULT: ACCEPT', rendered)
+        self.assertEqual(self.module.stage_report('pr', 'VERDICT: PASS'), 'VERDICT: PASS')
+
+    def test_duplicate_packet_blocks_are_warning_only(self):
+        block = '```python\nprint("fixture")\n```\n'
+        warnings = self.module.packet_warnings(block * 2)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('warning only', warnings[0])
+
+    def test_fallback_has_remaining_budget_and_never_a_third_call(self):
+        quota = json.dumps({'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}})
+        valid = json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False,
+                            'result': 'VERDICT: PASS'})
+        calls = []
+        def run(command, prompt, cwd, timeout):
+            calls.append((command[0], timeout))
+            return (1, quota, '') if len(calls) == 1 else (0, valid, '')
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(self.module.shutil, 'which', return_value='fixture'), \
+             patch.object(self.module, 'run', side_effect=run), \
+             patch.object(self.module.time, 'monotonic', side_effect=[0, 0, 721]):
+            source, report, reason = self.module.review_snapshot(Path(temporary), 'a' * 40, 'pr', 'Review', 'Evidence')
+        self.assertEqual(calls, [('codex', 720), ('claude', 719)])
+        self.assertEqual(report, 'VERDICT: PASS')
+        self.assertIn('fallback', reason)
+
+
 if __name__ == '__main__':
     unittest.main()
