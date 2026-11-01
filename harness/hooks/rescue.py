@@ -7,6 +7,7 @@ This does not decide whether to escalate, create a worktree, merge, or sign off.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -46,7 +47,8 @@ def git(repo: Path, *args: str, index_file: Path | None = None) -> str:
                          text=True, env=env, timeout=30)
     if result.returncode:
         raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
-    return result.stdout.strip()
+    # Git prints one record terminator. Paths may themselves end in whitespace.
+    return result.stdout.removesuffix("\n")
 
 
 def git_bytes(repo: Path, *args: str, index_file: Path | None = None) -> bytes:
@@ -115,6 +117,50 @@ def git_repository_identity(repo: Path) -> tuple[tuple[str, int, int], ...]:
     return tuple(locations)
 
 
+def policy_file_snapshot(path: Path) -> tuple[int, int, bytes] | None:
+    """Pin small local Git policy files without following a file symlink."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if os.path.lexists(path):
+            raise OSError("rescue Git policy file changed during inspection")
+        return None
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 1_000_000:
+            raise OSError("rescue Git policy file is unsupported")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            data = handle.read(1_000_001)
+        after = os.fstat(fd)
+        current = os.stat(path, follow_symlinks=False)
+        stable = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if (len(data) > 1_000_000 or any(getattr(before, key) != getattr(after, key)
+                                           or getattr(before, key) != getattr(current, key)
+                                           for key in stable)):
+            raise OSError("rescue Git policy file changed during inspection")
+        return before.st_dev, before.st_ino, hashlib.sha256(data).digest()
+    finally:
+        os.close(fd)
+
+
+def git_policy_state(repo: Path) -> tuple[object, ...]:
+    """Pin mutable local attribute/exclusion policy before model and fallback."""
+    common = Path(git(repo, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = repo / common
+    info = common / "info"
+    if not stat.S_ISDIR(info.lstat().st_mode):
+        raise OSError("rescue Git info directory is unsupported")
+    env = git_inspection_environment()
+    command = [*GIT_INSPECTION_OPTIONS, "config", "--local", "--includes", "--null",
+               "--get-regexp", r"^(core\.attributesfile|core\.excludesfile)$"]
+    code, config = _bounded_git(repo, command, env, timeout=30, limit=1_000_000)
+    if code not in (0, 1) or (code == 1 and config):
+        raise OSError("rescue Git policy configuration could not be inspected")
+    return (policy_file_snapshot(info / "attributes"),
+            policy_file_snapshot(info / "exclude"), config)
+
+
 def log(wal: Path | None, record: dict) -> None:
     if wal is None:
         return
@@ -165,6 +211,7 @@ def main() -> int:
         dirty = dirty_state(repo, base)
         git_identity = git_repository_identity(repo)
         grafts_before = has_grafts(repo)
+        policy_before = git_policy_state(repo)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         parser.error("repo Git state could not be inspected safely")
     if root != repo or not branch or dirty:
@@ -206,6 +253,7 @@ def main() -> int:
     try:
         if code != 0:
             changed = (git(repo, "rev-parse", "HEAD") != base
+                       or git_policy_state(repo) != policy_before
                        or dirty_state(repo, base)
                        or git(repo, "branch", "--show-current") != branch
                        or git_repository_identity(repo) != git_identity
@@ -225,11 +273,13 @@ def main() -> int:
         actual_branch = git(repo, "branch", "--show-current")
         branch_head = git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
         grafts_present = has_grafts(repo)
+        policy_ok = git_policy_state(repo) == policy_before
         commits = 0 if grafts_present else int(git(repo, "rev-list", "--count", f"{base}..{head}"))
         history_ok = not grafts_present and base_is_ancestor(repo, base, head)
         identity_ok = git_repository_identity(repo) == git_identity
         status = "blocked"
-        if code == 0 and identity_ok and actual_branch == branch and branch_head == head and history_ok:
+        if (code == 0 and policy_ok and identity_ok and actual_branch == branch
+                and branch_head == head and history_ok):
             if dirty_after:
                 status = "needs-main-commit"
             elif commits > 0:
@@ -266,7 +316,8 @@ def main() -> int:
         return 3
     finally:
         target.close()
-    return 0 if report["status"] == "needs-main-verification" else 3
+    # Main must independently verify every rescue, including a clean descendant.
+    return 3
 
 
 if __name__ == "__main__":

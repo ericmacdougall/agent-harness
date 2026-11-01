@@ -64,6 +64,31 @@ if os.environ.get('CODEX_COMMIT'):
     if os.environ.get('CODEX_STAGE_AFTER_COMMIT'):
         Path('app.txt').write_text('staged after commit\\n')
         subprocess.run(['git', 'add', 'app.txt'], check=True)
+if os.environ.get('CODEX_EMPTY_COMMIT'):
+    import subprocess
+    subprocess.run(['git', 'commit', '--allow-empty', '-qm', 'model descendant'], check=True)
+if os.environ.get('CODEX_INFO_IDENT'):
+    import subprocess
+    policy = Path(subprocess.run(['git', 'rev-parse', '--git-path', 'info/attributes'],
+                                 capture_output=True, text=True, check=True).stdout.strip())
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text('app.txt ident\\n')
+if os.environ.get('CODEX_IDENT_VARIANT'):
+    file = Path('app.txt')
+    before = file.stat()
+    content = file.read_text()
+    position = content.index('$Id: ') + len('$Id: ')
+    replacement = '0' if content[position] != '0' else '1'
+    file.write_text(content[:position] + replacement + content[position + 1:])
+    os.utime(file, ns=(before.st_atime_ns, before.st_mtime_ns))
+if os.environ.get('CODEX_INFO_EXCLUDE'):
+    import subprocess
+    policy = Path(subprocess.run(['git', 'rev-parse', '--git-path', 'info/exclude'],
+                                 capture_output=True, text=True, check=True).stdout.strip())
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    with policy.open('a') as handle:
+        handle.write('\\n/unfinished.py\\n')
+    Path('unfinished.py').write_text('print("unfinished rescue work")\\n')
 if os.environ.get('CODEX_SET_IGNORECASE') or os.environ.get('CODEX_ADD_CASE_VARIANT'):
     import subprocess
     subprocess.run(['git', 'config', 'core.ignoreCase', 'true'], check=True)
@@ -242,7 +267,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
 
     def test_model_committed_clean_worktree_still_needs_main_verification(self):
         result = self.invoke(env={'CODEX_ACTION': 'updated', 'CODEX_COMMIT': '1'})
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'needs-main-verification')
         self.assertEqual(report['commits'], 1)
@@ -253,10 +278,62 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
     def test_clean_descendant_with_ignorecase_config_still_needs_verification(self):
         result = self.invoke(env={'CODEX_ACTION': 'updated', 'CODEX_COMMIT': '1',
                                   'CODEX_SET_IGNORECASE': '1'})
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'needs-main-verification')
         self.assertFalse(report['dirty'])
+
+    def test_info_attributes_change_blocks_clean_descendant(self):
+        result = self.invoke(env={'CODEX_EMPTY_COMMIT': '1', 'CODEX_INFO_IDENT': '1'})
+        self.assertEqual(git(self.repo, 'status', '--porcelain'), '')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(self.output.read_text())['status'], 'blocked')
+
+    def test_info_attributes_change_suppresses_failed_model_fallback(self):
+        capture = self.root / 'fallback-prompt.txt'
+        result = self.invoke(env={'CODEX_INFO_IDENT': '1', 'CODEX_EXIT': '7',
+                                  'CAPTURE_CLAUDE_PROMPT': str(capture)})
+        self.assertEqual(git(self.repo, 'status', '--porcelain'), '')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertFalse(capture.exists())
+
+    def test_preexisting_ident_variant_cannot_produce_success_exit(self):
+        (self.repo / '.git/info/attributes').write_text('app.txt ident\n')
+        (self.repo / 'app.txt').write_text('print("$Id$")\n')
+        git(self.repo, 'add', 'app.txt')
+        git(self.repo, 'commit', '-qm', 'ident baseline')
+        (self.repo / 'app.txt').unlink()
+        git(self.repo, 'checkout', 'HEAD', '--', 'app.txt')
+        original = (self.repo / 'app.txt').read_text()
+        self.assertIn('$Id: ', original)
+        result = self.invoke(env={'CODEX_EMPTY_COMMIT': '1', 'CODEX_IDENT_VARIANT': '1'})
+        self.assertNotEqual((self.repo / 'app.txt').read_text(), original)
+        self.assertEqual(git(self.repo, 'status', '--porcelain'), '')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'needs-main-verification')
+        self.assertFalse(report['dirty'])
+
+    def test_info_exclude_cannot_hide_dirty_descendant(self):
+        result = self.invoke(env={'CODEX_EMPTY_COMMIT': '1', 'CODEX_INFO_EXCLUDE': '1'})
+        self.assertEqual(git(self.repo, 'status', '--porcelain'), '')
+        self.assertTrue((self.repo / 'unfinished.py').is_file())
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(self.output.read_text())['status'], 'blocked')
+
+    def test_info_exclude_suppresses_failed_model_fallback(self):
+        capture = self.root / 'fallback-prompt.txt'
+        result = self.invoke(env={'CODEX_INFO_EXCLUDE': '1', 'CODEX_EXIT': '7',
+                                  'CAPTURE_CLAUDE_PROMPT': str(capture)})
+        self.assertEqual(git(self.repo, 'status', '--porcelain'), '')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertFalse(capture.exists())
 
     def test_case_variant_addition_cannot_hide_dirty_descendant(self):
         if (self.repo / 'APP.TXT').exists():
@@ -484,6 +561,32 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         capture = self.root / 'fallback-prompt.txt'
         result = self.invoke(env={'CODEX_WORKTREE_REDIRECT': str(self.root / 'shadow-worktree'),
                                   'CODEX_EXIT': '7', 'CAPTURE_CLAUDE_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertFalse(capture.exists())
+
+    def test_trailing_space_worktree_redirect_does_not_hide_dirty_original(self):
+        shadow = self.repo / ' '
+        result = self.invoke(env={'CODEX_ACTION': 'updated', 'CODEX_COMMIT': '1',
+                                  'CODEX_WORKTREE_REDIRECT': str(shadow)})
+        raw_root = subprocess.run(['git', '-C', str(self.repo), 'rev-parse',
+                                   '--show-toplevel'], capture_output=True,
+                                  text=True, check=True).stdout
+        self.assertEqual(Path(raw_root[:-1]).resolve(), shadow.resolve())
+        self.assertTrue(raw_root.endswith('/ \n'))
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'dirty original\n')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(self.output.read_text())['status'], 'blocked')
+
+    def test_trailing_space_worktree_redirect_suppresses_fallback(self):
+        shadow = self.repo / ' '
+        capture = self.root / 'fallback-prompt.txt'
+        result = self.invoke(env={'CODEX_WORKTREE_REDIRECT': str(shadow),
+                                  'CODEX_EXIT': '7',
+                                  'CAPTURE_CLAUDE_PROMPT': str(capture)})
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'dirty original\n')
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
