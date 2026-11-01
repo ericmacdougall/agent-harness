@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
+import errno
 import json
 import os
 import re
 import secrets
 import stat
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +25,10 @@ HOOKS = ("process.py", "git_safety.py", "report_file.py", "wal.py", "wal_note.py
 TOOLS = ("watch-tests.py",)
 NO_TARGET_CHECK = object()
 NO_CONTENT_CHECK = object()
+
+
+class DirectoryPublicationError(OSError):
+    """An exclusive directory publish could not be completed safely."""
 
 
 def managed_hooks(claude: Path) -> dict[str, dict]:
@@ -144,6 +151,31 @@ def require_pinned_parent(path: Path, directory: int, pinned_parent) -> None:
     require_current_parent(path, directory)
 
 
+def rename_directory_exclusive(parent: int, staged: str, destination: str) -> None:
+    """Publish a staged directory without replacing an empty concurrent winner."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == 'darwin':
+        name, exclusive_flag = 'renameatx_np', 0x00000004  # RENAME_EXCL
+    elif sys.platform.startswith('linux'):
+        name, exclusive_flag = 'renameat2', 0x1  # RENAME_NOREPLACE
+    else:
+        raise DirectoryPublicationError('Exclusive directory publication is unavailable on this platform')
+    rename = getattr(libc, name, None)
+    if rename is None:
+        raise DirectoryPublicationError('Exclusive directory publication is unavailable on this platform')
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                       ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if rename(parent, os.fsencode(staged), parent, os.fsencode(destination), exclusive_flag):
+        error = ctypes.get_errno()
+        if not error:
+            raise DirectoryPublicationError('Exclusive directory publication failed without an error code')
+        if error in (errno.ENOSYS, errno.ENOTSUP, errno.EINVAL):
+            raise DirectoryPublicationError('Exclusive directory publication is unavailable on this filesystem')
+        raise OSError(error, os.strerror(error))
+
+
 class DirectoryPins:
     """Keep original directory inodes alive until install or rollback finishes."""
 
@@ -202,7 +234,12 @@ class DirectoryPins:
                 else:
                     raise OSError(f'Directory appeared during installation: {path}')
                 require_pinned_parent(path, parent, self.fds[path.parent])
-                os.rename(staged, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+                try:
+                    rename_directory_exclusive(parent, staged, path.name)
+                except OSError as error:
+                    if error.errno in (errno.EEXIST, errno.ENOTEMPTY):
+                        raise DirectoryPublicationError(f'Directory appeared during installation: {path.name}') from error
+                    raise
                 self.fds[path] = directory
             except BaseException:
                 if self.fds[path] is None:
@@ -455,7 +492,10 @@ def main() -> None:
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
     parser.add_argument("--home", type=Path, default=Path.home(), help=argparse.SUPPRESS)
     args = parser.parse_args()
-    changes = install(args.home, args.apply)
+    try:
+        changes = install(args.home, args.apply)
+    except DirectoryPublicationError as error:
+        parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"
     print(f"{action} Agent Harness in {args.home.expanduser() / '.claude'}")
     for path in changes:
