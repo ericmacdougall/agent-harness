@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent
 START = "<!-- agent-harness:start -->"
 END = "<!-- agent-harness:end -->"
 AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
-HOOKS = ("process.py", "git_safety.py", "report_file.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py")
+HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py")
 TOOLS = ("watch-tests.py",)
 NO_TARGET_CHECK = object()
 NO_CONTENT_CHECK = object()
@@ -75,7 +75,7 @@ def merged_settings(current: dict, claude: Path) -> dict:
         entries[:] = preserved
         entries.append(entry)
     allowed = settings.setdefault("permissions", {}).setdefault("allow", [])
-    for name in ("wal_note.py", "publish_feature.py", "integrate_local.py"):
+    for name in ("wal_note.py", "publish_feature.py", "integrate_local.py", "deliver.py"):
         rule = f"Bash(python3 ~/.claude/hooks/{name} *)"
         if rule not in allowed:
             allowed.append(rule)
