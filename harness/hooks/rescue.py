@@ -20,25 +20,69 @@ from pathlib import Path
 from wal import append as append_wal
 from process import run as run_process
 from report_file import ReportTarget
-from git_safety import git_environment, require_safe_source
+from git_safety import _bounded_git, git_environment, require_safe_source
 
 
-def git(repo: Path, *args: str) -> str:
+GIT_INSPECTION_OPTIONS = ("-c", "core.commitGraph=false",
+                          "-c", "core.splitIndex=false")
+GIT_OUTPUT_LIMIT = 40_000_000
+
+
+def git_inspection_environment(index_file: Path | None = None) -> dict[str, str]:
     env = git_environment()
+    env["GIT_GRAFT_FILE"] = os.devnull
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    if index_file is not None:
+        env["GIT_INDEX_FILE"] = str(index_file)
+    return env
+
+
+def git(repo: Path, *args: str, index_file: Path | None = None) -> str:
+    env = git_inspection_environment(index_file)
     require_safe_source(repo, env)
     # A rescue model can forge cached commit parents or trees without changing objects.
-    result = run_process(["git", "-C", str(repo), "-c", "core.commitGraph=false", *args],
+    result = run_process(["git", "-C", str(repo), *GIT_INSPECTION_OPTIONS, *args],
                          text=True, env=env, timeout=30)
     if result.returncode:
         raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
     return result.stdout.strip()
 
 
+def git_bytes(repo: Path, *args: str, index_file: Path | None = None) -> bytes:
+    """Capture complete binary inspection output within the source-index budget."""
+    env = git_inspection_environment(index_file)
+    require_safe_source(repo, env)
+    command = [*GIT_INSPECTION_OPTIONS, *args]
+    code, output = _bounded_git(repo, command, env, timeout=30, limit=GIT_OUTPUT_LIMIT)
+    if code:
+        raise subprocess.CalledProcessError(code, ["git", "-C", str(repo), *command])
+    return output
+
+
+def dirty_state(repo: Path, head: str) -> bool:
+    """Check worktree and staged changes without trusting source-index stat caches."""
+    status = ("status", "--porcelain", "--untracked-files=all")
+    if git_bytes(repo, *status):
+        return True
+    with tempfile.TemporaryDirectory(prefix="rescue-index-") as temp:
+        private_index = Path(temp) / "index"
+        git(repo, "read-tree", head, index_file=private_index)
+        source_entries = git_bytes(repo, "ls-files", "--stage", "-z")
+        private_entries = git_bytes(repo, "ls-files", "--stage", "-z",
+                                    index_file=private_index)
+        if (source_entries and not source_entries.endswith(b"\0")) or (
+                private_entries and not private_entries.endswith(b"\0")):
+            raise OSError("rescue Git index listing was incomplete")
+        if source_entries != private_entries:
+            return True
+        return bool(git_bytes(repo, *status, index_file=private_index))
+
+
 def base_is_ancestor(repo: Path, base: str, head: str) -> bool:
     """Treat a real divergent history as blocked, but surface Git errors."""
-    env = git_environment()
+    env = git_inspection_environment()
     require_safe_source(repo, env)
-    result = run_process(["git", "-C", str(repo), "-c", "core.commitGraph=false",
+    result = run_process(["git", "-C", str(repo), *GIT_INSPECTION_OPTIONS,
                           "merge-base", "--is-ancestor",
                           base, head], text=True, env=env, timeout=30)
     if result.returncode not in (0, 1):
@@ -49,11 +93,25 @@ def base_is_ancestor(repo: Path, base: str, head: str) -> bool:
 
 def has_grafts(repo: Path) -> bool:
     """Refuse source-local history rewriting before trusting ancestry checks."""
-    raw = git(repo, "rev-parse", "--git-path", "info/grafts")
-    path = Path(raw)
-    if not path.is_absolute():
-        path = repo / path
-    return os.path.lexists(path)
+    common = Path(git(repo, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = repo / common
+    return os.path.lexists(common / "info" / "grafts")
+
+
+def git_repository_identity(repo: Path) -> tuple[tuple[str, int, int], ...]:
+    """Pin the worktree root, per-worktree Git dir, and shared object/ref store."""
+    locations = []
+    for option in ("--show-toplevel", "--absolute-git-dir", "--git-common-dir"):
+        path = Path(git(repo, "rev-parse", option))
+        if not path.is_absolute():
+            path = repo / path
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
+        if not stat.S_ISDIR(info.st_mode):
+            raise OSError("rescue Git directory is not a directory")
+        locations.append((str(resolved), info.st_dev, info.st_ino))
+    return tuple(locations)
 
 
 def log(wal: Path | None, record: dict) -> None:
@@ -103,7 +161,8 @@ def main() -> int:
         root = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
         branch = git(repo, "branch", "--show-current")
         base = git(repo, "rev-parse", "HEAD")
-        dirty = git(repo, "status", "--porcelain", "--untracked-files=all")
+        dirty = dirty_state(repo, base)
+        git_identity = git_repository_identity(repo)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         parser.error("repo Git state could not be inspected safely")
     if root != repo or not branch or dirty:
@@ -143,8 +202,9 @@ def main() -> int:
     try:
         if code != 0:
             changed = (git(repo, "rev-parse", "HEAD") != base
-                       or bool(git(repo, "status", "--porcelain", "--untracked-files=all"))
-                       or git(repo, "branch", "--show-current") != branch)
+                       or dirty_state(repo, base)
+                       or git(repo, "branch", "--show-current") != branch
+                       or git_repository_identity(repo) != git_identity)
             if changed:
                 fallback_reason = "Astra failed after modifying the worktree; preserve it for main-agent inspection."
             else:
@@ -156,14 +216,15 @@ def main() -> int:
                 else:
                     stderr = "Claude executable unavailable"
         head = git(repo, "rev-parse", "HEAD")
-        dirty_after = bool(git(repo, "status", "--porcelain", "--untracked-files=all"))
+        dirty_after = dirty_state(repo, head)
         actual_branch = git(repo, "branch", "--show-current")
         branch_head = git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
         grafts_present = has_grafts(repo)
         commits = 0 if grafts_present else int(git(repo, "rev-list", "--count", f"{base}..{head}"))
         history_ok = not grafts_present and base_is_ancestor(repo, base, head)
+        identity_ok = git_repository_identity(repo) == git_identity
         status = "blocked"
-        if code == 0 and actual_branch == branch and branch_head == head and history_ok:
+        if code == 0 and identity_ok and actual_branch == branch and branch_head == head and history_ok:
             if dirty_after:
                 status = "needs-main-commit"
             elif commits > 0:

@@ -11,7 +11,8 @@ from unittest.mock import patch
 
 
 RESCUE = Path(__file__).resolve().parents[1] / 'harness/hooks/rescue.py'
-# Outer test watchdog for a functional two-model fallback, not a product deadline.
+# Outer test watchdogs, not product deadlines. Validation runs several Git reads.
+STANDARD_HELPER_WATCHDOG_SECONDS = 30
 FUNCTIONAL_HELPER_WATCHDOG_SECONDS = 90
 sys.path.insert(0, str(RESCUE.parent))
 SPEC = importlib.util.spec_from_file_location('rescue_under_test', RESCUE)
@@ -120,6 +121,60 @@ if os.environ.get('CODEX_FORGE_GRAPH_PARENT') or os.environ.get('CODEX_FORGE_GRA
     data[-hash_size:] = digest(data[:-hash_size]).digest()
     graph.chmod(0o600)
     graph.write_bytes(data)
+if os.environ.get('CODEX_REDIRECT_GITDIR') or os.environ.get('CODEX_REDIRECT_COMMON_DIR'):
+    import subprocess
+    primary = os.environ['CODEX_PRIMARY_REPO']
+    shadow = os.environ['CODEX_SHADOW_REPO']
+    branch = subprocess.run(['git', 'branch', '--show-current'], capture_output=True,
+                            text=True, check=True).stdout.strip()
+    subprocess.run(['git', 'clone', '-q', '--branch', branch, primary, shadow], check=True)
+    if not os.environ.get('CODEX_SHADOW_NO_COMMIT'):
+        subprocess.run(['git', '-C', shadow, '-c', 'user.name=Fixture',
+                        '-c', 'user.email=fixture@example.invalid',
+                        'commit', '--allow-empty', '-qm', 'shadow descendant'], check=True)
+    if os.environ.get('CODEX_REDIRECT_GITDIR'):
+        Path('.git').write_text('gitdir: ' + str(Path(shadow) / '.git') + chr(10))
+    else:
+        gitdir = subprocess.run(['git', 'rev-parse', '--absolute-git-dir'],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        (Path(gitdir) / 'commondir').write_text(str(Path(shadow) / '.git') + chr(10))
+if os.environ.get('CODEX_WORKTREE_REDIRECT'):
+    import shutil, subprocess
+    shadow = Path(os.environ['CODEX_WORKTREE_REDIRECT'])
+    shadow.mkdir()
+    shutil.copy2('app.txt', shadow / 'app.txt')
+    Path('app.txt').write_text('dirty original' + chr(10))
+    subprocess.run(['git', 'config', 'core.worktree', str(shadow)], check=True)
+if os.environ.get('CODEX_STAGE_AND_RESTORE'):
+    import subprocess
+    original = subprocess.run(['git', 'show', 'HEAD:app.txt'], capture_output=True,
+                              text=True, check=True).stdout
+    Path('app.txt').write_text('staged value' + chr(10))
+    subprocess.run(['git', 'add', 'app.txt'], check=True)
+    Path('app.txt').write_text(original)
+if os.environ.get('CODEX_FORGE_INDEX_STAT'):
+    import hashlib, struct, subprocess, time
+    time.sleep(1.1)
+    raw_index = subprocess.run(['git', 'rev-parse', '--git-path', 'index'],
+                               capture_output=True, text=True, check=True).stdout.strip()
+    index = Path(raw_index)
+    if not index.is_absolute():
+        index = Path.cwd() / index
+    data = bytearray(index.read_bytes())
+    if data[:4] != b'DIRC' or int.from_bytes(data[4:8], 'big') != 2:
+        raise ValueError('fixture requires a v2 Git index')
+    info = Path('app.txt').stat()
+    fields = (info.st_ctime_ns // 10**9, info.st_ctime_ns % 10**9,
+              info.st_mtime_ns // 10**9, info.st_mtime_ns % 10**9,
+              info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+              info.st_gid, info.st_size)
+    data[12:52] = struct.pack('>10I', *(value & 0xffffffff for value in fields))
+    object_format = subprocess.run(['git', 'rev-parse', '--show-object-format'],
+                                   capture_output=True, text=True, check=True).stdout.strip()
+    digest = hashlib.sha1 if object_format == 'sha1' else hashlib.sha256
+    hash_size = digest().digest_size
+    data[-hash_size:] = digest(data[:-hash_size]).digest()
+    index.write_bytes(data)
 last = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 last.write_text('Fixture handoff')
 race = os.environ.get('RACE_OUTPUT')
@@ -148,7 +203,8 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         path.write_text(f'#!{sys.executable}\n{body}')
         path.chmod(0o700)
 
-    def invoke(self, *, output=None, packet=None, wal=None, env=None, watchdog_seconds=15):
+    def invoke(self, *, output=None, packet=None, wal=None,
+               env=None, watchdog_seconds=STANDARD_HELPER_WATCHDOG_SECONDS):
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(packet or self.packet),
                    '--output', str(output or self.output)]
         if wal is not None:
@@ -240,6 +296,21 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(report['commits'], 0)
         self.assertEqual(report['head'], ancestor)
 
+    def test_graft_added_after_presence_check_cannot_spoof_history(self):
+        ancestor = self.two_commit_base()
+        git(self.repo, 'reset', '--hard', '-q', ancestor)
+        self.assertFalse(rescue.has_grafts(self.repo))
+        graft = Path(git(self.repo, 'rev-parse', '--git-path', 'info/grafts'))
+        if not graft.is_absolute():
+            graft = self.repo / graft
+        graft.parent.mkdir(parents=True, exist_ok=True)
+        graft.write_text(self.base + '\n' + ancestor + ' ' + self.base + '\n')
+        self.assertEqual(git(self.repo, 'rev-list', '--count',
+                             f'{self.base}..{ancestor}'), '1')
+        self.assertEqual(rescue.git(self.repo, 'rev-list', '--count',
+                                    f'{self.base}..{ancestor}'), '0')
+        self.assertFalse(rescue.base_is_ancestor(self.repo, self.base, ancestor))
+
     def test_forged_commit_graph_parent_does_not_accept_sibling(self):
         ancestor = self.two_commit_base()
         result = self.invoke(env={'CODEX_RESET_TO': ancestor, 'CODEX_DIVERGE': '1',
@@ -283,6 +354,133 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertTrue(graph.is_file())
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertEqual(json.loads(self.output.read_text())['status'], 'blocked')
+
+    def test_linked_worktree_gitdir_redirect_is_blocked(self):
+        primary = self.repo
+        linked = self.root / 'linked'
+        git(primary, 'worktree', 'add', '-q', '-b', 'linked', str(linked))
+        self.repo = linked
+        approved_gitdir = git(linked, 'rev-parse', '--absolute-git-dir')
+        result = self.invoke(env={'CODEX_REDIRECT_GITDIR': '1',
+                                  'CODEX_PRIMARY_REPO': str(primary),
+                                  'CODEX_SHADOW_REPO': str(self.root / 'shadow')})
+        self.assertNotEqual(git(linked, 'rev-parse', '--absolute-git-dir'), approved_gitdir)
+        self.assertEqual(git(primary, 'rev-parse', 'refs/heads/linked'), self.base)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(self.output.read_text())['status'], 'blocked')
+
+    def test_linked_worktree_common_dir_redirect_is_blocked(self):
+        primary = self.repo
+        linked = self.root / 'linked'
+        git(primary, 'worktree', 'add', '-q', '-b', 'linked', str(linked))
+        self.repo = linked
+        approved_gitdir = git(linked, 'rev-parse', '--absolute-git-dir')
+        approved_common = git(linked, 'rev-parse', '--git-common-dir')
+        result = self.invoke(env={'CODEX_REDIRECT_COMMON_DIR': '1',
+                                  'CODEX_PRIMARY_REPO': str(primary),
+                                  'CODEX_SHADOW_REPO': str(self.root / 'shadow')})
+        self.assertEqual(git(linked, 'rev-parse', '--absolute-git-dir'), approved_gitdir)
+        self.assertNotEqual(git(linked, 'rev-parse', '--git-common-dir'), approved_common)
+        self.assertEqual(git(primary, 'rev-parse', 'refs/heads/linked'), self.base)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(self.output.read_text())['status'], 'blocked')
+
+    def test_gitdir_redirect_at_same_head_suppresses_fallback(self):
+        primary = self.repo
+        linked = self.root / 'linked'
+        git(primary, 'worktree', 'add', '-q', '-b', 'linked', str(linked))
+        self.repo = linked
+        capture = self.root / 'fallback-prompt.txt'
+        result = self.invoke(env={'CODEX_REDIRECT_GITDIR': '1',
+                                  'CODEX_SHADOW_NO_COMMIT': '1',
+                                  'CODEX_PRIMARY_REPO': str(primary),
+                                  'CODEX_SHADOW_REPO': str(self.root / 'shadow'),
+                                  'CODEX_EXIT': '7',
+                                  'CAPTURE_CLAUDE_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertFalse(capture.exists())
+
+    def test_worktree_config_redirect_does_not_hide_dirty_original(self):
+        shadow = self.root / 'shadow-worktree'
+        result = self.invoke(env={'CODEX_ACTION': 'updated', 'CODEX_COMMIT': '1',
+                                  'CODEX_WORKTREE_REDIRECT': str(shadow)})
+        self.assertEqual(git(self.repo, 'rev-parse', '--show-toplevel'),
+                         str(shadow.resolve()))
+        self.assertEqual(git(self.repo, 'status', '--porcelain'), '')
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'dirty original\n')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(self.output.read_text())['status'], 'blocked')
+
+    def test_worktree_config_redirect_at_same_head_suppresses_fallback(self):
+        capture = self.root / 'fallback-prompt.txt'
+        result = self.invoke(env={'CODEX_WORKTREE_REDIRECT': str(self.root / 'shadow-worktree'),
+                                  'CODEX_EXIT': '7', 'CAPTURE_CLAUDE_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertFalse(capture.exists())
+
+    def test_forged_index_stat_does_not_hide_dirty_descendant(self):
+        result = self.invoke(env={'CODEX_ACTION': 'updated', 'CODEX_COMMIT': '1',
+                                  'CODEX_DIRTY_AFTER_COMMIT': '1',
+                                  'CODEX_FORGE_INDEX_STAT': '1'})
+        self.assertEqual(git(self.repo, 'status', '--porcelain'), '')
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'new dirty edit\n')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'needs-main-commit')
+        self.assertTrue(report['dirty'])
+        self.assertEqual(report['commits'], 1)
+
+    def test_forged_index_stat_after_failed_model_suppresses_fallback(self):
+        capture = self.root / 'fallback-prompt.txt'
+        result = self.invoke(env={'CODEX_ACTION': 'changed', 'CODEX_FORGE_INDEX_STAT': '1',
+                                  'CODEX_EXIT': '7', 'CAPTURE_CLAUDE_PROMPT': str(capture)})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'blocked')
+        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertFalse(capture.exists())
+
+    def test_staged_only_edit_with_clean_worktree_needs_main_commit(self):
+        result = self.invoke(env={'CODEX_ACTION': 'updated', 'CODEX_COMMIT': '1',
+                                  'CODEX_STAGE_AND_RESTORE': '1'})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['status'], 'needs-main-commit')
+        self.assertEqual(report['commits'], 1)
+        self.assertEqual(git(self.repo, 'show', ':app.txt'), 'staged value')
+        self.assertEqual((self.repo / 'app.txt').read_text(), 'updated\n')
+
+    def test_clean_inspection_does_not_refresh_source_index(self):
+        tracked = self.repo / 'app.txt'
+        info = tracked.stat()
+        os.utime(tracked, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+        index = self.repo / '.git/index'
+        before = index.read_bytes()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(self.output.read_text())['status'], 'blocked')
+        self.assertEqual(index.read_bytes(), before)
+
+    def test_private_inspection_does_not_create_shared_index(self):
+        git(self.repo, 'config', 'core.splitIndex', 'true')
+        git(self.repo, 'update-index', '--split-index')
+        gitdir = self.repo / '.git'
+        index_before = (gitdir / 'index').read_bytes()
+        shared_before = {path.name: path.read_bytes()
+                         for path in gitdir.glob('sharedindex.*')}
+        self.assertTrue(shared_before)
+        result = self.invoke()
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(self.output.read_text())['status'], 'blocked')
+        self.assertEqual((gitdir / 'index').read_bytes(), index_before)
+        self.assertEqual({path.name: path.read_bytes()
+                          for path in gitdir.glob('sharedindex.*')}, shared_before)
 
     def test_dirty_descendant_commit_still_needs_main_commit(self):
         result = self.invoke(env={'CODEX_ACTION': 'updated', 'CODEX_COMMIT': '1',
