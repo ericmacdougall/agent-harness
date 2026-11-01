@@ -2,6 +2,7 @@
 """Rerun a test command when source files change; no extra dependencies."""
 
 import argparse
+import importlib.util
 import os
 import stat
 import subprocess
@@ -9,8 +10,25 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'hooks'))
-from process import run as run_process
+
+def load_process_runner():
+    """Load only the helper belonging to this supported installation layout."""
+    directory = Path(__file__).resolve().parent
+    if directory.name == 'agent-harness':
+        helper = directory / 'process.py'
+    elif directory.name == 'tools':
+        helper = directory.parent / 'hooks' / 'process.py'
+    else:
+        raise ImportError('Unsupported Agent Harness watcher layout')
+    # A named import could reuse an unrelated sys.modules entry or load a
+    # sibling hooks directory in Codex, where helpers live beside the watcher.
+    spec = importlib.util.spec_from_file_location('_agent_harness_watch_process', helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.run
+
+
+run_process = load_process_runner()
 
 
 SKIP = {'.git', '.claude', 'node_modules', 'vendor', '.venv', 'venv', 'dist', 'build',
