@@ -316,6 +316,26 @@ class CodexInstallerTests(unittest.TestCase):
             first = json.loads((backups[0] / 'manifest.json').read_text())
             self.assertEqual({Path(item['path']).name for item in first}, {'AGENTS.md', 'hooks.json', 'config.toml'})
 
+    def test_delivery_workflow_dependency_closure_starts_without_claude_or_source_imports(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            install(home, apply=True)
+            harness = home / '.codex' / 'agent-harness'
+            required = ('deliver.py', 'github_identity.py', 'process.py', 'git_safety.py',
+                        'report_file.py', 'publish_feature.py', 'integrate_local.py')
+            for name in required:
+                target = harness / name
+                self.assertTrue(target.is_file(), f'{name} was not installed')
+                self.assertEqual(target.read_bytes(), (ROOT / 'harness' / 'hooks' / name).read_bytes())
+            self.assertFalse((home / '.claude').exists())
+            environment = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+            environment.update(HOME=str(home), PYTHONNOUSERSITE='1')
+            result = subprocess.run([sys.executable, str(harness / 'deliver.py'), '--help'],
+                                    cwd=home, env=environment, text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('prepare', result.stdout)
+            self.assertIn('finish', result.stdout)
+
     def test_existing_policy_is_not_overridden(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary).resolve()
