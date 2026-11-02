@@ -257,6 +257,9 @@ def main():
     print('\n'.join(changes))
     if not args.apply:
         print('Run with --apply after reviewing the paths. Existing agent permissions are not modified.')
+    installed = args.home.expanduser().resolve() / '.agent-harness/tui-plugin/plugin/launcher.py'
+    print('Local stdio command: ' + shlex.join([sys.executable, str(installed), 'serve']))
+    print('For Codex, register that absolute command with: codex mcp add harness-tui -- COMMAND ARGS')
     print('Client/plugin activation and unpacked browser-extension activation are separate; see docs/tui-plugin.md.')
     return 0
 

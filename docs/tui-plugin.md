@@ -50,12 +50,30 @@ codex plugin marketplace add "$HOME/.agent-harness/tui-plugin"
 codex plugin add harness-tui@agent-harness-local
 ```
 
+This registers the skill package. A successful plugin registration does not
+prove that its MCP server is active. On the tested Codex app-server, register
+the installed absolute stdio command as well, using the Python path printed by
+the installer:
+
+```sh
+codex mcp add harness-tui -- /absolute/path/to/python3 "$HOME/.agent-harness/tui-plugin/plugin/launcher.py" serve
+```
+
+`codex mcp list` verifies configuration; actual runtime discovery should show
+server `agent-harness-tui` and tool `open_tui`. The qualified route uses the
+installer's absolute paths, not untested raw-source variable expansion.
+
 For Claude Code:
 
 ```sh
 claude plugin marketplace add "$HOME/.agent-harness/tui-plugin" --scope user
 claude plugin install harness-tui@agent-harness-local --scope user
+claude mcp list
 ```
+
+The tested Claude Code native plugin route reports
+`plugin:harness-tui:harness-tui` as connected. Avoid also adding a duplicate
+standalone server when that plugin route is healthy.
 
 Start a new client session after activation. Use the `open-tui` skill or ask
 "Open the Go TUI with this conversation as a reference." Client tool approval
