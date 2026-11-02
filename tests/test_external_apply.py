@@ -47,6 +47,138 @@ class ExternalApply(unittest.TestCase):
                                 '--resolve-journal', key, '--check', fixtures.CHECK, '--timeout', '15',
                                 env=self.env, check=False)
 
+    def test_prevalidation_preserves_settled_and_pending_journal_placement(self):
+        target = self.target()
+        with patch.dict(os.environ, self.env, clear=True), self.scope() as scope:
+            settled = scope.reserve_external(base=self.base, target=self.base, task_digest='b' * 64)
+            settled = scope.complete_external(settled)
+            guard = scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+            self.ff(target)
+            # Model the durable resolved-write / archive boundary of another
+            # attempt. A preflight must leave even settled active state in place.
+            active = settled.journal.parent.parent.parent / 'active' / settled.key
+            settled.journal.parent.rename(active)
+            before = {str(path.relative_to(scope.root)): path.read_bytes()
+                      for path in scope.root.rglob('journal.json')}
+            # This old-API control exposes the unsafe implementation shortcut:
+            # completion validates, but it also resolves and archives evidence.
+            validator = getattr(scope, 'validate_external', scope.complete_external)
+            validator(guard)
+            after = {str(path.relative_to(scope.root)): path.read_bytes()
+                     for path in scope.root.rglob('journal.json')}
+            self.assertEqual(before, after)
+            self.assertEqual(integration.read_journal(guard.journal.parent)['phase'], 'applying')
+
+    def test_prevalidation_rejects_closed_foreign_dirty_and_moved_pin(self):
+        target = self.target()
+        with patch.dict(os.environ, self.env, clear=True), self.scope() as scope:
+            guard = scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+            self.ff(target)
+            foreign = integration.ExternalApplyGuard(object(), guard.journal.parent, guard.record)
+            with self.assertRaises(integration.ExternalApplyError):
+                scope.validate_external(foreign)
+            tracked = self.original / 'app.txt'
+            original = tracked.read_bytes()
+            tracked.write_text('dirty target\n')
+            with self.assertRaises(integration.ExternalApplyError):
+                scope.validate_external(guard)
+            tracked.write_bytes(original)
+            fixtures.command('git', 'update-ref', guard.ref, self.base, target,
+                             cwd=self.original, env=self.env)
+            with self.assertRaises(integration.ExternalApplyError):
+                scope.validate_external(guard)
+            fixtures.command('git', 'update-ref', guard.ref, target, self.base,
+                             cwd=self.original, env=self.env)
+            self.assertIs(scope.validate_external(guard), guard)
+        with self.assertRaises(integration.ExternalApplyError):
+            scope.validate_external(guard)
+
+    def test_prevalidation_rejects_same_bytes_replacement_and_late_content_change(self):
+        target = self.target()
+        with patch.dict(os.environ, self.env, clear=True), self.scope() as scope:
+            guard = scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+            self.ff(target)
+            before = guard.journal.read_bytes()
+            guard.journal.unlink()
+            guard.journal.write_bytes(before)
+            guard.journal.chmod(0o600)
+            with self.assertRaises(integration.ExternalApplyError):
+                scope.validate_external(guard)
+            loaded = scope.load_external(guard.key, TASK)
+            self.assertIs(scope.validate_external(loaded), loaded)
+            scan = integration._scan_journals
+
+            def mutate_after_scan(*args, **kwargs):
+                result = scan(*args, **kwargs)
+                changed = loaded.record
+                changed['phase'] = 'reserved'
+                integration.write_journal(loaded.journal.parent, changed)
+                return result
+
+            with patch.object(integration, '_scan_journals', side_effect=mutate_after_scan):
+                with self.assertRaises(integration.ExternalApplyError):
+                    scope.validate_external(loaded)
+            self.assertEqual(integration.read_journal(loaded.journal.parent)['phase'], 'reserved')
+
+    def test_prevalidation_refuses_other_barrier_and_operator_resolution(self):
+        target = self.target()
+        with patch.dict(os.environ, self.env, clear=True):
+            with self.scope() as scope:
+                other = scope.reserve_external(base=self.base, target=self.base, task_digest='b' * 64)
+                other = scope.complete_external(other)
+                guard = scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+                self.ff(target)
+                active = other.journal.parent.parent.parent / 'active' / other.key
+                other.journal.parent.rename(active)
+                pending = other.record
+                for name in ('resolved_by', 'resolved_head', 'previous_phase'):
+                    pending.pop(name)
+                pending['phase'] = 'applying'
+                integration.write_journal(active, pending)
+                before = guard.journal.read_bytes()
+                with self.assertRaises(integration.ExternalApplyError) as caught:
+                    scope.validate_external(guard)
+                self.assertEqual(caught.exception.journal, active / 'journal.json')
+                self.assertEqual(guard.journal.read_bytes(), before)
+            # Operator recovery is deliberately not a workflow completion proof.
+            self.assertEqual(self.resolve(other.key).returncode, 0)
+            self.assertEqual(self.resolve(guard.key).returncode, 0)
+            with self.scope() as scope:
+                resolved = scope.load_external(guard.key, TASK)
+                before = resolved.journal.read_bytes()
+                with self.assertRaises(integration.ExternalApplyError):
+                    scope.validate_external(resolved)
+                self.assertEqual(resolved.journal.read_bytes(), before)
+
+    def test_prevalidation_does_not_recreate_missing_namespace(self):
+        target = self.target()
+        with patch.dict(os.environ, self.env, clear=True), self.scope() as scope:
+            guard = scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+            self.ff(target)
+            archive = guard.journal.parent.parent.parent / 'archive'
+            archive.rmdir()
+            before = guard.journal.read_bytes()
+            with self.assertRaises(integration.ExternalApplyError):
+                scope.validate_external(guard)
+            self.assertFalse(archive.exists())
+            self.assertEqual(guard.journal.read_bytes(), before)
+
+    def test_read_only_load_refuses_missing_archive_without_recreating_it(self):
+        target = self.target()
+        with patch.dict(os.environ, self.env, clear=True), self.scope() as scope:
+            guard = scope.reserve_external(base=self.base, target=target, task_digest=TASK)
+            archive = guard.journal.parent.parent.parent / 'archive'
+            archive.rmdir()
+            before = guard.journal.read_bytes()
+            with self.assertRaises(integration.ExternalApplyError):
+                scope.load_external(guard.key, TASK, create=False)
+            self.assertFalse(archive.exists())
+            self.assertEqual(guard.journal.read_bytes(), before)
+            loaded = scope.load_external(guard.key, TASK)
+            self.assertTrue(archive.is_dir())
+            self.assertEqual(loaded.record, guard.record)
+            self.assertEqual(guard.journal.read_bytes(), before)
+
     def test_unprotected_failed_check_control_can_claim_already_integrated(self):
         # This is the control: clean advanced HEAD alone cannot prove a passed check.
         target = self.target()

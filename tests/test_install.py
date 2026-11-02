@@ -504,6 +504,20 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('prepare', result.stdout)
         self.assertIn('finish', result.stdout)
 
+    def test_installed_usage_guard_starts_without_source_imports(self):
+        install(self.home, apply=True)
+        helper = self.claude / 'hooks' / 'usage_guard.py'
+        self.assertTrue(helper.is_file(), 'Usage guard was not installed')
+        self.assertEqual(helper.read_bytes(), (ROOT / 'harness/hooks/usage_guard.py').read_bytes())
+        state = self.home / 'owned-usage-state'
+        environment = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+        environment.update(HOME=str(self.home), PYTHONNOUSERSITE='1', AGENT_HARNESS_USAGE_DIR=str(state))
+        result = subprocess.run([sys.executable, str(helper), '--help'], cwd=self.home,
+                                env=environment, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('reconcile', result.stdout)
+        self.assertFalse(state.exists(), 'Help must not create usage state')
+
     def managed_snapshot(self):
         return {str(path.relative_to(self.claude)): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
                 for path in self.claude.rglob('*')
@@ -579,38 +593,76 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
 
     def test_every_managed_write_boundary_rolls_back_to_exact_originals(self):
-        from install import atomic_write, AGENTS, HOOKS, TOOLS
-        total = len(AGENTS) + len(HOOKS) + len(TOOLS) + 2
-        for boundary in range(total):
-            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
-                home = Path(temporary).resolve()
-                claude = home / '.claude'
-                claude.mkdir()
-                (claude / 'CLAUDE.md').write_text('existing instructions\n')
-                (claude / 'settings.json').write_text('{"model":"keep"}\n')
-                before = {path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-                          for path in (claude / 'CLAUDE.md', claude / 'settings.json')}
-                writes = 0
-                fired = False
+        from install import atomic_write
 
-                def fail_at_boundary(path, data, mode=0o600, **kwargs):
-                    nonlocal writes, fired
-                    if 'agent-harness-backups' not in path.parts and not fired:
-                        if writes == boundary and not fired:
-                            fired = True
-                            raise OSError('fixture: interrupted managed write')
-                        writes += 1
-                    return atomic_write(path, data, mode, **kwargs)
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            claude = home / '.claude'
+            claude.mkdir()
+            planned = [Path(path) for path in install(home, apply=False)]
+            observed = []
 
-                with patch('install.atomic_write', side_effect=fail_at_boundary):
-                    with self.assertRaisesRegex(OSError, 'interrupted managed write'):
-                        install(home, apply=True)
-                self.assertEqual(writes, boundary)
-                self.assertEqual({path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-                                  for path in (claude / 'CLAUDE.md', claude / 'settings.json')}, before)
-                for folder in ('agents', 'hooks', 'tools'):
-                    self.assertEqual(list((claude / folder).iterdir()) if (claude / folder).exists() else [], [])
-                self.assertFalse(list(claude.rglob('.agent-harness-*')))
+            def record_write(path, data, mode=0o600, **kwargs):
+                if 'agent-harness-backups' not in path.relative_to(claude).parts:
+                    observed.append(path)
+                return atomic_write(path, data, mode, **kwargs)
+
+            with patch('install.atomic_write', side_effect=record_write):
+                install(home, apply=True)
+            self.assertEqual(observed, planned)
+            self.assertEqual(len(observed), len(set(observed)))
+            relative_plan = [path.relative_to(claude) for path in observed]
+        fired_boundaries = set()
+        for existing in (False, True):
+            for boundary, destination in enumerate(relative_plan):
+                with self.subTest(existing=existing, boundary=boundary, destination=str(destination)), \
+                        tempfile.TemporaryDirectory() as temporary:
+                    home = Path(temporary).resolve()
+                    claude = home / '.claude'
+                    claude.mkdir()
+                    if existing:
+                        for index, relative in enumerate(relative_plan):
+                            path = claude / relative
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_text('Original managed file: ' + str(relative) + '\n')
+                            path.chmod(0o600 if index % 2 else 0o640)
+                    (claude / 'CLAUDE.md').write_text('existing instructions\n')
+                    (claude / 'settings.json').write_text('{"model":"keep"}\n')
+                    foreign = claude / 'foreign.txt'
+                    foreign.write_text('unrelated user data\n')
+                    foreign.chmod(0o640)
+
+                    def snapshot():
+                        return {str(path.relative_to(claude)):
+                                (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                                for path in claude.rglob('*')
+                                if path.is_file() and 'agent-harness-backups' not in path.parts}
+
+                    before = snapshot()
+                    writes = []
+                    fired = False
+
+                    def fail_at_boundary(path, data, mode=0o600, **kwargs):
+                        nonlocal fired
+                        if 'agent-harness-backups' not in path.parts and not fired:
+                            relative = path.relative_to(claude)
+                            self.assertEqual(relative, relative_plan[len(writes)])
+                            if len(writes) == boundary:
+                                fired = True
+                                fired_boundaries.add((existing, relative))
+                                raise OSError('fixture: interrupted managed write')
+                            writes.append(relative)
+                        return atomic_write(path, data, mode, **kwargs)
+
+                    with patch('install.atomic_write', side_effect=fail_at_boundary):
+                        with self.assertRaisesRegex(OSError, 'interrupted managed write'):
+                            install(home, apply=True)
+                    self.assertTrue(fired, 'planned failure boundary never executed')
+                    self.assertEqual(len(writes), boundary)
+                    self.assertEqual(snapshot(), before)
+                    self.assertFalse(list(claude.rglob('.agent-harness-*')))
+        self.assertEqual(fired_boundaries,
+                         {(existing, relative) for existing in (False, True) for relative in relative_plan})
 
     def test_swapped_ancestor_at_each_write_stage_cannot_redirect_install(self):
         from install import atomic_write

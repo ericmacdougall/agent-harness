@@ -2,6 +2,12 @@
 
 This page separates observed behavior from intended workflow. Source fixtures and private Claude transcripts are not published.
 
+## Usage-guard validation requirements
+
+Current release evidence belongs in the exact-head PR/private receipts with commands, observed counts, outcomes and limits. Historical results below do not validate later changes. For the usage guard, required focused controls cover structured provider errors overriding apparent success, bounded calls/cooldowns and packet limits, stage separation, declared input drift, nonvacuous terminal test results, gate/reuse identity, low-disk zero-launch behavior, start/final handoff, unknown/interrupted reconciliation, private-file tamper/alias/concurrency refusal and both installed dependency closures. Provider regression fixtures are synthetic and make no paid calls. Actual supervisor/installer smoke proofs and final full evidence are reported separately; no statistical reliability is inferred from deterministic cases.
+
+The workflow obtains independent code inspection before stable full validation, freezes runtime inputs/docs, runs required full validation once, then obtains fresh exact-head PR evidence review. Late counts belong in release receipts so updating this page does not itself invalidate the reviewed subject.
+
 ## Automated checks in this repository
 
 Run `python3 -m unittest discover -s tests -v` and `python3 -m compileall -q install.py install_codex.py harness tests`. The tests exercise guarded feature publication, rejected protected/stale pushes, a credential prompt under a real pseudo-terminal and a stalled local pre-push hook (both must return `BLOCKED_REMOTE` instead of hanging), merge conflict and failed-check rollback, dirty-checkout preservation, rejection of a subdirectory or unparseable check before any merge, installer preservation/idempotence/symlink refusal, tolerance of foreign hooks with empty `args`, private backup directories, and private WAL metadata including `.`/`..` session identifiers. The tests isolate Git from user and system configuration. CI is configured to run them on Ubuntu and macOS with Python 3.10 and the latest 3.x. Local remote fixtures use bare repositories and Git hooks, without network listeners. The terminal reader drains output even when it observes process exit before the output becomes readable. These are deterministic helper checks, not proof that an autonomous agent follows the whole workflow.

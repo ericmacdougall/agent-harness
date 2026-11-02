@@ -280,15 +280,16 @@ def main():
     return integrate_scratch(args, preparations, checks)
 
 
-def private_directory(path):
+def private_directory(path, *, create=True):
     if path.is_symlink():
         raise OSError('private scratch path is a symlink')
     created = False
-    try:
-        path.mkdir(mode=0o700)
-        created = True
-    except FileExistsError:
-        pass
+    if create:
+        try:
+            path.mkdir(mode=0o700)
+            created = True
+        except FileExistsError:
+            pass
     info = os.stat(path, follow_symlinks=False)
     if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
             or stat.S_IMODE(info.st_mode) != 0o700):
@@ -358,14 +359,14 @@ def scope_key(identity, branch):
     return hashlib.sha256(f'{identity[0]}\0{identity[1]}\0{branch}'.encode()).hexdigest()
 
 
-def scope_directory(root, identity, branch):
+def scope_directory(root, identity, branch, *, create=True):
     scopes = root / 'scopes'
-    private_directory(scopes)
+    private_directory(scopes, create=create)
     key = scope_key(identity, branch)
     scope = scopes / key
-    private_directory(scope)
+    private_directory(scope, create=create)
     for name in ('active', 'archive'):
-        private_directory(scope / name)
+        private_directory(scope / name, create=create)
     return scope
 
 
@@ -675,10 +676,11 @@ def scan_journals(root, repo, identity, branch, key, timeout):
     return _scan_journals(root, repo, identity, branch, key, timeout)
 
 
-def _scan_journals(root, repo, identity, branch, key, timeout, *, completing_guard=None):
+def _scan_journals(root, repo, identity, branch, key, timeout, *, completing_guard=None,
+                   archive_settled=True):
     """Inspect bounded active state; archived history is an exact-key lookup."""
     deadline = time.monotonic() + min(timeout, JOURNAL_SCAN_SECONDS)
-    scope = scope_directory(root, identity, branch)
+    scope = scope_directory(root, identity, branch, create=archive_settled)
     exact = None
     count = 0
     # Schema 1 is a fixed legacy namespace: new attempts never add to it.
@@ -708,7 +710,7 @@ def _scan_journals(root, repo, identity, branch, key, timeout, *, completing_gua
                 return entry, record, None
             if entry.name == key and record['phase'] == 'delivered':
                 exact = (entry, record)
-            if record['schema'] in (2, 3):
+            if archive_settled and record['schema'] in (2, 3):
                 archived = archive_journal(entry)
                 if exact is not None and exact[0] == entry:
                     exact = (archived, record)
@@ -950,6 +952,21 @@ class ExternalApplyGuard:
         self._owner = owner
         self._directory = directory
         self._record = dict(record)
+        self._location = self._location_signature()
+
+    def _location_signature(self):
+        signature = []
+        for path in (self._directory, self.journal):
+            info = os.stat(path, follow_symlinks=False)
+            signature.append((info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                              info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+        return tuple(signature)
+
+    def _location_is_current(self):
+        try:
+            return self._location_signature() == self._location
+        except OSError:
+            return False
 
     @property
     def key(self):
@@ -1149,13 +1166,14 @@ class OriginalScope:
                                      target=record.get('target') if record else None,
                                      reservation_started=reservation_started) from None
 
-    def load_external(self, key, task_digest):
+    def load_external(self, key, task_digest, *, create=True):
+        """Load a guard, optionally refusing missing namespaces without repair."""
         directory = None
         try:
             self._assert_current()
             if not hex_identity(key, 64) or not hex_identity(task_digest, 64):
                 raise OSError('invalid guard selection')
-            scope = scope_directory(self.root, self.identity, self.branch)
+            scope = scope_directory(self.root, self.identity, self.branch, create=create)
             found = [scope / area / key for area in ('active', 'archive')
                      if os.path.lexists(scope / area / key)]
             if len(found) != 1:
@@ -1171,15 +1189,15 @@ class OriginalScope:
             raise ExternalApplyError('External apply guard could not be verified',
                                      journal=directory / 'journal.json' if directory else None) from None
 
-    def complete_external(self, guard):
+    def _validated_external(self, guard, *, archive_settled):
         if not isinstance(guard, ExternalApplyGuard) or guard._owner is not self:
             raise ExternalApplyError('External apply guard belongs to another context')
         directory = guard.journal.parent
         try:
             self._assert_current()
             record = read_journal(directory)
-            scope = scope_directory(self.root, self.identity, self.branch)
-            if (record != guard.record or record.get('schema') != 3
+            scope = scope_directory(self.root, self.identity, self.branch, create=archive_settled)
+            if (not guard._location_is_current() or record != guard.record or record.get('schema') != 3
                     or directory.parent not in {scope / 'active', scope / 'archive'}
                     or (record['original_dev'], record['original_ino']) != self.identity
                     or record['branch'] != self.branch or record['object_format'] != self.object_format
@@ -1189,16 +1207,34 @@ class OriginalScope:
                 raise OSError('external apply completion state changed')
             blocking, blocked, _ = _scan_journals(self.root, self.repo, self.identity,
                                                 self.branch, guard.key, self.timeout,
-                                                completing_guard=guard)
+                                                completing_guard=guard,
+                                                archive_settled=archive_settled)
             if blocking is not None:
                 raise ExternalApplyError('Another original recovery barrier requires inspection',
                                          journal=blocking / 'journal.json',
                                          ref=blocked.get('ref') if blocked else None,
                                          target=blocked.get('target') if blocked else None)
             self._assert_current()
-            if (not checked_original(self.repo, self.branch, guard.target, self.timeout)
+            if (not guard._location_is_current() or read_journal(directory) != record
+                    or not checked_original(self.repo, self.branch, guard.target, self.timeout)
                     or external_pin_state(self.repo, record, self.timeout) != ('matches_target', True)):
                 raise OSError('external apply changed during recovery scan')
+            return directory, record
+        except ExternalApplyError:
+            raise
+        except (IndexInspectionError, OSError, subprocess.TimeoutExpired):
+            raise ExternalApplyError('External apply remains subject to recovery inspection',
+                                     journal=directory / 'journal.json', ref=guard.ref,
+                                     target=guard.target) from None
+
+    def validate_external(self, guard):
+        """Verify a live guard without changing any journal content or placement."""
+        self._validated_external(guard, archive_settled=False)
+        return guard
+
+    def complete_external(self, guard):
+        directory, record = self._validated_external(guard, archive_settled=True)
+        try:
             if record['phase'] != 'resolved':
                 record.update(phase='resolved', previous_phase=record['phase'],
                               resolved_by='workflow', resolved_head=guard.target)

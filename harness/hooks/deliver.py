@@ -29,7 +29,7 @@ from git_safety import git_environment, require_safe_source
 from integrate_local import (ALLOWED_GIT_ENV, ExternalApplyError, OriginalScope,
                              acquire_scope_lock, approved_check, approved_prepare,
                              checkout_identity, git_common_directory, journal_key,
-                             private_directory, read_journal, run as run_check,
+                             fsync_directory, private_directory, read_journal, run as run_check,
                              scope_key, valid_identity_text, write_journal)
 from process import cleanup_discarded
 
@@ -404,14 +404,17 @@ class Workflow:
         return self.state
 
     def save(self, **changes):
-        self.assert_context()
-        if (self._pointer() != self.generation
-                or private_json(self.directory / "journal.json") != self.state):
-            raise DeliveryError("RECOVERY_REQUIRED", "Workflow generation or state changed during delivery")
+        self.assert_state()
         value = {**self.state, **changes}
         self.validate_state(value)
         write_journal(self.directory, value)
         self.state = value
+
+    def assert_state(self):
+        self.assert_context()
+        if (self._pointer() != self.generation
+                or private_json(self.directory / "journal.json") != self.state):
+            raise DeliveryError("RECOVERY_REQUIRED", "Workflow generation or state changed during delivery")
 
     def facts(self):
         return {"generation": self.generation, "state": str(self.directory / "journal.json"),
@@ -894,6 +897,129 @@ def verify_remote_descendant(flow, url, target, *, observed=None):
     return observed
 
 
+def resume_binding(flow):
+    """Pin the unchanged workflow files as well as their parsed metadata."""
+    flow.assert_state()
+    directories = (flow.root / "generations", flow.directory)
+    files = (flow.root / "journal.json", flow.directory / "journal.json")
+    return (tuple((info.st_dev, info.st_ino) for info in (path.lstat() for path in directories)),
+            tuple((info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink,
+                   info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                  for info in (path.lstat() for path in files)))
+
+
+def resume_executor():
+    """Record the followup executor without rewriting historical source bindings."""
+    hooks = Path(__file__).resolve().parent
+    names = ("deliver.py", "integrate_local.py", "process.py", "git_safety.py")
+    observed = {name: (hooks / name).read_bytes() for name in names}
+    revision = None
+    if hooks.name == "hooks" and hooks.parent.name == "harness":
+        repo = hooks.parent.parent
+        code, top = git(repo, "rev-parse", "--show-toplevel")
+        if code == 0 and Path(top.strip()).resolve() == repo:
+            head = git_value(repo, "rev-parse", "--verify", "HEAD^{commit}")
+            storage = git_value(repo, "rev-parse", "--show-object-format")
+            code, tree = git(repo, "ls-tree", "-z", head, "--", *("harness/hooks/" + name for name in names))
+            tracked = {}
+            for entry in tree.split("\0"):
+                if entry:
+                    metadata, path = entry.split("\t", 1)
+                    mode, kind, oid = metadata.split()
+                    if mode in {"100644", "100755"} and kind == "blob":
+                        tracked[path] = oid
+            algorithm = {"sha1": hashlib.sha1, "sha256": hashlib.sha256}.get(storage)
+            # Git blob IDs bind raw bytes, independently of index flags or
+            # repository clean/textconv filters. HEAD alone proves no content.
+            if (code == 0 and algorithm is not None and all(
+                    stat.S_ISREG((hooks / name).lstat().st_mode)
+                    and tracked.get("harness/hooks/" + name) == algorithm(
+                        b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
+                    and (hooks / name).read_bytes() == data for name, data in observed.items())
+                    and git_value(repo, "rev-parse", "--verify", "HEAD^{commit}") == head):
+                revision = head
+    return {"protocol": "remote-resume-v1", "revision": revision,
+            "helpers_sha256": {name: hashlib.sha256(data).hexdigest() for name, data in observed.items()}}
+
+
+def resume_remote_finish(flow, preparations, checks):
+    """Resume only the same pending transaction already at its pinned target."""
+    args, state = flow.args, flow.state
+    digest = checks_digest(preparations, checks)
+    if (state["phase"] != "REMOTE_APPLYING" or state["guard_key"] is None
+            or state["checks_digest"] != digest or state["local_key"] is not None
+            or any(state[name] is None for name in ("target", "merge_head", "apply_base", "pr_number"))):
+        raise recovery_error(flow, "Resume requires the exact pending remote transaction",
+                             state["apply_base"] or state["baseline"])
+    with OriginalScope(flow.original, flow.branch, args.timeout) as scope:
+        guard = scope.load_external(state["guard_key"], task_generation_digest(flow), create=False)
+        if (guard.record["phase"] not in {"reserved", "applying"}
+                or guard.target != state["target"] or guard.base != state["apply_base"]
+                or not ancestry(flow.original, state["baseline"], guard.base)):
+            raise recovery_error(flow, "Resume guard does not match the pending transaction",
+                                 state["apply_base"], journal=guard.journal)
+        binding = resume_binding(flow)
+
+        def revalidate():
+            if (resume_binding(flow) != binding
+                    or kit_digest(args.kit_file) != state["kit_digest"]):
+                raise recovery_error(flow, "Resume workflow or run kit changed", state["apply_base"])
+            scope.validate_external(guard)
+
+        revalidate()
+        repository, url = origin_destination(flow.original)
+        if repository != state["repository"]:
+            raise DeliveryError("BLOCKED_POLICY", "Original repository changed since prepare", code=2)
+        pr = verify_remote_pr(flow)
+        merge = pr.get("mergeCommit")
+        if (pr["state"] != "MERGED" or not isinstance(merge, dict)
+                or merge.get("oid") != state["merge_head"]):
+            raise recovery_error(flow, "Merged PR proof does not match the pending transaction", state["apply_base"])
+        fetch_target(flow, url, state["target"])
+        if not ancestry(flow.original, state["merge_head"], state["target"]):
+            raise recovery_error(flow, "Merged PR is absent from the pinned target", state["apply_base"])
+        verify_remote_descendant(flow, url, state["target"])
+        revalidate()
+        attempts = flow.directory / "resumes"
+        private_directory(attempts)
+        attempt = attempts / secrets.token_hex(16)
+        attempt.mkdir(mode=0o700)
+        fsync_directory(attempts)
+        start = {"schema": 1, "kind": "delivery_resume", "generation": flow.generation,
+                 "guard_key": guard.key, "target": guard.target, "checks_digest": digest,
+                 "kit_digest": state["kit_digest"], "reason": args.resume_reason,
+                 "executor": resume_executor()}
+        private_directory(attempt / "start")
+        write_journal(attempt / "start", start, first=True)
+        try:
+            revalidate()
+            run_checks(flow.original, preparations, checks, args.timeout)
+            revalidate()
+            if origin_destination(flow.original)[0] != state["repository"]:
+                raise DeliveryError("BLOCKED_POLICY", "Original repository changed after checks", code=2)
+            final_pr = verify_remote_pr(flow)
+            final_merge = final_pr.get("mergeCommit")
+            if (final_pr["state"] != "MERGED" or not isinstance(final_merge, dict)
+                    or final_merge.get("oid") != state["merge_head"]):
+                raise DeliveryError("RECHECK_REQUIRED", "Merged PR proof changed after resume checks")
+            observed = verify_remote_descendant(flow, url, state["target"])
+            revalidate()
+            guard = scope.complete_external(guard)
+            revalidate()
+            flow.complete("remote", state["target"], digest)
+        except (DeliveryError, ExternalApplyError, OSError, subprocess.TimeoutExpired):
+            # An incomplete attempt is evidence for diagnosis, never cached success.
+            raise recovery_error(flow, "Resume did not complete; preserved transaction requires inspection",
+                                 state["apply_base"], journal=guard.journal) from None
+        private_directory(attempt / "final")
+        write_journal(attempt / "final", {"schema": 1, "kind": "delivery_resume_result",
+                      "generation": flow.generation, "status": "DELIVERED", "target": state["target"]}, first=True)
+        report("DELIVERED", "Pending remote delivery passed fresh checks at its pinned target",
+               head=state["target"], receipt=str(flow.receipt), resume_record=str(attempt / "final" / "journal.json"),
+               remote_observed_head=observed, **flow.facts())
+        return 0
+
+
 def remote_finish(flow, preparations, checks):
     args, state = flow.args, flow.state
     if state["phase"] not in {"PR_READY", "REMOTE_APPLYING"}:
@@ -1085,6 +1211,8 @@ def finish(args):
             raise DeliveryError("BLOCKED_POLICY", "Run kit changed since prepare", code=2)
         if args.resolve_baseline is not None:
             return resolve_baseline(flow, preparations, checks)
+        if args.resume:
+            return resume_remote_finish(flow, preparations, checks)
         old = flow.completed()
         if old is not None:
             if old["mode"] != args.mode:
@@ -1224,9 +1352,20 @@ def parse_args():
     finish_mode.add_argument("--resolve-baseline", help="Accept only this full clean tested HEAD; never delivery")
     end.add_argument("--check", action="append", default=[])
     end.add_argument("--prepare", action="append", default=[])
+    end.add_argument("--resume", action="store_true", help="Explicitly resume this pending remote delivery at its pinned target")
+    end.add_argument("--resume-reason", help="Bounded private explanation for resuming an interrupted attempt")
     args = parser.parse_args()
     if not 1 <= args.timeout <= 3600:
         parser.error("--timeout must be between 1 and 3600 seconds")
+    if args.phase == "finish":
+        if args.resume and (args.mode != "remote" or not args.generation or args.kit_file is None):
+            parser.error("--resume requires --mode remote, --generation and --kit-file")
+        if args.resume:
+            if (not valid_identity_text(args.resume_reason) or not 1 <= len(args.resume_reason.strip()) <= 512
+                    or any(ord(char) < 32 for char in args.resume_reason)):
+                parser.error("--resume requires a nonempty reason of at most 512 characters without control characters")
+        elif args.resume_reason is not None:
+            parser.error("--resume-reason requires --resume")
     return args
 
 
