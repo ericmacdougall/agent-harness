@@ -141,6 +141,10 @@ class TuiPluginEntryTests(unittest.TestCase):
             self.assertNotIn('touch DO_NOT_EXECUTE', command)
             self.assertEqual(Path(args[3]).stat().st_mode & 0o777, 0o700)
             self.assertNotIn('shell', dispatch.call_args.kwargs)
+            child_env = dispatch.call_args.kwargs.get('env')
+            self.assertIsInstance(child_env, dict)
+            self.assertEqual(child_env['HOME'], folder)
+            self.assertEqual(set(child_env), {'HOME', 'TERM', 'PATH', 'LANG'})
 
     def test_timeout_is_unknown_and_never_automatically_retried(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, HOME=folder):
@@ -161,6 +165,40 @@ class TuiPluginEntryTests(unittest.TestCase):
                                     prepared['reference_file'], '--reference-sha256', prepared['sha256']])
             self.assertNotIn(reference()['body'], ' '.join(argv))
             self.assertFalse((Path(folder) / 'DO_NOT_EXECUTE').exists())
+
+    def test_go_child_environment_excludes_credentials_and_startup_variables(self):
+        forbidden = ('CONTROL_PLANE_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
+                     'GITHUB_TOKEN', 'SSH_AUTH_SOCK', 'BASH_ENV', 'PYTHONPATH', 'HTTP_PROXY')
+        sentinel = 'synthetic-control-only'
+        with tempfile.TemporaryDirectory() as folder, patch.dict(
+                os.environ, {**dict.fromkeys(forbidden, sentinel),
+                             'HOME': folder, 'TERM': 'xterm-256color'}):
+            binary = self.configured(folder)
+            binary.write_text('#!' + sys.executable + '\nimport json,os\nfrom pathlib import Path\n'
+                              'names=' + repr(forbidden + ('HOME', 'TERM', 'PATH', 'LANG')) + '\n'
+                              'Path(os.environ["HOME"],"environment.json").write_text('
+                              'json.dumps({name:os.environ.get(name) for name in names}))\n')
+            prepared = launcher.prepare_reference(reference())
+            self.assertEqual(launcher.run_reference(prepared['reference_id'], prepared['sha256']), 0)
+            observed = (Path(folder) / 'environment.json').read_text()
+            child_env = json.loads(observed)
+            self.assertNotIn(sentinel, observed)
+            for name in forbidden:
+                self.assertIsNone(child_env[name], name)
+            self.assertEqual(child_env['HOME'], folder)
+            self.assertEqual(child_env['TERM'], 'xterm-256color')
+            self.assertEqual(child_env['PATH'], '/usr/bin:/bin:/usr/sbin:/sbin')
+            self.assertEqual(child_env['LANG'], 'en_US.UTF-8')
+
+    def test_child_environment_preserves_safe_terminal_and_replaces_unsafe_values(self):
+        for term in ('screen-256color', 'dumb', '', 'xterm\nunsafe', 'x' * 65):
+            with self.subTest(term=term), patch.dict(os.environ, TERM=term):
+                result = launcher.child_environment()
+                expected = term if term in {'screen-256color', 'dumb'} else 'xterm-256color'
+                self.assertEqual(result['TERM'], expected)
+                self.assertEqual(set(result), {'HOME', 'TERM', 'PATH', 'LANG'})
+        with patch.dict(os.environ, {'HOME': '/tmp'}, clear=True):
+            self.assertEqual(launcher.child_environment()['TERM'], 'xterm-256color')
 
     def test_digest_mismatch_and_hardlink_never_spawn(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, HOME=folder):

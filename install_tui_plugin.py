@@ -155,7 +155,7 @@ def install(home: Path, binary: Path, apply: bool, *, browsers=(), claude_deskto
         payloads[desktop_path] = b''  # Merge after taking a pinned snapshot.
     catalog = {'name': 'agent-harness-local', 'owner': {'name': 'Agent Harness contributors'},
                'plugins': [{'name': 'harness-tui', 'source': './plugin',
-                            'description': 'Open the local reference TUI', 'version': '0.1.0'}]}
+                            'description': 'Open the local reference TUI', 'version': '0.1.1'}]}
     marketplace = base / 'tui-plugin'
     payloads[marketplace / '.claude-plugin' / 'marketplace.json'] = (json.dumps(catalog, indent=2) + '\n').encode()
     payloads[marketplace / '.agents' / 'plugins' / 'marketplace.json'] = (json.dumps(catalog, indent=2) + '\n').encode()

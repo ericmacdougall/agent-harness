@@ -154,6 +154,14 @@ when no longer needed. There is no automatic retention daemon. Local processes
 running as your account can read your files and settings; origin/mode checks are
 not isolation from the same user.
 
+Go launches and Terminal dispatch receive an explicit environment containing
+only `HOME`, a validated `TERM` (or `xterm-256color` fallback), a fixed system
+`PATH` and UTF-8 locale. API keys, proxy settings, SSH agents and shell/Python
+startup variables are not inherited by those child processes. An already
+running Terminal app can have its own environment; the final Go process still
+receives the restricted environment. This does not erase credentials from the
+parent client or promise that a reference's text contains no secrets.
+
 ## Launch outcomes and terminal use
 
 `LAUNCH_REQUESTED` means macOS Terminal accepted a request. It does not prove the

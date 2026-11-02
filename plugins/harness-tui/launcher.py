@@ -36,6 +36,15 @@ HEX_ID = re.compile(r'[0-9a-f]{32}\Z')
 SHA = re.compile(r'[0-9a-f]{64}\Z')
 
 
+def child_environment():
+    """Keep offline launches independent of inherited credentials/startup hooks."""
+    term = os.environ.get('TERM', '')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9+_.-]{0,63}', term):
+        term = 'xterm-256color'
+    return {'HOME': str(Path.home()), 'TERM': term,
+            'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'en_US.UTF-8'}
+
+
 class InvalidReference(ValueError):
     """A bounded caller-visible error containing no supplied content."""
 
@@ -253,7 +262,8 @@ def open_reference(reference):
             os.close(fd)
         try:
             dispatch = subprocess.run(['/usr/bin/open', '-a', 'Terminal', str(bundle / 'open.command')],
-                                      capture_output=True, timeout=10, check=False)
+                                      capture_output=True, timeout=10, check=False,
+                                      env=child_environment())
         except subprocess.TimeoutExpired:
             result.update(status='UNKNOWN', reason='Terminal dispatch timed out; inspect before retrying')
             return result
@@ -280,7 +290,7 @@ def run_reference(identifier: str, digest: str):
         write_private(fd, 'run-intent.json', b'{"status":"PROCESS_START_REQUESTED"}\n')
         argv = [config['binary'], 'tui', '--reference-only', '--reference-file',
                 str(bundle / 'reference.json'), '--reference-sha256', digest]
-        process = subprocess.Popen(argv)
+        process = subprocess.Popen(argv, env=child_environment())
         write_private(fd, 'process-started.json',
                       (json.dumps({'status': 'PROCESS_STARTED', 'pid': process.pid}) + '\n').encode())
         code = process.wait()
@@ -370,7 +380,7 @@ def mcp_server(incoming, outgoing):
                     requested = request.get('params', {}).get('protocolVersion')
                     version = requested if requested in {'2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'} else '2025-11-25'
                     result = {'protocolVersion': version, 'capabilities': {'tools': {}},
-                              'serverInfo': {'name': 'agent-harness-tui', 'version': '0.1.0'}}
+                              'serverInfo': {'name': 'agent-harness-tui', 'version': '0.1.1'}}
                     initialized = True
                 elif method == 'ping':
                     result = {}

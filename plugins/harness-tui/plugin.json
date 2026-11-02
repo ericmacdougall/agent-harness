@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "harness-tui",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Open the local Go TUI with a private current-chat reference.",
   "license": "MIT",
   "extensions": {
