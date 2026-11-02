@@ -12,6 +12,10 @@ Use Python 3.10+ on macOS. The Go executable is installed separately and must
 support `tui --reference-only --reference-file FILE --reference-sha256 HEX`.
 This public plugin package does not include the private operator application.
 Choose the executable you trust; model-visible tool arguments cannot change it.
+The installer first runs its `tui --help` with a five-second/64-KiB bound and
+requires declarations of all three reference flags. An incompatible binary is
+refused before any destination writes. This checks advertised capability;
+actual offline behavior still needs testing against the real executable.
 
 Preview all destination paths, then apply the same options:
 
@@ -27,6 +31,9 @@ private executable setting to `~/.agent-harness/tui-launcher.json`, and register
 only the browsers you selected. It merges one server into Claude Desktop only
 when requested. Existing Claude/Codex permission settings, model choices, hooks,
 global instructions and the disabled bridge block are not edited.
+An existing same-name Claude Desktop server is reused only if it exactly matches
+the proposed entry. Custom command, environment or disabled-state differences
+are refused for explicit resolution instead of being overwritten.
 
 Before replacing files, the installer saves private backups and a manifest under
 `~/.agent-harness/tui-plugin-backups`. A failed write attempts to restore the

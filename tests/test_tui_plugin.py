@@ -271,9 +271,19 @@ class TuiPluginEntryTests(unittest.TestCase):
 
 
 class TuiPluginInstallerTests(unittest.TestCase):
+    def test_incompatible_binary_refused_before_writes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            binary = home / 'old-tui'
+            binary.write_text('#!/bin/sh\necho "old tui help"\n')
+            binary.chmod(0o700)
+            with self.assertRaisesRegex(ValueError, 'reference'):
+                install_tui_plugin.install(home, binary, True)
+            self.assertFalse((home / '.agent-harness').exists())
+
     def binary(self, home):
         binary = Path(home) / 'example-tui'
-        binary.write_text('#!/bin/sh\nexit 0\n')
+        binary.write_text('#!/bin/sh\nprintf "%s\\n" "--reference-only --reference-file --reference-sha256"\n')
         binary.chmod(0o700)
         return binary
 
@@ -319,6 +329,45 @@ class TuiPluginInstallerTests(unittest.TestCase):
         source['mcpServers']['harness-tui'] = {'command': 'some-other-user-tool'}
         with self.assertRaisesRegex(ValueError, 'different harness-tui'):
             install_tui_plugin.merge_desktop(json.dumps(source).encode(), server)
+
+    def test_same_args_do_not_authorize_overwriting_user_desktop_fields(self):
+        server = {'command': sys.executable, 'args': ['/private/plugin/launcher.py', 'serve']}
+        for changes in ({'env': {'HOME': '/private/isolated'}}, {'disabled': True},
+                        {'command': '/trusted/custom-wrapper'}):
+            source = {'mcpServers': {'harness-tui': {**server, **changes}}}
+            with self.assertRaisesRegex(ValueError, 'different harness-tui'):
+                install_tui_plugin.merge_desktop(json.dumps(source).encode(), server)
+
+    def test_desktop_user_edits_refused_without_apply_side_effects(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder).resolve()
+            binary = self.binary(home)
+            config = home / 'Library/Application Support/Claude/claude_desktop_config.json'
+            config.parent.mkdir(parents=True)
+            server = {'command': sys.executable,
+                      'args': [str(home / '.agent-harness/tui-plugin/plugin/launcher.py'), 'serve'],
+                      'env': {'HOME': '/private/isolated'}, 'disabled': True}
+            original = json.dumps({'mcpServers': {'harness-tui': server}}).encode()
+            config.write_bytes(original)
+            with patch.object(install_tui_plugin.sys, 'platform', 'darwin'):
+                with self.assertRaisesRegex(ValueError, 'different harness-tui'):
+                    install_tui_plugin.install(home, binary, True, claude_desktop=True)
+            self.assertEqual(config.read_bytes(), original)
+            self.assertFalse((home / '.agent-harness').exists())
+
+    def test_binary_help_time_and_output_are_bounded(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            noisy = home / 'noisy'
+            noisy.write_text('#!' + sys.executable + '\nimport os\nwhile True: os.write(1,b"x"*4096)\n')
+            noisy.chmod(0o700)
+            with self.assertRaisesRegex(ValueError, 'output limit'):
+                install_tui_plugin.check_binary_contract(noisy, timeout=1, limit=256)
+            hung = home / 'hung'
+            hung.write_text('#!' + sys.executable + '\nimport time\ntime.sleep(10)\n')
+            hung.chmod(0o700)
+            with self.assertRaisesRegex(ValueError, 'deadline'):
+                install_tui_plugin.check_binary_contract(hung, timeout=0.05)
 
     def test_symlink_destination_refused_without_target_writes(self):
         with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as elsewhere:

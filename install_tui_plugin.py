@@ -8,10 +8,15 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
+import selectors
 import shlex
+import signal
 import stat
+import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +27,51 @@ ROOT = Path(__file__).resolve().parent
 SOURCE = ROOT / 'plugins' / 'harness-tui'
 HOST_NAME = 'com.agentharness.tui'
 EXTENSION_ID = 'gdpiohlkkniinkfhlbhcjoimlcnhnkgj'
+
+
+def check_binary_contract(binary: Path, *, timeout=5, limit=65536):
+    """Read a trusted executable's help with bounded memory, time and children.
+
+    This checks its declared flags, not whether its implementation honors them.
+    Actual offline UI testing remains a separate release check.
+    """
+    process = subprocess.Popen([str(binary), 'tui', '--help'], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               start_new_session=True)
+    reaped = False
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        with selectors.DefaultSelector() as poller:
+            poller.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not poller.select(remaining):
+                    raise ValueError('TUI reference capability help exceeded its deadline')
+                chunk = os.read(process.stdout.fileno(), min(4096, limit + 1 - len(output)))
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > limit:
+                    raise ValueError('TUI reference capability help exceeded its output limit')
+        try:
+            code = process.wait(timeout=max(0, deadline - time.monotonic()))
+            reaped = True
+        except subprocess.TimeoutExpired as error:
+            raise ValueError('TUI reference capability help exceeded its deadline') from error
+    finally:
+        if not reaped:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=2)
+        process.stdout.close()
+    help_text = output.decode('utf-8', errors='replace')
+    flags = ('reference-only', 'reference-file', 'reference-sha256')
+    if code not in {0, 2} or any(not re.search(r'(?<!\S)--?' + flag + r'(?=\s|$)', help_text)
+                               for flag in flags):
+        raise ValueError('TUI executable does not declare the required reference flags; update it before installing')
 
 
 def native_directory(home: Path, browser: str, platform: str) -> Path:
@@ -43,9 +93,8 @@ def merge_desktop(data: bytes, server: dict) -> bytes:
         raise ValueError('Claude Desktop mcpServers must be an object')
     existing = servers.get('harness-tui')
     if existing is not None and existing != server:
-        # A previous managed install has this exact fixed launcher path/action.
-        if not isinstance(existing, dict) or existing.get('args') != server['args']:
-            raise ValueError('Claude Desktop already has a different harness-tui server; resolve it explicitly')
+        # Equal args do not prove ownership of command/env/disabled user edits.
+        raise ValueError('Claude Desktop already has a different harness-tui server; resolve it explicitly')
     servers['harness-tui'] = server
     return (json.dumps(value, indent=2) + '\n').encode()
 
@@ -59,6 +108,7 @@ def install(home: Path, binary: Path, apply: bool, *, browsers=(), claude_deskto
     if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.getuid()}
             or info.st_mode & 0o022 or not os.access(binary, os.X_OK)):
         raise ValueError('TUI binary must be a trusted executable regular file')
+    check_binary_contract(binary)
     base = home / '.agent-harness'
     destination = base / 'tui-plugin' / 'plugin'
     launcher = destination / 'launcher.py'
