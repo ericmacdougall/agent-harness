@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Agent Harness — Open TUI",
+  "version": "0.1.0",
+  "description": "Open the current ChatGPT or Claude chat as a private reference in the local Go TUI.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsQH91O/9WgE+4DpW5PR3RfQgaKiq54I4/gZHMpDUCQnJ9x3Po8Roe4CSXj0MPP3/dCrx8EKE1E0/8sH3RNatbeaAH7JSqVY4ZicxzbFuGaQipd0eHQd2W2QKXawAXoFfXvp78hBsDP75tpHTLMhUMWCiKuLn/M9Gt/nV7QxmJF6/RLwUxT0oN2pou9Gkozp3R9b6CNIt2XhZv8Y098gX4bVAoGaL2qjlqPBrJeeAusrdXrMW64W2vUkAGFPZa4DnXLXTySouC2iV6X0OCFhsiff084MIKZCruXPQooeWuX01jG5ObWFadrb+UsGLwuF5b7TvN4zjenJ97/KqMuCWpwIDAQAB",
+  "permissions": ["activeTab", "scripting", "nativeMessaging"],
+  "action": {"default_title": "Open this chat in the Go TUI", "default_popup": "popup.html"},
+  "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'none'; connect-src 'none'"}
+}

@@ -1,0 +1,8 @@
+:root { color-scheme: light dark; font: 14px/1.45 system-ui, sans-serif; }
+body { margin: 0; width: 380px; }
+main { padding: 16px; }
+h1 { font-size: 18px; margin: 0 0 8px; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow: auto; border: 1px solid #8886; padding: 10px; }
+button { width: 100%; min-height: 40px; font: inherit; cursor: pointer; }
+button:disabled { cursor: default; }
+#status { min-height: 3em; }
