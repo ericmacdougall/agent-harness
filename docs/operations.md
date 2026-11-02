@@ -61,8 +61,10 @@ Toolchain entries identify an absolute `path` or an `executable` resolved throug
 Run focused test evidence with a finite timeout:
 
 ```sh
-python3 ~/.codex/agent-harness/usage_guard.py check --repo /absolute/worktree --manifest /private/inputs.json --purpose feature-focused --owner owner-a --label focused --timeout 300 --kind focused --adapter unittest -- python3 -m unittest discover -s tests -v
+python3 ~/.codex/agent-harness/usage_guard.py check --repo /absolute/worktree --manifest /private/inputs.json --purpose feature-focused --owner owner-a --label focused --timeout 300 --kind focused --adapter unittest -- python3 -m unittest discover -s tests -p 'test_feature.py' -v
 ```
+
+Replace `test_feature.py` with the actual module for the focused change.
 
 Adapters require a recognized terminal result and nonzero observed executed count; zero cases or ambiguous output are NO_RESULT. The supported test formats are unittest summaries, pytest summaries and Go JSON test events. A non-test command needs `--kind command --adapter command --success-exit 0`, an explicit exit predicate rather than a claim about test coverage. Assertion findings, compile/process failures, provider errors and unknown results remain distinct. Receipts omit raw argv, prompts, source/log tails and credential values.
 
