@@ -1,0 +1,18 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "harness-tui",
+  "version": "0.1.1",
+  "description": "Open the local Go TUI with a private current-chat reference.",
+  "license": "MIT",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Harness TUI",
+        "shortDescription": "Open your Go TUI with current-chat context",
+        "longDescription": "Open an offline reference view using supplied chat context. No job is submitted and no conversation history is scanned.",
+        "developerName": "Agent Harness contributors",
+        "category": "Productivity"
+      }
+    }
+  }
+}

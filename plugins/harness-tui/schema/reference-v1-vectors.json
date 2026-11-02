@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "max_file_bytes": 262144,
+  "max_body_bytes": 131072,
+  "cases": [
+    {
+      "id": "valid-unicode",
+      "valid": true,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "valid-utc-offset-fraction",
+      "valid": true,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00.123456789+00:00\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "valid-escaped-surrogate-pair",
+      "valid": true,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Caf\\u00e9 \\ud83e\\udd86\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "valid-literal-replacement",
+      "valid": true,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Real replacement character: �\",\"truncated\":false}"
+    },
+    {
+      "id": "valid-literal-backslash-u",
+      "valid": true,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"An example literal \\\\ud800 is not an escaped surrogate.\",\"truncated\":false}"
+    },
+    {
+      "id": "valid-excerpt-source",
+      "valid": true,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"excerpt\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":true,\"session_id\":\"session-1\",\"source_url\":\"https://chatgpt.com/c/example\"}"
+    },
+    {
+      "id": "invalid-boolean-schema",
+      "valid": false,
+      "json": "{\"schema\":true,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "invalid-decimal-schema",
+      "valid": false,
+      "json": "{\"schema\":1.0,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "invalid-future-schema",
+      "valid": false,
+      "json": "{\"schema\":2,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "invalid-missing-body",
+      "valid": false,
+      "json": "{\"schema\": 1, \"client\": \"codex\", \"captured_at\": \"2026-11-02T00:00:00Z\", \"title\": \"Current context\", \"kind\": \"summary\", \"truncated\": false}"
+    },
+    {
+      "id": "invalid-unknown-field",
+      "valid": false,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false,\"command\":\"touch NEVER\"}"
+    },
+    {
+      "id": "invalid-duplicate-schema",
+      "valid": false,
+      "json": "{\"schema\": 1, \"client\": \"codex\", \"captured_at\": \"2026-11-02T00:00:00Z\", \"title\": \"Current context\", \"kind\": \"summary\", \"body\": \"Caf\\u00e9 \\ud83e\\udd86\\nReference only\", \"truncated\": false,\"schema\":1}"
+    },
+    {
+      "id": "invalid-array-root",
+      "valid": false,
+      "json": "[]"
+    },
+    {
+      "id": "invalid-trailing-json",
+      "valid": false,
+      "json": "{\"schema\": 1, \"client\": \"codex\", \"captured_at\": \"2026-11-02T00:00:00Z\", \"title\": \"Current context\", \"kind\": \"summary\", \"body\": \"Caf\\u00e9 \\ud83e\\udd86\\nReference only\", \"truncated\": false} {}"
+    },
+    {
+      "id": "invalid-lone-high-surrogate",
+      "valid": false,
+      "json": "{\"schema\": 1, \"client\": \"codex\", \"captured_at\": \"2026-11-02T00:00:00Z\", \"title\": \"Current context\", \"kind\": \"summary\", \"body\": \"\\ud800\", \"truncated\": false}"
+    },
+    {
+      "id": "invalid-lone-low-surrogate",
+      "valid": false,
+      "json": "{\"schema\": 1, \"client\": \"codex\", \"captured_at\": \"2026-11-02T00:00:00Z\", \"title\": \"Current context\", \"kind\": \"summary\", \"body\": \"\\udc00\", \"truncated\": false}"
+    },
+    {
+      "id": "invalid-high-followed-by-normal",
+      "valid": false,
+      "json": "{\"schema\": 1, \"client\": \"codex\", \"captured_at\": \"2026-11-02T00:00:00Z\", \"title\": \"Current context\", \"kind\": \"summary\", \"body\": \"\\ud800A\", \"truncated\": false}"
+    },
+    {
+      "id": "invalid-no-utc",
+      "valid": false,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T01:00:00+01:00\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "invalid-impossible-date",
+      "valid": false,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-02-30T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "invalid-date-only",
+      "valid": false,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "invalid-blank-body",
+      "valid": false,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\" \\n\\t\",\"truncated\":false}"
+    },
+    {
+      "id": "invalid-blank-client",
+      "valid": false,
+      "json": "{\"schema\":1,\"client\":\" \",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "invalid-kind",
+      "valid": false,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"complete\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "invalid-truncated-string",
+      "valid": false,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":\"false\"}"
+    },
+    {
+      "id": "invalid-session-number",
+      "valid": false,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false,\"session_id\":3}"
+    },
+    {
+      "id": "invalid-client-scalars",
+      "valid": false,
+      "json": "{\"schema\":1,\"client\":\"🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"Current context\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "valid-title-512-scalars",
+      "valid": true,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "invalid-title-513-scalars",
+      "valid": false,
+      "json": "{\"schema\":1,\"client\":\"codex\",\"captured_at\":\"2026-11-02T00:00:00Z\",\"title\":\"🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆\",\"kind\":\"summary\",\"body\":\"Café 🦆\\nReference only\",\"truncated\":false}"
+    },
+    {
+      "id": "invalid-raw-utf8",
+      "valid": false,
+      "utf8_base64": "eyJzY2hlbWEiOiAxLCAiY2xpZW50IjogImNvZGV4IiwgImNhcHR1cmVkX2F0IjogIjIwMjYtMTEtMDJUMDA6MDA6MDBaIiwgInRpdGxlIjogIkN1cnJlbnQg/yBjb250ZXh0IiwgImtpbmQiOiAic3VtbWFyeSIsICJib2R5IjogIkNhZsOpIPCfpoZcblJlZmVyZW5jZSBvbmx5IiwgInRydW5jYXRlZCI6IGZhbHNlfQ=="
+    }
+  ]
+}
