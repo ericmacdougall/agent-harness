@@ -12,6 +12,8 @@ manager, enable Developer mode, choose **Load unpacked**, and select this `brows
 directory. The extension ID must be `gdpiohlkkniinkfhlbhcjoimlcnhnkgj`; the native
 host allowlists precisely that ID. The manifest's key is public identity material,
 not a private signing credential.
+After an update, reload the unpacked extension in the extension manager and reopen
+its popup so the new capture code is active.
 
 Open the current conversation at `https://chatgpt.com` or `https://claude.ai`, open
 the extension, review the preview, and click its launch button. The popup reports

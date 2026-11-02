@@ -25,18 +25,20 @@ class Element {
   matches(selectors) {
     return selectors.split(",").some(selector => {
       selector = selector.trim();
-      const tag = selector.match(/^[a-z]+/i)?.[0];
+      const tag = selector.match(/^[a-z][a-z0-9]*/i)?.[0];
       if (tag && tag.toUpperCase() !== this.tagName) return false;
       const klass = selector.match(/^\.([\w-]+)$/)?.[1];
       if (klass) return (this.attrs.class || "").split(/\s+/).includes(klass);
-      for (const [, name, operator, value, insensitive] of selector.matchAll(/\[([\w-]+)(\*?=)?(?:"([^"]*)")?(?:\s+(i))?\]/g)) {
+      for (const [, name, operator, value, insensitive] of selector.matchAll(/\[([\w-]+)([\*$]?=)?(?:"([^"]*)")?(?:\s+(i))?\]/g)) {
         let actual = this.attrs[name];
         if (actual === undefined) return false;
         if (!operator) continue;
         actual = String(actual);
         const expected = insensitive ? value.toLowerCase() : value;
         if (insensitive) actual = actual.toLowerCase();
-        if (operator === "=" ? actual !== expected : !actual.includes(expected)) return false;
+        if (operator === "=" && actual !== expected) return false;
+        if (operator === "*=" && !actual.includes(expected)) return false;
+        if (operator === "$=" && !actual.endsWith(expected)) return false;
       }
       return Boolean(tag || selector.startsWith("["));
     });
@@ -59,6 +61,7 @@ class Element {
     this.children.forEach(visit);
     return result;
   }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
 }
 const el = (tag, attrs, ...children) => new Element(tag, attrs, children);
 const user = (...children) => el("div", {"data-message-author-role": "user"}, ...children);
@@ -66,9 +69,14 @@ const assistant = (...children) => el("div", {"data-message-author-role": "assis
 
 function capture(children, href = "https://chatgpt.com/c/example?private=query#fragment", title = "Synthetic chat") {
   const body = el("body", {}, el("main", {}, ...children));
+  return captureBody(body, href, title);
+}
+
+function captureBody(body, href = "https://chatgpt.com/c/synthetic", title = "Synthetic Work chat") {
   const document = {
     body, title,
     querySelector: selector => body.querySelectorAll(selector)[0] || null,
+    querySelectorAll: selector => body.querySelectorAll(selector),
   };
   const context = vm.createContext({URL, TextEncoder, TextDecoder, Date, document, location: {href},
     Node: {TEXT_NODE: 3, ELEMENT_NODE: 1}, getComputedStyle: node => node.style});
@@ -86,6 +94,43 @@ test("ChatGPT ordered messages exclude hidden children and strip URL secrets", (
   assert.equal(ref.truncated, false);
   assert.equal(ref.schema, 1);
   assert.match(ref.captured_at, /Z$/);
+});
+
+const workUnit = (role, ...children) => el("div", {
+  "data-chatgpt-search-unit-key": `synthetic-unit:0:${role}`,
+  "data-chatgpt-search-message-ids": "synthetic-message",
+}, ...children);
+const workConversation = (...children) => el("div", {role: "region", "aria-label": "Conversation"}, ...children);
+const workTurn = (state, ...children) => el("section", {"data-turn-key": "synthetic-turn"},
+  el("span", {"data-talvt-turn-state": state}), ...children);
+
+test("ChatGPT Work region wins over unrelated main and captures explicit role units", () => {
+  const body = el("body", {},
+    el("main", {}, user("UNRELATED_MAIN_CANARY")),
+    el("main", {}, "Other application pane"),
+    el("main", {}, workConversation(workTurn("complete",
+      el("h4", {"data-conversation-role": "user"}, "USER_ROLE_HEADING"),
+      workUnit("user", "WORK_USER_CANARY", el("span", {hidden: ""}, "HIDDEN_CANARY")),
+      workUnit("assistant", el("h4", {"data-conversation-role": "assistant"}, "ASSISTANT_ROLE_HEADING"),
+        "WORK_ASSISTANT_CANARY", el("form", {}, "DRAFT_CANARY")),
+    ))),
+  );
+  const ref = captureBody(body);
+  assert.equal(ref.body, "User:\nWORK_USER_CANARY\n\nAssistant:\nWORK_ASSISTANT_CANARY");
+  assert.equal(ref.kind, "excerpt");
+  assert.equal(ref.truncated, false);
+});
+
+test("Work fallback is limited to the Conversation region and complete assistant turns", () => {
+  assert.throws(() => capture([workTurn("complete", workUnit("user", "UNSCOPED_CANARY"))]), /NO_RENDERED_MESSAGES/);
+  assert.throws(() => captureBody(el("body", {}, workConversation(
+    el("h4", {"data-conversation-role": "user"}, "HEADING_ONLY_CANARY"),
+  ))), /NO_RENDERED_MESSAGES/);
+  const ref = captureBody(el("body", {}, workConversation(workTurn("running",
+    workUnit("user", "COMMITTED_USER_CANARY"), workUnit("assistant", "UNFINISHED_CANARY"),
+  ))));
+  assert.equal(ref.body, "User:\nCOMMITTED_USER_CANARY");
+  assert.equal(ref.truncated, true);
 });
 
 test("Claude role selectors and nested assistant containers produce one excerpt", () => {

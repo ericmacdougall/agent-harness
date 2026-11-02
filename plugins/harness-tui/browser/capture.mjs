@@ -10,11 +10,11 @@ export function captureCurrentChat() {
     throw new Error("UNSUPPORTED_PAGE");
   }
   const chatgpt = page.hostname === "chatgpt.com";
-  const selectors = chatgpt
+  const classicSelectors = chatgpt
     ? '[data-message-author-role="user"], [data-message-author-role="assistant"]'
     : '[data-testid="user-message"], [data-testid="assistant-message"], .font-claude-response, [data-message-author-role="user"], [data-message-author-role="assistant"]';
   const excluded = 'aside, nav, [role="navigation"], [data-testid*="sidebar" i], form, textarea, input, select, [contenteditable="true"]';
-  const ignored = 'script, style, noscript, button, [role="button"], svg, textarea, input, select, form, [contenteditable="true"]';
+  const ignored = 'script, style, noscript, button, [role="button"], svg, textarea, input, select, form, [contenteditable="true"], h4[data-conversation-role]';
   const blocks = new Set(["DIV", "P", "PRE", "LI", "BR", "H1", "H2", "H3", "H4", "H5", "H6", "SECTION", "ARTICLE", "TR"]);
   let clipped = false;
   let nodesLeft = 20000;
@@ -68,13 +68,19 @@ export function captureCurrentChat() {
     }
     return wellFormed(pieces.join("")).trim();
   }
-  const root = document.querySelector("main, [role='main']") || document.body;
+  // Work can have several main panes; only the explicit conversation owns its units.
+  const conversations = chatgpt ? Array.from(document.querySelectorAll('[role="region"][aria-label="Conversation"]')).filter(node => !hidden(node)) : [];
+  if (conversations.length > 1) throw new Error("AMBIGUOUS_CONVERSATION");
+  const workConversation = conversations[0];
+  const root = workConversation || document.querySelector("main, [role='main']") || document.body;
+  const selectors = workConversation ? classicSelectors +
+    ', div[data-chatgpt-search-unit-key$=":user"][data-chatgpt-search-message-ids], div[data-chatgpt-search-unit-key$=":assistant"][data-chatgpt-search-message-ids]' : classicSelectors;
   const selected = root.querySelectorAll(selectors);
   if (selected.length > 500) clipped = true;
   const candidates = Array.from(selected).slice(-500);
   const messages = candidates.filter(node => !node.closest(excluded) && !hidden(node) &&
     !candidates.some(other => other !== node && other.contains(node)));
-  const stop = document.querySelector('[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop response"]');
+  const stop = root.querySelector('[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop response"]');
   const streaming = stop && !hidden(stop);
   const parts = [];
   let bodyBytes = 0;
@@ -82,8 +88,11 @@ export function captureCurrentChat() {
   for (let i = messages.length - 1; i >= 0; i--) {
     if (nodesLeft < 0) { clipped = true; break; }
     const node = messages[i];
-    const role = node.matches('[data-message-author-role="user"], [data-testid="user-message"]') ? "User" : "Assistant";
+    const role = node.matches('[data-message-author-role="user"], [data-testid="user-message"], [data-chatgpt-search-unit-key$=":user"]') ? "User" : "Assistant";
+    const workUnit = workConversation && node.hasAttribute("data-chatgpt-search-unit-key") && node.hasAttribute("data-chatgpt-search-message-ids");
+    const turnState = workUnit ? node.closest("[data-turn-key]")?.querySelector("[data-talvt-turn-state]")?.getAttribute("data-talvt-turn-state") : null;
     if (node.closest('[data-is-streaming="true"], [aria-busy="true"]') ||
+        (workUnit && role === "Assistant" && turnState !== "complete") ||
         (streaming && role === "Assistant" && i === messages.length - 1)) {
       clipped = true;
       continue;
