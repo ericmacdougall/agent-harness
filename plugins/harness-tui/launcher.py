@@ -18,7 +18,7 @@ import stat
 import struct
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -328,11 +328,11 @@ def tool_schema():
     string = lambda maximum: {'type': 'string', 'maxLength': maximum}
     return {'type': 'object', 'additionalProperties': False, 'required': ['reference'],
             'properties': {'reference': {'type': 'object', 'additionalProperties': False,
-                'required': sorted(REFERENCE_REQUIRED), 'properties': {
+                'required': sorted(REFERENCE_REQUIRED - {'captured_at'}), 'properties': {
                     'schema': {'type': 'integer', 'const': 1}, 'client': string(64),
-                    'captured_at': {'type': 'string', 'description': 'UTC RFC3339 capture time'},
+                    'captured_at': {'type': 'string', 'description': 'UTC RFC3339 capture time; local receipt time is used when omitted'},
                     'title': string(512), 'kind': {'enum': ['summary', 'excerpt', 'transcript']},
-                    'body': {'type': 'string', 'description': 'Inert reference text, at most128 KiB UTF-8'},
+                    'body': {'type': 'string', 'description': 'Inert reference text, at most 128 KiB UTF-8'},
                     'truncated': {'type': 'boolean'}, 'session_id': string(128), 'source_url': string(2048)}}}}
 
 
@@ -388,7 +388,10 @@ def mcp_server(incoming, outgoing):
                             or not isinstance(params.get('arguments'), dict)
                             or set(params['arguments']) != {'reference'}):
                         raise InvalidReference('Unsupported tool or arguments')
-                    opened = open_reference(validate_reference(params['arguments']['reference']))
+                    supplied = params['arguments']['reference']
+                    if isinstance(supplied, dict) and 'captured_at' not in supplied:
+                        supplied = {**supplied, 'captured_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}
+                    opened = open_reference(validate_reference(supplied))
                     result = {'content': [{'type': 'text', 'text': json.dumps(opened)}],
                               'structuredContent': opened,
                               'isError': opened['status'] != 'LAUNCH_REQUESTED'}

@@ -50,6 +50,12 @@ To uninstall, remove the marked block from `CLAUDE.md`, remove the four hook ent
 
 ## Operating model
 
+An optional [Harness TUI plugin](docs/tui-plugin.md) opens a compatible local Go
+operator in an offline reference view using context supplied by the current
+chat. It includes local MCP adapters for Codex/ChatGPT and Claude clients plus
+an explicit Chromium action for active browser conversations. Its separate
+installer preserves existing agent permissions and global harness settings.
+
 1. The main agent records the initial checkout, scopes the request, asks about consequential ambiguity, and assigns one owner to each nonoverlapping task. Related follow-ups go to the same owner.
 2. The owner writes WAL intent and a risk table, reconciles independent planning objections, implements recoverable increments and meaningful failing controls, then runs focused checks.
 3. Independent code inspection comes before expensive full validation. The owner repairs findings, runs affected checks and freezes runtime inputs/docs; required full validation runs once at the stable subject, followed by a fresh exact-HEAD PR evidence review. Live testers inspect runnable flows when relevant. Main checks scope, evidence and documentation.

@@ -1,0 +1,7 @@
+{
+  "name": "harness-tui",
+  "version": "0.1.0",
+  "description": "Open the local Go TUI with a private current-chat reference.",
+  "author": {"name": "Agent Harness contributors"},
+  "license": "MIT"
+}

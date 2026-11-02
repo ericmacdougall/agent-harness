@@ -13,6 +13,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import install_tui_plugin
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / 'plugins' / 'harness-tui'
@@ -229,6 +231,20 @@ class TuiPluginEntryTests(unittest.TestCase):
         opened.assert_not_called()
         self.assertIn('error', result[0])
 
+    def test_mcp_omitted_timestamp_uses_local_receipt_time(self):
+        value = reference()
+        del value['captured_at']
+        init = {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                'params': {'protocolVersion': '2025-11-25'}}
+        call = {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
+                'params': {'name': 'open_tui', 'arguments': {'reference': value}}}
+        with patch.object(launcher, 'open_reference', return_value={'status': 'LAUNCH_REQUESTED'}) as opened:
+            result = self.rpc([init, call])
+        self.assertFalse(result[-1]['result']['isError'])
+        captured = opened.call_args.args[0]['captured_at']
+        self.assertRegex(captured, r'Z$')
+        self.assertEqual(launcher.validate_reference(opened.call_args.args[0])['captured_at'], captured)
+
     def test_mcp_malformed_and_oversized_frames_do_not_echo(self):
         for raw in (b'{invalid-secret-content}\n', b'x' * 262145 + b'\n',
                     b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":[]}\n'):
@@ -238,3 +254,116 @@ class TuiPluginEntryTests(unittest.TestCase):
             opened.assert_not_called()
             self.assertIn('error', json.loads(output.getvalue()))
             self.assertNotIn(b'invalid-secret-content', output.getvalue())
+
+    def test_generated_command_quotes_real_paths(self):
+        with tempfile.TemporaryDirectory(prefix="tui ' $(touch NO_EXEC) ") as folder:
+            with patch.dict(os.environ, HOME=folder):
+                self.configured(folder)
+                with patch.object(launcher.sys, 'platform', 'darwin'), patch.object(
+                        launcher.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+                    prepared = launcher.open_reference(reference())
+                script = Path(prepared['reference_file']).parent / 'open.command'
+                child = subprocess.run(['/bin/sh', str(script)], env=os.environ.copy(),
+                                       cwd=folder, capture_output=True, timeout=10)
+                self.assertEqual(child.returncode, 0, child.stderr)
+                self.assertEqual(json.loads((Path(folder) / 'argv.json').read_text())[0], 'tui')
+                self.assertFalse((Path(folder) / 'NO_EXEC').exists())
+
+
+class TuiPluginInstallerTests(unittest.TestCase):
+    def binary(self, home):
+        binary = Path(home) / 'example-tui'
+        binary.write_text('#!/bin/sh\nexit 0\n')
+        binary.chmod(0o700)
+        return binary
+
+    def test_preview_is_read_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            binary = self.binary(folder)
+            paths = install_tui_plugin.install(Path(folder), binary, False, browsers=['chrome'])
+            self.assertGreater(len(paths), 10)
+            self.assertFalse((Path(folder) / '.agent-harness').exists())
+
+    def test_install_preserves_agent_settings_and_pins_native_origin(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            binary = self.binary(home)
+            sentinels = {}
+            for name in ('.codex/config.toml', '.codex/AGENTS.md', '.claude/settings.json', '.claude/CLAUDE.md'):
+                path = home / name
+                path.parent.mkdir(exist_ok=True)
+                sentinels[path] = b'preserve existing permissions and disabled bridge\n'
+                path.write_bytes(sentinels[path])
+            install_tui_plugin.install(home, binary, True, browsers=['chrome'])
+            for path, data in sentinels.items():
+                self.assertEqual(path.read_bytes(), data)
+            root = home / '.agent-harness'
+            config = root / 'tui-launcher.json'
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(config.read_text())['binary'], str(binary.resolve()))
+            plugin = (root / 'tui-plugin/plugin').resolve()
+            mcp = json.loads((plugin / '.mcp.json').read_text())['mcpServers']['harness-tui']
+            self.assertEqual(mcp, {'command': sys.executable, 'args': [str(plugin / 'launcher.py'), 'serve']})
+            hosts = list(home.rglob('com.agentharness.tui.json'))
+            self.assertEqual(len(hosts), 1)
+            host = json.loads(hosts[0].read_text())
+            self.assertEqual(host['allowed_origins'], [launcher.NATIVE_ORIGIN])
+            self.assertEqual(Path(host['path']).stat().st_mode & 0o777, 0o700)
+
+    def test_desktop_merge_preserves_other_servers_and_collision(self):
+        server = {'command': 'python', 'args': ['/private/plugin/launcher.py', 'serve']}
+        source = {'theme': 'dark', 'mcpServers': {'existing': {'command': 'keep'}}}
+        merged = json.loads(install_tui_plugin.merge_desktop(json.dumps(source).encode(), server))
+        self.assertEqual(merged['theme'], source['theme'])
+        self.assertEqual(merged['mcpServers']['existing'], source['mcpServers']['existing'])
+        source['mcpServers']['harness-tui'] = {'command': 'some-other-user-tool'}
+        with self.assertRaisesRegex(ValueError, 'different harness-tui'):
+            install_tui_plugin.merge_desktop(json.dumps(source).encode(), server)
+
+    def test_symlink_destination_refused_without_target_writes(self):
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as elsewhere:
+            home = Path(folder)
+            binary = self.binary(home)
+            (home / '.agent-harness').symlink_to(elsewhere, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                install_tui_plugin.install(home, binary, True)
+            self.assertEqual(list(Path(elsewhere).iterdir()), [])
+
+    def test_failed_reinstall_restores_original_bytes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            binary = self.binary(home)
+            install_tui_plugin.install(home, binary, True)
+            root = home / '.agent-harness'
+            tracked = {p: p.read_bytes() for p in (root / 'tui-plugin').rglob('*') if p.is_file()}
+            tracked[root / 'tui-launcher.json'] = (root / 'tui-launcher.json').read_bytes()
+            real = install_tui_plugin.atomic_write
+            count = 0
+            def fail_once(path, data, *args, **kwargs):
+                nonlocal count
+                if 'tui-plugin-backups' not in path.parts:
+                    count += 1
+                    if count == 3:
+                        raise OSError('controlled publication failure')
+                return real(path, data, *args, **kwargs)
+            with patch.object(install_tui_plugin, 'atomic_write', side_effect=fail_once):
+                with self.assertRaisesRegex(OSError, 'controlled'):
+                    install_tui_plugin.install(home, binary, True)
+            self.assertEqual({p: p.read_bytes() for p in tracked}, tracked)
+
+    def test_installed_stdio_real_subprocess_handshake(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            install_tui_plugin.install(home, self.binary(home), True)
+            installed = home / '.agent-harness/tui-plugin/plugin/launcher.py'
+            requests = [
+                {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2025-11-25'}},
+                {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
+                {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}]
+            result = subprocess.run([sys.executable, str(installed), 'serve'],
+                                    input=''.join(json.dumps(r) + '\n' for r in requests),
+                                    env={**os.environ, 'HOME': folder}, text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            responses = [json.loads(line) for line in result.stdout.splitlines()]
+            self.assertEqual(len(responses), 2)
+            self.assertEqual(responses[1]['result']['tools'][0]['name'], 'open_tui')
