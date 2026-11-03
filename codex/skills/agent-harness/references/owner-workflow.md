@@ -2,7 +2,7 @@
 
 ## Dispatch admission and replacement
 
-Before assigning an owner, inspect the active chat mode, the spawn tool's currently advertised models, and its inheritance/override constraints. Treat those live capabilities as authoritative; model catalogs and slugs change. If Daybreak is enabled, explicitly choose an advertised Daybreak-compatible model. If none is selectable, stop dispatch and report the capability mismatch rather than trying a non-Daybreak model or repeatedly submitting a known-incompatible choice.
+Before assigning an owner, inspect the active chat mode, the spawn tool's advertised models and inheritance/override constraints, and the current client/runtime model catalog when available. Model catalogs and slugs change, but spawn metadata can also be incomplete: a missing model in that metadata is not by itself a denial. If Daybreak is enabled and a current runtime catalog entry is corroborated by the parent's active mode, explicitly select that compatible model and attempt dispatch once. Never hardcode its slug or trust a stale cache alone. If the one attempt is rejected before start, record no child effects and stop rather than trying a non-Daybreak model or repeatedly submitting the selection.
 
 Classify the dispatch result before changing the ledger:
 

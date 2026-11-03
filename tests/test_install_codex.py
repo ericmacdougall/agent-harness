@@ -37,7 +37,8 @@ class CodexInstallerTests(unittest.TestCase):
                               'owner-workflow.md').read_bytes())
         combined = '\n'.join((agents, skill, workflow))
 
-        for required in ('advertised Daybreak-compatible model', 'pre-dispatch',
+        for required in ('current client/runtime model catalog', 'metadata can be incomplete',
+                         "parent's active mode", 'attempt dispatch once', 'pre-dispatch',
                          'does not rebind', 'post-start', 'quiesce',
                          '`resumable=true`', 'side-effect-free probe', 'quarantine',
                          'same scope, branch, worktree', 'reviewer must remain independent'):
