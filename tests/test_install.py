@@ -113,6 +113,13 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual((self.claude / "CLAUDE.md").read_text().count(START), 1)
         self.assertTrue(list((self.claude / "agent-harness-backups").rglob("settings.json")))
 
+    def test_installs_stale_resumable_child_replacement_guidance(self):
+        install(self.home, apply=True)
+        instructions = (self.claude / "CLAUDE.md").read_text()
+        self.assertIn("A resumable child is not proof", instructions)
+        self.assertIn("Quiesce the old writer", instructions)
+        self.assertIn("fresh replacement", instructions)
+
     def test_tolerates_user_hook_with_empty_args(self):
         (self.claude / "settings.json").write_text(json.dumps(
             {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3", "args": []}]}]}}
