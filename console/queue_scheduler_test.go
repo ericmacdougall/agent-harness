@@ -187,6 +187,9 @@ func TestQueueHeldHeadAndPauseWinBeforeWrite(t *testing.T) {
 	}
 }
 func TestQueueAttachmentsSurviveAcceptanceAndParentFinality(t *testing.T) {
+	if !attachmentCleanupSupported() {
+		t.Skip("descriptor-confined cleanup unavailable on this platform")
+	}
 	a, s := queueNativeFixture(t)
 	source := filepath.Join(s.CWD, "input.txt")
 	if err := os.WriteFile(source, []byte("delayed owner bytes"), 0600); err != nil {

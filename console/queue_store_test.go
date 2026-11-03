@@ -10,6 +10,9 @@ import (
 )
 
 func TestQueueStoreDedupRetentionAndRecovery(t *testing.T) {
+	if !attachmentCleanupSupported() {
+		t.Skip("descriptor-confined cleanup unavailable on this platform")
+	}
 	dir := t.TempDir()
 	a, err := newApp(dir, nil)
 	if err != nil {
@@ -71,7 +74,7 @@ func TestQueueStoreDedupRetentionAndRecovery(t *testing.T) {
 	if recovered.inputs[0].Text != "private unsent payload" {
 		t.Fatal("recovery lost accepted unsent input")
 	}
-	restored.attachmentRemove = func(string) error { return errors.New("injected queue unlink failure") }
+	restored.attachmentCleanup = func(string, os.FileInfo, string, string) error { return errors.New("injected queue unlink failure") }
 	if err = restored.discardInput(recovered.ID, "queued", false); err == nil {
 		t.Fatal("explicit queue discard hid snapshot unlink failure")
 	}

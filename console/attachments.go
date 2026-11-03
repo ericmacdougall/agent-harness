@@ -12,9 +12,10 @@ import (
 )
 
 type attachmentSnapshot struct {
-	Path string
-	Hash string
-	Size int64
+	Path              string
+	Hash              string
+	Size              int64
+	DirectoryIdentity string
 }
 
 func credentialFile(path string) bool {
@@ -117,9 +118,9 @@ func (a *app) finishAttachmentCleanupLocked(s *session, entry *queuedInput) erro
 		return errors.New("attachment cleanup has no durable pending owner")
 	}
 	root := filepath.Join(a.dataDir, "attachments")
-	remove := a.attachmentRemove
-	if remove == nil {
-		remove = os.Remove
+	cleanup := a.attachmentCleanup
+	if cleanup == nil {
+		cleanup = removeOwnedAttachment
 	}
 	for _, saved := range entry.Snapshots {
 		clean := filepath.Clean(saved.Path)
@@ -127,20 +128,11 @@ func (a *app) finishAttachmentCleanupLocked(s *session, entry *queuedInput) erro
 		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return errors.New("attachment cleanup path escaped private storage")
 		}
-		info, err := os.Lstat(clean)
-		if os.IsNotExist(err) {
-			continue
+		if saved.DirectoryIdentity == "" {
+			return errors.New("attachment cleanup lacks pinned directory identity")
 		}
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-			return errors.New("attachment cleanup path is not an owned regular file")
-		}
-		if err = remove(clean); err != nil && !os.IsNotExist(err) {
+		if err = cleanup(a.dataDir, a.dataDirInfo, filepath.Base(clean), saved.DirectoryIdentity); err != nil {
 			return errors.New("attachment cleanup could not remove an owned snapshot")
-		}
-	}
-	if len(entry.Snapshots) > 0 {
-		if err := settingsSyncParent(root); err != nil {
-			return errors.New("attachment cleanup directory durability is unknown")
 		}
 	}
 	old := *entry
@@ -258,5 +250,5 @@ func (a *app) snapshotAttachment(path string) (attachmentSnapshot, error) {
 		return result, errors.New("attachment namespace durability could not be established")
 	}
 	digest := sha256.Sum256(data)
-	return attachmentSnapshot{Path: destination, Hash: hex.EncodeToString(digest[:]), Size: int64(len(data))}, nil
+	return attachmentSnapshot{Path: destination, Hash: hex.EncodeToString(digest[:]), Size: int64(len(data)), DirectoryIdentity: ownedDirectoryIdentity(info)}, nil
 }

@@ -59,6 +59,12 @@ reconciliation. Discard releases retained snapshot files, but it does not
 cancel provider work or alter whether delivery occurred. Starting a new
 objective is refused while retained payloads still need reconciliation.
 
+On macOS and Linux, cleanup pins the private data and attachment directories,
+unlinks by basename relative to the open directory, and syncs that same handle.
+If an ancestor or attachment directory changes identity, cleanup fails closed
+with its receipt intact. Windows builds retain `cleanup_pending` because this
+release has no equivalent descriptor-confined deletion primitive there.
+
 Repository controls expose local tracking and worktree state. Sync preserves
 local work if a remote is unavailable. Removal refuses dirty, locked, current,
 or unpushed work and requires exact-path confirmation. A new terminal request

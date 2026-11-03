@@ -162,7 +162,8 @@ type app struct {
 	writeInputs        func(string, []byte) error
 	attachmentSyncFile func(*os.File) error
 	attachmentSyncDir  func(string) error
-	attachmentRemove   func(string) error
+	attachmentCleanup  func(string, os.FileInfo, string, string) error
+	dataDirInfo        os.FileInfo
 	releaseState       func()
 	coreSecretMu       sync.Mutex
 	coreSecrets        []string
@@ -230,7 +231,12 @@ func newApp(dir string, ref *reference) (*app, error) {
 		f.Close()
 		return nil, e
 	}
-	a := &app{reference: ref, hub: newEventHub(), dataDir: dir, journal: f, clients: map[string]*rpcClient{}, runtime: defaultRuntime, resolvePolicy: defaultPolicy, newRedactor: func() streamRedactor { return plainStream{} }, redact: func(value string) string { return value }}
+	dataDirInfo, e := os.Lstat(dir)
+	if e != nil {
+		f.Close()
+		return nil, e
+	}
+	a := &app{reference: ref, hub: newEventHub(), dataDir: dir, dataDirInfo: dataDirInfo, journal: f, clients: map[string]*rpcClient{}, runtime: defaultRuntime, resolvePolicy: defaultPolicy, newRedactor: func() streamRedactor { return plainStream{} }, redact: func(value string) string { return value }}
 	a.releaseState = release
 	a.providers = discoverProviders()
 	if e = a.restore(); e != nil {

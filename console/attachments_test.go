@@ -8,6 +8,9 @@ import (
 )
 
 func TestOrdinarySendAttachmentSurvivesNextComposerSelection(t *testing.T) {
+	if !attachmentCleanupSupported() {
+		t.Skip("descriptor-confined cleanup unavailable on this platform")
+	}
 	a, base, _ := checkpointFixture(t)
 	binary, _ := os.Executable()
 	a.runtime = func(string, string) (string, []string, error) {
@@ -46,7 +49,7 @@ func TestOrdinarySendAttachmentSurvivesNextComposerSelection(t *testing.T) {
 	if entry == nil || !entry.RetentionOnly || entry.Status != "retained" {
 		t.Fatalf("ordinary send did not retain explicit attachment ownership: %#v", entry)
 	}
-	a.attachmentRemove = func(string) error { return errors.New("injected unlink failure") }
+	a.attachmentCleanup = func(string, os.FileInfo, string, string) error { return errors.New("injected unlink failure") }
 	finishNativeQueueTurn(a, s)
 	if entry.Status != "cleanup_pending" || !activeQueue(s) {
 		t.Fatalf("unlink failure pruned durable attachment owner: %#v", entry)
@@ -79,6 +82,9 @@ func TestOrdinarySendAttachmentSurvivesNextComposerSelection(t *testing.T) {
 }
 
 func TestOrdinarySendAttachmentSurvivesUnknownRestart(t *testing.T) {
+	if !attachmentCleanupSupported() {
+		t.Skip("descriptor-confined cleanup unavailable on this platform")
+	}
 	dataDir := t.TempDir()
 	cwd, _ := filepath.EvalSymlinks(t.TempDir())
 	a, err := newApp(dataDir, nil)
@@ -126,6 +132,78 @@ func TestOrdinarySendAttachmentSurvivesUnknownRestart(t *testing.T) {
 	}
 	if _, err = os.Stat(snapshot); !os.IsNotExist(err) {
 		t.Fatal("explicit recovery discard did not release snapshot")
+	}
+}
+
+func TestAttachmentCleanupRefusesSwappedDataDirectory(t *testing.T) {
+	if !attachmentCleanupSupported() {
+		t.Skip("descriptor-confined cleanup unavailable on this platform")
+	}
+	a, err := newApp(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.close()
+	cwd, _ := filepath.EvalSymlinks(t.TempDir())
+	s := emptySession("codex", cwd, "")
+	s.ProviderID = "provider"
+	s.task = &trackedTask{ID: "task", Generation: 1, objective: "owned cleanup", passes: map[string]string{}, attempts: map[string]int{}}
+	ensureTaskAuthority(s.task)
+	a.sessions = append(a.sessions, s)
+	source := filepath.Join(s.CWD, "same-name.txt")
+	if err = os.WriteFile(source, []byte("private original"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := a.snapshotAttachment(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := &queuedInput{RetentionOnly: true, RequestID: "cleanup", Status: "cleanup_pending", TaskID: s.task.ID, Generation: s.task.Generation, Snapshots: map[string]attachmentSnapshot{source: snapshot}}
+	s.inputs = append(s.inputs, entry)
+	if err = a.saveInputsLocked(s); err != nil {
+		t.Fatal(err)
+	}
+
+	moved := a.dataDir + "-original"
+	outside := t.TempDir()
+	if err = os.Mkdir(filepath.Join(outside, "attachments"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(outside, "attachments", filepath.Base(snapshot.Path))
+	if err = os.WriteFile(outsideFile, []byte("outside must survive"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a.attachmentCleanup = func(dataDir string, expected os.FileInfo, name, directoryIdentity string) error {
+		if err := os.Rename(dataDir, moved); err != nil {
+			return err
+		}
+		if err := os.Symlink(outside, dataDir); err != nil {
+			return err
+		}
+		return removeOwnedAttachment(dataDir, expected, name, directoryIdentity)
+	}
+	if err = a.finishAttachmentCleanupLocked(s, entry); err == nil {
+		t.Fatal("swapped data directory was allowed to redirect cleanup")
+	}
+	if entry.Status != "cleanup_pending" || len(entry.Snapshots) != 1 {
+		t.Fatalf("failed confinement pruned cleanup owner: %#v", entry)
+	}
+	if data, readErr := os.ReadFile(outsideFile); readErr != nil || string(data) != "outside must survive" {
+		t.Fatalf("outside same-basename target was changed: %q %v", data, readErr)
+	}
+	originalMoved := filepath.Join(moved, "attachments", filepath.Base(snapshot.Path))
+	if data, readErr := os.ReadFile(originalMoved); readErr != nil || string(data) != "private original" {
+		t.Fatalf("pinned original snapshot was lost: %q %v", data, readErr)
+	}
+	if err = os.Remove(a.dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Rename(moved, a.dataDir); err != nil {
+		t.Fatal(err)
+	}
+	a.attachmentCleanup = nil
+	if err = a.finishAttachmentCleanupLocked(s, entry); err != nil {
+		t.Fatal("cleanup did not resume after restoring the pinned directory", err)
 	}
 }
 
