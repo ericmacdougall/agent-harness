@@ -304,9 +304,7 @@ func (a *app) codexQuestion(client *rpcClient, packet rpcPacket) {
 		return
 	}
 	if current.reviewParent != "" {
-		current.Status = "error"
-		current.Error = "Independent reviewer requested user input; review blocked"
-		a.finishReviewLocked(current)
+		a.blockReviewerLocked(current, "Independent reviewer requested user input; review blocked")
 		a.mu.Unlock()
 		_ = client.reject(packet.ID, "independent review requires unattended read-only evidence")
 		return

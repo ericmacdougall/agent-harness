@@ -158,9 +158,9 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 		current.Effort = policy.Effort
 	}
 
-	if current.codex != nil && current.codex.runtimeHash != fingerprint {
+	if current.codex != nil && current.codex.runtimeHash != fingerprint || claudeRuntimeChanged(current, fingerprint) {
 		a.mu.Unlock()
-		return errors.New("credentials or tools changed; start a new context session")
+		return errRuntimeChanged
 	}
 	if !automatic || current.task == nil {
 		generation := uint64(1)
@@ -494,6 +494,9 @@ func (a *app) changeCWD(id, path string) error {
 	}
 	if current.Status == "running" || current.Status == "waiting" || current.Status == "starting" || current.Status == "unknown" {
 		return errors.New("pause or reconcile the active turn before changing its working directory")
+	}
+	if oneOf(current.requests[current.lastRequest], "intent", "accepted", "unknown") {
+		return errors.New("the last request has no native final outcome; reconcile it before changing its working directory")
 	}
 	if activeQueue(current) {
 		return errors.New("queued or retained inputs bind this cwd; cancel or discard them first")

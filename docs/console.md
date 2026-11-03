@@ -123,7 +123,10 @@ or became ready.
 
 Settings are revisioned. Conflicting edits are refused rather than silently
 overwriting a newer configuration. Changes affect new stages; a running request
-retains its admitted account and policy.
+retains its admitted account and policy. If a stored credential, environment
+value or tool configuration changes the runtime behind an existing Codex or
+Claude conversation, its next send is refused, including automatic
+continuations. Start a new context session to continue.
 
 | Setting | Behavior and boundary |
 | --- | --- |
@@ -192,8 +195,10 @@ old native sessions may still need reconciliation.
 Closing a browser tab does not stop the server. Use **Quit console** and confirm
 the shutdown, or Ctrl-C in the process's terminal. Stopping a selected turn is
 different from shutting down the whole console. If cancellation lacks a native
-terminal confirmation, its state remains unknown and its Stop control stays
-available.
+terminal confirmation, its outcome stays unresolved and its Stop control stays
+available. A tab cannot be closed, and its working directory cannot change, while
+its last request is unresolved. This release has no action to discard an
+unresolved tab; it keeps its session slot until a later native final arrives.
 
 ## Verification
 

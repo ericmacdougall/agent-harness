@@ -16,6 +16,11 @@ func (a *app) closeSession(id string) error {
 	case "starting", "running", "waiting", "unknown":
 		return errors.New("pause or reconcile active work before closing this tab")
 	}
+	// A paused status is a UI state, not a provider outcome. Restore drops closed
+	// sessions, so closing here would erase the only receipt of an unresolved turn.
+	if oneOf(current.requests[current.lastRequest], "intent", "accepted", "unknown") {
+		return errors.New("the last request has no native final outcome; stop or reconcile it before closing this tab")
+	}
 	for _, child := range current.Agents {
 		if child.CanPause || child.Status == "starting" || child.Status == "running" || child.Status == "active" {
 			return errors.New("an owner is still active; stop or reconcile it before closing")

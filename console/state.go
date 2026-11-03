@@ -124,7 +124,9 @@ type session struct {
 	codex               *rpcClient
 	claude              *claudeRun
 	claudeStarted       bool
-	attachmentSnapshots map[string]attachmentSnapshot
+	// Runtime identity that owns the Claude conversation; a change refuses --resume.
+	conversationRuntimeHash string
+	attachmentSnapshots     map[string]attachmentSnapshot
 }
 type providerInfo struct {
 	ID        string `json:"id"`

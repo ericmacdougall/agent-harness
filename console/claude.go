@@ -83,6 +83,16 @@ func (r *claudeRun) writeAdmitted(ctx context.Context, value any, admit inputAdm
 	return err
 }
 
+var errRuntimeChanged = errors.New("credentials or tools changed; start a new context session")
+
+// claudeRuntimeChanged reports whether resuming would carry this conversation
+// into a different credential or tool runtime. A stored API key change does not
+// pass through an auth transition, so this is what stops --resume, including
+// unattended continuations, from crossing into another account.
+func claudeRuntimeChanged(current *session, fingerprint string) bool {
+	return current.Provider == "claude" && current.conversationRuntimeHash != "" && current.conversationRuntimeHash != fingerprint
+}
+
 func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile string) error {
 	a.mu.Lock()
 	run := current.claude
@@ -107,6 +117,13 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 	if runtimeErr != nil {
 		a.rejectedSend(current, requestID, runtimeErr)
 		return runtimeErr
+	}
+	a.mu.Lock()
+	runtimeChanged := claudeRuntimeChanged(current, fingerprint)
+	a.mu.Unlock()
+	if runtimeChanged {
+		a.rejectedSend(current, requestID, errRuntimeChanged)
+		return errRuntimeChanged
 	}
 	if run != nil && (usedRun || (run.taskID != taskID || run.inputRevision != revision) || run.runtimeHash != fingerprint || run.policy.Model != policy.Model || run.policy.Effort != policy.Effort || run.policy.Permissions != policy.Permissions || run.policy.HarnessInstructions != policy.HarnessInstructions || run.cwd != cwd) {
 		// Stream-json results do not identify the input request. A process may
@@ -295,9 +312,13 @@ func (a *app) detachStartedClaudeRun(current *session, run *claudeRun) {
 // holding the same generation admission used by serialized frame writes. A
 // transition therefore either sees and cancels the attached run or prevents
 // publication and cancels the otherwise invisible process here.
+//
+// Lock order is generation admission, then a.mu, matching admitted writers. A
+// pending writer on the generation lock blocks new readers, so waiting for it
+// while holding a.mu would deadlock against a writer that needs a.mu to finish.
 func (a *app) attachStartedClaudeRun(current *session, run *claudeRun, profile string, generation uint64, taskID string, revision uint64) error {
-	a.mu.Lock()
 	release, err := a.authAdmission("claude", profile, generation)()
+	a.mu.Lock()
 	if err == nil && (current.claude != nil || current.Restored) {
 		err = refused("Claude session binding changed before process publication")
 	}
@@ -305,11 +326,12 @@ func (a *app) attachStartedClaudeRun(current *session, run *claudeRun, profile s
 		run.taskID = taskID
 		run.inputRevision = revision
 		current.claude = run
+		current.conversationRuntimeHash = run.runtimeHash
 	}
+	a.mu.Unlock()
 	if release != nil {
 		release()
 	}
-	a.mu.Unlock()
 	if err != nil {
 		run.cancel()
 	}
@@ -494,9 +516,7 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 			request := mapField(value, "request")
 			if inputLifecycleBlocked(current) || current.reviewParent != "" {
 				if current.reviewParent != "" {
-					current.Status = "error"
-					current.Error = "Independent reviewer requested interactive permission"
-					a.finishReviewLocked(current)
+					a.blockReviewerLocked(current, "Independent reviewer requested interactive permission")
 				}
 				go run.write(map[string]any{"type": "control_response", "response": map[string]any{"subtype": "error", "request_id": textField(value, "request_id"), "error": "interactive question unavailable for this lifecycle"}})
 				break
@@ -520,7 +540,8 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 				current.PendingQuestions = append(current.PendingQuestions, q)
 				current.Status = "waiting"
 			} else {
-				_ = run.write(map[string]any{"type": "control_response", "response": map[string]any{"subtype": "error", "request_id": textField(value, "request_id"), "error": "This console does not support this control request"}})
+				// Never write while holding a.mu: the write waits on auth admission.
+				go run.write(map[string]any{"type": "control_response", "response": map[string]any{"subtype": "error", "request_id": textField(value, "request_id"), "error": "This console does not support this control request"}})
 				current.Error = "Claude requested an unsupported control operation"
 			}
 		}

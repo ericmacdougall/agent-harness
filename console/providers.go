@@ -142,13 +142,14 @@ func (a *app) codexClient(profile string, cwds ...string) (*rpcClient, error) {
 }
 
 func (a *app) publishCodexClient(key, profile string, generation uint64, existing, client *rpcClient) (*rpcClient, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	// Generation admission precedes a.mu; see attachStartedClaudeRun.
 	release, err := a.authAdmission("codex", profile, generation)()
 	if err != nil {
 		return nil, err
 	}
 	defer release()
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if concurrent := a.clients[key]; concurrent != nil && concurrent != existing {
 		return concurrent, nil
 	}

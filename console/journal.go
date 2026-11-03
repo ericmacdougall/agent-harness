@@ -22,6 +22,7 @@ func (a *app) restore() error {
 	scan := bufio.NewScanner(a.journal)
 	scan.Buffer(make([]byte, 4096), 65536)
 	records := map[string]journalRecord{}
+	receipts := map[string]string{}
 	checkpoints := map[string]journalRecord{}
 	reviewRecords := map[string]journalRecord{}
 	order := []string{}
@@ -47,6 +48,11 @@ func (a *app) restore() error {
 			order = append(order, record.SessionID)
 		}
 		records[record.SessionID] = record
+		// Bookkeeping records such as cwd carry no request. They must not stand in
+		// for the last request receipt when deciding what restart can trust.
+		if record.RequestID != "" {
+			receipts[record.SessionID] = record.State
+		}
 	}
 	if err = scan.Err(); err != nil {
 		return err
@@ -74,7 +80,7 @@ func (a *app) restore() error {
 		current.Title = "Restored " + record.Provider + " session"
 		current.Supervision.State = "paused"
 		current.Supervision.Reason = "App restarted. Prior writer is read-only; continue in a new session with available context."
-		if oneOf(record.State, "intent", "accepted", "unknown") {
+		if oneOf(receipts[id], "intent", "accepted", "unknown") {
 			current.Status = "unknown"
 			current.Error = "A prior send has no durable final outcome. It was not replayed."
 		}

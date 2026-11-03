@@ -38,6 +38,20 @@ func (a *app) finishReviewLocked(s *session) {
 		s.reviewDone = nil
 	}
 }
+
+// blockReviewerLocked makes a reviewer's failure terminal. The waiter reads
+// Status only after it wakes, so a late completion must not be able to move an
+// interactive reviewer back to idle and have its text accepted as a verdict.
+func (a *app) blockReviewerLocked(s *session, reason string) {
+	s.Status = "error"
+	s.Error = reason
+	if oneOf(s.requests[s.lastRequest], "intent", "accepted") {
+		s.requests[s.lastRequest] = "unknown"
+		s.providerFinal = false
+		_ = a.record(s, s.lastRequest, "review_unknown")
+	}
+	a.finishReviewLocked(s)
+}
 func (a *app) runReviews(parent *session) {
 	a.mu.Lock()
 	task := parent.task
