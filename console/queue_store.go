@@ -192,8 +192,6 @@ func (a *app) restoreInputs() error {
 		}
 		seen := map[string]bool{}
 		totalText := 0
-		totalBytes := int64(0)
-		totalSnapshots := 0
 		for _, entry := range disk.Entries {
 			if entry == nil || entry.RequestID == "" || len(entry.RequestID) > 128 || seen[entry.RequestID] || (entry.Status != "discarded" && (entry.TaskID != disk.TaskID || entry.Generation != disk.Generation)) || len(entry.Text) > 128<<10 {
 				return errors.New("invalid recovered queue entry")
@@ -201,8 +199,6 @@ func (a *app) restoreInputs() error {
 			seen[entry.RequestID] = true
 			totalText += len(entry.Text)
 			for _, attachment := range entry.Snapshots {
-				totalSnapshots++
-				totalBytes += attachment.Size
 				if attachment.Size < 0 || filepath.Clean(attachment.Path) != attachment.Path || !strings.HasPrefix(attachment.Path, filepath.Join(a.dataDir, "attachments")+string(filepath.Separator)) {
 					return errors.New("queued attachment recovery path refused")
 				}
@@ -223,7 +219,10 @@ func (a *app) restoreInputs() error {
 				return errors.New("unknown queued input state")
 			}
 		}
-		if totalText > queueTextLimit || totalBytes > queueAttachmentLimit || totalSnapshots > 16 {
+		if totalText > queueTextLimit {
+			return errors.New("recovered queue exceeds retention bound")
+		}
+		if err := attachmentRetentionBound(disk.Entries, nil); err != nil {
 			return errors.New("recovered queue exceeds retention bound")
 		}
 		for _, entry := range disk.Entries {

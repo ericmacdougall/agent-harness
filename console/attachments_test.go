@@ -165,6 +165,140 @@ func TestOrdinarySendAttachmentSurvivesUnknownRestart(t *testing.T) {
 	}
 }
 
+func TestOrdinarySendRefusesAttachmentsBeyondRecoveryBound(t *testing.T) {
+	if !attachmentCleanupSupported() {
+		t.Skip("descriptor-confined cleanup unavailable on this platform")
+	}
+	a, base, _ := checkpointFixture(t)
+	binary, _ := os.Executable()
+	a.runtime = func(string, string) (string, []string, error) {
+		return binary, append(os.Environ(), "HARNESS_CONSOLE_RPC_FIXTURE=1"), nil
+	}
+	s, err := a.createSession("codex", base.CWD, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{filepath.Join(s.CWD, "nine-a.bin"), filepath.Join(s.CWD, "nine-b.bin")}
+	for _, path := range paths {
+		if err = os.WriteFile(path, make([]byte, 9<<20), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = a.selectAttachments(s.ID, paths); err != nil {
+		t.Fatal(err)
+	}
+	snapshots := map[string]string{}
+	for _, path := range paths {
+		snapshots[path] = s.attachmentSnapshots[path].Path
+	}
+	if err = a.send(s.ID, "ordinary-too-large", "must fail before provider delivery", paths, false); err == nil || !strings.Contains(err.Error(), "16 MiB") {
+		t.Fatal("aggregate-over-limit ordinary send was not refused clearly", err)
+	}
+	if queueEntry(s, "ordinary-too-large") != nil {
+		t.Fatal("refused ordinary send gained durable attachment ownership")
+	}
+	if _, exists := s.requests["ordinary-too-large"]; exists {
+		t.Fatal("refused ordinary send persisted provider intent")
+	}
+	if len(s.Attachments) != len(paths) || len(s.attachmentSnapshots) != len(paths) {
+		t.Fatal("refused ordinary send consumed composer snapshots")
+	}
+	for source, snapshot := range snapshots {
+		if s.attachmentSnapshots[source].Path != snapshot {
+			t.Fatal("refused ordinary send replaced composer snapshot")
+		}
+		if _, statErr := os.Stat(snapshot); statErr != nil {
+			t.Fatal("refused ordinary send orphaned or removed composer snapshot", statErr)
+		}
+	}
+	if s.Status == "running" {
+		t.Fatal("refused ordinary send reached provider startup")
+	}
+}
+
+func TestOrdinarySendExactRecoveryBoundRestartsBeforeFinality(t *testing.T) {
+	if !attachmentCleanupSupported() {
+		t.Skip("descriptor-confined cleanup unavailable on this platform")
+	}
+	dataDir := t.TempDir()
+	cwd, _ := filepath.EvalSymlinks(t.TempDir())
+	a, err := newApp(dataDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, _ := os.Executable()
+	a.runtime = func(string, string) (string, []string, error) {
+		return binary, append(os.Environ(), "HARNESS_CONSOLE_RPC_FIXTURE=1"), nil
+	}
+	s, err := a.createSession("codex", cwd, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{filepath.Join(cwd, "eight-a.bin"), filepath.Join(cwd, "eight-b.bin")}
+	for _, path := range paths {
+		if err = os.WriteFile(path, make([]byte, 8<<20), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = a.selectAttachments(s.ID, paths); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.send(s.ID, "ordinary-exact-limit", "retain exactly the recovery byte limit", paths, false); err != nil {
+		t.Fatal(err)
+	}
+	a.close()
+	restored, err := newApp(dataDir, nil)
+	if err != nil {
+		t.Fatal("exact-limit retained attachments prevented startup recovery", err)
+	}
+	defer restored.close()
+	if len(restored.sessions) != 1 {
+		t.Fatal("restart lost exact-limit session")
+	}
+	entry := queueEntry(restored.sessions[0], "ordinary-exact-limit")
+	if entry == nil || entry.Status != "retained" || len(entry.Snapshots) != 2 {
+		t.Fatalf("restart lost exact-limit attachment ownership: %#v", entry)
+	}
+}
+
+func TestOrdinaryRetentionCountsExistingQueuedAttachments(t *testing.T) {
+	if !attachmentCleanupSupported() {
+		t.Skip("descriptor-confined cleanup unavailable on this platform")
+	}
+	a, err := newApp(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.close()
+	cwd, _ := filepath.EvalSymlinks(t.TempDir())
+	s := emptySession("codex", cwd, "")
+	s.task = &trackedTask{ID: "task", Generation: 1, objective: "aggregate ownership", passes: map[string]string{}, attempts: map[string]int{}}
+	ensureTaskAuthority(s.task)
+	a.sessions = append(a.sessions, s)
+	existingPath := filepath.Join(cwd, "existing.bin")
+	newPath := filepath.Join(cwd, "new.bin")
+	if err = os.WriteFile(existingPath, make([]byte, 8<<20), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(newPath, make([]byte, 9<<20), 0600); err != nil {
+		t.Fatal(err)
+	}
+	existing, err := a.snapshotAttachment(existingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.inputs = append(s.inputs, &queuedInput{RequestID: "existing", Status: "retained", TaskID: s.task.ID, Generation: s.task.Generation, Snapshots: map[string]attachmentSnapshot{existingPath: existing}})
+	if err = a.selectAttachments(s.ID, []string{newPath}); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.retainOrdinaryAttachmentsLocked(s, "new", "new input", []string{newPath}, "runtime"); err == nil || !strings.Contains(err.Error(), "16 MiB") {
+		t.Fatal("ordinary retention ignored existing queued attachment bytes", err)
+	}
+	if queueEntry(s, "new") != nil || len(s.attachmentSnapshots) != 1 {
+		t.Fatal("aggregate refusal transferred or durably recorded composer ownership")
+	}
+}
+
 func TestAttachmentCleanupRefusesSwappedDataDirectory(t *testing.T) {
 	if !attachmentCleanupSupported() {
 		t.Skip("descriptor-confined cleanup unavailable on this platform")
@@ -234,6 +368,59 @@ func TestAttachmentCleanupRefusesSwappedDataDirectory(t *testing.T) {
 	a.attachmentCleanup = nil
 	if err = a.finishAttachmentCleanupLocked(s, entry); err != nil {
 		t.Fatal("cleanup did not resume after restoring the pinned directory", err)
+	}
+}
+
+func TestComposerReplacementRefusesSwappedDataDirectory(t *testing.T) {
+	if !attachmentCleanupSupported() {
+		t.Skip("descriptor-confined cleanup unavailable on this platform")
+	}
+	a, err := newApp(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.close()
+	cwd, _ := filepath.EvalSymlinks(t.TempDir())
+	s := emptySession("codex", cwd, "")
+	a.sessions = append(a.sessions, s)
+	source := filepath.Join(cwd, "composer-swap.txt")
+	if err = os.WriteFile(source, []byte("private composer snapshot"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.selectAttachments(s.ID, []string{source}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := s.attachmentSnapshots[source]
+	moved := a.dataDir + "-original"
+	outside := t.TempDir()
+	if err = os.Mkdir(filepath.Join(outside, "attachments"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(outside, "attachments", filepath.Base(snapshot.Path))
+	if err = os.WriteFile(outsideFile, []byte("outside must survive"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Rename(a.dataDir, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Symlink(outside, a.dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.selectAttachments(s.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if data, readErr := os.ReadFile(outsideFile); readErr != nil || string(data) != "outside must survive" {
+		t.Fatalf("composer replacement followed swapped data directory: %q %v", data, readErr)
+	}
+	originalMoved := filepath.Join(moved, "attachments", filepath.Base(snapshot.Path))
+	if data, readErr := os.ReadFile(originalMoved); readErr != nil || string(data) != "private composer snapshot" {
+		t.Fatalf("confined refusal changed the pinned original snapshot: %q %v", data, readErr)
+	}
+	if err = os.Remove(a.dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Rename(moved, a.dataDir); err != nil {
+		t.Fatal(err)
 	}
 }
 

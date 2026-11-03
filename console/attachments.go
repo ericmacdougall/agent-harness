@@ -38,7 +38,7 @@ func (a *app) selectAttachments(id string, paths []string) error {
 		item, err := a.snapshotAttachment(path)
 		if err != nil {
 			for _, saved := range selected {
-				_ = os.Remove(saved.Path)
+				a.removeAttachmentSnapshot(saved)
 			}
 			return err
 		}
@@ -49,17 +49,24 @@ func (a *app) selectAttachments(id string, paths []string) error {
 	current := a.findLocked(id)
 	if current == nil {
 		for _, saved := range selected {
-			_ = os.Remove(saved.Path)
+			a.removeAttachmentSnapshot(saved)
 		}
 		return errors.New("session not found")
 	}
 	for _, saved := range current.attachmentSnapshots {
-		_ = os.Remove(saved.Path)
+		a.removeAttachmentSnapshot(saved)
 	}
 	current.attachmentSnapshots = selected
 	current.Attachments = append([]string{}, paths...)
 	a.changedLocked()
 	return nil
+}
+
+func (a *app) removeAttachmentSnapshot(saved attachmentSnapshot) {
+	if saved.DirectoryIdentity == "" {
+		return
+	}
+	_ = removeOwnedAttachment(a.dataDir, a.dataDirInfo, filepath.Base(saved.Path), saved.DirectoryIdentity)
 }
 
 // Called under app.mu after send admission. Transfer immutable snapshots out of
@@ -75,6 +82,9 @@ func (a *app) retainOrdinaryAttachmentsLocked(s *session, request, text string, 
 	snapshots := map[string]attachmentSnapshot{}
 	for _, path := range paths {
 		snapshots[path] = s.attachmentSnapshots[path]
+	}
+	if err := attachmentRetentionBound(s.inputs, snapshots); err != nil {
+		return err
 	}
 	entry := &queuedInput{
 		RetentionOnly:         true,
@@ -112,6 +122,43 @@ func (a *app) retainOrdinaryAttachmentsLocked(s *session, request, text string, 
 	}
 	s.Attachments = []string{}
 	return nil
+}
+
+// attachmentRetentionBound is the admission and recovery boundary for every
+// snapshot durably owned by a session. It only accounts metadata; snapshot
+// bytes remain in their existing private files.
+func attachmentRetentionBound(entries []*queuedInput, additional map[string]attachmentSnapshot) error {
+	totalBytes := int64(0)
+	totalSnapshots := 0
+	add := func(snapshots map[string]attachmentSnapshot) error {
+		for _, saved := range snapshots {
+			if saved.Size < 0 || saved.Size > queueAttachmentLimit-totalBytes {
+				return errors.New("retained attachments reached 16 MiB / 16 files; reconcile or discard retained inputs")
+			}
+			totalBytes += saved.Size
+			totalSnapshots++
+			if totalSnapshots > 16 {
+				return errors.New("retained attachments reached 16 MiB / 16 files; reconcile or discard retained inputs")
+			}
+		}
+		return nil
+	}
+	for _, entry := range entries {
+		if entry != nil {
+			if err := add(entry.Snapshots); err != nil {
+				return err
+			}
+		}
+	}
+	return add(additional)
+}
+
+func selectedAttachmentSnapshots(s *session, paths []string) map[string]attachmentSnapshot {
+	snapshots := make(map[string]attachmentSnapshot, len(paths))
+	for _, path := range paths {
+		snapshots[path] = s.attachmentSnapshots[path]
+	}
+	return snapshots
 }
 
 // Called under app.mu. cleanup_pending is the durable owner until every
@@ -241,7 +288,7 @@ func (a *app) snapshotAttachment(path string) (attachmentSnapshot, error) {
 	}
 	closeErr := file.Close()
 	if err != nil || closeErr != nil {
-		_ = os.Remove(destination)
+		a.removeAttachmentSnapshot(attachmentSnapshot{Path: destination, DirectoryIdentity: ownedDirectoryIdentity(info)})
 		return result, errors.New("attachment snapshot could not be saved")
 	}
 	syncDir := a.attachmentSyncDir
@@ -252,7 +299,7 @@ func (a *app) snapshotAttachment(path string) (attachmentSnapshot, error) {
 		err = syncDir(a.dataDir)
 	}
 	if err != nil {
-		_ = os.Remove(destination)
+		a.removeAttachmentSnapshot(attachmentSnapshot{Path: destination, DirectoryIdentity: ownedDirectoryIdentity(info)})
 		return result, errors.New("attachment namespace durability could not be established")
 	}
 	digest := sha256.Sum256(data)

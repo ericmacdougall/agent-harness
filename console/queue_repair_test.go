@@ -18,6 +18,135 @@ func postReplaceQueueFault(t *testing.T, a *app) {
 		return errSettingsDurability
 	}
 }
+
+func cleanupCompletionFault(t *testing.T, a *app) {
+	t.Helper()
+	writes := 0
+	a.writeInputs = func(path string, data []byte) error {
+		writes++
+		if err := settingsAtomicWrite(path, data); err != nil {
+			return err
+		}
+		if writes == 2 {
+			return errSettingsDurability
+		}
+		return nil
+	}
+}
+
+func TestQueueRepairInterruptedCleanupCompletionRestarts(t *testing.T) {
+	if !attachmentCleanupSupported() {
+		t.Skip("descriptor-confined cleanup unavailable on this platform")
+	}
+	for _, retentionOnly := range []bool{false, true} {
+		name := "queued_discard"
+		if retentionOnly {
+			name = "ordinary_finality"
+		}
+		t.Run(name, func(t *testing.T) {
+			a, s := queueNativeFixture(t)
+			source := filepath.Join(s.CWD, name+".bin")
+			if err := os.WriteFile(source, []byte("cleanup completion crash"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.selectAttachments(s.ID, []string{source}); err != nil {
+				t.Fatal(err)
+			}
+			request := "cleanup-queued"
+			var entry *queuedInput
+			var err error
+			if retentionOnly {
+				finishNativeQueueTurn(a, s)
+				s.Status = "idle"
+				s.task.State = "blocked"
+				request = "cleanup-ordinary"
+				if err = a.send(s.ID, request, "ordinary attachment cleanup", []string{source}, false); err != nil {
+					t.Fatal(err)
+				}
+				entry = queueEntry(s, request)
+			} else {
+				entry, err = a.enqueueInput(s.ID, request, "queued attachment cleanup", []string{source})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			snapshot := entry.Snapshots[source].Path
+			cleanupCompletionFault(t, a)
+			if retentionOnly {
+				finishNativeQueueTurn(a, s)
+			} else if err = a.discardInput(s.ID, request, false); err == nil {
+				t.Fatal("cleanup completion interruption reported success")
+			}
+			if _, statErr := os.Stat(snapshot); !os.IsNotExist(statErr) {
+				t.Fatal("fixture did not interrupt after snapshot unlink", statErr)
+			}
+			dir := a.dataDir
+			a.close()
+			restored, err := newApp(dir, nil)
+			if err != nil {
+				t.Fatal("restart could not reconcile completed cleanup", err)
+			}
+			defer restored.close()
+			recovered := queueEntry(restored.sessions[0], request)
+			if recovered == nil || recovered.Status != "discarded" || len(recovered.Snapshots) != 0 {
+				t.Fatalf("restart did not finish interrupted cleanup: %#v", recovered)
+			}
+			if restored.sessions[0].codex != nil {
+				t.Fatal("cleanup recovery replayed provider work")
+			}
+		})
+	}
+}
+
+func TestQueueRepairPartialMultiSnapshotCleanupRestarts(t *testing.T) {
+	if !attachmentCleanupSupported() {
+		t.Skip("descriptor-confined cleanup unavailable on this platform")
+	}
+	a, s := queueNativeFixture(t)
+	paths := []string{filepath.Join(s.CWD, "partial-a.bin"), filepath.Join(s.CWD, "partial-b.bin")}
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte("original survives private cleanup"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.selectAttachments(s.ID, paths); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := a.enqueueInput(s.ID, "partial-cleanup", "two private snapshots", paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	a.attachmentCleanup = func(dataDir string, expected os.FileInfo, name, directoryIdentity string) error {
+		calls++
+		if calls == 2 {
+			return errors.New("injected second unlink failure")
+		}
+		return removeOwnedAttachment(dataDir, expected, name, directoryIdentity)
+	}
+	if err = a.discardInput(s.ID, entry.RequestID, false); err == nil {
+		t.Fatal("partial cleanup failure reported success")
+	}
+	if entry.Status != "cleanup_pending" || len(entry.Snapshots) != 2 {
+		t.Fatalf("partial cleanup lost durable owner: %#v", entry)
+	}
+	dir := a.dataDir
+	a.close()
+	restored, err := newApp(dir, nil)
+	if err != nil {
+		t.Fatal("restart could not finish partial cleanup", err)
+	}
+	defer restored.close()
+	recovered := queueEntry(restored.sessions[0], entry.RequestID)
+	if recovered == nil || recovered.Status != "discarded" || len(recovered.Snapshots) != 0 {
+		t.Fatalf("restart did not finish partial cleanup: %#v", recovered)
+	}
+	for _, path := range paths {
+		if data, readErr := os.ReadFile(path); readErr != nil || string(data) != "original survives private cleanup" {
+			t.Fatal("private cleanup changed unrelated composer source", path, readErr)
+		}
+	}
+}
 func TestQueueRepairDiscardTurnoverRestart(t *testing.T) {
 	a, s := queueNativeFixture(t)
 	q, err := a.enqueueInput(s.ID, "discard-before-turnover", "Unsent followup", nil)

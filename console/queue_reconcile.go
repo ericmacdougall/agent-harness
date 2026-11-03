@@ -29,8 +29,9 @@ func mergeQueueCandidates(current, previous queueDisk) (queueDisk, error) {
 		}
 	}
 	byID := map[string]*queuedInput{}
+	cleanupCompleted := map[string]bool{}
 	order := []string{}
-	for _, disk := range []queueDisk{previous, current} {
+	for candidateIndex, disk := range []queueDisk{previous, current} {
 		for _, entry := range disk.Entries {
 			if entry == nil || entry.RequestID == "" {
 				return current, errors.New("invalid interrupted queue entry")
@@ -55,6 +56,13 @@ func mergeQueueCandidates(current, previous queueDisk) (queueDisk, error) {
 			if prior.Text == "" {
 				prior.Text = entry.Text
 			}
+			// Main discarded + beforeimage cleanup_pending is the one safe
+			// interrupted-cleanup transition: unlink was authorized durably and
+			// may already be complete. Retain the pending owner so idempotent,
+			// confined cleanup can finish. The opposite direction remains unknown.
+			if candidateIndex == 1 && prior.Status == "cleanup_pending" && entry.Status == "discarded" && entry.Text == "" && len(entry.Snapshots) == 0 {
+				cleanupCompleted[entry.RequestID] = true
+			}
 			for path, snapshot := range entry.Snapshots {
 				if old, ok := prior.Snapshots[path]; ok && old != snapshot {
 					return current, errors.New("conflicting attachment candidates; preserve state")
@@ -72,7 +80,10 @@ func mergeQueueCandidates(current, previous queueDisk) (queueDisk, error) {
 	chosen.Entries = []*queuedInput{}
 	for _, id := range order {
 		entry := byID[id]
-		if entry.Text != "" || len(entry.Snapshots) > 0 || entry.Status != "discarded" {
+		if cleanupCompleted[id] {
+			entry.Status = "cleanup_pending"
+			entry.Reason = "Interrupted cleanup completion; resume idempotent private cleanup, never provider replay"
+		} else if entry.Text != "" || len(entry.Snapshots) > 0 || entry.Status != "discarded" {
 			entry.Status = "unknown"
 			entry.Reason = "Interrupted private commit; payload and snapshot owners retained, never replay automatically"
 		}

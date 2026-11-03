@@ -129,6 +129,9 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 		snapshots, attachmentErr = a.followupSnapshotsLocked(current, followup, policy, fingerprint)
 	} else {
 		snapshots, attachmentErr = a.selectedAttachments(current, attachments)
+		if attachmentErr == nil {
+			attachmentErr = attachmentRetentionBound(current.inputs, selectedAttachmentSnapshots(current, attachments))
+		}
 	}
 	if attachmentErr != nil {
 		a.mu.Unlock()

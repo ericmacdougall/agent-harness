@@ -123,17 +123,11 @@ func (a *app) enqueueInput(id, request, text string, paths []string) (*queuedInp
 	pending := 0
 	textBytes := len(text)
 	futureObjective := len(s.task.objective) + len(text) + 160
-	bytesRetained := int64(0)
-	filesRetained := 0
 	for _, entry := range s.inputs {
 		textBytes += len(entry.Text)
 		if pendingInput(entry) {
 			pending++
 			futureObjective += len(entry.Text) + 160
-		}
-		for _, saved := range entry.Snapshots {
-			bytesRetained += saved.Size
-			filesRetained++
 		}
 	}
 	if pending >= 8 || textBytes > queueTextLimit || futureObjective > queueTextLimit {
@@ -149,11 +143,9 @@ func (a *app) enqueueInput(id, request, text string, paths []string) (*queuedInp
 		}
 		saved := s.attachmentSnapshots[path]
 		snapshots[path] = saved
-		bytesRetained += saved.Size
-		filesRetained++
 	}
-	if bytesRetained > queueAttachmentLimit || filesRetained > 16 {
-		return nil, errors.New("retained attachments reached 16 MiB / 16 files; reconcile or discard retained inputs")
+	if err := attachmentRetentionBound(s.inputs, snapshots); err != nil {
+		return nil, err
 	}
 	info, err := os.Stat(s.CWD)
 	if err != nil {
