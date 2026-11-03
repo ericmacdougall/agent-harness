@@ -27,6 +27,18 @@ python3.11 install_codex.py --apply
 
 Replace `python3.11` with your available Python 3.11+ executable if needed. The Codex installer adds a narrow permission profile for private WAL writes and local Git commits. To explicitly select built-in Full Access for new chats, preview and apply with `--default-full-access`; [Codex setup and limits](docs/codex.md) explains the effect, legacy sandbox conflicts, and separate Browser site permissions. Windows behavior has not been tested.
 
+### Keep substantive Codex work open
+
+Use the main WAL path shown by the session hook to arm a checkpoint before dispatching work. Inspect it with `status`, and record the outcome in the WAL before choosing `complete`, `blocked`, `handoff`, or `paused`.
+
+```sh
+session_wal="/path/from/the/session/hook/main.jsonl"
+python3 ~/.codex/agent-harness/wal.py continuation --wal "$session_wal" active
+python3 ~/.codex/agent-harness/wal.py continuation --wal "$session_wal" status
+```
+
+With trusted hooks, Stop can request one automatic continuation per session when the checkpoint is active. It keeps the checkpoint visible after that allowance is spent. This helps catch an early final reply while a test or worker is still running. It requires explicit tracking and does not supervise detached jobs. See [checkpoint and handoff rules](codex/skills/agent-harness/references/delivery.md).
+
 ## Capabilities by edition
 
 | | Claude Code | Codex |
@@ -65,7 +77,7 @@ Both editions install `deliver.py`. Its prepare phase verifies reviewed commits 
 
 Both editions also install the opt-in `usage_guard.py` for finite command receipts, resource checks, full-run gates and advisory reuse. PLAN and CODE_INSPECTION are separate from PR signoff. The review helper validates structured provider errors before verdict text, caps provider launches, warns on large packets and shares cooldowns only among callers using the same private state directory and opaque provider/auth-pool alias. It does not intercept arbitrary shell/native model calls or enforce distributed account budgets. Missing final receipts remain unknown; reconciliation appends evidence rather than inventing success. Tiny reversible fixes keep the direct fast path. See [usage guard operations](docs/operations.md#usage-guard) for declarations, commands and limits.
 
-The helpers are not a sandbox for repository code, tests, hooks or merge drivers. The main agent must invoke them and inspect the evidence; no global Stop hook claims compliance or prevents ordinary background work and questions. The dependency-free watcher provides a usable test loop in either edition.
+The helpers are not a sandbox for repository code, tests, hooks or merge drivers. The main agent must invoke them and inspect the evidence. A tracked Codex checkpoint can request one continuation, while verification remains the main agent’s responsibility. The dependency-free watcher provides a usable test loop in either edition.
 
 ## Evidence and limits
 

@@ -264,6 +264,35 @@ class CodexInstallerTests(unittest.TestCase):
                         install(home, apply=True)
                 self.assertTrue(changed)
                 self.assertEqual(owner.read_text(), 'concurrent published edit\n')
+    def test_custom_same_command_lifecycle_hook_refuses_without_writes(self):
+        for event, options in (
+            ('Stop', {'matcher': 'custom', 'timeout': 10}),
+            ('Interrupt', {'timeout': 3}),
+            ('Stop', {'timeout': 10, 'statusMessage': 'Operator customization'}),
+        ):
+            with self.subTest(event=event, options=options), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve()
+                codex_home = home / '.codex'
+                codex_home.mkdir()
+                agents = codex_home / 'AGENTS.md'
+                config = codex_home / 'config.toml'
+                hooks = codex_home / 'hooks.json'
+                agents.write_text('Operator instructions.')
+                config.write_text('model = "gpt-6-sol"\n')
+                handler = {'type': 'command', 'command': managed_command(codex_home),
+                           'timeout': options['timeout']}
+                group = {'hooks': [handler]}
+                if 'matcher' in options:
+                    group['matcher'] = options['matcher']
+                if 'statusMessage' in options:
+                    handler['statusMessage'] = options['statusMessage']
+                hooks.write_text(json.dumps({'hooks': {event: [group]}}))
+                before = {path: path.read_bytes() for path in (agents, config, hooks)}
+                with self.assertRaisesRegex(ValueError, f'custom {event}'):
+                    install(home, apply=True)
+                self.assertEqual({path: path.read_bytes() for path in before}, before)
+                self.assertFalse((codex_home / 'agent-harness').exists())
+
     def test_preview_apply_idempotence_and_foreign_settings(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary).resolve()
@@ -306,7 +335,7 @@ class CodexInstallerTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE((home / '.agent-harness' / 'codex-wals').stat().st_mode), 0o700)
             hooks = json.loads((codex_home / 'hooks.json').read_text())
             self.assertEqual(hooks['custom'], {'keep': True})
-            self.assertEqual(hooks['hooks']['Stop'], [{'hooks': [foreign]}])
+            self.assertEqual(hooks['hooks']['Stop'][0], {'hooks': [foreign]})
             for event in HOOK_EVENTS:
                 commands = [item['command'] for group in hooks['hooks'][event]
                             for item in group['hooks'] if item['type'] == 'command']
