@@ -276,7 +276,7 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if current.requests[requestID] == "final" {
+	if current.requests[requestID] != "intent" {
 		return nil
 	}
 	if current.Status == "running" {

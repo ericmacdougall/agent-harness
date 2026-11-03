@@ -217,7 +217,7 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if current.requests[requestID] == "final" {
+	if current.requests[requestID] != "intent" {
 		return nil
 	}
 	current.context = ""

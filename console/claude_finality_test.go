@@ -19,17 +19,26 @@ type claudeResultBeforeAckWriter struct {
 	app               *app
 	session           *session
 	requestID         string
+	waitState         string
+	closeJournal      bool
 	finalBeforeReturn bool
 	once              sync.Once
 }
 
 func (w *claudeResultBeforeAckWriter) Write(data []byte) (int, error) {
 	w.once.Do(func() {
+		if w.closeJournal {
+			_ = w.app.journal.Close()
+		}
 		_, _ = io.WriteString(w.result, `{"type":"result","result":"bounded fixture complete"}`+"\n")
+		waitState := w.waitState
+		if waitState == "" {
+			waitState = "final"
+		}
 		deadline := time.Now().Add(time.Second)
 		for time.Now().Before(deadline) {
 			w.app.mu.Lock()
-			w.finalBeforeReturn = w.session.requests[w.requestID] == "final"
+			w.finalBeforeReturn = w.session.requests[w.requestID] == waitState
 			w.app.mu.Unlock()
 			if w.finalBeforeReturn {
 				return
@@ -271,5 +280,91 @@ func TestClaudeFinalJournalFailureStaysUnknownAndDoesNotAdvance(t *testing.T) {
 	time.Sleep(350 * time.Millisecond)
 	if a.revision != revision {
 		t.Fatal("undurable Claude final scheduled automatic advancement")
+	}
+}
+
+func TestClaudeLateWriteAckCannotDowngradeUndurableFinal(t *testing.T) {
+	a, err := newApp(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.close()
+	requestID := "claude-undurable-before-ack"
+	current := emptySession("claude", t.TempDir(), "")
+	current.ProviderID = "claude-undurable-before-ack-provider"
+	current.Status = "running"
+	current.Supervision.State = "active"
+	current.lastRequest = requestID
+	current.requests[requestID] = "intent"
+	current.requestOrder = append(current.requestOrder, requestID)
+	current.policy, _ = defaultPolicy("claude", "", "main")
+	if err = a.record(current, requestID, "intent"); err != nil {
+		t.Fatal(err)
+	}
+	a.sessions = append(a.sessions, current)
+	a.runtime = func(string, string) (string, []string, error) { return "/fixture/claude", nil, nil }
+	_, _, fingerprint, err := a.resolveRuntime(current.policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputReader, outputWriter := io.Pipe()
+	input := &claudeResultBeforeAckWriter{result: outputWriter, app: a, session: current, requestID: requestID, waitState: "unknown", closeJournal: true}
+	run := &claudeRun{input: input, done: make(chan struct{}), cwd: current.CWD, runtimeHash: fingerprint, policy: current.policy}
+	current.claude = run
+	readDone := make(chan struct{})
+	go func() {
+		a.readClaude(current, run, outputReader)
+		close(readDone)
+	}()
+	if err = a.sendClaude(current, requestID, "bounded fixture", current.CWD, ""); err != nil {
+		t.Fatal(err)
+	}
+	_ = outputWriter.Close()
+	<-readDone
+	if !input.finalBeforeReturn || current.requests[requestID] != "unknown" || current.Status != "unknown" || current.providerFinal {
+		t.Fatalf("late Claude write acknowledgment downgraded undurable final: observed=%v request=%q status=%q providerFinal=%v", input.finalBeforeReturn, current.requests[requestID], current.Status, current.providerFinal)
+	}
+}
+
+func TestCodexLateStartReplyCannotDowngradeUndurableFinal(t *testing.T) {
+	a, err := newApp(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.close()
+	current := emptySession("codex", t.TempDir(), "")
+	current.ProviderID = "codex-undurable-before-ack-provider"
+	current.Status = "idle"
+	policy, _ := defaultPolicy("codex", "", "main")
+	current.policy = policy
+	a.resolvePolicy = func(string, string, string) (resolvedPolicy, error) { return policy, nil }
+	a.runtime = func(string, string) (string, []string, error) { return "/fixture/codex", nil, nil }
+	_, _, fingerprint, err := a.resolveRuntime(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &rpcClient{runtimeHash: fingerprint, pending: map[string]chan rpcPacket{}, done: make(chan struct{})}
+	client.input = replySink{reply: func(data []byte) {
+		var packet map[string]any
+		_ = json.Unmarshal(data, &packet)
+		_ = a.journal.Close()
+		a.codexEvent(client, "turn/started", json.RawMessage(`{"threadId":"codex-undurable-before-ack-provider","turn":{"id":"codex-undurable-turn"}}`))
+		a.codexEvent(client, "turn/completed", json.RawMessage(`{"threadId":"codex-undurable-before-ack-provider","turn":{"id":"codex-undurable-turn","status":"completed"}}`))
+		id, _ := json.Marshal(packet["id"])
+		client.mu.Lock()
+		ch := client.pending[string(id)]
+		client.mu.Unlock()
+		ch <- rpcPacket{ID: id, Result: json.RawMessage(`{"turn":{"id":"codex-undurable-turn"}}`)}
+	}}
+	current.codex = client
+	a.sessions = append(a.sessions, current)
+	requestID := "codex-undurable-before-ack"
+	sendErr := a.send(current.ID, requestID, "bounded fixture", nil, false)
+	client.writer.close()
+	if current.requests[requestID] != "unknown" || current.Status != "unknown" || current.providerFinal {
+		t.Fatalf("late Codex start reply downgraded undurable final: request=%q status=%q providerFinal=%v", current.requests[requestID], current.Status, current.providerFinal)
+	}
+	if sendErr != nil {
+		t.Fatalf("late Codex start reply surfaced a second receipt failure after finality was already quarantined: %v", sendErr)
 	}
 }
