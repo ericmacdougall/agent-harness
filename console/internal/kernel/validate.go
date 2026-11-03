@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -18,6 +19,16 @@ var (
 	codePattern     = regexp.MustCompile(`^[a-z0-9_]{1,40}$`)
 	timePattern     = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$`)
 )
+
+// validTime requires the fixed width that makes times compare as strings, and a real
+// calendar date. Parsing reads no clock.
+func validTime(at string) bool {
+	if !timePattern.MatchString(at) {
+		return false
+	}
+	_, err := time.Parse("2006-01-02T15:04:05.000000000Z", at)
+	return err == nil
+}
 
 // errBadValue marks a malformed value, which Decide reports as a refusal.
 var errBadValue = errors.New("value outside its enum or shape")
@@ -58,7 +69,7 @@ func validateFact(f Fact) error {
 	fail := func(field string) error {
 		return fmt.Errorf("%w: %s on %s", errBadValue, field, f.Kind)
 	}
-	if !timePattern.MatchString(f.At) {
+	if !validTime(f.At) {
 		return fail("at")
 	}
 	for name, value := range map[string]string{"sessionId": f.SessionID, "providerId": f.ProviderID, "profileId": f.ProfileID, "requestId": f.RequestID, "turnId": f.TurnID, "taskId": f.TaskID} {
@@ -83,6 +94,9 @@ func validateFact(f Fact) error {
 	if f.Reason != "" && (f.Kind != FactAbandoned && f.Kind != FactLegacyImported || len(f.Reason) > MaxReasonBytes || !utf8.ValidString(f.Reason)) {
 		return fail("reason")
 	}
+	if !oneOfValues(string(f.Receipt), "", string(ReceiptIntent), string(ReceiptAccepted), string(ReceiptFinal), string(ReceiptUnknown), string(ReceiptRejected), string(ReceiptAbandoned)) {
+		return fail("receipt")
+	}
 	if !closedFields(f) {
 		return fail("closed value")
 	}
@@ -96,6 +110,8 @@ func validateFact(f Fact) error {
 		valid = f.TurnID != ""
 	case FactRuntimeIdentityBound:
 		valid = f.RuntimeIdentity != ""
+	case FactCwdChanged:
+		valid = f.CWD != ""
 	case FactAbandoned:
 		valid = f.Reason != ""
 	case FactSessionQuarantined:

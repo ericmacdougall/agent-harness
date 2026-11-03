@@ -470,27 +470,30 @@ type Quarantined struct {
 func Replay(facts []Fact) (Projection, []Quarantined, error) {
 	p := NewProjection()
 	var quarantined []Quarantined
-	bad := map[string]bool{}
+	reported, applied := map[string]bool{}, map[string]bool{}
 	for _, f := range facts {
 		next, err := Reduce(p, f)
 		if err == nil {
 			p = next
 			continue
 		}
-		if !errors.Is(err, ErrIllegalFact) || f.SessionID == "" {
+		if !errors.Is(err, ErrIllegalFact) {
 			return NewProjection(), nil, err
 		}
-		first := !bad[f.SessionID]
-		if first {
+		if f.SessionID == "" {
+			return NewProjection(), nil, fmt.Errorf("%w: %v", ErrUnreadableLog, err)
+		}
+		if !reported[f.SessionID] {
 			quarantined = append(quarantined, Quarantined{SessionID: f.SessionID, Err: err})
 		}
-		bad[f.SessionID] = true
+		reported[f.SessionID] = true
 		p = p.copyShell()
 		p.LastSeq, p.LastKind = f.Seq, f.Kind
-		if current := p.Sessions[f.SessionID]; current != nil && first {
+		if current := p.Sessions[f.SessionID]; current != nil && !applied[f.SessionID] {
 			s := current.clone()
 			quarantine(s, "illegal_fact")
 			p.Sessions[f.SessionID] = s
+			applied[f.SessionID] = true
 		}
 	}
 	return p, quarantined, nil

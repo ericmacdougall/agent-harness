@@ -235,6 +235,45 @@ func Redact(text string, redactor func(string) string) RedactedReason // A nil r
 
 `Decide` stamps `Seq` as `LastSeq` plus position, `SchemaVersion`, `At`, and `SessionRevision`.
 
+## 10. Settled readings
+
+The independent model listed 34 places these tables left open. None changes a table's rows. Each reading below is now part of the specification.
+
+1. `At` must also be a real calendar date, otherwise `bad_time`.
+2. Only the provider rule reads `Principal.SessionID`. An empty session on a provider input passes authorization and gives `not_found`.
+3. An unknown input kind is `forbidden` for every principal.
+4. `create` on a closed session's ID gives `session_exists`. For every other input, `not_found` comes before the row's checks.
+5. The first fact in a decision has `Seq` `LastSeq+1`. `SessionRevision` is the session's value after the fact, 1 on creation, 0 on a global fact.
+6. A fact holds the fields its row names. `ProviderCompleted` also carries the session's bound `TurnID`, empty for Claude. `ProviderRefused` and `OutcomeUnknown` carry their reason code.
+7. A late fact holds normalized values: table 5's request, status and digest.
+8. Raw `LateFrameObserved` with a key already present is illegal. Its request is stored as given, since `Decide` normalizes.
+9. A raw fact with a value out of shape, or a kind out of its closed values, is illegal.
+10. A session fact's `SessionRevision` must equal `Revision + 1`, otherwise it is illegal. This is the compare-and-swap the plan's `Log.Append` relies on.
+11. Raw `TurnBound` needs only what table 4 says: Codex, `LastRequest`, nonempty turn. Input-level checks are in `Decide`.
+12. `no_owner` is a `Decide` rule. Raw `SessionCreated` with a provider ID and no identity is legal. Raw `ConversationBound` with a different provider ID on a started conversation is illegal.
+13. The quarantine reason is `ReasonCode`. A later `SessionQuarantined` overwrites the code. Replay's `illegal_fact` does not overwrite a code already set.
+14. `Redact` trims, the fact holds the trimmed text, and the 500-byte limit applies after trimming.
+15. `LegacyImported` copies `ProviderID`, `ProfileID`, `CWD` and `RuntimeIdentity`. An empty provider is legal there, since only shape applies.
+16. Replay's first-illegal row applies even on a session already quarantined by a fact, keeping its code.
+17. Replay's first-illegal row applies literally to a closed session too. It stays closed.
+18. A session reported by replay and then created by a later fact is reported only once.
+19. Precondition failures satisfy `errors.Is(ErrIllegalFact)`. Bad schema, unknown kind and bad sequence satisfy `errors.Is(ErrUnreadableLog)`. Decoding failures satisfy `ErrMalformedFact`.
+20. `ControlRequested` and `ControlOutcome` have only the closed, read-only and closed-value rules in `Reduce`.
+21. "Knows a request" means it is still in `Requests`. A request ID trimmed past 256 can be reused until K2's receipts, which make identity durable.
+22. `Hidden` restricts nothing but `VisibleSessions`.
+23. Comparison with a model treats nil and empty as equal, except replay against live, which is strict.
+24. An already abandoned session compares the expected request with `Abandoned.RequestID`, and its idempotent result has no stop effects.
+25. The identity shape covers session, profile, request, turn and provider IDs. `ProfileID` may be empty, and `auth-boundary` matches it exactly.
+26. `Reduce` needs only an increasing sequence. Gapless sequence is `Log.Append`'s rule.
+27. On every kind, the enum-bearing fields `Status`, `Control`, `Outcome`, `LateKind` and `State` must be empty unless that kind's row names them, otherwise the fact is illegal: `ProviderCompleted` has `Status`; `LateFrameObserved` has `Status` and `LateKind`; `ControlRequested` has `Control`; `ControlOutcome` has `Control` and `Outcome`; `LegacyImported` has `State`, in the reason-code shape. All other unnamed fields are shape-checked only and need not be empty.
+28. `Provider` on any fact, when nonempty, must be Codex or Claude, including `LegacyImported`.
+29. Replay reports a session once, but quarantines on the first illegal fact it sees while the session exists, even if an earlier illegal fact was reported before the session was created.
+30. `Reduce` ignores `SessionID` and `SessionRevision` on a global fact beyond shape. `TaskID` is an identity, and `ObjectiveHash` a digest, on any fact. `Generation`, `InputRevision` and `Passes` have no check at K1a. None of these change a session.
+31. In `Reduce`, the `Abandoned` fact's `Reason` must be nonempty, while `LegacyImported` may have none, and `Reason` on either kind is at most 500 bytes of valid UTF-8. Trimming is `Decide`'s.
+32. `Redact` applies the redactor, then trims Unicode whitespace.
+33. A raw fact with a bad `At` is illegal. Raw `RuntimeIdentityBound` or `CwdChanged` with an empty value is illegal.
+34. `TurnBound` needs a nonempty request. With no request the fact is illegal.
+
 ## Review record
 
 Round 1 blocked on nine row findings, all applied. Round 2 blocked on four (a lost interrupt, an out-of-shape identity, `CWD` shape, and the position of the shape check), all applied as the reviewer proposed. **No third table review was run**, by decision: the findings were narrow with exact fixes, and each round found finer grain rather than a wrong structure. The independent model is the check on these tables: a disagreement the tables cannot settle is stop condition S2, which returns to a plan review of the table.

@@ -207,7 +207,7 @@ func Decide(p Projection, in In) (Decision, error) {
 	if err := authorize(in); err != nil {
 		return Decision{}, err
 	}
-	if !timePattern.MatchString(in.At) {
+	if !validTime(in.At) {
 		return refuse("bad_time", "a fixed-width UTC time is required")
 	}
 	b := &builder{p: p, at: in.At, revision: map[string]uint64{}}
@@ -530,7 +530,7 @@ func decideCompleted(b *builder, s *Session, in In) (Decision, error) {
 		b.add(Fact{Kind: FactOutcomeUnknown, SessionID: s.ID, RequestID: in.RequestID, ReasonCode: "invalid_final_status"})
 		return b.finish()
 	}
-	b.add(Fact{Kind: FactProviderCompleted, SessionID: s.ID, RequestID: in.RequestID, Status: in.Status})
+	b.add(Fact{Kind: FactProviderCompleted, SessionID: s.ID, RequestID: in.RequestID, TurnID: s.TurnID, Status: in.Status})
 	return b.finish()
 }
 
