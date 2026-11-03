@@ -24,6 +24,7 @@ type claudeRun struct {
 	policy        resolvedPolicy
 	taskID        string
 	inputRevision uint64
+	requestID     string
 }
 
 func (r *claudeRun) cancel() {
@@ -194,7 +195,23 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 		}()
 	}
 	frame := map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": prompt}, "parent_tool_use_id": nil, "session_id": providerID}
-	if err := run.writeAdmitted(context.Background(), frame, a.turnAdmission(current, current.dispatchEpoch, requestID)); err != nil {
+	admit := a.turnAdmission(current, current.dispatchEpoch, requestID)
+	bindRequest := func() (func(), error) {
+		release, err := admit()
+		if err != nil {
+			return nil, err
+		}
+		a.mu.Lock()
+		if current.claude != run || current.lastRequest != requestID || current.requests[requestID] != "intent" {
+			a.mu.Unlock()
+			release()
+			return nil, refused("Claude request binding changed before dispatch")
+		}
+		run.requestID = requestID
+		a.mu.Unlock()
+		return release, nil
+	}
+	if err := run.writeAdmitted(context.Background(), frame, bindRequest); err != nil {
 		a.unknownSend(current, requestID, err)
 		return err
 	}
@@ -292,6 +309,14 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 			}
 			partialID = ""
 		case "result":
+			requestID := run.requestID
+			if requestID == "" || requestID != current.lastRequest || !oneOf(current.requests[requestID], "intent", "accepted", "final") {
+				current.Status = "unknown"
+				current.Error = "Claude returned a result without an exact active request binding. No request was replayed."
+				current.Supervision.State = "paused"
+				current.Supervision.Reason = current.Error
+				break
+			}
 			current.providerFinal = true
 			a.revokeQuestionsLocked(current, "")
 			current.Status = "idle"
@@ -319,13 +344,9 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 					a.addMessageLocked(current, message{Role: "assistant", Text: text})
 				}
 			}
-			for id, status := range current.requests {
-				if status == "accepted" {
-					current.requests[id] = "final"
-				}
-			}
-			_ = a.record(current, current.lastRequest, "final")
-			a.inputOutcomeLocked(current, current.lastRequest, "retained", "Main turn final; files retained for possible owner/tool readers until explicit discard")
+			current.requests[requestID] = "final"
+			_ = a.record(current, requestID, "final")
+			a.inputOutcomeLocked(current, requestID, "retained", "Main turn final; files retained for possible owner/tool readers until explicit discard")
 			if current.queueUncertain {
 				current.Status = "unknown"
 				current.Supervision.State = "paused"

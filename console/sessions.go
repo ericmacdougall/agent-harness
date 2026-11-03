@@ -295,6 +295,9 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 func (a *app) rejectedSend(current *session, requestID string, err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if current.requests[requestID] == "final" {
+		return
+	}
 	current.requests[requestID] = "rejected"
 	if entry := queueEntry(current, requestID); entry != nil {
 		if entry.DeliveredInputRevision == 0 {
@@ -315,6 +318,12 @@ func (a *app) rejectedSend(current *session, requestID string, err error) {
 	a.changedLocked()
 }
 func (a *app) unknownSend(current *session, requestID string, err error) {
+	a.mu.Lock()
+	if current.requests[requestID] == "final" {
+		a.mu.Unlock()
+		return
+	}
+	a.mu.Unlock()
 	var rejected *providerRejectedError
 	if !errors.Is(err, errQueueDurability) && (errors.As(err, &rejected) || isDispatchRefused(err)) {
 		a.rejectedSend(current, requestID, err)
@@ -322,6 +331,9 @@ func (a *app) unknownSend(current *session, requestID string, err error) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if current.requests[requestID] == "final" {
+		return
+	}
 	current.requests[requestID] = "unknown"
 	a.inputOutcomeLocked(current, requestID, "unknown", "Provider outcome unknown; no replay")
 	current.Status = "unknown"
