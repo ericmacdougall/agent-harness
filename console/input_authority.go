@@ -123,7 +123,7 @@ func (a *app) revokeInputOutcomeLocked(s *session, request string) {
 	if request != s.lastRequest || !oneOf(s.requests[request], "intent", "accepted") {
 		return
 	}
-	s.requests[request] = "unknown"
+	a.transitionRequestLocked(s, request, "unknown")
 	s.providerFinal = false
 	s.resumeRequested = false
 	s.Status = "unknown"

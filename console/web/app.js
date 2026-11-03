@@ -30,13 +30,14 @@ function el(tag, className, text) {
   return node;
 }
 
-async function api(path, body, method = body === undefined ? 'GET' : 'POST') {
+async function api(path, body, method = body === undefined ? 'GET' : 'POST', timeoutMs = 0) {
   if (state.stopped) throw new Error('Console stopped. Reopen Agent Harness from its launcher.');
   const headers = { Authorization: `Bearer ${token}` };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const response = await fetch(path, {
     method, headers, cache: 'no-store',
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
   });
   let result;
   try { result = await response.json(); }
@@ -192,8 +193,8 @@ function renderTabs() {
     const wrapper = el('div', 'session-tab-wrap');
     const close = el('button', 'session-tab-close', '×');
     close.setAttribute('aria-label', `Close ${item.title || 'session'}`);
-    close.title = item.pendingInputs?.length ? 'Resolve stored follow-up payloads before closing this tab.' : item.unresolved ? 'The last request has no final outcome yet, so this tab stays open.' : 'Close console tab; preserve provider history';
-    close.disabled = !!item.pendingInputs?.length || !!item.unresolved || running(item.status) || ['unknown', 'disconnected'].includes(item.status) || item.agents?.some(agent => running(agent.status));
+    close.title = item.pendingInputs?.length ? 'Resolve stored follow-up payloads before closing this tab.' : item.unresolved ? 'The last request has no final outcome yet. Discard the turn to close this tab.' : 'Close console tab; preserve provider history';
+    close.disabled = !!item.pendingInputs?.length || !!item.unresolved || running(item.status) || item.status === 'unknown' || item.agents?.some(agent => running(agent.status));
     close.addEventListener('click', () => act(close, async () => {
       if ((state.drafts.get(item.id) || (item.id === state.active && $('#chat-input').value)) && !window.confirm('Close this tab and discard its unsent draft? Provider history is preserved.')) return;
       await api(`/api/sessions/${encodeURIComponent(item.id)}/close`, {});
@@ -530,12 +531,17 @@ function render() {
   $('#conversation-eyebrow').textContent = selectedID ? 'AGENT TRANSCRIPT' : current ? `${current.provider.toUpperCase()} · ${current.model || 'MODEL NOT REPORTED'}` : 'YOUR WORKSPACE';
   $('#back-to-session').hidden = !selectedID;
   const status = selected?.status || current?.status || 'No session';
-  $('#session-status').textContent = status;
+  $('#session-status').textContent = status === 'abandoned' ? 'discarded' : status;
   $('#session-status').className = `status-pill ${status}`;
   $('#cwd-label').textContent = pathLabel(current?.cwd);
   $('#cwd-button').title = current?.cwd || 'Change working directory';
   $('#composer-context').textContent = selectedID ? 'Sends to the main session' : current ? `${current.provider === 'claude' ? 'Claude Code' : 'Codex'} · ${current.effort || 'Default effort'}` : 'Choose a session to begin';
   $('#recovery-banner').hidden = !current?.restored;
+  const discarded = current?.abandoned;
+  $('#recovery-title').textContent = discarded ? 'You discarded this turn' : 'Restored history is read-only';
+  $('#recovery-text').textContent = discarded
+    ? `Provider work may still finish, and its output is ignored here. Check the directory before starting another session in it. Discarded ${new Date(discarded.at).toLocaleString()}. Reason: ${discarded.reason}`
+    : 'Continue in a new session with the prior context, profile and directory. Unresolved actions are not replayed; the new session waits for your next message.';
   $('#chat-input').readOnly = !!current?.restored;
   $('#chat-input').placeholder = current?.restored ? 'Continue in a new session to send your next message.' : 'What would you like to build?';
   $('#cwd-button').disabled = !!current?.restored || !!current?.pendingInputs?.length;
@@ -548,6 +554,7 @@ function render() {
   $('#composer-hint').textContent = action.reason || (action.kind === 'queue' ? 'Follow-ups stay with this objective. Admission is not delivery; paused work holds the queue.' : action.label === 'Send new objective' ? 'This starts a new objective after the previous task ended.' : '');
   $('#composer-hint').hidden = !$('#composer-hint').textContent;
   $('#stop-session').hidden = !current || current.restored || !(running(current.status) || current.canStop);
+  $('#discard-turn').hidden = !current?.canDiscard;
   $('#pause-session').hidden = !current || current.restored || !running(current.status);
   const resumable = current && (['paused', 'disconnected'].includes(current.status) || current.status === 'idle' && current.supervision?.state === 'waiting' && current.messages?.some(message => message.role === 'user'));
   $('#resume-session').hidden = !!current?.restored || !resumable || !current.providerId;
@@ -847,8 +854,51 @@ function confirmAction(options) {
   $('#confirm-label').hidden = !options.confirmValue;
   $('#confirm-action').textContent = options.label || 'Continue';
   $('#confirm-error').hidden = true;
+  $('#confirm-reason').value = '';
+  $('#confirm-reason').hidden = !options.requireReason;
+  $('#confirm-reason-label').hidden = !options.requireReason;
   $('#confirm-dialog').showModal();
+  if (options.requireReason) $('#confirm-reason').focus();
 }
+
+// Set while a confirmed request is in flight. It has already been sent, so nothing
+// may dismiss the dialog until it resolves; requests in this state carry a timeout.
+function setConfirmPending(pending) {
+  state.confirmPending = pending;
+  for (const button of $$('#confirm-dialog [data-close]')) button.disabled = pending;
+}
+$('#confirm-dialog').addEventListener('cancel', event => { if (state.confirmPending) event.preventDefault(); });
+$('#confirm-dialog').addEventListener('close', () => { if (state.confirmPending) $('#confirm-dialog').showModal(); });
+
+// The trigger disappears on success, so look up the next focus after state reloads.
+function focusAfterDiscard(id) {
+  const wrapper = [...$$('.session-tab-wrap')].find(node => node.querySelector('.session-tab')?.classList.contains('active'));
+  const target = [wrapper?.querySelector('.session-tab-close:not(:disabled)'), $('.pending-input-actions button:not(:disabled)'), wrapper?.querySelector('.session-tab'), $('#chat-input')]
+    .find(node => node && !node.disabled);
+  target?.focus();
+}
+
+function discardTurn() {
+  const current = session();
+  if (!current?.canDiscard) return;
+  const expected = current.discardRequestId || '';
+  confirmAction({
+    title: 'Discard this turn?', label: 'Discard turn', requireReason: true,
+    description: 'Use this when a turn has no final outcome and you are done waiting. This cannot be undone. The turn is recorded as discarded, not as completed, and no replay happens. It may not stop the provider: its work can still finish, and that output is ignored here. This tab becomes read-only.',
+    run: async () => {
+      try {
+        await api(`/api/sessions/${encodeURIComponent(current.id)}/abandon`, { expectedRequestId: expected, reason: $('#confirm-reason').value }, 'POST', 15000);
+      } catch (error) {
+        if (error.name === 'TimeoutError' || error.name === 'AbortError') throw new Error('No response yet, so the discard may have been saved. Discard again to check; retrying is safe.');
+        throw error;
+      }
+      await loadState();
+      notify('Turn discarded.');
+      state.focusAfterConfirm = () => focusAfterDiscard(current.id);
+    },
+  });
+}
+$('#discard-turn').addEventListener('click', discardTurn);
 
 function removeWorktree(row) {
   const current = session();
@@ -873,10 +923,23 @@ $('#confirm-form').addEventListener('submit', async event => {
     $('#confirm-error').hidden = false;
     return;
   }
+  if (options.requireReason && !$('#confirm-reason').value.trim()) {
+    $('#confirm-error').textContent = 'Enter a reason.';
+    $('#confirm-error').hidden = false;
+    $('#confirm-reason').focus();
+    return;
+  }
   $('#confirm-action').disabled = true;
-  try { await options.run(); $('#confirm-dialog').close(); }
+  setConfirmPending(true);
+  let confirmed = false;
+  try { await options.run(); confirmed = true; }
   catch (error) { $('#confirm-error').textContent = errorText(error); $('#confirm-error').hidden = false; }
-  finally { $('#confirm-action').disabled = state.stopped; }
+  finally { setConfirmPending(false); $('#confirm-action').disabled = state.stopped; }
+  if (confirmed) {
+    $('#confirm-dialog').close();
+    state.focusAfterConfirm?.();
+    state.focusAfterConfirm = null;
+  }
 });
 
 async function changeCwd(path, button) {
@@ -1198,6 +1261,7 @@ for (const dialog of $$('dialog')) {
   dialog.addEventListener('click', event => {
     if (event.target !== dialog) return;
     const box = dialog.getBoundingClientRect();
+    if (dialog.id === 'confirm-dialog' && state.confirmPending) return;
     if (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom) dialog.close();
   });
 }

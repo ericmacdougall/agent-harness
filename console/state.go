@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -126,6 +127,7 @@ type session struct {
 	claudeStarted       bool
 	// Runtime identity that owns the Claude conversation; a change refuses --resume.
 	conversationRuntimeHash string
+	abandoned               *abandonedTurn
 	attachmentSnapshots     map[string]attachmentSnapshot
 }
 type providerInfo struct {
@@ -136,6 +138,8 @@ type providerInfo struct {
 	Reason    string `json:"reason"`
 }
 type journalRecord struct {
+	AbandonedRequest    string            `json:"abandonedRequest,omitempty"`
+	AbandonReason       string            `json:"abandonReason,omitempty"`
 	ReviewInputRevision uint64            `json:"reviewInputRevision,omitempty"`
 	ReviewObjectiveHash string            `json:"reviewObjectiveHash,omitempty"`
 	Cascade             *cascadeSelection `json:"cascade,omitempty"`
@@ -180,6 +184,9 @@ type app struct {
 	dataDir            string
 	defaultCWD         string
 	journal            *os.File
+	journalWrite       func([]byte) (int, error)
+	journalSync        func() error
+	journalBroken      bool
 	journalMu          sync.Mutex
 	clients            map[string]*rpcClient
 	runtime            runtimeResolver
@@ -264,6 +271,11 @@ func (a *app) record(s *session, request, state string) error {
 	r.ReviewInputRevision = s.reviewInputRevision
 	r.ReviewObjectiveHash = s.reviewObjectiveHash
 	r.PolicyRevision = s.PolicyRevision
+	if state == "abandoned" && s.abandoned != nil {
+		r.At = s.abandoned.At
+		r.AbandonedRequest = s.abandoned.RequestID
+		r.AbandonReason = s.abandoned.Reason
+	}
 	if s.task != nil {
 		r.Checkpoint = checkpointSnapshot(s)
 		r.TaskID = s.task.ID
@@ -281,14 +293,37 @@ func (a *app) record(s *session, request, state string) error {
 	}
 	a.journalMu.Lock()
 	defer a.journalMu.Unlock()
+	if a.journalBroken {
+		return errors.New("journal could not be repaired after a failed write; restart the console")
+	}
 	info, statErr := a.journal.Stat()
 	if statErr != nil || info.Size()+int64(len(b)+1) > 8<<20 {
 		return errors.New("journal recovery bound reached; preserve state and start a new directory")
 	}
-	if _, e = a.journal.Write(append(b, '\n')); e != nil {
+	line := append(b, '\n')
+	write, sync := a.journal.Write, a.journal.Sync
+	if a.journalWrite != nil {
+		write = a.journalWrite
+	}
+	if a.journalSync != nil {
+		sync = a.journalSync
+	}
+	n, e := write(line)
+	if e == nil && n != len(line) {
+		e = io.ErrShortWrite
+	}
+	if e == nil {
+		e = sync()
+	}
+	if e != nil {
+		// A partial line would join the next record and make the whole journal
+		// unreadable. Remove it, or refuse further appends if that also fails.
+		if a.journal.Truncate(info.Size()) != nil || a.journal.Sync() != nil {
+			a.journalBroken = true
+		}
 		return e
 	}
-	return a.journal.Sync()
+	return nil
 }
 func (a *app) changedLocked() {
 	a.revision++
@@ -323,9 +358,18 @@ func (a *app) state() map[string]any {
 	for index, s := range sessions {
 		current := a.sessions[index]
 		s["pendingInputs"] = a.inputStateLocked(current)
-		unresolved := oneOf(current.requests[current.lastRequest], "intent", "accepted", "unknown")
+		unresolved := current.abandoned == nil && requestUnresolved(current.requests[current.lastRequest])
 		s["unresolved"] = unresolved
 		s["canStop"] = unresolved && !current.Restored && (current.codex != nil || current.claude != nil)
+		s["canDiscard"] = canAbandonLocked(current)
+		s["discardRequestId"] = current.lastRequest
+		// The record decides, so a queue or lifecycle failure cannot make a discarded
+		// tab look unresolved again.
+		if current.abandoned != nil {
+			s["status"] = "abandoned"
+			s["error"] = abandonedNotice
+			s["abandoned"] = current.abandoned
+		}
 		a.cleanValue(s)
 	}
 	var ref *reference

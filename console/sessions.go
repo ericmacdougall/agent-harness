@@ -158,7 +158,7 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 		current.Effort = policy.Effort
 	}
 
-	if current.codex != nil && current.codex.runtimeHash != fingerprint || claudeRuntimeChanged(current, fingerprint) {
+	if current.codex != nil && current.codex.runtimeHash != fingerprint || claudeRuntimeChanged(current, conversationIdentity(runtimeBinary, runtimeEnv, policy)) {
 		a.mu.Unlock()
 		return errRuntimeChanged
 	}
@@ -205,7 +205,7 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 	current.lastRequest = requestID
 	current.turnID = ""
 	current.codexTurn = nil
-	current.requests[requestID] = "intent"
+	a.transitionRequestLocked(current, requestID, "intent")
 	current.requestOrder = append(current.requestOrder, requestID)
 	if len(current.requestOrder) > 256 {
 		delete(current.requests, current.requestOrder[0])
@@ -219,12 +219,12 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 	if followup == nil {
 		if err := a.retainOrdinaryAttachmentsLocked(current, requestID, text, attachments, fingerprint); err != nil {
 			if current.queueUncertain {
-				current.requests[requestID] = "unknown"
+				a.transitionRequestLocked(current, requestID, "unknown")
 				current.Status = "unknown"
 				current.Error = "Attachment ownership commit is uncertain; no provider write or replay"
 				_ = a.record(current, requestID, "unknown")
 			} else {
-				current.requests[requestID] = "rejected"
+				a.transitionRequestLocked(current, requestID, "rejected")
 				_ = a.record(current, requestID, "rejected")
 			}
 			a.mu.Unlock()
@@ -283,10 +283,10 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 func (a *app) rejectedSend(current *session, requestID string, err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if oneOf(current.requests[requestID], "final", "unknown") {
+	if current.abandoned != nil || requestTerminal(current.requests[requestID]) {
 		return
 	}
-	current.requests[requestID] = "rejected"
+	a.transitionRequestLocked(current, requestID, "rejected")
 	if entry := queueEntry(current, requestID); entry != nil {
 		if entry.DeliveredInputRevision == 0 {
 			current.providerFinal = true
@@ -307,7 +307,7 @@ func (a *app) rejectedSend(current *session, requestID string, err error) {
 }
 func (a *app) unknownSend(current *session, requestID string, err error) {
 	a.mu.Lock()
-	if oneOf(current.requests[requestID], "final", "unknown") {
+	if current.abandoned != nil || requestTerminal(current.requests[requestID]) {
 		a.mu.Unlock()
 		return
 	}
@@ -319,10 +319,10 @@ func (a *app) unknownSend(current *session, requestID string, err error) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if oneOf(current.requests[requestID], "final", "unknown") {
+	if current.abandoned != nil || requestTerminal(current.requests[requestID]) {
 		return
 	}
-	current.requests[requestID] = "unknown"
+	a.transitionRequestLocked(current, requestID, "unknown")
 	a.revokeQuestionsLocked(current, "")
 	a.inputOutcomeLocked(current, requestID, "unknown", "Provider outcome unknown; no replay")
 	current.Status = "unknown"
@@ -421,6 +421,12 @@ func (a *app) control(sessionID, action, agentID string) error {
 		a.mu.Unlock()
 		return errors.New("unknown session control")
 	}
+	// A restored or discarded tab has no writer to control, and its status is the
+	// only remaining record that its outcome is unresolved.
+	if current.Restored {
+		a.mu.Unlock()
+		return errors.New("this tab is read-only; continue in a new session")
+	}
 	if current.task != nil && (current.task.reviewing || current.task.ReviewStatus == "queued") {
 		current.task.reviewing = false
 		current.task.ReviewStatus = "paused"
@@ -429,8 +435,10 @@ func (a *app) control(sessionID, action, agentID string) error {
 	current.controlEpoch++
 	current.resumeRequested = false
 	a.holdInputsLocked(current, "User paused; explicit Resume required")
-	current.Status = "paused"
-	if current.requests[current.lastRequest] == "unknown" {
+	// Pause is a UI state, not an outcome, so it cannot replace unknown.
+	if current.Status != "unknown" && current.requests[current.lastRequest] != "unknown" {
+		current.Status = "paused"
+	} else {
 		current.Status = "unknown"
 	}
 	a.revokeQuestionsLocked(current, "")
@@ -484,7 +492,7 @@ func (a *app) control(sessionID, action, agentID string) error {
 		return err
 	}
 	a.mu.Lock()
-	if target == current.ProviderID && current.requests[current.lastRequest] != "unknown" {
+	if target == current.ProviderID && !current.Restored && current.Status != "unknown" && current.requests[current.lastRequest] != "unknown" {
 		current.Status = "paused"
 	}
 	if current.Error == pauseUnconfirmedError {
@@ -504,6 +512,9 @@ func (a *app) changeCWD(id, path string) error {
 	current := a.findLocked(id)
 	if current == nil {
 		return errors.New("session not found")
+	}
+	if current.Restored {
+		return errors.New("this tab is read-only; continue in a new session")
 	}
 	if current.Status == "running" || current.Status == "waiting" || current.Status == "starting" || current.Status == "unknown" {
 		return errors.New("pause or reconcile the active turn before changing its working directory")

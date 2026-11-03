@@ -99,6 +99,26 @@ func (a *app) resolveRuntimeCaptured(policy resolvedPolicy) (string, []string, s
 	return binary, env, hex.EncodeToString(sum[:]), generation, nil
 }
 
+// conversationIdentity names the credentials and tools behind a conversation. It
+// leaves out the settings revision and the MCP config hash that embeds it: a save
+// revokes the old GoodQA proxy on purpose, but that alone changes neither account
+// nor tools, and the next process picks up the new config.
+func conversationIdentity(binary string, env []string, policy resolvedPolicy) string {
+	tools := policy.MCPIdentity
+	if tools == "" {
+		tools = policy.MCPConfigSHA256
+	}
+	stable := []string{binary, tools}
+	for _, value := range env {
+		if !strings.HasPrefix(value, "HARNESS_SETTINGS_REVISION=") {
+			stable = append(stable, value)
+		}
+	}
+	sort.Strings(stable)
+	sum := sha256.Sum256([]byte(strings.Join(stable, "\x00")))
+	return hex.EncodeToString(sum[:])
+}
+
 func (a *app) resolveRuntime(policy resolvedPolicy) (string, []string, string, error) {
 	binary, env, fingerprint, _, err := a.resolveRuntimeCaptured(policy)
 	return binary, env, fingerprint, err

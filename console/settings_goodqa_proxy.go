@@ -91,14 +91,14 @@ func loadGoodQASnapshot(path, digest string) (goodqaProxySnapshot, error) {
 	return snapshot, nil
 }
 
-func (s *settingsStore) goodqaPolicyLocked(profile settingsProfile) (string, string, error) {
+func (s *settingsStore) goodqaPolicyLocked(profile settingsProfile) (string, string, string, error) {
 	g := s.disk.Settings.GoodQA
 	if !g.Enabled || len(g.AllowedTools) == 0 {
-		return "", "", nil
+		return "", "", "", nil
 	}
 	catalog, e := s.goodqaCatalogLocked()
 	if e != nil {
-		return "", "", e
+		return "", "", "", e
 	}
 	known := map[string]bool{}
 	for _, tool := range catalog.Tools {
@@ -106,7 +106,7 @@ func (s *settingsStore) goodqaPolicyLocked(profile settingsProfile) (string, str
 	}
 	for _, name := range g.AllowedTools {
 		if !known[name] {
-			return "", "", errors.New("GoodQA tools changed; discover and explicitly select current names")
+			return "", "", "", errors.New("GoodQA tools changed; discover and explicitly select current names")
 		}
 	}
 	active := []string{}
@@ -116,39 +116,43 @@ func (s *settingsStore) goodqaPolicyLocked(profile settingsProfile) (string, str
 		}
 	}
 	if len(active) == 0 {
-		return "", "", nil
+		return "", "", "", nil
 	}
 	snapshot := goodqaProxySnapshot{Schema: 1, DataDir: s.dir, Revision: s.disk.Revision, ProfileID: profile.ID, ProfileGeneration: profile.Generation, Generation: g.Generation, Endpoint: g.Endpoint, CredentialRef: s.disk.Refs["goodqa:credential"], AllowedTools: active}
 	sort.Strings(snapshot.AllowedTools)
 	data, _ := json.Marshal(snapshot)
 	dir := filepath.Join(s.dir, "mcp")
 	if e = settingsPrivateDirectory(dir); e != nil {
-		return "", "", e
+		return "", "", "", e
 	}
 	digest := settingsDigest(data)
 	path := filepath.Join(dir, "goodqa-snapshot-"+digest+".json")
 	if e = settingsWriteImmutable(path, data); e != nil {
-		return "", "", e
+		return "", "", "", e
 	}
 	binary, e := os.Executable()
 	if e != nil {
-		return "", "", errors.New("console executable unavailable")
+		return "", "", "", errors.New("console executable unavailable")
 	}
 	binary, e = filepath.EvalSymlinks(binary)
 	if e != nil {
-		return "", "", e
+		return "", "", "", e
 	}
 	name, e := goodqaMCPServerName(digest)
 	if e != nil {
-		return "", "", e
+		return "", "", "", e
 	}
 	config := stdioMCPConfig{Servers: map[string]stdioMCPServer{name: {Type: "stdio", Command: binary, Args: []string{"--goodqa-proxy", "--config", path, "--sha256", digest}}}}
 	raw, _ := json.Marshal(config)
 	configPath := filepath.Join(dir, "goodqa-client-"+settingsDigest(raw)+".json")
 	if e = settingsWriteImmutable(configPath, raw); e != nil {
-		return "", "", e
+		return "", "", "", e
 	}
-	return configPath, settingsDigest(raw), nil
+	// The tool identity omits Revision, which exists to revoke the old proxy.
+	unrevised := snapshot
+	unrevised.Revision = 0
+	identity, _ := json.Marshal(unrevised)
+	return configPath, settingsDigest(raw), settingsDigest(identity), nil
 }
 func settingsWriteImmutable(path string, data []byte) error {
 	existing, e := settingsRead(path, goodqaFrameLimit)

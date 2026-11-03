@@ -304,7 +304,7 @@ func claudeConversationFixture(t *testing.T, live bool) (*app, *session, *[]stri
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.conversationRuntimeHash = fingerprint
+	s.conversationRuntimeHash = conversationIdentity("/fixture/claude-absent", env, policy)
 	if live {
 		done := make(chan struct{})
 		close(done)
@@ -373,7 +373,7 @@ func TestClaudeUnchangedRuntimeStillRetiresAndContinues(t *testing.T) {
 func TestAttachPublishesConversationRuntimeHash(t *testing.T) {
 	a := testApp(t)
 	s := emptySession("claude", t.TempDir(), "")
-	run := &claudeRun{input: &closeTrackingSink{}, done: make(chan struct{}), runtimeHash: "owner-hash"}
+	run := &claudeRun{input: &closeTrackingSink{}, done: make(chan struct{}), conversationIdentity: "owner-hash"}
 	if err := a.attachStartedClaudeRun(s, run, "", 0, "task", 1); err != nil {
 		t.Fatal(err)
 	}

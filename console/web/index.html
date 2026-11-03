@@ -69,8 +69,8 @@
           </header>
           <section id="recovery-banner" class="recovery-banner no-select" aria-label="Restored session recovery" hidden>
             <div>
-              <strong>Restored history is read-only</strong>
-              <p>Continue in a new session with the prior context, profile and directory. Unresolved actions are not replayed; the new session waits for your next message.</p>
+              <strong id="recovery-title">Restored history is read-only</strong>
+              <p id="recovery-text">Continue in a new session with the prior context, profile and directory. Unresolved actions are not replayed; the new session waits for your next message.</p>
             </div>
             <button id="continue-as-new" type="button" class="primary-button" data-testid="continue-as-new">Continue in new session</button>
           </section>
@@ -156,6 +156,9 @@
             </button>
             <button type="button" class="quiet-button" id="resume-session" hidden>
               ↻ Resume
+            </button>
+            <button type="button" class="quiet-button" id="discard-turn" data-testid="discard-turn" hidden>
+              Discard turn
             </button>
             <button type="button" class="stop-button" id="stop-session" hidden>
                   ■ Stop
@@ -360,6 +363,10 @@
           Confirm path
         </label>
         <input id="confirm-input" autocomplete="off">
+        <label id="confirm-reason-label" class="field-label" for="confirm-reason" hidden>
+          Reason
+        </label>
+        <textarea id="confirm-reason" rows="2" maxlength="500" autocomplete="off" hidden></textarea>
         <div class="form-error" id="confirm-error" role="alert" hidden>
         </div>
         <div class="dialog-footer">

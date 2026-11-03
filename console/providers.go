@@ -304,7 +304,7 @@ func (a *app) providerDisconnected(client *rpcClient, err error) {
 			// finals, but never allow an unfinished request to become final later.
 			unfinished := oneOf(current.requests[current.lastRequest], "intent", "accepted")
 			if unfinished {
-				current.requests[current.lastRequest] = "unknown"
+				a.transitionRequestLocked(current, current.lastRequest, "unknown")
 				current.providerFinal = false
 			}
 			if binding := current.codexTurn; binding != nil {
@@ -395,7 +395,7 @@ func (a *app) beginAuthenticationTransition(provider, profile string) {
 	a.mu.Lock()
 	runs := map[*claudeRun]bool{}
 	for _, current := range append(append([]*session{}, a.sessions...), a.reviews...) {
-		if current.Provider != provider || current.ProfileID != profile {
+		if current.Provider != provider || current.ProfileID != profile || current.abandoned != nil {
 			continue
 		}
 		if current.claude != nil {
@@ -408,7 +408,7 @@ func (a *app) beginAuthenticationTransition(provider, profile string) {
 		a.holdInputsLocked(current, authChangedReason)
 		a.revokeQuestionsLocked(current, "")
 		if oneOf(current.requests[current.lastRequest], "intent", "accepted") {
-			current.requests[current.lastRequest] = "unknown"
+			a.transitionRequestLocked(current, current.lastRequest, "unknown")
 			current.providerFinal = false
 		}
 		for i := range current.Agents {

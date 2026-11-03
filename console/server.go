@@ -88,6 +88,21 @@ func (a *app) handler(host, token string) http.Handler {
 		}
 		writeJSON(w, 200, map[string]bool{"closed": true})
 	})
+	mux.HandleFunc("POST /api/sessions/{id}/abandon", func(w http.ResponseWriter, r *http.Request) {
+		var input struct {
+			ExpectedRequestID string `json:"expectedRequestId"`
+			Reason            string `json:"reason"`
+		}
+		if err := decodeJSON(w, r, &input); err != nil {
+			a.apiError(w, err)
+			return
+		}
+		if err := a.abandonTurn(r.PathValue("id"), input.ExpectedRequestID, input.Reason); err != nil {
+			a.apiError(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]bool{"abandoned": true})
+	})
 	mux.HandleFunc("POST /api/sessions/{id}/send", func(w http.ResponseWriter, r *http.Request) {
 		var input struct {
 			RequestID   string   `json:"requestId"`

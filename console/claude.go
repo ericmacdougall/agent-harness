@@ -13,19 +13,21 @@ import (
 )
 
 type claudeRun struct {
-	command       *exec.Cmd
-	input         io.WriteCloser
-	writeOnce     sync.Once
-	writer        *inputWriter
-	done          chan struct{}
-	cancelOnce    sync.Once
-	cwd           string
-	runtimeHash   string
-	policy        resolvedPolicy
-	taskID        string
-	inputRevision uint64
-	requestID     string // Immutable after the sole user-frame admission.
-	authAdmit     inputAdmission
+	command     *exec.Cmd
+	input       io.WriteCloser
+	writeOnce   sync.Once
+	writer      *inputWriter
+	done        chan struct{}
+	cancelOnce  sync.Once
+	cwd         string
+	runtimeHash string
+	// Survives settings revisions, unlike runtimeHash; see conversationIdentity.
+	conversationIdentity string
+	policy               resolvedPolicy
+	taskID               string
+	inputRevision        uint64
+	requestID            string // Immutable after the sole user-frame admission.
+	authAdmit            inputAdmission
 }
 
 func (r *claudeRun) cancel() {
@@ -89,8 +91,8 @@ var errRuntimeChanged = errors.New("credentials or tools changed; start a new co
 // into a different credential or tool runtime. A stored API key change does not
 // pass through an auth transition, so this is what stops --resume, including
 // unattended continuations, from crossing into another account.
-func claudeRuntimeChanged(current *session, fingerprint string) bool {
-	return current.Provider == "claude" && current.conversationRuntimeHash != "" && current.conversationRuntimeHash != fingerprint
+func claudeRuntimeChanged(current *session, identity string) bool {
+	return current.Provider == "claude" && current.conversationRuntimeHash != "" && current.conversationRuntimeHash != identity
 }
 
 func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile string) error {
@@ -118,8 +120,9 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 		a.rejectedSend(current, requestID, runtimeErr)
 		return runtimeErr
 	}
+	identity := conversationIdentity(binary, env, policy)
 	a.mu.Lock()
-	runtimeChanged := claudeRuntimeChanged(current, fingerprint)
+	runtimeChanged := claudeRuntimeChanged(current, identity)
 	a.mu.Unlock()
 	if runtimeChanged {
 		a.rejectedSend(current, requestID, errRuntimeChanged)
@@ -219,7 +222,7 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 			a.unknownSend(current, requestID, err)
 			return err
 		}
-		run = &claudeRun{command: command, input: input, done: make(chan struct{}), cwd: cwd, runtimeHash: fingerprint, policy: policy, authAdmit: a.authAdmission("claude", profile, authGeneration)}
+		run = &claudeRun{command: command, input: input, done: make(chan struct{}), cwd: cwd, runtimeHash: fingerprint, conversationIdentity: identity, policy: policy, authAdmit: a.authAdmission("claude", profile, authGeneration)}
 		if err = a.attachStartedClaudeRun(current, run, profile, authGeneration, taskID, revision); err != nil {
 			// Start succeeded, so every later failure must reap the child even when
 			// the generation fence refused publication before the session saw it.
@@ -231,6 +234,14 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 		startedRun = true
 		go func() {
 			a.readClaude(current, run, output)
+			// Without a final, nothing supervises this tree any more. After a final,
+			// its background work is the tool's own and retirement must not kill it.
+			a.mu.Lock()
+			final := current.requests[run.requestID] == "final"
+			a.mu.Unlock()
+			if !final {
+				terminateProcess(command)
+			}
 			err := command.Wait()
 			run.writeOnce.Do(func() { run.writer = newInputWriter(run.input) })
 			run.writer.close()
@@ -279,14 +290,14 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 		return nil
 	}
 	current.context = ""
-	current.requests[requestID] = "accepted"
+	a.transitionRequestLocked(current, requestID, "accepted")
 	a.inputOutcomeLocked(current, requestID, "retained", "Provider accepted; attachment consumers may still be active")
 	if current.requests[requestID] == "unknown" {
 		a.changedLocked()
 		return nil
 	}
 	if err := a.record(current, requestID, "accepted"); err != nil {
-		current.requests[requestID] = "unknown"
+		a.transitionRequestLocked(current, requestID, "unknown")
 		a.revokeQuestionsLocked(current, "")
 		current.providerFinal = false
 		current.Status = "unknown"
@@ -326,7 +337,7 @@ func (a *app) attachStartedClaudeRun(current *session, run *claudeRun, profile s
 		run.taskID = taskID
 		run.inputRevision = revision
 		current.claude = run
-		current.conversationRuntimeHash = run.runtimeHash
+		current.conversationRuntimeHash = run.conversationIdentity
 	}
 	a.mu.Unlock()
 	if release != nil {
@@ -345,7 +356,7 @@ func (a *app) claudeUnfinishedLocked(current *session, run *claudeRun, reason st
 	if current.claude != run || requestID == "" || current.lastRequest != requestID || !oneOf(current.requests[requestID], "intent", "accepted") {
 		return
 	}
-	current.requests[requestID] = "unknown"
+	a.transitionRequestLocked(current, requestID, "unknown")
 	current.providerFinal = false
 	current.Status = "unknown"
 	current.Error = reason
@@ -368,7 +379,7 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 			a.mu.Unlock()
 			return
 		}
-		if oneOf(current.requests[run.requestID], "final", "unknown") {
+		if requestTerminal(current.requests[run.requestID]) {
 			a.mu.Unlock()
 			if kind == "control_request" {
 				// Drain terminal output without reopening waiting state. A denial
@@ -446,7 +457,7 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 		case "result":
 			requestID := run.requestID
 			requestState := current.requests[requestID]
-			if oneOf(requestState, "final", "unknown") {
+			if requestTerminal(requestState) {
 				break
 			}
 			if requestID == "" || requestID != current.lastRequest || !oneOf(requestState, "intent", "accepted") {
@@ -457,7 +468,7 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 				current.Supervision.Reason = current.Error
 				if active := current.lastRequest; oneOf(current.requests[active], "intent", "accepted") {
 					current.providerFinal = false
-					current.requests[active] = "unknown"
+					a.transitionRequestLocked(current, active, "unknown")
 					a.inputOutcomeLocked(current, active, "unknown", "Provider result has no exact request binding; no replay")
 					_ = a.record(current, active, "unknown")
 				}
@@ -490,10 +501,11 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 					a.addMessageLocked(current, message{Role: "assistant", Text: text})
 				}
 			}
-			current.requests[requestID] = "final"
+			// Persist before publishing: a final that was never saved is unknown, and
+			// unknown cannot later become final.
 			if err := a.record(current, requestID, "final"); err != nil {
 				current.providerFinal = false
-				current.requests[requestID] = "unknown"
+				a.transitionRequestLocked(current, requestID, "unknown")
 				current.Status = "unknown"
 				current.Error = "Claude completed but the final receipt could not be persisted. No request was replayed."
 				current.Supervision.State = "paused"
@@ -501,6 +513,7 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 				a.inputOutcomeLocked(current, requestID, "unknown", "Provider completed but final receipt durability is unknown; no replay")
 				break
 			}
+			a.transitionRequestLocked(current, requestID, "final")
 			current.providerFinal = true
 			a.inputOutcomeLocked(current, requestID, "retained", "Main turn final; files retained for possible owner/tool readers until explicit discard")
 			if current.queueUncertain {

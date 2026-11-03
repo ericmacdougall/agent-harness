@@ -38,7 +38,7 @@ func (a *app) quarantineCodexLocked(current *session, requestID, reason string) 
 		current.codexTurn.pending = nil
 		current.codexTurn.pendingBytes = 0
 	}
-	current.requests[requestID] = "unknown"
+	a.transitionRequestLocked(current, requestID, "unknown")
 	a.revokeQuestionsLocked(current, "")
 	current.Status = "unknown"
 	current.Error = reason
@@ -64,6 +64,12 @@ func (a *app) startCodexTurn(ctx context.Context, current *session, client *rpcC
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if current.codexTurn != binding || current.codex != client || current.lastRequest != requestID {
+		// Discard detached this turn while its start was unanswered.
+		if err == nil && binding.interruptOnBind {
+			if turnID := codexFrameTurn(result, true); turnID != "" {
+				go a.interruptBoundTurn(current, client, requestID, turnID)
+			}
+		}
 		return err
 	}
 	if !oneOf(current.requests[requestID], "intent", "accepted") {
@@ -118,7 +124,7 @@ func (a *app) startCodexTurn(ctx context.Context, current *session, client *rpcC
 	if binding.interruptOnBind {
 		go a.interruptBoundTurn(current, client, requestID, binding.turnID)
 	}
-	current.requests[requestID] = "accepted"
+	a.transitionRequestLocked(current, requestID, "accepted")
 	a.inputOutcomeLocked(current, requestID, "retained", "Provider accepted; files retained for delayed consumers until explicit discard")
 	if current.requests[requestID] == "unknown" {
 		a.changedLocked()
@@ -152,7 +158,7 @@ func (a *app) codexCompletionLocked(current *session, client *rpcClient, complet
 	requestID := current.lastRequest
 	// Check lifecycle independently of request/binding revocation. A stale
 	// correlated completion cannot restore authority after disconnection.
-	if current.Restored || current.queueUncertain || current.codex != client || current.providerFinal || current.Status == "disconnected" || oneOf(current.requests[requestID], "final", "unknown") {
+	if current.Restored || current.queueUncertain || current.codex != client || current.providerFinal || current.Status == "disconnected" || requestTerminal(current.requests[requestID]) {
 		return
 	}
 	binding := current.codexTurn
@@ -183,8 +189,10 @@ func (a *app) codexCompletionLocked(current *session, client *rpcClient, complet
 	current.providerFinal = true
 	a.revokeQuestionsLocked(current, current.ProviderID)
 	current.turnID = ""
-	current.requests[requestID] = "final"
 	current.Status = "idle"
+	if current.Error == pauseUnconfirmedError {
+		current.Error = ""
+	}
 	if current.Supervision.State == "paused" {
 		current.Status = "paused"
 	}
@@ -199,9 +207,11 @@ func (a *app) codexCompletionLocked(current *session, client *rpcClient, complet
 		current.Supervision.State = "paused"
 		current.Supervision.Reason = "User or provider interrupted this turn"
 	}
+	// Persist before publishing: a final that was never saved is unknown, and unknown
+	// cannot later become final.
 	if err := a.record(current, requestID, "final"); err != nil {
 		current.providerFinal = false
-		current.requests[requestID] = "unknown"
+		a.transitionRequestLocked(current, requestID, "unknown")
 		a.revokeQuestionsLocked(current, "")
 		current.Status = "unknown"
 		current.Error = "Could not persist the final outcome"
@@ -210,6 +220,7 @@ func (a *app) codexCompletionLocked(current *session, client *rpcClient, complet
 		a.inputOutcomeLocked(current, requestID, "unknown", "Provider completed but final receipt durability is unknown; no replay")
 		return
 	}
+	a.transitionRequestLocked(current, requestID, "final")
 	a.inputOutcomeLocked(current, requestID, "retained", "Main turn final; files retained for possible owner/tool readers until explicit discard")
 	if current.queueUncertain {
 		current.Status = "unknown"

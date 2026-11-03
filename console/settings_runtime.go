@@ -152,7 +152,7 @@ func (s *settingsStore) policy(provider, profile, stage string) (resolvedPolicy,
 		policy.HarnessInstructions = consoleHarnessInstructions
 	}
 	var err error
-	policy.MCPConfigPath, policy.MCPConfigSHA256, err = s.goodqaPolicyLocked(p)
+	policy.MCPConfigPath, policy.MCPConfigSHA256, policy.MCPIdentity, err = s.goodqaPolicyLocked(p)
 	if err != nil {
 		return resolvedPolicy{}, err
 	}

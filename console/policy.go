@@ -14,6 +14,7 @@ type policyStep struct {
 type resolvedPolicy struct {
 	MCPConfigPath       string       `json:"mcpConfigPath,omitempty"`
 	MCPConfigSHA256     string       `json:"mcpConfigSHA256,omitempty"`
+	MCPIdentity         string       `json:"mcpIdentity,omitempty"`
 	Revision            string       `json:"revision"`
 	Provider            string       `json:"provider"`
 	ProfileID           string       `json:"profileId"`

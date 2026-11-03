@@ -46,7 +46,7 @@ func (a *app) blockReviewerLocked(s *session, reason string) {
 	s.Status = "error"
 	s.Error = reason
 	if oneOf(s.requests[s.lastRequest], "intent", "accepted") {
-		s.requests[s.lastRequest] = "unknown"
+		a.transitionRequestLocked(s, s.lastRequest, "unknown")
 		s.providerFinal = false
 		_ = a.record(s, s.lastRequest, "review_unknown")
 	}
@@ -215,7 +215,7 @@ func (a *app) runIndependentReview(parent *session, task *trackedTask, step poli
 	current.reviewDone = make(chan struct{})
 	current.Status = "running"
 	current.lastRequest = "review-" + freshID()
-	current.requests[current.lastRequest] = "intent"
+	a.transitionRequestLocked(current, current.lastRequest, "intent")
 	done := current.reviewDone
 	compactSubject := task.Subject
 	compactSubject.Files = nil

@@ -197,7 +197,9 @@ both the primary queue file and its beforeimage, recovery validates both,
 preserves every non-conflicting payload and snapshot owner, promotes the merged
 state durably, and marks it unknown. Missing, conflicting, corrupt, foreign, or
 over-limit recovery data fails closed for manual preservation rather than
-guessing which candidate won. Unresolved sends stay unknown and are not
+guessing which candidate won. The one exception is an incomplete final journal
+line, which was never acknowledged: it is moved to a `sessions.jsonl.torn-*` file
+and startup continues from the last complete record. Unresolved sends stay unknown and are not
 replayed. Use an explicit new session with available context when continuing;
 old native sessions may still need reconciliation.
 
@@ -208,9 +210,19 @@ terminal confirmation, its outcome stays unresolved and its Stop control stays
 available while the provider connection remains. A Pause sent before the provider
 has named the turn is applied when it does; if that interrupt fails, the session
 shows an error and Stop can retry it. A tab cannot be closed, and its working directory cannot change, while
-its last request is unresolved. This release has no action to discard an
-unresolved tab. Restored tabs are read-only and do not count toward the
-session limit, so old unresolved history cannot refuse new work.
+its last request is unresolved. Restored tabs are read-only and do not count
+toward the session limit, and restart keeps every unresolved tab, trimming only
+older resolved history.
+
+When you are done waiting on an unresolved turn, use **Discard turn** and give a
+reason. It is explicit, needs confirmation and cannot be undone. The console
+appends a discard record with the turn's identity, your reason and the time, and
+the earlier receipts stay in the journal. It is not a success, a verdict or a
+review pass, and a later provider final cannot reopen the turn. It may not stop the
+provider: the console sends a best-effort interrupt and ignores later output, so
+check the directory before starting another session in it. The tab becomes
+read-only and can then be closed, once any stored follow-up payloads are resolved.
+If the record cannot be saved, the discard fails and the turn stays unresolved.
 
 ## Verification
 
