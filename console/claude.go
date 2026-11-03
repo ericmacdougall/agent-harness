@@ -25,6 +25,7 @@ type claudeRun struct {
 	taskID        string
 	inputRevision uint64
 	requestID     string // Immutable after the sole user-frame admission.
+	authAdmit     inputAdmission
 }
 
 func (r *claudeRun) cancel() {
@@ -49,7 +50,33 @@ func (r *claudeRun) writeAdmitted(ctx context.Context, value any, admit inputAdm
 		return errors.New("Claude process has ended")
 	default:
 	}
-	err = r.writer.writeAdmitted(ctx, append(data, '\n'), admit)
+	err = r.writer.writeAdmitted(ctx, append(data, '\n'), func() (func(), error) {
+		var authRelease, release func()
+		var admissionErr error
+		if r.authAdmit != nil {
+			authRelease, admissionErr = r.authAdmit()
+			if admissionErr != nil {
+				return authRelease, admissionErr
+			}
+		}
+		if admit != nil {
+			release, admissionErr = admit()
+			if admissionErr != nil {
+				if authRelease != nil {
+					authRelease()
+				}
+				return release, admissionErr
+			}
+		}
+		return func() {
+			if release != nil {
+				release()
+			}
+			if authRelease != nil {
+				authRelease()
+			}
+		}, nil
+	})
 	if err != nil && !isDispatchRefused(err) {
 		r.cancel()
 	}
@@ -76,7 +103,7 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 		taskMetadata = checkpointMetadata(metadataTask)
 	}
 	a.mu.Unlock()
-	binary, env, fingerprint, runtimeErr := a.resolveRuntime(policy)
+	binary, env, fingerprint, authGeneration, runtimeErr := a.resolveRuntimeCaptured(policy)
 	if runtimeErr != nil {
 		a.rejectedSend(current, requestID, runtimeErr)
 		return runtimeErr
@@ -174,7 +201,7 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 			a.unknownSend(current, requestID, err)
 			return err
 		}
-		run = &claudeRun{command: command, input: input, done: make(chan struct{}), cwd: cwd, runtimeHash: fingerprint, policy: policy}
+		run = &claudeRun{command: command, input: input, done: make(chan struct{}), cwd: cwd, runtimeHash: fingerprint, policy: policy, authAdmit: a.authAdmission("claude", profile, authGeneration)}
 		a.mu.Lock()
 		if current.task != nil {
 			run.taskID = taskID

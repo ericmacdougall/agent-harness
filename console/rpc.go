@@ -33,6 +33,7 @@ type rpcClient struct {
 	disconnected atomic.Bool
 
 	runtimeHash string
+	authAdmit   inputAdmission
 	mu          sync.Mutex
 	writeOnce   sync.Once
 	writer      *inputWriter
@@ -48,6 +49,10 @@ type rpcClient struct {
 }
 
 func startRPC(binary string, env []string, onEvent func(*rpcClient, string, json.RawMessage), onRequest func(*rpcClient, rpcPacket), onClose func(*rpcClient, error), configArgs ...string) (*rpcClient, error) {
+	return startRPCWithAuthority(binary, env, nil, onEvent, onRequest, onClose, configArgs...)
+}
+
+func startRPCWithAuthority(binary string, env []string, authAdmit inputAdmission, onEvent func(*rpcClient, string, json.RawMessage), onRequest func(*rpcClient, rpcPacket), onClose func(*rpcClient, error), configArgs ...string) (*rpcClient, error) {
 	args := append([]string{"app-server", "--stdio"}, configArgs...)
 	command := exec.Command(binary, args...)
 	command.Env = env
@@ -66,7 +71,7 @@ func startRPC(binary string, env []string, onEvent func(*rpcClient, string, json
 	if err = command.Start(); err != nil {
 		return nil, err
 	}
-	client := &rpcClient{pending: map[string]chan rpcPacket{}, input: input, command: command, done: make(chan struct{}), onEvent: onEvent, onRequest: onRequest, onClose: onClose}
+	client := &rpcClient{pending: map[string]chan rpcPacket{}, input: input, command: command, done: make(chan struct{}), authAdmit: authAdmit, onEvent: onEvent, onRequest: onRequest, onClose: onClose}
 	go func() { client.read(output); err := command.Wait(); client.finish(err) }()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -147,22 +152,37 @@ func (c *rpcClient) writeAdmitted(ctx context.Context, value any, admit inputAdm
 		if c.disconnected.Load() {
 			return nil, refused("provider connection authority revoked")
 		}
-		var release func()
+		var authRelease, release func()
 		var err error
+		if c.authAdmit != nil {
+			authRelease, err = c.authAdmit()
+			if err != nil {
+				return authRelease, err
+			}
+		}
 		if admit != nil {
 			release, err = admit()
 			if err != nil {
+				if authRelease != nil {
+					authRelease()
+				}
 				return release, err
+			}
+		}
+		releaseAll := func() {
+			if release != nil {
+				release()
+			}
+			if authRelease != nil {
+				authRelease()
 			}
 		}
 		// Admission itself may have waited across a disconnect.
 		if c.disconnected.Load() {
-			if release != nil {
-				release()
-			}
+			releaseAll()
 			return nil, refused("provider connection authority revoked")
 		}
-		return release, nil
+		return releaseAll, nil
 	})
 	if err != nil && !isDispatchRefused(err) {
 		go func() { c.finish(err); terminateProcess(c.command) }()

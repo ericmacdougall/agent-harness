@@ -90,7 +90,7 @@ func (a *app) codexClient(profile string, cwds ...string) (*rpcClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	binary, env, fingerprint, err := a.resolveRuntime(policy)
+	binary, env, fingerprint, generation, err := a.resolveRuntimeCaptured(policy)
 	if err != nil {
 		return nil, err
 	}
@@ -124,19 +124,35 @@ func (a *app) codexClient(profile string, cwds ...string) (*rpcClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	client, err := startRPC(binary, env, a.codexEvent, a.codexQuestion, a.providerDisconnected, configArgs...)
+	client, err := startRPCWithAuthority(binary, env, a.authAdmission("codex", profile, generation), a.codexEvent, a.codexQuestion, a.providerDisconnected, configArgs...)
 	if err != nil {
 		return nil, err
 	}
 	client.runtimeHash = fingerprint
-	a.mu.Lock()
-	if concurrent := a.clients[key]; concurrent != nil && concurrent != existing {
-		a.mu.Unlock()
+	published, generationErr := a.publishCodexClient(key, profile, generation, existing, client)
+	if generationErr != nil {
 		client.close()
+		return nil, generationErr
+	}
+	if published != client {
+		client.close()
+		return published, nil
+	}
+	return client, nil
+}
+
+func (a *app) publishCodexClient(key, profile string, generation uint64, existing, client *rpcClient) (*rpcClient, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	release, err := a.authAdmission("codex", profile, generation)()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if concurrent := a.clients[key]; concurrent != nil && concurrent != existing {
 		return concurrent, nil
 	}
 	a.clients[key] = client
-	a.mu.Unlock()
 	return client, nil
 }
 func (a *app) createSession(provider, cwd, profile string) (*session, error) {
@@ -344,11 +360,11 @@ func (a *app) providerDisconnected(client *rpcClient, err error) {
 
 const authChangedReason = "Authenticated provider context changed. Prior parent and child capabilities are unverified; queued writes and controls were revoked. Reconcile possible in-flight effects before fresh dispatch."
 
-// authenticatedProfileChanged is a hard authority boundary. Advancing the
-// generation changes future runtime/cache identity; revoking live sources
-// prevents already-queued writes from crossing into the new login context.
-func (a *app) authenticatedProfileChanged(provider, profile string) {
-	a.advanceAuthGeneration(provider, profile)
+// beginAuthenticationTransition is a hard authority boundary. It fences the
+// generation before revoking live sources so queued writes cannot cross into
+// a login attempt that may already be mutating credentials.
+func (a *app) beginAuthenticationTransition(provider, profile string) {
+	a.setAuthTransition(provider, profile, false)
 	if provider == "codex" {
 		a.mu.Lock()
 		clients := map[*rpcClient]bool{}
@@ -415,6 +431,12 @@ func (a *app) authenticatedProfileChanged(provider, profile string) {
 	a.mu.Unlock()
 	for run := range runs {
 		run.cancel()
+	}
+}
+
+func (a *app) finishAuthenticationTransition(provider, profile string, successful bool) {
+	if successful {
+		a.setAuthTransition(provider, profile, true)
 	}
 }
 func newUUID() string {

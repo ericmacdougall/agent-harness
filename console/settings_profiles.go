@@ -110,6 +110,15 @@ func (s *settingsStore) startLogin(revision uint64, id, generation string) (sett
 	runCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	task := &settingsLogin{ID: freshID(), ProfileID: id, Generation: generation, State: "running", Reason: "Complete the official provider browser sign-in", CheckedAt: time.Now().UTC().Format(time.RFC3339), cancel: cancel}
 	s.login[task.ID] = task
+	if s.app == nil {
+		delete(s.login, task.ID)
+		cancel()
+		return settingsLogin{}, errors.New("provider authority invalidation is unavailable; restart before signing in")
+	}
+	// The provider may mutate its keyring before emitting output or returning a
+	// final status. Fence the old profile generation before the process starts,
+	// and keep it fenced unless the status probe proves a successful outcome.
+	s.app.beginAuthenticationTransition(p.Provider, p.ID)
 	go s.runLogin(runCtx, task, p, binary, home)
 	return *task, nil
 }
@@ -224,26 +233,19 @@ func (s *settingsStore) finishLogin(task *settingsLogin, p settingsProfile, err 
 	task.CheckedAt = time.Now().UTC().Format(time.RFC3339)
 	if err != nil {
 		task.State = "failed"
-		task.Reason = "Official login did not complete; retry supported sign-in or inspect its browser window. Raw credential output was discarded."
+		task.Reason = "Official login outcome could not be verified; this profile remains fenced. Retry supported sign-in or restart to reconcile. Raw credential output was discarded."
 		task.cancel()
 		s.mu.Unlock()
+		s.app.finishAuthenticationTransition(p.Provider, p.ID, false)
 		return
 	}
-	// Do not publish completion until every authority inherited from the old
-	// authenticated context has been fenced. This applies even when the user
-	// signs into the same configured profile again.
+	// Do not publish completion until the successful status probe releases the
+	// transition fence. This applies even for the same configured profile.
 	task.State = "invalidating"
-	task.Reason = "Official login succeeded; revoking work inherited from the previous authenticated context"
+	task.Reason = "Official login succeeded; finalizing the new authenticated context"
 	task.cancel()
 	s.mu.Unlock()
-	if s.app == nil {
-		s.mu.Lock()
-		task.State = "failed"
-		task.Reason = "Official login succeeded but prior provider authority could not be invalidated; restart before using this profile"
-		s.mu.Unlock()
-		return
-	}
-	s.app.authenticatedProfileChanged(p.Provider, p.ID)
+	s.app.finishAuthenticationTransition(p.Provider, p.ID, true)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current, ok = s.profileLocked(p.ID)
