@@ -31,6 +31,10 @@ func validTime(at string) bool {
 	return err == nil
 }
 
+// ValidateFact checks a fact's values against their closed sets and shapes, the same
+// check Reduce applies. The event log calls it so nothing out of shape is stored.
+func ValidateFact(f Fact) error { return validateFact(f) }
+
 // errBadValue marks a malformed value, which Decide reports as a refusal.
 var errBadValue = errors.New("value outside its enum or shape")
 

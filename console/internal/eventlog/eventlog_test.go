@@ -57,7 +57,7 @@ func (d *driver) do(in kernel.In) (kernel.Decision, error) {
 	if err != nil || len(decision.Facts) == 0 {
 		return decision, err
 	}
-	stored, err := d.log.Append(ctx, d.p.LastSeq, "", "", decision.Facts)
+	stored, _, err := d.log.Append(ctx, d.p.LastSeq, "", "", decision.Facts)
 	if err != nil {
 		return decision, err
 	}
@@ -146,7 +146,7 @@ func TestSequenceCompareAndSwap(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := d.log.Count()
-	if _, err = d.log.Append(ctx, stale.LastSeq, "", "", decision.Facts); !errors.Is(err, ErrConflict) {
+	if _, _, err = d.log.Append(ctx, stale.LastSeq, "", "", decision.Facts); !errors.Is(err, ErrConflict) {
 		t.Fatalf("stale decision committed: %v", err)
 	}
 	if d.log.Count() != before || d.log.Latched() {
@@ -154,7 +154,7 @@ func TestSequenceCompareAndSwap(t *testing.T) {
 	}
 	// A sequence that skips ahead is a conflict too.
 	decision.Facts[0].Seq = d.p.LastSeq + 5
-	if _, err = d.log.Append(ctx, d.p.LastSeq, "", "", decision.Facts); !errors.Is(err, ErrConflict) {
+	if _, _, err = d.log.Append(ctx, d.p.LastSeq, "", "", decision.Facts); !errors.Is(err, ErrConflict) {
 		t.Fatalf("gap committed: %v", err)
 	}
 }
@@ -176,7 +176,7 @@ func TestConcurrentAppendsOneWinsNoGap(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			_, err = d.log.Append(ctx, base.LastSeq, "", "", decision.Facts)
+			_, _, err = d.log.Append(ctx, base.LastSeq, "", "", decision.Facts)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -206,18 +206,21 @@ func TestCommandReceiptsAreIdempotentAndBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := d.log.CommandDigest([]byte(`{"kind":"create","sessionId":"a"}`))
-	first, err := d.log.Append(ctx, d.p.LastSeq, "cmd-1", digest, decision.Facts)
+	first, replayed, err := d.log.Append(ctx, d.p.LastSeq, "cmd-1", digest, decision.Facts)
+	if replayed {
+		t.Fatal("first append reported as replayed")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
 	count := d.log.Count()
 	// A lost response retries with the old expected sequence: same facts, nothing new.
-	again, err := d.log.Append(ctx, d.p.LastSeq, "cmd-1", digest, decision.Facts)
-	if err != nil || len(again) != len(first) || again[0].Seq != first[0].Seq || d.log.Count() != count {
+	again, replayed, err := d.log.Append(ctx, d.p.LastSeq, "cmd-1", digest, decision.Facts)
+	if err != nil || !replayed || len(again) != len(first) || again[0].Seq != first[0].Seq || d.log.Count() != count {
 		t.Fatalf("retry: %v %+v", err, again)
 	}
 	other := d.log.CommandDigest([]byte(`{"kind":"create","sessionId":"b"}`))
-	if _, err = d.log.Append(ctx, d.p.LastSeq, "cmd-1", other, decision.Facts); !errors.Is(err, ErrCommandConflict) {
+	if _, _, err = d.log.Append(ctx, d.p.LastSeq, "cmd-1", other, decision.Facts); !errors.Is(err, ErrCommandConflict) {
 		t.Fatalf("reused identity: %v", err)
 	}
 	if strings.Contains(digest, "sessionId") || len(digest) != 64 {
@@ -356,6 +359,7 @@ func TestQuotaKeepsReserveForMustAppend(t *testing.T) {
 	d := open(t, t.TempDir())
 	defer d.log.Close()
 	d.session("a")
+	d.session("idle")
 	d.must(kernel.In{Kind: kernel.InSend, Principal: user, SessionID: "a", RequestID: "r1", RuntimeIdentity: "owner"})
 	// Move the counter to the edge of the ordinary limit, as a long-lived log would be.
 	set := func(count uint64) {
@@ -378,9 +382,17 @@ func TestQuotaKeepsReserveForMustAppend(t *testing.T) {
 	if _, err = d.do(kernel.In{Kind: kernel.ObUnknown, Principal: provider, SessionID: "a", RequestID: "r1", ReasonCode: "deadline"}); err != nil {
 		t.Fatalf("must-append refused at quota: %v", err)
 	}
+	// Repeated pauses are ordinary facts, so they cannot drain the reserve.
+	if _, err = d.do(kernel.In{Kind: kernel.InPause, Principal: user, SessionID: "idle"}); !errors.Is(err, ErrQuota) {
+		t.Fatalf("pause used the reserve: %v", err)
+	}
+	// A stop still records, from the reserve: here it owes the unbound turn's interrupt.
+	if _, err = d.do(kernel.In{Kind: kernel.InStop, Principal: user, SessionID: "a"}); err != nil {
+		t.Fatalf("stop refused at quota: %v", err)
+	}
 	set(MaxFacts)
-	if _, err = d.do(kernel.In{Kind: kernel.InAbandon, Principal: user, SessionID: "a", ExpectedRequest: "r1", Reason: kernel.Redact("done", func(s string) string { return s })}); !errors.Is(err, ErrLatched) {
-		t.Fatalf("spent reserve did not latch: %v", err)
+	if _, err = d.do(kernel.In{Kind: kernel.InAbandon, Principal: user, SessionID: "a", ExpectedRequest: "r1", Reason: kernel.Redact("done", func(s string) string { return s })}); !errors.Is(err, ErrLatched) || !d.log.Latched() {
+		t.Fatalf("spent reserve did not latch: %v latched=%v", err, d.log.Latched())
 	}
 }
 
@@ -406,7 +418,7 @@ func TestSecretsNeverReachTheFiles(t *testing.T) {
 		_, _ = d.do(in)
 	}
 	digest := d.log.CommandDigest([]byte(canary))
-	_, _ = d.log.Append(ctx, d.p.LastSeq, "c", digest, nil)
+	_, _, _ = d.log.Append(ctx, d.p.LastSeq, "c", digest, nil)
 	d.log.Close()
 	needle := []byte(strings.TrimPrefix(canary, "CANARY-"))
 	for _, name := range []string{fileName, fileName + "-wal", fileName + "-shm"} {
@@ -641,7 +653,7 @@ func TestOpenTime(t *testing.T) {
 			}
 		}
 		if len(batch) >= 5000 {
-			if _, err = d.log.Append(ctx, expected, "", "", batch); err != nil {
+			if _, _, err = d.log.Append(ctx, expected, "", "", batch); err != nil {
 				t.Fatal(err)
 			}
 			expected = d.p.LastSeq
@@ -649,7 +661,7 @@ func TestOpenTime(t *testing.T) {
 		}
 	}
 	if len(batch) > 0 {
-		if _, err = d.log.Append(ctx, expected, "", "", batch); err != nil {
+		if _, _, err = d.log.Append(ctx, expected, "", "", batch); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -689,7 +701,7 @@ func TestRestartThatCannotCommitLatches(t *testing.T) {
 	if p.Sessions["a"] == nil || p.Sessions["a"].ReadOnly {
 		t.Fatal("projection should be the replayed log, without the restart that failed")
 	}
-	if _, err = l.Append(ctx, p.LastSeq, "", "", []kernel.Fact{{Seq: p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(1), Kind: kernel.FactProcessRestarted}}); !errors.Is(err, ErrLatched) {
+	if _, _, err = l.Append(ctx, p.LastSeq, "", "", []kernel.Fact{{Seq: p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(1), Kind: kernel.FactProcessRestarted}}); !errors.Is(err, ErrLatched) {
 		t.Fatalf("latched log admitted: %v", err)
 	}
 }
@@ -725,7 +737,7 @@ func TestAppendReturnsTheDecodedFacts(t *testing.T) {
 	d := open(t, t.TempDir())
 	defer d.log.Close()
 	f := kernel.Fact{Seq: d.p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(3), Kind: kernel.FactSessionCreated, SessionID: "a", SessionRevision: 1, Provider: kernel.ProviderClaude, Passes: map[string]string{}}
-	stored, err := d.log.Append(ctx, d.p.LastSeq, "", "", []kernel.Fact{f})
+	stored, _, err := d.log.Append(ctx, d.p.LastSeq, "", "", []kernel.Fact{f})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -733,5 +745,93 @@ func TestAppendReturnsTheDecodedFacts(t *testing.T) {
 	want, _ := kernel.DecodeFact(data)
 	if stored[0].Passes != nil || fmt.Sprintf("%#v", stored[0]) != fmt.Sprintf("%#v", want) {
 		t.Fatalf("returned %#v, replay decodes %#v", stored[0], want)
+	}
+}
+
+// The storage boundary validates facts itself, so no caller can store one out of shape.
+func TestAppendRefusesAFactOutOfShape(t *testing.T) {
+	dir := t.TempDir()
+	d := open(t, dir)
+	d.session("a")
+	s := d.p.Sessions["a"]
+	bad := kernel.Fact{Seq: d.p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(9), Kind: kernel.FactLateFrameObserved, SessionID: "a", SessionRevision: s.Revision + 1, LateKind: "final", Digest: canary}
+	before := d.log.Count()
+	if _, _, err := d.log.Append(ctx, d.p.LastSeq, "", "", []kernel.Fact{bad}); err == nil || d.log.Count() != before || d.log.Latched() {
+		t.Fatalf("out-of-shape fact stored: %v", err)
+	}
+	d.log.Close()
+	data, _ := os.ReadFile(filepath.Join(dir, fileName))
+	if bytes.Contains(data, []byte(canary)) {
+		t.Fatal("canary stored")
+	}
+}
+
+// A revoking fact that loses the sequence race latches too: authority must not
+// outlive a revocation that did not commit.
+func TestRevokingConflictLatches(t *testing.T) {
+	d := open(t, t.TempDir())
+	defer d.log.Close()
+	d.session("a")
+	stale := d.p
+	d.session("b")
+	decision, err := kernel.Decide(stale, kernel.In{Kind: kernel.ObAuthBoundary, Principal: system, At: stamp(99), Provider: kernel.ProviderCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = d.log.Append(ctx, stale.LastSeq, "", "", decision.Facts); !errors.Is(err, ErrLatched) || !d.log.Latched() {
+		t.Fatalf("revoking conflict: %v", err)
+	}
+}
+
+// The canary check also reads the WAL while the log is open, before a checkpoint.
+func TestSecretsNeverReachTheOpenWAL(t *testing.T) {
+	dir := t.TempDir()
+	d := open(t, dir)
+	defer d.log.Close()
+	d.session("a")
+	d.must(kernel.In{Kind: kernel.InSend, Principal: user, SessionID: "a", RequestID: "r1", RuntimeIdentity: "owner"})
+	d.must(kernel.In{Kind: kernel.ObAccepted, Principal: provider, SessionID: "a", RequestID: "r1", Status: canary, Digest: canary})
+	d.must(kernel.In{Kind: kernel.ObCompleted, Principal: provider, SessionID: "a", RequestID: "r1", TurnID: "x", Status: canary, Digest: canary})
+	if _, err := d.do(kernel.In{Kind: kernel.ObUnknown, Principal: provider, SessionID: "a", RequestID: "r1", ReasonCode: canary}); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.p.Sessions["a"].Evidence) == 0 {
+		t.Fatal("no late evidence was recorded, so the check is vacuous")
+	}
+	needle := []byte(strings.TrimPrefix(canary, "CANARY-"))
+	wal, err := os.ReadFile(filepath.Join(dir, fileName+"-wal"))
+	if err != nil || len(wal) == 0 {
+		t.Fatalf("no open WAL to inspect: %v", err)
+	}
+	if bytes.Contains(wal, needle) {
+		t.Fatal("secret reached the WAL")
+	}
+}
+
+func TestLockRefusesASymlink(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Symlink(filepath.Join(dir, "elsewhere"), filepath.Join(dir, LockName)); err != nil {
+		t.Skip("symlinks unavailable")
+	}
+	if l, _, _, err := Open(ctx, dir, stamp(0)); err == nil {
+		l.Close()
+		t.Fatal("opened through a symlinked lock")
+	}
+}
+
+func TestPathWithURIMetacharactersIsRefused(t *testing.T) {
+	root := t.TempDir()
+	// "a%62" percent-decodes to "ab": without the guard SQLite would open ab's log
+	// while the lock guards a%62.
+	dir, decoy := filepath.Join(root, "a%62"), filepath.Join(root, "ab")
+	if os.Mkdir(dir, 0o700) != nil || os.Mkdir(decoy, 0o700) != nil {
+		t.Skip("cannot create those names here")
+	}
+	if l, _, _, err := Open(ctx, dir, stamp(0)); err == nil {
+		l.Close()
+		t.Fatal("opened a path SQLite reads differently")
+	}
+	if _, err := os.Stat(filepath.Join(decoy, fileName)); err == nil {
+		t.Fatal("a log was created in the decoy directory")
 	}
 }

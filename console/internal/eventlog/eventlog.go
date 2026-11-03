@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/ericmacdougall/agent-harness/console/internal/kernel"
@@ -41,7 +43,13 @@ var mustAppend = map[kernel.FactKind]bool{
 	kernel.FactProcessRestarted: true, kernel.FactProviderCompleted: true, kernel.FactOutcomeUnknown: true,
 	kernel.FactProviderRefused: true, kernel.FactAbandoned: true, kernel.FactSessionClosed: true,
 	kernel.FactControlOutcome: true, kernel.FactAuthBoundaryCrossed: true, kernel.FactLateFrameObserved: true,
-	kernel.FactControlRequested: true, kernel.FactSessionQuarantined: true,
+	kernel.FactSessionQuarantined: true,
+}
+
+// isMustAppend classifies by fact: only a stop request may use the reserve, so
+// repeated pauses cannot drain it.
+func isMustAppend(f kernel.Fact) bool {
+	return mustAppend[f.Kind] || f.Kind == kernel.FactControlRequested && f.Control == "stop"
 }
 
 // revoking kinds take authority away. If one cannot commit, authority must not
@@ -93,6 +101,12 @@ func Open(ctx context.Context, dir string, now string) (*Log, kernel.Projection,
 		return nil, empty, nil, err
 	}
 	path := filepath.Join(dir, fileName)
+	// The DSN is a URI, so these would make SQLite open a different file than the one
+	// the lock guards.
+	if strings.ContainsAny(path, "?#%") {
+		unlock()
+		return nil, empty, nil, errors.New("data directory path may not contain ?, # or %")
+	}
 	if info, err := os.Lstat(path); err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
 		unlock()
 		return nil, empty, nil, errors.New("event log must be a regular file")
@@ -124,12 +138,13 @@ func Open(ctx context.Context, dir string, now string) (*Log, kernel.Projection,
 		return fail(err)
 	}
 	if len(decision.Facts) > 0 {
-		if _, err = l.Append(ctx, p.LastSeq, "", "", decision.Facts); err != nil {
+		stored, _, err := l.Append(ctx, p.LastSeq, "", "", decision.Facts)
+		if err != nil {
 			// The restart rule could not be recorded, so nothing may be admitted.
 			l.latch()
 			return l, p, quarantined, nil
 		}
-		for _, f := range decision.Facts {
+		for _, f := range stored {
 			if p, err = kernel.Reduce(p, f); err != nil {
 				return fail(err)
 			}
@@ -170,7 +185,11 @@ func (l *Log) initialize(ctx context.Context) error {
 	if format != formatVersion {
 		return fmt.Errorf("%w: format %d", ErrFormat, format)
 	}
-	for _, check := range []struct{ name, want string }{{"journal_mode", "wal"}, {"synchronous", "2"}} {
+	checks := []struct{ name, want string }{{"journal_mode", "wal"}, {"synchronous", "2"}}
+	if runtime.GOOS == "darwin" {
+		checks = append(checks, struct{ name, want string }{"fullfsync", "1"}, struct{ name, want string }{"checkpoint_fullfsync", "1"})
+	}
+	for _, check := range checks {
 		var got string
 		if err = tx.QueryRowContext(ctx, "PRAGMA "+check.name).Scan(&got); err != nil || got != check.want {
 			return fmt.Errorf("pragma %s is %q, want %q", check.name, got, check.want)
@@ -243,30 +262,37 @@ func (l *Log) latch() {
 // Append commits facts decided against a projection whose last sequence was
 // expectedSeq. commandID and digest are optional; with them a retry of the same
 // command returns the facts it already committed, and a different command under the
-// same identity is refused. It returns the facts as stored, which the caller reduces.
+// same identity is refused. It returns the facts as stored, which the caller reduces,
+// and whether they were already committed by an earlier call, in which case they
+// are already in any projection that saw that call.
 //
 // Outcomes follow the plan's log health table: a definite failure writes nothing
 // and returns its error; any commit error not known to precede commit, or a revoking
 // fact that cannot commit, latches the log.
-func (l *Log) Append(ctx context.Context, expectedSeq uint64, commandID, digest string, facts []kernel.Fact) ([]kernel.Fact, error) {
+func (l *Log) Append(ctx context.Context, expectedSeq uint64, commandID, digest string, facts []kernel.Fact) ([]kernel.Fact, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.latched {
-		return nil, ErrLatched
+		return nil, false, ErrLatched
 	}
-	stored, err := l.append(ctx, expectedSeq, commandID, digest, facts)
-	if err != nil && !errors.Is(err, errAmbiguous) && !errors.Is(err, ErrConflict) && !errors.Is(err, ErrCommandConflict) && hasRevoking(facts) {
+	stored, replayed, err := l.append(ctx, expectedSeq, commandID, digest, facts)
+	switch {
+	case err == nil:
+		return stored, replayed, nil
+	case errors.Is(err, errAmbiguous), errors.Is(err, errReserveSpent):
 		l.latched = true
-		return nil, fmt.Errorf("%w: a revoking fact could not commit: %v", ErrLatched, err)
-	}
-	if errors.Is(err, errAmbiguous) {
+		return nil, false, fmt.Errorf("%w: %v", ErrLatched, err)
+	case hasRevoking(facts):
+		// Authority must not outlive a revocation that did not commit, even definitely.
 		l.latched = true
-		return nil, fmt.Errorf("%w: %v", ErrLatched, err)
+		return nil, false, fmt.Errorf("%w: a revoking fact could not commit: %v", ErrLatched, err)
 	}
-	return stored, err
+	return nil, false, err
 }
 
 var errAmbiguous = errors.New("commit outcome unknown")
+
+var errReserveSpent = errors.New("the must-append reserve is spent")
 
 func hasRevoking(facts []kernel.Fact) bool {
 	for _, f := range facts {
@@ -277,19 +303,19 @@ func hasRevoking(facts []kernel.Fact) bool {
 	return false
 }
 
-func (l *Log) append(ctx context.Context, expectedSeq uint64, commandID, digest string, facts []kernel.Fact) ([]kernel.Fact, error) {
+func (l *Log) append(ctx context.Context, expectedSeq uint64, commandID, digest string, facts []kernel.Fact) ([]kernel.Fact, bool, error) {
 	if len(facts) == 0 {
-		return nil, errors.New("nothing to append")
+		return nil, false, errors.New("nothing to append")
 	}
 	if (commandID == "") != (digest == "") {
-		return nil, errors.New("a command identity needs its digest")
+		return nil, false, errors.New("a command identity needs its digest")
 	}
 	if err := step("begin"); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	tx, err := l.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer tx.Rollback()
 	if commandID != "" {
@@ -298,73 +324,78 @@ func (l *Log) append(ctx context.Context, expectedSeq uint64, commandID, digest 
 		err = tx.QueryRowContext(ctx, `SELECT digest, first_seq, last_seq FROM receipts WHERE command_id = ?`, commandID).Scan(&storedDigest, &first, &last)
 		if err == nil {
 			if !hmac.Equal([]byte(storedDigest), []byte(digest)) {
-				return nil, ErrCommandConflict
+				return nil, false, ErrCommandConflict
 			}
-			return readRange(ctx, tx, first, last)
+			stored, err := readRange(ctx, tx, first, last)
+			return stored, true, err
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	var count uint64
 	if err = tx.QueryRowContext(ctx, `SELECT fact_count FROM metadata`).Scan(&count); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if count != expectedSeq {
-		return nil, ErrConflict
+		return nil, false, ErrConflict
 	}
 	limit := uint64(MaxFacts - Reserve)
 	for _, f := range facts {
-		if !mustAppend[f.Kind] {
+		if !isMustAppend(f) {
 			if count+uint64(len(facts)) > limit {
-				return nil, ErrQuota
+				return nil, false, ErrQuota
 			}
 		}
 	}
 	if count+uint64(len(facts)) > MaxFacts {
-		return nil, fmt.Errorf("%w: the must-append reserve is spent", ErrLatched)
+		return nil, false, errReserveSpent
 	}
 	stored := make([]kernel.Fact, 0, len(facts))
 	for i, f := range facts {
 		if f.Seq != expectedSeq+uint64(i)+1 {
-			return nil, ErrConflict
+			return nil, false, ErrConflict
+		}
+		// The storage boundary validates too, so no path can store a fact out of shape.
+		if err := kernel.ValidateFact(f); err != nil {
+			return nil, false, err
 		}
 		body, err := kernel.EncodeFact(f)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		// What is stored is what a replay will decode, so the caller reduces that.
 		decoded, err := kernel.DecodeFact(body)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO facts (seq, kind, body, checksum) VALUES (?, ?, ?, ?)`, f.Seq, string(f.Kind), body, checksum(f.Seq, body)); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		stored = append(stored, decoded)
 	}
 	if err := step("written"); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE metadata SET fact_count = ?`, count+uint64(len(facts))); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if commandID != "" {
 		if _, err = tx.ExecContext(ctx, `INSERT INTO receipts VALUES (?, ?, ?, ?)`, commandID, digest, facts[0].Seq, facts[len(facts)-1].Seq); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	if err := step("before-commit"); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err = tx.Commit(); err != nil {
-		return nil, fmt.Errorf("%w: %v", errAmbiguous, err)
+		return nil, false, fmt.Errorf("%w: %v", errAmbiguous, err)
 	}
 	if err := step("after-commit"); err != nil {
-		return nil, fmt.Errorf("%w: %v", errAmbiguous, err)
+		return nil, false, fmt.Errorf("%w: %v", errAmbiguous, err)
 	}
 	l.count = count + uint64(len(facts))
-	return stored, nil
+	return stored, false, nil
 }
 
 func step(name string) error {
@@ -375,24 +406,37 @@ func step(name string) error {
 }
 
 func readRange(ctx context.Context, tx *sql.Tx, first, last uint64) ([]kernel.Fact, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT body FROM facts WHERE seq BETWEEN ? AND ? ORDER BY seq`, first, last)
+	rows, err := tx.QueryContext(ctx, `SELECT seq, body, checksum FROM facts WHERE seq BETWEEN ? AND ? ORDER BY seq`, first, last)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	facts := []kernel.Fact{}
+	want := first
 	for rows.Next() {
+		var seq uint64
 		var body []byte
-		if err = rows.Scan(&body); err != nil {
+		var sum string
+		if err = rows.Scan(&seq, &body, &sum); err != nil {
 			return nil, err
+		}
+		if seq != want || sum != checksum(seq, body) {
+			return nil, fmt.Errorf("%w: receipt range is damaged", kernel.ErrUnreadableLog)
 		}
 		f, err := kernel.DecodeFact(body)
 		if err != nil {
 			return nil, err
 		}
 		facts = append(facts, f)
+		want++
 	}
-	return facts, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if want != last+1 {
+		return nil, fmt.Errorf("%w: receipt range is incomplete", kernel.ErrUnreadableLog)
+	}
+	return facts, nil
 }
 
 // Count is the number of committed facts.
@@ -404,6 +448,8 @@ func (l *Log) Count() uint64 {
 
 // Close releases the database and the directory lock.
 func (l *Log) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	var err error
 	if l.db != nil {
 		err = l.db.Close()
