@@ -47,7 +47,7 @@ func (a *app) checkpointUpdate(id string, input checkpointInput) error {
 	return a.checkpointUpdateGuarded(id, input, nil)
 }
 
-// Codex supplies an exact binding guard, checked at every mutation lock.
+// Provider entry points supply an exact binding guard, checked at every mutation lock.
 func (a *app) checkpointUpdateGuarded(id string, input checkpointInput, guard func(*session) bool) error {
 	a.mu.Lock()
 	current := a.findLocked(id)
@@ -73,6 +73,7 @@ func (a *app) checkpointUpdateGuarded(id string, input checkpointInput, guard fu
 		return errors.New("scope exceeds checkpoint bound")
 	}
 	cwd := current.CWD
+	provider, profile := current.Provider, current.ProfileID
 	epoch := current.controlEpoch
 	if input.State == "active" || input.State == "blocked" || input.State == "handoff" {
 		task.State = input.State
@@ -99,7 +100,7 @@ func (a *app) checkpointUpdateGuarded(id string, input checkpointInput, guard fu
 	if err != nil {
 		return err
 	}
-	policy, err := a.policyFor(current.Provider, current.ProfileID, input.Stage)
+	policy, err := a.policyFor(provider, profile, input.Stage)
 	if err != nil {
 		return err
 	}

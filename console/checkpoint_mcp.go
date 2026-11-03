@@ -97,9 +97,15 @@ func (a *app) checkpointHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	a.mu.Lock()
 	id := ""
+	var guard func(*session) bool
 	for _, s := range a.sessions {
 		if s.task != nil && s.Provider == "claude" && r.Header.Get("Authorization") == "Bearer "+s.task.capability && s.Status == "running" {
-			id = s.ID
+			// Retain admission across body decoding and subject capture. The
+			// capability alone must not authorize a later run of the same task.
+			guard = a.claudeCheckpointGuardLocked(s)
+			if guard(s) {
+				id = s.ID
+			}
 			break
 		}
 	}
@@ -113,12 +119,41 @@ func (a *app) checkpointHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid checkpoint", 400)
 		return
 	}
-	if err := a.checkpointUpdate(id, input); err != nil {
+	if err := a.checkpointUpdateGuarded(id, input, guard); err != nil {
 		http.Error(w, a.clean(err.Error()), 409)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"recorded": true, "note": "End turn after needs_review; independent review runs next"})
 }
+
+// Created and invoked only with app.mu held; all captured identities are values
+// from initial HTTP admission, not properties of a subsequently replaced task.
+func (a *app) claudeCheckpointGuardLocked(s *session) func(*session) bool {
+	run, task := s.claude, s.task
+	request, epoch, capability := s.lastRequest, s.controlEpoch, task.capability
+	taskID, generation, revision, hash := task.ID, task.Generation, task.InputRevision, task.ObjectiveHash
+	return func(current *session) bool {
+		if current != s || a.findLocked(s.ID) != s || current.Provider != "claude" || current.claude != run || run == nil || current.task != task || current.controlEpoch != epoch {
+			return false
+		}
+		if current.lastRequest != request || request == "" || run.requestID != request || run.taskID != taskID || run.inputRevision != revision || !oneOf(current.requests[request], "intent", "accepted") {
+			return false
+		}
+		if task.ID != taskID || task.Generation != generation || task.InputRevision != revision || task.ObjectiveHash != hash || task.capability != capability || capability == "" {
+			return false
+		}
+		if current.providerFinal || current.Restored || current.queueUncertain || current.Status != "running" || oneOf(current.Supervision.State, "paused", "unknown") {
+			return false
+		}
+		select {
+		case <-run.done:
+			return false
+		default:
+			return true
+		}
+	}
+}
+
 func (a *app) checkpointConfig(s *session) (string, []string, error) {
 	binary, err := os.Executable()
 	if err != nil {

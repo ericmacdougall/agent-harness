@@ -127,7 +127,9 @@ func (a *app) startCodexTurn(ctx context.Context, current *session, client *rpcC
 
 func (a *app) codexCompletionLocked(current *session, client *rpcClient, completion codexCompletion) {
 	requestID := current.lastRequest
-	if oneOf(current.requests[requestID], "final", "unknown") {
+	// Check lifecycle independently of request/binding revocation. A stale
+	// correlated completion cannot restore authority after disconnection.
+	if current.Restored || current.queueUncertain || current.codex != client || current.providerFinal || current.Status == "disconnected" || oneOf(current.requests[requestID], "final", "unknown") {
 		return
 	}
 	binding := current.codexTurn

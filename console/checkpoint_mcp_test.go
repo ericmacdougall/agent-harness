@@ -10,10 +10,7 @@ import (
 )
 
 func TestScopedMCPDeliveryCannotAuthorizeGUI(t *testing.T) {
-	a, s, input := checkpointFixture(t)
-	s.Provider = "claude"
-	s.Status = "running"
-	s.task.capability = "0123456789abcdef0123456789abcdef"
+	a, s, input := claudeCheckpointFixture(t)
 	input.State = "blocked"
 	input.Scope = "controlled MCP transport"
 	server := httptest.NewServer(http.HandlerFunc(a.checkpointHTTP))

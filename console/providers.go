@@ -276,23 +276,48 @@ func (a *app) providerDisconnected(client *rpcClient, err error) {
 	for _, current := range append(append([]*session{}, a.sessions...), a.reviews...) {
 		if current.codex == client {
 			current.Restored = true
+			current.controlEpoch++
+			current.resumeRequested = false
+			// Disconnect is a terminal authority boundary, including while a
+			// turn/start reply or completion is still in flight. Keep durable
+			// finals, but never allow an unfinished request to become final later.
+			unfinished := oneOf(current.requests[current.lastRequest], "intent", "accepted")
+			if unfinished {
+				current.requests[current.lastRequest] = "unknown"
+				current.providerFinal = false
+			}
+			if binding := current.codexTurn; binding != nil {
+				binding.clearFrames()
+				binding.pending = nil
+				binding.pendingBytes = 0
+				current.codexTurn = nil
+			}
+			current.turnID = ""
 			a.revokeQuestionsLocked(current, "")
-			if current.reviewParent != "" {
+			current.Supervision.State = "paused"
+			current.Supervision.Reason = "Provider connection closed"
+			if unfinished {
 				current.Status = "unknown"
-				current.Error = "Independent review disconnected; outcome unknown"
-				_ = a.record(current, current.lastRequest, "review_unknown")
+				current.Error = "Provider disconnected before a final outcome. Reconcile before sending again."
+				// Existing input ownership remains retained. Do not start a queue
+				// transaction from a close callback that can overlap app shutdown.
+				_ = a.record(current, current.lastRequest, "unknown")
+			}
+			if current.reviewParent != "" {
+				if current.requests[current.lastRequest] != "final" {
+					current.Status = "unknown"
+					current.Error = "Independent review disconnected; outcome unknown"
+					_ = a.record(current, current.lastRequest, "review_unknown")
+				}
 				a.finishReviewLocked(current)
 				continue
 			}
-			if current.Status == "running" || current.Status == "starting" {
+			if current.requests[current.lastRequest] == "unknown" || current.Status == "running" || current.Status == "starting" {
 				current.Status = "unknown"
 				current.Error = "Provider disconnected before a final outcome. Reconcile before sending again."
 			} else {
 				current.Status = "disconnected"
 			}
-			current.Supervision.State = "paused"
-			current.Supervision.Reason = "Provider connection closed"
-			current.PendingQuestions = []question{}
 		}
 	}
 	a.changedLocked()
