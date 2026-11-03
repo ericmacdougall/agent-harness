@@ -7,8 +7,10 @@ package kernel
 // A comment `SPEC-AMBIGUOUS: n` marks a place the tables left open. Every failure message
 // carries the numbers touched in that step, so a disagreement caused by a reading can be
 // told apart from a defect. Numbers 1 to 36 are settled by SPEC.md section 10; 1 to 34 use
-// its numbers, and 35 and 36 were closed by its items 30 and 31. One small point stays open:
-// section 10 names no error for Quarantined.Err, so it is only required to be non-nil.
+// its numbers, and 35 and 36 were closed by its items 30 and 31. Still open:
+// section 10 names no error for Quarantined.Err, so it is only required to be non-nil; and
+// 37. Item 39 says repeated control-outcome frames append facts, but table 7 makes a frame that
+// would not change PauseUnconfirmed idempotent. Table 7 is coded, so an exact repeat is idempotent.
 
 import (
 	"errors"
@@ -291,6 +293,9 @@ func (m *mdlModel) apply(f Fact) {
 	case FactSessionQuarantined:
 		// SPEC-AMBIGUOUS: 13
 		m.note(13)
+		if s.quarantine != "" && f.ReasonCode == "illegal_fact" {
+			m.hit("t2.quarantine.overwrite_with_illegal_fact")
+		}
 		s.quarantine = f.ReasonCode
 		s.readOnly, s.connected, s.hidden = true, false, false
 		s.pending = sticky
@@ -1041,6 +1046,7 @@ func (m *mdlModel) predictControlOutcome(s *mdlMSession, in In) mdlOutcome {
 	if (in.Control != "pause" && in.Control != "stop") || !mdlContains([]string{"confirmed", "rejected", "unconfirmed"}, in.Outcome) {
 		return m.late(s, in, "control_outcome")
 	}
+	// SPEC-AMBIGUOUS: 37
 	if s.wouldBeUnconfirmed(in.Outcome) == s.unconfirmed {
 		m.hit("t7.control_outcome.idempotent")
 		return mdlOutcome{}
@@ -1809,7 +1815,9 @@ func (g *mdlGen) scriptQuarantine() []mdlGenStep {
 	out := g.codexReady(a)
 	out = append(out, mdlStep(ObQuarantine, "ghost-"+a, mdlCode("x")),
 		mdlStep(ObQuarantine, a), mdlStep(ObQuarantine, a, mdlCode("BAD CODE")),
-		mdlStep(ObQuarantine, a, mdlCode("first_code")), mdlStep(ObQuarantine, a, mdlCode("second_code")))
+		mdlStep(ObQuarantine, a, mdlCode("first_code")), mdlStep(ObQuarantine, a, mdlCode("second_code")),
+		// Section 10 item 13: the code replay would use still overwrites when it arrives as a fact.
+		mdlStep(ObQuarantine, a, mdlCode("illegal_fact")), mdlStep(ObQuarantine, a, mdlCode("after_illegal")))
 	out = append(out, g.codexReady(b)...)
 	out = append(out, mdlSend(b, "r1"), mdlStep(ObQuarantine, b, mdlCode("q")), mdlStep(ObTurnBound, b, mdlReq("r1"), mdlTurn("t1")))
 	out = append(out, mdlClaudeNew(c), mdlSend(c, "r1"), mdlStep(ObQuarantine, c, mdlCode("q")), mdlStep(InStop, c))
@@ -2251,14 +2259,15 @@ func mdlCompareFact(want mdlWantFact, got Fact) string {
 	if want.Seq != got.Seq || want.SessionRevision != got.SessionRevision || got.SchemaVersion != SchemaVersion {
 		return fmt.Sprintf("%s stamps: want seq %d rev %d schema %d, got seq %d rev %d schema %d", got.Kind, want.Seq, want.SessionRevision, SchemaVersion, got.Seq, got.SessionRevision, got.SchemaVersion)
 	}
-	for _, name := range want.must {
-		w, g := mdlStringField(want.Fact, name), mdlStringField(got, name)
-		if w != g {
-			return fmt.Sprintf("%s %s: want %q, got %q", got.Kind, name, w, g)
+	// Every field, not only the named ones: an unnamed field must be empty (zero) on a
+	// decided fact. SchemaVersion is stamped by Decide, so the prediction takes it too.
+	expected := want.Fact
+	expected.SchemaVersion = SchemaVersion
+	ev, gv := reflect.ValueOf(expected), reflect.ValueOf(got)
+	for i := 0; i < ev.NumField(); i++ {
+		if w, g := ev.Field(i).Interface(), gv.Field(i).Interface(); !mdlSameValue(w, g) {
+			return fmt.Sprintf("%s field %s: want %#v, got %#v", got.Kind, ev.Type().Field(i).Name, w, g)
 		}
-	}
-	if got.Reason != "" && got.Kind != FactAbandoned && got.Kind != FactLegacyImported {
-		return fmt.Sprintf("%s carries Reason %q", got.Kind, got.Reason)
 	}
 	// Section 7: nothing Decide returns can be refused by Reduce.
 	if !mdlFactInShape(got) {
@@ -2297,7 +2306,15 @@ func mdlModelReplay(facts []Fact, cov map[string]int) (m *mdlModel, reported []s
 			m.apply(f)
 			continue
 		}
+		// Section 10 item 35: an illegal global fact is unreadable whatever SessionID it carries.
 		if f.SessionID == "" || f.Kind == FactProcessRestarted || f.Kind == FactLegacyImportCompleted {
+			if f.SessionID != "" {
+				if m.sessions[f.SessionID] != nil {
+					m.hit("t8.unreadable.global_live_session")
+				} else {
+					m.hit("t8.unreadable.global_ghost_session")
+				}
+			}
 			if mdlContains(ReservedFactKinds, f.Kind) {
 				m.hit("t8.unreadable.reserved_no_session")
 			} else {
@@ -2400,8 +2417,26 @@ func mdlBuildReplayVariants(m *mdlModel, log []Fact, rng *rand.Rand) []mdlReplay
 		{"bad schema", insert(pos, badSchema)},
 		{"unknown kind", insert(pos, base("NotAKind", sid))},
 		{"illegal global", insert(pos, emptyDigest)},
-		{"reserved without session", insert(pos, base(reserved, ""))},
 	}
+	for _, target := range []string{sid, "ghost-global"} {
+		noDigest := base(FactLegacyImportCompleted, target)
+		noDigest.SessionRevision = 1
+		first, again := base(FactLegacyImportCompleted, target), base(FactLegacyImportCompleted, target)
+		first.Digest, again.Digest = "sha256:first", "sha256:again"
+		restartBad := base(FactProcessRestarted, target)
+		restartBad.Status = "open"
+		restartBadAt := base(FactProcessRestarted, target)
+		restartBadAt.At = "now"
+		variants = append(variants,
+			mdlReplayVariant{"empty-digest import with session " + target, insert(pos, noDigest)},
+			mdlReplayVariant{"repeated import with session " + target, insert(pos, first, again)},
+			mdlReplayVariant{"illegal restart with session " + target, insert(pos, restartBad)},
+			mdlReplayVariant{"bad-time restart with session " + target, insert(pos, restartBadAt)},
+		)
+	}
+	variants = append(variants, []mdlReplayVariant{
+		{"reserved without session", insert(pos, base(reserved, ""))},
+	}...)
 	if len(seqRepeat) > 1 {
 		variants = append(variants, mdlReplayVariant{"sequence not increasing", seqRepeat})
 	}
@@ -2820,7 +2855,7 @@ func mdlTableRows() []string {
 		"t4.unknown.pending_survives", "t4.intended.clears_bound_turn",
 		"t4.control_outcome.unresolved_not_confirmed", "t4.control_outcome.abandoned_clears", "t4.control_outcome.abandoned_not_confirmed", "t4.control_outcome.resolved_not_confirmed",
 		"t5.request.known", "t5.request.unknown", "t5.sticky", "t5.status.empty", "t5.status.valid", "t5.status.invalid", "t5.digest.valid", "t5.digest.empty",
-		"t8.unreadable.schema", "t8.unreadable.seq", "t8.unreadable.kind", "t8.unreadable.global", "t8.unreadable.reserved_no_session",
+		"t8.unreadable.schema", "t8.unreadable.seq", "t8.unreadable.kind", "t8.unreadable.global", "t8.unreadable.reserved_no_session", "t8.unreadable.global_live_session", "t8.unreadable.global_ghost_session", "t2.quarantine.overwrite_with_illegal_fact",
 		"t8.reserved_follows_rows", "t8.ghost", "t8.ghost_once", "t8.ghost_then_created", "t8.ghost_created_quarantined", "t8.first", "t8.first_on_closed", "t8.first_on_quarantined", "t8.later_applied", "t8.later_skipped",
 		"raw.verdict.legal", "raw.verdict.illegal", "raw.verdict.unreadable",
 		"raw.tag.legal.legal", "raw.tag.repeat.legal", "raw.tag.gap.legal", "raw.tag.illegal.illegal", "raw.tag.receipt_transition.illegal",

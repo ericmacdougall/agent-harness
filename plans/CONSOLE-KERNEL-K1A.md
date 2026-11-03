@@ -134,7 +134,7 @@ Effects are returned with the decision, in the order listed. `Decision.Idempoten
 
 Every value on a fact has a closed set or a shape: identities `[A-Za-z0-9._:/@+=-]{1,128}`, digests and runtime identity `[A-Za-z0-9:_-]{1,128}`, reason codes `[a-z0-9_]{1,40}`, `Control` and `Outcome` as listed, and `Reason` only on `Abandoned` and `LegacyImported`. `CWD` is at most 4,096 bytes of valid UTF-8 with no control characters, may be empty on `create`, and must be nonempty on `change-cwd`. Only fields that reach a fact are checked, after the row's own checks, so a read-only stop always fires its effects and an idempotent retry is not refused over an unused field. A value out of shape then gives `bad_value` on a user or system input. A provider input never does: a frame cannot be refused back to the provider, so its rows above say what happens. A request out of shape is simply not `LastRequest`. `Decide` encodes, decodes and reduces each fact before returning, and any failure there is a refusal `bad_value`, so nothing it returns can be refused by `Reduce` or changed by the codec.
 
-`LegacyImported` and `LegacyImportCompleted` come only from the importer in K3, and have no input row. A `final` import leaves `FinalStatus` empty. `LegacyImported.RequestID` follows the same empty rule as `Abandoned`.
+`LegacyImported` and `LegacyImportCompleted` come only from the importer in K3, and have no input row. A `final` import leaves `FinalStatus` empty. `LegacyImported` needs a request exactly when it has a receipt, as table 2 says.
 
 Fact kinds for later slices stay known to the codec so a log holding them stays readable by kind, but `Reduce` refuses them as illegal until their slice lands.
 
@@ -273,6 +273,11 @@ The independent model listed 34 places these tables left open. None changes a ta
 32. `Redact` applies the redactor, then trims Unicode whitespace.
 33. A raw fact with a bad `At` is illegal. Raw `RuntimeIdentityBound` or `CwdChanged` with an empty value is illegal.
 34. `TurnBound` needs a nonempty request. With no request the fact is illegal.
+35. An illegal global fact refuses the log as unreadable, whatever `SessionID` it carries.
+36. If `Decide`'s own pre-check finds a fact `Reduce` refuses for a precondition, that is a kernel bug and returns a plain error, not a refusal. Only a value out of shape is `bad_value`.
+37. A `quarantine` input with a code out of shape is `bad_value` with no effects: only the adapter sends it, so this is an adapter bug.
+38. A disconnect ends the Codex turn: K4 stops the provider's process group whenever its stream ends, so clearing `TurnID` is correct. K6 must keep this true.
+39. Repeated `disconnected` frames append facts, and `control-outcome` frames that change `PauseUnconfirmed` do, while an exact repeat is idempotent per table 7. K2's quota and must-append reserve bound them; coalescing them is deferred.
 
 ## Review record
 

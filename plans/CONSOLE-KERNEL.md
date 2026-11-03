@@ -236,7 +236,7 @@ Each slice is its own branch and PR, with its own code inspection. Sizes exclude
 | Slice | Scope | Acceptance | Depends on |
 |---|---|---|---|
 | **K0** | This plan and the catalog | Plan review | None |
-| **K1a** | `internal/kernel` core, per [the closed tables](CONSOLE-KERNEL-K1A.md): session lifecycle, receipts, turn and control, late evidence, restart, authorization, codec. Under 1,200 non-test lines. No I/O, no wiring. | Plan review accepts the tables. In-scope reproducers fail at `2132280` and pass. Model written by a separate agent from the tables alone compares every K1a field and the effect list, at 3,000 seeds with the seed printed. `go test -race`. Every mutated table row is caught by that model. One blind inspection with no blocker on a tabled object, or one repair then a clean second. | K0 |
+| **K1a** | `internal/kernel` core, per [the closed tables](CONSOLE-KERNEL-K1A.md): session lifecycle, receipts, turn and control, late evidence, restart, authorization, codec. About 1,300 non-test code lines, accepted. No I/O, no wiring. | Plan review accepts the tables. In-scope reproducers fail at `2132280` and pass. Model written by a separate agent from the tables alone compares every K1a field and the effect list, at 3,000 seeds with the seed printed. `go test -race`. Every mutated table row is caught by that model. One blind inspection with no blocker on a tabled object, or one repair then a clean second. | K0 |
 | **K1b** | Children, questions and the control side they share | Same recipe, deferred controls F6-child, F9, F11 | K1a, before K7 |
 | **K1c** | Inputs | Same recipe | K1a, before K8 |
 | **K1d** | Tasks, reviews, checkpoints, supervision and continuation budget | Same recipe, deferred controls F1, F7, F8 | K1a, before K9 |

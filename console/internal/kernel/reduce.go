@@ -218,9 +218,7 @@ func interruptOwed(s *Session) bool {
 func stickyOwed(s *Session) bool { return s.PendingInterrupt || interruptOwed(s) }
 
 func quarantine(s *Session, reason string) {
-	if s.Quarantine == "" || reason != "illegal_fact" {
-		s.Quarantine = reason
-	}
+	s.Quarantine = reason
 	s.PendingInterrupt = stickyOwed(s)
 	s.ReadOnly, s.Connected, s.Hidden = true, false, false
 	s.ControlEpoch++
@@ -480,7 +478,7 @@ func Replay(facts []Fact) (Projection, []Quarantined, error) {
 		if !errors.Is(err, ErrIllegalFact) {
 			return NewProjection(), nil, err
 		}
-		if f.SessionID == "" {
+		if f.SessionID == "" || globalFact(f.Kind) {
 			return NewProjection(), nil, fmt.Errorf("%w: %v", ErrUnreadableLog, err)
 		}
 		if !reported[f.SessionID] {
@@ -491,7 +489,11 @@ func Replay(facts []Fact) (Projection, []Quarantined, error) {
 		p.LastSeq, p.LastKind = f.Seq, f.Kind
 		if current := p.Sessions[f.SessionID]; current != nil && !applied[f.SessionID] {
 			s := current.clone()
-			quarantine(s, "illegal_fact")
+			code := "illegal_fact"
+			if s.Quarantine != "" {
+				code = s.Quarantine
+			}
+			quarantine(s, code)
 			p.Sessions[f.SessionID] = s
 			applied[f.SessionID] = true
 		}
