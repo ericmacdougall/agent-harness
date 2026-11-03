@@ -76,6 +76,7 @@ const (
 	ObPayloadReleased   InputKind = "payload-released"
 	ObReviewOutcome     InputKind = "review-outcome"
 	ObReviewCancelled   InputKind = "review-cancelled"
+	ObQuarantine        InputKind = "quarantine"
 )
 
 // Command is the decoded, untrusted shape of a request. Provider adapters build
@@ -100,6 +101,25 @@ type Command struct {
 	Digest          string    `json:"digest,omitempty"`
 	State           string    `json:"state,omitempty"`
 	Status          string    `json:"status,omitempty"`
+}
+
+// userCommands are the only kinds a decoded body may name. Observations and system
+// inputs come from adapters inside the process, never from a request.
+var userCommands = map[InputKind]bool{InCreate: true, InSend: true, InPause: true, InStop: true, InResume: true, InChildControl: true, InChangeCWD: true, InClose: true, InAbandon: true, InAnswer: true, InQueueInput: true, InDiscardInput: true, InCheckpoint: true}
+
+// allowedPrincipals is default-deny: a kind not listed here is refused for everyone.
+var allowedPrincipals = map[InputKind][]PrincipalClass{
+	InCreate: {PrincipalUser, PrincipalSystem}, InSend: {PrincipalUser, PrincipalSystem}, InDispatchInput: {PrincipalSystem},
+	InPause: {PrincipalUser}, InStop: {PrincipalUser}, InResume: {PrincipalUser}, InChildControl: {PrincipalUser},
+	InChangeCWD: {PrincipalUser}, InClose: {PrincipalUser}, InAbandon: {PrincipalUser}, InAnswer: {PrincipalUser},
+	InQueueInput: {PrincipalUser}, InDiscardInput: {PrincipalUser}, InCheckpoint: {PrincipalAgentRun},
+	InStartReview: {PrincipalSystem}, InSetPolicy: {PrincipalSystem}, InSetCascade: {PrincipalSystem},
+	InSetSupervision: {PrincipalSystem}, InSetBudget: {PrincipalSystem}, InSetReviewResult: {PrincipalSystem},
+	ObConversationBound: {PrincipalProvider}, ObConnected: {PrincipalProvider}, ObDisconnected: {PrincipalProvider},
+	ObAccepted: {PrincipalProvider}, ObRefused: {PrincipalProvider}, ObUnknown: {PrincipalProvider}, ObTurnBound: {PrincipalProvider},
+	ObCompleted: {PrincipalProvider}, ObQuestion: {PrincipalProvider}, ObControlOutcome: {PrincipalProvider}, ObChild: {PrincipalProvider},
+	ObChildOutcome: {PrincipalProvider}, ObAuthBoundary: {PrincipalSystem}, ObRestart: {PrincipalSystem}, ObInputOutcome: {PrincipalSystem},
+	ObPayloadReleased: {PrincipalSystem}, ObReviewOutcome: {PrincipalSystem}, ObReviewCancelled: {PrincipalSystem}, ObQuarantine: {PrincipalSystem},
 }
 
 var commandFields = func() map[string]bool {
@@ -128,6 +148,9 @@ func DecodeCommand(data []byte) (Command, error) {
 	if _, err := decoder.Token(); err != io.EOF {
 		return Command{}, errors.New("malformed command: trailing content")
 	}
+	if !userCommands[c.Kind] {
+		return Command{}, errors.New("malformed command: not a command kind")
+	}
 	return c, nil
 }
 
@@ -144,7 +167,7 @@ type In struct {
 	RequestID       string
 	ExpectedRequest string
 	TurnID          string
-	Reason          string
+	Reason          RedactedReason
 	ReasonCode      string
 	ID              string
 	Role            string
@@ -263,6 +286,9 @@ func (b *builder) finish() (Decision, error) {
 	next := b.p
 	for _, f := range b.facts {
 		reduced, err := Reduce(next, f)
+		if errors.Is(err, errBadValue) {
+			return refuse("bad_value", "a value is outside what this field allows")
+		}
 		if err != nil {
 			return Decision{}, fmt.Errorf("decide produced an illegal fact: %w", err)
 		}
@@ -274,6 +300,12 @@ func (b *builder) finish() (Decision, error) {
 // Decide maps one input to facts and effects. It is pure and provider-neutral, so a
 // guard cannot apply to one provider or one path only.
 func Decide(p Projection, in In) (Decision, error) {
+	if err := authorize(in); err != nil {
+		return Decision{}, err
+	}
+	if !timePattern.MatchString(in.At) {
+		return refuse("bad_time", "a fixed-width UTC time is required")
+	}
 	b := &builder{p: p, at: in.At, revision: map[string]uint64{}}
 	if in.Kind == ObRestart {
 		return decideRestart(b)
@@ -286,10 +318,12 @@ func Decide(p Projection, in In) (Decision, error) {
 		if in.Kind == ObAuthBoundary {
 			return decideAuth(b, in)
 		}
+		// A discarded tab may close before its start is answered. The reply still has
+		// to interrupt that turn, with nothing left to record.
+		if in.Kind == ObTurnBound && s != nil && s.PendingInterrupt && in.RequestID == s.LastRequest && in.TurnID != "" {
+			return Decision{Effects: []Effect{{Kind: EffectInterrupt, Class: ClassStopWork, SessionID: s.ID, RequestID: in.RequestID, TurnID: in.TurnID}}}, nil
+		}
 		return refuse("not_found", "session not found")
-	}
-	if err := authorize(in, s); err != nil {
-		return Decision{}, err
 	}
 	switch in.Kind {
 	case InSend, InDispatchInput:
@@ -322,6 +356,7 @@ func Decide(p Projection, in In) (Decision, error) {
 		if s.ReadOnly {
 			return b.late(s, in, "conversation")
 		}
+		bindIdentity(b, s, in)
 		b.add(Fact{Kind: FactConversationBound, SessionID: s.ID, ProviderID: in.ProviderID})
 		return b.finish()
 	case ObConnected:
@@ -373,8 +408,11 @@ func Decide(p Projection, in In) (Decision, error) {
 		return b.finish()
 	case ObReviewOutcome:
 		return decideReviewOutcome(b, s, in)
+	case ObQuarantine:
+		b.add(Fact{Kind: FactSessionQuarantined, SessionID: s.ID, ReasonCode: in.ReasonCode})
+		return b.finish()
 	case ObReviewCancelled:
-		if s.Review == nil || s.Review.ID != in.ID {
+		if s.Review == nil || s.Review.ID != in.ID || s.Review.Status != "running" {
 			return b.late(s, in, "review")
 		}
 		b.add(Fact{Kind: FactReviewCancelled, SessionID: s.ID, ID: in.ID})
@@ -383,20 +421,31 @@ func Decide(p Projection, in In) (Decision, error) {
 	return refuse("unknown_input", "unknown input")
 }
 
-func authorize(in In, s *Session) error {
+// authorize runs before anything else, including restart and create, and denies any
+// kind or principal it does not name.
+func authorize(in In) error {
+	forbidden := &Refusal{Code: "forbidden", Message: "this principal cannot do that"}
+	allowed := false
+	for _, class := range allowedPrincipals[in.Kind] {
+		allowed = allowed || class == in.Principal.Class
+	}
+	if !allowed {
+		return forbidden
+	}
 	switch in.Kind {
-	case InAbandon, InClose, InPause, InStop, InResume, InAnswer, InChangeCWD, InChildControl, InDiscardInput, InQueueInput:
-		if in.Principal.Class != PrincipalUser {
-			return &Refusal{Code: "forbidden", Message: "this action needs the user"}
-		}
-	case InCheckpoint:
-		if in.Principal.Class != PrincipalAgentRun || in.Principal.SessionID != s.ID {
-			return &Refusal{Code: "forbidden", Message: "checkpoints are limited to this session's run"}
-		}
 	case InSend:
-		if !in.Automatic && in.Principal.Class != PrincipalUser {
-			return &Refusal{Code: "forbidden", Message: "this action needs the user"}
+		// Only the scheduler continues on its own, and a user always acts directly.
+		if in.Automatic != (in.Principal.Class == PrincipalSystem) {
+			return forbidden
 		}
+	case InDispatchInput:
+		if !in.Automatic {
+			return forbidden
+		}
+	}
+	// A run or a provider connection speaks for its own session only.
+	if (in.Principal.Class == PrincipalProvider || in.Principal.Class == PrincipalAgentRun) && in.Principal.SessionID != in.SessionID {
+		return forbidden
 	}
 	return nil
 }
@@ -411,9 +460,6 @@ func decideRestart(b *builder) (Decision, error) {
 }
 
 func decideCreate(b *builder, in In) (Decision, error) {
-	if in.Principal.Class != PrincipalUser && in.Principal.Class != PrincipalSystem {
-		return refuse("forbidden", "this action needs the user")
-	}
 	if in.SessionID == "" || b.p.Sessions[in.SessionID] != nil {
 		return refuse("session_exists", "session identity is missing or already used")
 	}
@@ -464,8 +510,16 @@ func decideSend(b *builder, s *Session, in In) (Decision, error) {
 	if s.Provider == ProviderCodex && !s.Connected {
 		return b.refuseAdmission(s, in, "disconnected", "provider connection is lost; continue in a new session")
 	}
+	if in.RuntimeIdentity == "" {
+		return b.refuseAdmission(s, in, "no_identity", "the runtime identity is unavailable; try again")
+	}
 	if s.RuntimeIdentity != "" && in.RuntimeIdentity != s.RuntimeIdentity {
 		return b.refuseAdmission(s, in, "runtime_changed", "credentials or tools changed; start a new context session")
+	}
+	// A conversation that began with no recorded owner cannot be claimed by a runtime
+	// that may hold another account.
+	if s.RuntimeIdentity == "" && s.ConversationStarted {
+		return b.refuseAdmission(s, in, "no_owner", "this conversation has no recorded owner; start a new context session")
 	}
 	if in.Kind == InDispatchInput {
 		return decideDispatchInput(b, s, in)
@@ -473,6 +527,9 @@ func decideSend(b *builder, s *Session, in In) (Decision, error) {
 	if in.Automatic {
 		if s.Task == nil || s.Task.ID != in.ExpectedTask || s.ControlEpoch != in.ExpectedEpoch {
 			return b.refuseAdmission(s, in, "stale_binding", "automatic continuation belongs to an older task or control")
+		}
+		if taskEnded(s.Task) {
+			return b.refuseAdmission(s, in, "task_ended", "this task has ended; start a new objective")
 		}
 		if s.Supervision.State != SupervisionActive && s.Supervision.State != SupervisionWaiting {
 			return b.refuseAdmission(s, in, "not_active", "automatic continuation is no longer active")
@@ -495,13 +552,22 @@ func decideSend(b *builder, s *Session, in In) (Decision, error) {
 		}
 	}
 	bindIdentity(b, s, in)
-	fact := Fact{Kind: FactRequestIntended, SessionID: s.ID, RequestID: in.RequestID, TaskID: in.TaskID, Generation: in.Generation, ObjectiveHash: in.ObjectiveHash}
-	if !in.Automatic {
+	fact := Fact{Kind: FactRequestIntended, SessionID: s.ID, RequestID: in.RequestID}
+	if in.Automatic {
+		// Spent in the same commit as the send, and the task never changes here.
+		b.add(Fact{Kind: FactContinuationBudgetChanged, SessionID: s.ID, RemainingBursts: s.Supervision.RemainingBursts - 1, Progress: s.Supervision.Progress})
+		fact.TaskID = s.Task.ID
+	} else {
+		fact.TaskID, fact.Generation, fact.ObjectiveHash = in.TaskID, in.Generation, in.ObjectiveHash
 		fact.Status, fact.RemainingBursts = "new_objective", in.RemainingBursts
 	}
 	b.add(fact)
 	b.effect(Effect{Kind: EffectStartTurn, Class: ClassNewWork, SessionID: s.ID, RequestID: in.RequestID, Fence: s.ControlEpoch})
 	return b.finish()
+}
+
+func taskEnded(task *Task) bool {
+	return task != nil && (task.State == TaskComplete || task.State == TaskBlocked || task.State == TaskHandoff)
 }
 
 func bindIdentity(b *builder, s *Session, in In) {
@@ -516,6 +582,9 @@ func decideDispatchInput(b *builder, s *Session, in In) (Decision, error) {
 	}
 	if s.Task == nil {
 		return b.refuseAdmission(s, in, "no_task", "queued input has no task")
+	}
+	if taskEnded(s.Task) {
+		return b.refuseAdmission(s, in, "task_ended", "this task has ended; start a new objective")
 	}
 	// FIFO: a held or unknown head is never bypassed.
 	var head *Input
@@ -548,7 +617,7 @@ func activeQueue(s *Session) bool {
 func stopEffects(s *Session, kind EffectKind) []Effect {
 	effects := []Effect{}
 	// A Claude turn has no addressable turn to interrupt; its process is the handle.
-	if s.Provider == ProviderClaude && s.Requests[s.LastRequest].open() {
+	if s.Provider == ProviderClaude && s.Requests[s.LastRequest].unresolved() {
 		effects = append(effects, Effect{Kind: EffectTerminate, Class: ClassStopWork, SessionID: s.ID, RequestID: s.LastRequest})
 		return effects
 	}
@@ -567,6 +636,20 @@ func decideControl(b *builder, s *Session, in In) (Decision, error) {
 			return decision, nil
 		}
 		return decision, &Refusal{Code: "read_only", Message: "this tab is read-only; continue in a new session"}
+	}
+	// An unknown turn may still be running. Stop still works, and changes no admission
+	// authority: it only records that the interrupt is owed if the turn is unnamed.
+	if s.Requests[s.LastRequest] == ReceiptUnknown {
+		effects := stopEffects(s, EffectInterrupt)
+		if s.Provider == ProviderCodex && s.TurnID == "" && !s.PendingInterrupt {
+			b.add(Fact{Kind: FactControlRequested, SessionID: s.ID, Control: "stop"})
+		}
+		if len(b.facts) == 0 && len(effects) == 0 {
+			return Decision{Idempotent: true}, &Refusal{Code: "nothing_to_stop", Message: "there is nothing running to stop"}
+		}
+		decision, err := b.finish()
+		decision.Effects = effects
+		return decision, err
 	}
 	control := "pause"
 	if in.Kind == InStop {
@@ -650,7 +733,7 @@ func decideClose(b *builder, s *Session) (Decision, error) {
 // decideAbandon is explicit, user-only, and needs the expected request, so a dialog
 // opened for an older turn cannot discard a newer one. It never produces a final.
 func decideAbandon(b *builder, s *Session, in In) (Decision, error) {
-	reason := strings.TrimSpace(in.Reason)
+	reason := in.Reason.String()
 	if reason == "" || len(reason) > MaxReasonBytes {
 		return refuse("bad_reason", "a reason of up to 500 bytes is required")
 	}
@@ -740,21 +823,22 @@ func decideDiscardInput(b *builder, s *Session, in In) (Decision, error) {
 }
 
 func decideInputOutcome(b *builder, s *Session, in In) (Decision, error) {
-	if entry := findInput(s, in.RequestID); entry == nil || entry.Status == InputDiscarded {
-		return refuse("not_found", "queued input not found")
+	entry := findInput(s, in.RequestID)
+	if entry == nil || entry.Status != InputDispatching {
+		return refuse("no_dispatch", "this input has no open dispatch")
 	}
 	b.add(Fact{Kind: FactInputOutcome, SessionID: s.ID, RequestID: in.RequestID, Status: in.Status})
 	return b.finish()
 }
 
 func decideCheckpoint(b *builder, s *Session, in In) (Decision, error) {
-	if s.ReadOnly || !s.Requests[s.LastRequest].open() || s.Task == nil || s.Task.ID != in.TaskID {
+	if s.ReadOnly || !s.Requests[s.LastRequest].open() || s.Task == nil || s.Task.ID != in.TaskID || s.Supervision.State == SupervisionPaused {
 		return refuse("checkpoint_stale", "checkpoint belongs to an inactive request or task")
 	}
 	if s.Task.State == TaskComplete {
 		return refuse("checkpoint_complete", "a complete task cannot be reopened")
 	}
-	b.add(Fact{Kind: FactCheckpointRecorded, SessionID: s.ID, TaskID: in.TaskID, State: in.State, Stage: in.Stage, Digest: in.Digest, Status: in.Status})
+	b.add(Fact{Kind: FactCheckpointRecorded, SessionID: s.ID, TaskID: in.TaskID, State: in.State, Stage: in.Stage, Digest: in.Digest})
 	return b.finish()
 }
 
@@ -788,10 +872,22 @@ func decideSetting(b *builder, s *Session, in In) (Decision, error) {
 // late records evidence for a frame or effect result that cannot change anything,
 // coalesced per request and kind so a noisy provider cannot consume the log.
 func (b *builder) late(s *Session, in In, kind string) (Decision, error) {
-	if s.Evidence[evidenceKey(in.RequestID, kind)] == in.Status+"|"+in.Digest {
+	// Provider values are free text, so only safe shapes reach the log. A request this
+	// session never made shares one key, or a provider could grow the map at will.
+	status, digest, request := in.Status, in.Digest, in.RequestID
+	if status != "" && !codePattern.MatchString(status) {
+		status = "invalid"
+	}
+	if digest != "" && !digestPattern.MatchString(digest) {
+		digest = ""
+	}
+	if _, known := s.Requests[request]; !known {
+		request = ""
+	}
+	if prior, seen := s.Evidence[evidenceKey(request, kind)]; seen && strings.HasPrefix(prior, status+"|") {
 		return Decision{Idempotent: true}, nil
 	}
-	b.add(Fact{Kind: FactLateFrameObserved, SessionID: s.ID, RequestID: in.RequestID, LateKind: kind, Status: in.Status, Digest: in.Digest})
+	b.add(Fact{Kind: FactLateFrameObserved, SessionID: s.ID, RequestID: request, LateKind: kind, Status: status, Digest: digest})
 	return b.finish()
 }
 
@@ -800,7 +896,7 @@ func decideEffectResult(b *builder, s *Session, in In) (Decision, error) {
 	kind := map[InputKind]string{ObAccepted: "accepted", ObRefused: "refused", ObUnknown: "write_unknown"}[in.Kind]
 	// A result on a terminal, unknown or foreign receipt still has to be recorded,
 	// for instance a failed drain after a discard, but it changes no outcome.
-	if in.RequestID != s.LastRequest || !receipt.open() {
+	if in.RequestID != s.LastRequest || !receipt.open() || s.ReadOnly {
 		return b.late(s, in, kind)
 	}
 	switch in.Kind {
@@ -823,8 +919,15 @@ func decideTurnBound(b *builder, s *Session, in In) (Decision, error) {
 	if in.RequestID != s.LastRequest {
 		return b.late(s, in, "turn_bound")
 	}
+	if in.TurnID == "" || (s.TurnID != "" && s.TurnID != in.TurnID) {
+		return b.late(s, in, "turn_bound")
+	}
+	if s.TurnID == in.TurnID {
+		return Decision{Idempotent: true}, nil
+	}
+	// An unknown turn may still be running, so its name is kept for a later Stop.
 	pending := s.PendingInterrupt
-	if !pending && !s.Requests[in.RequestID].open() {
+	if !pending && !s.Requests[in.RequestID].unresolved() {
 		return b.late(s, in, "turn_bound")
 	}
 	b.add(Fact{Kind: FactTurnBound, SessionID: s.ID, RequestID: in.RequestID, TurnID: in.TurnID})
@@ -852,6 +955,10 @@ func decideCompleted(b *builder, s *Session, in In) (Decision, error) {
 	if s.Provider == ProviderCodex && (s.TurnID == "" || s.TurnID != in.TurnID) {
 		return b.late(s, in, "final")
 	}
+	if !oneOfValues(in.Status, finalStatuses...) {
+		b.add(Fact{Kind: FactOutcomeUnknown, SessionID: s.ID, RequestID: in.RequestID, ReasonCode: "invalid_final_status"})
+		return b.finish()
+	}
 	b.add(Fact{Kind: FactProviderCompleted, SessionID: s.ID, RequestID: in.RequestID, Status: in.Status})
 	return b.finish()
 }
@@ -859,13 +966,14 @@ func decideCompleted(b *builder, s *Session, in In) (Decision, error) {
 func decideQuestion(b *builder, s *Session, in In) (Decision, error) {
 	reject := Effect{Kind: EffectRejectQuestion, Class: ClassStopWork, SessionID: s.ID, RequestID: in.RequestID, ID: in.ID}
 	// A reviewer must run unattended, so asking is a terminal review failure. Nothing
-	// can then reopen it, since the run is no longer running.
+	// can then reopen it, since the run is no longer running. Every path to read-only
+	// ends a running review first, so this cannot fire on a read-only session.
 	if s.Review != nil && s.Review.Status == "running" && s.Review.ID == in.ReviewRunID {
 		b.add(Fact{Kind: FactReviewOutcome, SessionID: s.ID, ID: s.Review.ID, Verdict: "failed", ReasonCode: "reviewer_interactive"})
 		b.effect(reject)
 		return b.finish()
 	}
-	if s.ReadOnly || in.RequestID != s.LastRequest || !s.Requests[s.LastRequest].open() || len(s.Questions) >= 16 {
+	if s.ReadOnly || in.ReviewRunID != "" || in.RequestID != s.LastRequest || !s.Requests[s.LastRequest].open() || len(s.Questions) >= 16 {
 		decision, err := b.late(s, in, "question")
 		if err == nil {
 			decision.Effects = append(decision.Effects, reject)
@@ -880,7 +988,12 @@ func decideQuestion(b *builder, s *Session, in In) (Decision, error) {
 		return decision, err
 	}
 	b.add(Fact{Kind: FactQuestionOpened, SessionID: s.ID, RequestID: in.RequestID, ID: in.ID, Status: in.Status, Digest: in.Digest, ExpiresAt: in.ExpiresAt, TurnID: in.TurnID})
-	return b.finish()
+	decision, err := b.finish()
+	if err != nil {
+		// A question this session cannot hold is still owed an answer.
+		return Decision{Effects: []Effect{reject}}, err
+	}
+	return decision, nil
 }
 
 func decideReviewOutcome(b *builder, s *Session, in In) (Decision, error) {

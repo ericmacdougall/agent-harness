@@ -92,7 +92,7 @@ func globalFact(kind FactKind) bool {
 
 // Fact is one committed event. It holds identity, enums and digests only: prompts,
 // question text, attachment bytes and secrets never appear here. Reason is the sole
-// user-written field, bounded and redacted at the boundary.
+// user-written field, bounded here and redacted through RedactedReason.
 type Fact struct {
 	Seq             uint64            `json:"seq"`
 	SchemaVersion   int               `json:"schemaVersion"`

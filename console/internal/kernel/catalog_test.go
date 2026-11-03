@@ -2,11 +2,13 @@ package kernel
 
 import (
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -31,10 +33,15 @@ func (r *rig) apply(in In) (Decision, error) {
 		in.At = testAt
 	}
 	if in.Principal.Class == "" {
-		in.Principal.Class = PrincipalUser
-		if !isCommand(in.Kind) {
-			in.Principal.Class = PrincipalProvider
+		if allowed := allowedPrincipals[in.Kind]; len(allowed) > 0 {
+			in.Principal.Class = allowed[0]
 		}
+	}
+	if in.Principal.SessionID == "" && (in.Principal.Class == PrincipalProvider || in.Principal.Class == PrincipalAgentRun) {
+		in.Principal.SessionID = in.SessionID
+	}
+	if (in.Kind == InSend || in.Kind == InDispatchInput) && in.RuntimeIdentity == "" {
+		in.RuntimeIdentity = "owner"
 	}
 	decision, err := Decide(r.p, in)
 	for _, f := range decision.Facts {
@@ -55,12 +62,8 @@ func (r *rig) apply(in In) (Decision, error) {
 	return decision, err
 }
 
-func isCommand(kind InputKind) bool {
-	switch kind {
-	case InCreate, InSend, InDispatchInput, InPause, InStop, InResume, InChildControl, InChangeCWD, InClose, InAbandon, InAnswer, InQueueInput, InDiscardInput:
-		return true
-	}
-	return false
+func rr(text string) RedactedReason {
+	return Redact(text, func(value string) string { return value })
 }
 
 func (r *rig) must(in In) Decision {
@@ -141,7 +144,7 @@ func TestCatalogR1(t *testing.T) {
 func TestCatalogR2(t *testing.T) {
 	r := newRig(t)
 	for i := 0; i < MaxVisibleSessions+8; i++ {
-		id := "s" + string(rune('A'+i))
+		id := fmt.Sprintf("s%02d", i)
 		if i < 3 {
 			r.started(id, ProviderClaude)
 			continue
@@ -154,7 +157,7 @@ func TestCatalogR2(t *testing.T) {
 	for _, s := range VisibleSessions(r.p) {
 		visible[s.ID] = true
 	}
-	for _, id := range []string{"sA", "sB", "sC"} {
+	for _, id := range []string{"s00", "s01", "s02"} {
 		if !visible[id] {
 			t.Fatalf("unresolved %s dropped", id)
 		}
@@ -165,7 +168,7 @@ func TestCatalogR2(t *testing.T) {
 	// Everything past the limit still unresolved stays visible.
 	r = newRig(t)
 	for i := 0; i < MaxVisibleSessions+5; i++ {
-		r.started("u"+string(rune('A'+i)), ProviderClaude)
+		r.started(fmt.Sprintf("u%02d", i), ProviderClaude)
 	}
 	r.restart()
 	if got := len(VisibleSessions(r.p)); got != MaxVisibleSessions+5 {
@@ -176,18 +179,18 @@ func TestCatalogR2(t *testing.T) {
 func TestCatalogR3(t *testing.T) {
 	r := newRig(t)
 	for i := 0; i < MaxVisibleSessions+2; i++ {
-		id := "s" + string(rune('A'+i))
+		id := fmt.Sprintf("s%02d", i)
 		r.started(id, ProviderClaude)
 		r.complete(id, "A")
 	}
 	r.restart()
-	if !r.session("sA").Hidden {
+	if !r.session("s00").Hidden {
 		t.Fatal("oldest resolved tab was not trimmed")
 	}
-	r.must(In{Kind: InClose, SessionID: "sZ"})
+	r.must(In{Kind: InClose, SessionID: "s25"})
 	r.restart() // Skipped as a repeat only if nothing happened since.
 	for _, s := range VisibleSessions(r.p) {
-		if s.ID == "sA" {
+		if s.ID == "s00" {
 			t.Fatal("trimmed tab reappeared after another closed")
 		}
 	}
@@ -200,8 +203,9 @@ func TestCatalogR4(t *testing.T) {
 	before := r.session("s")
 	revision := before.Revision
 	decision, err := r.apply(In{Kind: InPause, SessionID: "s"})
-	if err == nil || len(decision.Facts) != 0 {
-		t.Fatalf("pause on read-only: %v %v", err, decision.Facts)
+	// The adapter no-ops if no writer remains; the stop itself is never refused.
+	if err != nil || len(decision.Facts) != 0 || len(decision.Effects) != 1 || decision.Effects[0].Class != ClassStopWork {
+		t.Fatalf("pause on read-only: %v %+v", err, decision)
 	}
 	s := r.session("s")
 	if s.Revision != revision || Status(s) != "unknown" {
@@ -212,7 +216,7 @@ func TestCatalogR4(t *testing.T) {
 	r = newRig(t)
 	r.started("c", ProviderCodex)
 	r.must(In{Kind: InPause, SessionID: "c"})
-	r.must(In{Kind: InAbandon, SessionID: "c", ExpectedRequest: "A", Reason: "done"})
+	r.must(In{Kind: InAbandon, SessionID: "c", ExpectedRequest: "A", Reason: rr("done")})
 	revision = r.session("c").Revision
 	decision, err = r.apply(In{Kind: InStop, SessionID: "c"})
 	if err != nil || len(decision.Facts) != 0 || len(decision.Effects) != 1 || decision.Effects[0].Class != ClassStopWork || decision.Effects[0].TurnID != "turn-A" {
@@ -237,6 +241,28 @@ func TestCatalogR5(t *testing.T) {
 			t.Fatalf("after restart: %s", got)
 		}
 	})
+	// Every field outside the enumerated restart rule keeps its value.
+	r := newRig(t)
+	r.started("s", ProviderCodex)
+	r.must(In{Kind: InStartReview, SessionID: "s", ID: "run", Stage: "plan", Digest: "d"})
+	r.must(In{Kind: ObChild, SessionID: "s", ID: "child", Role: "owner", TurnID: "t", Status: ChildRunning})
+	before := r.session("s")
+	r.restart()
+	after := r.session("s")
+	rule := map[string]bool{}
+	for _, field := range restartWrites {
+		rule[field] = true
+	}
+	beforeValue, afterValue := reflect.ValueOf(*before), reflect.ValueOf(*after)
+	for i := 0; i < beforeValue.NumField(); i++ {
+		name := beforeValue.Type().Field(i).Name
+		if !rule[name] && !reflect.DeepEqual(beforeValue.Field(i).Interface(), afterValue.Field(i).Interface()) {
+			t.Errorf("restart changed %s, outside its rule", name)
+		}
+	}
+	if !after.ReadOnly || after.Connected || after.TurnID != "" || after.Requests["A"] != ReceiptUnknown || after.Review.Status != "unknown" || after.Children[0].Status != ChildUnknown {
+		t.Fatalf("restart rule not applied: %+v", after)
+	}
 }
 
 func TestCatalogR6(t *testing.T) {
@@ -378,7 +404,7 @@ func TestCatalogT5(t *testing.T) {
 		r.complete("s", "A")
 		r.must(In{Kind: ObUnknown, SessionID: "s", RequestID: "A"})
 		r.must(In{Kind: ObRefused, SessionID: "s", RequestID: "A"})
-		r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: "x"}, "nothing_to_discard")
+		r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("x")}, "nothing_to_discard")
 		r.must(In{Kind: ObAuthBoundary, Provider: provider})
 		r.restart()
 		if got := r.session("s").Requests["A"]; got != ReceiptFinal {
@@ -388,11 +414,8 @@ func TestCatalogT5(t *testing.T) {
 	r := newRig(t)
 	r.started("q", ProviderClaude)
 	r.complete("q", "A")
-	s := r.session("q").clone()
-	s.Quarantine = "illegal_fact"
-	r.p = r.p.copyShell()
-	r.p.Sessions["q"] = s
-	r.must(In{Kind: InAbandon, SessionID: "q", ExpectedRequest: "A", Reason: "stuck"})
+	r.must(In{Kind: ObQuarantine, SessionID: "q", ReasonCode: "illegal_fact"})
+	r.must(In{Kind: InAbandon, SessionID: "q", ExpectedRequest: "A", Reason: rr("stuck")})
 	if got := r.session("q"); got.Requests["A"] != ReceiptFinal || got.Abandoned == nil || got.ProviderFinal != true {
 		t.Fatalf("release rewrote a final: %+v", got.Requests)
 	}
@@ -468,11 +491,6 @@ func TestCatalogG2(t *testing.T) {
 				t.Fatal("unresolved turn replaced")
 			}
 			r.complete("s", "A")
-			r.must(In{Kind: InSetSupervision, SessionID: "s", State: SupervisionActive})
-			s2 := r.session("s").clone()
-			s2.Task.State = TaskBlocked
-			r.p = r.p.copyShell()
-			r.p.Sessions["s"] = s2
 			r.must(In{Kind: InSend, SessionID: "s", RequestID: "C", TaskID: "next", Generation: 2})
 		}
 	})
@@ -540,7 +558,7 @@ func TestCatalogP6(t *testing.T) {
 	r := newRig(t)
 	r.must(In{Kind: InCreate, SessionID: "s", Provider: ProviderClaude})
 	before := r.p
-	decision, err := Decide(before, In{Kind: InSend, Principal: Principal{Class: PrincipalUser}, At: testAt, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1})
+	decision, err := Decide(before, In{Kind: InSend, Principal: Principal{Class: PrincipalUser}, At: testAt, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1, RuntimeIdentity: "owner"})
 	if err != nil || len(decision.Facts) == 0 {
 		t.Fatal(err)
 	}
@@ -579,13 +597,11 @@ func TestCatalogP7(t *testing.T) {
 func TestCatalogD2(t *testing.T) {
 	eachProvider(t, func(t *testing.T, provider string) {
 		r := newRig(t)
-		s := r.started("s", provider)
-		s2 := s.clone()
-		s2.Task.Passes = map[string]string{"plan": "kept"}
-		r.p = r.p.copyShell()
-		r.p.Sessions["s"] = s2
+		r.started("s", provider)
+		r.must(In{Kind: InStartReview, SessionID: "s", ID: "run", Stage: "plan", Digest: "kept"})
+		r.must(In{Kind: ObReviewOutcome, SessionID: "s", ID: "run", Verdict: "pass", Digest: "kept"})
 		r.must(In{Kind: InPause, SessionID: "s"})
-		decision := r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: "  done waiting  "})
+		decision := r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("  done waiting  ")})
 		if len(decision.Facts) != 1 || decision.Facts[0].Kind != FactAbandoned || decision.Facts[0].Reason != "done waiting" || decision.Facts[0].RequestID != "A" || decision.Facts[0].At != testAt {
 			t.Fatalf("fact: %+v", decision.Facts)
 		}
@@ -593,15 +609,15 @@ func TestCatalogD2(t *testing.T) {
 		if got.Requests["A"] != ReceiptAbandoned || got.ProviderFinal || got.Task.Passes["plan"] != "kept" || len(got.Task.Passes) != 1 {
 			t.Fatalf("minted or lost an outcome: %+v", got)
 		}
-		r.refused(In{Kind: InAbandon, Principal: Principal{Class: PrincipalAgentRun, SessionID: "s"}, SessionID: "s", ExpectedRequest: "A", Reason: "x"}, "forbidden")
+		r.refused(In{Kind: InAbandon, Principal: Principal{Class: PrincipalAgentRun, SessionID: "s"}, SessionID: "s", ExpectedRequest: "A", Reason: rr("x")}, "forbidden")
 	})
 	r := newRig(t)
 	r.started("s", ProviderClaude)
-	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: "x"}, "stop_first")
+	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("x")}, "stop_first")
 	r.must(In{Kind: InPause, SessionID: "s"})
-	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "B", Reason: "x"}, "turn_changed")
-	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: " "}, "bad_reason")
-	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: strings.Repeat("x", 501)}, "bad_reason")
+	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "B", Reason: rr("x")}, "turn_changed")
+	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr(" ")}, "bad_reason")
+	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr(strings.Repeat("x", 501))}, "bad_reason")
 }
 
 func TestCatalogD3(t *testing.T) {
@@ -609,7 +625,7 @@ func TestCatalogD3(t *testing.T) {
 	r.started("s", ProviderCodex)
 	r.must(In{Kind: InStartReview, SessionID: "s", ID: "run", Stage: "final", Digest: "d"})
 	r.must(In{Kind: InPause, SessionID: "s"})
-	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: "done"})
+	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("done")})
 	r.must(In{Kind: ObCompleted, SessionID: "s", RequestID: "A", TurnID: "turn-A", Status: "completed"})
 	decision := r.must(In{Kind: ObQuestion, SessionID: "s", RequestID: "A", ID: "q", TurnID: "turn-A"})
 	r.must(In{Kind: ObReviewOutcome, SessionID: "s", ID: "run", Verdict: "pass", Digest: "d"})
@@ -630,13 +646,13 @@ func TestCatalogD4(t *testing.T) {
 	r := newRig(t)
 	r.started("s", ProviderClaude)
 	r.must(In{Kind: InPause, SessionID: "s"})
-	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: "first", At: testAt})
+	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("first"), At: testAt})
 	seq := r.p.LastSeq
-	decision := r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: "second", At: "2026-11-04T00:00:00.000000000Z"})
+	decision := r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("second"), At: "2026-11-04T00:00:00.000000000Z"})
 	if !decision.Idempotent || r.p.LastSeq != seq || r.session("s").Abandoned.Reason != "first" || r.session("s").Abandoned.At != testAt {
 		t.Fatalf("retry changed the decision: %+v", r.session("s").Abandoned)
 	}
-	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "older", Reason: "x"}, "discarded_other")
+	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "older", Reason: rr("x")}, "discarded_other")
 	// A second fact is illegal even if something emitted one.
 	f := Fact{Seq: r.p.LastSeq + 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactAbandoned, SessionID: "s", SessionRevision: r.session("s").Revision + 1, RequestID: "A", Reason: "x"}
 	if _, err := Reduce(r.p, f); !errors.Is(err, ErrIllegalFact) {
@@ -648,7 +664,7 @@ func TestCatalogD6(t *testing.T) {
 	r := newRig(t)
 	r.started("s", ProviderClaude)
 	r.complete("s", "A")
-	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: "late"}, "nothing_to_discard")
+	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("late")}, "nothing_to_discard")
 	if s := r.session("s"); s.Requests["A"] != ReceiptFinal || s.Abandoned != nil {
 		t.Fatal("final changed")
 	}
@@ -663,7 +679,7 @@ func TestCatalogD10(t *testing.T) {
 	r.complete("s", "A")
 	r.must(In{Kind: InDispatchInput, Principal: Principal{Class: PrincipalSystem}, Automatic: true, SessionID: "s", RequestID: "q1", ObjectiveHash: "next"})
 	r.must(In{Kind: InPause, SessionID: "s"})
-	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "q1", Reason: "done"})
+	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "q1", Reason: rr("done")})
 	if got := findInput(r.session("s"), "q1").Status; got != InputUnknown {
 		t.Fatalf("entry stuck: %s", got)
 	}
@@ -682,7 +698,7 @@ func TestCatalogD11(t *testing.T) {
 		r := newRig(t)
 		r.started("s", provider)
 		r.must(In{Kind: InPause, SessionID: "s"})
-		r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: "done"})
+		r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("done")})
 		epoch := r.session("s").ControlEpoch
 		_, _ = r.apply(In{Kind: InPause, SessionID: "s"})
 		_, _ = r.apply(In{Kind: InStop, SessionID: "s"})
@@ -715,12 +731,12 @@ func TestCatalogD11(t *testing.T) {
 func TestCatalogD12(t *testing.T) {
 	r := newRig(t)
 	r.started("s", ProviderClaude)
-	s := r.session("s").clone()
-	s.Task.State = TaskActive
-	r.p = r.p.copyShell()
-	r.p.Sessions["s"] = s
+	r.must(In{Kind: InCheckpoint, Principal: Principal{Class: PrincipalAgentRun, SessionID: "s"}, SessionID: "s", TaskID: "task-s", State: TaskActive, Stage: "plan"})
+	if got := r.session("s").Task.State; got != TaskActive {
+		t.Fatalf("task %s", got)
+	}
 	r.must(In{Kind: InPause, SessionID: "s"})
-	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: "done"})
+	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("done")})
 	r.restart()
 	got := r.session("s").Task
 	if got.State != TaskBlocked || got.ReviewStatus != ReviewInvalidated {
@@ -757,7 +773,7 @@ func TestCatalogE4(t *testing.T) {
 	r.must(In{Kind: InCreate, SessionID: "s", Provider: ProviderCodex, Status: "connected"})
 	r.must(In{Kind: InSend, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1})
 	r.must(In{Kind: InPause, SessionID: "s"})
-	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: "done"})
+	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("done")})
 	if !r.session("s").PendingInterrupt {
 		t.Fatal("pending interrupt lost at discard")
 	}
@@ -788,7 +804,11 @@ func TestCatalogV1(t *testing.T) {
 	last := facts[len(facts)-1]
 	illegalFact := Fact{Seq: last.Seq + 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactProviderCompleted, SessionID: "bad", SessionRevision: 99, RequestID: "A"}
 	facts = append(facts, illegalFact)
-	follow := Fact{Seq: last.Seq + 2, SchemaVersion: SchemaVersion, At: testAt, Kind: FactProviderConnected, SessionID: "good", SessionRevision: 4}
+	prefix, _, err := Replay(facts[:len(facts)-1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	follow := Fact{Seq: last.Seq + 2, SchemaVersion: SchemaVersion, At: testAt, Kind: FactProviderConnected, SessionID: "good", SessionRevision: prefix.Sessions["good"].Revision + 1}
 	facts = append(facts, follow)
 	p, quarantined, err := Replay(facts)
 	if err != nil {
@@ -805,7 +825,7 @@ func TestCatalogV1(t *testing.T) {
 	}
 	// Discard and close still work on a quarantined session.
 	q := &rig{t: t, p: p}
-	q.must(In{Kind: InAbandon, SessionID: "bad", ExpectedRequest: "A", Reason: "stuck"})
+	q.must(In{Kind: InAbandon, SessionID: "bad", ExpectedRequest: "A", Reason: rr("stuck")})
 	q.must(In{Kind: InClose, SessionID: "bad"})
 	// Unreadable refuses, and never partially.
 	for _, broken := range []Fact{
@@ -901,7 +921,7 @@ func TestCatalogI9(t *testing.T) {
 		}
 		if row.receipt == ReceiptUnknown {
 			r.refused(In{Kind: InClose, SessionID: "s"}, "unresolved")
-			r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: "done"})
+			r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("done")})
 		}
 		r.must(In{Kind: InClose, SessionID: "s"})
 	}
@@ -947,6 +967,7 @@ func TestCatalogL8(t *testing.T) {
 // L11 is the source mutation run in tools, recorded with the slice's evidence. This
 // keeps the in-process equivalents of those mutants pinned.
 func TestCatalogL11(t *testing.T) {
+	TestDispatchEndsEveryPassForTheOlderInput(t) // M15
 	r := newRig(t)
 	r.started("s", ProviderClaude)
 	r.must(In{Kind: InQueueInput, SessionID: "s", RequestID: "q", PayloadHash: "h"})
@@ -975,7 +996,7 @@ func TestCatalogL11(t *testing.T) {
 func TestCatalogCoverage(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "..", "plans", "CONSOLE-KERNEL-CATALOG.md"))
 	if err != nil {
-		t.Skip("catalog not present in this checkout")
+		t.Fatalf("catalog is required: %v", err)
 	}
 	row := regexp.MustCompile(`^\| ([A-Z]\d+) \|`)
 	k1 := regexp.MustCompile(`\bK1\b`)
@@ -1061,11 +1082,9 @@ func TestReduceRefusesCloseOverAnUnresolvedReceipt(t *testing.T) {
 		t.Fatalf("close accepted over an unresolved receipt: %v", err)
 	}
 	r2 := newRig(t)
-	r2.must(In{Kind: InCreate, SessionID: "s", Provider: ProviderClaude})
-	r2.must(In{Kind: InSend, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1})
-	r2.must(In{Kind: ObRefused, SessionID: "s", RequestID: "A"})
-	r2.must(In{Kind: InSetBudget, SessionID: "s", RemainingBursts: 0})
+	r2.started("s", ProviderClaude)
 	r2.must(In{Kind: InQueueInput, SessionID: "s", RequestID: "q", PayloadHash: "h"})
+	r2.complete("s", "A")
 	f = Fact{Seq: r2.p.LastSeq + 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactSessionClosed, SessionID: "s", SessionRevision: r2.session("s").Revision + 1}
 	if _, err := Reduce(r2.p, f); !errors.Is(err, ErrIllegalFact) {
 		t.Fatalf("close accepted over a retained payload: %v", err)

@@ -76,7 +76,7 @@ A pending interrupt is projection state, not an adapter flag. `TurnBound` always
 
 ### Restart rule
 
-Opening appends one global `ProcessRestarted{processEpoch}`. Its reducer rule, the same one live and on replay:
+Opening appends one global `ProcessRestarted`. Its reducer rule, the same one live and on replay:
 
 | State | After restart |
 |---|---|
@@ -88,6 +88,9 @@ Opening appends one global `ProcessRestarted{processEpoch}`. Its reducer rule, t
 | Pending controls | Dropped, with the receipt unknown if unresolved |
 | Running review runs | `unknown` |
 | Live children | Quarantined |
+| Supervision | Paused, with reason `restarted` unless discarded |
+| Review results pending | Cleared |
+| Resolved history beyond the visible limit | Hidden for good |
 
 ### Other rules that remove whole classes
 

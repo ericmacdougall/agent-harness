@@ -167,6 +167,9 @@ func (m *model) apply(f Fact) {
 	case FactSessionClosed:
 		s.closed = true
 	case FactControlRequested:
+		if s.receipts[s.last] == "unknown" {
+			return
+		}
 		if f.Control == "resume" {
 			for id, status := range s.inputs {
 				if status == "held" {
@@ -262,7 +265,15 @@ func (w *walk) input() In {
 		return in
 	}
 	provider := func(kind InputKind) In {
-		in.Kind, in.Principal = kind, Principal{Class: PrincipalProvider}
+		in.Kind, in.Principal = kind, Principal{Class: PrincipalProvider, SessionID: in.SessionID}
+		return in
+	}
+	system := func(kind InputKind) In {
+		in.Kind, in.Principal = kind, Principal{Class: PrincipalSystem}
+		return in
+	}
+	agent := func(kind InputKind) In {
+		in.Kind, in.Principal = kind, Principal{Class: PrincipalAgentRun, SessionID: in.SessionID}
 		return in
 	}
 	if s == nil || w.rng.Intn(12) == 0 {
@@ -274,7 +285,8 @@ func (w *walk) input() In {
 	in.SessionID = s.ID
 	in.RequestID = s.LastRequest
 	in.TurnID = s.TurnID
-	switch w.rng.Intn(30) {
+	in.RuntimeIdentity = "owner"
+	switch w.rng.Intn(64) {
 	case 0, 1, 2, 3:
 		in.RequestID, in.TaskID, in.Generation, in.ObjectiveHash = w.id("r"), w.id("t"), 1, "h"
 		in.RemainingBursts = 3
@@ -306,7 +318,7 @@ func (w *walk) input() In {
 	case 16:
 		return user(InClose)
 	case 17:
-		in.ExpectedRequest, in.Reason = s.LastRequest, "done"
+		in.ExpectedRequest, in.Reason = s.LastRequest, rr("done")
 		return user(InAbandon)
 	case 18:
 		in.ID, in.Status, in.Digest, in.ExpiresAt = w.id("q"), "approval", "d", "2030-01-01T00:00:00.000000000Z"
@@ -329,7 +341,14 @@ func (w *walk) input() In {
 			in.RequestID = s.Inputs[w.rng.Intn(len(s.Inputs))].RequestID
 		}
 		if w.rng.Intn(2) == 0 {
-			return provider(ObPayloadReleased)
+			for _, id := range w.p.Order {
+				for _, entry := range w.p.Sessions[id].Inputs {
+					if entry.Status == InputCleanup {
+						in.SessionID, in.RequestID = id, entry.RequestID
+					}
+				}
+			}
+			return system(ObPayloadReleased)
 		}
 		return user(InDiscardInput)
 	case 22:
@@ -337,13 +356,12 @@ func (w *walk) input() In {
 			in.RequestID = s.Inputs[0].RequestID
 		}
 		in.ObjectiveHash, in.Automatic = "h", true
-		in.Kind, in.Principal = InDispatchInput, Principal{Class: PrincipalSystem}
-		return in
+		return system(InDispatchInput)
 	case 23:
 		switch w.rng.Intn(3) {
 		case 0:
 			in.Provider = s.Provider
-			return provider(ObAuthBoundary)
+			return system(ObAuthBoundary)
 		case 1:
 			return provider(ObDisconnected)
 		}
@@ -351,15 +369,125 @@ func (w *walk) input() In {
 		return provider(ObChild)
 	case 24, 25:
 		in.ID, in.Stage, in.Digest = w.id("run"), "plan", "d"
-		return user(InStartReview)
+		return system(InStartReview)
 	case 26, 27, 28:
 		if s.Review != nil {
 			in.ID, in.Digest, in.Verdict = s.Review.ID, s.Review.Digest, []string{"pass", "block"}[w.rng.Intn(2)]
 		}
-		return provider(ObReviewOutcome)
+		return system(ObReviewOutcome)
+	case 29, 63:
+		for _, id := range w.p.Order {
+			for _, entry := range w.p.Sessions[id].Inputs {
+				if entry.Status == InputDispatching {
+					in.SessionID, in.RequestID = id, entry.RequestID
+				}
+			}
+		}
+		in.Status = []string{InputRetained, InputUnknown, InputHeld}[w.rng.Intn(3)]
+		return system(ObInputOutcome)
+	case 30:
+		in.Status = "pause"
+		in.Outcome = []string{"confirmed", "rejected", "unconfirmed"}[w.rng.Intn(3)]
+		return provider(ObControlOutcome)
+	case 31:
+		in.ID, in.Status, in.ReasonCode = "child", "completed", "done"
+		return provider(ObChildOutcome)
+	case 32:
+		in.TaskID, in.State, in.Stage = "", []string{TaskActive, TaskNeedsReview, TaskBlocked, TaskHandoff, TaskComplete}[w.rng.Intn(5)], "plan"
+		if s.Task != nil {
+			in.TaskID = s.Task.ID
+		}
+		return agent(InCheckpoint)
+	case 33:
+		in.PolicyRevision = w.id("rev")
+		return system(InSetPolicy)
+	case 34:
+		in.Cascade = w.id("cascade")
+		return system(InSetCascade)
+	case 35:
+		in.State, in.ReasonCode = []string{SupervisionActive, SupervisionWaiting, SupervisionPaused, SupervisionBlocked}[w.rng.Intn(4)], "scheduler"
+		return system(InSetSupervision)
+	case 36:
+		in.RemainingBursts, in.Progress = int64(w.rng.Intn(4)), int64(w.rng.Intn(4))
+		return system(InSetBudget)
+	case 37:
+		in.Status = []string{"pending", "clear"}[w.rng.Intn(2)]
+		return system(InSetReviewResult)
+	case 38:
+		if s.Review != nil {
+			in.ID = s.Review.ID
+		}
+		return system(ObReviewCancelled)
+	case 39:
+		in.ID, in.Status = "child", []string{"interrupt", "resume"}[w.rng.Intn(2)]
+		return user(InChildControl)
+	case 40:
+		in.ProviderID = w.id("conv")
+		return provider(ObConversationBound)
+	case 41:
+		return provider(ObConnected)
+	case 42:
+		if s.Review != nil {
+			in.ReviewRunID = s.Review.ID
+		}
+		in.ID, in.Status, in.ExpiresAt = w.id("q"), "approval", "2030-01-01T00:00:00.000000000Z"
+		return provider(ObQuestion)
+	case 43:
+		in.RequestID, in.Status = "", "completed"
+		return provider(ObCompleted)
+	case 46, 47, 48, 49:
+		in.RequestID, in.PayloadHash = w.id("q"), "h"
+		return user(InQueueInput)
+	case 50, 51, 52, 53:
+		// Aim dispatch at a session that can take it, or the queue paths stay shallow.
+		for _, id := range w.p.Order {
+			open := w.p.Sessions[id]
+			if !open.ReadOnly && !open.Requests[open.LastRequest].unresolved() {
+				for _, entry := range open.Inputs {
+					if entry.Status == InputQueued {
+						in.SessionID, in.RequestID = id, entry.RequestID
+						break
+					}
+				}
+			}
+		}
+		in.ObjectiveHash, in.Automatic = "h", true
+		return system(InDispatchInput)
+	case 54, 55, 56:
+		for _, id := range w.p.Order {
+			open := w.p.Sessions[id]
+			if !open.ReadOnly && open.Requests[open.LastRequest].open() && (open.Provider == ProviderClaude || open.TurnID != "") {
+				in.SessionID, in.RequestID, in.TurnID = id, open.LastRequest, open.TurnID
+			}
+		}
+		in.ID, in.Status, in.Digest, in.ExpiresAt = w.id("q"), "approval", "d", "2030-01-01T00:00:00.000000000Z"
+		return provider(ObQuestion)
+	case 57, 58, 59:
+		for _, id := range w.p.Order {
+			if open := w.p.Sessions[id]; len(open.Questions) > 0 {
+				in.SessionID, in.ID = id, open.Questions[0].ID
+				break
+			}
+		}
+		return user(InAnswer)
+	case 60, 61, 62:
+		for _, id := range w.p.Order {
+			for _, entry := range w.p.Sessions[id].Inputs {
+				if entry.Status == InputHeld || entry.Status == InputRetained || entry.Status == InputQueued {
+					in.SessionID, in.RequestID = id, entry.RequestID
+				}
+			}
+		}
+		return user(InDiscardInput)
+	case 44:
+		in.RequestID, in.Automatic = w.id("r"), true
+		if s.Task != nil {
+			in.ExpectedTask = s.Task.ID
+		}
+		in.ExpectedEpoch = s.ControlEpoch
+		return system(InSend)
 	}
-	in.Kind = ObRestart
-	return in
+	return system(ObRestart)
 }
 
 func (w *walk) commit(f Fact) error {
@@ -383,9 +511,15 @@ func (w *walk) commit(f Fact) error {
 func (w *walk) note(f Fact, before *Session, next Projection) {
 	w.coverage[string(f.Kind)]++
 	if f.Kind == FactProcessRestarted {
+		for _, id := range next.Order {
+			w.noteFields(string(f.Kind), w.p.Sessions[id], next.Sessions[id])
+		}
 		return
 	}
-	after := next.Sessions[f.SessionID]
+	w.noteFields(string(f.Kind), before, next.Sessions[f.SessionID])
+}
+
+func (w *walk) noteFields(kind string, before, after *Session) {
 	if before == nil || after == nil {
 		return
 	}
@@ -395,10 +529,10 @@ func (w *walk) note(f Fact, before *Session, next Projection) {
 		if name == "Revision" || reflect.DeepEqual(beforeValue.Field(i).Interface(), afterValue.Field(i).Interface()) {
 			continue
 		}
-		if w.written[string(f.Kind)] == nil {
-			w.written[string(f.Kind)] = map[string]bool{}
+		if w.written[kind] == nil {
+			w.written[kind] = map[string]bool{}
 		}
-		w.written[string(f.Kind)][name] = true
+		w.written[kind][name] = true
 	}
 }
 
@@ -443,6 +577,24 @@ func (w *walk) checkMonotonic() string {
 		if s.Closed && s.Abandoned == nil && s.Requests[s.LastRequest].unresolved() {
 			return "INV3: closed with an unresolved receipt: " + id
 		}
+		if s.Closed || w.p.LastKind != FactProcessRestarted {
+			continue
+		}
+		// The restart table, checked independently of how the reducer got there.
+		running := s.Review != nil && s.Review.Status == "running"
+		if !s.ReadOnly || s.Connected || s.TurnID != "" || s.PendingInterrupt || s.ReviewResultPending || len(s.Questions) != 0 || s.Requests[s.LastRequest].open() || running {
+			return fmt.Sprintf("restart table: %s kept authority", id)
+		}
+		for _, child := range s.Children {
+			if child.Status == ChildRunning {
+				return "restart table: running child on " + id
+			}
+		}
+		for _, input := range s.Inputs {
+			if input.Status == InputQueued || input.Status == InputDispatching {
+				return "restart table: open input on " + id
+			}
+		}
 	}
 	return ""
 }
@@ -453,6 +605,10 @@ func runWalk(seed int64, steps int, c codec) (string, *walk) {
 	for step := 0; step < steps; step++ {
 		in := w.input()
 		decision, err := Decide(w.p, in)
+		repeat, repeatErr := Decide(w.p, in)
+		if fmt.Sprint(err) != fmt.Sprint(repeatErr) || !reflect.DeepEqual(decision, repeat) {
+			return fmt.Sprintf("seed=%d step=%d %s: Decide is not pure", seed, step, in.Kind), w
+		}
 		var refusal *Refusal
 		if err != nil && !errors.As(err, &refusal) {
 			return fmt.Sprintf("seed=%d step=%d %s: %v", seed, step, in.Kind, err), w
@@ -519,16 +675,24 @@ func TestPropertyAgainstModel(t *testing.T) {
 		}
 	}
 	// A run that never reached these proves nothing.
-	for _, kind := range []FactKind{FactSessionCreated, FactRequestIntended, FactProviderAccepted, FactProviderRefused, FactProviderCompleted, FactOutcomeUnknown, FactTurnBound, FactLateFrameObserved, FactControlRequested, FactCwdChanged, FactSessionClosed, FactAbandoned, FactProcessRestarted, FactQuestionOpened, FactQuestionAnswered, FactInputQueued, FactInputDispatchPrepared, FactInputDiscarded, FactPayloadReleased, FactAuthBoundaryCrossed, FactProviderDisconnected, FactChildObserved, FactReviewStarted, FactReviewOutcome, FactAdmissionRefused} {
-		if coverage[string(kind)] == 0 {
+	for kind := range factWrites {
+		if coverage[string(kind)] == 0 && kind != FactLegacyInputHeld && kind != FactChildQuarantined && kind != FactQuestionRevoked && kind != FactSessionQuarantined {
 			t.Errorf("vacuous run: no %s", kind)
 		}
+	}
+	if coverage[string(FactProcessRestarted)] == 0 {
+		t.Error("vacuous run: no restart")
 	}
 	// Reduce only writes what the field-to-fact table declares.
 	for kind, fields := range written {
 		declared := map[string]bool{}
 		for _, field := range factWrites[FactKind(kind)] {
 			declared[field] = true
+		}
+		if FactKind(kind) == FactProcessRestarted {
+			for _, field := range restartWrites {
+				declared[field] = true
+			}
 		}
 		for field := range fields {
 			if !declared[field] {
@@ -594,7 +758,7 @@ func TestDecideIsPure(t *testing.T) {
 	if failure != "" {
 		t.Fatal(failure)
 	}
-	in := In{Kind: ObRestart, At: testAt}
+	in := In{Kind: ObRestart, Principal: Principal{Class: PrincipalSystem}, At: testAt}
 	before := canonical(w.p)
 	one, _ := Decide(w.p, in)
 	two, _ := Decide(w.p, in)
