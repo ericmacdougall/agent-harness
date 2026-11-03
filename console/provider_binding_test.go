@@ -228,8 +228,8 @@ func TestIdentityCodexBufferBoundsAndCompletedDuplicates(t *testing.T) {
 }
 func TestIdentityCodexBufferFlushPrecedesCompletion(t *testing.T) {
 	a, s, c, bind, _ := identityHeldReply(t)
-	identityEvent(a, c, "turn/completed", "turn-B")
 	identityRootFrame(a, c, "item/completed", "turn-B", "early-tool")
+	identityEvent(a, c, "turn/completed", "turn-B")
 	bind()
 	a.mu.Lock()
 	if s.requests["B"] != "final" || s.Supervision.progress != 1 {

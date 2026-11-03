@@ -149,6 +149,73 @@ func TestIdentityCodexEarlyCompletionNeedsReply(t *testing.T) {
 		})
 	}
 }
+func TestIdentityCodexPendingCompletionFencesLaterFrames(t *testing.T) {
+	for _, priorContent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("prior-content-%t", priorContent), func(t *testing.T) {
+			a, s, c, bind, _ := identityHeldReply(t)
+			a.mu.Lock()
+			before := len(s.Messages)
+			a.mu.Unlock()
+			want := 0
+			if priorContent {
+				identityRootFrame(a, c, "item/completed", "turn-B", "before-final")
+				want = 1
+			}
+			identityEvent(a, c, "turn/completed", "turn-B")
+			lateFrames := func() {
+				for _, method := range []string{"item/completed", "item/agentMessage/delta", "error", "thread/tokenUsage/updated"} {
+					identityRootFrame(a, c, method, "turn-B", "after-final-"+method)
+				}
+			}
+			lateFrames()
+			if priorContent {
+				// Discard terminal frames before accounting: even a flood or an
+				// oversized frame must not clear legitimate earlier content.
+				for i := 0; i <= maxCodexPendingFrames; i++ {
+					identityRootFrame(a, c, "item/completed", "turn-B", fmt.Sprintf("flood-%d", i))
+				}
+				raw, _ := json.Marshal(map[string]any{"threadId": s.ProviderID, "turnId": "turn-B", "itemId": "oversized", "delta": strings.Repeat("x", maxCodexPendingBytes)})
+				a.codexEvent(c, "item/agentMessage/delta", raw)
+			}
+			a.mu.Lock()
+			if len(s.Messages) != before || len(s.filters) != 0 || s.Supervision.progress != 0 || len(s.Usage) != 0 || s.Error != "" || len(s.codexTurn.completed) != 0 || s.providerFinal {
+				t.Error("unbound frames changed visible state or completed-item IDs")
+			}
+			if len(s.codexTurn.frames) != want || s.codexTurn.framesDropped {
+				t.Error("post-terminal frames retained or discarded earlier content")
+			}
+			a.mu.Unlock()
+			bind()
+			lateFrames()
+			identityEvent(a, c, "turn/completed", "turn-B")
+			a.mu.Lock()
+			if s.requests["B"] != "final" || !s.providerFinal || len(s.Messages) != before+want || len(s.filters) != 0 || s.Supervision.progress != uint64(want) || len(s.Usage) != 0 || s.Error != "" || len(s.codexTurn.completed) != want {
+				t.Errorf("terminal fence failed: request=%s messages=%d filters=%d progress=%d usage=%v error=%q completed=%v", s.requests["B"], len(s.Messages)-before, len(s.filters), s.Supervision.progress, s.Usage, s.Error, s.codexTurn.completed)
+			}
+			if priorContent && !s.codexTurn.completed["before-final"] {
+				t.Error("legitimate earlier completed item lost")
+			}
+			a.mu.Unlock()
+			assertIdentityFinalReceipts(t, a, "B", 1)
+		})
+	}
+}
+
+func TestIdentityCodexStalePendingCompletionPreservesCurrentContent(t *testing.T) {
+	a, s, c, bind, _ := identityHeldReply(t)
+	identityEvent(a, c, "turn/completed", "turn-A")
+	identityRootFrame(a, c, "item/completed", "turn-B", "current-tool")
+	bind()
+	a.mu.Lock()
+	if s.requests["B"] != "accepted" || s.providerFinal || s.Supervision.progress != 1 || !s.codexTurn.completed["current-tool"] {
+		t.Error("stale completion suppressed current content or finalized B")
+	}
+	a.mu.Unlock()
+	assertIdentityFinalReceipts(t, a, "B", 0)
+	identityEvent(a, c, "turn/completed", "turn-B")
+	assertIdentityFinalReceipts(t, a, "B", 1)
+}
+
 func waitIdentityState(t *testing.T, a *app, s *session, request, state string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

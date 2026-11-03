@@ -104,6 +104,13 @@ func (b *codexTurnBinding) bufferFrame(method, turn string, raw json.RawMessage)
 	if b.framesDropped {
 		return
 	}
+	// A pending completion fences later content for that turn even before
+	// the reply establishes authority. Keep earlier and other-turn frames.
+	for _, completion := range b.pending {
+		if completion.turnID == turn {
+			return
+		}
+	}
 	if len(b.frames) >= maxCodexPendingFrames || len(raw)+len(turn) > maxCodexPendingBytes-b.frameBytes {
 		b.clearFrames()
 		b.framesDropped = true
