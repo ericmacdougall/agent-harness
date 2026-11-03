@@ -1,5 +1,6 @@
 import { openSettings } from './settings.js';
 import { composerAction as resolveComposerAction, submissionMatches } from './composer.js';
+import { renderAgentControlNotice } from './agent-control.js';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -391,6 +392,8 @@ function renderAgents() {
   detail.replaceChildren();
   if (selected) {
     detail.append(el('h3', '', selected.name || selected.role || 'Agent'), el('p', '', selected.task || 'No task reported'));
+    const recovery = renderAgentControlNotice(el, selected);
+    if (recovery) detail.append(recovery);
     const actions = el('div', 'agent-detail-actions');
     for (const [label, name, allowed] of [['Pause', 'pause', selected.canPause], ['Resume', 'resume', selected.canResume], ['Stop', 'stop', selected.canStop]]) {
       const button = el('button', '', label);

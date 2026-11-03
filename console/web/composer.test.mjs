@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { composerAction, submissionMatches } from './composer.js';
+import { agentControlNotice, renderAgentControlNotice } from './agent-control.js';
 
 const context = () => ({ stopped: false, submissions: new Set() });
 const session = (status = 'idle', work = { state: 'active', reviewStatus: 'none' }) => ({ id: 'session', status, work, pendingInputs: [] });
@@ -51,4 +52,37 @@ test('uncertain retries never change routing, text or attachment order', () => {
   assert.equal(submissionMatches(prior, { ...prior, text: 'A different objective' }), false);
   assert.equal(submissionMatches(prior, { ...prior, attachments: [...prior.attachments].reverse() }), false);
   assert.equal(submissionMatches(prior, { ...prior, attachments: [...prior.attachments, '/selected/three'] }), false);
+});
+
+test('disabled native child controls expose accessible recovery guidance', () => {
+  const reason = 'This child belongs to a stale parent authentication context.';
+  const notice = agentControlNotice({ controlReason: reason });
+  assert.deepEqual(notice, {
+    role: 'status',
+    label: 'Agent control recovery',
+    reason,
+    recovery: 'Quarantine this child and quiesce its writer. Reconcile messages, worktree, processes, receipts, and any in-flight effects before starting one fresh replacement from the current parent context. Do not automatically replay uncertain operations.',
+  });
+});
+
+test('agent controls without a reason do not show recovery guidance', () => {
+  assert.equal(agentControlNotice({ canResume: false }), null);
+  assert.equal(agentControlNotice({ controlReason: '   ' }), null);
+});
+
+test('agent recovery guidance renders as a labelled status', () => {
+  const createElement = (tag, className, text) => ({
+    tag, className, text, dataset: {}, attributes: {}, children: [],
+    setAttribute(name, value) { this.attributes[name] = value; },
+    append(...children) { this.children.push(...children); },
+  });
+  const node = renderAgentControlNotice(createElement, { controlReason: 'Resume is denied.' });
+  assert.equal(node.attributes.role, 'status');
+  assert.equal(node.attributes['aria-label'], 'Agent control recovery');
+  assert.equal(node.dataset.testid, 'agent-control-notice');
+  assert.deepEqual(node.children.map(child => child.text), [
+    'Controls unavailable',
+    'Resume is denied.',
+    'Quarantine this child and quiesce its writer. Reconcile messages, worktree, processes, receipts, and any in-flight effects before starting one fresh replacement from the current parent context. Do not automatically replay uncertain operations.',
+  ]);
 });
