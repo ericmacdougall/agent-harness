@@ -171,7 +171,7 @@ type Fact struct {
 type Abandonment struct{ RequestID, Reason, At string }
 type Session struct { // Field meanings: tables 1 to 5.
 	ID, Provider, ProviderID, ProfileID, CWD, RuntimeIdentity, Quarantine, LastRequest, FinalStatus, LastRefusal, TurnID string
-	ConversationStarted, Connected, ReadOnly, Closed, Hidden, ProviderFinal, PendingInterrupt, Paused, PauseUnconfirmed bool
+	ConversationStarted, Connected, ReadOnly, Closed, Hidden, ProviderFinal, PendingInterrupt, Paused, PauseUnconfirmed, ControlPending bool
 	Abandoned             *Abandonment
 	Revision, ControlEpoch uint64
 	Requests              map[string]Receipt
@@ -231,6 +231,8 @@ func DecodeFact([]byte) (Fact, error)
 func Status(*Session) string
 func VisibleSessions(Projection) []*Session
 func Redact(text string, redactor func(string) string) RedactedReason // A nil redactor gives an empty reason.
+func MustAppend(p Projection, f Fact) bool // Section 11: may f use the reserve, judged against p, the projection f was decided on.
+const MaxOpenSessions = 1000
 ```
 
 `Decide` stamps `Seq` as `LastSeq` plus position, `SchemaVersion`, `At`, and `SessionRevision`.
