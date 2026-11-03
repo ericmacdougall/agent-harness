@@ -1,12 +1,12 @@
 # Console kernel plan
 
-Status: revision 2, after a blocked plan review. No kernel code exists on this branch.
+Status: revision 3, after two blocked plan reviews. No kernel code exists on this branch.
 
 ## Decision and why
 
 Console 0.2 will not ship. It is rebuilt on a durable event log with one pure reducer.
 
-Across six exact-head reviews the blocker count did not converge, and repairs caused new blockers. The session has about 50 fields mixing presentation and authority. `Status` is written at about 147 sites, and `restore()` is a second hand-written projection of the same truth. A seeded restore-versus-live test against the last repaired head measures the drift: see [the catalog](CONSOLE-KERNEL-CATALOG.md).
+Across six exact-head reviews the blocker count did not converge, and repairs caused new blockers. The session has about 50 fields mixing presentation and authority. `Status` is assigned at about 90 non-test sites, and `restore()` is a second hand-written projection of the same truth. A seeded restore-versus-live test against the last repaired head measures the drift: see [the catalog](CONSOLE-KERNEL-CATALOG.md).
 
 The catalog is the specification. Each entry names a defect the review record found, and the rule that excludes it.
 
@@ -15,7 +15,7 @@ The catalog is the specification. Each entry names a defect the review record fo
 - **INV1** Receipts follow the table below. Nothing leaves a terminal state.
 - **INV2** The projection after replaying any prefix of the log equals the live projection at that point, for every field marked authority in the field table. A difference is allowed only where the enumerated restart rules define it.
 - **INV3** A session with an unresolved receipt or a retained payload is never dropped, trimmed or closed without an `Abandoned` fact.
-- **INV4** No provider write, resume or continuation is admitted unless the last receipt is resolved, the session is writable, and the runtime identity matches the one that owns the conversation.
+- **INV4** No new provider work (start, resume, continuation) is admitted unless the last receipt is resolved, the session is writable, and the runtime identity matches the one that owns the conversation. A question answer is admitted only while its own request is the active one. Stop-work effects are always available.
 - **INV5** Opening the log or reconnecting a browser makes no provider call. Starting a new session is a user action or an explicit launch argument, and is outside this rule.
 - **INV6** Secrets, prompt bodies, question text and attachment bytes never enter the log. It holds references and keyed digests, enum reasons, and one redacted, bounded, user-written field: the discard reason.
 - **INV7** A fact is committed before the effect it authorizes. A provider effect with no observed result is unknown and is never retried. A local effect is idempotent and is reconciled from the projection on open.
@@ -30,7 +30,7 @@ The catalog is the specification. Each entry names a defect the review record fo
 | `unknown` | `abandoned` |
 | `final`, `rejected`, `abandoned` | terminal |
 
-`intent -> final` covers a result that arrives before the write acknowledgement. `unknown` is sticky by decision: a native final that arrives after it is kept as `LateFrameObserved{kind: final, status}` and shown, but does not change the receipt. The user discards the turn. This follows the standing rule that unknown stays unknown, and accepts that a turn which really finished still needs a discard.
+`intent -> final` covers a result that arrives before the write acknowledgement. `unknown` is sticky by decision: a native final that arrives after it is kept as `LateFrameObserved{kind: final, status}` and shown, but does not change the receipt. The user discards the turn. This is the user's decision. Discard and continue-in-new-session both show that a late final was observed and that its output is not carried forward.
 
 ## Shape
 
@@ -57,14 +57,20 @@ HTTP / UI    adapters (Codex, Claude)     frames, exits, replies
 
 `Decide` returns effect descriptors with its facts. Replay calls only `Reduce`, so replay can never fire an effect.
 
-**Provider effects** (write a frame, start a turn, interrupt, answer a question, terminate) carry `{sessionId, requestId, processEpoch, fence}`, where `fence` is the session's control epoch. Immediately before writing, the adapter takes that session's single-flight gate and rechecks the fence against the published projection. A stale fence means the write does not happen and the result is `ProviderRefused`. This is what stops a queued write that was admitted before a later `Abandoned` or `AuthBoundaryCrossed`.
+**New-work effects** (start a turn, write a frame, answer a question) carry `{sessionId, requestId, processEpoch, fence}`, where `fence` is the session's control epoch. The gate belongs to the actual writer, so a shared Codex client's stdin has one gate. The adapter takes it, rechecks the fence and the log health latch against the published state, writes, and holds the gate until the write completes. A stale fence or a latch means no write, and the result is `ProviderRefused`.
+
+**Revocation drains.** After a revoking fact (`Abandoned`, `AuthBoundaryCrossed`, a stop control) publishes, and outside the kernel lock, the revoker drains that writer's gate before acknowledging or before credentials change. If the drain passes its deadline, the revoker kills the process group and records `OutcomeUnknown`. This closes the window between a recheck and the write syscall, which a test holds open.
+
+**Stop-work effects** (interrupt, terminate, process-group kill) never take the write gate, ignore fence staleness, and stay available when the log is latched, so a hung write or a later boundary cannot prevent a stop.
 
 The outcome of a provider effect is an observation:
 - Definitely not written: `ProviderRefused`.
-- Possibly written, or past the deadline: `OutcomeUnknown`.
+- Possibly written, or past the effect's acknowledgement deadline: `OutcomeUnknown`.
 - Provider acknowledged: `ProviderAccepted`.
 
-A pending interrupt is projection state, not an adapter flag. `Decide` on `TurnBound` emits the interrupt effect if a control or discard is pending, so it cannot be lost and cannot fire on replay.
+Deadlines are per effect and cover only the write or RPC acknowledgement, generously, since `unknown` is irreversible. A running `accepted` turn has no timer, and a test shows an fsync stall cannot trigger a deadline.
+
+A pending interrupt is projection state, not an adapter flag. `TurnBound` always reaches `Decide`, including on an abandoned request, where it emits the interrupt effect and changes no receipt. So the interrupt cannot be lost, and cannot fire on replay.
 
 **Local effects** (rename the imported journal, attachment cleanup, worktree removal) are idempotent. On open, a reconcile pass derives them from the projection and runs them. It appends only the facts recording their results.
 
@@ -89,7 +95,7 @@ Opening appends one global `ProcessRestarted{processEpoch}`. Its reducer rule, t
 - **Guards live once.** `Decide` is not provider-specific. Adapters translate frames and do not decide.
 - **Status is derived.** `Status` is a pure function of the projection plus the connection state from `ProviderConnected` and `ProviderDisconnected`. Nothing assigns it once a session is kernel-owned.
 - **Discard is a fact.** `Abandoned` needs a matching expected request and a reason. Idempotency is on `(session, request)`, so a retry with a different reason returns the first fact rather than a conflict. It moves an unresolved receipt to `abandoned`, leaves a `final` alone, and makes the session read-only and closable once payloads are released. It carries no verdict or pass, and does not claim the provider stopped.
-- **A bad fact does not take down the console.** A log that cannot be read refuses with a clear message. An invalid transition in a readable log quarantines that session read-only and leaves the rest running. Reducing on a copy before commit means this should arise only from a reducer change.
+- **A bad fact does not take down the console.** A log that cannot be read refuses with a clear message. An invalid transition in a readable log quarantines that session read-only and leaves the rest running. Discard and close still work on a quarantined session. Reducing on a copy before commit means this should arise only from a reducer change.
 - **History keeps its meaning.** From K11, reducer semantics are frozen per `schemaVersion`, with golden log fixtures. Development logs before K11 are disposable.
 
 ### Fact vocabulary
@@ -97,13 +103,13 @@ Opening appends one global `ProcessRestarted{processEpoch}`. Its reducer rule, t
 Every fact has `seq`, `schemaVersion`, `at`. Session facts also have `sessionId` and `sessionRevision`. Global facts have no session.
 
 - **Global:** `ProcessRestarted`, `LegacyImportCompleted{digest}`.
-- **Session and provider:** `SessionCreated`, `ConversationBound{providerId}`, `ProviderConnected`, `ProviderDisconnected`, `RuntimeIdentityBound`, `AuthBoundaryCrossed`, `CwdChanged`, `SessionClosed`, `Abandoned{requestId, reason}`, `SessionQuarantined{reasonCode}`.
+- **Session and provider:** `SessionCreated`, `ConversationBound{providerId}`, `ProviderConnected`, `ProviderDisconnected`, `RuntimeIdentityBound`, `AuthBoundaryCrossed`, `CwdChanged`, `SessionClosed`, `Abandoned{requestId, reason}`, `SessionQuarantined{reasonCode}`, `SupervisionChanged{state, reasonCode}`, `CascadeSelected`, `PolicyBound{revision}`, `ContinuationBudgetChanged{remaining, progress}`.
 - **Requests:** `RequestIntended`, `ProviderAccepted`, `ProviderRefused`, `ProviderCompleted{status}`, `OutcomeUnknown{reasonCode}`, `TurnBound{turnId}`, `LateFrameObserved{kind, status, digest}`, `AdmissionRefused{reasonCode}`. The last is only for automatic continuations and queued dispatch, where no user is waiting on a response, coalesced per reason. A user command gets its refusal in the response.
 - **Controls:** `ControlRequested{pause|stop|resume}`, `ControlOutcome{confirmed|rejected|unconfirmed}`.
 - **Questions:** `QuestionOpened{id, kind, digest, expiresAt}`, `QuestionAnswered`, `QuestionRevoked`.
 - **Children:** `ChildObserved{id, role, turnId}`, `ChildControlOutcome`, `ChildQuarantined`.
 - **Inputs and payloads:** `InputQueued{payloadHash}`, `InputDispatchPrepared`, `InputOutcome`, `InputDiscarded`, `PayloadReleased`.
-- **Reviews and checkpoints:** `ReviewStarted`, `ReviewCancelled`, `ReviewOutcome{verdict|failed|unknown}`, `CheckpointRecorded`.
+- **Reviews and checkpoints:** `ReviewStarted`, `ReviewCancelled`, `ReviewOutcome{verdict|failed|unknown}`, `ReviewResultPending`, `CheckpointRecorded`.
 - **Import:** `LegacyImported`, `LegacyInputHeld`.
 
 Unknown kinds or versions refuse the log. A provider ID or path is identity, not a secret, and is stored as is.
@@ -114,12 +120,12 @@ Every current session field is one of these. INV2 covers authority fields only.
 
 | Class | Fields |
 |---|---|
-| **Authority, in the projection** | `ID`, `Provider`, `ProviderID`, `ProfileID`, `CWD`, `lastRequest`, `requests`, `requestOrder`, `task`, `Work`, `controlEpoch`, `dispatchEpoch`, `providerFinal`, `queueUncertain`, `Restored`, `resumeRequested`, `cancelRequested`, `inputs` (metadata), `PendingQuestions` (identity), `Agents` (identity and control state), `turnID`, the `review*` fields, `Cascade`, `PolicyRevision`, `claudeStarted`, `conversationRuntimeHash`, `abandoned`, `Supervision.State`, `Supervision.Reason` |
+| **Authority, in the projection** | `ID`, `Provider`, `ProviderID`, `ProfileID`, `CWD`, `lastRequest`, `requests`, `requestOrder`, `task`, `Work`, `controlEpoch`, `dispatchEpoch`, `providerFinal`, `queueUncertain`, `Restored`, `resumeRequested`, `cancelRequested`, `inputs` (metadata), `PendingQuestions` (identity), `Agents` (identity and control state), `turnID`, the `review*` fields, `Cascade`, `PolicyRevision`, `claudeStarted`, `conversationRuntimeHash`, `abandoned`, `Supervision.State`, `Supervision.Reason`, `Supervision.RemainingBursts`, `Supervision.progress`, `Supervision.lastProgress`, `pendingReviewResult` |
 | **Derived** | `Status`, `Error`, `Supervision.NextCheckpoint` |
-| **Adapter, process-local, gone after restart** | `codex`, `claude`, `codexTurn`, `dispatchMu`, `delivery`, `reviewDone`, `filters`, `scheduled`, `pendingReviewResult`, `policy` (re-resolved per dispatch) |
-| **Presentation, not durable** | `Title`, `Model`, `Effort`, `Messages`, `Usage`, `Attachments` (composer), `attachmentSnapshots` (composer), `context`, `Supervision.RemainingBursts`, `Supervision.progress` |
+| **Adapter, process-local, gone after restart** | `codex`, `claude`, `codexTurn`, `dispatchMu`, `delivery`, `reviewDone`, `filters`, `scheduled`, `policy` (re-resolved per dispatch) |
+| **Presentation, not durable** | `Title`, `Model`, `Effort`, `Messages`, `Usage`, `Attachments` (composer), `attachmentSnapshots` (composer), `context` |
 
-K1 turns this table into a test: adding a session field without classifying it fails.
+Continuation guards read these budget and progress fields, so they are authority and `Decide` can see them. Each authority field has one writing fact, kept as a table in `internal/kernel` and checked by a K1 test that every fact in that table is produced by its generator. The test that every `session` struct field is classified needs that struct, so it lands in K5a as an AST test in `package main`.
 
 ### Log health
 
@@ -129,12 +135,14 @@ K1 turns this table into a test: adding a session field without classifying it f
 |---|---|---|
 | Committed | Fact is durable | Reduce and continue |
 | Definite failure | Transaction rolled back, nothing written (disk full, quota) | Nothing reduced. The command returns an error and the turn stays resolvable. Observations stay in a bounded per-session retry buffer; on overflow, go to latched |
-| Ambiguous commit | The commit call failed without saying which | Read back on the same connection. Present: reduce it. Absent: definite failure. Unreadable: latched |
-| Latched | Log state is unknown | All admission refuses, all sessions show read-only with a restart message, until restart replays the truth |
+| Ambiguous commit | Any commit error not known to precede commit | Latched. Restart replays the truth. Read-back is not trusted, because a present fact may not be durable and an absent one may reappear on recovery. It may be added only if K2's fault injection, including an injected fsync failure, proves it safe |
+| Revoking fact not committed | `AuthBoundaryCrossed`, `QuestionRevoked` or `ChildQuarantined` failed, even definitely | Latched, because authority must not outlive the failure |
+| `ProcessRestarted` not committed at open | Disk full or quota at start | Start latched and read-only from replay, with a visible message |
+| Latched | Log state is unknown | All new work refuses and every effect recheck sees it. Stop-work stays available. Sessions show read-only with a restart message, until restart replays the truth |
 
-A definite failure on discard leaves the turn resolvable (D7). A latch revokes authority because nothing can be decided (P1). Both are visible in the session state.
+A definite failure on discard leaves the turn resolvable (D7). A latch revokes authority because nothing can be decided (P1). Both are visible in the session state. Discard on a full disk may therefore fail; the reserve below is logical only, so a real ENOSPC refuses and says so.
 
-**Must-append class.** `ProcessRestarted`, `ProviderCompleted`, `OutcomeUnknown`, `Abandoned` and `SessionClosed` are exempt from the quota, using a reserved headroom, so the console can always start, record outcomes, discard, and close.
+**Must-append class.** Every fact needed to discard, release, close, or record a terminal outcome is exempt from the quota, using a reserved headroom: `ProcessRestarted`, `ProviderCompleted`, `OutcomeUnknown`, `Abandoned`, `SessionClosed`, `InputOutcome`, `InputDiscarded`, `PayloadReleased`, `ReviewOutcome`, `ControlOutcome`, `ChildControlOutcome`, `QuestionRevoked`. The reserve is sized from the bound on open requests and payloads. `ProcessRestarted` is not appended when the last fact is already one, so a crash loop cannot spend the reserve, and process epochs need no durability because fences are in-process. If the reserve is exhausted, the log latches.
 
 ### Storage
 
@@ -202,13 +210,13 @@ No second reader for the journal. Queue payloads need one permanent, bounded, re
 | `abandoned` | `abandoned` | Read-only, closable |
 | None (`created`, `cwd`, `admission_failed` only) | None | Read-only |
 
-The session's last record decides only `closed`, which imports nothing for that session. `LegacyImported` carries `{sessionId, provider, providerId, cwd, profile, lastRequestId, receipt, taskId, generation, inputRevision, objectiveHash, passes}`. Passes import as history and authorize nothing. Review records become `ReviewOutcome{unknown}` on their parent. Checkpoints become task metadata.
+The session's last record decides only `closed`, which imports nothing for that session. Every imported session can be closed, subject only to INV3: a `final`, `rejected`, no-request or synthetic session closes directly, and an `unknown` one closes after discard. `LegacyImported` carries `{sessionId, provider, providerId, cwd, profile, lastRequestId, receipt, taskId, generation, inputRevision, objectiveHash, passes}`. Passes import as history and authorize nothing. Review records become `ReviewOutcome{unknown}` on their parent. Checkpoints become task metadata.
 
-**Queue files** become `LegacyInputHeld` by hash, with the payload staying in place. An orphan with no session is imported as a held input under a synthetic read-only session, so it stays visible. A corrupt queue file is set aside and shown on its session as unknown, without refusing the console. An entry missing `DirectoryIdentity` is held, and its release skips the identity-guarded cleanup and leaves the file for the user, so the tab can still close.
+**Queue files** become `LegacyInputHeld` by hash, with the payload staying in place and its attachment snapshot references recorded on the fact. Kernel orphan cleanup is restricted to the kernel's own namespace, so legacy attachments are never treated as orphans. An orphan with no session is imported as a held input under a synthetic read-only session, so it stays visible. A corrupt queue file is set aside and shown on its session as unknown, without refusing the console. An entry missing `DirectoryIdentity` is held, and its release skips the identity-guarded cleanup and leaves the file for the user, so the tab can still close.
 
-**After commit,** `sessions.jsonl` is renamed to `sessions.jsonl.imported-<timestamp>` and never deleted, and a sentinel `sessions.jsonl` with one non-JSON line takes its place. `6172744` refuses to start on a non-JSON line, confirmed from source, so an old binary stops instead of starting empty. A crash between commit and rename finishes on next start: a `sessions.jsonl` whose digest matches the marker is the pending rename. An incomplete final line was never acknowledged, so it is set aside in its own file. A corrupt complete line refuses the import and changes nothing.
+**After commit,** the swap is atomic: write a temporary sentinel, hard-link `sessions.jsonl` to `sessions.jsonl.imported-<timestamp>`, then rename the sentinel over `sessions.jsonl`. The old journal is never deleted, and there is no moment without a `sessions.jsonl`, so an old binary can never create an empty one. The sentinel is one newline-terminated non-JSON line. `6172744` refuses to start on a non-JSON line, confirmed from source. Recovery covers each intermediate state: a real `sessions.jsonl` whose digest matches the marker means the swap is unfinished. An incomplete final line in the old journal was never acknowledged, so it is set aside in its own file. A corrupt complete line refuses the import and changes nothing.
 
-**Rollback round trip.** A documented command replaces the sentinel with the renamed file so the old binary runs. Its limits are stated in the docs: the old binary does not see anything recorded in the log, and payloads the kernel released are gone. Upgrading again finds a real `sessions.jsonl` with a different digest than the marker. It refuses to start and names `--reimport`, an explicit command that imports that file under a new generation, leaving earlier facts intact and read-only. K3 tests both directions.
+**Rollback round trip.** A documented command replaces the sentinel with the renamed file so the old binary runs. Its limits are stated in the docs: the old binary does not see anything recorded in the log, and payloads the kernel released are gone. Upgrading again finds a real `sessions.jsonl` with a different digest than the marker. It refuses to start and names `--reimport`, an explicit command that imports that file under new session identities linked to the earlier generation, so no terminal state moves and earlier facts stay intact and read-only. K3 tests both directions.
 
 Import is tested against journal shapes generated by the actual `6172744` code, and against a private copy of the real data directory. That copy's contents stay out of the repository.
 
@@ -216,19 +224,22 @@ Import is tested against journal shapes generated by the actual `6172744` code, 
 
 Each slice is its own branch and PR, with its own code inspection. Sizes exclude tests. A slice that outgrows about 1,500 lines is split before review.
 
-**K5 to K9 are mergeable and reviewable but not runnable on real data.** Every session created by a wired build is `kernelOwned`. Until K10:
-- The binary refuses the default data directory and any directory containing `sessions.jsonl`.
-- An unconverted operation on a kernel-owned session refuses visibly rather than mutating. The direct-write check covers the whole package for owned sessions.
+**K5 to K9 are mergeable and reviewable but not runnable on real data.** Until K10:
+- The binary refuses any data directory lacking a development marker, which only an explicit flag creates. It survives a restart, because the guard does not depend on `sessions.jsonl` being absent.
+- Every entry point, including background paths such as the scheduler, event readers and auth transitions, passes a default-deny ownership gate. An unconverted operation on a kernel-owned session refuses visibly rather than mutating.
+- An AST inventory lists every authority write in `package main`, against an allowlist that shrinks by slice.
 - Cross-provider reviewers refuse until K9.
 
 | Slice | Scope | Acceptance | Depends on |
 |---|---|---|---|
 | **K0** | This plan and the catalog | Plan review | None |
-| **K1** | `internal/kernel`: enums, facts, effect descriptors, `Decide`, `Reduce`, restart rule, command decode, field classification test. No I/O, no wiring. | Catalog entries marked reducer. Property test: random inputs, INV1, INV2 on every prefix, determinism at 1,000 runs with randomized map order, seed printed. Duplicate, reordered, unknown-version and illegal facts refuse. Failing controls by mutating the transition table. | K0 |
+| **K1** | `internal/kernel`: enums, facts with encoder and decoder, effect descriptors, `Decide`, `Reduce`, restart rule, command decode, field-to-fact table. No I/O, no wiring. | Catalog entries marked reducer. Property test with random inputs, seed printed: every fact round-trips through the real encoder before reducing, and results are checked against an independently written model of the receipt and restart tables, since live and replay alone are one fold. Determinism at 1,000 runs with randomized map order. Duplicate, reordered, unknown-version and illegal facts refuse. Failing controls: transition table mutations caught by the model, and for INV2 a seeded field dropped by the encoder or set outside `Reduce`. | K0 |
 | **K2** | `internal/eventlog`: append with revision CAS, receipts, replay, health latch, must-append reserve, quota, notices. Not wired. | The five falsifiers. Kill at each transaction boundary, `SQLITE_BUSY`, short write, disk-full, and ambiguous commit injection, then reopen. Concurrent append. Secrets canary across the database, WAL and free pages. | K1 |
 | **K3** | `internal/legacyimport` and the queue decoder, not wired | Fixtures from `6172744` shapes, including cwd after receipt, torn tail, corrupt line, corrupt queue, orphan queue and missing identity. Crash at each step. Held lock refuses. Rollback and `--reimport` both ways. | K2 |
-| **K4** | Process lifecycle, on the current console. Adapter identity computation. | Catalog process entries, with real child processes on Linux and Mac. This work carries through wiring. | K0 |
-| **K5** | Wire Claude send, finality and restart. `kernelOwned` gate and data-directory guard. Fence and single-flight gate. | Seeded test through the real API, with the operation set limited to what K5 owns. Commit-to-effect crash matrix for send. Lock rule tests rerun. | K1, K2, K4 |
+| **B** | Labelled baseline PR to `main`, per Landing | Public-repo scan clean. Guard refuses a directory without the marker. Reviewed and merged through the main agent. | K0 |
+| **K4** | Process lifecycle, on the baseline. Adapter identity computation. | Catalog process entries, with real child processes on Linux and Mac. This work carries through wiring. | B |
+| **K5a** | Ownership gate at every entry point, AST inventory, field classification test. No behaviour change. | Gate default-denies a marked session on every entry point. Inventory test fails on an unlisted write. | Baseline, K1 |
+| **K5b** | Wire Claude send, finality and restart. Writer gate, fence and drain. | Seeded test through the real API, with the operation set limited to what K5b owns. Commit-to-effect crash matrix for send. Test holding a write between recheck and syscall. Lock rule tests rerun. | K1, K2, K4, K5a |
 | **K6** | Wire Codex: conversation binding, turn binding, finality, disconnect | Same for Codex. Client cache key stays separate from conversation identity. | K5 |
 | **K7** | Controls, questions, cwd, close, auth boundary, children, and **discard** with its UI, since it shares control's state | Control, question and all discard entries. Delayed-response scenarios. Operation set grows. | K6 |
 | **K8** | Queue and attachment ownership as facts. Content-addressed payload is durable first, the fact second, and orphan cleanup runs only after replay. Beforeimages removed. | Queue entries, with fault injection at each step. | K7 |
@@ -236,15 +247,14 @@ Each slice is its own branch and PR, with its own code inspection. Sizes exclude
 | **K10** | Wire import. Remove the data-directory guard. | Seeded test with the full operation set at **10,000 seeds**, zero divergence, including questions, reviews and checkpoints. Import end to end. | K3, K9 |
 | **K11** | Replacement release | One frozen full qualification on the Linux runner, Mac native, click-test including discard keyboard and focus, bounded real-provider smoke, exact-head PR review, private-copy import rehearsal, no-write verify on the stopped directory, golden fixtures. Then install. Only then is the old console stopped, with the user's existing authorization. | K10 |
 
-**Landing.** The console is not on `main`, so a 25,000-line baseline exists once however this is done, with no line-by-line correctness review either way. Recommended: a labelled baseline PR to `main` before K4, so later slices each show a small diff, on these conditions:
-1. The data-directory guard is in the baseline, so a build from `main` cannot touch real data.
+**Landing.** The console is not on `main`, so a 25,000-line baseline exists once, with no line-by-line correctness review. By user decision it lands as one labelled squashed PR to `main` before K4, so later slices each show a small diff. Conditions:
+1. The data-directory guard is in the baseline, so a build from `main` refuses real data.
 2. `version` is an unreleased label, not `0.2.0`.
-3. The workflow's executable upload on `main` is removed or relabelled.
-4. `README.md` and `docs/console.md` say unreleased.
+3. The workflow's executable upload on `main` is removed.
+4. `README.md` and `docs/console.md` say unreleased, and the known-defect list is linked.
 5. No installer change.
-6. History is squashed under the public identity.
-
-Alternative: a long-lived integration branch, which keeps known-defective code off public `main`, but makes the final merge a giant diff. This is a user choice, asked separately.
+6. A public-repo scan for private content and non-public emails passes first, and history is squashed under the public identity.
+7. Review and merge go through the main agent.
 
 K1 to K3 are new packages. They land with `console/go.mod` and a workflow that runs `go test ./internal/...`, because the existing workflow's `go build .` needs a main package. The baseline merge reconciles `go.mod`, including any `go` directive the refreshed SQLite requires.
 
