@@ -433,6 +433,25 @@ class LiveReceipts(unittest.TestCase):
         self.assertEqual((result.returncode, timed['execution'], timed['result'], timed['reason']),
                          (3, 'INTERRUPTED', 'NO_RESULT', 'TIMEOUT'))
 
+    def test_command_adapter_rejects_test_kinds_before_launch(self):
+        for kind in ('focused', 'full'):
+            with self.subTest(kind=kind):
+                marker = self.repo.parent / f'{self.repo.name}-{kind}-launched'
+                self.addCleanup(lambda path=marker: path.unlink() if path.exists() else None)
+                program = f'from pathlib import Path; Path({str(marker)!r}).write_text("launched")'
+
+                result, value = self.invoke(*self.arguments(f'invalid-{kind}',
+                                                            [sys.executable, '-c', program],
+                                                            adapter='command', kind=kind))
+
+                self.assertEqual((result.returncode, value['execution'], value['result'], value['reason']),
+                                 (2, 'NOT_STARTED', 'NO_RESULT', 'INVALID_OUTPUT'))
+                self.assertEqual(value['message'],
+                                 'The command adapter cannot validate focused or full test evidence; '
+                                 'use a test adapter or --kind command')
+                self.assertFalse(marker.exists())
+                self.assertEqual(list(self.store_path.rglob('attempt-*.json')), [])
+
     def test_killed_supervisor_missing_final_is_unknown_and_blocks_duplicate(self):
         marker = self.repo.parent / (self.repo.name + '-child.json')
         self.addCleanup(lambda: marker.unlink() if marker.exists() else None)

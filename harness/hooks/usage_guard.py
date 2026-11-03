@@ -945,14 +945,20 @@ def main():
             store.ack_pool(args.provider, args.pool, actor=args.actor, reason=args.reason, evidence=args.evidence)
             value = {'availability_acknowledged': True, 'result': 'NO_RESULT'}
         else:
-            manifest = load_manifest(args.manifest)
-            subject = capture_subject(args.repo, args.manifest)
-            if args.action == 'gate': value = store.check_gate(subject, args.reference)
+            if args.action == 'gate':
+                subject = capture_subject(args.repo, args.manifest)
+                value = store.check_gate(subject, args.reference)
             else:
                 command = args.command[1:] if args.command[:1] == ['--'] else args.command
                 if not command: raise GuardError('INVALID_OUTPUT', 'A command is required')
                 if args.adapter == 'command' and args.success_exit != 0:
                     raise GuardError('INVALID_OUTPUT', 'Non-test commands require the explicit supported --success-exit 0 predicate')
+                if args.adapter == 'command' and args.kind in {'focused', 'full'}:
+                    raise GuardError('INVALID_OUTPUT',
+                                     'The command adapter cannot validate focused or full test evidence; '
+                                     'use a test adapter or --kind command')
+                manifest = load_manifest(args.manifest)
+                subject = capture_subject(args.repo, args.manifest)
                 public = manifest.get('public_arguments') is True
                 declared = command if public else ['opaque-command', manifest.get('command_revision', 'unknown')]
                 invocation = invocation_identity(subject, purpose=args.purpose,
