@@ -774,6 +774,7 @@ func TestK1F3ControlIsClosed(t *testing.T) {
 		"lateKind":   {Kind: FactLateFrameObserved, LateKind: "free"},
 		"latestatus": {Kind: FactLateFrameObserved, LateKind: "final", Status: "Free Text"},
 		"digest":     {Kind: FactLateFrameObserved, LateKind: "final", Digest: "free text"},
+		"keydigest":  {Kind: FactLateFrameObserved, LateKind: "final", Digest: "CANARY-sk-live-7f3a9c2e"},
 		"state":      {Kind: FactProviderConnected, State: "anything"},
 		"reason":     {Kind: FactCwdChanged, CWD: "/x", Reason: "free"},
 		"control2":   {Kind: FactProviderConnected, Control: "pause"},

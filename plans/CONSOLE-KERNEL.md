@@ -164,6 +164,8 @@ Falsify before building on this (first step of K2):
 
 If 3, 4 or 5 cannot be met, stop and reassess the store.
 
+**K2 as built.** `console/internal/eventlog` on `modernc.org/sqlite` v1.60.1 (SQLite 3.53.4; v1.61.x was under two weeks old). The limit is 1,000,000 facts, with the last 50,000 reserved for must-append facts; opening at that limit takes about 6 seconds on the reference Mac, and 0.4 seconds at 100,000. Opening replays in place, after the falsifier found per-fact projection copies made it grow with facts times sessions. Crash safety is qualified on Linux, macOS and Windows. Third-party notices move to K5, the first slice whose binary links SQLite. The module's `go` directive rises to 1.26.
+
 **Growth.** The 8 MiB refusal goes away. K2 states a numeric quota, and user recovery is an export followed by an explicit start in a new data directory, since export alone frees nothing. Quota checks use a counter rather than `COUNT(*)` per append.
 
 ## Reuse, verified against the branches

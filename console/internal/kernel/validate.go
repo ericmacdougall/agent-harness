@@ -14,10 +14,11 @@ import (
 // backstop for INV6 and for closed states: free text from a provider cannot reach
 // the log, and no value outside an enum can reach a reducer rule.
 var (
-	identityPattern = regexp.MustCompile(`^[A-Za-z0-9._:/@+=-]{1,128}$`)
-	digestPattern   = regexp.MustCompile(`^[A-Za-z0-9:_-]{1,128}$`)
-	codePattern     = regexp.MustCompile(`^[a-z0-9_]{1,40}$`)
-	timePattern     = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$`)
+	identityPattern    = regexp.MustCompile(`^[A-Za-z0-9._:/@+=-]{1,128}$`)
+	digestPattern      = regexp.MustCompile(`^[A-Za-z0-9:_-]{1,128}$`)
+	codePattern        = regexp.MustCompile(`^[a-z0-9_]{1,40}$`)
+	frameDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	timePattern        = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$`)
 )
 
 // validTime requires the fixed width that makes times compare as strings, and a real
@@ -53,7 +54,7 @@ func closedFields(f Fact) bool {
 	case FactProviderCompleted:
 		status = finalStatuses
 	case FactLateFrameObserved:
-		if f.Status != "" && !codePattern.MatchString(f.Status) {
+		if f.Status != "" && !codePattern.MatchString(f.Status) || f.Digest != "" && !frameDigestPattern.MatchString(f.Digest) {
 			return false
 		}
 		status, late = []string{f.Status}, lateKinds

@@ -85,7 +85,7 @@ Epoch fences cannot outlive a process, so restart need not move it.
 
 `Evidence` maps `(request, kind)` to `status|digest`. `request` is the frame's request if this session knows it, otherwise empty, so a provider cannot grow the map with invented requests. `kind` is one of `accepted`, `refused`, `write_unknown`, `turn_bound`, `final`, `conversation`, `connected`, `disconnected`, `control_outcome`. Later kinds arrive with their slices.
 
-The first frame per key is sticky: if the key exists, no fact is appended. The stored status is the frame's status if it matches `[a-z0-9_]{1,40}`, otherwise `invalid`, or empty if the frame has none. The stored digest is the frame's if it matches `[A-Za-z0-9:_-]{1,128}`, otherwise empty. A late frame changes nothing else and emits no effect.
+The first frame per key is sticky: if the key exists, no fact is appended. The stored status is the frame's status if it matches `[a-z0-9_]{1,40}`, otherwise `invalid`, or empty if the frame has none. The stored digest is the frame's if it is 64 lowercase hex characters, a hash the adapter computed, otherwise empty. A late frame changes nothing else and emits no effect.
 
 ## 6. Status
 
@@ -277,6 +277,7 @@ The independent model listed 34 places these tables left open. None changes a ta
 36. If `Decide`'s own pre-check finds a fact `Reduce` refuses for a precondition, that is a kernel bug and returns a plain error, not a refusal. Only a value out of shape is `bad_value`.
 37. A `quarantine` input with a code out of shape is `bad_value` with no effects: only the adapter sends it, so this is an adapter bug.
 38. A disconnect ends the Codex turn: K4 stops the provider's process group whenever its stream ends, so clearing `TurnID` is correct. K6 must keep this true.
+40. Changed in K2 after a secrets canary found an API-key-shaped value stored as late evidence: a late frame's digest must be 64 lowercase hex characters. `Reduce` refuses a raw `LateFrameObserved` whose digest is neither empty nor that hex form. Identity fields such as provider and turn IDs are identities by design and are stored as given; adapters must never put secrets in them.
 39. Repeated `disconnected` frames append facts, and `control-outcome` frames that change `PauseUnconfirmed` do, while an exact repeat is idempotent per table 7. K2's quota and must-append reserve bound them; coalescing them is deferred.
 
 ## Review record

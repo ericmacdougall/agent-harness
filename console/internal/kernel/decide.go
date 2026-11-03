@@ -448,7 +448,9 @@ func (b *builder) late(s *Session, in In, kind string) (Decision, error) {
 	if status != "" && !codePattern.MatchString(status) {
 		status = "invalid"
 	}
-	if digest != "" && !digestPattern.MatchString(digest) {
+	// A provider frame's digest must be one the adapter computed, never provider text:
+	// a secret such as an API key can match a looser shape.
+	if !frameDigestPattern.MatchString(digest) {
 		digest = ""
 	}
 	if _, known := s.Requests[request]; !known {

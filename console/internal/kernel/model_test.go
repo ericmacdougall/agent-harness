@@ -11,6 +11,9 @@ package kernel
 // section 10 names no error for Quarantined.Err, so it is only required to be non-nil; and
 // 37. Item 39 says repeated control-outcome frames append facts, but table 7 makes a frame that
 // would not change PauseUnconfirmed idempotent. Table 7 is coded, so an exact repeat is idempotent.
+// 38. Item 40 narrows the stored late digest, but section 7's fact digest shape is unchanged, so
+// whether Reduce refuses a raw LateFrameObserved with a non-hex in-shape Digest is open. Raw late
+// facts are generated only with a 64-hex or empty Digest.
 
 import (
 	"errors"
@@ -31,6 +34,7 @@ import (
 var (
 	mdlIdentityShape = regexp.MustCompile(`^[A-Za-z0-9._:/@+=-]{1,128}$`)
 	mdlDigestShape   = regexp.MustCompile(`^[A-Za-z0-9:_-]{1,128}$`)
+	mdlLateDigest    = regexp.MustCompile(`^[0-9a-f]{64}$`) // Table 5 and section 10 item 40.
 	mdlCodeShape     = regexp.MustCompile(`^[a-z0-9_]{1,40}$`)
 	mdlTimeShape     = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$`)
 )
@@ -608,7 +612,7 @@ func (m *mdlModel) late(s *mdlMSession, in In, kind string) mdlOutcome {
 		m.hit("t5.status.invalid")
 	}
 	mdlDigest := in.Digest
-	if mdlDigestShape.MatchString(mdlDigest) {
+	if mdlLateDigest.MatchString(mdlDigest) {
 		m.hit("t5.digest.valid")
 	} else {
 		mdlDigest = ""
@@ -1347,6 +1351,12 @@ func (g *mdlGen) foreignRequest(m *mdlModel) string {
 	return s.order[g.rng.Intn(len(s.order))]
 }
 
+const (
+	mdlHexA   = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	mdlHexB   = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+	mdlCanary = "CANARY-sk-live-7f3a9c2e"
+)
+
 var (
 	mdlLongID    = strings.Repeat("x", 129)
 	mdlLongCode  = strings.Repeat("a", 41)
@@ -1372,7 +1382,7 @@ func (g *mdlGen) corrupt(m *mdlModel, gs *mdlGenStep) {
 	case 5:
 		in.Status = g.pick("", "completed", "failed", "interrupted", "running", "cancelled", "Free Text!", mdlLongCode, "COMPLETED")
 	case 6:
-		in.Digest = bad("sha256:abc")
+		in.Digest = bad("sha256:abc", mdlHexA, mdlHexA, mdlCanary, strings.ToUpper(mdlHexA), mdlHexA[:63], mdlHexA+"0")
 	case 7:
 		in.ReasonCode = g.pick("", "BAD CODE", mdlLongCode, "ok_code")
 	case 8:
@@ -1460,7 +1470,7 @@ func (g *mdlGen) randomRaw(m *mdlModel) mdlGenStep {
 			return gs
 		},
 		func() mdlGenStep {
-			return mdlRawFact("", Fact{Kind: FactLateFrameObserved, SessionID: sid, RequestID: g.pick("", last, g.foreignRequest(m)), LateKind: g.pick(mdlLateKinds...), Status: g.pick("", "ok", "invalid"), Digest: g.pick("", "d1")})
+			return mdlRawFact("", Fact{Kind: FactLateFrameObserved, SessionID: sid, RequestID: g.pick("", last, g.foreignRequest(m)), LateKind: g.pick(mdlLateKinds...), Status: g.pick("", "ok", "invalid"), Digest: g.pick("", mdlHexA)})
 		},
 		func() mdlGenStep {
 			return mdlRawFact("", Fact{Kind: FactTurnBound, SessionID: sid, RequestID: last, TurnID: g.pick("t-a", "t-b", "", "bad turn")})
@@ -1686,7 +1696,7 @@ func (g *mdlGen) scriptConversation() []mdlGenStep {
 		mdlStep(InCreate, b, mdlProv(ProviderClaude), mdlIdentity(mdlRtOne)),
 		mdlStep(ObConversationBound, b, mdlConv("conv-b")),
 		mdlStep(ObRestart, ""),
-		mdlStep(ObConversationBound, b, mdlConv("conv-b"), mdlStatus("late_status"), mdlDigest("sha256:1")),
+		mdlStep(ObConversationBound, b, mdlConv("conv-b"), mdlStatus("late_status"), mdlDigest(mdlCanary)),
 	}
 }
 
@@ -1699,8 +1709,11 @@ func (g *mdlGen) scriptFrames() []mdlGenStep {
 		mdlStep(ObDisconnected, a), mdlStep(ObDisconnected, a), mdlStep(ObConnected, a),
 		mdlSend(a, "r1"),
 		mdlStep(ObRefused, a, mdlReq("r1"), mdlCode("no_cap")),
-		mdlStep(ObAccepted, a, mdlReq("r1"), mdlStatus("ok_status"), mdlDigest("sha256:1")),
-		mdlStep(ObAccepted, a, mdlReq("r1"), mdlStatus("second"), mdlDigest("sha256:2")),
+		mdlStep(ObAccepted, a, mdlReq("r1"), mdlStatus("ok_status"), mdlDigest(mdlHexA)),
+		mdlStep(ObAccepted, a, mdlReq("r1"), mdlStatus("second"), mdlDigest(mdlHexB)),
+		mdlStep(ObRefused, a, mdlReq("r1"), mdlDigest(mdlCanary)),
+		mdlStep(ObUnknown, a, mdlReq("r1"), mdlDigest("sha256:abc")),
+		mdlStep(ObCompleted, a, mdlReq("r1"), mdlDigest(strings.ToUpper(mdlHexA))),
 		mdlStep(ObAccepted, a, mdlReq("r-invented"), mdlStatus("Free Text!"), mdlDigest("bad digest!")),
 		mdlStep(ObRefused, a, mdlReq("r-invented"), mdlStatus(mdlLongCode), mdlDigest(mdlLongID)),
 		mdlSend(a, "r2"),
@@ -1907,7 +1920,7 @@ func (g *mdlGen) scriptRaw() []mdlGenStep {
 		mdlRawFact("legal", Fact{Kind: FactControlRequested, SessionID: a, Control: "pause"}),
 		mdlRawFact("legal", Fact{Kind: FactControlOutcome, SessionID: a, Control: "pause", Outcome: "confirmed"}),
 		mdlRawFact("illegal", Fact{Kind: FactSessionQuarantined, SessionID: a}),
-		mdlRawFact("legal", Fact{Kind: FactLateFrameObserved, SessionID: a, RequestID: "r1", LateKind: "final", Status: "ok", Digest: "d1"}),
+		mdlRawFact("legal", Fact{Kind: FactLateFrameObserved, SessionID: a, RequestID: "r1", LateKind: "final", Status: "ok", Digest: mdlHexA}),
 		mdlRawFact("illegal", Fact{Kind: FactProviderConnected, SessionID: "ghost-" + a}),
 		mdlRawFact("legal", Fact{Kind: FactAuthBoundaryCrossed, SessionID: a}),
 		mdlRawFact("illegal", Fact{Kind: FactProviderConnected, SessionID: a}),
@@ -1930,8 +1943,9 @@ func (g *mdlGen) scriptRaw() []mdlGenStep {
 		mdlRawFact("legal", Fact{Kind: FactTurnBound, SessionID: d, RequestID: "r1", TurnID: "t1"}),
 		mdlRawFact("repeat", Fact{Kind: FactTurnBound, SessionID: d, RequestID: "r1", TurnID: "t1"}),
 		mdlRawFact("legal", Fact{Kind: FactTurnBound, SessionID: d, RequestID: "r1", TurnID: "t2"}),
-		mdlRawFact("legal", Fact{Kind: FactLateFrameObserved, SessionID: d, RequestID: "r1", LateKind: "accepted", Status: "first", Digest: "d1"}),
-		mdlRawFact("illegal", Fact{Kind: FactLateFrameObserved, SessionID: d, RequestID: "r1", LateKind: "accepted", Status: "second", Digest: "d2"}),
+		// SPEC-AMBIGUOUS: 38
+		mdlRawFact("legal", Fact{Kind: FactLateFrameObserved, SessionID: d, RequestID: "r1", LateKind: "accepted", Status: "first", Digest: mdlHexA}),
+		mdlRawFact("illegal", Fact{Kind: FactLateFrameObserved, SessionID: d, RequestID: "r1", LateKind: "accepted", Status: "second", Digest: mdlHexB}),
 		mdlRawFact("legal", Fact{Kind: FactLateFrameObserved, SessionID: d, RequestID: "r-unknown", LateKind: "accepted"}),
 		mdlRawFact("illegal", Fact{Kind: FactLateFrameObserved, SessionID: d, RequestID: "r1", LateKind: "not_a_kind"}),
 		mdlRawFact("illegal", Fact{Kind: FactLateFrameObserved, SessionID: d, RequestID: "r1", LateKind: "final", Status: "Free Text!"}),
@@ -2103,7 +2117,7 @@ func (g *mdlGen) scriptTrim() []mdlGenStep {
 		out = append(out, mdlSend(a, r), mdlStep(ObCompleted, a, mdlReq(r), mdlStatus("completed")))
 	}
 	return append(out,
-		mdlStep(ObAccepted, a, mdlReq("tr-0"), mdlStatus("late"), mdlDigest("sha256:trim")),
+		mdlStep(ObAccepted, a, mdlReq("tr-0"), mdlStatus("late"), mdlDigest(mdlHexB)),
 		mdlStep(ObAccepted, a, mdlReq("tr-300"), mdlStatus("late")),
 		mdlSend(a, "tr-200"),
 		mdlSend(a, "tr-0"),

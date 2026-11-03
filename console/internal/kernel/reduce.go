@@ -124,6 +124,13 @@ func illegal(f Fact, why string) error {
 // Reduce is pure and the sole writer of authority. Live state and replay both call
 // it, with no other path to the projection.
 func Reduce(p Projection, f Fact) (Projection, error) {
+	return reduce(p, f, true)
+}
+
+// reduce is Reduce. With owned true the caller owns p's maps outright, as Replay does,
+// so the shell is reused instead of copied for every fact. Copying it per fact made
+// opening a log grow with facts times sessions.
+func reduce(p Projection, f Fact, copyShell bool) (Projection, error) {
 	if f.SchemaVersion != SchemaVersion {
 		return p, fmt.Errorf("%w: schema version %d", ErrUnreadableLog, f.SchemaVersion)
 	}
@@ -139,7 +146,10 @@ func Reduce(p Projection, f Fact) (Projection, error) {
 	if err := validateFact(f); err != nil {
 		return p, fmt.Errorf("%w: %w", ErrIllegalFact, err)
 	}
-	next := p.copyShell()
+	next := p
+	if copyShell {
+		next = p.copyShell()
+	}
 	next.LastSeq, next.LastKind = f.Seq, f.Kind
 	switch f.Kind {
 	case FactProcessRestarted:
@@ -469,8 +479,9 @@ func Replay(facts []Fact) (Projection, []Quarantined, error) {
 	p := NewProjection()
 	var quarantined []Quarantined
 	reported, applied := map[string]bool{}, map[string]bool{}
+	// Replay owns this projection until it returns, so it reduces in place.
 	for _, f := range facts {
-		next, err := Reduce(p, f)
+		next, err := reduce(p, f, false)
 		if err == nil {
 			p = next
 			continue
