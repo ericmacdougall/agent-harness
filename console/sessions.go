@@ -436,6 +436,13 @@ func (a *app) control(sessionID, action, agentID string) error {
 	a.revokeQuestionsLocked(current, "")
 	current.Supervision.State = "paused"
 	current.Supervision.Reason = "User " + action
+	// With turn/start unanswered, the newest listed turn is not known to be ours.
+	// The interrupt waits for the correlated reply instead of guessing.
+	binding := current.codexTurn
+	interruptOnBind := provider == "codex" && binding != nil && binding.client == client && binding.turnID == "" && binding.requestID == current.lastRequest && oneOf(current.requests[current.lastRequest], "intent", "accepted")
+	if interruptOnBind {
+		binding.interruptOnBind = true
+	}
 	a.changedLocked()
 	a.mu.Unlock()
 	release()
@@ -452,6 +459,9 @@ func (a *app) control(sessionID, action, agentID string) error {
 	}
 	if client == nil {
 		return errors.New("provider is disconnected")
+	}
+	if interruptOnBind {
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -476,6 +486,9 @@ func (a *app) control(sessionID, action, agentID string) error {
 	a.mu.Lock()
 	if target == current.ProviderID && current.requests[current.lastRequest] != "unknown" {
 		current.Status = "paused"
+	}
+	if current.Error == pauseUnconfirmedError {
+		current.Error = ""
 	}
 	a.changedLocked()
 	a.mu.Unlock()

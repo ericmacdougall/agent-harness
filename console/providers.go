@@ -193,7 +193,7 @@ func (a *app) createSession(provider, cwd, profile string) (*session, error) {
 		}
 	}
 	a.mu.Lock()
-	if len(a.sessions) >= maxSessions {
+	if a.atSessionLimitLocked() {
 		a.mu.Unlock()
 		return nil, errors.New("session limit reached; close a session before opening another")
 	}

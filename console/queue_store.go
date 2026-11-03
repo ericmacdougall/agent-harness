@@ -175,8 +175,18 @@ func (a *app) restoreInputs() error {
 			if s.task == nil || disk.TaskID != s.task.ID || disk.Generation != s.task.Generation {
 				return errors.New("queued input task identity disagrees with journal; preserve state")
 			}
-			if disk.InputRevision < s.task.InputRevision {
+			// An uncertain commit advances the journal one revision past a queue file
+			// the replacement may never have reached. That is the state restart exists
+			// to reconcile: this session is unknown and read-only, so the durable file
+			// wins. Any other gap is still corruption.
+			uncertainCommit := s.Status == "unknown" && disk.InputRevision+1 == s.task.InputRevision
+			if disk.InputRevision < s.task.InputRevision && !uncertainCommit {
 				return errors.New("queued input authority is older than journal")
+			}
+			if uncertainCommit {
+				s.task.passes = map[string]string{}
+				s.task.Subject = reviewSubject{}
+				s.task.Stage = ""
 			}
 			if disk.InputRevision > s.task.InputRevision {
 				s.task.passes = map[string]string{}

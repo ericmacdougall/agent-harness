@@ -105,6 +105,11 @@ func (a *app) enqueueInput(id, request, text string, paths []string) (*queuedInp
 				}
 			}
 		}
+		// The client clears its draft on success, so an entry whose commit outcome
+		// is unknown must not be acknowledged: it may not survive restart.
+		if s.queueUncertain {
+			return nil, queueUncertainError()
+		}
 		return prior, nil
 	}
 	if s.queueUncertain {

@@ -192,8 +192,8 @@ function renderTabs() {
     const wrapper = el('div', 'session-tab-wrap');
     const close = el('button', 'session-tab-close', '×');
     close.setAttribute('aria-label', `Close ${item.title || 'session'}`);
-    close.title = item.pendingInputs?.length ? 'Resolve stored follow-up payloads before closing this tab.' : 'Close console tab; preserve provider history';
-    close.disabled = !!item.pendingInputs?.length || running(item.status) || ['unknown', 'disconnected'].includes(item.status) || item.agents?.some(agent => running(agent.status));
+    close.title = item.pendingInputs?.length ? 'Resolve stored follow-up payloads before closing this tab.' : item.unresolved ? 'The last request has no final outcome yet, so this tab stays open.' : 'Close console tab; preserve provider history';
+    close.disabled = !!item.pendingInputs?.length || !!item.unresolved || running(item.status) || ['unknown', 'disconnected'].includes(item.status) || item.agents?.some(agent => running(agent.status));
     close.addEventListener('click', () => act(close, async () => {
       if ((state.drafts.get(item.id) || (item.id === state.active && $('#chat-input').value)) && !window.confirm('Close this tab and discard its unsent draft? Provider history is preserved.')) return;
       await api(`/api/sessions/${encodeURIComponent(item.id)}/close`, {});
@@ -547,7 +547,7 @@ function render() {
   $('#send-message').title = action.reason || action.label;
   $('#composer-hint').textContent = action.reason || (action.kind === 'queue' ? 'Follow-ups stay with this objective. Admission is not delivery; paused work holds the queue.' : action.label === 'Send new objective' ? 'This starts a new objective after the previous task ended.' : '');
   $('#composer-hint').hidden = !$('#composer-hint').textContent;
-  $('#stop-session').hidden = !current || current.restored || !running(current.status);
+  $('#stop-session').hidden = !current || current.restored || !(running(current.status) || current.canStop);
   $('#pause-session').hidden = !current || current.restored || !running(current.status);
   const resumable = current && (['paused', 'disconnected'].includes(current.status) || current.status === 'idle' && current.supervision?.state === 'waiting' && current.messages?.some(message => message.role === 'user'));
   $('#resume-session').hidden = !!current?.restored || !resumable || !current.providerId;

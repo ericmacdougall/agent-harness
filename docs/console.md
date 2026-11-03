@@ -10,6 +10,11 @@ The optional [conversation launcher](tui-plugin.md) passes supplied context
 into a clearly labeled new session. It does not take over an existing desktop
 chat or claim to have imported history that the provider cannot return.
 
+The console blocks unsafe child resumes but does not dispatch replacement owners
+itself; a parent does that in its current context after reconciling the old
+writer. The Go model and tool engine is separate experimental work and is not
+part of this release.
+
 ## Sessions and work
 
 Use the top tabs to switch sessions or create a new one. Each session has its
@@ -128,6 +133,10 @@ value or tool configuration changes the runtime behind an existing Codex or
 Claude conversation, its next send is refused, including automatic
 continuations. Start a new context session to continue.
 
+A new installation defaults to full access with approvals set to never. Change
+the default permission mode in Settings before starting work if you want provider
+approvals.
+
 | Setting | Behavior and boundary |
 | --- | --- |
 | Provider profiles | Separate global, API-key, and supported managed sign-in profiles. Allowed profiles can be selected for new work. |
@@ -196,9 +205,12 @@ Closing a browser tab does not stop the server. Use **Quit console** and confirm
 the shutdown, or Ctrl-C in the process's terminal. Stopping a selected turn is
 different from shutting down the whole console. If cancellation lacks a native
 terminal confirmation, its outcome stays unresolved and its Stop control stays
-available. A tab cannot be closed, and its working directory cannot change, while
+available while the provider connection remains. A Pause sent before the provider
+has named the turn is applied when it does; if that interrupt fails, the session
+shows an error and Stop can retry it. A tab cannot be closed, and its working directory cannot change, while
 its last request is unresolved. This release has no action to discard an
-unresolved tab; it keeps its session slot until a later native final arrives.
+unresolved tab. Restored tabs are read-only and do not count toward the
+session limit, so old unresolved history cannot refuse new work.
 
 ## Verification
 

@@ -120,7 +120,7 @@ func (a *app) failedFreshAdmission(provider, cwd, profile string, selection *cas
 	current.Supervision.Reason = "No provider input was dispatched"
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if len(a.sessions) >= maxSessions {
+	if a.atSessionLimitLocked() {
 		return nil, errors.New("session limit reached; close an inactive tab")
 	}
 	a.sessions = append(a.sessions, current)

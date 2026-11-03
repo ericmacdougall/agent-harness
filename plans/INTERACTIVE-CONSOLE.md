@@ -2,7 +2,7 @@
 
 ## Outcome and location
 
-Build a real desktop-oriented chat console in the public repository as `console/`, an independent Go 1.22 module using only the standard library. A single `harness-console` executable embeds its HTML/CSS/JavaScript, opens a browser window, and uses locally installed Codex and Claude Code. The existing private operator and reference reader remain separate compatibility paths. Supplied references are visible context, never automatically submitted model instructions.
+Build a real desktop-oriented chat console in the public repository as `console/`, an independent Go 1.22 module using the standard library plus `golang.org/x/sys`. A single `harness-console` executable embeds its HTML/CSS/JavaScript, opens a browser window, and uses locally installed Codex and Claude Code. The existing private operator and reference reader remain separate compatibility paths. Supplied references are visible context, never automatically submitted model instructions.
 
 The user explicitly requested the session/chat/agent/worktree layout, then authorized building and deep verification. Main recorded that authorization. Independent plan review remains required before product code.
 

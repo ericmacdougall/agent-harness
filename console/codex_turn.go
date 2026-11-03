@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 )
 
 // This binding is owned by one correlated turn/start RPC, never by notifications.
@@ -18,6 +19,8 @@ type codexTurnBinding struct {
 	frameBytes    int
 	framesDropped bool
 	completed     map[string]bool
+	// A control arrived before the provider named the turn; interrupt it on bind.
+	interruptOnBind bool
 }
 type codexCompletion struct {
 	turnID  string
@@ -112,6 +115,9 @@ func (a *app) startCodexTurn(ctx context.Context, current *session, client *rpcC
 			return nil
 		}
 	}
+	if binding.interruptOnBind {
+		go a.interruptBoundTurn(current, client, requestID, binding.turnID)
+	}
 	current.requests[requestID] = "accepted"
 	a.inputOutcomeLocked(current, requestID, "retained", "Provider accepted; files retained for delayed consumers until explicit discard")
 	if current.requests[requestID] == "unknown" {
@@ -123,6 +129,23 @@ func (a *app) startCodexTurn(ctx context.Context, current *session, client *rpcC
 	}
 	a.changedLocked()
 	return err
+}
+
+const pauseUnconfirmedError = "Pause could not be confirmed; the provider turn may still be running. Use Stop to try again."
+
+func (a *app) interruptBoundTurn(current *session, client *rpcClient, requestID, turnID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := client.call(ctx, "turn/interrupt", map[string]any{"threadId": current.ProviderID, "turnId": turnID}, nil)
+	if err == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if current.lastRequest == requestID && oneOf(current.requests[requestID], "intent", "accepted") {
+		current.Error = pauseUnconfirmedError
+		a.changedLocked()
+	}
 }
 
 func (a *app) codexCompletionLocked(current *session, client *rpcClient, completion codexCompletion) {

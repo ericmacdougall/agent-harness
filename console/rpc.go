@@ -72,7 +72,13 @@ func startRPCWithAuthority(binary string, env []string, authAdmit inputAdmission
 		return nil, err
 	}
 	client := &rpcClient{pending: map[string]chan rpcPacket{}, input: input, command: command, done: make(chan struct{}), authAdmit: authAdmit, onEvent: onEvent, onRequest: onRequest, onClose: onClose}
-	go func() { client.read(output); err := command.Wait(); client.finish(err) }()
+	go func() {
+		client.read(output)
+		// Once its stream ends this provider cannot be supervised. Stop the whole
+		// group before Wait reaps the leader, so the group ID cannot have been reused.
+		terminateProcess(command)
+		client.finish(command.Wait())
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	params := map[string]any{"clientInfo": map[string]any{"name": "agent-harness-console", "version": version}, "capabilities": map[string]any{"experimentalApi": true}}
@@ -94,7 +100,6 @@ func (c *rpcClient) read(reader io.Reader) {
 		var packet rpcPacket
 		if err := json.Unmarshal(scanner.Bytes(), &packet); err != nil {
 			c.finish(errors.New("provider emitted malformed JSON"))
-			_ = c.command.Process.Kill()
 			return
 		}
 		if len(packet.ID) > 0 && packet.Method == "" {

@@ -302,6 +302,18 @@ func (a *app) findLocked(id string) *session {
 	}
 	return nil
 }
+
+// Restored tabs are read-only and an unresolved one cannot be closed, so counting
+// them would let old history refuse all new work.
+func (a *app) atSessionLimitLocked() bool {
+	live := 0
+	for _, s := range a.sessions {
+		if !s.Restored {
+			live++
+		}
+	}
+	return live >= maxSessions
+}
 func (a *app) state() map[string]any {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -309,7 +321,11 @@ func (a *app) state() map[string]any {
 	var sessions []map[string]any
 	_ = json.Unmarshal(b, &sessions)
 	for index, s := range sessions {
-		s["pendingInputs"] = a.inputStateLocked(a.sessions[index])
+		current := a.sessions[index]
+		s["pendingInputs"] = a.inputStateLocked(current)
+		unresolved := oneOf(current.requests[current.lastRequest], "intent", "accepted", "unknown")
+		s["unresolved"] = unresolved
+		s["canStop"] = unresolved && !current.Restored && (current.codex != nil || current.claude != nil)
 		a.cleanValue(s)
 	}
 	var ref *reference
