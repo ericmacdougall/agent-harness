@@ -7,6 +7,30 @@ import (
 	"path/filepath"
 )
 
+// Recovery promotion can change Reason before retiring the cleanup beforeimage.
+// Both pending candidates must independently authorize exactly the same cleanup:
+// compare all persisted identity, payload, outcome and snapshot-owner metadata,
+// ignoring only the explanatory Reason (and the non-persisted cwdInfo).
+func compatiblePendingCleanup(current, previous *queuedInput) bool {
+	if current.Status != "cleanup_pending" || previous.Status != "cleanup_pending" ||
+		current.RequestID != previous.RequestID || current.RequestHash != previous.RequestHash ||
+		current.TaskID != previous.TaskID || current.Generation != previous.Generation ||
+		current.RetentionOnly != previous.RetentionOnly || current.CleanupReason != previous.CleanupReason ||
+		current.Text != previous.Text || current.PayloadHash != previous.PayloadHash ||
+		current.QueuedAtInputRevision != previous.QueuedAtInputRevision || current.DeliveredInputRevision != previous.DeliveredInputRevision ||
+		current.CreatedAt != previous.CreatedAt || current.CWD != previous.CWD ||
+		current.PolicyRevision != previous.PolicyRevision || current.PolicyHash != previous.PolicyHash || current.RuntimeHash != previous.RuntimeHash ||
+		len(current.Snapshots) != len(previous.Snapshots) {
+		return false
+	}
+	for path, snapshot := range current.Snapshots {
+		if prior, ok := previous.Snapshots[path]; !ok || prior != snapshot {
+			return false
+		}
+	}
+	return true
+}
+
 // Merge only interrupted commits from this session. This never admits a provider
 // writer: all recovered payload is held/unknown and requires explicit user action.
 func mergeQueueCandidates(current, previous queueDisk) (queueDisk, error) {
@@ -29,13 +53,15 @@ func mergeQueueCandidates(current, previous queueDisk) (queueDisk, error) {
 		}
 	}
 	byID := map[string]*queuedInput{}
-	cleanupCompleted := map[string]bool{}
+	cleanupAuthorized := map[string]bool{}
 	order := []string{}
 	for candidateIndex, disk := range []queueDisk{previous, current} {
+		seen := map[string]bool{}
 		for _, entry := range disk.Entries {
-			if entry == nil || entry.RequestID == "" {
+			if entry == nil || entry.RequestID == "" || seen[entry.RequestID] {
 				return current, errors.New("invalid interrupted queue entry")
 			}
+			seen[entry.RequestID] = true
 			prior := byID[entry.RequestID]
 			if prior == nil {
 				copy := *entry
@@ -53,15 +79,20 @@ func mergeQueueCandidates(current, previous queueDisk) (queueDisk, error) {
 			if prior.Text != "" && entry.Text != "" && prior.Text != entry.Text {
 				return current, errors.New("conflicting queued payload; preserve state")
 			}
+			// Decide before merging payload or snapshot maps: a union of different
+			// owners must not acquire either candidate's cleanup authorization.
+			if candidateIndex == 1 && compatiblePendingCleanup(entry, prior) {
+				cleanupAuthorized[entry.RequestID] = true
+			}
 			if prior.Text == "" {
 				prior.Text = entry.Text
 			}
-			// Main discarded + beforeimage cleanup_pending is the one safe
+			// Main discarded + beforeimage cleanup_pending is also a safe
 			// interrupted-cleanup transition: unlink was authorized durably and
 			// may already be complete. Retain the pending owner so idempotent,
 			// confined cleanup can finish. The opposite direction remains unknown.
 			if candidateIndex == 1 && prior.Status == "cleanup_pending" && entry.Status == "discarded" && entry.Text == "" && len(entry.Snapshots) == 0 {
-				cleanupCompleted[entry.RequestID] = true
+				cleanupAuthorized[entry.RequestID] = true
 			}
 			for path, snapshot := range entry.Snapshots {
 				if old, ok := prior.Snapshots[path]; ok && old != snapshot {
@@ -80,7 +111,7 @@ func mergeQueueCandidates(current, previous queueDisk) (queueDisk, error) {
 	chosen.Entries = []*queuedInput{}
 	for _, id := range order {
 		entry := byID[id]
-		if cleanupCompleted[id] {
+		if cleanupAuthorized[id] {
 			entry.Status = "cleanup_pending"
 			entry.Reason = "Interrupted cleanup completion; resume idempotent private cleanup, never provider replay"
 		} else if entry.Text != "" || len(entry.Snapshots) > 0 || entry.Status != "discarded" {

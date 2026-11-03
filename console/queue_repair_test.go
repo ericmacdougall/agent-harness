@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -38,14 +40,21 @@ func TestQueueRepairInterruptedCleanupCompletionRestarts(t *testing.T) {
 	if !attachmentCleanupSupported() {
 		t.Skip("descriptor-confined cleanup unavailable on this platform")
 	}
-	for _, retentionOnly := range []bool{false, true} {
-		name := "queued_discard"
-		if retentionOnly {
-			name = "ordinary_finality"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		retentionOnly bool
+		interruptions int
+	}{
+		{"queued_discard", false, 0},
+		{"ordinary_finality", true, 0},
+		{"queued_discard_second_interruption", false, 1},
+		{"ordinary_finality_second_interruption", true, 1},
+		{"queued_discard_repeated_interruptions", false, 3},
+		{"ordinary_finality_repeated_interruptions", true, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			a, s := queueNativeFixture(t)
-			source := filepath.Join(s.CWD, name+".bin")
+			source := filepath.Join(s.CWD, tc.name+".bin")
 			if err := os.WriteFile(source, []byte("cleanup completion crash"), 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -55,7 +64,7 @@ func TestQueueRepairInterruptedCleanupCompletionRestarts(t *testing.T) {
 			request := "cleanup-queued"
 			var entry *queuedInput
 			var err error
-			if retentionOnly {
+			if tc.retentionOnly {
 				finishNativeQueueTurn(a, s)
 				s.Status = "idle"
 				s.task.State = "blocked"
@@ -72,7 +81,7 @@ func TestQueueRepairInterruptedCleanupCompletionRestarts(t *testing.T) {
 			}
 			snapshot := entry.Snapshots[source].Path
 			cleanupCompletionFault(t, a)
-			if retentionOnly {
+			if tc.retentionOnly {
 				finishNativeQueueTurn(a, s)
 			} else if err = a.discardInput(s.ID, request, false); err == nil {
 				t.Fatal("cleanup completion interruption reported success")
@@ -81,20 +90,281 @@ func TestQueueRepairInterruptedCleanupCompletionRestarts(t *testing.T) {
 				t.Fatal("fixture did not interrupt after snapshot unlink", statErr)
 			}
 			dir := a.dataDir
+			path := a.queuePath(s)
 			a.close()
+			current := readCleanupCandidate(t, path, request)
+			previous := readCleanupCandidate(t, path+".previous", request)
+			if current.Status != "discarded" || previous.Status != "cleanup_pending" || previous.Snapshots[source].Path != snapshot {
+				t.Fatal("first interruption did not preserve the completed-cleanup transition")
+			}
+			for i := 0; i < tc.interruptions; i++ {
+				interruptCleanupPromotion(t, dir)
+				current = readCleanupCandidate(t, path, request)
+				pending := readCleanupCandidate(t, path+".previous", request)
+				if current.Status != "cleanup_pending" || pending.Status != "cleanup_pending" || current.Reason == pending.Reason {
+					t.Fatal("promotion interruption did not leave distinct pending candidates")
+				}
+				if !reflect.DeepEqual(previous, pending) || !reflect.DeepEqual(current.Snapshots, pending.Snapshots) {
+					t.Fatal("promotion changed the retained beforeimage or snapshot owners")
+				}
+			}
 			restored, err := newApp(dir, nil)
 			if err != nil {
 				t.Fatal("restart could not reconcile completed cleanup", err)
 			}
-			defer restored.close()
+			t.Cleanup(restored.close)
 			recovered := queueEntry(restored.sessions[0], request)
 			if recovered == nil || recovered.Status != "discarded" || len(recovered.Snapshots) != 0 {
 				t.Fatalf("restart did not finish interrupted cleanup: %#v", recovered)
 			}
-			if restored.sessions[0].codex != nil {
+			restored.scheduleInputs(restored.sessions[0].ID)
+			if restored.sessions[0].codex != nil || restored.sessions[0].claude != nil || len(restored.clients) != 0 {
 				t.Fatal("cleanup recovery replayed provider work")
 			}
+			if data, readErr := os.ReadFile(source); readErr != nil || string(data) != "cleanup completion crash" {
+				t.Fatal("cleanup changed the original source", readErr)
+			}
+			if _, statErr := os.Stat(path + ".previous"); !os.IsNotExist(statErr) {
+				t.Fatal("successful recovery did not retire the beforeimage", statErr)
+			}
+			restored.close()
+			restarted, err := newApp(dir, nil)
+			if err != nil {
+				t.Fatal("completed cleanup was not restart-stable", err)
+			}
+			defer restarted.close()
+			if entry := queueEntry(restarted.sessions[0], request); entry == nil || entry.Status != "discarded" || len(entry.Snapshots) != 0 {
+				t.Fatalf("completed cleanup did not remain discarded: %#v", entry)
+			}
 		})
+	}
+}
+
+func readCleanupCandidate(t *testing.T, path, request string) *queuedInput {
+	t.Helper()
+	data, err := settingsRead(path, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var disk queueDisk
+	if err = settingsDecode(data, &disk); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range disk.Entries {
+		if entry.RequestID == request {
+			return entry
+		}
+	}
+	t.Fatal("cleanup candidate has no requested owner")
+	return nil
+}
+
+func interruptCleanupPromotion(t *testing.T, dir string) {
+	t.Helper()
+	journal, err := os.OpenFile(filepath.Join(dir, "sessions.jsonl"), os.O_RDWR|os.O_APPEND, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Use real journal and queue recovery with a deterministic fault at the main
+	// write boundary, before promotion can retire the original beforeimage.
+	recovery := &app{dataDir: dir, journal: journal, hub: newEventHub(), clients: map[string]*rpcClient{}, redact: func(text string) string { return text }}
+	defer recovery.close()
+	if err = recovery.restore(); err != nil {
+		t.Fatal(err)
+	}
+	writes := 0
+	recovery.writeInputs = func(path string, data []byte) error {
+		writes++
+		if err := settingsAtomicWrite(path, data); err != nil {
+			return err
+		}
+		return errSettingsDurability
+	}
+	if err = recovery.restoreInputs(); err == nil || writes != 1 || !strings.Contains(err.Error(), "could not be durably promoted") {
+		t.Fatal("interruption did not reach recovered-main replacement", err, writes)
+	}
+}
+
+func TestQueueRepairIncompatiblePendingCleanupCandidates(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		change  func(*queuedInput)
+		wantErr bool
+	}{
+		{"request", func(q *queuedInput) { q.RequestID = "other-request" }, false},
+		{"request_hash", func(q *queuedInput) { q.RequestHash = "other-request-hash" }, true},
+		{"task", func(q *queuedInput) { q.TaskID = "other-task" }, true},
+		{"generation", func(q *queuedInput) { q.Generation++ }, true},
+		{"payload", func(q *queuedInput) { q.Text = "still-live payload" }, false},
+		{"payload_hash", func(q *queuedInput) { q.PayloadHash = "other-payload" }, false},
+		{"retention", func(q *queuedInput) { q.RetentionOnly = true }, false},
+		{"outcome", func(q *queuedInput) { q.DeliveredInputRevision++ }, false},
+		{"cleanup_outcome", func(q *queuedInput) { q.CleanupReason = "different final outcome" }, false},
+		{"queued_revision", func(q *queuedInput) { q.QueuedAtInputRevision++ }, false},
+		{"created", func(q *queuedInput) { q.CreatedAt = "other-time" }, false},
+		{"cwd", func(q *queuedInput) { q.CWD = "/other" }, false},
+		{"policy_revision", func(q *queuedInput) { q.PolicyRevision = "other-revision" }, false},
+		{"policy_hash", func(q *queuedInput) { q.PolicyHash = "other-policy" }, false},
+		{"runtime", func(q *queuedInput) { q.RuntimeHash = "other-runtime" }, false},
+		{"missing_owner", func(q *queuedInput) { delete(q.Snapshots, "source") }, false},
+		{"different_owner", func(q *queuedInput) {
+			q.Snapshots["other-source"] = q.Snapshots["source"]
+			delete(q.Snapshots, "source")
+		}, false},
+		{"snapshot_identity", func(q *queuedInput) {
+			snapshot := q.Snapshots["source"]
+			snapshot.DirectoryIdentity = "other-directory"
+			q.Snapshots["source"] = snapshot
+		}, true},
+		{"snapshot_path", func(q *queuedInput) {
+			snapshot := q.Snapshots["source"]
+			snapshot.Path = "/private/other"
+			q.Snapshots["source"] = snapshot
+		}, true},
+		{"queued", func(q *queuedInput) { q.Status = "queued" }, false},
+		{"held", func(q *queuedInput) { q.Status = "held" }, false},
+		{"dispatching", func(q *queuedInput) { q.Status = "dispatching" }, false},
+		{"unknown", func(q *queuedInput) { q.Status = "unknown" }, false},
+		{"retained", func(q *queuedInput) { q.Status = "retained" }, false},
+	} {
+		for _, changePrevious := range []bool{false, true} {
+			slot := "/current"
+			if changePrevious {
+				slot = "/previous"
+			}
+			t.Run(tc.name+slot, func(t *testing.T) {
+				candidate := func() queueDisk {
+					return queueDisk{Schema: 1, SessionID: "session", TaskID: "task", Generation: 1, Entries: []*queuedInput{{
+						RequestID: "request", RequestHash: "request-hash", TaskID: "task", Generation: 1,
+						Status: "cleanup_pending", CleanupReason: "local discard", PayloadHash: "payload",
+						Snapshots: map[string]attachmentSnapshot{"source": {Path: "/private/snapshot", Hash: "bytes", Size: 1, DirectoryIdentity: "directory"}},
+					}}}
+				}
+				current, previous := candidate(), candidate()
+				current.Entries[0].Reason = "Recovered cleanup"
+				if changePrevious {
+					tc.change(previous.Entries[0])
+				} else {
+					tc.change(current.Entries[0])
+				}
+				merged, err := mergeQueueCandidates(current, previous)
+				if tc.wantErr {
+					if err == nil {
+						t.Fatal("conflicting candidates were not rejected")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(merged.Entries) == 0 {
+					t.Fatal("incompatible candidates lost their owners")
+				}
+				for _, entry := range merged.Entries {
+					if entry.Status != "unknown" {
+						t.Fatalf("incompatible candidates acquired authority: %#v", entry)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestQueueRepairIncompatiblePendingCleanupRestartPreservesSnapshots(t *testing.T) {
+	if !attachmentCleanupSupported() {
+		t.Skip("descriptor-confined cleanup unavailable on this platform")
+	}
+	for _, missingOwner := range []bool{false, true} {
+		name := "contradictory_outcome"
+		if missingOwner {
+			name = "different_owners"
+		}
+		t.Run(name, func(t *testing.T) {
+			a, s := queueNativeFixture(t)
+			source := filepath.Join(s.CWD, "preserved.bin")
+			if err := os.WriteFile(source, []byte("preserve incompatible ownership"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.selectAttachments(s.ID, []string{source}); err != nil {
+				t.Fatal(err)
+			}
+			entry, err := a.enqueueInput(s.ID, "incompatible-cleanup", "queued payload", []string{source})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot := entry.Snapshots[source]
+			a.attachmentCleanup = func(string, os.FileInfo, string, string) error {
+				return errors.New("injected failure before unlink")
+			}
+			if err = a.discardInput(s.ID, entry.RequestID, false); err == nil {
+				t.Fatal("cleanup did not stop before unlink")
+			}
+			path, dir := a.queuePath(s), a.dataDir
+			a.close()
+			data, err := settingsRead(path, 1<<20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var disk queueDisk
+			if err = settingsDecode(data, &disk); err != nil {
+				t.Fatal(err)
+			}
+			if err = settingsAtomicWrite(path+".previous", data); err != nil {
+				t.Fatal(err)
+			}
+			if missingOwner {
+				disk.Entries[0].Snapshots = nil
+			} else {
+				disk.Entries[0].DeliveredInputRevision++
+			}
+			data, err = json.Marshal(disk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = settingsAtomicWrite(path, data); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := newApp(dir, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restored.close()
+			recovered := queueEntry(restored.sessions[0], entry.RequestID)
+			if recovered == nil || recovered.Status != "unknown" || recovered.Snapshots[source] != snapshot {
+				t.Fatalf("incompatible cleanup lost quarantined ownership: %#v", recovered)
+			}
+			if data, readErr := os.ReadFile(snapshot.Path); readErr != nil || string(data) != "preserve incompatible ownership" {
+				t.Fatal("incompatible cleanup deleted retained bytes", readErr)
+			}
+			restored.scheduleInputs(restored.sessions[0].ID)
+			if restored.sessions[0].codex != nil || restored.sessions[0].claude != nil || len(restored.clients) != 0 {
+				t.Fatal("incompatible cleanup replayed provider work")
+			}
+		})
+	}
+}
+
+func TestQueueRepairDuplicateCandidatesCannotAuthorizeCleanup(t *testing.T) {
+	for _, duplicatePrevious := range []bool{false, true} {
+		for _, liveFirst := range []bool{false, true} {
+			pending := &queuedInput{RequestID: "request", TaskID: "task", Generation: 1, Status: "cleanup_pending"}
+			live := *pending
+			live.Status = "unknown"
+			current := queueDisk{SessionID: "session", TaskID: "task", Generation: 1, Entries: []*queuedInput{pending}}
+			previous := current
+			duplicates := []*queuedInput{pending, &live}
+			if liveFirst {
+				duplicates = []*queuedInput{&live, pending}
+			}
+			if duplicatePrevious {
+				previous.Entries = duplicates
+			} else {
+				current.Entries = duplicates
+			}
+			if _, err := mergeQueueCandidates(current, previous); err == nil {
+				t.Fatalf("duplicate request owners were merged into cleanup authority: previous=%v liveFirst=%v", duplicatePrevious, liveFirst)
+			}
+		}
 	}
 }
 
