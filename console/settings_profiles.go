@@ -209,23 +209,51 @@ func (s *settingsStore) runLogin(ctx context.Context, task *settingsLogin, p set
 			}
 		}
 	}
+	s.finishLogin(task, p, err)
+}
+
+func (s *settingsStore) finishLogin(task *settingsLogin, p settingsProfile, err error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	current, ok = s.profileLocked(p.ID)
+	current, ok := s.profileLocked(p.ID)
 	if !ok || current.Generation != task.Generation || task.State == "cancelled" {
 		task.State = "cancelled"
 		task.Reason = "Profile changed; any completed isolated provider login may require manual cleanup"
+		s.mu.Unlock()
 		return
 	}
 	task.CheckedAt = time.Now().UTC().Format(time.RFC3339)
 	if err != nil {
 		task.State = "failed"
 		task.Reason = "Official login did not complete; retry supported sign-in or inspect its browser window. Raw credential output was discarded."
-	} else {
-		task.State = "complete"
-		task.Reason = "Official login completed; entitlement and harness execution remain unverified"
+		task.cancel()
+		s.mu.Unlock()
+		return
 	}
+	// Do not publish completion until every authority inherited from the old
+	// authenticated context has been fenced. This applies even when the user
+	// signs into the same configured profile again.
+	task.State = "invalidating"
+	task.Reason = "Official login succeeded; revoking work inherited from the previous authenticated context"
 	task.cancel()
+	s.mu.Unlock()
+	if s.app == nil {
+		s.mu.Lock()
+		task.State = "failed"
+		task.Reason = "Official login succeeded but prior provider authority could not be invalidated; restart before using this profile"
+		s.mu.Unlock()
+		return
+	}
+	s.app.authenticatedProfileChanged(p.Provider, p.ID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok = s.profileLocked(p.ID)
+	if !ok || current.Generation != task.Generation || task.State == "cancelled" {
+		task.State = "cancelled"
+		task.Reason = "Profile changed; completed isolated provider login requires manual reconciliation"
+		return
+	}
+	task.State = "complete"
+	task.Reason = "Official login completed; prior provider sessions were quarantined and entitlement remains unverified"
 }
 
 var settingsLoginURL = regexp.MustCompile(`https://[^\s<>"']+`)

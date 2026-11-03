@@ -341,6 +341,82 @@ func (a *app) providerDisconnected(client *rpcClient, err error) {
 	}
 	a.changedLocked()
 }
+
+const authChangedReason = "Authenticated provider context changed. Prior parent and child capabilities are unverified; queued writes and controls were revoked. Reconcile possible in-flight effects before fresh dispatch."
+
+// authenticatedProfileChanged is a hard authority boundary. Advancing the
+// generation changes future runtime/cache identity; revoking live sources
+// prevents already-queued writes from crossing into the new login context.
+func (a *app) authenticatedProfileChanged(provider, profile string) {
+	a.advanceAuthGeneration(provider, profile)
+	if provider == "codex" {
+		a.mu.Lock()
+		clients := map[*rpcClient]bool{}
+		for key, client := range a.clients {
+			if strings.HasPrefix(key, "codex:"+profile+":") {
+				client.disconnected.Store(true)
+				clients[client] = true
+				delete(a.clients, key)
+			}
+		}
+		for _, current := range append(append([]*session{}, a.sessions...), a.reviews...) {
+			if current.Provider == provider && current.ProfileID == profile && current.codex != nil {
+				current.codex.disconnected.Store(true)
+				clients[current.codex] = true
+			}
+		}
+		a.mu.Unlock()
+		for client := range clients {
+			a.providerDisconnected(client, errors.New(authChangedReason))
+			go client.close()
+		}
+		return
+	}
+	if provider != "claude" {
+		return
+	}
+	a.mu.Lock()
+	runs := map[*claudeRun]bool{}
+	for _, current := range append(append([]*session{}, a.sessions...), a.reviews...) {
+		if current.Provider != provider || current.ProfileID != profile {
+			continue
+		}
+		if current.claude != nil {
+			runs[current.claude] = true
+			current.claude = nil
+		}
+		current.Restored = true
+		current.controlEpoch++
+		current.resumeRequested = false
+		a.holdInputsLocked(current, authChangedReason)
+		a.revokeQuestionsLocked(current, "")
+		if oneOf(current.requests[current.lastRequest], "intent", "accepted") {
+			current.requests[current.lastRequest] = "unknown"
+			current.providerFinal = false
+		}
+		for i := range current.Agents {
+			child := &current.Agents[i]
+			if !oneOf(child.Status, "completed", "failed", "interrupted") {
+				quarantineCodexChild(child)
+				child.ControlReason = authChangedReason + " " + nativeChildResumeReason
+			}
+		}
+		current.Status = "unknown"
+		current.Error = authChangedReason
+		current.Supervision.State = "paused"
+		current.Supervision.Reason = authChangedReason
+		if current.reviewParent != "" {
+			_ = a.record(current, current.lastRequest, "review_unknown")
+			a.syncReviewAgentLocked(current)
+			a.finishReviewLocked(current)
+		}
+	}
+	a.changedLocked()
+	a.mu.Unlock()
+	for run := range runs {
+		run.cancel()
+	}
+}
 func newUUID() string {
 	id := freshID()
 	return id[:8] + "-" + id[8:12] + "-4" + id[13:16] + "-8" + id[17:20] + "-" + id[20:]

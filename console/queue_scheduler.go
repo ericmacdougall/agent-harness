@@ -110,7 +110,7 @@ func (a *app) scheduleInputs(id string) {
 			return
 		}
 		if s.resumeRequested {
-			text = s.pendingReviewResult + "\nResume the authorized current objective from the last verified checkpoint. Reuse existing owners; obtain fresh applicable reviews before completion."
+			text = s.pendingReviewResult + "\nResume the authorized current objective from the last verified checkpoint. Treat lifecycle resumability as insufficient after any authentication, session, mode, model, network, browser, filesystem, or permission transition. Before reusing a child, run a bounded side-effect-free probe in that child's context for every required capability. If the probe is unavailable or fails, quarantine the child, preserve and reconcile its WAL/messages/branch/worktree/processes/receipts and possible in-flight effects, quiesce the old writer, then dispatch one fresh replacement in the current authenticated parent context with the same scope, branch, worktree, WAL handoff, and acceptance checks. Replacement is pending until those steps succeed; never replay an uncertain operation or create concurrent owners. Obtain fresh applicable reviews before completion."
 		} else if s.pendingReviewResult != "" {
 			if s.Supervision.RemainingBursts <= 0 {
 				s.Supervision.State = "waiting"
