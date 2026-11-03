@@ -12,7 +12,7 @@ Each field belongs to exactly one table.
 |---|---|
 | 2 Session lifecycle | `ID`, `Provider`, `ProviderID`, `ProfileID`, `CWD`, `ConversationStarted`, `RuntimeIdentity`, `Connected`, `ReadOnly`, `Closed`, `Hidden`, `Quarantine`, `Abandoned`, `Revision` |
 | 3 Receipt | `LastRequest`, `Requests`, `RequestOrder`, `ProviderFinal`, `FinalStatus`, `LastRefusal` |
-| 4 Turn and control | `TurnID`, `PendingInterrupt`, `Paused`, `PauseUnconfirmed`, `ControlEpoch` |
+| 4 Turn and control | `TurnID`, `PendingInterrupt`, `Paused`, `PauseUnconfirmed`, `ControlPending`, `ControlEpoch` |
 | 5 Late evidence | `Evidence` |
 
 `Revision` increases by one with every session fact on the session. A global fact does not change it. A fact not listed in a table changes nothing in that table. Read-only is never cleared: such a session can never send again, only stop, discard and close.
@@ -27,7 +27,7 @@ Each field belongs to exactly one table.
 | `ProviderConnected` | Writable | `Connected` true |
 | `ProviderDisconnected` | Writable | `Connected` false; rows in tables 3 and 4 |
 | `AuthBoundaryCrossed` | Writable | `ReadOnly` true, `Connected` false; rows in tables 3 and 4 |
-| `SessionQuarantined` | Session not closed, nonempty `ReasonCode` | `Quarantine` set, `ReadOnly` true, `Connected` false, `Hidden` false so it stays visible; table 4 row |
+| `SessionQuarantined` | Session not closed and not already quarantined, nonempty `ReasonCode` | `Quarantine` set, `ReadOnly` true, `Connected` false, `Hidden` false so it stays visible; table 4 row |
 | `Abandoned` | Not already abandoned, `RequestID` equals `LastRequest` | `Abandoned` set to `{RequestID, Reason, At}`, `ReadOnly` true, `Connected` false; rows in tables 3 and 4 |
 | `CwdChanged` | Writable, last receipt not unresolved | `CWD` set |
 | `SessionClosed` | Last receipt not unresolved and no quarantine, unless `Abandoned` is set | `Closed` true |
@@ -243,7 +243,7 @@ The event log keeps its last 50,000 facts (`Reserve`, out of `MaxFacts` 1,000,00
 
 ### Changes to the tables this needs
 
-- **Open session limit.** `create` refuses `session_limit` while 1,000 sessions are not closed (hidden ones count). The importer in K3 enforces the same limit before it commits, refusing an import that would exceed it. A log that already holds more opens normally, since replay applies no limit, and new sessions are refused until enough close; the proof then counts its actual open sessions, and K2 refuses to open a log whose open sessions exceed 1,000 times the reserve margin it can prove, which cannot happen through `Decide`.
+- **Open session limit.** `create` refuses `session_limit` while 1,000 sessions are not closed (hidden ones count). The importer in K3 enforces the same limit before it commits, refusing an import that would exceed it. A log holding more than 1,000 open sessions opens normally, and new sessions are refused until enough close. The event log refuses to open one holding more than 2,000, which `Decide` cannot produce: 2,000 × 11 × 2 + 1 = 44,001 is the most the reserve is shown to cover.
 - **Control pending.** New table 4 field `ControlPending`, in table 1's turn and control row: set by `ControlRequested`, cleared by `ControlOutcome`, `ProviderCompleted`, `ProviderRefused`, `RequestIntended` and restart. Table 7 `control-outcome`: when `ControlPending` is false, late `control_outcome`. Otherwise the existing closed-value and idempotence checks apply, then `ControlOutcome`. So an outcome needs a request, and alternating outcomes become sticky late evidence.
 - **Disconnect.** Table 7 `disconnected`: when not `Connected` and the last receipt is not open, idempotent with no fact. So each disconnect fact needs a connect or an open request since the last one.
 - **Quarantine.** Table 7 `quarantine`: already quarantined, idempotent with no fact. Table 2 and item 13 change to match: a session is quarantined once, and its first code stands. Replay's own quarantine is unchanged.
