@@ -104,7 +104,7 @@ func (a *app) runReviews(parent *session) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if parent.task != task || parent.controlEpoch != epoch || task.InputRevision != inputRevision || task.ObjectiveHash != objectiveDigest {
+	if parent.task != task || parent.controlEpoch != epoch || task.InputRevision != inputRevision || task.ObjectiveHash != objectiveDigest || task.State == "complete" {
 		return
 	}
 	task.reviewing = false

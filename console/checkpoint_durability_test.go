@@ -230,3 +230,82 @@ func TestCheckpointDurableDuplicateEntryPoints(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckpointFailedPassingReviewRevokesAuthority(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		name := "durable"
+		if fail {
+			name = "journal-refused"
+		}
+		t.Run(name, func(t *testing.T) {
+			a, s, input := checkpointFixture(t)
+			s.scheduled = true // Observe the review outcome before continuation.
+			s.task.passes["plan_review"] = "prior-plan-pass"
+			input.Stage = "final_review"
+			if err := a.checkpointUpdate(s.ID, input); err != nil {
+				t.Fatal(err)
+			}
+			a.runtime = func(string, string) (string, []string, error) { return "/synthetic/cli", nil, nil }
+			policy, err := defaultPolicy("codex", "", "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, fingerprint, err := a.resolveRuntime(policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &rpcClient{pending: map[string]chan rpcPacket{}, done: make(chan struct{})}
+			t.Cleanup(func() { close(client.done) })
+			client.input = replySink{reply: func(data []byte) {
+				var packet rpcPacket
+				_ = json.Unmarshal(data, &packet)
+				result := json.RawMessage(`{"thread":{"id":"passing-review"}}`)
+				if packet.Method == "turn/start" {
+					// Both frames precede the reply and must be correlated through
+					// the real binding path before runReviews can consume PASS.
+					verdict, _ := json.Marshal(reviewVerdict{TaskID: s.task.ID, Generation: s.task.Generation, InputRevision: s.task.InputRevision, ObjectiveHash: s.task.ObjectiveHash, Stage: input.Stage, Digest: s.task.Subject.Digest, Verdict: "PASS", Findings: []string{}})
+					frame, _ := json.Marshal(map[string]any{"threadId": "passing-review", "turnId": "review-turn", "item": map[string]any{"id": "verdict", "type": "agentMessage", "text": string(verdict)}})
+					a.codexEvent(client, "item/completed", frame)
+					a.codexEvent(client, "turn/completed", json.RawMessage(`{"threadId":"passing-review","turn":{"id":"review-turn","status":"completed"}}`))
+					result = json.RawMessage(`{"turn":{"id":"review-turn"}}`)
+				}
+				client.mu.Lock()
+				ch := client.pending[string(packet.ID)]
+				client.mu.Unlock()
+				if ch != nil {
+					ch <- rpcPacket{ID: packet.ID, Result: result}
+				}
+			}}
+			a.clients["codex::"+fingerprint] = client
+			if fail {
+				// Refuse only the parent's outcome record; reviewer native final
+				// receipts remain writable, so this is not a reviewer failure.
+				s.PolicyRevision = strings.Repeat("x", 60001)
+			}
+			epoch := s.controlEpoch
+			a.runReviews(s)
+			if len(a.reviews) != 1 || !a.reviews[0].providerFinal || s.task.attempts[attemptKey(s.task, input.Stage)] != 1 {
+				t.Fatal("control did not reach a native final and parsed passing verdict")
+			}
+			if !fail {
+				if s.task.passes["final_review"] != s.task.Subject.Digest || s.task.ReviewStatus != "passed" || s.pendingReviewResult == "" {
+					t.Fatal("durable review control did not publish PASS")
+				}
+				return
+			}
+			if len(s.task.passes) != 0 || s.task.State != "unknown" || s.task.ReviewStatus != "unknown" || s.task.reviewing || s.pendingReviewResult != "" || s.controlEpoch <= epoch {
+				t.Fatal("undurable passing review retained usable authority")
+			}
+			for _, message := range s.Messages {
+				if message.Role == "review" {
+					t.Error("undurable PASS was published")
+				}
+			}
+			s.PolicyRevision = "" // Restored storage cannot authorize replay.
+			input.State = "complete"
+			if a.checkpointUpdate(s.ID, input) == nil {
+				t.Fatal("undurable PASS authorized completion")
+			}
+		})
+	}
+}

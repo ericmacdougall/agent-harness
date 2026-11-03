@@ -13,6 +13,7 @@ type checkpointRecord struct {
 	Generation    uint64            `json:"generation"`
 	State         string            `json:"state"`
 	Stage         string            `json:"stage"`
+	ScopeHash     string            `json:"scopeHash,omitempty"`
 	Subject       reviewSubject     `json:"subject"`
 	ReviewStatus  string            `json:"reviewStatus"`
 	Attempts      map[string]int    `json:"attempts"`
@@ -27,7 +28,7 @@ func checkpointSnapshot(s *session) *checkpointRecord {
 	}
 	subject := t.Subject
 	subject.Files = nil
-	return &checkpointRecord{InputRevision: t.InputRevision, ObjectiveHash: t.ObjectiveHash, ID: t.ID, Generation: t.Generation, State: t.State, Stage: t.Stage, Subject: subject, ReviewStatus: t.ReviewStatus, Attempts: t.attempts, Passes: t.passes, Bursts: s.Supervision.RemainingBursts}
+	return &checkpointRecord{InputRevision: t.InputRevision, ObjectiveHash: t.ObjectiveHash, ID: t.ID, Generation: t.Generation, State: t.State, Stage: t.Stage, ScopeHash: objectiveHash(t.scope), Subject: subject, ReviewStatus: t.ReviewStatus, Attempts: t.attempts, Passes: t.passes, Bursts: s.Supervision.RemainingBursts}
 }
 func restoreCheckpoint(s *session, r journalRecord) {
 	checkpoint := r.Checkpoint

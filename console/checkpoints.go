@@ -68,6 +68,10 @@ func (a *app) checkpointUpdateGuarded(id string, input checkpointInput, guard fu
 		a.mu.Unlock()
 		return errors.New("prior review or checkpoint outcome is unknown; continue in a new session after reconciliation")
 	}
+	if task.State == "complete" && input.State != "complete" {
+		a.mu.Unlock()
+		return errors.New("completed task cannot be reopened by a checkpoint")
+	}
 	if len(input.Scope) > 2000 {
 		a.mu.Unlock()
 		return errors.New("scope exceeds checkpoint bound")
@@ -113,11 +117,24 @@ func (a *app) checkpointUpdateGuarded(id string, input checkpointInput, guard fu
 		return errors.New("prior review or checkpoint outcome became unknown during capture")
 	}
 	subject = bindSubject(subject, task)
+	// Completion may have committed while this caller captured its subject.
+	// Only an exact durable duplicate can succeed, without another write.
+	if task.State == "complete" {
+		if input.State == "complete" && task.Stage == input.Stage && task.Subject.Digest == subject.Digest && task.scope == input.Scope && task.passes["final_review"] == subject.Digest {
+			return nil
+		}
+		return errors.New("checkpoint does not match the durable completion")
+	}
 	if input.State == "complete" {
 		if task.passes["final_review"] != subject.Digest {
 			return errors.New("final review has not passed this exact subject")
 		}
 		task.State = "complete"
+		task.Stage = input.Stage
+		task.Subject = subject
+		task.scope = input.Scope
+		task.ReviewStatus = "passed"
+		task.reviewing = false
 		current.Supervision.State = "complete"
 		current.Supervision.Reason = "Independent final gate passed"
 		err := a.recordCheckpoint(current)
