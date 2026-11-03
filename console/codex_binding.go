@@ -88,9 +88,13 @@ func codexFrameTurn(raw json.RawMessage, completion bool) string {
 	}
 	return envelope
 }
+func ownsCodexSource(s *session, client *rpcClient) bool {
+	return s != nil && client != nil && !client.disconnected.Load() && !s.Restored && s.codex == client
+}
+
 func activeCodexBinding(s *session, client *rpcClient) *codexTurnBinding {
 	b := s.codexTurn
-	if b == nil || s.codex != client || b.client != client || b.requestID != s.lastRequest || !oneOf(s.requests[b.requestID], "intent", "accepted") {
+	if b == nil || !ownsCodexSource(s, client) || b.client != client || b.requestID != s.lastRequest || !oneOf(s.requests[b.requestID], "intent", "accepted") {
 		return nil
 	}
 	return b

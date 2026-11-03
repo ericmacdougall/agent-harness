@@ -17,11 +17,13 @@ func TestSettingsSecretFilterThroughCoreEventsHTTPAndJournal(t *testing.T) {
 	a.redact = s.redact
 	a.newRedactor = s.stream
 	current := emptySession("codex", a.dataDir, "global-codex")
+	client := &rpcClient{}
+	current.codex = client
 	current.ProviderID = "controlled-thread"
 	current.lastRequest = "sink-request"
 	current.turnID = "sink-turn"
 	current.requests[current.lastRequest] = "accepted"
-	current.codexTurn = &codexTurnBinding{requestID: current.lastRequest, turnID: current.turnID}
+	current.codexTurn = &codexTurnBinding{client: client, requestID: current.lastRequest, turnID: current.turnID}
 	a.sessions = []*session{current}
 	handler := a.handler("127.0.0.1:8011", "synthetic-bootstrap")
 	checkHTTP := func() {
@@ -37,7 +39,7 @@ func TestSettingsSecretFilterThroughCoreEventsHTTPAndJournal(t *testing.T) {
 		id := freshID()
 		emit := func(delta string) {
 			raw, _ := json.Marshal(map[string]any{"threadId": current.ProviderID, "turnId": current.turnID, "itemId": id, "delta": delta})
-			a.codexEvent(nil, "item/agentMessage/delta", raw)
+			a.codexEvent(client, "item/agentMessage/delta", raw)
 			checkHTTP()
 		}
 		emit("lead " + secret[:split])
@@ -52,13 +54,13 @@ func TestSettingsSecretFilterThroughCoreEventsHTTPAndJournal(t *testing.T) {
 			t.Fatal("raw provider message sink retained full secret")
 		}
 		complete, _ := json.Marshal(map[string]any{"threadId": current.ProviderID, "turnId": current.turnID, "item": map[string]any{"type": "agentMessage", "id": id, "text": "lead " + secret + " tail"}})
-		a.codexEvent(nil, "item/completed", complete)
+		a.codexEvent(client, "item/completed", complete)
 		checkHTTP()
 	}
 	tool, _ := json.Marshal(map[string]any{"threadId": current.ProviderID, "turnId": current.turnID, "item": map[string]any{"type": "mcpToolCall", "id": "tool-result", "result": map[string]string{"text": secret}}})
-	a.codexEvent(nil, "item/completed", tool)
+	a.codexEvent(client, "item/completed", tool)
 	errorFrame, _ := json.Marshal(map[string]any{"threadId": current.ProviderID, "turnId": current.turnID, "error": map[string]string{"message": secret}})
-	a.codexEvent(nil, "error", errorFrame)
+	a.codexEvent(client, "error", errorFrame)
 	if len(current.Messages) != len(secret) || current.Supervision.progress != 1 || current.Error == "" {
 		t.Fatal("bound redaction events were not exercised")
 	}

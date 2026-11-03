@@ -122,8 +122,14 @@ func (a *app) syncReviewAgentLocked(review *session) {
 				if parent.Agents[i].ID == review.ProviderID {
 					child := &parent.Agents[i]
 					child.Status = review.Status
-					child.CanStop = !review.providerFinal
+					child.CanStop = !review.providerFinal && !review.Restored
 					child.ControlReason = review.Error
+					if review.Restored {
+						child.CanPause, child.CanResume = false, false
+						if !review.providerFinal {
+							quarantineCodexChild(child)
+						}
+					}
 				}
 			}
 		}

@@ -71,7 +71,7 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 		}
 		a.mu.Lock()
 		current, _ := a.sessionForThreadLocked(parent)
-		if current != nil && current.codex == client && id != current.ProviderID {
+		if ownsCodexSource(current, client) && id != current.ProviderID {
 			exists := false
 			for _, child := range current.Agents {
 				if child.ID == id {
@@ -89,7 +89,7 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 	}
 	a.mu.Lock()
 	current, child := a.sessionForThreadLocked(thread)
-	if current == nil || current.codex != client {
+	if !ownsCodexSource(current, client) {
 		a.mu.Unlock()
 		return
 	}
@@ -142,6 +142,9 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 }
 
 func (a *app) applyCodexEventLocked(current *session, child *agent, client *rpcClient, method string, value map[string]any, thread string) {
+	if !ownsCodexSource(current, client) {
+		return
+	}
 	stamp := now()
 	if child != nil {
 		child.LastSeen = &stamp
@@ -230,6 +233,9 @@ func (a *app) applyCodexEventLocked(current *session, child *agent, client *rpcC
 }
 
 func (a *app) codexQuestion(client *rpcClient, packet rpcPacket) {
+	if client == nil || client.disconnected.Load() {
+		return
+	}
 	params := object(packet.Params)
 
 	if packet.Method == "currentTime/read" {
@@ -466,8 +472,9 @@ func (a *app) refreshAgents(current *session) {
 	a.mu.Lock()
 	client := current.codex
 	thread := current.ProviderID
+	owned := ownsCodexSource(current, client)
 	a.mu.Unlock()
-	if client == nil || thread == "" {
+	if !owned || thread == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -480,6 +487,9 @@ func (a *app) refreshAgents(current *session) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if !ownsCodexSource(current, client) {
+		return
+	}
 	for _, data := range result.Data {
 		id := textField(data, "id")
 		if id == "" {

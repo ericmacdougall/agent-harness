@@ -223,6 +223,8 @@ func TestCodexStaleCompletionCannotFinalizeCurrentRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	current := emptySession("codex", dir, "")
+	client := &rpcClient{}
+	current.codex = client
 	current.ProviderID = "codex-stale-completion-fixture"
 	current.Status = "running"
 	current.Supervision.State = "active"
@@ -231,13 +233,13 @@ func TestCodexStaleCompletionCannotFinalizeCurrentRequest(t *testing.T) {
 	current.requests["current-request"] = "accepted"
 	current.requestOrder = append(current.requestOrder, "prior-request", "current-request")
 	current.turnID = "current-turn"
-	current.codexTurn = &codexTurnBinding{requestID: current.lastRequest, turnID: current.turnID}
+	current.codexTurn = &codexTurnBinding{client: client, requestID: current.lastRequest, turnID: current.turnID}
 	if err = a.record(current, "current-request", "accepted"); err != nil {
 		t.Fatal(err)
 	}
 	a.sessions = append(a.sessions, current)
 
-	a.codexEvent(nil, "turn/completed", json.RawMessage(`{"threadId":"codex-stale-completion-fixture","turn":{"id":"prior-turn","status":"completed"}}`))
+	a.codexEvent(client, "turn/completed", json.RawMessage(`{"threadId":"codex-stale-completion-fixture","turn":{"id":"prior-turn","status":"completed"}}`))
 	if current.requests["current-request"] != "accepted" || current.turnID != "current-turn" || current.Status != "running" {
 		t.Fatalf("stale completion finalized current work: request=%q turn=%q status=%q", current.requests["current-request"], current.turnID, current.Status)
 	}

@@ -274,13 +274,7 @@ func (a *app) runIndependentReview(parent *session, task *trackedTask, step poli
 		}
 	}
 	status := current.Status
-	for i := range parent.Agents {
-		if parent.Agents[i].ID == current.ProviderID {
-			parent.Agents[i].Status = status
-			parent.Agents[i].CanStop = !current.providerFinal
-			parent.Agents[i].ControlReason = current.Error
-		}
-	}
+	a.syncReviewAgentLocked(current)
 	a.changedLocked()
 	a.mu.Unlock()
 	if status != "idle" {

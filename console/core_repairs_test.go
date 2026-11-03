@@ -326,14 +326,15 @@ func TestRepairOwnerResumeRefusesAcrossObservableContextChanges(t *testing.T) {
 }
 func TestRepairOwnerResumeDenialSurvivesLateEventAndRefresh(t *testing.T) {
 	a, parent, _ := checkpointFixture(t)
+	client := &rpcClient{pending: map[string]chan rpcPacket{}, done: make(chan struct{})}
+	parent.codex = client
 	parent.ProviderID = "parent-thread"
 	parent.Agents = append(parent.Agents, agent{ID: "owner-thread", Provider: "codex", Status: "running", CanPause: true, CanStop: true})
-	a.codexEvent(nil, "turn/completed", json.RawMessage(`{"threadId":"owner-thread","turn":{"id":"owner-turn","status":"interrupted"}}`))
+	a.codexEvent(client, "turn/completed", json.RawMessage(`{"threadId":"owner-thread","turn":{"id":"owner-turn","status":"interrupted"}}`))
 	owner := parent.Agents[0]
 	if owner.CanResume || !strings.Contains(owner.ControlReason, "fresh owner") || owner.Status != "interrupted" {
 		t.Fatal("late completion removed native resume denial", owner)
 	}
-	client := &rpcClient{pending: map[string]chan rpcPacket{}, done: make(chan struct{})}
 	calls := []map[string]any{}
 	client.input = replySink{reply: func(data []byte) {
 		var packet map[string]any
@@ -460,7 +461,9 @@ func TestRepairUnknownReviewerKeepsStopControl(t *testing.T) {
 }
 func TestRepairStopControlClosesOnlyAfterNativeFinal(t *testing.T) {
 	a, parent, _ := checkpointFixture(t)
+	client := &rpcClient{}
 	review := emptySession("codex", parent.CWD, "")
+	review.codex = client
 	review.ProviderID = "owned-review"
 	review.reviewParent = parent.ID
 	review.Status = "unknown"
@@ -468,7 +471,7 @@ func TestRepairStopControlClosesOnlyAfterNativeFinal(t *testing.T) {
 	review.lastRequest = "owned-request"
 	review.requests[review.lastRequest] = "accepted"
 	review.turnID = "owned-turn"
-	review.codexTurn = &codexTurnBinding{requestID: review.lastRequest, turnID: review.turnID}
+	review.codexTurn = &codexTurnBinding{client: client, requestID: review.lastRequest, turnID: review.turnID}
 	review.reviewDone = make(chan struct{})
 	a.reviews = append(a.reviews, review)
 	parent.Agents = append(parent.Agents, agent{ID: review.ProviderID, Provider: "codex", Role: "reviewer"})
@@ -478,7 +481,7 @@ func TestRepairStopControlClosesOnlyAfterNativeFinal(t *testing.T) {
 	if !parent.Agents[0].CanStop || parent.Agents[0].ControlReason == "" {
 		t.Fatal("unknown outcome lost visible stop/reconcile state")
 	}
-	a.codexEvent(nil, "turn/completed", json.RawMessage(`{"threadId":"owned-review","turn":{"id":"owned-turn","status":"interrupted"}}`))
+	a.codexEvent(client, "turn/completed", json.RawMessage(`{"threadId":"owned-review","turn":{"id":"owned-turn","status":"interrupted"}}`))
 	if !review.providerFinal || parent.Agents[0].CanStop {
 		t.Fatal("verified final outcome did not close stop control")
 	}

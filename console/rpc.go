@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,6 +30,8 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 type rpcClient struct {
+	disconnected atomic.Bool
+
 	runtimeHash string
 	mu          sync.Mutex
 	writeOnce   sync.Once
@@ -127,6 +130,9 @@ func (c *rpcClient) writeContext(ctx context.Context, value any) error {
 	return c.writeAdmitted(ctx, value, nil)
 }
 func (c *rpcClient) writeAdmitted(ctx context.Context, value any, admit inputAdmission) error {
+	if c.disconnected.Load() {
+		return refused("provider connection authority revoked")
+	}
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -137,7 +143,27 @@ func (c *rpcClient) writeAdmitted(ctx context.Context, value any, admit inputAdm
 		return errors.New("provider connection is closed")
 	default:
 	}
-	err = c.writer.writeAdmitted(ctx, append(data, '\n'), admit)
+	err = c.writer.writeAdmitted(ctx, append(data, '\n'), func() (func(), error) {
+		if c.disconnected.Load() {
+			return nil, refused("provider connection authority revoked")
+		}
+		var release func()
+		var err error
+		if admit != nil {
+			release, err = admit()
+			if err != nil {
+				return release, err
+			}
+		}
+		// Admission itself may have waited across a disconnect.
+		if c.disconnected.Load() {
+			if release != nil {
+				release()
+			}
+			return nil, refused("provider connection authority revoked")
+		}
+		return release, nil
+	})
 	if err != nil && !isDispatchRefused(err) {
 		go func() { c.finish(err); terminateProcess(c.command) }()
 	}

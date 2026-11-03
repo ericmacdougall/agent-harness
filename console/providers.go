@@ -112,7 +112,7 @@ func (a *app) codexClient(profile string, cwds ...string) (*rpcClient, error) {
 	a.mu.Lock()
 	existing := a.clients[key]
 	a.mu.Unlock()
-	if existing != nil {
+	if existing != nil && !existing.disconnected.Load() {
 		select {
 		case <-existing.done:
 		default:
@@ -271,10 +271,14 @@ func (a *app) providerDisconnected(client *rpcClient, err error) {
 	if client == nil {
 		return
 	}
+	// Revoke queued writes as well as callbacks. A retained pointer does not
+	// carry authority after this connection loses its inherited context.
+	client.disconnected.Store(true)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, current := range append(append([]*session{}, a.sessions...), a.reviews...) {
 		if current.codex == client {
+			current.codex = nil
 			current.Restored = true
 			current.controlEpoch++
 			current.resumeRequested = false
@@ -293,6 +297,20 @@ func (a *app) providerDisconnected(client *rpcClient, err error) {
 				current.codexTurn = nil
 			}
 			current.turnID = ""
+			for i := range current.Agents {
+				child := &current.Agents[i]
+				managed := false
+				for _, review := range a.reviews {
+					if review.reviewParent == current.ID && review.ProviderID == child.ID {
+						managed = true
+						break
+					}
+				}
+				// Managed reviewers have their own connection and finality.
+				if !managed && !oneOf(child.Status, "completed", "failed", "interrupted") {
+					quarantineCodexChild(child)
+				}
+			}
 			a.revokeQuestionsLocked(current, "")
 			current.Supervision.State = "paused"
 			current.Supervision.Reason = "Provider connection closed"
@@ -309,6 +327,7 @@ func (a *app) providerDisconnected(client *rpcClient, err error) {
 					current.Error = "Independent review disconnected; outcome unknown"
 					_ = a.record(current, current.lastRequest, "review_unknown")
 				}
+				a.syncReviewAgentLocked(current)
 				a.finishReviewLocked(current)
 				continue
 			}

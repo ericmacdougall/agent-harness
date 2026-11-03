@@ -8,6 +8,15 @@ import (
 
 const nativeChildResumeReason = "Direct child resume is unavailable without a verified child-context capability probe. Reconcile this owner's WAL, messages, branch/worktree, processes, and possible in-flight effects; confirm the old writer is quiescent; then dispatch one fresh owner in the current authenticated parent context. Replacement is pending and is not automatic."
 
+const disconnectedChildReason = "Provider connection closed; inherited child permissions are unverified. " + nativeChildResumeReason
+
+func quarantineCodexChild(child *agent) {
+	child.Status = "unknown"
+	child.turnID = ""
+	child.CanPause, child.CanResume, child.CanStop = false, false, false
+	child.ControlReason = disconnectedChildReason
+}
+
 func denyNativeChildResume(child *agent) {
 	child.CanResume = false
 	child.ControlReason = nativeChildResumeReason
@@ -39,6 +48,24 @@ func (a *app) controlAgent(parent *session, id, action string) error {
 		a.mu.Unlock()
 		return errors.New("agent is not owned by this session")
 	}
+	provider := selected.Provider
+	client := parent.codex
+	owner := parent
+	var review *session
+	for _, candidate := range a.reviews {
+		if candidate.reviewParent == parent.ID && candidate.ProviderID == id {
+			review = candidate
+			client = review.codex
+			owner = review
+			break
+		}
+	}
+	// A live parent cannot confer authority on a disconnected reviewer.
+	// Check before changing either the parent's queue or the child controls.
+	if provider != "claude" && !ownsCodexSource(owner, client) {
+		a.mu.Unlock()
+		return errors.New(disconnectedChildReason)
+	}
 	if action == "pause" || action == "stop" {
 		parent.controlEpoch++
 		parent.resumeRequested = false
@@ -46,16 +73,6 @@ func (a *app) controlAgent(parent *session, id, action string) error {
 		a.revokeQuestionsLocked(parent, id)
 		selected.Status = "paused"
 		a.changedLocked()
-	}
-	provider := selected.Provider
-	client := parent.codex
-	var review *session
-	for _, candidate := range a.reviews {
-		if candidate.reviewParent == parent.ID && candidate.ProviderID == id {
-			review = candidate
-			client = review.codex
-			break
-		}
 	}
 	if action == "resume" && review != nil {
 		a.mu.Unlock()
@@ -112,6 +129,9 @@ func (a *app) controlAgent(parent *session, id, action string) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if !ownsCodexSource(owner, client) {
+		return errors.New(disconnectedChildReason)
+	}
 	for i := range parent.Agents {
 		if parent.Agents[i].ID == id {
 			parent.Agents[i].Status = "paused"

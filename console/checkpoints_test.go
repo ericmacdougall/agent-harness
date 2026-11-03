@@ -74,7 +74,9 @@ func TestCheckpointSubjectDetectsEvidenceMutation(t *testing.T) {
 }
 func TestManagedReviewerEventsPreferActualReviewSession(t *testing.T) {
 	a, parent, _ := checkpointFixture(t)
+	client := &rpcClient{}
 	review := emptySession("codex", parent.CWD, "")
+	review.codex = client
 	review.ProviderID = "independent-review-thread"
 	review.reviewParent = parent.ID
 	review.reviewDone = make(chan struct{})
@@ -82,14 +84,14 @@ func TestManagedReviewerEventsPreferActualReviewSession(t *testing.T) {
 	review.lastRequest = "review-request"
 	review.requests[review.lastRequest] = "accepted"
 	review.turnID = "turn"
-	review.codexTurn = &codexTurnBinding{requestID: review.lastRequest, turnID: review.turnID}
+	review.codexTurn = &codexTurnBinding{client: client, requestID: review.lastRequest, turnID: review.turnID}
 	a.reviews = append(a.reviews, review)
 	parent.Agents = append(parent.Agents, agent{ID: review.ProviderID, Role: "reviewer"})
 	actual, child := a.sessionForThreadLocked(review.ProviderID)
 	if actual != review || child != nil {
 		t.Fatal("reviewer root routed into parent child slot")
 	}
-	a.codexEvent(nil, "turn/completed", []byte(`{"threadId":"independent-review-thread","turn":{"id":"turn","status":"completed"}}`))
+	a.codexEvent(client, "turn/completed", []byte(`{"threadId":"independent-review-thread","turn":{"id":"turn","status":"completed"}}`))
 	select {
 	case <-done:
 	default:
