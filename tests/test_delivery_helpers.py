@@ -999,6 +999,46 @@ class DeliveryHelpers(unittest.TestCase):
         cmd('git', 'update-ref', 'refs/heads/main', self.base, cwd=self.repo)
         cmd('git', 'reset', '-q', '--hard', self.feature_head, cwd=self.feature)
 
+    def test_pointer_only_in_unpublished_merge_or_root_is_refused(self):
+        # Both shapes escape a parent-free diff: an evil merge adds a pointer in
+        # neither parent, and an unrelated root commit has no parent to diff.
+        for case in ('two-parent merge', 'octopus merge', 'unrelated root'):
+            with self.subTest(case):
+                remote = self.lfs_remote()
+                sides = []
+                for index in range(1 if case == 'two-parent merge' else 2):
+                    side = f'side-{index}'
+                    cmd('git', 'branch', side, self.feature_head, cwd=self.repo)
+                    cmd('git', 'switch', '-q', side, cwd=self.feature)
+                    (self.feature / f'side{index}.txt').write_text(f'{index}\n')
+                    cmd('git', 'add', f'side{index}.txt', cwd=self.feature)
+                    cmd('git', 'commit', '-qm', side, cwd=self.feature)
+                    sides.append(side)
+                cmd('git', 'switch', '-q', 'feat/app', cwd=self.feature)
+                if case == 'unrelated root':
+                    cmd('git', 'switch', '-q', '--orphan', 'orphan', cwd=self.feature)
+                    (self.feature / 'asset.bin').write_text(self.POINTER)
+                    cmd('git', 'add', 'asset.bin', cwd=self.feature)
+                    cmd('git', 'commit', '-qm', 'unrelated root', cwd=self.feature)
+                    cmd('git', 'switch', '-q', 'feat/app', cwd=self.feature)
+                    # `-s ours` keeps the pointer out of every merge diff; only
+                    # the root commit's own diff contains it.
+                    cmd('git', 'merge', '-q', '-s', 'ours', '--allow-unrelated-histories', '--no-edit',
+                        'orphan', cwd=self.feature)
+                else:
+                    cmd('git', 'merge', '-q', '--no-commit', *sides, cwd=self.feature)
+                    (self.feature / 'asset.bin').write_text(self.POINTER)
+                    cmd('git', 'add', 'asset.bin', cwd=self.feature)
+                    cmd('git', 'commit', '-qm', f'evil {case}', cwd=self.feature)
+                    cmd('git', 'rm', '-q', 'asset.bin', cwd=self.feature)
+                    cmd('git', 'commit', '-qm', 'drop pointer from tip', cwd=self.feature)
+                result, data = self.publish_in_process()
+                self.assertEqual((result, data['status']), (2, 'BLOCKED_POLICY'), data)
+                self.assert_lfs_ref_absent(remote)
+                self.reset_publication_fixture(remote)
+                for name in [*sides, *(['orphan'] if case == 'unrelated root' else [])]:
+                    cmd('git', 'branch', '-D', name, cwd=self.repo)
+
     def test_local_tracking_ref_cannot_hide_unpublished_pointer(self):
         remote = self.lfs_remote()
         (self.feature / 'asset.bin').write_text(self.POINTER)

@@ -51,19 +51,21 @@ LFS_OBJECT_LIMIT = 300_000
 LFS_ENUMERATION_BYTE_LIMIT = 19_500_000  # 300,000 SHA-256 IDs plus newlines
 LFS_COMMIT_LIMIT = 100_000
 LFS_REF_LIMIT = 200_000
+LFS_REF_BYTE_LIMIT = 64_000_000  # streamed before parsing; refs are counted as they arrive
 LFS_DIFF_BYTE_LIMIT = 256_000_000  # raw diff records are streamed; paths are discarded
 OID = re.compile(rb'(?:[0-9a-f]{40}|[0-9a-f]{64})')
 BLOB_MODES = {b'100644', b'100755', b'120000'}
 
 
-def stream_records(repo, args, timeout, consume, *, separator, stdin_data=b'', byte_limit):
+def stream_records(repo, args, timeout, consume, *, separator, stdin_data=b'', byte_limit,
+                   settings=()):
     """Stream one Git command's records to `consume`; never buffer unbounded output.
 
     Input is staged in an unlinked temporary file, so Git cannot block writing
     output while this process blocks writing input.
     """
     command = ['git', '-C', str(repo), *args]
-    env = git_environment()
+    env = git_environment(settings=settings)
     deadline = time.monotonic() + timeout
     with tempfile.TemporaryFile() as source:
         source.write(stdin_data)
@@ -132,20 +134,27 @@ def published_tips(transport, git, remote, config, deadline):
     Only the destination's own advertisement is trusted. Local remote-tracking
     refs can be stale or rewritten, and excluding them could hide new pointers.
     """
-    listed = git(transport, 'ls-remote', '--refs', '--', remote, 'refs/heads/*', 'refs/tags/*',
-                 timeout=time_left(deadline), config_extra=config, text=False)
-    if listed.returncode:
-        raise ValueError('cannot list destination refs')
-    tips = set()
-    lines = listed.stdout.splitlines()
-    if len(lines) > LFS_REF_LIMIT:
-        raise ValueError('destination ref count exceeds LFS scan budget')
-    for line in lines:
+    tips, count = set(), [0]
+
+    def consume(line):
+        count[0] += 1
+        if count[0] > LFS_REF_LIMIT:
+            raise ValueError('destination ref count exceeds LFS scan budget')
         fields = line.split(b'\t')
         if len(fields) != 2 or not OID.fullmatch(fields[0]) or not fields[1].startswith(b'refs/'):
             raise ValueError('malformed destination ref listing')
         if fields[1].startswith((b'refs/heads/', b'refs/tags/')):
             tips.add(fields[0])
+    # Stream the destination advertisement so a huge or hostile listing is
+    # refused by count and bytes before it is buffered.
+    try:
+        stream_records(transport, ['ls-remote', '--refs', '--', remote, 'refs/heads/*', 'refs/tags/*'],
+                       time_left(deadline), consume, separator=b'\n',
+                       byte_limit=LFS_REF_BYTE_LIMIT, settings=config)
+    except ValueError as error:
+        if str(error) == 'Git could not enumerate unpublished history':
+            raise ValueError('cannot list destination refs') from None
+        raise
     if not tips:
         return []
     ordered = sorted(tips)
