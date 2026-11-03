@@ -1,0 +1,257 @@
+package core
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"unicode/utf8"
+)
+
+const (
+	CommandSchemaVersion = 1
+	MaxCommandBytes      = 64 << 10
+	maxCommandDepth      = 16
+	maxCommandMembers    = 64
+)
+
+type PrincipalClass string
+
+const (
+	PrincipalUser     PrincipalClass = "user"
+	PrincipalAgentRun PrincipalClass = "agent-run"
+	PrincipalObserver PrincipalClass = "observer"
+)
+
+type Principal struct {
+	Class      PrincipalClass
+	Subject    string
+	SessionID  string
+	Generation uint64
+}
+
+type CommandKind string
+
+const (
+	CommandCreate      CommandKind = "create"
+	CommandTransition  CommandKind = "transition"
+	CommandReserve     CommandKind = "reserve-budget"
+	CommandRelease     CommandKind = "release-budget"
+	CommandTerminalize CommandKind = "terminalize"
+	CommandDelete      CommandKind = "delete"
+)
+
+type Payload struct {
+	State    string `json:"state"`
+	Category string `json:"category"`
+	Amount   int64  `json:"amount"`
+}
+
+const (
+	BudgetCategoryModel  = "model"
+	BudgetCategoryTool   = "tool"
+	BudgetCategoryReview = "review"
+)
+
+type Command struct {
+	SchemaVersion    uint64      `json:"schema_version"`
+	ID               string      `json:"id"`
+	SessionID        string      `json:"session_id"`
+	Generation       uint64      `json:"generation"`
+	ExpectedRevision uint64      `json:"expected_revision"`
+	Kind             CommandKind `json:"kind"`
+	Payload          Payload     `json:"payload"`
+}
+
+var (
+	ErrMalformedCommand = errors.New("malformed command")
+	ErrForbidden        = errors.New("forbidden")
+)
+
+func DecodeCommand(raw []byte) (Command, []byte, string, error) {
+	var zero Command
+	if len(raw) == 0 || len(raw) > MaxCommandBytes || !utf8.Valid(raw) {
+		return zero, nil, "", ErrMalformedCommand
+	}
+	if err := validateJSON(raw); err != nil {
+		return zero, nil, "", fmt.Errorf("%w: %v", ErrMalformedCommand, err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var cmd Command
+	if err := dec.Decode(&cmd); err != nil {
+		return zero, nil, "", fmt.Errorf("%w: %v", ErrMalformedCommand, err)
+	}
+	if err := validateCommand(cmd); err != nil {
+		return zero, nil, "", fmt.Errorf("%w: %v", ErrMalformedCommand, err)
+	}
+	canonical, err := json.Marshal(cmd)
+	if err != nil {
+		return zero, nil, "", err
+	}
+	digest := sha256.Sum256(canonical)
+	return cmd, canonical, hex.EncodeToString(digest[:]), nil
+}
+
+func validateCommand(cmd Command) error {
+	if cmd.SchemaVersion != CommandSchemaVersion {
+		return errors.New("unsupported command schema")
+	}
+	if cmd.ID == "" || len(cmd.ID) > 128 || cmd.SessionID == "" || len(cmd.SessionID) > 128 {
+		return errors.New("invalid command identity")
+	}
+	if strings.TrimSpace(cmd.ID) != cmd.ID || strings.TrimSpace(cmd.SessionID) != cmd.SessionID {
+		return errors.New("non-canonical command identity")
+	}
+	switch cmd.Kind {
+	case CommandCreate, CommandTransition, CommandReserve, CommandRelease, CommandTerminalize, CommandDelete:
+	default:
+		return errors.New("unknown command kind")
+	}
+	if cmd.Payload.Amount < 0 || len(cmd.Payload.State) > 128 || len(cmd.Payload.Category) > 128 {
+		return errors.New("invalid payload")
+	}
+	return nil
+}
+
+func Authorize(p Principal, cmd Command) error {
+	if len(p.Subject) > 128 || len(p.SessionID) > 128 {
+		return ErrForbidden
+	}
+	switch p.Class {
+	case PrincipalUser:
+		return nil
+	case PrincipalAgentRun:
+		if cmd.Kind != CommandTransition || p.SessionID != cmd.SessionID || p.Generation != cmd.Generation || p.Subject == "" {
+			return ErrForbidden
+		}
+		return nil
+	case PrincipalObserver:
+		return ErrForbidden
+	default:
+		return ErrForbidden
+	}
+}
+
+func BindPrincipalDigest(canonical []byte, p Principal) (string, error) {
+	principalBytes, err := CanonicalPrincipal(p)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.New()
+	_, _ = digest.Write(canonical)
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write(principalBytes)
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func CanonicalPrincipal(p Principal) ([]byte, error) {
+	return json.Marshal(struct {
+		Class      PrincipalClass `json:"class"`
+		Subject    string         `json:"subject"`
+		SessionID  string         `json:"session_id"`
+		Generation uint64         `json:"generation"`
+	}{p.Class, p.Subject, p.SessionID, p.Generation})
+}
+
+func validateJSON(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	members := 0
+	if err := parseJSONValue(dec, 0, &members); err != nil {
+		return err
+	}
+	if tok, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing token %v", tok)
+		}
+		return err
+	}
+	return nil
+}
+
+func parseJSONValue(dec *json.Decoder, depth int, members *int) error {
+	if depth > maxCommandDepth {
+		return errors.New("maximum depth exceeded")
+	}
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := map[string]struct{}{}
+		folded := map[string]struct{}{}
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyTok.(string)
+			if !ok || !isASCIIKey(key) {
+				return errors.New("object keys must be exact lower-case strings")
+			}
+			lower := strings.ToLower(key)
+			if _, exists := seen[key]; exists {
+				return errors.New("duplicate object key")
+			}
+			if _, exists := folded[lower]; exists {
+				return errors.New("case-variant object key")
+			}
+			seen[key], folded[lower] = struct{}{}, struct{}{}
+			(*members)++
+			if *members > maxCommandMembers {
+				return errors.New("maximum members exceeded")
+			}
+			if err := parseJSONValue(dec, depth+1, members); err != nil {
+				return err
+			}
+		}
+		end, err := dec.Token()
+		if err != nil || end != json.Delim('}') {
+			return errors.New("unterminated object")
+		}
+	case '[':
+		for dec.More() {
+			if err := parseJSONValue(dec, depth+1, members); err != nil {
+				return err
+			}
+		}
+		end, err := dec.Token()
+		if err != nil || end != json.Delim(']') {
+			return errors.New("unterminated array")
+		}
+	default:
+		return errors.New("unexpected delimiter")
+	}
+	return nil
+}
+
+func isASCIIKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	for _, char := range []byte(key) {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func IsBudgetCategory(category string) bool {
+	switch category {
+	case BudgetCategoryModel, BudgetCategoryTool, BudgetCategoryReview:
+		return true
+	default:
+		return false
+	}
+}
