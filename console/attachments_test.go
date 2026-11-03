@@ -4,8 +4,38 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestAttachmentSelectionFailsBeforeSnapshotWhenCleanupUnsupported(t *testing.T) {
+	if attachmentCleanupSupported() {
+		t.Skip("platform provides descriptor-confined cleanup")
+	}
+	dataDir := t.TempDir()
+	a, err := newApp(dataDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.close()
+	cwd := t.TempDir()
+	s := emptySession("codex", cwd, "")
+	a.sessions = append(a.sessions, s)
+	source := filepath.Join(cwd, "unsupported.txt")
+	if err = os.WriteFile(source, []byte("must not be copied"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	err = a.selectAttachments(s.ID, []string{source})
+	if err == nil || !strings.Contains(err.Error(), "unsupported on this platform") {
+		t.Fatal("unsupported attachment selection did not fail clearly and early", err)
+	}
+	if len(s.Attachments) != 0 || len(s.attachmentSnapshots) != 0 {
+		t.Fatal("unsupported selection mutated composer attachment state")
+	}
+	if _, statErr := os.Stat(filepath.Join(dataDir, "attachments")); !os.IsNotExist(statErr) {
+		t.Fatal("unsupported selection created private snapshot storage")
+	}
+}
 
 func TestOrdinarySendAttachmentSurvivesNextComposerSelection(t *testing.T) {
 	if !attachmentCleanupSupported() {

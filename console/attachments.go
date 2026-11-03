@@ -27,6 +27,9 @@ func credentialFile(path string) bool {
 	return false
 }
 func (a *app) selectAttachments(id string, paths []string) error {
+	if len(paths) > 0 && !attachmentCleanupSupported() {
+		return errors.New("attachments are unsupported on this platform because confined cleanup is unavailable")
+	}
 	if err := a.validateAttachments(paths); err != nil {
 		return err
 	}
@@ -183,6 +186,9 @@ func (a *app) selectedAttachments(current *session, paths []string) ([]string, e
 }
 func (a *app) snapshotAttachment(path string) (attachmentSnapshot, error) {
 	result := attachmentSnapshot{}
+	if !attachmentCleanupSupported() {
+		return result, errors.New("attachments are unsupported on this platform because confined cleanup is unavailable")
+	}
 	canonical, err := filepath.EvalSymlinks(path)
 	if err != nil || filepath.Clean(canonical) != filepath.Clean(path) {
 		return result, errors.New("attachment path contains a redirect; select the real file")

@@ -39,7 +39,7 @@ The console journals metadata and send outcomes, not full prompts or credentials
 
 The file picker snapshots selected bytes into private files. Sending verifies those snapshots, so later edits to the original do not silently change an attachment. Known credential files and configured secrets are refused. Files remain subject to the provider's normal access permissions after submission.
 
-Automatic attachment cleanup uses descriptor-relative, no-follow deletion on macOS and Linux. Windows builds fail closed and retain `cleanup_pending` ownership because this release does not provide an equivalent confined deletion primitive there; attachment cleanup and native Windows qualification remain release limits.
+Automatic attachment cleanup uses descriptor-relative, no-follow deletion on macOS and Linux. Windows builds reject attachment selection before copying bytes or starting provider work because this release does not provide an equivalent confined deletion primitive there. Text-only chat remains available; attachment support and native Windows qualification are not claimed.
 
 Repository controls show the selected cwd, worktrees, branches and local tracking state. Sync uses guarded fetch/fast-forward/push. Remote failure preserves local work and reports failure. Removing a worktree requires exact-path confirmation and refuses dirty, locked, current-session or unpushed work. These controls do not run destructive force/reset/clean commands.
 
