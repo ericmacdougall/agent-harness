@@ -31,6 +31,29 @@ func compatiblePendingCleanup(current, previous *queuedInput) bool {
 	return true
 }
 
+// compatibleCompletedCleanup recognizes only the exact durable transition made
+// by finishAttachmentCleanupLocked. Every persisted identity, payload binding,
+// revision and policy field must survive unchanged. Only the cleanup state and
+// released snapshot owners may differ, and Reason must prove the same outcome.
+func compatibleCompletedCleanup(current, previous *queuedInput) bool {
+	if current.Status != "discarded" || previous.Status != "cleanup_pending" ||
+		len(previous.Snapshots) == 0 || len(current.Snapshots) != 0 ||
+		current.Text != "" || previous.Text != "" || current.CleanupReason != "" ||
+		current.RequestID != previous.RequestID || current.RequestHash != previous.RequestHash ||
+		current.TaskID != previous.TaskID || current.Generation != previous.Generation ||
+		current.RetentionOnly != previous.RetentionOnly || current.PayloadHash != previous.PayloadHash ||
+		current.QueuedAtInputRevision != previous.QueuedAtInputRevision || current.DeliveredInputRevision != previous.DeliveredInputRevision ||
+		current.CreatedAt != previous.CreatedAt || current.CWD != previous.CWD ||
+		current.PolicyRevision != previous.PolicyRevision || current.PolicyHash != previous.PolicyHash || current.RuntimeHash != previous.RuntimeHash {
+		return false
+	}
+	outcome := previous.CleanupReason
+	if outcome == "" {
+		outcome = "Private attachment ownership released"
+	}
+	return current.Reason == outcome
+}
+
 // Merge only interrupted commits from this session. This never admits a provider
 // writer: all recovered payload is held/unknown and requires explicit user action.
 func mergeQueueCandidates(current, previous queueDisk) (queueDisk, error) {
@@ -91,7 +114,7 @@ func mergeQueueCandidates(current, previous queueDisk) (queueDisk, error) {
 			// interrupted-cleanup transition: unlink was authorized durably and
 			// may already be complete. Retain the pending owner so idempotent,
 			// confined cleanup can finish. The opposite direction remains unknown.
-			if candidateIndex == 1 && prior.Status == "cleanup_pending" && entry.Status == "discarded" && entry.Text == "" && len(entry.Snapshots) == 0 {
+			if candidateIndex == 1 && compatibleCompletedCleanup(entry, prior) {
 				cleanupAuthorized[entry.RequestID] = true
 			}
 			for path, snapshot := range entry.Snapshots {

@@ -270,16 +270,99 @@ func TestQueueRepairIncompatiblePendingCleanupCandidates(t *testing.T) {
 	}
 }
 
+func TestQueueRepairIncompatibleCompletedCleanupCandidates(t *testing.T) {
+	basePending := func() *queuedInput {
+		return &queuedInput{
+			RetentionOnly: true, CleanupReason: "authorized outcome", RequestHash: "request-hash", RequestID: "request",
+			Status: "cleanup_pending", CreatedAt: "created", Reason: "pending", TaskID: "task", Generation: 2,
+			QueuedAtInputRevision: 3, DeliveredInputRevision: 4, CWD: "/cwd", PolicyRevision: "policy-revision",
+			PayloadHash: "payload", PolicyHash: "policy", RuntimeHash: "runtime",
+			Snapshots: map[string]attachmentSnapshot{"source": {Path: "/private/snapshot", Hash: "bytes", Size: 1, DirectoryIdentity: "directory"}},
+		}
+	}
+	baseDiscarded := func() *queuedInput {
+		entry := *basePending()
+		entry.Status = "discarded"
+		entry.Reason = entry.CleanupReason
+		entry.CleanupReason = ""
+		entry.Snapshots = nil
+		return &entry
+	}
+	changes := []struct {
+		name   string
+		change func(*queuedInput)
+	}{
+		{"retention", func(q *queuedInput) { q.RetentionOnly = false }},
+		{"queued_revision", func(q *queuedInput) { q.QueuedAtInputRevision++ }},
+		{"delivery_outcome", func(q *queuedInput) { q.DeliveredInputRevision++ }},
+		{"cleanup_outcome", func(q *queuedInput) {
+			if q.Status == "discarded" {
+				q.Reason = "contradictory outcome"
+			} else {
+				q.CleanupReason = "contradictory outcome"
+			}
+		}},
+		{"payload", func(q *queuedInput) { q.PayloadHash = "other-payload" }},
+		{"created", func(q *queuedInput) { q.CreatedAt = "other-created" }},
+		{"cwd", func(q *queuedInput) { q.CWD = "/other" }},
+		{"policy_revision", func(q *queuedInput) { q.PolicyRevision = "other-revision" }},
+		{"policy", func(q *queuedInput) { q.PolicyHash = "other-policy" }},
+		{"runtime", func(q *queuedInput) { q.RuntimeHash = "other-runtime" }},
+	}
+	for _, tc := range changes {
+		for _, mutatePending := range []bool{false, true} {
+			slot := "discarded"
+			if mutatePending {
+				slot = "pending"
+			}
+			t.Run(tc.name+"/"+slot, func(t *testing.T) {
+				pending, discarded := basePending(), baseDiscarded()
+				if mutatePending {
+					tc.change(pending)
+				} else {
+					tc.change(discarded)
+				}
+				current := queueDisk{SessionID: "session", TaskID: "task", Generation: 2, Entries: []*queuedInput{discarded}}
+				previous := queueDisk{SessionID: "session", TaskID: "task", Generation: 2, Entries: []*queuedInput{pending}}
+				merged, err := mergeQueueCandidates(current, previous)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(merged.Entries) != 1 || merged.Entries[0].Status != "unknown" || len(merged.Entries[0].Snapshots) != 1 {
+					t.Fatalf("incompatible completed cleanup gained unlink authority or lost ownership: %#v", merged.Entries)
+				}
+			})
+		}
+	}
+
+	t.Run("reversed_candidate_positions", func(t *testing.T) {
+		current := queueDisk{SessionID: "session", TaskID: "task", Generation: 2, Entries: []*queuedInput{basePending()}}
+		previous := queueDisk{SessionID: "session", TaskID: "task", Generation: 2, Entries: []*queuedInput{baseDiscarded()}}
+		merged, err := mergeQueueCandidates(current, previous)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(merged.Entries) != 1 || merged.Entries[0].Status != "unknown" || len(merged.Entries[0].Snapshots) != 1 {
+			t.Fatalf("reversed cleanup chronology gained unlink authority: %#v", merged.Entries)
+		}
+	})
+}
+
 func TestQueueRepairIncompatiblePendingCleanupRestartPreservesSnapshots(t *testing.T) {
 	if !attachmentCleanupSupported() {
 		t.Skip("descriptor-confined cleanup unavailable on this platform")
 	}
-	for _, missingOwner := range []bool{false, true} {
-		name := "contradictory_outcome"
-		if missingOwner {
-			name = "different_owners"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		mutatePrevious bool
+		change         func(*queuedInput)
+	}{
+		{"current_delivery_outcome", false, func(q *queuedInput) { q.DeliveredInputRevision++ }},
+		{"current_missing_owner", false, func(q *queuedInput) { q.Snapshots = nil }},
+		{"previous_retention", true, func(q *queuedInput) { q.RetentionOnly = !q.RetentionOnly }},
+		{"previous_runtime", true, func(q *queuedInput) { q.RuntimeHash = "contradictory-runtime" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			a, s := queueNativeFixture(t)
 			source := filepath.Join(s.CWD, "preserved.bin")
 			if err := os.WriteFile(source, []byte("preserve incompatible ownership"), 0600); err != nil {
@@ -309,13 +392,21 @@ func TestQueueRepairIncompatiblePendingCleanupRestartPreservesSnapshots(t *testi
 			if err = settingsDecode(data, &disk); err != nil {
 				t.Fatal(err)
 			}
-			if err = settingsAtomicWrite(path+".previous", data); err != nil {
+			var previous queueDisk
+			if err = settingsDecode(data, &previous); err != nil {
 				t.Fatal(err)
 			}
-			if missingOwner {
-				disk.Entries[0].Snapshots = nil
+			if tc.mutatePrevious {
+				tc.change(previous.Entries[0])
 			} else {
-				disk.Entries[0].DeliveredInputRevision++
+				tc.change(disk.Entries[0])
+			}
+			previousData, marshalErr := json.Marshal(previous)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			if err = settingsAtomicWrite(path+".previous", previousData); err != nil {
+				t.Fatal(err)
 			}
 			data, err = json.Marshal(disk)
 			if err != nil {
