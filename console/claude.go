@@ -310,14 +310,17 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 			partialID = ""
 		case "result":
 			requestID := run.requestID
-			if requestID == "" || requestID != current.lastRequest || !oneOf(current.requests[requestID], "intent", "accepted", "final") {
+			requestState := current.requests[requestID]
+			if requestState == "final" {
+				break
+			}
+			if requestID == "" || requestID != current.lastRequest || !oneOf(requestState, "intent", "accepted") {
 				current.Status = "unknown"
 				current.Error = "Claude returned a result without an exact active request binding. No request was replayed."
 				current.Supervision.State = "paused"
 				current.Supervision.Reason = current.Error
 				break
 			}
-			current.providerFinal = true
 			a.revokeQuestionsLocked(current, "")
 			current.Status = "idle"
 			if current.Supervision.State == "paused" {
@@ -345,7 +348,17 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 				}
 			}
 			current.requests[requestID] = "final"
-			_ = a.record(current, requestID, "final")
+			if err := a.record(current, requestID, "final"); err != nil {
+				current.providerFinal = false
+				current.requests[requestID] = "unknown"
+				current.Status = "unknown"
+				current.Error = "Claude completed but the final receipt could not be persisted. No request was replayed."
+				current.Supervision.State = "paused"
+				current.Supervision.Reason = current.Error
+				a.inputOutcomeLocked(current, requestID, "unknown", "Provider completed but final receipt durability is unknown; no replay")
+				break
+			}
+			current.providerFinal = true
 			a.inputOutcomeLocked(current, requestID, "retained", "Main turn final; files retained for possible owner/tool readers until explicit discard")
 			if current.queueUncertain {
 				current.Status = "unknown"

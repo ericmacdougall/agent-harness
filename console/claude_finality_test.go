@@ -88,6 +88,7 @@ func TestClaudeResultBeforeWriteAckRemainsFinalAcrossRestart(t *testing.T) {
 	if got := current.requests[requestID]; got != "final" {
 		t.Fatalf("terminal request downgraded after write acknowledgment: %q", got)
 	}
+	a.readClaude(current, run, bytes.NewBufferString(`{"type":"result","result":"duplicate bounded fixture complete"}`+"\n"))
 	a.close()
 
 	states := []string{}
@@ -203,5 +204,72 @@ func TestProviderErrorWithoutFinalRemainsUnknown(t *testing.T) {
 	a.unknownSend(current, "unresolved", errors.New("controlled missing provider outcome"))
 	if current.requests["unresolved"] != "unknown" || current.Status != "unknown" {
 		t.Fatalf("genuinely unresolved request was not preserved as unknown: %#v", current)
+	}
+}
+
+func TestCodexStaleCompletionCannotFinalizeCurrentRequest(t *testing.T) {
+	dir := t.TempDir()
+	a, err := newApp(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := emptySession("codex", dir, "")
+	current.ProviderID = "codex-stale-completion-fixture"
+	current.Status = "running"
+	current.Supervision.State = "active"
+	current.lastRequest = "current-request"
+	current.requests["prior-request"] = "final"
+	current.requests["current-request"] = "accepted"
+	current.requestOrder = append(current.requestOrder, "prior-request", "current-request")
+	current.turnID = "current-turn"
+	if err = a.record(current, "current-request", "accepted"); err != nil {
+		t.Fatal(err)
+	}
+	a.sessions = append(a.sessions, current)
+
+	a.codexEvent(nil, "turn/completed", json.RawMessage(`{"threadId":"codex-stale-completion-fixture","turn":{"id":"prior-turn","status":"completed"}}`))
+	if current.requests["current-request"] != "accepted" || current.turnID != "current-turn" || current.Status != "running" {
+		t.Fatalf("stale completion finalized current work: request=%q turn=%q status=%q", current.requests["current-request"], current.turnID, current.Status)
+	}
+	a.close()
+	restored, err := newApp(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.close()
+	if len(restored.sessions) != 1 || restored.sessions[0].Status != "unknown" {
+		t.Fatalf("unresolved current request did not restart without replay authority: %#v", restored.state())
+	}
+}
+
+func TestClaudeFinalJournalFailureStaysUnknownAndDoesNotAdvance(t *testing.T) {
+	a, err := newApp(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.close()
+	requestID := "undurable-claude-final"
+	current := emptySession("claude", t.TempDir(), "")
+	current.ProviderID = "claude-undurable-final-fixture"
+	current.Status = "running"
+	current.Supervision.State = "active"
+	current.lastRequest = requestID
+	current.requests[requestID] = "accepted"
+	current.requestOrder = append(current.requestOrder, requestID)
+	run := &claudeRun{input: &repairSink{}, done: make(chan struct{}), requestID: requestID}
+	current.claude = run
+	a.sessions = append(a.sessions, current)
+	if err = a.journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	a.readClaude(current, run, bytes.NewBufferString(`{"type":"result","result":"provider completed but receipt storage failed"}`+"\n"))
+	if current.requests[requestID] != "unknown" || current.Status != "unknown" || current.Supervision.State != "paused" || current.providerFinal {
+		t.Fatalf("undurable Claude final advertised completion: request=%q status=%q supervision=%q providerFinal=%v", current.requests[requestID], current.Status, current.Supervision.State, current.providerFinal)
+	}
+	revision := a.revision
+	time.Sleep(350 * time.Millisecond)
+	if a.revision != revision {
+		t.Fatal("undurable Claude final scheduled automatic advancement")
 	}
 }

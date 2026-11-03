@@ -160,20 +160,41 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 	case "thread/tokenUsage/updated":
 		current.Usage = mapField(value, "tokenUsage")
 	case "turn/completed":
-		if child == nil {
-			current.providerFinal = true
-		}
-		a.revokeQuestionsLocked(current, thread)
 		turn := mapField(value, "turn")
+		turnID := textField(turn, "id")
 		status := textField(turn, "status")
 		if child != nil {
+			a.revokeQuestionsLocked(current, thread)
 			child.Status = status
 			child.CanPause = false
 			child.CanStop = false
 			denyNativeChildResume(child)
 		} else {
+			requestID := current.lastRequest
+			requestState := current.requests[requestID]
+			if requestState == "final" {
+				break
+			}
+			if current.turnID != "" && turnID != current.turnID {
+				break
+			}
+			if requestID == "" || current.turnID == "" || turnID == "" || !oneOf(requestState, "intent", "accepted") {
+				current.providerFinal = false
+				current.Status = "unknown"
+				current.Error = "Codex returned a completion without the exact active turn binding. No request was replayed."
+				current.Supervision.State = "paused"
+				current.Supervision.Reason = current.Error
+				if requestID != "" && oneOf(requestState, "intent", "accepted") {
+					current.requests[requestID] = "unknown"
+					a.inputOutcomeLocked(current, requestID, "unknown", "Provider completion was not bound to the active turn; no replay")
+					_ = a.record(current, requestID, "unknown")
+				}
+				break
+			}
+			current.providerFinal = true
+			a.revokeQuestionsLocked(current, thread)
 			current.turnID = ""
-			current.requests[current.lastRequest] = "final"
+			current.requests[requestID] = "final"
 			current.Status = "idle"
 			if current.Supervision.State == "paused" {
 				current.Status = "paused"
@@ -189,11 +210,17 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 				current.Supervision.State = "paused"
 				current.Supervision.Reason = "User or provider interrupted this turn"
 			}
-			if err := a.record(current, current.lastRequest, "final"); err != nil {
+			if err := a.record(current, requestID, "final"); err != nil {
+				current.providerFinal = false
+				current.requests[requestID] = "unknown"
 				current.Status = "unknown"
 				current.Error = "Could not persist the final outcome"
+				current.Supervision.State = "paused"
+				current.Supervision.Reason = current.Error
+				a.inputOutcomeLocked(current, requestID, "unknown", "Provider completed but final receipt durability is unknown; no replay")
+				break
 			}
-			a.inputOutcomeLocked(current, current.lastRequest, "retained", "Main turn final; files retained for possible owner/tool readers until explicit discard")
+			a.inputOutcomeLocked(current, requestID, "retained", "Main turn final; files retained for possible owner/tool readers until explicit discard")
 			if current.queueUncertain {
 				current.Status = "unknown"
 				current.Supervision.State = "paused"

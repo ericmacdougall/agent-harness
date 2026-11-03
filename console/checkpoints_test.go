@@ -80,6 +80,8 @@ func TestManagedReviewerEventsPreferActualReviewSession(t *testing.T) {
 	review.reviewDone = make(chan struct{})
 	done := review.reviewDone
 	review.lastRequest = "review-request"
+	review.requests[review.lastRequest] = "accepted"
+	review.turnID = "turn"
 	a.reviews = append(a.reviews, review)
 	parent.Agents = append(parent.Agents, agent{ID: review.ProviderID, Role: "reviewer"})
 	actual, child := a.sessionForThreadLocked(review.ProviderID)

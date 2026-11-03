@@ -22,6 +22,8 @@ func TestRepairCancelledApprovalCannotWriteDecision(t *testing.T) {
 	s.codex = c
 	s.Status = "waiting"
 	s.turnID = "cancelled-turn"
+	s.lastRequest = "cancelled-request"
+	s.requests[s.lastRequest] = "accepted"
 	s.PendingQuestions = []question{{ID: "approval", method: "item/commandExecution/requestApproval", Choices: []string{"accept", "decline"}, ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339), rpcID: json.RawMessage(`17`)}}
 	a.codexEvent(c, "turn/completed", []byte(`{"threadId":"test-provider","turn":{"id":"cancelled-turn","status":"interrupted"}}`))
 	if err := a.answerQuestion(s.ID, "approval", "accept"); err == nil || sink.Len() != 0 || s.Status != "paused" {
@@ -457,6 +459,9 @@ func TestRepairStopControlClosesOnlyAfterNativeFinal(t *testing.T) {
 	review.reviewParent = parent.ID
 	review.Status = "unknown"
 	review.Error = "Interrupt unconfirmed"
+	review.lastRequest = "owned-request"
+	review.requests[review.lastRequest] = "accepted"
+	review.turnID = "owned-turn"
 	review.reviewDone = make(chan struct{})
 	a.reviews = append(a.reviews, review)
 	parent.Agents = append(parent.Agents, agent{ID: review.ProviderID, Provider: "codex", Role: "reviewer"})
