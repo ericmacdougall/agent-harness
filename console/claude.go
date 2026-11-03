@@ -193,14 +193,12 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 			if current.claude != run {
 				return
 			}
-			current.claude = nil
-			if current.lastRequest == run.requestID && (current.Status == "running" || current.Status == "waiting") {
-				current.Status = "unknown"
-				current.Error = "Claude ended before a final result. No request was replayed."
-				if err != nil {
-					current.Error = "Claude exited before a final result. Check authentication and process availability."
-				}
+			reason := "Claude ended before a final result. No request was replayed."
+			if err != nil {
+				reason = "Claude exited before a final result. Check authentication and process availability. No request was replayed."
 			}
+			a.claudeUnfinishedLocked(current, run, reason)
+			current.claude = nil
 			a.changedLocked()
 		}()
 	}
@@ -245,6 +243,25 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 	a.changedLocked()
 	return nil
 }
+
+// UI pause/stop is not a provider outcome. Only the exact unfinished request
+// loses authority here; a durable final or an already unknown request is sticky.
+func (a *app) claudeUnfinishedLocked(current *session, run *claudeRun, reason string) {
+	requestID := run.requestID
+	if current.claude != run || requestID == "" || current.lastRequest != requestID || !oneOf(current.requests[requestID], "intent", "accepted") {
+		return
+	}
+	current.requests[requestID] = "unknown"
+	current.providerFinal = false
+	current.Status = "unknown"
+	current.Error = reason
+	current.Supervision.State = "paused"
+	current.Supervision.Reason = reason
+	a.revokeQuestionsLocked(current, "")
+	a.inputOutcomeLocked(current, requestID, "unknown", "Claude ended without a durable final outcome; retain inputs and reconcile without replay")
+	_ = a.record(current, requestID, "unknown")
+}
+
 func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 65536), 2<<20)
@@ -256,6 +273,15 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 		if current.claude != run || run.requestID != "" && run.requestID != current.lastRequest {
 			a.mu.Unlock()
 			return
+		}
+		if oneOf(current.requests[run.requestID], "final", "unknown") {
+			a.mu.Unlock()
+			if kind == "control_request" {
+				// Drain terminal output without reopening waiting state. A denial
+				// releases a CLI still waiting for its permission response.
+				go run.write(map[string]any{"type": "control_response", "response": map[string]any{"subtype": "error", "request_id": textField(value, "request_id"), "error": "request is no longer active"}})
+			}
+			continue
 		}
 		switch kind {
 		case "system":
@@ -432,7 +458,10 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 		a.mu.Unlock()
 	}
 	if err := scanner.Err(); err != nil {
-		a.failSession(current, fmt.Errorf("Claude output stream exceeded its bound or failed"))
+		a.mu.Lock()
+		a.claudeUnfinishedLocked(current, run, "Claude output stream exceeded its bound or failed before a final result. No request was replayed.")
+		a.changedLocked()
+		a.mu.Unlock()
 		run.cancel()
 	}
 }

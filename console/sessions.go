@@ -383,7 +383,7 @@ func (a *app) control(sessionID, action, agentID string) error {
 			a.mu.Unlock()
 			return errors.New("no resumable task or unresolved review; continue in a new session")
 		}
-		if !current.providerFinal && current.Provider == "codex" {
+		if !current.providerFinal {
 			a.mu.Unlock()
 			return errors.New("prior native finality is unverified; reconcile before Resume")
 		}
@@ -421,6 +421,9 @@ func (a *app) control(sessionID, action, agentID string) error {
 	current.resumeRequested = false
 	a.holdInputsLocked(current, "User paused; explicit Resume required")
 	current.Status = "paused"
+	if provider == "claude" && current.requests[current.lastRequest] == "unknown" {
+		current.Status = "unknown"
+	}
 	a.revokeQuestionsLocked(current, "")
 	current.Supervision.State = "paused"
 	current.Supervision.Reason = "User " + action
@@ -432,12 +435,9 @@ func (a *app) control(sessionID, action, agentID string) error {
 		if run == nil {
 			return errors.New("no Claude turn is running")
 		}
-		a.mu.Lock()
-		current.Status = "paused"
-		current.PendingQuestions = []question{}
-		_ = a.record(current, current.lastRequest, "paused")
-		a.changedLocked()
-		a.mu.Unlock()
+		// Preserve the request receipt: pause is a UI control, not a final
+		// outcome. A restart before exit must still see intent/accepted as
+		// unknown; repeated controls must not mask unknown or final receipts.
 		run.cancel()
 		return nil
 	}

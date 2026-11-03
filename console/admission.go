@@ -96,7 +96,13 @@ func (a *app) questionAdmission(s *session, selected question) inputAdmission {
 			}
 		}
 		expiry, expiryErr := time.Parse(time.RFC3339, selected.ExpiresAt)
-		valid := expiryErr == nil && time.Now().Before(expiry) && (selected.client != nil || selected.run != nil) && selected.requestID != "" && index >= 0 && s.Status == "waiting" && s.controlEpoch == selected.epoch && selected.requestID == s.lastRequest && selected.generation == generation && selected.inputRevision == revision && selected.objectiveHash == hash && selected.turnID == turn && (selected.client == s.codex && selected.run == s.claude)
+		active := oneOf(s.requests[selected.requestID], "intent", "accepted")
+		if selected.run != nil {
+			active = active && selected.run.requestID == selected.requestID
+		}
+		// The queued writer checks authority here immediately before dispatch,
+		// under app.mu, rather than trusting the earlier UI answer selection.
+		valid := active && expiryErr == nil && time.Now().Before(expiry) && (selected.client != nil || selected.run != nil) && selected.requestID != "" && index >= 0 && s.Status == "waiting" && s.controlEpoch == selected.epoch && selected.requestID == s.lastRequest && selected.generation == generation && selected.inputRevision == revision && selected.objectiveHash == hash && selected.turnID == turn && (selected.client == s.codex && selected.run == s.claude)
 		if !valid {
 			a.mu.Unlock()
 			s.dispatchMu.Unlock()

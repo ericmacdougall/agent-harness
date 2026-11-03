@@ -66,6 +66,13 @@ back to a new conversation. This adds process startup overhead and relies on
 the CLI's conversation persistence and resume behavior. Late output from the
 retired process cannot finalize the next request. An unknown or final request
 cannot be reopened by a late acknowledgment, error, or duplicate completion.
+Pause and Stop cancel the Claude process but do not establish a final outcome.
+An exit or output-stream failure without a bound final result leaves the request
+unknown and retains its inputs for reconciliation, including across restart.
+Resume and automatic continuations require the prior durable final receipt;
+confirmed process exit alone cannot authorize replay. Post-terminal content is
+ignored and permission requests are denied without reopening the waiting state.
+Queued answers recheck the exact process and active request at write admission.
 
 ### Follow-up queue and review authority
 

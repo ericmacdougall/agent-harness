@@ -102,6 +102,13 @@ func (a *app) scheduleInputs(id string) {
 			a.mu.Unlock()
 			return
 		}
+		if !s.providerFinal {
+			s.Supervision.State = "waiting"
+			s.Supervision.Reason = "Prior native turn finality is not established; reconcile before continuation"
+			a.changedLocked()
+			a.mu.Unlock()
+			return
+		}
 		if s.resumeRequested {
 			text = s.pendingReviewResult + "\nResume the authorized current objective from the last verified checkpoint. Reuse existing owners; obtain fresh applicable reviews before completion."
 		} else if s.pendingReviewResult != "" {

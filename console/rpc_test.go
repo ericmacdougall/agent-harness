@@ -11,6 +11,10 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("HARNESS_CONSOLE_LIFECYCLE_FIXTURE") != "" {
+		claudeLifecycleProcess()
+		os.Exit(0)
+	}
 	if os.Getenv("HARNESS_CONSOLE_IDENTITY_FIXTURE") == "1" {
 		scan := bufio.NewScanner(os.Stdin)
 		for scan.Scan() {
