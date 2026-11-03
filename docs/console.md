@@ -73,6 +73,9 @@ Resume and automatic continuations require the prior durable final receipt;
 confirmed process exit alone cannot authorize replay. Post-terminal content is
 ignored and permission requests are denied without reopening the waiting state.
 Queued answers recheck the exact process and active request at write admission.
+An ordinary send also refuses to replace an unresolved Claude request, even
+when its tracked task is blocked or complete. Fresh requests and definite
+pre-execution refusals do not require a final receipt from a nonexistent turn.
 
 ### Follow-up queue and review authority
 

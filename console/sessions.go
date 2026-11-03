@@ -51,6 +51,10 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 		}
 		return errors.New("prior request outcome is unknown; it was not replayed")
 	}
+	if current.Provider == "claude" && oneOf(current.requests[current.lastRequest], "intent", "accepted", "unknown") {
+		a.mu.Unlock()
+		return errors.New("prior Claude request outcome is unresolved; reconcile before sending")
+	}
 	if current.Status == "running" || current.Status == "starting" || current.Status == "waiting" || current.Status == "unknown" {
 		a.mu.Unlock()
 		return errors.New("this session is busy or needs reconciliation")
@@ -106,6 +110,10 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 	if runtimeErr != nil {
 		a.mu.Unlock()
 		return runtimeErr
+	}
+	if current.Provider == "claude" && oneOf(current.requests[current.lastRequest], "intent", "accepted", "unknown") {
+		a.mu.Unlock()
+		return errors.New("prior Claude request outcome changed; reconcile before sending")
 	}
 	if policyErr != nil {
 		a.mu.Unlock()

@@ -241,6 +241,65 @@ func TestClaudeLifecycleResumeBeforeExitRequiresFinal(t *testing.T) {
 	}
 }
 
+func TestClaudeLifecycleOrdinarySendRequiresPriorOutcome(t *testing.T) {
+	for _, phase := range []string{"initial", "after-runtime"} {
+		for _, state := range []string{"intent", "accepted", "unknown"} {
+			t.Run(phase+"-"+state, func(t *testing.T) {
+				a, s, run, _ := lifecycleReaderSession(t)
+				// A stopped process with unresolved tool effects is still not a
+				// safe conversation to resume under a replacement user request.
+				close(run.done)
+				s.Status = "paused"
+				s.Supervision.State = "paused"
+				task := &trackedTask{ID: "blocked-task", State: "blocked", Generation: 1}
+				s.task = task
+				s.requests["active"] = state
+				if phase == "after-runtime" {
+					s.requests["active"] = "final"
+				}
+				calls := 0
+				a.runtime = func(string, string) (string, []string, error) {
+					calls++
+					a.mu.Lock()
+					s.requests["active"] = state
+					a.mu.Unlock()
+					return "/fixture/missing-claude", nil, nil
+				}
+				if err := a.send(s.ID, "replacement", "new ordinary objective", nil, false); err == nil {
+					t.Error("unresolved ordinary send accepted")
+				}
+				wantCalls := 0
+				if phase == "after-runtime" {
+					wantCalls = 1
+				}
+				if calls != wantCalls || s.lastRequest != "active" || len(s.requestOrder) != 0 || s.task != task {
+					t.Fatalf("ordinary send replaced unresolved authority: runtime=%d last=%s requests=%v sameTask=%v", calls, s.lastRequest, s.requestOrder, s.task == task)
+				}
+			})
+		}
+	}
+}
+
+func TestClaudeLifecycleOrdinarySendAllowsFreshFinalAndRejected(t *testing.T) {
+	for _, state := range []string{"fresh", "final", "rejected"} {
+		t.Run(state, func(t *testing.T) {
+			a, s, _, _ := lifecycleReaderSession(t)
+			s.Status = "paused"
+			s.task = &trackedTask{ID: "prior-task", State: "blocked", Generation: 1}
+			s.requests["active"] = state
+			if state == "fresh" {
+				s.lastRequest = ""
+			}
+			calls := 0
+			control := errors.New("positive control reached runtime")
+			a.runtime = func(string, string) (string, []string, error) { calls++; return "", nil, control }
+			if err := a.send(s.ID, "replacement", "new ordinary objective", nil, false); calls != 1 || !errors.Is(err, control) {
+				t.Fatal("valid ordinary request did not reach runtime", state, calls, err)
+			}
+		})
+	}
+}
+
 func TestClaudeLifecycleResultThenPermissionDoesNotStallQueue(t *testing.T) {
 	a, s, _, audit := lifecycleSession(t, "final-control")
 	gate := filepath.Join(t.TempDir(), "release-result")
