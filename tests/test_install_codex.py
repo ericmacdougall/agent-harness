@@ -21,6 +21,30 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(tomllib is not None, 'Codex installer requires Python 3.11+')
 class CodexInstallerTests(unittest.TestCase):
+    def test_dispatch_guidance_covers_daybreak_and_auth_replacement_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            install(home, apply=True)
+            installed = home / '.codex'
+            agents = (installed / 'AGENTS.md').read_text()
+            skill = (installed / 'skills' / 'agent-harness' / 'SKILL.md').read_text()
+            workflow = (installed / 'skills' / 'agent-harness' / 'references' / 'owner-workflow.md').read_text()
+            self.assertEqual((installed / 'skills' / 'agent-harness' / 'SKILL.md').read_bytes(),
+                             (SOURCE / 'skills' / 'agent-harness' / 'SKILL.md').read_bytes())
+            self.assertEqual((installed / 'skills' / 'agent-harness' / 'references' /
+                              'owner-workflow.md').read_bytes(),
+                             (SOURCE / 'skills' / 'agent-harness' / 'references' /
+                              'owner-workflow.md').read_bytes())
+        combined = '\n'.join((agents, skill, workflow))
+
+        for required in ('advertised Daybreak-compatible model', 'pre-dispatch',
+                         'does not rebind', 'post-start', 'quiesce',
+                         '`resumable=true`', 'side-effect-free probe', 'quarantine',
+                         'same scope, branch, worktree', 'reviewer must remain independent'):
+            self.assertIn(required, combined)
+        for forbidden in ('gpt-daybreak-blue-latest', 'account ID =', 'token ='):
+            self.assertNotIn(forbidden, combined)
+
     def test_inline_marker_text_is_preserved(self):
         original = 'Keep <!-- agent-harness-codex:start --> this example <!-- agent-harness-codex:end --> intact.\n'
         merged = merge_marked(original, 'Managed.')

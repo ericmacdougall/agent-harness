@@ -1,7 +1,7 @@
 {
   "name": "harness-tui",
-  "version": "0.1.1",
-  "description": "Open the local Go TUI with a private current-chat reference.",
+  "version": "0.2.0",
+  "description": "Open the local agent console with private current-chat context.",
   "author": {"name": "Agent Harness contributors"},
   "license": "MIT",
   "skills": "./skills/",

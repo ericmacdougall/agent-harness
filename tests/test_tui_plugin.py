@@ -118,6 +118,141 @@ class TuiPluginEntryTests(unittest.TestCase):
         config.chmod(0o600)
         return binary
 
+    def configured_console(self, folder, *, ready=True):
+        binary = self.configured(folder)
+        config = Path(folder) / '.agent-harness/tui-launcher.json'
+        config.write_text(json.dumps({'schema': 2, 'binary': str(binary), 'mode': 'console'}))
+        script = """import json,os,sys,threading
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler,HTTPServer
+arguments=sys.argv[1:]
+Path(os.environ['HOME'],'console-observation.json').write_text(json.dumps({'argv':arguments,'cwd':os.getcwd(),'env':dict(os.environ)}))
+class Handler(BaseHTTPRequestHandler):
+ def log_message(self,*args): pass
+ def do_GET(self):
+  self.send_response(200);self.send_header('X-Agent-Harness-Console','test-v1');self.end_headers();self.wfile.write(b'<html>Console</html>')
+  if self.path=='/quit':threading.Thread(target=self.server.shutdown).start()
+server=HTTPServer(('127.0.0.1',0),Handler)
+if READY:
+ path=Path(arguments[arguments.index('--ready-file')+1])
+ value={'status':'UI_READY','origin':'http://127.0.0.1:'+str(server.server_port),'pid':os.getpid(),'version':'test-v1'}
+ fd=os.open(path,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+ with os.fdopen(fd,'w') as output:json.dump(value,output)
+server.serve_forever()
+"""
+        binary.write_text('#!' + sys.executable + '\n' + script.replace('if READY:', 'if ' + repr(ready) + ':'))
+        return binary
+
+    def stop_console(self, opened):
+        import signal
+        import time
+        from urllib.request import ProxyHandler, build_opener
+        bundle = Path(opened['reference_file']).parent
+        ready = bundle / 'ready.json'
+        if ready.exists():
+            origin = json.loads(ready.read_text())['origin']
+            try:
+                with build_opener(ProxyHandler({})).open(origin + '/quit', timeout=2):
+                    pass
+            except OSError:
+                pass
+        else:
+            os.kill(opened['pid'], signal.SIGTERM)
+        deadline = time.monotonic() + 3
+        while not (bundle / 'process-exited.json').exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue((bundle / 'process-exited.json').exists())
+
+    def test_console_direct_launch_validates_readiness_and_cwd_without_terminal(self):
+        with tempfile.TemporaryDirectory(prefix="console ' $(touch NEVER) ") as folder:
+            with patch.dict(os.environ, {'HOME': folder, 'OPENAI_API_KEY': 'synthetic-sensitive'}):
+                self.configured_console(folder)
+                cwd = Path(folder) / "work ' $(touch NEVER)"
+                cwd.mkdir()
+                opened = launcher.open_reference(reference(session_id='foreign-current-chat'), cwd=str(cwd))
+                try:
+                    self.assertEqual(opened['status'], 'LAUNCH_REQUESTED', opened)
+                    self.assertEqual(opened['readiness'], 'UI_READY')
+                    seen = json.loads((Path(folder) / 'console-observation.json').read_text())
+                    self.assertEqual(seen['cwd'], str(cwd.resolve()))
+                    self.assertEqual(seen['argv'][:4], ['--reference-file', opened['reference_file'],
+                                                     '--reference-sha256', opened['sha256']])
+                    self.assertEqual(seen['argv'][4:6], ['--cwd', str(cwd.resolve())])
+                    self.assertNotIn('--session', seen['argv'])
+                    self.assertNotIn('synthetic-sensitive', json.dumps(seen))
+                    self.assertFalse((cwd / 'NEVER').exists())
+                    self.assertFalse((Path(opened['reference_file']).parent / 'open.command').exists())
+                    with self.assertRaises(FileExistsError):
+                        launcher.run_reference(opened['reference_id'], opened['sha256'])
+                finally:
+                    if 'pid' in opened:
+                        self.stop_console(opened)
+
+    def test_console_ready_file_binds_pid_origin_and_private_mode(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder).resolve()
+            directory.chmod(0o700)
+            ready = directory / 'ready.json'
+            base = {'status': 'UI_READY', 'origin': 'http://127.0.0.1:12345',
+                    'pid': 123, 'version': 'test-v1'}
+            for changes in ({'pid': 124}, {'origin': 'http://localhost:12345'},
+                            {'origin': 'https://example.com'}, {'pid': True},
+                            {'origin': 'http://127.0.0.1:65536'}):
+                ready.write_text(json.dumps({**base, **changes}))
+                ready.chmod(0o600)
+                fd = launcher.private_directory(directory)
+                try:
+                    with patch.object(launcher, 'build_opener') as connection:
+                        with self.assertRaises(ValueError):
+                            launcher.console_ready(fd, SimpleNamespace(pid=123))
+                        connection.assert_not_called()
+                finally:
+                    os.close(fd)
+            ready.write_text(json.dumps(base))
+            ready.chmod(0o644)
+            fd = launcher.private_directory(directory)
+            try:
+                with self.assertRaises(launcher.InvalidReference):
+                    launcher.console_ready(fd, SimpleNamespace(pid=123))
+            finally:
+                os.close(fd)
+
+    def test_console_missing_ready_is_unknown_without_second_spawn(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, HOME=folder):
+            self.configured_console(folder, ready=False)
+            with patch.object(launcher, 'READY_TIMEOUT', 0.2):
+                opened = launcher.open_reference(reference())
+            try:
+                self.assertEqual(opened['status'], 'UNKNOWN', opened)
+                self.assertIn('pid', opened)
+                self.assertTrue((Path(opened['reference_file']).parent / 'run-intent.json').exists())
+            finally:
+                if 'pid' in opened:
+                    self.stop_console(opened)
+
+    def test_invalid_working_directories_never_create_reference_or_child(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, HOME=folder):
+            self.configured_console(folder)
+            for value in ('relative', '/missing-console-directory', folder + '\n', 3):
+                with self.subTest(value=value), patch.object(launcher.subprocess, 'Popen') as child:
+                    with self.assertRaises((ValueError, OSError)):
+                        launcher.open_reference(reference(), cwd=value)
+                    child.assert_not_called()
+            self.assertFalse((Path(folder) / '.agent-harness/tui-references').exists())
+
+    def test_cwd_is_revalidated_before_reference_replay(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, HOME=folder):
+            self.configured_console(folder)
+            cwd = Path(folder) / 'removed'
+            cwd.mkdir()
+            prepared = launcher.prepare_reference(reference(), str(cwd))
+            cwd.rmdir()
+            with patch.object(launcher.subprocess, 'Popen') as child:
+                with self.assertRaises(OSError):
+                    launcher.run_reference(prepared['reference_id'], prepared['sha256'])
+                child.assert_not_called()
+
     def test_missing_config_retains_reference_without_open(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, HOME=folder):
             with patch.object(launcher.subprocess, 'run') as dispatch:
@@ -261,6 +396,15 @@ class TuiPluginEntryTests(unittest.TestCase):
         self.assertEqual(results[2], results[3])
         opened.assert_called_once()
 
+    def test_mcp_optional_cwd_passes_separately_from_reference(self):
+        init = {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}}
+        call = {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
+                'params': {'name': 'open_tui', 'arguments': {'reference': reference(), 'cwd': '/known/project'}}}
+        with patch.object(launcher, 'open_reference', return_value={'status': 'LAUNCH_REQUESTED'}) as opened:
+            self.assertFalse(self.rpc([init, call])[-1]['result']['isError'])
+        self.assertEqual(opened.call_args.kwargs, {'cwd': '/known/project'})
+        self.assertNotIn('cwd', opened.call_args.args[0])
+
     def test_mcp_no_init_and_notifications_never_launch(self):
         call = {'jsonrpc': '2.0', 'method': 'tools/call',
                 'params': {'name': 'open_tui', 'arguments': {'reference': reference()}}}
@@ -324,6 +468,32 @@ class TuiPluginInstallerTests(unittest.TestCase):
         binary.write_text('#!/bin/sh\nprintf "%s\\n" "--reference-only --reference-file --reference-sha256"\n')
         binary.chmod(0o700)
         return binary
+
+    def test_binary_help_does_not_receive_parent_provider_credentials(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            binary = home / 'console'
+            observed = home / 'help-env.json'
+            binary.write_text('#!' + sys.executable + '\nimport json,os\n'
+                              'open(' + repr(str(observed)) + ',"w").write(json.dumps({"sentinelPresent":os.environ.get("OPENAI_API_KEY")=="synthetic-help-sentinel"}))\n'
+                              'print("--reference-file --reference-sha256 --cwd --ready-file")\n')
+            binary.chmod(0o700)
+            with patch.dict(os.environ, OPENAI_API_KEY='synthetic-help-sentinel'):
+                self.assertEqual(install_tui_plugin.check_binary_contract(binary), 'console')
+            self.assertFalse(json.loads(observed.read_text())['sentinelPresent'])
+
+    def test_console_installer_accepts_direct_contract_and_saves_mode(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            binary = home / 'console'
+            binary.write_text('#!' + sys.executable + '\nimport sys\n'
+                              'if sys.argv[1:] == ["--help"]:\n'
+                              ' print("--reference-file --reference-sha256 --cwd --ready-file")\n'
+                              'else: sys.exit(2)\n')
+            binary.chmod(0o700)
+            install_tui_plugin.install(home, binary, True)
+            self.assertEqual(json.loads((home / '.agent-harness/tui-launcher.json').read_text()),
+                             {'schema': 2, 'binary': str(binary.resolve()), 'mode': 'console'})
 
     def test_preview_is_read_only(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -1,0 +1,58 @@
+name: Console
+
+on:
+  push:
+    paths:
+      - 'console/**'
+      - '.github/workflows/console.yml'
+  pull_request:
+    paths:
+      - 'console/**'
+      - '.github/workflows/console.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            binary: harness-console
+          - os: macos-latest
+            binary: harness-console
+          - os: windows-latest
+            binary: harness-console.exe
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: false
+      - name: Test browser composer
+        run: node --test web/composer.test.mjs
+      - name: Test
+        run: go test ./...
+      - name: Race
+        run: go test -race ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: go build -trimpath -o dist/${{ matrix.binary }} .
+      - name: Retain native executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-console-${{ runner.os }}-${{ runner.arch }}
+          path: console/dist/*
+          if-no-files-found: error

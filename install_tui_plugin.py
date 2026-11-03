@@ -29,15 +29,17 @@ HOST_NAME = 'com.agentharness.tui'
 EXTENSION_ID = 'gdpiohlkkniinkfhlbhcjoimlcnhnkgj'
 
 
-def check_binary_contract(binary: Path, *, timeout=5, limit=65536):
+def read_binary_help(binary: Path, arguments, *, timeout, limit):
     """Read a trusted executable's help with bounded memory, time and children.
 
     This checks its declared flags, not whether its implementation honors them.
     Actual offline UI testing remains a separate release check.
     """
-    process = subprocess.Popen([str(binary), 'tui', '--help'], stdin=subprocess.DEVNULL,
+    process = subprocess.Popen([str(binary), *arguments], stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               start_new_session=True)
+                               start_new_session=True,
+                               env={'HOME': str(Path.home()), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin',
+                                    'LANG': 'en_US.UTF-8'})
     reaped = False
     output = bytearray()
     deadline = time.monotonic() + timeout
@@ -68,10 +70,25 @@ def check_binary_contract(binary: Path, *, timeout=5, limit=65536):
             process.wait(timeout=2)
         process.stdout.close()
     help_text = output.decode('utf-8', errors='replace')
-    flags = ('reference-only', 'reference-file', 'reference-sha256')
-    if code not in {0, 2} or any(not re.search(r'(?<!\S)--?' + flag + r'(?=\s|$)', help_text)
-                               for flag in flags):
-        raise ValueError('TUI executable does not declare the required reference flags; update it before installing')
+    return code, help_text
+
+
+def check_binary_contract(binary: Path, *, timeout=5, limit=65536):
+    """Select a declared console or legacy contract within one shared budget."""
+    deadline = time.monotonic() + timeout
+    code, text = read_binary_help(binary, ['--help'], timeout=timeout, limit=limit)
+    def declares(flags):
+        return code in {0, 2} and all(re.search(r'(?<!\S)--?' + flag + r'(?=\s|$)', text)
+                                     for flag in flags)
+    if declares(('reference-file', 'reference-sha256', 'cwd', 'ready-file')):
+        return 'console'
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ValueError('TUI reference capability help exceeded its deadline')
+    code, text = read_binary_help(binary, ['tui', '--help'], timeout=remaining, limit=limit)
+    if declares(('reference-only', 'reference-file', 'reference-sha256')):
+        return 'legacy'
+    raise ValueError('Executable does not declare a supported reference launch contract')
 
 
 def native_directory(home: Path, browser: str, platform: str) -> Path:
@@ -108,7 +125,7 @@ def install(home: Path, binary: Path, apply: bool, *, browsers=(), claude_deskto
     if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.getuid()}
             or info.st_mode & 0o022 or not os.access(binary, os.X_OK)):
         raise ValueError('TUI binary must be a trusted executable regular file')
-    check_binary_contract(binary)
+    mode = check_binary_contract(binary)
     base = home / '.agent-harness'
     destination = base / 'tui-plugin' / 'plugin'
     launcher = destination / 'launcher.py'
@@ -136,7 +153,10 @@ def install(home: Path, binary: Path, apply: bool, *, browsers=(), claude_deskto
         '$schema': 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json',
         'mcpServers': {'harness-tui': {'type': 'stdio', **server}}}, indent=2) + '\n').encode()
     config_path = base / 'tui-launcher.json'
-    payloads[config_path] = (json.dumps({'schema': 1, 'binary': str(binary)}, indent=2) + '\n').encode()
+    config = {'schema': 1, 'binary': str(binary)}
+    if mode == 'console':
+        config = {'schema': 2, 'binary': str(binary), 'mode': 'console'}
+    payloads[config_path] = (json.dumps(config, indent=2) + '\n').encode()
     entry = base / 'tui-plugin' / 'native-host'
     script = '#!/bin/sh\nexec ' + ' '.join(shlex.quote(x) for x in [
         sys.executable, str(launcher), 'native-host']) + ' "$@"\n'
@@ -155,7 +175,7 @@ def install(home: Path, binary: Path, apply: bool, *, browsers=(), claude_deskto
         payloads[desktop_path] = b''  # Merge after taking a pinned snapshot.
     catalog = {'name': 'agent-harness-local', 'owner': {'name': 'Agent Harness contributors'},
                'plugins': [{'name': 'harness-tui', 'source': './plugin',
-                            'description': 'Open the local reference TUI', 'version': '0.1.1'}]}
+                            'description': 'Open the local interactive agent console', 'version': '0.2.0'}]}
     marketplace = base / 'tui-plugin'
     payloads[marketplace / '.claude-plugin' / 'marketplace.json'] = (json.dumps(catalog, indent=2) + '\n').encode()
     payloads[marketplace / '.agents' / 'plugins' / 'marketplace.json'] = (json.dumps(catalog, indent=2) + '\n').encode()
@@ -180,8 +200,12 @@ def install(home: Path, binary: Path, apply: bool, *, browsers=(), claude_deskto
         previous = originals[config_path]
         if previous:
             old = json.loads(previous[0])
-            if (not isinstance(old, dict) or set(old) != {'schema', 'binary'}
-                    or type(old['schema']) is not int or old['schema'] != 1):
+            known_legacy = (isinstance(old, dict) and set(old) == {'schema', 'binary'}
+                            and type(old.get('schema')) is int and old['schema'] == 1)
+            known_console = (isinstance(old, dict) and set(old) == {'schema', 'binary', 'mode'}
+                             and type(old.get('schema')) is int and old['schema'] == 2
+                             and old['mode'] == 'console')
+            if not (known_legacy or known_console):
                 raise ValueError('Existing TUI launcher config is not a known schema; preserve and resolve it')
         if desktop_path:
             old = originals[desktop_path]
@@ -243,7 +267,7 @@ def install(home: Path, binary: Path, apply: bool, *, browsers=(), claude_deskto
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, default=Path.home())
-    parser.add_argument('--binary', type=Path, required=True, help='Trusted Go executable supporting tui --reference-only')
+    parser.add_argument('--binary', type=Path, required=True, help='Trusted interactive harness-console executable or compatible legacy reference reader')
     parser.add_argument('--browser', action='append', choices=['chrome', 'chromium', 'edge'], default=[])
     parser.add_argument('--claude-desktop', action='store_true', help='Merge one local server into Claude Desktop config')
     parser.add_argument('--apply', action='store_true')

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Open a local Go TUI with a private, inert current-conversation reference.
+"""Open the local agent console with a private, inert current-conversation reference.
 
 The stdio/native transports receive supplied text, never arbitrary paths or
-commands. They expose no history discovery, network listener or background job.
+commands. They do not discover conversation history. The configured console
+starts its authenticated loopback interface through its normal entrypoint.
 """
 
 from __future__ import annotations
@@ -18,9 +19,12 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+from urllib.request import build_opener, HTTPRedirectHandler, ProxyHandler
 
 
 MAX_BYTES = 262144
@@ -34,10 +38,11 @@ REFERENCE_OPTIONAL = {'session_id', 'source_url'}
 UTC_PATTERN = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|\+00:00)\Z')
 HEX_ID = re.compile(r'[0-9a-f]{32}\Z')
 SHA = re.compile(r'[0-9a-f]{64}\Z')
+READY_TIMEOUT = 10
 
 
 def child_environment():
-    """Keep offline launches independent of inherited credentials/startup hooks."""
+    """Keep launches independent of inherited credentials and startup hooks."""
     term = os.environ.get('TERM', '')
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9+_.-]{0,63}', term):
         term = 'xterm-256color'
@@ -189,7 +194,21 @@ def read_private(directory: int, name: str, limit: int = MAX_BYTES) -> bytes:
         return data
 
 
-def prepare_reference(reference):
+def validate_cwd(value=None):
+    """Accept an existing directory, preserving no shell syntax or lazy paths."""
+    if value is None:
+        value = str(Path.cwd())
+    if (not isinstance(value, str) or not value or len(value) > 4096
+            or any(ord(char) < 32 for char in value) or not Path(value).is_absolute()):
+        raise InvalidReference('Working directory must be an absolute existing directory')
+    path = Path(value).resolve(strict=True)
+    if not path.is_dir():
+        raise InvalidReference('Working directory is not a directory')
+    return str(path)
+
+
+def prepare_reference(reference, cwd=None):
+    working_directory = validate_cwd(cwd)
     value = validate_reference(reference)
     for key, text in list(value.items()):
         if isinstance(text, str):
@@ -216,6 +235,7 @@ def prepare_reference(reference):
         fd = private_directory(bundle)
         try:
             write_private(fd, 'reference.json', encoded)
+            write_private(fd, 'launch.json', (json.dumps({'schema': 1, 'cwd': working_directory}) + '\n').encode())
         finally:
             os.close(fd)
     finally:
@@ -231,10 +251,14 @@ def load_config():
         value = decode_json(read_private(fd, 'tui-launcher.json', 16384))
     finally:
         os.close(fd)
-    if (not isinstance(value, dict) or set(value) != {'schema', 'binary'}
-            or type(value['schema']) is not int or value['schema'] != 1
-            or not isinstance(value['binary'], str) or not Path(value['binary']).is_absolute()):
-        raise InvalidReference('TUI launcher config requires schema 1 and one absolute binary path')
+    legacy = (isinstance(value, dict) and set(value) == {'schema', 'binary'}
+              and type(value.get('schema')) is int and value['schema'] == 1)
+    console = (isinstance(value, dict) and set(value) == {'schema', 'binary', 'mode'}
+               and type(value.get('schema')) is int and value['schema'] == 2
+               and value['mode'] == 'console')
+    if (not (legacy or console) or not isinstance(value['binary'], str)
+            or not Path(value['binary']).is_absolute()):
+        raise InvalidReference('Launcher config requires a supported mode and absolute binary path')
     binary = Path(value['binary'])
     info = binary.lstat()
     if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.getuid()}
@@ -243,11 +267,13 @@ def load_config():
     return value
 
 
-def open_reference(reference):
-    prepared = prepare_reference(reference)
+def open_reference(reference, cwd=None):
+    prepared = prepare_reference(reference, cwd)
     result = {**prepared, 'status': 'NOT_LAUNCHED'}
     try:
-        load_config()
+        config = load_config()
+        if config.get('mode') == 'console':
+            return launch_console(prepared, config)
         if sys.platform != 'darwin':
             result['reason'] = 'Automatic Terminal opening supports macOS; use the foreground command here'
             return result
@@ -276,10 +302,10 @@ def open_reference(reference):
     return result
 
 
-def run_reference(identifier: str, digest: str):
+def prepared_launch(identifier, digest, config):
+    """Bind argv to the private bytes and the working directory checked again."""
     if not HEX_ID.fullmatch(identifier) or not SHA.fullmatch(digest):
         raise InvalidReference('Invalid reference identifier or SHA-256')
-    config = load_config()
     bundle = private_root() / 'tui-references' / identifier
     fd = private_directory(bundle)
     try:
@@ -287,10 +313,105 @@ def run_reference(identifier: str, digest: str):
         if hashlib.sha256(data).hexdigest() != digest:
             raise InvalidReference('Reference content no longer matches its launch digest')
         read_reference(data)
+        try:
+            metadata = decode_json(read_private(fd, 'launch.json', 8192))
+        except FileNotFoundError:
+            metadata = {'schema': 1, 'cwd': str(Path.home())}
+        if (not isinstance(metadata, dict) or set(metadata) != {'schema', 'cwd'}
+                or type(metadata['schema']) is not int or metadata['schema'] != 1):
+            raise InvalidReference('Invalid private launch metadata')
+        cwd = validate_cwd(metadata['cwd'])
+        common = ['--reference-file', str(bundle / 'reference.json'), '--reference-sha256', digest]
+        if config.get('mode') == 'console':
+            argv = [config['binary'], *common, '--cwd', cwd, '--ready-file', str(bundle / 'ready.json')]
+        else:
+            argv = [config['binary'], 'tui', '--reference-only', *common]
+        return bundle, fd, argv, cwd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def record_exit(process, bundle):
+    code = process.wait()
+    try:
+        fd = private_directory(bundle)
+        try:
+            write_private(fd, 'process-exited.json',
+                          (json.dumps({'status': 'PROCESS_EXITED', 'exit_code': code}) + '\n').encode())
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        pass  # A removed/changed private bundle cannot receive a new exit record.
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        return None
+
+
+def console_ready(fd, process):
+    try:
+        ready = decode_json(read_private(fd, 'ready.json', 4096))
+    except FileNotFoundError:
+        return False
+    if (not isinstance(ready, dict) or set(ready) != {'status', 'origin', 'pid', 'version'}
+            or ready['status'] != 'UI_READY' or type(ready['pid']) is not int
+            or ready['pid'] != process.pid or not isinstance(ready['version'], str)):
+        raise InvalidReference('Console readiness file is invalid')
+    origin = ready['origin']
+    if not isinstance(origin, str) or not re.fullmatch(r'http://127\.0\.0\.1:[1-9][0-9]{0,4}', origin):
+        raise InvalidReference('Console readiness origin is not a loopback listener')
+    if not 1 <= int(urlsplit(origin).port) <= 65535:
+        raise InvalidReference('Console readiness port is invalid')
+    with build_opener(ProxyHandler({}), NoRedirect()).open(origin + '/', timeout=1) as response:
+        return response.status == 200 and response.headers.get('X-Agent-Harness-Console') == ready['version']
+
+
+def launch_console(prepared, config):
+    result = {**prepared, 'status': 'NOT_LAUNCHED'}
+    bundle, fd, argv, cwd = prepared_launch(prepared['reference_id'], prepared['sha256'], config)
+    process = None
+    try:
         write_private(fd, 'run-intent.json', b'{"status":"PROCESS_START_REQUESTED"}\n')
-        argv = [config['binary'], 'tui', '--reference-only', '--reference-file',
-                str(bundle / 'reference.json'), '--reference-sha256', digest]
-        process = subprocess.Popen(argv, env=child_environment())
+        process = subprocess.Popen(argv, cwd=cwd, env=child_environment(),
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True)
+        write_private(fd, 'process-started.json',
+                      (json.dumps({'status': 'PROCESS_STARTED', 'pid': process.pid}) + '\n').encode())
+        threading.Thread(target=record_exit, args=(process, bundle), daemon=True).start()
+        result['pid'] = process.pid
+        deadline = time.monotonic() + READY_TIMEOUT
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                result.update(status='DISPATCH_FAILED', reason='Console exited before readiness was established')
+                return result
+            try:
+                if console_ready(fd, process):
+                    result.update(status='LAUNCH_REQUESTED', readiness='UI_READY',
+                                  note='Console HTTP interface is ready; browser display is not confirmed')
+                    return result
+            except OSError:
+                pass  # Listener setup can race the first readiness probe.
+            time.sleep(0.05)
+        result.update(status='UNKNOWN', reason='Console readiness timed out; inspect this process before retrying')
+        return result
+    except (OSError, ValueError):
+        if process is None:
+            raise
+        result.update(status='UNKNOWN', pid=process.pid,
+                      reason='Console started but readiness could not be validated; inspect before retrying')
+        return result
+    finally:
+        os.close(fd)
+
+
+def run_reference(identifier: str, digest: str):
+    config = load_config()
+    bundle, fd, argv, cwd = prepared_launch(identifier, digest, config)
+    try:
+        write_private(fd, 'run-intent.json', b'{"status":"PROCESS_START_REQUESTED"}\n')
+        process = subprocess.Popen(argv, env=child_environment(), cwd=cwd)
         write_private(fd, 'process-started.json',
                       (json.dumps({'status': 'PROCESS_STARTED', 'pid': process.pid}) + '\n').encode())
         code = process.wait()
@@ -325,10 +446,11 @@ def native_host(origin: str, incoming, outgoing):
         chunks.append(chunk)
         remaining -= len(chunk)
     value = decode_json(b''.join(chunks))
-    if (not isinstance(value, dict) or set(value) != {'action', 'reference'}
+    if (not isinstance(value, dict) or not {'action', 'reference'} <= value.keys()
+            or value.keys() - {'action', 'reference', 'cwd'}
             or value['action'] != 'open_tui'):
         raise InvalidReference('Unsupported native message shape or action')
-    result = open_reference(validate_reference(value['reference']))
+    result = open_reference(validate_reference(value['reference']), **({'cwd': value['cwd']} if 'cwd' in value else {}))
     encoded = json.dumps(result, separators=(',', ':')).encode('utf-8')
     outgoing.write(struct.pack('<I', len(encoded)) + encoded)
     outgoing.flush()
@@ -337,7 +459,9 @@ def native_host(origin: str, incoming, outgoing):
 def tool_schema():
     string = lambda maximum: {'type': 'string', 'maxLength': maximum}
     return {'type': 'object', 'additionalProperties': False, 'required': ['reference'],
-            'properties': {'reference': {'type': 'object', 'additionalProperties': False,
+            'properties': {'cwd': {'type': 'string', 'maxLength': 4096,
+                'description': 'Optional existing absolute working directory for the console'},
+                'reference': {'type': 'object', 'additionalProperties': False,
                 'required': sorted(REFERENCE_REQUIRED - {'captured_at'}), 'properties': {
                     'schema': {'type': 'integer', 'const': 1}, 'client': string(64),
                     'captured_at': {'type': 'string', 'description': 'UTC RFC3339 capture time; local receipt time is used when omitted'},
@@ -380,7 +504,7 @@ def mcp_server(incoming, outgoing):
                     requested = request.get('params', {}).get('protocolVersion')
                     version = requested if requested in {'2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'} else '2025-11-25'
                     result = {'protocolVersion': version, 'capabilities': {'tools': {}},
-                              'serverInfo': {'name': 'agent-harness-tui', 'version': '0.1.1'}}
+                              'serverInfo': {'name': 'agent-harness-tui', 'version': '0.2.0'}}
                     initialized = True
                 elif method == 'ping':
                     result = {}
@@ -388,7 +512,7 @@ def mcp_server(incoming, outgoing):
                     raise InvalidReference('MCP initialization is required before tool use')
                 elif method == 'tools/list':
                     result = {'tools': [{'name': 'open_tui', 'description':
-                        'Open the local Go TUI with supplied current-chat reference text. No job is submitted. '
+                        'Open the local agent console with supplied current-chat context and an optional working directory. '
                         'Use kind summary for agent context or excerpt for partial transcript; never imply hidden history access.',
                         'inputSchema': tool_schema(), 'annotations': {'readOnlyHint': False,
                             'destructiveHint': False, 'idempotentHint': False, 'openWorldHint': False}}]}
@@ -396,12 +520,14 @@ def mcp_server(incoming, outgoing):
                     params = request.get('params')
                     if (not isinstance(params, dict) or params.get('name') != 'open_tui'
                             or not isinstance(params.get('arguments'), dict)
-                            or set(params['arguments']) != {'reference'}):
+                            or 'reference' not in params['arguments']
+                            or params['arguments'].keys() - {'reference', 'cwd'}):
                         raise InvalidReference('Unsupported tool or arguments')
                     supplied = params['arguments']['reference']
                     if isinstance(supplied, dict) and 'captured_at' not in supplied:
                         supplied = {**supplied, 'captured_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}
-                    opened = open_reference(validate_reference(supplied))
+                    opened = open_reference(validate_reference(supplied),
+                                            **({'cwd': params['arguments']['cwd']} if 'cwd' in params['arguments'] else {}))
                     result = {'content': [{'type': 'text', 'text': json.dumps(opened)}],
                               'structuredContent': opened,
                               'isError': opened['status'] != 'LAUNCH_REQUESTED'}
@@ -429,7 +555,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='action', required=True)
     for name in ('prepare', 'open', 'foreground', 'serve'):
-        commands.add_parser(name)
+        command = commands.add_parser(name)
+        if name in {'prepare', 'open', 'foreground'}:
+            command.add_argument('--cwd', help='Existing absolute directory for this console launch')
     native = commands.add_parser('native-host')
     native.add_argument('origin')
     run = commands.add_parser('run')
@@ -447,11 +575,11 @@ def main(argv=None):
             return run_reference(args.id, args.sha256)
         reference = read_reference(read_bounded(sys.stdin.buffer))
         if args.action == 'prepare':
-            result = prepare_reference(reference)
+            result = prepare_reference(reference, args.cwd)
         elif args.action == 'open':
-            result = open_reference(reference)
+            result = open_reference(reference, args.cwd)
         else:
-            prepared = prepare_reference(reference)
+            prepared = prepare_reference(reference, args.cwd)
             return run_reference(prepared['reference_id'], prepared['sha256'])
         print(json.dumps(result))
         return 0 if result['status'] in {'PREPARED', 'LAUNCH_REQUESTED'} else 1

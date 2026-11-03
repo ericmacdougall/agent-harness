@@ -1,34 +1,45 @@
-# Open the Go TUI from a conversation
+# Open the interactive agent console from a conversation
 
-The optional Harness TUI plugin opens an offline reference view in a compatible
-local Go operator executable. You can request it from a local MCP-capable client
-or click the Chromium extension while viewing a ChatGPT or Claude conversation.
-The conversation is reference data: opening it does not create a task, send a
-message, connect to an API, or start the disabled Codex bridge.
+The Harness TUI plugin name and `open_tui` tool remain compatible with existing
+clients. With the current `harness-console` binary, they open the interactive
+local web interface with supplied chat context and an optional working directory.
+The context is visible reference data and is not automatically submitted as a
+provider prompt. The user can then send messages through the console.
+
+An older configured Go operator continues to open its offline reference view.
+Install the console binary to select the interactive route. Opening either mode
+does not enable the disabled Codex bridge.
 
 ## Install the local components
 
-Use Python 3.10+ on macOS. The Go executable is installed separately and must
-support `tui --reference-only --reference-file FILE --reference-sha256 HEX`.
-This public plugin package does not include the private operator application.
-Choose the executable you trust; model-visible tool arguments cannot change it.
-The installer first runs its `tui --help` with a five-second/64-KiB bound and
-requires declarations of all three reference flags. An incompatible binary is
-refused before any destination writes. This checks advertised capability;
-actual offline behavior still needs testing against the real executable.
+The Python plugin installer supports macOS and Linux with Python 3.10+. The
+standalone Go console is a separate cross-platform executable under `console/`.
+Windows users can launch that packaged executable directly; this Python
+fd-based adapter and Chromium native-host registration are not qualified there.
+
+Choose the executable you trust; model-visible arguments cannot replace it.
+The installer reads `--help` for the direct console contract, then falls back
+to `tui --help` for the legacy reader. Both probes share a five-second deadline
+and each is bounded to 64 KiB. Console help must declare `--reference-file`,
+`--reference-sha256`, `--cwd` and `--ready-file`. Legacy help must declare all
+three reference flags. Incompatible binaries are refused before destination
+writes. Advertised flags are a preflight, while actual application behavior
+still requires integration testing.
 
 Preview all destination paths, then apply the same options:
 
 ```sh
-python3 install_tui_plugin.py --binary /absolute/path/to/operator --browser chrome --claude-desktop
-python3 install_tui_plugin.py --binary /absolute/path/to/operator --browser chrome --claude-desktop --apply
+python3 install_tui_plugin.py --binary /absolute/path/to/harness-console --browser chrome --claude-desktop
+python3 install_tui_plugin.py --binary /absolute/path/to/harness-console --browser chrome --claude-desktop --apply
 ```
 
 Omit `--claude-desktop` when you do not use that client. Repeat `--browser` for
 `edge` or `chromium` if needed. No browser registration is written by default.
 The installer copies the plugin under `~/.agent-harness/tui-plugin`, writes its
 private executable setting to `~/.agent-harness/tui-launcher.json`, and registers
-only the browsers you selected. It merges one server into Claude Desktop only
+only the browsers you selected. Config schema 2 with `mode: console` selects
+the direct GUI contract. Existing schema-1 binary configs retain the legacy
+reader contract. Reinstallation accepts either known schema. It merges one server into Claude Desktop only
 when requested. Existing Claude/Codex permission settings, model choices, hooks,
 global instructions and the disabled bridge block are not edited.
 An existing same-name Claude Desktop server is reused only if it exactly matches
@@ -76,7 +87,7 @@ The tested Claude Code native plugin route reports
 standalone server when that plugin route is healthy.
 
 Start a new client session after activation. Use the `open-tui` skill or ask
-"Open the Go TUI with this conversation as a reference." Client tool approval
+"Open the agent console with this conversation and the current working directory." Client tool approval
 settings still apply. Installing this plugin does not approve tools or trust
 hooks on your behalf; this package defines no lifecycle hooks.
 
@@ -118,8 +129,9 @@ virtualized messages may not exist in the DOM. For long conversations it favors
 the most recent messages and marks deliberate clipping. Missing known message
 containers fail clearly rather than falling back to the entire page.
 
-There is no background scraping, page-to-native external messaging bridge,
-network listener or remote upload. Safari and Firefox adapters are not included.
+The extension performs no background scraping, external page-to-native bridge
+or remote upload. The configured console opens its authenticated loopback web
+interface. Safari and Firefox adapters are not included.
 Direct cloud-to-local tool execution through an authenticated remote route is a
 separate deployment choice; this installer does not configure a tunnel/service.
 
@@ -162,14 +174,24 @@ running Terminal app can have its own environment; the final Go process still
 receives the restricted environment. This does not erase credentials from the
 parent client or promise that a reference's text contains no secrets.
 
-## Launch outcomes and terminal use
+## Launch outcomes and foreground use
 
-`LAUNCH_REQUESTED` means macOS Terminal accepted a request. It does not prove the
-Go UI initialized. Inspect the new window to confirm display. `NOT_LAUNCHED`
-means configuration/platform preflight failed; `DISPATCH_FAILED` records a
-nonzero Terminal dispatch. `UNKNOWN` records a timeout or uncertain result:
-inspect the window/process before trying again. The reference path and digest
-remain available. There is no automatic retry.
+Console mode launches the executable directly with a private path and digest,
+validated cwd, and a private readiness-file path. It creates a one-shot intent
+before starting the child and records the PID. The console writes a private
+`UI_READY` record after its loopback HTTP interface is live. The launcher checks
+that record's PID, loopback origin and server header with redirects and proxies
+disabled. `LAUNCH_REQUESTED` with `readiness: UI_READY` establishes this HTTP
+readiness. Browser rendering and provider operation still need their own checks.
+
+In legacy mode, `LAUNCH_REQUESTED` only confirms macOS Terminal dispatch. Legacy
+automatic Terminal opening is macOS-only, while its foreground route is available
+on other supported hosts.
+
+`NOT_LAUNCHED` means configuration/preflight failed before a child was started.
+`DISPATCH_FAILED` means dispatch failed or the console exited before readiness.
+`UNKNOWN` means startup or readiness is uncertain. Inspect the recorded process
+and retained reference before retrying. No automatic second launch is made.
 
 Each reference directory can contain `run-intent.json`, `process-started.json`
 and `process-exited.json`. A process-start record establishes process creation,
@@ -184,12 +206,18 @@ To prepare a reference without opening anything, feed strict schema-1 JSON to:
 python3 "$HOME/.agent-harness/tui-plugin/plugin/launcher.py" prepare < reference.json
 ```
 
-Replace `prepare` with `foreground` to view it in the current terminal, or `open`
-to request a macOS Terminal window. CLI input requires `captured_at`; only MCP
-fills an omitted timestamp. `foreground` also works where automatic Terminal
-opening is unsupported, assuming a compatible local Go executable is available.
-Detach using the Go reference view's displayed controls. No account/API token is
-needed for this offline view.
+Add `--cwd /absolute/project` to `prepare`, `open` or `foreground` when the
+working directory is known. The directory is validated during preparation and
+again before process creation. MCP and native messages accept optional `cwd`
+separately from the inert reference object. Unknown cwd can be omitted.
+
+Replace `prepare` with `open` for the configured GUI route, or `foreground` to
+keep the child in the current terminal. Legacy `open` requests a Terminal
+window. CLI input requires `captured_at`; only MCP fills an omitted timestamp.
+Provider authentication is needed for interactive model work, while reading
+supplied context remains local. A foreign reference session ID is not passed
+as a writable provider session. The console handles explicit imports through
+its own session controls.
 
 ## Development and checks
 

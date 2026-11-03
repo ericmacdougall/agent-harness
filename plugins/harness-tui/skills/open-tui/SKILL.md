@@ -1,11 +1,12 @@
 ---
 name: open-tui
-description: Open the local Go TUI with a private reference to this conversation when the user requests it.
+description: Open the local interactive agent console with private current-chat context when requested.
 ---
 
-Use the packaged `open_tui` MCP tool when the user asks to open the Go TUI,
-view this conversation there, or hand current context to it. This is a local
-UI action. It submits no job and sends no message to another chat.
+Use the packaged `open_tui` MCP tool when the user asks to open the agent console,
+Go TUI, or this conversation in the local app. The current console opens an
+interactive GUI. An older configured operator opens its offline reference view.
+Opening context submits no provider prompt. The user sends messages through the app.
 
 Pass a `reference` object with schema integer `1`, a short `client` label,
 a useful `title`, `kind`, `body`, and boolean
@@ -29,12 +30,20 @@ The body limit is 128 KiB UTF-8 and the whole encoded object limit is 256 KiB.
 Prefer a concise handoff. If you deliberately clip text, set `truncated: true`
 and explain the omission; don't label a rendered browser excerpt as full history.
 
-Call `open_tui` once with `{ "reference": { ... } }`. Explain its actual result:
-`LAUNCH_REQUESTED` means Terminal accepted a request, not that the UI is ready.
+Pass optional `cwd` only when the current working directory is known. It must
+be an existing absolute directory. Never infer a writable provider session from
+reference metadata. A foreign desktop chat imports as labeled context for a new
+interactive session.
+
+Call `open_tui` once with `{ "reference": { ... }, "cwd": "/known/project" }`,
+omitting unknown cwd. Explain its actual result. `LAUNCH_REQUESTED` with
+`readiness: UI_READY` confirms the console HTTP interface, while browser display
+still needs visual verification. Legacy mode only confirms Terminal dispatch.
 For `UNKNOWN`, inspect the local outcome before retrying. For other failures,
 report the returned reason and retained reference path. Native client tool
 permissions still apply; do not change approval settings to make a call succeed.
 
 If this client cannot reach local MCP, explain that limitation and use the
 explicit local browser extension or documented foreground handoff. Do not
-create a network listener, tunnel, or remote service automatically.
+create a remote listener or tunnel automatically. The configured console creates
+its authenticated loopback-only interface as part of its normal local launch.

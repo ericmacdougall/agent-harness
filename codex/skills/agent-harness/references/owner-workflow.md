@@ -1,5 +1,16 @@
 # Owner workflow
 
+## Dispatch admission and replacement
+
+Before assigning an owner, inspect the active chat mode, the spawn tool's currently advertised models, and its inheritance/override constraints. Treat those live capabilities as authoritative; model catalogs and slugs change. If Daybreak is enabled, explicitly choose an advertised Daybreak-compatible model. If none is selectable, stop dispatch and report the capability mismatch rather than trying a non-Daybreak model or repeatedly submitting a known-incompatible choice.
+
+Classify the dispatch result before changing the ledger:
+
+- A pre-dispatch HTTP, authentication, or model-admission rejection means no child started. Record a redacted `dispatch failure`, leave the task outcome open, and do not infer branch or worktree effects.
+- A returned child identity, start event, message, or uncertain start means the child may have effects. If authentication expires after start, fresh parent authentication does not rebind that child. Treat `resumable=true` only as lifecycle evidence. After an auth, session, mode, model, network, browser, filesystem, or permission transition, run a bounded, side-effect-free probe of the task's required capability in the child's context before resuming. If the probe is unavailable or fails, quarantine the child as stale. Preserve its failure evidence and inspect its messages, WAL, branch/worktree state, processes, receipts, and unknown in-flight effects before deciding whether replacement is safe.
+
+Do not retry an old agent authentication context. When the parent is newly authenticated or newly model-enabled, create at most one fresh replacement in that context and hand it the existing owner entry: the same scope, branch, worktree, WAL location, decisions, pending checks, and next checkpoint. For a post-start failure, quiesce the old writer before replacement and never automatically replay a command or external operation whose completion is unknown. Preserve the original WAL and receipts as evidence. Do not create a second branch or concurrent owner for the same scope. A replacement reviewer must remain independent of implementation, and an owner replacement must not be reused as its own reviewer. Do not ask the user to turn off the parent's active mode or bypass a denied capability by broadening permissions or switching command surfaces. Record only redacted error categories and capability evidence; account identifiers, credentials, tokens, and raw authentication responses do not belong in prompts, WAL notes, receipts, or logs.
+
 ## Scope and plan
 
 The main agent gives one owner a branch and isolated Git worktree for a coherent feature. Keep vendor directories, virtual environments, build output, credentials, and caches out of copies and commits. Use shared package-manager content caches; install from the lockfile in the worktree when needed. Reuse the owner for related follow-ups. The owner records a WAL intent, assumptions, risk table, planned checks, and rollback before editing.

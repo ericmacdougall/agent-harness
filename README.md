@@ -62,11 +62,21 @@ To uninstall, remove the marked block from `CLAUDE.md`, remove the four hook ent
 
 ## Operating model
 
-An optional [Harness TUI plugin](docs/tui-plugin.md) opens a compatible local Go
-operator in an offline reference view using context supplied by the current
-chat. It includes local MCP adapters for Codex/ChatGPT and Claude clients plus
-an explicit Chromium action for active browser conversations. Its separate
-installer preserves existing agent permissions and global harness settings.
+The [interactive console](console/README.md) is a separate local Go application
+with an embedded browser interface: real Codex and Claude Code conversations,
+session tabs, owned-agent transcripts and controls, repository state, and
+settings. Follow-ups accepted while a provider is busy are kept in a bounded,
+private FIFO queue. They advance the tracked objective only at provider dispatch,
+which invalidates reviews for the earlier objective. Retained or uncertain input
+is never replayed automatically and requires explicit reconciliation or local
+discard. The console requires an installed provider CLI. See the
+[console guide](docs/console.md) for account storage, permissions, queue
+retention, recovery, and verification limits.
+
+The optional [conversation launcher](docs/tui-plugin.md) opens the console with
+explicitly supplied chat context. The older offline Go reference reader remains
+a compatibility target. The separate launcher installer preserves existing
+agent permissions and global harness settings.
 
 1. The main agent records the initial checkout, scopes the request, asks about consequential ambiguity, and assigns one owner to each nonoverlapping task. Related follow-ups go to the same owner.
 2. The owner writes WAL intent and a risk table, reconciles independent planning objections, implements recoverable increments and meaningful failing controls, then runs focused checks.
