@@ -764,7 +764,7 @@ def prepare(args):
                                         "--original-branch", flow.branch, "--expected-head", head,
                                         "--expected-repository", repository, "--timeout", str(args.timeout)],
                                        # At most 24 sequential bounded Git waits,
-                                       # including source guards and both LFS passes.
+                                       # including source guards and the one-deadline LFS scan.
                                        timeout=24 * args.timeout + 30)
                 published = json.loads(output)
                 if not isinstance(published, dict):

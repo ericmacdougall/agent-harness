@@ -854,7 +854,7 @@ class DeliveryHelpers(unittest.TestCase):
             spec.loader.exec_module(module)
         argv = [str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
                 '--original-branch', 'main', '--expected-head', self.feature_head]
-        with patch.object(module, 'LFS_OBJECT_LIMIT', 1, create=True), \
+        with patch.object(module, 'LFS_OBJECT_LIMIT', 0, create=True), \
              patch.object(sys, 'argv', argv), patch.dict(os.environ, isolated_env(), clear=True), \
              patch('sys.stdout', new_callable=io.StringIO) as output:
             result = module.main()
@@ -893,6 +893,221 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertTrue(producer_started.exists(), 'refusal must reach the streaming producer')
         time.sleep(3)
         self.assertFalse(marker.exists(), 'enumeration producer survived refusal')
+        self.assert_lfs_ref_absent(remote)
+
+    POINTER = ('version https://git-lfs.github.com/spec/v1\n'
+               'oid sha256:' + 'a' * 64 + '\nsize 123\n')
+
+    def publish_in_process(self, *extra, env=None, **limits):
+        """Run the publisher with patched budgets; returns (exit code, report)."""
+        spec = importlib.util.spec_from_file_location('publish_range', PUBLISH)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(PUBLISH.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        argv = [str(PUBLISH), '--repo', str(self.feature), '--branch', 'feat/app',
+                '--original-branch', 'main', '--expected-head', head, *extra]
+        with contextlib.ExitStack() as stack:
+            for name, value in limits.items():
+                self.assertTrue(hasattr(module, name), name)
+                stack.enter_context(patch.object(module, name, value))
+            stack.enter_context(patch.object(sys, 'argv', argv))
+            stack.enter_context(patch.dict(os.environ, env or isolated_env(), clear=True))
+            output = stack.enter_context(patch('sys.stdout', new_callable=io.StringIO))
+            result = module.main()
+        return result, json.loads(output.getvalue())
+
+    def published_large_history(self, commits=400, pointer_at=3, remove_at=6):
+        """Publish a long main history whose early commits held an LFS pointer."""
+        stream = []
+        parent = self.base
+        for index in range(commits):
+            body = [f'commit refs/heads/main\nmark :{index + 1}\n'
+                    f'committer Harness <h@example.invalid> {1_700_000_000 + index} +0000\n'
+                    f'data 4\nc{index % 10:02d}\n'
+                    + (f'from {parent}\n' if index == 0 else '')]
+            body.append(f'M 100644 inline file{index % 40}.txt\ndata <<EOF\n{index}\nEOF\n')
+            if index == pointer_at:
+                body.append(f'M 100644 inline asset.bin\ndata {len(self.POINTER)}\n{self.POINTER}\n')
+            if remove_at is not None and index == remove_at:
+                body.append('D asset.bin\n')
+            stream.append(''.join(body) + '\n')
+        stream.append('done\n')
+        imported = subprocess.run(['git', 'fast-import', '--quiet', '--force', '--done'], cwd=self.repo,
+                                  input=''.join(stream).encode(), capture_output=True, env=isolated_env())
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        remote = self.lfs_remote()
+        cmd('git', 'reset', '-q', '--hard', 'main', cwd=self.feature)
+        (self.feature / 'app.txt').write_text('feature on long history\n')
+        cmd('git', 'commit', '-qam', 'feature on long history', cwd=self.feature)
+        objects = cmd('git', 'rev-list', '--objects', '--count', 'main', cwd=self.repo).stdout.strip()
+        self.assertGreater(int(objects), 2 * commits)
+        self.assertIn('version https://git-lfs', cmd('git', 'log', '-p', 'main', '--', 'asset.bin',
+                                                     cwd=self.repo).stdout)
+        return remote
+
+    def test_large_published_history_with_old_lfs_pointer_publishes_new_commits(self):
+        # Failing control: the previous helper enumerated all reachable history,
+        # so a published old pointer or an object budget below history size
+        # blocked every feature push in a large repository.
+        remote = self.published_large_history()
+        result, data = self.publish_in_process(LFS_OBJECT_LIMIT=50)
+        self.assertEqual((result, data['status']), (0, 'PUSHED'), data)
+        head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        self.assertEqual(cmd('git', 'rev-parse', 'refs/heads/feat/app', cwd=remote).stdout.strip(), head)
+
+    def test_new_pointer_on_large_published_history_is_still_refused(self):
+        remote = self.published_large_history()
+        (self.feature / 'new.bin').write_text(self.POINTER.replace('a' * 64, 'c' * 64))
+        cmd('git', 'add', 'new.bin', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'new pointer', cwd=self.feature)
+        (self.feature / 'new.bin').unlink()
+        cmd('git', 'commit', '-qam', 'hide new pointer from tip', cwd=self.feature)
+        result, data = self.publish_in_process(LFS_OBJECT_LIMIT=50)
+        self.assertEqual((result, data['status']), (2, 'BLOCKED_POLICY'), data)
+        self.assertIn('Git LFS', data['message'])
+        self.assert_lfs_ref_absent(remote)
+
+    def test_unpublished_commit_reusing_published_pointer_blob_is_refused(self):
+        # Each reused blob already exists on the destination. Git's object range
+        # excludes blobs in the boundary commit's tree, so an object-only scan
+        # misses the copy; the per-commit diff sees every changed path.
+        for case in ('restore removed pointer', 'copy pointer still on main'):
+            with self.subTest(case):
+                remove_at = 6 if case.startswith('restore') else None
+                remote = self.published_large_history(commits=20, remove_at=remove_at)
+                if remove_at is None:
+                    shutil.copyfile(self.feature / 'asset.bin', self.feature / 'copy.bin')
+                    cmd('git', 'add', 'copy.bin', cwd=self.feature)
+                    path = 'copy.bin'
+                else:
+                    old = cmd('git', 'rev-list', '-1', 'main', '--', 'asset.bin', cwd=self.repo).stdout.strip()
+                    cmd('git', 'checkout', '-q', f'{old}~1', '--', 'asset.bin', cwd=self.feature)
+                    path = 'asset.bin'
+                self.assertEqual((self.feature / path).read_text(), self.POINTER)
+                cmd('git', 'commit', '-qm', case, cwd=self.feature)
+                reused = cmd('git', 'rev-parse', f'HEAD:{path}', cwd=self.feature).stdout.strip()
+                self.assertEqual(cmd('git', 'cat-file', '-t', reused, cwd=remote).stdout.strip(), 'blob')
+                result, data = self.publish_in_process()
+                self.assertEqual((result, data['status']), (2, 'BLOCKED_POLICY'), data)
+                self.assert_lfs_ref_absent(remote)
+                self.reset_publication_fixture(remote)
+
+    def reset_publication_fixture(self, remote):
+        shutil.rmtree(remote)
+        cmd('git', 'remote', 'remove', 'origin', cwd=self.repo)
+        cmd('git', 'update-ref', 'refs/heads/main', self.base, cwd=self.repo)
+        cmd('git', 'reset', '-q', '--hard', self.feature_head, cwd=self.feature)
+
+    def test_pointer_only_in_unpublished_merge_or_root_is_refused(self):
+        # Both shapes escape a parent-free diff: an evil merge adds a pointer in
+        # neither parent, and an unrelated root commit has no parent to diff.
+        for case in ('two-parent merge', 'octopus merge', 'unrelated root'):
+            with self.subTest(case):
+                remote = self.lfs_remote()
+                sides = []
+                for index in range(1 if case == 'two-parent merge' else 2):
+                    side = f'side-{index}'
+                    cmd('git', 'branch', side, self.feature_head, cwd=self.repo)
+                    cmd('git', 'switch', '-q', side, cwd=self.feature)
+                    (self.feature / f'side{index}.txt').write_text(f'{index}\n')
+                    cmd('git', 'add', f'side{index}.txt', cwd=self.feature)
+                    cmd('git', 'commit', '-qm', side, cwd=self.feature)
+                    sides.append(side)
+                cmd('git', 'switch', '-q', 'feat/app', cwd=self.feature)
+                if case == 'unrelated root':
+                    cmd('git', 'switch', '-q', '--orphan', 'orphan', cwd=self.feature)
+                    (self.feature / 'asset.bin').write_text(self.POINTER)
+                    cmd('git', 'add', 'asset.bin', cwd=self.feature)
+                    cmd('git', 'commit', '-qm', 'unrelated root', cwd=self.feature)
+                    cmd('git', 'switch', '-q', 'feat/app', cwd=self.feature)
+                    # `-s ours` keeps the pointer out of every merge diff; only
+                    # the root commit's own diff contains it.
+                    cmd('git', 'merge', '-q', '-s', 'ours', '--allow-unrelated-histories', '--no-edit',
+                        'orphan', cwd=self.feature)
+                else:
+                    cmd('git', 'merge', '-q', '--no-ff', '--no-commit', *sides, cwd=self.feature)
+                    (self.feature / 'asset.bin').write_text(self.POINTER)
+                    cmd('git', 'add', 'asset.bin', cwd=self.feature)
+                    cmd('git', 'commit', '-qm', f'evil {case}', cwd=self.feature)
+                    parents = cmd('git', 'rev-list', '--parents', '-1', 'HEAD', cwd=self.feature).stdout.split()
+                    self.assertEqual(len(parents) - 1, len(sides) + 1)  # a real merge, never a fast-forward
+                    cmd('git', 'rm', '-q', 'asset.bin', cwd=self.feature)
+                    cmd('git', 'commit', '-qm', 'drop pointer from tip', cwd=self.feature)
+                result, data = self.publish_in_process()
+                self.assertEqual((result, data['status']), (2, 'BLOCKED_POLICY'), data)
+                self.assert_lfs_ref_absent(remote)
+                self.reset_publication_fixture(remote)
+                for name in [*sides, *(['orphan'] if case == 'unrelated root' else [])]:
+                    cmd('git', 'branch', '-D', name, cwd=self.repo)
+
+    def test_local_tracking_ref_cannot_hide_unpublished_pointer(self):
+        remote = self.lfs_remote()
+        (self.feature / 'asset.bin').write_text(self.POINTER)
+        cmd('git', 'add', 'asset.bin', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'unpublished pointer', cwd=self.feature)
+        head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        # A stale or forged tracking ref claims the destination already has it.
+        cmd('git', 'update-ref', 'refs/remotes/origin/feat/app', head, cwd=self.repo)
+        result, data = self.publish_in_process()
+        self.assertEqual((result, data['status']), (2, 'BLOCKED_POLICY'), data)
+        self.assert_lfs_ref_absent(remote)
+
+    def test_unknown_and_non_commit_destination_tips_only_widen_the_scan(self):
+        remote = self.lfs_remote()
+        other = self.root / 'other'
+        cmd('git', 'clone', '-q', str(remote), str(other))
+        cmd('git', 'config', 'user.email', 'o@example.invalid', cwd=other)
+        cmd('git', 'config', 'user.name', 'Other', cwd=other)
+        (other / 'other.txt').write_text('unknown to the source\n')
+        cmd('git', 'add', 'other.txt', cwd=other)
+        cmd('git', 'commit', '-qm', 'remote-only', cwd=other)
+        blob = cmd('git', 'rev-parse', 'HEAD:other.txt', cwd=other).stdout.strip()
+        cmd('git', 'push', '-q', 'origin', 'HEAD:refs/heads/elsewhere', cwd=other)
+        cmd('git', 'update-ref', 'refs/tags/blob-tag', blob, cwd=remote)
+        cmd('git', 'tag', '-a', '-m', 'annotated', 'base-tag', self.base, cwd=self.repo)
+        cmd('git', 'push', '-q', 'origin', 'base-tag', cwd=self.repo)
+        result, data = self.publish_in_process(LFS_OBJECT_LIMIT=5)
+        self.assertEqual((result, data['status']), (0, 'PUSHED'), data)
+
+    def test_head_already_on_destination_needs_no_blob_scan(self):
+        remote = self.lfs_remote()
+        cmd('git', 'push', '-q', 'origin', f'{self.feature_head}:refs/heads/already', cwd=self.repo)
+        result, data = self.publish_in_process(LFS_OBJECT_LIMIT=0)
+        self.assertEqual((result, data['status']), (0, 'PUSHED'), data)
+        self.assertEqual(cmd('git', 'rev-parse', 'refs/heads/feat/app', cwd=remote).stdout.strip(),
+                         self.feature_head)
+
+    def test_undecidable_lfs_scan_fails_closed_with_reason(self):
+        remote = self.lfs_remote()
+        cases = {'commit budget': ({'LFS_COMMIT_LIMIT': 0}, 'LFS scan commit budget exceeded'),
+                 'ref budget': ({'LFS_REF_LIMIT': 0}, 'destination ref count exceeds LFS scan budget'),
+                 'object budget': ({'LFS_OBJECT_LIMIT': 0}, 'LFS scan object budget exceeded')}
+        for name, (limits, reason) in cases.items():
+            with self.subTest(name):
+                result, data = self.publish_in_process(**limits)
+                self.assertEqual((result, data['status'], data.get('reason')), (4, 'BLOCKED_REMOTE', reason), data)
+                self.assertIn('Git LFS', data['message'])
+                self.assert_lfs_ref_absent(remote)
+
+    def test_lfs_scan_deadline_covers_every_scan_command(self):
+        remote = self.lfs_remote()
+        bin_dir = self.root / 'slow-bin'
+        bin_dir.mkdir()
+        wrapper = bin_dir / 'git'
+        # Each scan command alone fits the timeout; together they exceed it.
+        wrapper.write_text(f'#!{sys.executable}\nimport os, sys, time\n'
+                           'if "rev-list" in sys.argv or "diff-tree" in sys.argv:\n'
+                           '    time.sleep(1.5)\n'
+                           f'os.execv({shutil.which("git")!r}, ["git", *sys.argv[1:]])\n')
+        wrapper.chmod(0o700)
+        env = isolated_env()
+        env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
+        started = time.monotonic()
+        result, data = self.publish_in_process('--timeout', '2', env=env)
+        self.assertEqual((result, data['status'], data.get('reason')),
+                         (4, 'BLOCKED_REMOTE', 'LFS scan exceeded 2 seconds'), data)
+        self.assertLess(time.monotonic() - started, 20)
         self.assert_lfs_ref_absent(remote)
 
     def test_source_pre_push_hook_cannot_change_verified_commit_or_block_delivery(self):

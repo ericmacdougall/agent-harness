@@ -49,17 +49,30 @@ def pinned_url(url, repo):
 
 LFS_OBJECT_LIMIT = 300_000
 LFS_ENUMERATION_BYTE_LIMIT = 19_500_000  # 300,000 SHA-256 IDs plus newlines
+LFS_COMMIT_LIMIT = 100_000
+LFS_REF_LIMIT = 200_000
+LFS_REF_BYTE_LIMIT = 64_000_000  # streamed before parsing; refs are counted as they arrive
+LFS_DIFF_BYTE_LIMIT = 256_000_000  # raw diff records are streamed; paths are discarded
+OID = re.compile(rb'(?:[0-9a-f]{40}|[0-9a-f]{64})')
+BLOB_MODES = {b'100644', b'100755', b'120000'}
 
 
-def reachable_oids(repo, head, timeout):
-    """Read fixed-size ID records; never buffer unbounded rev-list output or paths."""
-    command = ['git', '-C', str(repo), 'rev-list', '--objects', '--no-object-names',
-               '--filter=blob:limit=1024', head]
-    env = git_environment()
-    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, start_new_session=True)
+def stream_records(repo, args, timeout, consume, *, separator, stdin_data=b'', byte_limit,
+                   settings=()):
+    """Stream one Git command's records to `consume`; never buffer unbounded output.
+
+    Input is staged in an unlinked temporary file, so Git cannot block writing
+    output while this process blocks writing input.
+    """
+    command = ['git', '-C', str(repo), *args]
+    env = git_environment(settings=settings)
     deadline = time.monotonic() + timeout
-    oids, pending, total = [], b'', 0
+    with tempfile.TemporaryFile() as source:
+        source.write(stdin_data)
+        source.seek(0)
+        process = subprocess.Popen(command, env=env, stdin=source, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, start_new_session=True)
+    pending, total = b'', 0
     try:
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ)
@@ -73,26 +86,21 @@ def reachable_oids(repo, head, timeout):
                 if not chunk:
                     break
                 total += len(chunk)
-                if total > LFS_ENUMERATION_BYTE_LIMIT:
+                if total > byte_limit:
                     raise ValueError('LFS enumeration byte budget exceeded')
-                lines = (pending + chunk).split(b'\n')
-                pending = lines.pop()
-                for oid in lines:
-                    if not re.fullmatch(rb'(?:[0-9a-f]{40}|[0-9a-f]{64})', oid):
-                        raise ValueError('malformed reachable object ID')
-                    if len(oids) >= LFS_OBJECT_LIMIT:
-                        raise ValueError('LFS scan object budget exceeded')
-                    oids.append(oid)
-                if len(pending) > 64:
-                    raise ValueError('oversized reachable object record')
+                records = (pending + chunk).split(separator)
+                pending = records.pop()
+                for record in records:
+                    consume(record)
+                if len(pending) > 65536:
+                    raise ValueError('oversized Git record')
         if pending:
-            raise ValueError('truncated reachable object ID')
+            raise ValueError('truncated Git record')
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise subprocess.TimeoutExpired(command, timeout)
         if process.wait(timeout=remaining):
-            raise ValueError('cannot enumerate reachable objects')
-        return oids
+            raise ValueError('Git could not enumerate unpublished history')
     finally:
         # Enumeration is read-only: stop immediately on refusal, including writers
         # blocked on the pipe. Never call communicate(), which would buffer output.
@@ -101,14 +109,122 @@ def reachable_oids(repo, head, timeout):
         process.wait()
 
 
-def has_reachable_lfs_pointer(repo, head, git, timeout=600):
-    """Scan small blobs in all history being published, with bounded work."""
-    oids = reachable_oids(repo, head, timeout)
+def bounded_ids(limit, message):
+    found = []
+
+    def consume(record):
+        if not OID.fullmatch(record):
+            raise ValueError('malformed object ID')
+        if len(found) >= limit:
+            raise ValueError(message)
+        found.append(record)
+    return found, consume
+
+
+def time_left(deadline):
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise subprocess.TimeoutExpired('LFS scan', 0)
+    return left
+
+
+def published_tips(transport, git, remote, config, deadline):
+    """Return destination branch/tag tips that this object store already has.
+
+    Only the destination's own advertisement is trusted. Local remote-tracking
+    refs can be stale or rewritten, and excluding them could hide new pointers.
+    """
+    tips, count = set(), [0]
+
+    def consume(line):
+        count[0] += 1
+        if count[0] > LFS_REF_LIMIT:
+            raise ValueError('destination ref count exceeds LFS scan budget')
+        fields = line.split(b'\t')
+        if len(fields) != 2 or not OID.fullmatch(fields[0]) or not fields[1].startswith(b'refs/'):
+            raise ValueError('malformed destination ref listing')
+        if fields[1].startswith((b'refs/heads/', b'refs/tags/')):
+            tips.add(fields[0])
+    # Stream the destination advertisement so a huge or hostile listing is
+    # refused by count and bytes before it is buffered.
+    try:
+        stream_records(transport, ['ls-remote', '--refs', '--', remote, 'refs/heads/*', 'refs/tags/*'],
+                       time_left(deadline), consume, separator=b'\n',
+                       byte_limit=LFS_REF_BYTE_LIMIT, settings=config)
+    except ValueError as error:
+        if str(error) == 'Git could not enumerate unpublished history':
+            raise ValueError('cannot list destination refs') from None
+        raise
+    if not tips:
+        return []
+    ordered = sorted(tips)
+    # Peel tags to commits; a tip that is absent here or names a tree or blob is
+    # skipped, so it can only enlarge the scanned range.
+    known = git(transport, 'cat-file', '--batch-check=%(objectname) %(objecttype)',
+                input=b''.join(oid + b'^{commit}\n' for oid in ordered), text=False,
+                timeout=time_left(deadline))
+    rows = known.stdout.splitlines()
+    if known.returncode or len(rows) != len(ordered):
+        raise ValueError('cannot inspect destination tips locally')
+    present = set()
+    for oid, row in zip(ordered, rows):
+        fields = row.split()
+        if fields == [oid + b'^{commit}', b'missing']:
+            continue
+        if len(fields) != 2 or not OID.fullmatch(fields[0]) or fields[1] != b'commit':
+            raise ValueError('malformed destination tip metadata')
+        present.add(fields[0])
+    return sorted(present)
+
+
+def unpublished_blobs(transport, head, tips, deadline):
+    """Blobs at paths changed by commits the destination does not have.
+
+    The diff of each unpublished commit against every parent includes every new
+    blob plus older blobs that the commit re-references, as Git LFS pre-push does.
+    """
+    def remaining():
+        return time_left(deadline)
+    revisions = b''.join([head.encode() + b'\n', *(b'^' + tip + b'\n' for tip in tips)])
+    commits, consume = bounded_ids(LFS_COMMIT_LIMIT, 'LFS scan commit budget exceeded')
+    stream_records(transport, ['rev-list', '--stdin'], remaining(), consume, separator=b'\n',
+                   stdin_data=revisions, byte_limit=LFS_ENUMERATION_BYTE_LIMIT)
+    blobs, expect_path = set(), [False]
+
+    def collect(record):
+        if expect_path[0]:
+            expect_path[0] = False
+            return
+        fields = record.split(b' ')
+        if (len(fields) != 5 or not fields[0].startswith(b':') or not OID.fullmatch(fields[3])
+                or not fields[4][:1].isalpha()):
+            raise ValueError('malformed unpublished diff record')
+        expect_path[0] = True
+        if fields[1] in BLOB_MODES and fields[3].strip(b'0'):
+            blobs.add(fields[3])
+            if len(blobs) > LFS_OBJECT_LIMIT:
+                raise ValueError('LFS scan object budget exceeded')
+    if commits:
+        stream_records(transport, ['diff-tree', '--stdin', '-r', '-m', '--root', '--no-commit-id',
+                                   '--raw', '-z', '--no-renames', '--no-abbrev'],
+                       remaining(), collect, separator=b'\0',
+                       stdin_data=b'\n'.join(commits) + b'\n', byte_limit=LFS_DIFF_BYTE_LIMIT)
+        if expect_path[0]:
+            raise ValueError('truncated unpublished diff record')
+    return sorted(blobs), len(commits)
+
+
+def has_reachable_lfs_pointer(repo, head, git, timeout=600, tips=(), deadline=None):
+    """Scan small blobs introduced by unpublished commits, with bounded work."""
+    deadline = time.monotonic() + timeout if deadline is None else deadline
+    oids, commit_count = unpublished_blobs(repo, head, tips, deadline)
+    if not commit_count:
+        return False  # The destination already advertises a ref containing head.
     if not oids:
-        raise ValueError('no reachable objects')
+        return False
     oid_set = set(oids)
     checked = git(repo, 'cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)',
-                  input=b'\n'.join(oids) + b'\n', text=False)
+                  input=b'\n'.join(oids) + b'\n', text=False, timeout=time_left(deadline))
     if checked.returncode:
         raise ValueError('cannot inspect object sizes')
     blobs = []
@@ -128,7 +244,8 @@ def has_reachable_lfs_pointer(repo, head, git, timeout=600):
         raise ValueError('LFS scan byte budget exceeded')
     if not blobs:
         return False
-    scanned = git(repo, 'cat-file', '--batch', input=b'\n'.join(blobs) + b'\n', text=False)
+    scanned = git(repo, 'cat-file', '--batch', input=b'\n'.join(blobs) + b'\n', text=False,
+                  timeout=time_left(deadline))
     if scanned.returncode:
         raise ValueError('cannot read candidate blobs')
     versions = {'version https://git-lfs.github.com/spec/v1',
@@ -326,15 +443,25 @@ def _publish(args, attempt, reply):
             if args.branch == match.group(1):
                 reply('BLOCKED_POLICY', 'Refusing to publish the remote default branch', branch=args.branch, remote=remote)
                 return 2
-            # Scan the same graph the push will traverse. Source shallow boundaries
-            # and grafts are not inherited by this transport, even when their hidden
-            # ancestor objects remain available through alternates. The source LFS
-            # upload hook is bypassed, so refuse every pointer in this graph.
+            # Scan the commits this push can add: everything reachable from head
+            # except history the destination itself advertises. Source shallow
+            # boundaries and grafts are not inherited by this transport, even when
+            # hidden ancestor objects remain available through alternates. The
+            # source LFS upload hook is bypassed, so refuse every pointer at a path
+            # those commits change. One deadline bounds the whole scan.
+            scan_deadline = time.monotonic() + args.timeout
             try:
-                contains_lfs = has_reachable_lfs_pointer(transport, head, git, timeout=args.timeout)
-            except ValueError:
+                tips = published_tips(transport, git, pinned_remote, pinned_config, scan_deadline)
+                contains_lfs = has_reachable_lfs_pointer(transport, head, git, tips=tips,
+                                                         deadline=scan_deadline)
+            except (ValueError, subprocess.TimeoutExpired) as error:
+                # Reasons are fixed strings from this module; never echo paths or Git output.
+                reason = (f'LFS scan exceeded {args.timeout} seconds'
+                          if isinstance(error, subprocess.TimeoutExpired)
+                          else str(error) if re.fullmatch(r'[A-Za-z ]{1,80}', str(error))
+                          else 'LFS scan refused')
                 reply("BLOCKED_REMOTE", "Could not verify whether Git LFS content needs uploading; continue local integration",
-                       branch=args.branch, remote=remote)
+                       branch=args.branch, remote=remote, reason=reason)
                 return 4
             if contains_lfs:
                 reply("BLOCKED_POLICY", "Git LFS pointer found; publish with an LFS-aware workflow",
