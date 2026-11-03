@@ -114,6 +114,10 @@ func (a *app) startCodexTurn(ctx context.Context, current *session, client *rpcC
 	}
 	current.requests[requestID] = "accepted"
 	a.inputOutcomeLocked(current, requestID, "retained", "Provider accepted; files retained for delayed consumers until explicit discard")
+	if current.requests[requestID] == "unknown" {
+		a.changedLocked()
+		return nil
+	}
 	if err = a.record(current, requestID, "accepted"); err != nil {
 		a.quarantineCodexLocked(current, requestID, "Provider accepted input but receipt could not be persisted")
 	}

@@ -231,6 +231,10 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 	current.context = ""
 	current.requests[requestID] = "accepted"
 	a.inputOutcomeLocked(current, requestID, "retained", "Provider accepted; attachment consumers may still be active")
+	if current.requests[requestID] == "unknown" {
+		a.changedLocked()
+		return nil
+	}
 	if err := a.record(current, requestID, "accepted"); err != nil {
 		current.requests[requestID] = "unknown"
 		a.revokeQuestionsLocked(current, "")
@@ -421,7 +425,7 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 			}
 		case "control_request":
 			request := mapField(value, "request")
-			if current.Supervision.State == "paused" || current.Status == "paused" || current.reviewParent != "" {
+			if inputLifecycleBlocked(current) || current.reviewParent != "" {
 				if current.reviewParent != "" {
 					current.Status = "error"
 					current.Error = "Independent reviewer requested interactive permission"

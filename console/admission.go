@@ -13,6 +13,11 @@ func isDispatchRefused(err error) bool {
 	var target *dispatchRefusedError
 	return errors.As(err, &target)
 }
+
+func inputLifecycleBlocked(s *session) bool {
+	return s.queueUncertain || s.Restored || oneOf(s.Status, "unknown", "blocked", "paused") || oneOf(s.Supervision.State, "unknown", "blocked", "paused")
+}
+
 func (a *app) turnAdmission(s *session, epoch uint64, request string) inputAdmission {
 	if s.reviewParent != "" {
 		return a.managedReviewAdmission(s)
@@ -20,7 +25,7 @@ func (a *app) turnAdmission(s *session, epoch uint64, request string) inputAdmis
 	return func() (func(), error) {
 		s.dispatchMu.Lock()
 		a.mu.Lock()
-		valid := s.controlEpoch == epoch && s.Status == "running" && s.lastRequest == request && !s.Restored && s.Supervision.State != "paused"
+		valid := s.controlEpoch == epoch && s.Status == "running" && s.lastRequest == request && !inputLifecycleBlocked(s)
 		if valid {
 			if err := a.commitDeliveryLocked(s, request); err != nil {
 				a.mu.Unlock()
@@ -102,7 +107,7 @@ func (a *app) questionAdmission(s *session, selected question) inputAdmission {
 		}
 		// The queued writer checks authority here immediately before dispatch,
 		// under app.mu, rather than trusting the earlier UI answer selection.
-		valid := active && expiryErr == nil && time.Now().Before(expiry) && (selected.client != nil || selected.run != nil) && selected.requestID != "" && index >= 0 && s.Status == "waiting" && s.controlEpoch == selected.epoch && selected.requestID == s.lastRequest && selected.generation == generation && selected.inputRevision == revision && selected.objectiveHash == hash && selected.turnID == turn && (selected.client == s.codex && selected.run == s.claude)
+		valid := !inputLifecycleBlocked(s) && active && expiryErr == nil && time.Now().Before(expiry) && (selected.client != nil || selected.run != nil) && selected.requestID != "" && index >= 0 && s.Status == "waiting" && s.controlEpoch == selected.epoch && selected.requestID == s.lastRequest && selected.generation == generation && selected.inputRevision == revision && selected.objectiveHash == hash && selected.turnID == turn && (selected.client == s.codex && selected.run == s.claude)
 		if !valid {
 			a.mu.Unlock()
 			s.dispatchMu.Unlock()

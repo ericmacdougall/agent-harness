@@ -277,7 +277,7 @@ func (a *app) codexQuestion(client *rpcClient, packet rpcPacket) {
 		_ = client.reject(packet.ID, "No matching console session for this question")
 		return
 	}
-	if current.Supervision.State == "paused" || current.Status == "paused" || current.Restored || current.Status == "unknown" {
+	if inputLifecycleBlocked(current) {
 		a.mu.Unlock()
 		_ = client.reject(packet.ID, "session lifecycle revoked this question")
 		return

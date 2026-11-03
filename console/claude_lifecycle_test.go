@@ -444,7 +444,7 @@ func TestClaudeLifecycleTerminalFramesCannotReopen(t *testing.T) {
 }
 
 func TestClaudeLifecycleQueuedAnswerChecksActiveAuthority(t *testing.T) {
-	for _, state := range []string{"intent", "accepted", "final", "unknown", "different-run"} {
+	for _, state := range []string{"intent", "accepted", "final", "unknown", "different-run", "queue-uncertain", "lifecycle-unknown", "lifecycle-blocked", "lifecycle-paused"} {
 		t.Run(state, func(t *testing.T) {
 			a, s, run, sink := lifecycleReaderSession(t)
 			a.readClaude(s, run, strings.NewReader(lifecycleQuestion))
@@ -463,6 +463,19 @@ func TestClaudeLifecycleQueuedAnswerChecksActiveAuthority(t *testing.T) {
 			if state == "different-run" {
 				s.requests["active"] = "accepted"
 				run.requestID = "other-request"
+			}
+			if strings.HasPrefix(state, "lifecycle-") || state == "queue-uncertain" {
+				s.requests["active"] = "accepted"
+				switch state {
+				case "queue-uncertain":
+					s.queueUncertain = true
+				case "lifecycle-unknown":
+					s.Status = "unknown"
+				case "lifecycle-blocked":
+					s.Supervision.State = "blocked"
+				case "lifecycle-paused":
+					s.Supervision.State = "paused"
+				}
 			}
 			a.mu.Unlock()
 			close(blocker.release)

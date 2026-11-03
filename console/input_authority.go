@@ -75,6 +75,7 @@ func (a *app) inputOutcomeLocked(s *session, request, status, reason string) {
 	if s.queueUncertain {
 		entry.Status = "unknown"
 		entry.Reason = "Private commit durability unknown; retain payload and reconcile on restart"
+		a.revokeInputOutcomeLocked(s, request)
 		s.delivery = nil
 		return
 	}
@@ -106,9 +107,36 @@ func (a *app) inputOutcomeLocked(s *session, request, status, reason string) {
 	if err := a.saveInputsLocked(s); err != nil {
 		s.Status = "unknown"
 		s.Error = "Queued input outcome could not be persisted"
-		s.Supervision.State = "blocked"
+		if s.Supervision.State != "paused" {
+			s.Supervision.State = "blocked"
+		}
+		s.Supervision.Reason = s.Error
+		a.revokeInputOutcomeLocked(s, request)
 	}
 	s.delivery = nil
+}
+
+// A failed ownership receipt revokes an unfinished provider request even when
+// the queue replacement definitely did not happen. Provider input already did.
+// Cleanup after a durable final must preserve that final request receipt.
+func (a *app) revokeInputOutcomeLocked(s *session, request string) {
+	if request != s.lastRequest || !oneOf(s.requests[request], "intent", "accepted") {
+		return
+	}
+	s.requests[request] = "unknown"
+	s.providerFinal = false
+	s.resumeRequested = false
+	s.Status = "unknown"
+	if s.Supervision.State != "paused" {
+		s.Supervision.State = "blocked"
+	}
+	s.Supervision.Reason = s.Error
+	a.revokeQuestionsLocked(s, "")
+	if entry := queueEntry(s, request); entry != nil {
+		entry.Status = "unknown"
+		entry.Reason = "Provider input outcome could not be persisted; retain payload and reconcile without replay"
+	}
+	_ = a.record(s, request, "unknown")
 }
 
 func objectiveInput(text string, snapshots map[string]attachmentSnapshot) string {
