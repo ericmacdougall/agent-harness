@@ -1,6 +1,6 @@
-# Agent Harness Console (development)
+# Agent Harness Console
 
-A local Go application with an embedded browser interface and real Codex and Claude Code CLI sessions. It is being built and verified on this feature branch; release packaging and final independent acceptance are pending.
+A local Go application with an embedded browser interface and Codex and Claude Code CLI sessions. It can be built from source or packaged as unsigned standalone archives. The archives are compile checks; verify provider authentication and UI flows on each target before deployment.
 
 ## Run from source
 

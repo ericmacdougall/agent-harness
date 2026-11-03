@@ -67,7 +67,7 @@ func startRPC(binary string, env []string, onEvent func(*rpcClient, string, json
 	go func() { client.read(output); err := command.Wait(); client.finish(err) }()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	params := map[string]any{"clientInfo": map[string]any{"name": "agent-harness-console", "version": "0.1.0"}, "capabilities": map[string]any{"experimentalApi": true}}
+	params := map[string]any{"clientInfo": map[string]any{"name": "agent-harness-console", "version": version}, "capabilities": map[string]any{"experimentalApi": true}}
 	if err = client.call(ctx, "initialize", params, nil); err != nil {
 		client.close()
 		return nil, fmt.Errorf("Codex initialization failed: %w", err)

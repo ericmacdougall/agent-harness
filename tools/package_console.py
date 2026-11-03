@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build unsigned standalone console archives using the installed Go toolchain.
 
-Example: python3 tools/package_console.py --output-dir /absolute/new-release --version 0.1.0
+Example: python3 tools/package_console.py --output-dir /absolute/new-release --version 0.2.0
 The output must not exist. SHA256SUMS is published last; without it a release is
 incomplete. Builds are compile checks, not proof of target runtime/UI behavior.
 """
@@ -281,7 +281,7 @@ def publish_archive(source, destination):
 
 def package(output, version, targets=TARGETS):
     if not isinstance(version, str) or len(version) > 64 or VERSION.fullmatch(version) is None:
-        raise PackagingError('version must be a numeric SemVer such as 0.1.0')
+        raise PackagingError('version must be a numeric SemVer such as 0.2.0')
     targets = tuple(targets)
     if not targets or len(set(targets)) != len(targets) or any(target not in TARGETS for target in targets):
         raise PackagingError('choose distinct supported targets only')
@@ -352,7 +352,7 @@ def package(output, version, targets=TARGETS):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--output-dir', required=True, type=Path, help='absolute new directory; parent must exist')
-    parser.add_argument('--version', required=True, help='numeric archive version, e.g. 0.1.0')
+    parser.add_argument('--version', required=True, help='numeric archive version, e.g. 0.2.0')
     parser.add_argument('--target', action='append', choices=TARGETS,
                         help='repeat to select fixed targets; default is all six')
     args = parser.parse_args(argv)
