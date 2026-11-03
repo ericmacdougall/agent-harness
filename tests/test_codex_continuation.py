@@ -68,3 +68,37 @@ class ContinuationTests(unittest.TestCase):
         self.assertNotIn('decision', self.event('Stop', stop_hook_active=False))
         self.assertNotIn('decision', self.event('Stop', turn_id='initial', stop_hook_active=True))
         self.assertEqual(self.event('Stop', turn_id='initial', stop_hook_active=False)['decision'], 'block')
+
+    def test_two_concurrent_stop_events_can_only_claim_once(self):
+        import concurrent.futures
+        self.state('active')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            calls = [pool.submit(self.event, 'Stop', turn_id=turn, stop_hook_active=False)
+                     for turn in ('one', 'two')]
+            results = [call.result() for call in calls]
+        self.assertEqual(sum(item.get('decision') == 'block' for item in results), 1)
+
+    def test_corrupt_symlinked_or_busy_state_cannot_instruct_codex(self):
+        import fcntl
+        self.state('active')
+        checkpoint = self.wal.with_name('continuation.json')
+        private = 'private fixture transcript'
+        for invalid in (private, 'x' * 513):
+            checkpoint.write_text(invalid)
+            result = self.event('Stop', turn_id='one', stop_hook_active=False)
+            self.assertNotIn('decision', result)
+            self.assertNotIn(private, json.dumps(result))
+            self.assertIn('could not', result['systemMessage'])
+        checkpoint.unlink()
+        target = self.home / 'unrelated'
+        target.write_text(private)
+        checkpoint.symlink_to(target)
+        self.assertNotIn('decision', self.event('Stop', turn_id='one', stop_hook_active=False))
+        self.assertEqual(target.read_text(), private)
+        checkpoint.unlink()
+        self.state('active')
+        with self.wal.with_name('continuation.lock').open('r+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self.event('Stop', turn_id='one', stop_hook_active=False)
+        self.assertNotIn('decision', result)
+        self.assertFalse(self.state('status')['used'])

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Codex hook and note writer: private metadata-only WALs per session and agent."""
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import fcntl
@@ -11,7 +13,7 @@ import secrets
 import sys
 import stat
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -53,13 +55,11 @@ def safe_id(value: object) -> str:
     return f"z-{stem}-{digest}"
 
 
-def append(path: Path, record: dict) -> None:
+@contextmanager
+def session_directory(session: str):
     root = wal_root()
-    if (path.parent.parent != root or path.suffix != ".jsonl"
-            or not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", path.parent.name)
-            or path.parent.name in {".", ".."}):
-        raise ValueError("WAL path must be a per-session JSONL under ~/.agent-harness/codex-wals")
-    payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", session) or session in {".", ".."}:
+        raise ValueError("invalid session directory")
     root.parent.mkdir(mode=0o700, exist_ok=True)
     # Pin each directory with an fd: never follow a redirected session or WAL path.
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -67,7 +67,7 @@ def append(path: Path, record: dict) -> None:
         directory = os.open(root.parent, flags)
         stack.callback(os.close, directory)
         pinned = [(root.parent, None, directory)]
-        for name in ("codex-wals", path.parent.name):
+        for name in ("codex-wals", session):
             try:
                 os.mkdir(name, mode=0o700, dir_fd=directory)
             except FileExistsError:
@@ -91,6 +91,17 @@ def append(path: Path, record: dict) -> None:
                 return False
             return True
 
+        yield directory, current_directory
+
+
+def append(path: Path, record: dict) -> None:
+    root = wal_root()
+    if (path.parent.parent != root or path.suffix != ".jsonl"
+            or not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", path.parent.name)
+            or path.parent.name in {".", ".."}):
+        raise ValueError("WAL path must be a per-session JSONL under ~/.agent-harness/codex-wals")
+    payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+    with session_directory(path.parent.name) as (directory, current_directory), ExitStack() as stack:
         file_flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
         for attempt in range(4):
             if not current_directory():
@@ -147,13 +158,130 @@ def append(path: Path, record: dict) -> None:
             raise ValueError("WAL target changed during append")
 
 
+WORK_STATES = {"active", "blocked", "handoff", "complete", "paused"}
+STATE_FILE = "continuation.json"
+CONTINUE_REASON = (
+    "The session still has active tracked work. Continue with the next authorized "
+    "step or reconcile the running check. Only mark completion after verification. "
+    "Honor any explicit user stop. If external action is required or a durable "
+    "monitor owns the work, record the evidence in the WAL and update the checkpoint."
+)
+UNFINISHED = "The session has unfinished tracked work. Its continuation allowance has been used or cannot be applied."
+UNAVAILABLE = "The continuation checkpoint could not be read or updated. Check its status before claiming completion."
+
+
+def state_file(directory: int, name: str, flags: int) -> int:
+    fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600):
+        os.close(fd)
+        raise ValueError("invalid private continuation file")
+    return fd
+
+
+def read_checkpoint(directory: int) -> dict | None:
+    try:
+        fd = state_file(directory, STATE_FILE, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as handle:
+        data = handle.read(513)
+    if len(data) > 512:
+        raise ValueError("oversize continuation checkpoint")
+    state = json.loads(data)
+    if (not isinstance(state, dict) or set(state) != {"state", "used"}
+            or not isinstance(state["state"], str) or state["state"] not in WORK_STATES
+            or not isinstance(state["used"], bool)):
+        raise ValueError("invalid continuation checkpoint")
+    return state
+
+
+def save_checkpoint(directory: int, current_directory, state: dict) -> None:
+    temp = "continuation-" + secrets.token_hex(12)
+    fd = state_file(directory, temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(state, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if not current_directory():
+            raise ValueError("continuation directory changed")
+        os.replace(temp, STATE_FILE, src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        try:
+            os.unlink(temp, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+
+
+def checkpoint(session: str, action: str) -> tuple[dict | None, bool]:
+    with session_directory(session) as (directory, current_directory):
+        # The stable lock serializes the budget claim and explicit status changes.
+        lock = state_file(directory, "continuation.lock", os.O_RDWR | os.O_CREAT)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            named = os.stat("continuation.lock", dir_fd=directory, follow_symlinks=False)
+            if not os.path.samestat(named, os.fstat(lock)) or not current_directory():
+                raise ValueError("continuation lock or directory changed")
+            state = read_checkpoint(directory)
+            active = state is not None and state["state"] == "active"
+            claimed = action == "claim" and active and not state["used"]
+            if claimed:
+                state = {"state": "active", "used": True}
+            elif action in WORK_STATES and not (action == "active" and active):
+                state = {"state": action, "used": False}
+            elif action == "interrupt" and active:
+                state = {"state": "paused", "used": False}
+            else:
+                return state, False
+            save_checkpoint(directory, current_directory, state)
+            return state, claimed
+        finally:
+            os.close(lock)
+
+
+def lifecycle_hook(data: dict, session: str) -> None:
+    interrupt = data["hook_event_name"] == "Interrupt"
+    may_claim = (isinstance(data.get("turn_id"), str) and bool(data["turn_id"])
+                 and data.get("stop_hook_active") is False)
+    action = "interrupt" if interrupt else "claim" if may_claim else "status"
+    try:
+        state, claimed = checkpoint(session, action)
+    except (OSError, ValueError):
+        result = {"systemMessage": UNAVAILABLE}
+    else:
+        if claimed:
+            result = {"decision": "block", "reason": CONTINUE_REASON}
+        elif state is not None and state["state"] == "active":
+            result = {"systemMessage": UNFINISHED}
+        else:
+            result = {}
+    print(json.dumps(result))
+
+
+def checkpoint_context(session: str, text: str) -> str:
+    try:
+        state, _ = checkpoint(session, "status")
+    except (OSError, ValueError):
+        return text + " " + UNAVAILABLE
+    if state is not None and state["state"] == "active":
+        return text + " An active work checkpoint remains open. Reconcile its WAL and live evidence."
+    return text
+
+
 def hook() -> None:
     data = json.load(sys.stdin)
     event = data.get('hook_event_name')
     session_id = data.get("session_id")
     if not session_id:
         raise ValueError("Codex did not supply a session_id; refusing to use a shared WAL")
-    root = wal_root() / safe_id(session_id)
+    session = safe_id(session_id)
+    if event in {"Stop", "Interrupt"}:
+        lifecycle_hook(data, session)
+        return
+    root = wal_root() / session
     main_wal = root / "main.jsonl"
     record = {
         "at": datetime.now(timezone.utc).isoformat(),
@@ -162,12 +290,12 @@ def hook() -> None:
     if event == "SessionStart":
         record["source"] = data.get("source", "")
         append(main_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": f"Session WAL: {main_wal}. Add redacted intent before edits, then decisions, checks, commits and handoffs. Hook metadata is not a semantic work log."}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Add redacted intent before edits, then decisions, checks, commits and handoffs. Hook metadata is not a semantic work log.")}}))
     elif event == "UserPromptSubmit":
         prompt = str(data.get("prompt", ""))
         record["prompt_chars"] = len(prompt)
         append(main_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": f"Session WAL: {main_wal}. Use the fast path for small changes. For substantive work, scope and coordinate an owner. Record redacted intent before editing."}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Use the fast path for small changes. For substantive work, scope and coordinate an owner. Record redacted intent before editing.")}}))
     elif event == "SubagentStart":
         agent_id = safe_id(data.get("agent_id"))
         agent_type = safe_id(data.get("agent_type"))
@@ -215,6 +343,9 @@ def main() -> None:
     entry.add_argument('--wal', type=Path, required=True)
     entry.add_argument('--event', choices=sorted(EVENTS), required=True)
     entry.add_argument('--note', required=True)
+    continuation = subcommands.add_parser('continuation')
+    continuation.add_argument('--wal', type=Path, required=True)
+    continuation.add_argument('state', choices=sorted(WORK_STATES | {'status'}))
     args = parser.parse_args()
     if args.command == 'hook':
         hook()
@@ -222,6 +353,15 @@ def main() -> None:
         path = wal_root() / safe_id(args.label + '-' + secrets.token_hex(8)) / 'main.jsonl'
         append(path, {'at': datetime.now(timezone.utc).isoformat(), 'event': 'manual-start'})
         print(json.dumps({'status': 'STARTED', 'wal': str(path)}))
+    elif args.command == 'continuation':
+        path = args.wal.expanduser().absolute()
+        if path.name != 'main.jsonl' or path.parent.parent != wal_root():
+            parser.error('continuation requires a main session WAL path')
+        try:
+            state, _ = checkpoint(path.parent.name, args.state)
+        except (OSError, ValueError):
+            parser.error(UNAVAILABLE)
+        print(json.dumps(state or {'state': 'untracked', 'used': False}))
     else:
         note(args.wal, args.event, args.note)
 

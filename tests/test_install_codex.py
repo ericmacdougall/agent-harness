@@ -306,7 +306,7 @@ class CodexInstallerTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE((home / '.agent-harness' / 'codex-wals').stat().st_mode), 0o700)
             hooks = json.loads((codex_home / 'hooks.json').read_text())
             self.assertEqual(hooks['custom'], {'keep': True})
-            self.assertEqual(hooks['hooks']['Stop'], [{'hooks': [foreign]}])
+            self.assertEqual(hooks['hooks']['Stop'][0], {'hooks': [foreign]})
             for event in HOOK_EVENTS:
                 commands = [item['command'] for group in hooks['hooks'][event]
                             for item in group['hooks'] if item['type'] == 'command']

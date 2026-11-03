@@ -32,7 +32,7 @@ SKILL_FILES = ('SKILL.md', 'references/owner-workflow.md',
                'references/testing-and-evals.md', 'references/delivery.md')
 DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report_file.py',
                     'usage_guard.py', 'publish_feature.py', 'integrate_local.py', 'deliver.py')
-HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart')
+HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
 
 def merge_marked(existing: str, addition: str) -> str:
@@ -75,7 +75,7 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
                                 and handler.get('command') == command)]
             if handlers:
                 preserved.append({**group, 'hooks': handlers})
-        preserved.append({'hooks': [{'type': 'command', 'command': command, 'timeout': 10}]})
+        preserved.append({'hooks': [{'type': 'command', 'command': command, 'timeout': 1 if event == 'Interrupt' else 10}]})
         hooks[event] = preserved
     return result
 
