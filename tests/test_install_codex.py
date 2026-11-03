@@ -43,6 +43,8 @@ class CodexInstallerTests(unittest.TestCase):
                          '`resumable=true`', 'side-effect-free probe', 'quarantine',
                          'same scope, branch, worktree', 'reviewer must remain independent'):
             self.assertIn(required, combined)
+        self.assertIn('custom agent roles pin their model', agents)
+        self.assertIn('generic role that accepts the explicit compatible model', skill)
         for forbidden in ('gpt-daybreak-blue-latest', 'account ID =', 'token ='):
             self.assertNotIn(forbidden, combined)
 
