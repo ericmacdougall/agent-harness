@@ -216,6 +216,8 @@ func (a *app) restoreInputs() error {
 				s.Status = "unknown"
 				s.Error = "A queued provider dispatch has no reconciled outcome; no replay"
 				entry.Reason = "Prior provider delivery is uncertain; never replay automatically"
+			case "cleanup_pending":
+				entry.Reason = "Resuming durable attachment cleanup; never provider replay"
 			case "retained", "discarded": // Retained bytes are read-only recovery data.
 			default:
 				return errors.New("unknown queued input state")
@@ -225,6 +227,9 @@ func (a *app) restoreInputs() error {
 			return errors.New("recovered queue exceeds retention bound")
 		}
 		for _, entry := range disk.Entries {
+			if entry.Status == "cleanup_pending" {
+				continue
+			}
 			holder := &session{attachmentSnapshots: entry.Snapshots}
 			paths := []string{}
 			for path := range entry.Snapshots {
@@ -240,6 +245,13 @@ func (a *app) restoreInputs() error {
 			s.Error = "Queued input commit was interrupted; reconciled both private metadata slots without replay"
 			if err := a.promoteRecoveredInputs(s); err != nil {
 				return errors.New("reconciled queued input could not be durably promoted; beforeimage preserved")
+			}
+		}
+		for _, entry := range s.inputs {
+			if entry.Status == "cleanup_pending" {
+				if err := a.finishAttachmentCleanupLocked(s, entry); err != nil {
+					return errors.New("pending attachment cleanup could not be reconciled; preserve state")
+				}
 			}
 		}
 	}

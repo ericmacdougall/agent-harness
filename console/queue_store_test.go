@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,7 +64,6 @@ func TestQueueStoreDedupRetentionAndRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer restored.close()
 	recovered := restored.sessions[0]
 	if len(recovered.inputs) != 1 || recovered.inputs[0].Status != "held" || !recovered.Restored {
 		t.Fatal("restart failed to hold unsent input")
@@ -71,11 +71,27 @@ func TestQueueStoreDedupRetentionAndRecovery(t *testing.T) {
 	if recovered.inputs[0].Text != "private unsent payload" {
 		t.Fatal("recovery lost accepted unsent input")
 	}
-	if err = restored.discardInput(recovered.ID, "queued", false); err != nil {
+	restored.attachmentRemove = func(string) error { return errors.New("injected queue unlink failure") }
+	if err = restored.discardInput(recovered.ID, "queued", false); err == nil {
+		t.Fatal("explicit queue discard hid snapshot unlink failure")
+	}
+	if entry := queueEntry(recovered, "queued"); entry == nil || entry.Status != "cleanup_pending" || len(entry.Snapshots) != 1 {
+		t.Fatalf("failed queue cleanup lost durable snapshot owner: %#v", entry)
+	}
+	if _, err = os.Stat(snapshot); err != nil {
+		t.Fatal("failed queue cleanup removed ownership without unlink proof", err)
+	}
+	restored.close()
+	reconciled, err := newApp(dir, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer reconciled.close()
+	if entry := queueEntry(reconciled.sessions[0], "queued"); entry == nil || entry.Status != "discarded" || activeQueue(reconciled.sessions[0]) {
+		t.Fatalf("restart did not finish explicit queue discard cleanup: %#v", entry)
+	}
 	if _, err = os.Stat(snapshot); !os.IsNotExist(err) {
-		t.Fatal("cancelled private snapshot not released")
+		t.Fatal("restart did not release explicitly discarded private snapshot")
 	}
 }
 func TestQueueBoundsAndHeldInputDoNotBypass(t *testing.T) {

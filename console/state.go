@@ -162,6 +162,7 @@ type app struct {
 	writeInputs        func(string, []byte) error
 	attachmentSyncFile func(*os.File) error
 	attachmentSyncDir  func(string) error
+	attachmentRemove   func(string) error
 	releaseState       func()
 	coreSecretMu       sync.Mutex
 	coreSecrets        []string

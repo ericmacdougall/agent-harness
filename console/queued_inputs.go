@@ -12,6 +12,7 @@ import (
 
 type queuedInput struct {
 	RetentionOnly          bool                          `json:"retentionOnly,omitempty"`
+	CleanupReason          string                        `json:"cleanupReason,omitempty"`
 	RequestHash            string                        `json:"requestHash"`
 	RequestID              string                        `json:"requestId"`
 	Status                 string                        `json:"status"`
@@ -216,10 +217,10 @@ func (a *app) discardInput(id, request string, explicit bool) error {
 		return errors.New("dispatch is in progress; pause and reconcile before local discard")
 	}
 	old := *entry
-	entry.Status = "discarded"
+	entry.Status = "cleanup_pending"
 	entry.Text = ""
-	entry.Reason = "Local payload discarded; delivery outcome is unchanged"
-	entry.Snapshots = nil
+	entry.Reason = "Local discard committed; private snapshot cleanup is pending"
+	entry.CleanupReason = "Local payload discarded; delivery outcome is unchanged"
 	if err := a.saveInputsLocked(s); err != nil {
 		*entry = old
 		if s.queueUncertain {
@@ -229,8 +230,11 @@ func (a *app) discardInput(id, request string, explicit bool) error {
 		}
 		return err
 	}
-	for _, saved := range old.Snapshots {
-		_ = os.Remove(saved.Path)
+	if err := a.finishAttachmentCleanupLocked(s, entry); err != nil {
+		entry.Status = "cleanup_pending"
+		entry.Reason = "Local discard committed; snapshot cleanup must resume after restart"
+		a.changedLocked()
+		return err
 	}
 	a.changedLocked()
 	go a.advance(s.ID)

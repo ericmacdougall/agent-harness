@@ -110,6 +110,54 @@ func (a *app) retainOrdinaryAttachmentsLocked(s *session, request, text string, 
 	return nil
 }
 
+// Called under app.mu. cleanup_pending is the durable owner until every
+// console-owned path is absent and that directory removal is durable.
+func (a *app) finishAttachmentCleanupLocked(s *session, entry *queuedInput) error {
+	if entry.Status != "cleanup_pending" {
+		return errors.New("attachment cleanup has no durable pending owner")
+	}
+	root := filepath.Join(a.dataDir, "attachments")
+	remove := a.attachmentRemove
+	if remove == nil {
+		remove = os.Remove
+	}
+	for _, saved := range entry.Snapshots {
+		clean := filepath.Clean(saved.Path)
+		rel, err := filepath.Rel(root, clean)
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return errors.New("attachment cleanup path escaped private storage")
+		}
+		info, err := os.Lstat(clean)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("attachment cleanup path is not an owned regular file")
+		}
+		if err = remove(clean); err != nil && !os.IsNotExist(err) {
+			return errors.New("attachment cleanup could not remove an owned snapshot")
+		}
+	}
+	if len(entry.Snapshots) > 0 {
+		if err := settingsSyncParent(root); err != nil {
+			return errors.New("attachment cleanup directory durability is unknown")
+		}
+	}
+	old := *entry
+	entry.Status = "discarded"
+	entry.Reason = entry.CleanupReason
+	if entry.Reason == "" {
+		entry.Reason = "Private attachment ownership released"
+	}
+	entry.CleanupReason = ""
+	entry.Snapshots = nil
+	if err := a.saveInputsLocked(s); err != nil {
+		*entry = old
+		return err
+	}
+	return nil
+}
+
 // Called under app.mu: the provider receives only private snapshots, never the mutable original.
 func (a *app) selectedAttachments(current *session, paths []string) ([]string, error) {
 	result := []string{}

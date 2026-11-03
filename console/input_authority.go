@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 )
 
 type queuedDelivery struct {
@@ -80,21 +79,24 @@ func (a *app) inputOutcomeLocked(s *session, request, status, reason string) {
 		return
 	}
 	if entry.RetentionOnly && status == "retained" && s.providerFinal {
-		old := *entry
-		entry.Status = "discarded"
-		entry.Reason = "Provider turn reached a native final outcome; attachment ownership released"
-		entry.Snapshots = nil
+		entry.Status = "cleanup_pending"
+		entry.Reason = "Provider final; durable attachment cleanup is pending"
+		entry.CleanupReason = "Provider turn reached a native final outcome; attachment ownership released"
 		if err := a.saveInputsLocked(s); err != nil {
-			*entry = old
 			entry.Status = "unknown"
-			entry.Reason = "Final attachment cleanup durability is unknown; preserve files for restart reconciliation"
+			entry.Reason = "Cleanup-pending ownership durability is unknown; preserve files for restart reconciliation"
 			s.Status = "unknown"
 			s.Error = "Ordinary input attachment cleanup could not be persisted"
 			s.Supervision.State = "blocked"
 			return
 		}
-		for _, saved := range old.Snapshots {
-			_ = os.Remove(saved.Path)
+		if err := a.finishAttachmentCleanupLocked(s, entry); err != nil {
+			entry.Status = "cleanup_pending"
+			entry.Reason = "Provider final; attachment cleanup must resume after restart"
+			s.Status = "unknown"
+			s.Error = err.Error()
+			s.Supervision.State = "blocked"
+			return
 		}
 		s.delivery = nil
 		return

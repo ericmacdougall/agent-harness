@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -45,15 +46,35 @@ func TestOrdinarySendAttachmentSurvivesNextComposerSelection(t *testing.T) {
 	if entry == nil || !entry.RetentionOnly || entry.Status != "retained" {
 		t.Fatalf("ordinary send did not retain explicit attachment ownership: %#v", entry)
 	}
+	a.attachmentRemove = func(string) error { return errors.New("injected unlink failure") }
 	finishNativeQueueTurn(a, s)
-	if entry.Status != "discarded" || activeQueue(s) {
-		t.Fatalf("native final outcome left ordinary attachment receipt blocking later work: %#v", entry)
+	if entry.Status != "cleanup_pending" || !activeQueue(s) {
+		t.Fatalf("unlink failure pruned durable attachment owner: %#v", entry)
 	}
-	if _, err = os.Stat(firstSnapshot); !os.IsNotExist(err) {
-		t.Fatal("native final outcome did not release completed ordinary-send snapshot")
+	if _, err = os.Stat(firstSnapshot); err != nil {
+		t.Fatal("unlink failure lost the still-owned snapshot", err)
 	}
 	if _, err = a.selectedAttachments(s, []string{second}); err != nil {
-		t.Fatal("discarding A disturbed independent composer B", err)
+		t.Fatal("failed cleanup of A disturbed independent composer B", err)
+	}
+	dataDir := a.dataDir
+	sessionID := s.ID
+	a.close()
+	restored, err := newApp(dataDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.close()
+	recovered := restored.findLocked(sessionID)
+	if recovered == nil {
+		t.Fatal("restart lost attachment owner session")
+	}
+	recoveredEntry := queueEntry(recovered, "ordinary-with-file")
+	if recoveredEntry == nil || recoveredEntry.Status != "discarded" || activeQueue(recovered) {
+		t.Fatalf("restart did not finish pending cleanup: %#v", recoveredEntry)
+	}
+	if _, err = os.Stat(firstSnapshot); !os.IsNotExist(err) {
+		t.Fatal("restart cleanup did not remove completed ordinary-send snapshot")
 	}
 }
 
