@@ -44,9 +44,14 @@ func checkpointTool() map[string]any {
 	return map[string]any{"type": "function", "name": "harness_console_checkpoint", "description": "Track substantive work, request independent review and verified completion. Use the taskId/generation/inputRevision/objectiveHash from application context. Casual questions need no checkpoint. Review requires bounded real evidence. End your turn after needs_review; the console dispatches an independent reviewer.", "inputSchema": map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"subjectRoot": map[string]any{"type": "string", "description": "Current cwd or a registered feature worktree of the same Git repository; leave empty for current cwd"}, "taskId": map[string]any{"type": "string"}, "generation": map[string]any{"type": "integer"}, "inputRevision": map[string]any{"type": "integer"}, "objectiveHash": map[string]any{"type": "string"}, "state": map[string]any{"type": "string", "enum": []string{"active", "needs_review", "complete", "blocked", "handoff"}}, "stage": map[string]any{"type": "string", "enum": []string{"plan_review", "code_review", "final_review"}}, "kind": map[string]any{"type": "string", "enum": []string{"code", "artifact"}}, "head": map[string]any{"type": "string"}, "evidence": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "scope": map[string]any{"type": "string"}}, "required": []string{"taskId", "generation", "inputRevision", "objectiveHash", "state", "stage", "kind", "head", "evidence", "scope"}}}
 }
 func (a *app) checkpointUpdate(id string, input checkpointInput) error {
+	return a.checkpointUpdateGuarded(id, input, nil)
+}
+
+// Codex supplies an exact binding guard, checked at every mutation lock.
+func (a *app) checkpointUpdateGuarded(id string, input checkpointInput, guard func(*session) bool) error {
 	a.mu.Lock()
 	current := a.findLocked(id)
-	if current == nil || current.task == nil {
+	if current == nil || current.task == nil || (guard != nil && !guard(current)) {
 		a.mu.Unlock()
 		return errors.New("no admitted task")
 	}
@@ -100,7 +105,7 @@ func (a *app) checkpointUpdate(id string, input checkpointInput) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if current.task != task || task.Generation != input.Generation || task.InputRevision != input.InputRevision || task.ObjectiveHash != input.ObjectiveHash || current.controlEpoch != epoch || current.CWD != cwd || current.Supervision.State == "paused" {
+	if (guard != nil && !guard(current)) || current.task != task || task.Generation != input.Generation || task.InputRevision != input.InputRevision || task.ObjectiveHash != input.ObjectiveHash || current.controlEpoch != epoch || current.CWD != cwd || current.Supervision.State == "paused" {
 		return errors.New("task changed during capture")
 	}
 	subject = bindSubject(subject, task)

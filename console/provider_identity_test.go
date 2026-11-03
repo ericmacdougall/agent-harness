@@ -105,6 +105,7 @@ func TestIdentityCodexEarlyCompletionNeedsReply(t *testing.T) {
 			a, s, c := identityCodexFixture(t)
 			var premature bool
 			c.input = replySink{reply: func(data []byte) {
+				identityRootFrame(a, c, "item/completed", "turn-B", "early-tool")
 				identityEvent(a, c, "turn/started", "turn-B")
 				identityEvent(a, c, "turn/completed", "turn-B")
 				a.mu.Lock()
@@ -131,6 +132,12 @@ func TestIdentityCodexEarlyCompletionNeedsReply(t *testing.T) {
 			defer a.mu.Unlock()
 			if premature {
 				t.Error("unbound early completion declared final before RPC reply")
+			}
+			if mode == "success" && s.Supervision.progress != 1 {
+				t.Error("matching early content lost")
+			}
+			if mode != "success" && (s.Supervision.progress != 0 || len(s.codexTurn.frames) != 0) {
+				t.Error("failed reply retained or published early content")
 			}
 			if mode == "success" {
 				if err != nil || s.requests["B"] != "final" || !s.providerFinal {

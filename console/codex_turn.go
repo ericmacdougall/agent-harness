@@ -2,16 +2,22 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 )
 
 // This binding is owned by one correlated turn/start RPC, never by notifications.
 // Pending completion metadata is bounded and cannot authorize a final receipt.
 type codexTurnBinding struct {
-	requestID string
-	client    *rpcClient
-	turnID    string
-	pending   []codexCompletion
+	pendingBytes  int
+	requestID     string
+	client        *rpcClient
+	turnID        string
+	pending       []codexCompletion
+	frames        []codexPendingFrame
+	frameBytes    int
+	framesDropped bool
+	completed     map[string]bool
 }
 type codexCompletion struct {
 	turnID  string
@@ -24,6 +30,11 @@ func (a *app) quarantineCodexLocked(current *session, requestID, reason string) 
 		return
 	}
 	current.providerFinal = false
+	if current.codexTurn != nil {
+		current.codexTurn.clearFrames()
+		current.codexTurn.pending = nil
+		current.codexTurn.pendingBytes = 0
+	}
 	current.requests[requestID] = "unknown"
 	current.Status = "unknown"
 	current.Error = reason
@@ -44,11 +55,7 @@ func (a *app) startCodexTurn(ctx context.Context, current *session, client *rpcC
 	current.codexTurn = binding
 	current.turnID = ""
 	a.mu.Unlock()
-	var result struct {
-		Turn struct {
-			ID string `json:"id"`
-		} `json:"turn"`
-	}
+	var result json.RawMessage
 	err := client.callAdmitted(ctx, "turn/start", params, &result, admit)
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -56,6 +63,9 @@ func (a *app) startCodexTurn(ctx context.Context, current *session, client *rpcC
 		return err
 	}
 	if !oneOf(current.requests[requestID], "intent", "accepted") {
+		binding.pending = nil
+		binding.pendingBytes = 0
+		binding.clearFrames()
 		return err
 	}
 	if err != nil {
@@ -65,19 +75,35 @@ func (a *app) startCodexTurn(ctx context.Context, current *session, client *rpcC
 			a.quarantineCodexLocked(current, requestID, "Codex completion arrived without a successful turn/start binding. No request was replayed.")
 		}
 		binding.pending = nil
+		binding.pendingBytes = 0
+		binding.clearFrames()
 		return err
 	}
-	if result.Turn.ID == "" {
-		err = errors.New("Codex turn/start reply omitted the turn binding. No request was replayed.")
+	turnID := codexFrameTurn(result, true)
+	if turnID == "" {
+		err = errors.New("Codex turn/start reply omitted or ambiguously specified the turn binding. No request was replayed.")
 		a.quarantineCodexLocked(current, requestID, err.Error())
 		binding.pending = nil
+		binding.pendingBytes = 0
+		binding.clearFrames()
 		return err
 	}
-	binding.turnID = result.Turn.ID
+	binding.turnID = turnID
 	current.turnID = binding.turnID
 	current.context = ""
+	frames := binding.frames
+	binding.clearFrames()
+	for _, frame := range frames {
+		if frame.turnID == binding.turnID {
+			a.applyCodexEventLocked(current, nil, client, frame.method, object(frame.raw), current.ProviderID)
+		}
+	}
+	if current.reviewParent != "" {
+		a.syncReviewAgentLocked(current)
+	}
 	pending := binding.pending
 	binding.pending = nil
+	binding.pendingBytes = 0
 	for _, completion := range pending {
 		if completion.turnID == binding.turnID {
 			a.codexCompletionLocked(current, client, completion)
@@ -110,12 +136,14 @@ func (a *app) codexCompletionLocked(current *session, client *rpcClient, complet
 				return
 			}
 		}
-		if len(binding.pending) >= 16 {
+		if len(binding.pending) >= 16 || len(completion.turnID)+len(completion.status)+len(completion.message) > maxCodexPendingBytes-binding.pendingBytes {
 			a.quarantineCodexLocked(current, requestID, "Codex exceeded the pending completion bound before request identity was established. No request was replayed.")
 			binding.pending = nil
+			binding.pendingBytes = 0
 			return
 		}
 		binding.pending = append(binding.pending, completion)
+		binding.pendingBytes += len(completion.turnID) + len(completion.status) + len(completion.message)
 		return
 	}
 	if binding.turnID != completion.turnID || !oneOf(current.requests[requestID], "intent", "accepted") {

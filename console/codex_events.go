@@ -71,7 +71,7 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 		}
 		a.mu.Lock()
 		current, _ := a.sessionForThreadLocked(parent)
-		if current != nil && id != current.ProviderID {
+		if current != nil && current.codex == client && id != current.ProviderID {
 			exists := false
 			for _, child := range current.Agents {
 				if child.ID == id {
@@ -93,6 +93,55 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 		a.mu.Unlock()
 		return
 	}
+	if child == nil {
+		switch method {
+		case "item/agentMessage/delta", "item/completed", "thread/tokenUsage/updated", "error":
+			turn := codexFrameTurn(raw, false)
+			binding := activeCodexBinding(current, client)
+			if binding == nil || turn == "" {
+				a.mu.Unlock()
+				return
+			}
+			if binding.turnID == "" {
+				binding.bufferFrame(method, turn, raw)
+				a.mu.Unlock()
+				return
+			}
+			if !boundCodexTurn(current, client, turn) {
+				a.mu.Unlock()
+				return
+			}
+		case "turn/completed":
+			turnID := codexFrameTurn(raw, true)
+			if turnID == "" {
+				a.mu.Unlock()
+				return
+			}
+			before := current.requests[current.lastRequest]
+			turn := mapField(value, "turn")
+			a.codexCompletionLocked(current, client, codexCompletion{turnID: turnID, status: textField(turn, "status"), message: textField(mapField(turn, "error"), "message")})
+			if current.requests[current.lastRequest] != before {
+				if current.reviewParent != "" {
+					a.syncReviewAgentLocked(current)
+				}
+				a.changedLocked()
+			}
+			a.mu.Unlock()
+			return
+		default:
+			a.mu.Unlock()
+			return
+		}
+	}
+	a.applyCodexEventLocked(current, child, client, method, value, thread)
+	if current.reviewParent != "" {
+		a.syncReviewAgentLocked(current)
+	}
+	a.changedLocked()
+	a.mu.Unlock()
+}
+
+func (a *app) applyCodexEventLocked(current *session, child *agent, client *rpcClient, method string, value map[string]any, thread string) {
 	stamp := now()
 	if child != nil {
 		child.LastSeen = &stamp
@@ -111,6 +160,9 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 		}
 	case "item/agentMessage/delta":
 		id := textField(value, "itemId")
+		if child == nil && (id == "" || len(id) > maxCodexItemIDBytes || current.codexTurn.completed[id]) {
+			return
+		}
 		delta := textField(value, "delta")
 		filter := current.filters[id]
 		if filter == nil {
@@ -135,6 +187,9 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 	case "item/completed":
 		item := mapField(value, "item")
 		kind := textField(item, "type")
+		if child == nil && !current.codexTurn.acceptCompletedItem(textField(item, "id")) {
+			return
+		}
 		if kind == "agentMessage" {
 			delete(current.filters, textField(item, "id"))
 			a.addMessageLocked(current, message{ID: textField(item, "id"), Role: "assistant", Text: textField(item, "text"), AgentID: thread})
@@ -172,11 +227,6 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 	case "error":
 		current.Error = a.clean(textField(mapField(value, "error"), "message"))
 	}
-	if current.reviewParent != "" {
-		a.syncReviewAgentLocked(current)
-	}
-	a.changedLocked()
-	a.mu.Unlock()
 }
 
 func (a *app) codexQuestion(client *rpcClient, packet rpcPacket) {
@@ -189,7 +239,12 @@ func (a *app) codexQuestion(client *rpcClient, packet rpcPacket) {
 	if packet.Method == "item/tool/call" {
 		a.mu.Lock()
 		current, _ := a.sessionForThreadLocked(textField(params, "threadId"))
-		valid := current != nil && current.ProviderID == textField(params, "threadId") && current.codex == client && current.reviewParent == "" && current.turnID != "" && current.turnID == textField(params, "turnId") && textField(params, "tool") == "harness_console_checkpoint"
+		turn := codexFrameTurn(packet.Params, false)
+		var binding *codexTurnBinding
+		if current != nil {
+			binding = current.codexTurn
+		}
+		valid := current != nil && current.ProviderID == textField(params, "threadId") && current.codex == client && current.reviewParent == "" && boundCodexTurn(current, client, turn) && textField(params, "tool") == "harness_console_checkpoint"
 		a.mu.Unlock()
 		var err error
 		if !valid {
@@ -198,7 +253,9 @@ func (a *app) codexQuestion(client *rpcClient, packet rpcPacket) {
 			var input checkpointInput
 			input, err = parseCheckpoint(params["arguments"])
 			if err == nil {
-				err = a.checkpointUpdate(current.ID, input)
+				err = a.checkpointUpdateGuarded(current.ID, input, func(s *session) bool {
+					return s.codexTurn == binding && boundCodexTurn(s, client, turn)
+				})
 			}
 		}
 		body := "Checkpoint recorded. End turn after needs_review so independent review can run."
@@ -214,7 +271,7 @@ func (a *app) codexQuestion(client *rpcClient, packet rpcPacket) {
 		return
 	}
 	a.mu.Lock()
-	current, _ := a.sessionForThreadLocked(textField(params, "threadId"))
+	current, child := a.sessionForThreadLocked(textField(params, "threadId"))
 	if current == nil {
 		a.mu.Unlock()
 		_ = client.reject(packet.ID, "No matching console session for this question")
@@ -228,6 +285,16 @@ func (a *app) codexQuestion(client *rpcClient, packet rpcPacket) {
 	if current.codex != client {
 		a.mu.Unlock()
 		_ = client.reject(packet.ID, "question connection does not own this session")
+		return
+	}
+	turn := codexFrameTurn(packet.Params, false)
+	valid := boundCodexTurn(current, client, turn)
+	if child != nil {
+		valid = turn != "" && child.turnID == turn && oneOf(child.Status, "running", "active", "waiting")
+	}
+	if !valid {
+		a.mu.Unlock()
+		_ = client.reject(packet.ID, "question has no exact active turn binding")
 		return
 	}
 	if current.reviewParent != "" {
@@ -258,9 +325,6 @@ func (a *app) codexQuestion(client *rpcClient, packet rpcPacket) {
 		return
 	}
 	a.bindQuestionLocked(current, &q, textField(params, "threadId"), textField(params, "turnId"))
-	if q.turnID == "" {
-		q.turnID = current.turnID
-	}
 	q.Questions, _ = params["questions"].([]any)
 	q.Questions = a.cleanStructured(q.Questions)
 	current.PendingQuestions = append(current.PendingQuestions, q)

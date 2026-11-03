@@ -166,6 +166,8 @@ func TestRepairValidApprovalIsBoundToActualTurn(t *testing.T) {
 	s.Status = "running"
 	s.turnID = "turn-one"
 	s.lastRequest = "request-one"
+	s.requests[s.lastRequest] = "accepted"
+	s.codexTurn = &codexTurnBinding{requestID: s.lastRequest, client: client, turnID: s.turnID}
 	params := json.RawMessage(`{"threadId":"test-provider","turnId":"turn-one","command":"echo safe"}`)
 	a.codexQuestion(client, rpcPacket{ID: json.RawMessage(`12`), Method: "item/commandExecution/requestApproval", Params: params})
 	if len(s.PendingQuestions) != 1 {
@@ -376,6 +378,9 @@ func TestRepairInteractiveReviewErrorStillCancelsOwnedTurn(t *testing.T) {
 	review := emptySession("codex", parent.CWD, "")
 	review.ProviderID = "interactive-review"
 	review.turnID = "owned-review-turn"
+	review.lastRequest = "review-request"
+	review.requests[review.lastRequest] = "accepted"
+	review.codexTurn = &codexTurnBinding{requestID: review.lastRequest, client: client, turnID: review.turnID}
 	review.Status = "running"
 	review.codex = client
 	review.reviewParent = parent.ID

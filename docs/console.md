@@ -43,10 +43,18 @@ safe to run. All provider processes run as the same local OS user.
 Native finality requires an exact request binding and a durable final receipt
 before the follow-up queue can advance. For Codex, only the correlated
 `turn/start` RPC reply binds a request to its turn ID; `turn/started` is not
-authority. Up to sixteen distinct early completions can wait for that reply.
-A missing/failed reply, empty binding, or overflow leaves ambiguous work unknown
-with no replay, even if the provider actually finished. Matching early
-completions are finalized after the reply, including for managed reviews.
+authority. Up to sixteen distinct early completions, limited to 256 KiB of
+retained identity/status/error strings, can wait for that reply. A missing or
+ambiguous binding, failed reply with early completion, or completion overflow
+leaves ambiguous work unknown with no replay, even if the provider finished.
+Matching early completions are finalized after the reply, including for managed
+reviews. Root content and telemetry require the same exact active binding;
+identified pre-reply frames stay private in a separate 128-frame/256-KiB buffer.
+Content-buffer overflow drops diagnostic content without establishing finality.
+Questions without exact active turn identity are rejected before entering the
+waiting state; checkpoint updates recheck binding at their mutation points.
+See the [console README](../console/README.md#workflow-and-history) for identity
+shapes, deduplication limits, buffering behavior and local-test limitations.
 
 Claude stream-json results do not identify the input request. Each process
 therefore admits only one user turn, and its request identity never changes.
