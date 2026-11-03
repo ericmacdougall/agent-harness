@@ -30,6 +30,24 @@ func (s *blockingAuthSink) Write(p []byte) (int, error) {
 }
 func (s *blockingAuthSink) Close() error { return nil }
 
+type closeTrackingSink struct {
+	mu     sync.Mutex
+	closed bool
+}
+
+func (s *closeTrackingSink) Write(p []byte) (int, error) { return len(p), nil }
+func (s *closeTrackingSink) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	return nil
+}
+func (s *closeTrackingSink) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
 func TestSuccessfulSameProfileAuthTransitionRevokesCachedClientAndChild(t *testing.T) {
 	a, current, _ := checkpointFixture(t)
 	settings, _ := settingsTestStore(t)
@@ -243,5 +261,45 @@ func TestClaudeQueuedFrameCannotCrossAuthTransition(t *testing.T) {
 	sink.mu.Unlock()
 	if strings.Contains(written, "second") {
 		t.Fatal("post-transition Claude frame reached provider input")
+	}
+}
+
+func TestClaudeStartedProcessCannotPublishAcrossAuthTransition(t *testing.T) {
+	a, current, _ := checkpointFixture(t)
+	profile := "claude-late-publication"
+	current.Provider, current.ProfileID = "claude", profile
+	generation := uint64(0)
+	// Model a process that has already started while an older admitted write
+	// keeps the generation drain open. Publication must still observe the
+	// boundary immediately and cancel this otherwise invisible process.
+	releaseOld, err := a.authAdmission("claude", profile, generation)()
+	if err != nil {
+		t.Fatal(err)
+	}
+	transitioned := make(chan struct{})
+	go func() {
+		a.beginAuthenticationTransition("claude", profile)
+		close(transitioned)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for !a.authTransitioning("claude", profile) && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if !a.authTransitioning("claude", profile) {
+		t.Fatal("Claude auth transition boundary was not published")
+	}
+	sink := &closeTrackingSink{}
+	run := &claudeRun{input: sink, done: make(chan struct{}), authAdmit: a.authAdmission("claude", profile, generation)}
+	if err = a.attachStartedClaudeRun(current, run, profile, generation, "task", 1); err == nil {
+		t.Fatal("old-generation Claude process published after transition boundary")
+	}
+	if current.claude != nil || !sink.isClosed() {
+		t.Fatal("refused late Claude process remained attached or live")
+	}
+	releaseOld()
+	select {
+	case <-transitioned:
+	case <-time.After(time.Second):
+		t.Fatal("Claude transition did not finish after old admission drained")
 	}
 }

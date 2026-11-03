@@ -131,6 +131,7 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 		a.mu.Unlock()
 		run = nil
 	}
+	startedRun := false
 	if run == nil {
 		var err error
 		args := []string{"--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--forward-subagent-text", "--permission-prompts", "host", "--system-prompt-snapshot", "off", "--append-system-prompt", policy.HarnessInstructions + "\n" + taskMetadata}
@@ -202,13 +203,15 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 			return err
 		}
 		run = &claudeRun{command: command, input: input, done: make(chan struct{}), cwd: cwd, runtimeHash: fingerprint, policy: policy, authAdmit: a.authAdmission("claude", profile, authGeneration)}
-		a.mu.Lock()
-		if current.task != nil {
-			run.taskID = taskID
-			run.inputRevision = revision
+		if err = a.attachStartedClaudeRun(current, run, profile, authGeneration, taskID, revision); err != nil {
+			// Start succeeded, so every later failure must reap the child even when
+			// the generation fence refused publication before the session saw it.
+			_ = command.Wait()
+			close(run.done)
+			a.unknownSend(current, requestID, err)
+			return err
 		}
-		current.claude = run
-		a.mu.Unlock()
+		startedRun = true
 		go func() {
 			a.readClaude(current, run, output)
 			err := command.Wait()
@@ -247,6 +250,9 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 		return release, nil
 	}
 	if err := run.writeAdmitted(context.Background(), frame, bindRequest); err != nil {
+		if startedRun {
+			a.detachStartedClaudeRun(current, run)
+		}
 		a.unknownSend(current, requestID, err)
 		return err
 	}
@@ -274,6 +280,40 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 	}
 	a.changedLocked()
 	return nil
+}
+
+func (a *app) detachStartedClaudeRun(current *session, run *claudeRun) {
+	a.mu.Lock()
+	if current.claude == run && run.requestID == "" {
+		current.claude = nil
+	}
+	a.mu.Unlock()
+	run.cancel()
+}
+
+// attachStartedClaudeRun binds a newly started process to the session while
+// holding the same generation admission used by serialized frame writes. A
+// transition therefore either sees and cancels the attached run or prevents
+// publication and cancels the otherwise invisible process here.
+func (a *app) attachStartedClaudeRun(current *session, run *claudeRun, profile string, generation uint64, taskID string, revision uint64) error {
+	a.mu.Lock()
+	release, err := a.authAdmission("claude", profile, generation)()
+	if err == nil && (current.claude != nil || current.Restored) {
+		err = refused("Claude session binding changed before process publication")
+	}
+	if err == nil {
+		run.taskID = taskID
+		run.inputRevision = revision
+		current.claude = run
+	}
+	if release != nil {
+		release()
+	}
+	a.mu.Unlock()
+	if err != nil {
+		run.cancel()
+	}
+	return err
 }
 
 // UI pause/stop is not a provider outcome. Only the exact unfinished request
