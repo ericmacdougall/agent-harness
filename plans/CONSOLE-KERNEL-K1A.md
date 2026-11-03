@@ -235,6 +235,46 @@ func Redact(text string, redactor func(string) string) RedactedReason // A nil r
 
 `Decide` stamps `Seq` as `LastSeq` plus position, `SchemaVersion`, `At`, and `SessionRevision`.
 
+## 11. Reserve bounds
+
+The event log keeps its last 50,000 facts (`Reserve`, out of `MaxFacts` 1,000,000) for facts that must still record when the log is otherwise full. Whether a fact may use the reserve is a kernel rule, `MustAppend(p, f)`, decided against the projection the fact was decided on; the log calls it and refuses everything else at the limit with a definite `ErrQuota`. A kind is never eligible as such: each fact is eligible only while it changes a one-way state, so every eligible fact consumes something that only an ordinary fact can create again.
+
+### Changes to the tables this needs
+
+- **Open session limit.** `create` refuses `session_limit` while 1,000 sessions are not closed (hidden ones count). `LegacyImported` obeys the same limit in K3. This bounds the sessions that can draw on the reserve.
+- **Control pending.** New table 4 field `ControlPending`: set by `ControlRequested`, cleared by `ControlOutcome`, `ProviderCompleted`, `ProviderRefused`, `RequestIntended` and restart. Table 7 `control-outcome`: when `ControlPending` is false, late `control_outcome`. Otherwise `ControlOutcome`, whatever its value. So an outcome needs a request, and alternating outcomes become sticky late evidence.
+- **Disconnect.** Table 7 `disconnected`: when not `Connected` and the last receipt is not open, idempotent with no fact. So each disconnect fact needs a connect or an open request since the last one.
+- **Quarantine.** Table 7 `quarantine`: already quarantined, idempotent with no fact. Table 2 and item 13 change to match: a session is quarantined once, and its first code stands. Replay's own quarantine is unchanged.
+- **Late final.** Only a late `final` on the session's `LastRequest` is eligible. Late finals on older requests remain ordinary facts.
+
+### Eligibility, per kind
+
+| Fact | Eligible when, judged before the fact | Uses per session once ordinary facts stop |
+|---|---|---|
+| `ProviderCompleted`, `OutcomeUnknown`, `ProviderRefused` | Always: each needs an open `LastRequest`, and moves it out of open | 1 together: the receipt is monotone and only `RequestIntended`, ordinary, opens a new one |
+| `Abandoned` | Always | 1: sticky |
+| `SessionClosed` | Always | 1: sticky |
+| `AuthBoundaryCrossed` | Always: needs a writable session, and makes it read-only | 1 |
+| `SessionQuarantined` | Always, with the change above | 1 |
+| `ProviderDisconnected` | `Connected` or last receipt open, both enforced by `Decide` above | 1: afterwards it is disconnected with no open receipt, and only `ProviderConnected` or `RequestIntended`, ordinary, re-arms it |
+| `ControlRequested` | `Control` is `stop`, and it changes `Paused` or newly owes the interrupt | 2: `Paused` is cleared only by `RequestIntended` or restart, and restart leaves the session read-only, where no control fact is recorded; the owed interrupt is set at most once per request |
+| `ControlOutcome` | `ControlPending` true, enforced by `Decide` above | 2: one per `ControlRequested`, which is at most 2 |
+| `LateFrameObserved` | `LateKind` is `final` and `RequestID` is the session's `LastRequest` | 1: sticky per key, and `LastRequest` changes only with `RequestIntended` |
+| `ProcessRestarted` | Always | See the proof |
+
+Every other fact is ordinary, including `TurnBound`: at the limit a Codex completion then records as unknown, which is safe.
+
+### Proof sketch
+
+1. Below the limit, eligible and ordinary facts both take ordinary space, so the reserve is untouched.
+2. Once ordinary facts reach `MaxFacts - Reserve`, no ordinary fact can commit. No session is created, no request opened, no connection made. So each session's eligible uses are bounded by its state at that moment, and the table above gives at most 1+1+1+1+1+1+2+2+1 = 11 per session.
+3. At most 1,000 sessions are not closed. A closed session accepts no fact. So session facts use at most 11,000 reserve facts.
+4. A restart is skipped when the last fact is already a restart. So restarts are at most one more than the other reserve facts: at most 11,001.
+5. Total at most 22,001, under 50,000, with a factor of two in hand for a later slice's kinds, which must extend this table before they may be eligible.
+6. If the reserve is still spent, which the proof says cannot happen, the log latches, and that is a defect to report.
+
+The independent model checks this table directly: for each fact, `MustAppend` against its own reading, and a bound of 11 eligible facts per session after a simulated limit, under generators that repeat and alternate every provider frame.
+
 ## 10. Settled readings
 
 The independent model listed 34 places these tables left open. None changes a table's rows. Each reading below is now part of the specification.
@@ -251,7 +291,7 @@ The independent model listed 34 places these tables left open. None changes a ta
 10. A session fact's `SessionRevision` must equal `Revision + 1`, otherwise it is illegal. This is the compare-and-swap the plan's `Log.Append` relies on.
 11. Raw `TurnBound` needs only what table 4 says: Codex, `LastRequest`, nonempty turn. Input-level checks are in `Decide`.
 12. `no_owner` is a `Decide` rule. Raw `SessionCreated` with a provider ID and no identity is legal. Raw `ConversationBound` with a different provider ID on a started conversation is illegal.
-13. The quarantine reason is `ReasonCode`. A later `SessionQuarantined` overwrites the code. Replay's `illegal_fact` does not overwrite a code already set.
+13. The quarantine reason is `ReasonCode`. A session is quarantined once; a later `quarantine` input records nothing (section 11). Replay's `illegal_fact` does not overwrite a code already set.
 14. `Redact` trims, the fact holds the trimmed text, and the 500-byte limit applies after trimming.
 15. `LegacyImported` copies `ProviderID`, `ProfileID`, `CWD` and `RuntimeIdentity`. An empty provider is legal there, since only shape applies.
 16. Replay's first-illegal row applies even on a session already quarantined by a fact, keeping its code.
@@ -279,7 +319,7 @@ The independent model listed 34 places these tables left open. None changes a ta
 38. A disconnect ends the Codex turn: K4 stops the provider's process group whenever its stream ends, so clearing `TurnID` is correct. K6 must keep this true.
 41. Changed in K2: a writable pause or stop that would change nothing records no fact, so repeated presses cannot grow the log or spend the must-append reserve. Its stop effects still fire.
 40. Changed in K2 after a secrets canary found an API-key-shaped value stored as late evidence: a late frame's digest must be 64 lowercase hex characters. `Reduce` refuses a raw `LateFrameObserved` whose digest is neither empty nor that hex form. Identity fields such as provider and turn IDs are identities by design and are stored as given; adapters must never put secrets in them.
-39. Repeated `disconnected` frames append facts, and `control-outcome` frames that change `PauseUnconfirmed` do, while an exact repeat is idempotent per table 7. K2's quota and must-append reserve bound them; coalescing them is deferred.
+39. Superseded by section 11: repeated `disconnected` frames record only when connected or a request is open, and `control-outcome` frames only while a control request is pending.
 
 ## Review record
 
