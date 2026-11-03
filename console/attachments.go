@@ -58,6 +58,58 @@ func (a *app) selectAttachments(id string, paths []string) error {
 	return nil
 }
 
+// Called under app.mu after send admission. Transfer immutable snapshots out of
+// the composer before another selection can replace them. The queue store gives
+// accepted/uncertain provider consumers durable ownership and explicit cleanup.
+func (a *app) retainOrdinaryAttachmentsLocked(s *session, request, text string, paths []string, runtime string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	if len(s.inputs) >= queueReceiptLimit {
+		return errors.New("input receipt limit reached; discard retained inputs")
+	}
+	snapshots := map[string]attachmentSnapshot{}
+	for _, path := range paths {
+		snapshots[path] = s.attachmentSnapshots[path]
+	}
+	entry := &queuedInput{
+		RetentionOnly:         true,
+		RequestID:             request,
+		RequestHash:           objectiveHash(text + "\x00" + strings.Join(paths, "\x00")),
+		Status:                "dispatching",
+		CreatedAt:             now(),
+		Reason:                "Provider write intent; files retained for delayed consumers",
+		TaskID:                s.task.ID,
+		Generation:            s.task.Generation,
+		QueuedAtInputRevision: s.task.InputRevision,
+		CWD:                   s.CWD,
+		PolicyRevision:        s.PolicyRevision,
+		PayloadHash:           objectiveHash(text + "\x00" + request),
+		PolicyHash:            policyHash(s.policy),
+		RuntimeHash:           runtime,
+		Snapshots:             snapshots,
+	}
+	s.inputs = append(s.inputs, entry)
+	if err := a.saveInputsLocked(s); err != nil {
+		if !s.queueUncertain {
+			s.inputs = s.inputs[:len(s.inputs)-1]
+			return err
+		}
+		entry.Status = "unknown"
+		entry.Reason = "Attachment ownership commit is uncertain; preserve files and restart to reconcile"
+		for _, path := range paths {
+			delete(s.attachmentSnapshots, path)
+		}
+		s.Attachments = []string{}
+		return err
+	}
+	for _, path := range paths {
+		delete(s.attachmentSnapshots, path)
+	}
+	s.Attachments = []string{}
+	return nil
+}
+
 // Called under app.mu: the provider receives only private snapshots, never the mutable original.
 func (a *app) selectedAttachments(current *session, paths []string) ([]string, error) {
 	result := []string{}

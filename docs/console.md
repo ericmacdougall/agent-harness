@@ -50,10 +50,14 @@ even when its source or artifact digest matches. Dispatch is also refused if
 the cwd, account/model/tools policy, runtime, immutable attachment snapshots,
 task generation, or pause epoch changed after acceptance.
 
-Delivered inputs remain as read-only recovery records until the user explicitly
-discards the local payload. Discard releases retained snapshot files, but it
-does not cancel provider work or alter whether delivery occurred. Starting a
-new objective is refused while retained payloads still need reconciliation.
+Queued follow-ups remain as read-only recovery records until the user explicitly
+discards the local payload. Ordinary sends transfer attachment ownership out of
+the composer while the provider turn can still have delayed readers, then
+release those snapshots automatically after a native final outcome. If finality
+or cleanup durability is unknown, the receipt and files remain for explicit
+reconciliation. Discard releases retained snapshot files, but it does not
+cancel provider work or alter whether delivery occurred. Starting a new
+objective is refused while retained payloads still need reconciliation.
 
 Repository controls expose local tracking and worktree state. Sync preserves
 local work if a remote is unavailable. Removal refuses dirty, locked, current,

@@ -11,6 +11,7 @@ import (
 )
 
 type queuedInput struct {
+	RetentionOnly          bool                          `json:"retentionOnly,omitempty"`
 	RequestHash            string                        `json:"requestHash"`
 	RequestID              string                        `json:"requestId"`
 	Status                 string                        `json:"status"`
@@ -45,6 +46,9 @@ func policyHash(policy resolvedPolicy) string {
 	return objectiveHash(string(data))
 }
 func pendingInput(entry *queuedInput) bool {
+	if entry.RetentionOnly {
+		return false
+	}
 	return entry.Status == "queued" || entry.Status == "held" || entry.Status == "dispatching" || entry.Status == "unknown"
 }
 func (a *app) inputStateLocked(s *session) []map[string]any {

@@ -203,6 +203,21 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 		a.mu.Unlock()
 		return errors.New("could not persist send intent")
 	}
+	if followup == nil {
+		if err := a.retainOrdinaryAttachmentsLocked(current, requestID, text, attachments, fingerprint); err != nil {
+			if current.queueUncertain {
+				current.requests[requestID] = "unknown"
+				current.Status = "unknown"
+				current.Error = "Attachment ownership commit is uncertain; no provider write or replay"
+				_ = a.record(current, requestID, "unknown")
+			} else {
+				current.requests[requestID] = "rejected"
+				_ = a.record(current, requestID, "rejected")
+			}
+			a.mu.Unlock()
+			return err
+		}
+	}
 	if !automatic {
 		current.Supervision = supervision{State: "active", NextCheckpoint: "Provider turn, owners, review and delivery", RemainingBursts: 3}
 	}
