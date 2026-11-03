@@ -236,17 +236,20 @@ Each slice is its own branch and PR, with its own code inspection. Sizes exclude
 | Slice | Scope | Acceptance | Depends on |
 |---|---|---|---|
 | **K0** | This plan and the catalog | Plan review | None |
-| **K1** | `internal/kernel`: enums, facts with encoder and decoder, effect descriptors, `Decide`, `Reduce`, restart rule, command decode, field-to-fact table. No I/O, no wiring. | Catalog entries marked reducer. Property test with random inputs, seed printed: every fact round-trips through the real encoder before reducing, and results are checked against an independently written model of the receipt and restart tables, since live and replay alone are one fold. Determinism at 1,000 runs with randomized map order. Duplicate, reordered, unknown-version and illegal facts refuse. Failing controls: transition table mutations caught by the model, and for INV2 a seeded field dropped by the encoder or set outside `Reduce`. | K0 |
-| **K2** | `internal/eventlog`: append with revision CAS, receipts, replay, health latch, must-append reserve, quota, notices. Not wired. | The five falsifiers. Kill at each transaction boundary, `SQLITE_BUSY`, short write, disk-full, and ambiguous commit injection, then reopen. Concurrent append. Secrets canary across the database, WAL and free pages. | K1 |
+| **K1a** | `internal/kernel` core, per [the closed tables](CONSOLE-KERNEL-K1A.md): session lifecycle, receipts, turn and control, late evidence, restart, authorization, codec. Under 1,200 non-test lines. No I/O, no wiring. | Plan review accepts the tables. In-scope reproducers fail at `2132280` and pass. Model written by a separate agent from the tables alone compares every K1a field and the effect list, at 3,000 seeds with the seed printed. `go test -race`. Every mutated table row is caught by that model. One blind inspection with no blocker on a tabled object, or one repair then a clean second. | K0 |
+| **K1b** | Children, questions and the control side they share | Same recipe, deferred controls F6-child, F9, F11 | K1a, before K7 |
+| **K1c** | Inputs | Same recipe | K1a, before K8 |
+| **K1d** | Tasks, reviews, checkpoints, supervision and continuation budget | Same recipe, deferred controls F1, F7, F8 | K1a, before K9 |
+| **K2** | `internal/eventlog`: append with revision CAS, receipts, replay, health latch, must-append reserve, quota, notices. Not wired. | The five falsifiers. Kill at each transaction boundary, `SQLITE_BUSY`, short write, disk-full, and ambiguous commit injection, then reopen. Concurrent append. Secrets canary across the database, WAL and free pages. | K1a |
 | **K3** | `internal/legacyimport` and the queue decoder, not wired | Fixtures from `6172744` shapes, including cwd after receipt, torn tail, corrupt line, corrupt queue, orphan queue and missing identity. Crash at each step. Held lock refuses. Rollback and `--reimport` both ways. | K2 |
 | **B** | Labelled baseline PR to `main`, per Landing | Public-repo scan clean. Guard refuses a directory without the marker. Reviewed and merged through the main agent. | K0 |
 | **K4** | Process lifecycle, on the baseline. Adapter identity computation. | Catalog process entries, with real child processes on Linux and Mac. This work carries through wiring. | B |
-| **K5a** | Ownership gate at every entry point, AST inventory, field classification test. No behaviour change. | Gate default-denies a marked session on every entry point. Inventory test fails on an unlisted write. | Baseline, K1 |
-| **K5b** | Wire Claude send, finality and restart. Writer gate, fence and drain. | Seeded test through the real API, with the operation set limited to what K5b owns. Commit-to-effect crash matrix for send. Test holding a write between recheck and syscall. Lock rule tests rerun. | K1, K2, K4, K5a |
+| **K5a** | Ownership gate at every entry point, AST inventory, field classification test. No behaviour change. | Gate default-denies a marked session on every entry point. Inventory test fails on an unlisted write. | Baseline, K1a |
+| **K5b** | Wire Claude send, finality and restart. Writer gate, fence and drain. | Seeded test through the real API, with the operation set limited to what K5b owns. Commit-to-effect crash matrix for send. Test holding a write between recheck and syscall. Lock rule tests rerun. | K1a, K2, K4, K5a |
 | **K6** | Wire Codex: conversation binding, turn binding, finality, disconnect | Same for Codex. Client cache key stays separate from conversation identity. | K5 |
-| **K7** | Controls, questions, cwd, close, auth boundary, children, and **discard** with its UI, since it shares control's state | Control, question and all discard entries. Delayed-response scenarios. Operation set grows. | K6 |
-| **K8** | Queue and attachment ownership as facts. Content-addressed payload is durable first, the fact second, and orphan cleanup runs only after replay. Beforeimages removed. | Queue entries, with fault injection at each step. | K7 |
-| **K9** | Reviews and checkpoints, including cross-provider reviewers | Review entries | K8 |
+| **K7** | Controls, questions, cwd, close, auth boundary, children, and **discard** with its UI, since it shares control's state | Control, question and all discard entries. Delayed-response scenarios. Operation set grows. | K6, K1b |
+| **K8** | Queue and attachment ownership as facts. Content-addressed payload is durable first, the fact second, and orphan cleanup runs only after replay. Beforeimages removed. | Queue entries, with fault injection at each step. | K7, K1c |
+| **K9** | Reviews and checkpoints, including cross-provider reviewers | Review entries | K8, K1d |
 | **K10** | Wire import. Remove the data-directory guard. | Seeded test with the full operation set at **10,000 seeds**, zero divergence, including questions, reviews and checkpoints. Import end to end. | K3, K9 |
 | **K11** | Replacement release | One frozen full qualification on the Linux runner, Mac native, click-test including discard keyboard and focus, bounded real-provider smoke, exact-head PR review, private-copy import rehearsal, no-write verify on the stopped directory, golden fixtures. Then install. Only then is the old console stopped, with the user's existing authorization. | K10 |
 
@@ -259,17 +262,17 @@ Each slice is its own branch and PR, with its own code inspection. Sizes exclude
 6. A public-repo scan for private content and non-public emails passes first, and history is squashed under the public identity.
 7. Review and merge go through the main agent.
 
-K1 to K3 are new packages. They land with `console/go.mod` and a workflow that runs `go test ./internal/...`, because the existing workflow's `go build .` needs a main package. The baseline merge reconciles `go.mod`, including any `go` directive the refreshed SQLite requires.
+K1a, K2 and K3 are new packages. They land with `console/go.mod` and a workflow that runs `go test ./internal/...`, because the existing workflow's `go build .` needs a main package. The baseline merge reconciles `go.mod`, including any `go` directive the refreshed SQLite requires.
 
 ## Findings carried from plan review
 
-Each is closed in the named slice, and K1's two are settled in its first commit.
+Each is closed in the named slice.
 
 | Slice | Finding | Direction |
 |---|---|---|
-| K1, K2, K7 | Stop conflicts with INV7 and failed appends: at quota a literal implementation refuses Stop while the provider runs | Stop effects are exempt from INV7 and never depend on an append. `ControlRequested{stop}` is must-append, and a stop outcome may have no recorded request. R4 means no authority change; the stop effect still fires |
-| K1 | A failed drain after `Abandoned` has no legal fact, because `abandoned` is terminal | Effect observations on a terminal or `unknown` receipt become `LateFrameObserved`, and the K1 model covers them |
-| K1 | `ProcessRestarted{processEpoch}` conflicts with skipping a repeat | Remove the field. The live epoch stays outside the projection |
+| K1a, K2, K7 | Stop conflicts with INV7 and failed appends: at quota a literal implementation refuses Stop while the provider runs | Stop effects are exempt from INV7 and never depend on an append. `ControlRequested{stop}` is must-append, and a stop outcome may have no recorded request. R4 means no authority change; the stop effect still fires |
+| K1a | A failed drain after `Abandoned` has no legal fact, because `abandoned` is terminal | Effect observations on a terminal or `unknown` receipt become `LateFrameObserved`, and the K1 model covers them |
+| K1a | `ProcessRestarted{processEpoch}` conflicts with skipping a repeat | Remove the field. The live epoch stays outside the projection |
 | K2 | Must-append list is still incomplete | Add `ProviderRefused`, `LateFrameObserved{final}`, `AuthBoundaryCrossed`, `ChildQuarantined`, coalesced where the plan coalesces, and include them in reserve sizing |
 | K5b, K7 | Entering the latch drains nothing | Entering the latch drains every writer gate, with the same deadline and kill. Console-controlled credential changes wait or refuse. State the policy for running turns |
 | K6 | A kill on a shared Codex writer stops other sessions | Record `OutcomeUnknown` for every open request on that client, with a test |
@@ -277,7 +280,8 @@ Each is closed in the named slice, and K1's two are settled in its first commit.
 
 ## Stop conditions
 
-- Stop and report if a class one to four blocker (late frame reopening, restore divergence, one-provider guard, publish before persist) recurs inside the reducer after K1 review: the problem would then be the specification, not the structure.
+- K1a: **S1** a second inspection after a repair still blocks with a late-frame, restore, one-path or publish-before-persist finding on a tabled object. **S2** the independent model and the reducer disagree in a way the table cannot settle. **S3** K1a passes two owner-days. **S4** K2 falsifier 3, 4 or 5 fails. On S1 or S2 the next step is a plan review of the table, never another code repair.
+- K1b to K1d: same recipe, with a two-inspection cap each. If together they exceed two owner-days or one needs a third inspection, report it.
 - Stop and report if K2's falsifiers 3, 4 or 5 fail, or if the log cannot run under `console.lock`.
 - Stop and report if the same finding class returns after two genuine repairs in any slice.
 - Reviews are helper receipts where they can route, labelled native otherwise. Sol may take a later look after about Nov 9; that is not a gate.

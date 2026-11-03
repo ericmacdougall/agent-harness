@@ -1,0 +1,111 @@
+package kernel
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+)
+
+func TestRepro2F1OldVerdictPassesNewObjective(t *testing.T) {
+	r := newRig(t)
+	r.started("s", ProviderClaude)
+	r.must(In{Kind: InStartReview, SessionID: "s", ID: "run", Stage: "plan", Digest: "d"})
+	r.complete("s", "A")
+	r.must(In{Kind: InSend, SessionID: "s", RequestID: "B", TaskID: "t2", Generation: 2})
+	r.must(In{Kind: ObReviewOutcome, SessionID: "s", ID: "run", Verdict: "pass", Digest: "d"})
+	if got := r.session("s").Task; got.ID == "t2" && got.Passes["plan"] != "" {
+		t.Fatalf("t2 got a pass from the old run: %+v", got)
+	}
+}
+func TestRepro2F2AlternatingStatusDefeatsCoalescing(t *testing.T) {
+	r := newRig(t)
+	r.started("s", ProviderCodex)
+	r.complete("s", "A")
+	seq := r.p.LastSeq
+	for i := 0; i < 1000; i++ {
+		r.must(In{Kind: ObCompleted, SessionID: "s", RequestID: "A", TurnID: "x", Status: []string{"completed", "failed"}[i%2]})
+	}
+	if got := r.p.LastSeq - seq; got > 2 {
+		t.Fatalf("appended %d facts", got)
+	}
+}
+func TestRepro2F3ControlOutcomeLogsFreeText(t *testing.T) {
+	r := newRig(t)
+	r.started("s", ProviderClaude)
+	d := r.must(In{Kind: ObControlOutcome, SessionID: "s", Status: "Bearer secret-value", Outcome: "confirmed"})
+	if len(d.Facts) == 1 && strings.Contains(d.Facts[0].Control, "secret") {
+		t.Fatalf("free text in fact: %+v", d.Facts[0])
+	}
+}
+func TestRepro2F4CreateWithProviderIDSkipsOwner(t *testing.T) {
+	r := newRig(t)
+	r.must(In{Kind: InCreate, SessionID: "s", Provider: ProviderClaude, ProviderID: "existing"})
+	if _, err := r.apply(In{Kind: InSend, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1, RuntimeIdentity: "other"}); err == nil {
+		t.Fatal("any runtime claimed an existing conversation")
+	}
+}
+func TestRepro2F5UserCreateForgesConnected(t *testing.T) {
+	c, err := DecodeCommand([]byte(`{"kind":"create","sessionId":"s","provider":"codex","status":"connected"}`))
+	if err != nil {
+		t.Skip(err)
+	}
+	r := newRig(t)
+	r.must(In{Kind: c.Kind, SessionID: c.SessionID, Provider: c.Provider, Status: c.Status})
+	if r.session("s").Connected {
+		t.Fatal("a user body set Connected without a provider fact")
+	}
+}
+func TestRepro2F6StopUnreachableAfterBoundary(t *testing.T) {
+	r := newRig(t)
+	r.started("s", ProviderCodex)
+	r.must(In{Kind: ObAuthBoundary, Provider: ProviderCodex})
+	d, err := r.apply(In{Kind: InStop, SessionID: "s"})
+	if err != nil || len(d.Effects) == 0 {
+		t.Fatalf("stop after boundary with a bound turn: %v %+v", err, d)
+	}
+}
+func TestRepro2F7CheckpointClearsFailedReview(t *testing.T) {
+	r := newRig(t)
+	r.started("s", ProviderClaude)
+	r.must(In{Kind: InStartReview, SessionID: "s", ID: "run", Stage: "plan", Digest: "d"})
+	r.must(In{Kind: ObQuestion, SessionID: "s", RequestID: "A", ID: "q", ReviewRunID: "run"})
+	_, err := r.apply(In{Kind: InCheckpoint, Principal: Principal{Class: PrincipalAgentRun, SessionID: "s"}, SessionID: "s", TaskID: "task-s", State: TaskComplete})
+	if err == nil {
+		t.Fatalf("checkpoint admitted after failed review: %+v", r.session("s").Task)
+	}
+}
+func TestRepro2F8ReusedTaskKeepsPasses(t *testing.T) {
+	r := newRig(t)
+	r.started("s", ProviderClaude)
+	r.must(In{Kind: InStartReview, SessionID: "s", ID: "run", Stage: "plan", Digest: "d"})
+	r.must(In{Kind: ObReviewOutcome, SessionID: "s", ID: "run", Verdict: "pass", Digest: "d"})
+	r.complete("s", "A")
+	_, err := r.apply(In{Kind: InSend, SessionID: "s", RequestID: "B", TaskID: "task-s", Generation: 2, ObjectiveHash: "different"})
+	if err == nil && len(r.session("s").Task.Passes) != 0 {
+		t.Fatalf("old passes survive a new objective: %+v", r.session("s").Task)
+	}
+}
+func TestRepro2F9OutcomeReopensQuarantinedChild(t *testing.T) {
+	r := newRig(t)
+	r.started("s", ProviderClaude)
+	r.complete("s", "A")
+	r.must(In{Kind: ObChild, SessionID: "s", ID: "c", TurnID: "t", Status: ChildRunning})
+	r.must(In{Kind: ObAuthBoundary, Provider: ProviderClaude})
+	r.must(In{Kind: ObChildOutcome, SessionID: "s", ID: "c", Status: ChildRunning})
+	var refusal *Refusal
+	if _, err := r.apply(In{Kind: InClose, SessionID: "s"}); errors.As(err, &refusal) {
+		t.Fatalf("tab trapped: %s", refusal.Code)
+	}
+}
+func TestRepro2F11ClosedSessionQuestionNotRejected(t *testing.T) {
+	r := newRig(t)
+	sent(t, r, "s", ProviderCodex)
+	r.must(In{Kind: InPause, SessionID: "s"})
+	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("done")})
+	r.must(In{Kind: InClose, SessionID: "s"})
+	d, _ := r.apply(In{Kind: ObQuestion, SessionID: "s", RequestID: "A", ID: "q", TurnID: "t", ExpiresAt: "2030-01-01T00:00:00.000000000Z"})
+	if len(d.Effects) == 0 {
+		t.Fatal(fmt.Sprintf("no reject effect: %+v", d))
+	}
+}
