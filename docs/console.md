@@ -150,6 +150,28 @@ available.
 
 ## Verification
 
+### Build standalone archives
+
+The package helper uses the `go` executable on `PATH` and builds offline from
+the module cache. Use a security-patched Go executable, then prefetch the pinned
+module in the same user environment before packaging:
+
+```sh
+go version
+cd console
+go mod download
+go mod verify
+cd ..
+python3 tools/package_console.py --output-dir /absolute/new-directory --version 0.2.0
+```
+
+The package helper disables Go's automatic toolchain switching; setting only
+`GOTOOLCHAIN` does not change the executable it chooses from `PATH`. The output
+directory must not exist. A missing dependency fails the offline build;
+`go mod download` is the explicit network step. `SHA256SUMS` appears only
+after all selected target archives are complete. The six archives are unsigned
+compile checks, not proof that the GUI or native vault works on every target.
+
 The preregistered [ordinary, deep, and negative scenarios](../plans/CONSOLE-SCENARIOS.md)
 define flow acceptance. Deterministic subprocess and HTTP fixtures exercise
 protocol, concurrency, failure, redaction, and recovery controls without paid
