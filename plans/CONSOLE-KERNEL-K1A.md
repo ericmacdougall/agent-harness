@@ -15,7 +15,7 @@ Each field belongs to exactly one table.
 | 4 Turn and control | `TurnID`, `PendingInterrupt`, `Paused`, `PauseUnconfirmed`, `ControlEpoch` |
 | 5 Late evidence | `Evidence` |
 
-`Revision` increases by one with every fact on the session. A fact not listed in a table changes nothing in that table. Read-only is never cleared: such a session can never send again, only stop, discard and close.
+`Revision` increases by one with every session fact on the session. A global fact does not change it. A fact not listed in a table changes nothing in that table. Read-only is never cleared: such a session can never send again, only stop, discard and close.
 
 ## 2. Session lifecycle
 
@@ -32,9 +32,10 @@ Each field belongs to exactly one table.
 | `CwdChanged` | Writable, last receipt not unresolved | `CWD` set |
 | `SessionClosed` | Last receipt not unresolved and no quarantine, unless `Abandoned` is set | `Closed` true |
 | `ProcessRestarted` (global) | None | Every session not closed: `ReadOnly` true, `Connected` false; rows in tables 3 and 4. Then trim below |
+| `LegacyImportCompleted` (global) | Nonempty digest, not already completed | `LegacyImported` on the projection set to the digest. No session changes |
 | `LegacyImported` | Session absent, revision 1, receipt in `final`, `rejected`, `unknown`, `abandoned` or none, with a request exactly when there is a receipt | `ReadOnly` true, `Connected` false, `ConversationStarted` is `ProviderID != ""`. If receipt: `LastRequest`, `Requests`, `RequestOrder` set, `ProviderFinal` true only for `final`, and for `abandoned`, `Abandoned` set |
 
-A closed session accepts no fact. A read-only session accepts only `LateFrameObserved`, `ControlOutcome`, `SessionClosed`, `Abandoned`, `SessionQuarantined` and `TurnBound`.
+A closed session accepts no fact. Besides the global restart, a read-only session accepts only `LateFrameObserved`, `ControlOutcome`, `SessionClosed`, `Abandoned`, `SessionQuarantined` and `TurnBound`.
 
 **Trim.** After a restart, a session that is not closed or hidden is protected if it is not abandoned and either its last receipt is unresolved or it is quarantined. The budget is 24 minus the protected count, clamped at 0. Candidates are sessions not closed, not hidden and not protected. Walking candidates newest to oldest by creation order, each takes one from the budget while any remains, and the rest get `Hidden` true. `Hidden` is sticky except as `SessionQuarantined` says. `VisibleSessions` returns sessions neither closed nor hidden, in creation order.
 
@@ -57,7 +58,7 @@ Transitions exactly: none to `intent`; `intent` to `accepted`, `final`, `unknown
 
 Applies with `Provider` as written. A Claude session never has a `TurnID` or a pending interrupt, since its process is the stop handle.
 
-**Owed** below means: last receipt, before the fact, is unresolved, `TurnID` is empty, and provider is Codex.
+**Owed** below means: last receipt, before the fact, is unresolved, `TurnID` is empty, and provider is Codex. **Sticky owed** means `PendingInterrupt` stays true if already true, and otherwise becomes owed, so a later fact can never clear an interrupt still due.
 
 | Fact | `TurnID` | `PendingInterrupt` | `Paused` | `PauseUnconfirmed` | `ControlEpoch` |
 |---|---|---|---|---|---|
@@ -67,12 +68,12 @@ Applies with `Provider` as written. A Claude session never has a `TurnID` or a p
 | `ProviderRefused` | Empty | False | Same | Same | Same |
 | `OutcomeUnknown` | Same | Same | Same | Same | +1 |
 | `ProviderDisconnected` | Empty | Same | Same | Same | +1 |
-| `ControlRequested` when last receipt is `unknown` | Same | Owed | Same | Same | Same |
-| `ControlRequested` otherwise | Same | Owed | True | Same | +1 |
+| `ControlRequested` when last receipt is `unknown` | Same | Sticky owed | Same | Same | Same |
+| `ControlRequested` otherwise | Same | Sticky owed | True | Same | +1 |
 | `ControlOutcome` | Same | Same | Same | True when outcome is not `confirmed`, the last receipt is unresolved and not abandoned; otherwise false | Same |
-| `AuthBoundaryCrossed` | Same | Owed | Same | Same | +1 |
-| `Abandoned` | Same | Owed | Same | Same | +1 |
-| `SessionQuarantined` | Same | Owed | Same | Same | +1 |
+| `AuthBoundaryCrossed` | Same | Sticky owed | Same | Same | +1 |
+| `Abandoned` | Same | Sticky owed | Same | Same | +1 |
+| `SessionQuarantined` | Same | Sticky owed | Same | Same | +1 |
 | `CwdChanged` | Same | Same | Same | Same | +1 |
 | `ProcessRestarted` | Empty | False | False | False | Same |
 
@@ -108,7 +109,7 @@ First match wins.
 
 Authorization runs first, before every other check including restart, and is default-deny. `forbidden` otherwise. A `provider` input must carry `Principal.SessionID` equal to its session. Then a time check: `At` must be fixed-width UTC `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`, otherwise refusal `bad_time`.
 
-Effects are returned with the decision, in the order listed. A refusal returns no facts. Checks run in the order written, and the first that applies decides. A session that is missing or closed gives refusal `not_found`, except as `turn-bound` says.
+Effects are returned with the decision, in the order listed. `Decision.Idempotent` is true exactly when a decision that is not a refusal has no facts. Adapters stamp `At` on provider frames, so `bad_time` and `not_found` reach a provider only through an adapter bug or a closed session. A refusal returns no facts. Checks run in the order written, and the first that applies decides. A session that is missing or closed gives refusal `not_found`, except as `turn-bound` says.
 
 | Input | Principal | Rule |
 |---|---|---|
@@ -118,7 +119,7 @@ Effects are returned with the decision, in the order listed. A refusal returns n
 | `change-cwd` | user | Read-only: `read_only`. Unresolved: `unresolved`. Empty path: `bad_request`. Else `CwdChanged` |
 | `close` | user | No `Abandoned`, and last receipt unresolved or `Quarantine` set: `unresolved`. Else `SessionClosed` |
 | `abandon` | user | `RequestID` on the fact is empty exactly when `LastRequest` is empty, which is how a quarantined session with no receipt reaches close. Reason empty after trimming, or over 500 bytes: `bad_reason`. Already abandoned: idempotent if the expected request matches, otherwise `discarded_other`. Expected request differs from `LastRequest`: `turn_changed`. Not read-only and status is `running`: `stop_first`. Last receipt not unresolved and status not `unknown`: `nothing_to_discard`. Else `Abandoned`, plus stop effects as they stood before the fact |
-| `conversation-bound` | provider | Read-only, or provider ID empty or out of shape: late `conversation`. Session identity set and input identity set and different: `runtime_changed`. Both identities empty: `no_owner`. Else `RuntimeIdentityBound` if the input has one and the session has none, then `ConversationBound` |
+| `conversation-bound` | provider | Read-only, provider ID empty or out of shape, or input identity out of shape: late `conversation`. Session identity set and input identity set and different: `runtime_changed`. Both identities empty: `no_owner`. Same provider ID as bound: idempotent. `ConversationStarted` with a different provider ID: late `conversation`, so a conversation is never silently replaced. Else `RuntimeIdentityBound` if the input has one and the session has none, then `ConversationBound` |
 | `connected` | provider | Read-only: late `connected`. Already connected: idempotent. Else `ProviderConnected` |
 | `disconnected` | provider | Read-only: late `disconnected`. Else `ProviderDisconnected` |
 | `accepted` | provider | Not `LastRequest`, last receipt not open, or read-only: late `accepted`. Receipt already `accepted`: idempotent. Else `ProviderAccepted` |
@@ -131,7 +132,7 @@ Effects are returned with the decision, in the order listed. A refusal returns n
 | `quarantine` | system | Empty reason: `bad_value`. Else `SessionQuarantined`, plus stop effects |
 | `restart` | system | Last fact was `ProcessRestarted`: idempotent, no fact. Else `ProcessRestarted`. No effects |
 
-Every value on a fact has a closed set or a shape: identities `[A-Za-z0-9._:/@+=-]{1,128}`, digests and runtime identity `[A-Za-z0-9:_-]{1,128}`, reason codes `[a-z0-9_]{1,40}`, `Control` and `Outcome` as listed, and `Reason` only on `Abandoned` and `LegacyImported`. A value out of shape on a user or system input gives `bad_value`. A provider input never does: a frame cannot be refused back to the provider, so its rows above say what happens. A request out of shape is simply not `LastRequest`. `Decide` encodes, decodes and reduces each fact before returning, and any failure there is a refusal `bad_value`, so nothing it returns can be refused by `Reduce` or changed by the codec.
+Every value on a fact has a closed set or a shape: identities `[A-Za-z0-9._:/@+=-]{1,128}`, digests and runtime identity `[A-Za-z0-9:_-]{1,128}`, reason codes `[a-z0-9_]{1,40}`, `Control` and `Outcome` as listed, and `Reason` only on `Abandoned` and `LegacyImported`. `CWD` is at most 4,096 bytes of valid UTF-8 with no control characters, may be empty on `create`, and must be nonempty on `change-cwd`. Only fields that reach a fact are checked, after the row's own checks, so a read-only stop always fires its effects and an idempotent retry is not refused over an unused field. A value out of shape then gives `bad_value` on a user or system input. A provider input never does: a frame cannot be refused back to the provider, so its rows above say what happens. A request out of shape is simply not `LastRequest`. `Decide` encodes, decodes and reduces each fact before returning, and any failure there is a refusal `bad_value`, so nothing it returns can be refused by `Reduce` or changed by the codec.
 
 `LegacyImported` and `LegacyImportCompleted` come only from the importer in K3, and have no input row. A `final` import leaves `FinalStatus` empty. `LegacyImported.RequestID` follows the same empty rule as `Abandoned`.
 
@@ -145,7 +146,7 @@ Fact kinds for later slices stay known to the codec so a log holding them stays 
 |---|---|
 | Schema version not current, kind not known, or sequence not increasing | The log is unreadable: `ErrUnreadableLog`, empty projection |
 | Illegal fact with no session, including a global fact | Same |
-| Illegal fact on a session that exists, the first for that session | Fact skipped. `LastSeq` and `LastKind` advance. `Quarantine` set to `illegal_fact` unless already set, `ReadOnly` true, `Connected` false, `Hidden` false, `ControlEpoch` +1, `PendingInterrupt` owed. `Revision` unchanged. Session reported once in `[]Quarantined` |
+| Illegal fact on a session that exists, the first for that session | Fact skipped. `LastSeq` and `LastKind` advance. `Quarantine` set to `illegal_fact` unless already set, `ReadOnly` true, `Connected` false, `Hidden` false, `ControlEpoch` +1, `PendingInterrupt` sticky owed. `Revision` unchanged. Session reported once in `[]Quarantined` |
 | Illegal fact on a session that does not exist | Fact skipped, `LastSeq` and `LastKind` advance, session reported once |
 | Later fact on a quarantined session | Applied if `Reduce` accepts it, otherwise skipped with `LastSeq` and `LastKind` advancing and no further change |
 
@@ -154,12 +155,86 @@ A fact of a later slice's kind is illegal, so it follows the same rows. Quaranti
 ## 9. API the model drives
 
 ```go
-func Decide(p Projection, in In) (Decision, error)        // error is *Refusal{Code, Message}, or a bug
-func Reduce(p Projection, f Fact) (Projection, error)     // ErrIllegalFact, ErrUnreadableLog
+package kernel
+
+type FactKind string // FactProcessRestarted, FactLegacyImportCompleted, FactSessionCreated, FactConversationBound, FactProviderConnected, FactProviderDisconnected, FactRuntimeIdentityBound, FactAuthBoundaryCrossed, FactCwdChanged, FactSessionClosed, FactAbandoned, FactSessionQuarantined, FactRequestIntended, FactProviderAccepted, FactProviderRefused, FactProviderCompleted, FactOutcomeUnknown, FactTurnBound, FactLateFrameObserved, FactControlRequested, FactControlOutcome, FactLegacyImported
+type Receipt string  // ReceiptNone "", ReceiptIntent, ReceiptAccepted, ReceiptFinal, ReceiptUnknown, ReceiptRejected, ReceiptAbandoned
+
+type Fact struct {
+	Seq, SessionRevision, Generation, InputRevision uint64
+	SchemaVersion                                   int
+	Kind                                            FactKind
+	At, SessionID, Provider, ProviderID, ProfileID, CWD, RequestID, TurnID, Status, ReasonCode, Reason, Control, Outcome, LateKind, Digest, RuntimeIdentity, TaskID, ObjectiveHash, State string
+	Receipt Receipt
+	Passes  map[string]string
+}
+type Abandonment struct{ RequestID, Reason, At string }
+type Session struct { // Field meanings: tables 1 to 5.
+	ID, Provider, ProviderID, ProfileID, CWD, RuntimeIdentity, Quarantine, LastRequest, FinalStatus, LastRefusal, TurnID string
+	ConversationStarted, Connected, ReadOnly, Closed, Hidden, ProviderFinal, PendingInterrupt, Paused, PauseUnconfirmed bool
+	Abandoned             *Abandonment
+	Revision, ControlEpoch uint64
+	Requests              map[string]Receipt
+	RequestOrder          []string
+	Evidence              map[string]string // Key is request + "\x00" + kind, value is status + "|" + digest.
+}
+type Projection struct {
+	Sessions       map[string]*Session
+	Order          []string
+	LastSeq        uint64
+	LastKind       FactKind
+	LegacyImported string
+}
+func NewProjection() Projection
+
+type PrincipalClass string // PrincipalUser, PrincipalProvider, PrincipalSystem
+type Principal struct {
+	Class     PrincipalClass
+	SessionID string
+}
+type InputKind string // InCreate "create", InSend "send", InPause "pause", InStop "stop", InChangeCWD "change-cwd", InClose "close", InAbandon "abandon", ObConversationBound "conversation-bound", ObConnected "connected", ObDisconnected "disconnected", ObAccepted "accepted", ObRefused "refused", ObUnknown "write-unknown", ObTurnBound "turn-bound", ObCompleted "completed", ObControlOutcome "control-outcome", ObAuthBoundary "auth-boundary", ObQuarantine "quarantine", ObRestart "restart"
+type In struct {
+	Kind      InputKind
+	Principal Principal
+	At, SessionID, Provider, ProviderID, ProfileID, CWD, RequestID, ExpectedRequest, TurnID, ReasonCode, Status, Control, Outcome, Digest, RuntimeIdentity string
+	Reason RedactedReason
+}
+type EffectKind string  // EffectStartTurn "start-turn", EffectInterrupt "interrupt", EffectTerminate "terminate"
+type EffectClass string // ClassNewWork "new-work", ClassStopWork "stop-work"
+type Effect struct {
+	Kind      EffectKind
+	Class     EffectClass
+	SessionID, RequestID, TurnID string
+	Fence     uint64 // start-turn only.
+}
+type Decision struct {
+	Facts      []Fact
+	Effects    []Effect
+	Idempotent bool
+}
+type Refusal struct{ Code, Message string } // *Refusal is the error for an expected refusal.
+type Quarantined struct {
+	SessionID string
+	Err       error
+}
+var ErrIllegalFact, ErrUnreadableLog, ErrMalformedFact error
+const SchemaVersion = 1
+const ProviderCodex, ProviderClaude = "codex", "claude"
+const MaxVisibleSessions = 24
+var ReservedFactKinds []FactKind // Later-slice kinds, known to the codec, refused by Reduce.
+
+func Decide(p Projection, in In) (Decision, error)
+func Reduce(p Projection, f Fact) (Projection, error)
 func Replay(facts []Fact) (Projection, []Quarantined, error)
-func EncodeFact(Fact) ([]byte, error); func DecodeFact([]byte) (Fact, error)
-func Status(*Session) string; func VisibleSessions(Projection) []*Session
-func Redact(text string, redactor func(string) string) RedactedReason
+func EncodeFact(Fact) ([]byte, error)
+func DecodeFact([]byte) (Fact, error)
+func Status(*Session) string
+func VisibleSessions(Projection) []*Session
+func Redact(text string, redactor func(string) string) RedactedReason // A nil redactor gives an empty reason.
 ```
 
-`In` has `Kind, Principal{Class, SessionID}, At, SessionID, Provider, ProviderID, ProfileID, CWD, RequestID, ExpectedRequest, TurnID, Reason RedactedReason, ReasonCode, Status, Control, Outcome, Digest, RuntimeIdentity`. `Decision` has `Facts []Fact, Effects []Effect, Idempotent bool`. `Effect` has `Kind, Class, SessionID, RequestID, TurnID, Fence`. `Projection` has `Sessions map[string]*Session, Order []string, LastSeq uint64, LastKind FactKind`. Principals: `PrincipalUser`, `PrincipalProvider`, `PrincipalSystem`.
+`Decide` stamps `Seq` as `LastSeq` plus position, `SchemaVersion`, `At`, and `SessionRevision`.
+
+## Review record
+
+Round 1 blocked on nine row findings, all applied. Round 2 blocked on four (a lost interrupt, an out-of-shape identity, `CWD` shape, and the position of the shape check), all applied as the reviewer proposed. **No third table review was run**, by decision: the findings were narrow with exact fixes, and each round found finer grain rather than a wrong structure. The independent model is the check on these tables: a disagreement the tables cannot settle is stop condition S2, which returns to a plan review of the table.
