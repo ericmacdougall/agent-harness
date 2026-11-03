@@ -140,12 +140,11 @@ func (a *app) runReviews(parent *session) {
 		parent.Supervision.Reason = "Review requires repair: " + findings
 	}
 	parent.Supervision.State = "active"
-	a.addMessageLocked(parent, message{Role: "review", Text: fmt.Sprintf("%s %s\n%s", stage, task.ReviewStatus, findings)})
 	if err = a.recordCheckpoint(parent); err != nil {
-		task.State = "blocked"
-		parent.Supervision.State = "blocked"
-		parent.Supervision.Reason = "Could not persist review outcome"
+		a.changedLocked()
+		return
 	}
+	a.addMessageLocked(parent, message{Role: "review", Text: fmt.Sprintf("%s %s\n%s", stage, task.ReviewStatus, findings)})
 	a.changedLocked()
 	parent.pendingReviewResult = formatReviewResult(stage, passed, findings, inputRevision, objectiveDigest)
 	go a.advance(parent.ID)

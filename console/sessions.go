@@ -51,9 +51,9 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 		}
 		return errors.New("prior request outcome is unknown; it was not replayed")
 	}
-	if current.Provider == "claude" && oneOf(current.requests[current.lastRequest], "intent", "accepted", "unknown") {
+	if oneOf(current.requests[current.lastRequest], "intent", "accepted", "unknown") {
 		a.mu.Unlock()
-		return errors.New("prior Claude request outcome is unresolved; reconcile before sending")
+		return errors.New("prior request outcome is unresolved; reconcile before sending")
 	}
 	if current.Status == "running" || current.Status == "starting" || current.Status == "waiting" || current.Status == "unknown" {
 		a.mu.Unlock()
@@ -111,9 +111,9 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 		a.mu.Unlock()
 		return runtimeErr
 	}
-	if current.Provider == "claude" && oneOf(current.requests[current.lastRequest], "intent", "accepted", "unknown") {
+	if oneOf(current.requests[current.lastRequest], "intent", "accepted", "unknown") {
 		a.mu.Unlock()
-		return errors.New("prior Claude request outcome changed; reconcile before sending")
+		return errors.New("prior request outcome changed; reconcile before sending")
 	}
 	if policyErr != nil {
 		a.mu.Unlock()
@@ -430,7 +430,7 @@ func (a *app) control(sessionID, action, agentID string) error {
 	current.resumeRequested = false
 	a.holdInputsLocked(current, "User paused; explicit Resume required")
 	current.Status = "paused"
-	if provider == "claude" && current.requests[current.lastRequest] == "unknown" {
+	if current.requests[current.lastRequest] == "unknown" {
 		current.Status = "unknown"
 	}
 	a.revokeQuestionsLocked(current, "")
@@ -474,7 +474,7 @@ func (a *app) control(sessionID, action, agentID string) error {
 		return err
 	}
 	a.mu.Lock()
-	if target == current.ProviderID {
+	if target == current.ProviderID && current.requests[current.lastRequest] != "unknown" {
 		current.Status = "paused"
 	}
 	a.changedLocked()

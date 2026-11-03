@@ -66,7 +66,7 @@ func (a *app) checkpointUpdateGuarded(id string, input checkpointInput, guard fu
 	}
 	if task.ReviewStatus == "unknown" {
 		a.mu.Unlock()
-		return errors.New("prior review outcome is unknown; continue in a new session after reconciliation")
+		return errors.New("prior review or checkpoint outcome is unknown; continue in a new session after reconciliation")
 	}
 	if len(input.Scope) > 2000 {
 		a.mu.Unlock()
@@ -80,8 +80,8 @@ func (a *app) checkpointUpdateGuarded(id string, input checkpointInput, guard fu
 		task.scope = input.Scope
 		current.Supervision.State = input.State
 		current.Supervision.Reason = input.Scope
-		a.changedLocked()
 		recordErr := a.recordCheckpoint(current)
+		a.changedLocked()
 		a.mu.Unlock()
 		return recordErr
 	}
@@ -109,6 +109,9 @@ func (a *app) checkpointUpdateGuarded(id string, input checkpointInput, guard fu
 	if (guard != nil && !guard(current)) || current.task != task || task.Generation != input.Generation || task.InputRevision != input.InputRevision || task.ObjectiveHash != input.ObjectiveHash || current.controlEpoch != epoch || current.CWD != cwd || current.Supervision.State == "paused" {
 		return errors.New("task changed during capture")
 	}
+	if task.ReviewStatus == "unknown" {
+		return errors.New("prior review or checkpoint outcome became unknown during capture")
+	}
 	subject = bindSubject(subject, task)
 	if input.State == "complete" {
 		if task.passes["final_review"] != subject.Digest {
@@ -117,8 +120,9 @@ func (a *app) checkpointUpdateGuarded(id string, input checkpointInput, guard fu
 		task.State = "complete"
 		current.Supervision.State = "complete"
 		current.Supervision.Reason = "Independent final gate passed"
+		err := a.recordCheckpoint(current)
 		a.changedLocked()
-		return a.recordCheckpoint(current)
+		return err
 	}
 	if task.reviewing || task.ReviewStatus == "queued" {
 		if task.Stage == input.Stage && task.Subject.Digest == subject.Digest {
@@ -146,11 +150,27 @@ func (a *app) checkpointUpdateGuarded(id string, input checkpointInput, guard fu
 	task.reviewPolicy = policy
 	current.Supervision.State = "active"
 	current.Supervision.Reason = "Independent " + input.Stage + " queued"
+	err = a.recordCheckpoint(current)
 	a.changedLocked()
-	return a.recordCheckpoint(current)
+	return err
 }
 func (a *app) recordCheckpoint(s *session) error {
-	return a.record(s, "", "checkpoint:"+s.task.State+":"+s.task.Stage+":"+s.task.ID+":"+fmt.Sprint(s.task.Generation))
+	err := a.record(s, "", "checkpoint:"+s.task.State+":"+s.task.Stage+":"+s.task.ID+":"+fmt.Sprint(s.task.Generation))
+	if err != nil {
+		// record does not distinguish a pre-write refusal from a partial write
+		// or failed sync. Conservatively quarantine every failure; a retry
+		// must never acknowledge tentative state or dispatch it as durable.
+		// Revoke admissions already resolving policy or awaiting review.
+		s.controlEpoch++
+		s.task.State = "unknown"
+		s.task.ReviewStatus = "unknown"
+		s.task.reviewing = false
+		s.task.passes = map[string]string{}
+		s.Supervision.State = "blocked"
+		s.Supervision.Reason = "Checkpoint persistence is unconfirmed; reconcile in a new session, no replay"
+		s.pendingReviewResult = ""
+	}
+	return err
 }
 func checkpointMetadata(task *trackedTask) string {
 	return fmt.Sprintf("Current console taskId=%s generation=%d inputRevision=%d objectiveHash=%s. For substantive work use harness_console_checkpoint. Request plan_review before implementation, code_review after tests/commit, and final_review before complete. End turn after needs_review and await review findings. Tiny reversible fixes and casual chat need no checkpoint. Never claim a review that has not actually run.", task.ID, task.Generation, task.InputRevision, task.ObjectiveHash)

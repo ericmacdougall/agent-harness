@@ -518,10 +518,11 @@ func TestQueueRepairDiscardTurnoverRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.mu.Lock()
-	s.Status = "idle"
-	s.providerFinal = true
 	s.task.State = "blocked"
 	a.mu.Unlock()
+	// Turnover requires the exact native final and its request receipt, not
+	// just presentation flags claiming the prior turn finished.
+	finishNativeQueueTurn(a, s)
 	if err = a.send(s.ID, "next-objective", "An explicitly new objective", nil, false); err != nil {
 		t.Fatal(err)
 	}
