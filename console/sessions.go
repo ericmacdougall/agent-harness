@@ -195,6 +195,8 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 	}
 	current.dispatchEpoch = epoch
 	current.lastRequest = requestID
+	current.turnID = ""
+	current.codexTurn = nil
 	current.requests[requestID] = "intent"
 	current.requestOrder = append(current.requestOrder, requestID)
 	if len(current.requestOrder) > 256 {
@@ -259,43 +261,21 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
-	var result struct {
-		Turn struct {
-			ID string `json:"id"`
-		} `json:"turn"`
-	}
 	params := map[string]any{"threadId": providerID, "cwd": cwd, "input": []map[string]any{{"type": "text", "text": prompt}}, "clientUserMessageId": requestID}
 	applyTurnPolicy(params, policy, cwd)
 	if metadataTask != nil {
 		params["additionalContext"] = map[string]any{"consoleTask": map[string]any{"kind": "application", "value": checkpointMetadata(metadataTask)}}
 	}
-	err := client.callAdmitted(ctx, "turn/start", params, &result, a.turnAdmission(current, epoch, requestID))
+	err := a.startCodexTurn(ctx, current, client, requestID, params, a.turnAdmission(current, epoch, requestID))
 	if err != nil {
 		a.unknownSend(current, requestID, err)
-		return err
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if current.requests[requestID] != "intent" {
-		return nil
-	}
-	if current.Status == "running" {
-		current.turnID = result.Turn.ID
-	}
-	current.context = ""
-	current.requests[requestID] = "accepted"
-	a.inputOutcomeLocked(current, requestID, "retained", "Provider accepted; files retained for delayed consumers until explicit discard")
-	if err = a.record(current, requestID, "accepted"); err != nil {
-		current.Status = "unknown"
-		current.Error = "Provider accepted input but receipt could not be persisted"
-	}
-	a.changedLocked()
 	return err
 }
 func (a *app) rejectedSend(current *session, requestID string, err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if current.requests[requestID] == "final" {
+	if oneOf(current.requests[requestID], "final", "unknown") {
 		return
 	}
 	current.requests[requestID] = "rejected"
@@ -319,7 +299,7 @@ func (a *app) rejectedSend(current *session, requestID string, err error) {
 }
 func (a *app) unknownSend(current *session, requestID string, err error) {
 	a.mu.Lock()
-	if current.requests[requestID] == "final" {
+	if oneOf(current.requests[requestID], "final", "unknown") {
 		a.mu.Unlock()
 		return
 	}
@@ -331,7 +311,7 @@ func (a *app) unknownSend(current *session, requestID string, err error) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if current.requests[requestID] == "final" {
+	if oneOf(current.requests[requestID], "final", "unknown") {
 		return
 	}
 	current.requests[requestID] = "unknown"

@@ -117,6 +117,7 @@ type session struct {
 	lastRequest         string
 	filters             map[string]streamRedactor
 	turnID              string
+	codexTurn           *codexTurnBinding
 	context             string
 	requests            map[string]string
 	requestOrder        []string

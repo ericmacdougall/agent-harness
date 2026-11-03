@@ -40,6 +40,25 @@ subject drift, user pause, and exhausted repair budgets stop automatic
 advancement and explain why. Review does not make arbitrary repository code
 safe to run. All provider processes run as the same local OS user.
 
+Native finality requires an exact request binding and a durable final receipt
+before the follow-up queue can advance. For Codex, only the correlated
+`turn/start` RPC reply binds a request to its turn ID; `turn/started` is not
+authority. Up to sixteen distinct early completions can wait for that reply.
+A missing/failed reply, empty binding, or overflow leaves ambiguous work unknown
+with no replay, even if the provider actually finished. Matching early
+completions are finalized after the reply, including for managed reviews.
+
+Claude stream-json results do not identify the input request. Each process
+therefore admits only one user turn, and its request identity never changes.
+Before another turn, the console closes stdin and waits up to five seconds for
+exit, then starts a fresh process with `--resume` and the same conversation ID.
+The task/checkpoint and follow-up revision bindings still accompany each turn.
+Failure to confirm exit refuses replacement; failure to resume does not fall
+back to a new conversation. This adds process startup overhead and relies on
+the CLI's conversation persistence and resume behavior. Late output from the
+retired process cannot finalize the next request. An unknown or final request
+cannot be reopened by a late acknowledgment, error, or duplicate completion.
+
 ### Follow-up queue and review authority
 
 While tracked work is active, **Queue follow-up** records the new request

@@ -74,7 +74,7 @@ func (a *app) restore() error {
 		current.Title = "Restored " + record.Provider + " session"
 		current.Supervision.State = "paused"
 		current.Supervision.Reason = "App restarted. Prior writer is read-only; continue in a new session with available context."
-		if record.State == "intent" || record.State == "accepted" {
+		if oneOf(record.State, "intent", "accepted", "unknown") {
 			current.Status = "unknown"
 			current.Error = "A prior send has no durable final outcome. It was not replayed."
 		}

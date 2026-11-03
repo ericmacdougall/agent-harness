@@ -146,7 +146,7 @@ func TestClaudeResultBeforeWriteAckRemainsFinalAcrossRestart(t *testing.T) {
 	}
 }
 
-func TestCodexCompletionBeforeStartReplyErrorRemainsFinal(t *testing.T) {
+func TestCodexUnboundCompletionBeforeStartReplyErrorRemainsUnknown(t *testing.T) {
 	dir := t.TempDir()
 	a, err := newApp(dir, nil)
 	if err != nil {
@@ -182,8 +182,8 @@ func TestCodexCompletionBeforeStartReplyErrorRemainsFinal(t *testing.T) {
 		t.Fatal("controlled missing turn/start reply did not fail")
 	}
 	a.unknownSend(current, requestID, err)
-	if got := current.requests[requestID]; got != "final" || current.Status == "unknown" {
-		t.Fatalf("late turn/start error downgraded terminal request: state=%q status=%q", got, current.Status)
+	if got := current.requests[requestID]; got != "unknown" || current.Status != "unknown" || current.providerFinal {
+		t.Fatalf("unbound completion escaped quarantine: state=%q status=%q", got, current.Status)
 	}
 	client.writer.close()
 	a.close()
@@ -193,8 +193,8 @@ func TestCodexCompletionBeforeStartReplyErrorRemainsFinal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer restored.close()
-	if len(restored.sessions) != 1 || restored.sessions[0].Status == "unknown" {
-		t.Fatalf("completed Codex request restored as uncertain: %#v", restored.state())
+	if len(restored.sessions) != 1 || restored.sessions[0].Status != "unknown" {
+		t.Fatalf("unbound Codex request did not restore as uncertain: %#v", restored.state())
 	}
 	restored.runtime = func(string, string) (string, []string, error) {
 		return "", nil, errors.New("completed request must not reach provider runtime")
@@ -231,6 +231,7 @@ func TestCodexStaleCompletionCannotFinalizeCurrentRequest(t *testing.T) {
 	current.requests["current-request"] = "accepted"
 	current.requestOrder = append(current.requestOrder, "prior-request", "current-request")
 	current.turnID = "current-turn"
+	current.codexTurn = &codexTurnBinding{requestID: current.lastRequest, turnID: current.turnID}
 	if err = a.record(current, "current-request", "accepted"); err != nil {
 		t.Fatal(err)
 	}

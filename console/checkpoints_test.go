@@ -82,6 +82,7 @@ func TestManagedReviewerEventsPreferActualReviewSession(t *testing.T) {
 	review.lastRequest = "review-request"
 	review.requests[review.lastRequest] = "accepted"
 	review.turnID = "turn"
+	review.codexTurn = &codexTurnBinding{requestID: review.lastRequest, turnID: review.turnID}
 	a.reviews = append(a.reviews, review)
 	parent.Agents = append(parent.Agents, agent{ID: review.ProviderID, Role: "reviewer"})
 	actual, child := a.sessionForThreadLocked(review.ProviderID)

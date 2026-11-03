@@ -252,7 +252,7 @@ func (a *app) runIndependentReview(parent *session, task *trackedTask, step poli
 		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 		params := map[string]any{"threadId": current.ProviderID, "cwd": current.CWD, "input": []any{map[string]any{"type": "text", "text": prompt}}}
 		applyTurnPolicy(params, policy, current.CWD)
-		err = current.codex.callAdmitted(ctx, "turn/start", params, nil, a.reviewAdmission(parent, originalTask, current))
+		err = a.startCodexTurn(ctx, current, current.codex, current.lastRequest, params, a.reviewAdmission(parent, originalTask, current))
 		cancel()
 	}
 	if err != nil {

@@ -89,7 +89,7 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 	}
 	a.mu.Lock()
 	current, child := a.sessionForThreadLocked(thread)
-	if current == nil {
+	if current == nil || current.codex != client {
 		a.mu.Unlock()
 		return
 	}
@@ -100,12 +100,9 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 	switch method {
 	case "turn/started":
 		turn := mapField(value, "turn")
-		if child == nil {
-			current.turnID = textField(turn, "id")
-			if current.Supervision.State != "paused" {
-				current.Status = "running"
-			}
-		} else {
+		// Root notifications carry no request authority. Only the correlated
+		// turn/start reply can establish the root request-to-turn binding.
+		if child != nil {
 			child.turnID = textField(turn, "id")
 			child.Status = "running"
 			child.CanPause = true
@@ -170,66 +167,7 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 			child.CanStop = false
 			denyNativeChildResume(child)
 		} else {
-			requestID := current.lastRequest
-			requestState := current.requests[requestID]
-			if requestState == "final" {
-				break
-			}
-			if current.turnID != "" && turnID != current.turnID {
-				break
-			}
-			if requestID == "" || current.turnID == "" || turnID == "" || !oneOf(requestState, "intent", "accepted") {
-				current.providerFinal = false
-				current.Status = "unknown"
-				current.Error = "Codex returned a completion without the exact active turn binding. No request was replayed."
-				current.Supervision.State = "paused"
-				current.Supervision.Reason = current.Error
-				if requestID != "" && oneOf(requestState, "intent", "accepted") {
-					current.requests[requestID] = "unknown"
-					a.inputOutcomeLocked(current, requestID, "unknown", "Provider completion was not bound to the active turn; no replay")
-					_ = a.record(current, requestID, "unknown")
-				}
-				break
-			}
-			current.providerFinal = true
-			a.revokeQuestionsLocked(current, thread)
-			current.turnID = ""
-			current.requests[requestID] = "final"
-			current.Status = "idle"
-			if current.Supervision.State == "paused" {
-				current.Status = "paused"
-			}
-			if status == "failed" {
-				current.Status = "error"
-				current.Error = a.clean(textField(mapField(turn, "error"), "message"))
-				current.Supervision.State = "blocked"
-				current.Supervision.Reason = current.Error
-			}
-			if status == "interrupted" {
-				current.Status = "paused"
-				current.Supervision.State = "paused"
-				current.Supervision.Reason = "User or provider interrupted this turn"
-			}
-			if err := a.record(current, requestID, "final"); err != nil {
-				current.providerFinal = false
-				current.requests[requestID] = "unknown"
-				current.Status = "unknown"
-				current.Error = "Could not persist the final outcome"
-				current.Supervision.State = "paused"
-				current.Supervision.Reason = current.Error
-				a.inputOutcomeLocked(current, requestID, "unknown", "Provider completed but final receipt durability is unknown; no replay")
-				break
-			}
-			a.inputOutcomeLocked(current, requestID, "retained", "Main turn final; files retained for possible owner/tool readers until explicit discard")
-			if current.queueUncertain {
-				current.Status = "unknown"
-				current.Supervision.State = "paused"
-			}
-			if current.reviewParent != "" {
-				a.finishReviewLocked(current)
-			} else if status == "completed" {
-				go a.advance(current.ID)
-			}
+			a.codexCompletionLocked(current, client, codexCompletion{turnID: turnID, status: status, message: textField(mapField(turn, "error"), "message")})
 		}
 	case "error":
 		current.Error = a.clean(textField(mapField(value, "error"), "message"))

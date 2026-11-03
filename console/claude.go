@@ -24,7 +24,7 @@ type claudeRun struct {
 	policy        resolvedPolicy
 	taskID        string
 	inputRevision uint64
-	requestID     string
+	requestID     string // Immutable after the sole user-frame admission.
 }
 
 func (r *claudeRun) cancel() {
@@ -59,6 +59,7 @@ func (r *claudeRun) writeAdmitted(ctx context.Context, value any, admit inputAdm
 func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile string) error {
 	a.mu.Lock()
 	run := current.claude
+	usedRun := run != nil && run.requestID != ""
 	providerID := current.ProviderID
 	hasHistory := current.claudeStarted
 	policy := current.policy
@@ -80,11 +81,15 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 		a.rejectedSend(current, requestID, runtimeErr)
 		return runtimeErr
 	}
-	if run != nil && ((run.taskID != taskID || run.inputRevision != revision) || run.runtimeHash != fingerprint || run.policy.Model != policy.Model || run.policy.Effort != policy.Effort || run.policy.Permissions != policy.Permissions || run.policy.HarnessInstructions != policy.HarnessInstructions || run.cwd != cwd) {
-		a.mu.Lock()
-		current.claude = nil
-		a.mu.Unlock()
-		run.cancel()
+	if run != nil && (usedRun || (run.taskID != taskID || run.inputRevision != revision) || run.runtimeHash != fingerprint || run.policy.Model != policy.Model || run.policy.Effort != policy.Effort || run.policy.Permissions != policy.Permissions || run.policy.HarnessInstructions != policy.HarnessInstructions || run.cwd != cwd) {
+		// Stream-json results do not identify the input request. A process may
+		// admit only one user turn; retire it before resuming the conversation.
+		// Keep the pointer until exit is confirmed, so a timeout cannot allow
+		// a later send to bypass the still-live process boundary.
+		// EOF lets the CLI flush conversation history before the resumed process
+		// opens it. A process that cannot drain is not safe to replace.
+		run.writeOnce.Do(func() { run.writer = newInputWriter(run.input) })
+		run.writer.close()
 		select {
 		case <-run.done:
 		case <-time.After(5 * time.Second):
@@ -92,6 +97,11 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 			a.rejectedSend(current, requestID, err)
 			return err
 		}
+		a.mu.Lock()
+		if current.claude == run {
+			current.claude = nil
+		}
+		a.mu.Unlock()
 		run = nil
 	}
 	if run == nil {
@@ -184,7 +194,7 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 				return
 			}
 			current.claude = nil
-			if current.Status == "running" || current.Status == "waiting" {
+			if current.lastRequest == run.requestID && (current.Status == "running" || current.Status == "waiting") {
 				current.Status = "unknown"
 				current.Error = "Claude ended before a final result. No request was replayed."
 				if err != nil {
@@ -202,7 +212,7 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 			return nil, err
 		}
 		a.mu.Lock()
-		if current.claude != run || current.lastRequest != requestID || current.requests[requestID] != "intent" {
+		if current.claude != run || current.lastRequest != requestID || current.requests[requestID] != "intent" || run.requestID != "" {
 			a.mu.Unlock()
 			release()
 			return nil, refused("Claude request binding changed before dispatch")
@@ -224,8 +234,13 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 	current.requests[requestID] = "accepted"
 	a.inputOutcomeLocked(current, requestID, "retained", "Provider accepted; attachment consumers may still be active")
 	if err := a.record(current, requestID, "accepted"); err != nil {
+		current.requests[requestID] = "unknown"
+		current.providerFinal = false
 		current.Status = "unknown"
 		current.Error = "Claude input was accepted but its receipt could not be saved"
+		current.Supervision.State = "paused"
+		current.Supervision.Reason = current.Error
+		a.inputOutcomeLocked(current, requestID, "unknown", "Accepted receipt durability is unknown; no replay")
 	}
 	a.changedLocked()
 	return nil
@@ -238,7 +253,7 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 		value := object(scanner.Bytes())
 		kind := textField(value, "type")
 		a.mu.Lock()
-		if current.claude != run {
+		if current.claude != run || run.requestID != "" && run.requestID != current.lastRequest {
 			a.mu.Unlock()
 			return
 		}
@@ -311,7 +326,7 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 		case "result":
 			requestID := run.requestID
 			requestState := current.requests[requestID]
-			if requestState == "final" {
+			if oneOf(requestState, "final", "unknown") {
 				break
 			}
 			if requestID == "" || requestID != current.lastRequest || !oneOf(requestState, "intent", "accepted") {
@@ -319,8 +334,15 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 				current.Error = "Claude returned a result without an exact active request binding. No request was replayed."
 				current.Supervision.State = "paused"
 				current.Supervision.Reason = current.Error
+				if active := current.lastRequest; oneOf(current.requests[active], "intent", "accepted") {
+					current.providerFinal = false
+					current.requests[active] = "unknown"
+					a.inputOutcomeLocked(current, active, "unknown", "Provider result has no exact request binding; no replay")
+					_ = a.record(current, active, "unknown")
+				}
 				break
 			}
+			current.claudeStarted = true
 			a.revokeQuestionsLocked(current, "")
 			current.Status = "idle"
 			if current.Supervision.State == "paused" {

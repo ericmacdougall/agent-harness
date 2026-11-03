@@ -11,6 +11,25 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("HARNESS_CONSOLE_IDENTITY_FIXTURE") == "1" {
+		scan := bufio.NewScanner(os.Stdin)
+		for scan.Scan() {
+			var frame map[string]any
+			_ = json.Unmarshal(scan.Bytes(), &frame)
+			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"type": "system", "session_id": frame["session_id"]})
+			if textField(mapField(frame, "message"), "content") == "request-B" {
+				deadline := time.Now().Add(10 * time.Second)
+				for time.Now().Before(deadline) {
+					if _, err := os.Stat(os.Getenv("HARNESS_CONSOLE_IDENTITY_GATE")); err == nil {
+						break
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"type": "result", "result": "identity fixture complete"})
+		}
+		os.Exit(0)
+	}
 	if len(os.Args) > 2 && os.Args[1] == "mcp" && os.Args[2] == "list" && os.Getenv("HARNESS_CONSOLE_RPC_FIXTURE") == "1" {
 		value := os.Getenv("HARNESS_CONSOLE_MCP_LIST_JSON")
 		if value == "" {
