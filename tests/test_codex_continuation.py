@@ -102,3 +102,28 @@ class ContinuationTests(unittest.TestCase):
             result = self.event('Stop', turn_id='one', stop_hook_active=False)
         self.assertNotIn('decision', result)
         self.assertFalse(self.state('status')['used'])
+
+    def test_spent_budget_survives_every_transition_and_interrupt(self):
+        self.state('active')
+        self.assertEqual(self.event('Stop', turn_id='original', stop_hook_active=False)['decision'], 'block')
+        for terminal in ('blocked', 'handoff', 'paused', 'complete', 'interrupt'):
+            if terminal == 'interrupt':
+                self.event('Interrupt', turn_id='original')
+            else:
+                self.state(terminal)
+            self.assertTrue(self.state('status')['used'])
+            self.state('active')
+            self.assertNotIn('decision', self.event('Stop', turn_id='again', stop_hook_active=False))
+
+    def test_interrupt_is_durable_even_if_checkpoint_lock_is_busy(self):
+        import fcntl
+        self.state('active')
+        with self.wal.with_name('continuation.lock').open('r+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.event('Interrupt', turn_id='interrupted')
+            self.assertEqual(self.state('status')['state'], 'paused')
+            self.assertEqual(self.event('Stop', turn_id='interrupted', stop_hook_active=False), {})
+        self.assertEqual(self.state('status')['state'], 'paused')
+        self.assertEqual(self.event('Stop', turn_id='later', stop_hook_active=False), {})
+        self.state('active')
+        self.assertEqual(self.event('Stop', turn_id='later', stop_hook_active=False)['decision'], 'block')

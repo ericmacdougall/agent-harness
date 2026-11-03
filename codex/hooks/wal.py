@@ -160,6 +160,7 @@ def append(path: Path, record: dict) -> None:
 
 WORK_STATES = {"active", "blocked", "handoff", "complete", "paused"}
 STATE_FILE = "continuation.json"
+INTERRUPT_FILE = "continuation.interrupt"
 CONTINUE_REASON = (
     "The session still has active tracked work. Continue with the next authorized "
     "step or reconcile the running check. Only mark completion after verification. "
@@ -180,34 +181,54 @@ def state_file(directory: int, name: str, flags: int) -> int:
     return fd
 
 
-def read_checkpoint(directory: int) -> dict | None:
+def read_private(directory: int, name: str, limit: int) -> bytes | None:
     try:
-        fd = state_file(directory, STATE_FILE, os.O_RDONLY)
+        fd = state_file(directory, name, os.O_RDONLY)
     except FileNotFoundError:
         return None
     with os.fdopen(fd, "rb") as handle:
-        data = handle.read(513)
-    if len(data) > 512:
-        raise ValueError("oversize continuation checkpoint")
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("oversize continuation file")
+    return data
+
+
+def read_interrupt(directory: int) -> str | None:
+    marker = read_private(directory, INTERRUPT_FILE, 32)
+    if marker is None:
+        return None
+    if not re.fullmatch(rb"[0-9a-f]{32}", marker):
+        raise ValueError("invalid interrupt generation")
+    return marker.decode("ascii")
+
+
+def read_checkpoint(directory: int) -> dict | None:
+    data = read_private(directory, STATE_FILE, 512)
+    if data is None:
+        return None
     state = json.loads(data)
-    if (not isinstance(state, dict) or set(state) != {"state", "used"}
+    if (not isinstance(state, dict) or set(state) != {"state", "used", "interrupt"}
             or not isinstance(state["state"], str) or state["state"] not in WORK_STATES
-            or not isinstance(state["used"], bool)):
+            or not isinstance(state["used"], bool)
+            or (state["interrupt"] is not None and (
+                not isinstance(state["interrupt"], str)
+                or not re.fullmatch(r"[0-9a-f]{32}", state["interrupt"])
+            ))):
         raise ValueError("invalid continuation checkpoint")
     return state
 
 
-def save_checkpoint(directory: int, current_directory, state: dict) -> None:
+def replace_private(directory: int, current_directory, name: str, data: bytes) -> None:
     temp = "continuation-" + secrets.token_hex(12)
     fd = state_file(directory, temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
     try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(state, handle)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         if not current_directory():
             raise ValueError("continuation directory changed")
-        os.replace(temp, STATE_FILE, src_dir_fd=directory, dst_dir_fd=directory)
+        os.replace(temp, name, src_dir_fd=directory, dst_dir_fd=directory)
         os.fsync(directory)
     finally:
         try:
@@ -216,28 +237,44 @@ def save_checkpoint(directory: int, current_directory, state: dict) -> None:
             pass
 
 
+def visible_checkpoint(state: dict | None, marker: str | None) -> dict | None:
+    if state is not None and state["state"] == "active" and marker != state["interrupt"]:
+        return {**state, "state": "paused"}
+    return state
+
+
 def checkpoint(session: str, action: str) -> tuple[dict | None, bool]:
     with session_directory(session) as (directory, current_directory):
-        # The stable lock serializes the budget claim and explicit status changes.
+        if not current_directory():
+            raise ValueError("continuation directory changed")
+        if action == "interrupt":
+            # Independent of the claim lock: an interrupt must not be lost to
+            # contention. A later explicit resume acknowledges this generation.
+            marker = secrets.token_hex(16).encode("ascii")
+            replace_private(directory, current_directory, INTERRUPT_FILE, marker)
+            return None, False
+        if action in {"claim", "status"}:
+            state = visible_checkpoint(read_checkpoint(directory), read_interrupt(directory))
+            if action == "status" or state is None or state["state"] != "active":
+                return state, False
         lock = state_file(directory, "continuation.lock", os.O_RDWR | os.O_CREAT)
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             named = os.stat("continuation.lock", dir_fd=directory, follow_symlinks=False)
             if not os.path.samestat(named, os.fstat(lock)) or not current_directory():
                 raise ValueError("continuation lock or directory changed")
-            state = read_checkpoint(directory)
-            active = state is not None and state["state"] == "active"
-            claimed = action == "claim" and active and not state["used"]
-            if claimed:
-                state = {"state": "active", "used": True}
-            elif action in WORK_STATES and not (action == "active" and active):
-                state = {"state": action, "used": False}
-            elif action == "interrupt" and active:
-                state = {"state": "paused", "used": False}
+            marker = read_interrupt(directory)
+            state = visible_checkpoint(read_checkpoint(directory), marker)
+            used = state["used"] if state is not None else False
+            if action == "claim":
+                if state is None or state["state"] != "active" or used:
+                    return state, False
+                state = {**state, "used": True}
             else:
-                return state, False
-            save_checkpoint(directory, current_directory, state)
-            return state, claimed
+                state = {"state": action, "used": used, "interrupt": marker}
+            replace_private(directory, current_directory, STATE_FILE, json.dumps(state).encode())
+            visible = visible_checkpoint(state, read_interrupt(directory))
+            return visible, action == "claim" and visible["state"] == "active"
         finally:
             os.close(lock)
 
@@ -361,7 +398,8 @@ def main() -> None:
             state, _ = checkpoint(path.parent.name, args.state)
         except (OSError, ValueError):
             parser.error(UNAVAILABLE)
-        print(json.dumps(state or {'state': 'untracked', 'used': False}))
+        print(json.dumps({'state': state['state'], 'used': state['used']} if state else
+                         {'state': 'untracked', 'used': False}))
     else:
         note(args.wal, args.event, args.note)
 

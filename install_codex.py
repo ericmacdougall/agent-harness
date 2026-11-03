@@ -63,6 +63,9 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
         raise ValueError('hooks.json hooks must be an object')
     command = managed_command(codex_home)
     for event in HOOK_EVENTS:
+        lifecycle = event in {'Stop', 'Interrupt'}
+        managed = {'hooks': [{'type': 'command', 'command': command,
+                              'timeout': 1 if event == 'Interrupt' else 10}]}
         groups = hooks.setdefault(event, [])
         if not isinstance(groups, list):
             raise ValueError(f'hooks.json {event} must be a list')
@@ -73,9 +76,12 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
                                 and handler.get('command') == command)]
+            if lifecycle and len(handlers) != len(group['hooks']) and group != managed:
+                raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
+                                 'reconcile that group explicitly before installing')
             if handlers:
                 preserved.append({**group, 'hooks': handlers})
-        preserved.append({'hooks': [{'type': 'command', 'command': command, 'timeout': 1 if event == 'Interrupt' else 10}]})
+        preserved.append(managed)
         hooks[event] = preserved
     return result
 
