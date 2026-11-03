@@ -1,6 +1,6 @@
 # Console kernel plan
 
-Status: revision 3, after two blocked plan reviews. No kernel code exists on this branch.
+Status: accepted. Plan review round 3 returned ACCEPT on revision 3, with the findings below carried to their slices. No kernel code exists on this branch.
 
 ## Decision and why
 
@@ -257,6 +257,20 @@ Each slice is its own branch and PR, with its own code inspection. Sizes exclude
 7. Review and merge go through the main agent.
 
 K1 to K3 are new packages. They land with `console/go.mod` and a workflow that runs `go test ./internal/...`, because the existing workflow's `go build .` needs a main package. The baseline merge reconciles `go.mod`, including any `go` directive the refreshed SQLite requires.
+
+## Findings carried from plan review
+
+Each is closed in the named slice, and K1's two are settled in its first commit.
+
+| Slice | Finding | Direction |
+|---|---|---|
+| K1, K2, K7 | Stop conflicts with INV7 and failed appends: at quota a literal implementation refuses Stop while the provider runs | Stop effects are exempt from INV7 and never depend on an append. `ControlRequested{stop}` is must-append, and a stop outcome may have no recorded request. R4 means no authority change; the stop effect still fires |
+| K1 | A failed drain after `Abandoned` has no legal fact, because `abandoned` is terminal | Effect observations on a terminal or `unknown` receipt become `LateFrameObserved`, and the K1 model covers them |
+| K1 | `ProcessRestarted{processEpoch}` conflicts with skipping a repeat | Remove the field. The live epoch stays outside the projection |
+| K2 | Must-append list is still incomplete | Add `ProviderRefused`, `LateFrameObserved{final}`, `AuthBoundaryCrossed`, `ChildQuarantined`, coalesced where the plan coalesces, and include them in reserve sizing |
+| K5b, K7 | Entering the latch drains nothing | Entering the latch drains every writer gate, with the same deadline and kill. Console-controlled credential changes wait or refuse. State the policy for running turns |
+| K6 | A kill on a shared Codex writer stops other sessions | Record `OutcomeUnknown` for every open request on that client, with a test |
+| K5a, K5b | Field table needs clarifying | Name the `review*` fields, since `reviewDone` is adapter state. State whether restored tabs lose `Title`, `Messages`, `Model` and `context`, and where continuation text comes from after restart |
 
 ## Stop conditions
 

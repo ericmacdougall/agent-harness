@@ -30,7 +30,7 @@ This test stays as a regression, moved to the real API in K5. Acceptance is zero
 | R1 | Restart keeps the last request's identity and receipt, with intent or accepted shown as unknown | 7048366 F2, property | run | reducer, api | K1, K5b, K6 |
 | R2 | Restart never drops an unresolved tab or one with a retained payload, however many tabs exist | 7048366 F1 | run | reducer, api | K1, K5b, K8 |
 | R3 | A trimmed resolved tab does not reappear when other tabs close (view rule `visibleSessions`) | property | run | reducer | K1 |
-| R4 | Pause or Stop on a read-only or unknown session changes nothing, and that session cannot then be closed | 7048366 F2 | run | reducer, api | K1, K7 |
+| R4 | Pause or Stop on a read-only or unknown session changes no authority state, and that session cannot then be closed. A stop effect still fires where a writer exists | 7048366 F2 | run | reducer, api | K1, K7 |
 | R5 | Every authority field shown live survives restart unchanged, except the enumerated restart rule table in the plan | property, F9 | run | reducer | K1 |
 | R6 | A bookkeeping record such as a cwd change cannot hide an unresolved receipt | 20094e5 F2, red-team B7 | run | reducer | K1 |
 | R7 | Changing cwd is refused while the last request is unresolved | 20094e5 F2, red-team B7 | run | reducer | K1 |
