@@ -1026,10 +1026,12 @@ class DeliveryHelpers(unittest.TestCase):
                     cmd('git', 'merge', '-q', '-s', 'ours', '--allow-unrelated-histories', '--no-edit',
                         'orphan', cwd=self.feature)
                 else:
-                    cmd('git', 'merge', '-q', '--no-commit', *sides, cwd=self.feature)
+                    cmd('git', 'merge', '-q', '--no-ff', '--no-commit', *sides, cwd=self.feature)
                     (self.feature / 'asset.bin').write_text(self.POINTER)
                     cmd('git', 'add', 'asset.bin', cwd=self.feature)
                     cmd('git', 'commit', '-qm', f'evil {case}', cwd=self.feature)
+                    parents = cmd('git', 'rev-list', '--parents', '-1', 'HEAD', cwd=self.feature).stdout.split()
+                    self.assertEqual(len(parents) - 1, len(sides) + 1)  # a real merge, never a fast-forward
                     cmd('git', 'rm', '-q', 'asset.bin', cwd=self.feature)
                     cmd('git', 'commit', '-qm', 'drop pointer from tip', cwd=self.feature)
                 result, data = self.publish_in_process()
