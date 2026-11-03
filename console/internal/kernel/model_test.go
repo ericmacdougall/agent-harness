@@ -313,6 +313,9 @@ func (m *mdlModel) apply(f Fact) {
 	case FactSessionClosed:
 		s.closed = true
 	case FactRequestIntended:
+		if s.mdlTurn != "" {
+			m.hit("t4.intended.clears_bound_turn")
+		}
 		s.receipts[f.RequestID] = ReceiptIntent
 		s.lastReq = f.RequestID
 		s.order = append(s.order, f.RequestID)
@@ -338,6 +341,9 @@ func (m *mdlModel) apply(f Fact) {
 		s.providerFinal, s.finalStatus = true, f.Status
 		s.mdlTurn, s.pending, s.unconfirmed = "", false, false
 	case FactOutcomeUnknown:
+		if s.pending {
+			m.hit("t4.unknown.pending_survives")
+		}
 		s.receipts[s.lastReq] = ReceiptUnknown
 		s.providerFinal = false
 		s.epoch++
@@ -355,6 +361,18 @@ func (m *mdlModel) apply(f Fact) {
 			s.epoch++
 		}
 	case FactControlOutcome:
+		if f.Outcome != "confirmed" {
+			switch {
+			case s.unresolved():
+				m.hit("t4.control_outcome.unresolved_not_confirmed")
+			case s.abandoned != nil && s.unconfirmed:
+				m.hit("t4.control_outcome.abandoned_clears")
+			case s.abandoned != nil:
+				m.hit("t4.control_outcome.abandoned_not_confirmed")
+			default:
+				m.hit("t4.control_outcome.resolved_not_confirmed")
+			}
+		}
 		s.unconfirmed = s.wouldBeUnconfirmed(f.Outcome)
 	}
 }
@@ -1212,6 +1230,9 @@ func (g *mdlGen) next(m *mdlModel) mdlGenStep {
 		g.queue = g.pending[0]()
 		g.pending = g.pending[1:]
 	}
+	if len(g.queue) == 0 && g.rng.Intn(60) == 0 {
+		g.queue = g.scriptReach()
+	}
 	var gs mdlGenStep
 	if len(g.queue) > 0 {
 		gs, g.queue = g.queue[0], g.queue[1:]
@@ -1486,6 +1507,9 @@ func (g *mdlGen) randomRaw(m *mdlModel) mdlGenStep {
 		},
 		func() mdlGenStep {
 			return mdlRawFact("", Fact{Kind: FactAbandoned, SessionID: sid, RequestID: last, Reason: g.pick("", " spaced ", strings.Repeat("r", 500), strings.Repeat("r", 501), "bad\xff")})
+		},
+		func() mdlGenStep {
+			return mdlRawFact("", Fact{Kind: FactControlOutcome, SessionID: sid, Control: g.pick("pause", "stop"), Outcome: g.pick("confirmed", "rejected", "unconfirmed")})
 		},
 		func() mdlGenStep {
 			g.n++
@@ -2011,6 +2035,38 @@ func (g *mdlGen) scriptFields() []mdlGenStep {
 	}
 }
 
+// scriptReach puts the model in states that mutation of the table rows showed were missed.
+// It holds no restart, so next can repeat it on fresh sessions.
+func (g *mdlGen) scriptReach() []mdlGenStep {
+	a, b, c, d, e, f, h := g.fresh("rc"), g.fresh("rc"), g.fresh("rc"), g.fresh("rc"), g.fresh("rc"), g.fresh("rc"), g.fresh("rc")
+	outcome := func(sid, control, result string) mdlGenStep {
+		return mdlRawFact("legal", Fact{Kind: FactControlOutcome, SessionID: sid, Control: control, Outcome: result})
+	}
+	// An interrupt still due survives OutcomeUnknown, and a later turn-bound fires it.
+	out := g.codexReady(a)
+	out = append(out, mdlSend(a, "r1"), mdlStep(InPause, a), mdlStep(ObUnknown, a, mdlReq("r1")), mdlStep(ObTurnBound, a, mdlReq("r1"), mdlTurn("t1")))
+	// Abandoned, with PauseUnconfirmed true going in, then false going in.
+	out = append(out, g.codexReady(b)...)
+	out = append(out, mdlSend(b, "r1"), mdlStep(ObControlOutcome, b, mdlCtl("stop", "rejected")), mdlStep(InPause, b),
+		mdlStep(InAbandon, b, mdlExpect("r1"), mdlBecause("discard it")),
+		outcome(b, "stop", "rejected"), outcome(b, "pause", "unconfirmed"), outcome(b, "stop", "rejected"))
+	// Resolved receipts: final, rejected and none.
+	out = append(out, mdlClaudeNew(c), mdlSend(c, "r1"), mdlStep(ObCompleted, c, mdlReq("r1"), mdlStatus("completed")),
+		outcome(c, "stop", "rejected"), outcome(c, "pause", "unconfirmed"))
+	out = append(out, mdlClaudeNew(d), mdlSend(d, "r1"), mdlStep(ObRefused, d, mdlReq("r1")),
+		outcome(d, "stop", "rejected"), outcome(d, "pause", "unconfirmed"))
+	out = append(out, mdlClaudeNew(e), outcome(e, "stop", "rejected"), outcome(e, "pause", "unconfirmed"))
+	// Unresolved, so the same outcomes do set it, and confirmed clears it.
+	out = append(out, mdlClaudeNew(f), mdlSend(f, "r1"), mdlStep(ObUnknown, f, mdlReq("r1")),
+		outcome(f, "stop", "rejected"), outcome(f, "stop", "confirmed"), outcome(f, "pause", "unconfirmed"))
+	// A turn bound on a final receipt is cleared by the next send.
+	out = append(out, g.codexReady(h)...)
+	return append(out, mdlSend(h, "r1"), mdlStep(ObTurnBound, h, mdlReq("r1"), mdlTurn("t1")),
+		mdlStep(ObCompleted, h, mdlReq("r1"), mdlTurn("t1"), mdlStatus("completed")),
+		mdlRawFact("legal", Fact{Kind: FactTurnBound, SessionID: h, RequestID: "r1", TurnID: "t2"}),
+		mdlSend(h, "r2"))
+}
+
 func (g *mdlGen) scriptManySessions() []mdlGenStep {
 	var out []mdlGenStep
 	var idle []string
@@ -2052,7 +2108,7 @@ func (g *mdlGen) regularScripts() []func() []mdlGenStep {
 	return []func() []mdlGenStep{
 		g.scriptCreateAndAuth, g.scriptSend, g.scriptControl, g.scriptCWD, g.scriptAbandon,
 		g.scriptConversation, g.scriptFrames, g.scriptTurns, g.scriptCompleted,
-		g.scriptControlOutcome, g.scriptBoundary, g.scriptQuarantine, g.scriptRestart, g.scriptRaw, g.scriptFields,
+		g.scriptControlOutcome, g.scriptBoundary, g.scriptQuarantine, g.scriptRestart, g.scriptRaw, g.scriptFields, g.scriptReach,
 	}
 }
 
@@ -2761,6 +2817,8 @@ func mdlTableRows() []string {
 		"t2.legacy.", "t2.legacy.final", "t2.legacy.rejected", "t2.legacy.unknown", "t2.legacy.abandoned",
 		"t3.restart.open_to_unknown", "t3.abandoned.overwrites", "t3.abandoned.keeps", "t3.trim256", "t3.refused.default_code",
 		"t4.control_requested.unknown", "t4.control_requested.other",
+		"t4.unknown.pending_survives", "t4.intended.clears_bound_turn",
+		"t4.control_outcome.unresolved_not_confirmed", "t4.control_outcome.abandoned_clears", "t4.control_outcome.abandoned_not_confirmed", "t4.control_outcome.resolved_not_confirmed",
 		"t5.request.known", "t5.request.unknown", "t5.sticky", "t5.status.empty", "t5.status.valid", "t5.status.invalid", "t5.digest.valid", "t5.digest.empty",
 		"t8.unreadable.schema", "t8.unreadable.seq", "t8.unreadable.kind", "t8.unreadable.global", "t8.unreadable.reserved_no_session",
 		"t8.reserved_follows_rows", "t8.ghost", "t8.ghost_once", "t8.ghost_then_created", "t8.ghost_created_quarantined", "t8.first", "t8.first_on_closed", "t8.first_on_quarantined", "t8.later_applied", "t8.later_skipped",
