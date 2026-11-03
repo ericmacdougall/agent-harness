@@ -24,6 +24,16 @@ does not have an independent host control channel; interrupting its parent
 controls the process tree. An application-managed reviewer has a separate
 provider session. Missing model, write, or activity telemetry is unknown.
 
+Direct resume of a native Codex child is unavailable until the provider exposes
+a bounded child-context probe for the authentication, network, browser, and
+filesystem boundaries the task requires. Thread metadata is not capability
+proof after a parent account or permission change, so the console does not send
+a resume turn to the old child. Reconcile its WAL, messages, branch/worktree,
+processes, and possible in-flight effects; confirm the old writer is quiescent;
+then dispatch one fresh owner through a supported native mechanism in the
+current authenticated parent context. That replacement remains pending until
+performed; the console does not claim to create it automatically.
+
 Substantive work uses bounded checkpoints and independent review. A structured
 review is tied to its actual subject and evidence. Unknown transport outcomes,
 subject drift, user pause, and exhausted repair budgets stop automatic

@@ -80,7 +80,7 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 			}
 			if !exists {
 				stamp := now()
-				current.Agents = append(current.Agents, agent{ID: id, CWD: textField(data, "cwd"), ParentID: parent, Name: textField(data, "agentNickname"), Role: textField(data, "agentRole"), Task: textField(data, "preview"), Model: textField(data, "model"), Provider: "codex", Status: "starting", LastSeen: &stamp, CanPause: true, CanStop: true})
+				current.Agents = append(current.Agents, agent{ID: id, CWD: textField(data, "cwd"), ParentID: parent, Name: textField(data, "agentNickname"), Role: textField(data, "agentRole"), Task: textField(data, "preview"), Model: textField(data, "model"), Provider: "codex", Status: "starting", LastSeen: &stamp, CanPause: true, CanStop: true, ControlReason: nativeChildResumeReason})
 			}
 			a.changedLocked()
 		}
@@ -170,7 +170,7 @@ func (a *app) codexEvent(client *rpcClient, method string, raw json.RawMessage) 
 			child.Status = status
 			child.CanPause = false
 			child.CanStop = false
-			child.CanResume = status == "interrupted"
+			denyNativeChildResume(child)
 		} else {
 			current.turnID = ""
 			current.requests[current.lastRequest] = "final"
@@ -479,7 +479,7 @@ func (a *app) refreshAgents(current *session) {
 		child.Status = status
 		child.CanPause = status == "active"
 		child.CanStop = child.CanPause
-		child.CanResume = status == "idle"
+		denyNativeChildResume(child)
 		if seconds, ok := data["updatedAt"].(float64); ok {
 			stamp := time.Unix(int64(seconds), 0).UTC().Format(time.RFC3339)
 			child.LastSeen = &stamp

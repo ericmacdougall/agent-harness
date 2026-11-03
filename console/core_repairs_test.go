@@ -254,7 +254,7 @@ func TestRepairReviewVerdictUnknownCannotBeProseOrMalformedPass(t *testing.T) {
 		}
 	}
 }
-func TestRepairOwnerResumePreservesFeatureWorkingDirectory(t *testing.T) {
+func TestRepairOwnerResumeRefusesBeforeProviderRPC(t *testing.T) {
 	a, parent, _ := checkpointFixture(t)
 	feature, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -281,55 +281,77 @@ func TestRepairOwnerResumePreservesFeatureWorkingDirectory(t *testing.T) {
 		}
 	}}
 	parent.codex = client
-	if err = a.controlAgent(parent, "owner-thread", "resume"); err != nil {
-		t.Fatal(err)
-	}
-	client.writer.close()
-	if len(calls) != 2 || calls[0]["method"] != "thread/read" || calls[1]["method"] != "turn/start" {
-		t.Fatal("missing native metadata admission", calls)
-	}
-	params, _ := calls[1]["params"].(map[string]any)
-	for _, key := range []string{"cwd", "model", "effort", "serviceTier", "sandboxPolicy", "approvalPolicy", "permissions"} {
-		if _, exists := params[key]; exists {
-			t.Fatalf("main runtime overrode native owner %s: %v", key, params)
+	for range 2 {
+		if err = a.controlAgent(parent, "owner-thread", "resume"); err == nil || !strings.Contains(err.Error(), "fresh owner") {
+			t.Fatal("native direct resume was not refused with a fresh-owner handoff", err)
 		}
 	}
+	if len(calls) != 0 {
+		t.Fatal("resume refusal contacted the old provider client", calls)
+	}
 	owner := parent.Agents[0]
-	if owner.CWD != feature || owner.Model != "owner-model" || owner.Effort != "low" || owner.RuntimeProvider != "owner-runtime" {
-		t.Fatal("native owner runtime metadata not preserved", owner)
+	if owner.CanResume || !strings.Contains(owner.ControlReason, "fresh owner") || owner.Status != "interrupted" {
+		t.Fatal("resume denial was not sticky and user-visible", owner)
 	}
 }
-func TestRepairOwnerResumeRefusesUnavailableRuntimeMetadata(t *testing.T) {
-	for _, missing := range []string{"model", "reasoningEffort", "modelProvider", "canAcceptDirectInput"} {
-		t.Run(missing, func(t *testing.T) {
+func TestRepairOwnerResumeRefusesAcrossObservableContextChanges(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*session)
+	}{
+		{name: "unchanged", configure: func(*session) {}},
+		{name: "settings revision changed", configure: func(parent *session) { parent.PolicyRevision = "new-settings" }},
+		{name: "profile changed", configure: func(parent *session) { parent.ProfileID = "new-profile" }},
+		{name: "legacy provider unknown", configure: func(parent *session) { parent.Agents[0].Provider = "" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			a, parent, _ := checkpointFixture(t)
-			parent.Agents = append(parent.Agents, agent{ID: "owner", Provider: "codex", Status: "interrupted"})
-			client := &rpcClient{pending: map[string]chan rpcPacket{}, done: make(chan struct{})}
+			parent.Agents = append(parent.Agents, agent{ID: "owner", Provider: "codex", Status: "interrupted", CanResume: true})
+			test.configure(parent)
 			calls := 0
-			client.input = replySink{reply: func(data []byte) {
-				var packet map[string]any
-				_ = json.Unmarshal(data, &packet)
-				calls++
-				id, _ := json.Marshal(packet["id"])
-				meta := map[string]any{"id": "owner", "cwd": parent.CWD, "model": "owner-model", "reasoningEffort": "low", "modelProvider": "openai", "canAcceptDirectInput": true}
-				meta[missing] = nil
-				body, _ := json.Marshal(map[string]any{"thread": meta})
-				client.mu.Lock()
-				ch := client.pending[string(id)]
-				client.mu.Unlock()
-				if ch != nil {
-					ch <- rpcPacket{ID: id, Result: body}
-				}
-			}}
-			parent.codex = client
+			parent.codex = &rpcClient{pending: map[string]chan rpcPacket{}, done: make(chan struct{}), input: replySink{reply: func([]byte) { calls++ }}}
 			if err := a.controlAgent(parent, "owner", "resume"); err == nil {
-				t.Fatal("missing native runtime metadata accepted")
+				t.Fatal("native direct resume was accepted")
 			}
-			client.writer.close()
-			if calls != 1 {
-				t.Fatal("unavailable metadata still dispatched model turn")
+			if calls != 0 || parent.Agents[0].CanResume {
+				t.Fatal("resume refusal contacted the old client or left resume enabled", calls, parent.Agents[0])
 			}
 		})
+	}
+}
+func TestRepairOwnerResumeDenialSurvivesLateEventAndRefresh(t *testing.T) {
+	a, parent, _ := checkpointFixture(t)
+	parent.ProviderID = "parent-thread"
+	parent.Agents = append(parent.Agents, agent{ID: "owner-thread", Provider: "codex", Status: "running", CanPause: true, CanStop: true})
+	a.codexEvent(nil, "turn/completed", json.RawMessage(`{"threadId":"owner-thread","turn":{"id":"owner-turn","status":"interrupted"}}`))
+	owner := parent.Agents[0]
+	if owner.CanResume || !strings.Contains(owner.ControlReason, "fresh owner") || owner.Status != "interrupted" {
+		t.Fatal("late completion removed native resume denial", owner)
+	}
+	client := &rpcClient{pending: map[string]chan rpcPacket{}, done: make(chan struct{})}
+	calls := []map[string]any{}
+	client.input = replySink{reply: func(data []byte) {
+		var packet map[string]any
+		_ = json.Unmarshal(data, &packet)
+		calls = append(calls, packet)
+		id, _ := json.Marshal(packet["id"])
+		body, _ := json.Marshal(map[string]any{"data": []any{map[string]any{"id": "owner-thread", "cwd": parent.CWD, "source": map[string]any{"parent_thread_id": "parent-thread"}, "status": map[string]any{"type": "idle"}}}})
+		client.mu.Lock()
+		ch := client.pending[string(id)]
+		client.mu.Unlock()
+		if ch != nil {
+			ch <- rpcPacket{ID: id, Result: body}
+		}
+	}}
+	parent.codex = client
+	a.refreshAgents(parent)
+	client.writer.close()
+	owner = parent.Agents[0]
+	if owner.CanResume || !strings.Contains(owner.ControlReason, "fresh owner") || owner.Status != "idle" {
+		t.Fatal("agent refresh removed native resume denial", owner)
+	}
+	if len(calls) != 1 || calls[0]["method"] != "thread/list" {
+		t.Fatal("unexpected refresh calls", calls)
 	}
 }
 func TestRepairInteractiveReviewErrorStillCancelsOwnedTurn(t *testing.T) {
