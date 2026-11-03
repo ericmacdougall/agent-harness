@@ -14,7 +14,8 @@ import (
 	"testing"
 )
 
-// Each TestCatalog<ID> is an entry in plans/CONSOLE-KERNEL-CATALOG.md owned by K1.
+// Each TestCatalog<ID> is an entry in plans/CONSOLE-KERNEL-CATALOG.md owned by K1a.
+// These pin one scenario each. The independent check is model_test.go.
 
 const testAt = "2026-11-03T10:00:00.000000000Z"
 
@@ -25,8 +26,10 @@ type rig struct {
 
 func newRig(t *testing.T) *rig { return &rig{t: t, p: NewProjection()} }
 
-// apply commits the way the log will: facts round-trip through the real codec and
-// only decoded facts are reduced.
+func rr(text string) RedactedReason {
+	return Redact(text, func(value string) string { return value })
+}
+
 func (r *rig) apply(in In) (Decision, error) {
 	r.t.Helper()
 	if in.At == "" {
@@ -37,33 +40,21 @@ func (r *rig) apply(in In) (Decision, error) {
 			in.Principal.Class = allowed[0]
 		}
 	}
-	if in.Principal.SessionID == "" && (in.Principal.Class == PrincipalProvider || in.Principal.Class == PrincipalAgentRun) {
+	if in.Principal.SessionID == "" && in.Principal.Class == PrincipalProvider {
 		in.Principal.SessionID = in.SessionID
 	}
-	if (in.Kind == InSend || in.Kind == InDispatchInput) && in.RuntimeIdentity == "" {
+	if in.Kind == InSend && in.RuntimeIdentity == "" {
 		in.RuntimeIdentity = "owner"
 	}
 	decision, err := Decide(r.p, in)
 	for _, f := range decision.Facts {
-		data, encodeErr := EncodeFact(f)
-		if encodeErr != nil {
-			r.t.Fatal(encodeErr)
-		}
-		decoded, decodeErr := DecodeFact(data)
-		if decodeErr != nil {
-			r.t.Fatal(decodeErr)
-		}
-		next, reduceErr := Reduce(r.p, decoded)
+		next, reduceErr := Reduce(r.p, f)
 		if reduceErr != nil {
-			r.t.Fatalf("Decide emitted an illegal fact: %v", reduceErr)
+			r.t.Fatalf("Decide returned a fact Reduce refuses: %v", reduceErr)
 		}
 		r.p = next
 	}
 	return decision, err
-}
-
-func rr(text string) RedactedReason {
-	return Redact(text, func(value string) string { return value })
 }
 
 func (r *rig) must(in In) Decision {
@@ -77,24 +68,33 @@ func (r *rig) must(in In) Decision {
 
 func (r *rig) refused(in In, code string) {
 	r.t.Helper()
-	before := r.p
-	decision, err := r.apply(in)
+	before := r.p.LastSeq
+	_, err := r.apply(in)
 	var refusal *Refusal
 	if !errors.As(err, &refusal) || refusal.Code != code {
 		r.t.Fatalf("%s: got %v, want refusal %s", in.Kind, err, code)
 	}
-	if len(decision.Facts) == 0 && before.LastSeq != r.p.LastSeq {
+	if r.p.LastSeq != before {
 		r.t.Fatal("refusal moved the log")
 	}
 }
 
 func (r *rig) session(id string) *Session { return r.p.Sessions[id] }
 
-// started opens a session and a request in the given provider, leaving it accepted.
+// sent opens a session and leaves request A at intent, with Codex connected.
+func (r *rig) sent(id, provider string) {
+	r.t.Helper()
+	r.must(In{Kind: InCreate, SessionID: id, Provider: provider})
+	if provider == ProviderCodex {
+		r.must(In{Kind: ObConnected, SessionID: id})
+	}
+	r.must(In{Kind: InSend, SessionID: id, RequestID: "A"})
+}
+
+// started leaves request A accepted, with the Codex turn bound.
 func (r *rig) started(id, provider string) *Session {
 	r.t.Helper()
-	r.must(In{Kind: InCreate, SessionID: id, Provider: provider, ProviderID: "conv-" + id, Status: "connected"})
-	r.must(In{Kind: InSend, SessionID: id, RequestID: "A", TaskID: "task-" + id, Generation: 1, ObjectiveHash: "objective", RemainingBursts: 3})
+	r.sent(id, provider)
 	r.must(In{Kind: ObAccepted, SessionID: id, RequestID: "A"})
 	if provider == ProviderCodex {
 		r.must(In{Kind: ObTurnBound, SessionID: id, RequestID: "A", TurnID: "turn-A"})
@@ -104,11 +104,7 @@ func (r *rig) started(id, provider string) *Session {
 
 func (r *rig) complete(id, request string) {
 	r.t.Helper()
-	turn := ""
-	if r.session(id).Provider == ProviderCodex {
-		turn = r.session(id).TurnID
-	}
-	r.must(In{Kind: ObCompleted, SessionID: id, RequestID: request, TurnID: turn, Status: "completed"})
+	r.must(In{Kind: ObCompleted, SessionID: id, RequestID: request, TurnID: r.session(id).TurnID, Status: "completed"})
 }
 
 func (r *rig) restart() {
@@ -133,8 +129,7 @@ func TestCatalogR1(t *testing.T) {
 		}
 	})
 	r := newRig(t)
-	r.must(In{Kind: InCreate, SessionID: "s", Provider: ProviderClaude})
-	r.must(In{Kind: InSend, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1})
+	r.sent("s", ProviderClaude)
 	r.restart()
 	if got := r.session("s").Requests["A"]; got != ReceiptUnknown {
 		t.Fatalf("intent after restart: %q", got)
@@ -145,12 +140,10 @@ func TestCatalogR2(t *testing.T) {
 	r := newRig(t)
 	for i := 0; i < MaxVisibleSessions+8; i++ {
 		id := fmt.Sprintf("s%02d", i)
-		if i < 3 {
-			r.started(id, ProviderClaude)
-			continue
-		}
 		r.started(id, ProviderClaude)
-		r.complete(id, "A")
+		if i >= 3 {
+			r.complete(id, "A")
+		}
 	}
 	r.restart()
 	visible := map[string]bool{}
@@ -165,7 +158,6 @@ func TestCatalogR2(t *testing.T) {
 	if len(visible) != MaxVisibleSessions {
 		t.Fatalf("%d visible", len(visible))
 	}
-	// Everything past the limit still unresolved stays visible.
 	r = newRig(t)
 	for i := 0; i < MaxVisibleSessions+5; i++ {
 		r.started(fmt.Sprintf("u%02d", i), ProviderClaude)
@@ -188,7 +180,7 @@ func TestCatalogR3(t *testing.T) {
 		t.Fatal("oldest resolved tab was not trimmed")
 	}
 	r.must(In{Kind: InClose, SessionID: "s25"})
-	r.restart() // Skipped as a repeat only if nothing happened since.
+	r.restart()
 	for _, s := range VisibleSessions(r.p) {
 		if s.ID == "s00" {
 			t.Fatal("trimmed tab reappeared after another closed")
@@ -200,10 +192,8 @@ func TestCatalogR4(t *testing.T) {
 	r := newRig(t)
 	r.started("s", ProviderClaude)
 	r.restart()
-	before := r.session("s")
-	revision := before.Revision
+	revision := r.session("s").Revision
 	decision, err := r.apply(In{Kind: InPause, SessionID: "s"})
-	// The adapter no-ops if no writer remains; the stop itself is never refused.
 	if err != nil || len(decision.Facts) != 0 || len(decision.Effects) != 1 || decision.Effects[0].Class != ClassStopWork {
 		t.Fatalf("pause on read-only: %v %+v", err, decision)
 	}
@@ -212,19 +202,12 @@ func TestCatalogR4(t *testing.T) {
 		t.Fatalf("authority changed: rev %d status %s", s.Revision, Status(s))
 	}
 	r.refused(In{Kind: InClose, SessionID: "s"}, "unresolved")
-	// A stop effect still fires where there may be a writer, and changes no authority.
+	// A resolved read-only session has nothing to stop.
 	r = newRig(t)
-	r.started("c", ProviderCodex)
-	r.must(In{Kind: InPause, SessionID: "c"})
-	r.must(In{Kind: InAbandon, SessionID: "c", ExpectedRequest: "A", Reason: rr("done")})
-	revision = r.session("c").Revision
-	decision, err = r.apply(In{Kind: InStop, SessionID: "c"})
-	if err != nil || len(decision.Facts) != 0 || len(decision.Effects) != 1 || decision.Effects[0].Class != ClassStopWork || decision.Effects[0].TurnID != "turn-A" {
-		t.Fatalf("stop on a discarded turn with a live writer: %v %+v", err, decision)
-	}
-	if r.session("c").Revision != revision {
-		t.Fatal("stop changed authority")
-	}
+	r.started("c", ProviderClaude)
+	r.complete("c", "A")
+	r.restart()
+	r.refused(In{Kind: InStop, SessionID: "c"}, "read_only")
 }
 
 func TestCatalogR5(t *testing.T) {
@@ -236,41 +219,35 @@ func TestCatalogR5(t *testing.T) {
 		if got := Status(r.session("s")); got != "disconnected" {
 			t.Fatalf("idle session after auth: %s", got)
 		}
+		before := r.session("s")
 		r.restart()
-		if got := Status(r.session("s")); got != "disconnected" {
+		after := r.session("s")
+		if got := Status(after); got != "disconnected" {
 			t.Fatalf("after restart: %s", got)
 		}
-	})
-	// Every field outside the enumerated restart rule keeps its value.
-	r := newRig(t)
-	r.started("s", ProviderCodex)
-	r.must(In{Kind: InStartReview, SessionID: "s", ID: "run", Stage: "plan", Digest: "d"})
-	r.must(In{Kind: ObChild, SessionID: "s", ID: "child", Role: "owner", TurnID: "t", Status: ChildRunning})
-	before := r.session("s")
-	r.restart()
-	after := r.session("s")
-	rule := map[string]bool{}
-	for _, field := range restartWrites {
-		rule[field] = true
-	}
-	beforeValue, afterValue := reflect.ValueOf(*before), reflect.ValueOf(*after)
-	for i := 0; i < beforeValue.NumField(); i++ {
-		name := beforeValue.Type().Field(i).Name
-		if !rule[name] && !reflect.DeepEqual(beforeValue.Field(i).Interface(), afterValue.Field(i).Interface()) {
-			t.Errorf("restart changed %s, outside its rule", name)
+		rule := map[string]bool{"Requests": true, "ProviderFinal": true, "ReadOnly": true, "Connected": true, "TurnID": true, "PendingInterrupt": true, "Paused": true, "PauseUnconfirmed": true, "Hidden": true}
+		beforeValue, afterValue := reflect.ValueOf(*before), reflect.ValueOf(*after)
+		for i := 0; i < beforeValue.NumField(); i++ {
+			name := beforeValue.Type().Field(i).Name
+			if !rule[name] && !reflect.DeepEqual(beforeValue.Field(i).Interface(), afterValue.Field(i).Interface()) {
+				t.Errorf("restart changed %s, outside its rule", name)
+			}
 		}
+	})
+}
+
+func rawFact(p Projection, s *Session, f Fact) Fact {
+	f.Seq, f.SchemaVersion, f.At = p.LastSeq+1, SchemaVersion, testAt
+	if s != nil {
+		f.SessionID, f.SessionRevision = s.ID, s.Revision+1
 	}
-	if !after.ReadOnly || after.Connected || after.TurnID != "" || after.Requests["A"] != ReceiptUnknown || after.Review.Status != "unknown" || after.Children[0].Status != ChildUnknown {
-		t.Fatalf("restart rule not applied: %+v", after)
-	}
+	return f
 }
 
 func TestCatalogR6(t *testing.T) {
 	r := newRig(t)
 	r.started("s", ProviderClaude)
-	s := r.session("s")
-	f := Fact{Seq: r.p.LastSeq + 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactCwdChanged, SessionID: "s", SessionRevision: s.Revision + 1, CWD: "/other"}
-	if _, err := Reduce(r.p, f); !errors.Is(err, ErrIllegalFact) {
+	if _, err := Reduce(r.p, rawFact(r.p, r.session("s"), Fact{Kind: FactCwdChanged, CWD: "/other"})); !errors.Is(err, ErrIllegalFact) {
 		t.Fatalf("a cwd fact over an unresolved receipt was accepted: %v", err)
 	}
 	r.must(In{Kind: InPause, SessionID: "s"})
@@ -284,8 +261,7 @@ func TestCatalogR6(t *testing.T) {
 func TestCatalogR7(t *testing.T) {
 	for _, state := range []string{"intent", "accepted", "unknown"} {
 		r := newRig(t)
-		r.must(In{Kind: InCreate, SessionID: "s", Provider: ProviderClaude})
-		r.must(In{Kind: InSend, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1})
+		r.sent("s", ProviderClaude)
 		if state != "intent" {
 			r.must(In{Kind: ObAccepted, SessionID: "s", RequestID: "A"})
 		}
@@ -298,6 +274,8 @@ func TestCatalogR7(t *testing.T) {
 	r.started("s", ProviderClaude)
 	r.complete("s", "A")
 	r.must(In{Kind: InChangeCWD, SessionID: "s", CWD: "/other"})
+	r.refused(In{Kind: InChangeCWD, SessionID: "s", CWD: "/bad\x07path"}, "bad_value")
+	r.refused(In{Kind: InChangeCWD, SessionID: "s"}, "bad_request")
 }
 
 func TestCatalogR8(t *testing.T) {
@@ -305,69 +283,16 @@ func TestCatalogR8(t *testing.T) {
 		r := newRig(t)
 		r.started("s", provider)
 		r.must(In{Kind: InPause, SessionID: "s"})
-		r.must(In{Kind: ObControlOutcome, SessionID: "s", Status: "pause", Outcome: "rejected"})
+		r.must(In{Kind: ObControlOutcome, SessionID: "s", Control: "pause", Outcome: "rejected"})
+		if !r.session("s").PauseUnconfirmed {
+			t.Fatal("rejected interrupt not visible")
+		}
 		r.refused(In{Kind: InClose, SessionID: "s"}, "unresolved")
 		r.complete("s", "A")
+		if r.session("s").PauseUnconfirmed {
+			t.Fatal("stale unconfirmed message on a final turn")
+		}
 		r.must(In{Kind: InClose, SessionID: "s"})
-		if !r.session("s").Closed {
-			t.Fatal("not closed")
-		}
-	})
-}
-
-func TestCatalogT1(t *testing.T) {
-	eachProvider(t, func(t *testing.T, provider string) {
-		r := newRig(t)
-		s := r.started("s", provider)
-		_ = s
-		r.must(In{Kind: InStartReview, SessionID: "s", ID: "run", Stage: "plan_review", Digest: "d"})
-		decision := r.must(In{Kind: ObQuestion, SessionID: "s", RequestID: "A", ID: "q", ReviewRunID: "run"})
-		if len(decision.Effects) != 1 || decision.Effects[0].Kind != EffectRejectQuestion {
-			t.Fatalf("reviewer question not rejected: %+v", decision.Effects)
-		}
-		if got := r.session("s").Review.Status; got != "failed" {
-			t.Fatalf("review %s", got)
-		}
-		r.must(In{Kind: ObReviewOutcome, SessionID: "s", ID: "run", Verdict: "pass", Digest: "d"})
-		s = r.session("s")
-		if s.Review.Status != "failed" || len(s.Task.Passes) != 0 {
-			t.Fatalf("failed reviewer reopened: %s %v", s.Review.Status, s.Task.Passes)
-		}
-	})
-}
-
-func TestCatalogT2(t *testing.T) {
-	r := newRig(t)
-	r.started("s", ProviderClaude)
-	r.complete("s", "A")
-	decision := r.must(In{Kind: ObQuestion, SessionID: "s", RequestID: "A", ID: "q", Status: "permission", ExpiresAt: "2026-11-03T11:00:00.000000000Z"})
-	if len(decision.Effects) != 1 || decision.Effects[0].Kind != EffectRejectQuestion || decision.Effects[0].Class != ClassStopWork {
-		t.Fatalf("late question not rejected: %+v", decision.Effects)
-	}
-	s := r.session("s")
-	if len(s.Questions) != 0 || Status(s) != "idle" {
-		t.Fatalf("session reopened: %s", Status(s))
-	}
-	r.refused(In{Kind: InAnswer, SessionID: "s", ID: "q"}, "question_stale")
-}
-
-func TestAnswerIsNewWorkOnlyWhileItsRequestIsActive(t *testing.T) {
-	eachProvider(t, func(t *testing.T, provider string) {
-		r := newRig(t)
-		s := r.started("s", provider)
-		r.must(In{Kind: ObQuestion, SessionID: "s", RequestID: "A", ID: "q", TurnID: s.TurnID, Status: "approval", Digest: "d", ExpiresAt: "2026-11-03T11:00:00.000000000Z"})
-		if got := Status(r.session("s")); got != "waiting" {
-			t.Fatalf("status %s", got)
-		}
-		r.refused(In{Kind: InAnswer, SessionID: "s", ID: "q", At: "2026-11-03T12:00:00.000000000Z"}, "question_stale")
-		decision := r.must(In{Kind: InAnswer, SessionID: "s", ID: "q"})
-		if len(decision.Effects) != 1 || decision.Effects[0].Kind != EffectAnswerQuestion || decision.Effects[0].Class != ClassNewWork || decision.Effects[0].Fence != r.session("s").ControlEpoch {
-			t.Fatalf("answer effect: %+v", decision.Effects)
-		}
-		if len(r.session("s").Questions) != 0 {
-			t.Fatal("question still open")
-		}
-		r.refused(In{Kind: InAnswer, SessionID: "s", ID: "q"}, "question_stale")
 	})
 }
 
@@ -376,11 +301,8 @@ func TestCatalogT3(t *testing.T) {
 	r.started("s", ProviderCodex)
 	r.must(In{Kind: ObCompleted, SessionID: "s", RequestID: "A", TurnID: "turn-stale", Status: "completed"})
 	s := r.session("s")
-	if s.Requests["A"] != ReceiptAccepted || s.ProviderFinal {
-		t.Fatalf("foreign turn finalized: %q", s.Requests["A"])
-	}
-	if s.Evidence[evidenceKey("A", "final")] == "" {
-		t.Fatal("evidence not kept")
+	if s.Requests["A"] != ReceiptAccepted || s.ProviderFinal || s.Evidence[evidenceKey("A", "final")] == "" {
+		t.Fatalf("foreign turn: %q %v", s.Requests["A"], s.Evidence)
 	}
 	r.complete("s", "A")
 	if r.session("s").Requests["A"] != ReceiptFinal {
@@ -416,7 +338,7 @@ func TestCatalogT5(t *testing.T) {
 	r.complete("q", "A")
 	r.must(In{Kind: ObQuarantine, SessionID: "q", ReasonCode: "illegal_fact"})
 	r.must(In{Kind: InAbandon, SessionID: "q", ExpectedRequest: "A", Reason: rr("stuck")})
-	if got := r.session("q"); got.Requests["A"] != ReceiptFinal || got.Abandoned == nil || got.ProviderFinal != true {
+	if got := r.session("q"); got.Requests["A"] != ReceiptFinal || got.Abandoned == nil || !got.ProviderFinal {
 		t.Fatalf("release rewrote a final: %+v", got.Requests)
 	}
 }
@@ -459,47 +381,26 @@ func TestCatalogT6(t *testing.T) {
 	}
 }
 
-func TestCatalogG1(t *testing.T) {
-	eachProvider(t, func(t *testing.T, provider string) {
-		r := newRig(t)
-		r.started("s", provider)
-		r.must(In{Kind: InPause, SessionID: "s"})
-		r.refused(In{Kind: InResume, SessionID: "s"}, "no_finality")
-		r.must(In{Kind: ObRefused, SessionID: "s", RequestID: "A"})
-		r.refused(In{Kind: InResume, SessionID: "s"}, "no_finality")
-	})
-	r := newRig(t)
-	r.started("s", ProviderClaude)
-	r.complete("s", "A")
-	r.must(In{Kind: InSetSupervision, SessionID: "s", State: SupervisionPaused})
-	r.must(In{Kind: InResume, SessionID: "s"})
-	if r.session("s").Supervision.State != SupervisionActive {
-		t.Fatal("resume after verified final failed")
-	}
-}
-
 func TestCatalogG2(t *testing.T) {
 	eachProvider(t, func(t *testing.T, provider string) {
 		for _, outcome := range []string{"rejected", "confirmed"} {
 			r := newRig(t)
 			r.started("s", provider)
 			r.must(In{Kind: InPause, SessionID: "s"})
-			r.must(In{Kind: ObControlOutcome, SessionID: "s", Status: "pause", Outcome: outcome})
-			r.refused(In{Kind: InSend, SessionID: "s", RequestID: "B", TaskID: "other", Generation: 2}, "unresolved")
-			s := r.session("s")
-			if s.LastRequest != "A" || s.Task.ID != "task-s" {
+			r.must(In{Kind: ObControlOutcome, SessionID: "s", Control: "pause", Outcome: outcome})
+			r.refused(In{Kind: InSend, SessionID: "s", RequestID: "B"}, "unresolved")
+			if r.session("s").LastRequest != "A" {
 				t.Fatal("unresolved turn replaced")
 			}
 			r.complete("s", "A")
-			r.must(In{Kind: InSend, SessionID: "s", RequestID: "C", TaskID: "next", Generation: 2})
+			r.must(In{Kind: InSend, SessionID: "s", RequestID: "C"})
 		}
 	})
 }
 
 func TestCatalogG3(t *testing.T) {
 	r := newRig(t)
-	r.must(In{Kind: InCreate, SessionID: "s", Provider: ProviderCodex, Status: "connected"})
-	r.must(In{Kind: InSend, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1})
+	r.sent("s", ProviderCodex)
 	decision := r.must(In{Kind: InPause, SessionID: "s"})
 	if len(decision.Effects) != 0 {
 		t.Fatalf("Pause guessed a turn: %+v", decision.Effects)
@@ -509,20 +410,8 @@ func TestCatalogG3(t *testing.T) {
 		t.Fatalf("bound turn not interrupted: %+v", decision.Effects)
 	}
 	decision = r.must(In{Kind: ObTurnBound, SessionID: "s", RequestID: "A", TurnID: "turn-A"})
-	if len(decision.Effects) != 0 {
+	if len(decision.Effects) != 0 || !decision.Idempotent {
 		t.Fatal("interrupt fired twice")
-	}
-}
-
-func TestCatalogG4(t *testing.T) {
-	r := newRig(t)
-	r.started("s", ProviderCodex)
-	r.must(In{Kind: ObChild, SessionID: "s", ID: "child", TurnID: "turn-child", Status: ChildRunning})
-	r.refused(In{Kind: InChildControl, SessionID: "s", ID: "child", Status: "resume"}, "child_resume_refused")
-	r.must(In{Kind: ObAuthBoundary, Provider: ProviderCodex})
-	r.refused(In{Kind: InChildControl, SessionID: "s", ID: "child", Status: "resume"}, "child_resume_refused")
-	if got := r.session("s").Children[0]; got.Status != ChildUnknown || got.ReasonCode != "auth_changed" {
-		t.Fatalf("child %+v", got)
 	}
 }
 
@@ -531,20 +420,16 @@ func TestCatalogG5(t *testing.T) {
 		r := newRig(t)
 		s := r.started("s", provider)
 		fence := s.ControlEpoch
-		r.must(In{Kind: ObQuestion, SessionID: "s", RequestID: "A", ID: "q", TurnID: s.TurnID, ExpiresAt: "2030-01-01T00:00:00.000000000Z"})
-		r.must(In{Kind: ObChild, SessionID: "s", ID: "child", TurnID: "t", Status: ChildRunning})
 		decision := r.must(In{Kind: ObAuthBoundary, Provider: provider})
-		if len(decision.Effects) == 0 || decision.Effects[0].Class != ClassStopWork {
+		if len(decision.Effects) != 1 || decision.Effects[0].Class != ClassStopWork {
 			t.Fatalf("no stop effect: %+v", decision.Effects)
 		}
 		s = r.session("s")
-		if s.ControlEpoch == fence || !s.ReadOnly || s.Requests["A"] != ReceiptUnknown || len(s.Questions) != 0 || s.Children[0].Status != ChildUnknown {
+		if s.ControlEpoch == fence || !s.ReadOnly || s.Requests["A"] != ReceiptUnknown {
 			t.Fatalf("authority survived: %+v", s)
 		}
-		r.refused(In{Kind: InSend, SessionID: "s", RequestID: "B", TaskID: "x"}, "read_only")
-		r.refused(In{Kind: InAnswer, SessionID: "s", ID: "q"}, "question_stale")
+		r.refused(In{Kind: InSend, SessionID: "s", RequestID: "B"}, "read_only")
 	})
-	// A profile boundary leaves other profiles alone.
 	r := newRig(t)
 	r.must(In{Kind: InCreate, SessionID: "a", Provider: ProviderClaude, ProfileID: "one"})
 	r.must(In{Kind: InCreate, SessionID: "b", Provider: ProviderClaude, ProfileID: "two"})
@@ -552,19 +437,18 @@ func TestCatalogG5(t *testing.T) {
 	if !r.session("a").ReadOnly || r.session("b").ReadOnly {
 		t.Fatal("boundary crossed profiles")
 	}
+	r.refused(In{Kind: ObAuthBoundary, Provider: "claudee"}, "bad_provider")
 }
 
 func TestCatalogP6(t *testing.T) {
 	r := newRig(t)
 	r.must(In{Kind: InCreate, SessionID: "s", Provider: ProviderClaude})
 	before := r.p
-	decision, err := Decide(before, In{Kind: InSend, Principal: Principal{Class: PrincipalUser}, At: testAt, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1, RuntimeIdentity: "owner"})
+	decision, err := Decide(before, In{Kind: InSend, Principal: Principal{Class: PrincipalUser}, At: testAt, SessionID: "s", RequestID: "A", RuntimeIdentity: "owner"})
 	if err != nil || len(decision.Facts) == 0 {
 		t.Fatal(err)
 	}
-	// The append failed, so nothing is reduced: the projection has no trace of it.
-	s := before.Sessions["s"]
-	if s.Task != nil || s.LastRequest != "" || len(s.Requests) != 0 {
+	if s := before.Sessions["s"]; s.LastRequest != "" || len(s.Requests) != 0 {
 		t.Fatalf("Decide published state: %+v", s)
 	}
 }
@@ -572,44 +456,33 @@ func TestCatalogP6(t *testing.T) {
 func TestCatalogP7(t *testing.T) {
 	eachProvider(t, func(t *testing.T, provider string) {
 		r := newRig(t)
-		r.must(In{Kind: InCreate, SessionID: "s", Provider: provider, Status: "connected"})
-		r.must(In{Kind: InSend, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1})
-		r.must(In{Kind: ObRefused, SessionID: "s", RequestID: "A", ReasonCode: "rejected"})
-		// A never-dispatched task stays idle, so a new objective is not stuck.
-		r.must(In{Kind: InSend, SessionID: "s", RequestID: "B", TaskID: "t2", Generation: 2})
+		r.sent("s", provider)
+		r.must(In{Kind: ObRefused, SessionID: "s", RequestID: "A", ReasonCode: "over_capacity"})
+		s := r.session("s")
+		if s.LastRefusal != "over_capacity" || Status(s) != "error" {
+			t.Fatalf("no visible reason: %q %s", s.LastRefusal, Status(s))
+		}
+		r.must(In{Kind: InSend, SessionID: "s", RequestID: "B"})
+		if s := r.session("s"); s.LastRefusal != "" {
+			t.Fatal("reason outlived the next send")
+		}
 	})
-	r := newRig(t)
-	r.started("s", ProviderClaude)
-	r.complete("s", "A")
-	r.must(In{Kind: InSetBudget, SessionID: "s", RemainingBursts: 0})
-	_, err := r.apply(In{Kind: InSend, Principal: Principal{Class: PrincipalSystem}, Automatic: true, SessionID: "s", RequestID: "B", ExpectedTask: "task-s"})
-	var refusal *Refusal
-	if !errors.As(err, &refusal) || r.session("s").LastRefusal != refusal.Code {
-		t.Fatalf("automatic refusal not visible: %v %q", err, r.session("s").LastRefusal)
-	}
-	before := r.p.LastSeq
-	_, _ = r.apply(In{Kind: InSend, Principal: Principal{Class: PrincipalSystem}, Automatic: true, SessionID: "s", RequestID: "C", ExpectedTask: "task-s"})
-	if r.p.LastSeq != before {
-		t.Fatal("repeat refusal was not coalesced")
-	}
 }
 
 func TestCatalogD2(t *testing.T) {
 	eachProvider(t, func(t *testing.T, provider string) {
 		r := newRig(t)
 		r.started("s", provider)
-		r.must(In{Kind: InStartReview, SessionID: "s", ID: "run", Stage: "plan", Digest: "kept"})
-		r.must(In{Kind: ObReviewOutcome, SessionID: "s", ID: "run", Verdict: "pass", Digest: "kept"})
 		r.must(In{Kind: InPause, SessionID: "s"})
 		decision := r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("  done waiting  ")})
 		if len(decision.Facts) != 1 || decision.Facts[0].Kind != FactAbandoned || decision.Facts[0].Reason != "done waiting" || decision.Facts[0].RequestID != "A" || decision.Facts[0].At != testAt {
 			t.Fatalf("fact: %+v", decision.Facts)
 		}
 		got := r.session("s")
-		if got.Requests["A"] != ReceiptAbandoned || got.ProviderFinal || got.Task.Passes["plan"] != "kept" || len(got.Task.Passes) != 1 {
-			t.Fatalf("minted or lost an outcome: %+v", got)
+		if got.Requests["A"] != ReceiptAbandoned || got.ProviderFinal || Status(got) != "abandoned" {
+			t.Fatalf("minted an outcome: %+v", got)
 		}
-		r.refused(In{Kind: InAbandon, Principal: Principal{Class: PrincipalAgentRun, SessionID: "s"}, SessionID: "s", ExpectedRequest: "A", Reason: rr("x")}, "forbidden")
+		r.refused(In{Kind: InAbandon, Principal: Principal{Class: PrincipalProvider, SessionID: "s"}, SessionID: "s", ExpectedRequest: "A", Reason: rr("x")}, "forbidden")
 	})
 	r := newRig(t)
 	r.started("s", ProviderClaude)
@@ -623,22 +496,12 @@ func TestCatalogD2(t *testing.T) {
 func TestCatalogD3(t *testing.T) {
 	r := newRig(t)
 	r.started("s", ProviderCodex)
-	r.must(In{Kind: InStartReview, SessionID: "s", ID: "run", Stage: "final", Digest: "d"})
 	r.must(In{Kind: InPause, SessionID: "s"})
 	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("done")})
 	r.must(In{Kind: ObCompleted, SessionID: "s", RequestID: "A", TurnID: "turn-A", Status: "completed"})
-	decision := r.must(In{Kind: ObQuestion, SessionID: "s", RequestID: "A", ID: "q", TurnID: "turn-A"})
-	r.must(In{Kind: ObReviewOutcome, SessionID: "s", ID: "run", Verdict: "pass", Digest: "d"})
-	r.refused(In{Kind: InCheckpoint, Principal: Principal{Class: PrincipalAgentRun, SessionID: "s"}, SessionID: "s", TaskID: "task-s", State: TaskComplete}, "checkpoint_stale")
 	s := r.session("s")
-	if s.Requests["A"] != ReceiptAbandoned || s.ProviderFinal || len(s.Questions) != 0 || len(s.Task.Passes) != 0 || s.Task.State == TaskComplete {
-		t.Fatalf("late frame changed the turn: %+v", s)
-	}
-	if len(decision.Effects) != 1 || decision.Effects[0].Kind != EffectRejectQuestion {
-		t.Fatalf("late question not rejected: %+v", decision.Effects)
-	}
-	if s.Evidence[evidenceKey("A", "final")] == "" {
-		t.Fatal("late final not kept as evidence")
+	if s.Requests["A"] != ReceiptAbandoned || s.ProviderFinal || s.Evidence[evidenceKey("A", "final")] == "" {
+		t.Fatalf("late final changed the turn: %+v", s)
 	}
 }
 
@@ -646,16 +509,14 @@ func TestCatalogD4(t *testing.T) {
 	r := newRig(t)
 	r.started("s", ProviderClaude)
 	r.must(In{Kind: InPause, SessionID: "s"})
-	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("first"), At: testAt})
+	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("first")})
 	seq := r.p.LastSeq
 	decision := r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("second"), At: "2026-11-04T00:00:00.000000000Z"})
 	if !decision.Idempotent || r.p.LastSeq != seq || r.session("s").Abandoned.Reason != "first" || r.session("s").Abandoned.At != testAt {
 		t.Fatalf("retry changed the decision: %+v", r.session("s").Abandoned)
 	}
 	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "older", Reason: rr("x")}, "discarded_other")
-	// A second fact is illegal even if something emitted one.
-	f := Fact{Seq: r.p.LastSeq + 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactAbandoned, SessionID: "s", SessionRevision: r.session("s").Revision + 1, RequestID: "A", Reason: "x"}
-	if _, err := Reduce(r.p, f); !errors.Is(err, ErrIllegalFact) {
+	if _, err := Reduce(r.p, rawFact(r.p, r.session("s"), Fact{Kind: FactAbandoned, RequestID: "A", Reason: "x"})); !errors.Is(err, ErrIllegalFact) {
 		t.Fatalf("second abandon accepted: %v", err)
 	}
 }
@@ -670,29 +531,6 @@ func TestCatalogD6(t *testing.T) {
 	}
 }
 
-func TestCatalogD10(t *testing.T) {
-	r := newRig(t)
-	r.must(In{Kind: InCreate, SessionID: "s", Provider: ProviderClaude})
-	r.must(In{Kind: InSend, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1})
-	r.must(In{Kind: ObAccepted, SessionID: "s", RequestID: "A"})
-	r.must(In{Kind: InQueueInput, SessionID: "s", RequestID: "q1", PayloadHash: "h"})
-	r.complete("s", "A")
-	r.must(In{Kind: InDispatchInput, Principal: Principal{Class: PrincipalSystem}, Automatic: true, SessionID: "s", RequestID: "q1", ObjectiveHash: "next"})
-	r.must(In{Kind: InPause, SessionID: "s"})
-	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "q1", Reason: rr("done")})
-	if got := findInput(r.session("s"), "q1").Status; got != InputUnknown {
-		t.Fatalf("entry stuck: %s", got)
-	}
-	r.refused(In{Kind: InClose, SessionID: "s"}, "queue_active")
-	decision := r.must(In{Kind: InDiscardInput, SessionID: "s", RequestID: "q1"})
-	if len(decision.Effects) != 1 || decision.Effects[0].Class != ClassLocal {
-		t.Fatalf("no local cleanup: %+v", decision.Effects)
-	}
-	r.refused(In{Kind: InClose, SessionID: "s"}, "queue_active")
-	r.must(In{Kind: ObPayloadReleased, SessionID: "s", RequestID: "q1"})
-	r.must(In{Kind: InClose, SessionID: "s"})
-}
-
 func TestCatalogD11(t *testing.T) {
 	eachProvider(t, func(t *testing.T, provider string) {
 		r := newRig(t)
@@ -700,27 +538,20 @@ func TestCatalogD11(t *testing.T) {
 		r.must(In{Kind: InPause, SessionID: "s"})
 		r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("done")})
 		epoch := r.session("s").ControlEpoch
-		_, _ = r.apply(In{Kind: InPause, SessionID: "s"})
-		_, _ = r.apply(In{Kind: InStop, SessionID: "s"})
-		r.refused(In{Kind: InResume, SessionID: "s"}, "read_only")
 		r.refused(In{Kind: InChangeCWD, SessionID: "s", CWD: "/x"}, "read_only")
-		r.refused(In{Kind: InSend, SessionID: "s", RequestID: "B", TaskID: "x"}, "read_only")
-		r.must(In{Kind: ObControlOutcome, SessionID: "s", Status: "pause", Outcome: "confirmed"})
+		r.refused(In{Kind: InSend, SessionID: "s", RequestID: "B"}, "read_only")
 		r.must(In{Kind: ObRefused, SessionID: "s", RequestID: "A"})
 		r.must(In{Kind: ObUnknown, SessionID: "s", RequestID: "A"})
 		r.must(In{Kind: ObDisconnected, SessionID: "s"})
-		decision := r.must(In{Kind: ObAuthBoundary, Provider: provider})
-		if len(decision.Facts) != 0 {
+		if decision := r.must(In{Kind: ObAuthBoundary, Provider: provider}); len(decision.Facts) != 0 {
 			t.Fatal("auth boundary touched a discarded session")
 		}
 		s := r.session("s")
 		if s.ControlEpoch != epoch || s.Requests["A"] != ReceiptAbandoned || Status(s) != "abandoned" {
 			t.Fatalf("discarded tab changed: %d %q %s", s.ControlEpoch, s.Requests["A"], Status(s))
 		}
-		// Reduce refuses authority facts on it, whichever path produced them.
-		for _, kind := range []FactKind{FactControlRequested, FactCwdChanged, FactAuthBoundaryCrossed, FactRequestIntended, FactProviderCompleted, FactCheckpointRecorded} {
-			f := Fact{Seq: r.p.LastSeq + 1, SchemaVersion: SchemaVersion, At: testAt, Kind: kind, SessionID: "s", SessionRevision: s.Revision + 1, RequestID: "A"}
-			if _, err := Reduce(r.p, f); !errors.Is(err, ErrIllegalFact) {
+		for _, kind := range []FactKind{FactControlRequested, FactCwdChanged, FactAuthBoundaryCrossed, FactRequestIntended, FactProviderCompleted, FactProviderConnected} {
+			if _, err := Reduce(r.p, rawFact(r.p, s, Fact{Kind: kind, RequestID: "A", Control: "pause", Status: "completed"})); !errors.Is(err, ErrIllegalFact) {
 				t.Errorf("%s accepted: %v", kind, err)
 			}
 		}
@@ -728,56 +559,34 @@ func TestCatalogD11(t *testing.T) {
 	})
 }
 
-func TestCatalogD12(t *testing.T) {
-	r := newRig(t)
-	r.started("s", ProviderClaude)
-	r.must(In{Kind: InCheckpoint, Principal: Principal{Class: PrincipalAgentRun, SessionID: "s"}, SessionID: "s", TaskID: "task-s", State: TaskActive, Stage: "plan"})
-	if got := r.session("s").Task.State; got != TaskActive {
-		t.Fatalf("task %s", got)
-	}
-	r.must(In{Kind: InPause, SessionID: "s"})
-	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("done")})
-	r.restart()
-	got := r.session("s").Task
-	if got.State != TaskBlocked || got.ReviewStatus != ReviewInvalidated {
-		t.Fatalf("task after replay: %+v", got)
-	}
-}
-
 func TestCatalogE1(t *testing.T) {
 	eachProvider(t, func(t *testing.T, provider string) {
-		r := newRig(t)
-		r.must(In{Kind: InCreate, SessionID: "s", Provider: provider, Status: "connected"})
-		decision := r.must(In{Kind: InSend, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1})
-		fence := decision.Effects[0].Fence
-		if decision.Effects[0].Class != ClassNewWork {
-			t.Fatalf("class %s", decision.Effects[0].Class)
-		}
-		r.must(In{Kind: InPause, SessionID: "s"})
-		if r.session("s").ControlEpoch == fence {
-			t.Fatal("a later control did not move the fence, so a queued write would still pass")
-		}
-		r = newRig(t)
-		r.must(In{Kind: InCreate, SessionID: "s", Provider: provider, Status: "connected"})
-		decision = r.must(In{Kind: InSend, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1})
-		fence = decision.Effects[0].Fence
-		r.must(In{Kind: ObAuthBoundary, Provider: provider})
-		if r.session("s").ControlEpoch == fence {
-			t.Fatal("auth boundary did not move the fence")
+		for _, later := range []In{{Kind: InPause, SessionID: "s"}, {Kind: ObAuthBoundary, Provider: provider}, {Kind: ObQuarantine, SessionID: "s", ReasonCode: "bad"}} {
+			r := newRig(t)
+			r.must(In{Kind: InCreate, SessionID: "s", Provider: provider})
+			if provider == ProviderCodex {
+				r.must(In{Kind: ObConnected, SessionID: "s"})
+			}
+			decision := r.must(In{Kind: InSend, SessionID: "s", RequestID: "A"})
+			if decision.Effects[0].Class != ClassNewWork {
+				t.Fatalf("class %s", decision.Effects[0].Class)
+			}
+			r.must(later)
+			if r.session("s").ControlEpoch == decision.Effects[0].Fence {
+				t.Fatalf("%s did not move the fence, so a queued write would still pass", later.Kind)
+			}
 		}
 	})
 }
 
 func TestCatalogE4(t *testing.T) {
 	r := newRig(t)
-	r.must(In{Kind: InCreate, SessionID: "s", Provider: ProviderCodex, Status: "connected"})
-	r.must(In{Kind: InSend, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1})
+	r.sent("s", ProviderCodex)
 	r.must(In{Kind: InPause, SessionID: "s"})
 	r.must(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("done")})
 	if !r.session("s").PendingInterrupt {
 		t.Fatal("pending interrupt lost at discard")
 	}
-	before := r.p
 	decision := r.must(In{Kind: ObTurnBound, SessionID: "s", RequestID: "A", TurnID: "turn-A"})
 	if len(decision.Effects) != 1 || decision.Effects[0].Kind != EffectInterrupt {
 		t.Fatalf("interrupt not emitted on an abandoned request: %+v", decision.Effects)
@@ -785,31 +594,28 @@ func TestCatalogE4(t *testing.T) {
 	if r.session("s").Requests["A"] != ReceiptAbandoned {
 		t.Fatal("receipt changed")
 	}
-	// Replay reduces the same facts and has no way to produce an effect.
-	var facts []Fact
-	facts = append(facts, decision.Facts...)
-	if next, err := Reduce(before, facts[0]); err != nil || next.Sessions["s"].PendingInterrupt {
-		t.Fatalf("replay: %v", err)
+}
+
+// recordFacts builds a two-session log with one good and one bad session.
+func recordFacts(t *testing.T) []Fact {
+	t.Helper()
+	r := newRig(t)
+	facts := []Fact{}
+	for _, in := range []In{
+		{Kind: InCreate, SessionID: "good", Provider: ProviderClaude},
+		{Kind: InSend, SessionID: "good", RequestID: "A"},
+		{Kind: InCreate, SessionID: "bad", Provider: ProviderClaude},
+		{Kind: InSend, SessionID: "bad", RequestID: "A"},
+	} {
+		facts = append(facts, r.must(in).Facts...)
 	}
-	if got := ReconcileEffects(r.p); len(got) != 0 {
-		t.Fatalf("restart owes no provider effect: %+v", got)
-	}
+	return facts
 }
 
 func TestCatalogV1(t *testing.T) {
-	r := newRig(t)
-	r.started("good", ProviderClaude)
-	r.started("bad", ProviderClaude)
-	facts := append([]Fact{}, recordFacts(t)...)
+	facts := recordFacts(t)
 	last := facts[len(facts)-1]
-	illegalFact := Fact{Seq: last.Seq + 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactProviderCompleted, SessionID: "bad", SessionRevision: 99, RequestID: "A"}
-	facts = append(facts, illegalFact)
-	prefix, _, err := Replay(facts[:len(facts)-1])
-	if err != nil {
-		t.Fatal(err)
-	}
-	follow := Fact{Seq: last.Seq + 2, SchemaVersion: SchemaVersion, At: testAt, Kind: FactProviderConnected, SessionID: "good", SessionRevision: prefix.Sessions["good"].Revision + 1}
-	facts = append(facts, follow)
+	facts = append(facts, Fact{Seq: last.Seq + 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactProviderCompleted, SessionID: "bad", SessionRevision: 99, RequestID: "A", Status: "completed"})
 	p, quarantined, err := Replay(facts)
 	if err != nil {
 		t.Fatalf("a bad fact stopped the console: %v", err)
@@ -820,14 +626,25 @@ func TestCatalogV1(t *testing.T) {
 	if s := p.Sessions["bad"]; s.Quarantine == "" || !s.ReadOnly || Status(s) != "unknown" {
 		t.Fatalf("bad session not quarantined: %+v", s)
 	}
-	if p.Sessions["good"].ReadOnly || !p.Sessions["good"].Connected {
+	if p.Sessions["good"].ReadOnly {
 		t.Fatal("good session affected")
 	}
-	// Discard and close still work on a quarantined session.
+	// Discard and close survive the next replay.
 	q := &rig{t: t, p: p}
-	q.must(In{Kind: InAbandon, SessionID: "bad", ExpectedRequest: "A", Reason: rr("stuck")})
-	q.must(In{Kind: InClose, SessionID: "bad"})
-	// Unreadable refuses, and never partially.
+	for _, in := range []In{{Kind: InAbandon, SessionID: "bad", ExpectedRequest: "A", Reason: rr("stuck")}, {Kind: InClose, SessionID: "bad"}} {
+		facts = append(facts, q.must(in).Facts...)
+	}
+	again, _, err := Replay(facts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := again.Sessions["bad"]; s.Abandoned == nil || !s.Closed || !reflect.DeepEqual(again, q.p) {
+		t.Fatalf("restart undid the exit: %+v", s)
+	}
+	// A later slice's kind quarantines rather than refusing.
+	if _, list, err := Replay(append(recordFacts(t), Fact{Seq: last.Seq + 1, SchemaVersion: SchemaVersion, At: testAt, Kind: ReservedFactKinds[0], SessionID: "good", SessionRevision: 9})); err != nil || len(list) != 1 {
+		t.Fatalf("reserved kind: %v %+v", err, list)
+	}
 	for _, broken := range []Fact{
 		{Seq: last.Seq + 1, SchemaVersion: 99, At: testAt, Kind: FactProviderConnected, SessionID: "good"},
 		{Seq: last.Seq + 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactKind("FutureFact"), SessionID: "good"},
@@ -839,26 +656,8 @@ func TestCatalogV1(t *testing.T) {
 	}
 }
 
-// recordFacts builds the two-session log used by V1.
-func recordFacts(t *testing.T) []Fact {
-	t.Helper()
-	r := newRig(t)
-	facts := []Fact{}
-	for _, in := range []In{
-		{Kind: InCreate, SessionID: "good", Provider: ProviderClaude, Status: "connected"},
-		{Kind: InSend, SessionID: "good", RequestID: "A", TaskID: "t", Generation: 1},
-		{Kind: ObAccepted, SessionID: "good", RequestID: "A"},
-		{Kind: InCreate, SessionID: "bad", Provider: ProviderClaude, Status: "connected"},
-		{Kind: InSend, SessionID: "bad", RequestID: "A", TaskID: "t", Generation: 1},
-		{Kind: ObAccepted, SessionID: "bad", RequestID: "A"},
-	} {
-		facts = append(facts, r.must(in).Facts...)
-	}
-	return facts
-}
-
 func TestCatalogV3(t *testing.T) {
-	f := Fact{Seq: 7, SchemaVersion: SchemaVersion, At: "2026-11-03T10:00:00.123456789Z", Kind: FactLegacyImported, SessionID: "s", SessionRevision: 1, Passes: map[string]string{"plan": "d"}, Attachments: []string{"a"}, Receipt: ReceiptFinal, RemainingBursts: 3}
+	f := Fact{Seq: 7, SchemaVersion: SchemaVersion, At: "2026-11-03T10:00:00.123456789Z", Kind: FactLegacyImported, SessionID: "s", SessionRevision: 1, Passes: map[string]string{"plan": "d"}, Receipt: ReceiptFinal}
 	data, err := EncodeFact(f)
 	if err != nil {
 		t.Fatal(err)
@@ -868,19 +667,10 @@ func TestCatalogV3(t *testing.T) {
 		t.Fatal(err)
 	}
 	again, _ := EncodeFact(decoded)
-	if string(again) != string(data) || decoded.At != f.At {
+	if string(again) != string(data) || !reflect.DeepEqual(decoded, f) {
 		t.Fatalf("not canonical: %s vs %s", again, data)
 	}
-	for _, bad := range []string{
-		`{"seq":1,"seq":2}`,
-		`{"ſeq":1}`,
-		`{"SEQ":1}`,
-		`{"unknown":1}`,
-		`[1]`,
-		`{"seq":1} trailing`,
-		`{"passes":{"a":"1","a":"2"}}`,
-		"",
-	} {
+	for _, bad := range []string{`{"seq":1,"seq":2}`, `{"ſeq":1}`, `{"SEQ":1}`, `{"unknown":1}`, `[1]`, `{"seq":1} trailing`, `{"passes":{"a":"1","a":"2"}}`, ""} {
 		if _, err := DecodeFact([]byte(bad)); !errors.Is(err, ErrMalformedFact) {
 			t.Errorf("%q accepted: %v", bad, err)
 		}
@@ -891,33 +681,29 @@ func TestCatalogS2(t *testing.T) {
 	r := newRig(t)
 	r.started("s", ProviderCodex)
 	r.complete("s", "A")
-	first := r.must(In{Kind: ObCompleted, SessionID: "s", RequestID: "A", TurnID: "x", Status: "completed", Digest: "d"})
-	if len(first.Facts) != 1 {
-		t.Fatal("first late frame not recorded")
-	}
 	seq := r.p.LastSeq
 	for i := 0; i < 1000; i++ {
-		r.must(In{Kind: ObCompleted, SessionID: "s", RequestID: "A", TurnID: "x", Status: "completed", Digest: "d"})
+		r.must(In{Kind: ObCompleted, SessionID: "s", RequestID: "A", TurnID: "x", Status: []string{"completed", "failed"}[i%2], Digest: fmt.Sprintf("digest%d", i)})
+		r.must(In{Kind: ObCompleted, SessionID: "s", RequestID: fmt.Sprintf("foreign%d", i), TurnID: "x", Status: "completed"})
 	}
-	if r.p.LastSeq != seq {
-		t.Fatalf("noisy provider appended %d facts", r.p.LastSeq-seq)
+	if got := r.p.LastSeq - seq; got != 2 {
+		t.Fatalf("noisy provider appended %d facts", got)
+	}
+	if got := len(r.session("s").Evidence); got != 2 {
+		t.Fatalf("evidence grew to %d", got)
 	}
 }
 
 func TestCatalogI9(t *testing.T) {
-	rows := []struct {
+	for _, row := range []struct {
 		receipt Receipt
 		request string
-		state   string
-	}{
-		{ReceiptFinal, "A", TaskComplete}, {ReceiptRejected, "A", TaskIdle}, {ReceiptUnknown, "A", TaskActive}, {ReceiptAbandoned, "A", TaskBlocked}, {ReceiptNone, "", ""},
-	}
-	for _, row := range rows {
+	}{{ReceiptFinal, "A"}, {ReceiptRejected, "A"}, {ReceiptUnknown, "A"}, {ReceiptAbandoned, "A"}, {ReceiptNone, ""}} {
 		r := newRig(t)
-		r.p, _ = Reduce(r.p, Fact{Seq: 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactLegacyImported, SessionID: "s", SessionRevision: 1, Provider: ProviderClaude, ProviderID: "conv", RequestID: row.request, Receipt: row.receipt, TaskID: "t", State: row.state, Reason: "old"})
-		s := r.session("s")
-		if s == nil || !s.ReadOnly {
-			t.Fatalf("%q not imported read-only", row.receipt)
+		var err error
+		r.p, err = Reduce(r.p, Fact{Seq: 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactLegacyImported, SessionID: "s", SessionRevision: 1, Provider: ProviderClaude, ProviderID: "conv", RequestID: row.request, Receipt: row.receipt, TaskID: "t", Reason: "old"})
+		if err != nil || !r.session("s").ReadOnly {
+			t.Fatalf("%q not imported read-only: %v", row.receipt, err)
 		}
 		if row.receipt == ReceiptUnknown {
 			r.refused(In{Kind: InClose, SessionID: "s"}, "unresolved")
@@ -925,7 +711,13 @@ func TestCatalogI9(t *testing.T) {
 		}
 		r.must(In{Kind: InClose, SessionID: "s"})
 	}
-	// Quarantine is reachable from replay and has its way out in V1.
+	// A quarantined session with no receipt reaches close too.
+	r := newRig(t)
+	r.must(In{Kind: InCreate, SessionID: "s", Provider: ProviderClaude})
+	r.must(In{Kind: ObQuarantine, SessionID: "s", ReasonCode: "bad"})
+	r.refused(In{Kind: InClose, SessionID: "s"}, "unresolved")
+	r.must(In{Kind: InAbandon, SessionID: "s", Reason: rr("stuck")})
+	r.must(In{Kind: InClose, SessionID: "s"})
 	for _, bad := range []Receipt{ReceiptIntent, ReceiptAccepted} {
 		if _, err := Reduce(NewProjection(), Fact{Seq: 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactLegacyImported, SessionID: "s", SessionRevision: 1, RequestID: "A", Receipt: bad}); !errors.Is(err, ErrIllegalFact) {
 			t.Fatalf("imported %q as if confirmed: %v", bad, err)
@@ -940,11 +732,8 @@ func TestCatalogL1(t *testing.T) {
 		r.complete("idle", "A")
 		r.started("busy", provider)
 		r.must(In{Kind: ObAuthBoundary, Provider: provider})
-		if got := r.session("idle").Requests["A"]; got != ReceiptFinal {
+		if got := r.session("idle").Requests["A"]; got != ReceiptFinal || Status(r.session("idle")) == "unknown" {
 			t.Fatalf("idle receipt: %q", got)
-		}
-		if got := Status(r.session("idle")); got == "unknown" {
-			t.Fatal("idle session marked unknown")
 		}
 		if got := r.session("busy").Requests["A"]; got != ReceiptUnknown {
 			t.Fatalf("busy receipt: %q", got)
@@ -953,53 +742,159 @@ func TestCatalogL1(t *testing.T) {
 	})
 }
 
-func TestCatalogL8(t *testing.T) {
+// Regressions from the K1 inspections that stayed in scope.
+
+func TestK1F2StickyEvidence(t *testing.T) {
 	r := newRig(t)
 	r.started("s", ProviderCodex)
-	r.must(In{Kind: ObChild, SessionID: "s", ID: "child-1", Role: "owner", TurnID: "t", Status: ChildRunning})
-	r.restart()
-	children := r.session("s").Children
-	if len(children) != 1 || children[0].ID != "child-1" || children[0].Role != "owner" || children[0].Status != ChildUnknown {
-		t.Fatalf("child identity lost: %+v", children)
+	r.complete("s", "A")
+	seq := r.p.LastSeq
+	for i := 0; i < 1000; i++ {
+		r.must(In{Kind: ObCompleted, SessionID: "s", RequestID: "A", TurnID: "x", Status: []string{"completed", "failed"}[i%2]})
+	}
+	if got := r.p.LastSeq - seq; got != 1 {
+		t.Fatalf("appended %d facts", got)
 	}
 }
 
-// L11 is the source mutation run in tools, recorded with the slice's evidence. This
-// keeps the in-process equivalents of those mutants pinned.
-func TestCatalogL11(t *testing.T) {
-	TestDispatchEndsEveryPassForTheOlderInput(t) // M15
+func TestK1F3ControlIsClosed(t *testing.T) {
 	r := newRig(t)
 	r.started("s", ProviderClaude)
-	r.must(In{Kind: InQueueInput, SessionID: "s", RequestID: "q", PayloadHash: "h"})
-	r.must(In{Kind: ObAuthBoundary, Provider: ProviderClaude}) // M1: inputs held at the boundary.
-	if got := findInput(r.session("s"), "q").Status; got != InputHeld {
-		t.Fatalf("M1: %s", got)
+	decision := r.must(In{Kind: ObControlOutcome, SessionID: "s", Control: "Bearer secret-value", Status: "Bearer secret-value", Outcome: "confirmed"})
+	for _, f := range decision.Facts {
+		if strings.Contains(fmt.Sprintf("%+v", f), "secret") {
+			t.Fatalf("free text in fact: %+v", f)
+		}
 	}
-	r2 := newRig(t)
-	r2.started("s", ProviderClaude)
-	r2.restart() // M7: a read-only session accepts no new writer.
-	f := Fact{Seq: r2.p.LastSeq + 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactProviderConnected, SessionID: "s", SessionRevision: r2.session("s").Revision + 1}
-	if _, err := Reduce(r2.p, f); !errors.Is(err, ErrIllegalFact) {
-		t.Fatalf("M7: %v", err)
-	}
-	r3 := newRig(t)
-	r3.started("s", ProviderClaude)
-	r3.must(In{Kind: InStartReview, SessionID: "s", ID: "run", Stage: "plan", Digest: "d"})
-	r3.must(In{Kind: InPause, SessionID: "s"}) // M21: a verdict is bound to its epoch.
-	r3.must(In{Kind: ObReviewOutcome, SessionID: "s", ID: "run", Verdict: "pass", Digest: "d"})
-	if len(r3.session("s").Task.Passes) != 0 {
-		t.Fatal("M21: late verdict accepted after an epoch change")
+	for name, f := range map[string]Fact{
+		"control":    {Kind: FactControlOutcome, Control: "free text", Outcome: "confirmed"},
+		"outcome":    {Kind: FactControlOutcome, Control: "pause", Outcome: "free"},
+		"status":     {Kind: FactProviderCompleted, RequestID: "A", Status: "free text"},
+		"reasonCode": {Kind: FactOutcomeUnknown, RequestID: "A", ReasonCode: "Bearer secret-value"},
+		"lateKind":   {Kind: FactLateFrameObserved, LateKind: "free"},
+		"latestatus": {Kind: FactLateFrameObserved, LateKind: "final", Status: "Free Text"},
+		"digest":     {Kind: FactLateFrameObserved, LateKind: "final", Digest: "free text"},
+		"state":      {Kind: FactProviderConnected, State: "anything"},
+		"reason":     {Kind: FactCwdChanged, CWD: "/x", Reason: "free"},
+		"control2":   {Kind: FactProviderConnected, Control: "pause"},
+	} {
+		if _, err := Reduce(r.p, rawFact(r.p, r.session("s"), f)); !errors.Is(err, ErrIllegalFact) {
+			t.Errorf("%s accepted: %v", name, err)
+		}
 	}
 }
 
-// Every catalog row owned by K1 must have its test.
+func TestK1F4F5ConnectionAndOwner(t *testing.T) {
+	r := newRig(t)
+	r.refused(In{Kind: InCreate, SessionID: "s", Provider: ProviderCodex, ProviderID: "existing"}, "no_owner")
+	r.must(In{Kind: InCreate, SessionID: "s", Provider: ProviderClaude, ProviderID: "existing", RuntimeIdentity: "owner"})
+	if s := r.session("s"); !s.ConversationStarted || s.Connected {
+		t.Fatalf("create: %+v", s)
+	}
+	r.refused(In{Kind: InSend, SessionID: "s", RequestID: "A", RuntimeIdentity: "other"}, "runtime_changed")
+	// A create input cannot set the connection: only a provider fact can.
+	r.must(In{Kind: InCreate, SessionID: "c", Provider: ProviderCodex, Status: "connected"})
+	if r.session("c").Connected {
+		t.Fatal("create set Connected")
+	}
+	r.refused(In{Kind: InSend, SessionID: "c", RequestID: "A"}, "disconnected")
+	// Only a conversation started with a recorded owner can be continued.
+	r.must(In{Kind: InCreate, SessionID: "u", Provider: ProviderClaude})
+	r.refused(In{Kind: ObConversationBound, SessionID: "u", ProviderID: "conv"}, "no_owner")
+	r.must(In{Kind: ObConversationBound, SessionID: "u", ProviderID: "conv", RuntimeIdentity: "owner"})
+	r.must(In{Kind: ObConversationBound, SessionID: "u", ProviderID: "other", RuntimeIdentity: "owner"})
+	if got := r.session("u").ProviderID; got != "conv" {
+		t.Fatalf("conversation replaced by %s", got)
+	}
+}
+
+func TestK1F6ParentStopSurvivesBoundaryAndDiscard(t *testing.T) {
+	r := newRig(t)
+	r.started("s", ProviderCodex)
+	r.must(In{Kind: ObAuthBoundary, Provider: ProviderCodex})
+	decision, err := r.apply(In{Kind: InStop, SessionID: "s"})
+	if err != nil || len(decision.Effects) != 1 || decision.Effects[0].TurnID != "turn-A" {
+		t.Fatalf("stop after boundary: %v %+v", err, decision)
+	}
+	r = newRig(t)
+	r.started("c", ProviderClaude)
+	r.must(In{Kind: InPause, SessionID: "c"})
+	r.must(In{Kind: InAbandon, SessionID: "c", ExpectedRequest: "A", Reason: rr("done")})
+	decision, err = r.apply(In{Kind: InStop, SessionID: "c"})
+	if err != nil || len(decision.Effects) != 1 || decision.Effects[0].Kind != EffectTerminate {
+		t.Fatalf("terminate cannot be retried after discard: %v %+v", err, decision)
+	}
+}
+
+func TestK1F10DecideReturnsOnlyWhatSurvivesTheCodec(t *testing.T) {
+	r := newRig(t)
+	r.started("s", ProviderClaude)
+	r.must(In{Kind: InPause, SessionID: "s"})
+	r.refused(In{Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr(strings.Repeat("\xff", 200))}, "bad_value")
+	r2 := newRig(t)
+	r2.refused(In{Kind: InCreate, SessionID: "s", Provider: ProviderClaude, CWD: "/bad\xffpath"}, "bad_value")
+}
+
+func TestStickyInterruptSurvivesEveryLaterFact(t *testing.T) {
+	cases := map[string][]In{
+		"pause then unknown":      {{Kind: InPause, SessionID: "s"}, {Kind: ObUnknown, SessionID: "s", RequestID: "A", ReasonCode: "deadline"}},
+		"unknown then stop":       {{Kind: ObUnknown, SessionID: "s", RequestID: "A", ReasonCode: "deadline"}, {Kind: InStop, SessionID: "s"}},
+		"auth while unbound":      {{Kind: ObAuthBoundary, Provider: ProviderCodex}},
+		"quarantine":              {{Kind: ObQuarantine, SessionID: "s", ReasonCode: "bad"}},
+		"stop then disconnect":    {{Kind: InStop, SessionID: "s"}, {Kind: ObDisconnected, SessionID: "s"}},
+		"discard then quarantine": {{Kind: InPause, SessionID: "s"}, {Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("x")}, {Kind: ObQuarantine, SessionID: "s", ReasonCode: "bad"}},
+		"discard then close":      {{Kind: InPause, SessionID: "s"}, {Kind: InAbandon, SessionID: "s", ExpectedRequest: "A", Reason: rr("x")}, {Kind: InClose, SessionID: "s"}},
+	}
+	for name, steps := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			r.sent("s", ProviderCodex)
+			for _, step := range steps {
+				r.must(step)
+			}
+			decision := r.must(In{Kind: ObTurnBound, SessionID: "s", RequestID: "A", TurnID: "turn-A"})
+			if len(decision.Effects) != 1 || decision.Effects[0].Kind != EffectInterrupt {
+				t.Fatalf("late bind did not interrupt: %+v", decision)
+			}
+		})
+	}
+}
+
+func TestAuthorizationIsDefaultDeny(t *testing.T) {
+	r := newRig(t)
+	r.sent("s", ProviderClaude)
+	user := Principal{Class: PrincipalUser}
+	provider := Principal{Class: PrincipalProvider, SessionID: "s"}
+	foreign := Principal{Class: PrincipalProvider, SessionID: "other"}
+	for name, in := range map[string]In{
+		"user forges final":     {Kind: ObCompleted, Principal: user, SessionID: "s", RequestID: "A", Status: "completed"},
+		"foreign session frame": {Kind: ObCompleted, Principal: foreign, SessionID: "s", RequestID: "A", Status: "completed"},
+		"user forges restart":   {Kind: ObRestart, Principal: user},
+		"provider restarts":     {Kind: ObRestart, Principal: provider},
+		"provider discards":     {Kind: InAbandon, Principal: provider, SessionID: "s", ExpectedRequest: "A", Reason: rr("x")},
+		"provider boundary":     {Kind: ObAuthBoundary, Principal: provider, SessionID: "s", Provider: ProviderClaude},
+		"no principal":          {Kind: InPause, SessionID: "s"},
+		"unlisted kind":         {Kind: InputKind("future"), Principal: user, SessionID: "s"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			in.At = testAt
+			decision, err := Decide(r.p, in)
+			var refusal *Refusal
+			if !errors.As(err, &refusal) || refusal.Code != "forbidden" || len(decision.Facts) != 0 {
+				t.Fatalf("got %v %+v", err, decision)
+			}
+		})
+	}
+}
+
+// Every catalog row owned by K1a must have its test here.
 func TestCatalogCoverage(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "..", "plans", "CONSOLE-KERNEL-CATALOG.md"))
 	if err != nil {
 		t.Fatalf("catalog is required: %v", err)
 	}
 	row := regexp.MustCompile(`^\| ([A-Z]\d+) \|`)
-	k1 := regexp.MustCompile(`\bK1\b`)
+	k1a := regexp.MustCompile(`\bK1a\b`)
 	owned := []string{}
 	for _, line := range strings.Split(string(data), "\n") {
 		match := row.FindStringSubmatch(line)
@@ -1007,12 +902,12 @@ func TestCatalogCoverage(t *testing.T) {
 			continue
 		}
 		cells := strings.Split(strings.Trim(line, "| "), "|")
-		if k1.MatchString(cells[len(cells)-1]) {
+		if k1a.MatchString(cells[len(cells)-1]) {
 			owned = append(owned, match[1])
 		}
 	}
-	if len(owned) < 25 {
-		t.Fatalf("parsed only %d K1 rows", len(owned))
+	if len(owned) < 20 {
+		t.Fatalf("parsed only %d K1a rows", len(owned))
 	}
 	file, err := parser.ParseFile(token.NewFileSet(), "catalog_test.go", nil, 0)
 	if err != nil {
@@ -1028,65 +923,5 @@ func TestCatalogCoverage(t *testing.T) {
 		if !present["TestCatalog"+id] {
 			t.Errorf("catalog entry %s has no TestCatalog%s", id, id)
 		}
-	}
-}
-
-// Three mutants survived the first source run. These close those gaps.
-
-func TestDispatchEndsEveryPassForTheOlderInput(t *testing.T) {
-	r := newRig(t)
-	r.must(In{Kind: InCreate, SessionID: "s", Provider: ProviderClaude})
-	r.must(In{Kind: InSend, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1, ObjectiveHash: "one"})
-	r.must(In{Kind: ObAccepted, SessionID: "s", RequestID: "A"})
-	r.must(In{Kind: InStartReview, SessionID: "s", ID: "run", Stage: "plan", Digest: "d"})
-	r.must(In{Kind: ObReviewOutcome, SessionID: "s", ID: "run", Verdict: "pass", Digest: "d"})
-	if r.session("s").Task.Passes["plan"] != "d" {
-		t.Fatal("pass not recorded")
-	}
-	r.must(In{Kind: InQueueInput, SessionID: "s", RequestID: "q", PayloadHash: "h"})
-	r.complete("s", "A")
-	r.must(In{Kind: InDispatchInput, Principal: Principal{Class: PrincipalSystem}, Automatic: true, SessionID: "s", RequestID: "q", ObjectiveHash: "two"})
-	task := r.session("s").Task
-	if len(task.Passes) != 0 || task.InputRevision != 1 || task.ObjectiveHash != "two" {
-		t.Fatalf("older input's pass authorizes a new objective: %+v", task)
-	}
-}
-
-func TestRuntimeIdentityRefusesBothProvidersIncludingAutomatic(t *testing.T) {
-	eachProvider(t, func(t *testing.T, provider string) {
-		r := newRig(t)
-		r.must(In{Kind: InCreate, SessionID: "s", Provider: provider, Status: "connected"})
-		r.must(In{Kind: InSend, SessionID: "s", RequestID: "A", TaskID: "t", Generation: 1, RuntimeIdentity: "owner", RemainingBursts: 3})
-		if r.session("s").RuntimeIdentity != "owner" {
-			t.Fatal("identity not bound")
-		}
-		r.must(In{Kind: ObAccepted, SessionID: "s", RequestID: "A"})
-		if provider == ProviderCodex {
-			r.must(In{Kind: ObTurnBound, SessionID: "s", RequestID: "A", TurnID: "turn"})
-		}
-		r.complete("s", "A")
-		r.refused(In{Kind: InSend, SessionID: "s", RequestID: "B", TaskID: "t2", Generation: 2, RuntimeIdentity: "other"}, "runtime_changed")
-		r.refused(In{Kind: InSend, Principal: Principal{Class: PrincipalSystem}, Automatic: true, SessionID: "s", RequestID: "C", ExpectedTask: "t", RuntimeIdentity: "other"}, "runtime_changed")
-		if got := r.session("s").LastRefusal; got != "runtime_changed" {
-			t.Fatalf("automatic refusal not visible: %q", got)
-		}
-		r.must(In{Kind: InSend, SessionID: "s", RequestID: "D", TaskID: "t3", Generation: 2, RuntimeIdentity: "owner"})
-	})
-}
-
-func TestReduceRefusesCloseOverAnUnresolvedReceipt(t *testing.T) {
-	r := newRig(t)
-	s := r.started("s", ProviderClaude)
-	f := Fact{Seq: r.p.LastSeq + 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactSessionClosed, SessionID: "s", SessionRevision: s.Revision + 1}
-	if _, err := Reduce(r.p, f); !errors.Is(err, ErrIllegalFact) {
-		t.Fatalf("close accepted over an unresolved receipt: %v", err)
-	}
-	r2 := newRig(t)
-	r2.started("s", ProviderClaude)
-	r2.must(In{Kind: InQueueInput, SessionID: "s", RequestID: "q", PayloadHash: "h"})
-	r2.complete("s", "A")
-	f = Fact{Seq: r2.p.LastSeq + 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactSessionClosed, SessionID: "s", SessionRevision: r2.session("s").Revision + 1}
-	if _, err := Reduce(r2.p, f); !errors.Is(err, ErrIllegalFact) {
-		t.Fatalf("close accepted over a retained payload: %v", err)
 	}
 }

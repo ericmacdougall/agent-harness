@@ -28,114 +28,44 @@ var receiptTransitions = map[Receipt][]Receipt{
 func (r Receipt) open() bool       { return r == ReceiptIntent || r == ReceiptAccepted }
 func (r Receipt) unresolved() bool { return r.open() || r == ReceiptUnknown }
 
-// Input and task states are closed strings shared with the view.
 const (
-	InputQueued      = "queued"
-	InputHeld        = "held"
-	InputDispatching = "dispatching"
-	InputRetained    = "retained"
-	InputUnknown     = "unknown"
-	InputCleanup     = "cleanup_pending"
-	InputDiscarded   = "discarded"
-
-	TaskIdle        = "idle"
-	TaskActive      = "active"
-	TaskBlocked     = "blocked"
-	TaskHandoff     = "handoff"
-	TaskNeedsReview = "needs_review"
-	TaskComplete    = "complete"
-
-	SupervisionActive  = "active"
-	SupervisionWaiting = "waiting"
-	SupervisionPaused  = "paused"
-	SupervisionBlocked = "blocked"
-
-	ReviewInvalidated = "invalidated"
-	ReviewUnknown     = "unknown"
-	ReviewPaused      = "paused"
-
-	ChildRunning = "running"
-	ChildUnknown = "unknown"
+	ProviderCodex  = "codex"
+	ProviderClaude = "claude"
 
 	maxReceiptsKept = 256
 	// MaxVisibleSessions bounds resolved history shown after a restart.
 	MaxVisibleSessions = 24
 )
 
-type Task struct {
-	ID            string
-	Generation    uint64
-	State         string
-	Stage         string
-	InputRevision uint64
-	ObjectiveHash string
-	ReviewStatus  string
-	Passes        map[string]string
-}
-
-type Input struct {
-	RequestID      string
-	Status         string
-	PayloadHash    string
-	Attachments    []string
-	DeliveredInRev uint64
-	Legacy         bool
-}
-
-type Question struct {
-	ID, Kind, RequestID, Digest, ExpiresAt string
-	ControlEpoch                           uint64
-	TurnID                                 string
-}
-
-type Child struct {
-	ID, Role, TurnID, Status, ReasonCode string
-}
-
-type ReviewRun struct {
-	ID, Stage, Digest, Status string
-	ControlEpoch              uint64
-}
-
 type Abandonment struct {
 	RequestID, Reason, At string
 }
 
-type Supervision struct {
-	State, ReasonCode string
-	RemainingBursts   int64
-	Progress          int64
-	LastProgress      int64
-}
-
-// Session is authority only. Presentation fields and process-local handles live
-// outside the kernel; Status is derived by Status, never assigned.
+// Session is authority only, and each field belongs to one table in
+// plans/CONSOLE-KERNEL-K1A.md. Status is derived by Status, never assigned.
 type Session struct {
 	ID, Provider, ProviderID, ProfileID, CWD string
 	ConversationStarted                      bool
-	Revision                                 uint64
-	LastRequest                              string
-	Requests                                 map[string]Receipt
-	RequestOrder                             []string
-	FinalStatus                              string
-	TurnID                                   string
-	PendingInterrupt                         bool
-	PauseUnconfirmed                         bool
-	ControlEpoch                             uint64
-	ProviderFinal                            bool
-	ReadOnly, Closed, Hidden, Connected      bool
+	RuntimeIdentity                          string
+	Connected, ReadOnly, Closed, Hidden      bool
 	Quarantine                               string
-	RuntimeIdentity, PolicyRevision, Cascade string
-	Task                                     *Task
-	Inputs                                   []Input
-	Questions                                []Question
-	Children                                 []Child
-	Review                                   *ReviewRun
-	ReviewResultPending                      bool
 	Abandoned                                *Abandonment
-	Supervision                              Supervision
-	LastRefusal                              string
-	Evidence                                 map[string]string
+	Revision                                 uint64
+
+	LastRequest   string
+	Requests      map[string]Receipt
+	RequestOrder  []string
+	ProviderFinal bool
+	FinalStatus   string
+	LastRefusal   string
+
+	TurnID           string
+	PendingInterrupt bool
+	Paused           bool
+	PauseUnconfirmed bool
+	ControlEpoch     uint64
+
+	Evidence map[string]string
 }
 
 // Projection is immutable once published: Reduce copies what it changes, so a
@@ -157,35 +87,17 @@ func (s *Session) clone() *Session {
 		next.Requests[key] = value
 	}
 	next.RequestOrder = append([]string(nil), s.RequestOrder...)
-	if s.Task != nil {
-		task := *s.Task
-		task.Passes = cloneStrings(s.Task.Passes)
-		next.Task = &task
-	}
-	next.Inputs = append([]Input(nil), s.Inputs...)
-	next.Questions = append([]Question(nil), s.Questions...)
-	next.Children = append([]Child(nil), s.Children...)
-	if s.Review != nil {
-		review := *s.Review
-		next.Review = &review
-	}
 	if s.Abandoned != nil {
 		abandoned := *s.Abandoned
 		next.Abandoned = &abandoned
 	}
-	next.Evidence = cloneStrings(s.Evidence)
+	if s.Evidence != nil {
+		next.Evidence = make(map[string]string, len(s.Evidence))
+		for key, value := range s.Evidence {
+			next.Evidence[key] = value
+		}
+	}
 	return &next
-}
-
-func cloneStrings(in map[string]string) map[string]string {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
 }
 
 func (p Projection) copyShell() Projection {
@@ -198,14 +110,11 @@ func (p Projection) copyShell() Projection {
 	return next
 }
 
-// Facts a read-only session may still receive. Everything else is illegal, which
-// is what stops a returning Pause, a queue failure or an auth boundary from
-// changing a discarded or restored tab, whichever path it came from.
+// Facts a read-only session may still receive. Everything else is illegal, whichever
+// path produced it, which is what keeps a discarded or restored tab unchanged.
 var readOnlyFacts = map[FactKind]bool{
-	FactLateFrameObserved: true, FactControlOutcome: true, FactChildControlOutcome: true, FactChildQuarantined: true,
-	FactSessionClosed: true, FactAbandoned: true, FactSessionQuarantined: true, FactInputOutcome: true, FactInputDiscarded: true,
-	FactPayloadReleased: true, FactReviewOutcome: true, FactReviewCancelled: true, FactTurnBound: true, FactQuestionRevoked: true,
-	FactLegacyInputHeld: true,
+	FactLateFrameObserved: true, FactControlOutcome: true, FactSessionClosed: true,
+	FactAbandoned: true, FactSessionQuarantined: true, FactTurnBound: true,
 }
 
 func illegal(f Fact, why string) error {
@@ -224,8 +133,11 @@ func Reduce(p Projection, f Fact) (Projection, error) {
 	if f.Seq <= p.LastSeq {
 		return p, fmt.Errorf("%w: sequence %d after %d", ErrUnreadableLog, f.Seq, p.LastSeq)
 	}
+	if !coreFacts[f.Kind] {
+		return p, illegal(f, "kind belongs to a later slice")
+	}
 	if err := validateFact(f); err != nil {
-		return p, fmt.Errorf("%w: %v", ErrIllegalFact, err)
+		return p, fmt.Errorf("%w: %w", ErrIllegalFact, err)
 	}
 	next := p.copyShell()
 	next.LastSeq, next.LastKind = f.Seq, f.Kind
@@ -248,7 +160,7 @@ func Reduce(p Projection, f Fact) (Projection, error) {
 		if current != nil || f.SessionRevision != 1 {
 			return p, illegal(f, "session exists or bad revision")
 		}
-		created := &Session{ID: f.SessionID, Provider: f.Provider, ProviderID: f.ProviderID, ProfileID: f.ProfileID, CWD: f.CWD, Revision: 1, Requests: map[string]Receipt{}, Connected: f.Kind == FactSessionCreated && f.Status == "connected"}
+		created := &Session{ID: f.SessionID, Provider: f.Provider, ProviderID: f.ProviderID, ProfileID: f.ProfileID, CWD: f.CWD, RuntimeIdentity: f.RuntimeIdentity, Revision: 1, Requests: map[string]Receipt{}, ConversationStarted: f.ProviderID != ""}
 		if f.Kind == FactLegacyImported {
 			if err := reduceLegacy(created, f); err != nil {
 				return p, err
@@ -276,9 +188,9 @@ func Reduce(p Projection, f Fact) (Projection, error) {
 	return next, nil
 }
 
+// advance refuses a repeat as well as a move out of a terminal state: a second final
+// could otherwise change the recorded status of a turn that already finished.
 func advance(s *Session, f Fact, request string, to Receipt) error {
-	// A repeat is refused, not ignored: a second final could otherwise change the
-	// recorded status of a turn that already finished.
 	from := s.Requests[request]
 	for _, allowed := range receiptTransitions[from] {
 		if allowed == to {
@@ -289,43 +201,6 @@ func advance(s *Session, f Fact, request string, to Receipt) error {
 	return illegal(f, fmt.Sprintf("receipt %q to %q", from, to))
 }
 
-func revokeQuestions(s *Session) { s.Questions = nil }
-
-func quarantineChildren(s *Session, reason string) {
-	for i := range s.Children {
-		if s.Children[i].Status == ChildRunning {
-			s.Children[i].Status = ChildUnknown
-			s.Children[i].ReasonCode = reason
-			s.Children[i].TurnID = ""
-		}
-	}
-}
-
-func holdInputs(s *Session) {
-	for i := range s.Inputs {
-		if s.Inputs[i].Status == InputQueued {
-			s.Inputs[i].Status = InputHeld
-		}
-	}
-}
-
-func dispatchingToUnknown(s *Session, request string) {
-	for i := range s.Inputs {
-		if s.Inputs[i].Status == InputDispatching && (request == "" || s.Inputs[i].RequestID == request) {
-			s.Inputs[i].Status = InputUnknown
-		}
-	}
-}
-
-func findInput(s *Session, request string) *Input {
-	for i := range s.Inputs {
-		if s.Inputs[i].RequestID == request {
-			return &s.Inputs[i]
-		}
-	}
-	return nil
-}
-
 func requireRequest(s *Session, f Fact) error {
 	if f.RequestID == "" || f.RequestID != s.LastRequest {
 		return illegal(f, "not the active request")
@@ -333,50 +208,61 @@ func requireRequest(s *Session, f Fact) error {
 	return nil
 }
 
+// interruptOwed is a start still unanswered: only the correlated reply can name the
+// turn, so the interrupt waits for it.
+func interruptOwed(s *Session) bool {
+	return s.Requests[s.LastRequest].unresolved() && s.TurnID == "" && s.Provider == ProviderCodex
+}
+
+// stickyOwed keeps an interrupt already due, so a later fact can never clear it.
+func stickyOwed(s *Session) bool { return s.PendingInterrupt || interruptOwed(s) }
+
+func quarantine(s *Session, reason string) {
+	if s.Quarantine == "" || reason != "illegal_fact" {
+		s.Quarantine = reason
+	}
+	s.PendingInterrupt = stickyOwed(s)
+	s.ReadOnly, s.Connected, s.Hidden = true, false, false
+	s.ControlEpoch++
+}
+
+func openToUnknown(s *Session, f Fact) error {
+	if !s.Requests[s.LastRequest].open() {
+		return nil
+	}
+	s.ProviderFinal = false
+	return advance(s, f, s.LastRequest, ReceiptUnknown)
+}
+
 func reduceSession(s *Session, f Fact) error {
 	switch f.Kind {
 	case FactConversationBound:
-		s.ProviderID = f.ProviderID
-		s.ConversationStarted = true
-	case FactProviderConnected:
-		s.Connected = true
-	case FactProviderDisconnected:
-		s.Connected = false
-		if s.Requests[s.LastRequest].open() {
-			if err := advance(s, f, s.LastRequest, ReceiptUnknown); err != nil {
-				return err
-			}
-			dispatchingToUnknown(s, s.LastRequest)
-			s.ProviderFinal = false
+		if f.ProviderID == "" || s.ConversationStarted && f.ProviderID != s.ProviderID {
+			return illegal(f, "a conversation is never replaced")
 		}
-		revokeQuestions(s)
-		quarantineChildren(s, "disconnected")
-		s.TurnID = ""
+		s.ProviderID, s.ConversationStarted = f.ProviderID, true
 	case FactRuntimeIdentityBound:
 		if s.RuntimeIdentity != "" && s.RuntimeIdentity != f.RuntimeIdentity {
 			return illegal(f, "conversation already owned by another runtime")
 		}
 		s.RuntimeIdentity = f.RuntimeIdentity
-	case FactAuthBoundaryCrossed:
-		// Only an unfinished request becomes unknown. An idle session has nothing to
-		// reconcile, so it becomes read-only and stays closable.
-		if s.Requests[s.LastRequest].open() {
-			if err := advance(s, f, s.LastRequest, ReceiptUnknown); err != nil {
-				return err
-			}
-			dispatchingToUnknown(s, s.LastRequest)
-			s.ProviderFinal = false
+	case FactProviderConnected:
+		s.Connected = true
+	case FactProviderDisconnected:
+		if err := openToUnknown(s, f); err != nil {
+			return err
 		}
-		// A start still unanswered would otherwise run on under revoked credentials.
-		s.PendingInterrupt = s.Requests[s.LastRequest].unresolved() && s.TurnID == "" && s.Provider == ProviderCodex
+		s.Connected, s.TurnID = false, ""
+		s.ControlEpoch++
+	case FactAuthBoundaryCrossed:
+		s.PendingInterrupt = stickyOwed(s)
+		if err := openToUnknown(s, f); err != nil {
+			return err
+		}
 		s.ReadOnly, s.Connected = true, false
 		s.ControlEpoch++
-		revokeQuestions(s)
-		holdInputs(s)
-		quarantineChildren(s, "auth_changed")
-		s.TurnID = ""
-		s.Supervision.State, s.Supervision.ReasonCode = SupervisionPaused, "auth_changed"
-		endRunningReview(s)
+	case FactSessionQuarantined:
+		quarantine(s, f.ReasonCode)
 	case FactCwdChanged:
 		if s.Requests[s.LastRequest].unresolved() {
 			return illegal(f, "last request is unresolved")
@@ -384,29 +270,12 @@ func reduceSession(s *Session, f Fact) error {
 		s.CWD = f.CWD
 		s.ControlEpoch++
 	case FactSessionClosed:
-		if s.Abandoned == nil && s.Requests[s.LastRequest].unresolved() {
-			return illegal(f, "unresolved request without discard")
-		}
-		for _, input := range s.Inputs {
-			if input.Status != InputDiscarded {
-				return illegal(f, "retained payload")
-			}
+		if s.Abandoned == nil && (s.Requests[s.LastRequest].unresolved() || s.Quarantine != "") {
+			return illegal(f, "unresolved without discard")
 		}
 		s.Closed = true
 	case FactAbandoned:
 		return reduceAbandoned(s, f)
-	case FactSessionQuarantined:
-		quarantineSession(s, f.ReasonCode)
-	case FactSupervisionChanged:
-		s.Supervision.State, s.Supervision.ReasonCode = f.State, f.ReasonCode
-	case FactCascadeSelected:
-		s.Cascade = f.Cascade
-	case FactPolicyBound:
-		s.PolicyRevision = f.PolicyRevision
-	case FactContinuationBudgetChanged:
-		s.Supervision.RemainingBursts = f.RemainingBursts
-		s.Supervision.LastProgress = s.Supervision.Progress
-		s.Supervision.Progress = f.Progress
 	case FactRequestIntended:
 		return reduceIntended(s, f)
 	case FactProviderAccepted:
@@ -421,23 +290,11 @@ func reduceSession(s *Session, f Fact) error {
 		if err := advance(s, f, f.RequestID, ReceiptRejected); err != nil {
 			return err
 		}
-		if entry := findInput(s, f.RequestID); entry != nil && entry.Status == InputDispatching {
-			entry.Status = InputHeld
-			// The objective already advanced for this input, so the task cannot simply
-			// continue. Blocked lets a new objective start once the payload is resolved.
-			if s.Task != nil {
-				s.Task.State = TaskBlocked
-			}
-		}
-		revokeQuestions(s)
-		s.TurnID, s.PendingInterrupt = "", false
 		s.LastRefusal = f.ReasonCode
 		if s.LastRefusal == "" {
 			s.LastRefusal = "provider_refused"
 		}
-		if s.Supervision.State != SupervisionPaused {
-			s.Supervision.State, s.Supervision.ReasonCode = SupervisionBlocked, s.LastRefusal
-		}
+		s.TurnID, s.PendingInterrupt = "", false
 	case FactProviderCompleted:
 		if err := requireRequest(s, f); err != nil {
 			return err
@@ -445,14 +302,8 @@ func reduceSession(s *Session, f Fact) error {
 		if err := advance(s, f, f.RequestID, ReceiptFinal); err != nil {
 			return err
 		}
-		s.ProviderFinal = true
-		s.FinalStatus = f.Status
-		s.PauseUnconfirmed, s.PendingInterrupt = false, false
-		s.TurnID = ""
-		revokeQuestions(s)
-		if entry := findInput(s, f.RequestID); entry != nil && entry.Status == InputDispatching {
-			entry.Status = InputRetained
-		}
+		s.ProviderFinal, s.FinalStatus = true, f.Status
+		s.TurnID, s.PendingInterrupt, s.PauseUnconfirmed = "", false, false
 	case FactOutcomeUnknown:
 		if err := requireRequest(s, f); err != nil {
 			return err
@@ -461,138 +312,34 @@ func reduceSession(s *Session, f Fact) error {
 			return err
 		}
 		s.ProviderFinal = false
-		revokeQuestions(s)
-		dispatchingToUnknown(s, f.RequestID)
-		s.Supervision.State, s.Supervision.ReasonCode = SupervisionPaused, f.ReasonCode
+		s.ControlEpoch++
 	case FactTurnBound:
 		if err := requireRequest(s, f); err != nil {
 			return err
 		}
-		s.TurnID = f.TurnID
-		s.PendingInterrupt = false
+		if s.Provider != ProviderCodex {
+			return illegal(f, "only Codex binds a turn")
+		}
+		s.TurnID, s.PendingInterrupt = f.TurnID, false
 	case FactLateFrameObserved:
 		if s.Evidence == nil {
 			s.Evidence = map[string]string{}
 		}
-		s.Evidence[evidenceKey(f.RequestID, f.LateKind)] = f.Status + "|" + f.Digest
-	case FactAdmissionRefused:
-		s.LastRefusal = f.ReasonCode
+		key := evidenceKey(f.RequestID, f.LateKind)
+		if _, seen := s.Evidence[key]; seen {
+			return illegal(f, "evidence for this key is sticky")
+		}
+		s.Evidence[key] = f.Status + "|" + f.Digest
 	case FactControlRequested:
-		return reduceControl(s, f)
+		owed := stickyOwed(s)
+		if s.Requests[s.LastRequest] == ReceiptUnknown {
+			s.PendingInterrupt = owed
+			return nil
+		}
+		s.PendingInterrupt, s.Paused = owed, true
+		s.ControlEpoch++
 	case FactControlOutcome:
 		s.PauseUnconfirmed = f.Outcome != "confirmed" && s.Requests[s.LastRequest].unresolved() && s.Abandoned == nil
-	case FactQuestionOpened:
-		if err := requireRequest(s, f); err != nil {
-			return err
-		}
-		if !s.Requests[f.RequestID].open() {
-			return illegal(f, "request is not active")
-		}
-		s.Questions = append(s.Questions, Question{ID: f.ID, Kind: f.Status, RequestID: f.RequestID, Digest: f.Digest, ExpiresAt: f.ExpiresAt, ControlEpoch: s.ControlEpoch, TurnID: f.TurnID})
-	case FactQuestionAnswered, FactQuestionRevoked:
-		var kept []Question
-		found := false
-		for _, q := range s.Questions {
-			if q.ID == f.ID {
-				found = true
-				continue
-			}
-			kept = append(kept, q)
-		}
-		if !found {
-			return illegal(f, "no such question")
-		}
-		s.Questions = kept
-	case FactChildObserved:
-		for i := range s.Children {
-			if s.Children[i].ID == f.ID {
-				s.Children[i].TurnID, s.Children[i].Status = f.TurnID, f.Status
-				return nil
-			}
-		}
-		s.Children = append(s.Children, Child{ID: f.ID, Role: f.Role, TurnID: f.TurnID, Status: f.Status})
-	case FactChildControlOutcome:
-		for i := range s.Children {
-			if s.Children[i].ID == f.ID {
-				s.Children[i].Status, s.Children[i].ReasonCode = f.Status, f.ReasonCode
-				return nil
-			}
-		}
-		return illegal(f, "no such child")
-	case FactChildQuarantined:
-		for i := range s.Children {
-			if s.Children[i].ID == f.ID {
-				s.Children[i].Status, s.Children[i].ReasonCode, s.Children[i].TurnID = ChildUnknown, f.ReasonCode, ""
-				return nil
-			}
-		}
-		return illegal(f, "no such child")
-	case FactInputQueued:
-		if findInput(s, f.RequestID) != nil {
-			return illegal(f, "input exists")
-		}
-		s.Inputs = append(s.Inputs, Input{RequestID: f.RequestID, Status: InputQueued, PayloadHash: f.PayloadHash, Attachments: append([]string(nil), f.Attachments...)})
-	case FactInputDispatchPrepared:
-		entry := findInput(s, f.RequestID)
-		if entry == nil || entry.Status != InputQueued || s.Task == nil || s.Task.ID != f.TaskID || s.Task.State == TaskComplete {
-			return illegal(f, "input not dispatchable")
-		}
-		// A follow-up changes the objective, so every pass for the older input ends.
-		s.Task.InputRevision = f.InputRevision
-		s.Task.ObjectiveHash = f.ObjectiveHash
-		s.Task.Passes = map[string]string{}
-		s.Task.Stage, s.Task.ReviewStatus = "", ""
-		s.Task.State = TaskActive
-		entry.Status, entry.DeliveredInRev = InputDispatching, f.InputRevision
-	case FactInputOutcome:
-		entry := findInput(s, f.RequestID)
-		if entry == nil || entry.Status != InputDispatching {
-			return illegal(f, "input has no open dispatch")
-		}
-		entry.Status = f.Status
-	case FactInputDiscarded:
-		entry := findInput(s, f.RequestID)
-		if entry == nil || entry.Status == InputDispatching || entry.Status == InputCleanup || entry.Status == InputDiscarded {
-			return illegal(f, "input not discardable")
-		}
-		entry.Status = InputCleanup
-	case FactPayloadReleased:
-		entry := findInput(s, f.RequestID)
-		if entry == nil || entry.Status != InputCleanup {
-			return illegal(f, "payload not pending release")
-		}
-		entry.Status = InputDiscarded
-	case FactReviewStarted:
-		if s.Task == nil {
-			return illegal(f, "no task")
-		}
-		s.Review = &ReviewRun{ID: f.ID, Stage: f.Stage, Digest: f.Digest, Status: "running", ControlEpoch: s.ControlEpoch}
-		s.Task.ReviewStatus = "running"
-	case FactReviewCancelled:
-		if s.Review == nil || s.Review.ID != f.ID || s.Review.Status != "running" {
-			return illegal(f, "no running review")
-		}
-		s.ReviewResultPending = false
-		endRunningReview(s)
-	case FactReviewOutcome:
-		return reduceReviewOutcome(s, f)
-	case FactReviewResultPending:
-		s.ReviewResultPending = f.Status == "pending"
-	case FactCheckpointRecorded:
-		if s.Task == nil || s.Task.ID != f.TaskID || s.Task.State == TaskComplete {
-			return illegal(f, "checkpoint on a completed or foreign task")
-		}
-		// An agent reports progress. It never writes a review status of its own: the
-		// one thing it can ask for is a review, and only the review writes the result.
-		s.Task.State, s.Task.Stage = f.State, f.Stage
-		if f.State == TaskNeedsReview {
-			s.Task.ReviewStatus = "queued"
-		}
-	case FactLegacyInputHeld:
-		if findInput(s, f.RequestID) != nil {
-			return illegal(f, "input exists")
-		}
-		s.Inputs = append(s.Inputs, Input{RequestID: f.RequestID, Status: f.Status, PayloadHash: f.PayloadHash, Attachments: append([]string(nil), f.Attachments...), Legacy: true})
 	default:
 		return illegal(f, "not a session fact")
 	}
@@ -611,48 +358,13 @@ func reduceIntended(s *Session, f Fact) error {
 	}
 	s.LastRequest = f.RequestID
 	s.RequestOrder = append(s.RequestOrder, f.RequestID)
-	// Only resolved history is trimmed; the active request is always the newest.
+	// Only resolved history is trimmed: the active request is always the newest.
 	if len(s.RequestOrder) > maxReceiptsKept {
 		delete(s.Requests, s.RequestOrder[0])
 		s.RequestOrder = s.RequestOrder[1:]
 	}
-	s.TurnID, s.FinalStatus = "", ""
-	s.ProviderFinal, s.PendingInterrupt, s.PauseUnconfirmed = false, false, false
-	s.LastRefusal = ""
-	revokeQuestions(s)
-	if f.Status == "new_objective" && f.TaskID != "" && (s.Task == nil || s.Task.ID != f.TaskID) {
-		s.Task = &Task{ID: f.TaskID, Generation: f.Generation, State: TaskIdle, ObjectiveHash: f.ObjectiveHash, InputRevision: f.InputRevision, Passes: map[string]string{}}
-	}
-	if f.Status == "new_objective" {
-		s.Supervision = Supervision{State: SupervisionActive, RemainingBursts: f.RemainingBursts}
-	}
-	return nil
-}
-
-func reduceControl(s *Session, f Fact) error {
-	if f.Control == "resume" {
-		s.Supervision.State, s.Supervision.ReasonCode = SupervisionActive, ""
-		for i := range s.Inputs {
-			if s.Inputs[i].Status == InputHeld {
-				s.Inputs[i].Status = InputQueued
-			}
-		}
-		return nil
-	}
-	// An unknown turn was already paused when it became unknown. A stop here only
-	// asks for the interrupt once the turn is named; no admission authority moves.
-	if s.Requests[s.LastRequest] == ReceiptUnknown {
-		s.PendingInterrupt = s.TurnID == "" && s.Provider == ProviderCodex
-		return nil
-	}
-	s.ControlEpoch++
-	holdInputs(s)
-	revokeQuestions(s)
-	if s.Task != nil && (s.Task.ReviewStatus == "running" || s.Task.ReviewStatus == "queued") {
-		s.Task.ReviewStatus, s.Task.State = ReviewPaused, TaskBlocked
-	}
-	s.Supervision.State, s.Supervision.ReasonCode = SupervisionPaused, "user_"+f.Control
-	s.PendingInterrupt = s.Requests[s.LastRequest].unresolved() && s.TurnID == "" && s.Provider == ProviderCodex
+	s.ProviderFinal, s.FinalStatus, s.LastRefusal = false, "", ""
+	s.TurnID, s.PendingInterrupt, s.Paused, s.PauseUnconfirmed = "", false, false, false
 	return nil
 }
 
@@ -663,79 +375,21 @@ func reduceAbandoned(s *Session, f Fact) error {
 	if f.RequestID != s.LastRequest {
 		return illegal(f, "not the last request")
 	}
-	receipt := s.Requests[f.RequestID]
-	if receipt.unresolved() {
+	s.PendingInterrupt = stickyOwed(s)
+	if s.Requests[f.RequestID].unresolved() {
 		if err := advance(s, f, f.RequestID, ReceiptAbandoned); err != nil {
 			return err
 		}
 		s.ProviderFinal = false
 	}
-	if s.Task != nil && s.Task.State != TaskComplete {
-		s.Task.State, s.Task.ReviewStatus = TaskBlocked, ReviewInvalidated
-	}
 	s.Abandoned = &Abandonment{RequestID: f.RequestID, Reason: f.Reason, At: f.At}
-	// With the start unanswered, the interrupt waits for the turn to be named. The
-	// flag stays set across read-only so TurnBound can still fire it.
-	s.PendingInterrupt = receipt.unresolved() && s.TurnID == "" && s.Provider == ProviderCodex
 	s.ReadOnly, s.Connected = true, false
 	s.ControlEpoch++
-	revokeQuestions(s)
-	quarantineChildren(s, "parent_discarded")
-	dispatchingToUnknown(s, f.RequestID)
-	holdInputs(s)
-	s.Supervision.State, s.Supervision.ReasonCode = SupervisionPaused, "discarded"
-	endRunningReview(s)
-	s.ReviewResultPending = false
-	return nil
-}
-
-// endRunningReview makes a run that lost its authority terminal, so no verdict can
-// still land on it.
-func endRunningReview(s *Session) {
-	if s.Review != nil && s.Review.Status == "running" {
-		s.Review.Status = "unknown"
-		if s.Task != nil {
-			s.Task.ReviewStatus = ReviewUnknown
-		}
-	}
-}
-
-func quarantineSession(s *Session, reason string) {
-	s.Quarantine, s.ReadOnly, s.Connected = reason, true, false
-	endRunningReview(s)
-}
-
-func reduceReviewOutcome(s *Session, f Fact) error {
-	if s.Review == nil || s.Review.ID != f.ID || s.Review.Status != "running" {
-		return illegal(f, "no running review")
-	}
-	if s.ReadOnly && f.Verdict != "unknown" {
-		return illegal(f, "a read-only session cannot record a verdict")
-	}
-	s.Review.Status = f.Verdict
-	if s.Task == nil {
-		return nil
-	}
-	switch f.Verdict {
-	case "pass":
-		if s.Task.Passes == nil {
-			s.Task.Passes = map[string]string{}
-		}
-		s.Task.Passes[s.Review.Stage] = s.Review.Digest
-		s.Task.ReviewStatus = "pass"
-	case "block":
-		s.Task.ReviewStatus = "block"
-	default:
-		s.Task.ReviewStatus = ReviewUnknown
-		s.Task.State = TaskBlocked
-	}
 	return nil
 }
 
 func reduceLegacy(s *Session, f Fact) error {
 	s.ReadOnly = true
-	s.Supervision.State = SupervisionPaused
-	s.ConversationStarted = f.ProviderID != ""
 	switch f.Receipt {
 	case ReceiptNone:
 		if f.RequestID != "" {
@@ -755,13 +409,6 @@ func reduceLegacy(s *Session, f Fact) error {
 	default:
 		return illegal(f, "legacy receipt must already be resolved or unknown")
 	}
-	if f.TaskID != "" {
-		passes := cloneStrings(f.Passes)
-		if passes == nil {
-			passes = map[string]string{}
-		}
-		s.Task = &Task{ID: f.TaskID, Generation: f.Generation, InputRevision: f.InputRevision, ObjectiveHash: f.ObjectiveHash, State: f.State, Passes: passes, ReviewStatus: ReviewUnknown}
-	}
 	return nil
 }
 
@@ -778,32 +425,14 @@ func reduceRestart(p *Projection) {
 			s.ProviderFinal = false
 		}
 		s.ReadOnly, s.Connected = true, false
-		s.TurnID, s.PendingInterrupt, s.PauseUnconfirmed = "", false, false
-		revokeQuestions(s)
-		dispatchingToUnknown(s, "")
-		holdInputs(s)
-		endRunningReview(s)
-		s.ReviewResultPending = false
-		quarantineChildren(s, "restarted")
-		s.Supervision.State = SupervisionPaused
-		if s.Abandoned == nil {
-			s.Supervision.ReasonCode = "restarted"
-		}
+		s.TurnID, s.PendingInterrupt, s.Paused, s.PauseUnconfirmed = "", false, false, false
 		p.Sessions[id] = s
 	}
 	trimResolved(p)
 }
 
 func protectedFromTrim(s *Session) bool {
-	if s.Abandoned == nil && (s.Requests[s.LastRequest].unresolved() || s.Quarantine != "") {
-		return true
-	}
-	for _, input := range s.Inputs {
-		if input.Status != InputDiscarded {
-			return true
-		}
-	}
-	return false
+	return s.Abandoned == nil && (s.Requests[s.LastRequest].unresolved() || s.Quarantine != "")
 }
 
 // trimResolved marks the oldest resolved history hidden. The mark is sticky, so a
@@ -836,7 +465,8 @@ type Quarantined struct {
 }
 
 // Replay folds a decoded log. An unreadable log refuses. An illegal fact quarantines
-// only its session, so one bad record cannot stop the whole console from starting.
+// only its session and is skipped, while later legal facts still apply, so a discard
+// and close on a quarantined session survive the next restart.
 func Replay(facts []Fact) (Projection, []Quarantined, error) {
 	p := NewProjection()
 	var quarantined []Quarantined
@@ -850,17 +480,16 @@ func Replay(facts []Fact) (Projection, []Quarantined, error) {
 		if !errors.Is(err, ErrIllegalFact) || f.SessionID == "" {
 			return NewProjection(), nil, err
 		}
-		// Later legal facts still apply, so a discard and close on a quarantined
-		// session survive the next restart. Only the illegal fact itself is skipped.
-		if !bad[f.SessionID] {
+		first := !bad[f.SessionID]
+		if first {
 			quarantined = append(quarantined, Quarantined{SessionID: f.SessionID, Err: err})
 		}
 		bad[f.SessionID] = true
 		p = p.copyShell()
 		p.LastSeq, p.LastKind = f.Seq, f.Kind
-		if current := p.Sessions[f.SessionID]; current != nil && current.Quarantine == "" {
+		if current := p.Sessions[f.SessionID]; current != nil && first {
 			s := current.clone()
-			quarantineSession(s, "illegal_fact")
+			quarantine(s, "illegal_fact")
 			p.Sessions[f.SessionID] = s
 		}
 	}
@@ -889,31 +518,20 @@ func Status(s *Session) string {
 		return "closed"
 	case s.Abandoned != nil:
 		return "abandoned"
-	case s.Quarantine != "", receipt == ReceiptUnknown, hasInputStatus(s, InputUnknown):
+	case s.Quarantine != "", receipt == ReceiptUnknown:
 		return "unknown"
 	case s.ReadOnly:
 		return "disconnected"
-	case receipt.open() && len(s.Questions) > 0:
-		return "waiting"
-	case receipt.open() && s.Supervision.State == SupervisionPaused:
+	case receipt.open() && s.Paused:
 		return "paused"
 	case receipt.open():
 		return "running"
-	case s.FinalStatus == "failed", receipt == ReceiptRejected && s.Supervision.State == SupervisionBlocked:
+	case receipt == ReceiptRejected && !s.Paused, s.FinalStatus == "failed":
 		return "error"
-	case s.Supervision.State == SupervisionPaused, s.FinalStatus == "interrupted":
+	case s.Paused, s.FinalStatus == "interrupted":
 		return "paused"
 	case s.Provider == ProviderCodex && !s.Connected:
 		return "disconnected"
 	}
 	return "idle"
-}
-
-func hasInputStatus(s *Session, status string) bool {
-	for _, input := range s.Inputs {
-		if input.Status == status {
-			return true
-		}
-	}
-	return false
 }

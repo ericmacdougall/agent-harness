@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Facts hold identity, closed enums, digests and one redacted reason. This is the
@@ -30,13 +32,27 @@ func oneOfValues(value string, allowed ...string) bool {
 }
 
 var finalStatuses = []string{"completed", "failed", "interrupted"}
-var inputOutcomes = []string{InputRetained, InputUnknown, InputHeld}
-var heldStatuses = []string{InputHeld, InputUnknown, InputRetained, InputCleanup}
-var verdicts = []string{"pass", "block", "failed", "unknown"}
-var checkpointStates = []string{TaskActive, TaskBlocked, TaskHandoff, TaskNeedsReview, TaskComplete}
-var childStatuses = []string{ChildRunning, "completed", "failed", "interrupted", ChildUnknown}
-var supervisionStates = []string{SupervisionActive, SupervisionWaiting, SupervisionPaused, SupervisionBlocked}
-var lateKinds = []string{"accepted", "refused", "write_unknown", "turn_bound", "final", "question", "review", "conversation", "connected", "disconnected", "child"}
+var lateKinds = []string{"accepted", "refused", "write_unknown", "turn_bound", "final", "conversation", "connected", "disconnected", "control_outcome"}
+
+// closedStatus is the rule that no enum-bearing string is free on any kind: each kind
+// names the exact values Status, Control, Outcome, LateKind and State may hold.
+func closedFields(f Fact) bool {
+	status, control, outcome, late := []string{""}, []string{""}, []string{""}, []string{""}
+	switch f.Kind {
+	case FactProviderCompleted:
+		status = finalStatuses
+	case FactLateFrameObserved:
+		if f.Status != "" && !codePattern.MatchString(f.Status) {
+			return false
+		}
+		status, late = []string{f.Status}, lateKinds
+	case FactControlRequested:
+		control = []string{"pause", "stop"}
+	case FactControlOutcome:
+		control, outcome = []string{"pause", "stop"}, []string{"confirmed", "rejected", "unconfirmed"}
+	}
+	return oneOfValues(f.Status, status...) && oneOfValues(f.Control, control...) && oneOfValues(f.Outcome, outcome...) && oneOfValues(f.LateKind, late...) && (f.State == "" || f.Kind == FactLegacyImported && codePattern.MatchString(f.State))
+}
 
 func validateFact(f Fact) error {
 	fail := func(field string) error {
@@ -45,15 +61,12 @@ func validateFact(f Fact) error {
 	if !timePattern.MatchString(f.At) {
 		return fail("at")
 	}
-	if f.ExpiresAt != "" && !timePattern.MatchString(f.ExpiresAt) {
-		return fail("expiresAt")
-	}
-	for name, value := range map[string]string{"sessionId": f.SessionID, "providerId": f.ProviderID, "profileId": f.ProfileID, "requestId": f.RequestID, "turnId": f.TurnID, "id": f.ID, "role": f.Role, "taskId": f.TaskID, "stage": f.Stage, "policyRevision": f.PolicyRevision, "cascade": f.Cascade} {
+	for name, value := range map[string]string{"sessionId": f.SessionID, "providerId": f.ProviderID, "profileId": f.ProfileID, "requestId": f.RequestID, "turnId": f.TurnID, "taskId": f.TaskID} {
 		if value != "" && !identityPattern.MatchString(value) {
 			return fail(name)
 		}
 	}
-	for name, value := range map[string]string{"digest": f.Digest, "objectiveHash": f.ObjectiveHash, "payloadHash": f.PayloadHash, "runtimeIdentity": f.RuntimeIdentity} {
+	for name, value := range map[string]string{"digest": f.Digest, "objectiveHash": f.ObjectiveHash, "runtimeIdentity": f.RuntimeIdentity} {
 		if value != "" && !digestPattern.MatchString(value) {
 			return fail(name)
 		}
@@ -64,66 +77,29 @@ func validateFact(f Fact) error {
 	if f.Provider != "" && !oneOfValues(f.Provider, ProviderCodex, ProviderClaude) {
 		return fail("provider")
 	}
-	if len(f.CWD) > 4096 || strings.ContainsAny(f.CWD, "\x00\n\r") {
+	if len(f.CWD) > 4096 || !utf8.ValidString(f.CWD) || strings.IndexFunc(f.CWD, unicode.IsControl) >= 0 {
 		return fail("cwd")
 	}
-	if len(f.Attachments) > 16 {
-		return fail("attachments")
-	}
-	for _, path := range f.Attachments {
-		if path == "" || len(path) > 4096 || strings.ContainsAny(path, "\x00\n\r") {
-			return fail("attachments")
-		}
-	}
-	if f.Reason != "" && (f.Kind != FactAbandoned && f.Kind != FactLegacyImported || len(f.Reason) > MaxReasonBytes) {
+	if f.Reason != "" && (f.Kind != FactAbandoned && f.Kind != FactLegacyImported || len(f.Reason) > MaxReasonBytes || !utf8.ValidString(f.Reason)) {
 		return fail("reason")
+	}
+	if !closedFields(f) {
+		return fail("closed value")
 	}
 	valid := true
 	switch f.Kind {
 	case FactSessionCreated:
-		valid = oneOfValues(f.Provider, ProviderCodex, ProviderClaude) && oneOfValues(f.Status, "", "connected")
+		valid = oneOfValues(f.Provider, ProviderCodex, ProviderClaude)
 	case FactRequestIntended:
-		valid = f.RequestID != "" && oneOfValues(f.Status, "", "new_objective")
-	case FactProviderCompleted:
-		valid = oneOfValues(f.Status, finalStatuses...)
+		valid = f.RequestID != ""
 	case FactTurnBound:
 		valid = f.TurnID != ""
-	case FactLateFrameObserved:
-		valid = oneOfValues(f.LateKind, lateKinds...) && (f.Status == "" || codePattern.MatchString(f.Status))
-	case FactControlRequested:
-		valid = oneOfValues(f.Control, "pause", "stop", "resume")
-	case FactControlOutcome:
-		valid = oneOfValues(f.Outcome, "confirmed", "rejected", "unconfirmed")
-	case FactQuestionOpened:
-		valid = f.ID != "" && f.ExpiresAt != "" && (f.Status == "" || codePattern.MatchString(f.Status))
-	case FactQuestionAnswered, FactQuestionRevoked:
-		valid = f.ID != ""
-	case FactChildObserved, FactChildControlOutcome:
-		valid = f.ID != "" && oneOfValues(f.Status, childStatuses...)
-	case FactChildQuarantined:
-		valid = f.ID != ""
-	case FactInputQueued:
-		valid = f.RequestID != "" && f.PayloadHash != ""
-	case FactInputDispatchPrepared:
-		valid = f.RequestID != "" && f.TaskID != "" && f.InputRevision > 0
-	case FactInputOutcome:
-		valid = f.RequestID != "" && oneOfValues(f.Status, inputOutcomes...)
-	case FactLegacyInputHeld:
-		valid = f.RequestID != "" && f.PayloadHash != "" && oneOfValues(f.Status, heldStatuses...)
-	case FactReviewStarted:
-		valid = f.ID != "" && f.Stage != "" && f.Digest != ""
-	case FactReviewOutcome:
-		valid = f.ID != "" && oneOfValues(f.Verdict, verdicts...)
-	case FactReviewResultPending:
-		valid = oneOfValues(f.Status, "pending", "clear")
-	case FactCheckpointRecorded:
-		valid = f.TaskID != "" && oneOfValues(f.State, checkpointStates...)
-	case FactSupervisionChanged:
-		valid = oneOfValues(f.State, supervisionStates...)
 	case FactRuntimeIdentityBound:
 		valid = f.RuntimeIdentity != ""
-	case FactLegacyImported:
-		valid = f.State == "" || oneOfValues(f.State, append([]string{TaskIdle}, checkpointStates...)...)
+	case FactAbandoned:
+		valid = f.Reason != ""
+	case FactSessionQuarantined:
+		valid = f.ReasonCode != ""
 	}
 	if !valid {
 		return fail("value")
@@ -137,6 +113,9 @@ type RedactedReason struct{ text string }
 
 // Redact applies the console's secret redactor to user-written text.
 func Redact(text string, redactor func(string) string) RedactedReason {
+	if redactor == nil {
+		return RedactedReason{}
+	}
 	return RedactedReason{text: strings.TrimSpace(redactor(text))}
 }
 

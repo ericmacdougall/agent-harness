@@ -26,65 +26,54 @@ const (
 type FactKind string
 
 const (
-	FactProcessRestarted          FactKind = "ProcessRestarted"
-	FactLegacyImportCompleted     FactKind = "LegacyImportCompleted"
-	FactSessionCreated            FactKind = "SessionCreated"
-	FactConversationBound         FactKind = "ConversationBound"
-	FactProviderConnected         FactKind = "ProviderConnected"
-	FactProviderDisconnected      FactKind = "ProviderDisconnected"
-	FactRuntimeIdentityBound      FactKind = "RuntimeIdentityBound"
-	FactAuthBoundaryCrossed       FactKind = "AuthBoundaryCrossed"
-	FactCwdChanged                FactKind = "CwdChanged"
-	FactSessionClosed             FactKind = "SessionClosed"
-	FactAbandoned                 FactKind = "Abandoned"
-	FactSessionQuarantined        FactKind = "SessionQuarantined"
-	FactSupervisionChanged        FactKind = "SupervisionChanged"
-	FactCascadeSelected           FactKind = "CascadeSelected"
-	FactPolicyBound               FactKind = "PolicyBound"
-	FactContinuationBudgetChanged FactKind = "ContinuationBudgetChanged"
-	FactRequestIntended           FactKind = "RequestIntended"
-	FactProviderAccepted          FactKind = "ProviderAccepted"
-	FactProviderRefused           FactKind = "ProviderRefused"
-	FactProviderCompleted         FactKind = "ProviderCompleted"
-	FactOutcomeUnknown            FactKind = "OutcomeUnknown"
-	FactTurnBound                 FactKind = "TurnBound"
-	FactLateFrameObserved         FactKind = "LateFrameObserved"
-	FactAdmissionRefused          FactKind = "AdmissionRefused"
-	FactControlRequested          FactKind = "ControlRequested"
-	FactControlOutcome            FactKind = "ControlOutcome"
-	FactQuestionOpened            FactKind = "QuestionOpened"
-	FactQuestionAnswered          FactKind = "QuestionAnswered"
-	FactQuestionRevoked           FactKind = "QuestionRevoked"
-	FactChildObserved             FactKind = "ChildObserved"
-	FactChildControlOutcome       FactKind = "ChildControlOutcome"
-	FactChildQuarantined          FactKind = "ChildQuarantined"
-	FactInputQueued               FactKind = "InputQueued"
-	FactInputDispatchPrepared     FactKind = "InputDispatchPrepared"
-	FactInputOutcome              FactKind = "InputOutcome"
-	FactInputDiscarded            FactKind = "InputDiscarded"
-	FactPayloadReleased           FactKind = "PayloadReleased"
-	FactReviewStarted             FactKind = "ReviewStarted"
-	FactReviewCancelled           FactKind = "ReviewCancelled"
-	FactReviewOutcome             FactKind = "ReviewOutcome"
-	FactReviewResultPending       FactKind = "ReviewResultPending"
-	FactCheckpointRecorded        FactKind = "CheckpointRecorded"
-	FactLegacyImported            FactKind = "LegacyImported"
-	FactLegacyInputHeld           FactKind = "LegacyInputHeld"
+	FactProcessRestarted      FactKind = "ProcessRestarted"
+	FactLegacyImportCompleted FactKind = "LegacyImportCompleted"
+	FactSessionCreated        FactKind = "SessionCreated"
+	FactConversationBound     FactKind = "ConversationBound"
+	FactProviderConnected     FactKind = "ProviderConnected"
+	FactProviderDisconnected  FactKind = "ProviderDisconnected"
+	FactRuntimeIdentityBound  FactKind = "RuntimeIdentityBound"
+	FactAuthBoundaryCrossed   FactKind = "AuthBoundaryCrossed"
+	FactCwdChanged            FactKind = "CwdChanged"
+	FactSessionClosed         FactKind = "SessionClosed"
+	FactAbandoned             FactKind = "Abandoned"
+	FactSessionQuarantined    FactKind = "SessionQuarantined"
+	FactRequestIntended       FactKind = "RequestIntended"
+	FactProviderAccepted      FactKind = "ProviderAccepted"
+	FactProviderRefused       FactKind = "ProviderRefused"
+	FactProviderCompleted     FactKind = "ProviderCompleted"
+	FactOutcomeUnknown        FactKind = "OutcomeUnknown"
+	FactTurnBound             FactKind = "TurnBound"
+	FactLateFrameObserved     FactKind = "LateFrameObserved"
+	FactControlRequested      FactKind = "ControlRequested"
+	FactControlOutcome        FactKind = "ControlOutcome"
+	FactLegacyImported        FactKind = "LegacyImported"
 )
 
-// knownFacts is closed: an unknown kind refuses the log rather than being skipped.
-var knownFacts = map[FactKind]bool{
+// coreFacts are the kinds Reduce applies at K1a.
+var coreFacts = map[FactKind]bool{
 	FactProcessRestarted: true, FactLegacyImportCompleted: true, FactSessionCreated: true, FactConversationBound: true,
 	FactProviderConnected: true, FactProviderDisconnected: true, FactRuntimeIdentityBound: true, FactAuthBoundaryCrossed: true,
-	FactCwdChanged: true, FactSessionClosed: true, FactAbandoned: true, FactSessionQuarantined: true, FactSupervisionChanged: true,
-	FactCascadeSelected: true, FactPolicyBound: true, FactContinuationBudgetChanged: true, FactRequestIntended: true,
+	FactCwdChanged: true, FactSessionClosed: true, FactAbandoned: true, FactSessionQuarantined: true, FactRequestIntended: true,
 	FactProviderAccepted: true, FactProviderRefused: true, FactProviderCompleted: true, FactOutcomeUnknown: true, FactTurnBound: true,
-	FactLateFrameObserved: true, FactAdmissionRefused: true, FactControlRequested: true, FactControlOutcome: true,
-	FactQuestionOpened: true, FactQuestionAnswered: true, FactQuestionRevoked: true, FactChildObserved: true,
-	FactChildControlOutcome: true, FactChildQuarantined: true, FactInputQueued: true, FactInputDispatchPrepared: true,
-	FactInputOutcome: true, FactInputDiscarded: true, FactPayloadReleased: true, FactReviewStarted: true, FactReviewCancelled: true,
-	FactReviewOutcome: true, FactReviewResultPending: true, FactCheckpointRecorded: true, FactLegacyImported: true, FactLegacyInputHeld: true,
+	FactLateFrameObserved: true, FactControlRequested: true, FactControlOutcome: true, FactLegacyImported: true,
 }
+
+// ReservedFactKinds belong to K1b to K1d. They are known by kind, so a log holding one
+// quarantines its session rather than refusing outright, and K2 can size its reserve.
+var ReservedFactKinds = []FactKind{"AdmissionRefused", "SupervisionChanged", "CascadeSelected", "PolicyBound", "ContinuationBudgetChanged", "QuestionOpened", "QuestionAnswered", "QuestionRevoked", "ChildObserved", "ChildControlOutcome", "ChildQuarantined", "InputQueued", "InputDispatchPrepared", "InputOutcome", "InputDiscarded", "PayloadReleased", "ReviewStarted", "ReviewCancelled", "ReviewOutcome", "ReviewResultPending", "CheckpointRecorded", "LegacyInputHeld"}
+
+// knownFacts is closed: an unknown kind refuses the log rather than being skipped.
+var knownFacts = func() map[FactKind]bool {
+	known := map[FactKind]bool{}
+	for kind := range coreFacts {
+		known[kind] = true
+	}
+	for _, kind := range ReservedFactKinds {
+		known[kind] = true
+	}
+	return known
+}()
 
 func globalFact(kind FactKind) bool {
 	return kind == FactProcessRestarted || kind == FactLegacyImportCompleted
@@ -94,44 +83,34 @@ func globalFact(kind FactKind) bool {
 // question text, attachment bytes and secrets never appear here. Reason is the sole
 // user-written field, bounded here and redacted through RedactedReason.
 type Fact struct {
-	Seq             uint64            `json:"seq"`
-	SchemaVersion   int               `json:"schemaVersion"`
-	At              string            `json:"at"`
-	Kind            FactKind          `json:"kind"`
-	SessionID       string            `json:"sessionId,omitempty"`
-	SessionRevision uint64            `json:"sessionRevision,omitempty"`
-	Provider        string            `json:"provider,omitempty"`
-	ProviderID      string            `json:"providerId,omitempty"`
-	ProfileID       string            `json:"profileId,omitempty"`
-	CWD             string            `json:"cwd,omitempty"`
-	RequestID       string            `json:"requestId,omitempty"`
-	TurnID          string            `json:"turnId,omitempty"`
-	ID              string            `json:"id,omitempty"`
-	Role            string            `json:"role,omitempty"`
-	Status          string            `json:"status,omitempty"`
-	ReasonCode      string            `json:"reasonCode,omitempty"`
-	Reason          string            `json:"reason,omitempty"`
-	Control         string            `json:"control,omitempty"`
-	Outcome         string            `json:"outcome,omitempty"`
-	LateKind        string            `json:"lateKind,omitempty"`
-	Digest          string            `json:"digest,omitempty"`
-	ExpiresAt       string            `json:"expiresAt,omitempty"`
-	TaskID          string            `json:"taskId,omitempty"`
-	Generation      uint64            `json:"generation,omitempty"`
-	InputRevision   uint64            `json:"inputRevision,omitempty"`
-	ObjectiveHash   string            `json:"objectiveHash,omitempty"`
-	PayloadHash     string            `json:"payloadHash,omitempty"`
-	Attachments     []string          `json:"attachments,omitempty"`
-	Stage           string            `json:"stage,omitempty"`
-	Verdict         string            `json:"verdict,omitempty"`
-	State           string            `json:"state,omitempty"`
-	RuntimeIdentity string            `json:"runtimeIdentity,omitempty"`
-	PolicyRevision  string            `json:"policyRevision,omitempty"`
-	Cascade         string            `json:"cascade,omitempty"`
-	RemainingBursts int64             `json:"remainingBursts,omitempty"`
-	Progress        int64             `json:"progress,omitempty"`
-	Receipt         Receipt           `json:"receipt,omitempty"`
-	Passes          map[string]string `json:"passes,omitempty"`
+	Seq             uint64   `json:"seq"`
+	SchemaVersion   int      `json:"schemaVersion"`
+	At              string   `json:"at"`
+	Kind            FactKind `json:"kind"`
+	SessionID       string   `json:"sessionId,omitempty"`
+	SessionRevision uint64   `json:"sessionRevision,omitempty"`
+	Provider        string   `json:"provider,omitempty"`
+	ProviderID      string   `json:"providerId,omitempty"`
+	ProfileID       string   `json:"profileId,omitempty"`
+	CWD             string   `json:"cwd,omitempty"`
+	RequestID       string   `json:"requestId,omitempty"`
+	TurnID          string   `json:"turnId,omitempty"`
+	Status          string   `json:"status,omitempty"`
+	ReasonCode      string   `json:"reasonCode,omitempty"`
+	Reason          string   `json:"reason,omitempty"`
+	Control         string   `json:"control,omitempty"`
+	Outcome         string   `json:"outcome,omitempty"`
+	LateKind        string   `json:"lateKind,omitempty"`
+	Digest          string   `json:"digest,omitempty"`
+	RuntimeIdentity string   `json:"runtimeIdentity,omitempty"`
+	Receipt         Receipt  `json:"receipt,omitempty"`
+	// Legacy task identity, carried on LegacyImported for K1d. Not projected at K1a.
+	TaskID        string            `json:"taskId,omitempty"`
+	Generation    uint64            `json:"generation,omitempty"`
+	InputRevision uint64            `json:"inputRevision,omitempty"`
+	ObjectiveHash string            `json:"objectiveHash,omitempty"`
+	State         string            `json:"state,omitempty"`
+	Passes        map[string]string `json:"passes,omitempty"`
 }
 
 var factFields = func() map[string]bool {
