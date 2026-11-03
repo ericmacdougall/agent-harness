@@ -233,6 +233,7 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 	a.inputOutcomeLocked(current, requestID, "retained", "Provider accepted; attachment consumers may still be active")
 	if err := a.record(current, requestID, "accepted"); err != nil {
 		current.requests[requestID] = "unknown"
+		a.revokeQuestionsLocked(current, "")
 		current.providerFinal = false
 		current.Status = "unknown"
 		current.Error = "Claude input was accepted but its receipt could not be saved"
@@ -357,6 +358,7 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 			}
 			if requestID == "" || requestID != current.lastRequest || !oneOf(requestState, "intent", "accepted") {
 				current.Status = "unknown"
+				a.revokeQuestionsLocked(current, "")
 				current.Error = "Claude returned a result without an exact active request binding. No request was replayed."
 				current.Supervision.State = "paused"
 				current.Supervision.Reason = current.Error

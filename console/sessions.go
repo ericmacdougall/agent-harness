@@ -323,6 +323,7 @@ func (a *app) unknownSend(current *session, requestID string, err error) {
 		return
 	}
 	current.requests[requestID] = "unknown"
+	a.revokeQuestionsLocked(current, "")
 	a.inputOutcomeLocked(current, requestID, "unknown", "Provider outcome unknown; no replay")
 	current.Status = "unknown"
 	current.Error = a.clean(publicError(err))

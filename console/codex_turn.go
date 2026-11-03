@@ -36,6 +36,7 @@ func (a *app) quarantineCodexLocked(current *session, requestID, reason string) 
 		current.codexTurn.pendingBytes = 0
 	}
 	current.requests[requestID] = "unknown"
+	a.revokeQuestionsLocked(current, "")
 	current.Status = "unknown"
 	current.Error = reason
 	current.Supervision.State = "paused"
@@ -172,6 +173,7 @@ func (a *app) codexCompletionLocked(current *session, client *rpcClient, complet
 	if err := a.record(current, requestID, "final"); err != nil {
 		current.providerFinal = false
 		current.requests[requestID] = "unknown"
+		a.revokeQuestionsLocked(current, "")
 		current.Status = "unknown"
 		current.Error = "Could not persist the final outcome"
 		current.Supervision.State = "paused"
