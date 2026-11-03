@@ -81,7 +81,7 @@ test('agent recovery guidance renders as a labelled status', () => {
   assert.equal(node.attributes['aria-label'], 'Agent control recovery');
   assert.equal(node.dataset.testid, 'agent-control-notice');
   assert.deepEqual(node.children.map(child => child.text), [
-    'Controls unavailable',
+    'Resume unavailable',
     'Resume is denied.',
     'Quarantine this child and quiesce its writer. Reconcile messages, worktree, processes, receipts, and any in-flight effects before starting one fresh replacement from the current parent context. Do not automatically replay uncertain operations.',
   ]);

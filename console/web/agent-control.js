@@ -19,7 +19,7 @@ export function renderAgentControlNotice(createElement, agent) {
   recovery.setAttribute('aria-label', notice.label);
   recovery.dataset.testid = 'agent-control-notice';
   recovery.append(
-    createElement('strong', '', 'Controls unavailable'),
+    createElement('strong', '', 'Resume unavailable'),
     createElement('p', '', notice.reason),
     createElement('p', '', notice.recovery),
   );
