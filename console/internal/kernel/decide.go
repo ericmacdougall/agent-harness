@@ -359,6 +359,12 @@ func decideControl(b *builder, s *Session, in In) (Decision, error) {
 		b.effects = effects
 		return b.finish()
 	}
+	// A control request is recorded only when it changes something: the session not
+	// yet paused, or an interrupt newly owed. A repeat still fires its stop effects, so
+	// repeated presses cannot grow the log or spend the must-append reserve.
+	if s.Paused && (s.PendingInterrupt || !interruptOwed(s)) {
+		return Decision{Idempotent: true, Effects: effects}, nil
+	}
 	control := "pause"
 	if in.Kind == InStop {
 		control = "stop"

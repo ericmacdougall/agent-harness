@@ -417,8 +417,18 @@ func TestSecretsNeverReachTheFiles(t *testing.T) {
 	} {
 		_, _ = d.do(in)
 	}
-	digest := d.log.CommandDigest([]byte(canary))
-	_, _, _ = d.log.Append(ctx, d.p.LastSeq, "c", digest, nil)
+	// A receipt holds only its keyed digest, never the command.
+	decision, err := kernel.Decide(d.p, kernel.In{Kind: kernel.InCreate, Principal: user, At: stamp(77), SessionID: "receipt", Provider: kernel.ProviderClaude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = d.log.Append(ctx, d.p.LastSeq, "cmd-canary", d.log.CommandDigest([]byte(canary)), decision.Facts); err != nil {
+		t.Fatal(err)
+	}
+	var receipts int
+	if err = d.log.db.QueryRow(`SELECT count(*) FROM receipts`).Scan(&receipts); err != nil || receipts != 1 {
+		t.Fatalf("receipt not written, so the check is vacuous: %d %v", receipts, err)
+	}
 	d.log.Close()
 	needle := []byte(strings.TrimPrefix(canary, "CANARY-"))
 	for _, name := range []string{fileName, fileName + "-wal", fileName + "-shm"} {
@@ -698,8 +708,8 @@ func TestRestartThatCannotCommitLatches(t *testing.T) {
 		t.Fatalf("open with a failed restart: err=%v latched=%v", err, l != nil && l.Latched())
 	}
 	defer l.Close()
-	if p.Sessions["a"] == nil || p.Sessions["a"].ReadOnly {
-		t.Fatal("projection should be the replayed log, without the restart that failed")
+	if p.Sessions["a"] == nil || !p.Sessions["a"].ReadOnly || p.Sessions["a"].Connected {
+		t.Fatal("a latched open must show every session read-only")
 	}
 	if _, _, err = l.Append(ctx, p.LastSeq, "", "", []kernel.Fact{{Seq: p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(1), Kind: kernel.FactProcessRestarted}}); !errors.Is(err, ErrLatched) {
 		t.Fatalf("latched log admitted: %v", err)
@@ -833,5 +843,49 @@ func TestPathWithURIMetacharactersIsRefused(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(decoy, fileName)); err == nil {
 		t.Fatal("a log was created in the decoy directory")
+	}
+}
+
+// Repeated presses neither grow the log nor reach the reserve.
+func TestRepeatedControlsRecordOnce(t *testing.T) {
+	d := open(t, t.TempDir())
+	defer d.log.Close()
+	d.session("idle")
+	d.session("busy")
+	d.must(kernel.In{Kind: kernel.InSend, Principal: user, SessionID: "busy", RequestID: "r1", RuntimeIdentity: "owner"})
+	before := d.log.Count()
+	for i := 0; i < 200; i++ {
+		for _, id := range []string{"idle", "busy"} {
+			for _, kind := range []kernel.InputKind{kernel.InStop, kernel.InPause} {
+				if _, err := d.do(kernel.In{Kind: kind, Principal: user, SessionID: id}); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	if got := d.log.Count() - before; got > 2 {
+		t.Fatalf("800 presses appended %d facts", got)
+	}
+}
+
+func TestAppendAfterCloseRefuses(t *testing.T) {
+	d := open(t, t.TempDir())
+	d.log.Close()
+	if _, _, err := d.log.Append(ctx, d.p.LastSeq, "", "", []kernel.Fact{{Seq: d.p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(1), Kind: kernel.FactProcessRestarted}}); err == nil {
+		t.Fatal("append after close")
+	}
+}
+
+func TestMissingLogIsNotAFreshStart(t *testing.T) {
+	dir := t.TempDir()
+	d := open(t, dir)
+	d.session("a")
+	d.log.Close()
+	for _, name := range []string{fileName, fileName + "-wal", fileName + "-shm"} {
+		_ = os.Remove(filepath.Join(dir, name))
+	}
+	if l, _, _, err := Open(ctx, dir, stamp(0)); err == nil {
+		l.Close()
+		t.Fatal("a deleted log opened as a new one")
 	}
 }

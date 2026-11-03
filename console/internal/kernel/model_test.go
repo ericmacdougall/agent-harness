@@ -91,6 +91,7 @@ type mdlMSession struct {
 	providerFinal, pending, paused, unconfirmed  bool
 
 	abandoned       *Abandonment
+	controlFacts    int // Decided ControlRequested facts since the last RequestIntended.
 	revision, epoch uint64
 	receipts        map[string]Receipt
 	order           []string
@@ -235,6 +236,16 @@ func (m *mdlModel) applyDecided(f Fact) {
 		m.hit("model.predicted_illegal." + string(f.Kind))
 	}
 	m.apply(f)
+	// Section 10 item 41: at most two per request, one that pauses and one that newly owes.
+	if s := m.sessions[f.SessionID]; s != nil && f.Kind == FactControlRequested {
+		s.controlFacts++
+		if s.controlFacts == 2 {
+			m.hit("t7.control.second_fact")
+		}
+		if s.controlFacts > 2 {
+			m.hit("model.control_requested_over_two")
+		}
+	}
 }
 
 func (m *mdlModel) apply(f Fact) {
@@ -322,6 +333,7 @@ func (m *mdlModel) apply(f Fact) {
 	case FactSessionClosed:
 		s.closed = true
 	case FactRequestIntended:
+		s.controlFacts = 0
 		if s.mdlTurn != "" {
 			m.hit("t4.intended.clears_bound_turn")
 		}
@@ -842,6 +854,9 @@ func (m *mdlModel) predictControl(s *mdlMSession, in In) mdlOutcome {
 		} else {
 			m.hit("t7.control.unknown_effects")
 		}
+	case s.paused && (s.pending || !s.owed()):
+		// Table 7 and section 10 item 41: a press that would change nothing.
+		m.hit("t7.control.already_paused." + string(in.Kind))
 	default:
 		m.hit("t7.control." + string(in.Kind))
 		d.add(s.id, Fact{Kind: FactControlRequested, Control: string(in.Kind)}, "Control")
@@ -1243,6 +1258,9 @@ func (g *mdlGen) next(m *mdlModel) mdlGenStep {
 	if len(g.queue) == 0 && g.rng.Intn(60) == 0 {
 		g.queue = g.scriptReach()
 	}
+	if len(g.queue) == 0 && g.rng.Intn(80) == 0 {
+		g.queue = g.scriptRepeatedControl()
+	}
 	var gs mdlGenStep
 	if len(g.queue) > 0 {
 		gs, g.queue = g.queue[0], g.queue[1:]
@@ -1624,6 +1642,33 @@ func (g *mdlGen) scriptControl() []mdlGenStep {
 	out = append(out, mdlSend(b, "r1"), mdlStep(ObUnknown, b, mdlReq("r1")), mdlStep(InStop, b), mdlStep(InPause, b))
 	out = append(out, mdlClaudeNew(c), mdlSend(c, "r1"), mdlStep(ObUnknown, c, mdlReq("r1")), mdlStep(InStop, c))
 	out = append(out, mdlStep(InCreate, d, mdlProv(ProviderCodex)), mdlStep(ObRestart, ""), mdlStep(InStop, c), mdlStep(InPause, d))
+	return append(out, g.scriptRepeatedControl()...)
+}
+
+// scriptRepeatedControl presses pause and stop again and again (section 10 item 41).
+func (g *mdlGen) scriptRepeatedControl() []mdlGenStep {
+	idle, unbound, bound, claude, owes := g.fresh("rp"), g.fresh("rp"), g.fresh("rp"), g.fresh("rp"), g.fresh("rp")
+	presses := func(sid string) []mdlGenStep {
+		return []mdlGenStep{mdlStep(InPause, sid), mdlStep(InPause, sid), mdlStep(InStop, sid), mdlStep(InStop, sid), mdlStep(InPause, sid)}
+	}
+	out := g.codexReady(idle)
+	out = append(out, presses(idle)...)
+	out = append(out, g.codexReady(unbound)...)
+	out = append(out, mdlSend(unbound, "r1"))
+	out = append(out, presses(unbound)...)
+	out = append(out, mdlStep(ObTurnBound, unbound, mdlReq("r1"), mdlTurn("t1")))
+	out = append(out, presses(unbound)...)
+	out = append(out, g.codexReady(bound)...)
+	out = append(out, mdlSend(bound, "r1"), mdlStep(ObTurnBound, bound, mdlReq("r1"), mdlTurn("t1")))
+	out = append(out, presses(bound)...)
+	out = append(out, mdlClaudeNew(claude), mdlSend(claude, "r1"))
+	out = append(out, presses(claude)...)
+	out = append(out, mdlStep(ObCompleted, claude, mdlReq("r1"), mdlStatus("completed")))
+	out = append(out, presses(claude)...)
+	// Paused with the turn bound, then a disconnect makes the interrupt owed: the second fact.
+	out = append(out, g.codexReady(owes)...)
+	out = append(out, mdlSend(owes, "r1"), mdlStep(ObTurnBound, owes, mdlReq("r1"), mdlTurn("t1")), mdlStep(InPause, owes),
+		mdlStep(ObDisconnected, owes), mdlStep(InStop, owes), mdlStep(InStop, owes), mdlStep(InPause, owes))
 	return out
 }
 
@@ -2736,6 +2781,9 @@ func (r *mdlModelRun) doInput(gs mdlGenStep) string {
 			return msg
 		}
 		r.m.applyDecided(wf.Fact)
+		if s := r.m.sessions[got.SessionID]; s != nil && s.controlFacts > 2 {
+			return fmt.Sprintf("session %s has %d ControlRequested facts for request %q", s.id, s.controlFacts, s.lastReq)
+		}
 	}
 	return ""
 }
@@ -2891,7 +2939,7 @@ func mdlTableRows() []string {
 		"create.empty.session_exists", "create.closed.session_exists", "create.used.session_exists", "create.bad_provider", "create.no_owner", "create.bad_value", "create.fact",
 		"send.replay.intent", "send.replay.accepted", "send.replay.final", "send.not_replayed", "send.bad_request", "send.read_only", "send.unresolved", "send.disconnected",
 		"send.no_identity", "send.runtime_changed", "send.no_owner", "send.bad_value", "send.binds_identity", "send.fact",
-		"control.read_only", "control.read_only_effects", "control.unknown_owed", "control.nothing_to_stop", "control.unknown_effects", "control.pause", "control.stop",
+		"control.read_only", "control.read_only_effects", "control.unknown_owed", "control.nothing_to_stop", "control.unknown_effects", "control.pause", "control.stop", "control.already_paused.pause", "control.already_paused.stop", "control.second_fact",
 		"cwd.read_only", "cwd.unresolved", "cwd.bad_request", "cwd.bad_value", "cwd.fact",
 		"close.unresolved", "close.fact",
 		"abandon.bad_reason", "abandon.idempotent", "abandon.discarded_other", "abandon.turn_changed", "abandon.stop_first", "abandon.nothing_to_discard", "abandon.no_receipt", "abandon.limit_after_trim", "abandon.bad_value", "abandon.fact",

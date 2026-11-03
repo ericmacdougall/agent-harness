@@ -35,6 +35,8 @@ const (
 	// data directory.
 	LockName = "console.lock"
 	fileName = "facts.db"
+	// markerName records that this directory has held a log.
+	markerName = "facts.db.created"
 )
 
 // mustAppend kinds record an outcome, a release, a close or a restart. They may use
@@ -42,14 +44,18 @@ const (
 var mustAppend = map[kernel.FactKind]bool{
 	kernel.FactProcessRestarted: true, kernel.FactProviderCompleted: true, kernel.FactOutcomeUnknown: true,
 	kernel.FactProviderRefused: true, kernel.FactAbandoned: true, kernel.FactSessionClosed: true,
-	kernel.FactControlOutcome: true, kernel.FactAuthBoundaryCrossed: true, kernel.FactLateFrameObserved: true,
-	kernel.FactSessionQuarantined: true,
+	kernel.FactControlOutcome: true, kernel.FactAuthBoundaryCrossed: true, kernel.FactSessionQuarantined: true,
+	kernel.FactProviderDisconnected: true,
 }
 
-// isMustAppend classifies by fact: only a stop request may use the reserve, so
-// repeated pauses cannot drain it.
+// isMustAppend classifies by fact. A stop request may use the reserve; the kernel
+// records one only when it changes something, so repeats cannot drain it. Of late
+// frames only a final may, since a discard must be able to show it was seen. A
+// disconnect may, since it settles an open request as unknown. A turn binding may
+// not: at the limit a Codex completion then records as unknown, which is safe.
 func isMustAppend(f kernel.Fact) bool {
-	return mustAppend[f.Kind] || f.Kind == kernel.FactControlRequested && f.Control == "stop"
+	return mustAppend[f.Kind] || f.Kind == kernel.FactControlRequested && f.Control == "stop" ||
+		f.Kind == kernel.FactLateFrameObserved && f.LateKind == "final"
 }
 
 // revoking kinds take authority away. If one cannot commit, authority must not
@@ -101,6 +107,7 @@ func Open(ctx context.Context, dir string, now string) (*Log, kernel.Projection,
 		return nil, empty, nil, err
 	}
 	path := filepath.Join(dir, fileName)
+	marker := filepath.Join(dir, markerName)
 	// The DSN is a URI, so these would make SQLite open a different file than the one
 	// the lock guards.
 	if strings.ContainsAny(path, "?#%") {
@@ -110,6 +117,13 @@ func Open(ctx context.Context, dir string, now string) (*Log, kernel.Projection,
 	if info, err := os.Lstat(path); err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
 		unlock()
 		return nil, empty, nil, errors.New("event log must be a regular file")
+	}
+	// A log that was created here and is now missing is lost data, not a fresh start.
+	if _, err := os.Lstat(marker); err == nil {
+		if _, err := os.Lstat(path); err != nil {
+			unlock()
+			return nil, empty, nil, errors.New("event log is missing from a directory that had one; restore it or choose a new directory")
+		}
 	}
 	db, err := sql.Open("sqlite", dsn(path))
 	if err != nil {
@@ -124,6 +138,11 @@ func Open(ctx context.Context, dir string, now string) (*Log, kernel.Projection,
 	}
 	if err = l.initialize(ctx); err != nil {
 		return fail(err)
+	}
+	if _, err := os.Lstat(marker); err != nil {
+		if err = os.WriteFile(marker, []byte("facts.db\n"), 0o600); err != nil {
+			return fail(err)
+		}
 	}
 	facts, err := l.load(ctx)
 	if err != nil {
@@ -140,8 +159,15 @@ func Open(ctx context.Context, dir string, now string) (*Log, kernel.Projection,
 	if len(decision.Facts) > 0 {
 		stored, _, err := l.Append(ctx, p.LastSeq, "", "", decision.Facts)
 		if err != nil {
-			// The restart rule could not be recorded, so nothing may be admitted.
+			// The restart rule could not be recorded, so nothing may be admitted. The
+			// projection still shows that rule applied, so no session looks live; it is
+			// held in memory only, and the log refuses every append until restart.
 			l.latch()
+			for _, f := range decision.Facts {
+				if p, err = kernel.Reduce(p, f); err != nil {
+					return fail(err)
+				}
+			}
 			return l, p, quarantined, nil
 		}
 		for _, f := range stored {
@@ -274,6 +300,9 @@ func (l *Log) Append(ctx context.Context, expectedSeq uint64, commandID, digest 
 	defer l.mu.Unlock()
 	if l.latched {
 		return nil, false, ErrLatched
+	}
+	if l.db == nil {
+		return nil, false, errors.New("event log is closed")
 	}
 	stored, replayed, err := l.append(ctx, expectedSeq, commandID, digest, facts)
 	switch {
@@ -450,6 +479,7 @@ func (l *Log) Count() uint64 {
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.latched = true
 	var err error
 	if l.db != nil {
 		err = l.db.Close()
