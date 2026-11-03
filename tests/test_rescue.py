@@ -490,9 +490,9 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         result = self.invoke(env={'CODEX_RESET_TO': ancestor, 'CODEX_DIVERGE': '1',
                                   'CODEX_FORGE_GRAPH_PARENT': self.base})
         head = git(self.repo, 'rev-parse', 'HEAD')
-        self.assertEqual(subprocess.run(
-            ['git', '-C', str(self.repo), 'merge-base', '--is-ancestor', self.base, head]
-        ).returncode, 0)
+        # Git versions differ in whether they trust this deliberately forged
+        # commit-graph. The security invariant is that rescue's graph-disabled
+        # reads see the real sibling relationship and reject it either way.
         self.assertEqual(subprocess.run(
             ['git', '-C', str(self.repo), '-c', 'core.commitGraph=false',
              'merge-base', '--is-ancestor', self.base, head]
@@ -824,9 +824,13 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
 
     def test_fallback_when_astra_executable_unavailable_is_blind_and_handed_off(self):
         (self.bin / 'codex').unlink()
+        # Do not inherit an ambient Codex installation from a system bin dir.
+        # The fixture still needs real Git for the rescue pre/postflight reads.
+        (self.bin / 'git').symlink_to(shutil.which('git'))
         capture = self.root / 'fallback-prompt.txt'
         result = self.invoke(env={'CLAUDE_ACTION': 'fallback',
-                                  'CAPTURE_CLAUDE_PROMPT': str(capture)},
+                                  'CAPTURE_CLAUDE_PROMPT': str(capture),
+                                  'PATH': str(self.bin)},
                              watchdog_seconds=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
