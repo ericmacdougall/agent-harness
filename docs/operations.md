@@ -444,6 +444,22 @@ GoodQA's own independent-acceptance rule for done transitions still applies.
 - **Enforcing on `harness`:** once #35672 is resolved, add `{"key_file": ...}` to its route, run `doctor --project harness`, then set `"enforced_projects": ["harness"]` and `"mode": "enforce"`.
 - **Rollback:** set the modes to `off`, or delete the `spec_flow.py hook` handler from `~/.claude/settings.json`.
 
+## PR review map
+
+`review_map.py` builds one self-contained HTML page for pair-programming a pull request:
+
+```sh
+python3 ~/.claude/hooks/review_map.py generate --repo <checkout> --pr <N>      # or --branch <name> --no-gh
+python3 ~/.claude/hooks/review_map.py attach --map <file.html> --yes           # tickets come from the PR's commits
+python3 ~/.claude/hooks/review_map.py list --repo <checkout> --state open
+```
+
+The page has a grouped change map (tile area follows changed lines), reasoning per commit (Why, What, Testing, Risk), known edges with diff snippets (spec NEG cases, spec risks, commit Risk lines and review findings), the refinements reviews caught (finding, fix commit, test file), suggested next steps and prompts to run next. It loads nothing from the network, escapes every string, pins its single script with a CSP hash and is written with mode 0600 to `~/.agent-harness/work/review-maps/` (override with `HARNESS_REVIEW_WORK`).
+
+Sources are matched to the PR only by commit SHA (at least 8 hex characters), exact branch name or a project-qualified ticket reference; each attribution shows its basis, and a report that reviewed an older head is marked stale. Specs and reports are found under `~/.agent-harness/work`, WAL notes under `~/.claude/wals`. Refinement links (finding to fix commit) are inferred and labeled so. Text is redacted with the harness redactor plus e-mail, JWT and home-directory patterns before it is truncated, and generation refuses to write a page that an independent detector still finds token-shaped text in. Ticket references come only from the PR's commit messages, never from PR comments, and `attach` needs `--yes`. It uploads the page and comments with its sha256 once per ticket (a rerun reports `ALREADY_ATTACHED`); projects the member key cannot reach are reported `UNREACHABLE`.
+
+The console lists the selected session repository's pull requests; selecting one and pressing **Open review map** builds the page and shows it in a sandboxed frame (no access to the console token or API). **Attach to GoodQA tickets** asks you to confirm the ticket list first. The console runs `~/.claude/hooks/review_map.py` (override with `HARNESS_REVIEW_MAP`).
+
 ## Lower-level publication and local integration
 
 ```sh
