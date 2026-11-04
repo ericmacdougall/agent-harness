@@ -84,6 +84,7 @@ BAD = [
     ("revert authorizer without ticket", sub(REVERT, "recorded in GoodQA #14159", "said so in chat"), {}, "cite the ticket"),
     ("disguised revert", sub(GOOD, "Why: an agent", "This reverts commit abc1234def.\nWhy: an agent"), {}, "this is a revert"),
     ("empty", "", {}, "empty commit message"),
+    ("merge-looking single parent", "Merge branch main into feat: rewrite auth", {}, "subject: must be"),
     ("subject only", "fix(deliver): refuse non-compliant ranges", {}, "body: missing"),
 ]
 GOOD_CASES = [
@@ -95,7 +96,7 @@ GOOD_CASES = [
     ("project ref", sub(GOOD, "GoodQA #14151", "GoodQA work-tracker-automatic#35652"), {}),
     ("multi-line sections", sub(GOOD, "What: prepare runs the commit policy over the owner range and blocks.",
                                 "What:\n- prepare runs the policy over the owner range\n- finish posts ticket comments"), {}),
-    ("git merge", "Merge branch 'side' into main", {}),
+    ("git merge", "Merge branch 'side' into main", {"is_merge": True}),
     ("merge in progress", "Merge side into main", {"is_merge": True}),
     ("fixup unpublished", "fixup! fix(deliver): x", {"allow_autosquash": True}),
     ("risk section", sub(GOOD, "Refs: GoodQA #14151\n", "Refs: GoodQA #14151\nRisk: none beyond a new publish gate; revert the commit.\n"), {}),
@@ -165,6 +166,11 @@ class ShellAnalysis(unittest.TestCase):
             "bash -l -c 'git commit -m wip'": "wip",
             "bash -xc 'git commit -m wip'": "wip",
             "sh -euc 'git commit -m wip'": "wip",
+            "if git diff --cached --quiet; then echo none; else git commit -m wip; fi": "wip",
+            "for f in a; do git commit -m wip; done": "wip",
+            "{ git add -A; git commit -m wip; }": "wip",
+            "! git commit -m wip": "wip",
+            "git commit --cleanup=verbatim -m wip": "wip",
             "timeout 30 git commit -m wip": "wip",
         }
         for command, expected in cases.items():
@@ -187,7 +193,10 @@ class ShellAnalysis(unittest.TestCase):
                         "git commit --allow-empty-message -m ''", "bash -c \"$CMD\" && git commit",
                         "git -c alias.ci=commit ci -m wip", "xargs -I{} git commit -m {}",
                         "find . -name x -exec git commit -m wip \\;", "parallel git commit -m ::: a", "sudo -u eric git commit -m wip",
-                        "cd \"$REPO\" && git commit -F msg.txt"):
+                        "cd \"$REPO\" && git commit -F msg.txt",
+                        "printf 'wip\\n' > msg.txt && git commit -F msg.txt",
+                        "git commit --cleanup=strip -m x", "git commit -e -m x", "git commit --edit -m x",
+                        "env -S 'git commit -m wip'", "watch git commit -m wip"):
             with self.subTest(command):
                 with self.assertRaises(cp.Unresolvable):
                     cp.analyze(command, self.dir)
@@ -483,6 +492,27 @@ class InspectionRegressions(Fixture):
         with_session = {"session_id": "sess-1", "cwd": str(self.repo), "tool_input": {"command": "git commit -m 'emergency: wip'"}}
         self.assertEqual(cp.run_hook(with_session, POLICY)[0], 0)
         self.assertEqual(cp.run_hook({**with_session, "session_id": None}, POLICY)[0], 2)
+
+    def test_bad_policy_file_only_affects_commits(self):
+        copy = self.root / "hooks-bad"
+        shutil.copytree(HOOKS, copy, ignore=shutil.ignore_patterns("__pycache__"))
+        with open(copy / "commit_policy.json", "a") as handle:
+            handle.write(",")
+        def run(command, tool="Bash"):
+            return subprocess.run([sys.executable, str(copy / "commit_policy.py"), "hook"], text=True,
+                                  input=json.dumps({"session_id": "s", "cwd": str(self.repo), "tool_name": tool,
+                                                    "tool_input": {"command": command}}),
+                                  capture_output=True, env=self.env, timeout=60)
+        self.assertEqual(run("ls -la && npm test").returncode, 0)
+        broken = run("git commit -m wip")
+        self.assertEqual(broken.returncode, 2)
+        self.assertIn("enforcement", broken.stderr)
+
+    def test_edit_tools_mentioning_commit_are_not_blocked(self):
+        payload = {"session_id": "s", "cwd": str(self.repo), "tool_name": "apply_patch",
+                   "tool_input": {"input": "*** docs: run git commit -m wip"}}
+        self.assertEqual(cp.run_hook(payload, POLICY)[0], 0)
+        self.assertEqual(cp.run_hook({**payload, "tool_name": "write_stdin"}, POLICY)[0], 2)
 
     def test_agent_markers_exclude_codex_home(self):
         self.assertIn("CODEX_TOOL_CALL_ID", cp.AGENT_MARKERS)

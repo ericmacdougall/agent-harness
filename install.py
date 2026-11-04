@@ -41,7 +41,7 @@ def managed_scripts(claude: Path) -> set[str]:
 def managed_hooks(claude: Path) -> dict[str, list[dict]]:
     script = str(claude / "hooks" / "wal.py")
     policy = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "commit_policy.py"), "hook"],
-              "timeout": 15, "onFailure": "block"}
+              "timeout": 60, "onFailure": "block"}  # gh pr create checks GitHub and GoodQA
 
     def command(event: str, fail_closed: bool = False) -> dict:
         hook = {"type": "command", "command": "python3", "args": [script, event], "timeout": 10}

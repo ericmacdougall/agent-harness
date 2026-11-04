@@ -174,7 +174,6 @@
     ]
   },
   "exempt": {
-    "generated_merge_subject": "^Merge (?:branch|branches|pull request|remote-tracking branch|tag|commit) ",
     "autosquash_prefixes": [
       "fixup! ",
       "squash! ",

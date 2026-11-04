@@ -156,7 +156,9 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
         return ["message: empty commit message"]
     subject_line = text.split("\n", 1)[0]
     exempt = policy["exempt"]
-    if is_merge or re.match(exempt["generated_merge_subject"], subject_line):
+    # Only a real merge (MERGE_HEAD present, or more than one parent) is exempt. A subject
+    # that merely starts with "Merge" proves nothing: squash commits must comply.
+    if is_merge:
         return []
     if any(subject_line.startswith(prefix) for prefix in exempt["autosquash_prefixes"]):
         return [] if allow_autosquash else [
@@ -568,7 +570,7 @@ def parse_commit_args(args):
     """Return option dict from git commit argument words (already static strings)."""
     opts = {"message": [], "file": None, "reuse": None, "amend": False, "no_edit": False, "fixup": None,
             "squash": None, "trailer": [], "template": None, "dry_run": False, "allow_empty_message": False,
-            "help": False}
+            "help": False, "edit": False, "cleanup": None}
     i = 0
     while i < len(args):
         arg = args[i]
@@ -600,6 +602,10 @@ def parse_commit_args(args):
                 opts["amend"] = True
             elif name == "no-edit":
                 opts["no_edit"] = True
+            elif name == "edit":
+                opts["edit"] = True
+            elif name == "cleanup":
+                opts["cleanup"] = value
             elif name in ("dry-run", "short", "porcelain", "long"):
                 opts["dry_run"] = True
             elif name == "allow-empty-message":
@@ -633,6 +639,8 @@ def parse_commit_args(args):
                     break  # optional attached argument
                 if flag == "h":
                     opts["help"] = True
+                if flag == "e":
+                    opts["edit"] = True
     return opts
 
 
@@ -654,6 +662,11 @@ def resolve_commit(args, cwd, stdin_body, facts):
         return None, context
     if opts["allow_empty_message"]:
         raise Unresolvable("--allow-empty-message is not allowed")
+    if opts["edit"]:
+        raise Unresolvable("-e/--edit lets an editor rewrite the message after it is checked; drop it")
+    if opts["cleanup"] not in (None, "default", "whitespace", "verbatim"):
+        raise Unresolvable(f"--cleanup={opts['cleanup']} changes the message after it is checked; omit it")
+    context["file"] = opts["file"]
     if opts["fixup"] is not None or opts["squash"] is not None:
         target = opts["fixup"] if opts["fixup"] is not None else opts["squash"]
         prefix = "squash! " if opts["squash"] is not None else "fixup! "
@@ -770,6 +783,7 @@ def _gh_create(args, cwd, remote):
 
 WRAPPERS = {"env", "command", "exec", "time", "nohup", "nice", "builtin", "caffeinate", "timeout",
             "gtimeout", "stdbuf", "ionice", "chronic"}
+RESERVED = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time", "fi", "done", "in"}
 TEXT_TOOLS = {"echo", "printf", "grep", "egrep", "rg", "ag", "awk", "sed", "cat", "less", "man", "head", "tail"}
 SHELLS = {"bash", "sh", "zsh", "dash"}
 
@@ -860,10 +874,13 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
             if re.match(r"^\d*(?:>>?|<)\S+$", token[1]) and not argv:
                 continue
             argv.append(token)
-        while argv and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0][1]):
+        while argv and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0][1]) or argv[0][1] in RESERVED):
             argv = argv[1:]
         while argv and os.path.basename(argv[0][1]) in WRAPPERS:
             wrapper = os.path.basename(argv[0][1])
+            if wrapper == "env" and any(w[1] in ("-S", "--split-string") or w[1].startswith("--split-string=")
+                                        for w in argv[1:]):
+                raise Unresolvable("env -S splits a string the policy cannot follow; run git commit directly")
             argv = argv[1:]
             while argv and (argv[0][1].startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0][1])):
                 argv = argv[1:]
@@ -956,6 +973,10 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                                        "ssh host 'cd repo && git commit -F - <<\"EOF\"' with the message, or -m")
             facts = repo_facts(repo) if repo and not remote else None
             message, context = resolve_commit(values, repo, stdin_body, facts)
+            written = context.get("file")
+            if written not in (None, "-") and text.count(written) > 1:
+                raise Unresolvable(f"the message file {written} is also written by this command, so the checked "
+                                   "content may not be what git commits; write it in an earlier step")
             if message is not None:
                 context["facts"] = facts
                 context["remote"] = remote
@@ -1086,7 +1107,7 @@ def run_hook(payload: dict, policy: dict) -> tuple:
     command = command_text(payload.get("tool_input"))
     if not command:
         raw = json.dumps(payload.get("tool_input"), ensure_ascii=False) if payload.get("tool_input") else ""
-        if re.search(r"\bgit\b", raw) and re.search(r"\bcommit\b", raw):
+        if shell_like(payload) and re.search(r"\bgit\b", raw) and re.search(r"\bcommit\b", raw):
             return 2, ("Commit policy: this tool call looks like it runs git commit, but its input shape is not "
                        "a shell command the policy can check (e.g. interactive stdin). Run git commit as a "
                        "single shell command: git commit -F <message-file>.")
@@ -1142,14 +1163,15 @@ def _check_pr_create(target, policy, session_dir):
     try:
         if base is None:
             info = subprocess.run(["gh", "api", f"repos/{slug}", "--jq", ".default_branch"],
-                                  capture_output=True, text=True, timeout=15)
+                                  capture_output=True, text=True, timeout=10)
             base = info.stdout.strip() if info.returncode == 0 else None
         if not base:
             raise OSError("cannot read the repository default branch; pass --base")
         config = policy["ticket_systems"]
         for system in config.values():
-            system["total_deadline_seconds"] = min(float(system.get("total_deadline_seconds", 90)), 30)
-        report = check_github(slug, base, head, policy, verify_tickets=True)
+            # The hook timeout is 60s: 10s default branch + 15s compare + 25s tickets.
+            system["total_deadline_seconds"] = min(float(system.get("total_deadline_seconds", 90)), 25)
+        report = check_github(slug, base, head, policy, verify_tickets=True, timeout=15)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         return 2, (f"PR blocked by the commit policy: the branch range could not be checked ({error}). "
                    f"Push the branch first, then run: python3 {HERE / 'commit_policy.py'} check-github "
@@ -1168,6 +1190,26 @@ def _check_pr_create(target, policy, session_dir):
     if policy.get("enforcement") == "warn":
         return 0, "commit-policy (warn mode, not blocking):\n" + text
     return 2, text
+
+
+PREFILTER_ACTION = re.compile(r"\b(?:commit|commit-tree|revert|merge)\b|\bpr\s+create\b")
+SHELL_TOOLS = {"bash", "shell", "local_shell", "exec_command", "unified_exec", "write_stdin", "container.exec",
+               "powershell"}
+
+
+def shell_like(payload) -> bool:
+    """Edit tools (apply_patch, Write) may mention git commit in file text; only shells run it."""
+    name = str(payload.get("tool_name") or "").lower()
+    return name in SHELL_TOOLS or name.startswith(("bash", "shell", "exec"))
+
+
+def may_commit(payload) -> bool:
+    """Cheap test run before the policy file is even loaded."""
+    command = command_text(payload.get("tool_input"))
+    if not command:
+        raw = json.dumps(payload.get("tool_input"), ensure_ascii=False) if payload.get("tool_input") else ""
+        return shell_like(payload) and bool(re.search(r"\bgit\b", raw) and re.search(r"\bcommit\b", raw))
+    return bool(re.search(r"\b(?:git|gh)\b", command) and PREFILTER_ACTION.search(command))
 
 
 def command_text(tool_input) -> str:
@@ -1529,18 +1571,24 @@ def main(argv=None) -> int:
                                 capture_output=True)
         print(json.dumps({"status": "REMOVED" if result.returncode == 0 else "ABSENT"}))
         return 0
-    try:
-        policy = load_policy()
-    except (OSError, ValueError) as error:
-        print(f"commit-policy: cannot load {POLICY_FILE}: {error}; refusing to guess", file=sys.stderr)
-        return 2
+    payload = None
     if args.command == "hook":
         try:
             payload = json.load(sys.stdin)
         except ValueError:
             print("commit-policy: hook payload is not JSON", file=sys.stderr)
             return 2
-        code, text = run_hook(payload if isinstance(payload, dict) else {}, policy)
+        payload = payload if isinstance(payload, dict) else {}
+        if not may_commit(payload):
+            return 0  # every non-commit tool call stays independent of the policy file
+    try:
+        policy = load_policy()
+    except (OSError, ValueError) as error:
+        print(f"commit-policy: cannot load {POLICY_FILE}: {error}; refusing to guess. Fix the JSON, or set "
+              '"enforcement": "off" there to stop enforcement.', file=sys.stderr)
+        return 2
+    if args.command == "hook":
+        code, text = run_hook(payload, policy)
         if text:
             print(text, file=sys.stderr)
         return code

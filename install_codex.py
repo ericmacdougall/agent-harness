@@ -92,7 +92,7 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
         preserved.append(managed)
         if event == 'PreToolUse':
             # Commit message policy for every tool (no matcher): shell argv, strings, stdin writes.
-            preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 15}]})
+            preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 60}]})
         hooks[event] = preserved
     return result
 

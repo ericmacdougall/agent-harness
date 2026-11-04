@@ -208,7 +208,7 @@ Co-Authored-By: ...
 - **Trailers** such as Co-Authored-By and Signed-off-by come last, after a blank line.
 - **Repeats.** A message identical to the previous commit's message is rejected.
 - **Exemptions.**
-  - Merges are exempt: either a merge is in progress (`MERGE_HEAD`), or the subject is one git generated.
+  - Only real merges are exempt: a merge in progress (`MERGE_HEAD`), or a commit with more than one parent in a range. A single-parent commit whose subject starts with "Merge" is judged like any other, and so is a `gh pr merge --squash` message.
   - `fixup!`, `squash!` and `amend!` commits are allowed only on an unpublished branch. The publication check always rejects them.
 
 ### Enforcement points
@@ -227,7 +227,11 @@ Co-Authored-By: ...
      - the message comes from `$VAR`, another `$()`, or an unquoted heredoc containing `$`;
      - the commit would open an editor;
      - `-F` names a file that does not exist yet;
-     - the command is a bare `git revert`, `git commit-tree`, `eval`, `xargs`, or `gh pr merge --squash` without a subject and body.
+     - the command is a bare `git revert`, `git commit-tree`, `eval`, or `gh pr merge --squash` without a subject and body;
+     - git commit runs through another program (`xargs`, `find -exec`, `parallel`, `watch`, `sudo`, `env -S`), through `git -c alias.*`, or through a configured alias that expands to commit;
+     - the message could change after the check: `-e`/`--edit`, `--cleanup=strip|scissors`, or a `-F` file that the same command writes.
+
+   Shell keywords (`if`/`then`/`else`/`for`/`do`/`while`/`{ }`/`!`), `timeout` and `caffeinate` are unwrapped and checked. A script file (`bash deploy.sh`) or a program such as `python3 -c` that commits is not visible to the hook. Outside dev2/T2 the git backstop covers those cases, and the publication checks cover them everywhere.
 
    It also analyzes `ssh <host> '<remote command>'`, `ssh <host> bash -s <<'EOF'` and nested `bash -lc` strings, which is where most dev2/T2 commits run. A remote host's files, HEAD and repository are not visible, so a remote `-F <file>`, `--amend --no-edit` or `-C` fails closed. Pass the message inline instead: `ssh host 'cd repo && git commit -F - <<"EOF" ... EOF'`. Remote commits are held to the ticket rule (`remote_tickets_required`).
 
@@ -284,6 +288,7 @@ Co-Authored-By: ...
 
 ### Rollout and rollback
 
+- A malformed `commit_policy.json` blocks only commit-like commands, with an explanation. Every other tool call runs before the file is read. The PreToolUse handler's timeout is 60 seconds, because `gh pr create` consults GitHub and GoodQA (internal budget: 10 + 15 + 25 seconds).
 - `enforcement` in `commit_policy.json` takes three values:
   - `enforce` (the default) blocks.
   - `warn` prints the problems and allows.
