@@ -373,6 +373,18 @@ class RunProbe(unittest.TestCase):
         self.assertEqual(data["survivors"], 0)
         self.assertLess(data["observed"]["peak_rss_gb"], 3)
 
+    def test_dev_zero_read_ends_as_a_memory_bound_finding(self):
+        """The real 2026-11-04 failure shape: a consumer that slurps /dev/zero with no bound."""
+        code = "f=open('/dev/zero','rb')\nb=bytearray()\nwhile True: b+=f.read(1<<26)\n"
+        started = time.time()
+        done, data = self.probe(["--class", "memory", "--worst-case", "transcript_path=/dev/zero: unbounded memory growth",
+                                 "--max-rss-gb", "1", "--timeout-s", "20"], code)
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertEqual(data["outcome"], "bound-hit:memory")
+        self.assertLess(time.time() - started, 20)
+        self.assertLess(data["observed"]["peak_rss_gb"], 3)  # stopped near its 1 GB bound, not at 66 GB
+        self.assertEqual(data["survivors"], 0)
+
     def test_time_bound(self):
         done, data = self.probe(["--class", "hang", "--worst-case", "blocks forever on a FIFO", "--timeout-s", "1"],
                                 "import time\ntime.sleep(60)")

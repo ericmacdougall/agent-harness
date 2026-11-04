@@ -574,6 +574,40 @@ def deny_message(rule, detail, hatch, capped):
 
 # ---------------------------------------------------------------- side effects
 
+def live_heavy_jobs() -> int:
+    """Live run_capped wrappers on this host, read from their sidecars (stale files are ignored)."""
+    state = os.path.join(os.path.expanduser("~"), ".agent-harness", "state", "run_capped")
+    count = 0
+    try:
+        for name in os.listdir(state):
+            if name.endswith(".json") and name[:-5].isdigit():
+                try:
+                    os.kill(int(name[:-5]), 0)
+                    count += 1
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    count += 1
+    except OSError:
+        pass
+    return count
+
+
+def max_heavy_jobs() -> int:
+    value = 2
+    env = os.environ.get("HARNESS_MAX_HEAVY_MAC", "")
+    if env.isdigit() and int(env) > 0:
+        return int(env)
+    try:
+        import json
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource_limits.json")
+        if os.path.exists(path):
+            value = int(json.load(open(path)).get("max_heavy_mac", value))
+    except (OSError, ValueError, TypeError):
+        pass
+    return value
+
+
 def log_event(record: dict) -> None:
     try:
         import json
@@ -637,6 +671,11 @@ def run(raw: str) -> int:
         return 0
     decision = decide(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None)
     action = decision["action"]
+    if action == "allow" and decision.get("hatch_reason") and live_heavy_jobs() >= max_heavy_jobs():
+        sys.stderr.write(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
+                         f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n")
+        log_event({"event": "deny-concurrency", "rule": decision["rule"]})
+        return 2
     if action == "allow":
         if decision.get("hatch_reason"):
             log_hatch_to_wal(payload, decision)
