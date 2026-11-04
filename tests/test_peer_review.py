@@ -1123,10 +1123,18 @@ class ProviderEnvelopeTests(unittest.TestCase):
         vague = self.module.normalize_provider('codex', 1, 'Credit balance too low')
         self.assertFalse(vague['account_cooldown'])
 
+    # Shape of a real codex-cli 0.163.0 run with a revoked refresh token (dev2).
     REVOKED = [
-        {'type': 'thread.started', 'thread_id': 'fixture'}, {'type': 'turn.started'},
+        {'type': 'thread.started', 'thread_id': 'fixture'},
+        {'type': 'item.completed', 'item': {'id': 'h1', 'type': 'error', 'message': 'hooks file could not be parsed'}},
+        {'type': 'turn.started'},
+        *({'type': 'error', 'message': f'Reconnecting... {n}/5 (workspace routing discovery unauthorized (401))'}
+          for n in range(2, 6)),
+        {'type': 'item.completed', 'item': {'id': 'w1', 'type': 'error',
+                                            'message': 'Falling back from WebSockets to HTTPS transport.'}},
         *({'type': 'error', 'message': f'Reconnecting... {n}/5 (workspace routing discovery unauthorized (401))'}
           for n in range(1, 6)),
+        {'type': 'error', 'message': 'workspace routing discovery unauthorized (401)'},
         {'type': 'turn.failed', 'error': {'message': 'workspace routing discovery unauthorized (401)'}}]
 
     def transcript(self, records):
@@ -1150,7 +1158,7 @@ class ProviderEnvelopeTests(unittest.TestCase):
         result = self.module.normalize_provider('codex', 0, self.codex(extra=[retry]),
                                                 last_message='VERDICT: PASS\nReviewed.')
         self.assertEqual(result['result'], 'CHECK_OK')
-        dangling = self.module.normalize_provider('codex', 1, self.transcript(self.REVOKED[:-1]))
+        dangling = self.module.normalize_provider('codex', 1, self.transcript(self.REVOKED[:-2]))
         self.assertEqual((dangling['reason'], dangling['fallback_allowed']), ('INVALID_OUTPUT', False))
 
     def test_unrecognized_codex_failures_still_refuse_fallback(self):
@@ -1173,6 +1181,13 @@ class ProviderEnvelopeTests(unittest.TestCase):
                 {'type': 'turn.started'},
                 {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'VERDICT: BLOCK\nF1 bug'}},
                 {'type': 'turn.completed'}]),
+            'error then different turn.failed': self.transcript([
+                {'type': 'error', 'message': 'unauthorized (401)'},
+                {'type': 'turn.failed', 'error': {'message': 'internal error'}}]),
+            'paired error not last': self.transcript([
+                {'type': 'error', 'message': 'unauthorized (401)'},
+                {'type': 'turn.failed', 'error': {'message': 'unauthorized (401)'}},
+                {'type': 'turn.started'}]),
             'auth error after a message': self.transcript([
                 {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'VERDICT: BLOCK\nF1'}},
                 {'type': 'turn.failed', 'error': {'message': 'unauthorized (401)'}}]),

@@ -140,6 +140,13 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                 if (kind == 'error' and set(record) == {'type', 'message'} and isinstance(record['message'], str)
                         and CODEX_RECONNECTING.match(record['message'])):
                     continue
+                if (kind == 'error' and set(record) == {'type', 'message'} and isinstance(record['message'], str)
+                        and len(records) >= 2 and record is records[-2] and records[-1].get('type') == 'turn.failed'
+                        and isinstance(records[-1].get('error'), dict)
+                        and records[-1]['error'].get('message') == record['message']):
+                    # Codex reports a fatal error once as `error`, then again as the
+                    # final `turn.failed`; classify the pair by that final record.
+                    continue
                 if kind in {'error', 'turn.failed'} or record.get('is_error') is True or record.get('error') is not None:
                     return codex_failure(record, terminal=record is records[-1] and not completed and not messages)
                 if kind == 'turn.completed':
