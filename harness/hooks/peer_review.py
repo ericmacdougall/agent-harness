@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Independent read-only Codex review, with a blind Opus CLI fallback."""
 
+# Hooks run under the host python3, which is 3.9 on macOS; keep annotations lazy.
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
