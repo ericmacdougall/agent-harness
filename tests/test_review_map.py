@@ -305,5 +305,26 @@ class RedTeamRegressions(Base):
         self.assertTrue(quoted[0]["hunks"], "hunks must not vanish for names git quotes")
 
 
+class InspectionTwoRegressions(Base):
+    def test_f1_wal_branch_only_note_is_not_attributed(self):
+        (self.wals / "s1" / "main.jsonl").write_text(json.dumps({"at": "2026-11-04T00:00:00+00:00", "event": "decision",
+            "note": "other repo decision on feat/review-map-demo about secret plans"}) + "\n")
+        model = rm.build_model(self.repo, None, "feat/review-map-demo", use_gh=False, roots=[self.work])
+        self.assertEqual([w for w in model["wal"] if "secret plans" in w["note"]], [])
+
+    def test_f3_f4_rename_keeps_new_path_and_hunks(self):
+        sh(self.repo, "mv", "src/ledger.py", "src/ledger2.py")
+        (self.repo / "src" / "ledger2.py").write_text((self.repo / "src" / "ledger2.py").read_text() + "# moved\n")
+        sh(self.repo, "add", "."); sh(self.repo, "commit", "-qm", "refactor(x): rename\n\nRefs: none (test)")
+        model = rm.build_model(self.repo, None, "feat/review-map-demo", use_gh=False, roots=[self.work], wal=False)
+        paths = [f["path"] for f in model["diff"]["files"]]
+        self.assertIn("src/ledger2.py", paths)
+        self.assertTrue(all(p for p in paths))
+
+    def test_f3_bad_range_fails_loudly(self):
+        with self.assertRaises(rm.MapError):
+            rm.collect_diff(self.repo, "f" * 40, "e" * 40)
+
+
 if __name__ == "__main__":
     unittest.main()

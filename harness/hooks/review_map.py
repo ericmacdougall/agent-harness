@@ -232,6 +232,8 @@ def collect_pr(repo: Path, pr, branch, use_gh=True) -> dict:
 
 def collect_diff(repo, base_sha, head_sha) -> dict:
     rc, out = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z", "-M", base_sha, head_sha, limit=800_000)
+    if rc != 0:
+        raise MapError("git diff failed for the PR range")
     files = []
     parts = out.split("\0")
     k = 0
@@ -245,10 +247,12 @@ def collect_diff(repo, base_sha, head_sha) -> dict:
             name = parts[k + 1] if k + 1 < len(parts) else ""
             k += 2
         binary = add == "-"
+        if not name or not (binary or (add.isdigit() and dele.isdigit())):
+            continue  # a record cut by the output limit or in an unexpected shape
         files.append({"path": name, "added": 0 if binary else int(add), "deleted": 0 if binary else int(dele),
                       "binary": binary, "hunks": []})
     files.sort(key=lambda f: -(f["added"] + f["deleted"]))
-    truncated = len(files) > MAX_FILES_DETAIL
+    truncated = len(files) > MAX_FILES_DETAIL or len(out) >= 800_000
     budget = MAX_DIFF_BYTES
     for item in files[:MAX_FILES_DETAIL]:
         if item["binary"] or budget <= 0:
@@ -432,19 +436,19 @@ def find_reports(roots, shas, branch, tickets) -> list:
             continue
         if not (re.search(r"Reviewed HEAD:|(?i:red[- ]?team|review|finding|verdict|_RESULT)", raw[:4000] + path.name)):
             continue
-        text = scrub(raw)
-        head = re.search(r"(?m)^Reviewed HEAD:\s*([0-9a-f]{40})", text)
+        head = re.search(r"(?m)^Reviewed HEAD:\s*([0-9a-f]{40})", raw)
         basis = None
         if head and head.group(1) in shas:
             basis = f"Reviewed HEAD {head.group(1)[:10]} is a commit of this PR"
-        elif re.search(r"(?i)red[- ]?team|review|finding|verdict|_RESULT", path.name + text[:400]):
-            hit = sha_hit(text, shas)
+        elif re.search(r"(?i)red[- ]?team|review|finding|verdict|_RESULT", path.name + raw[:400]):
+            hit = sha_hit(raw, shas)
             if hit:
                 basis = f"report cites PR commit {hit}"
-            elif any(n.search(text) for n in needles) and any(r.search(text) for r in ticket_res):
+            elif any(n.search(raw) for n in needles) and any(r.search(raw) for r in ticket_res):
                 basis = "report names the PR branch and ticket"
         if not basis:
-            continue
+            continue  # relevance is decided on raw text; only matching files are redacted and rendered
+        text = scrub(raw)
         parsed = parse_report(text)
         if not parsed["findings"] and not parsed["verdict"]:
             continue
@@ -460,8 +464,8 @@ def find_wal(shas, branch, tickets, since, until) -> list:
     entries = []
     wanted = [t.split("#")[-1] for t in tickets]
     needles = [re.compile(r"(?<![0-9a-f])" + s[:8] + r"[0-9a-f]*(?![0-9a-f])") for s in shas]
-    if branch and len(branch) > 7:
-        needles.append(re.compile(r"(?<![A-Za-z0-9._/-])" + re.escape(branch) + r"(?![A-Za-z0-9._/-])"))
+    branch_needle = re.compile(r"(?<![A-Za-z0-9._/-])" + re.escape(branch) + r"(?![A-Za-z0-9._/-])") \
+        if branch and len(branch) > 7 else None
     ticket_res = []
     for ref in tickets:
         project, number = ref.split(" ", 1)[1].split("#")
@@ -498,9 +502,12 @@ def find_wal(shas, branch, tickets, since, until) -> list:
                                                                       "scope", "status", "handoff", "blocker", "intent"):
                     continue
                 basis = None
+                ticket_hit = any(r.search(note) for r in ticket_res)
                 if any(n.search(note) for n in needles):
-                    basis = "note cites a PR commit or the branch"
-                elif any(r.search(note) for r in ticket_res):
+                    basis = "note cites a PR commit"
+                elif branch_needle and branch_needle.search(note) and ticket_hit:
+                    basis = "note cites the PR branch and ticket"  # a branch name alone also matches other repos
+                elif ticket_hit:
                     basis = "note cites the PR ticket"
                 if basis:
                     entries.append({"at": row.get("at", ""), "event": row["event"], "note": scrub(note)[:900], "basis": basis})
