@@ -438,6 +438,12 @@ class StopTest(Base):
         self.assertIn("policy_error", policy)
         self.assertEqual(wa.load_policy(Path(self.tmp.name) / "absent.json")["stop"], "enforce")
 
+    def test_a_new_problem_is_a_new_signature_with_a_fresh_bound(self):
+        self.capture("first needs triage")
+        self.assertEqual([self.stop().get("decision") for _ in range(4)], ["block"] * 3 + [None])
+        self.capture("second needs triage")
+        self.assertEqual(self.stop().get("decision"), "block")
+
     def test_blocked_signature_blocks_again_after_six_hours(self):
         self.capture("needs triage")
         for _ in range(4):
@@ -517,6 +523,13 @@ class RemovalTest(Base):
         self.assertEqual(self.cli("remove", old)[0], 0)
         self.assertEqual(self.data()["tombstones"][old]["proofKind"], "superseded_by_closed")
         self.check_schema()
+
+    def test_removal_reverifies_evidence_so_a_vanished_commit_blocks_it(self):
+        """Red-team note: a force-pushed or garbage-collected commit between done and removal."""
+        aid = self.done_ask(25)
+        with mock.patch.object(wa, "commit_exists", lambda sha, repo=None: False):
+            self.assertEqual(self.cli("remove", aid)[0], 2)
+        self.assertEqual(self.cli("remove", aid)[0], 0)
 
     def test_removal_boundary_is_24h_plus_a_second(self):
         aid = self.done_ask(24)
@@ -682,6 +695,12 @@ class StoreTest(Base):
         self.assertEqual(len(self.data()["messages"]), 3 if False else len(self.data()["messages"]))
         self.assertGreaterEqual(len(self.data()["messages"]), 2)
         self.assertEqual(wa.verify_events(), [])
+
+    def test_clock_rollback_is_reported_by_verify(self):
+        self.capture("one")
+        CLOCK[0] -= 3600
+        self.capture("two")
+        self.assertTrue(any("clock went backwards" in p for p in wa.verify_events()))
 
     def test_event_tamper_is_detected(self):
         msg = self.capture("x")

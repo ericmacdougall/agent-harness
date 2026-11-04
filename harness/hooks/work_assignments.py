@@ -1752,7 +1752,7 @@ def cmd_failures(args):
 
 def verify_events() -> list:
     """Per-hive hash chain, and the snapshot equals a fold of the events (index and session caches excluded)."""
-    problems, prev = [], {}
+    problems, prev, clocks = [], {}, {}
     try:
         events = read_events()
     except StoreCorrupt as error:
@@ -1763,6 +1763,11 @@ def verify_events() -> list:
             problems.append(f"{ev['id']}: chain broken")
             break
         prev[ev["hiveId"]] = ev["sha256"]
+        last_at = clocks.get(ev["hiveId"], "")
+        if ev["at"] < last_at:
+            problems.append(f"{ev['id']}: clock went backwards ({last_at} then {ev['at']}); the 24h gate trusts the host clock")
+            break
+        clocks[ev["hiveId"]] = ev["at"]
     if problems:
         return problems
     try:
