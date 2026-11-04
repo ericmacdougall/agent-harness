@@ -258,6 +258,51 @@ def lint(text: str, config: dict | None = None) -> list:
     return problems
 
 
+# --------------------------------------------------------------------------- blockchain domain gates
+
+def _domain_gates():
+    try:
+        import domain_gates
+        return domain_gates
+    except ImportError:  # older install without the domain gates: behave as before
+        return None
+
+
+def append_domain_block(text: str, repo, spec_policy: dict) -> str:
+    """Append the `## Domain checklist` block when blockchain work is detected; otherwise return text unchanged."""
+    dg = _domain_gates()
+    if dg is None:
+        return text
+    try:
+        if dg.settings(repo, spec_policy)["disabled"]:
+            return text
+        detected = dg.detect(Path(repo))
+        block = dg.render_block([d["domain"] for d in detected], repo, detected) if detected else ""
+    except Exception:  # guidance must never block writing a spec
+        return text
+    return text.rstrip("\n") + "\n\n" + block if block else text
+
+
+def domain_lint(text: str, repo, spec_policy: dict):
+    """Return (warnings, problems) for the domain checklist; problems only when domain_gates.mode is enforce."""
+    dg = _domain_gates()
+    if dg is None:
+        return [], []
+    try:
+        config = dg.settings(repo, spec_policy)
+        if config["disabled"]:
+            return [], []
+        domains = dg.active_domains(repo, spec_policy)
+        missing = dg.missing_items(text, domains, repo)
+    except Exception as error:
+        return [f"domain gates could not run ({type(error).__name__}); skipped"], []
+    if not missing:
+        return [], []
+    note = (f"domain checklist items without a NEG case naming them or `Domain-gate: <id> waived (<reason>)`: "
+            f"{', '.join(missing)}")
+    return ([note], []) if config["mode"] != "enforce" else ([], [note])
+
+
 # --------------------------------------------------------------------------- reviews (local sidecar)
 
 def reviews_path(spec_path: Path) -> Path:
@@ -268,7 +313,7 @@ def load_reviews(spec_path: Path) -> list:
     path = reviews_path(spec_path)
     if not path.exists():
         return []
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(read_spec_text(path))
     if not isinstance(data, dict) or data.get("v") != 1 or not isinstance(data.get("reviews"), list):
         raise SpecError(f"{path} is not a v1 reviews file", EXIT_USAGE)
     return data["reviews"]
@@ -330,7 +375,7 @@ def render_reviews(entries: list, core: str) -> str:
 
 
 def write_spec_with_reviews(spec_path: Path, entries: list):
-    text = spec_path.read_text(encoding="utf-8")
+    text = read_spec_text(spec_path)
     core = spec_core(text)
     tail = normalize_text(text)[len(core):]
     lines = tail.splitlines()
@@ -363,7 +408,7 @@ def parse_review_report(path: Path):
 
 def read_regular(path: Path, limit: int, *, tail: bool = False):
     try:
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))  # never wait on a FIFO
     except OSError as error:
         raise SpecError(f"cannot open {path} ({error.strerror}); symlinks are refused", EXIT_USAGE) from None
     try:
@@ -387,6 +432,21 @@ def read_regular(path: Path, limit: int, *, tail: bool = False):
     if tail:
         return data, info.st_size
     return data
+
+
+MAX_SPEC_BYTES = 1_000_000
+
+
+def read_spec_bytes(path: Path) -> bytes:
+    """Spec and review sidecar files: one regular, unlinked, bounded file (they are uploaded to the ticket)."""
+    return read_regular(Path(path), MAX_SPEC_BYTES)
+
+
+def read_spec_text(path: Path) -> str:
+    try:
+        return read_spec_bytes(path).decode("utf-8")
+    except UnicodeDecodeError:
+        raise SpecError(f"{path} is not valid UTF-8", EXIT_USAGE) from None
 
 
 KEY_FRAGMENT = re.compile(r"-----(?:BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----")
@@ -1221,22 +1281,25 @@ def cmd_new(args, spec_policy):
         title=session.ticket.title or f"{session.project}#{session.number}", project=session.project,
         number=session.number, author=args.author,
         signoff="human" if "human sign-off" in description.lower() else "main")
+    text = append_domain_block(text, getattr(args, "repo", None) or ".", spec_policy)
     atomic_write(out, text.encode("utf-8"))
     print(json.dumps({"status": "CREATED", "spec": str(out), "ticket": session.ticket.label}))
     return EXIT_OK
 
 
 def cmd_lint(args, spec_policy):
-    text = Path(args.spec).read_text(encoding="utf-8")
+    text = read_spec_text(Path(args.spec))
     _, _, config = ticket_config(spec_policy)
     problems = lint(text, config)
-    print(json.dumps({"status": "FAIL" if problems else "PASS", "problems": problems,
+    warnings, domain_problems = domain_lint(text, getattr(args, "repo", None) or ".", spec_policy)
+    problems = problems + domain_problems
+    print(json.dumps({"status": "FAIL" if problems else "PASS", "problems": problems, "warnings": warnings,
                       "spec_core_sha": core_sha(text)}, indent=1))
     return EXIT_MISSING if problems else EXIT_OK
 
 
 def cmd_packet(args, spec_policy):
-    text = Path(args.spec).read_text(encoding="utf-8")
+    text = read_spec_text(Path(args.spec))
     try:
         _, _, config = ticket_config(spec_policy)
     except (OSError, ValueError, ImportError) as error:
@@ -1255,7 +1318,7 @@ def cmd_packet(args, spec_policy):
 
 def cmd_review(args, spec_policy):
     spec_path = Path(args.spec)
-    text = spec_path.read_text(encoding="utf-8")
+    text = read_spec_text(spec_path)
     core = core_sha(text)
     entries = load_reviews(spec_path)
     now = datetime.now(timezone.utc).isoformat()
@@ -1310,7 +1373,7 @@ def cmd_attach(args, spec_policy):
     spec_path = Path(args.spec)
     entries = load_reviews(spec_path)
     write_spec_with_reviews(spec_path, entries)  # refresh the rendered Reviews section first
-    text = spec_path.read_text(encoding="utf-8")
+    text = read_spec_text(spec_path)
     spec = parse_spec(text)
     _, _, config = ticket_config(spec_policy)
     problems = lint(text, config)
@@ -1322,8 +1385,8 @@ def cmd_attach(args, spec_policy):
     session = Session(spec["header"]["Ticket"], spec_policy)
     records, _, _ = session.records()
     latest = current_reviews(entries, core)
-    files = [("spec", spec_path.name, "text/markdown", spec_path.read_bytes()),
-             ("reviews", reviews_path(spec_path).name, "text/plain", reviews_path(spec_path).read_bytes())]
+    files = [("spec", spec_path.name, "text/markdown", read_spec_bytes(spec_path)),
+             ("reviews", reviews_path(spec_path).name, "text/plain", read_spec_bytes(reviews_path(spec_path)))]
     for role in ROLES:
         report = latest[role].get("report")
         if report:
@@ -1335,7 +1398,7 @@ def cmd_attach(args, spec_policy):
     reason = re.match(r"^not-applicable\s*\((.+)\)$", click)
     record = {"v": 1, "kind": "spec", "ticket": session.ticket.label, "issue_id": session.ticket.id,
               "actor": parse_author(args.actor), "author": author, "spec_core_sha": core,
-              "spec_file_sha": sha256_bytes(spec_path.read_bytes()),
+              "spec_file_sha": sha256_bytes(read_spec_bytes(spec_path)),
               "ac": [ident for ident, _ in spec["criteria"]], "neg": [ident for ident, _, _ in spec["negatives"]],
               "click_test": {"required": not reason, "reason": reason.group(1) if reason else None},
               "signoff": spec["header"].get("Sign-off", "main"),
@@ -1544,9 +1607,12 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("--ticket", required=True)
     new.add_argument("--out", required=True)
     new.add_argument("--author", required=True, help="agent:<id> (model), human:<name> or model:<name>")
+    new.add_argument("--repo", default=".", help="repo scanned for blockchain signals (default .)")
     for name in ("lint", "packet"):
         item = sub.add_parser(name)
         item.add_argument("spec")
+        if name == "lint":
+            item.add_argument("--repo", default=".", help="repo scanned for blockchain signals (default .)")
         if name == "packet":
             item.add_argument("--out", required=True)
     review = sub.add_parser("review", help="record an adversarial or acceptance review of the spec")
@@ -1636,7 +1702,7 @@ def main(argv=None) -> int:
     try:
         spec_policy = load_spec_policy()
         if args.command == "plan-gate":
-            code, text = plan_ticket_gate(Path(args.repo), Path(args.packet).read_text(encoding="utf-8"),
+            code, text = plan_ticket_gate(Path(args.repo), read_spec_text(Path(args.packet)),
                                           spec_policy=spec_policy)
             if text:
                 print(text, file=sys.stderr)
