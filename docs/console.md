@@ -14,7 +14,7 @@ Build and start instructions are in [console/README.md](../console/README.md).
 The console blocks unsafe child resumes but does not dispatch replacement owners
 itself; a parent does that in its current context after reconciling the old
 writer. The Go model and tool engine is separate experimental work and is not
-part of this release.
+part of this baseline.
 
 ## Sessions and work
 
@@ -116,7 +116,7 @@ On macOS and Linux, cleanup pins the private data and attachment directories,
 unlinks by basename relative to the open directory, and syncs that same handle.
 If an ancestor or attachment directory changes identity, cleanup fails closed
 with its receipt intact. Windows builds reject attachment selection before
-copying bytes or starting provider work because this release has no equivalent
+copying bytes or starting provider work because this baseline has no equivalent
 descriptor-confined deletion primitive there; text-only chat remains available.
 
 Repository controls expose local tracking and worktree state. Sync preserves

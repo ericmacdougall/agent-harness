@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -54,11 +53,6 @@ func run(args []string, out io.Writer) error {
 	readyFile := flags.String("ready-file", "", "Private GUI readiness receipt path")
 	noOpen := flags.Bool("no-open", false, "Print the local URL without opening a browser")
 	listen := flags.String("listen", "127.0.0.1:0", "Loopback listener address")
-	configDir, _ := os.UserConfigDir()
-	defaultDir := ""
-	if configDir != "" {
-		defaultDir = filepath.Join(configDir, "agent-harness", "console")
-	}
 	dataDir := flags.String("data-dir", "", "New private directory for this unreleased baseline (required)")
 	showVersion := flags.Bool("version", false, "Print version")
 	if err := flags.Parse(args); err != nil {
@@ -71,7 +65,7 @@ func run(args []string, out io.Writer) error {
 		fmt.Fprintln(out, "Agent Harness Console", version)
 		return nil
 	}
-	admitted, err := baselineDataDir(*dataDir, defaultDir)
+	admitted, err := baselineDataDir(*dataDir, protectedRoot())
 	if err != nil {
 		return err
 	}

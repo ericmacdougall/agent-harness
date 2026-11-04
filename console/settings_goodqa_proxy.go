@@ -57,6 +57,9 @@ func runSettingsHelper(args []string, in io.Reader, out, diagnostics io.Writer) 
 	if e != nil {
 		return true, e
 	}
+	if e = baselineAdmitted(snapshot.DataDir); e != nil {
+		return true, e
+	}
 	return true, serveGoodQAProxy(context.Background(), snapshot, newCredentialVault(), in, out, diagnostics)
 }
 func loadGoodQASnapshot(path, digest string) (goodqaProxySnapshot, error) {

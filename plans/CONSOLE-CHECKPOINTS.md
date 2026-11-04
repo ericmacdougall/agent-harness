@@ -1,5 +1,7 @@
 # Scoped checkpoints and automatic review dispatch
 
+> **Unreleased baseline.** This plan describes the console kept on `main` as the base for the event-log rebuild. That console is not released, packaged or installed; see `console/README.md`.
+
 This delta makes default supervision and configured review ladders operational. It adds no global automation and does not restore the disabled Codex bridge.
 
 ## Admission and authority

@@ -63,6 +63,10 @@ func runCLILaunch(args []string, in io.Reader, out, errOut io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Before the ticket is consumed or settings are opened.
+	if err = baselineAdmitted(ticket.DataDir); err != nil {
+		return err
+	}
 	if err = os.Remove(*path); err != nil {
 		return errors.New("launch ticket already consumed or unavailable")
 	}

@@ -1,6 +1,6 @@
 # Agent Harness Console
 
-> **Unreleased baseline. Do not use it for real work.** This tree is on `main` only so that the durable event-log rebuild reviews as small diffs; the rebuild itself lands separately. It has known defects that the rebuild replaces. It is not packaged, installed or released, and it refuses the default console data directory and any directory it did not create (`--data-dir` must name a new directory).
+> **Unreleased baseline. Do not use it for real work.** This tree is on `main` only so that the durable event-log rebuild reviews as small diffs; the rebuild itself lands separately. It has known defects that the rebuild replaces. It is not packaged, installed or released, and it refuses the default console data directory and any directory it did not create (`--data-dir` must name a new directory). It still drives the real Codex and Claude Code CLIs with their normal home configuration, and its sessions default to full access with approvals off, so run it only against scratch projects.
 
 A local Go application with an embedded browser interface and Codex and Claude Code CLI sessions, built from source.
 

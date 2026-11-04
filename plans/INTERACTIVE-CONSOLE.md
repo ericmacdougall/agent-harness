@@ -1,5 +1,7 @@
 # Interactive agent console
 
+> **Unreleased baseline.** This plan describes the console kept on `main` as the base for the event-log rebuild. That console is not released, packaged or installed; see `console/README.md`.
+
 ## Outcome and location
 
 Build a real desktop-oriented chat console in the public repository as `console/`, an independent Go 1.22 module using the standard library plus `golang.org/x/sys`. A single `harness-console` executable embeds its HTML/CSS/JavaScript, opens a browser window, and uses locally installed Codex and Claude Code. The existing private operator and reference reader remain separate compatibility paths. Supplied references are visible context, never automatically submitted model instructions.

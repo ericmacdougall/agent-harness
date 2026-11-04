@@ -1,5 +1,7 @@
 # Console scenario registration
 
+> **Unreleased baseline.** This plan describes the console kept on `main` as the base for the event-log rebuild. That console is not released, packaged or installed; see `console/README.md`.
+
 These are authored regression cases, registered before implementation. They are tuning cases and provide no field reliability estimate. Baseline is public commit7b519cab, which has only the reference launcher and no interactive console. Candidate is the eventual frozen console commit. The endpoint is a complete workflow with correct rendered output, actual provider/fixture state and preserved local work. A failed step fails its whole chain. No skipped cluster is green.
 
 ## Ordinary chain, eight consequential steps

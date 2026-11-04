@@ -1,8 +1,10 @@
 # Console frontend and launcher contract
 
+> **Unreleased baseline.** This plan describes the console kept on `main` as the base for the event-log rebuild. That console is not released, packaged or installed; see `console/README.md`.
+
 ## Launch
 
-Use `[BINARY, --reference-file, FILE, --reference-sha256, HEX, --cwd, DIR]`. The executable accepts optional `--session ID`, `--provider codex|claude`, `--no-open` and loopback-only `--listen`. Normal launch needs no arguments. The Go executable embeds `console/web/index.html`, `app.js`, `style.css`; no runtime Go/Node install is required. A supplied foreign session is imported as context for a labeled new interactive session.
+Use `[BINARY, --reference-file, FILE, --reference-sha256, HEX, --cwd, DIR, --data-dir, NEW_DIR]`; the unreleased baseline requires `--data-dir` and refuses the default console directory. The executable accepts optional `--session ID`, `--provider codex|claude`, `--no-open` and loopback-only `--listen`. The Go executable embeds `console/web/index.html`, `app.js`, `style.css`; no runtime Go/Node install is required. A supplied foreign session is imported as context for a labeled new interactive session.
 
 ## Authentication
 

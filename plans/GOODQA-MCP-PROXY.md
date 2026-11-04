@@ -1,5 +1,7 @@
 # GoodQA tool allowlist proxy
 
+> **Unreleased baseline.** This plan describes the console kept on `main` as the base for the event-log rebuild. That console is not released, packaged or installed; see `console/README.md`.
+
 Settings owner owns `console/settings_goodqa_proxy*.go` and, after review admission, `console/mcp.go`. The console checkpoint helper remains core-owned. Opt-in metadata snapshots identify a fixed validated endpoint, settings revision, exact discovered allowed tool names and opaque OS-vault credential reference. No upstream bearer enters provider environment, MCP JSON, arguments or logs. The helper loads the scoped credential itself from the native vault. It never receives the GUI bearer.
 
 The executable's stdio helper mode permits initialize, ping, lifecycle notifications, filtered tools/list and exact allowlisted tools/call. Reject all other methods and tool names. Forward only to the fixed configured origin with redirects disabled, bounded response/frame sizes, deadlines, protocol/session headers and explicit lost/unknown state. A changed endpoint, tool list, vault generation or policy revision requires a new admitted helper configuration. Foreign/stale configuration cannot broaden access. Browser/desktop/hive capabilities remain disabled unless their actual discovered names were explicitly selected; no disabled bridge/old Hive workflow is revived.
