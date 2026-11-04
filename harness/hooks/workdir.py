@@ -648,7 +648,17 @@ def _scratch_base() -> Path:
     return scratch_root() / (f"claude-{uid}" if uid is not None else "claude")
 
 
-def task_output_candidates(now: float | None = None, days: float = DEFAULT_TASK_OUTPUT_DAYS) -> list[Path]:
+def durable_tmp_disabled() -> bool:
+    """The installer's remembered --no-durable-tmp choice."""
+    try:
+        state = json.loads((home() / ".agent-harness" / "install-state.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(state, dict) and state.get("durable_tmp") is False
+
+
+def task_output_candidates(now: float | None = None, days: float = DEFAULT_TASK_OUTPUT_DAYS,
+                           current_session: str | None = None) -> list[Path]:
     """Old Claude Code background-task output files in the durable scratch root only."""
     now = time.time() if now is None else now
     base, found = _scratch_base(), []
@@ -661,7 +671,8 @@ def task_output_candidates(now: float | None = None, days: float = DEFAULT_TASK_
     for project in projects:
         try:
             sessions = [e for e in os.scandir(project.path)
-                        if e.is_dir(follow_symlinks=False) and SESSION_UUID.fullmatch(e.name)]
+                        if e.is_dir(follow_symlinks=False) and SESSION_UUID.fullmatch(e.name)
+                        and e.name != current_session and not os.path.lexists(Path(e.path) / KEEP)]
         except OSError:
             continue
         for session in sessions:
@@ -722,8 +733,9 @@ def open_files(paths: list[Path], run=None) -> set | None:
 
 
 def prune_task_output(apply: bool, days: float = DEFAULT_TASK_OUTPUT_DAYS, now: float | None = None,
-                      open_check=open_files) -> dict:
-    found = task_output_candidates(now, days)
+                      open_check=open_files, current_session: str | None = None) -> dict:
+    now = time.time() if now is None else now
+    found = task_output_candidates(now, days, current_session)
     held = open_check(found)
     if held is None:
         return {"status": "SKIPPED", "reason": "could not determine which files are open; deleted nothing",
@@ -734,7 +746,8 @@ def prune_task_output(apply: bool, days: float = DEFAULT_TASK_OUTPUT_DAYS, now: 
         for path in removable:
             try:
                 info = os.stat(path, follow_symlinks=False)
-                if stat.S_ISREG(info.st_mode) and not _protected(path):
+                # Re-check age just before unlinking: a file written since the open check is kept.
+                if stat.S_ISREG(info.st_mode) and not _protected(path) and now - info.st_mtime >= days * DAY:
                     os.unlink(path)
                     removed.append(str(path))
             except OSError as exc:
@@ -743,19 +756,26 @@ def prune_task_output(apply: bool, days: float = DEFAULT_TASK_OUTPUT_DAYS, now: 
             "open": sorted(held), "removed": removed, "errors": errors}
 
 
-def spawn_task_output_prune(now: float | None = None, popen=None) -> bool:
-    """At most daily, start a detached task-output prune so the session hook never waits on lsof."""
+def spawn_task_output_prune(now: float | None = None, popen=None, session_id: str | None = None) -> bool:
+    """At most daily, start a detached task-output prune so the session hook never waits on lsof.
+
+    It only reports unless AGENT_HARNESS_TASK_OUTPUT_PRUNE=apply: deleting Claude task output with no
+    backup needs the user's explicit choice.
+    """
     import subprocess
     now = time.time() if now is None else now
     stamp = work_root() / TASK_STAMP
     try:
-        if not _scratch_base().is_dir() or os.path.islink(stamp) or now - _mtime(stamp) < DAY:
+        if (durable_tmp_disabled() or not _scratch_base().is_dir() or os.path.islink(stamp)
+                or now - _mtime(stamp) < DAY):
             return False
         work_root().mkdir(mode=0o700, parents=True, exist_ok=True)
         os.close(os.open(stamp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600))
         os.utime(stamp, (now, now))
-        (popen or subprocess.Popen)([sys.executable, str(Path(__file__).resolve()), "prune-task-output", "--apply",
-                                     "--report", str(work_root() / TASK_REPORT)],
+        mode = ["--apply"] if os.environ.get("AGENT_HARNESS_TASK_OUTPUT_PRUNE") == "apply" else []
+        current = ["--current-session", session_id] if session_id and SESSION_UUID.fullmatch(session_id) else []
+        (popen or subprocess.Popen)([sys.executable, str(Path(__file__).resolve()), "prune-task-output", *mode,
+                                     *current, "--report", str(work_root() / TASK_REPORT)],
                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
         return True
@@ -777,18 +797,20 @@ def main(argv: list[str] | None = None) -> int:
                      help="idle days for session directories in the durable scratch root")
     cmd.add_argument("--current-session", help="session id that is never eligible")
     cmd.add_argument("--include-task-output", action="store_true",
-                     help="also delete Claude Code task output (tasks/); only after a verified backup")
+                     help="also delete Claude Code task output (tasks/); it is not backed up")
     task = sub.add_parser("prune-task-output",
-                          help=f"remove Claude task output older than {DEFAULT_TASK_OUTPUT_DAYS} days that no "
-                               "live process holds open (runs daily from SessionStart)")
+                          help=f"list (default) or remove Claude task output older than {DEFAULT_TASK_OUTPUT_DAYS} "
+                               "days that no live process holds open; SessionStart runs it daily, deleting "
+                               "only when AGENT_HARNESS_TASK_OUTPUT_PRUNE=apply")
     task.add_argument("--apply", action="store_true", help="delete; otherwise list")
     task.add_argument("--days", type=float, default=DEFAULT_TASK_OUTPUT_DAYS)
     task.add_argument("--report", type=Path, help="also write the JSON result to this private file")
+    task.add_argument("--current-session", help="session id whose task output is never removed")
     args = parser.parse_args(argv)
     if args.action == "prune-task-output":
         if args.days < 1:
             parser.error("retention periods must be at least 1 day")
-        result = prune_task_output(args.apply, args.days)
+        result = prune_task_output(args.apply, args.days, current_session=args.current_session)
         text = json.dumps(result, indent=2)
         print(text)
         if args.report:

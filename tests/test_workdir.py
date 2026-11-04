@@ -389,17 +389,48 @@ class TaskOutputPruneTests(HomeCase):
             result = workdir.open_files([Path("/x/a.output")], run=lambda *a, **k: subprocess.CompletedProcess(a[0], 2, "", "err"))
         self.assertIsNone(result)
 
-    def test_session_start_spawn_is_daily_and_detached(self):
+    def test_session_start_spawn_is_daily_detached_and_report_only_by_default(self):
         self.make("b1.output", 20)
         calls = []
         popen = lambda args, **kwargs: calls.append((args, kwargs))
-        self.assertTrue(workdir.spawn_task_output_prune(popen=popen))
+        self.assertTrue(workdir.spawn_task_output_prune(popen=popen, session_id=UUID))
         self.assertFalse(workdir.spawn_task_output_prune(popen=popen))
         self.assertEqual(len(calls), 1)
         args, kwargs = calls[0]
-        self.assertEqual(args[2:4], ["prune-task-output", "--apply"])
+        self.assertEqual(args[2], "prune-task-output")
+        self.assertNotIn("--apply", args)
+        self.assertEqual(args[args.index("--current-session") + 1], UUID)
         self.assertTrue(kwargs["start_new_session"])
         self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+        os.unlink(self.work / workdir.TASK_STAMP)
+        with patch.dict(os.environ, {"AGENT_HARNESS_TASK_OUTPUT_PRUNE": "apply"}):
+            self.assertTrue(workdir.spawn_task_output_prune(popen=popen))
+        self.assertIn("--apply", calls[1][0])
+
+    def test_spawn_skipped_after_opt_out(self):
+        self.make("b1.output", 20)
+        state = self.home / ".agent-harness" / "install-state.json"
+        state.write_text('{"schema": 1, "durable_tmp": false}')
+        calls = []
+        self.assertFalse(workdir.spawn_task_output_prune(popen=lambda a, **k: calls.append(a)))
+        self.assertEqual(calls, [])
+
+    def test_keep_and_current_session_are_exempt(self):
+        kept = self.make("b1.output", 30)
+        (kept.parent.parent / workdir.KEEP).write_text("")
+        current = self.make("b2.output", 30, session=OTHER_UUID)
+        result = workdir.prune_task_output(True, open_check=lambda p: set(), current_session=OTHER_UUID)
+        self.assertEqual(result["removed"], [])
+        self.assertTrue(kept.exists())
+        self.assertTrue(current.exists())
+
+    def test_file_written_after_check_is_kept(self):
+        path = self.make("b1.output", 30)
+        def check(paths):
+            os.utime(path)  # a writer reopened and appended between the check and the unlink
+            return set()
+        self.assertEqual(workdir.prune_task_output(True, open_check=check)["removed"], [])
+        self.assertTrue(path.exists())
 
 
 if __name__ == "__main__":

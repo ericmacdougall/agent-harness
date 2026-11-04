@@ -147,7 +147,7 @@ def work_dir_context(session_id: str, event: str, data: dict) -> str:
             text += workdir.scratchpad_drift_warning(data.get("scratchpad_dir"))
             if data.get("source") == "startup":
                 text += workdir.retention_hint(session_id)
-            workdir.spawn_task_output_prune()  # detached and at most daily; never waited on
+            workdir.spawn_task_output_prune(session_id=session_id)  # detached, at most daily
         except Exception:
             pass
     return text
