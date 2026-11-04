@@ -1798,13 +1798,15 @@ def main(argv=None) -> int:
         return 0
     payload = None
     if args.command == "hook":
-        _HOOK_STATE["raw"] = sys.stdin.read()
+        # Decoded tolerantly so undecodable bytes are a JSON error, not a crash that blocks every call.
+        _HOOK_STATE["raw"] = sys.stdin.buffer.read().decode("utf-8", errors="replace")
         try:
             payload = json.loads(_HOOK_STATE["raw"])
         except ValueError:
             print("commit-policy: hook payload is not JSON", file=sys.stderr)
             return 2
         payload = payload if isinstance(payload, dict) else {}
+        _HOOK_STATE["payload"] = payload
         _HOOK_STATE["may_commit"] = may_commit(payload)
         if not _HOOK_STATE["may_commit"]:
             return 0  # every non-commit tool call stays independent of the policy file
@@ -1875,7 +1877,8 @@ def main(argv=None) -> int:
 
 
 # What the PreToolUse hook knew before a crash; read only by crash_exit_code.
-_HOOK_STATE = {"raw": None, "may_commit": None}
+_HOOK_STATE = {"raw": None, "payload": None, "may_commit": None}
+GIT_WORD = re.compile(r"\b(?:git|gh)\b", re.IGNORECASE)
 
 
 def crash_exit_code(argv) -> int:
@@ -1892,14 +1895,23 @@ def crash_exit_code(argv) -> int:
         return 1
     if _HOOK_STATE["may_commit"] is not None:
         return 2 if _HOOK_STATE["may_commit"] else 0
-    raw = _HOOK_STATE["raw"]
-    if raw is None or re.search(r"\b(?:git|gh)\b", raw, re.IGNORECASE):
+    raw, payload = _HOOK_STATE["raw"], _HOOK_STATE["payload"]
+    if raw is None or GIT_WORD.search(raw):
         return 2
+    if payload is not None:
+        # The raw text can hide "git" behind JSON escapes (\u0067it); search the decoded payload too.
+        try:
+            decoded = json.dumps(payload, ensure_ascii=False)
+        except (TypeError, ValueError, RecursionError):
+            return 2
+        if GIT_WORD.search(decoded):
+            return 2
     return 0
 
 
 def entry(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    _HOOK_STATE.update(raw=None, payload=None, may_commit=None)  # never decide from a previous call
     try:
         return main(argv)
     except (SystemExit, KeyboardInterrupt):
@@ -1909,9 +1921,22 @@ def entry(argv=None) -> int:
         if code == 1:
             raise
         verdict = "refusing the action (fail-closed)" if code == 2 else "not a commit, allowing it"
-        print(f"commit-policy: internal error ({type(error).__name__}); {verdict}", file=sys.stderr)
+        try:
+            print(f"commit-policy: internal error ({type(error).__name__}); {verdict}", file=sys.stderr)
+        except Exception:  # a closed stderr must not change the decision
+            pass
         return code
 
 
+def _exit(code: int) -> None:
+    """Exit with exactly code: a flush failing on a closed pipe at shutdown would make it 120 (allow)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(code)
+
+
 if __name__ == "__main__":
-    sys.exit(entry())
+    _exit(entry())

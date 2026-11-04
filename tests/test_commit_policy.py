@@ -986,7 +986,50 @@ sys.exit(cp.entry(sys.argv[3:]))
 
     def test_script_entry_point_uses_the_crash_boundary(self):
         source = (HOOKS / "commit_policy.py").read_text(encoding="utf-8")
-        self.assertTrue(source.rstrip().endswith("sys.exit(entry())"))
+        self.assertTrue(source.rstrip().endswith("_exit(entry())"))
+
+    def test_escaped_git_in_crashed_prefilter_blocks(self):
+        # \u0067it decodes to git; the raw-text fallback alone would allow it.
+        runner = self.root / "crash_runner.py"
+        runner.write_text(self.RUNNER)
+        payload = '{"tool_name":"Bash","tool_input":{"command":"\\u0067it commit -m x"}}'
+        result = subprocess.run([sys.executable, str(runner), str(HOOKS), "may_commit", "hook"], input=payload,
+                                text=True, capture_output=True, env=self.env, timeout=60)
+        self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_state_from_a_previous_call_is_not_reused(self):
+        runner = self.root / "stale_runner.py"
+        runner.write_text("""import io, json, sys
+sys.path.insert(0, sys.argv[1])
+import commit_policy as cp
+cp._HOOK_STATE.update(raw="ls", payload={}, may_commit=False)  # left over from an earlier call
+def boom(*a, **k):
+    raise RuntimeError("injected")
+cp.main = boom
+sys.exit(cp.entry(["hook"]))
+""")
+        result = subprocess.run([sys.executable, str(runner), str(HOOKS)], input="", text=True,
+                                capture_output=True, env=self.env, timeout=60)
+        self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_closed_stderr_keeps_the_block_exit(self):
+        runner = self.root / "pipe_runner.py"
+        runner.write_text(self.RUNNER)
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git commit -m x"}})
+        script = (f"import subprocess, sys\n"
+                  f"p = subprocess.Popen([sys.executable, {str(HOOKS / 'commit_policy.py')!r}, 'hook'],\n"
+                  f"    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)\n"
+                  f"p.stderr.close()\n"
+                  f"p.stdin.write({payload.encode()!r}); p.stdin.close()\n"
+                  f"sys.exit(p.wait())\n")
+        result = subprocess.run([sys.executable, "-c", script], env=self.env, cwd=self.repo, timeout=60)
+        self.assertEqual(result.returncode, 2)
+
+    def test_undecodable_stdin_is_a_json_error_not_a_crash(self):
+        result = subprocess.run([sys.executable, str(HOOKS / "commit_policy.py"), "hook"], input=b"\xff\xfe",
+                                capture_output=True, env=self.env, timeout=60)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"not JSON", result.stderr)
 
 
 if __name__ == "__main__":
