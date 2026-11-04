@@ -295,10 +295,12 @@ def domain_lint(text: str, repo, spec_policy: dict):
             found = dg.detect(Path(repo)) if config["source"] != "env HARNESS_DOMAIN_GATES" else []
             return ([f"domain gates disabled by {config['source']} although blockchain work was detected"] if found else []), []
         domains = dg.active_domains(repo, spec_policy)
-        missing = dg.missing_items(text, domains, repo)
+        missing = dg.missing_items(text, domains, repo, strict=config["mode"] == "enforce")
         skipped = not domains and not dg.spec_domains(text) and not dg.is_git_repo(repo)
     except Exception as error:
-        return [f"domain gates could not run ({type(error).__name__}); skipped"], []
+        note = f"domain gates could not run ({type(error).__name__})"
+        enforcing = isinstance(spec_policy.get("domain_gates"), dict) and spec_policy["domain_gates"].get("mode") == "enforce"
+        return ([], [note + "; enforce mode fails closed"]) if enforcing else ([note + "; skipped"], [])
     notes = ["domain gates skipped: --repo is not a git checkout (pass --repo <worktree>)"] if skipped else []
     if not missing:
         return notes, []
@@ -1383,7 +1385,10 @@ def cmd_attach(args, spec_policy):
     problems = lint(text, config)
     core = core_sha(text)
     author = parse_author(spec["header"].get("Author", ""))
-    problems += domain_lint(text, getattr(args, "repo", None) or ".", spec_policy)[1]  # only fails in enforce mode
+    domain_warnings, domain_problems = domain_lint(text, getattr(args, "repo", None) or ".", spec_policy)
+    problems += domain_problems  # only fails in enforce mode
+    for warning in domain_warnings:
+        print(f"spec-flow: warning: {warning}", file=sys.stderr)
     problems += review_problems(entries, core, author)
     if problems:
         raise SpecError("spec not attached:\n" + "\n".join("  - " + p for p in problems))

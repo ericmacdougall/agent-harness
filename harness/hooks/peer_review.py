@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 
 from process import run as run_process, signal_group
@@ -265,9 +266,10 @@ def domain_section(repo: Path, base, changed_paths=None):
         return '', None
     try:
         if changed_paths is None and base:
-            changed_paths = [p for p in git(repo, 'diff', '--name-only', '-z', f'{base}..HEAD').split('\0') if p][:5000]
+            changed_paths = [p for p in git(repo, 'diff', '--name-only', '--no-renames', '-z', f'{base}..HEAD').split('\0') if p][:5000]
         paths = changed_paths or []
-        distrust = domain_gates.OPT_OUT_FILE in paths or not base or len(paths) >= 5000
+        distrust = (not base or len(paths) >= 5000 or any(
+            unicodedata.normalize('NFC', p).casefold().startswith('.harness/') for p in paths))  # case-insensitive volumes
         state = domain_gates.settings(repo, ignore_repo_file=distrust)
         if state['disabled']:
             return '', state['source']

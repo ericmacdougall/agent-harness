@@ -458,6 +458,27 @@ class PeerReviewTests(unittest.TestCase):
         section, source = pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])  # trusted: file existed before the diff
         self.assertEqual((section, source), ("", ".harness/domain-gates.json"))
 
+    def test_case_variant_opt_out_file_is_distrusted(self):
+        repo = make_repo({"foundry.toml": "x"})
+        section, source = pr.domain_section(repo, "b" * 40, changed_paths=[".HARNESS/Domain-Gates.json"])
+        self.assertIn("Domain checklist", section)
+        self.assertIsNone(source)
+
+    def test_repo_file_cannot_switch_off_policy_enforce(self):
+        repo = make_repo({"foundry.toml": "x", ".harness/domain-gates.json": json.dumps({"disabled": True})})
+        self.assertTrue(dg.active_domains(repo, policy={"domain_gates": {"mode": "enforce"}}, env={}))
+        self.assertEqual(dg.active_domains(repo, policy={"domain_gates": {"mode": "warn"}}, env={}), [])
+
+    def test_enforce_fails_closed_on_broken_data(self):
+        repo = make_repo({"foundry.toml": "x"})
+        bad = Path(tempfile.mkdtemp()) / "c.json"
+        bad.write_text("{not json")
+        with mock.patch.object(dg, "CHECKLIST_FILE", bad):
+            warnings, problems = sf.domain_lint(SPEC, repo, {"domain_gates": {"mode": "enforce"}})
+            self.assertTrue(problems)
+            warnings, problems = sf.domain_lint(SPEC, repo, {})
+            self.assertEqual(problems, [])
+
     def test_go_mod_substring_is_not_a_dependency(self):
         self.assertEqual(dg.detect(make_repo({"go.mod": "require example.com/foo/web3stuff v1.0.0\n"})), [])
         self.assertIn("evm", names(dg.detect(make_repo({"go.mod": "require github.com/ethereum/go-ethereum v1.13.0\n"}))))

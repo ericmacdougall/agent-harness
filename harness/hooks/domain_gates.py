@@ -388,8 +388,10 @@ def settings(repo=None, policy=None, env=None, ignore_repo_file: bool = False) -
     config = (policy or {}).get("domain_gates")
     config = config if isinstance(config, dict) else {}
     mode = config.get("mode") if config.get("mode") in ("warn", "enforce") else "warn"
+    # a repo file is repo-controlled text: it can opt out in warn mode but never switch off a policy-level enforce
+    repo_off = mode != "enforce" and repo_options(repo, ignore_repo_file).get("disabled") is True
     disabled = (str(env.get("HARNESS_DOMAIN_GATES", "")).strip().lower() in DISABLE_VALUES
-                or config.get("disabled") is True or repo_options(repo, ignore_repo_file).get("disabled") is True)
+                or config.get("disabled") is True or repo_off)
     source = ("env HARNESS_DOMAIN_GATES" if str(env.get("HARNESS_DOMAIN_GATES", "")).strip().lower() in DISABLE_VALUES
               else "spec_policy.json" if config.get("disabled") is True else OPT_OUT_FILE)
     return {"disabled": disabled, "mode": mode, "source": source if disabled else None}
@@ -484,8 +486,11 @@ def waived_items(spec_text: str) -> set:
             if len(m.group(2).strip()) >= 10 and "<" not in m.group(2) and len(set(m.group(2).lower())) >= 6}
 
 
-def missing_items(spec_text: str, domains, repo=None) -> list:
-    """Checklist item ids with neither a NEG case naming them nor a valid waiver line."""
+def missing_items(spec_text: str, domains, repo=None, strict: bool = False) -> list:
+    """Checklist item ids with neither a NEG case naming them nor a valid waiver line.
+
+    A broken data file gives [] unless strict, where it raises ValueError (enforce mode must not pass silently).
+    """
     try:
         data = merged_data(repo)
         keys = []
@@ -506,6 +511,8 @@ def missing_items(spec_text: str, domains, repo=None) -> list:
                     missing.append(item["id"])
         return missing
     except (ValueError, KeyError):
+        if strict:
+            raise ValueError("domain checklist data unusable")
         return []
 
 
