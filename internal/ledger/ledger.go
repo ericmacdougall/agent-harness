@@ -37,6 +37,7 @@ const LockWait = 10 * time.Second
 const (
 	FakeNowEnv        = "HARNESS_LEDGER_FAKE_NOW_MS"
 	CrashAfterCASEnv  = "HARNESS_LEDGER_TEST_CRASH_AFTER_CAS"
+	LockWaitEnv       = "HARNESS_LEDGER_TEST_LOCK_WAIT_MS"
 	DirName           = "goodqa"
 	projectsFile      = "projects.json"
 	trustFile         = "trust.json"
@@ -59,6 +60,19 @@ var (
 
 func wrap(kind error, format string, a ...any) error {
 	return fmt.Errorf("%w: %s", kind, fmt.Sprintf(format, a...))
+}
+
+// CheckTestEnv refuses test-only variables in release builds, before any work is done.
+func CheckTestEnv() error {
+	if writer.TestHooksAllowed {
+		return nil
+	}
+	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, writer.FakeMachineIDEnv} {
+		if _, ok := os.LookupEnv(k); ok {
+			return wrap(ErrUsage, "%s is a test-only variable and is refused by release builds", k)
+		}
+	}
+	return nil
 }
 
 // Now returns the current time in ms (or the development-build fake clock).
@@ -586,9 +600,15 @@ type Result struct {
 }
 
 func (l *Ledger) lock() (*lock.Lock, error) {
-	lk, err := lock.Acquire(filepath.Join(l.Root, DirName, lockFile), lock.Wait(LockWait))
+	wait := LockWait
+	if v := os.Getenv(LockWaitEnv); v != "" && writer.TestHooksAllowed {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			wait = time.Duration(ms) * time.Millisecond
+		}
+	}
+	lk, err := lock.Acquire(filepath.Join(l.Root, DirName, lockFile), lock.Wait(wait))
 	if errors.Is(err, lock.ErrBusy) {
-		return nil, wrap(ErrBusy, "another process holds the ledger lock (waited %s)", LockWait)
+		return nil, wrap(ErrBusy, "another process holds the ledger lock (waited %s)", wait)
 	}
 	if err != nil {
 		return nil, wrap(ErrRefused, "cannot take the ledger lock: %v", err)
@@ -664,7 +684,7 @@ func (l *Ledger) Append(drafts []op.Draft, opts AppendOptions, check func(*fold.
 	if err != nil {
 		return nil, err
 	}
-	res, err := l.appendLocked(drafts, check)
+	res, err := l.appendLocked(drafts, opts, check)
 	lk.Close()
 	if err != nil {
 		return nil, err
@@ -673,7 +693,7 @@ func (l *Ledger) Append(drafts []op.Draft, opts AppendOptions, check func(*fold.
 	return res, nil
 }
 
-func (l *Ledger) appendLocked(drafts []op.Draft, check func(*fold.View, []op.Draft) error) (*Result, error) {
+func (l *Ledger) appendLocked(drafts []op.Draft, opts AppendOptions, check func(*fold.View, []op.Draft) error) (*Result, error) {
 	now, err := Now()
 	if err != nil {
 		return nil, err
@@ -693,6 +713,11 @@ func (l *Ledger) appendLocked(drafts []op.Draft, check func(*fold.View, []op.Dra
 		}
 		if check != nil {
 			if err := check(v, drafts); err != nil {
+				return nil, err
+			}
+			// check may build payloads (ticket.create needs the fresh status list), so scan again here:
+			// every byte that reaches mint has passed the secret scan.
+			if err := scanDrafts(drafts, opts.RedactSecrets); err != nil {
 				return nil, err
 			}
 		}

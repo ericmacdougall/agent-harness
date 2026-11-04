@@ -93,7 +93,10 @@ func Main(args []string, env Env) int {
 			asJSON = true
 		}
 	}
-	err := run(cmd, rest, env)
+	err := ledger.CheckTestEnv()
+	if err == nil {
+		err = run(cmd, rest, env)
+	}
 	if err == nil {
 		return 0
 	}
