@@ -51,11 +51,14 @@ An agent cannot mark a harness ticket done without proof.
 ## Acceptance criteria
 
 - AC-1: done refuses a ticket without evidence. Verify by: tests.test_spec_flow DoneGate.
+  Source: ticket:GoodQA harness#14398
 - AC-2: done passes a complete ticket. Verify by: live check RT2.
+  Source: ticket:GoodQA harness#14398
 
 ## Negative cases
 
 - NEG-1 (AC-1): a tampered attachment is not accepted.
+  Source: ticket:GoodQA harness#14398
 
 ## Risks
 

@@ -332,8 +332,18 @@ def load_record(path: Path, key: str, value: str):
     # Compact `"key":"value"` first: it matches only the record's own field, not parentUuid references or
     # quotes of the id elsewhere. The bare-value pass handles differently spaced JSON and costs one more scan.
     first = load_lines(path, f'"{key}":"{value}"'.encode("utf-8"), key, value)
-    return first if first not in (None, "malformed") else (
-        load_lines(path, value.encode("utf-8"), key, value) or first)
+    if first not in (None, "malformed") or _compact_json(path, key):
+        return first
+    return load_lines(path, value.encode("utf-8"), key, value) or first
+
+
+def _compact_json(path: Path, key: str) -> bool:
+    """True when the file's first megabyte already shows compact `"key":"` fields, so a miss is a real miss."""
+    try:
+        with open(path, "rb") as handle:
+            return f'"{key}":"'.encode() in handle.read(1 << 20)
+    except OSError:
+        return False
 
 
 def load_lines(path: Path, needle: bytes, key: str, value: str):
