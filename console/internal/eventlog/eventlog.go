@@ -105,6 +105,17 @@ func LockDir(dir string) (*DirLock, error) {
 	return &DirLock{dir: dir, unlock: unlock}, nil
 }
 
+// Exists reports whether dir has, or had, an event log: the log file or the marker
+// written when it was created.
+func Exists(dir string) bool {
+	for _, name := range []string{fileName, markerName} {
+		if _, err := os.Lstat(filepath.Join(dir, name)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // Dir is the locked directory.
 func (d *DirLock) Dir() string { return d.dir }
 

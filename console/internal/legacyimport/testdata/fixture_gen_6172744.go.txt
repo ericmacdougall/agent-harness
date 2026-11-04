@@ -1,0 +1,225 @@
+package main
+
+// Fixture generator for K3, built against 6172744's own package. It writes 0.1.0
+// data directories with record() and saveInputsLocked(), then opens a copy of each
+// with newApp() and records whether 0.1.0 starts on it and what it restores.
+// Synthetic content only. Run: FIXTURE_OUT=<dir> go test -run TestGenerateFixtures
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+)
+
+func fixtureApp(t *testing.T, dir string) *app {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "sessions.jsonl"), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return &app{dataDir: dir, journal: f}
+}
+
+func fsession(id, provider string) *session {
+	s := emptySession(provider, "/work/"+id, "")
+	s.ID, s.ProviderID = id, "prov-"+id
+	return s
+}
+
+func must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func receipts(t *testing.T, a *app) {
+	for _, flow := range []struct {
+		id, provider string
+		states       []string
+	}{
+		{"created", "claude", []string{"created"}},
+		{"intent", "codex", []string{"created", "intent"}},
+		{"accepted", "codex", []string{"created", "intent", "accepted"}},
+		{"final", "claude", []string{"created", "intent", "accepted", "final"}},
+		{"rejected", "codex", []string{"created", "intent", "rejected"}},
+		{"unknown", "codex", []string{"created", "intent", "unknown"}},
+		{"paused", "codex", []string{"created", "intent", "accepted", "paused"}},
+		{"cwdafter", "claude", []string{"created", "intent", "final", "cwd"}},
+		{"closed", "codex", []string{"created", "intent", "final", "closed"}},
+	} {
+		s := fsession(flow.id, flow.provider)
+		for _, state := range flow.states {
+			request := ""
+			switch state {
+			case "intent", "accepted", "final", "rejected", "unknown", "paused":
+				request = "req-" + flow.id
+			}
+			if state == "cwd" {
+				s.CWD = "/work/moved"
+			}
+			must(t, a.record(s, request, state))
+		}
+	}
+	// admission_failed is written with an empty provider ID.
+	s := emptySession("codex", "/work/af", "")
+	s.ID = "admission"
+	must(t, a.record(s, "", "admission_failed"))
+}
+
+func checkpointAndReview(t *testing.T, a *app) {
+	s := fsession("task", "codex")
+	s.task = &trackedTask{ID: "task-1", Generation: 2, InputRevision: 3, ObjectiveHash: objectiveHash("objective"), State: "running", Stage: "plan", passes: map[string]string{"plan": "d1"}, attempts: map[string]int{}}
+	s.task.objective = "objective"
+	must(t, a.record(s, "", "created"))
+	must(t, a.record(s, "", "checkpoint:running:plan:task-1:2"))
+	must(t, a.record(s, "req-task", "intent"))
+	must(t, a.record(s, "req-task", "final"))
+	r := fsession("review", "codex")
+	r.reviewParent, r.reviewTaskID, r.reviewGeneration, r.reviewStage = "task", "task-1", 2, "plan"
+	must(t, a.record(r, "req-review", "review_unknown"))
+}
+
+func many(t *testing.T, a *app) {
+	for i := 0; i < 30; i++ {
+		s := fsession(fmt.Sprintf("m%02d", i), "codex")
+		must(t, a.record(s, "", "created"))
+		if i%7 == 0 {
+			must(t, a.record(s, "req-m", "intent"))
+		}
+	}
+}
+
+func queue(t *testing.T, a *app, id string, identity string) {
+	s := fsession(id, "codex")
+	must(t, a.record(s, "", "created"))
+	attachments := filepath.Join(a.dataDir, "attachments")
+	must(t, os.MkdirAll(attachments, 0o700))
+	body := []byte("synthetic attachment " + id)
+	path := filepath.Join(attachments, "0123456789abcdef0123456789abcdef-note.txt")
+	must(t, os.WriteFile(path, body, 0o600))
+	sum := sha256.Sum256(body)
+	text := "synthetic queued text " + id
+	s.inputs = []*queuedInput{{RequestID: "q-" + id, RequestHash: objectiveHash("rh-" + id), Status: "queued", CreatedAt: "2026-11-03T10:00:00Z", Text: text, PayloadHash: objectiveHash(text), Snapshots: map[string]attachmentSnapshot{"/user/note.txt": {Path: path, Hash: hex.EncodeToString(sum[:]), Size: int64(len(body)), DirectoryIdentity: identity}}}}
+	must(t, a.saveInputsLocked(s))
+}
+
+// observe opens a copy of dir with the real 0.1.0 startup and records the outcome.
+func observe(t *testing.T, dir string) string {
+	copyDir := filepath.Join(t.TempDir(), "data")
+	must(t, copyTree(dir, copyDir))
+	a, err := newApp(copyDir, nil)
+	if err != nil {
+		return "refuses: " + err.Error() + "\n"
+	}
+	defer a.close()
+	lines := []string{"starts"}
+	for _, s := range a.sessions {
+		lines = append(lines, fmt.Sprintf("session %s status=%s inputs=%d", s.ID, s.Status, len(s.inputs)))
+	}
+	for _, r := range a.reviews {
+		lines = append(lines, "review "+r.ID+" parent="+r.reviewParent)
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func copyTree(from, to string) error {
+	return filepath.Walk(from, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(from, path)
+		target := filepath.Join(to, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o700)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		// Snapshot paths are absolute, so the copy points them at itself, as a test
+		// harness installing a fixture does.
+		data = []byte(strings.ReplaceAll(string(data), from, to))
+		return os.WriteFile(target, data, 0o600)
+	})
+}
+
+// finish replaces the generation directory path with a placeholder, so tests can
+// install a fixture anywhere, and writes the 0.1.0 observation beside it.
+func finish(t *testing.T, out, name, dir string) {
+	target := filepath.Join(out, name)
+	must(t, os.MkdirAll(filepath.Join(target, "data"), 0o755))
+	var names []string
+	must(t, filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || info.Name() == "console.lock" {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, path)
+		names = append(names, rel)
+		return nil
+	}))
+	sort.Strings(names)
+	for _, rel := range names {
+		data, err := os.ReadFile(filepath.Join(dir, rel))
+		must(t, err)
+		data = []byte(strings.ReplaceAll(string(data), dir, "@DATADIR@"))
+		dest := filepath.Join(target, "data", rel)
+		must(t, os.MkdirAll(filepath.Dir(dest), 0o755))
+		must(t, os.WriteFile(dest, data, 0o644))
+	}
+	must(t, os.WriteFile(filepath.Join(target, "observed-0.1.txt"), []byte(observe(t, dir)), 0o644))
+}
+
+func TestGenerateFixtures(t *testing.T) {
+	out := os.Getenv("FIXTURE_OUT")
+	if out == "" {
+		t.Skip("FIXTURE_OUT not set")
+	}
+	build := func(name string, fill func(*app)) string {
+		dir := filepath.Join(t.TempDir(), "data")
+		a := fixtureApp(t, dir)
+		fill(a)
+		return dir
+	}
+	all := build("receipts", func(a *app) { receipts(t, a); checkpointAndReview(t, a) })
+	finish(t, out, "receipts", all)
+	finish(t, out, "many", build("many", func(a *app) { many(t, a) }))
+	finish(t, out, "queue", build("queue", func(a *app) { queue(t, a, "qs", "1:2") }))
+	finish(t, out, "queue-no-identity", build("queue-no-identity", func(a *app) { queue(t, a, "qn", "") }))
+	orphan := build("orphan", func(a *app) {
+		queue(t, a, "orph", "1:2")
+		s := fsession("orph", "codex")
+		must(t, a.record(s, "", "closed"))
+	})
+	finish(t, out, "orphan-queue", orphan)
+	corrupt := build("corrupt-queue", func(a *app) { queue(t, a, "cq", "1:2") })
+	sum := sha256.Sum256([]byte("cq"))
+	must(t, os.WriteFile(filepath.Join(corrupt, "queued-inputs", hex.EncodeToString(sum[:])+".json"), []byte("{not json"), 0o600))
+	finish(t, out, "corrupt-queue", corrupt)
+	torn := build("torn", func(a *app) { receipts(t, a) })
+	f, err := os.OpenFile(filepath.Join(torn, "sessions.jsonl"), os.O_APPEND|os.O_WRONLY, 0o600)
+	must(t, err)
+	_, err = f.WriteString(`{"at":"2026-11-03T10:00:00Z","sessionId":"torn","prov`)
+	must(t, err)
+	f.Close()
+	finish(t, out, "torn-tail", torn)
+	bad := build("corrupt-line", func(a *app) { receipts(t, a) })
+	data, err := os.ReadFile(filepath.Join(bad, "sessions.jsonl"))
+	must(t, err)
+	lines := strings.SplitAfter(string(data), "\n")
+	lines = append(lines[:3], append([]string{"not json at all\n"}, lines[3:]...)...)
+	must(t, os.WriteFile(filepath.Join(bad, "sessions.jsonl"), []byte(strings.Join(lines, "")), 0o600))
+	finish(t, out, "corrupt-line", bad)
+	empty := filepath.Join(t.TempDir(), "data")
+	must(t, os.MkdirAll(empty, 0o700))
+	finish(t, out, "missing-journal", empty)
+}

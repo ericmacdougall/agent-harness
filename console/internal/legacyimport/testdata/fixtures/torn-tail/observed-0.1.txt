@@ -1,0 +1,1 @@
+refuses: console journal is incomplete; preserve it for recovery

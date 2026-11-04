@@ -1,0 +1,11 @@
+starts
+session created status=disconnected inputs=0
+session intent status=unknown inputs=0
+session accepted status=unknown inputs=0
+session final status=disconnected inputs=0
+session rejected status=disconnected inputs=0
+session unknown status=disconnected inputs=0
+session paused status=disconnected inputs=0
+session cwdafter status=disconnected inputs=0
+session task status=disconnected inputs=0
+review review parent=task
