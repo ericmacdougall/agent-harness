@@ -61,6 +61,11 @@ class NetwatchInstallTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name).resolve()
+        # The suite may itself run with the opt-out set; these tests choose it.
+        env = unittest.mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(nw.OPT_OUT_ENV, None)
         self.key = "linux_amd64"
         self.archive = tar_archive(self.key, [(f"netwatch_{VERSION}_{self.key}/netwatch", VERSION.encode(), "file"),
                                               (f"netwatch_{VERSION}_{self.key}/README.md", b"docs", "file")])
@@ -287,7 +292,6 @@ class NetwatchInstallTests(unittest.TestCase):
         self.assertEqual(os.stat(self.home / ".agent-harness" / nw.STATE_FILE).st_mode & 0o777, 0o600)
         nw.save_choice(self.home, True)
         os.environ[nw.OPT_OUT_ENV] = "0"
-        self.addCleanup(os.environ.pop, nw.OPT_OUT_ENV, None)
         self.assertFalse(nw.choice(self.home, None))
 
     def test_non_https_download_refused(self):

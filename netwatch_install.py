@@ -168,11 +168,6 @@ def file_sha256(path: Path) -> str | None:
         return None
 
 
-def version_tuple(version: str | None):
-    m = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", version or "")
-    return tuple(int(x) for x in m.groups()) if m else None
-
-
 def installed_version(binary: Path, run=subprocess.run) -> str | None:
     if not binary.is_file():
         return None
