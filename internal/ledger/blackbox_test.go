@@ -1035,50 +1035,43 @@ func TestUnverifiedChainCapped(t *testing.T) {
 	w.newTicket(w.repo, nil, "still writable")
 }
 
-// Finding 1 (delta review): a restored writer entry is self only while its ref in the repository matches
-// this HOME's mirror, so a writer.json entry naming a registered writer cannot vouch for a forged ref.
-// Finding 4: a ref the mirror lacks does not block init --from-mirror.
-func TestRestoredWriterTiedToHomeMirror(t *testing.T) {
+// Findings 1 and 4 (delta reviews of 8e88ffe and de40ada): a restored writer's packs are read from this
+// HOME's mirror, never from the repository, so a forged ref (or forged objects, commit-graph or grafts in
+// a copied .git) under a registered writer's name is not trusted, and a restored clone keeps working while
+// the original checkout goes on writing. A ref the mirror lacks does not block init --from-mirror.
+func TestRestoredWriterReadFromHomeMirror(t *testing.T) {
 	w := newWorld(t)
 	project := w.jsonOK(w.repo, nil, "init", "--slug", "tied")["project"].(string)
 	for i := 0; i < 3; i++ {
 		w.newTicket(w.repo, nil, fmt.Sprintf("t%d", i))
 	}
 	old := w.ownRefs()[0]
-	tip := strings.TrimSpace(w.git(w.repo, "rev-parse", old))
-	os.RemoveAll(filepath.Join(w.repo, ".git"))
-	w.git(w.repo, "init", "-q")
+	mirror := filepath.Join(w.home, ".agent-harness", "ledgers", project, "mirror.git")
+	clone := filepath.Join(filepath.Dir(w.repo), "clone")
+	w.git(filepath.Dir(w.repo), "init", "-q", clone)
 	// An extra ref (a collaborator's, or planted) is already in the fresh repository.
 	stray, _ := op.NewID(op.PrefixWriter, 1767225600000)
-	w.git(w.repo, "fetch", "-q", filepath.Join(w.home, ".agent-harness", "ledgers", project, "mirror.git"),
-		"+"+old+":"+store.RefName(project, stray))
-	w.ok(w.repo, nil, "init", "--from-mirror", "--slug", "tied")
-	if got := titles(w.jsonOK(w.repo, nil, "list")); len(got) != 3 {
+	w.git(clone, "fetch", "-q", mirror, "+"+old+":"+store.RefName(project, stray))
+	w.ok(clone, nil, "init", "--from-mirror", "--slug", "tied")
+	if got := titles(w.jsonOK(clone, nil, "list")); len(got) != 3 {
 		t.Fatalf("restored list %v", got)
 	}
-	_, oldWriter, _ := store.ParseRefName(old)
-	classOf := func() string {
-		var st struct {
-			Writers []struct{ ID, Class string }
-		}
-		if err := json.Unmarshal([]byte(w.ok(w.repo, nil, "status", "--json")), &st); err != nil {
-			t.Fatal(err)
-		}
-		for _, x := range st.Writers {
-			if x.ID == oldWriter {
-				return x.Class
-			}
-		}
-		return ""
+	// The original checkout writes again; the clone's copy of that ref is now behind the mirror.
+	w.newTicket(w.repo, nil, "t3 from the original")
+	if got := titles(w.jsonOK(clone, nil, "list")); len(got) != 4 {
+		t.Fatalf("restored clone after the original wrote again: %v", got)
 	}
-	if c := classOf(); c != "self" {
-		t.Fatalf("control: restored writer is %q, want self", c)
-	}
-	// Move the restored writer's ref off the mirror's tip (a truncated chain stands in for a forged one).
-	// Its ops (the project root among them) then stop folding, so the ledger refuses rather than trusting it.
-	w.git(w.repo, "update-ref", old, tip+"~1", tip)
-	if r := w.run(w.repo, nil, "tickets", "status", "--json"); r.code != 3 || strings.Contains(r.stdout, `"class":"self"`) {
-		t.Fatalf("a restored writer whose ref differs from this HOME's mirror is still trusted: exit %d %s", r.code, r.stdout)
+	// Point the clone's ref at a forged chain: a pack claiming to be that writer's, with a ticket.
+	forged := filepath.Join(filepath.Dir(w.repo), "forger")
+	w.git(filepath.Dir(w.repo), "init", "-q", forged)
+	w.ok(forged, nil, "init", "--slug", "forger")
+	w.newTicket(forged, nil, "FORGED")
+	ftip := strings.TrimSpace(w.git(forged, "for-each-ref", "--format=%(objectname)", "refs/goodqa/"))
+	w.git(clone, "fetch", "-q", forged, ftip)
+	w.git(clone, "update-ref", old, ftip)
+	list := titles(w.jsonOK(clone, nil, "list"))
+	if len(list) != 4 || strings.Contains(strings.Join(list, ","), "FORGED") {
+		t.Fatalf("a forged repository ref under a restored writer was read: %v", list)
 	}
 }
 

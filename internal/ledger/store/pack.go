@@ -329,6 +329,15 @@ func (g *Git) ReadRefBudget(project, writer, tip string, budgetp *int64, maxChai
 		if co.typ != "commit" || tr.typ != "tree" {
 			return nil, errors.New("unexpected object type")
 		}
+		// rev-list's parents can come from a commit-graph or info/grafts file that travels with a copied
+		// .git; the commit object itself must name the same single parent.
+		parent := ""
+		if i > 0 {
+			parent = commits[i-1]
+		}
+		if commitParents(co.body) != parent {
+			return nil, errors.New("commit parents differ from the walked chain")
+		}
 		packs[i].Commit = c
 		packs[i].Lease = leaseFromMessage(co.body)
 		entries, err := parseTree(tr.body, n)
@@ -435,6 +444,18 @@ func (g *Git) TipHLC(tip string) (op.HLC, error) {
 		return op.HLC{}, errors.New("tip has no single hlc-* entry")
 	}
 	return h, nil
+}
+
+// commitParents returns the commit header's parent ids joined by spaces ("" for a root commit).
+func commitParents(commit []byte) string {
+	hdr, _, _ := bytes.Cut(commit, []byte("\n\n"))
+	var ps []string
+	for _, l := range strings.Split(string(hdr), "\n") {
+		if p, ok := strings.CutPrefix(l, "parent "); ok {
+			ps = append(ps, p)
+		}
+	}
+	return strings.Join(ps, " ")
 }
 
 func leaseFromMessage(commit []byte) string {

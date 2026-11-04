@@ -208,3 +208,31 @@ func TestReadBudgetAndReusedBlob(t *testing.T) {
 		t.Fatalf("reused ops blob: %v", err)
 	}
 }
+
+// Delta review of de40ada: rev-list's parents can come from info/grafts (or a commit-graph) in a copied
+// .git; a chain whose commit objects name other parents is refused.
+func TestGraftedParentsRefused(t *testing.T) {
+	g := bare(t)
+	project, writer := ids(t)
+	c1, err := g.WritePack("", []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base}, op.KindProjectCreate)}, "lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := g.WritePack(c1, []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base + 1}, op.KindTicketCreate)}, "lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.ReadRef(project, writer, c2); err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	// Graft c2 onto nothing: rev-list then walks c2 alone, as a root, while c2 still names c1.
+	if err := os.MkdirAll(g.GitDir+"/info", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(g.GitDir+"/info/grafts", []byte(c2+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.ReadRef(project, writer, c2); err == nil || !strings.Contains(err.Error(), "parents differ") {
+		t.Fatalf("grafted chain read: %v", err)
+	}
+}

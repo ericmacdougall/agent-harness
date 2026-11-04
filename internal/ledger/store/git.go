@@ -32,7 +32,7 @@ const (
 
 // Settings added on top of gitx.BaseSettings for every ledger git call.
 var ledgerSettings = []gitx.Setting{{Key: "maintenance.auto", Value: "false"}, {Key: "gc.auto", Value: "0"},
-	{Key: "protocol.version", Value: "2"}, {Key: "core.askPass", Value: ""}, {Key: "credential.helper", Value: ""},
+	{Key: "protocol.version", Value: "2"}, {Key: "core.commitGraph", Value: "false"}, {Key: "core.askPass", Value: ""}, {Key: "credential.helper", Value: ""},
 	// The ledger only ever moves objects between local repositories: refuse every other transport, so a
 	// repository's url.*.insteadOf cannot turn a mirror transfer into a network request.
 	{Key: "protocol.allow", Value: "never"}, {Key: "protocol.file.allow", Value: "always"}}

@@ -327,18 +327,21 @@ func MirrorDir(project string) (string, error) {
 
 // ---------------------------------------------------------------------------------------- view
 
-func (l *Ledger) classes() (map[string]string, *writer.Map, error) {
+// classes gives each writer of this checkout its fold class. restored maps each restored writer that counts as self to its tip in this HOME's mirror: its packs are
+// read from the mirror, never from the repository, whose objects, commit-graph and grafts travel with a
+// copied .git.
+func (l *Ledger) classes() (classes map[string]string, restored map[string]string, mirror *store.Git, err error) {
 	m, _, err := writer.Load(l.Dir)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// 0a folds only this machine's own writers. trust.json is not read: no 0a command writes it, and it
 	// would travel with a copied .git. A repository ledger's writer counts as self only when this HOME's
 	// registry recorded it (with the same lease); writer.json alone proves nothing. A repo-less ledger
 	// already lives under this HOME.
 	out := map[string]string{}
+	restored = map[string]string{}
 	var reg map[string]string
-	var mirror *store.Git
 	if l.InRepo {
 		reg = l.registry()
 		if mdir, err := MirrorDir(l.Project); err == nil {
@@ -354,34 +357,38 @@ func (l *Ledger) classes() (map[string]string, *writer.Map, error) {
 		switch {
 		case !ok:
 		case e.Restored && e.Lease == "":
-			// A restored writer never appends again, and its id and lease hash are not secret, so a
-			// planted "restored" entry proves nothing by itself: its ref here must be exactly the ref this
-			// HOME's mirror holds for it.
-			if mirror != nil && l.restoredMatchesMirror(mirror, e.Writer) {
+			// A restored writer's id and lease hash are not secret, so a planted "restored" entry proves
+			// nothing by itself: the writer counts only through the copy of its ref in this HOME's mirror,
+			// and that copy is what is read (the original checkout may still be appending to it).
+			if tip := mirrorTip(mirror, l.Project, e.Writer); tip != "" {
 				out[e.Writer] = fold.ClassSelf
+				restored[e.Writer] = tip
 			}
 		case h == store.LeaseHash(e.Lease):
 			out[e.Writer] = fold.ClassSelf
 		}
 	}
-	return out, m, nil
+	return out, restored, mirror, nil
 }
 
-func (l *Ledger) restoredMatchesMirror(mirror *store.Git, w string) bool {
-	ref := store.RefName(l.Project, w)
-	want, err := mirror.Tip(ref)
-	if err != nil || want == "" {
-		return false
+func mirrorTip(mirror *store.Git, project, w string) string {
+	if mirror == nil {
+		return ""
 	}
-	got, err := l.Git.Tip(ref)
-	return err == nil && got == want
+	tip, err := mirror.Tip(store.RefName(project, w))
+	if err != nil {
+		return ""
+	}
+	return tip
 }
 
 type snapshot struct {
-	tips    map[string]string
-	bad     []string
-	classes map[string]string
-	key     string
+	tips       map[string]string
+	bad        []string
+	classes    map[string]string
+	key        string
+	mirror     *store.Git
+	fromMirror map[string]bool // refs read from the HOME mirror (restored writers)
 }
 
 func (l *Ledger) snapshot() (*snapshot, error) {
@@ -389,9 +396,15 @@ func (l *Ledger) snapshot() (*snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	classes, _, err := l.classes()
+	classes, restored, mirror, err := l.classes()
 	if err != nil {
 		return nil, err
+	}
+	fromMirror := map[string]bool{}
+	src := map[string]any{}
+	for w, tip := range restored {
+		r := store.RefName(l.Project, w)
+		refs[r], fromMirror[r], src[r] = tip, true, "mirror"
 	}
 	tips := map[string]any{}
 	for r, t := range refs {
@@ -406,11 +419,11 @@ func (l *Ledger) snapshot() (*snapshot, error) {
 	for i, b := range bad {
 		badAny[i] = b
 	}
-	k, err := pycompat.Canonical(map[string]any{"v": Version, "project": l.Project, "tips": tips, "classes": cl, "bad": badAny})
+	k, err := pycompat.Canonical(map[string]any{"v": Version, "project": l.Project, "tips": tips, "classes": cl, "bad": badAny, "sources": src})
 	if err != nil {
 		return nil, err
 	}
-	return &snapshot{tips: refs, bad: bad, classes: classes, key: fold.HandleHash(string(k))}, nil
+	return &snapshot{tips: refs, bad: bad, classes: classes, key: fold.HandleHash(string(k)), mirror: mirror, fromMirror: fromMirror}, nil
 }
 
 // readAll reads and validates every writer ref of the project. Refs of other projects and malformed names
@@ -458,7 +471,11 @@ func (l *Ledger) readAll(s *snapshot) (fold.Input, error) {
 			budget, chain = min(store.UnverifiedBudget, viewLeft), store.UnverifiedMaxChain
 		}
 		allowed := budget
-		packs, err := l.Git.ReadRefBudget(proj, w, s.tips[r], &budget, chain)
+		g := l.Git
+		if s.fromMirror[r] {
+			g = s.mirror
+		}
+		packs, err := g.ReadRefBudget(proj, w, s.tips[r], &budget, chain)
 		if !folded(r) {
 			viewLeft -= allowed - budget // what was read, whether or not the ref was then rejected
 		}
