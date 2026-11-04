@@ -26,8 +26,7 @@ type tcase struct {
 	Host        string            `json:"host"`
 	BadByte     bool              `json:"bad_byte"`
 	LauncherDir *uint32           `json:"launcher_dir_mode"`
-	ViaShared   bool              `json:"launcher_via_shared_symlink"`
-	ViaSafe     bool              `json:"launcher_via_safe_symlink"`
+	Link        string            `json:"launcher_link"`
 	Want        string            `json:"want"`
 	Reason      string            `json:"reason"`
 }
@@ -54,16 +53,27 @@ func TestSharedCases(t *testing.T) {
 			mustOK(t, os.Chmod(dir, 0o700))
 			bin := filepath.Join(dir, "launcher", "harness")
 			other := filepath.Join(dir, "other", "harness")
-			if c.ViaShared || c.ViaSafe {
-				// launcher -> shared/x (shared 0777, not sticky) or -> real (0700): the resolved chain decides.
+			if c.Link != "" {
+				// dir/launcher is a symlink (layouts in the cases.json comment); shared is 0777, not sticky.
+				shared := filepath.Join(dir, "shared")
+				if c.Link == "shared" || c.Link == "two_hop_shared" {
+					mustOK(t, os.Mkdir(shared, 0o700))
+					mustOK(t, os.Chmod(shared, 0o777))
+				}
 				real := filepath.Join(dir, "real")
-				if c.ViaShared {
-					real = filepath.Join(dir, "shared", "x")
-					mustOK(t, os.Mkdir(filepath.Dir(real), 0o700))
-					mustOK(t, os.Chmod(filepath.Dir(real), 0o777))
+				if c.Link == "shared" {
+					real = filepath.Join(shared, "x")
 				}
 				mustOK(t, os.Mkdir(real, 0o700))
-				mustOK(t, os.Symlink(real, filepath.Dir(bin)))
+				switch c.Link {
+				case "two_hop_shared":
+					mustOK(t, os.Symlink(real, filepath.Join(shared, "lnk")))
+					mustOK(t, os.Symlink(filepath.Join(shared, "lnk"), filepath.Dir(bin)))
+				case "relative_safe":
+					mustOK(t, os.Symlink("real", filepath.Dir(bin)))
+				default:
+					mustOK(t, os.Symlink(real, filepath.Dir(bin)))
+				}
 			} else {
 				mustOK(t, os.MkdirAll(filepath.Dir(bin), 0o700))
 			}
