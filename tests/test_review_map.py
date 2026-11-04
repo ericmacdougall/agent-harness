@@ -363,5 +363,25 @@ class DeepJsonTests(unittest.TestCase):
                 self.assertEqual(rm.find_wal(["a" * 40], "feat/some-branch", ["GoodQA goodqa#1"], 0, 0), [])
 
 
+class IntegrationReviewRegressions(Base):
+    def test_csp_placeholder_in_file_name_cannot_inject_attributes(self):
+        (self.repo / "a__CSP__ x.txt").write_text("hi\n")
+        sh(self.repo, "add", "."); sh(self.repo, "commit", "-qm", "chore(x): odd name\n\nRefs: none (test)")
+        page = Path(self.generate()[1]["path"]).read_text()
+        self.assertEqual(page.count("default-src 'none'"), 1)
+        self.assertIn("a__CSP__ x.txt", page)
+
+    def test_zero_width_split_secret_is_redacted(self):
+        for gap in ("\u200b", "\ufeff", "\u061c", "\u2060"):
+            self.assertNotIn("abcdefgh", rm.scrub("sk-abcdefgh" + gap + "ijklmnopqrstuv"))
+
+    def test_missing_redactor_reports_json_not_traceback(self):
+        buf = io.StringIO()
+        with mock.patch.dict(sys.modules, {"integrate_local": None}), contextlib.redirect_stdout(buf):
+            code = rm.main(["generate", "--repo", str(self.repo), "--branch=-x", "--no-gh"])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(buf.getvalue())["status"], "ERROR")
+
+
 if __name__ == "__main__":
     unittest.main()

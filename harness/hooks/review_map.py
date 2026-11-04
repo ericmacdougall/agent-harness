@@ -70,7 +70,7 @@ LEAK_SHAPES = re.compile(r"(?:-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|\bgh[pousr]_
                          r"|\b[sr]k_(?:live|test)_[A-Za-z0-9]{8,}|\bxox[abprs]-[A-Za-z0-9-]{8,}|\bnpm_[A-Za-z0-9]{30,}|\bglpat-[A-Za-z0-9_-]{16,}|\bya29\.[A-Za-z0-9_-]{20,}|\b\d{8,10}:[A-Za-z0-9_-]{35}\b)")
 
 
-CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200e\u200f\u202a-\u202e\u2066-\u2069\u200b-\u200d\u2060\ufeff\u061c]")
 HIGH_ENTROPY = re.compile(r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[a-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_-])")
 
 
@@ -890,7 +890,7 @@ def render(model: dict) -> str:
     out.append(f"<script>{JS}</script></body></html>")
     page = "".join(out)
     digest = base64.b64encode(hashlib.sha256(JS.encode()).digest()).decode()
-    return page.replace("__CSP__", f"default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{digest}'; base-uri 'none'; form-action 'none'")
+    return page.replace("__CSP__", f"default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{digest}'; base-uri 'none'; form-action 'none'", 1)  # first hit is the meta tag; later text (file names) must never be substituted
 
 
 # --------------------------------------------------------------------------- output
@@ -1068,7 +1068,11 @@ def main(argv=None) -> int:
     try:
         return {"generate": cmd_generate, "attach": cmd_attach, "list": cmd_list}[args.command](args)
     except MapError as error:
-        print(json.dumps({"status": "ERROR", "error": scrub(str(error))}))
+        try:
+            message = scrub(str(error))
+        except MapError:  # the redactor itself is missing: report without it rather than raise again
+            message = "review_map cannot run: " + str(error)[:200].replace("\n", " ")
+        print(json.dumps({"status": "ERROR", "error": message}))
         return error.code
 
 
