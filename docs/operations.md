@@ -201,8 +201,10 @@ Co-Authored-By: ...
 - **Testing.** Name the exact command and its result. Bare text like "tests pass" is rejected. If you didn't test, write `not run: <reason>`.
 - **Refs.** Reference a GoodQA ticket as `GoodQA #N` (project `goodqa`) or `GoodQA <project-slug>#N`.
   - PR references and `R-NNNNNN` coordinator records are recognized. They do not count as a ticket, because they cannot be verified.
-  - In tracked repositories (origin matches `ticket_systems.*.repos`), only `chore` and `docs` may write `Refs: none (<reason>)`. Every other type needs a GoodQA ticket.
+  - A repository is tracked when the `url` or `pushurl` of any remote, raw or rewritten by `insteadOf`, matches `ticket_systems.*.repos`. Renaming `origin`, pointing it at a fork with a tracked `pushurl`, or tracking only a second remote does not shed the rule. `check-range --push-url <url>` also counts the push destination.
+  - In tracked repositories only `chore` and `docs` may write `Refs: none (<reason>)`. Every other type needs a GoodQA ticket.
   - Other repositories accept `none (<reason>)` for any type.
+  - **Local ledger refs** (`Refs: Ledger <slug>#<8+ hex>`, the `ledger` system) count only in untracked repositories that have a remote, or in remote-less repositories whose absolute top-level path fully matches a regex in `ticket_systems.ledger.allowed_repos` (empty by default). They never satisfy a tracked repository's rule. Each one is resolved through `harness tickets show --json --min-version --as-of --slug`, with a 5-second deadline; a missing, old, hanging or malformed binary rejects the commit as "could not verify". GoodQA verification and delivery comments ignore them. See [the local ledger](ledger.md#commit-policy).
 - **Reverts.** A revert uses type `revert` and includes `Reason:` and `Authorized-by:` lines. In tracked repositories, `Authorized-by:` must cite the GoodQA ticket that records the authorization.
   - A commit is treated as a revert if its body says "This reverts commit", even when its subject uses another type.
   - The policy enforces a recorded and verifiable citation. It cannot prove that a human approved the revert.
@@ -245,7 +247,7 @@ Co-Authored-By: ...
    - It runs alongside each repository's own hooks and never changes `core.hooksPath`.
    - It enforces only when both of these hold:
      - an agent marker is present (`CLAUDECODE`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_SANDBOX` or `AI_AGENT`);
-     - the repository's origin matches `backstop_repos`.
+     - any remote URL of the repository matches `backstop_repos`.
    - Everywhere else it stays silent: human commits, test fixtures, and other repositories that agents run.
    - The installer reports "backstop inactive" when Git is older than 2.54.
    - If the script is removed, the hook command exits 0.
@@ -286,7 +288,7 @@ Co-Authored-By: ...
 
 ### Checks, waivers and audit
 
-- **Check a draft:** `python3 ~/.claude/hooks/commit_policy.py check-message --file msg.txt`
+- **Check a draft:** `python3 ~/.claude/hooks/commit_policy.py check-message --file msg.txt` (add `--repo <checkout>` to apply that repository's tracked-repo rule and resolve `Ledger` refs)
 - **Check a range:** `python3 ~/.claude/hooks/commit_policy.py check-range --repo . --base origin/main --head HEAD --branch <branch> --verify-tickets` (exit 0 pass, 2 blocked, 4 tickets unverified; `deliver.py prepare` reports the last case as exit 6 `TICKETS_UNVERIFIED`)
 - **Waivers.** A waiver is the only exception path. There is no environment-variable bypass.
 
