@@ -208,6 +208,15 @@ class Classification(unittest.TestCase):
         self.assertIn("build", log)
         self.assertNotIn("sk-abcdef", log)
 
+    def test_m2_wrapper_flags_never_swallow_the_command(self):
+        for command in ("env -i pytest", "sudo -n pytest", "sudo -S pytest", "sudo -i pytest", "time -p pytest",
+                        "env FOO=1 pytest", "sudo -u root pytest", "nice -n 5 pytest", "time pytest", "nice pytest",
+                        "env -u FOO pytest", "sudo -E -H npm run build", "nohup nice -n 10 time -p pytest", "env -i FOO=1 npm test",
+                        "caffeinate -i pytest", "stdbuf -oL pytest", "arch -arm64 pytest", "exec pytest", "command pytest"):
+            with self.subTest(command=command):
+                self.assertEqual(decide(command)["action"], "deny", command)
+        self.assertEqual(decide("sudo -u root ls")["action"], "allow")  # control: wrappers around light commands stay allowed
+
     def test_off_mode(self):
         self.assertEqual(guard.decide("pytest", None, dict(MODES, **{"full-suite": "off"})), {"action": "allow"})
 
@@ -317,6 +326,36 @@ def wait_dead(pid, seconds=8):
 def state(pid):
     out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return out
+
+
+class BoundValidation(unittest.TestCase):
+    def run_script(self, script, flags):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp, "ran")
+            done = subprocess.run([sys.executable, str(HOOKS / script)] + flags + ["--", sys.executable, "-c",
+                                  "open(%r,'w').write('x')" % str(marker)], capture_output=True, text=True, timeout=30)
+            return done, marker.exists()
+
+    def test_m1_nan_inf_and_nonpositive_bounds_are_refused_and_nothing_runs(self):
+        for bad in ("nan", "inf", "-inf", "-1", "0", "NaN", "infinity"):
+            done, ran = self.run_script("run_capped.py", ["--max-rss-gb", bad])
+            self.assertEqual(done.returncode, 2, ("capped rss", bad, done.stderr))
+            self.assertFalse(ran, ("capped rss ran", bad))
+        for flag in ("--timeout-s", "--poll-s"):
+            for bad in ("nan", "inf", "-1"):
+                done, ran = self.run_script("run_capped.py", ["--max-rss-gb", "1", flag, bad])
+                self.assertEqual(done.returncode, 2, (flag, bad, done.stderr))
+                self.assertFalse(ran, (flag, bad))
+        base = ["--class", "memory", "--worst-case", "reads /dev/zero: unbounded"]
+        for flag in ("--timeout-s", "--max-rss-gb", "--max-file-mb", "--poll-s"):
+            for bad in ("nan", "inf", "-1"):
+                flags = base + ["--max-rss-gb", "1", "--timeout-s", "5"]
+                flags = [f for i, f in enumerate(flags) if not (flags[i - 1] == flag or f == flag)] + [flag, bad]
+                done, ran = self.run_script("run_probe.py", flags)
+                self.assertEqual(done.returncode, 2, (flag, bad, done.stdout + done.stderr))
+                self.assertFalse(ran, ("probe ran", flag, bad))
+        done, ran = self.run_script("run_probe.py", base + ["--max-rss-gb", "1", "--timeout-s", "5"])  # control: valid runs
+        self.assertEqual((done.returncode, ran), (0, True), done.stdout + done.stderr)
 
 
 class RunCapped(unittest.TestCase):

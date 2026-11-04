@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -58,7 +59,7 @@ def limits():
     except Exception:  # incl. safe_input.InputRejected (FIFO, device, oversize): keep defaults
         pass
     env = os.environ.get("HARNESS_MAX_AGENTS", "")
-    if env.isdigit() and int(env) > 0:
+    if re.fullmatch(r"[0-9]{1,6}", env) and int(env) > 0:  # ASCII digits only: "²" must not raise
         deny_at = int(env)
     return min(warn_at, deny_at), deny_at
 

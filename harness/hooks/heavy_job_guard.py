@@ -173,8 +173,19 @@ REMOTE_CMDS = {"ssh", "scp", "sftp", "rsync", "mosh", "sshpass"}
 PYTHON = re.compile(r"^(?:python|pypy)[\d.]*$")
 NODE_RUNNERS = {"node", "nodejs", "tsx", "ts-node", "deno", "esno"}
 PM = {"npm", "pnpm", "yarn", "bun", "bunx"}
-SHELL_KEYWORDS = {"do", "then", "else", "elif", "{", "}", "!", "if", "while", "until", "time", "coproc"}
-WRAPPER_VALUE_FLAGS = {"-u", "-g", "-n", "-C", "-S", "-p", "-t", "-o", "-i", "--user", "--group", "-U", "--unset"}
+SHELL_KEYWORDS = {"do", "then", "else", "elif", "{", "}", "!", "if", "while", "until", "coproc"}
+# Flags that consume the NEXT token, per wrapper. Anything not listed takes no value, so an unknown flag can never
+# swallow the command it wraps (`env -i pytest`, `sudo -n pytest`, `time -p pytest`).
+WRAPPER_VALUE_FLAGS = {
+    "env": {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"},
+    "sudo": {"-u", "--user", "-g", "--group", "-C", "--close-from", "-h", "--host", "-p", "--prompt", "-r", "--role",
+             "-t", "--type", "-T", "--command-timeout", "-U", "--other-user", "-D", "--chdir", "-R", "--chroot"},
+    "nice": {"-n", "--adjustment"},
+    "time": {"-f", "--format", "-o", "--output"},
+    "caffeinate": {"-t", "-w"},
+    "stdbuf": {"-i", "-o", "-e"},
+    "exec": {"-a"},
+}
 WRAPPERS = {"env", "sudo", "nohup", "time", "command", "exec", "nice", "caffeinate", "stdbuf", "arch",
             "setsid", "builtin"}
 BROWSER_BINS = {"chromium", "chromium-browser", "chrome", "google-chrome", "google-chrome-stable",
@@ -306,9 +317,12 @@ def classify(argv, ctx, depth=0):
         ctx.capped = "--max-rss-gb" in args
         return classify(args[args.index("--") + 1:] if "--" in args else [], ctx, depth + 1)
     if low in WRAPPERS:
-        rest = list(args)
-        while rest and (rest[0].startswith("-") or ASSIGN.match(rest[0]) or rest[0].isdigit()):
-            rest = rest[2:] if rest[0] in WRAPPER_VALUE_FLAGS and low in ("sudo", "env", "nice", "stdbuf", "arch") else rest[1:]
+        rest, valued = list(args), WRAPPER_VALUE_FLAGS.get(low, set())
+        while rest and (rest[0].startswith("-") or (low in ("env", "sudo") and ASSIGN.match(rest[0]))):
+            if rest[0] == "--":
+                rest = rest[1:]
+                break
+            rest = rest[2:] if rest[0] in valued else rest[1:]
         return classify(rest, ctx, depth + 1)
     if low == "eval":
         return classify_text(" ".join(args), ctx, depth + 1)
@@ -632,7 +646,7 @@ def live_heavy_jobs() -> int:
 def max_heavy_jobs() -> int:
     value = 2
     env = os.environ.get("HARNESS_MAX_HEAVY_MAC", "")
-    if env.isdigit() and int(env) > 0:
+    if re.fullmatch(r"[0-9]{1,6}", env) and int(env) > 0:
         return int(env)
     try:
         import json

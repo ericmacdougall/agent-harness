@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -132,6 +133,13 @@ class BudgetParsing(unittest.TestCase):
             self.assertTrue(rb.check(text, host="mac", cap=self.MAC10), bad)
         self.assertEqual(rb.check(base, host="mac", cap=self.MAC10), [])  # control
 
+    def test_l5_extra_tokens_after_the_figure_are_rejected(self):
+        base = packet(host="mac", mem="1 GB", wall="5 min", checkpoint="none")
+        for bad in ("3 GB 900 GB", "3 GB and 900 GB", "3 GB, 900 GB", "3GB 900MB"):
+            self.assertTrue(rb.check(base.replace("Peak memory: 1 GB", "Peak memory: " + bad), host="mac", cap=self.MAC10), bad)
+        self.assertEqual(rb.check(base.replace("Peak memory: 1 GB", "Peak memory: 3 GB"), host="mac",
+                                  cap=dict(self.MAC10, mem_available_gb=20)), [])
+
     def test_redteam_f8_vm_hosts_are_checked_and_decoys_ignored(self):
         text = packet(host="vm:x", mem="900 GB", wall="5 min", checkpoint="none")
         self.assertTrue(any("Capacity" in p for p in rb.check(text)))
@@ -208,6 +216,13 @@ class AgentGate(unittest.TestCase):
         out = subprocess.run([sys.executable, "-c", "import agent_gate;print(agent_gate.limits())"], cwd=str(shutil_dir),
                              capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(shutil_dir)))
         self.assertEqual(out.stdout.strip(), "(3, 5)")
+
+    def test_l3_non_ascii_digit_in_env_keeps_the_default_limit(self):
+        for value in ("\u00b2", "\u0662\u0660", "1e3", "-4"):
+            with unittest.mock.patch.dict(os.environ, {"HARNESS_MAX_AGENTS": value}):
+                self.assertEqual(agent_gate.limits(), (12, 20), value)
+        with unittest.mock.patch.dict(os.environ, {"HARNESS_MAX_AGENTS": "30"}):
+            self.assertEqual(agent_gate.limits()[1], 30)
 
     def test_hook_process_denies_and_fails_open(self):
         home = tempfile.mkdtemp()

@@ -36,6 +36,7 @@ Stdlib only, Python 3.9 compatible.
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import os
 import resource
@@ -48,6 +49,17 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_capped  # noqa: E402
+
+def positive_finite(text):
+    """argparse type: a finite number > 0. NaN/inf would silently disable every comparison against the bound."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"{text!r} must be a finite number greater than 0")
+    return value
+
 
 CLASSES = ("memory", "disk", "cpu", "process", "network", "external-write", "sandbox-escape", "hang")
 REQUIRED_BOUND = {"memory": "max_rss_gb", "disk": "max_file_mb", "process": "max_procs"}
@@ -69,13 +81,13 @@ def parse(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--class", dest="klass", choices=CLASSES)
     parser.add_argument("--worst-case", dest="worst_case")
-    parser.add_argument("--max-rss-gb", type=float, default=0)
-    parser.add_argument("--timeout-s", type=float, default=0)
-    parser.add_argument("--max-file-mb", type=float, default=0)
+    parser.add_argument("--max-rss-gb", type=positive_finite, default=0)
+    parser.add_argument("--timeout-s", type=positive_finite, default=0)
+    parser.add_argument("--max-file-mb", type=positive_finite, default=0)
     parser.add_argument("--max-procs", type=int, default=0)
     parser.add_argument("--net", action="store_true", help="declare that the probe needs the network")
     parser.add_argument("--report")
-    parser.add_argument("--poll-s", type=float, default=0.1)
+    parser.add_argument("--poll-s", type=positive_finite, default=0.1)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     try:

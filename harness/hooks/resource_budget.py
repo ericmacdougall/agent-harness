@@ -80,6 +80,8 @@ def gb(value: str):
     value = head(value)
     if not clean_number(value):
         return None
+    if len(re.findall(NUMBER, value)) != 1:
+        return None  # exactly one figure before the method note: "3 GB 900 GB" is ambiguous
     match = re.search(NUMBER + r"\s*(TB|GB|GiB|G|MB|MiB|M)\b", value, re.I)
     if not match:
         return None
@@ -90,6 +92,8 @@ def gb(value: str):
 def minutes(value: str):
     value = head(value)
     if not clean_number(value):
+        return None
+    if len(re.findall(NUMBER, value)) != 1:
         return None
     match = re.search(NUMBER + r"\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b", value, re.I)
     if not match:
@@ -129,7 +133,9 @@ def lint_budget(text: str):
     parsed["capacity"] = None
     if VM_HOST.match(host):
         cap_text = fields.get("capacity", "")
-        cap_mem, cap_cores = gb(cap_text), re.search(NUMBER + r"\s*cores?\b", cap_text, re.I)
+        mem_match = re.search(NUMBER + r"\s*(TB|GB|GiB|G)\b\s*(?:of\s+)?(?:memory|ram)", cap_text, re.I)
+        cap_mem = (float(mem_match.group(1)) * (1024 if mem_match.group(2).lower() == "tb" else 1)) if mem_match else None
+        cap_cores = re.search(NUMBER + r"\s*cores?\b", cap_text, re.I)
         if cap_mem is None or not cap_cores:
             problems.append("Resource budget: a vm host needs `Capacity:` with memory and cores, e.g. 16 GB memory, 8 cores, 100 GB disk")
         else:
@@ -153,7 +159,7 @@ def lint_budget(text: str):
     if fields.get("peak memory") and not parsed["mem_gb"] > 0:
         problems.append("Resource budget: `Peak memory:` needs one plain positive number with a unit before the method, e.g. 6 GB")
     cpu_head = head(fields.get("cpu", ""))
-    cores = re.search(NUMBER, cpu_head) if clean_number(cpu_head) else None
+    cores = re.search(NUMBER, cpu_head) if clean_number(cpu_head) and len(re.findall(NUMBER, cpu_head)) == 1 else None
     parsed["cores"] = float(cores.group(1)) if cores else 0.0
     if fields.get("cpu") and not parsed["cores"] > 0:
         problems.append("Resource budget: `CPU:` needs one plain positive number of cores before the method")

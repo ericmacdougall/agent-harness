@@ -31,12 +31,30 @@ Stdlib only, Python 3.9 compatible. Linux and macOS (uses `ps -axo`).
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import os
 import signal
 import subprocess
 import sys
 import time
+
+def finite_non_negative(text):
+    """--timeout-s: 0 means no limit; NaN, inf and negatives are refused."""
+    value = positive_finite(text) if float(text) != 0 else 0.0
+    return value
+
+
+def positive_finite(text):
+    """argparse type: a finite number > 0. NaN/inf would silently disable every comparison against the bound."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"{text!r} must be a finite number greater than 0")
+    return value
+
 
 GRACE_S = 2.0
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".agent-harness", "state", "run_capped")
@@ -204,10 +222,10 @@ def write_sidecar(args, child_pid, pgid, command, status="running", note=""):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--max-rss-gb", type=float, required=True)
+    parser.add_argument("--max-rss-gb", type=positive_finite, required=True)
     parser.add_argument("--max-procs", type=int, default=0, help="0 = no limit")
-    parser.add_argument("--timeout-s", type=float, default=0, help="0 = no limit")
-    parser.add_argument("--poll-s", type=float, default=0.2)
+    parser.add_argument("--timeout-s", type=finite_non_negative, default=0, help="0 = no limit")
+    parser.add_argument("--poll-s", type=positive_finite, default=0.2)
     parser.add_argument("--on-breach", choices=("pause", "kill"), default="pause")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
