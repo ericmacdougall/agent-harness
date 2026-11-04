@@ -36,7 +36,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'ticket_adapters.py', 'commit_policy.py', 'commit_policy.json',
                     # Spec flow commands work by hand in Codex; its done hook is Claude Code only.
                     'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
-                    'provenance_hooks.py', 'safe_input.py')
+                    'provenance_hooks.py', 'safe_input.py', 'work_assignments.py', 'work_assignments_policy.json')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
@@ -62,6 +62,35 @@ def managed_command(codex_home: Path) -> str:
 
 def policy_command(codex_home: Path) -> str:
     return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'commit_policy.py')) + ' hook'
+
+
+WORK_ASSIGNMENT_HOOKS = (('SessionStart', None, 'session'), ('UserPromptSubmit', None, 'prompt'), ('Stop', None, 'stop'),
+                         ('PostCompact', None, 'compact'), ('PostToolUse', 'AskUserQuestion|request_user_input', 'ask-answer'),
+                         ('PreToolUse', None, 'guard'), ('SubagentStart', None, 'subagent-start'))
+
+
+def work_assignment_command(codex_home: Path, name: str) -> str:
+    return ('python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'work_assignments.py'))
+            + ' hook ' + name + ' --runtime codex')
+
+
+def merge_work_assignment_hooks(hooks: dict, codex_home: Path) -> None:
+    prefix = 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'work_assignments.py')) + ' hook '
+    for event, matcher, name in WORK_ASSIGNMENT_HOOKS:
+        groups = hooks.setdefault(event, [])
+        if not isinstance(groups, list):
+            raise ValueError(f'hooks.json {event} must be a list')
+        kept = []
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get('hooks'), list):
+                raise ValueError(f'hooks.json {event} has an invalid hook group')
+            handlers = [h for h in group['hooks'] if not (isinstance(h, dict) and str(h.get('command', '')).startswith(prefix))]
+            if handlers:
+                kept.append({**group, 'hooks': handlers})
+        entry = {'hooks': [{'type': 'command', 'command': work_assignment_command(codex_home, name), 'timeout': 10}]}
+        if matcher:
+            entry['matcher'] = matcher
+        hooks[event] = kept + [entry]
 
 
 def merge_hooks(existing: dict, codex_home: Path) -> dict:
@@ -97,6 +126,7 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
             # Commit message policy for every tool (no matcher): shell argv, strings, stdin writes.
             preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 60}]})
         hooks[event] = preserved
+    merge_work_assignment_hooks(hooks, codex_home)
     return result
 
 

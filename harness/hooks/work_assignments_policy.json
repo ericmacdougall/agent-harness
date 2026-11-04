@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "capture": "enforce",
+  "stop": "enforce",
+  "guard": "enforce",
+  "stale_hours": 12,
+  "max_stop_blocks": 3
+}

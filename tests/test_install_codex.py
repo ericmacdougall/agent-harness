@@ -42,6 +42,18 @@ class CodexInstallerTests(unittest.TestCase):
         self.assertIn(f'{end}\nUser instructions after block.\n', merged)
         self.assertEqual(merge_marked(merged, '# Agent Harness for Codex\nNew.'), merged)
 
+    def test_request_ledger_hooks_are_merged_idempotently_for_codex(self):
+        home = Path('/h/.codex')
+        from install_codex import merge_hooks
+        once = merge_hooks({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': 'user-stop'}]}]}}, home)
+        twice = merge_hooks(once, home)
+        self.assertEqual(once, twice)
+        ledger = [h['command'] for e, gs in twice['hooks'].items() for g in gs for h in g['hooks'] if 'work_assignments.py' in h['command']]
+        self.assertEqual(sorted(c.split(' hook ')[1].split()[0] for c in ledger),
+                         sorted(['session', 'prompt', 'stop', 'compact', 'ask-answer', 'guard', 'subagent-start']))
+        self.assertTrue(all(c.endswith('--runtime codex') for c in ledger))
+        self.assertIn('user-stop', [h['command'] for g in twice['hooks']['Stop'] for h in g['hooks']])
+
     def test_toml_multiline_marker_text_is_preserved(self):
         original = 'note = """literal # agent-harness-codex:profile-start data # agent-harness-codex:profile-end retained"""\n'
         merged = merge_config(original, Path('/tmp/private-wals'))

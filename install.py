@@ -23,7 +23,8 @@ END = "<!-- agent-harness:end -->"
 AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py",
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
-         "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py")
+         "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py",
+         "work_assignments.py", "work_assignments_policy.json")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -40,7 +41,7 @@ class DirectoryPublicationError(OSError):
 
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
-            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py")}
+            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "work_assignments.py")}
 
 
 SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
@@ -60,6 +61,24 @@ def provenance_hook_groups(claude: Path) -> dict[str, list[dict]]:
         "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [hook("ask-gate")]}],
         "Stop": [{"hooks": [hook("stop-lint")]}],
         "UserPromptSubmit": [{"hooks": [hook("prompt")]}],
+    }
+
+
+def work_assignment_hook_groups(claude: Path) -> dict[str, list[dict]]:
+    """Request ledger (docs/work-assignments.md): capture, Stop enforcement, re-injection, store guard.
+    Modes live in work_assignments_policy.json. The hooks fail open on their own bugs and record the failure."""
+    script = str(claude / "hooks" / "work_assignments.py")
+
+    def hook(name: str) -> dict:
+        return {"type": "command", "command": "python3", "args": [script, "hook", name], "timeout": 10}
+
+    return {
+        "UserPromptSubmit": [{"hooks": [hook("prompt")]}],
+        "Stop": [{"hooks": [hook("stop")]}],
+        "SessionStart": [{"hooks": [hook("session")]}],
+        "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [hook("ask-answer")]}],
+        "PreToolUse": [{"matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash", "hooks": [hook("guard")]}],
+        "SubagentStart": [{"matcher": SUBAGENT_MATCHER, "hooks": [hook("subagent-start")]}],
     }
 
 
@@ -103,6 +122,8 @@ def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]
     if provenance:
         for event, groups in provenance_hook_groups(claude).items():
             managed.setdefault(event, []).extend(groups)
+    for event, groups in work_assignment_hook_groups(claude).items():
+        managed.setdefault(event, []).extend(groups)
     return managed
 
 
@@ -162,6 +183,9 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
         rule = f"Bash(python3 ~/.claude/hooks/spec_flow.py {action} *)"
         if rule not in allowed:
             allowed.append(rule)
+    rule = "Bash(python3 ~/.claude/hooks/work_assignments.py *)"  # the 24h removal gate lives in the script itself
+    if rule not in allowed:
+        allowed.append(rule)
     rule = "Bash(python3 ~/.claude/hooks/workdir.py prune)"  # dry run only; --apply still asks
     if rule not in allowed:
         allowed.append(rule)
