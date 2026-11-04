@@ -348,13 +348,61 @@ class SpecFlowTests(unittest.TestCase):
         repo = make_repo({"foundry.toml": "x"})
         self.assertEqual(sf.domain_lint(full_neg_spec(), repo, {}), ([], []))
         self.assertEqual(sf.domain_lint(SPEC, make_repo({"a.txt": "x"}), {}), ([], []))
-        self.assertEqual(sf.domain_lint(SPEC, repo, {"domain_gates": {"disabled": True}}), ([], []))
+        quiet = sf.domain_lint(SPEC, make_repo({"a.txt": "x"}), {"domain_gates": {"disabled": True}})
+        self.assertEqual(quiet, ([], []))
+        traced, _ = sf.domain_lint(SPEC, repo, {"domain_gates": {"disabled": True}})
+        self.assertTrue(traced and "disabled by spec_policy.json" in traced[0])  # an opt-out leaves a trace
 
     def test_spec_block_domains_stay_binding(self):
         text = SPEC + "\n" + dg.render_block(["solana"])
         warnings, _ = sf.domain_lint(text, make_repo({"a.txt": "x"}), {})
         self.assertTrue(warnings)
         self.assertEqual(set(dg.missing_items(text, [])), {i["id"] for i in dg.checklist("solana")})  # block alone covers nothing
+
+    def test_hostile_spec_is_fast(self):
+        import time
+        hostile = SPEC + "\n" + "## Domain checklist\n" * 40000
+        started = time.monotonic()
+        dg.missing_items(hostile, ["evm"])
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_decoy_generic_words_do_not_cover_items(self):
+        decoy = SPEC.replace("a zero deposit is refused.", "secret redaction in logs; gas fee ui role label; db migration; "
+                             "signature; confirmation dialog; rollback")
+        self.assertEqual(set(dg.missing_items(decoy, ["evm"])), ITEM_IDS)
+
+    def test_only_neg_bullets_count(self):
+        text = SPEC.replace("- NEG-1 (AC-1): a zero deposit is refused.", "reentrancy and precision and access control\n- loose bullet about oracle")
+        self.assertEqual(set(dg.missing_items(text, ["evm"])), ITEM_IDS)
+
+    def test_waivers_in_fences_or_low_entropy_do_not_count(self):
+        fenced = SPEC + "\n```\nDomain-gate: reentrancy waived (pure library, no calls)\n```\n"
+        self.assertIn("reentrancy", dg.missing_items(fenced, ["evm"]))
+        self.assertIn("reentrancy", dg.missing_items(SPEC + "\nDomain-gate: reentrancy waived (xxxxxxxxxxxx)\n", ["evm"]))
+
+    def test_untracked_files_are_detected(self):
+        repo = make_repo({"README.md": "x"})
+        (repo / "New.sol").write_text("contract N {}")  # not added
+        self.assertIn("evm", names(dg.detect(repo)))
+
+    def test_not_a_git_checkout_warns_instead_of_silent_pass(self):
+        warnings, _ = sf.domain_lint(SPEC, Path(tempfile.mkdtemp()), {})
+        self.assertTrue(any("not a git checkout" in w for w in warnings))
+
+    def test_cargo_table_dependency_and_ledger_word_boundaries(self):
+        self.assertIn("solana", names(dg.detect(make_repo({"Cargo.toml": '[dependencies.anchor-lang]\nversion = "0.30"\n'}))))
+        lb = make_repo({"load_balancer.proto": "message A {}", "go.mod": "require nats.go v1\n"})
+        self.assertEqual(dg.detect(lb), [])
+
+    def test_enforce_applies_at_attach(self):
+        spec = Path(tempfile.mkdtemp()) / "s.md"
+        spec.write_text(SPEC)
+        args = mock.Mock(spec=["spec", "repo"])
+        args.spec, args.repo = str(spec), str(make_repo({"foundry.toml": "x"}))
+        with mock.patch.object(sf, "ticket_config", return_value=(None, None, None)):
+            with self.assertRaises(sf.SpecError) as ctx:
+                sf.cmd_attach(args, {"domain_gates": {"mode": "enforce"}})
+        self.assertIn("domain checklist items", str(ctx.exception))
 
     def test_packet_and_plain_lint_unaffected(self):
         repo = make_repo({"foundry.toml": "x"})
@@ -383,15 +431,46 @@ def sf_template_text():
 class PeerReviewTests(unittest.TestCase):
     def test_section_is_bounded_and_marked(self):
         repo = make_repo({"foundry.toml": "x"})
-        section = pr.domain_section(repo, None)
+        section, _ = pr.domain_section(repo, None)
         self.assertIn("Domain checklist", section)
         self.assertLessEqual(len(section.encode()), pr.DOMAIN_SECTION_LIMIT)
-        self.assertEqual(pr.domain_section(make_repo({"a.txt": "x"}), None), "")
+        self.assertEqual(pr.domain_section(make_repo({"a.txt": "x"}), None), ("", None))
 
     def test_opt_out_env(self):
         repo = make_repo({"foundry.toml": "x"})
         with mock.patch.dict(os.environ, {"HARNESS_DOMAIN_GATES": "off"}):
-            self.assertEqual(pr.domain_section(repo, None), "")
+            section, source = pr.domain_section(repo, "b" * 40, changed_paths=[])
+        self.assertEqual(section, "")
+        self.assertIn("HARNESS_DOMAIN_GATES", source)
+
+    def test_both_domains_keep_their_own_guidance(self):
+        section = dg.packet_section(["evm", "solana"], None)
+        self.assertIn("cross-program invocation", section)
+
+    def test_repo_file_cannot_disable_or_extend_without_trusted_base(self):
+        extra = {"disabled": True, "extra_checklists": {"items": {"my-item": {"title": "t", "neg": "{subject} injected text", "verify": "v"}}}}
+        repo = make_repo({"foundry.toml": "x", ".harness/domain-gates.json": json.dumps(extra)})
+        for base, paths in (("b" * 40, [".harness/domain-gates.json"]), (None, [])):
+            section, source = pr.domain_section(repo, base, changed_paths=paths)
+            self.assertIn("Domain checklist", section)
+            self.assertNotIn("injected text", section)
+            self.assertIsNone(source)
+        section, source = pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])  # trusted: file existed before the diff
+        self.assertEqual((section, source), ("", ".harness/domain-gates.json"))
+
+    def test_go_mod_substring_is_not_a_dependency(self):
+        self.assertEqual(dg.detect(make_repo({"go.mod": "require example.com/foo/web3stuff v1.0.0\n"})), [])
+        self.assertIn("evm", names(dg.detect(make_repo({"go.mod": "require github.com/ethereum/go-ethereum v1.13.0\n"}))))
+
+    def test_extra_scaffolds_validated_and_labelled(self):
+        extra = {"extra_checklists": {"domains": {"evm": {"scaffolds": [
+            {"id": "ok", "title": "mine", "commands": ["forge test"]}, {"title": "no id"},
+            {"id": "x", "title": "t", "commands": ["a\x1bb"]}]}}}}
+        repo = make_repo({"foundry.toml": "x", ".harness/domain-gates.json": json.dumps(extra)})
+        ids = [s["id"] for s in dg.scaffold("evm", repo)]
+        self.assertIn("ok", ids)
+        self.assertNotIn("x", ids)
+        self.assertTrue([s for s in dg.scaffold("evm", repo) if s["id"] == "ok"][0]["title"].startswith("[repo-supplied]"))
 
     def test_prompt_carries_section_without_touching_packet(self):
         captured = {}

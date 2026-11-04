@@ -42,7 +42,7 @@ CORE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}$")
 HARDHAT = re.compile(r"^hardhat\.config\.(js|cjs|mjs|ts|cts|mts)$")
 MANIFESTS = {"package.json", "Cargo.toml", "go.mod", "pyproject.toml", "foundry.toml"}
 REQUIREMENTS = re.compile(r"^requirements[A-Za-z0-9._-]*\.txt$")
-LEDGER_WORDS = re.compile(r"(?i)ledger|journal|posting|balance")
+LEDGER_WORDS = re.compile(r"(?i)(?<![a-z])(?:ledger|journal|posting|balance)s?(?![a-z])")
 NATS_NAMES = ("nats", "nats.go", "nats-io", "async-nats", "nats-py", "nats.js", "nats.ws", "nats.deno", "nats.net")
 # (domain, confidence, needle). A needle matches a dependency name in a manifest.
 DEPENDENCIES = (
@@ -76,8 +76,14 @@ def _read_small(root: Path, rel: str, limit: int, budget=None):
             if budget[0] + info.st_size > MAX_TOTAL_READ:
                 return None
             budget[0] += info.st_size
-        data = os.read(fd, limit + 1)
-        return data.decode("utf-8", "replace") if len(data) <= limit else None
+        chunks, total = [], 0
+        while total <= limit:
+            chunk = os.read(fd, min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return b"".join(chunks).decode("utf-8", "replace") if total <= limit else None
     except OSError:
         return None
     finally:
@@ -99,7 +105,7 @@ def _tracked_files(root: Path, max_files: int):
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_GLOBAL": os.devnull,
            "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0"}
     try:
-        done = subprocess.run(["git", "-C", str(root), "-c", "core.fsmonitor=false", "ls-files", "-z", "--", *SIGNAL_PATHSPECS],
+        done = subprocess.run(["git", "-C", str(root), "-c", "core.fsmonitor=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", *SIGNAL_PATHSPECS],
                               capture_output=True, timeout=15, env=env)
     except (OSError, subprocess.SubprocessError):
         return []
@@ -113,8 +119,9 @@ def _dep_present(text: str, name: str, kind: str) -> bool:
     if kind == "package.json":
         return name in _package_deps(text)
     if kind == "go.mod":
-        return re.search(r"(?m)^\s*(?:require\s+)?\S*[/ ]" + re.escape(name) + r"(?:/\S*)?\s+v", text) is not None or \
-            re.search(r"(?m)^\s*(?:require\s+)?\S*" + re.escape(name) + r"\S*\s+v\d", text) is not None
+        return re.search(r"(?m)^\s*(?:require\s+)?(?:\S*/)?" + re.escape(name) + r"(?:/\S*)?\s+v\d", text) is not None
+    if re.search(r"(?m)^\s*\[[\w.-]*dependencies\." + re.escape(name) + r"\]", text):
+        return True
     pattern = r"(?im)^\s*[\"']?" + re.escape(name) + r"[\"']?\s*(?:[=<>~!\[;{]|$)"
     return re.search(pattern, text) is not None
 
@@ -150,16 +157,20 @@ class _Found:
         return sorted(self.domains.values(), key=lambda e: (order[e["confidence"]], e["domain"]))
 
 
+def _base(path: str) -> str:
+    return path.rsplit("/", 1)[-1][:40]  # evidence names files by base name only: paths are repo-controlled text
+
+
 def _path_signals(path: str, found: _Found, tag: str):
     base = path.rsplit("/", 1)[-1]
     if base.endswith(".sol"):
-        found.add("evm", "high", f"{tag}solidity file {path}")
+        found.add("evm", "high", f"{tag}solidity file {_base(path)}")
     if base == "foundry.toml":
-        found.add("evm", "high", f"{tag}foundry.toml {path}")
+        found.add("evm", "high", f"{tag}foundry.toml")
     if HARDHAT.match(base):
-        found.add("evm", "high", f"{tag}hardhat config {path}")
+        found.add("evm", "high", f"{tag}hardhat config {_base(path)}")
     if base == "Anchor.toml":
-        found.add("solana", "high", f"{tag}Anchor.toml {path}")
+        found.add("solana", "high", f"{tag}Anchor.toml")
 
 
 def detect(repo, changed_paths=None, max_files: int = MAX_FILES) -> list:
@@ -192,10 +203,10 @@ def detect(repo, changed_paths=None, max_files: int = MAX_FILES) -> list:
             for domain, confidence, names in DEPENDENCIES:
                 for name in names:
                     if _dep_present(text, name, kind):
-                        found.add(domain, confidence, f"dependency {name} in {path}")
+                        found.add(domain, confidence, f"dependency {name} in {_base(path)}")
             for name in NATS_NAMES:
                 if kind != "foundry.toml" and _dep_present(text, name, kind):
-                    nats_in.append(f"{name} in {path}")
+                    nats_in.append(f"{name} in {_base(path)}")
                     break
         elif base.endswith(".proto"):
             protos += 1
@@ -205,7 +216,7 @@ def detect(repo, changed_paths=None, max_files: int = MAX_FILES) -> list:
                     ledger_in.append(path)
     proto_paths = [p for p in files if p.endswith(".proto")]
     if proto_paths and nats_in and ledger_in:
-        found.add("ledger-messaging", "medium", f"proto {proto_paths[0]} + nats ({nats_in[0]}) + ledger signal ({ledger_in[0]})")
+        found.add("ledger-messaging", "medium", f"proto {_base(proto_paths[0])} + nats ({nats_in[0]}) + ledger signal ({_base(ledger_in[0])})")
     return found.result()
 
 
@@ -255,13 +266,25 @@ def repo_options(repo, ignore: bool = False) -> dict:
     return options
 
 
+def _scaffold(value):
+    if not (isinstance(value, dict) and _text(value.get("id"), 60) and _text(value.get("title"), 200)):
+        return None
+    commands = value.get("commands", [])
+    if not isinstance(commands, list) or not all(_text(c, 300) for c in commands):
+        return None
+    out = {"id": value["id"], "title": "[repo-supplied] " + value["title"], "commands": commands[:10]}
+    if _text(value.get("notes")):
+        out["notes"] = value["notes"]
+    return out
+
+
 def _valid_extra(extra: dict) -> dict:
     items, domains = {}, {}
     for ident, item in list(extra.get("items", {}).items() if isinstance(extra.get("items"), dict) else [])[:MAX_EXTRA_ITEMS]:
         if (isinstance(ident, str) and CORE_ID.match(ident) and isinstance(item, dict)
                 and all(_text(item.get(k)) for k in ("title", "neg", "verify"))):
             keywords = item.get("keywords", [])
-            items[ident] = {"title": item["title"], "neg": item["neg"], "verify": item["verify"],
+            items[ident] = {"title": "[repo-supplied] " + item["title"], "neg": item["neg"], "verify": item["verify"],
                             "keywords": [k for k in keywords if _text(k, 60)][:10] if isinstance(keywords, list) else []}
     for name, domain in list(extra.get("domains", {}).items() if isinstance(extra.get("domains"), dict) else [])[:10]:
         if not (isinstance(name, str) and CORE_ID.match(name) and isinstance(domain, dict)):
@@ -272,17 +295,19 @@ def _valid_extra(extra: dict) -> dict:
         for key in ("title", "subject", "surface"):
             if _text(domain.get(key), 200):
                 clean[key] = domain[key]
-        for key in ("prompts", "scaffolds"):
-            value = domain.get(key)
-            if isinstance(value, list):
-                clean[key] = [v for v in value if (_text(v) if key == "prompts" else isinstance(v, dict))][:10]
+        prompts = domain.get("prompts")
+        if isinstance(prompts, list):
+            clean["prompts"] = [v for v in prompts if _text(v)][:10]
+        scaffolds = domain.get("scaffolds")
+        if isinstance(scaffolds, list):
+            clean["scaffolds"] = [_scaffold(v) for v in scaffolds[:10] if _scaffold(v)]
         domains[name] = clean
     return {"items": items, "domains": domains}
 
 
-def merged_data(repo=None, extra=None) -> dict:
+def merged_data(repo=None, extra=None, ignore_repo_file: bool = False) -> dict:
     data = json.loads(json.dumps(load_checklists()))
-    extra = extra if extra is not None else repo_options(repo).get("extra") or {}
+    extra = extra if extra is not None else repo_options(repo, ignore_repo_file).get("extra") or {}
     for ident, item in extra.get("items", {}).items():
         data["items"].setdefault(ident, item)  # a repo can add items, never weaken a built-in one
     for name, domain in extra.get("domains", {}).items():
@@ -320,7 +345,7 @@ def checklist(domain: str, repo=None, data=None) -> list:
         neg = item["neg"]
         for token, value in fill.items():
             neg = neg.replace(token, value)
-        out.append({"id": ident, "title": item["title"], "neg": neg, "verify": item["verify"],
+        out.append({"id": ident, "title": item["title"], "neg": neg, "neg_raw": item["neg"], "verify": item["verify"],
                     "keywords": list(base.get("keywords", [])) + list(item.get("keywords", []))})
     return out
 
@@ -365,7 +390,18 @@ def settings(repo=None, policy=None, env=None, ignore_repo_file: bool = False) -
     mode = config.get("mode") if config.get("mode") in ("warn", "enforce") else "warn"
     disabled = (str(env.get("HARNESS_DOMAIN_GATES", "")).strip().lower() in DISABLE_VALUES
                 or config.get("disabled") is True or repo_options(repo, ignore_repo_file).get("disabled") is True)
-    return {"disabled": disabled, "mode": mode}
+    source = ("env HARNESS_DOMAIN_GATES" if str(env.get("HARNESS_DOMAIN_GATES", "")).strip().lower() in DISABLE_VALUES
+              else "spec_policy.json" if config.get("disabled") is True else OPT_OUT_FILE)
+    return {"disabled": disabled, "mode": mode, "source": source if disabled else None}
+
+
+def is_git_repo(repo) -> bool:
+    try:
+        done = subprocess.run(["git", "-C", str(repo), "rev-parse", "--is-inside-work-tree"], capture_output=True, timeout=10,
+                              env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_GLOBAL": os.devnull})
+        return done.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def active_domains(repo, policy=None, changed_paths=None, env=None, ignore_repo_file: bool = False) -> list:
@@ -404,14 +440,26 @@ def render_block(domains, repo=None, detected=None) -> str:
 
 
 def spec_domains(spec_text: str) -> list:
-    match = re.search(r"(?m)^## Domain checklist[ \t]*$.*?^Domains:[ \t]*([^\n]+)$", spec_text, re.S)
-    return [d.strip() for d in match.group(1).split(",") if d.strip()] if match else []
+    """Domains named by the first `## Domain checklist` block (line-based: hostile specs cannot make it slow)."""
+    lines = spec_text.split("\n")
+    for index, line in enumerate(lines):
+        if line.rstrip() == "## Domain checklist":
+            for follow in lines[index + 1:index + 6]:
+                if follow.startswith("Domains:"):
+                    return [d.strip() for d in follow[len("Domains:"):].split(",") if d.strip()][:10]
+            return []
+    return []
 
 
 def _negative_text(spec_text: str) -> str:
-    match = re.search(r"(?ms)^## Negative cases[ \t]*$(.*?)(?=^## |\Z)", spec_text)
-    body = match.group(1) if match else ""
-    return re.sub(r"<[^<>\n]*>", " ", body).lower().replace("-", " ")
+    """Bodies of `- NEG-n (AC-n): ...` bullets in the Negative cases section, placeholders removed."""
+    inside, found = False, []
+    for line in spec_text.split("\n"):
+        if line.startswith("## "):
+            inside = line.rstrip() == "## Negative cases"
+        elif inside and re.match(r"^- NEG-\d+\s*\([^)]*\):\s*\S", line):
+            found.append(line)
+    return re.sub(r"<[^<>\n]*>", " ", "\n".join(found)).lower().replace("-", " ")
 
 
 def _keyword_hit(text: str, keyword: str) -> bool:
@@ -426,8 +474,14 @@ WAIVER = re.compile(r"(?m)^Domain-gate:[ \t]*([a-z0-9-]+)[ \t]+waived[ \t]*\(([^
 
 
 def waived_items(spec_text: str) -> set:
-    return {m.group(1) for m in WAIVER.finditer(spec_text)
-            if len(m.group(2).strip()) >= 10 and "<" not in m.group(2)}
+    unfenced, fenced = [], False
+    for line in spec_text.split("\n"):
+        if line.startswith("```") or line.startswith("~~~"):
+            fenced = not fenced
+        elif not fenced:
+            unfenced.append(line)
+    return {m.group(1) for m in WAIVER.finditer("\n".join(unfenced))
+            if len(m.group(2).strip()) >= 10 and "<" not in m.group(2) and len(set(m.group(2).lower())) >= 6}
 
 
 def missing_items(spec_text: str, domains, repo=None) -> list:
@@ -455,10 +509,10 @@ def missing_items(spec_text: str, domains, repo=None) -> list:
         return []
 
 
-def packet_section(domains, repo=None, limit: int = 6000) -> str:
+def packet_section(domains, repo=None, limit: int = 9000, ignore_repo_file: bool = False) -> str:
     """Compact reviewer-facing checklist (titles plus NEG templates), cut at `limit` bytes."""
     try:
-        data = merged_data(repo)
+        data = merged_data(repo, ignore_repo_file=ignore_repo_file)
         out = ["## Domain checklist (generated by the harness from repo signals; not part of the signed packet)",
                "Treat each item as a review question: is there a NEG case and a test, or a justified waiver?"]
         seen = set()
@@ -466,10 +520,10 @@ def packet_section(domains, repo=None, limit: int = 6000) -> str:
             key = resolve_domain(name, data)
             out.append(f"### {key}")
             for item in checklist(key, data=data):
-                if item["id"] not in seen:
-                    seen.add(item["id"])
+                if (item["id"], item["neg_raw"]) not in seen:
+                    seen.add((item["id"], item["neg_raw"]))
                     out.append(f"- {item['id']}: {item['title']}. {item['neg']}")
-        prompts = suggested_prompts(domains)[:4]
+        prompts = suggested_prompts(domains)[:8]
         out += ["### Follow-up questions"] + [f"- {p}" for p in prompts] if prompts else []
     except (ValueError, KeyError):
         return ""

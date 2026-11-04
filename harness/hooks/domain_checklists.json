@@ -9,9 +9,8 @@
       "title": "Reentrancy and callback ordering",
       "keywords": [
         "reentran",
-        "callback",
-        "checks-effects",
-        "re-enter"
+        "re-enter",
+        "checks-effects"
       ],
       "neg": "{subject} must not let a callback or external call re-enter a state-changing path before state is updated; test a malicious receiver that re-enters {surface} and assert balances and accounting are unchanged.",
       "verify": "Reentrant attacker contract/test plus an invariant that total accounted value equals total held value."
@@ -20,11 +19,10 @@
       "title": "Access control and privileged roles",
       "keywords": [
         "access control",
-        "access-control",
         "unauthori",
         "privilege",
         "onlyowner",
-        "role",
+        "owner check",
         "signer check"
       ],
       "neg": "{subject} must refuse every privileged action ({surface}) from an unauthorized caller, a revoked role holder and an uninitialized owner.",
@@ -34,7 +32,7 @@
       "title": "Integer and decimal precision, rounding, overflow",
       "keywords": [
         "precision",
-        "decimal",
+        "decimals",
         "rounding",
         "overflow",
         "underflow",
@@ -50,11 +48,9 @@
         "replay",
         "chain id",
         "chainid",
-        "chain-id",
         "domain separat",
         "eip-712",
-        "eip712",
-        "signature"
+        "eip712"
       ],
       "neg": "{subject} must reject a signature or signed message replayed on another chain, another contract or after use, and must bind chain id, verifying contract and purpose for {surface}.",
       "verify": "Test replaying a valid signature across chain id, contract address and a second submission; malleable or truncated signatures are refused."
@@ -64,7 +60,7 @@
       "keywords": [
         "nonce",
         "idempot",
-        "duplicate submit",
+        "duplicate submi",
         "double spend",
         "double-spend",
         "sequence number"
@@ -77,10 +73,8 @@
       "keywords": [
         "finality",
         "reorg",
-        "confirmation",
-        "rollback",
-        "orphan",
-        "re-org"
+        "confirmations",
+        "orphaned"
       ],
       "neg": "{subject} must not treat {surface} as final before the required confirmations, and must reverse or reconcile derived state when the observed block, ledger or slot is reorganized or dropped.",
       "verify": "Simulate a reorg (anvil snapshot/revert, ledger rewind or dropped transaction) and assert credits are reversed and no duplicate credit occurs on replay."
@@ -92,9 +86,7 @@
         "custody",
         "mpc",
         "private key",
-        "signer",
         "hsm",
-        "secret",
         "seed phrase",
         "mnemonic"
       ],
@@ -104,14 +96,14 @@
     "gas-dos": {
       "title": "Gas, resource limits and denial of service",
       "keywords": [
-        "gas",
-        "dos",
+        "gas limit",
+        "gas griefing",
         "denial of service",
         "unbounded",
         "compute budget",
-        "resource limit",
         "out of gas",
-        "fee"
+        "dos",
+        "fee griefing"
       ],
       "neg": "{subject} must stay within gas/compute/fee limits and not allow an attacker to block {surface} through unbounded loops, huge arrays, dust spam, forced reverts or fee griefing.",
       "verify": "Gas/compute snapshot with worst-case inputs; test with maximum-size collections and a reverting recipient."
@@ -119,11 +111,11 @@
     "upgradeability": {
       "title": "Upgradeability, initialization and migration",
       "keywords": [
-        "upgrade",
+        "upgradeab",
         "proxy",
-        "initializ",
+        "initializer",
+        "reinitializ",
         "storage layout",
-        "migration",
         "uups",
         "timelock",
         "program authority"
@@ -140,7 +132,6 @@
         "stale price",
         "flash loan",
         "flash-loan",
-        "external data",
         "manipulat"
       ],
       "neg": "{subject} must reject stale, zero, out-of-range or manipulated external data (price, rate, message) for {surface}, including single-block flash-loan manipulation, and must fail safe when the source is unavailable.",
@@ -189,7 +180,7 @@
           "id": "forge-invariant",
           "title": "Foundry invariant tests with handlers",
           "commands": [
-            "forge test --match-contract Invariant -vvv",
+            "forge test --match-test invariant_ -vvv",
             "forge coverage --report summary"
           ],
           "notes": "Use a handler with ghost variables and targetContract/targetSelector; set invariant runs/depth in foundry.toml and review fail_on_revert and show_metrics so reverting handlers cannot hide a vacuous run."
@@ -334,6 +325,10 @@
         "replay-chainid": {
           "neg": "{subject} must bind signed extrinsics to the genesis hash, spec version, transaction version, nonce and mortality era so {surface} cannot be replayed on another chain or after a runtime upgrade.",
           "verify": "Test an extrinsic signed for another genesis hash and an expired era; assert InvalidTransaction."
+        },
+        "finality-reorg": {
+          "neg": "{subject} must treat {surface} as final only at the GRANDPA-finalized head, not the best head, and must reconcile derived state when a fork is abandoned.",
+          "verify": "Test with a best-head fork switch and assert credits happen only after finalization (chain_getFinalizedHead)."
         }
       },
       "scaffolds": [

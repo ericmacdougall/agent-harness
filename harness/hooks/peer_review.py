@@ -29,7 +29,7 @@ from usage_guard import GuardError, UsageStore, capture_subject, invocation_iden
 PACKET_LIMIT = 150_000
 PACKET_WARNING = 32 * 1024
 PROVIDER_LIMIT = 1_000_000
-DOMAIN_SECTION_LIMIT = 6000  # generated reviewer checklist, kept outside the signed packet bytes
+DOMAIN_SECTION_LIMIT = 9000  # generated reviewer checklist, kept outside the signed packet bytes
 
 
 def provider_failure(record, *, trusted=True):
@@ -251,28 +251,33 @@ def packet_warnings(content):
     return warnings
 
 
-def domain_section(repo: Path, base, changed_paths=None) -> str:
-    """Blockchain checklist for the reviewer prompt, or '' (off, not detected, data unusable).
+def domain_section(repo: Path, base, changed_paths=None):
+    """Blockchain checklist for the reviewer prompt as (text, disabled_source).
 
-    It is appended to the prompt, never to the packet, so the packet SHA-256 and byte budget still describe
-    exactly what the author signed. A diff that edits .harness/domain-gates.json cannot disable its own review.
+    `repo` should be the committed snapshot, so working-tree edits cannot steer it. The text is appended to
+    the prompt, never to the packet, so the packet SHA-256 and byte budget still describe what the author
+    signed. A diff that edits .harness/domain-gates.json, or a review with no known base, cannot use that
+    file to disable the gates or add its own checklist text.
     """
     try:
         import domain_gates
     except ImportError:
-        return ''
+        return '', None
     try:
         if changed_paths is None and base:
             changed_paths = [p for p in git(repo, 'diff', '--name-only', '-z', f'{base}..HEAD').split('\0') if p][:5000]
         paths = changed_paths or []
-        found = domain_gates.active_domains(repo, changed_paths=paths,
-                                            ignore_repo_file=domain_gates.OPT_OUT_FILE in paths)
+        distrust = domain_gates.OPT_OUT_FILE in paths or not base or len(paths) >= 5000
+        state = domain_gates.settings(repo, ignore_repo_file=distrust)
+        if state['disabled']:
+            return '', state['source']
+        found = domain_gates.active_domains(repo, changed_paths=paths, ignore_repo_file=distrust)
         if not found:
-            return ''
-        return domain_gates.packet_section(found, repo, DOMAIN_SECTION_LIMIT)
+            return '', None
+        return domain_gates.packet_section(found, repo, DOMAIN_SECTION_LIMIT, ignore_repo_file=distrust), None
     except Exception as error:  # guidance must never break a review
         print(f'Warning: domain checklist skipped ({type(error).__name__})', file=sys.stderr)
-        return ''
+        return '', None
 
 
 REVIEW_SYSTEM = (
@@ -906,7 +911,7 @@ def main() -> int:
             # that needs reconciliation or consume the review time budget.
             base = make_snapshot(repo, snapshot, before[0], base=base, timeout=args.snapshot_timeout)
             options['base'] = base
-            options['domain_section'] = domain_section(repo, base)
+            options['domain_section'], options['domain_disabled'] = domain_section(snapshot, base)
             if repo_state(repo) != before:
                 raise OSError('source changed while preparing review')
             subject = capture_subject(repo, args.input_manifest)
@@ -955,8 +960,8 @@ def main() -> int:
     if options.get('domain_section'):
         note += ("Domain checklist injected into the reviewer prompt (not the packet), section SHA-256: "
                  + hashlib.sha256(options['domain_section'].encode('utf-8')).hexdigest() + "\n")
-    elif os.environ.get('HARNESS_DOMAIN_GATES', '').strip().lower() in ('off', '0', 'false', 'no', 'disabled'):
-        note += "Domain gates: disabled by HARNESS_DOMAIN_GATES.\n"
+    elif options.get('domain_disabled'):
+        note += f"Domain gates: disabled by {options['domain_disabled']}.\n"
     finalized = False
     reference = None
     announced = False

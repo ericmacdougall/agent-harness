@@ -291,16 +291,20 @@ def domain_lint(text: str, repo, spec_policy: dict):
     try:
         config = dg.settings(repo, spec_policy)
         if config["disabled"]:
-            return [], []
+            # stay silent for non-blockchain repos, but leave a trace when a blockchain repo is opted out
+            found = dg.detect(Path(repo)) if config["source"] != "env HARNESS_DOMAIN_GATES" else []
+            return ([f"domain gates disabled by {config['source']} although blockchain work was detected"] if found else []), []
         domains = dg.active_domains(repo, spec_policy)
         missing = dg.missing_items(text, domains, repo)
+        skipped = not domains and not dg.spec_domains(text) and not dg.is_git_repo(repo)
     except Exception as error:
         return [f"domain gates could not run ({type(error).__name__}); skipped"], []
+    notes = ["domain gates skipped: --repo is not a git checkout (pass --repo <worktree>)"] if skipped else []
     if not missing:
-        return [], []
+        return notes, []
     note = (f"domain checklist items without a NEG case naming them or `Domain-gate: <id> waived (<reason>)`: "
             f"{', '.join(missing)}")
-    return ([note], []) if config["mode"] != "enforce" else ([], [note])
+    return (notes + [note], []) if config["mode"] != "enforce" else (notes, [note])
 
 
 # --------------------------------------------------------------------------- reviews (local sidecar)
@@ -1379,6 +1383,7 @@ def cmd_attach(args, spec_policy):
     problems = lint(text, config)
     core = core_sha(text)
     author = parse_author(spec["header"].get("Author", ""))
+    problems += domain_lint(text, getattr(args, "repo", None) or ".", spec_policy)[1]  # only fails in enforce mode
     problems += review_problems(entries, core, author)
     if problems:
         raise SpecError("spec not attached:\n" + "\n".join("  - " + p for p in problems))
@@ -1627,6 +1632,7 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--report-file")
     attach = sub.add_parser("attach", help="attach the reviewed spec to its ticket")
     attach.add_argument("spec")
+    attach.add_argument("--repo", default=".", help="repo scanned for blockchain signals (default .)")
     evidence = sub.add_parser("evidence", help="attach proof for acceptance criteria")
     click = sub.add_parser("click-test", help="attach a click-test record")
     signoff = sub.add_parser("signoff", help="record a sign-off on the current spec")
