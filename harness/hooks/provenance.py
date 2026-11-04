@@ -18,11 +18,9 @@ ticket sources are syntax-checked and flagged `deferred` unless a local cache al
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 import unicodedata
 from pathlib import Path
@@ -498,6 +496,7 @@ def ticket_cache(home=None) -> dict:
 
 
 def git_line(repo: Path, sha: str, path: str, start: int, end: int):
+    import subprocess
     try:
         run = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{sha}:{path}"], capture_output=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
@@ -900,6 +899,7 @@ def find_user(session: str, text: str, home=None, limit: int = 5) -> list:
 
 
 def build_parser():
+    import argparse
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     check = sub.add_parser("check", help="resolve one Source")
