@@ -393,6 +393,9 @@ def apply_event(data: dict, ev: dict) -> None:
         rec.pop("removableAfter", None)
         rec["completion"] = {"status": "none"}
         rec.get("times", {}).pop("endedAt", None)
+        for item in rec.get("evidence", []):  # the old proof was for the old completion: done again needs fresh evidence
+            if item["verification"]["status"] == "verified":
+                item["verification"] = dict(item["verification"], status="stale", detail="ask reopened after done")
         touch(rec, ev)
     elif op == "tombstoned":
         data[kind].pop(tgt["id"], None)
@@ -877,7 +880,11 @@ def discover_codex(data: dict) -> None:
 
 def sync_all(data: dict, session=None) -> int:
     discover_codex(data)
-    wanted = [session] if session else sorted(data["sessions"], key=lambda s: data["sessions"][s].get("firstSeenAt", ""))[-40:]
+    recent = sorted(data["sessions"], key=lambda s: data["sessions"][s].get("firstSeenAt", ""))[-40:]
+    if session:  # this session plus the Codex rollouts the watcher tracks, so a hook-less Codex session is caught up
+        wanted = [session] + [sid for sid in recent[-10:] if sid != session and data["sessions"][sid].get("provider") == "codex"]
+    else:
+        wanted = recent
     return sum(sync_session(data, sid) for sid in wanted if sid in data["sessions"])
 
 
@@ -1594,6 +1601,8 @@ def drop(data, ask, why, proof, kind):
     tomb = {"id": ask["id"], "type": "ask", "finalState": ask["state"], "stateSince": ask["stateSince"], "removedAt": iso(now()),
             "removedBy": actor("harness", "harness", label="work-assignments"), "proofKind": kind, "proof": proof,
             "messageUuids": [u for u in uuids if u], "archive": {"file": archive.name, "line": number + 1}, "snapshotSha256": sha(line)}
+    if tomb["proof"] is None:
+        del tomb["proof"]
     emit(data, "tombstoned", "ask", ask["id"], {"tombstone": tomb}, tomb["removedBy"])
 
 

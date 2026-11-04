@@ -229,6 +229,27 @@ class CaptureTest(Base):
         self.assertEqual(next(iter(data["messages"].values()))["triage"]["status"], "untriaged")  # still blocking
         self.check_schema()
 
+    def test_codex_subagent_payload_creates_no_request(self):
+        """NEG-12 on Codex: subagent hooks carry the parent session id and an agent_id."""
+        self.hook("prompt", self.payload("do a thing", agent_id="a123"), runtime="codex")
+        self.assertEqual(self.data()["messages"], {})
+
+    def test_codex_rollout_is_discovered_without_a_prompt_hook(self):
+        """The Codex-trust gap: any harness hook on the machine catches up a new rollout's human turns."""
+        wa.hive_identity()  # the ledger starts now
+        CLOCK[0] += 10
+        day = Path(self.tmp.name) / "codex" / "sessions" / wa.iso(CLOCK[0])[:10].replace("-", "/")
+        day.mkdir(parents=True)
+        rollout = day / "rollout-2027-01-15T08-00-10-01a16a08-4480-78d3-83f9-b84140f2ebd7.jsonl"
+        item = {"type": "UserMessage", "id": "01a16512-0d07-78f3-b199-70f1db873611", "content": [{"type": "text", "text": "an untrusted-hook codex request"}]}
+        rollout.write_text(json.dumps({"timestamp": wa.iso(CLOCK[0]), "type": "session_meta", "payload": {}}) + "\n"
+                           + json.dumps({"timestamp": wa.iso(CLOCK[0] + 1), "type": "event_msg", "payload": {"type": "item_completed", "item": item}}) + "\n")
+        os.utime(rollout, (CLOCK[0], CLOCK[0]))
+        self.hook("session", {"session_id": SID, "transcript_path": str(self.transcript)})
+        msgs = list(self.data()["messages"].values())
+        self.assertEqual([(m["origin"]["actor"]["provider"], m["capturedVia"]) for m in msgs], [("codex", "rollout_sync")])
+        self.assertEqual(msgs[0]["origin"]["log"]["lineStart"], 2)
+
     def test_codex_rollout_human_turn_is_captured(self):
         rollout = Path(self.tmp.name) / "codex" / "sessions" / "2027" / "01" / "01" / "rollout-x.jsonl"
         rollout.parent.mkdir(parents=True)
@@ -317,9 +338,16 @@ class TriageTest(Base):
         again = self.capture("actually it is not fixed")
         self.assertEqual(self.cli("update", aid, "--state", "in_progress", "--reopen-by", again["id"])[0], 0)
         ask = self.asks()[aid]
-        self.assertNotIn("removableAfter", ask)  # reopening restarts the clock
+        self.assertNotIn("removableAfter", ask)  # reopening drops the clock until the ask is done again
         self.assertEqual(ask["state"], "in_progress")
+        self.assertEqual({e["verification"]["status"] for e in ask["evidence"]}, {"stale"})
         self.check_schema()
+        self.cli("update", aid, "--state", "ready")
+        self.assertEqual(self.cli("update", aid, "--state", "done")[0], 2)  # stale evidence cannot carry it to done again
+        self.assertEqual(self.cli("update", aid, "--evidence", "abc9999aaa")[0], 0)
+        CLOCK[0] += 3600
+        self.assertEqual(self.cli("update", aid, "--state", "done")[0], 0)
+        self.assertGreater(wa.parse_ts(self.asks()[aid]["removableAfter"]), CLOCK[0] + 23 * 3600)  # a fresh 24h clock
 
     def test_relate_stores_both_directions_and_prereq_status(self):
         _, a = self.split("one", "first thing here")
@@ -363,6 +391,21 @@ class StopTest(Base):
         self.split("work", "a thing to do", owner="agent:zz")
         with mock.patch.object(wa, "agent_stopped", lambda s, a: True):
             self.assertEqual(self.stop()["decision"], "block")
+
+    def test_codex_stop_payload_blocks_with_decision_block(self):
+        self.hook("prompt", self.payload("codex needs triage", turn_id="t1"), runtime="codex")
+        reply = self.hook("stop", {"session_id": SID, "transcript_path": str(self.transcript), "turn_id": "t1",
+                                   "stop_hook_active": False, "last_assistant_message": "done"}, runtime="codex")
+        self.assertEqual(reply["decision"], "block")
+
+    def test_cannot_bind_message_blocks_then_stop_releases_after_the_bound(self):
+        self.hook("prompt", self.payload("filler words " * 3 + "never in the transcript"), runtime="claude")
+        # the transcript never receives the line, so the message stays pending
+        CLOCK[0] += 3 * 3600
+        replies = [self.stop() for _ in range(5)]
+        self.assertEqual([r.get("decision") for r in replies], ["block"] * 3 + [None, None])
+        msg = next(iter(self.data()["messages"].values()))
+        self.assertEqual(msg["triage"]["status"], "untriaged")  # still unresolved after Stop let go
 
     def test_clean_state_does_not_block(self):
         msg = self.capture("thanks")
@@ -460,6 +503,26 @@ class RemovalTest(Base):
         self.assertEqual(self.cli("remove", aid)[0], 0)
         self.assertEqual(self.data()["tombstones"][aid]["proofKind"], "user_proof")
         self.check_schema()
+
+    def test_superseded_ask_is_removable_only_after_the_superseding_ask_closes(self):
+        _, old = self.split("old thing", "the old approach to exporting")
+        _, new = self.split("new thing", "the new approach to exporting")
+        self.assertEqual(self.cli("update", old, "--state", "superseded")[0], 2)  # needs a superseded_by relation first
+        self.cli("relate", old, "superseded_by", new)
+        self.assertEqual(self.cli("update", old, "--state", "superseded")[0], 0)
+        CLOCK[0] += 25 * 3600
+        self.assertEqual(self.cli("remove", old)[0], 2)  # the superseding ask is still open
+        self.advance(new)
+        CLOCK[0] += 1
+        self.assertEqual(self.cli("remove", old)[0], 0)
+        self.assertEqual(self.data()["tombstones"][old]["proofKind"], "superseded_by_closed")
+        self.check_schema()
+
+    def test_removal_boundary_is_24h_plus_a_second(self):
+        aid = self.done_ask(24)
+        self.assertEqual(self.cli("remove", aid)[0], 2)  # exactly 24h is not "more than 24h"
+        CLOCK[0] += 1
+        self.assertEqual(self.cli("remove", aid)[0], 0)
 
     def test_unrelated_human_message_cannot_cancel_an_ask(self):
         """Review blocker 1: any later human message used to cancel any ask."""
@@ -691,6 +754,21 @@ class GuardTest(Base):
             self.assertEqual(reply["hookSpecificOutput"]["permissionDecision"], "deny", cmd)
         for cmd in (f"cat {snap}", "python3 ~/.claude/hooks/work_assignments.py status", "ls ~/.agent-harness"):
             self.assertEqual(self.hook("guard", {"tool_name": "Bash", "tool_input": {"command": cmd}}), {}, cmd)
+
+    def test_guard_denies_codex_payload_shapes(self):
+        snap = str(wa.files()["snap"])
+        for payload in ({"tool_name": "apply_patch", "tool_input": {"input": f"*** Update File: {snap}\n+x"}},
+                        {"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", f"echo x > {snap}"]}},
+                        {"tool_name": "local_shell", "tool_input": {"command": ["rm", snap]}}):
+            reply = self.hook("guard", payload, runtime="codex")
+            self.assertEqual(reply["hookSpecificOutput"]["permissionDecision"], "deny", payload["tool_name"])
+        self.assertEqual(self.hook("guard", {"tool_name": "shell", "tool_input": {"command": ["cat", snap]}}, runtime="codex"), {})
+
+    def test_guard_crash_exits_zero_and_records_a_failure(self):
+        with mock.patch.object(wa, "load_policy", side_effect=RuntimeError("policy exploded")):
+            reply = self.hook("guard", {"tool_name": "Write", "tool_input": {"file_path": str(wa.files()["snap"])}})
+        self.assertEqual(reply, {})  # fail open, never block every tool
+        self.assertEqual(wa.pending_failures()[-1]["event"], "guard")
 
     def test_guard_exemption_string_and_glob_do_not_bypass(self):
         """Red-team MAJOR."""
