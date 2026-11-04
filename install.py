@@ -22,7 +22,8 @@ START = "<!-- agent-harness:start -->"
 END = "<!-- agent-harness:end -->"
 AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py",
-         "ticket_adapters.py", "commit_policy.py", "commit_policy.json")
+         "ticket_adapters.py", "commit_policy.py", "commit_policy.json",
+         "spec_flow.py", "spec_policy.json", "spec_template.md")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -35,13 +36,21 @@ class DirectoryPublicationError(OSError):
 
 
 def managed_scripts(claude: Path) -> set[str]:
-    return {str(claude / "hooks" / "wal.py"), str(claude / "hooks" / "commit_policy.py")}
+    return {str(claude / "hooks" / name) for name in ("wal.py", "commit_policy.py", "spec_flow.py")}
+
+
+SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
+GOODQA_STATUS_TOOLS = (r"^mcp__.*goodqa.*__(close_issue_done|close_issue_wont_fix|update_issue|"
+                       r"bulk_update_issues|archive_issue|reassign_issue|call_api)$")
 
 
 def managed_hooks(claude: Path) -> dict[str, list[dict]]:
     script = str(claude / "hooks" / "wal.py")
     policy = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "commit_policy.py"), "hook"],
               "timeout": 60, "onFailure": "block"}  # gh pr create checks GitHub and GoodQA
+    # Spec gate: GoodQA status changes; internal budget 40 s, so the explanation arrives before 60 s.
+    spec_gate = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "spec_flow.py"), "hook"],
+                 "timeout": 60, "onFailure": "block"}
 
     def command(event: str, fail_closed: bool = False) -> dict:
         hook = {"type": "command", "command": "python3", "args": [script, event], "timeout": 10}
@@ -53,8 +62,12 @@ def managed_hooks(claude: Path) -> dict[str, list[dict]]:
         "SessionStart": [{"hooks": [command("session")]}],
         "UserPromptSubmit": [{"hooks": [command("prompt", True)]}],
         "SubagentStart": [{
-            "matcher": "^(task-owner|click-tester|fixer|red-team)$",
+            "matcher": SUBAGENT_MATCHER,
             "hooks": [command("subagent")],
+        }],
+        "SubagentStop": [{
+            "matcher": SUBAGENT_MATCHER,
+            "hooks": [command("subagent_stop")],
         }],
         "PreToolUse": [{
             "matcher": "Agent|Task|Workflow|Bash|PowerShell|Write|Edit|MultiEdit|NotebookEdit",
@@ -63,6 +76,9 @@ def managed_hooks(claude: Path) -> dict[str, list[dict]]:
             # Commit message policy: validates git commit / gh pr merge --squash before they run.
             "matcher": "Bash",
             "hooks": [policy],
+        }, {
+            "matcher": GOODQA_STATUS_TOOLS,
+            "hooks": [spec_gate],
         }],
     }
 
@@ -95,6 +111,11 @@ def merged_settings(current: dict, claude: Path) -> dict:
     # Read-only policy checks are preapproved; `waive` deliberately is not.
     for action in ("check-message", "check-range", "report"):
         rule = f"Bash(python3 ~/.claude/hooks/commit_policy.py {action} *)"
+        if rule not in allowed:
+            allowed.append(rule)
+    # Read-only spec checks are preapproved; commands that post to tickets are not.
+    for action in ("lint", "status", "packet"):
+        rule = f"Bash(python3 ~/.claude/hooks/spec_flow.py {action} *)"
         if rule not in allowed:
             allowed.append(rule)
     return settings

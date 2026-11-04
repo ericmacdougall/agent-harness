@@ -152,6 +152,15 @@ def main() -> None:
         append(main_wal, record)
         append(agent_wal, record)
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": f"Your private WAL: {agent_wal}. Read the main scope brief and decision log in {main_wal}; challenge omissions and harmful shortcuts. Before editing, record intent, assumptions, domain invariants, a risk table and negative acceptance cases. Then log decisions, tests, commits, blockers and handoff. Do not log secrets or PII."}}))
+    elif event == "subagent_stop":
+        # SubagentStop: lets spec_flow.py record when a click-test agent finished. Only ids that
+        # SubagentStart logged are recorded, so spurious stops (empty agent_type) leave no trace.
+        agent_id = safe_id(data.get("agent_id"))
+        agent_wal = root / f"agent-{agent_id}.jsonl"
+        if data.get("agent_id") and agent_wal.exists():
+            record.update({"agent_id": agent_id, "agent_type": safe_id(data.get("agent_type"))})
+            append(main_wal, record)
+            append(agent_wal, record)
     elif event == "pretool":
         agent_id = data.get("agent_id")
         wal = root / f"agent-{safe_id(agent_id)}.jsonl" if agent_id else main_wal

@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "mode": "warn",
+  "plan_ticket_gate": "warn",
+  "ticket_system": "goodqa",
+  "enforced_projects": [],
+  "projects": {
+    "work-tracker-automatic": {
+      "project_id": "4bcc60e4-664b-417c-933a-1223ed8def60",
+      "org_id": "a19d343e-f162-4a05-849d-4565e90e4b3f"
+    },
+    "harness": {
+      "project_id": "75ebadd3-9b4c-4b8c-bc86-9a4c1cbd3a53",
+      "org_id": "1150f036-83d3-46a3-a9da-84b84e9f69d8"
+    }
+  },
+  "hook_deadline_seconds": 40,
+  "command_deadline_seconds": 300,
+  "max_log_bytes": 2000000,
+  "max_media_bytes": 15000000,
+  "max_record_bytes": 65536,
+  "close_reason_min_chars": 20,
+  "upload_host_suffixes": [
+    ".digitaloceanspaces.com"
+  ]
+}

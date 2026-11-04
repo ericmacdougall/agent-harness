@@ -702,6 +702,19 @@ def commit_policy_gate(repo, base):
     return (6 if report['status'] == 'UNVERIFIED' else 2), commit_policy.format_report(report)
 
 
+def plan_ticket_gate(repo, content):
+    """Plan review starts substantive work: in ticket-tracked repos the packet must name its ticket."""
+    try:
+        import spec_flow
+    except ImportError:
+        return 0, ''  # older install without the spec flow; the commit policy still requires Refs
+    text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+    try:
+        return spec_flow.plan_ticket_gate(repo, text)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return 0, f'spec-flow: plan ticket gate could not run ({error}); continuing'
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("plan", "code-inspection", "pr"))
@@ -778,6 +791,15 @@ def main() -> int:
         target.close()
         evidence.close()
         parser.error('review requires a clean worktree')
+    if args.stage == 'plan':
+        code, text = plan_ticket_gate(repo, evidence.content)
+        if text:
+            print(text, file=sys.stderr)
+        if code:
+            target.close()
+            evidence.close()
+            print('Plan review not started: name the ticket this work belongs to first.', file=sys.stderr)
+            return code
     if args.stage == 'pr':
         code, text = commit_policy_gate(repo, args.base)
         if text:
