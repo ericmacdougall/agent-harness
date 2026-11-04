@@ -415,7 +415,9 @@ class LedgerAdapter:
             return "not_found", None
         command = [self._executable(), "tickets", "show", handle, "--json", "--min-version", self.min_version,
                    "--as-of", str(int(as_of_ms)), "--slug", slug]
-        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        # No GIT_* (the repository is chosen by cwd) and no HARNESS_LEDGER_* test variables, which a
+        # test build would honour (fake clock or machine id could defeat the --as-of bound).
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "HARNESS_LEDGER_"))}
         env["GIT_TERMINAL_PROMPT"] = "0"
         try:
             result = self.runner(command, cwd=cwd, env=env, timeout=self.timeout, input="")

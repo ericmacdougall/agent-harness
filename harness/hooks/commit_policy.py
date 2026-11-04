@@ -201,7 +201,11 @@ def repo_ticket_context(repo, policy: dict, *, push_url: str | None = None):
         urls = sorted(set(urls) | {push_url})
     patterns = [pattern for config in policy["ticket_systems"].values() if not is_ledger_system(config)
                 for pattern in config.get("repos", [])]
-    tracked = any(re.search(pattern, url) for url in urls for pattern in patterns)
+    # Hosts are case-insensitive and an explicit port (ssh://git@ssh.github.com:443/...) must not hide a
+    # tracked path, so match each URL as written and with ":<port>/" removed, ignoring case. This only
+    # makes more repositories tracked. SSH host aliases from ~/.ssh/config cannot be seen (known limit).
+    variants = set(urls) | {re.sub(r":\d+/", "/", url) for url in urls}
+    tracked = any(re.search(pattern, url, re.I) for url in variants for pattern in patterns)
     allowed = False
     ledgers = [config for config in policy["ticket_systems"].values() if is_ledger_system(config)]
     if ledgers and not tracked:
@@ -232,7 +236,10 @@ def ledger_checker(policy: dict, context, as_of_ms: int):
             return None
         if status == "ambiguous":
             return f"Ledger {slug}#{handle} is ambiguous; use more hex digits"
-        return f"Ledger {slug}#{handle} does not exist in this machine's ledger before the commit date"
+        when = datetime.fromtimestamp(as_of_ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return (f"Ledger {slug}#{handle} does not exist in this machine's ledger before the commit date ({when}); "
+                "the ticket must predate the commit's author date. After rewording an older commit to cite a "
+                "newer ticket, run git commit --amend --reset-author")
     return check
 
 

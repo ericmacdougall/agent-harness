@@ -52,7 +52,7 @@ class LedgerWorld(unittest.TestCase):
         if not go:
             raise unittest.SkipTest("go toolchain not installed; real-binary ledger cases need it")
         cls.bin_dir = Path(tempfile.mkdtemp(prefix="cp-ledger-bin-"))
-        out = subprocess.run([go, "build", "-o", str(cls.bin_dir / "harness"), "./cmd/harness"], cwd=ROOT,
+        out = subprocess.run([go, "build", "-tags", "ledgertest", "-o", str(cls.bin_dir / "harness"), "./cmd/harness"], cwd=ROOT,
                              capture_output=True, text=True, timeout=600)
         if out.returncode:
             shutil.rmtree(cls.bin_dir, True)
@@ -201,6 +201,13 @@ class TrackedRepoRule(LedgerWorld):
         # Ledger refs never reach the remote-ticket verification or delivery comments.
         self.assertEqual(cp._commit_refs(FEAT.format(ref=self.ref), policy), [])
 
+    def test_case_and_port_variants_still_tracked(self):
+        for url in ("https://GitHub.com/EricMacDougall/x.git", "ssh://git@ssh.github.com:443/ericmacdougall/x.git",
+                    "https://github.com:443/ericmacdougall/x.git"):
+            with self.subTest(url):
+                self.git("remote", "set-url", "origin", url)
+                self.assert_rejected()
+
     def test_push_url_counts_toward_tracking(self):
         policy = cp.load_policy()
         self.assertFalse(cp.repo_ticket_context(str(self.repo), policy)["tracked"])
@@ -287,6 +294,13 @@ class ShimFailsClosed(unittest.TestCase):
         self.assert_unverified(self.fake('echo \'["list"]\'\n'))
         self.assert_unverified(self.fake(f"cat <<'EOF'\n{self.good_json().replace('demo', 'other')}\nEOF\n"))
         self.assert_unverified(self.fake(f"cat <<'EOF'\n{self.good_json(created=10**15)}\nEOF\n"))
+
+    def test_test_only_variables_are_not_passed_to_the_binary(self):
+        script = (f'if [ -n "$HARNESS_LEDGER_FAKE_NOW_MS$HARNESS_LEDGER_FAKE_MACHINE_ID" ]; then echo leaked; exit 0; fi\n'
+                  f"cat <<'EOF'\n{self.good_json()}\nEOF\n")
+        with mock.patch.dict(os.environ, {"HARNESS_LEDGER_FAKE_NOW_MS": "1", "HARNESS_LEDGER_FAKE_MACHINE_ID": "m"}):
+            problems, _ = self.problems(self.fake(script))
+        self.assertEqual(problems, [])
 
     def test_not_found_and_ambiguous_fail(self):
         problems, _ = self.problems(self.fake('echo \'{"error":"not_found","message":"x"}\'; exit 3\n'))
