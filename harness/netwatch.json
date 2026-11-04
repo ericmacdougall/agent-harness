@@ -1,0 +1,26 @@
+{
+  "version": "v0.1.0",
+  "repo": "ericmacdougall/netwatch",
+  "assets": {
+    "darwin_arm64": {
+      "sha256": "f123f14d42847a3c4703d43c83ce89bf9802fe5abe6d6aa1776789f51838f3d1",
+      "binary_sha256": "245d55461937533a7b3f7709d523a8de13535a98ddfe0fb56b7f14da635dc1ce"
+    },
+    "darwin_amd64": {
+      "sha256": "d1da4b9e26c0ec0892fe6b5d0c9dbd15a156a916b655643cc78905dd8a6cd281",
+      "binary_sha256": "23dfcc8bc93f8f242d662e96b3444a6c81e57c81c9077762dfd23d8ba5bed326"
+    },
+    "linux_amd64": {
+      "sha256": "8a81c645e88dcbe91cdbeeb1b804c97c4133affff543b9517f8159524725df00",
+      "binary_sha256": "e33daa0b1578db083a598ba55d2c07ec9056e9eaa4d058c6c9252d0d325da49a"
+    },
+    "linux_arm64": {
+      "sha256": "a80cee25facb22c79d2352e300071b575031bd3a6ae0c94d66f001cd055b0459",
+      "binary_sha256": "426219d6d7be3a469fa0f4869b17b5653ace457b236b11ec11e9f8d8ea7400a9"
+    },
+    "windows_amd64": {
+      "sha256": "134714f87a5163f5b4a771a0a18494a3a12d9801efe8de9a853d120b5f2eb0e6",
+      "binary_sha256": "297a81e5f6c4d33d17bc9850f59df74a0ff37878ec864eee5887ce15ca0765fa"
+    }
+  }
+}

@@ -368,6 +368,22 @@ The watcher polls common source extensions plus exact dependency filenames: `pyp
 
 Watcher-authored status shows run number, elapsed time, exit status, and watched-file count without printing the checkout path or command arguments. Child test output is streamed verbatim and remains the test command's responsibility. Root-resolution and scan errors stop the watcher with exit 2 and generic messages; a missing command executable returns 127 without echoing its path. A child directory removed during scanning is skipped, while a missing root fails. A stalled test process group is terminated after `--timeout` (600 seconds by default), with `--once` returning 124 on timeout. Stop a continuous watch with Ctrl-C. After changing this helper, run `python3 install.py --apply` from the harness checkout to update the user-wide copy; the installer retains private backups of replaced files for manual recovery.
 
+## netwatch monitor
+
+`install.py --apply` and `install_codex.py --apply` also install [netwatch](https://github.com/ericmacdougall/netwatch), a small public Go binary that records gateway and internet latency, apps that start using the network, and orphaned or runaway developer processes. `harness/netwatch.json` pins the version, the SHA-256 of each platform archive and the SHA-256 of the binary inside it. The installer:
+
+1. hashes any existing `~/.agent-harness/bin/netwatch` (`netwatch.exe` on Windows) and, if it matches the pinned binary, downloads nothing;
+2. otherwise downloads only `https://github.com/ericmacdougall/netwatch/releases/download/<version>/...`, refuses an archive or binary whose digest differs, reads only the expected binary member, places it atomically and checks that it reports the pinned version (a binary reporting a newer version is kept, not downgraded);
+3. runs `netwatch install` to register a per-user service (a LaunchAgent on macOS, a `systemd --user` unit on Linux, a logon Scheduled Task on Windows; no root or administrator rights) unless the binary is unchanged and `netwatch status` already reports it running.
+
+- The service belongs to whoever runs the installer, so it is registered only when the target is your real home. With a non-default `--home`, as in tests, netwatch is skipped; `--netwatch` places the binary but still leaves the service alone.
+- A download, digest or service failure is reported as one `netwatch:` status line and never fails the harness install.
+- `--no-netwatch` skips netwatch and is remembered in `~/.agent-harness/netwatch-state.json`; `--netwatch` turns it back on. `AGENT_HARNESS_NETWATCH=0` skips it for one run. Opting out does not remove an installed service; run `~/.agent-harness/bin/netwatch uninstall` for that, and pass `--no-netwatch` to later installs or they register it again.
+- An upgrade re-registers the service, which keeps a custom config or log directory only when it is set through `NETWATCH_CONFIG` / `NETWATCH_LOG_DIR` in the installer's environment.
+- To upgrade the pin, copy the version and digests from the release's `SHA256SUMS` and the extracted binaries into `harness/netwatch.json`, then rerun the installer.
+
+Agents read it with `netwatch orphans --json` and `netwatch report --since 1h --json`. `orphans --kill` is opt-in, needs `--pid`, `--match` or `--all`, re-checks each process immediately before signalling and sends only `SIGTERM` on macOS and Linux. Logs stay on the machine (`~/Library/Logs/netwatch`, `~/.local/state/netwatch` or `%LOCALAPPDATA%\netwatch\logs`), are owner-only, and have secrets in command lines masked.
+
 ## Design limits
 
 The policy is intentionally risk-scaled. The small fix path skips worktrees and review loops. A normal code task gets only relevant tests and documents. The agents must not infer that the presence of a test or a reviewer PASS proves quality. Independent checks, reviewer availability, UI tool access and remote permissions vary by environment; handoffs must say exactly what ran and what did not.

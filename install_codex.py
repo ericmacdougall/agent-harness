@@ -17,7 +17,7 @@ try:
 except ModuleNotFoundError:  # Codex installer requires Python 3.11+.
     tomllib = None
 
-from install import (DirectoryPins, atomic_write, git_hook_status, markdown_marker_lines, read_regular,
+from install import (DirectoryPins, netwatch_status, atomic_write, git_hook_status, markdown_marker_lines, read_regular,
                      safe_unlink)
 
 
@@ -336,6 +336,11 @@ def main() -> None:
     parser.add_argument('--default-full-access', action='store_true',
                         help='Explicitly select built-in Full Access and no approval prompts for new sessions')
     parser.add_argument('--home', type=Path, default=Path.home())
+    netwatch = parser.add_mutually_exclusive_group()
+    netwatch.add_argument('--no-netwatch', dest='netwatch', action='store_false', default=None,
+                          help='do not install or upgrade the netwatch monitor (remembered)')
+    netwatch.add_argument('--netwatch', dest='netwatch', action='store_true',
+                          help='install or upgrade the pinned netwatch monitor (the default; remembered)')
     args = parser.parse_args()
     try:
         changes = install(args.home, args.apply, default_full_access=args.default_full_access)
@@ -347,6 +352,7 @@ def main() -> None:
     for path in changes:
         print(f'  {path}')
     print(f'  {install_git_backstop(args.home, args.apply)}')
+    print(f'  {netwatch_status(args.home, args.apply, args.netwatch)}')
     if args.apply:
         print('Review and trust the new user hooks with /hooks in a new Codex session.')
 

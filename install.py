@@ -668,6 +668,27 @@ def install_git_backstop(home: Path, apply: bool) -> str:
     return git_hook_status(home, GIT_HOOK_KEY, home / ".claude" / "hooks" / "commit_policy.py", apply=apply)
 
 
+def netwatch_status(home: Path, apply: bool, flag) -> str:
+    """Optional monitor; never fails the harness install.
+
+    With a non-default --home (tests, staging a home) netwatch is skipped
+    unless --netwatch is passed, so installer tests never download it."""
+    try:
+        import netwatch_install
+        home = home.expanduser().resolve()
+        if home != Path.home().resolve() and flag is None:
+            return "netwatch: skipped (non-default --home; pass --netwatch to place the binary)"
+        enabled = netwatch_install.choice(home, flag)
+        if apply and flag is not None:
+            try:
+                netwatch_install.save_choice(home, enabled)
+            except OSError as error:
+                return f"netwatch: could not save the choice ({error.__class__.__name__}); nothing changed"
+        return netwatch_install.status(home, apply, enabled)
+    except Exception as error:  # noqa: BLE001
+        return f"netwatch: skipped ({error.__class__.__name__}: {error})"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
@@ -677,6 +698,11 @@ def main() -> None:
                         help=f"stop setting {TMPDIR_KEY} (remembered); remove it if it is the harness value")
     choice.add_argument("--durable-tmp", dest="durable_tmp", action="store_true",
                         help=f"set {TMPDIR_KEY} to ~/.agent-harness/scratch when unset (the default; remembered)")
+    netwatch = parser.add_mutually_exclusive_group()
+    netwatch.add_argument("--no-netwatch", dest="netwatch", action="store_false", default=None,
+                          help="do not install or upgrade the netwatch monitor (remembered)")
+    netwatch.add_argument("--netwatch", dest="netwatch", action="store_true",
+                          help="install or upgrade the pinned netwatch monitor (the default; remembered)")
     args = parser.parse_args()
     durable_tmp = durable_tmp_choice(args.home, args.durable_tmp)
     if args.apply and args.durable_tmp is not None:
@@ -697,6 +723,7 @@ def main() -> None:
         print(f"  {path}")
     print(f"  {install_git_backstop(args.home, args.apply)}")
     print(f"  {scratch_status(args.home, args.apply, durable_tmp)}")
+    print(f"  {netwatch_status(args.home, args.apply, args.netwatch)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")
 
