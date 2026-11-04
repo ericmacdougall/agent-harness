@@ -99,25 +99,55 @@ def read_text_arg(path, limit: int = 4 * SMALL_FILE) -> str:
     return read_small(path, limit).decode("utf-8", "replace")
 
 
+MODE_RANK = {"off": 0, "warn": 1, "enforce": 2}
+POLICY_KEYS = ("spec", "plan_packet", "ask_user_question", "stop_lint", "ticket_lookup")
+
+
+def stricter(current, wanted):
+    """The stricter of two modes. Environment overrides go through this: they may tighten, never loosen."""
+    if wanted in MODE_RANK and MODE_RANK[wanted] > MODE_RANK.get(current, 0):
+        return wanted
+    return current
+
+
+def _overlay(policy: dict, loaded: dict, tighten_only: bool) -> None:
+    pick = stricter if tighten_only else (lambda current, wanted: wanted if wanted in MODES else current)
+    for key in POLICY_KEYS:
+        if key in loaded:
+            policy[key] = pick(policy[key], loaded[key])
+    if isinstance(loaded.get("wal"), dict):
+        for event, mode in loaded["wal"].items():
+            policy["wal"][event] = pick(policy["wal"].get(event, "warn"), mode)
+
+
+def _read_policy_file(path) -> dict:
+    loaded = loads_line(read_small(path, 1 << 16))
+    if not isinstance(loaded, dict) or loaded.get("schema") != 1:
+        raise ValueError("not a schema 1 provenance policy")
+    return loaded
+
+
 def load_policy(path=None) -> dict:
-    path = Path(path or os.environ.get("HARNESS_PROVENANCE_POLICY") or POLICY_FILE)
+    """The installed provenance_policy.json (or `path`) decides the modes. The environment can only tighten them:
+    HARNESS_PROVENANCE_POLICY names an extra policy whose modes apply only where stricter, so an agent that sets
+    a variable inline cannot downgrade an enforce policy. Loosening happens in the installed file alone."""
     policy = json.loads(json.dumps(DEFAULT_POLICY))
+    policy.setdefault("ticket_lookup", "enforce")
+    main_path = Path(path or POLICY_FILE)
     try:
-        loaded = loads_line(read_small(path, 1 << 16))
-        if not isinstance(loaded, dict) or loaded.get("schema") != 1:
-            raise ValueError("not a schema 1 provenance policy")
-        for key in ("spec", "plan_packet", "ask_user_question", "stop_lint", "ticket_lookup"):
-            if loaded.get(key) in MODES:
-                policy[key] = loaded[key]
-        if isinstance(loaded.get("wal"), dict):
-            for event, mode in loaded["wal"].items():
-                if mode in MODES:
-                    policy["wal"][event] = mode
+        _overlay(policy, _read_policy_file(main_path), tighten_only=False)
     except Problem as error:
-        if error.code != "file-unreadable" or Path(path).exists():
+        if error.code != "file-unreadable" or main_path.exists():
             policy["policy_error"] = clip(error.message, 120)
     except (OSError, ValueError) as error:  # a broken policy must not silently disable the gate
         policy["policy_error"] = clip(error, 120)
+    extra = None if path else os.environ.get("HARNESS_PROVENANCE_POLICY")
+    if extra:
+        try:
+            _overlay(policy, _read_policy_file(extra), tighten_only=True)
+        except (Problem, OSError, ValueError) as error:
+            policy["policy_error"] = clip(getattr(error, "message", error), 120)
+    policy["ticket_lookup"] = stricter(policy["ticket_lookup"], os.environ.get("HARNESS_PROVENANCE_TICKET_LOOKUP"))
     return policy
 
 
@@ -143,7 +173,9 @@ NOT_USER_TAGS = ("agent-message", "task-notification", "system-reminder", "paste
                  "artifact-content-authored-by-others", "ide_opened_file", "ide_selection", "browser_instruction",
                  "user-prompt-submit-hook", "teammate-message", "command-stdout")
 _TAGS = "|".join(re.escape(tag) for tag in NOT_USER_TAGS)
-_TAG_TOKEN = re.compile(r"<(/?)(" + _TAGS + r")\b[^<>]{0,300}>", re.I)
+# Fail closed: an opener is just `<tag`, whatever follows (nested angle brackets, long attributes); a closer must
+# be exactly `</tag>` (spaces before `>` allowed). Looser closers or stricter openers would let hidden text through.
+_TAG_TOKEN = re.compile(r"</(" + _TAGS + r")\s*>|<(" + _TAGS + r")\b", re.I)
 _WRAPPER = re.compile(r"^\s*<([A-Za-z][\w:-]*)\b[^>]*>.*</\1\s*>\s*$", re.S)
 SENTINEL = "\ufffc"  # replaces a removed block so an excerpt cannot span text on both sides of it
 
@@ -156,11 +188,12 @@ def strip_blocks(text: str) -> str:
     stack, spans = [], []  # open tags awaiting a close; closed top-level (start, end) blocks
     by_name = {}  # tag name -> indexes into `stack`, so a close finds its opener in O(1)
     for tag in _TAG_TOKEN.finditer(text):
-        name = tag.group(2).lower()
-        if not tag.group(1):
+        if tag.group(2):
+            name = tag.group(2).lower()
             by_name.setdefault(name, []).append(len(stack))
             stack.append((name, tag.start()))
             continue
+        name = tag.group(1).lower()
         positions = by_name.get(name)
         if not positions:
             continue  # a close with no opener is plain text
@@ -618,8 +651,8 @@ def weak_problem(result: dict):
     stop work): it stays marked unverified and callers warn."""
     reasons = set(result.get("weak_reasons") or [])
     if result.get("ok") and result.get("weak") and (reasons - {"ticket-unreachable"} or not reasons):
-        return ("source is an unverified citation (ticket lookup is off or not in the local cache, or a file line without an "
-                "excerpt); cite the user's words or a sourced WAL entry, add a file excerpt, or have main run "
+        return ("source is an unverified citation (a ticket that could not be confirmed, a project the credential cannot see, "
+                "lookup off, or a file line without an excerpt); cite the user's words or a sourced WAL entry, add a file excerpt, or have main run "
                 "`provenance.py cache-ticket` after checking the ticket")
     return None
 
@@ -634,6 +667,7 @@ def unreachable_warning(result: dict):
 
 TICKET_TIMEOUT = 4.0
 _TICKET_MEMO = {}
+_OUTAGE = {"until": 0.0}
 
 
 def store_ticket(project: str, number: int, title: str, checked_by: str) -> None:
@@ -659,7 +693,7 @@ def lookup_ticket(project: str, number: int):
         try:
             ticket = adapter.lookup(project, number)
         except ta.TicketOutOfScope:
-            return "unreachable", "project not visible to this credential"
+            return "out-of-scope", "project not visible to this credential"
         return ("missing", None) if ticket is None else ("found", str(getattr(ticket, "title", "") or ""))
     except BaseException as error:  # anything else is "could not check", never a crash or a guess
         if isinstance(error, (KeyboardInterrupt, SystemExit)):
@@ -673,7 +707,7 @@ TICKET_LOOKUP = lookup_ticket  # tests replace this
 def check_ticket(project: str, number: int):
     """('found', title) | ('missing', None) | ('unreachable', why) | ('unknown', None). A positive answer is cached
     on disk; an answer is remembered for this process so one claim never waits twice."""
-    mode = os.environ.get("HARNESS_PROVENANCE_TICKET_LOOKUP") or load_policy().get("ticket_lookup", "enforce")
+    mode = load_policy().get("ticket_lookup", "enforce")  # env may already have tightened it inside load_policy
     if mode not in MODES:
         mode = "enforce"
     if mode == "off":
@@ -683,6 +717,8 @@ def check_ticket(project: str, number: int):
     memo = _TICKET_MEMO.get(key)
     if memo and now - memo[0] < 60:
         return memo[1]
+    if now < _OUTAGE["until"]:  # an outage was just seen: do not make 20 serial 4 s lookups
+        return "unreachable", "tracker unreachable (recent lookup failed)"
     outcome = TICKET_LOOKUP(project, number)
     if outcome[0] == "found":
         try:
@@ -690,8 +726,10 @@ def check_ticket(project: str, number: int):
         except OSError:
             pass
     if outcome[0] == "missing" and mode == "warn":
-        outcome = ("unreachable", "missing (warn mode)")
+        outcome = ("missing-warn", "missing (warn mode)")
     _TICKET_MEMO[key] = (now, outcome)
+    if outcome[0] == "unreachable":
+        _OUTAGE["until"] = now + 60  # skip the remaining lookups of this process for a minute
     return outcome
 
 
@@ -734,7 +772,9 @@ def _resolve(source, ctx, depth, seen, result):
         result["origin"], result["ok"] = "ticket", True
         if state not in ("cache", "found"):
             result["deferred"], result["weak"] = True, True
-            result["weak_reasons"] = ["ticket-unreachable" if state == "unreachable" else "ticket-unverified"]
+            # Only a true outage may be warned about; out-of-scope projects and warn-mode misses stay refusable.
+            result["weak_reasons"] = [{"unreachable": "ticket-unreachable", "out-of-scope": "ticket-out-of-scope",
+                                       "missing-warn": "ticket-missing-warn"}.get(state, "ticket-unverified")]
     elif kind == "file":
         repo = Path(ctx.get("repo") or os.environ.get("HARNESS_PROVENANCE_REPO") or os.getcwd())
         text = git_line(repo, parsed["sha"], parsed["path"], parsed["line"], parsed["line_end"])

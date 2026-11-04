@@ -62,6 +62,30 @@ class Env(unittest.TestCase):
         self.wals = self.home / ".claude" / "wals" / SID
         self.wals.mkdir(parents=True)
 
+    def sandbox(self, **policy):
+        """A private copy of the hook scripts with its own installed policy: the only way a test may LOOSEN a mode
+        (environment variables can only tighten). Returns the directory holding the copied scripts."""
+        import shutil
+        target = self.home / "sandbox-hooks"
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(HOOKS, target, ignore=shutil.ignore_patterns("__pycache__"))
+        data = {"schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce", "stop_lint": "warn",
+                "ticket_lookup": "enforce", "wal": {"requirement": "enforce", "ask": "enforce", "blocker": "warn",
+                                                    "scope": "warn", "decision": "warn"}}
+        data.update(policy)
+        (target / "provenance_policy.json").write_text(json.dumps(data))
+        return target
+
+    def policy_file(self, **policy):
+        """In-process equivalent: point provenance.POLICY_FILE at a policy the test controls."""
+        path = self.home / "policy-inprocess.json"
+        path.write_text(json.dumps(dict({"schema": 1, "wal": {}}, **policy)))
+        patcher = mock.patch.object(provenance, "POLICY_FILE", path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return path
+
     def write_transcript(self, lines, raw=()):
         with open(self.transcript, "w", encoding="utf-8") as handle:
             for line in lines:
@@ -370,23 +394,20 @@ class RedTeamFixes(Env):
         self.reject(self.user(ide, "selected code lines here"), "excerpt-not-found")
 
     def test_f2_unverified_citations_do_not_satisfy_asks(self):
-        off = self.home / "policy-off.json"
-        off.write_text(json.dumps({"schema": 1, "spec": "enforce", "plan_packet": "warn", "ticket_lookup": "off",
-                                   "wal": {"requirement": "enforce", "ask": "enforce"}}))
-        env = dict(os.environ, HOME=str(self.home), HARNESS_PROVENANCE_POLICY=str(off))
-        with mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_POLICY": str(off)}):
-            weak = provenance.resolve("ticket:GoodQA nonexistent#99999")
-            self.assertTrue(weak["ok"] and weak["weak"])
-            self.assertTrue(provenance.weak_problem(weak))
-        out = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "ask", "--note", "n",
+        sandbox = self.sandbox(ticket_lookup="off")  # lookup off: an uncached ticket is only an unverified citation
+        self.policy_file(ticket_lookup="off")
+        env = dict(os.environ, HOME=str(self.home))
+        weak = provenance.resolve("ticket:GoodQA nonexistent#99999")
+        self.assertTrue(weak["ok"] and weak["weak"])
+        self.assertTrue(provenance.weak_problem(weak))
+        out = subprocess.run([sys.executable, str(sandbox / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "ask", "--note", "n",
                               "--reason", "needed for deploy", "--source", "ticket:GoodQA nonexistent#99999"],
                              capture_output=True, text=True, env=env)
         self.assertEqual(out.returncode, 2, out.stdout)
         self.assertIn("unverified citation", out.stderr)
-        cli = lambda *a: subprocess.run([sys.executable, str(HOOKS / "provenance.py"), *a], capture_output=True, text=True, env=env)  # noqa: E731
+        cli = lambda *a: subprocess.run([sys.executable, str(sandbox / "provenance.py"), *a], capture_output=True, text=True, env=env)  # noqa: E731
         self.assertEqual(cli("cache-ticket", "--ref", "GoodQA nonexistent#99999", "--title", "T", "--checked-by", "main").returncode, 0)
-        with mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_POLICY": str(off)}):
-            self.assertFalse(provenance.resolve("ticket:GoodQA nonexistent#99999")["weak"])
+        self.assertFalse(provenance.resolve("ticket:GoodQA nonexistent#99999")["weak"])
         sha = "a" * 40
         self.assertTrue(provenance.resolve(f"file:x.md:1@{sha}", {"repo": str(self.home)})["problems"])  # no repo: rejected, never weak-ok
 
@@ -401,6 +422,7 @@ class RedTeamFixes(Env):
 
         def fresh(outcome, source="ticket:GoodQA harness#14398"):
             provenance._TICKET_MEMO.clear()
+            provenance._OUTAGE["until"] = 0.0
             with mock.patch.object(provenance, "TICKET_LOOKUP", fake(outcome)):
                 return provenance.resolve(source)
 
@@ -409,6 +431,7 @@ class RedTeamFixes(Env):
         self.assertEqual(provenance.ticket_cache()["harness#14398"]["title"], "Real title")
         calls.clear()
         provenance._TICKET_MEMO.clear()
+        provenance._OUTAGE["until"] = 0.0
         self.assertTrue(provenance.resolve("ticket:GoodQA harness#14398")["ok"])  # served from the cache: no second lookup
         self.assertEqual(calls, [])
         missing = fresh(("missing", None), "ticket:GoodQA harness#99999")  # known missing: refused
@@ -430,11 +453,55 @@ class RedTeamFixes(Env):
                               capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))  # real adapter, no credentials
         self.assertEqual(note.returncode, 0, note.stderr)
         self.assertIn("could not be verified", note.stderr)
-        warn = self.home / "policy-warn.json"
-        warn.write_text(json.dumps({"schema": 1, "ticket_lookup": "warn"}))
-        with mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_POLICY": str(warn)}):
-            soft = fresh(("missing", None), "ticket:GoodQA harness#99998")
-        self.assertTrue(soft["ok"] and soft["weak"])  # warn mode never refuses a missing ticket
+        self.policy_file(ticket_lookup="warn")  # loosening comes from the installed policy file only
+        soft = fresh(("missing", None), "ticket:GoodQA harness#99998")
+        self.assertTrue(soft["ok"] and soft["weak"])  # warn mode accepts a missing ticket in specs...
+        self.assertIsNotNone(provenance.weak_problem(soft))  # ...but requirement and ask still refuse it
+        self.assertEqual(soft["weak_reasons"], ["ticket-missing-warn"])
+        scope = fresh(("out-of-scope", "project not visible"), "ticket:GoodQA FAKEPROJ#7")  # not an outage: stays refusable
+        self.assertTrue(scope["ok"] and scope["weak"])
+        self.assertIsNotNone(provenance.weak_problem(scope))
+        self.assertEqual(scope["weak_reasons"], ["ticket-out-of-scope"])
+        self.assertIsNone(provenance.unreachable_warning(scope))
+        provenance._TICKET_MEMO.clear()
+        provenance._OUTAGE["until"] = 0.0
+        calls = []
+        with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: calls.append(n) or ("unreachable", "down")):
+            for number in range(1, 8):
+                provenance.resolve(f"ticket:GoodQA harness#{number}")
+        self.assertEqual(len(calls), 1)  # after the first outage answer the rest of the process skips lookups
+        provenance._OUTAGE["until"] = 0.0
+
+    def test_environment_can_only_tighten_modes(self):
+        enforce = self.home / "installed-enforce.json"
+        enforce.write_text(json.dumps({"schema": 1, "spec": "enforce", "plan_packet": "enforce", "ticket_lookup": "enforce",
+                                       "wal": {"ask": "enforce", "blocker": "warn"}}))
+        loose = self.home / "env-loose.json"
+        loose.write_text(json.dumps({"schema": 1, "spec": "off", "plan_packet": "warn", "ticket_lookup": "off",
+                                     "wal": {"ask": "off", "blocker": "enforce"}}))
+        with mock.patch.object(provenance, "POLICY_FILE", enforce), \
+                mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_POLICY": str(loose), "HARNESS_PROVENANCE_TICKET_LOOKUP": "off"}):
+            policy = provenance.load_policy()
+            self.assertEqual((policy["spec"], policy["plan_packet"], policy["ticket_lookup"], policy["wal"]["ask"]),
+                             ("enforce", "enforce", "enforce", "enforce"))  # enforce stays enforce under env off/warn
+            self.assertEqual(policy["wal"]["blocker"], "enforce")  # ...but the env can still tighten (warn -> enforce)
+            provenance._TICKET_MEMO.clear()
+            provenance._OUTAGE["until"] = 0.0
+            with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: ("missing", None)):
+                self.assertFalse(provenance.resolve("ticket:GoodQA harness#424242")["ok"])  # lookup still enforced
+        warn = self.home / "installed-warn.json"
+        warn.write_text(json.dumps({"schema": 1, "spec": "warn", "ticket_lookup": "warn", "wal": {}}))
+        tight = self.home / "env-tight.json"
+        tight.write_text(json.dumps({"schema": 1, "spec": "enforce", "wal": {"scope": "enforce"}}))
+        with mock.patch.object(provenance, "POLICY_FILE", warn), \
+                mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_POLICY": str(tight), "HARNESS_PROVENANCE_TICKET_LOOKUP": "enforce"}):
+            policy = provenance.load_policy()
+            self.assertEqual((policy["spec"], policy["ticket_lookup"], policy["wal"]["scope"]), ("enforce", "enforce", "enforce"))
+        out = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "ask", "--note", "n",
+                              "--reason", "needed for deploy"],
+                             capture_output=True, text=True,
+                             env=dict(os.environ, HOME=str(self.home), HARNESS_PROVENANCE_POLICY=str(loose)))
+        self.assertEqual(out.returncode, 2, out.stdout)  # the installed policy still enforces the ask despite env off
 
     def test_m1_lookup_is_bounded_and_never_raises(self):
         start = time.perf_counter()
@@ -532,6 +599,11 @@ class RedTeamFixes(Env):
         self.assertEqual(provenance.strip_blocks("a<AGENT-MESSAGE>x<agent-message>y</agent-message>z</agent-message>b"), "a\ufffcb")
         self.assertEqual(provenance.strip_blocks("a<system-reminder>never closed"), "a\ufffc")
         self.assertEqual(provenance.strip_blocks("a</system-reminder>b"), "a</system-reminder>b")
+        # fail closed: odd openers still open a block, odd closers do not close one
+        self.assertEqual(provenance.strip_blocks("a<system-reminder <x>SECRET</system-reminder>b"), "a\ufffcb")
+        self.assertEqual(provenance.strip_blocks("a<system-reminder " + "k=v " * 200 + ">SECRET</system-reminder>b"), "a\ufffcb")
+        self.assertEqual(provenance.strip_blocks("a<system-reminder>SECRET</system-reminder foo>b"), "a\ufffc")
+        self.assertEqual(provenance.strip_blocks("<agent-message><system-reminder></agent-message>X"), "\ufffcX")  # inner opener inside a closed outer block
         self.assertEqual(provenance.strip_blocks("x<system-reminder>1</system-reminder>y<agent-message>2</agent-message>z"), "x\ufffcy\ufffcz")
 
     def test_f11_clip_strips_bidi_and_c1(self):

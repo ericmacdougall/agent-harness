@@ -21,8 +21,12 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
-os.environ.setdefault("HARNESS_PROVENANCE_TICKET_LOOKUP", "off")  # specs cite tickets; never call the tracker from tests
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
+sys.path.insert(0, str(HOOKS))
+import provenance  # noqa: E402
+# Specs cite tickets and the tracker must never be called from tests: an injected stub answers "tracker down"
+# (a warning, no refusal, no cache write). Environment variables cannot do this: they may only tighten modes.
+provenance.TICKET_LOOKUP = lambda project, number: ("unreachable", "tests are offline")
 sys.path.insert(0, str(HOOKS))
 import commit_policy as cp  # noqa: E402
 import spec_flow as sf  # noqa: E402

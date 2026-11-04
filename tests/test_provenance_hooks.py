@@ -95,22 +95,18 @@ class SlowInputs(base.Env):
 class Hooks(base.Env):
     def setUp(self):
         super().setUp()
-        self.policy = self.home / "policy.json"
-        self.set_policy()
-        self.env = dict(os.environ, HOME=str(self.home), HARNESS_PROVENANCE_POLICY=str(self.policy))
+        self.env = dict(os.environ, HOME=str(self.home))
+        self.sandbox_dir = self.sandbox()  # copy of the hooks whose installed policy this test controls (env can only tighten)
         main = self.wals / "main.jsonl"
-        note = [sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(main), "--event", "ask", "--note", "Confirm the staging key",
+        note = [sys.executable, str(self.sandbox_dir / "wal_note.py"), "--wal", str(main), "--event", "ask", "--note", "Confirm the staging key",
                 "--reason", "release needs it", "--source", self.user(HUMAN, QUOTE)]
         self.ask_id = json.loads(subprocess.run(note, capture_output=True, text=True, env=self.env, check=True).stdout)["id"]
 
     def set_policy(self, **modes):
-        data = {"schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce", "stop_lint": "warn",
-                "wal": {"requirement": "enforce", "ask": "enforce", "blocker": "warn", "scope": "warn", "decision": "warn"}}
-        data.update(modes)
-        self.policy.write_text(json.dumps(data))
+        self.sandbox_dir = self.sandbox(**modes)
 
     def run_hook(self, name, payload, raw=None):
-        run = subprocess.run([sys.executable, str(HOOKS / "provenance_hooks.py"), name], input=raw if raw is not None else json.dumps(payload),
+        run = subprocess.run([sys.executable, str(self.sandbox_dir / "provenance_hooks.py"), name], input=raw if raw is not None else json.dumps(payload),
                              capture_output=True, text=True, env=self.env)
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(run.stdout) if run.stdout.strip() else {}
