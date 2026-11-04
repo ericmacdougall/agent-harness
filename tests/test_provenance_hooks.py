@@ -124,7 +124,9 @@ class Hooks(base.Env):
         self.assertIn("no [ask:<id>]", denied["hookSpecificOutput"]["permissionDecisionReason"])
         fake = self.run_hook("ask-gate", self.ask_payload("Which key? [ask:wnotreal0001]"))
         self.assertIn("not in this session's ledger", fake["hookSpecificOutput"]["permissionDecisionReason"])
-        self.assertEqual(self.run_hook("ask-gate", self.ask_payload(f"Which key? [ask:{self.ask_id}]")), {})
+        allowed = self.run_hook("ask-gate", self.ask_payload(f"Which key? [ask:{self.ask_id}]"))
+        self.assertNotIn("permissionDecision", allowed["hookSpecificOutput"])
+        self.assertIn("Confirm the staging key", allowed["hookSpecificOutput"]["additionalContext"])  # the ask's note is shown
         self.set_policy(ask_user_question="warn")
         warn = self.run_hook("ask-gate", self.ask_payload("Which key?"))
         self.assertNotIn("permissionDecision", warn["hookSpecificOutput"])
@@ -161,6 +163,20 @@ class Hooks(base.Env):
             self.assertEqual(self.run_hook("stop-lint", {"session_id": bad, "last_assistant_message": message}), {})
             self.assertEqual(self.run_hook("prompt", {"session_id": bad}), {})
         self.assertEqual(self.run_hook("ask-gate", {"session_id": SID, "tool_name": "AskUserQuestion", "tool_input": "x"}), {})
+
+    def test_config_dir_override_and_claimed_reminder_cleanup(self):
+        import provenance
+        saved = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(self.home / "cfg")
+        try:
+            self.assertEqual(provenance.claude_home(), self.home / "cfg")
+        finally:
+            os.environ.pop("CLAUDE_CONFIG_DIR") if saved is None else os.environ.__setitem__("CLAUDE_CONFIG_DIR", saved)
+        path = hooks.reminder_path(SID)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x" * (1 << 17))  # larger than the read cap: the read fails, the claimed file must still go away
+        self.assertEqual(self.run_hook("prompt", {"session_id": SID}), {})
+        self.assertEqual([p.name for p in path.parent.iterdir() if p.name.startswith("provenance-reminder")], [])
 
     def test_ask_gate_fails_open_when_the_ledger_is_unavailable(self):
         import shutil

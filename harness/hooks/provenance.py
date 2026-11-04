@@ -283,7 +283,10 @@ def parse_source(text: str) -> dict:
 # --------------------------------------------------------------------------- transcripts
 
 def claude_home(home=None) -> Path:
-    return Path(home) if home else Path.home() / ".claude"
+    if home:
+        return Path(home)
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")  # Claude Code can relocate its config and transcripts
+    return Path(configured) if configured else Path.home() / ".claude"
 
 
 def find_transcript(session: str, home=None):

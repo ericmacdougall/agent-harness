@@ -336,10 +336,17 @@ def cmd_prompt(payload: dict) -> dict:
     claimed = path.with_name(f"{path.name}.{os.getpid()}")
     try:
         os.rename(path, claimed)  # atomic claim: two concurrent prompt hooks cannot both deliver it
+    except OSError:
+        return {}
+    try:
         text = prov.read_small(claimed, 1 << 16).decode("utf-8", "replace")
-        claimed.unlink()
     except (OSError, prov.Problem):
         return {}
+    finally:
+        try:
+            claimed.unlink()  # never leave a claimed file behind, even when the read failed
+        except OSError:
+            pass
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                    "additionalContext": "Provenance reminder: your last message had untraceable asks. " + text}}
 
@@ -361,6 +368,11 @@ def cmd_ask_gate(payload: dict) -> dict:
         if not outcome["ok"]:
             problems.append(f"question {index}: {outcome['problem']}")
     if not problems:
+        shown = [f"[ask:{m.group(1)}] = {prov.clip((find_ask(session, m.group(1)) or {}).get('note', ''), 100)}"
+                 for m in ASK_ID.finditer(json.dumps(questions, ensure_ascii=False))]
+        if shown:  # make an id reused for an unrelated question visible to the user
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                           "additionalContext": "Provenance ask ledger: " + "; ".join(shown)}}
         return {}
     reason = ("Provenance: AskUserQuestion needs a traceable origin for each question. " + "; ".join(problems) +
               ". Register it with `wal_note.py --event ask --note ... --reason ... --source ...`, then put "
