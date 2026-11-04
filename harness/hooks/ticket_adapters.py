@@ -16,6 +16,7 @@ import socket
 import stat
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -180,9 +181,18 @@ class GoodQAAdapter:
         except (ValueError, KeyError, IndexError, TypeError):
             raise TicketSystemUnavailable(f"GoodQA returned an unexpected shape for {tool}") from None
         if result.get("isError"):
-            error = data.get("error") if isinstance(data, dict) else None
+            # GoodQA wraps payloads as {"dataTrust": ..., "data": {...}}; errors sit under data.error.
+            inner = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+            error = inner.get("error") if isinstance(inner, dict) else None
             code = error.get("code") if isinstance(error, dict) else "error"
-            return {"__error__": str(code)}
+            details = error.get("details") if isinstance(error, dict) else None
+            reason = details.get("reason") if isinstance(details, dict) else None
+            # Only machine codes are kept: messages can echo untrusted filenames or content.
+            code = str(code)
+            found = {"__error__": code if re.fullmatch(r"[a-z_]{1,40}", code) else "error"}
+            if isinstance(reason, str) and re.fullmatch(r"[a-z_]{1,40}", reason):
+                found["__reason__"] = reason
+            return found
         return data
 
     def org_id(self):
@@ -208,8 +218,12 @@ class GoodQAAdapter:
         issue = data.get("issue", data)
         if not isinstance(issue, dict) or not isinstance(issue.get("id"), str) or issue.get("number") != int(number):
             raise TicketSystemUnavailable("GoodQA lookup returned an unexpected issue")
-        return Ticket("GoodQA", project, int(number), issue["id"], str(issue.get("title") or ""),
-                      str(issue.get("status") or ""))
+        ticket = Ticket("GoodQA", project, int(number), issue["id"], str(issue.get("title") or ""),
+                        str(issue.get("status") or ""))
+        ticket.project_id = issue.get("projectId")
+        ticket.description = str(issue.get("description") or "")
+        ticket.closed = bool(issue.get("closedAt")) or ticket.status in ("done", "wont_fix", "duplicate")
+        return ticket
 
     def comments_since(self, ticket: Ticket, since: datetime):
         """Newest-first pages until a page starts before `since` or the page budget ends."""
@@ -246,12 +260,136 @@ class GoodQAAdapter:
             raise TicketSystemUnavailable(f"GoodQA status update failed ({data['__error__']})")
         return data
 
+    # ---- spec flow (spec_flow.py): issue reads, attachments, uploads and the done transition
+
+    def issue(self, issue_id: str):
+        """Return the issue dict, or None when this credential cannot see it."""
+        return self.issue_access(issue_id)[0]
+
+    def issue_access(self, issue_id: str):
+        """(issue, None) when readable, or (None, "not_found" | "forbidden") when this credential cannot see it."""
+        data = self.call("get_issue", {"issueId": issue_id})
+        if data.get("__error__") in ("not_found", "forbidden"):
+            return None, data["__error__"]
+        if "__error__" in data:
+            raise TicketSystemUnavailable(f"GoodQA issue read failed ({data['__error__']})")
+        issue = data.get("issue", data)
+        if not isinstance(issue, dict) or issue.get("id") != issue_id:
+            raise TicketSystemUnavailable("GoodQA returned an unexpected issue")
+        return issue, None
+
+    def all_comments(self, issue_id: str, *, max_pages: int | None = None):
+        """Every active comment, oldest first. Running out of pages fails closed."""
+        pages = max(1, int(max_pages or self.config.get("max_comment_pages", 5)))
+        found, cursor = [], None
+        for _ in range(pages):
+            arguments = {"issueId": issue_id, "order": "asc", "limit": 200}
+            if cursor:
+                arguments["cursor"] = cursor
+            data = self.call("get_issue_comments", arguments)
+            if "__error__" in data or not isinstance(data.get("comments"), list):
+                raise TicketSystemUnavailable("GoodQA comments could not be read")
+            for item in data["comments"]:
+                if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                    raise TicketSystemUnavailable("GoodQA returned a malformed comment")
+                if not item.get("archivedAt"):
+                    found.append(item)
+            cursor = data.get("nextCursor")
+            if not data.get("hasMore") or not cursor:
+                return found
+        raise TicketSystemUnavailable("too many records on this ticket for the comment page budget; "
+                                      "raise max_comment_pages")
+
+    def attachments(self, issue_id: str):
+        data = self.call("issue_attachments_list", {"issueId": issue_id})
+        if "__error__" in data or not isinstance(data.get("attachments"), list):
+            raise TicketSystemUnavailable("GoodQA attachments could not be listed")
+        return [item for item in data["attachments"] if isinstance(item, dict)]
+
+    def upload(self, project_id: str, filename: str, mime: str, payload: bytes, sha256: str) -> str:
+        """Project-surface upload: start, PUT to the presigned URL, complete with the sha256."""
+        started = self.call("file_upload_start", {"surface": "project", "id": project_id, "filename": filename,
+                                                  "mime": mime, "sizeBytes": len(payload)})
+        started = started.get("data", started) if isinstance(started, dict) else {}
+        if "__error__" in started:
+            raise TicketSystemUnavailable(f"GoodQA upload start failed ({started['__error__']})")
+        attachment, target = started.get("attachment") or {}, started.get("upload") or {}
+        url, headers = target.get("url"), target.get("headers") or {}
+        if not isinstance(attachment.get("id"), str) or not isinstance(url, str) or not isinstance(headers, dict):
+            raise TicketSystemUnavailable("GoodQA upload start returned an unexpected shape")
+        self._check_upload_url(url)
+        request = urllib.request.Request(url, data=payload, method=str(target.get("method") or "PUT"),
+                                         headers={str(k): str(v) for k, v in headers.items()})
+        try:
+            with urllib.request.urlopen(request, timeout=max(self._remaining(), 30.0)) as response:
+                response.read(65536)
+        except urllib.error.HTTPError as error:
+            raise TicketSystemUnavailable(f"upload storage refused the file (HTTP {error.code})") from None
+        except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as error:
+            raise TicketSystemUnavailable(f"upload storage unreachable ({type(error).__name__})") from None
+        done = self.call("file_upload_complete", {"id": attachment["id"], "expectedSha256": sha256})
+        done = done.get("data", done) if isinstance(done, dict) else {}
+        if "__error__" in done:
+            raise TicketSystemUnavailable(f"GoodQA upload verification failed ({done['__error__']}"
+                                          f"{', ' + done['__reason__'] if '__reason__' in done else ''})")
+        row = done.get("attachment") or {}
+        if row.get("completionState") != "completed" or row.get("sha256") != sha256:
+            raise TicketSystemUnavailable("GoodQA did not verify the uploaded bytes")
+        return attachment["id"]
+
+    def _check_upload_url(self, url: str):
+        parsed = urllib.parse.urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        loopback = host in ("127.0.0.1", "localhost") and self.endpoint.startswith(("http://127.0.0.1",
+                                                                                    "http://localhost"))
+        suffixes = self.config.get("upload_host_suffixes") or [".digitaloceanspaces.com"]
+        if loopback:
+            return
+        if parsed.scheme != "https" or not any(host.endswith(s) for s in suffixes):
+            raise TicketSystemUnavailable("GoodQA returned an upload URL outside the allowed storage hosts")
+
+    def comment_with_files(self, issue_id: str, body: str, operation_id: str, attachment_ids=()):
+        arguments = {"issueId": issue_id, "body": body, "operationId": operation_id}
+        if attachment_ids:
+            arguments["attachmentIds"] = list(attachment_ids)
+        data = self.call("comment_on_issue", arguments)
+        if "__error__" in data:
+            raise TicketSystemUnavailable(f"GoodQA comment failed ({data['__error__']})")
+        comment = data.get("comment", data)
+        if not isinstance(comment, dict) or not isinstance(comment.get("id"), str):
+            raise TicketSystemUnavailable("GoodQA comment returned an unexpected shape")
+        return comment
+
+    def close_done(self, issue_id: str, note: str):
+        """Request status done. Returns (ok, detail); a refusal is not retried."""
+        data = self.call("close_issue_done", {"issueId": issue_id, "status": "done", "note": note})
+        if "__error__" in data:
+            return False, data["__error__"]
+        return True, "done"
+
     def update_instructions(self, ticket: Ticket, names: str) -> str:
         return (f"Comment on {ticket.label} naming {names}, for example with the GoodQA MCP tool "
                 f"comment_on_issue (issueId {ticket.id}) or the GoodQA UI.")
 
 
 ADAPTERS = {"goodqa": GoodQAAdapter}
+
+
+def project_config(config: dict, project: str | None, routes: dict | None = None) -> dict:
+    """Route a project slug to its own org and key (a GoodQA key is bound to one org).
+
+    `routes` maps slug -> {"org_id": ..., "key_file": ...}; it defaults to config["projects"].
+    Unlisted projects keep the system's default org and key.
+    """
+    routes = routes if routes is not None else (config.get("projects") or {})
+    route = routes.get((project or "").lower()) if isinstance(routes, dict) else None
+    if not isinstance(route, dict):
+        return config
+    merged = dict(config)
+    for key in ("org_id", "key_file", "endpoint"):
+        if route.get(key):
+            merged[key] = route[key]
+    return merged
 
 
 def adapter_for(config: dict, **kwargs):

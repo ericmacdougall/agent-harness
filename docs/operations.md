@@ -16,6 +16,7 @@
 | `integrate_local.py` | Checked scratch merge and protected fast-forward into the starting checkout. |
 | `watch-tests.py` | Polling test runner for source edits. |
 | `commit_policy.py`, `commit_policy.json`, `ticket_adapters.py` | Commit message policy: PreToolUse hook, git `commit-msg` backstop, range and GitHub checks, GoodQA ticket verification and delivery comments, waivers. |
+| `spec_flow.py`, `spec_policy.json`, `spec_template.md` | Spec-driven tickets: spec documents, spec reviews, per-criterion evidence, click-test records, sign-off and the done gate (CLI, plan-review ticket gate, PreToolUse hook on GoodQA status changes). |
 
 No background process is installed. Claude Code runs hooks, and the main agent invokes the other helpers when appropriate. The installer refuses symlinked managed files and directories, including its backup directory, before reading settings or writing files. Reinstallation preserves unrelated hooks even when they share an entry with a managed hook. The installer rejects non-regular managed files (including FIFOs) and files occupying managed directory paths. It reads all source payloads before writing, then backs up the captured original bytes in private files before replacing managed files. It keeps original directory and managed-file inodes open through installation and rollback. A missing directory is created under a random staging name, opened and checked while empty, then published under its final name; the installer does not infer that a newly opened final name is the directory it created. Each file write compares the captured parent and file identity; a replacement is refused before mutation. The published file inode is recorded before the directory `fsync`, so a later write error can still roll back that file. A descriptor for each published managed file remains open through rollback so its inode number cannot be recycled while the guard relies on it. Reads, replacements, and rollback traverse parents without following symlinks, and each replacement rechecks the visible parent after publication. A parent that moves during installation produces an error rather than a success report. On a caught write failure it attempts to restore the original bytes and permission bits of existing files and remove newly installed files. Restoration continues after an individual failure; an incomplete rollback reports affected paths and the backup directory. Backups and newly created empty directories remain. This is per-file atomic replacement with best-effort rollback, not a crash-safe transaction: power loss, process termination, or a second failure during recovery can still require manual restoration. In an eight-process disposable contention test, some installers may refuse an intervening directory creation and succeed on retry; the final installation remains coherent. Concurrent settings editors can still race over read-modify-write settings, so do not run them together.
 
@@ -310,6 +311,138 @@ Co-Authored-By: ...
 - **Remove the PreToolUse hook:**
   - Claude Code: delete the `commit_policy.py hook` handler from `~/.claude/settings.json`.
   - Codex: delete it from `~/.codex/hooks.json`.
+
+## Spec-driven tickets
+
+Every want, need, finding or bug is a GoodQA ticket. When an agent picks one up, it writes a spec, gets the spec reviewed and attaches it to the ticket. As it works, it attaches proof for each acceptance criterion. After deploy, it attaches the click-test record. Once signed off, the ticket can be marked done.
+
+The ticket is the record of truth. Each step posts one comment containing a readable summary and a fenced `harness-spec-record` JSON block, with its files attached. Attaching costs four calls: `file_upload_start` (project surface), a presigned `PUT`, `file_upload_complete` with the sha256, then `comment_on_issue` with `attachmentIds`. The done gate trusts a file only when `issue_attachments_list` shows it completed, on that comment, with the server-computed sha256 that the record names. Retries are idempotent: a record whose content key is already on the ticket is reported `ALREADY_RECORDED`, and the comment `operationId` is derived from that key.
+
+```sh
+S=~/.claude/hooks/spec_flow.py
+python3 $S new --ticket 'GoodQA harness#168' --out ~/specs/168.md --author 'agent:<id> (<model>)'
+python3 $S lint ~/specs/168.md
+python3 $S packet ~/specs/168.md --out ~/specs/168.packet.md      # exact bytes a helper review must see
+python3 ~/.claude/hooks/peer_review.py plan --repo <clean worktree> --packet ~/specs/168.packet.md --output ~/specs/168.adv.md
+python3 $S review ~/specs/168.md --role adversarial --report ~/specs/168.adv.md
+python3 $S review ~/specs/168.md --role acceptance --agent <red-team|task-owner|fixer id> --wal <main WAL> --verdict ACCEPT --report-file <its report>
+python3 $S attach ~/specs/168.md --actor 'agent:<id>'
+python3 $S evidence --ticket 'GoodQA harness#168' --actor 'agent:<id>' --ac AC-1 --really-tested RT1 --wal <WAL> [--commit <sha> --repo <checkout> --target origin/main] [--log run.log]
+python3 $S click-test --ticket 'GoodQA harness#168' --actor 'agent:<id>' --agent-id <click-tester id> --wal-dir ~/.claude/wals/<session> --url <url> --deployed-commit <sha> --repo <checkout> --result pass --report <its report> [--log f] [--screenshot f.png]
+python3 $S signoff --ticket 'GoodQA harness#168' --actor 'agent:<main id>' --by <main id> --kind agent --source '<where it was given>'
+python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same report, never writes
+```
+
+### Spec document
+
+- **Header lines:**
+  - `Ticket: GoodQA <project>#<n>`. The project slug is required; a bare `GoodQA #N` is rejected.
+  - `Author: agent:<id> (<model>)`, `human:<name>` or `model:<name>`.
+  - `Click-test: required` or `not-applicable (<reason>)`.
+  - `Sign-off: main` or `human`.
+- **Sections:** `## Outcome`, `## Scope`, `## Acceptance criteria`, `## Negative cases` and `## Risks`.
+  - Each criterion is written `- AC-n: <observable result>. Verify by: <check>.`
+  - Each negative case is written `- NEG-n (AC-n): ...`.
+  - `lint` rejects a spec that has no criteria, duplicate ids, a criterion without `Verify by:`, a negative case that names an unknown criterion, an unedited `<placeholder>`, or an unrecognized bullet.
+- **Reviews section:** `## Reviews` is generated from the sidecar `<spec>.reviews.json`. The *spec core* is everything above it, normalized to NFC and LF with trailing spaces trimmed. Reviews bind to the core's sha256. Editing the spec after review therefore makes its reviews stale, while regenerating the reviews table does not. Keep `## Reviews` last: `attach` refuses a spec with a section after it, since that section would be lost.
+
+### Reviews
+
+- **Two roles, distinct reviewers.** The `adversarial` and `acceptance` roles each need an `ACCEPT` on the current core.
+  - The two reviewers must differ in model, agent or person. Two runs of the same helper model count as one reviewer.
+  - Neither reviewer may be the spec author.
+  - A later `BLOCK` for a role replaces an earlier `ACCEPT`.
+- **Review sources:**
+  - **Helper report.** A `peer_review.py plan` report. It must have `Stage: plan`, a body verdict `PLAN_RESULT: ...`, and `Reviewed packet SHA-256` equal to the core sha.
+  - **Native agent.** A native agent id recorded by SubagentStart in the main WAL, plus its report file. Only `task-owner`, `click-tester`, `fixer` and `red-team` agents are logged. An adversarial review from a native agent requires `red-team`.
+  - **Human.** A human name with `--source`. This is self-attested.
+- **What `attach` uploads:** the spec, the reviews JSON and each review report. A report that changed since its review is refused.
+
+### Evidence, click-tests and sign-off
+
+- **Evidence** must name criteria of the attached spec. Proof is any of these; a note alone is not proof:
+  - a `REALLY_TESTED <id>:` WAL note newer than its `PENDING_REAL_TEST`;
+  - a log;
+  - a commit plus a note naming the check.
+- **Commits** must exist. With `--target`, they must also be reachable from that ref.
+- **Logs:**
+  - They are regular files; symlinks are refused.
+  - A log longer than `max_log_bytes` (2 MB) is cut to its tail.
+  - The text is redacted with `integrate_local.redact_output` (tokens, cookies, bearer, URL userinfo, keys).
+  - A log is refused if private-key material remains, or if the cut lands in what looks like a key.
+  - Screenshots and recordings (`png jpg gif webm mp4`, up to 15 MB) are checked by magic number and are not redacted.
+- **Click-tests:**
+  - Logs or a report are mandatory.
+  - `--deployed-commit` names the commit that was deployed and tested. Every commit cited by evidence on the current spec must be reachable from it, or the record is refused. Evidence commits added later make `done` NOT READY until a new click-test covers them. This is a membership check, so it also applies when the later commit was already inside the deployed commit; rerun the click-test. The deployed commit is declared by whoever records the click-test and is not read back from the deployment, so `done` lists it under Self-attested.
+  - The tester must be independent: a click-test whose tester is the spec author, a spec reviewer or anyone who posted evidence does not count toward READY.
+  - **Agent click-tester:**
+    - The agent must be recorded as `click-tester` in the session's `main.jsonl`.
+    - The start time is its SubagentStart record. The end time is its first `subagent_stop` record (from the SubagentStop hook). If there is none, `ended_at` is null and `last_activity_at` is recorded.
+    - A pass counts only if it comes from the click-tester: its report (first line `CLICK_TEST_RESULT: PASS|FAIL`, matching `--result`) has its sha256 noted in the agent's own WAL, or `--really-tested <id>` is found there.
+  - **Human click-tests** are self-attested.
+- **Sign-off:**
+  - It must come from someone other than the spec author, either spec reviewer, a click-tester, or anyone who posted spec, evidence or click-test records. By default this is the main agent. When the main agent directed the work, its independence is nominal; ask for `Sign-off: human` when that matters.
+  - It must be `--kind human` when the spec says `Sign-off: human` or the ticket text says "human sign-off".
+  - The sign-off identity is self-declared.
+  - GoodQA labels agent comments made through a user token as human, so comment authorship never proves a human.
+
+### Done gate
+
+`done` reports READY only when all of the following hold:
+
+- a verified spec is attached: its record carries the spec file (matching `spec_file_sha`), the reviews file and at least one criterion;
+- both reviews `ACCEPT` that spec's core;
+- every criterion has evidence on that core;
+- the evidence on that core cites at least one commit and attaches at least one execution log (this applies to every ticket, including documentation-only work: cite the docs commit and a check log);
+- the latest click-test on that core passed with logs, by an independent tester, at a deployed commit containing every evidence commit (unless the spec says not-applicable); a click-test of an older spec version is stale;
+- a valid sign-off exists on that core.
+
+Otherwise it lists each missing item with the command that fixes it. Under "Self-attested" it lists every check that rests on a name the helper cannot verify.
+
+**Exit codes:**
+
+| Code | Meaning |
+|---|---|
+| 0 | READY, or `--apply` on a ticket that is already done (`ALREADY_DONE`, safe to retry) |
+| 2 | Missing items, a refused record, a `lint` failure, or a command-line error from the argument parser |
+| 3 | Spec or input error found after parsing (for example a stale review, a refused log file, an unknown criterion) |
+| 4 | GoodQA unreachable, or the page budget ran out (fail closed) |
+| 5 | `--apply` was refused by GoodQA (`TRACKER_REFUSED`); the ticket is left unchanged |
+
+GoodQA's own independent-acceptance rule for done transitions still applies.
+
+### Gates
+
+1. **Ticket at plan review.** In tracked repositories (origin matches `ticket_systems.*.repos`), `peer_review.py plan` needs a `Ticket: GoodQA <project>#<n>` line naming a ticket that exists. The check is controlled by `plan_ticket_gate` in `spec_policy.json`:
+   - `warn` (the shipped default) prints the problem and continues.
+   - `enforce` stops before any reviewer launches, with exit 2.
+   - An unreachable GoodQA gives `TICKETS_UNVERIFIED` (exit 6 in enforce mode). A commit-policy `tickets` waiver for subject `plan-<packet sha256[:20]>` covers that case.
+   - Commits are already held to `Refs:` by the commit policy.
+2. **Done at the tracker call (Claude Code).** A PreToolUse hook (`spec_flow.py hook`, timeout 60 s, `onFailure: block`, internal budget `hook_deadline_seconds` = 40) watches `close_issue_done`, `close_issue_wont_fix`, `update_issue`, `bulk_update_issues`, `archive_issue`, `reassign_issue` and `call_api`.
+   - **Allowed without a network call:** open statuses (triage through `on_production`, which GoodQA documents as nonterminal) and `update_issue` without a status.
+   - **Gated by the spec:** `done`.
+   - **Need a reason:** `wont_fix` and `duplicate` need one of at least 20 characters.
+   - **Warn mode:** the hook allows the call and returns its findings as `additionalContext`, which Claude Code shows the agent next to the tool result (plain stderr from an allowing hook is never shown to the agent). It makes no permission decision, so normal permission rules still apply.
+   - **Blocked:** an unknown status, archiving an open ticket, a project, pipeline or stage move (`reassign_issue`, or `projectId`, `pipelineId` or `stageId` in an `update_issue` patch), and a `call_api` DELETE on an issue.
+   - **`call_api` writes:** every non-GET `call_api` call is unchecked unless the hook recognises it, and an unchecked call warns, or blocks while any project is enforced. The path is lowercased first, so a mixed-case path is gated like the canonical one; a path without a leading `/`, or with a query, fragment, `%` escape, backslash, or empty or dot segment, is unchecked. Recognised shapes: an exact `/issues/<uuid>` path with an object body whose fields are all known (`status` and `patch.status` are gated like `update_issue`, and two different values or an explicit null are an unknown status, `projectId`/`pipelineId`/`stageId` as a move, and descriptive fields such as `title`, `priority` and `labels` pass; any other field, such as `archivedAt` or `action`, is unchecked); the exact `/comments`, `/attachments` and `/time-entries` sub-paths (allowed unless the body carries a status); a collection write with an `items` list (checked like `bulk_update_issues`); and a plain create (`POST /v1/issues` or `/v1/projects/<uuid>/issues` with no status, patch, items, id or filter keys), which blocks only when the path names an enforced project. Routes that do not name issues (projects, stages, other resources) are unchecked too, because the hook cannot tell whether they move or close issues.
+   - **Bulk calls:** every item in a bulk call is checked, and one failing item blocks the call.
+   - **Where it blocks:** only in `mode: enforce`, and only for `enforced_projects`. Everywhere else it prints what is missing and allows the call.
+   - **Unreachable GoodQA:** a transport failure blocks only in enforce mode when enforced projects are configured. The status write goes to the same service, so blocking it costs little.
+   - **Refused key:** if any routed key gets `forbidden` reading the issue (a revoked or rotated key, or lost membership), the hook blocks in enforce mode while any project is enforced, and names `doctor`. Re-run `doctor` for each enforced project after any key or membership change.
+   - **Non-uuid issue id:** a missing or non-uuid `issueId` blocks while any project is enforced. Only `update_issue` and `reassign_issue` declare `issueId` as a uuid; the other tools only describe it as one.
+   - **Issue not found:** GoodQA also answers `not_found` to a key without membership. So when every routed key reports `not_found`, the hook first checks that each enforced project's key can still read its own project (`get_project`). If any cannot, it blocks and names `doctor`. If all can, the issue is outside every enforced project and the hook only warns.
+   - **Bulk calls while enforced:** one unresolvable item (a non-uuid id, or a not-found id while an enforced key is dead) blocks the whole call, including items in projects that are not enforced.
+   - **Out of reach:** the GoodQA UI, REST calls made with curl or scripts, Codex and Cursor. Codex has no SubagentStop or MCP PreToolUse hook here, and Cursor is not wired, so on Codex and Cursor the commands are run by hand and `done` is advisory. Parity is tracked in GoodQA work-tracker-automatic#35670, to be absorbed by the harness Go port.
+
+### Credentials and rollout
+
+- **Keys and routing.** A GoodQA key is bound to one organization. `spec_policy.json` `projects` maps a project slug to its `project_id` and `org_id`, and to `key_file` when it needs a different key. `doctor --project <slug>` checks that the routed key can create attachments, comment and transition in that project.
+  - `member.key` reaches FrameBright, including the `work-tracker-automatic` tracker.
+  - The Harness project lives in org Eric, and no key file reaches it yet.
+- **Shipped mode:** `mode: warn`, `plan_ticket_gate: warn`, `enforced_projects: []`. No project is enforced in this release.
+- **Before enforcing any project:** resolve the remaining items in GoodQA work-tracker-automatic#35672 (per-project plan ticket gate, a policy for tickets opened before enforcement, bulk timing with several routed keys). `doctor` reports the permissions GoodQA lists for the key; it does not try a write. Re-run it after any key or membership change.
+- **Enforcing on `harness`:** once #35672 is resolved, add `{"key_file": ...}` to its route, run `doctor --project harness`, then set `"enforced_projects": ["harness"]` and `"mode": "enforce"`.
+- **Rollback:** set the modes to `off`, or delete the `spec_flow.py hook` handler from `~/.claude/settings.json`.
 
 ## Lower-level publication and local integration
 
