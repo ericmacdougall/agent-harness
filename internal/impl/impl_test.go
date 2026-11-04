@@ -48,6 +48,8 @@ func TestSharedCases(t *testing.T) {
 	for _, c := range doc.Cases {
 		t.Run(c.Name, func(t *testing.T) {
 			dir := t.TempDir()
+			// t.TempDir's leaf follows the umask (0775 under umask 002), which safeAncestors rightly refuses.
+			mustOK(t, os.Chmod(dir, 0o700))
 			bin := filepath.Join(dir, "launcher", "harness")
 			other := filepath.Join(dir, "other", "harness")
 			os.MkdirAll(filepath.Dir(bin), 0o700)
