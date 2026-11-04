@@ -854,6 +854,8 @@ def _ticket_updates(flow, stage, head, pr_url):
                  "`commit_policy.py notify --stage deployed`")
     for item in record.get("waivers", []):
         lines.append(f"- Waiver used: {item['kind']} {item['subject'][:12]} (id {item['id']})")
+    for item in record.get("warnings", []):
+        lines.append(f"- Not verified (project out of the credential's scope): {item['ticket']}")
     results = commit_policy.notify(str(flow.original), flow.state["baseline"], flow.state["source_head"], policy,
                                    operation_seed=flow.generation, evidence="\n".join(lines), stage=stage,
                                    exclude=record.get("exclude", []))

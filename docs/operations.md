@@ -259,7 +259,10 @@ Co-Authored-By: ...
    - **Results.** Neither failure creates delivery state.
      - `BLOCKED_COMMIT_POLICY` (exit 2) lists each failing commit and stale ticket, with the fix.
      - `TICKETS_UNVERIFIED` (exit 6) means GoodQA was unreachable or answered unexpectedly. The check fails closed.
-   - **Projects the credential cannot see.** The member key reaches the FrameBright org only, so GoodQA answers `project_not_found` for a ref such as `GoodQA eric-app#7` in the Eric org. With `ticket_systems.goodqa.unreachable_projects` set to `"warn"` (the shipped value), that ticket is reported as `OUT_OF_SCOPE`: the ref still has to be well formed, the range passes with a printed warning and `unreachable_reason`, the warning is appended to `~/.agent-harness/commit-policy/warnings.jsonl`, and finish skips its comment. If the key is absent or set to `"block"`, the ref fails closed as `TICKETS_UNVERIFIED`. A missing ticket in a project the key can see is still `MISSING` and blocks. Set the key to `"block"` once durable cross-org access lands.
+   - **Projects the credential cannot see.** The member key reaches the FrameBright org only (`org_id` is pinned to it), so GoodQA answers `project_not_found` for Eric-org refs such as `GoodQA solve#7`.
+     - Only projects listed in `ticket_systems.goodqa.unreachable_projects` (shipped: `solve`, `ai-course`, `harness`) are reported as `OUT_OF_SCOPE`. The ref still has to be well formed. The range passes with a warning naming `unreachable_reason`. `deliver.py prepare` and the PR-review gate print it; the `gh pr create` hook passes silently. Each warning is recorded once per ticket and head in `~/.agent-harness/commit-policy/warnings.jsonl`. finish skips the ticket's comment and lists it as not verified on the other tickets' comments.
+     - Any other `project_not_found` fails closed as `TICKETS_UNVERIFIED`. That covers a typo, an invented slug, an Eric-org project not yet listed, and the default project `goodqa`, which is never treated as out of scope. A missing ticket in a project the key can see is still `MISSING` and blocks.
+     - Adding a confirmed slug is a config change. Empty the list once durable cross-org access lands.
    - Local-only delivery verifies tickets too.
    - **Legacy commits:** commits authored before `enforce_after` are reported as legacy and do not block.
 4. **Delivery comments in `deliver.py finish`.**
@@ -289,7 +292,7 @@ Co-Authored-By: ...
   - A `message` waiver applies only in the session that recorded it. A `tickets` waiver applies to one range head, which is the offline delivery path.
   - Waivers are self-attested. The threat model is careless or hurried agents, not adversarial ones: an agent can edit the installed hooks anyway. The `waive` command is not on the permission allow list, but Codex with `approval_policy = "never"` and Claude in bypass or broad-allow modes will not prompt.
   - Every waiver that gets used is listed in the reports and in the delivery ticket comment.
-- **Audit:** `commit_policy.py report --since 2026-11-04` lists the waivers and flags any whose WAL record is missing. It also lists out-of-scope ticket warnings (`warnings`).
+- **Audit:** `commit_policy.py report --since 2026-11-04` lists the waivers and flags any whose WAL record is missing. It also lists out-of-scope ticket warnings (`warnings`, `warning_count`).
 
 ### Rollout and rollback
 

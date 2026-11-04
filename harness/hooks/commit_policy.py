@@ -1139,7 +1139,7 @@ def wal_roots():
 
 def _read_lines(path: Path, limit: int = 64_000_000):
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # never wait on a FIFO
     except OSError:
         return []
     with os.fdopen(fd, "rb") as handle:
@@ -1194,10 +1194,7 @@ def record_waiver(wal: Path, kind: str, subject: str, reason: str, policy: dict)
     at = datetime.now(timezone.utc).isoformat()
     append(wal, {"at": at, "event": "waiver", "waiver_id": waiver_id, "kind": kind,
                  "subject": subject, "note": "COMMIT_POLICY_WAIVER: " + reason})
-    LEDGER.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(LEDGER.parent, 0o700)
-    fd = os.open(LEDGER, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as handle:
+    with _open_ledger(LEDGER) as handle:
         handle.write(json.dumps({"at": at, "id": waiver_id, "kind": kind, "subject": subject,
                                  "wal": str(wal)}, separators=(",", ":")) + "\n")
     return waiver_id
@@ -1551,7 +1548,7 @@ def evaluate(commits, policy, *, base, head, exclude, previous, tickets_required
                 entry.update(status="STALE", fix=adapter.update_instructions(ticket, naming))
                 report["status"] = "BLOCKED"
         except Exception as error:  # includes TicketSystemUnavailable; fail closed
-            if _out_of_scope_warns(error, policy, system):
+            if _out_of_scope_warns(error, policy, system, project):
                 reason = str(policy["ticket_systems"][system].get("unreachable_reason")
                              or "credential cannot reach this project")[:300]
                 entry.update(status="OUT_OF_SCOPE", warning=f"not verified: {str(error)[:200]}; {reason}")
@@ -1612,13 +1609,33 @@ def warnings_ledger() -> Path:
     return LEDGER.with_name("warnings.jsonl")
 
 
+def _open_ledger(path: Path):
+    """Append handle on a private regular file; a FIFO or other special file is refused, not waited on."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        os.set_blocking(fd, True)
+        return os.fdopen(fd, "a", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def record_warning(kind: str, ticket: str, head: str, reason: str):
-    """Audit trail for checks that passed with a warning instead of blocking (best effort)."""
+    """Audit trail for checks that passed with a warning instead of blocking (best effort, one row per head)."""
     try:
         path = warnings_ledger()
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+        for line in _read_lines(path, 16_000_000):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if (row.get("kind"), row.get("ticket"), row.get("head")) == (kind, ticket, head):
+                return
+        with _open_ledger(path) as handle:
             handle.write(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "kind": kind, "ticket": ticket,
                                      "head": head, "reason": reason}, separators=(",", ":")) + "\n")
     except OSError:
@@ -1656,10 +1673,16 @@ def list_waivers(since: datetime):
     return rows
 
 
-def _out_of_scope_warns(error, policy, system) -> bool:
-    """True when the ticket's project is invisible to the credential and policy opts into warning."""
+def _out_of_scope_warns(error, policy, system, project) -> bool:
+    """True only for a project explicitly listed as unreachable by this credential.
+
+    Any other project_not_found (a typo, an invented slug, or the default project after
+    the key's org changes) stays UNVERIFIED and fails closed.
+    """
     config = (policy.get("ticket_systems") or {}).get(system) or {}
-    return type(error).__name__ == "TicketOutOfScope" and config.get("unreachable_projects") == "warn"
+    listed = config.get("unreachable_projects")
+    return (type(error).__name__ == "TicketOutOfScope" and isinstance(listed, list)
+            and project in listed and project != config.get("default_project"))
 
 
 # OUT_OF_SCOPE: the credential cannot see the ticket's project and policy says warn.
@@ -1697,7 +1720,7 @@ def notify(repo, base, head, policy, *, operation_seed, evidence, stage="merged"
                 adapter.set_status(ticket, config["on_deployed_status"])
             results.append({"ticket": label, "status": "COMMENTED"})
         except Exception as error:
-            if _out_of_scope_warns(error, policy, system):
+            if _out_of_scope_warns(error, policy, system, project):
                 results.append({"ticket": label, "status": "OUT_OF_SCOPE", "error": str(error)[:200]})
                 continue
             results.append({"ticket": label, "status": "FAILED", "error": str(error)[:200]})

@@ -601,7 +601,7 @@ def commit_policy_gate(repo, base):
     except (OSError, subprocess.TimeoutExpired):
         return 2, 'commit policy: the commit range could not be inspected'
     if report['status'] == 'PASS':
-        return 0, commit_policy.format_report(report) if report['waivers'] else ''
+        return 0, commit_policy.format_report(report) if report['waivers'] or report.get('warnings') else ''
     return (6 if report['status'] == 'UNVERIFIED' else 2), commit_policy.format_report(report)
 
 
