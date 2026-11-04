@@ -1,6 +1,7 @@
 import { openSettings } from './settings.js';
 import { composerAction as resolveComposerAction, submissionMatches } from './composer.js';
 import { renderAgentControlNotice } from './agent-control.js';
+import { initReviewMap } from './review-map.js';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -1256,6 +1257,7 @@ for (const button of $$('.segmented-control button')) {
     renderRepository();
   });
 }
+const reviewMap = initReviewMap({ api, notify, el, session, $ });
 for (const button of $$('[data-close]')) button.addEventListener('click', () => button.closest('dialog').close());
 for (const dialog of $$('dialog')) {
   dialog.addEventListener('click', event => {
@@ -1270,4 +1272,4 @@ setInterval(() => {
 }, 10000);
 
 if (!token) connection(false, 'This window has no local access token. Reopen Agent Harness from its launcher.');
-else loadState().then(() => { connection(true); events(); }).catch(error => { connection(false, errorText(error)); notify(errorText(error), true); });
+else loadState().then(() => { connection(true); events(); reviewMap.reload(); }).catch(error => { connection(false, errorText(error)); notify(errorText(error), true); });
