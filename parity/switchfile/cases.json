@@ -496,7 +496,7 @@
    "name": "leading double slash binary",
    "raw_template": "{\"schema\": 1, \"groups\": {\"wal\": \"go\"}, \"hosts\": {\"claude\": {\"binary\": \"/$BIN\", \"sha256\": \"$SHA\"}}}",
    "want": "python",
-   "reason": "binary"
+   "reason": "invalid"
   },
   {
    "name": "lone surrogate binary",
@@ -592,6 +592,53 @@
    },
    "want": "python",
    "reason": "group"
+  },
+  {
+   "name": "binary path with dot-dot",
+   "raw_template": "{\"schema\": 1, \"groups\": {\"wal\": \"go\"}, \"hosts\": {\"claude\": {\"binary\": \"$BIN/../harness\", \"sha256\": \"$SHA\"}}}",
+   "want": "python",
+   "reason": "invalid"
+  },
+  {
+   "name": "binary path trailing slash",
+   "raw_template": "{\"schema\": 1, \"groups\": {\"wal\": \"go\"}, \"hosts\": {\"claude\": {\"binary\": \"$BIN/\", \"sha256\": \"$SHA\"}}}",
+   "want": "python",
+   "reason": "invalid"
+  },
+  {
+   "name": "symlinked ancestor into shared dir",
+   "launcher_via_shared_symlink": true,
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "binary"
+  },
+  {
+   "name": "symlinked ancestor into safe dir",
+   "launcher_via_safe_symlink": true,
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "go"
   }
  ]
 }
