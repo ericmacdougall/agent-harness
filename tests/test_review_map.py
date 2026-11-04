@@ -275,5 +275,35 @@ class ReviewFindingsRegressions(Base):
         self.assertTrue(any("stale" in row["basis"] for row in model["refinements"]))
 
 
+class RedTeamRegressions(Base):
+    def test_r1_scan_truncation_is_disclosed(self):
+        with mock.patch.object(rm, "MAX_SCAN", 1), mock.patch.object(rm, "wal_root", return_value=self.wals):
+            model = rm.build_model(self.repo, None, "feat/review-map-demo", use_gh=False, roots=[self.work], wal=False)
+        self.assertTrue(any("scan stopped" in w for w in model["meta"]["warnings"]))
+
+    def test_r2_very_long_line_is_bounded(self):
+        import time
+        start = time.time()
+        out = rm.scrub("a" * 200000)
+        self.assertLess(time.time() - start, 5)
+        self.assertIn("line truncated", out)
+
+    def test_r3_control_character_split_secret_is_redacted(self):
+        split = "sk-abcdefgh\u202eijklmnopqrstuv"
+        self.assertNotIn("abcdefgh", rm.scrub(split))
+        rm.assert_no_leak(rm.scrub(split))
+
+    def test_r4_other_repo_report_naming_branch_is_not_attributed(self):
+        (self.work / "other-repo-review.md").write_text("review of feat/review-map-demo in another repo\n1. HIGH leaked other repo finding text\nVERDICT: BLOCK\n")
+        model = rm.build_model(self.repo, None, "feat/review-map-demo", use_gh=False, roots=[self.work], wal=False)
+        self.assertNotIn("leaked other repo finding", json.dumps(model["reports"]))
+
+    def test_r5_hostile_filenames_keep_their_hunks(self):
+        model = rm.build_model(self.repo, None, "feat/review-map-demo", use_gh=False, roots=[self.work], wal=False)
+        quoted = [f for f in model["diff"]["files"] if '"' in f["path"]]
+        self.assertTrue(quoted)
+        self.assertTrue(quoted[0]["hunks"], "hunks must not vanish for names git quotes")
+
+
 if __name__ == "__main__":
     unittest.main()

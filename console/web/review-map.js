@@ -71,7 +71,7 @@ export function initReviewMap({ api, notify, el, session, $ }) {
       const label = el('label', 'ticket-choice');
       const box = document.createElement('input');
       box.type = 'checkbox';
-      box.checked = true;
+      box.checked = false; // an outward upload needs an explicit tick per ticket
       box.value = ref;
       label.append(box, document.createTextNode(` ${ref}`));
       tickets.append(label);
@@ -100,7 +100,7 @@ export function initReviewMap({ api, notify, el, session, $ }) {
   $('#review-map-attach').addEventListener('click', async () => {
     if (model.attaching || !model.map) return;
     const chosen = [...dialog.querySelectorAll('#review-map-tickets input:checked')].map(box => box.value);
-    if (!chosen.length) { $('#review-map-result').textContent = 'Tick at least one ticket.'; return; }
+    if (!chosen.length) { $('#review-map-result').textContent = 'Tick the ticket(s) to attach to.'; return; }
     model.attaching = true;
     const button = $('#review-map-attach');
     button.disabled = true;

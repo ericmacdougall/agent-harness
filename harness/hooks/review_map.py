@@ -44,6 +44,8 @@ MAX_SCAN_FILES = 4000
 MAX_HTML_BYTES = 8 * 1024 * 1024
 MAX_WAL_BYTES = 40 * 1024 * 1024
 MAX_FINDINGS_PER_REPORT = 40
+MAX_LINE = 3000
+MAX_SCAN = 30000
 GIT_TIMEOUT = 60
 
 
@@ -73,6 +75,9 @@ HIGH_ENTROPY = re.compile(r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0
 def scrub(value) -> str:
     """Redact tokens, keys, e-mail addresses and home directories from one string."""
     text = "" if value is None else str(value)
+    text = CONTROL.sub("", text)  # before redaction, or U+202E-style splitting defeats it
+    # redact_output is quadratic on very long lines; cap each line first
+    text = "\n".join(l if len(l) <= MAX_LINE else l[:MAX_LINE] + " [line truncated]" for l in text.split("\n"))
     try:
         from integrate_local import redact_output
     except ImportError as error:  # fail closed: never render unredacted text
@@ -108,7 +113,7 @@ def run(argv, cwd=None, timeout=GIT_TIMEOUT, limit=MAX_DIFF_BYTES):
 
 def git(repo, *args, limit=MAX_DIFF_BYTES):
     for item in args:
-        if item.startswith("-") and not item.startswith(("--no", "--format", "--numstat", "--name-only", "-U", "-M", "-s", "-q", "-e", "--reverse", "--verify", "-t", "-c", "-p", "--parents", "-n")) and item != "--":
+        if item.startswith("-") and not item.startswith(("--no", "--format", "--numstat", "--name-only", "-U", "-M", "-s", "-q", "-e", "--reverse", "--verify", "-t", "-c", "-p", "--parents", "-n", "-z")) and item != "--":
             raise MapError(f"refusing a git argument that looks like an option: {item[:20]}", EXIT_USAGE)
     return run(["git", "--no-pager", "-C", str(repo), "-c", "core.quotepath=off", "-c", "core.fsmonitor=", "-c", "core.pager=cat",
                 *args], limit=limit)
@@ -226,16 +231,19 @@ def collect_pr(repo: Path, pr, branch, use_gh=True) -> dict:
 
 
 def collect_diff(repo, base_sha, head_sha) -> dict:
-    rc, out = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--numstat", "-M", base_sha, head_sha, limit=400_000)
+    rc, out = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z", "-M", base_sha, head_sha, limit=800_000)
     files = []
-    for line in out.split("\n"):
-        parts = line.split("\t")
-        if len(parts) != 3:
+    parts = out.split("\0")
+    k = 0
+    while k < len(parts):
+        row = parts[k].split("\t")
+        k += 1
+        if len(row) < 3:
             continue
-        add, dele, name = parts
-        if "=>" in name:
-            name = re.sub(r"\{.*? => (.*?)\}", r"\1", name).replace("//", "/")
-            name = name.split(" => ")[-1]
+        add, dele, name = row[0], row[1], "\t".join(row[2:])
+        if name == "":  # rename: old and new paths follow as separate fields
+            name = parts[k + 1] if k + 1 < len(parts) else ""
+            k += 2
         binary = add == "-"
         files.append({"path": name, "added": 0 if binary else int(add), "deleted": 0 if binary else int(dele),
                       "binary": binary, "hunks": []})
@@ -245,7 +253,7 @@ def collect_diff(repo, base_sha, head_sha) -> dict:
     for item in files[:MAX_FILES_DETAIL]:
         if item["binary"] or budget <= 0:
             continue
-        rc, patch = git(repo, "diff", "--no-ext-diff", "--no-textconv", "-U2", "-M", base_sha, head_sha, "--", item["path"], limit=min(budget, 120_000))
+        rc, patch = git(repo, "diff", "--no-ext-diff", "--no-textconv", "-U2", "-M", base_sha, head_sha, "--", ":(literal)" + item["path"], limit=min(budget, 120_000))
         budget -= len(patch)
         patch = scrub(patch)
         item["hunks"] = split_hunks(patch)
@@ -306,7 +314,11 @@ def find_tickets(texts) -> list:
 
 # --------------------------------------------------------------------------- local sources
 
-def iter_files(roots, suffixes, limit=MAX_SCAN_FILES, depth=4):
+SCAN_STATE = {"truncated": False}
+
+
+def iter_files(roots, suffixes, limit=None, depth=4):
+    limit = MAX_SCAN if limit is None else limit
     count = 0
     for root in roots:
         root = Path(root)
@@ -328,16 +340,21 @@ def iter_files(roots, suffixes, limit=MAX_SCAN_FILES, depth=4):
                     continue
                 count += 1
                 if count > limit:
+                    SCAN_STATE["truncated"] = True
                     return
                 yield path, info
 
 
-def read_text(path: Path) -> str:
+def read_raw(path: Path) -> str:
     try:
         with open(path, "rb") as handle:
-            return scrub(handle.read(MAX_SOURCE_BYTES).decode("utf-8", "replace"))
+            return handle.read(MAX_SOURCE_BYTES).decode("utf-8", "replace")
     except OSError:
         return ""
+
+
+def read_text(path: Path) -> str:
+    return scrub(read_raw(path))
 
 
 def sha_hit(text: str, shas) -> str | None:
@@ -357,9 +374,10 @@ def find_specs(roots, tickets) -> list:
     except ImportError:
         return specs
     for path, _ in iter_files(roots, (".md",)):
-        text = read_text(path)
+        text = read_raw(path)
         if "## Acceptance criteria" not in text or "Ticket:" not in text:
             continue
+        text = scrub(text)
         header_ticket = re.search(r"(?im)^Ticket:[ \t]*(.+?)[ \t]*$", text)
         if not header_ticket:
             continue
@@ -404,13 +422,17 @@ def parse_report(text: str) -> dict:
 
 def find_reports(roots, shas, branch, tickets) -> list:
     reports = []
+    ticket_res = [re.compile(r"(?<![A-Za-z0-9-])" + re.escape(t.split(" ", 1)[1]) + r"\b", re.I) for t in tickets]
     needles = []
     if branch and (len(branch) >= 12 or "/" in branch):
         needles.append(re.compile(r"(?<![A-Za-z0-9._/-])" + re.escape(branch) + r"(?![A-Za-z0-9._/-])"))
     for path, info in iter_files(roots, (".md", ".txt")):
-        text = read_text(path)
-        if not text:
+        raw = read_raw(path)
+        if not raw:
             continue
+        if not (re.search(r"Reviewed HEAD:|(?i:red[- ]?team|review|finding|verdict|_RESULT)", raw[:4000] + path.name)):
+            continue
+        text = scrub(raw)
         head = re.search(r"(?m)^Reviewed HEAD:\s*([0-9a-f]{40})", text)
         basis = None
         if head and head.group(1) in shas:
@@ -419,8 +441,8 @@ def find_reports(roots, shas, branch, tickets) -> list:
             hit = sha_hit(text, shas)
             if hit:
                 basis = f"report cites PR commit {hit}"
-            elif any(n.search(text) for n in needles):
-                basis = "report names the PR branch"
+            elif any(n.search(text) for n in needles) and any(r.search(text) for r in ticket_res):
+                basis = "report names the PR branch and ticket"
         if not basis:
             continue
         parsed = parse_report(text)
@@ -641,6 +663,7 @@ def build_prompts(model) -> list:
 
 
 def build_model(repo: Path, pr, branch, use_gh=True, roots=None, wal=True) -> dict:
+    SCAN_STATE["truncated"] = False
     data = collect_pr(repo, pr, branch, use_gh)
     diff = collect_diff(repo, data["base_sha"], data["head_sha"])
     commits, meta = data["commits"], data["meta"]
@@ -651,6 +674,8 @@ def build_model(repo: Path, pr, branch, use_gh=True, roots=None, wal=True) -> di
     reports = find_reports(roots, set(shas), meta.get("head") or branch, tickets)
     since = min(_ts(c["date"]) for c in commits) - 3600
     wal_rows = find_wal(shas, meta.get("head") or branch, tickets, since, time.time()) if wal else []
+    if SCAN_STATE["truncated"]:
+        meta.setdefault("warnings", []).append(f"the work-directory scan stopped after {MAX_SCAN} files; specs or reports may be missing")
     paths = [f["path"] for f in diff["files"]]
     domains, _ = domain_signals(paths)
     model = {"meta": meta, "commits": commits, "base_sha": data["base_sha"], "head_sha": data["head_sha"], "diff": diff,
