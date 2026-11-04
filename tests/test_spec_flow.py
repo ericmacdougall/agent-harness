@@ -453,6 +453,23 @@ class Evidence(SpecFlowCase):
         self.assertEqual(code, 0, err)
         self.assertNotIn("ALREADY_RECORDED", out)
         self.assertEqual(json.loads(out.strip().splitlines()[-1])["status"], "RECORDED")
+        records, ignored = sf.ticket_records(self.fake.comments[ISSUE], 65536)
+        logs = [r for r in records if r["kind"] == "evidence"]
+        self.assertEqual(len(logs), 2)  # a new comment, not a replay of the rejected one
+        index = {row["id"]: row for row in self.fake.attachments.values()}
+        good, bad = sf.verified(records, index, "evidence")
+        self.assertEqual((len(good), len(bad)), (1, 1))
+
+    def test_malformed_records_are_ignored_not_fatal(self):
+        adapter = sf.make_adapter(self.config, self.spec_policy, "harness", time.monotonic() + 30)
+        for record in ({"v": 1, "kind": "click_test", "tester": "x"},
+                       {"v": 1, "kind": "evidence", "commits": ["abc"], "ac": ["AC-1"]},
+                       {"v": 1, "kind": "spec", "ac": "AC-1", "attachments": []},
+                       {"v": 1, "kind": "signoff", "by": ["x"]}):
+            adapter.comment_with_files(ISSUE, sf.record_body("x", record), str(uuid.uuid4()))
+        code, out, err = self.run_cli("status", "--ticket", "GoodQA harness#168")
+        self.assertEqual(code, 2, err)
+        self.assertIn("NOT READY", out)
 
     def test_symlinked_log_is_refused(self):
         real = self.tmp / "real.log"
@@ -842,6 +859,13 @@ class Hook(SpecFlowCase):
         for tool_input in cases:
             with self.subTest(tool_input=tool_input):
                 code, _ = self.hook("call_api", tool_input, **self.enforce())
+                self.assertEqual(code, 2)
+        for path in (f"/issues/{ISSUE}/close?via=/comments/", f"/issues/{ISSUE}/comments/../close",
+                     f"/issues/{ISSUE}/comments/%2e%2e/close", f"/v1/issues/{ISSUE}/attachments/x/../../transition",
+                     f"/v1/issues//{ISSUE}/close", f"/v1/issues/{ISSUE}/comments#x"):
+            with self.subTest(path=path):
+                code, _ = self.hook("call_api", {"method": "POST", "path": path, "body": {"status": "done"}},
+                                    **self.enforce())
                 self.assertEqual(code, 2)
         code, _ = self.hook("call_api", {"method": "POST", "path": f"/v1/issues/{ISSUE}/comments",
                                          "body": {"body": "hi"}}, **self.enforce())

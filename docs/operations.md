@@ -388,7 +388,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
 - a verified spec is attached: its record carries the spec file (matching `spec_file_sha`), the reviews file and at least one criterion;
 - both reviews `ACCEPT` that spec's core;
 - every criterion has evidence on that core;
-- the evidence on that core cites at least one commit and attaches at least one execution log;
+- the evidence on that core cites at least one commit and attaches at least one execution log (this applies to every ticket, including documentation-only work: cite the docs commit and a check log);
 - the latest click-test on that core passed with logs, by an independent tester, at a deployed commit containing every evidence commit (unless the spec says not-applicable); a click-test of an older spec version is stale;
 - a valid sign-off exists on that core.
 
@@ -418,7 +418,7 @@ GoodQA's own independent-acceptance rule for done transitions still applies.
    - **Gated by the spec:** `done`.
    - **Need a reason:** `wont_fix` and `duplicate` need one of at least 20 characters.
    - **Blocked:** an unknown status, archiving an open ticket, a project, pipeline or stage move (`reassign_issue`, or `projectId`, `pipelineId` or `stageId` in an `update_issue` patch), and a `call_api` DELETE on an issue.
-   - **`call_api` writes:** a status in `body.status` or `body.patch.status` is gated like `update_issue`; `items` in a collection write are checked like `bulk_update_issues`. A non-object body or an issue sub-resource other than comments, attachments and time entries (for example `/close`) is treated as an unknown status change. Other status-bearing collection writes block while anything is enforced; writes without one (such as creating an issue) block only when the path names an enforced project.
+   - **`call_api` writes:** a status in `body.status` or `body.patch.status` is gated like `update_issue`; `items` in a collection write are checked like `bulk_update_issues`. A non-object body, an issue sub-resource other than an exact `/comments`, `/attachments` or `/time-entries` path (for example `/close`), or an issue path with a query, fragment, escape, or empty or dot segment is treated as an unknown status change. Other status-bearing collection writes block while anything is enforced; writes without one (such as creating an issue) block only when the path names an enforced project.
    - **Bulk calls:** every item in a bulk call is checked, and one failing item blocks the call.
    - **Where it blocks:** only in `mode: enforce`, and only for `enforced_projects`. Everywhere else it prints what is missing and allows the call.
    - **Unreachable GoodQA:** a transport failure blocks only in enforce mode when enforced projects are configured. The status write goes to the same service, so blocking it costs little.

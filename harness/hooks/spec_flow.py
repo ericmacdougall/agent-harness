@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -494,6 +495,27 @@ def record_body(summary: str, record: dict) -> str:
     return f"{summary}\n\n```{RECORD_FENCE}\n{json.dumps(record, sort_keys=True, separators=(',', ':'))}\n```"
 
 
+_FIELD_TYPES = {"attachments": list, "commits": list, "ac": list, "reviews": list, "tester": dict,
+                "deployed_commit": dict, "covers_commits": list, "click_test": dict, "really_tested": dict}
+_STRING_FIELDS = ("key", "actor", "author", "spec_core_sha", "spec_file_sha", "by", "signer_kind", "result", "url",
+                  "pass_source", "signoff", "note")
+
+
+def record_shape_problem(record: dict):
+    """Records come from ticket comments anyone can write; refuse shapes the gate would trip over."""
+    for name, kind in _FIELD_TYPES.items():
+        if name in record and record[name] is not None and not isinstance(record[name], kind):
+            return f"field {name} is not a {kind.__name__}"
+    for name in _STRING_FIELDS:
+        if name in record and record[name] is not None and not isinstance(record[name], str):
+            return f"field {name} is not a string"
+    for name, inner in (("attachments", dict), ("commits", dict), ("reviews", dict), ("ac", str),
+                        ("covers_commits", str)):
+        if any(not isinstance(item, inner) for item in record.get(name) or []):
+            return f"field {name} holds an entry that is not a {inner.__name__}"
+    return None
+
+
 def ticket_records(comments: list, max_bytes: int):
     records, ignored = [], []
     for comment in comments:
@@ -509,6 +531,10 @@ def ticket_records(comments: list, max_bytes: int):
                 continue
             if not isinstance(record, dict) or record.get("v") != 1 or record.get("kind") not in KINDS:
                 ignored.append(f"comment {comment['id'][:8]}: unknown record version or kind")
+                continue
+            shape = record_shape_problem(record)
+            if shape:
+                ignored.append(f"comment {comment['id'][:8]}: malformed {record['kind']} record ({shape})")
                 continue
             record["_comment"] = comment["id"]
             record["_at"] = str(comment.get("createdAt") or "")
@@ -613,6 +639,11 @@ class Session:
         if any(item.get("key") == record["key"] for item in trusted):
             print(json.dumps({"status": "ALREADY_RECORDED", "kind": kind, "key": record["key"]}))
             return None
+        # A same-key record that failed verification must not be replayed by GoodQA's idempotent comment:
+        # fold the rejected comment ids into the operationId so this attempt creates a new comment.
+        rejected = sorted(item["_comment"] for item in records
+                          if item.get("key") == record["key"] and item not in trusted)
+        op_key = record["key"] + ("|retry:" + ",".join(rejected) if rejected else "")
         if not self.project_id:
             raise SpecError("cannot upload: the ticket's project id is unknown", EXIT_UNREACHABLE)
         attachments = []
@@ -622,8 +653,15 @@ class Session:
             attachments.append({"id": attachment, "sha256": digest, "role": role, "name": name})
         record = dict(record, attachments=attachments)
         comment = self.adapter.comment_with_files(self.ticket.id, record_body(summary, record),
-                                                  op_id(self.ticket.id, record["key"]),
+                                                  op_id(self.ticket.id, op_key),
                                                   [item["id"] for item in attachments])
+        if comment.get("id") in rejected:
+            raise SpecError("GoodQA replayed an earlier rejected comment instead of recording this one", EXIT_TRACKER)
+        bound = {row.get("id"): row for row in self.adapter.attachments(self.ticket.id)}
+        unbound = [item["name"] for item in attachments if (bound.get(item["id"]) or {}).get("commentId") != comment.get("id")]
+        if unbound:
+            raise SpecError(f"GoodQA did not bind {', '.join(unbound)} to the new comment; the record will not "
+                            "verify", EXIT_TRACKER)
         print(json.dumps({"status": "RECORDED", "kind": kind, "ticket": self.ticket.label,
                           "comment": comment["id"], "attachments": len(attachments)}))
         return comment
@@ -802,6 +840,16 @@ def classify(tool: str, tool_input: dict, min_reason: int):
         if method == "GET":
             return
         path = str(tool_input.get("path") or "")
+        parsed = urllib.parse.urlsplit(path)
+        segments = parsed.path.split("/")[1:]
+        if "/issues" in path.lower() and (parsed.query or parsed.fragment or parsed.scheme or parsed.netloc
+                                          or "%" in path or "\\" in path
+                                          or any(seg in ("", ".", "..") for seg in segments)):
+            # Queries, dot or empty segments and escapes can make a path mean something other than it reads.
+            found = re.search(r"/issues/(" + UUID + r")", path)
+            yield (found.group(1) if found else None), ("unknown" if found else "scope"), f"{method} {path} (unusual path)"
+            return
+        path = parsed.path
         raw = tool_input.get("body")
         body = raw if isinstance(raw, dict) else {}
         patch = body.get("patch") if isinstance(body.get("patch"), dict) else {}
@@ -813,7 +861,8 @@ def classify(tool: str, tool_input: dict, min_reason: int):
             yield issue.group(1), "unknown", f"{method} {path} with a non-object body"
         elif issue and re.search(r"/issues/" + UUID + r"/.+", path):
             # Sub-resources such as /close or /transition may change status in ways the gate cannot read.
-            if not re.search(r"/(comments|attachments|time-entries)(/|$)", path):
+            if not re.fullmatch(r"(/v\d+)?/issues/" + UUID + r"/(comments|attachments|time-entries)(/" + UUID + r")?",
+                                path):
                 yield issue.group(1), "unknown", f"{method} {path}"
         elif issue and status is not None:
             yield issue.group(1), _status_action(status, str(body.get("note") or ""), min_reason), status
