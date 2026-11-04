@@ -146,10 +146,23 @@ class InstallerTests(unittest.TestCase):
     def test_hand_wired_provenance_entries_are_replaced_not_duplicated(self):
         script = str(self.claude / "hooks" / "provenance_hooks.py")
         manual = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "python3",
-                                                  "args": [script, "stop-lint"], "timeout": 10}]}]}}
+                                                  "args": [script, "stop-lint"], "timeout": 99}]}]}}
         (self.claude / "settings.json").write_text(json.dumps(manual))
         install(self.home, apply=True)
         self.assertEqual([e for e in self.provenance_entries() if e[0] == "Stop"], [("Stop", None, "stop-lint")])
+        stop = json.loads((self.claude / "settings.json").read_text())["hooks"]["Stop"]
+        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10])  # the managed entry replaced the manual one
+
+    def test_foreign_hook_sharing_a_group_and_users_empty_event_list_survive(self):
+        script = str(self.claude / "hooks" / "provenance_hooks.py")
+        mixed = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other-stop"},
+                                               {"type": "command", "command": "python3", "args": [script, "stop-lint"]}]}],
+                           "Notification": []}}
+        (self.claude / "settings.json").write_text(json.dumps(mixed))
+        install(self.home, apply=True, provenance=False)
+        hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop"])
+        self.assertEqual(hooks["Notification"], [])  # untouched, not ours
 
     def test_no_provenance_hooks_flag_unregisters_and_default_restores(self):
         install(self.home, apply=True)

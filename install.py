@@ -130,6 +130,7 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
     for event in sorted(set(wanted) | set(managed_hooks(claude, True))):
         managed = wanted.get(event, [])
         entries = hooks.setdefault(event, [])
+        had_entries = bool(entries)
         preserved = []
         for item in entries:
             remaining = [
@@ -144,8 +145,8 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
                 preserved.append({**item, "hooks": remaining})
         entries[:] = preserved
         entries.extend(managed)
-        if not entries:
-            del hooks[event]  # an uninstalled gate leaves no empty event behind
+        if not entries and had_entries:
+            del hooks[event]  # an uninstalled gate leaves no empty event behind; a user's own empty list stays
     allowed = settings.setdefault("permissions", {}).setdefault("allow", [])
     for name in ("wal_note.py", "publish_feature.py", "integrate_local.py", "deliver.py"):
         rule = f"Bash(python3 ~/.claude/hooks/{name} *)"
