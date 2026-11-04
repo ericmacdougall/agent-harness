@@ -9,7 +9,9 @@ import math
 import os
 import secrets
 import selectors
+import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -167,18 +169,124 @@ def inspect_git(repo, *args, timeout=600):
     return run_git(repo, *INSPECTION_CONFIG, *args, timeout=timeout)
 
 
-def run(repo, command, *, timeout=None, discard_output=False, env=None):
+MIN_CHECK_PYTHON = (3, 10)
+CHECK_PYTHON_NAMES = {'python', 'python3'}
+CHECK_LOG_LIMIT = 32 * 1024 * 1024
+CHECK_TAIL_BYTES = 4096
+CHECK_TAIL_CHARS = 2000
+
+
+class CheckInterpreterError(OSError):
+    """A Python check would run an absent or unsupported interpreter."""
+
+
+def resolve_check_interpreter(name, env=None, timeout=15):
+    """Pin a check's `python`/`python3` to one absolute, supported executable.
+
+    Bare names resolve through PATH at run time, so a system Python 3.9 could
+    silently run a 3.10+ suite. Refuse that with a reason that names the fix.
+    """
+    search = (os.environ if env is None else env).get('PATH', os.defpath)
+    found = shutil.which(name, path=search)
+    if found is None:
+        raise CheckInterpreterError(f'{name} is not on PATH; Python checks need Python 3.10 or newer')
+    found = os.path.abspath(found)
+    try:
+        probe = run_process([found, '-I', '-c', 'import sys; print("%d.%d" % sys.version_info[:2])'],
+                            timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        raise CheckInterpreterError(f'{name} at {found} could not report its version') from None
+    match = re.fullmatch(r'(\d+)\.(\d+)\s*', probe.stdout or '')
+    if probe.returncode or match is None:
+        raise CheckInterpreterError(f'{name} at {found} could not report its version')
+    version = (int(match.group(1)), int(match.group(2)))
+    if version < MIN_CHECK_PYTHON:
+        raise CheckInterpreterError(
+            f'{name} on PATH is Python {version[0]}.{version[1]} ({found}); Python checks need 3.10 or newer. '
+            'Put a supported python3 first on PATH')
+    return found
+
+
+def redact_output(text):
+    text = re.sub(r"(https?://)[^/@\s]+@", r"\1[redacted]@", text)
+    text = re.sub(r"(?i)\b(token|password|passwd|secret|api[_-]?key|access[_-]?key|authorization)(\s*[=:]\s*)(\S+)",
+                  r"\1\2[redacted]", text)
+    text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [redacted]", text)
+    text = re.sub(r"\b(gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{16,})\b", "[redacted]", text)
+    return text
+
+
+class CheckLog:
+    """Owner-only, size-bounded log of check output plus a redacted in-memory tail.
+
+    Write failures only mark the log truncated: logging must never change a
+    check's outcome or block the child on its output pipe.
+    """
+    def __init__(self, directory):
+        private_directory(directory)
+        name = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + secrets.token_hex(4) + '.log'
+        self.path = directory / name
+        self.fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        self.written, self.truncated, self.tail = 0, False, bytearray()
+
+    def _write(self, data):
+        if self.fd is None:
+            self.truncated = True
+            return
+        room = CHECK_LOG_LIMIT - self.written
+        if len(data) > room:
+            self.truncated = True
+            data = data[:max(room, 0)]
+        try:
+            view = memoryview(data)
+            while view:
+                count = os.write(self.fd, view)
+                self.written += count
+                view = view[count:]
+        except OSError:
+            self.truncated = True
+            self.close()
+
+    def __call__(self, chunk):
+        self.tail.extend(chunk)
+        del self.tail[:-CHECK_TAIL_BYTES]
+        self._write(chunk)
+
+    def header(self, command):
+        self._write(('$ ' + shlex.join(command) + '\n').encode('utf-8', 'replace'))
+
+    def close(self):
+        if self.fd is not None:
+            fd, self.fd = self.fd, None
+            os.close(fd)
+
+    def facts(self):
+        tail = redact_output(self.tail.decode('utf-8', 'replace'))[-CHECK_TAIL_CHARS:]
+        return {'check_log': str(self.path), 'check_tail': tail, 'check_log_truncated': self.truncated}
+
+
+def run(repo, command, *, timeout=None, discard_output=False, env=None, sink=None):
     # Python test runners otherwise leave untracked __pycache__ after an aborted merge.
     output_options = {'discard_output': True} if discard_output else {}
+    if sink is not None:
+        output_options['sink'] = sink
+    environment = {**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"}
     executed = command
-    if (discard_output and len(command) >= 4 and command[0] in {'python', 'python3'}
+    if command and command[0] in CHECK_PYTHON_NAMES:
+        executed = [resolve_check_interpreter(command[0], environment), *command[1:]]
+    if (discard_output and len(command) >= 4 and command[0] in CHECK_PYTHON_NAMES
             and command[1:4] == ['-m', 'unittest', 'discover']):
         # Python before 3.12 exits zero when discovery finds no tests. Invoke
         # the same CLI parser once, then require its result to be nonempty.
-        executed = [command[0], '-c', NONEMPTY_UNITTEST, *command[3:]]
-    return run_process(executed, cwd=repo, timeout=timeout,
-                       env={**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"},
-                       **output_options)
+        executed = [executed[0], '-c', NONEMPTY_UNITTEST, *command[3:]]
+    return run_process(executed, cwd=repo, timeout=timeout, env=environment, **output_options)
+
+
+def require_check_interpreters(commands):
+    """Fail before any effect when a Python check would use an unsupported interpreter."""
+    for command in commands:
+        if command and command[0] in CHECK_PYTHON_NAMES:
+            resolve_check_interpreter(command[0])
 
 
 def run_git(repo, *args, timeout=600):
@@ -276,6 +384,11 @@ def main():
         return 2
     if not all(approved_prepare(argv) for argv in preparations) or not all(approved_check(argv) for argv in checks):
         report("BLOCKED_POLICY", "Verification command is outside the approved test/build set")
+        return 2
+    try:
+        require_check_interpreters(checks)
+    except CheckInterpreterError as error:
+        report("BLOCKED_POLICY", str(error))
         return 2
     return integrate_scratch(args, preparations, checks)
 
@@ -893,13 +1006,26 @@ def resolve_journal(args, repo, identity, root, common, common_info, root_info, 
         report('RECOVERY_REQUIRED', 'Confirmed recovery checkout is changed or dirty',
                journal=str(directory / 'journal.json'), head=observed_head(repo))
         return 3
-    for command in checks:
-        result = run(repo, command, timeout=args.timeout, discard_output=True)
-        if result.returncode:
-            report('RECOVERY_REQUIRED', 'Recovery baseline check failed; journal remains unresolved',
-                   journal=str(directory / 'journal.json'), head=observed_head(repo),
-                   phase='check', exit_code=result.returncode)
-            return 3
+    log = CheckLog(directory / 'checks')
+    try:
+        for command in checks:
+            log.header(command)
+            try:
+                result = run(repo, command, timeout=args.timeout, discard_output=True, sink=log)
+            except subprocess.TimeoutExpired:
+                log.close()
+                report('RECOVERY_REQUIRED', f'Recovery baseline check exceeded {args.timeout} seconds; journal remains unresolved',
+                       journal=str(directory / 'journal.json'), head=observed_head(repo),
+                       phase='check', **log.facts())
+                return 3
+            if result.returncode:
+                log.close()
+                report('RECOVERY_REQUIRED', 'Recovery baseline check failed; journal remains unresolved',
+                       journal=str(directory / 'journal.json'), head=observed_head(repo),
+                       phase='check', exit_code=result.returncode, **log.facts())
+                return 3
+    finally:
+        log.close()
     if (not common_state_is_current(repo, identity, common, common_info, root, root_info, args.timeout)
             or not checked_original(repo, args.original_branch, args.expected_head, args.timeout)):
         report('RECOVERY_REQUIRED', 'Recovery checkout changed during checks',

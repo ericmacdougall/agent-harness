@@ -2030,11 +2030,14 @@ class DeliveryHelpers(unittest.TestCase):
         self.add_feature_test()
         marker = self.root / 'post-commit-started'
         hook = self.repo / '.git/hooks/post-commit'
+        # The hook outlives any helper deadline, so only the helper's timeout can
+        # end it. The deadline is generous so load cannot expire it before the
+        # commit reaches the hook (a 4-second deadline did on busy hosts).
         hook.write_text('#!/bin/sh\n' + shlex.join([sys.executable, '-c',
-                         f'from pathlib import Path; import time; Path({str(marker)!r}).touch(); time.sleep(12)']) + '\n')
+                         f'from pathlib import Path; import time; Path({str(marker)!r}).touch(); time.sleep(600)']) + '\n')
         hook.chmod(0o700)
-        p = subprocess.run(self.integrate_args('--timeout', '4'), text=True, capture_output=True,
-                           env=isolated_env(), timeout=25)
+        p = subprocess.run(self.integrate_args('--timeout', '20'), text=True, capture_output=True,
+                           env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(p.stdout)
         self.assertTrue(marker.exists())
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'))
