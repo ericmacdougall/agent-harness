@@ -337,6 +337,24 @@ class DeepJsonTests(unittest.TestCase):
         done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "refused"))
 
+    def test_depth_boundary_and_non_object_wal_lines(self):
+        rm.safe_json_loads("[" * 100 + "]" * 100)
+        with self.assertRaises(ValueError):
+            rm.safe_json_loads("[" * 101 + "]" * 101)
+        rm.safe_json_loads('["' + "[" * 500 + '"]')   # brackets inside a string do not count
+        self.assertEqual(rm.safe_json_loads(b'{"a":"\\"[[[[ "}'), {"a": '"[[[[ '})
+        with tempfile.TemporaryDirectory() as tmp:
+            wals = Path(tmp) / "s"; wals.mkdir()
+            (wals / "main.jsonl").write_text('["note"]\n"note"\n42\n')
+            with mock.patch.object(rm, "wal_root", return_value=Path(tmp)):
+                self.assertEqual(rm.find_wal(["a" * 40], "feat/some-branch", ["GoodQA goodqa#1"], 0, 0), [])
+
+    def test_more_secret_shapes_are_redacted_and_refused(self):
+        for planted in ("ya29." + "a" * 30, "123456789:" + "A" * 35):
+            self.assertNotIn(planted, rm.scrub("x " + planted))
+            with self.assertRaises(rm.MapError):
+                rm.assert_no_leak(planted)
+
     def test_wal_line_with_deep_nesting_is_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:
             wals = Path(tmp) / "s"; wals.mkdir()

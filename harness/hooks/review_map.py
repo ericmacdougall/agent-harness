@@ -61,12 +61,12 @@ class MapError(Exception):
 EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b")
 HOME_PATH = re.compile(r"(?:/Users|/home)/[A-Za-z0-9._-]+")
 EXTRA_TOKENS = re.compile(r"\b(?:[sr]k_(?:live|test)_[A-Za-z0-9]{8,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}"
-                          r"|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{30,}|xox[abprs]-[A-Za-z0-9-]+)\b")
+                          r"|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{30,}|xox[abprs]-[A-Za-z0-9-]+|ya29\.[A-Za-z0-9_-]{20,}|\d{8,10}:[A-Za-z0-9_-]{35})\b")
 # Shapes that must never survive into the page; checked on the final bytes.
 LEAK_SHAPES = re.compile(r"(?:-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}"
                          r"|\bsk-[A-Za-z0-9_-]{16,}|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bAIza[0-9A-Za-z_-]{35}\b"
                          r"|(?i:\bbearer\s+[A-Za-z0-9._~+/=-]{16,})|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}"
-                         r"|\b[sr]k_(?:live|test)_[A-Za-z0-9]{8,}|\bxox[abprs]-[A-Za-z0-9-]{8,}|\bnpm_[A-Za-z0-9]{30,}|\bglpat-[A-Za-z0-9_-]{16,})")
+                         r"|\b[sr]k_(?:live|test)_[A-Za-z0-9]{8,}|\bxox[abprs]-[A-Za-z0-9-]{8,}|\bnpm_[A-Za-z0-9]{30,}|\bglpat-[A-Za-z0-9_-]{16,}|\bya29\.[A-Za-z0-9_-]{20,}|\b\d{8,10}:[A-Za-z0-9_-]{35}\b)")
 
 
 CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
@@ -527,6 +527,8 @@ def find_wal(shas, branch, tickets, since, until) -> list:
                 try:
                     row = safe_json_loads(line)
                 except ValueError:
+                    continue
+                if not isinstance(row, dict):
                     continue
                 note = row.get("note")
                 if not isinstance(note, str) or row.get("event") not in ("decision", "risk", "check", "commit", "result",
