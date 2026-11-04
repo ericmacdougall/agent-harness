@@ -5,6 +5,10 @@ package ledger
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +49,7 @@ const (
 	lockFile          = "writer.lock"
 	metaFile          = "meta.json"
 	mirrorWritersFile = "mirror-writers.json"
+	cacheKeyFile      = "cache.key"
 )
 
 // Error kinds, mapped to exit codes by the CLI.
@@ -108,6 +113,8 @@ type Ledger struct {
 	Project string
 	Slug    string
 	warn    []string
+
+	cacheSecret []byte // this HOME's view-cache key; nil until loaded, empty when unavailable
 }
 
 // Warnings collected while opening or writing (printed by the CLI on stderr).
@@ -515,6 +522,56 @@ type cacheDoc struct {
 	View      json.RawMessage `json:"view"`
 	ViewSHA   string          `json:"view_sha256"`
 	LedgerVer string          `json:"ledger_version"`
+	MAC       string          `json:"mac"`
+}
+
+// secret returns this HOME's view-cache key (~/.agent-harness/ledgers/<proj>/cache.key, 32 random bytes,
+// 0600), creating it on first use. view.cache.json travels with a copied .git and its key inputs are not
+// secret, so only a MAC under this key makes a cache this HOME's own. Nil means no cache is used.
+func (l *Ledger) secret() []byte {
+	if l.cacheSecret != nil {
+		return l.cacheSecret
+	}
+	l.cacheSecret = []byte{}
+	mdir, err := MirrorDir(l.Project)
+	if err != nil {
+		return nil
+	}
+	dir := filepath.Dir(mdir)
+	if os.MkdirAll(dir, 0o700) != nil {
+		return nil
+	}
+	d, err := safefs.OpenDir(dir)
+	if err != nil {
+		return nil
+	}
+	defer d.Close()
+	for attempt := 0; attempt < 2; attempt++ {
+		if b, err := d.ReadRegular(cacheKeyFile, 128); err == nil {
+			k, err := hex.DecodeString(strings.TrimSpace(string(b)))
+			if err != nil || len(k) != 32 {
+				return nil
+			}
+			l.cacheSecret = k
+			return k
+		}
+		k := make([]byte, 32)
+		if _, err := rand.Read(k); err != nil {
+			return nil
+		}
+		if d.PublishNew(cacheKeyFile, []byte(hex.EncodeToString(k)+"\n")) == nil {
+			l.cacheSecret = k
+			return k
+		}
+		// Another process created it first: read theirs.
+	}
+	return nil
+}
+
+func cacheMAC(secret []byte, key, viewSHA string) string {
+	m := hmac.New(sha256.New, secret)
+	m.Write([]byte(key + "\n" + viewSHA))
+	return hex.EncodeToString(m.Sum(nil))
 }
 
 func toGeneric(v any) (any, error) {
@@ -572,20 +629,24 @@ func (l *Ledger) loadCache(key string) *fold.View {
 	if json.Unmarshal(b, &doc) != nil || doc.Key != key || doc.LedgerVer != Version {
 		return nil
 	}
+	secret := l.secret()
+	if len(secret) == 0 || !hmac.Equal([]byte(doc.MAC), []byte(cacheMAC(secret, doc.Key, doc.ViewSHA))) {
+		return nil
+	}
 	var v fold.View
 	if json.Unmarshal(doc.View, &v) != nil {
 		return nil
 	}
 	c, err := canonicalView(&v)
-	if err != nil || fold.HandleHash(string(c)) != doc.ViewSHA || !bytes.Equal(c, doc.View) {
+	if err != nil || fold.HandleHash(string(c)) != doc.ViewSHA || !bytes.Equal(c, doc.View) || v.Slug != l.Slug {
 		return nil
 	}
 	return &v
 }
 
-// CacheBytes renders the cache document for v under key: Python-canonical JSON of
-// {key, ledger_version, view, view_sha256}.
-func CacheBytes(key string, v *fold.View) ([]byte, error) {
+// cacheBytes renders the cache document for v under key: Python-canonical JSON of
+// {key, ledger_version, mac, view, view_sha256}, mac being HMAC-SHA256(secret, key "\n" view_sha256).
+func cacheBytes(secret []byte, key string, v *fold.View) ([]byte, error) {
 	g, err := toGeneric(v)
 	if err != nil {
 		return nil, err
@@ -594,8 +655,9 @@ func CacheBytes(key string, v *fold.View) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	sha := fold.HandleHash(string(c))
 	doc, err := pycompat.Canonical(map[string]any{"key": key, "ledger_version": Version, "view": g,
-		"view_sha256": fold.HandleHash(string(c))})
+		"view_sha256": sha, "mac": cacheMAC(secret, key, sha)})
 	if err != nil {
 		return nil, err
 	}
@@ -603,7 +665,11 @@ func CacheBytes(key string, v *fold.View) ([]byte, error) {
 }
 
 func (l *Ledger) saveCache(key string, v *fold.View) {
-	b, err := CacheBytes(key, v)
+	secret := l.secret()
+	if len(secret) == 0 {
+		return
+	}
+	b, err := cacheBytes(secret, key, v)
 	if err != nil {
 		return
 	}

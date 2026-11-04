@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ericmacdougall/agent-harness/internal/ledger"
+	"github.com/ericmacdougall/agent-harness/internal/ledger/fold"
 	"github.com/ericmacdougall/agent-harness/internal/ledger/op"
 	"github.com/ericmacdougall/agent-harness/internal/ledger/store"
 	"github.com/ericmacdougall/agent-harness/internal/ledger/writer"
@@ -282,6 +283,20 @@ func TestCacheIsOnlyACache(t *testing.T) {
 	if got := w.ok(w.repo, nil, "list", "--json"); got != want {
 		t.Fatalf("tampered cache trusted: %s", got)
 	}
+	// Forged: the current key, an edited view and a recomputed view_sha256. Every key input travels with
+	// a copied .git, so only the MAC under this HOME's cache.key stops it (delta review of 18d34d8).
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(good, &doc); err != nil {
+		t.Fatal(err)
+	}
+	view := bytes.Replace(doc["view"], []byte(`"title":"two"`), []byte(`"title":"evil"`), 1)
+	sha, _ := json.Marshal(fold.HandleHash(string(view)))
+	doc["view"], doc["view_sha256"] = view, sha
+	forged, _ := json.Marshal(doc)
+	write(forged)
+	if got := w.ok(w.repo, nil, "list", "--json"); got != want {
+		t.Fatalf("forged cache trusted: %s", got)
+	}
 	write([]byte("{not json"))
 	if got := w.ok(w.repo, nil, "list", "--json"); got != want {
 		t.Fatal("corrupt cache broke list")
@@ -292,6 +307,9 @@ func TestCacheIsOnlyACache(t *testing.T) {
 	}
 	if again, _ := os.ReadFile(cache); !bytes.Equal(again, good) {
 		t.Fatal("rebuilt cache differs from the original bytes")
+	}
+	if st := w.ok(w.repo, nil, "status", "--json"); !strings.Contains(st, `"cache":{"fresh":true}`) {
+		t.Fatalf("this HOME's own cache is not used: %s", st)
 	}
 }
 
@@ -1056,22 +1074,39 @@ func TestRestoredWriterReadFromHomeMirror(t *testing.T) {
 	if got := titles(w.jsonOK(clone, nil, "list")); len(got) != 3 {
 		t.Fatalf("restored list %v", got)
 	}
-	// The original checkout writes again; the clone's copy of that ref is now behind the mirror.
+	// Extend the clone's copy of that writer's ref with a well-formed forged pack: right project, right
+	// writer, later clock. Read from the repository it would fold; read from the mirror it cannot.
+	_, oldWriter, _ := store.ParseRefName(old)
+	cg := &store.Git{GitDir: filepath.Join(clone, ".git")}
+	parent := strings.TrimSpace(w.git(clone, "rev-parse", old))
+	wall := time.Now().UnixMilli()
+	id, _ := op.NewID(op.PrefixOp, wall)
+	fo := &op.Op{V: 1, ID: id, Project: project, Writer: oldWriter, HLC: op.HLC{WallMs: wall},
+		Actor: op.Actor{Kind: "agent", Label: "forger"}, Ticket: op.PrefixTicket + id[len(op.PrefixOp):],
+		Kind: op.KindTicketCreate, Payload: op.TicketCreate("FORGED", "", "task", "low", nil, "todo", "unstarted")}
+	line, err := fo.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fo, err = op.Parse(line); err != nil {
+		t.Fatal(err)
+	}
+	ftip, err := cg.WritePack(parent, []*op.Op{fo}, "forged-lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cg.ReadRef(project, oldWriter, ftip); err != nil {
+		t.Fatalf("control: the forged chain must be valid when read from the repository: %v", err)
+	}
+	w.git(clone, "update-ref", old, ftip)
+	list := titles(w.jsonOK(clone, nil, "list"))
+	if len(list) != 3 || strings.Contains(strings.Join(list, ","), "FORGED") {
+		t.Fatalf("a forged repository ref under a restored writer was read: %v", list)
+	}
+	// The original checkout writes again; the clone's copy of that ref is no longer the mirror's.
 	w.newTicket(w.repo, nil, "t3 from the original")
 	if got := titles(w.jsonOK(clone, nil, "list")); len(got) != 4 {
 		t.Fatalf("restored clone after the original wrote again: %v", got)
-	}
-	// Point the clone's ref at a forged chain: a pack claiming to be that writer's, with a ticket.
-	forged := filepath.Join(filepath.Dir(w.repo), "forger")
-	w.git(filepath.Dir(w.repo), "init", "-q", forged)
-	w.ok(forged, nil, "init", "--slug", "forger")
-	w.newTicket(forged, nil, "FORGED")
-	ftip := strings.TrimSpace(w.git(forged, "for-each-ref", "--format=%(objectname)", "refs/goodqa/"))
-	w.git(clone, "fetch", "-q", forged, ftip)
-	w.git(clone, "update-ref", old, ftip)
-	list := titles(w.jsonOK(clone, nil, "list"))
-	if len(list) != 4 || strings.Contains(strings.Join(list, ","), "FORGED") {
-		t.Fatalf("a forged repository ref under a restored writer was read: %v", list)
 	}
 }
 

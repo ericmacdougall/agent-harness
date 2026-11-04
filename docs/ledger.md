@@ -105,10 +105,13 @@ ambiguous.
 | `<git common dir>/goodqa/` (0700) | `projects.json`, `writer.json` (machine fingerprint to writer map), `view.cache.json` and `writer.lock`, all 0600. A symlinked or group-readable directory is refused. Linked worktrees share it. |
 | `~/.agent-harness/ledgers/<proj>/mirror.git` | A bare local backup that copies the writer ref after every write. `init --from-mirror` restores from it and requires every restored ref to equal the mirror's tip. Refs the mirror lacks are left alone and stay `unverified`. A restored writer is `self` only when it is in `mirror-writers.json`, and its packs are then read from the mirror. |
 | `~/.agent-harness/ledgers/<proj>/mirror-writers.json` (0600) | This HOME's registry of the writers minted here (writer to lease hash). It is the trust anchor for `self`. A new writer is recorded before its first write. |
+| `~/.agent-harness/ledgers/<proj>/cache.key` (0600) | 32 random bytes, created on first use. The view cache is used only when its MAC under this key matches. |
 | `~/.agent-harness/ledgers/<proj>/repo.git` | The store for a repo-less ledger. |
 
-The view cache is only a cache. It is keyed by the exact set of ref tips and carries its own
-SHA-256, and a missing, stale or corrupt cache is rebuilt from the refs.
+The view cache is only a cache. It is keyed by the exact set of ref tips, writer classes and
+read sources, and carries its own SHA-256 and an HMAC-SHA256 under this HOME's `cache.key`.
+`view.cache.json` travels with a copied `.git`, so a cache without a valid MAC is ignored. A
+missing, stale, forged or corrupt cache is rebuilt from the refs.
 
 ## Commit policy
 
