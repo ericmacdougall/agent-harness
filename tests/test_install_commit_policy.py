@@ -34,6 +34,20 @@ class Installers(unittest.TestCase):
             self.assertIn("inactive", status)
         self.assertNotIn("commit_policy.py waive", json.dumps(settings["permissions"]))
 
+    def test_codex_hooks_register_policy_once(self):
+        sys.path.insert(0, str(HOOKS.parents[1]))
+        import install_codex
+        home = Path("/home/example/.codex")
+        hooks = install_codex.merge_hooks({}, home)
+        hooks = install_codex.merge_hooks(hooks, home)
+        commands = [handler["command"] for group in hooks["hooks"]["PreToolUse"] for handler in group["hooks"]]
+        policy = install_codex.policy_command(home)
+        self.assertEqual(commands.count(policy), 1)
+        self.assertEqual(commands.count(install_codex.managed_command(home)), 1)
+        group = next(g for g in hooks["hooks"]["PreToolUse"] if g["hooks"][0]["command"] == policy)
+        self.assertNotIn("matcher", group)
+        self.assertEqual(group["hooks"][0]["timeout"], 60)
+
     def test_old_git_reports_inactive_backstop(self):
         sys.path.insert(0, str(HOOKS.parents[1]))
         import install
