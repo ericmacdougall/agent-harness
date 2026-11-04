@@ -245,6 +245,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
             sys.path.pop(0)
 
     def test_both_reviewers_use_committed_snapshot_without_ignored_content(self):
+        baseline = subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], text=True).strip()
         (self.repo / '.gitignore').write_text('private.txt\nnode_modules/\n')
         subprocess.run(['git', '-C', str(self.repo), 'add', '.gitignore'], check=True)
         subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', 'ignore fixtures'], check=True)
@@ -262,7 +263,7 @@ seen = cwd / 'private.txt'
 exposed = seen.exists()
 ignored_read = seen.read_text() if exposed else None
 if exposed: seen.write_text('synthetic mutation')
-record = {'ignored_read': ignored_read, 'diff': subprocess.check_output(['git', 'diff', 'HEAD^', 'HEAD', '--'], text=True), 'config': (cwd / '.git/config').read_text(), 'cwd': str(cwd), 'exposed': exposed, 'vendor': (cwd / 'node_modules').exists(),
+record = {'ignored_read': ignored_read, 'diff': subprocess.check_output(['git', 'diff', os.environ['REVIEW_BASE'], 'HEAD', '--'], text=True), 'config': (cwd / '.git/config').read_text(), 'cwd': str(cwd), 'exposed': exposed, 'vendor': (cwd / 'node_modules').exists(),
           'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
           'history': subprocess.check_output(['git', 'log', '--format=%s'], text=True), 'prompt': prompt}
 Path(os.environ['ISOLATION_CAPTURE']).write_text(json.dumps(record))
@@ -278,8 +279,10 @@ else: print('PLAN_RESULT: ACCEPT')
                 self.fake('codex', 'import json,sys; print(json.dumps({"type":"turn.failed","error":{"code":"model_not_found"}}));sys.exit(7)' if fallback else body)
                 self.fake('claude', body)
                 capture = self.root / 'isolation.json'
+                # The named base is the only history a reviewer receives.
                 result = self.invoke(stage='plan', output=self.root / f'review-{fallback}.md',
-                                     env={'ISOLATION_CAPTURE': str(capture)})
+                                     env={'ISOLATION_CAPTURE': str(capture), 'REVIEW_BASE': baseline},
+                                     extra=('--base', baseline))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 record = json.loads(capture.read_text())
                 self.assertFalse(record['exposed'])
@@ -287,7 +290,10 @@ else: print('PLAN_RESULT: ACCEPT')
                 self.assertNotEqual(Path(record['cwd']).resolve(), self.repo.resolve())
                 self.assertFalse(record['vendor'])
                 self.assertEqual(record['head'], head)
-                self.assertIn('baseline', record['history'])
+                # Depth-1 snapshot: the base is diffable but is not walked as history.
+                self.assertEqual(record['history'].split('\n')[0], 'ignore fixtures')
+                self.assertNotIn('baseline', record['history'])
+                self.assertIn(f'git diff {baseline} HEAD', record['prompt'])
                 self.assertIn('private.txt', record['diff'])
                 self.assertNotIn(str(self.repo), record['config'])
                 self.assertIn(head, record['prompt'])
@@ -343,9 +349,9 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
             with self.subTest(failure=failure):
                 seen = []
                 output = self.root / f'{failure}.report'
-                def snapshot(repo, destination, head):
+                def snapshot(repo, destination, head, **options):
                     seen.append(destination)
-                    real_snapshot(repo, destination, head)
+                    real_snapshot(repo, destination, head, **options)
                     if failure == 'validation':
                         raise OSError('synthetic validation failure')
                     if failure == 'source-race':
