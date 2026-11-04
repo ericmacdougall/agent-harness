@@ -294,18 +294,18 @@ def domain_lint(text: str, repo, spec_policy: dict):
             # stay silent for non-blockchain repos, but leave a trace when a blockchain repo is opted out
             found = dg.detect(Path(repo)) if config["source"] != "env HARNESS_DOMAIN_GATES" else []
             return ([f"domain gates disabled by {config['source']} although blockchain work was detected"] if found else []), []
-        detected, scanned = dg.detect_checked(Path(repo))
+        detected, failure = dg.detect_full(Path(repo))
         domains = [d["domain"] for d in detected]
         missing = dg.missing_items(text, domains, repo, strict=config["mode"] == "enforce")
-        skipped = not scanned and not dg.spec_domains(text)
+        skipped = failure is not None
     except Exception as error:
         note = f"domain gates could not run ({type(error).__name__})"
         enforcing = isinstance(spec_policy.get("domain_gates"), dict) and spec_policy["domain_gates"].get("mode") == "enforce"
         return ([], [note + "; enforce mode fails closed"]) if enforcing else ([note + "; skipped"], [])
     notes = []
     if skipped:
-        note = "domain detection could not run: --repo is not a git checkout or git failed (pass --repo <worktree>)"
-        if config["mode"] == "enforce":
+        note = f"domain detection could not run: {failure} (pass --repo <worktree>)"
+        if config["mode"] == "enforce":  # a Domains: line in the spec never excuses a failed scan
             return [], [note + "; enforce mode fails closed"]
         notes = [note]
     if not missing:

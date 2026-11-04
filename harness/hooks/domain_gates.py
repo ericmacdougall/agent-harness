@@ -212,13 +212,19 @@ def detect(repo, changed_paths=None, max_files: int = MAX_FILES) -> list:
 
 def detect_checked(repo, changed_paths=None, max_files: int = MAX_FILES):
     """Like detect, but returns (domains, ok); ok is False when the repo scan could not run (not git, git failed)."""
+    found, reason = detect_full(repo, changed_paths, max_files)
+    return found, reason is None
+
+
+def detect_full(repo, changed_paths=None, max_files: int = MAX_FILES):
+    """Returns (domains, failure_reason or None); the reason names why the scan was incomplete."""
     found = _Found()
     try:
         root = Path(repo).resolve()
         if not root.is_dir():
-            return [], False
+            return [], "repo is not a directory"
     except OSError:
-        return [], False
+        return [], "repo is not readable"
     for path in list(changed_paths or [])[:max_files]:
         if isinstance(path, str) and path and "\0" not in path:
             _path_signals(path, found, "diff: ")
@@ -257,7 +263,9 @@ def detect_checked(repo, changed_paths=None, max_files: int = MAX_FILES):
     proto_paths = [p for p in files if p.endswith(".proto")]
     if proto_paths and nats_in and ledger_in:
         found.add("ledger-messaging", "medium", f"proto {_base(proto_paths[0])} + nats ({nats_in[0]}) + ledger signal ({_base(ledger_in[0])})")
-    return found.result(), ok and not rejected  # a manifest rejected as too deep is a visible failure
+    reason = (None if ok else "not a git checkout or git ls-files failed") if not rejected else \
+        "a manifest was rejected as too deeply nested"
+    return found.result(), reason
 
 
 # --------------------------------------------------------------------------- data

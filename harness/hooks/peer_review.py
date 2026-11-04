@@ -274,7 +274,7 @@ def domain_section(repo: Path, base, changed_paths=None):
             import spec_flow
             policy = spec_flow.load_spec_policy()
         except (ImportError, OSError, ValueError):
-            policy = None
+            policy, distrust = None, True  # unknown policy: never let the repo file switch the checklist off
         state = domain_gates.settings(repo, policy, ignore_repo_file=distrust)
         if state['disabled']:
             return '', state['source']

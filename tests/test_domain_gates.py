@@ -421,6 +421,17 @@ class SpecFlowTests(unittest.TestCase):
         self.assertTrue(problems)
         self.assertTrue(warnings and not soft)
 
+    def test_enforce_ignores_domains_line_when_scan_failed(self):
+        enforce = {"domain_gates": {"mode": "enforce"}}
+        with_line = SPEC + "\n" + dg.render_block(["xrpl"])
+        deep = make_repo({"package.json": "[" * 5000 + "]" * 5000})
+        _, problems = sf.domain_lint(with_line, deep, enforce)
+        self.assertTrue(any("deeply nested" in p for p in problems), problems)
+        repo = make_repo({"foundry.toml": "x"})
+        with mock.patch.object(dg.subprocess, "run", return_value=mock.Mock(returncode=128, stdout=b"")):
+            _, problems = sf.domain_lint(with_line, repo, enforce)
+        self.assertTrue(any("git ls-files failed" in p for p in problems), problems)
+
     def test_cargo_table_dependency_and_ledger_word_boundaries(self):
         self.assertIn("solana", names(dg.detect(make_repo({"Cargo.toml": '[dependencies.anchor-lang]\nversion = "0.30"\n'}))))
         lb = make_repo({"load_balancer.proto": "message A {}", "go.mod": "require nats.go v1\n"})
