@@ -31,8 +31,10 @@ func install(t *testing.T, name string) string {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// 0.1.0 resolves its data directory before writing absolute snapshot paths.
-	dir, err := filepath.EvalSymlinks(dir)
+	// 0.1.0 resolves its data directory before writing absolute snapshot paths, so
+	// the files carry the resolved form while the importer is handed dir as given
+	// (on macOS the temp dir sits under the /var symlink).
+	resolved, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +50,7 @@ func install(t *testing.T, name string) string {
 		}
 		// The placeholder sits inside JSON strings, so substitute the escaped form.
 		// The fixtures were written on Linux; 0.1.0 joins with the host separator.
-		quoted, _ := json.Marshal(filepath.Join(dir, attachmentsDirName) + string(filepath.Separator))
+		quoted, _ := json.Marshal(filepath.Join(resolved, attachmentsDirName) + string(filepath.Separator))
 		data = bytes.ReplaceAll(data, []byte("@DATADIR@/attachments/"), quoted[1:len(quoted)-1])
 		target := filepath.Join(dir, rel)
 		if err = os.MkdirAll(filepath.Dir(target), 0o700); err != nil {

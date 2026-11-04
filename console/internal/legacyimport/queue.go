@@ -26,6 +26,8 @@ const (
 	queueDirName         = "queued-inputs"
 	attachmentsDirName   = "attachments"
 	maxQueueFiles        = 4096
+	// maxQueueBytes bounds what the importer holds in memory across all queue files.
+	maxQueueBytes = 64 << 20
 )
 
 type queueDisk struct {
@@ -108,9 +110,10 @@ type Queue struct {
 	Sessions []SessionQueue
 	// Orphans are queue files whose session is not imported.
 	Orphans []string
-	// Stray are files that are not a queue file or its beforeimage.
+	// Stray are names that are not a queue file or its beforeimage. 0.1.0 never reads
+	// them, so they are reported and left alone, outside the digest and the guard.
 	Stray []string
-	// Digest covers every file, length-prefixed, sorted by name. Empty if none.
+	// Digest covers every queue file, length-prefixed, sorted by name. Empty if none.
 	Digest string
 	Files  int
 }
@@ -122,37 +125,53 @@ func sessionHash(id string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// readQueueDir reads every regular file in queued-inputs, bounded. A missing
-// directory is an empty queue.
-func readQueueDir(dir string) (map[string][]byte, error) {
+// readQueueDir reads the files 0.1.0 reads in queued-inputs: <sha256>.json and its
+// .previous beforeimage. Other names are returned as stray, by name only, since
+// 0.1.0 never reads them. Sizes are checked before any read. A missing directory is
+// an empty queue.
+func readQueueDir(dir string) (map[string][]byte, []string, error) {
 	path := filepath.Join(dir, queueDirName)
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
-		return map[string][]byte{}, nil
+		return map[string][]byte{}, nil, nil
 	}
 	if err != nil || !info.IsDir() {
-		return nil, refuse("queued-inputs is not a directory")
+		return nil, nil, refuse("queued-inputs is not a directory")
 	}
 	entries, err := os.ReadDir(path)
 	if err != nil {
-		return nil, refuse("queued-inputs cannot be listed")
+		return nil, nil, refuse("queued-inputs cannot be listed")
 	}
 	if len(entries) > maxQueueFiles {
-		return nil, refuse("queued-inputs holds more files than the importer reads")
+		return nil, nil, refuse("queued-inputs holds more files than the importer reads")
 	}
-	files := map[string][]byte{}
+	var stray []string
+	var total int64
+	var read []os.DirEntry
 	for _, entry := range entries {
+		if !queueName.MatchString(entry.Name()) {
+			stray = append(stray, entry.Name())
+			continue
+		}
 		info, err := entry.Info()
 		if err != nil || !info.Mode().IsRegular() || info.Size() > queueFileLimit {
-			return nil, refuse("queued-inputs holds a file that is not a bounded regular file")
+			return nil, nil, refuse("queued-inputs holds a queue file that is not a bounded regular file")
 		}
+		if total += info.Size(); total > maxQueueBytes {
+			return nil, nil, refuse("queued-inputs holds more than the importer reads")
+		}
+		read = append(read, entry)
+	}
+	files := map[string][]byte{}
+	for _, entry := range read {
 		data, err := os.ReadFile(filepath.Join(path, entry.Name()))
-		if err != nil {
-			return nil, refuse("a queue file cannot be read")
+		if err != nil || len(data) > queueFileLimit {
+			return nil, nil, refuse("a queue file cannot be read")
 		}
 		files[entry.Name()] = data
 	}
-	return files, nil
+	sort.Strings(stray)
+	return files, stray, nil
 }
 
 // QueueDigest is length-prefixed so no two file sets share a digest.
@@ -368,6 +387,12 @@ func decodeSession(dir string, s Session, main, previous []byte, hasMain, hasPre
 	attachments := filepath.Join(dir, attachmentsDirName) + string(filepath.Separator)
 	seen := map[string]bool{}
 	text, total, snapshots := 0, int64(0), 0
+	// Attachments are read only after the queue's bounds pass, as in 0.1.0.
+	type check struct {
+		input, snapshot int
+		disk            snapshotDisk
+	}
+	var pending []check
 	for _, e := range disk.Entries {
 		if e == nil || e.RequestID == "" || len(e.RequestID) > 128 || seen[e.RequestID] ||
 			e.Status != "discarded" && (e.TaskID != disk.TaskID || e.Generation != disk.Generation) || len(e.Text) > queueEntryTextLimit {
@@ -407,8 +432,10 @@ func decodeSession(dir string, s Session, main, previous []byte, hasMain, hasPre
 				out.Unknown = "attachment_path"
 				return out
 			}
-			snap := Snapshot{Path: a.Path, Hash: a.Hash, Size: a.Size, DirectoryIdentity: a.DirectoryIdentity}
-			snap.Intact = e.Status == "cleanup_pending" || attachmentIntact(a)
+			snap := Snapshot{Path: a.Path, Hash: a.Hash, Size: a.Size, DirectoryIdentity: a.DirectoryIdentity, Intact: e.Status == "cleanup_pending"}
+			if !snap.Intact {
+				pending = append(pending, check{len(out.Inputs), len(held.Snapshots), a})
+			}
 			if a.DirectoryIdentity == "" {
 				held.NoIdentity = true
 			}
@@ -419,6 +446,10 @@ func decodeSession(dir string, s Session, main, previous []byte, hasMain, hasPre
 	if text > queueTextLimit || total > queueAttachmentLimit || snapshots > queueSnapshotLimit {
 		out.Unknown = "queue_bound"
 		out.Inputs = nil
+		return out
+	}
+	for _, c := range pending {
+		out.Inputs[c.input].Snapshots[c.snapshot].Intact = attachmentIntact(c.disk)
 	}
 	return out
 }
@@ -442,14 +473,19 @@ func attachmentIntact(a snapshotDisk) bool {
 	return err == nil && hex.EncodeToString(sha(data)) == a.Hash
 }
 
-// DecodeQueue reads queued-inputs for the imported sessions. Files for sessions not
-// imported are orphans; other names are stray. Nothing is written.
-func DecodeQueue(dir string, sessions []Session) (Queue, error) {
-	files, err := readQueueDir(dir)
+// decodeQueue reads queued-inputs for the imported sessions. Callers hold the
+// console lock. Files for sessions not imported are orphans; other names are stray.
+// Nothing is written.
+func decodeQueue(dir string, sessions []Session) (Queue, error) {
+	files, stray, err := readQueueDir(dir)
 	if err != nil {
 		return Queue{}, err
 	}
-	out := Queue{Digest: QueueDigest(files), Files: len(files)}
+	// 0.1.0 resolves its data directory before writing snapshot paths (state.go:207).
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+	out := Queue{Digest: QueueDigest(files), Files: len(files), Stray: stray}
 	claimed := map[string]bool{}
 	for _, s := range sessions {
 		hash := sessionHash(s.ID)
@@ -470,11 +506,7 @@ func DecodeQueue(dir string, sessions []Session) (Queue, error) {
 		if claimed[name] {
 			continue
 		}
-		if queueName.MatchString(name) {
-			out.Orphans = append(out.Orphans, name)
-		} else {
-			out.Stray = append(out.Stray, name)
-		}
+		out.Orphans = append(out.Orphans, name)
 	}
 	return out, nil
 }

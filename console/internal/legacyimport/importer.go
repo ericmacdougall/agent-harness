@@ -104,7 +104,7 @@ func read(dir string, j journalFile) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
-	queue, err := DecodeQueue(dir, journal.Sessions)
+	queue, err := decodeQueue(dir, journal.Sessions)
 	if err != nil {
 		return Report{}, err
 	}
@@ -148,6 +148,13 @@ func batch(p kernel.Projection, r Report, generation uint64, now string) ([]kern
 		if !s.Closed {
 			open++
 		}
+	}
+	// 0.1.0 lets a session's queue file override its checkpoint's input revision and
+	// objective hash, and clear passes when the queue is newer. That mapping belongs
+	// with LegacyInputHeld (K1c). Until it exists here, no queue may reach a batch,
+	// whatever the completeness guard says.
+	if r.Queue.Files > 0 {
+		return nil, refuse("queue overrides are not mapped yet (K1c)")
 	}
 	if open+len(r.Journal.Sessions) > kernel.MaxOpenSessions {
 		return nil, refuse("%d open sessions after import is more than %d; close sessions in 0.1.0 and import again", open+len(r.Journal.Sessions), kernel.MaxOpenSessions)
@@ -270,7 +277,7 @@ func Import(ctx context.Context, dir string, opts Options) (*eventlog.Log, kerne
 		}
 		return log, p, SentinelReinstalled, nil
 	}
-	files, err := readQueueDir(dir)
+	files, _, err := readQueueDir(dir)
 	if err != nil {
 		return fail(err)
 	}
@@ -319,8 +326,14 @@ func run(ctx context.Context, dir string, log *eventlog.Log, p kernel.Projection
 		return fail(err)
 	}
 	stored, _, err := log.Append(ctx, p, "", "", facts)
-	if err != nil {
+	switch {
+	case errors.Is(err, eventlog.ErrConflict), errors.Is(err, eventlog.ErrQuota):
+		// Definite refusals: nothing was committed.
 		return fail(fmt.Errorf("%w: append: %v", ErrRefused, err))
+	case err != nil:
+		// The commit may or may not have landed. The next open reads the log and
+		// either finishes the swap or imports again; it never imports twice.
+		return fail(fmt.Errorf("import outcome unknown; the next open recovers: %w", err))
 	}
 	for _, f := range stored {
 		if p, err = kernel.Reduce(p, f); err != nil {
@@ -350,7 +363,7 @@ func swap(dir string, j journalFile, digest, now string, ops fileOps) error {
 			return err
 		}
 		if existing == "" {
-			if err := ops.Link(path, path+".imported-"+ts); err != nil {
+			if _, err := freeName(path+".imported-"+ts, func(n string) error { return ops.Link(path, n) }); err != nil {
 				return err
 			}
 			if err := ops.SyncDir(dir); err != nil {
@@ -373,10 +386,26 @@ func keepCopy(dir, prefix string, data []byte, ts string, ops fileOps, same func
 			}
 		}
 	}
-	if err := ops.WriteSync(filepath.Join(dir, prefix+ts), data, true); err != nil {
+	if _, err := freeName(filepath.Join(dir, prefix+ts), func(n string) error { return ops.WriteSync(n, data, true) }); err != nil {
 		return err
 	}
 	return ops.SyncDir(dir)
+}
+
+// freeName runs create with base, then base.2, base.3 and so on while the name is
+// taken, so a retry or a reimport with the same clock reading still finishes. The
+// copies it would collide with hold other content: callers look for a matching copy
+// first.
+func freeName(base string, create func(string) error) (string, error) {
+	name := base
+	for i := 2; i <= 100; i++ {
+		err := create(name)
+		if !errors.Is(err, os.ErrExist) {
+			return name, err
+		}
+		name = fmt.Sprintf("%s.%d", base, i)
+	}
+	return "", fmt.Errorf("no free name for %s", filepath.Base(base))
 }
 
 // findImported returns the .imported-* copy whose journal digest matches, if any.

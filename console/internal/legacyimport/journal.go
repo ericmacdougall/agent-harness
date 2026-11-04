@@ -26,30 +26,80 @@ func refuse(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrRefused, fmt.Sprintf(format, args...))
 }
 
-// record is 6172744's journalRecord, decoded leniently as 0.1.0 does: unknown fields
-// are ignored and a null line is a zero record.
+// record mirrors every field of 6172744's journalRecord (state.go:135) with its Go
+// type, so a line 0.1.0's json.Unmarshal refuses is refused here too. Unknown fields
+// are ignored and a null line is a zero record, as in 0.1.0. Fields the import does
+// not carry are decoded only to reproduce that refusal and are then dropped.
 type record struct {
-	At                  string          `json:"at"`
-	SessionID           string          `json:"sessionId"`
-	Provider            string          `json:"provider"`
-	ProviderID          string          `json:"providerId"`
-	ProfileID           string          `json:"profileId,omitempty"`
-	CWD                 string          `json:"cwd"`
-	RequestID           string          `json:"requestId,omitempty"`
-	State               string          `json:"state"`
-	TaskID              string          `json:"taskId,omitempty"`
-	TaskGeneration      uint64          `json:"taskGeneration,omitempty"`
-	Checkpoint          *Checkpoint     `json:"checkpoint,omitempty"`
-	ReviewParent        string          `json:"reviewParent,omitempty"`
-	ReviewTaskID        string          `json:"reviewTaskId,omitempty"`
-	ReviewGeneration    uint64          `json:"reviewGeneration,omitempty"`
-	ReviewStage         string          `json:"reviewStage,omitempty"`
-	Cascade             json.RawMessage `json:"cascade,omitempty"`
-	ReviewInputRevision uint64          `json:"reviewInputRevision,omitempty"`
+	ReviewInputRevision uint64      `json:"reviewInputRevision,omitempty"`
+	ReviewObjectiveHash string      `json:"reviewObjectiveHash,omitempty"`
+	Cascade             *cascade    `json:"cascade,omitempty"`
+	Checkpoint          *Checkpoint `json:"checkpoint,omitempty"`
+	ReviewTaskID        string      `json:"reviewTaskId,omitempty"`
+	ReviewGeneration    uint64      `json:"reviewGeneration,omitempty"`
+	ReviewStage         string      `json:"reviewStage,omitempty"`
+	ReviewDigest        string      `json:"reviewDigest,omitempty"`
+	PolicyRevision      string      `json:"policyRevision,omitempty"`
+	ReviewParent        string      `json:"reviewParent,omitempty"`
+	TaskID              string      `json:"taskId,omitempty"`
+	TaskGeneration      uint64      `json:"taskGeneration,omitempty"`
+	TaskStage           string      `json:"taskStage,omitempty"`
+	SubjectDigest       string      `json:"subjectDigest,omitempty"`
+	ReviewStatus        string      `json:"reviewStatus,omitempty"`
+	At                  string      `json:"at"`
+	SessionID           string      `json:"sessionId"`
+	Provider            string      `json:"provider"`
+	ProviderID          string      `json:"providerId"`
+	ProfileID           string      `json:"profileId,omitempty"`
+	CWD                 string      `json:"cwd"`
+	RequestID           string      `json:"requestId,omitempty"`
+	State               string      `json:"state"`
 }
 
-// Checkpoint is the part of 6172744's checkpointRecord the import carries. Subject,
-// attempts and bursts are task state for K1d and are not read here.
+// cascade, step, attempt and subject mirror 6172744's cascadeSelection, policyStep,
+// cascadeAttempt and reviewSubject for their types only.
+type cascade struct {
+	ConfigStage step      `json:"configStage"`
+	AdmissionID string    `json:"admissionId"`
+	Revision    string    `json:"revision"`
+	RequestID   string    `json:"requestId,omitempty"`
+	Stage       int       `json:"stage"`
+	Selected    step      `json:"selected"`
+	Reason      string    `json:"reason"`
+	Attempts    []attempt `json:"attempts"`
+}
+
+type step struct {
+	Provider  string `json:"provider"`
+	ProfileID string `json:"profileId"`
+	Model     string `json:"model"`
+	Effort    string `json:"effort"`
+}
+
+type attempt struct {
+	Stage     int    `json:"stage"`
+	Provider  string `json:"provider"`
+	ProfileID string `json:"profileId"`
+	Model     string `json:"model"`
+	Status    string `json:"status"`
+	Reason    string `json:"reason"`
+}
+
+type subject struct {
+	InputRevision uint64   `json:"inputRevision"`
+	ObjectiveHash string   `json:"objectiveHash"`
+	GitCommonDir  string   `json:"gitCommonDir,omitempty"`
+	Root          string   `json:"root"`
+	Kind          string   `json:"kind"`
+	Head          string   `json:"head,omitempty"`
+	Digest        string   `json:"digest"`
+	Evidence      []string `json:"evidence"`
+	Files         []string `json:"files"`
+}
+
+// Checkpoint mirrors 6172744's checkpointRecord (recovery.go:9). The import carries
+// the task identity, revision, objective hash and passes; subject, attempts and
+// bursts are task state for K1d and are decoded only for their types.
 type Checkpoint struct {
 	InputRevision uint64            `json:"inputRevision"`
 	ObjectiveHash string            `json:"objectiveHash"`
@@ -57,7 +107,11 @@ type Checkpoint struct {
 	Generation    uint64            `json:"generation"`
 	State         string            `json:"state"`
 	Stage         string            `json:"stage"`
+	Subject       subject           `json:"subject"`
+	ReviewStatus  string            `json:"reviewStatus"`
+	Attempts      map[string]int    `json:"attempts"`
 	Passes        map[string]string `json:"passes"`
+	Bursts        int               `json:"bursts"`
 }
 
 // States 6172744's record() can write. Any other state refuses the import.
@@ -188,6 +242,11 @@ func DecodeJournal(data []byte, present bool) (Journal, error) {
 		}
 		if cp, ok := checkpoints[id]; ok {
 			s.Checkpoint, s.TaskID, s.TaskGen = cp.Checkpoint, cp.TaskID, cp.TaskGeneration
+			// As restoreCheckpoint does: a task record without a checkpoint still names
+			// the task, at revision zero.
+			if s.Checkpoint == nil && cp.TaskID != "" {
+				s.Checkpoint = &Checkpoint{ID: cp.TaskID, Generation: cp.TaskGeneration, Stage: cp.TaskStage, State: "unknown"}
+			}
 		}
 		out.Sessions = append(out.Sessions, s)
 	}

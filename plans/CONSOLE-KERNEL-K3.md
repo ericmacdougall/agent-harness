@@ -35,7 +35,7 @@ This slice implements "Old sessions: one-way import" in [the kernel plan](CONSOL
    - `eventlog.Open` gains a variant, `OpenLocked(ctx, handle, now)`, that adopts an already-held lock.
    - The importer takes the bare lock and decodes, writing nothing. Only after decoding succeeds does it create or open the log.
    - `Verify(dir)` takes the lock, decodes and reports, and writes nothing. A test checks that the directory is byte-identical afterwards (names, sizes, mtimes, contents).
-   - Every refusal before commit leaves every file byte-identical. Two exceptions, both documented: the directory mtime, which the preflight probe changes, and `console.lock`, which is created if absent. The same test pattern checks each refusal case. Decode, the completeness guard, the open-session check and the preflight all run before anything is written (round 2 N1).
+   - Every refusal before commit leaves every file byte-identical. Two exceptions, both documented: the directory mtime, which the preflight probe changes, and `console.lock`, which is created if absent. When the directory already has an event log (recovery or `--reimport`), opening it appends the open's own restart fact before any import decision (item 6), so `facts.db` changes too. An append whose outcome is unknown is not reported as a refusal: the next open reads the log and either finishes the swap or imports again (code review F6, F7). The same test pattern checks each refusal case. Decode, the completeness guard, the open-session check and the preflight all run before anything is written (round 2 N1).
 2. **Decoder.**
    - It is a pure function from the journal's bytes to a typed `Legacy` value. It follows `restore()` exactly, with the corrections above, except that it does not apply the 24 window (see 4).
    - The closed state set is the list above. Any other state refuses the import.
@@ -115,7 +115,7 @@ This slice implements "Old sessions: one-way import" in [the kernel plan](CONSOL
     - `Log` keeps the projection it last published, including replay quarantines and the in-memory restart of a latched open.
     - `Append` checks the caller's `LastSeq` and judges against its own copy.
     - The copy advances from the decoded stored facts, and only after a successful new commit. It does not advance on a replayed receipt or on any error.
-    - `Append` also returns the new projection.
+    - `Log.Projection()` returns the new projection after an append, so `Append`'s signature is unchanged from K2 (code review F12).
     - The full K2 suite is rerun, including the race run.
 
 ## Risks and negative cases

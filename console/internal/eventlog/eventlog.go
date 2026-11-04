@@ -542,14 +542,15 @@ func readRange(ctx context.Context, tx *sql.Tx, first, last uint64) ([]kernel.Fa
 	return facts, nil
 }
 
-// Count is the number of committed facts.
-// Projection is the projection the log last published.
+// Projection is the projection the log last published: the fold of every
+// committed fact. Append decides against it, not against the caller's copy.
 func (l *Log) Projection() kernel.Projection {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.p
 }
 
+// Count is the number of committed facts.
 func (l *Log) Count() uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
