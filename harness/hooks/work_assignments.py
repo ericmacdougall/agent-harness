@@ -42,6 +42,7 @@ CLOSED = ("done", "cancelled")
 KINDS = ("request", "question", "decision", "bug", "feature", "chore")
 GATE_SECONDS = 24 * 3600
 PENDING_BIND_SECONDS = 2 * 3600
+BLOCK_MEMORY_SECONDS = 6 * 3600
 MAX_STORE_BYTES = 128 * 1024 * 1024
 MAX_PAYLOAD = 8 * 1024 * 1024
 SYNC_WINDOW = 64 * 1024
@@ -115,7 +116,7 @@ def files() -> dict:
     d = base()
     return {"dir": d, "store": d / "work-assignments.json", "lock": d / "work-assignments.lock",
             "bak": d / "work-assignments.json.bak", "audit": d / "work-assignments.audit.jsonl",
-            "fail": d / "work-assignments.failures.jsonl"}
+            "fail": d / "work-assignments.failures.jsonl", "spool": d / "work-assignments.spool.jsonl"}
 
 
 def new_store() -> dict:
@@ -241,16 +242,71 @@ def verify_audit() -> list:
     return problems
 
 
+def spool_message(fields: dict) -> None:
+    """Lock-free fallback for a capture the store could not take: one O_APPEND line, drained by the next transaction."""
+    private_dir()
+    record = dict(fields, spool_id=hashlib.sha256(os.urandom(16)).hexdigest()[:16], spooled_at=iso(now()))
+    fd = os.open(files()["spool"], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, (json.dumps(record, ensure_ascii=False) + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def drain_spool(data: dict) -> None:
+    """Caller holds the lock. Each spooled capture becomes an untriaged message once (spool_id dedupes a crash replay)."""
+    path = files()["spool"]
+    draining = path.with_name(path.name + ".draining")
+    try:
+        if path.exists():
+            if draining.exists():  # a previous drain died after renaming: fold both, spool_id dedupes
+                with open(draining, "ab") as out, open(path, "rb") as src:
+                    out.write(src.read())
+                path.unlink()
+            else:
+                os.replace(path, draining)
+        raw = prov.read_small(draining, 32 << 20)
+    except (OSError, prov.Problem):
+        return
+    seen = {m.get("spool_id") for m in data["messages"].values() if m.get("spool_id")}
+    for line in raw.split(b"\n"):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("spool_id") in seen:
+            continue
+        seen.add(rec.get("spool_id"))
+        mid = next_id(data, "m")
+        data["messages"][mid] = {k: rec.get(k) for k in ("runtime", "session", "transcript", "ts", "excerpt", "words", "chars",
+                                                           "text_sha", "pasted_only", "source", "uuid", "spool_id")}
+        data["messages"][mid].update(id=mid, line=None, captured_at=rec["spooled_at"], triage="untriaged", reason=None,
+                                     items=[], spooled=True)
+        if rec.get("session") and rec.get("transcript"):
+            session_record(data, rec["session"], rec.get("runtime") or "claude", rec["transcript"])
+    data["_drained"] = True
+
+
 @contextmanager
 def transaction(timeout: float = LOCK_SECONDS):
-    """lock, load, yield the data, save atomically (previous good copy kept as .bak)."""
+    """lock, load, drain the capture spool, yield the data, save atomically (previous good copy kept as .bak)."""
     with locked(timeout):
         data, raw = read_store()
+        drain_spool(data)
         yield data
+        if data.pop("_drained", None):
+            data["_unlink_draining"] = True
         data["rev"] = int(data.get("rev", 0)) + 1
         if raw is not None:
             write_private(files()["bak"], raw)
+        unlink = data.pop("_unlink_draining", False)
         write_private(files()["store"], json.dumps(data, ensure_ascii=False, indent=1, sort_keys=True).encode())
+        if unlink:  # only after the store holds the drained messages
+            try:
+                files()["spool"].with_name(files()["spool"].name + ".draining").unlink()
+            except OSError:
+                pass
 
 
 def record_failure(event: str, error) -> None:
@@ -335,6 +391,21 @@ def session_record(data, session, runtime, transcript):
     rec["transcript"] = transcript or rec.get("transcript")
     rec["runtime"] = runtime
     return rec
+
+
+def prompt_fields(payload: dict, runtime: str):
+    """Everything a capture needs, computed without the store (so it can be spooled)."""
+    session = str(payload.get("session_id") or "")
+    if not valid_session(session) or payload.get("agent_id") or not isinstance(payload.get("prompt"), str):
+        return None
+    found = classify_prompt(payload["prompt"])
+    if found is None:
+        return None
+    text, pasted = found
+    transcript = payload.get("transcript_path") if isinstance(payload.get("transcript_path"), str) else None
+    return {"runtime": runtime, "session": session, "transcript": transcript, "ts": iso(now()), "excerpt": excerpt_of(text),
+            "words": len(text.split()), "chars": len(text), "text_sha": text_hash(text), "pasted_only": pasted,
+            "source": "prompt", "uuid": None}
 
 
 def capture_prompt(data: dict, payload: dict, runtime: str):
@@ -589,7 +660,21 @@ def hook_prompt(payload: dict, runtime: str) -> dict:
     policy = load_policy()
     out = []
     session = str(payload.get("session_id") or "")
-    if policy["capture"] != "off" or pending_failures():
+    if policy["capture"] != "off":
+        fields = prompt_fields(payload, runtime)
+        try:
+            return prompt_with_store(payload, runtime, policy, session)
+        except Exception as error:  # whatever stopped the store: keep the message in the spool
+            if fields:
+                spool_message(fields)
+                record_failure("prompt:spooled", error)
+            raise
+    return prompt_with_store(payload, runtime, policy, session) if pending_failures() else {}
+
+
+def prompt_with_store(payload, runtime, policy, session):
+    out = []
+    if True:
         with transaction() as data:
             if policy["capture"] != "off":
                 capture_prompt(data, payload, runtime)
@@ -637,12 +722,18 @@ def hook_ask_answer(payload: dict, runtime: str) -> dict:
     if not text.strip() or text in ("null", "{}", '""'):
         return {}
     transcript = payload.get("transcript_path") if isinstance(payload.get("transcript_path"), str) else None
-    with transaction() as data:
-        session_record(data, session, runtime, transcript)
-        key = f"ask:{payload.get('tool_use_id') or text_hash(text)}"
-        if not any(m.get("uuid") == key for m in data["messages"].values()):
-            add_message(data, runtime=runtime, session=session, transcript=transcript, text=text, pasted=False,
-                        source="ask-answer", uuid=key)
+    key = f"ask:{payload.get('tool_use_id') or text_hash(text)}"
+    try:
+        with transaction() as data:
+            session_record(data, session, runtime, transcript)
+            if not any(m.get("uuid") == key for m in data["messages"].values()):
+                add_message(data, runtime=runtime, session=session, transcript=transcript, text=text, pasted=False,
+                            source="ask-answer", uuid=key)
+    except Exception:
+        spool_message({"runtime": runtime, "session": session, "transcript": transcript, "ts": iso(now()),
+                       "excerpt": excerpt_of(text), "words": len(text.split()), "chars": len(text), "text_sha": text_hash(text),
+                       "pasted_only": False, "source": "ask-answer", "uuid": key})
+        raise
     return {}
 
 
@@ -662,16 +753,22 @@ def hook_stop(payload: dict, runtime: str) -> dict:
             rec["blocks"] = {}
             return {}
         signature = ",".join(sorted(f"{k}:{i}" for k, i, _ in found))
-        used = rec["blocks"].get(signature, 0)
+        entry = rec["blocks"].get(signature)
+        if isinstance(entry, int):  # older int-only format
+            entry = {"n": entry, "ts": iso(now())}
+        if entry and now() - parse_ts(entry["ts"]) > BLOCK_MEMORY_SECONDS:
+            entry = None  # the same unresolved problem returning hours later is blocked afresh
+        used = entry["n"] if entry else 0
         listing = "\n".join("  - " + line for _, _, line in found[:12]) + (f"\n  ... {len(found) - 12} more" if len(found) > 12 else "")
         if policy["stop"] == "enforce" and used < policy["max_stop_blocks"]:
-            rec["blocks"][signature] = used + 1
+            rec["blocks"][signature] = {"n": used + 1, "ts": iso(now())}
             return {"decision": "block", "reason": (
                 f"Work assignments ({used + 1}/{policy['max_stop_blocks']}): unresolved before you stop:\n{listing}\n"
                 "Triage each message (`work_assignments.py split --msg M-n --item '...'` or `no-ask --msg M-n --reason '...'`) "
                 "and update stale items (`work_assignments.py update WA-n --owner ... --next ...` or `--state done --evidence <commit|PR#|url|tested:id>`).")}
         if policy["stop"] == "enforce":
-            if not any(v.get("session") == session and v.get("signature") == signature for v in data["violations"]):
+            if not any(v.get("session") == session and v.get("signature") == signature
+                       and now() - parse_ts(v["ts"]) < BLOCK_MEMORY_SECONDS for v in data["violations"]):
                 data["violations"].append({"session": session, "signature": signature, "ts": iso(now()), "surfaced": False})
                 audit_line("stop-violation", session=session, signature=signature[:500])
             return {"systemMessage": f"work-assignments VIOLATION: stopping with {len(found)} unresolved item(s); logged and shown next prompt"}

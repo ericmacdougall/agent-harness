@@ -262,6 +262,45 @@ class StopTest(Base):
         self.assertEqual(wa.load_policy(Path(self.tmp.name) / "absent.json")["stop"], "enforce")
 
 
+class SpoolTest(Base):
+    def test_lock_stall_spools_the_capture_and_next_sync_drains_it(self):
+        """Red-team MINOR: a lock stall over the budget must not drop the message. Control: no spool_message -> lost."""
+        hold = wa.locked()
+        hold.__enter__()
+        try:
+            with mock.patch.object(wa, "LOCK_SECONDS", 0.1):
+                original = wa.transaction
+                with mock.patch.object(wa, "transaction", lambda timeout=0.1: original(0.1)):
+                    reply = self.hook("prompt", self.payload("request that arrived during a lock stall"))
+        finally:
+            hold.__exit__(None, None, None)
+        self.assertIn("FAILED", reply.get("systemMessage", ""))
+        self.assertTrue(wa.files()["spool"].exists())
+        self.cli("sync")  # any transaction drains it
+        msgs = list(self.data()["messages"].values())
+        self.assertEqual([m["triage"] for m in msgs], ["untriaged"])
+        self.assertTrue(msgs[0]["spooled"])
+        self.assertFalse(wa.files()["spool"].exists())
+        self.cli("sync")
+        self.assertEqual(len(self.data()["messages"]), 1)  # drained once
+
+    def test_crash_replay_of_a_draining_file_does_not_duplicate(self):
+        wa.spool_message({"runtime": "claude", "session": SID, "transcript": None, "ts": wa.iso(CLOCK[0]), "excerpt": "e",
+                          "words": 1, "chars": 1, "text_sha": "x", "pasted_only": False, "source": "prompt", "uuid": None})
+        spool = wa.files()["spool"]
+        spool.with_name(spool.name + ".draining").write_bytes(spool.read_bytes())  # simulate a crash after rename
+        self.cli("sync")
+        self.assertEqual(len(self.data()["messages"]), 1)
+
+    def test_blocked_signature_blocks_again_after_six_hours(self):
+        self.capture("needs triage")
+        for _ in range(4):
+            self.hook("stop", {"session_id": SID, "transcript_path": str(self.transcript)})
+        CLOCK[0] += 7 * 3600
+        again = self.hook("stop", {"session_id": SID, "transcript_path": str(self.transcript)})
+        self.assertEqual(again.get("decision"), "block")
+
+
 class RemovalTest(Base):
     def done_item(self, hours):
         msg = self.capture("ship it")
