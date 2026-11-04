@@ -623,6 +623,36 @@ class PeerReviewTests(unittest.TestCase):
                     block = sf.append_domain_block("# Spec\n", repo, {})
                     self.assertIn("Domain scan incomplete", block)  # and in the spec block
 
+    def test_decoy_detected_domain_does_not_bypass_enforce(self):
+        ethers = json.dumps({"dependencies": {"ethers": "6"}})
+        decoy = make_repo({"Anchor.toml": "[programs]", "package.json": ethers[:-1] + ', "pad": "' + "x" * 3000 + '"}'})
+        deep = make_repo({"Anchor.toml": "[programs]",
+                          "package.json": '{"dependencies": {"ethers": "6"}, "x": ' + "[" * 5000 + "]" * 5000 + "}"})
+        enforce = {"domain_gates": {"mode": "enforce"}}
+        allow = {"domain_gates": {"mode": "enforce", "allow_truncated": True}}
+        for name, repo in (("padded", decoy), ("deep", deep)):
+            with self.subTest(case=name), mock.patch.object(dg, "MAX_MANIFEST_BYTES", 2000):
+                with mock.patch.object(sf, "load_spec_policy", return_value=enforce):
+                    with self.assertRaises(OSError):
+                        pr.domain_section(repo, "b" * 40, changed_paths=[])
+                _, problems = sf.domain_lint(SPEC, repo, enforce)  # the two callers agree
+                self.assertTrue(any("fails closed" in p for p in problems), problems)
+                for policy in (allow, {"domain_gates": {"mode": "warn"}}):
+                    with mock.patch.object(sf, "load_spec_policy", return_value=policy), contextlib.redirect_stderr(io.StringIO()):
+                        section, _ = pr.domain_section(repo, "b" * 40, changed_paths=[])
+                    self.assertIn("Domain scan incomplete", section)
+                    self.assertIn("solana", section.split("Domain scan incomplete")[1])  # names what was detected
+                    self.assertIn("### solana", section)  # the visible checklist still applies
+                warnings, problems = sf.domain_lint(SPEC, repo, allow)  # lint honours allow_truncated for both limits
+                self.assertFalse(any("fails closed" in p for p in problems), problems)
+
+    def test_unreadable_policy_warns_loudly(self):
+        repo = make_repo({"foundry.toml": "x"})
+        err = io.StringIO()
+        with mock.patch.object(sf, "load_spec_policy", side_effect=ValueError("bad")), contextlib.redirect_stderr(err):
+            pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])
+        self.assertIn("enforce refusals are OFF", err.getvalue())
+
     def test_allow_truncated_only_from_installed_policy(self):
         enforce = {"domain_gates": {"mode": "enforce"}}
         repo, limits = self.evasion_repos()["oversized manifest"]

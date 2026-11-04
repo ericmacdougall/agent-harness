@@ -296,7 +296,7 @@ def append_domain_block(text: str, repo, spec_policy: dict) -> str:
         detected, failure = dg.detect_full(Path(repo))
         block = dg.render_block([d["domain"] for d in detected], repo, detected) if detected else ""
         if failure and (failure.startswith("scan truncated") or "too deeply nested" in failure):
-            block = (block or "## Domain checklist\n") + dg.incomplete_notice(failure)
+            block = (block or "## Domain checklist\n") + dg.incomplete_notice(failure, [d["domain"] for d in detected])
     except Exception:  # guidance must never block writing a spec
         return text
     return text.rstrip("\n") + "\n\n" + block if block else text
@@ -325,7 +325,7 @@ def domain_lint(text: str, repo, spec_policy: dict):
     notes = list(env_warning)
     if skipped:
         note = f"domain detection could not run: {failure} (pass --repo <worktree>)"
-        if failure.startswith("scan truncated") and dg.allow_truncated(spec_policy):
+        if (failure.startswith("scan truncated") or "too deeply nested" in failure) and dg.allow_truncated(spec_policy):
             notes.append(note)  # a monorepo that legitimately exceeds the caps can opt in; still visible
         elif config["mode"] == "enforce":  # a Domains: line in the spec never excuses a failed scan
             return env_warning, [note + "; enforce mode fails closed"]

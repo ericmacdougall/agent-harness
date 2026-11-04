@@ -448,10 +448,11 @@ def suggested_prompts(domains) -> list:
 
 # --------------------------------------------------------------------------- settings
 
-def incomplete_notice(failure: str) -> str:
+def incomplete_notice(failure: str, detected=None) -> str:
     """Visible text for packets and spec blocks when a scan limit may have hidden a blockchain signal."""
+    found = (" Detected so far: " + ", ".join(_clean(d, 30) for d in detected) + "; other domains may be hidden.") if detected else ""
     return ("\n### Domain scan incomplete\nBlockchain detection hit a safety limit (" + _clean(failure, 120) +
-            "), so the checklist may be missing. Review for blockchain risks manually.\n")
+            "), so the checklist may be missing or partial." + found + " Review for blockchain risks manually.\n")
 
 
 def allow_truncated(policy) -> bool:

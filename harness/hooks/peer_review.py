@@ -274,8 +274,11 @@ def domain_section(repo: Path, base, changed_paths=None):
         try:
             import spec_flow
             policy = spec_flow.load_spec_policy()
-        except (ImportError, OSError, ValueError):
+        except (ImportError, OSError, ValueError) as error:
             policy, distrust = None, True  # unknown policy: never let the repo file switch the checklist off
+            if not isinstance(error, ImportError):
+                print(f'Warning: spec_policy.json could not be loaded ({type(error).__name__}); domain gates fall back '
+                      'to warn mode, so enforce refusals are OFF until it is fixed', file=sys.stderr)
         state = domain_gates.settings(repo, policy, ignore_repo_file=distrust)
         enforcing = state['mode'] == 'enforce'
         if state['warning']:
@@ -289,10 +292,10 @@ def domain_section(repo: Path, base, changed_paths=None):
             allowed = domain_gates.allow_truncated(policy)
             if not hiding:
                 raise RuntimeError('domain scan incomplete: ' + failure)
-            if enforcing and not detected and not allowed:
-                raise RuntimeError(f'the scan was incomplete ({failure}) and found no domain, so a signal may be hidden; '
+            if enforcing and not allowed:
+                raise RuntimeError(f'the scan was incomplete ({failure}), so a signal may be hidden; '
                                    'set domain_gates.allow_truncated in the installed spec_policy.json to review anyway')
-            notice = domain_gates.incomplete_notice(failure)
+            notice = domain_gates.incomplete_notice(failure, [d['domain'] for d in detected])
             print('Warning: ' + notice.strip().splitlines()[-1], file=sys.stderr)
         if not detected:
             return notice, None
