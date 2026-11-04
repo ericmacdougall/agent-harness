@@ -79,7 +79,7 @@ class TicketDelivery(workflow.DeliveryWorkflow):
                          (5, 'ALREADY_DELIVERED', 'PENDING'), report)
         self.assertIn('notify', report['ticket_updates']['retry'])
 
-    def test_missing_policy_record_is_never_skipped_silently(self):
+    def test_crash_between_create_and_record_adopts_only_a_matching_staged_record(self):
         self.fake.comment(self.issue, f'Implemented in {self.head[:10]}', datetime.now(timezone.utc))
         code, report = self.run_deliver(*self.prepare_args(), '--local-only')
         self.assertEqual((code, report['status']), (0, 'LOCAL_READY'), report)
@@ -90,13 +90,18 @@ class TicketDelivery(workflow.DeliveryWorkflow):
         self.assertFalse(staged.exists(), 'the staged record is consumed once the generation has its own')
         # Simulate a crash after flow.create but before the generation record write.
         data = json.loads(record.read_text())
-        data.update(source_head=self.head, baseline=self.base)
-        staged.write_text(json.dumps(data))
-        staged.chmod(0o600)
         record.unlink()
+        staged.write_text(json.dumps({**data, 'source_head': '0' * 40, 'baseline': self.base}))
+        staged.chmod(0o600)
+        code, report = self.run_deliver(*self.finish_args(mode='local'))
+        self.assertEqual((code, report['ticket_updates']['status']), (0, 'NOT_APPLICABLE'),
+                         'a staged record for another range must not be adopted')
+        self.assertEqual(len(self.fake.posted), 0)
+        staged.write_text(json.dumps({**data, 'source_head': self.head, 'baseline': self.base}))
+        staged.chmod(0o600)
         code, report = self.run_deliver(*self.finish_args(mode='local'))
         self.assertEqual((code, report['status'], report['ticket_updates']['status']),
-                         (0, 'LOCAL_DELIVERED', 'UPDATED'), report)
+                         (0, 'ALREADY_DELIVERED', 'UPDATED'), report)
         self.assertEqual(len(self.fake.posted), 1)
 
     def test_missing_ticket_blocks(self):

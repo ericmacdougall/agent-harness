@@ -228,12 +228,14 @@ Co-Authored-By: ...
      - the commit would open an editor;
      - `-F` names a file that does not exist yet;
      - the command is a bare `git revert`, `git commit-tree`, `eval`, or `gh pr merge --squash` without a subject and body;
-     - git commit runs through another program (`xargs`, `find -exec`, `parallel`, `watch`, `sudo`, `env -S`), through `git -c alias.*`, or through a configured alias that expands to commit;
+     - git commit runs through another program (`xargs`, `find -exec`, `parallel`, `watch`, `sudo`, `env -S`), through a pipe into a shell (`echo ... | bash`), or under a command name computed at run time (`$G commit`);
+     - a command that commits also runs a git subcommand that is not built in. That subcommand may be an alias, and the same command can define one (`git config alias...`, `GIT_CONFIG_*`);
+     - another program in the same command touches the `-F` message file (`sed -i`, `python3 -c`, `truncate`, `>|`; reading with `cat`, `grep` or `git add` is fine);
      - the message could change after the check: `-e`/`--edit`, `--cleanup=strip|scissors`, or a `-F` file that the same command writes (redirect, `tee`, `cp`/`mv`/`install`, or a write to an unknown path);
      - git commit runs inside `$(...)` or backticks (for example `OUT=$(git commit ...)`), or `git history` rewrites messages;
      - an unknown git subcommand (possibly an alias) runs where the repository configuration is not visible: an unknown working directory, or over ssh.
 
-   Shell keywords (`if`/`then`/`else`/`for`/`do`/`while`/`{ }`/`!`) and the wrappers `timeout`, `nice`, `ionice`, `stdbuf` and `caffeinate` (including their value flags) are unwrapped and checked. Shell options that take a value (`bash -o pipefail -c`, `--rcfile`, `-O`, `+o`) are understood. A remote alias whose command does not contain the word `commit` (`ssh dev2 'git ci -m x'`) is not detected; the publication checks catch it. A script file (`bash deploy.sh`) or a program such as `python3 -c` that commits is not visible to the hook. Outside dev2/T2 the git backstop covers those cases, and the publication checks cover them everywhere.
+   Shell keywords (`if`/`then`/`else`/`for`/`do`/`while`/`{ }`/`!`) and the wrappers `timeout`, `nice`, `ionice`, `stdbuf` and `caffeinate` (including their value flags) are unwrapped and checked. Shell options that take a value (`bash -o pipefail -c`, `--rcfile`, `-O`, `+o`) are understood. An alias call in a command that never contains the word `commit` (for example `git ci -m x`, locally or over ssh) is not analyzed. The git backstop catches it in tracked repositories on Git 2.54+, and the publication checks catch it everywhere. A script file (`bash deploy.sh`) or a program such as `python3 -c` that commits is not visible to the hook. Outside dev2/T2 the git backstop covers those cases, and the publication checks cover them everywhere.
 
    It also analyzes `ssh <host> '<remote command>'`, `ssh <host> bash -s <<'EOF'` and nested `bash -lc` strings, which is where most dev2/T2 commits run. A remote host's files, HEAD and repository are not visible, so a remote `-F <file>`, `--amend --no-edit` or `-C` fails closed. Pass the message inline instead: `ssh host 'cd repo && git commit -F - <<"EOF" ... EOF'`. Remote commits are held to the ticket rule (`remote_tickets_required`).
 
@@ -275,7 +277,7 @@ Co-Authored-By: ...
 ### Checks, waivers and audit
 
 - **Check a draft:** `python3 ~/.claude/hooks/commit_policy.py check-message --file msg.txt`
-- **Check a range:** `python3 ~/.claude/hooks/commit_policy.py check-range --repo . --base origin/main --head HEAD --branch <branch> --verify-tickets`
+- **Check a range:** `python3 ~/.claude/hooks/commit_policy.py check-range --repo . --base origin/main --head HEAD --branch <branch> --verify-tickets` (exit 0 pass, 2 blocked, 4 tickets unverified; `deliver.py prepare` reports the last case as exit 6 `TICKETS_UNVERIFIED`)
 - **Waivers.** A waiver is the only exception path. There is no environment-variable bypass.
 
   ```sh

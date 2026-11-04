@@ -139,6 +139,7 @@ class ShellAnalysis(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="cp-shell-")
         self.addCleanup(shutil.rmtree, self.dir)
         Path(self.dir, "msg.txt").write_text(GOOD)
+        Path(self.dir, "m").write_text(GOOD)
 
     def messages(self, command):
         return [item[0] for item in cp.analyze(command, self.dir)]
@@ -178,6 +179,13 @@ class ShellAnalysis(unittest.TestCase):
             "timeout --signal KILL 30 git commit -m wip": "wip",
             "cat msg.txt && git commit -F msg.txt": GOOD,
             "printf x > other.txt && git commit -F msg.txt": GOOD,
+            "cd /tmp && git commit -m wip > /dev/null": "wip",
+            "cd /tmp && echo hi > out.txt && git commit -m wip": "wip",
+            "git -C /tmp status > s.txt && git commit -m wip": "wip",
+            "bash -euo pipefail -c 'git commit -m wip'": "wip",
+            "bash -c -- 'git commit -m wip'": "wip",
+            "ksh -c 'git commit -m wip'": "wip",
+            "git commit -F m": GOOD,
             "timeout 30 git commit -m wip": "wip",
         }
         for command, expected in cases.items():
@@ -208,7 +216,15 @@ class ShellAnalysis(unittest.TestCase):
                         "bash -O extglob script.sh commit", "cd \"$R\" && git ci -m wip",
                         "cp /tmp/m.txt msg.txt && git commit -F msg.txt",
                         "printf x | tee msg.txt && git commit -F msg.txt",
-                        "printf x > \"$F\" && git commit -F msg.txt", "git history reword HEAD"):
+                        "printf x > \"$F\" && git commit -F msg.txt", "git history reword HEAD",
+                        "sed -i '' 's/a/b/' msg.txt && git commit -F msg.txt",
+                        "python3 -c \"open('msg.txt','w')\" && git commit -F msg.txt",
+                        "echo wip >| msg.txt && git commit -F msg.txt", "truncate -s0 msg.txt && git commit -F msg.txt",
+                        "git config alias.zz commit && git zz -m wip",
+                        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.zz GIT_CONFIG_VALUE_0=commit git zz -m wip",
+                        "echo 'git commit -m wip' | bash", "bash <<EOF\ngit commit -m $X\nEOF",
+                        "G=git; $G commit -m wip", "$(echo git) commit -m wip",
+                        "echo \"$(gi''t commit -m wip)\""):
             with self.subTest(command):
                 with self.assertRaises(cp.Unresolvable):
                     cp.analyze(command, self.dir)
@@ -268,7 +284,8 @@ class AnalyzerFuzz(unittest.TestCase):
         rng = random.Random(self.SEED)
         pieces = ["git", "commit", "-m", "-F", "-", "'wip'", '"x"', "$(cat <<'EOF'", "EOF", ")", "\n", "&&", "|",
                   ";", "ssh", "dev2", "bash", "-lc", "<<", "'", '"', "\\", "$X", "`id`", "cd", "/tmp", "gh", "pr",
-                  "create", "--amend", "--no-edit", "-C", "HEAD", "revert", "(", "#", "env", "A=1", "-am", "<<-X"]
+                  "create", "--amend", "--no-edit", "-C", "HEAD", "revert", "(", "#", "env", "A=1", "-am", "<<-X",
+                  ">", ">>", "out.txt", "tee", "cp", "|&", "<<<", "$(git", "`"]
         outcomes = {"found": 0, "unresolvable": 0}
         prefixes = ["", "git commit -m 'fix(x): y' ", "ssh dev2 'git commit -m z' ", "git commit -am ok "]
         for case in range(3000):
@@ -481,8 +498,11 @@ class InspectionRegressions(Fixture):
         git("config", "alias.ci", "commit", cwd=self.repo, env=self.env)
         with self.assertRaises(cp.Unresolvable):
             cp.analyze("git ci -m wip", str(self.repo))
-        git("config", "alias.st", "status", cwd=self.repo, env=self.env)
-        self.assertEqual(cp.analyze("git st && git log --grep commit", str(self.repo)), [])
+        # Any non-built-in subcommand next to a commit is refused: the alias could be redefined
+        # by the same command. Without a commit word the prefilter never runs analysis at all.
+        with self.assertRaises(cp.Unresolvable):
+            cp.analyze("git st && git log --grep commit", str(self.repo))
+        self.assertEqual(cp.analyze("git log --grep commit", str(self.repo)), [])
 
     def test_unknown_repo_requires_tickets(self):
         none_feat = sub(GOOD, "GoodQA #14151", "none (no tracker reason given)")
@@ -703,6 +723,9 @@ class TicketVerification(Fixture):
         down = self.check()
         self.assertEqual((down["status"], down["tickets"][0]["status"]), ("UNVERIFIED", "UNVERIFIED"))
         self.assertIn("unreachable", down["tickets"][0]["error"])
+        footer = cp.format_report(down)
+        self.assertIn("could not be verified", footer)
+        self.assertNotIn("reword", footer)
         self.policy["ticket_systems"]["goodqa"]["endpoint"] = "http://127.0.0.1:9/none"
         self.assertEqual(self.check()["status"], "UNVERIFIED")
 

@@ -388,7 +388,11 @@ def _heredocs(command: str):
             elif ch == "#" and (i == 0 or line[i - 1] in " \t;&|("):
                 rebuilt.append(line[i:])
                 break
-            elif line.startswith("<<", i) and not line.startswith("<<<", i):
+            elif line.startswith("<<<", i):
+                rebuilt.append("<<<")
+                i += 3
+                continue
+            elif line.startswith("<<", i):
                 match = opener.match(line, i)
                 if match:
                     delimiter = match.group(2) or match.group(3) or match.group(4)
@@ -796,9 +800,11 @@ SHELL_VALUE_OPTIONS = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
 WRAPPER_VALUE_FLAGS = {"nice": {"-n", "--adjustment"}, "timeout": {"-s", "-k", "--signal", "--kill-after"},
                        "gtimeout": {"-s", "-k", "--signal", "--kill-after"}, "ionice": {"-c", "-n", "-p", "-t"},
                        "stdbuf": {"-i", "-o", "-e"}, "env": {"-u", "--unset", "-C", "--chdir"}}
+READ_ONLY = {"cat", "head", "tail", "wc", "grep", "rg", "less", "ls", "test", "[", "stat", "file", "echo"}
+READ_ONLY_GIT = {"add", "diff", "status", "show", "log", "commit"}
 RESERVED = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time", "fi", "done", "in"}
 TEXT_TOOLS = {"echo", "printf", "grep", "egrep", "rg", "ag", "awk", "sed", "cat", "less", "man", "head", "tail"}
-SHELLS = {"bash", "sh", "zsh", "dash"}
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh"}
 
 
 SSH_ARG_OPTIONS = set("BbcDEeFIiJLlmOoPpQRSWw")
@@ -822,6 +828,13 @@ GIT_KNOWN = {"add", "am", "archive", "backfill", "bisect", "branch", "bundle", "
              "mailinfo", "mailsplit", "patch-id", "stripspace", "lfs"}
 
 
+def _mentions_commit(text, depth):
+    try:
+        return bool(analyze(text, None, depth + 1))
+    except Unresolvable:
+        return True
+
+
 def _shell_script(argv, stdin_body):
     """(script text, dynamic) for `bash [-opts]c 'script'`, `bash -s`/`bash` reading a heredoc."""
     i = 1
@@ -835,8 +848,12 @@ def _shell_script(argv, stdin_body):
             continue
         if word[:1] in "-+" and len(word) > 1:
             if word[0] == "-" and "c" in word[1:]:
-                return (argv[i + 1][1], argv[i + 1][2]) if i + 1 < len(argv) else None
-            i += 1
+                j = i + 1
+                if j < len(argv) and argv[j][1] == "--":
+                    j += 1
+                return (argv[j][1], argv[j][2]) if j < len(argv) else None
+            # -euo pipefail: a trailing o (or O) in a group takes the next word as its value
+            i += 2 if word[-1] in "oO" else 1
             continue
         # A script file runs code the hook cannot see. Refuse only when the same
         # invocation visibly mentions a commit; plain `bash deploy.sh` stays allowed.
@@ -889,7 +906,7 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
     text, bodies = _heredocs(command)
     found, writes = [], []  # writes: normalized paths this command may write (None = unknown)
 
-    def target(word):
+    def write_target(word):
         if word[2]:
             return None
         path = os.path.expanduser(word[1])
@@ -899,34 +916,41 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
             path = os.path.join(cwd, path)
         return os.path.normpath(path)
 
-    for words, _ in simple_commands(tokenize(text)):
-        stdin_body = None
+    segments = []  # (argv words, git subcommand) for the -F mention check
+    previous_op = ""
+    for words, operator in simple_commands(tokenize(text)):
+        piped, previous_op = previous_op in ("|", "|&"), operator
+        stdin_body = stdin_raw = None
         argv = []
         skip_next = write_next = False
         for index, token in enumerate(words):
             if token[0] == "heredoc":
-                stdin_body = bodies[token[1]][0] if bodies[token[1]][1] or not re.search(
-                    r"[$`\\]", bodies[token[1]][0]) else None
+                stdin_raw = bodies[token[1]][0]
+                stdin_body = stdin_raw if bodies[token[1]][1] or not re.search(r"[$`\\]", stdin_raw) else None
                 continue
             if skip_next:
                 skip_next = False
                 if write_next:
-                    writes.append(target(token))
+                    writes.append(write_target(token))
                 continue
             if REDIRECTS.match(token[1]):
                 skip_next, write_next = True, ">" in token[1]
                 continue
             attached = re.match(r"^\d*&?>>?(\S+)$", token[1])
             if attached:
-                writes.append(target((token[0], attached.group(1), token[2])))
+                writes.append(write_target((token[0], attached.group(1), token[2])))
                 continue
             if re.match(r"^\d*<\S+$", token[1]) and not argv:
                 continue
             argv.append(token)
         for word in argv:
-            if word[2] and re.search(r"\$\(|`", word[1]) and COMMIT_TEXT.search(word[1]):
-                raise Unresolvable("git commit inside $(...) or backticks cannot be checked; run git commit as "
-                                   "its own command (capture output with 2>&1 | tee if needed)")
+            if word[2] and re.search(r"\$\(|`", word[1]):
+                inner = [a or b for a, b in re.findall(r"\$\((.*)\)|`([^`]*)`", word[1], re.S)]
+                if COMMIT_TEXT.search(word[1]) or any(_mentions_commit(part, depth) for part in inner):
+                    raise Unresolvable("git commit inside $(...) or backticks cannot be checked; run git commit "
+                                       "as its own command (capture output with 2>&1 | tee if needed)")
+        if argv and argv[0][2] and any(w[1] == "commit" for w in argv[1:]):
+            raise Unresolvable("the command name is computed at run time ($VAR or $(...)); run git commit directly")
         while argv and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0][1]) or argv[0][1] in RESERVED):
             argv = argv[1:]
         while argv and os.path.basename(argv[0][1]) in WRAPPERS:
@@ -951,12 +975,14 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
         name = os.path.basename(argv[0][1])
         operands = [w for w in argv[1:] if not w[1].startswith("-")]
         if name == "tee":
-            writes.extend(target(w) for w in operands)
+            writes.extend(write_target(w) for w in operands)
         elif name in ("cp", "mv", "install", "ln", "rsync") and len(operands) >= 2:
-            destination = target(operands[-1])
+            destination = write_target(operands[-1])
             writes.append(destination)
             if destination:
                 writes.extend(os.path.join(destination, os.path.basename(w[1])) for w in operands[:-1])
+        sub_name = next((w[1] for w in argv[1:] if not w[1].startswith("-")), "") if name == "git" else ""
+        segments.append(([w[1] for w in argv], name, sub_name))
         if name in ("cd", "pushd") and len(argv) >= 2:
             if argv[1][2]:
                 cwd = None
@@ -965,6 +991,10 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                 cwd = target if os.path.isabs(target) else (os.path.join(cwd, target) if cwd else None)
             continue
         if name in SHELLS:
+            if ((piped and COMMIT_TEXT.search(text))
+                    or (stdin_raw and stdin_body is None and COMMIT_TEXT.search(stdin_raw))):
+                raise Unresolvable(f"{name} reads its script from a pipe or an unquoted heredoc the policy cannot "
+                                   "see exactly; run git commit directly or use a quoted heredoc (<<'EOF')")
             script = _shell_script(argv, stdin_body)
             if script is not None and re.search(r"\b(?:commit|revert|merge|pr)\b", script[0]):
                 if script[1]:
@@ -1018,13 +1048,11 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
         sub = argv[i][1]
         if sub == "history":
             raise Unresolvable("git history rewrites commit messages in an editor; use git commit --amend -F")
-        if sub not in GIT_KNOWN and (remote or not repo):
-            raise Unresolvable(f"git {sub} is not a known git command here (an alias?) and its repository "
-                               "configuration is not visible; run the underlying git command directly")
-        if sub not in GIT_KNOWN and repo and not remote:
-            alias = git(repo, "config", "--get", f"alias.{sub}", check=False).strip()
-            if alias and (alias.startswith("!") or re.search(r"\b(?:commit|commit-tree|revert|merge)\b", alias)):
-                raise Unresolvable(f"git {sub} is an alias for '{alias[:60]}'; run the git command directly")
+        if sub not in GIT_KNOWN:
+            # An alias can be defined by this same command (git config, GIT_CONFIG_*), so
+            # its current value proves nothing: refuse unknown subcommands next to a commit.
+            raise Unresolvable(f"git {sub} is not a built-in git command (an alias?); in a command that "
+                               "commits, run the underlying git command directly")
         rest = argv[i + 1:]
         if sub == "commit":
             if any(w[2] for w in rest):
@@ -1041,7 +1069,7 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
             facts = repo_facts(repo) if repo and not remote else None
             message, context = resolve_commit(values, repo, stdin_body, facts)
             if context.get("file") not in (None, "-"):
-                context["file_abs"] = target(("word", context["file"], False)) if not repo else os.path.normpath(
+                context["file_abs"] = write_target(("word", context["file"], False)) if not repo else os.path.normpath(
                     os.path.join(repo, os.path.expanduser(context["file"])))
             if message is not None:
                 context["facts"] = facts
@@ -1056,6 +1084,14 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
         elif sub == "commit-tree":
             raise Unresolvable("git commit-tree bypasses message checks; use git commit")
     for _, _, context in found:
+        if context.get("file") not in (None, "-"):
+            base = os.path.basename(context["file"])
+            for words_text, name, sub_name in segments:
+                if name in READ_ONLY or (name == "git" and sub_name in READ_ONLY_GIT):
+                    continue
+                if any(re.search(rf"(?<![\w.-]){re.escape(base)}(?![\w.-])", w) for w in words_text):
+                    raise Unresolvable(f"{name} also touches the message file {context['file']} in this command; "
+                                       "write and check the message in an earlier step, then git commit -F")
         path = context.get("file_abs")
         if path and (path in writes or None in writes):
             raise Unresolvable(f"the message file {context['file']} may be written by this same command, so the "
@@ -1506,8 +1542,18 @@ def format_report(report) -> str:
         lines.append(f"  WAIVER used: {item['kind']} {item['subject'][:12]} (id {item['id']}, recorded in {item['wal']})")
     if report["status"] != "PASS":
         script = HERE / "commit_policy.py"
-        lines += ["  Fix: reword commits (git rebase -i <base>, then git commit --amend -F <file>), update the "
-                  "named tickets, and re-run.",
+        bad_commits = any(item["problems"] and not item["waived"] and not item.get("legacy")
+                          for item in report["commits"])
+        stale = any(item.get("status") in ("STALE", "MISSING") for item in report["tickets"])
+        if bad_commits:
+            lines.append("  Fix commits: reword them (git rebase -i <base>, then git commit --amend -F <file>).")
+        if stale:
+            lines.append("  Fix tickets: comment on each STALE ticket naming the commit SHA or branch; reference "
+                         "real tickets for MISSING ones.")
+        if report["status"] == "UNVERIFIED":
+            lines.append("  Tickets could not be verified (GoodQA unreachable, or the key file is missing or not "
+                         "0600). Check access and retry; offline, record a tickets waiver for this head.")
+        lines += [
                   f"  Check locally: python3 {script} check-range --repo <repo> --base <base> --head <head> --verify-tickets",
                   f"  Exceptional bypass (recorded in your WAL): python3 {script} waive --wal <WAL> "
                   "--kind commit|tickets --subject <sha> --reason '<why>'"]
