@@ -119,6 +119,7 @@ export function initReviewMap({ api, notify, el, session, $ }) {
     }
   });
 
+  dialog.addEventListener('close', () => open.focus());
   stateSelect.addEventListener('change', () => { model.state = stateSelect.value; load(); });
   $('#pr-refresh').addEventListener('click', load);
   render();

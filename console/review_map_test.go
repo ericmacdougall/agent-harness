@@ -118,10 +118,9 @@ func TestReviewMapGenerateServeAttach(t *testing.T) {
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "ATTACHED") {
 		t.Fatalf("attach: %d %s", w.Code, w.Body.String())
 	}
-	if got := (*calls)[len(*calls)-1]; got[0] != "attach" || got[3] != "--yes" || got[4] != "--ticket" || got[5] != "GoodQA goodqa#14388" {
+	if got := (*calls)[len(*calls)-1]; got[0] != "attach" || got[3] != "--expect-sha256" || got[4] != digest || got[5] != "--yes" || got[6] != "--ticket" || got[7] != "GoodQA goodqa#14388" {
 		t.Fatalf("attach argv %v", got)
 	}
-	_ = digest
 }
 
 func TestReviewMapRejectsHostileInput(t *testing.T) {

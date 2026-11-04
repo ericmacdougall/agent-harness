@@ -215,5 +215,65 @@ class AttachTests(Base):
         self.assertEqual(posted[0][2], "text/html")
 
 
+class ReviewFindingsRegressions(Base):
+    """Findings from the code-inspection of d585b1a, each with a failing control."""
+
+    def gh_run(self, state="OPEN", extra_commits=(), head=None):
+        real = rm.run
+
+        def fake(argv, cwd=None, timeout=60, limit=800000):
+            if argv[0] == "gh":
+                shas = [self.first, self.second, *extra_commits]
+                data = {"title": "t", "state": state, "url": "u", "baseRefName": "main", "headRefName": "feat/review-map-demo",
+                        "headRefOid": head or self.second, "body": "Refs: GoodQA otherproj#9", "isDraft": True,
+                        "commits": [{"oid": s} for s in shas], "statusCheckRollup": []}
+                return 0, json.dumps(data)
+            return real(argv, cwd=cwd, timeout=timeout, limit=limit)
+        return fake
+
+    def model(self, **kw):
+        with mock.patch.object(rm, "run", self.gh_run(**kw)), mock.patch.object(rm, "wal_root", return_value=self.wals), \
+                mock.patch.object(rm, "work_root", return_value=self.work):
+            return rm.build_model(self.repo, 5, None)
+
+    def test_f1_pr_body_never_names_attach_targets(self):
+        model = self.model()
+        self.assertEqual(model["tickets"], ["GoodQA goodqa#14388"])
+        self.assertNotIn("otherproj", " ".join(model["tickets"]))
+
+    def test_f2_branch_only_match_needs_exact_boundary(self):
+        (self.work / "elsewhere.md").write_text("review of feat/review-map-demo-2 in another repo\n1. HIGH other repo finding that must not leak in\nVERDICT: BLOCK\n")
+        model = rm.build_model(self.repo, None, "feat/review-map-demo", use_gh=False, roots=[self.work], wal=False)
+        self.assertNotIn("other repo finding", json.dumps(model["reports"]))
+
+    def test_f3_partial_pr_is_warned(self):
+        model = self.model(extra_commits=("c" * 40,))
+        self.assertTrue(any("not available locally" in w for w in model["meta"]["warnings"]))
+        self.assertIn("Warning:", rm.render(model))
+        model = self.model(head=self.first)
+        self.assertTrue(any("not the PR head" in w for w in model["meta"]["warnings"]))
+
+    def test_f4_long_identifiers_are_redacted_not_fatal(self):
+        blob = "Zk9" + "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7dE9fG1hJ3kL5"
+        (self.repo / "go.sum").write_text(f"mod v1 h1:{blob}\n")
+        sh(self.repo, "add", "."); sh(self.repo, "commit", "-qm", "chore(x): lockfile\n\nRefs: none (test)")
+        code, result = self.generate()
+        self.assertEqual(code, 0, result)
+        self.assertNotIn(blob, Path(result["path"]).read_text())
+
+    def test_f5_attach_is_bound_to_reviewed_bytes(self):
+        _, result = self.generate()
+        meta = Path(result["path"]).with_suffix(".meta.json")
+        meta.unlink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(rm.main(["attach", "--map", result["path"], "--yes", "--ticket", "GoodQA goodqa#14388"]), 2)
+            self.assertEqual(rm.main(["attach", "--map", result["path"], "--yes", "--ticket", "GoodQA goodqa#14388",
+                                      "--expect-sha256", "0" * 64]), 3)
+
+    def test_f7_stale_report_is_marked(self):
+        model = rm.build_model(self.repo, None, "feat/review-map-demo", use_gh=False, roots=[self.work], wal=False)
+        self.assertTrue(any("stale" in row["basis"] for row in model["refinements"]))
+
+
 if __name__ == "__main__":
     unittest.main()

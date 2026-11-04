@@ -334,11 +334,21 @@ func (a *app) prAttachHTTP(w http.ResponseWriter, r *http.Request) {
 		apiError(w, errors.New("confirm between one and eight tickets"))
 		return
 	}
+	guard := "attach:" + item.sha
+	reviewMapMu.Lock()
+	if reviewMapBusy[guard] {
+		reviewMapMu.Unlock()
+		apiError(w, errors.New("an attach for this review map is already running"))
+		return
+	}
+	reviewMapBusy[guard] = true
+	reviewMapMu.Unlock()
+	defer func() { reviewMapMu.Lock(); delete(reviewMapBusy, guard); reviewMapMu.Unlock() }()
 	known := map[string]bool{}
 	for _, ref := range item.tickets {
 		known[ref] = true
 	}
-	args := []string{"attach", "--map", item.path, "--yes"}
+	args := []string{"attach", "--map", item.path, "--expect-sha256", item.sha, "--yes"}
 	for _, ref := range input.Tickets {
 		if !ticketRef.MatchString(ref) || !known[ref] {
 			apiError(w, errors.New("a ticket is not one of the references in this pull request's commits"))

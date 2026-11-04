@@ -81,10 +81,12 @@ def scrub(value) -> str:
     text = EXTRA_TOKENS.sub("[redacted]", text)
     text = EMAIL.sub("[email]", text)
     text = HOME_PATH.sub("~", text)
+    text = HIGH_ENTROPY.sub("[redacted-token]", text)
     return CONTROL.sub("", text)
 
 
 def assert_no_leak(page: str):
+    page = re.sub(r"<meta http-equiv=Content-Security-Policy content=\"[^\"]*\">", "", page)  # holds a base64 script hash
     found = LEAK_SHAPES.search(page) or HIGH_ENTROPY.search(page) or EMAIL.search(page) \
         or re.search(r"://[^/@\s]+:[^/@\s]+@", page) or re.search(r"/(?:Users|home)/[A-Za-z0-9._-]+", page)
     if found:
@@ -106,7 +108,7 @@ def run(argv, cwd=None, timeout=GIT_TIMEOUT, limit=MAX_DIFF_BYTES):
 
 def git(repo, *args, limit=MAX_DIFF_BYTES):
     for item in args:
-        if item.startswith("-") and not item.startswith(("--no", "--format", "--numstat", "--name-only", "-U", "-M", "-s", "-q", "-e", "--reverse", "--verify", "-t", "-c", "-p")) and item != "--":
+        if item.startswith("-") and not item.startswith(("--no", "--format", "--numstat", "--name-only", "-U", "-M", "-s", "-q", "-e", "--reverse", "--verify", "-t", "-c", "-p", "--parents", "-n")) and item != "--":
             raise MapError(f"refusing a git argument that looks like an option: {item[:20]}", EXIT_USAGE)
     return run(["git", "--no-pager", "-C", str(repo), "-c", "core.quotepath=off", "-c", "core.fsmonitor=", "-c", "core.pager=cat",
                 *args], limit=limit)
@@ -198,11 +200,25 @@ def collect_pr(repo: Path, pr, branch, use_gh=True) -> dict:
         meta["base"] = meta["base"] or base
     commits = commits[:MAX_COMMITS]
     infos = [info for info in (commit_info(repo, sha) for sha in commits) if info]
+    infos = [i for i in infos if len(git(repo, "rev-list", "--parents", "-n", "1", i["sha"], limit=500)[1].split()) <= 2] or infos
     if not infos:
         raise MapError("no commits found locally for this PR; fetch it first", EXIT_FAILED)
+    warnings = []
+    if len(infos) != len(commits):
+        warnings.append(f"{len(commits) - len(infos)} of {len(commits)} PR commits are not available locally; the map is partial")
+    if meta.get("head_oid") and infos[-1]["sha"] != meta["head_oid"]:
+        warnings.append("the newest local commit is not the PR head reported by GitHub; fetch the PR and regenerate")
+    meta["warnings"] = warnings
     first, last = infos[0]["sha"], infos[-1]["sha"]
     rc, parent = git(repo, "rev-parse", "--verify", "-q", first + "^")
     base_sha = parent.strip() if rc == 0 else "4b825dc642cb8eb36d8e8b3ecdcd8ff4c6a1f87c"
+    if str(meta.get("state")).upper() == "OPEN" and meta.get("base"):
+        # An open PR can contain merges of its base; diff from the merge-base so base changes are not attributed to it.
+        for candidate in ("origin/" + str(meta["base"]), str(meta["base"])):
+            rc2, mb = git(repo, "merge-base", candidate, last)
+            if rc2 == 0 and SHA.match(mb.strip()):
+                base_sha, rc = mb.strip(), 0
+                break
     # The empty tree id differs per hash format; ask git for it instead of hard-coding when the PR starts at the root.
     if rc != 0:
         base_sha = git(repo, "hash-object", "-t", "tree", "/dev/null")[1].strip() or base_sha
@@ -388,7 +404,9 @@ def parse_report(text: str) -> dict:
 
 def find_reports(roots, shas, branch, tickets) -> list:
     reports = []
-    needles = [n for n in (branch,) if n and len(n) > 6]
+    needles = []
+    if branch and (len(branch) >= 12 or "/" in branch):
+        needles.append(re.compile(r"(?<![A-Za-z0-9._/-])" + re.escape(branch) + r"(?![A-Za-z0-9._/-])"))
     for path, info in iter_files(roots, (".md", ".txt")):
         text = read_text(path)
         if not text:
@@ -401,7 +419,7 @@ def find_reports(roots, shas, branch, tickets) -> list:
             hit = sha_hit(text, shas)
             if hit:
                 basis = f"report cites PR commit {hit}"
-            elif any(n in text for n in needles):
+            elif any(n.search(text) for n in needles):
                 basis = "report names the PR branch"
         if not basis:
             continue
@@ -520,7 +538,7 @@ def build_refinements(reports, commits, diff) -> list:
     rows = []
     for report in reports:
         index = order.get(report.get("reviewed_head") or "")
-        stale = bool(report.get("reviewed_head")) and index is not None and index < len(commits) - 1 and False
+        stale = bool(report.get("reviewed_head")) and report["reviewed_head"] != commits[-1]["sha"]
         for finding in report["findings"]:
             words = keywords(finding["text"])
             fix, how = None, "unlinked: no later commit shares terms with the finding"
@@ -533,7 +551,7 @@ def build_refinements(reports, commits, diff) -> list:
                 fix, how = candidates[0], "next commit after the reviewed head (weak inference)"
             rows.append({"finding": finding["text"], "finding_id": finding["id"], "severity": finding["severity"],
                          "report": report["name"], "stage": report["stage"], "fix": fix, "stale": stale,
-                         "tests": [f for f in (fix["files"] if fix else []) if is_test_path(f)], "basis": how})
+                         "tests": [f for f in (fix["files"] if fix else []) if is_test_path(f)], "basis": how + (" [stale: report reviewed an older head]" if stale else "")})
     seen = {r["fix"]["sha"] for r in rows if r["fix"]}
     for commit in commits:
         if commit["sha"] not in seen and re.search(r"red[- ]?team|review (finding|feedback)|peer[- ]review", commit["body"], re.I):
@@ -600,7 +618,7 @@ def build_next_steps(model) -> list:
     if failing:
         steps.append(("Fix failing checks", ", ".join(str(n) for n in failing[:5])))
     if not model["tickets"]:
-        steps.append(("Cite a ticket", "No commit or PR body cites a GoodQA ticket; add Refs: GoodQA <project>#N."))
+        steps.append(("Cite a ticket", "No commit message cites a GoodQA ticket; add Refs: GoodQA <project>#N."))
     if model["domains"]:
         steps.append(("Run the domain checklist", "Domain signals " + ", ".join(model["domains"]) + ": walk reentrancy/access control, precision, replay/chain id, nonce/idempotency, finality, key custody, gas/DoS, upgradeability and oracle trust, with fuzz or invariant tests."))
     if model.get("diff_truncated"):
@@ -627,7 +645,7 @@ def build_model(repo: Path, pr, branch, use_gh=True, roots=None, wal=True) -> di
     diff = collect_diff(repo, data["base_sha"], data["head_sha"])
     commits, meta = data["commits"], data["meta"]
     shas = [c["sha"] for c in commits]
-    tickets = find_tickets([c["body"] for c in commits] + [meta.get("body") or ""])
+    tickets = find_tickets([c["body"] for c in commits])  # never the PR body or comments: any editor could add a target
     roots = [work_root()] if roots is None else roots
     specs = find_specs(roots, tickets)
     reports = find_reports(roots, set(shas), meta.get("head") or branch, tickets)
@@ -663,7 +681,7 @@ CSS = """
 @media (prefers-color-scheme:dark){:root{--bg:#10131a;--fg:#e8ebf1;--mut:#9aa3b2;--card:#181c25;--line:#2b3140;--add:#4fc26b;--del:#ff7b72;--acc:#8ab4ff;--warn:#f0a65a}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
 header,main{max-width:1180px;margin:0 auto;padding:16px}h1{font-size:22px;margin:.2em 0}h2{font-size:18px;margin:0 0 10px}
-nav{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);z-index:5}nav a{display:inline-block;margin:6px 10px 6px 0;color:var(--acc)}
+nav{top:0;background:var(--bg);border-bottom:1px solid var(--line);z-index:5}nav a{display:inline-block;margin:6px 10px 6px 0;color:var(--acc)}
 section{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px;margin:14px 0}
 .mut{color:var(--mut)}.pill{display:inline-block;border:1px solid var(--line);border-radius:99px;padding:0 8px;font-size:12px;margin-right:4px}
 .map{display:flex;flex-wrap:wrap;gap:8px}.group{flex:1 1 220px;border:1px solid var(--line);border-radius:6px;padding:6px}
@@ -675,6 +693,8 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:
 .l-add{color:var(--add)}.l-del{color:var(--del)}table{border-collapse:collapse;width:100%}td,th{border-top:1px solid var(--line);padding:6px;text-align:left;vertical-align:top;font-size:14px}
 button.act{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:4px 10px;cursor:pointer}details{margin:6px 0}summary{cursor:pointer}
 .hidden{display:none}.warn{color:var(--warn)}.sev-critical,.sev-high,.sev-blocker{color:var(--del);font-weight:600}
+@media (min-height:760px){nav{position:sticky}}
+input{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:2px 6px}
 @media (max-width:640px){header,main{padding:10px}}
 """
 
@@ -740,6 +760,8 @@ def render(model: dict) -> str:
         out.append(f"<span class=pill>{esc(ref)}</span>")
     for domain in model["domains"]:
         out.append(f"<span class='pill warn'>domain: {esc(domain)}</span>")
+    for warning in meta.get("warnings") or []:
+        out.append(f"</p><p class=warn role=alert>Warning: {esc(warning)}</p><p>")
     out.append("</p><p><label>Filter <input id=filter type=search placeholder='file, commit, finding'></label></p></header>")
     out.append("<nav><div style='max-width:1180px;margin:0 auto;padding:0 16px'>" + "".join(
         f"<a href='#{a}'>{n}</a>" for a, n in (("map", "Change map"), ("why", "Reasoning"), ("edges", "Edges"),
@@ -929,6 +951,10 @@ def cmd_attach(args) -> int:
             meta = {}
         if meta.get("sha256") != digest:
             raise MapError("the map changed since it was generated; regenerate it before attaching")
+    if args.expect_sha256 and args.expect_sha256 != digest:
+        raise MapError("the page is not the one that was reviewed (sha256 differs); regenerate and review it again")
+    if not meta and not args.expect_sha256:
+        raise MapError("no generation record next to the map; pass --expect-sha256 or regenerate", EXIT_USAGE)
     refs = args.ticket or meta.get("tickets") or []
     if not refs:
         raise MapError("no ticket reference: pass --ticket 'GoodQA project#N' (the PR's commits cite none)", EXIT_USAGE)
@@ -985,6 +1011,7 @@ def build_parser():
     a.add_argument("--map", required=True)
     a.add_argument("--ticket", action="append")
     a.add_argument("--dry-run", action="store_true")
+    a.add_argument("--expect-sha256", help="refuse unless the page bytes have this sha256")
     a.add_argument("--yes", action="store_true", help="confirm the ticket list (required to upload)")
     l = sub.add_parser("list")
     l.add_argument("--repo", required=True)

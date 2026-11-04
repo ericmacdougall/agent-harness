@@ -1961,8 +1961,11 @@ h1 {
 .pr-number{color:#8fb7ff}.pr-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pr-meta{grid-column:2;color:#9db0a5;font-size:9px}
 #pr-open-map:disabled{opacity:.55;cursor:not-allowed}
-.review-map-dialog{width:min(1100px,96vw);height:min(86vh,900px);display:flex;flex-direction:column}
+.review-map-dialog{width:min(1100px,96vw);height:min(86vh,900px);flex-direction:column}
 .review-map-dialog[open]{display:flex}
 #review-map-frame{flex:1;min-height:300px;width:100%;border:1px solid #28343a;border-radius:6px;background:#fff}
 .review-map-attach{border:1px solid #28343a;border-radius:6px;margin-top:8px;padding:6px 10px;font-size:12px}
 .ticket-choice{display:block;padding:2px 0}
+
+#pr-open-map[aria-busy=true]::after{content:' (can take up to a minute)'}
+.review-map-attach label{display:flex;gap:6px;align-items:center}
