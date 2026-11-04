@@ -1,4 +1,5 @@
 import json
+import shutil
 import os
 import stat
 import subprocess
@@ -334,6 +335,12 @@ class PruneTests(HomeCase):
 
 
 class TaskOutputPruneTests(HomeCase):
+    config = {"remote": "crypt-test:x", "password_command": ["false"]}
+
+    @staticmethod
+    def verify_all(files, base, config):
+        return {str(f) for f in files}, ""
+
     def make(self, name, days, session=UUID):
         tasks = self.scratch / f"claude-{os.getuid()}" / "-Users-x" / session / "tasks"
         tasks.mkdir(parents=True, exist_ok=True)
@@ -348,7 +355,8 @@ class TaskOutputPruneTests(HomeCase):
         held = self.make("b2.output", 20)
         recent = self.make("b3.output", 3)
         other = self.make("notes.txt", 40)
-        result = workdir.prune_task_output(True, open_check=lambda paths: {os.path.realpath(held)})
+        result = workdir.prune_task_output(True, open_check=lambda paths: {os.path.realpath(held)},
+                                           config=self.config, backup=self.verify_all)
         self.assertEqual(result["removed"], [str(old)])
         for survivor in (held, recent, other):
             self.assertTrue(survivor.exists(), survivor)
@@ -372,7 +380,7 @@ class TaskOutputPruneTests(HomeCase):
         link_session = self.scratch / f"claude-{os.getuid()}" / "-Users-x" / OTHER_UUID
         link_session.mkdir(parents=True)
         (link_session / "tasks").symlink_to(outside)
-        workdir.prune_task_output(True, open_check=lambda p: set())
+        workdir.prune_task_output(True, open_check=lambda p: set(), config=self.config, backup=self.verify_all)
         self.assertTrue(target.exists())
 
     def test_real_open_check_sees_a_held_file(self):
@@ -389,7 +397,7 @@ class TaskOutputPruneTests(HomeCase):
             result = workdir.open_files([Path("/x/a.output")], run=lambda *a, **k: subprocess.CompletedProcess(a[0], 2, "", "err"))
         self.assertIsNone(result)
 
-    def test_session_start_spawn_is_daily_detached_and_report_only_by_default(self):
+    def test_session_start_spawn_is_daily_and_detached(self):
         self.make("b1.output", 20)
         calls = []
         popen = lambda args, **kwargs: calls.append((args, kwargs))
@@ -397,15 +405,14 @@ class TaskOutputPruneTests(HomeCase):
         self.assertFalse(workdir.spawn_task_output_prune(popen=popen))
         self.assertEqual(len(calls), 1)
         args, kwargs = calls[0]
-        self.assertEqual(args[2], "prune-task-output")
-        self.assertNotIn("--apply", args)
+        self.assertEqual(args[2:4], ["prune-task-output", "--apply"])
         self.assertEqual(args[args.index("--current-session") + 1], UUID)
         self.assertTrue(kwargs["start_new_session"])
         self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
         os.unlink(self.work / workdir.TASK_STAMP)
-        with patch.dict(os.environ, {"AGENT_HARNESS_TASK_OUTPUT_PRUNE": "apply"}):
-            self.assertTrue(workdir.spawn_task_output_prune(popen=popen))
-        self.assertIn("--apply", calls[1][0])
+        with patch.dict(os.environ, {"AGENT_HARNESS_TASK_OUTPUT_PRUNE": "off"}):
+            self.assertFalse(workdir.spawn_task_output_prune(popen=popen))
+        self.assertEqual(len(calls), 1)
 
     def test_spawn_skipped_after_opt_out(self):
         self.make("b1.output", 20)
@@ -419,7 +426,8 @@ class TaskOutputPruneTests(HomeCase):
         kept = self.make("b1.output", 30)
         (kept.parent.parent / workdir.KEEP).write_text("")
         current = self.make("b2.output", 30, session=OTHER_UUID)
-        result = workdir.prune_task_output(True, open_check=lambda p: set(), current_session=OTHER_UUID)
+        result = workdir.prune_task_output(True, open_check=lambda p: set(), current_session=OTHER_UUID,
+                                           config=self.config, backup=self.verify_all)
         self.assertEqual(result["removed"], [])
         self.assertTrue(kept.exists())
         self.assertTrue(current.exists())
@@ -429,8 +437,111 @@ class TaskOutputPruneTests(HomeCase):
         def check(paths):
             os.utime(path)  # a writer reopened and appended between the check and the unlink
             return set()
-        self.assertEqual(workdir.prune_task_output(True, open_check=check)["removed"], [])
+        self.assertEqual(workdir.prune_task_output(True, open_check=check, config=self.config,
+                                                   backup=self.verify_all)["removed"], [])
         self.assertTrue(path.exists())
+
+
+class TaskOutputBackupTests(HomeCase):
+    config = {"remote": "remote:Backups/agent-scratch-task-output", "password_command": ["pw-cmd"]}
+
+    def make(self, name, days):
+        return TaskOutputPruneTests.make(self, name, days)
+
+    def test_no_backup_configured_deletes_nothing(self):
+        old = self.make("b1.output", 30)
+        result = workdir.prune_task_output(True, open_check=lambda p: set())
+        self.assertEqual(result["status"], "REPORT_ONLY")
+        self.assertEqual(result["candidates"], [str(old)])
+        self.assertTrue(old.exists())
+
+    def test_failed_or_partial_backup_deletes_only_verified(self):
+        first, second = self.make("b1.output", 30), self.make("b2.output", 30)
+        failed = workdir.prune_task_output(True, open_check=lambda p: set(), config=self.config,
+                                           backup=lambda files, base, config: (set(), "upload failed"))
+        self.assertEqual((failed["status"], failed["removed"]), ("BACKUP_FAILED", []))
+        self.assertTrue(first.exists() and second.exists())
+        partial = workdir.prune_task_output(True, open_check=lambda p: set(), config=self.config,
+                                            backup=lambda files, base, config: ({str(first)}, ""))
+        self.assertEqual(partial["removed"], [str(first)])
+        self.assertTrue(second.exists())
+
+    def test_file_changed_after_backup_is_kept(self):
+        path = self.make("b1.output", 30)
+        def backup(files, base, config):
+            with open(path, "a") as handle:
+                handle.write("more")
+            os.utime(path, (time.time() - 30 * DAY, time.time() - 30 * DAY))
+            return {str(path)}, ""
+        result = workdir.prune_task_output(True, open_check=lambda p: set(), config=self.config, backup=backup)
+        self.assertEqual(result["removed"], [])
+        self.assertTrue(path.exists())
+
+    def test_young_and_open_files_never_reach_the_backup(self):
+        young, held = self.make("b1.output", 3), self.make("b2.output", 30)
+        seen = []
+        workdir.prune_task_output(True, open_check=lambda p: {os.path.realpath(held)}, config=self.config,
+                                  backup=lambda files, base, config: (seen.extend(files) or set(), "x"))
+        self.assertEqual(seen, [])
+        self.assertTrue(young.exists() and held.exists())
+
+    def test_config_must_be_private_and_well_formed(self):
+        path = self.home / ".agent-harness" / workdir.BACKUP_CONFIG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.config))
+        os.chmod(path, 0o644)
+        self.assertIsNone(workdir.load_backup_config())
+        os.chmod(path, 0o600)
+        self.assertEqual(workdir.load_backup_config(), self.config)
+        for bad in ({"remote": "no-colon", "password_command": ["x"]}, {"remote": "r:x", "password_command": "x"}):
+            path.write_text(json.dumps(bad))
+            self.assertIsNone(workdir.load_backup_config())
+
+    def fake_run(self, fail=None):
+        calls = []
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            name = "password" if args == ["pw-cmd"] else args[1]
+            code = 1 if name == fail else 0
+            out = {"password": "s3cret-pass", "obscure": "OBSCURED"}.get(name, "")
+            return subprocess.CompletedProcess(args, code, out, "")
+        return run, calls
+
+    def test_rclone_backup_requires_upload_and_cryptcheck(self):
+        files = [self.make("b1.output", 30)]
+        base = workdir._scratch_base()
+        for fail in ("password", "obscure", "copy", "cryptcheck"):
+            run, calls = self.fake_run(fail)
+            verified, error = workdir.rclone_backup(files, base, self.config, run=run)
+            self.assertEqual(verified, set(), fail)
+            self.assertTrue(error, fail)
+        run, calls = self.fake_run()
+        verified, error = workdir.rclone_backup(files, base, self.config, run=run)
+        self.assertEqual((verified, error), ({str(files[0])}, ""))
+        self.assertEqual([c[0][1] for c in calls[1:]], ["obscure", "copy", "cryptcheck"])
+        env = calls[2][1]["env"]
+        self.assertEqual(env["RCLONE_CONFIG_AHTASKCRYPT_TYPE"], "crypt")
+        self.assertTrue(env["RCLONE_CONFIG_AHTASKCRYPT_REMOTE"].startswith("remote:Backups/agent-scratch-task-output/"))
+        for args, _ in calls:
+            self.assertNotIn("s3cret-pass", " ".join(args))  # the passphrase never appears in argv
+        self.assertEqual(calls[1][1]["input"], "s3cret-pass")
+        self.assertEqual(list(self.work.glob(".task-output-list-*")), [])
+
+    def test_real_rclone_crypt_round_trip(self):
+        rclone = shutil.which("rclone")
+        if not rclone:
+            self.skipTest("rclone not installed")
+        target = self.home / "crypt-target"
+        target.mkdir()
+        config = {"remote": f":local:{target}", "rclone": rclone,
+                  "password_command": [sys.executable, "-c", "print('integration-pass-phrase')"]}
+        old = self.make("b1.output", 30)
+        result = workdir.prune_task_output(True, open_check=lambda p: set(), config=config)
+        self.assertEqual(result["removed"], [str(old)], result)
+        stored = [p for p in target.rglob("*") if p.is_file()]
+        self.assertEqual(len(stored), 1)
+        self.assertNotIn("b1.output", str(stored[0]))
+        self.assertNotIn(b"secret-bearing", stored[0].read_bytes())
 
 
 if __name__ == "__main__":

@@ -732,8 +732,87 @@ def open_files(paths: list[Path], run=None) -> set | None:
     return held & wanted
 
 
+BACKUP_CONFIG = "task-output-backup.json"
+CRYPT_REMOTE = "AHTASKCRYPT"  # an env-only rclone crypt remote: the key never touches rclone.conf
+
+
+def load_backup_config() -> dict | None:
+    """~/.agent-harness/task-output-backup.json: {"remote": "<rclone remote:path>", "password_command": [...]}.
+
+    The password command prints the encryption passphrase (for example from the macOS keychain or a
+    secret manager); the passphrase is never stored by the harness.
+    """
+    path = home() / ".agent-harness" / BACKUP_CONFIG
+    try:
+        info = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+            return None  # must be a private regular file
+        config = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(config, dict) or not isinstance(config.get("remote"), str) or ":" not in config["remote"]
+            or not isinstance(config.get("password_command"), list) or not config["password_command"]
+            or not all(isinstance(part, str) for part in config["password_command"])):
+        return None
+    return config
+
+
+def _host() -> str:
+    import socket
+    return re.sub(r"[^A-Za-z0-9._-]", "_", socket.gethostname().split(".")[0]) or "host"
+
+
+def rclone_backup(files: list[Path], base: Path, config: dict, run=None) -> tuple[set, str]:
+    """Copy files to an encrypted rclone crypt remote and cryptcheck them; return (verified, error)."""
+    import subprocess
+    run = run or subprocess.run
+    rclone = config.get("rclone") or "rclone"
+    try:
+        secret = run(config["password_command"], capture_output=True, text=True, timeout=30)
+        passphrase = secret.stdout.strip() if secret.returncode == 0 else ""
+        if not passphrase:
+            return set(), "password command failed or printed nothing"
+        obscured = run([rclone, "obscure", "-"], input=passphrase, capture_output=True, text=True, timeout=30)
+        if obscured.returncode != 0 or not obscured.stdout.strip():
+            return set(), "rclone obscure failed"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return set(), f"backup setup failed ({exc.__class__.__name__})"
+    prefix = f"RCLONE_CONFIG_{CRYPT_REMOTE}_"
+    env = {**os.environ, prefix + "TYPE": "crypt",
+           prefix + "REMOTE": config["remote"].rstrip("/") + "/" + _host(),
+           prefix + "PASSWORD": obscured.stdout.strip(),
+           prefix + "FILENAME_ENCRYPTION": "standard", prefix + "DIRECTORY_NAME_ENCRYPTION": "true"}
+    relative = [str(p.relative_to(base)) for p in files]
+    fd, listing = None, work_root() / f".task-output-list-{os.getpid()}"
+    try:
+        work_root().mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(listing, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write("\n".join(relative) + "\n")
+        target = CRYPT_REMOTE.lower() + ":"
+        common = ["--files-from", str(listing), str(base), target]
+        copy = run([rclone, "copy", "--no-traverse", *common], env=env,
+                   capture_output=True, text=True, timeout=3600)
+        if copy.returncode != 0:
+            return set(), f"upload failed (rclone exit {copy.returncode}); deleted nothing"
+        check = run([rclone, "cryptcheck", "--one-way", *common], env=env,
+                    capture_output=True, text=True, timeout=3600)
+        if check.returncode != 0:
+            return set(), f"verification failed (rclone exit {check.returncode}); deleted nothing"
+        return {str(base / r) for r in relative}, ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        return set(), f"backup failed ({exc.__class__.__name__}); deleted nothing"
+    finally:
+        try:
+            os.unlink(listing)
+        except OSError:
+            pass
+
+
 def prune_task_output(apply: bool, days: float = DEFAULT_TASK_OUTPUT_DAYS, now: float | None = None,
-                      open_check=open_files, current_session: str | None = None) -> dict:
+                      open_check=open_files, current_session: str | None = None, backup=None,
+                      config=None) -> dict:
+    """List old task output; with apply, delete only files an encrypted backup has verified."""
     now = time.time() if now is None else now
     found = task_output_candidates(now, days, current_session)
     held = open_check(found)
@@ -741,38 +820,61 @@ def prune_task_output(apply: bool, days: float = DEFAULT_TASK_OUTPUT_DAYS, now: 
         return {"status": "SKIPPED", "reason": "could not determine which files are open; deleted nothing",
                 "candidates": [str(p) for p in found], "removed": []}
     removable = [p for p in found if os.path.realpath(p) not in held]
-    removed, errors = [], []
-    if apply:
-        for path in removable:
-            try:
-                info = os.stat(path, follow_symlinks=False)
-                # Re-check age just before unlinking: a file written since the open check is kept.
-                if stat.S_ISREG(info.st_mode) and not _protected(path) and now - info.st_mtime >= days * DAY:
-                    os.unlink(path)
-                    removed.append(str(path))
-            except OSError as exc:
-                errors.append({"path": str(path), "error": exc.__class__.__name__})
-    return {"status": "APPLIED" if apply else "DRY_RUN", "candidates": [str(p) for p in removable],
-            "open": sorted(held), "removed": removed, "errors": errors}
+    report = {"status": "DRY_RUN", "candidates": [str(p) for p in removable], "open": sorted(held),
+              "removed": [], "errors": []}
+    if not apply or not removable:
+        return report
+    config = load_backup_config() if config is None else config
+    if not config:
+        report.update(status="REPORT_ONLY", reason=f"no encrypted backup configured in "
+                      f"~/.agent-harness/{BACKUP_CONFIG}; deleted nothing")
+        return report
+    snapshot = {}
+    for path in removable:
+        try:
+            info = os.stat(path, follow_symlinks=False)
+            snapshot[str(path)] = (info.st_size, info.st_mtime_ns)
+        except OSError:
+            pass
+    verified, error = (backup or rclone_backup)([Path(p) for p in snapshot], _scratch_base(), config)
+    if error or not verified:
+        report.update(status="BACKUP_FAILED", reason=error or "nothing verified; deleted nothing")
+        return report
+    for path, (size, mtime_ns) in snapshot.items():
+        if path not in verified:
+            continue
+        try:
+            info = os.stat(path, follow_symlinks=False)
+            # Delete only the exact bytes that were backed up and are still old.
+            if (stat.S_ISREG(info.st_mode) and not _protected(Path(path))
+                    and (info.st_size, info.st_mtime_ns) == (size, mtime_ns)
+                    and now - info.st_mtime >= days * DAY):
+                os.unlink(path)
+                report["removed"].append(path)
+        except OSError as exc:
+            report["errors"].append({"path": path, "error": exc.__class__.__name__})
+    report["status"] = "APPLIED"
+    return report
 
 
 def spawn_task_output_prune(now: float | None = None, popen=None, session_id: str | None = None) -> bool:
     """At most daily, start a detached task-output prune so the session hook never waits on lsof.
 
-    It only reports unless AGENT_HARNESS_TASK_OUTPUT_PRUNE=apply: deleting Claude task output with no
-    backup needs the user's explicit choice.
+    Deletion happens only for files an encrypted backup verified (see load_backup_config); with no
+    backup configured the job only reports. AGENT_HARNESS_TASK_OUTPUT_PRUNE=off disables it.
     """
     import subprocess
     now = time.time() if now is None else now
     stamp = work_root() / TASK_STAMP
     try:
-        if (durable_tmp_disabled() or not _scratch_base().is_dir() or os.path.islink(stamp)
+        if (os.environ.get("AGENT_HARNESS_TASK_OUTPUT_PRUNE") == "off" or durable_tmp_disabled()
+                or not _scratch_base().is_dir() or os.path.islink(stamp)
                 or now - _mtime(stamp) < DAY):
             return False
         work_root().mkdir(mode=0o700, parents=True, exist_ok=True)
         os.close(os.open(stamp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600))
         os.utime(stamp, (now, now))
-        mode = ["--apply"] if os.environ.get("AGENT_HARNESS_TASK_OUTPUT_PRUNE") == "apply" else []
+        mode = ["--apply"]  # still deletes nothing without a verified encrypted backup
         current = ["--current-session", session_id] if session_id and SESSION_UUID.fullmatch(session_id) else []
         (popen or subprocess.Popen)([sys.executable, str(Path(__file__).resolve()), "prune-task-output", *mode,
                                      *current, "--report", str(work_root() / TASK_REPORT)],
@@ -800,8 +902,8 @@ def main(argv: list[str] | None = None) -> int:
                      help="also delete Claude Code task output (tasks/); it is not backed up")
     task = sub.add_parser("prune-task-output",
                           help=f"list (default) or remove Claude task output older than {DEFAULT_TASK_OUTPUT_DAYS} "
-                               "days that no live process holds open; SessionStart runs it daily, deleting "
-                               "only when AGENT_HARNESS_TASK_OUTPUT_PRUNE=apply")
+                               "days that no live process holds open; with --apply, deletes only files an "
+                               "encrypted rclone backup verified (SessionStart runs it daily)")
     task.add_argument("--apply", action="store_true", help="delete; otherwise list")
     task.add_argument("--days", type=float, default=DEFAULT_TASK_OUTPUT_DAYS)
     task.add_argument("--report", type=Path, help="also write the JSON result to this private file")

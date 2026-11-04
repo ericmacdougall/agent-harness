@@ -96,7 +96,8 @@ class ChaosProcesses(unittest.TestCase):
                 for _ in range(8):
                     workers.append(subprocess.Popen(
                         [sys.executable, '-c', code, str(gate), str(ROOT / 'install.py'), str(home)],
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        env={k: v for k, v in os.environ.items() if k != 'CLAUDE_CODE_TMPDIR'}))
                 gate.touch()
                 results = [(worker.communicate(timeout=20), worker.returncode) for worker in workers]
             finally:
@@ -115,7 +116,8 @@ class ChaosProcesses(unittest.TestCase):
                                          'Managed file changed since snapshot',
                                          'Managed file changed after replacement', 'FileExistsError')), streams)
             retry = subprocess.run([sys.executable, str(ROOT / 'install.py'), '--apply', '--home', str(home)],
-                                   capture_output=True, text=True, timeout=20)
+                                   capture_output=True, text=True, timeout=20,
+                                   env={k: v for k, v in os.environ.items() if k != 'CLAUDE_CODE_TMPDIR'})
             self.assertEqual(retry.returncode, 0, retry.stderr)
             text = (claude / 'CLAUDE.md').read_text()
             self.assertIn('Existing user guidance.', text)
@@ -123,7 +125,9 @@ class ChaosProcesses(unittest.TestCase):
             self.assertEqual(text.count('<!-- agent-harness:end -->'), 1)
             settings = json.loads((claude / 'settings.json').read_text())
             self.assertEqual(settings['model'], 'sonnet')
-            self.assertEqual(settings['env'], {'FIXTURE': 'keep'})
+            # The installer adds its durable scratch default and keeps the user's env values.
+            self.assertEqual(settings['env'], {'FIXTURE': 'keep',
+                                               'CLAUDE_CODE_TMPDIR': str(home / '.agent-harness' / 'scratch')})
             self.assertEqual(sum('wal.py' in json.dumps(item) for item in settings['hooks']['PreToolUse']), 1)
             for source in (ROOT / 'harness/agents').iterdir():
                 self.assertEqual((claude / 'agents' / source.name).read_bytes(), source.read_bytes())
