@@ -671,13 +671,42 @@ def excerpt_of(text: str) -> str:
     return prov.clip(redact(" ".join(text[:65536].split()[:15])), 160)
 
 
+# Phrases that usually mean the human asked for something. A no-ask on a message that has one is flagged in the
+# digest (it does not block): the cue names are stored, never the text, and false positives only cost a look.
+REQUEST_PHRASES = tuple((name, re.compile(rx)) for name, rx in (
+    ("please", r"\b(?:please|pls)\b"), ("can you", r"\bcan (?:you|u)\b"), ("could you", r"\bcould you\b"),
+    ("would you", r"\bwould you\b"), ("will you", r"\bwill you\b"), ("i need", r"\bi (?:really |still )?need\b"),
+    ("i want", r"\bi (?:really |still )?want\b"), ("i'd like", r"\bi(?:'d| would) like\b"),
+    ("make sure", r"\bmake sure\b"), ("don't forget", r"\bdon'?t forget\b"), ("let's", r"\blet(?:'s| us)\b")))
+IMPERATIVES = ("add", "build", "change", "check", "clean", "create", "delete", "deploy", "file", "find", "fix", "implement",
+               "install", "investigate", "make", "merge", "move", "post", "remove", "rename", "review", "run", "send", "set",
+               "ship", "start", "stop", "test", "update", "upgrade", "write")
+# An imperative verb at the start of a sentence (after optional filler such as "also" or "then") or right after "please".
+IMPERATIVE_RE = re.compile(r"(?:^|[.!?;:\n]\s*|\bplease\s+)(?:(?:also|and|then|now|just|so|ok(?:ay)?|pls|please),?\s+)*("
+                           + "|".join(IMPERATIVES) + r")\b")
+MAX_CUES = 8
+
+
+def request_cues(text: str) -> list:
+    low = str(text)[:65536].lower()
+    found = [name for name, rx in REQUEST_PHRASES if rx.search(low)]
+    for match in IMPERATIVE_RE.finditer(low):
+        cue = "imperative:" + match.group(1)
+        if cue not in found:
+            found.append(cue)
+    return found[:MAX_CUES]
+
+
 def text_ref(text: str, pasted=False) -> dict:
-    """sha256, counts and a redacted 15-word excerpt; pasted content gets no excerpt (the redactor is heuristic)."""
+    """sha256, counts, request-cue names and a redacted 15-word excerpt; pasted content gets neither excerpt nor cues
+    (the redactor is heuristic, and pasted logs are not the human's own words)."""
     ex = "" if pasted else excerpt_of(text)
     ref = {"sha256": sha(prov.norm(text[:prov.MAX_TEXT])), "chars": len(text), "words": len(text.split()),
            "redaction": {"policy": "harness-redactor/1", "applied": True, "hits": ex.count("[redacted]")}}
     if ex:
         ref["excerpt"] = ex
+    if not pasted:
+        ref["requestCues"] = request_cues(text)
     return ref
 
 
@@ -938,14 +967,49 @@ def problems_for(data: dict, session: str, policy: dict, ts=None) -> list:
     return found
 
 
+def message_cues(msg: dict) -> tuple:
+    """(cue names, basis). Messages captured before cues existed fall back to their redacted excerpt."""
+    text = msg.get("text") or {}
+    if "requestCues" in text:
+        return list(text["requestCues"]), "text"
+    if text.get("excerpt"):
+        return request_cues(text["excerpt"]), "excerpt"
+    return [], "none"
+
+
+def no_ask_rows(data: dict, session=None) -> list:
+    """Every no-ask, flagged (request phrase) first, then this session's, then newest."""
+    rows = []
+    for mid, msg in data["messages"].items():
+        if msg["triage"]["status"] == "no_ask":
+            cues, basis = message_cues(msg)
+            rows.append({"id": mid, "msg": msg, "cues": cues, "basis": basis})
+    rows.sort(key=lambda r: r["msg"]["triage"].get("at", ""), reverse=True)
+    rows.sort(key=lambda r: (not r["cues"], r["msg"]["sessionId"] != session))
+    return rows
+
+
+def no_ask_line(row: dict) -> str:
+    msg, triage = row["msg"], row["msg"]["triage"]
+    flag = ""
+    if row["cues"]:
+        flag = " !request-phrase(" + ",".join(row["cues"]) + (";excerpt" if row["basis"] == "excerpt" else "") + ")"
+    by = (triage.get("by") or {}).get("label") or (triage.get("by") or {}).get("kind") or "?"
+    return (f"  NO-ASK {row['id']}{flag}: \"{msg['text'].get('excerpt', '[pasted content]')}\" "
+            f"reason=\"{prov.clip(triage.get('reason', ''), 120)}\" by={by}"
+            + (f" -> reopen with work_assignments.py split --msg {row['id']} --item '...'" if row["cues"] else ""))
+
+
 def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
     ts = now()
     ix = data["index"]
     asks = [data["asks"][e["id"]] for e in ix["openAsks"] if e["id"] in data["asks"]]
     flagged = [a for a in asks if ask_flags(a, policy, ts)]
     ordered = sorted(asks, key=lambda a: (not ask_flags(a, policy, ts), a["origin"]["actor"].get("sessionId") != session, a["id"]))
+    no_asks = no_ask_rows(data, session)
     lines = [f"Work assignments: {len(ix['untriagedMessages'])} untriaged message(s), {len(asks)} open ask(s), "
-             f"{len(flagged)} flagged (no owner, stopped owner or stale), {len(ix['openDecisions'])} open decision(s)."]
+             f"{len(flagged)} flagged (no owner, stopped owner or stale), {len(ix['openDecisions'])} open decision(s), "
+             f"{len(no_asks)} no-ask(s), {sum(1 for r in no_asks if r['cues'])} flagged as a possible request."]
     for mid in ix["untriagedMessages"][:8]:
         lines.append(f"  UNTRIAGED {mid}: \"{data['messages'][mid]['text'].get('excerpt', '[pasted content]')}\" -> work_assignments.py split --msg {mid} --item '...' | no-ask")
     for ask in ordered[:limit]:
@@ -956,6 +1020,10 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
         lines.append(f"  ... {len(ordered) - limit} more: run `work_assignments.py status`")
     for d in ix["openDecisions"][:5]:
         lines.append(f"  DECISION {d['id']} [{d['state']}]: {prov.clip(d['compressed'], 80)}")
+    shown = min(8, limit)
+    lines.extend(no_ask_line(row) for row in no_asks[:shown])
+    if len(no_asks) > shown:
+        lines.append(f"  ... {len(no_asks) - shown} more no-ask(s): run `work_assignments.py status --json`")
     return "\n".join(lines)
 
 
@@ -1487,12 +1555,16 @@ def cmd_split(args):
     who = cli_actor(args.actor)
     with transaction() as data:
         msg = find_message(data, args.msg)
-        if msg["triage"]["status"] == "no_ask":
-            raise WAError("message was marked no-ask; it cannot also have asks")
+        prior = msg["triage"]
         made = [new_ask(data, description=text, kind=args.kind, owner=args.owner, message=msg["id"], who=who,
                         next_step=args.next or "", tickets=args.ticket or (), branch=args.branch or "") for text in args.item]
-        ids = list(msg["triage"].get("askIds", [])) + [a["id"] for a in made]
-        emit(data, "triaged", "message", msg["id"], {"triage": {"status": "split", "at": iso(now()), "by": who, "askIds": ids}}, who)
+        ids = list(prior.get("askIds", [])) + [a["id"] for a in made]
+        triage = {"status": "split", "at": iso(now()), "by": who, "askIds": ids}
+        if prior["status"] == "no_ask":  # a no-ask that was really a request; keep what was claimed and by whom
+            triage["reopenedFrom"] = {k: prior[k] for k in ("status", "at", "by", "reason") if k in prior}
+        elif prior.get("reopenedFrom"):
+            triage["reopenedFrom"] = prior["reopenedFrom"]
+        emit(data, "triaged", "message", msg["id"], {"triage": triage}, who)
     print("created " + ", ".join(a["id"] for a in made))
 
 

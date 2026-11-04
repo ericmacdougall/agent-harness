@@ -301,6 +301,58 @@ class TriageTest(Base):
         msg = self.capture("x request")
         self.assertEqual(self.cli("no-ask", "--msg", msg["id"], "--reason", "short")[0], 2)
 
+    def test_digest_lists_no_asks_and_flags_request_phrases(self):
+        """A no-ask can close a real request: the digest lists every no-ask with its reason and flags request phrases."""
+        real = self.capture("please fix the stop hook before you ship")
+        thanks = self.capture("thanks, that looks great")
+        self.assertEqual(real["text"]["requestCues"], ["please", "imperative:fix"])  # names only, never the text
+        self.assertEqual(thanks["text"]["requestCues"], [])
+        self.assertEqual(self.cli("no-ask", "--msg", real["id"], "--reason", "agent thought it was done")[0], 0)
+        self.assertEqual(self.cli("no-ask", "--msg", thanks["id"], "--reason", "pure thanks, nothing to do")[0], 0)
+        code, out = self.cli("status")
+        self.assertEqual(code, 0)
+        self.assertIn("2 no-ask(s), 1 flagged as a possible request", out)
+        lines = [l for l in out.splitlines() if l.strip().startswith("NO-ASK")]
+        self.assertEqual(len(lines), 2, out)
+        self.assertIn(real["id"], lines[0])  # flagged first
+        self.assertIn("!request-phrase(please,imperative:fix)", lines[0])
+        self.assertIn('reason="agent thought it was done"', lines[0])
+        self.assertIn("by=main", lines[0])
+        self.assertIn(thanks["id"], lines[1])
+        self.assertNotIn("!request-phrase", lines[1])
+        self.assertIn('reason="pure thanks, nothing to do"', lines[1])
+        self.check_schema()
+
+    def test_request_cues_ignore_pasted_content(self):
+        cues = wa.request_cues
+        self.assertEqual(cues("Can you check the logs? Also update the README."), ["can you", "imperative:update"])
+        self.assertEqual(cues("I need the report by Friday"), ["i need"])
+        self.assertEqual(cues("great, thanks!"), [])
+        self.assertEqual(cues("the fix landed yesterday"), [])  # verb not at a sentence start
+        self.assertNotIn("requestCues", wa.text_ref("please do everything", pasted=True))
+        self.assertLessEqual(len(cues(" ".join(["please can you could you would you i need i want make sure let us"] * 50))), 8)
+
+    def test_legacy_no_ask_without_cues_falls_back_to_excerpt(self):
+        msg = self.capture("could you remove the old cron job")
+        self.cli("no-ask", "--msg", msg["id"], "--reason", "handled elsewhere already")
+        with wa.transaction() as data:
+            data["messages"][msg["id"]]["text"].pop("requestCues")  # captured before cues existed
+        out = self.cli("status")[1]
+        self.assertIn("!request-phrase(could you;excerpt)", out)
+
+    def test_split_retriages_a_no_ask(self):
+        msg = self.capture("please add a retry to the uploader")
+        self.cli("no-ask", "--msg", msg["id"], "--reason", "misread as a thank you")
+        self.assertEqual(self.cli("split", "--msg", msg["id"], "--item", "add uploader retry")[0], 0)
+        data = self.data()
+        triage = data["messages"][msg["id"]]["triage"]
+        self.assertEqual(triage["status"], "split")
+        self.assertEqual(len(triage["askIds"]), 1)
+        self.assertEqual(triage["reopenedFrom"]["status"], "no_ask")
+        self.assertEqual(triage["reopenedFrom"]["reason"], "misread as a thank you")
+        self.assertNotIn("NO-ASK", self.cli("status")[1])
+        self.check_schema()
+
     def test_done_requires_verified_evidence_and_legal_transitions(self):
         """NEG-10: control = accepting an attested PR as done evidence."""
         _, aid = self.split("build it", "build the thing")

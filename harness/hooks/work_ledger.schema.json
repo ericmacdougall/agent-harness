@@ -549,6 +549,16 @@
               "minimum": 0
             }
           }
+        },
+        "requestCues": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "description": "Names of request phrases found in the typed text at capture (never the text). A no-ask on a message with any is flagged in the digest. Absent for pasted-only content and for messages captured before cues existed.",
+          "items": {
+            "type": "string",
+            "pattern": "^(imperative:)?[a-z' ]{2,24}$"
+          }
         }
       }
     },
@@ -2076,6 +2086,29 @@
                 "$ref": "#/$defs/decisionId"
               },
               "maxItems": 100
+            },
+            "reopenedFrom": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "status"
+              ],
+              "description": "The earlier no-ask this split replaced, kept for audit.",
+              "properties": {
+                "status": {
+                  "const": "no_ask"
+                },
+                "at": {
+                  "$ref": "#/$defs/timestamp"
+                },
+                "by": {
+                  "$ref": "#/$defs/actor"
+                },
+                "reason": {
+                  "type": "string",
+                  "maxLength": 300
+                }
+              }
             }
           },
           "allOf": [

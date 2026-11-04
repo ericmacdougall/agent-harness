@@ -43,7 +43,7 @@ on the machine also discovers new `~/.codex/sessions` rollouts and catches up th
 ```
 work_assignments.py status [--session S] [--json]       # answer every status question from this
 work_assignments.py split --msg M-... --item '...' [--owner agent:ID --ticket 'GoodQA p#n' --branch b --next '...']
-work_assignments.py no-ask --msg M-... --reason '...'   # at least 10 characters, audited
+work_assignments.py no-ask --msg M-... --reason '...'   # at least 10 characters, audited, listed in the digest
 work_assignments.py update A-... [--state S] [--owner O] [--next N] [--evidence E] [--block-reason K --decision D-...]
                                  [--reopen-by M-...] [--repo PATH] [--actor agent:ID]
 work_assignments.py cancel A-... --uuid U --file TRANSCRIPT --line N --quote 'words the user wrote' --binding B
@@ -59,6 +59,15 @@ that is a REALLY_TESTED WAL note (`wal-really-tested`). PR numbers and URLs cann
 `attested`. Tickets are referenced as `externalRefs` strings only (`GoodQA <project>#<n>`); this file never calls
 GoodQA or copies ticket status.
 
+A no-ask can hide a real request, so the digest (`status`, SessionStart and PostCompact) counts every no-ask and
+lists up to 8 of them with the reason and the actor who gave it. At capture the hook stores the names of request phrases
+found in the typed text (`please`, `can you`, `i need`, `make sure`, an imperative such as `fix` at the start of a
+sentence, and similar) as `text.requestCues`; the text itself is never stored. A no-ask on a message with any cue is
+flagged `!request-phrase(...)` and listed first. Messages captured before cues existed are checked against their
+redacted excerpt (`;excerpt`). To correct a no-ask, `split` the message: the split keeps the earlier no-ask as
+`triage.reopenedFrom`. The flag is advisory: it never blocks Stop, and a correct no-ask on a message that happens to
+contain a cue stays flagged until it is split.
+
 ## Removal gate
 
 `remove` and `prune` refuse unless the ask has been `done` with re-verifying verified evidence, or `cancelled` with a
@@ -71,7 +80,7 @@ line is re-read at removal. Removal appends the full record to the archive and l
 
 ## Known limits
 
-A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt. A superseded ask is removable only when its replacement, a different ask, is done with verified evidence.
+A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt and no request cues. Request cues are English keyword heuristics: they miss requests phrased without them and flag some messages that are not requests. A superseded ask is removable only when its replacement, a different ask, is done with verified evidence.
 
 The guard is best effort against shell tricks (a safety net for careless edits, not a sandbox); the event chain has
 no external anchor; a payload over 8 MB is rejected and recorded as a failure; messages are not pruned (a triaged
