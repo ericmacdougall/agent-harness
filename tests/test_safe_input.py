@@ -100,7 +100,13 @@ class HostileFiles(unittest.TestCase):
         with self.assertRaises(ValueError):
             safe_input.safe_json_loads("x" * 100, max_bytes=50)
         self.assertEqual(safe_input.safe_json_loads('{"a":"[[[[[[[[["}'), {"a": "[[[[[[[[["})
-        self.assertEqual(safe_input.safe_json_loads(b'{"a":[' + b"[" * 150 + b"]" * 150 + b"]}")["a"][0] is not None, True)
+        self.assertEqual(safe_input.safe_json_loads(b'{"a":[' + b"[" * 150 + b"]" * 150 + b"]}", max_depth=200)["a"][0] is not None, True)
+        with self.assertRaises(ValueError):  # compatible default: safe_json_loads(text, max_depth=100)
+            safe_input.safe_json_loads("[" * 101 + "]" * 101)
+        self.assertEqual(safe_input.safe_json_loads(bytearray(b"[[1]]")), [[1]])
+        import inspect
+        self.assertEqual(list(inspect.signature(safe_input.safe_json_loads).parameters)[:2], ["text", "max_depth"])
+        self.assertEqual(inspect.signature(safe_input.safe_json_loads).parameters["max_depth"].default, 100)
 
     def test_allowed_roots_and_toctou_guard(self):
         root = Path(self.hostile.root)

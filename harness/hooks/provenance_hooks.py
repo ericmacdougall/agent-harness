@@ -407,10 +407,17 @@ def install_limits(rss_limit=RSS_LIMIT_BYTES, wall_limit=WALL_LIMIT_SECONDS):
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0] not in ("ask-gate", "stop-lint", "prompt", "calibrate"):
+    if not argv or argv[0] not in ("ask-gate", "stop-lint", "prompt", "calibrate", "show-message"):
         print(__doc__, file=sys.stderr)
         return 3
     command = argv[0]
+    if command == "show-message" and len(argv) == 3:
+        for message in assistant_messages(argv[1]):
+            if message["uuid"] == argv[2]:
+                print(message["text"])
+                return 0
+        print("message not found", file=sys.stderr)
+        return 2
     if command == "calibrate":
         messages = assistant_messages(argv[1])
         limit = int(argv[2]) if len(argv) > 2 else 200

@@ -27,7 +27,7 @@ import stat
 import sys
 import time
 
-MAX_JSON_DEPTH = 200
+MAX_JSON_DEPTH = 100  # default of safe_json_loads(text, max_depth=100), shared with domain_gates and review_map
 MAX_LINE_BYTES = 8 * 1024 * 1024
 MAX_JSON_BYTES = 8 * 1024 * 1024
 DEFAULT_STDIN_BYTES = 4 * 1024 * 1024
@@ -128,11 +128,14 @@ def read_stdin_bounded(max_bytes: int = DEFAULT_STDIN_BYTES) -> bytes:
     return b"".join(chunks)
 
 
-def safe_json_loads(data, max_depth: int = MAX_JSON_DEPTH, max_bytes: int = MAX_JSON_BYTES):
+def safe_json_loads(text, max_depth: int = MAX_JSON_DEPTH, max_bytes: int = MAX_JSON_BYTES):
     """json.loads for untrusted text or bytes. Python 3.9 can abort the interpreter outright on deeply nested JSON
     instead of raising RecursionError, so size and nesting are checked first. Raises ValueError, never aborts."""
+    data = text
     if isinstance(data, str):
         data = data.encode("utf-8", "replace")
+    elif isinstance(data, bytearray):
+        data = bytes(data)
     if len(data) > max_bytes:
         raise ValueError("JSON input too large")
     if data.count(b"[") + data.count(b"{") > max_depth:  # depth cannot exceed the bracket count: cheap bound first
