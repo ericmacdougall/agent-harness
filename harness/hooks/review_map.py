@@ -33,6 +33,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
+import safe_input  # noqa: E402
 
 EXIT_OK, EXIT_USAGE, EXIT_FAILED, EXIT_PARTIAL = 0, 2, 3, 6
 MAX_FILES_DETAIL = 60
@@ -74,33 +75,9 @@ HIGH_ENTROPY = re.compile(r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0
 
 
 def safe_json_loads(text, max_depth=100):
-    """json.loads with a bracket-depth pre-scan: deeply nested input from a repo, PR or WAL must not
-    recurse into the interpreter (on 3.9 that can abort the process rather than raise)."""
-    if isinstance(text, (bytes, bytearray)):
-        text = bytes(text).decode("utf-8", "replace")
-    if len(text) > MAX_JSON_BYTES:
-        raise ValueError("JSON input too large")
-    depth, in_string, escaped = 0, False, False
-    for ch in text:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-        elif ch == '"':
-            in_string = True
-        elif ch in "[{":
-            depth += 1
-            if depth > max_depth:
-                raise ValueError("JSON nesting too deep")
-        elif ch in "]}":
-            depth -= 1
-    try:
-        return json.loads(text)
-    except RecursionError:
-        raise ValueError("JSON nesting too deep") from None
+    """json.loads for untrusted PR, repo or WAL text: the shared safe_input implementation (size, nesting and
+    number-length limits; str, bytes and bytearray). Raises ValueError, never aborts the interpreter."""
+    return safe_input.safe_json_loads(text, max_depth=max_depth, max_bytes=MAX_JSON_BYTES)
 
 
 def scrub(value) -> str:
@@ -1002,17 +979,18 @@ def cmd_attach(args) -> int:
     path = Path(args.map).expanduser()
     if path.is_symlink() or not path.is_file():
         raise MapError(f"{path} is not a regular file", EXIT_USAGE)
-    data = path.read_bytes()
-    if len(data) > MAX_HTML_BYTES:
-        raise MapError("the map is too large to attach")
+    try:
+        data = safe_input.read_bounded(path, MAX_HTML_BYTES)
+    except safe_input.InputRejected:
+        raise MapError("the map is too large or unreadable to attach")
     assert_no_leak(data.decode("utf-8", "replace"))
     digest = hashlib.sha256(data).hexdigest()
     meta_path = path.with_suffix(".meta.json")
     meta = {}
     if meta_path.is_file():
         try:
-            meta = safe_json_loads(meta_path.read_text())
-        except ValueError:
+            meta = safe_json_loads(safe_input.read_bounded(meta_path, MAX_JSON_BYTES))
+        except (ValueError, OSError, safe_input.InputRejected):
             meta = {}
         if meta.get("sha256") != digest:
             raise MapError("the map changed since it was generated; regenerate it before attaching")
