@@ -115,30 +115,11 @@ func (d *Dir) PublishNew(name string, body []byte) error {
 	if err := d.Current(); err != nil {
 		return err
 	}
-	var rnd [16]byte
-	if _, err := rand.Read(rnd[:]); err != nil {
-		return err
-	}
-	tmp := ".stage-" + hex.EncodeToString(rnd[:])
-	f, err := d.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	tmp, written, err := d.stage(body)
 	if err != nil {
 		return err
 	}
 	defer d.root.Remove(tmp)
-	_, werr := f.Write(body)
-	if werr == nil {
-		werr = f.Sync()
-	}
-	written, serr := f.Stat()
-	if cerr := f.Close(); werr == nil {
-		werr = cerr
-	}
-	if werr != nil {
-		return werr
-	}
-	if serr != nil {
-		return serr
-	}
 	if err := d.Current(); err != nil {
 		return err
 	}
@@ -175,4 +156,114 @@ func syncDir(r *os.Root) {
 		_ = f.Sync() // best effort, as on platforms where directory fsync is unsupported
 		f.Close()
 	}
+}
+
+// MkdirPrivate creates name (mode 0700) inside d, or accepts an existing real directory, and pins it.
+// A symlink, or anything else at that name, is refused.
+func (d *Dir) MkdirPrivate(name string) (*Dir, error) {
+	if err := validName(name); err != nil {
+		return nil, err
+	}
+	if err := d.Current(); err != nil {
+		return nil, err
+	}
+	if err := d.root.Mkdir(name, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return nil, err
+	}
+	li, err := d.root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !li.IsDir() {
+		return nil, fmt.Errorf("%w: %s is not a directory", ErrUnsafe, name)
+	}
+	return OpenDir(filepath.Join(d.path, name))
+}
+
+// Identity is what Replace requires the current file to still be; nil means "must not exist yet".
+type Identity struct {
+	info fs.FileInfo
+	body []byte
+}
+
+// Snapshot records name's identity and content for a later Replace (the usage_guard prior check).
+func (d *Dir) Snapshot(name string, max int64) (*Identity, error) {
+	body, err := d.ReadRegular(name, max)
+	if err != nil {
+		return nil, err
+	}
+	li, err := d.root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	return &Identity{info: li, body: body}, nil
+}
+
+// Replace atomically renames a fully written 0600 temp file over name, but only if name still matches
+// prior (same inode, size, mtime and bytes), or is still absent when prior is nil.
+func (d *Dir) Replace(name string, body []byte, prior *Identity) error {
+	if err := validName(name); err != nil {
+		return err
+	}
+	tmp, written, err := d.stage(body)
+	if err != nil {
+		return err
+	}
+	defer d.root.Remove(tmp)
+	if err := d.Current(); err != nil {
+		return err
+	}
+	li, lerr := d.root.Lstat(name)
+	switch {
+	case prior == nil && lerr == nil:
+		return fmt.Errorf("%w: %s", ErrExists, name)
+	case prior == nil && !errors.Is(lerr, fs.ErrNotExist):
+		return lerr
+	case prior != nil:
+		if lerr != nil || !os.SameFile(li, prior.info) || li.Size() != prior.info.Size() || !li.ModTime().Equal(prior.info.ModTime()) {
+			return fmt.Errorf("%w: %s changed since it was read", ErrChanged, name)
+		}
+		now, err := d.ReadRegular(name, int64(len(prior.body)))
+		if err != nil || !bytes.Equal(now, prior.body) {
+			return fmt.Errorf("%w: %s changed since it was read", ErrChanged, name)
+		}
+	}
+	if err := d.root.Rename(tmp, name); err != nil {
+		return err
+	}
+	syncDir(d.root)
+	visible, err := d.root.Lstat(name)
+	if err != nil || !os.SameFile(visible, written) {
+		return fmt.Errorf("%w: replaced %s is not the written file", ErrChanged, name)
+	}
+	return d.Current()
+}
+
+// stage writes body to a new private temp file and returns its name and identity.
+func (d *Dir) stage(body []byte) (string, fs.FileInfo, error) {
+	var rnd [16]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return "", nil, err
+	}
+	tmp := ".stage-" + hex.EncodeToString(rnd[:])
+	f, err := d.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", nil, err
+	}
+	_, werr := f.Write(body)
+	if werr == nil {
+		werr = f.Sync()
+	}
+	fi, serr := f.Stat()
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = serr
+	}
+	if werr != nil {
+		d.root.Remove(tmp)
+		return "", nil, werr
+	}
+	return tmp, fi, nil
 }
