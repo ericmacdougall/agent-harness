@@ -590,9 +590,13 @@ class Workflow:
         return {**value, "current_head": current}
 
 
-def gh(*args, timeout=30):
+def gh(*args, timeout=30, stderr_limit=0):
     env = git_environment()
     env.update({"GH_PROMPT_DISABLED": "1", "GH_HOST": "github.com", "GIT_TERMINAL_PROMPT": "0"})
+    if stderr_limit:
+        # Mutating calls (pr create) classify launch, budget and mid-run errors themselves, so
+        # raw exceptions propagate and the result is (code, stdout, bounded stderr).
+        return bounded_with_stderr(["gh", *args], env=env, timeout=min(timeout, 30), stderr_limit=stderr_limit)
     try:
         return bounded(["gh", *args], env=env, timeout=min(timeout, 30))
     except OSError:
@@ -884,12 +888,10 @@ def prepare_pr(flow, title, body):
             os.fsync(handle.fileno())
         flow.save(phase="PR_CREATING")
         try:
-            env = git_environment()
-            env.update({"GH_PROMPT_DISABLED": "1", "GH_HOST": "github.com", "GIT_TERMINAL_PROMPT": "0"})
-            code, _, error_text = bounded_with_stderr(
-                ["gh", "pr", "create", "-R", flow.state["repository"], "--head", flow.state["source_branch"],
-                 "--base", flow.branch, "--draft", "--title", title, "--body-file", str(staged)],
-                env=env, timeout=min(flow.args.timeout, 30), stderr_limit=GH_STDERR_LIMIT)
+            code, _, error_text = gh("pr", "create", "-R", flow.state["repository"],
+                                     "--head", flow.state["source_branch"], "--base", flow.branch, "--draft",
+                                     "--title", title, "--body-file", str(staged),
+                                     timeout=flow.args.timeout, stderr_limit=GH_STDERR_LIMIT)
         except (FileNotFoundError, PermissionError) as launch:
             if launch.filename != "gh":
                 flow.save(phase="REMOTE_UNCERTAIN")
