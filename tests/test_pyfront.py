@@ -87,11 +87,11 @@ class Dispatch(unittest.TestCase):
         self.home = self.root / "home"
         (self.home / ".agent-harness").mkdir(parents=True)
         self.binary = self.root / "bin" / "harness"
-        self.binary.parent.mkdir()
+        self.binary.parent.mkdir(mode=0o700)  # an umask-002 default (0775) fails the ancestor check
         self.binary.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"; echo \"marker=$AGENT_HARNESS_DISPATCHED\"\n")
         self.binary.chmod(0o700)
         self.helper = self.root / "hooks" / "wal.py"
-        self.helper.parent.mkdir()
+        self.helper.parent.mkdir(mode=0o700)
         self.helper.write_text(
             "import sys\nsys.path.insert(0, sys.argv[1])\nimport frontdoor\n"
             "frontdoor.dispatch('wal', 'claude', sys.argv[2], __file__, 'hook', sys.argv[3:], hook=True)\n"
