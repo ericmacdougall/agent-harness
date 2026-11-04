@@ -9,12 +9,12 @@ Threat model: a careless or hallucinating agent, not a hostile one. An agent tha
 | Source | Resolves when | Label |
 | --- | --- | --- |
 | `user:<session-uuid>/<message-uuid> "excerpt"` | the transcript `~/.claude/projects/*/<session>.jsonl` has a record whose `uuid` matches, that is human-authored, and whose typed text contains the excerpt | USER |
-| `ticket:GoodQA <project>#<n> [comment <id>]` | syntax is valid. No network call: it is `deferred` (an unverified citation) unless `~/.agent-harness/provenance/tickets.json` lists it, which main does with `provenance.py cache-ticket` after checking the tracker | TICKET |
+| `ticket:GoodQA <project>#<n> [comment <id>]` | syntax is valid and the ticket exists. A hit in `~/.agent-harness/provenance/tickets.json` is trusted; otherwise one GoodQA lookup runs through the harness ticket adapter (4 s deadline, one attempt) and a found ticket is cached. A ticket the tracker reports missing is refused (`ticket-missing`) when `ticket_lookup` is `enforce`; if the tracker is unreachable or the project is not visible to the credential, the cite is accepted with a warning and marked `unverified` (an outage never blocks work). `ticket_lookup` `warn` never refuses a missing ticket and `off` skips the lookup (cites then count as unverified). `provenance.py cache-ticket` records a ticket main checked by hand | TICKET |
 | `wal:<path>#<id>` or `#L<line>` | the WAL entry exists under `~/.claude/wals`, and its own `source` resolves (cycles and depth over 8 are rejected) | label of the end of the chain |
 | `file:<path>:<line>[-<end>]@<sha> ["excerpt"]` | `git cat-file blob <sha>:<path>` has those lines (and the excerpt) | FILE |
 | `inferred: from <src> ; <src> -- <rationale>` | at least one input is a grounded non-inferred source, every input resolves, and the rationale has 10+ characters | ASSUMPTION |
 
-Unverified citations (a deferred ticket, a `file:` line with no excerpt) are accepted in specs with a warning, are refused for `requirement` and `ask` events, never count as the grounded input of an `inferred:` source, and are listed apart in the asks ledger.
+Unverified citations (a ticket cite when `ticket_lookup` is off, a `file:` line with no excerpt) are accepted in specs with a warning, are refused for `requirement` and `ask` events (a ticket the tracker could not be reached for is only warned about), never count as the grounded input of an `inferred:` source, and are listed apart in the asks ledger.
 
 Quote excerpts with `"` (escape inner `"` as `\"`) or smart quotes. `...` joins up to 3 ordered segments of 8+ characters each.
 

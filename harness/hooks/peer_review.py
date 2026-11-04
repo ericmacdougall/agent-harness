@@ -755,6 +755,12 @@ def packet_provenance_gate(content):
     try:
         return provenance.packet_gate(text)
     except Exception as error:
+        try:
+            enforcing = provenance.load_policy().get('plan_packet') == 'enforce'
+        except Exception:
+            enforcing = False
+        if enforcing:  # a broken gate must not silently pass when the policy says enforce
+            return 2, f'provenance: packet check could not run ({type(error).__name__}); enforce mode stops here'
         return 0, f'provenance: packet check could not run ({type(error).__name__}); continuing'
 
 

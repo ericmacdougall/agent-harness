@@ -42,7 +42,7 @@ EXCERPT_MIN, EXCERPT_MAX, EXCERPT_SEGMENTS = 12, 300, 3
 RATIONALE_MIN = 10
 MODES = ("off", "warn", "enforce")
 DEFAULT_POLICY = {
-    "schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce", "stop_lint": "warn",
+    "schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce", "stop_lint": "warn", "ticket_lookup": "enforce",
     "wal": {"requirement": "enforce", "ask": "enforce", "blocker": "warn", "scope": "warn", "decision": "warn"},
 }
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,40}$")
@@ -106,7 +106,7 @@ def load_policy(path=None) -> dict:
         loaded = loads_line(read_small(path, 1 << 16))
         if not isinstance(loaded, dict) or loaded.get("schema") != 1:
             raise ValueError("not a schema 1 provenance policy")
-        for key in ("spec", "plan_packet", "ask_user_question", "stop_lint"):
+        for key in ("spec", "plan_packet", "ask_user_question", "stop_lint", "ticket_lookup"):
             if loaded.get(key) in MODES:
                 policy[key] = loaded[key]
         if isinstance(loaded.get("wal"), dict):
@@ -143,23 +143,50 @@ NOT_USER_TAGS = ("agent-message", "task-notification", "system-reminder", "paste
                  "artifact-content-authored-by-others", "ide_opened_file", "ide_selection", "browser_instruction",
                  "user-prompt-submit-hook", "teammate-message", "command-stdout")
 _TAGS = "|".join(re.escape(tag) for tag in NOT_USER_TAGS)
-_INNER = re.compile(r"<(" + _TAGS + r")\b[^>]*>(?:(?!<(?:" + _TAGS + r")\b[^>]*>).)*?</\1\s*>", re.S | re.I)
-_OPEN = re.compile(r"<(?:" + _TAGS + r")\b[^>]*>", re.I)
+_TAG_TOKEN = re.compile(r"<(/?)(" + _TAGS + r")\b[^<>]{0,300}>", re.I)
 _WRAPPER = re.compile(r"^\s*<([A-Za-z][\w:-]*)\b[^>]*>.*</\1\s*>\s*$", re.S)
 SENTINEL = "\ufffc"  # replaces a removed block so an excerpt cannot span text on both sides of it
 
 
 def strip_blocks(text: str) -> str:
-    """Remove every non-user-authored block; an unclosed opener removes the rest of the text."""
+    """Remove every non-user-authored block; an unclosed opener removes the rest of the text.
+    Linear: one pass over the tags with a stack (the earlier nested-regex form was quadratic on many openers)."""
     if len(text) > MAX_TEXT:
-        text = text[:MAX_TEXT] + SENTINEL  # bound regex work on absurdly long turns
-    for _ in range(100):
-        new = _INNER.sub(SENTINEL, text)
-        if new == text:
+        text = text[:MAX_TEXT] + SENTINEL  # bound the work on absurdly long turns
+    stack, spans = [], []  # open tags awaiting a close; closed top-level (start, end) blocks
+    by_name = {}  # tag name -> indexes into `stack`, so a close finds its opener in O(1)
+    for tag in _TAG_TOKEN.finditer(text):
+        name = tag.group(2).lower()
+        if not tag.group(1):
+            by_name.setdefault(name, []).append(len(stack))
+            stack.append((name, tag.start()))
+            continue
+        positions = by_name.get(name)
+        if not positions:
+            continue  # a close with no opener is plain text
+        index = positions[-1]
+        start = stack[index][1]
+        del stack[index:]  # openers inside this block go with it
+        for other in by_name.values():
+            while other and other[-1] >= index:
+                other.pop()
+        while spans and spans[-1][0] >= start:
+            spans.pop()
+        spans.append((start, tag.end()))
+    cut = stack[0][1] if stack else None  # an unclosed opener hides everything after it
+    out, pos = [], 0
+    for start, end in spans:
+        if cut is not None and start >= cut:
             break
-        text = new
-    opener = _OPEN.search(text)
-    return text[:opener.start()] + SENTINEL if opener else text
+        out.append(text[pos:start])
+        out.append(SENTINEL)
+        pos = end
+    if cut is not None:
+        out.append(text[pos:cut])
+        out.append(SENTINEL)
+    else:
+        out.append(text[pos:])
+    return "".join(out)
 
 
 # --------------------------------------------------------------------------- parsing
@@ -569,7 +596,7 @@ def resolve(source: str, ctx=None, depth: int = 0, seen=()) -> dict:
     """Resolve one Source. Never raises: the result says ok, why not, and the chain to the origin."""
     ctx = ctx if ctx is not None else {}
     result = {"source": clip(source, 200), "kind": None, "ok": False, "assumption": False, "origin": None,
-              "deferred": False, "weak": False, "problems": [], "chain": [], "inputs": []}
+              "deferred": False, "weak": False, "weak_reasons": [], "problems": [], "chain": [], "inputs": []}
     ctx["_resolves"] = ctx.get("_resolves", 0) + 1
     try:
         if ctx["_resolves"] > MAX_RESOLVES:
@@ -586,12 +613,86 @@ def resolve(source: str, ctx=None, depth: int = 0, seen=()) -> dict:
 
 
 def weak_problem(result: dict):
-    """Message when a resolved source is only a syntax-level citation; asks and requirements refuse these."""
-    if result.get("ok") and result.get("weak"):
-        return ("source is an unverified citation (ticket not in the local cache, or file line without an excerpt); "
-                "cite the user's words or a sourced WAL entry, add a file excerpt, or have main run "
+    """Message when a resolved source is only a syntax-level citation; asks and requirements refuse these.
+    A ticket that could not be checked because the tracker was unreachable is not refused (an outage must not
+    stop work): it stays marked unverified and callers warn."""
+    reasons = set(result.get("weak_reasons") or [])
+    if result.get("ok") and result.get("weak") and (reasons - {"ticket-unreachable"} or not reasons):
+        return ("source is an unverified citation (ticket lookup is off or not in the local cache, or a file line without an "
+                "excerpt); cite the user's words or a sourced WAL entry, add a file excerpt, or have main run "
                 "`provenance.py cache-ticket` after checking the ticket")
     return None
+
+
+def unreachable_warning(result: dict):
+    if result.get("ok") and "ticket-unreachable" in (result.get("weak_reasons") or []):
+        return "ticket could not be verified (tracker unreachable or out of scope): marked unverified"
+    return None
+
+
+# --------------------------------------------------------------------------- ticket lookup (bounded, cached)
+
+TICKET_TIMEOUT = 4.0
+_TICKET_MEMO = {}
+
+
+def store_ticket(project: str, number: int, title: str, checked_by: str) -> None:
+    cache_path = ticket_cache_path()
+    cache_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    data = ticket_cache()
+    data[f"{project}#{number}"] = {"title": clip(title, 160), "checked_by": clip(checked_by, 60)}
+    tmp = cache_path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    os.replace(tmp, cache_path)
+
+
+def lookup_ticket(project: str, number: int):
+    """('found', title) | ('missing', None) | ('unreachable', reason). Uses the harness ticket adapter with a
+    hard deadline of TICKET_TIMEOUT seconds and one attempt; never raises."""
+    try:
+        import spec_flow
+        import ticket_adapters as ta
+        spec_policy = spec_flow.load_spec_policy()
+        _, _, config = spec_flow.ticket_config(spec_policy)
+        adapter = spec_flow.make_adapter(config, spec_policy, project, time.monotonic() + TICKET_TIMEOUT)
+        adapter.timeout, adapter.attempts = min(float(adapter.timeout), TICKET_TIMEOUT), 1
+        try:
+            ticket = adapter.lookup(project, number)
+        except ta.TicketOutOfScope:
+            return "unreachable", "project not visible to this credential"
+        return ("missing", None) if ticket is None else ("found", str(getattr(ticket, "title", "") or ""))
+    except BaseException as error:  # anything else is "could not check", never a crash or a guess
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        return "unreachable", type(error).__name__
+
+
+TICKET_LOOKUP = lookup_ticket  # tests replace this
+
+
+def check_ticket(project: str, number: int):
+    """('found', title) | ('missing', None) | ('unreachable', why) | ('unknown', None). A positive answer is cached
+    on disk; an answer is remembered for this process so one claim never waits twice."""
+    mode = os.environ.get("HARNESS_PROVENANCE_TICKET_LOOKUP") or load_policy().get("ticket_lookup", "enforce")
+    if mode not in MODES:
+        mode = "enforce"
+    if mode == "off":
+        return "unknown", None
+    key = (project, number)
+    now = time.monotonic()
+    memo = _TICKET_MEMO.get(key)
+    if memo and now - memo[0] < 60:
+        return memo[1]
+    outcome = TICKET_LOOKUP(project, number)
+    if outcome[0] == "found":
+        try:
+            store_ticket(project, number, outcome[1] or "", "goodqa-lookup")
+        except OSError:
+            pass
+    if outcome[0] == "missing" and mode == "warn":
+        outcome = ("unreachable", "missing (warn mode)")
+    _TICKET_MEMO[key] = (now, outcome)
+    return outcome
 
 
 def label_of(result: dict) -> str:
@@ -621,17 +722,24 @@ def _resolve(source, ctx, depth, seen, result):
     elif kind == "ticket":
         key = f"{parsed['project']}#{parsed['number']}"
         cached = ticket_cache(home).get(key)
+        state, detail = ("cache", None) if cached else check_ticket(parsed["project"], parsed["number"])
+        if state == "missing":
+            raise Problem("ticket-missing", f"GoodQA {key} does not exist (the tracker answered not found)")
         node = {"kind": "ticket", "ref": f"GoodQA {key}", "comment": parsed["comment"],
-                "status": "verified" if cached else "deferred"}
-        if isinstance(cached, dict) and cached.get("title"):
-            node["title"] = clip(cached["title"], 120)
+                "status": "verified" if state in ("cache", "found") else "unverified"}
+        title = (cached or {}).get("title") if isinstance(cached, dict) else detail if state == "found" else None
+        if title:
+            node["title"] = clip(title, 120)
         result["chain"].append(node)
-        result["origin"], result["ok"], result["deferred"] = "ticket", True, not cached
-        result["weak"] = not cached  # syntax only: nothing proves the ticket exists
+        result["origin"], result["ok"] = "ticket", True
+        if state not in ("cache", "found"):
+            result["deferred"], result["weak"] = True, True
+            result["weak_reasons"] = ["ticket-unreachable" if state == "unreachable" else "ticket-unverified"]
     elif kind == "file":
         repo = Path(ctx.get("repo") or os.environ.get("HARNESS_PROVENANCE_REPO") or os.getcwd())
         text = git_line(repo, parsed["sha"], parsed["path"], parsed["line"], parsed["line_end"])
         result["weak"] = parsed["excerpt"] is None  # a bare line number proves the line exists, not what it says
+        result["weak_reasons"] = ["file-no-excerpt"] if result["weak"] else []
         if parsed["excerpt"] is not None:
             reason = excerpt_in(text, parsed["excerpt"])
             if reason:
@@ -662,7 +770,7 @@ def _resolve(source, ctx, depth, seen, result):
         result["problems"].extend(sub["problems"])
         result["assumption"] = sub["assumption"]
         result["origin"], result["ok"], result["deferred"] = sub["origin"], sub["ok"], sub["deferred"]
-        result["weak"] = sub["weak"]
+        result["weak"], result["weak_reasons"] = sub["weak"], list(sub["weak_reasons"])
     elif kind == "inferred":
         grounded = 0
         result["assumption"] = True
@@ -687,6 +795,7 @@ def _resolve(source, ctx, depth, seen, result):
         result["ok"] = not result["problems"]
         result["deferred"] = any(sub["deferred"] for sub in result["inputs"])
         result["weak"] = any(sub["weak"] for sub in result["inputs"])
+        result["weak_reasons"] = sorted({r for sub in result["inputs"] for r in sub["weak_reasons"]})
     result["ok"] = bool(result["ok"]) and not result["problems"]
 
 
@@ -1051,13 +1160,7 @@ def main(argv=None) -> int:
             found = re.match(r"^GoodQA\s+([A-Za-z0-9_.-]{1,80})#(\d{1,9})$", args.ref.strip())
             if not found:
                 raise Problem("bad-syntax", "--ref must look like `GoodQA <project>#<n>`")
-            cache_path = ticket_cache_path()
-            cache_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            data = ticket_cache()
-            data[f"{found.group(1)}#{found.group(2)}"] = {"title": clip(args.title, 160), "checked_by": clip(args.checked_by, 60)}
-            tmp = cache_path.with_suffix(f".{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
-            os.replace(tmp, cache_path)
+            store_ticket(found.group(1), int(found.group(2)), args.title, args.checked_by)
             print(f"cached {args.ref}")
             return 0
         if args.command == "asks":

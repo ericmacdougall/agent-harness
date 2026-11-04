@@ -21,6 +21,7 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
+os.environ.setdefault("HARNESS_PROVENANCE_TICKET_LOOKUP", "off")  # specs cite tickets; never call the tracker from tests
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import commit_policy as cp  # noqa: E402

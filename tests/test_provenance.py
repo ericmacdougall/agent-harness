@@ -370,18 +370,82 @@ class RedTeamFixes(Env):
         self.reject(self.user(ide, "selected code lines here"), "excerpt-not-found")
 
     def test_f2_unverified_citations_do_not_satisfy_asks(self):
-        weak = provenance.resolve("ticket:GoodQA nonexistent#99999")
-        self.assertTrue(weak["ok"] and weak["weak"])
+        off = self.home / "policy-off.json"
+        off.write_text(json.dumps({"schema": 1, "spec": "enforce", "plan_packet": "warn", "ticket_lookup": "off",
+                                   "wal": {"requirement": "enforce", "ask": "enforce"}}))
+        env = dict(os.environ, HOME=str(self.home), HARNESS_PROVENANCE_POLICY=str(off))
+        with mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_POLICY": str(off)}):
+            weak = provenance.resolve("ticket:GoodQA nonexistent#99999")
+            self.assertTrue(weak["ok"] and weak["weak"])
+            self.assertTrue(provenance.weak_problem(weak))
         out = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "ask", "--note", "n",
                               "--reason", "needed for deploy", "--source", "ticket:GoodQA nonexistent#99999"],
-                             capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))
+                             capture_output=True, text=True, env=env)
         self.assertEqual(out.returncode, 2, out.stdout)
         self.assertIn("unverified citation", out.stderr)
-        cli = lambda *a: subprocess.run([sys.executable, str(HOOKS / "provenance.py"), *a], capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))  # noqa: E731
+        cli = lambda *a: subprocess.run([sys.executable, str(HOOKS / "provenance.py"), *a], capture_output=True, text=True, env=env)  # noqa: E731
         self.assertEqual(cli("cache-ticket", "--ref", "GoodQA nonexistent#99999", "--title", "T", "--checked-by", "main").returncode, 0)
-        self.assertFalse(provenance.resolve("ticket:GoodQA nonexistent#99999")["weak"])
+        with mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_POLICY": str(off)}):
+            self.assertFalse(provenance.resolve("ticket:GoodQA nonexistent#99999")["weak"])
         sha = "a" * 40
         self.assertTrue(provenance.resolve(f"file:x.md:1@{sha}", {"repo": str(self.home)})["problems"])  # no repo: rejected, never weak-ok
+
+    def test_m1_ticket_lookup_found_missing_unreachable(self):
+        calls = []
+
+        def fake(outcome):
+            def lookup(project, number):
+                calls.append((project, number))
+                return outcome
+            return lookup
+
+        def fresh(outcome, source="ticket:GoodQA harness#14398"):
+            provenance._TICKET_MEMO.clear()
+            with mock.patch.object(provenance, "TICKET_LOOKUP", fake(outcome)):
+                return provenance.resolve(source)
+
+        found = fresh(("found", "Real title"))  # resolved: verified, cached, not weak
+        self.assertTrue(found["ok"] and not found["weak"] and found["chain"][0]["status"] == "verified", found)
+        self.assertEqual(provenance.ticket_cache()["harness#14398"]["title"], "Real title")
+        calls.clear()
+        provenance._TICKET_MEMO.clear()
+        self.assertTrue(provenance.resolve("ticket:GoodQA harness#14398")["ok"])  # served from the cache: no second lookup
+        self.assertEqual(calls, [])
+        missing = fresh(("missing", None), "ticket:GoodQA harness#99999")  # known missing: refused
+        self.assertFalse(missing["ok"])
+        self.assertEqual(missing["problems"][0]["code"], "ticket-missing")
+        out = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import provenance as p; "
+                              "p.TICKET_LOOKUP = lambda a, b: ('missing', None); import json; "
+                              "print(json.dumps(p.spec_lint(open(sys.argv[1]).read())[0]))" % str(HOOKS),
+                              str(self.write_spec("ticket:GoodQA harness#99999"))],
+                             capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))
+        self.assertIn("ticket-missing", out.stdout)  # spec lint (enforce) refuses a missing ticket cite
+        down = fresh(("unreachable", "URLError"), "ticket:GoodQA harness#7")  # outage: warn and mark unverified, never refuse
+        self.assertTrue(down["ok"] and down["weak"] and down["deferred"], down)
+        self.assertEqual(down["chain"][0]["status"], "unverified")
+        self.assertIsNone(provenance.weak_problem(down))
+        self.assertIn("could not be verified", provenance.unreachable_warning(down))
+        note = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "ask", "--note", "n",
+                               "--reason", "needed for the release", "--source", "ticket:GoodQA harness#7"],
+                              capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))  # real adapter, no credentials
+        self.assertEqual(note.returncode, 0, note.stderr)
+        self.assertIn("could not be verified", note.stderr)
+        warn = self.home / "policy-warn.json"
+        warn.write_text(json.dumps({"schema": 1, "ticket_lookup": "warn"}))
+        with mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_POLICY": str(warn)}):
+            soft = fresh(("missing", None), "ticket:GoodQA harness#99998")
+        self.assertTrue(soft["ok"] and soft["weak"])  # warn mode never refuses a missing ticket
+
+    def test_m1_lookup_is_bounded_and_never_raises(self):
+        start = time.perf_counter()
+        state = provenance.lookup_ticket("harness", 1)  # temp HOME has no credentials: fails fast, offline
+        self.assertEqual(state[0], "unreachable")
+        self.assertLess(time.perf_counter() - start, provenance.TICKET_TIMEOUT + 1.0)
+
+    def write_spec(self, source):
+        path = self.home / "spec-m1.md"
+        path.write_text(SPEC.format(s1=f"Source: {source}", s2=f"Source: {source}"))
+        return path
 
     def test_f4_reviews_section_is_not_an_enforcement_exemption(self):
         text = SPEC.format(s1="", s2="") + "\n## Reviews\n\n- adversarial: x\n"
@@ -457,6 +521,18 @@ class RedTeamFixes(Env):
                 walk(sub)
         walk(result)
         self.assertIn("too-many-sources", codes)
+
+    def test_strip_blocks_is_linear_on_adversarial_tags(self):
+        for text in ("<system-reminder " * 100_000, "<agent-message>" * 130_000, "<agent-message>x</agent-message>" * 60_000,
+                     "<system-reminder>" * 50_000 + "</agent-message>" * 50_000, "<system-reminder>" * (provenance.MAX_TEXT // 17),
+                     "<system-reminder><agent-message>" * 70_000 + "</system-reminder>" * 70_000):
+            start = time.perf_counter()
+            provenance.strip_blocks(text)
+            self.assertLess(time.perf_counter() - start, 1.0, text[:30])
+        self.assertEqual(provenance.strip_blocks("a<AGENT-MESSAGE>x<agent-message>y</agent-message>z</agent-message>b"), "a\ufffcb")
+        self.assertEqual(provenance.strip_blocks("a<system-reminder>never closed"), "a\ufffc")
+        self.assertEqual(provenance.strip_blocks("a</system-reminder>b"), "a</system-reminder>b")
+        self.assertEqual(provenance.strip_blocks("x<system-reminder>1</system-reminder>y<agent-message>2</agent-message>z"), "x\ufffcy\ufffcz")
 
     def test_f11_clip_strips_bidi_and_c1(self):
         self.assertEqual(provenance.clip("a\u202eb\x9bc"), "a b c")

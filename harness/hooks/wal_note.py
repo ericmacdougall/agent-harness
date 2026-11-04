@@ -51,6 +51,8 @@ def provenance_check(event, source):
             return mode, f"source rejected ({first['code']}): {first['message']}", result['assumption']
         if event in ('requirement', 'ask') and provenance.weak_problem(result):
             return mode, provenance.weak_problem(result), result['assumption']
+        if provenance.unreachable_warning(result):  # tracker outage: warn, never refuse
+            return 'warn', provenance.unreachable_warning(result), result['assumption']
         return mode, None, result['assumption']
     except Exception as error:
         return 'enforce' if event in ('requirement', 'ask') else 'warn', f'provenance check failed ({type(error).__name__})', False

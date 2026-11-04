@@ -4,6 +4,7 @@
   "plan_packet": "warn",
   "ask_user_question": "enforce",
   "stop_lint": "warn",
+  "ticket_lookup": "enforce",
   "wal": {
     "requirement": "enforce",
     "ask": "enforce",
