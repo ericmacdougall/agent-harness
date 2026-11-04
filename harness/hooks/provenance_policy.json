@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "spec": "enforce",
+  "plan_packet": "warn",
+  "wal": {
+    "requirement": "enforce",
+    "ask": "enforce",
+    "blocker": "warn",
+    "scope": "warn",
+    "decision": "warn"
+  }
+}

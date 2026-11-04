@@ -745,6 +745,19 @@ def commit_policy_gate(repo, base):
     return (6 if report['status'] == 'UNVERIFIED' else 2), commit_policy.format_report(report)
 
 
+def packet_provenance_gate(content):
+    """Plan packets: AC/NEG/REQ/ASK/DEC lines must cite a verifiable Source (mode in provenance_policy.json)."""
+    try:
+        import provenance
+    except ImportError:
+        return 0, ''
+    text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+    try:
+        return provenance.packet_gate(text)
+    except Exception as error:
+        return 0, f'provenance: packet check could not run ({type(error).__name__}); continuing'
+
+
 def plan_ticket_gate(repo, content):
     """Plan review starts substantive work: in ticket-tracked repos the packet must name its ticket."""
     try:
@@ -837,6 +850,14 @@ def main() -> int:
         evidence.close()
         parser.error('review requires a clean worktree')
     if args.stage == 'plan':
+        prov_code, prov_text = packet_provenance_gate(evidence.content)
+        if prov_text:
+            print(prov_text, file=sys.stderr)
+        if prov_code:
+            target.close()
+            evidence.close()
+            print('Plan review not started: every requirement needs a verifiable Source (provenance.py).', file=sys.stderr)
+            return prov_code
         code, text = plan_ticket_gate(repo, evidence.content)
         if text:
             print(text, file=sys.stderr)

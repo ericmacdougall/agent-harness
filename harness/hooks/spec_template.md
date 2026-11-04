@@ -16,11 +16,11 @@ Sign-off: {signoff}
 
 ## Acceptance criteria
 
-- AC-1: <observable result>. Verify by: <test command or live check>.
+- AC-1: <observable result>. Verify by: <test command or live check>. Source: <user:<session>/<uuid> "verbatim words" | ticket:GoodQA <project>#<n> | wal:<path>#<id> | file:<path>:<line>@<sha> | inferred: from <source> -- <why>>
 
 ## Negative cases
 
-- NEG-1 (AC-1): <input or situation that must be refused or handled>.
+- NEG-1 (AC-1): <input or situation that must be refused or handled>. Source: <as above>
 
 ## Risks
 
