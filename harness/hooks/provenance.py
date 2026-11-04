@@ -35,7 +35,7 @@ EXCERPT_MIN, EXCERPT_MAX, EXCERPT_SEGMENTS = 12, 300, 3
 RATIONALE_MIN = 10
 MODES = ("off", "warn", "enforce")
 DEFAULT_POLICY = {
-    "schema": 1, "spec": "enforce", "plan_packet": "warn",
+    "schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce", "stop_lint": "warn",
     "wal": {"requirement": "enforce", "ask": "enforce", "blocker": "warn", "scope": "warn", "decision": "warn"},
 }
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,40}$")
@@ -52,6 +52,10 @@ class Problem(Exception):
         self.message = message
 
 
+def safe_name(value) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(value or "unknown"))[:120]
+
+
 def clip(value, limit: int = 60) -> str:
     """Short, single-line, control-free text for errors and logs: never echo a whole excerpt."""
     text = re.sub(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]+", " ", str(value))
@@ -60,14 +64,15 @@ def clip(value, limit: int = 60) -> str:
 
 # --------------------------------------------------------------------------- policy
 
-def load_policy(path: Path = POLICY_FILE) -> dict:
+def load_policy(path=None) -> dict:
+    path = Path(path or os.environ.get("HARNESS_PROVENANCE_POLICY") or POLICY_FILE)
     policy = json.loads(json.dumps(DEFAULT_POLICY))
     try:
         with open(path, encoding="utf-8") as handle:
             loaded = json.load(handle)
         if not isinstance(loaded, dict) or loaded.get("schema") != 1:
             raise ValueError("not a schema 1 provenance policy")
-        for key in ("spec", "plan_packet"):
+        for key in ("spec", "plan_packet", "ask_user_question", "stop_lint"):
             if loaded.get(key) in MODES:
                 policy[key] = loaded[key]
         if isinstance(loaded.get("wal"), dict):

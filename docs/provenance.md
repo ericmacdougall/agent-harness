@@ -1,6 +1,6 @@
 # Requirement provenance
 
-Goal: the harness cannot carry or present a requirement, ask, blocker, acceptance criterion or decision whose origin cannot be traced. What is enforced is the ledger edge: nothing enters a spec, a requirement or the asks ledger without a verifiable Source, and lists are rendered from the ledger. Free text an agent types into chat is not intercepted (see Known gaps). Trigger: a status list told the user to supply a key nobody could trace to a user request (GoodQA #14398).
+Goal: the harness cannot carry or present a requirement, ask, blocker, acceptance criterion or decision whose origin cannot be traced. What is enforced: nothing enters a spec, a requirement or the asks ledger without a verifiable Source, lists are rendered from the ledger, and the Stop and AskUserQuestion hooks check that chat asks cite it. Trigger: a status list told the user to supply a key nobody could trace to a user request (GoodQA #14398).
 
 Threat model: a careless or hallucinating agent, not a hostile one. An agent that edits transcripts, `provenance_policy.json` or the hooks can defeat this, as with the other gates. Provenance proves a quote exists in a real user turn; it does not prove the quote supports the claim, so every ask list prints the quoted words next to the claim for a human to judge.
 
@@ -41,11 +41,49 @@ Rollback is `"off"` in `provenance_policy.json`; there is no data migration. New
 
 Asks are WAL events, so they use the existing locked append and per-agent files. `provenance.py asks --session <id>` merges the main and agent WALs and prints four groups: traceable asks, unverified citations (offline ticket or repo-file origin), assumptions to confirm, and BLOCKED untraceable items that must not be shown to the user. A status or ask list for the user is built from that output, never from memory. No Stop-hook that parses the chat was added: free text cannot be matched to ledger entries without false positives and negatives, and a fragile hook that blocks or nags erodes trust. The enforceable edge is the ledger plus the rule that lists are rendered from it.
 
+## Chat and AskUserQuestion hooks
+
+`provenance_hooks.py` closes the original incident path, a plain-chat "needed from you" list.
+
+- `ask-gate` (PreToolUse on `AskUserQuestion`): every question must contain `[ask:<id>]` naming an ask in this session's WALs (main and agents) whose Source still resolves and is not an unverified citation. Otherwise the call is denied with the fix. Policy key `ask_user_question`, default `enforce`.
+- `stop-lint` (Stop): finds user-directed ask items in the final assistant message and requires `[ask:<id>]` or an inline `[src: <source>]` that resolves on each. Policy key `stop_lint`, default `warn`: the user sees a system message and the agent gets the reminder on its next prompt via `prompt` (UserPromptSubmit). In `enforce` it blocks the stop once with the uncited items listed (`stop_hook_active` prevents a loop).
+- `prompt` (UserPromptSubmit): delivers a pending warn-mode reminder once.
+- Every hook fails open on its own errors (stderr note, exit 0). One-line disable: set the policy key to `"off"` (or `HARNESS_PROVENANCE_POLICY=<other json>` for one process), or delete the hook entry.
+
+Detector (conservative): a heading or label such as "What I need from you", "Your call", "Decisions needed", "Waiting on you", "Blocked on you", "Questions for you", "Open questions" makes the bullets under it ask items; a sentence such as "I need you to", "please provide|confirm|send|approve", "can you provide", "waiting on your answer", "tell me if you want", "say if you want", "which one do you want", "wait until you tell me" is an ask item by itself. A negation in the same sentence ("nothing is waiting on you", "I don't need anything from you") cancels it, and fenced code is ignored.
+
+### Calibration (this session, baab765b, last 200 assistant text messages, 2026-11-04)
+
+Labels were assigned by the owner agent (not a second human), after tuning the patterns on the same messages, so treat the numbers as an upper bound. Positive means the message asks something of the user or makes progress depend on the user's reply.
+
+| Set | Messages | Positives | Detector flagged | True positive | False positive | Missed |
+| --- | --- | --- | --- | --- | --- | --- |
+| all 200 | 200 | 19 | 18 | 18 | 0 | 1 |
+| random 50 (seed 20261104) | 50 | 6 | 5 | 5 | 0 | 1 |
+| held out: 10 other sessions | 108 | not labelled | 7 | 6 judged real asks | 1 (a rule statement, pattern since narrowed) | unknown |
+
+False positive rate on the 181 non-ask messages: 0 of 181 (the rule of three gives an upper bound near 2 percent at 95 percent confidence); the held-out set adds one false positive in 108 messages before the pattern fix. Recall on asks phrased as this agent usually phrases them is about 95 percent; asks phrased in other ways are not detected. The earlier version flagged two "nothing is waiting on you" status lines (4 percent of the 50-message sample) until negation handling was added, which is why that handling exists.
+
+Recommendation: `warn` stays the default. The measured false positive rate is under 5 percent, so `enforce` is reasonable once the agent habit of registering asks is in place; the cost of a miss is a single extra turn because the Stop block fires once.
+
+### settings.json entries (not applied by this change; main wires them at integration)
+
+```json
+"PreToolUse": [ { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "python3",
+    "args": ["/Users/eric/.claude/hooks/provenance_hooks.py", "ask-gate"], "timeout": 10 } ] } ],
+"Stop": [ { "hooks": [ { "type": "command", "command": "python3",
+    "args": ["/Users/eric/.claude/hooks/provenance_hooks.py", "stop-lint"], "timeout": 10 } ] } ],
+"UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "python3",
+    "args": ["/Users/eric/.claude/hooks/provenance_hooks.py", "prompt"], "timeout": 10 } ] } ]
+```
+
+Add them as extra groups next to the existing `wal.py` entries. Typical cost on a 75 MB transcript: `stop-lint` about 30 ms, `ask-gate` about 60 ms (interpreter start is about 24 ms of each).
+
 ## Known gaps
 
-- An agent can still type an unsourced request into chat. A deterministic edge would be a PreToolUse hook on `AskUserQuestion` that requires an `[ask:<id>]` naming a traceable ledger entry; it is not included because it needs settings.json wiring that the owner of the installed hooks should approve.
+- The Stop lint only sees asks phrased in the patterns above; other phrasings pass.
 - Provenance proves a quote exists in a user turn, not that it supports the claim.
-- A hostile agent can edit the transcript, the WAL or the policy file.
+- A hostile agent can edit the transcript, the WAL, the hooks or the policy file.
 
 ## Fail-safe behaviour
 

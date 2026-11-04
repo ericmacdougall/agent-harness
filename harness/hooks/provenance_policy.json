@@ -2,6 +2,8 @@
   "schema": 1,
   "spec": "enforce",
   "plan_packet": "warn",
+  "ask_user_question": "enforce",
+  "stop_lint": "warn",
   "wal": {
     "requirement": "enforce",
     "ask": "enforce",
