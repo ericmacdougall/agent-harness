@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -50,6 +51,32 @@ class Budget(unittest.TestCase):
         self.assertEqual(rb.check(text, host="dev2", cap=DEV2), [])
         problems = rb.check(text, host="mac", cap=MAC)
         self.assertTrue(any("peak memory 6 GB exceeds mac headroom" in p for p in problems), problems)
+
+    def test_cli_rejects_fifo_oversize_and_nonutf8_packets_without_hanging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = Path(tmp, "fifo.md")
+            os.mkfifo(fifo)
+            big = Path(tmp, "big.md")
+            big.write_bytes(b"x" * (2 * 1024 * 1024))
+            bad = Path(tmp, "bad.md")
+            bad.write_bytes(b"## Resource budget\n\xff\xfe\n")
+            for packet_path in (fifo, big, bad):
+                started = time.time()
+                done = subprocess.run([sys.executable, str(HOOKS / "resource_budget.py"), "check", "--host", "dev2", "--packet",
+                                       str(packet_path)], capture_output=True, text=True, timeout=20)
+                self.assertEqual(done.returncode, 2, packet_path.name + done.stdout)
+                self.assertLess(time.time() - started, 10)
+
+    def test_agent_gate_config_fifo_keeps_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hooks = Path(tmp, "hooks")
+            hooks.mkdir()
+            for name in ("agent_gate.py", "safe_input.py"):
+                (hooks / name).write_text((HOOKS / name).read_text())
+            os.mkfifo(hooks / "resource_limits.json")
+            out = subprocess.run([sys.executable, "-c", "import agent_gate;print(agent_gate.limits())"], cwd=str(hooks),
+                                 capture_output=True, text=True, timeout=15, env=dict(os.environ, PYTHONPATH=str(hooks)))
+            self.assertEqual(out.stdout.strip(), "(12, 20)")
 
     def test_cli_exit_codes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -175,7 +202,7 @@ class AgentGate(unittest.TestCase):
         home = tempfile.mkdtemp()
         shutil_dir = Path(home, "hooks")
         shutil_dir.mkdir()
-        for name in ("agent_gate.py", "heavy_job_guard.py"):
+        for name in ("agent_gate.py", "heavy_job_guard.py", "safe_input.py"):
             Path(shutil_dir, name).write_text((HOOKS / name).read_text())
         Path(shutil_dir, "resource_limits.json").write_text(json.dumps({"warn_agents": 3, "max_agents": 5}))
         out = subprocess.run([sys.executable, "-c", "import agent_gate;print(agent_gate.limits())"], cwd=str(shutil_dir),

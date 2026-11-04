@@ -36,10 +36,8 @@ import re
 import stat
 import sys
 
-MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
-MAX_JSON_DEPTH = 64
 MAX_COMMAND_CHARS = 1_000_000
-MAX_SCRIPT_BYTES = 256 * 1024
+MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enforce",
                  "build": "enforce", "media": "warn", "fan-out": "warn"}
 CAPPED_RULES = {"browser", "media", "fan-out"}  # memory hogs: hatch alone is not enough
@@ -59,23 +57,15 @@ RULE_HELP = {
 
 # ---------------------------------------------------------------- input safety
 
-def json_depth_ok(raw: str) -> bool:
-    """Reject deeply nested JSON before json.loads: Python 3.9's C scanner can SIGABRT."""
-    if len(raw) > MAX_PAYLOAD_BYTES:
-        return False
-    stripped = re.sub(r'"(?:[^"\\]|\\.)*"', '""', raw)
-    brackets = re.findall(r"[\[\]{}]", stripped)
-    if len(brackets) > 20000:
-        return False
-    depth = 0
-    for ch in brackets:
-        if ch in "[{":
-            depth += 1
-            if depth > MAX_JSON_DEPTH:
-                return False
-        else:
-            depth -= 1
-    return True
+def load_json_file(path: str, max_bytes: int = 64 * 1024):
+    """A small trusted-location config file, still read through safe_input (regular files only, size and depth bounded)."""
+    import safe_input
+    return safe_input.safe_json_loads(safe_input.read_bounded(path, max_bytes), max_depth=20, max_bytes=max_bytes)
+
+
+def parse_payload(data: bytes):
+    import safe_input
+    return safe_input.safe_json_loads(data, max_depth=100, max_bytes=8 * 1024 * 1024)
 
 
 # ---------------------------------------------------------------- shell scanning
@@ -235,9 +225,9 @@ def read_script(path: str, cwd: str):
         # Regular files only: opening a FIFO or /dev/zero-style device would hang or spin the hook.
         if not stat.S_ISREG(os.stat(full).st_mode):
             return None
-        with open(full, "r", errors="replace") as handle:
-            return handle.read(MAX_SCRIPT_BYTES)
-    except (OSError, ValueError):
+        import safe_input
+        return safe_input.read_bounded(full, MAX_SCRIPT_BYTES).decode("utf-8", "replace")
+    except (OSError, ValueError, ImportError, Exception):  # InputRejected (FIFO, device, too large) -> unknown script
         return None
 
 
@@ -557,10 +547,9 @@ def load_modes():
         import json
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
         if os.path.exists(path):
-            with open(path) as handle:
-                for rule, mode in (json.load(handle).get("modes") or {}).items():
-                    if mode in ("enforce", "warn", "off"):
-                        modes[rule] = mode
+            for rule, mode in (load_json_file(path).get("modes") or {}).items():
+                if mode in ("enforce", "warn", "off"):
+                    modes[rule] = mode
     except Exception:
         pass
     override = os.environ.get("HARNESS_HEAVY_GUARD", "")
@@ -649,8 +638,8 @@ def max_heavy_jobs() -> int:
         import json
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource_limits.json")
         if os.path.exists(path):
-            value = int(json.load(open(path)).get("max_heavy_mac", value))
-    except (OSError, ValueError, TypeError):
+            value = int(load_json_file(path).get("max_heavy_mac", value))
+    except Exception:  # incl. safe_input.InputRejected (FIFO, device, oversize): keep defaults
         pass
     return value
 
@@ -703,13 +692,14 @@ def log_hatch_to_wal(payload: dict, decision: dict) -> None:
         log_event({"event": "hatch-wal-failed", "error": type(error).__name__})
 
 
-def run(raw: str) -> int:
+def run(raw: bytes) -> int:
     import json
-    if not json_depth_ok(raw):
-        warn("payload too large or too deeply nested; failing open")
+    try:
+        payload = parse_payload(raw)
+    except ValueError:  # too large, too deeply nested, not UTF-8/JSON: never block Bash over a payload we cannot read
+        warn("payload too large, too deeply nested or malformed; failing open")
         log_event({"event": "fail-open", "reason": "payload-shape"})
         return 0
-    payload = json.loads(raw)
     if not isinstance(payload, dict) or payload.get("tool_name", "Bash") != "Bash":
         return 0
     tool_input = payload.get("tool_input")
@@ -744,7 +734,14 @@ def main() -> int:
     if os.environ.get("HARNESS_HEAVY_GUARD") == "off":
         return 0
     try:
-        return run(sys.stdin.read(MAX_PAYLOAD_BYTES + 1))
+        import safe_input
+        try:
+            raw = safe_input.read_stdin_bounded(8 * 1024 * 1024)
+        except safe_input.InputRejected as rejected:
+            warn(f"stdin rejected ({rejected.code}); failing open")
+            log_event({"event": "fail-open", "reason": rejected.code})
+            return 0
+        return run(raw)
     except Exception as error:  # fail open: a guard bug must never block every Bash call
         warn(f"internal error {type(error).__name__}; failing open")
         log_event({"event": "fail-open", "reason": type(error).__name__})

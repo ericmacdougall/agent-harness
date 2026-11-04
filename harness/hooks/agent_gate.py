@@ -25,16 +25,37 @@ LIVE_WINDOW_S = 600
 RESERVE_TTL_S = 120  # a spawn is reserved here until its `subagent` start record appears (burst safety)
 
 
+def load_json_file(path):
+    import safe_input
+    return safe_input.safe_json_loads(safe_input.read_bounded(path, 64 * 1024), max_depth=20, max_bytes=64 * 1024)
+
+
+def jsonl_records(path):
+    """Parsed WAL records, bounded per line; non-regular files and oversize lines are skipped (fail open)."""
+    import safe_input
+    try:
+        for _number, line in safe_input.iter_jsonl_lines(path, max_line=1024 * 1024, max_total_bytes=64 * 1024 * 1024,
+                                                         max_seconds=5):
+            if line is None:
+                continue
+            try:
+                yield safe_input.safe_json_loads(line, max_depth=20, max_bytes=1024 * 1024)
+            except ValueError:
+                continue
+    except safe_input.InputRejected:
+        return
+
+
 def limits():
     """(warn, deny) thresholds from resource_limits.json; the file wins over code defaults."""
     warn_at, deny_at = DEFAULT_WARN_AGENTS, DEFAULT_MAX_AGENTS
     try:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource_limits.json")
         if os.path.exists(path):
-            data = json.load(open(path))
+            data = load_json_file(path)
             deny_at = int(data.get("max_agents", deny_at))
             warn_at = int(data.get("warn_agents", warn_at))
-    except (OSError, ValueError, TypeError):
+    except Exception:  # incl. safe_input.InputRejected (FIFO, device, oversize): keep defaults
         pass
     env = os.environ.get("HARNESS_MAX_AGENTS", "")
     if env.isdigit() and int(env) > 0:
@@ -52,23 +73,21 @@ def live_agents(wal_dir: str, now: float, window: float = LIVE_WINDOW_S):
     for name in os.listdir(wal_dir):
         path = os.path.join(wal_dir, name)
         if name == "main.jsonl" or (name.startswith("agent-") and name.endswith(".jsonl")):
-            with open(path, "r", errors="replace") as handle:
-                for line in handle:
-                    try:
-                        record = json.loads(line)
-                        at = _ts(record["at"])
-                    except (ValueError, KeyError, TypeError):
-                        continue
-                    if at > now:
-                        break
-                    agent = record.get("agent_id")
-                    if not agent:
-                        continue
-                    if record.get("event") == "subagent":
-                        started.setdefault(agent, at)
-                    elif record.get("event") == "subagent_stop":
-                        stopped.add(agent)
-                    last[agent] = max(last.get(agent, 0), at)
+            for record in jsonl_records(path):
+                try:
+                    at = _ts(record["at"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if at > now:
+                    break
+                agent = record.get("agent_id")
+                if not agent:
+                    continue
+                if record.get("event") == "subagent":
+                    started.setdefault(agent, at)
+                elif record.get("event") == "subagent_stop":
+                    stopped.add(agent)
+                last[agent] = max(last.get(agent, 0), at)
     return sorted(a for a, t in started.items() if a not in stopped and now - last.get(a, t) <= window)
 
 
@@ -76,14 +95,12 @@ def recent_starts(wal_dir: str, now: float, window: float):
     count = 0
     path = os.path.join(wal_dir, "main.jsonl")
     try:
-        with open(path, "r", errors="replace") as handle:
-            for line in handle:
-                try:
-                    record = json.loads(line)
-                    if record.get("event") == "subagent" and now - window <= _ts(record["at"]) <= now:
-                        count += 1
-                except (ValueError, KeyError, TypeError):
-                    continue
+        for record in jsonl_records(path):
+            try:
+                if record.get("event") == "subagent" and now - window <= _ts(record["at"]) <= now:
+                    count += 1
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
     except OSError:
         pass
     return count
@@ -153,12 +170,13 @@ def main() -> int:
     if sys.platform != "darwin" and os.environ.get("HARNESS_HEAVY_GUARD_FORCE") != "1":
         return 0
     try:
-        raw = sys.stdin.read(4 * 1024 * 1024 + 1)
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from heavy_job_guard import json_depth_ok
-        if not json_depth_ok(raw):
-            return 0
-        payload = json.loads(raw)
+        import safe_input
+        try:
+            payload = safe_input.safe_json_loads(safe_input.read_stdin_bounded(8 * 1024 * 1024), max_depth=100,
+                                                 max_bytes=8 * 1024 * 1024)
+        except (safe_input.InputRejected, ValueError):
+            return 0  # fail open
         if not isinstance(payload, dict) or payload.get("tool_name") not in ("Agent", "Task", "Workflow"):
             return 0
         session = payload.get("session_id")

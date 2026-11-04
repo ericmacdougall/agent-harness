@@ -148,16 +148,20 @@ class Classification(unittest.TestCase):
 
     def test_guard_is_a_noop_off_the_mac_and_ssh_dev2_is_allowed_on_it(self):
         import io
-        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "pytest"}, "session_id": "s"})
-        with unittest.mock.patch.object(sys, "platform", "linux"), unittest.mock.patch.dict(
-                os.environ, {"HARNESS_HEAVY_GUARD_FORCE": ""}), unittest.mock.patch.object(sys, "stdin", io.StringIO(payload)):
-            self.assertEqual(guard.main(), 0)  # dev2/Linux: nothing is ever denied
-        with unittest.mock.patch.object(sys, "platform", "darwin"), unittest.mock.patch.object(sys, "stdin", io.StringIO(payload)), \
-                unittest.mock.patch.object(guard, "log_event"), unittest.mock.patch.object(sys, "stderr", io.StringIO()):
-            self.assertEqual(guard.main(), 2)  # the same command on the Mac is denied
-        ssh = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ssh dev2 'cd repo && pytest && npm run build'"}, "session_id": "s"})
-        with unittest.mock.patch.object(sys, "platform", "darwin"), unittest.mock.patch.object(sys, "stdin", io.StringIO(ssh)):
-            self.assertEqual(guard.main(), 0)
+        import safe_input
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "pytest"}, "session_id": "s"}).encode()
+        ssh = json.dumps({"tool_name": "Bash", "session_id": "s",
+                          "tool_input": {"command": "ssh dev2 'cd repo && pytest && npm run build'"}}).encode()
+
+        def run_main(platform, data):
+            with unittest.mock.patch.object(sys, "platform", platform), \
+                    unittest.mock.patch.dict(os.environ, {"HARNESS_HEAVY_GUARD_FORCE": ""}), \
+                    unittest.mock.patch.object(safe_input, "read_stdin_bounded", return_value=data), \
+                    unittest.mock.patch.object(guard, "log_event"), unittest.mock.patch.object(sys, "stderr", io.StringIO()):
+                return guard.main()
+        self.assertEqual(run_main("linux", payload), 0)   # dev2/Linux: nothing is ever denied
+        self.assertEqual(run_main("darwin", payload), 2)  # the same command on the Mac is denied
+        self.assertEqual(run_main("darwin", ssh), 0)      # ...but not when it is sent to dev2
 
     def test_redteam_f1_most_severe_finding_wins(self):
         self.assertEqual(decide("ffmpeg -i a b; npx playwright test")["action"], "deny")
@@ -236,6 +240,26 @@ class HookProcess(unittest.TestCase):
                 done = self.run_hook(raw)
                 self.assertEqual(done.returncode, 0, done.stderr[-300:])
         self.assertIn("failing open", self.run_hook("[" * 200000).stderr)
+
+    def test_safe_input_oversize_nonutf8_and_fifo_inputs_fail_open_quickly(self):
+        env = dict(os.environ, HARNESS_HEAVY_GUARD_FORCE="1", HOME=tempfile.mkdtemp())
+        hook = [sys.executable, str(HOOKS / "heavy_job_guard.py")]
+        for label, data in (("oversize", b'{"tool_name":"Bash","tool_input":{"command":"' + b"a" * (9 * 1024 * 1024) + b'"}}'),
+                            ("non-utf8", b'{"tool_name":"Bash","tool_input":{"command":"pytest \xff\xfe"}}'),
+                            ("nul-and-garbage", b"\x00\x01\x02" * 1000)):
+            started = time.time()
+            done = subprocess.run(hook, input=data, capture_output=True, env=env, timeout=30)
+            self.assertLess(time.time() - started, 10, label)
+            self.assertIn(done.returncode, (0, 2), label)
+            if label != "non-utf8":
+                self.assertEqual(done.returncode, 0, label)
+        with tempfile.TemporaryDirectory() as tmp:  # a FIFO where the config file should be: defaults, no hang
+            fifo = Path(tmp, "resource_limits.json")
+            os.mkfifo(fifo)
+            self.assertEqual(guard.load_modes()["build"], "enforce")
+            started = time.time()
+            self.assertEqual(guard.read_script(str(fifo), tmp), None)
+            self.assertLess(time.time() - started, 3)
 
     def test_internal_error_fails_open(self):
         done = self.run_hook(self.payload("pytest"), extra={"HARNESS_HEAVY_GUARD": "enforce"})

@@ -27,9 +27,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # safe_input lives beside this file
 
 CHECKPOINT_WALL_MIN = 10
 CHECKPOINT_MEM_GB = 4
@@ -285,9 +288,14 @@ def main(argv=None):
         print(json.dumps(dict(capacity(args.host), headroom={k: v for k, v in headroom(capacity(args.host)).items()
                                                             if k != "limits"}), indent=1))
         return 0
-    with open(args.packet) as handle:
-        text = handle.read()
-    cap = json.load(open(args.capacity_json)) if args.capacity_json else None
+    import safe_input
+    try:
+        text = safe_input.read_bounded(args.packet, 1024 * 1024).decode("utf-8", "replace")
+        cap = (safe_input.safe_json_loads(safe_input.read_bounded(args.capacity_json, 64 * 1024), max_depth=10, max_bytes=64 * 1024)
+               if args.capacity_json else None)
+    except (safe_input.InputRejected, ValueError) as error:
+        print(f"REJECTED: cannot read the input safely ({getattr(error, 'code', 'bad-json')})")
+        return 2
     found = check(text, host=args.host, cap=cap)
     problems = [p for p in found if not p.startswith("WARN:")]
     for note in found:
