@@ -28,6 +28,7 @@ GCLOUD_LOG = FAKE_BIN / "gcloud-calls.txt"
 (FAKE_BIN / "gcloud").write_text(
     "#!/bin/sh\n"
     f"echo \"$*\" >> {shlex.quote(str(GCLOUD_LOG))}\n"
+    "[ -z \"$GCLOUD_FAKE_STDERR\" ] || { echo \"$GCLOUD_FAKE_STDERR\" >&2; exit 3; }\n"
     "[ -n \"$GCLOUD_FAKE_KEY\" ] || exit 1\n"
     "printf '%s\\n' \"$GCLOUD_FAKE_KEY\"\n")
 (FAKE_BIN / "gcloud").chmod(0o755)
@@ -918,6 +919,16 @@ class TicketVerification(Fixture):
         adapter.comment(adapter.lookup("goodqa", 14151), "y", "00000000-0000-4000-8000-000000000002")
         self.assertEqual(len(self.fake.posted), 1, "the member key file keeps write access")
         self.assertFalse(GCLOUD_LOG.exists(), "gcloud is not consulted when the key file exists")
+
+    def test_secret_value_never_reaches_reports(self):
+        self.secret_source(None)
+        os.environ["GCLOUD_FAKE_STDERR"] = "leaked-secret-value-123"
+        self.addCleanup(os.environ.pop, "GCLOUD_FAKE_STDERR", None)
+        report = self.check()
+        text = json.dumps(report) + cp.format_report(report)
+        self.assertEqual(report["status"], "UNVERIFIED")
+        self.assertIn("gcloud exit 3", report["tickets"][0]["error"])
+        self.assertNotIn("leaked-secret-value-123", text)
 
     def test_missing_ticket_hint_names_project_qualified_form(self):
         self.fake.issues.clear()

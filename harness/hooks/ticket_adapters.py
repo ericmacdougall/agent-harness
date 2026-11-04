@@ -82,7 +82,7 @@ def read_key(path: str) -> str:
 READ_ONLY_TOOLS = frozenset({"list_orgs", "list_projects", "get_issue_by_number", "get_issue_comments"})
 
 
-def read_secret(spec: dict) -> str:
+def read_secret(spec: dict, timeout: float = 30.0) -> str:
     """Read a Secret Manager value in-process from gcloud's stdout.
 
     The value never appears in argv, the environment or a file, and is never cached on disk.
@@ -94,13 +94,17 @@ def read_secret(spec: dict) -> str:
         raise TicketSystemUnavailable("key_secret needs a valid Secret Manager name and project")
     try:
         result = subprocess.run(["gcloud", "secrets", "versions", "access", "latest", "--secret=" + name,
-                                 "--project=" + project], capture_output=True, timeout=30,
+                                 "--project=" + project], capture_output=True, timeout=max(1.0, min(30.0, timeout)),
                                 stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         raise TicketSystemUnavailable(f"Secret Manager credential {name} could not be read (gcloud)") from None
-    key = result.stdout.decode("utf-8", "replace").strip() if result.returncode == 0 else ""
+    if result.returncode != 0:
+        # gcloud's stderr is never echoed (it may quote the value); the exit code is enough to triage auth/IAM.
+        raise TicketSystemUnavailable(f"Secret Manager credential {name} could not be read (gcloud exit "
+                                      f"{result.returncode}; check gcloud auth and secretAccessor on {project})")
+    key = result.stdout.decode("utf-8", "replace").strip()
     if not key or len(key) > 4096 or any(ch.isspace() for ch in key):
-        raise TicketSystemUnavailable(f"Secret Manager credential {name} could not be read")
+        raise TicketSystemUnavailable(f"Secret Manager credential {name} is empty or malformed")
     return key
 
 
@@ -127,7 +131,7 @@ class GoodQAAdapter:
         path = self.config.get("key_file") or ""
         secret = self.config.get("key_secret")
         if secret and not Path(os.path.expanduser(path)).exists():
-            self._key, self._read_only = read_secret(secret), True
+            self._key, self._read_only = read_secret(secret, self._remaining()), True
         else:
             self._key = read_key(path)
 
