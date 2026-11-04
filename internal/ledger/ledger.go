@@ -38,6 +38,7 @@ const (
 	FakeNowEnv        = "HARNESS_LEDGER_FAKE_NOW_MS"
 	CrashAfterCASEnv  = "HARNESS_LEDGER_TEST_CRASH_AFTER_CAS"
 	LockWaitEnv       = "HARNESS_LEDGER_TEST_LOCK_WAIT_MS"
+	ViewBudgetEnv     = "HARNESS_LEDGER_TEST_VIEW_BUDGET"
 	DirName           = "goodqa"
 	projectsFile      = "projects.json"
 	cacheFile         = "view.cache.json"
@@ -66,7 +67,7 @@ func CheckTestEnv() error {
 	if writer.TestHooksAllowed {
 		return nil
 	}
-	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, writer.FakeMachineIDEnv} {
+	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, ViewBudgetEnv, writer.FakeMachineIDEnv} {
 		if _, ok := os.LookupEnv(k); ok {
 			return wrap(ErrUsage, "%s is a test-only variable, refused by builds without -tags ledgertest", k)
 		}
@@ -337,8 +338,12 @@ func (l *Ledger) classes() (map[string]string, *writer.Map, error) {
 	// already lives under this HOME.
 	out := map[string]string{}
 	var reg map[string]string
+	var mirror *store.Git
 	if l.InRepo {
 		reg = l.registry()
+		if mdir, err := MirrorDir(l.Project); err == nil {
+			mirror = &store.Git{GitDir: mdir}
+		}
 	}
 	for _, e := range m.Writers {
 		if !l.InRepo {
@@ -346,11 +351,30 @@ func (l *Ledger) classes() (map[string]string, *writer.Map, error) {
 			continue
 		}
 		h, ok := reg[e.Writer]
-		if ok && ((e.Restored && e.Lease == "") || h == store.LeaseHash(e.Lease)) {
+		switch {
+		case !ok:
+		case e.Restored && e.Lease == "":
+			// A restored writer never appends again, and its id and lease hash are not secret, so a
+			// planted "restored" entry proves nothing by itself: its ref here must be exactly the ref this
+			// HOME's mirror holds for it.
+			if mirror != nil && l.restoredMatchesMirror(mirror, e.Writer) {
+				out[e.Writer] = fold.ClassSelf
+			}
+		case h == store.LeaseHash(e.Lease):
 			out[e.Writer] = fold.ClassSelf
 		}
 	}
 	return out, m, nil
+}
+
+func (l *Ledger) restoredMatchesMirror(mirror *store.Git, w string) bool {
+	ref := store.RefName(l.Project, w)
+	want, err := mirror.Tip(ref)
+	if err != nil || want == "" {
+		return false
+	}
+	got, err := l.Git.Tip(ref)
+	return err == nil && got == want
 }
 
 type snapshot struct {
@@ -411,22 +435,33 @@ func (l *Ledger) readAll(s *snapshot) (fold.Input, error) {
 	})
 	seen := map[string][]byte{} // op id -> bytes, across refs
 	unfolded := 0
+	viewLeft := store.UnverifiedViewBudget // shared by every unverified ref in this view
+	if v := os.Getenv(ViewBudgetEnv); v != "" && writer.TestHooksAllowed {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			viewLeft = n
+		}
+	}
 	for _, r := range names {
 		proj, w, _ := store.ParseRefName(r)
 		if proj != l.Project {
 			continue
 		}
 		ref := fold.Ref{Writer: w}
-		budget := store.FoldedBudget
+		budget, chain := store.FoldedBudget, store.MaxChain
 		if !folded(r) {
-			if unfolded++; unfolded > MaxUnverifiedRefs {
-				ref.Rejected = fmt.Sprintf("more than %d refs from writers that are not this machine's; not read", MaxUnverifiedRefs)
+			if unfolded++; unfolded > MaxUnverifiedRefs || viewLeft <= 0 {
+				ref.Rejected = fmt.Sprintf("read limit for refs from writers that are not this machine's reached "+
+					"(%d refs or %d MiB per view); not read", MaxUnverifiedRefs, store.UnverifiedViewBudget>>20)
 				in.Refs = append(in.Refs, ref)
 				continue
 			}
-			budget = store.UnverifiedBudget
+			budget, chain = min(store.UnverifiedBudget, viewLeft), store.UnverifiedMaxChain
 		}
-		packs, err := l.Git.ReadRefBudget(proj, w, s.tips[r], budget)
+		allowed := budget
+		packs, err := l.Git.ReadRefBudget(proj, w, s.tips[r], &budget, chain)
+		if !folded(r) {
+			viewLeft -= allowed - budget // what was read, whether or not the ref was then rejected
+		}
 		if err != nil {
 			ref.Rejected = err.Error()
 			in.Refs = append(in.Refs, ref)
@@ -646,16 +681,18 @@ func (l *Ledger) currentWriter(now int64) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	w, lease, minted, err := writer.Resolve(l.Dir, writer.Fingerprint(mid, ino), now)
-	if err != nil || !l.InRepo {
+	var register func(w, lease string) error
+	if l.InRepo {
+		register = l.registerWriter // before writer.json records the new writer
+	}
+	w, lease, minted, err := writer.Resolve(l.Dir, writer.Fingerprint(mid, ino), now, register)
+	if err != nil || !l.InRepo || minted {
 		return w, lease, err
 	}
-	if minted {
-		return w, lease, l.registerWriter(w, lease)
-	}
 	if l.registry()[w] != store.LeaseHash(lease) {
-		return "", "", wrap(ErrRefused, "this checkout's writer %s is not registered in ~/.agent-harness/ledgers/%s: "+
-			"the ledger was not created on this machine (or that directory was removed), so it is not trusted", w, l.Project)
+		return "", "", wrap(ErrRefused, "this checkout's writer %s is not in this account's ledger registry "+
+			"(~/.agent-harness/ledgers/%s/%s): the repository was copied from another account or machine, or "+
+			"that directory was removed, so its ledger is not trusted here", w, l.Project, mirrorWritersFile)
 	}
 	return w, lease, nil
 }

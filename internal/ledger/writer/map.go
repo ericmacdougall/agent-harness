@@ -123,7 +123,11 @@ func newLease() (string, error) {
 
 // Resolve returns the writer for fingerprint fp, minting and saving a new one on a miss. The caller must
 // hold the writer lock. minted reports a new writer.
-func Resolve(dir *safefs.Dir, fp string, now int64) (w string, lease string, minted bool, err error) {
+//
+// register, when not nil, runs for a newly minted writer before writer.json records it: if it fails,
+// nothing is saved and the next call mints again, so a failed registration never leaves a writer that
+// exists here but is unknown to the registry.
+func Resolve(dir *safefs.Dir, fp string, now int64, register func(w, lease string) error) (w string, lease string, minted bool, err error) {
 	m, prior, err := Load(dir)
 	if err != nil {
 		return "", "", false, err
@@ -144,6 +148,11 @@ func Resolve(dir *safefs.Dir, fp string, now int64) (w string, lease string, min
 	lease, err = newLease()
 	if err != nil {
 		return "", "", false, err
+	}
+	if register != nil {
+		if err := register(id, lease); err != nil {
+			return "", "", false, err
+		}
 	}
 	m.Writers[fp] = Entry{Writer: id, Lease: lease, FirstSeen: now}
 	m.Current = id

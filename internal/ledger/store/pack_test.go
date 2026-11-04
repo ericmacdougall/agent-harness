@@ -176,11 +176,22 @@ func TestReadBudgetAndReusedBlob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := g.ReadRefBudget(project, writer, c2, FoldedBudget); err != nil {
+	full := FoldedBudget
+	if _, err := g.ReadRefBudget(project, writer, c2, &full, MaxChain); err != nil {
 		t.Fatalf("control: %v", err)
 	}
-	if _, err := g.ReadRefBudget(project, writer, c2, 300); err == nil || !strings.Contains(err.Error(), "budget") {
+	// The bytes read come off the caller's budget (commits, trees and blobs), so a view can share one.
+	if used := FoldedBudget - full; used < 200 || used > 64*1024 {
+		t.Fatalf("budget charged %d bytes for a two-pack ref", used)
+	}
+	small := int64(300)
+	if _, err := g.ReadRefBudget(project, writer, c2, &small, MaxChain); err == nil || !strings.Contains(err.Error(), "budget") {
 		t.Fatalf("over-budget ref read: %v", err)
+	}
+	// Finding 3: the chain cap is the caller's, so an unverified ref's commit walk can be kept short.
+	chain := FoldedBudget
+	if _, err := g.ReadRefBudget(project, writer, c2, &chain, 1); err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Fatalf("two-commit chain read with a cap of 1: %v", err)
 	}
 	// A commit that reuses c1's tree (and so its ops blob) on top of c1.
 	tree, err := exec.Command("git", "--git-dir="+g.GitDir, "rev-parse", c1+"^{tree}").Output()

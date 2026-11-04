@@ -16,6 +16,7 @@ import (
 	"github.com/ericmacdougall/agent-harness/internal/ledger"
 	"github.com/ericmacdougall/agent-harness/internal/ledger/op"
 	"github.com/ericmacdougall/agent-harness/internal/ledger/store"
+	"github.com/ericmacdougall/agent-harness/internal/ledger/writer"
 )
 
 // ACC-1 (brief section 7 criterion 1): the offline flow in an untracked repo leaves the worktree, branches
@@ -952,13 +953,154 @@ func TestManyPlantedRefsAreCapped(t *testing.T) {
 		t.Fatalf("%v %s", err, out)
 	}
 	st := w.ok(w.repo, nil, "status", "--json")
-	if n := strings.Count(st, "not this machine's; not read"); n != 6 {
+	if n := strings.Count(st, "machine's reached"); n != 6 {
 		t.Fatalf("want 6 refs over the cap, got %d", n)
 	}
 	if got := titles(w.jsonOK(w.repo, nil, "list")); len(got) != 1 || got[0] != "real" {
 		t.Fatalf("list %v", got)
 	}
 	w.newTicket(w.repo, nil, "still writable")
+}
+
+// Finding 3 (delta review): the unverified read budget is shared across the view, so once planted refs
+// have used it the rest are listed as rejected without being read.
+func TestUnverifiedBudgetIsPerView(t *testing.T) {
+	w := newWorld(t)
+	project := w.jsonOK(w.repo, nil, "init", "--slug", "shared")["project"].(string)
+	w.newTicket(w.repo, nil, "real")
+	tip := strings.TrimSpace(w.git(w.repo, "for-each-ref", "--format=%(objectname)", "refs/goodqa/"))
+	var in strings.Builder
+	for i := 0; i < 8; i++ {
+		id, _ := op.NewID(op.PrefixWriter, 1767225600000+int64(i))
+		fmt.Fprintf(&in, "create %s %s\n", store.RefName(project, id), tip)
+	}
+	cmd := exec.Command("git", "update-ref", "--stdin")
+	cmd.Dir, cmd.Env, cmd.Stdin = w.repo, w.env, strings.NewReader(in.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	// The bytes one planted ref makes the ledger read: its commits, trees and blobs.
+	size := 0
+	for _, c := range strings.Fields(w.git(w.repo, "rev-list", tip)) {
+		objs := []string{c, c + "^{tree}"}
+		for _, l := range strings.Split(strings.TrimSpace(w.git(w.repo, "ls-tree", c)), "\n") {
+			if f := strings.Fields(l); len(f) >= 3 && !strings.HasPrefix(f[3], "hlc-") {
+				objs = append(objs, f[2])
+			}
+		}
+		for _, o := range objs {
+			n, _ := strconv.Atoi(strings.TrimSpace(w.git(w.repo, "cat-file", "-s", o)))
+			size += n
+		}
+	}
+	read := func(st string) int { return strings.Count(st, "op project or writer differs") }
+	// The view cache would answer without reading, so drop it before each read.
+	cache := filepath.Join(w.repo, ".git", ledger.DirName, "view.cache.json")
+	// A view budget of one and a half planted refs: the first is read, the other seven are not (refused
+	// from their sizes, or past the limit), though each alone is under the per-ref budget.
+	os.Remove(cache)
+	st := w.ok(w.repo, []string{fmt.Sprintf("%s=%d", ledger.ViewBudgetEnv, size+size/2)}, "status", "--json")
+	if n := read(st); n != 1 {
+		t.Fatalf("want 1 planted ref read under a shared budget of %d bytes, got %d\n%s", size+size/2, n, st)
+	}
+	// Control: with the default budget every planted ref is read (and rejected for its writer mismatch).
+	os.Remove(cache)
+	if n := read(w.ok(w.repo, nil, "status", "--json")); n != 8 {
+		t.Fatalf("control: %d of 8 planted refs read", n)
+	}
+	if got := titles(w.jsonOK(w.repo, nil, "list")); len(got) != 1 || got[0] != "real" {
+		t.Fatalf("list %v", got)
+	}
+}
+
+// Finding 3 (delta review): an unverified ref's commit walk is capped at store.UnverifiedMaxChain commits,
+// so a long planted chain is refused from rev-list alone instead of being walked and read.
+func TestUnverifiedChainCapped(t *testing.T) {
+	w := newWorld(t)
+	project := w.jsonOK(w.repo, nil, "init", "--slug", "chain")["project"].(string)
+	planted, _ := op.NewID(op.PrefixWriter, 1767225600000)
+	var in strings.Builder
+	for i := 0; i <= store.UnverifiedMaxChain; i++ {
+		fmt.Fprintf(&in, "commit %s\ncommitter x <x@x> %d +0000\ndata 0\n\n", store.RefName(project, planted), 1767225600+i)
+	}
+	cmd := exec.Command("git", "fast-import", "--quiet")
+	cmd.Dir, cmd.Env, cmd.Stdin = w.repo, w.env, strings.NewReader(in.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	st := w.ok(w.repo, nil, "status", "--json")
+	if !strings.Contains(st, "chain empty or too long") {
+		t.Fatalf("a %d-commit unverified chain was walked:\n%s", store.UnverifiedMaxChain+1, st)
+	}
+	w.newTicket(w.repo, nil, "still writable")
+}
+
+// Finding 1 (delta review): a restored writer entry is self only while its ref in the repository matches
+// this HOME's mirror, so a writer.json entry naming a registered writer cannot vouch for a forged ref.
+// Finding 4: a ref the mirror lacks does not block init --from-mirror.
+func TestRestoredWriterTiedToHomeMirror(t *testing.T) {
+	w := newWorld(t)
+	project := w.jsonOK(w.repo, nil, "init", "--slug", "tied")["project"].(string)
+	for i := 0; i < 3; i++ {
+		w.newTicket(w.repo, nil, fmt.Sprintf("t%d", i))
+	}
+	old := w.ownRefs()[0]
+	tip := strings.TrimSpace(w.git(w.repo, "rev-parse", old))
+	os.RemoveAll(filepath.Join(w.repo, ".git"))
+	w.git(w.repo, "init", "-q")
+	// An extra ref (a collaborator's, or planted) is already in the fresh repository.
+	stray, _ := op.NewID(op.PrefixWriter, 1767225600000)
+	w.git(w.repo, "fetch", "-q", filepath.Join(w.home, ".agent-harness", "ledgers", project, "mirror.git"),
+		"+"+old+":"+store.RefName(project, stray))
+	w.ok(w.repo, nil, "init", "--from-mirror", "--slug", "tied")
+	if got := titles(w.jsonOK(w.repo, nil, "list")); len(got) != 3 {
+		t.Fatalf("restored list %v", got)
+	}
+	_, oldWriter, _ := store.ParseRefName(old)
+	classOf := func() string {
+		var st struct {
+			Writers []struct{ ID, Class string }
+		}
+		if err := json.Unmarshal([]byte(w.ok(w.repo, nil, "status", "--json")), &st); err != nil {
+			t.Fatal(err)
+		}
+		for _, x := range st.Writers {
+			if x.ID == oldWriter {
+				return x.Class
+			}
+		}
+		return ""
+	}
+	if c := classOf(); c != "self" {
+		t.Fatalf("control: restored writer is %q, want self", c)
+	}
+	// Move the restored writer's ref off the mirror's tip (a truncated chain stands in for a forged one).
+	// Its ops (the project root among them) then stop folding, so the ledger refuses rather than trusting it.
+	w.git(w.repo, "update-ref", old, tip+"~1", tip)
+	if r := w.run(w.repo, nil, "tickets", "status", "--json"); r.code != 3 || strings.Contains(r.stdout, `"class":"self"`) {
+		t.Fatalf("a restored writer whose ref differs from this HOME's mirror is still trusted: exit %d %s", r.code, r.stdout)
+	}
+}
+
+// Finding 2 (delta review): a writer is registered before writer.json records it, so a registration that
+// fails leaves nothing behind and the next command mints and registers again.
+func TestFailedRegistrationIsRetried(t *testing.T) {
+	w := newWorld(t)
+	project := w.jsonOK(w.repo, nil, "init", "--slug", "retry")["project"].(string)
+	reg := filepath.Join(w.home, ".agent-harness", "ledgers", project)
+	other := []string{writer.FakeMachineIDEnv + "=machine-B"} // a new fingerprint mints a new writer
+	if err := os.Chmod(reg, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	r := w.run(w.repo, other, "tickets", "new", "--title", "blocked", "--json")
+	os.Chmod(reg, 0o700)
+	if r.code == 0 {
+		t.Fatal("control: a write succeeded although the registry could not be updated")
+	}
+	w.newTicket(w.repo, other, "after the registry is writable again")
+	if got := titles(w.jsonOK(w.repo, other, "list")); len(got) != 1 {
+		t.Fatalf("list %v", got)
+	}
 }
 
 // RT-3: a repository-local url.*.insteadOf that rewrites the mirror path to a network URL or another local

@@ -230,3 +230,25 @@ func TestHandlesUniqueAndAtLeast8(t *testing.T) {
 		t.Fatalf("%+v", ts)
 	}
 }
+
+// Labels come out in identity order whatever the map iteration order: a ticket with many labels folds to
+// the same bytes on every run (Go randomizes map order, so 50 folds of 12 labels expose any reliance on it).
+func TestLabelsSortedDeterministically(t *testing.T) {
+	b, rootID := newBuilder(t)
+	me := writer(t)
+	ops := []*op.Op{b.mk(me, op.KindProjectCreate, "", base, op.ProjectCreate("p", "p", op.DefaultStatuses), rootID)}
+	c := b.mk(me, op.KindTicketCreate, "new", base+1000, op.TicketCreate("t", "", "task", "low", nil, "todo", "unstarted"), "")
+	ops = append(ops, c)
+	names := []string{"lima", "alpha", "kilo", "delta", "juliet", "bravo", "india", "echo", "hotel", "charlie", "golf", "foxtrot"}
+	for i, n := range names {
+		ops = append(ops, b.mk(me, op.KindLabelAdd, c.Ticket, base+2000+int64(i), op.Label(n), ""))
+	}
+	in := Input{Project: b.project, Classes: map[string]string{me: ClassSelf}, Refs: []Ref{{Writer: me, Ops: ops}}}
+	want := `["alpha","bravo","charlie","delta","echo","foxtrot","golf","hotel","india","juliet","kilo","lima"]`
+	for i := 0; i < 50; i++ {
+		got, _ := json.Marshal(Fold(in).Tickets[0].Labels)
+		if string(got) != want {
+			t.Fatalf("run %d: labels %s", i, got)
+		}
+	}
+}

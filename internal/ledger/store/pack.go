@@ -253,8 +253,12 @@ func parseTree(body []byte, n int) ([]treeEntry, error) {
 	return out, nil
 }
 
-// MaxChain bounds the commits read from one writer ref.
-const MaxChain = 100000
+// MaxChain bounds the commits read from one folded writer ref; UnverifiedMaxChain bounds those read from
+// a ref anyone who can write the repository could have planted, so its commit walk stays cheap.
+const (
+	MaxChain           = 100000
+	UnverifiedMaxChain = 4096
+)
 
 // Read budgets: the bytes of commits, trees and blobs one writer ref may make the ledger read. A folded
 // (self) ref gets room for years of use; a ref from an unverified or blocked writer, which anyone who can
@@ -262,21 +266,28 @@ const MaxChain = 100000
 const (
 	FoldedBudget     = int64(1) << 30
 	UnverifiedBudget = int64(16) << 20
+	// UnverifiedViewBudget is shared by all unverified refs in one view, so many planted refs together
+	// cannot make one read hold more than this.
+	UnverifiedViewBudget = int64(64) << 20
 )
 
 // ReadRef reads and validates every pack on a writer ref with the folded budget.
 func (g *Git) ReadRef(project, writer, tip string) ([]Pack, error) {
-	return g.ReadRefBudget(project, writer, tip, FoldedBudget)
+	budget := FoldedBudget
+	return g.ReadRefBudget(project, writer, tip, &budget, MaxChain)
 }
 
-// ReadRefBudget reads and validates every pack on a writer ref, oldest first, reading at most budget
-// bytes. Any defect rejects the whole ref (the returned error says why); nothing from a rejected ref is used.
-func (g *Git) ReadRefBudget(project, writer, tip string, budget int64) ([]Pack, error) {
+// ReadRefBudget reads and validates every pack on a writer ref, oldest first, reading at most *budget
+// bytes from a chain of at most maxChain commits. The bytes read are taken off *budget as they are read,
+// also when the ref is then rejected (an over-budget batch is refused from its sizes, before reading). Any
+// defect rejects the whole ref (the returned error says why); nothing from a rejected ref is used.
+func (g *Git) ReadRefBudget(project, writer, tip string, budgetp *int64, maxChain int) ([]Pack, error) {
+	budget := *budgetp
 	n, err := g.ObjectFormat()
 	if err != nil {
 		return nil, err
 	}
-	out, err := g.run(LocalTimeout, nil, nil, "rev-list", "--parents", "--reverse", fmt.Sprintf("--max-count=%d", MaxChain+1), tip)
+	out, err := g.run(LocalTimeout, nil, nil, "rev-list", "--parents", "--reverse", fmt.Sprintf("--max-count=%d", maxChain+1), tip)
 	if err != nil {
 		return nil, err
 	}
@@ -293,7 +304,7 @@ func (g *Git) ReadRefBudget(project, writer, tip string, budget int64) ([]Pack, 
 		commits = append(commits, f[0])
 		prev = f[0]
 	}
-	if len(commits) == 0 || len(commits) > MaxChain {
+	if len(commits) == 0 || len(commits) > maxChain {
 		return nil, errors.New("writer ref chain empty or too long")
 	}
 	names := make([]string, 0, 2*len(commits))
@@ -312,6 +323,7 @@ func (g *Git) ReadRefBudget(project, writer, tip string, budget int64) ([]Pack, 
 	for _, o := range objs {
 		budget -= int64(len(o.body))
 	}
+	*budgetp = budget
 	for i, c := range commits {
 		co, tr := objs[2*i], objs[2*i+1]
 		if co.typ != "commit" || tr.typ != "tree" {
@@ -368,6 +380,10 @@ func (g *Git) ReadRefBudget(project, writer, tip string, budget int64) ([]Pack, 
 	if err != nil {
 		return nil, err
 	}
+	for _, o := range blobs {
+		budget -= int64(len(o.body))
+	}
+	*budgetp = budget
 	var last op.HLC
 	first := true
 	for i := range packs {

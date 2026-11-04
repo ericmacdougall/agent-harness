@@ -56,12 +56,8 @@ func (g *Git) FetchFromMirror(mirror, project string) error {
 	if err != nil {
 		return err
 	}
+	// Refs the mirror lacks (a collaborator's or a planted ref) are left alone; they fold as unverified.
 	prefix := RefPrefix + project + "/log/"
-	for name, tip := range got {
-		if strings.HasPrefix(name, prefix) && want[name] != tip {
-			return errors.New("restored ref does not match the mirror: " + name)
-		}
-	}
 	for name, tip := range want {
 		if strings.HasPrefix(name, prefix) && got[name] != tip {
 			return errors.New("mirror ref was not restored: " + name)
