@@ -7,9 +7,12 @@ package kernel
 // create again, so once ordinary facts stop, each session has few left to spend.
 func MustAppend(p Projection, f Fact) bool {
 	switch f.Kind {
-	case FactProcessRestarted, FactProviderCompleted, FactOutcomeUnknown, FactProviderRefused,
+	case FactProviderCompleted, FactOutcomeUnknown, FactProviderRefused,
 		FactAbandoned, FactSessionClosed, FactAuthBoundaryCrossed, FactSessionQuarantined:
 		return true
+	case FactProcessRestarted:
+		// Reduce accepts a restart after a restart; only a first one changes anything.
+		return p.LastKind != FactProcessRestarted
 	case FactProviderDisconnected:
 		// Each row's condition is checked here, not only trusted from Decide.
 		s := p.Sessions[f.SessionID]

@@ -286,6 +286,12 @@ func (l *Log) latch() {
 // and whether they were already committed by an earlier call, in which case they
 // are already in any projection that saw that call.
 //
+// Contract: p must be the projection this log last published, reduced from every
+// stored fact. Append checks only p.LastSeq against its own count; it trusts the
+// rest of p for kernel.MustAppend and kernel.Reduce. A caller that passes another
+// projection with the right sequence can misjudge eligibility. TODO(K3): decide
+// whether the log should hold its own projection instead of trusting the caller's.
+//
 // Outcomes follow the plan's log health table: a definite failure writes nothing
 // and returns its error; any commit error not known to precede commit, or a revoking
 // fact that cannot commit, latches the log.

@@ -398,6 +398,23 @@ func TestQuotaKeepsReserveForMustAppend(t *testing.T) {
 	if _, _, err = d.log.Append(ctx, d.p, "", "", []kernel.Fact{again}); !errors.Is(err, ErrQuota) {
 		t.Fatalf("a stop that changes nothing used the reserve: %v", err)
 	}
+	// Likewise a restart after a restart: the first is eligible, a second changes nothing.
+	restart := func(n int) error {
+		f := kernel.Fact{Kind: kernel.FactProcessRestarted, SchemaVersion: kernel.SchemaVersion, Seq: d.p.LastSeq + 1, At: stamp(9100 + n)}
+		stored, _, err := d.log.Append(ctx, d.p, "", "", []kernel.Fact{f})
+		for _, f := range stored {
+			if d.p, err = kernel.Reduce(d.p, f); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return err
+	}
+	if err = restart(0); err != nil {
+		t.Fatalf("first restart refused at quota: %v", err)
+	}
+	if err = restart(1); !errors.Is(err, ErrQuota) || d.log.Latched() {
+		t.Fatalf("a restart after a restart used the reserve: %v latched=%v", err, d.log.Latched())
+	}
 	set(MaxFacts)
 	if _, err = d.do(kernel.In{Kind: kernel.InAbandon, Principal: user, SessionID: "a", ExpectedRequest: "r1", Reason: kernel.Redact("done", func(s string) string { return s })}); !errors.Is(err, ErrLatched) || !d.log.Latched() {
 		t.Fatalf("spent reserve did not latch: %v latched=%v", err, d.log.Latched())

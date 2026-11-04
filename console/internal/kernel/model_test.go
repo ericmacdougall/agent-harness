@@ -233,7 +233,8 @@ func (m *mdlModel) eligible(f Fact) bool {
 	yes := false
 	switch f.Kind {
 	case FactProcessRestarted:
-		yes = true
+		// Section 11: only when the last fact is not a restart, so raw repeats stay bounded.
+		yes = m.lastKind != FactProcessRestarted
 	case FactProviderCompleted, FactOutcomeUnknown, FactProviderRefused,
 		FactAbandoned, FactSessionClosed, FactAuthBoundaryCrossed, FactSessionQuarantined:
 		yes = s != nil
@@ -264,7 +265,7 @@ func (m *mdlModel) eligible(f Fact) bool {
 			m.hit("t11.eligible.late_final_empty_request")
 		}
 	}
-	conditional := map[FactKind]bool{FactProviderDisconnected: true, FactControlRequested: true, FactControlOutcome: true, FactLateFrameObserved: true}
+	conditional := map[FactKind]bool{FactProcessRestarted: true, FactProviderDisconnected: true, FactControlRequested: true, FactControlOutcome: true, FactLateFrameObserved: true}
 	switch {
 	case yes:
 		m.hit("t11.eligible." + string(f.Kind))
@@ -2272,7 +2273,10 @@ func (g *mdlGen) scriptIneligibleStops() []mdlGenStep {
 	}
 	out = append(out, mdlClaudeNew(neverConnected), disconnect(neverConnected))
 	out = append(out, g.codexReady(wasConnected)...)
-	return append(out, mdlStep(ObDisconnected, wasConnected), disconnect(wasConnected))
+	out = append(out, mdlStep(ObDisconnected, wasConnected), disconnect(wasConnected))
+	// Back-to-back raw restarts: legal, the first eligible and the second not.
+	restart := mdlRawFact("legal", Fact{Kind: FactProcessRestarted})
+	return append(out, restart, restart)
 }
 
 func (g *mdlGen) scriptReach() []mdlGenStep {
@@ -2413,8 +2417,11 @@ func (g *mdlGen) limitStep(m *mdlModel) mdlGenStep {
 		gs = mdlStep(InPause, sid)
 	case 13:
 		gs = mdlStep(InStop, sid)
-		if g.rng.Intn(5) == 0 {
+		switch g.rng.Intn(10) {
+		case 0, 1:
 			gs = mdlStep(ObRestart, "")
+		case 2, 3:
+			gs = mdlRawFact("", Fact{Kind: FactProcessRestarted})
 		}
 	case 14:
 		gs = mdlStep(InAbandon, sid, mdlExpect(last), mdlBecause("limit discard"))
@@ -3098,6 +3105,12 @@ func (r *mdlModelRun) doRaw(gs mdlGenStep) string {
 			if got := MustAppend(r.p, f); got != want {
 				return fmt.Sprintf("MustAppend(%s raw): model %v, kernel %v", f.Kind, want, got)
 			}
+		}
+		if r.limited && !want {
+			r.m.hit("t11.limit.refused")
+			return ""
+		}
+		if !r.noKernel {
 			if msg := r.commit(f); msg != "" {
 				return msg
 			}
@@ -3106,6 +3119,9 @@ func (r *mdlModelRun) doRaw(gs mdlGenStep) string {
 			r.log = append(r.log, f)
 		}
 		r.m.apply(f)
+		if r.limited {
+			return r.countReserve(f)
+		}
 		return ""
 	}
 	if r.noKernel {
@@ -3392,7 +3408,7 @@ func mdlTableRows() []string {
 		"t4.unknown.pending_survives", "t4.intended.clears_bound_turn",
 		"t4.control_outcome.unresolved_not_confirmed", "t4.control_outcome.abandoned_clears", "t4.control_outcome.abandoned_not_confirmed", "t4.control_outcome.resolved_not_confirmed",
 		"t11.limit.reached", "t11.limit.refused", "t11.limit.refused_whole_decision", "t11.limit.committed", "t11.ordinary", "t11.eligible.late_final_empty_request", "t11.stop_changes_nothing.unknown", "t11.stop_changes_nothing.paused", "t11.stop_newly_owes.unknown",
-		"t11.not_eligible.ProviderDisconnected", "t11.not_eligible.ControlRequested", "t11.not_eligible.ControlOutcome", "t11.not_eligible.LateFrameObserved",
+		"t11.not_eligible.ProcessRestarted", "t11.not_eligible.ProviderDisconnected", "t11.not_eligible.ControlRequested", "t11.not_eligible.ControlOutcome", "t11.not_eligible.LateFrameObserved",
 		"t5.request.known", "t5.request.unknown", "t5.sticky", "t5.status.empty", "t5.status.valid", "t5.status.invalid", "t5.digest.valid", "t5.digest.empty",
 		"t8.unreadable.schema", "t8.unreadable.seq", "t8.unreadable.kind", "t8.unreadable.global", "t8.unreadable.reserved_no_session", "t8.unreadable.global_live_session", "t8.unreadable.global_ghost_session",
 		"t8.reserved_follows_rows", "t8.ghost", "t8.ghost_once", "t8.ghost_then_created", "t8.ghost_created_quarantined", "t8.first", "t8.first_on_closed", "t8.first_on_quarantined", "t8.later_applied", "t8.later_skipped",

@@ -147,6 +147,10 @@ A definite failure on discard leaves the turn resolvable (D7). A latch revokes a
 
 **Must-append class.** Section 11 of the K1a tables defines which facts may use the reserve, enforced by the kernel rule `MustAppend`, with a proof that 50,000 suffices. A refusal at the limit is final for an ineligible fact: it is dropped, never retried.
 
+**Append contract.** `Log.Append` takes the projection the facts were decided on. It checks only that projection's `LastSeq` against its own count, and trusts the rest for `MustAppend` and `Reduce`. The caller must pass the projection the log last published. **TODO for K3:** decide whether the log should hold its own projection instead, so a wrong projection with the right sequence cannot misjudge reserve eligibility.
+
+**Adapter scope (K5–K7).** At the limit a pause or stop can be refused with `ErrQuota` while its `Decision` still lists stop effects. Whether the adapter still fires those stop-work effects is adapter code: K7 decides it, and tests it with a refused pause and stop at the limit.
+
 ### Storage
 
 SQLite through `modernc.org/sqlite`, as a transactional append-only log: `metadata`, `facts`, `receipts` (command ID unique, keyed digest bound, no command bodies). No materialized session tables. Open folds the log into memory.

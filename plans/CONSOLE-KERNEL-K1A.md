@@ -127,7 +127,7 @@ Effects are returned with the decision, in the order listed. `Decision.Idempoten
 | `write-unknown` | provider | Same guard, late `write_unknown`. Else `OutcomeUnknown`, with a reason code out of shape dropped |
 | `turn-bound` | provider | Session closed, pending, request is `LastRequest`, turn in shape: no facts, effect `interrupt`. Missing or closed otherwise: `not_found`. Claude: late `turn_bound`. Request not `LastRequest`, or turn empty or out of shape: late `turn_bound`. Same turn as bound: idempotent. Different turn already bound: late `turn_bound`. Pending: `TurnBound` and effect `interrupt{request, turn}`. Last receipt unresolved: `TurnBound`, no effect. Else late `turn_bound` |
 | `completed` | provider | Empty request: last receipt open and writable gives `OutcomeUnknown{unbound_completion}` on `LastRequest`; otherwise late `final`. Not `LastRequest`, last receipt not open, or read-only: late `final`. Codex and turn differs from `TurnID` or `TurnID` empty: late `final`. Status not in the enum: `OutcomeUnknown{invalid_final_status}`. Else `ProviderCompleted` |
-| `control-outcome` | provider | Control not `pause`, `stop`, or outcome not `confirmed`, `rejected`, `unconfirmed`: late `control_outcome`. Would not change `PauseUnconfirmed`: idempotent. Else `ControlOutcome` |
+| `control-outcome` | provider | `ControlPending` false (section 11), or control not `pause`, `stop`, or outcome not `confirmed`, `rejected`, `unconfirmed`: late `control_outcome`. Would not change `PauseUnconfirmed`: idempotent with no fact, and `ControlPending` stays true. Else `ControlOutcome` |
 | `auth-boundary` | system | Provider not Codex or Claude: `bad_provider`. Else one `AuthBoundaryCrossed` per session with that provider and profile, not closed and not read-only, in creation order, each with its stop effects. None: idempotent |
 | `quarantine` | system | Empty reason: `bad_value`. Else `SessionQuarantined`, plus stop effects |
 | `restart` | system | Last fact was `ProcessRestarted`: idempotent, no fact. Else `ProcessRestarted`. No effects |
@@ -262,7 +262,7 @@ The event log keeps its last 50,000 facts (`Reserve`, out of `MaxFacts` 1,000,00
 | `ControlRequested` | `Control` is `stop`, and it changes `Paused` or newly owes the interrupt | 2: `Paused` is cleared only by `RequestIntended` or restart, and restart leaves the session read-only, where no control fact is recorded; the owed interrupt is set at most once per request |
 | `ControlOutcome` | `ControlPending` true, enforced by `Decide` above | 2: one per `ControlRequested` made after the limit, plus at most one already pending when it was reached; together still at most 2, because a pending request leaves at most one more eligible |
 | `LateFrameObserved` | `LateKind` is `final` and `RequestID` is the session's `LastRequest` | 1: sticky per key, and `LastRequest` changes only with `RequestIntended` |
-| `ProcessRestarted` | Always | See the proof |
+| `ProcessRestarted` | The last fact is not a restart. `Reduce` accepts a restart after a restart, and `Decide` skips one, so this row does not depend on `Decide` | 0 per session; at most one more than all other reserve facts, see the proof |
 
 Every other fact is ordinary, including `TurnBound`: at the limit a Codex completion then records as unknown, which is safe.
 
@@ -271,7 +271,7 @@ Every other fact is ordinary, including `TurnBound`: at the limit a Codex comple
 1. Below the limit, eligible and ordinary facts both take ordinary space, so the reserve is untouched.
 2. Once ordinary facts reach `MaxFacts - Reserve`, no ordinary fact can commit. No session is created, no request opened, no connection made. So each session's eligible uses are bounded by its state at that moment, and the table above gives at most 1+1+1+1+1+1+2+2+1 = 11 per session.
 3. At most 1,000 sessions are not closed. A closed session accepts no fact. So session facts use at most 11,000 reserve facts.
-4. A restart is skipped when the last fact is already a restart. So restarts are at most one more than the other reserve facts: at most 11,001.
+4. A restart is eligible only when the last fact is not a restart, so this holds for raw facts too, not only for `Decide`. So restarts are at most one more than the other reserve facts: at most 11,001.
 5. Total at most 22,001, under 50,000, with a factor of two in hand for a later slice's kinds, which must extend this table before they may be eligible.
 6. If the reserve is still spent, which the proof says cannot happen, the log latches, and that is a defect to report.
 
