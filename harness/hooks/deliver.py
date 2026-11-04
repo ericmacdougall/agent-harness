@@ -27,7 +27,7 @@ from urllib.parse import quote
 from github_identity import github_repository, repository_name
 from git_safety import git_environment, require_safe_source
 from integrate_local import (ALLOWED_GIT_ENV, CheckInterpreterError, CheckLog, ExternalApplyError,
-                             OriginalScope, acquire_scope_lock, approved_check, approved_prepare,
+                             OriginalScope, acquire_scope_lock, approved_check, approved_prepare, redact_output,
                              require_check_interpreters,
                              checkout_identity, git_common_directory, journal_key,
                              fsync_directory, private_directory, read_journal, run as run_check,
@@ -52,6 +52,13 @@ SETTLED = {"PR_READY", "REMOTE_BLOCKED", "LOCAL_READY", "RESOLVED_BASELINE",
            "DELIVERED", "LOCAL_DELIVERED", "POLICY_BLOCKED"}
 
 
+# Delivery targets that are far behind origin or carry a huge staged/untracked set are almost
+# always a stale or corrupted checkout (the 77k staged adds / 40k behind case); refuse early with
+# a specific hint instead of a generic "dirty" failure or a status timeout. mode: refuse | warn.
+TARGET_POLICY = {"mode": "refuse", "max_behind": 1000, "max_staged": 5000, "max_untracked": 5000,
+                 "timeout": 30}
+
+
 class DeliveryError(Exception):
     def __init__(self, status, message, *, code=3, **facts):
         super().__init__(message)
@@ -64,23 +71,42 @@ def report(status, message, **facts):
 
 def bounded(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT):
     """Bound a child process group and output without echoing its private output."""
+    code, output, _ = bounded_with_stderr(command, cwd=cwd, env=env, timeout=timeout, limit=limit)
+    return code, output
+
+
+def bounded_with_stderr(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT, stderr_limit=0):
+    """Like bounded, optionally keeping the first stderr_limit bytes.
+
+    stderr is drained through a pipe and the excess discarded, so a child that
+    floods stderr neither blocks, fills the disk, nor grows our memory.
+    """
     process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE if stderr_limit else subprocess.DEVNULL,
                                start_new_session=True)
-    data, deadline = bytearray(), time.monotonic() + timeout
+    data, errors, deadline = bytearray(), bytearray(), time.monotonic() + timeout
     try:
         with selectors.DefaultSelector() as poller:
-            poller.register(process.stdout, selectors.EVENT_READ)
-            while True:
+            poller.register(process.stdout, selectors.EVENT_READ, "out")
+            if stderr_limit:
+                poller.register(process.stderr, selectors.EVENT_READ, "err")
+            while poller.get_map():
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or not poller.select(remaining):
+                ready = poller.select(remaining) if remaining > 0 else []
+                if not ready:
                     raise DeliveryError("BLOCKED_LOCAL", "Delivery command timed out")
-                chunk = os.read(process.stdout.fileno(), 65536)
-                if not chunk:
-                    break
-                data.extend(chunk)
-                if len(data) > limit:
-                    raise DeliveryError("BLOCKED_LOCAL", "Delivery command output exceeded limit", reason="OUTPUT_LIMIT")
+                for key, _ in ready:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                    if not chunk:
+                        poller.unregister(key.fileobj)
+                    elif key.data == "err":
+                        errors.extend(chunk[:max(0, stderr_limit - len(errors))])
+                    else:
+                        data.extend(chunk)
+                        if len(data) > limit:
+                            raise DeliveryError("BLOCKED_LOCAL", "Delivery command output exceeded limit",
+                                                reason="OUTPUT_LIMIT")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise DeliveryError("BLOCKED_LOCAL", "Delivery command timed out")
@@ -88,7 +114,7 @@ def bounded(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT):
             code = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
             raise DeliveryError("BLOCKED_LOCAL", "Delivery command timed out") from None
-        return code, bytes(data).decode("utf-8", "replace")
+        return code, bytes(data).decode("utf-8", "replace"), bytes(errors).decode("utf-8", "replace")
     except BaseException as failure:
         # A reaped leader says nothing about descendants that still hold stdout.
         # Reuse the shared bounded TERM/grace/KILL and discarded-output cleanup.
@@ -99,6 +125,8 @@ def bounded(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT):
         raise
     finally:
         process.stdout.close()
+        if process.stderr:
+            process.stderr.close()
 
 
 def git(repo, *args, timeout=30):
@@ -141,6 +169,55 @@ def snapshot(repo, branch, *, require_clean=True):
         if code or status:
             raise DeliveryError("BLOCKED_LOCAL", "Checkout is dirty or cannot be inspected")
     return valid_oid(git_value(repo, "rev-parse", "HEAD"))
+
+
+def _count_entries(repo, label, *args):
+    """Count NUL-separated entries of a git listing; a truncated or timed-out listing is 'too many'."""
+    try:
+        code, output = bounded(["git", "-C", str(repo), "-c", "core.fsmonitor=false",
+                                "-c", "core.untrackedCache=false", *args, "-z"],
+                               env=git_environment(), timeout=TARGET_POLICY["timeout"], limit=MAX_OUTPUT)
+    except DeliveryError:
+        return None
+    if code:
+        return 0  # unreadable here; the strict clean snapshot afterwards still decides
+    return output.count("\0")
+
+
+def target_preflight(original, branch):
+    """Refuse (or warn) before anything is published when the original checkout is a bad target."""
+    original = Path(original)
+    if original.is_symlink() or not original.is_dir():
+        return  # snapshot() reports the precise policy error
+    problems = []
+    for label, limit_name, args in (
+            ("staged", "max_staged", ("diff", "--cached", "--name-only")),
+            ("untracked", "max_untracked", ("ls-files", "--others", "--exclude-standard"))):
+        count = _count_entries(original, label, *args)
+        if count is None or count > TARGET_POLICY[limit_name]:
+            shown = "more than the inspectable bound" if count is None else str(count)
+            problems.append((f"original checkout has {shown} {label} paths (limit {TARGET_POLICY[limit_name]})",
+                             f"HUGE_{label.upper()}",
+                             "this looks like a corrupted or abandoned checkout; use a clean checkout of the "
+                             "target branch, or inspect and clear the index before delivering"))
+    code, behind = git(original, "rev-list", "--count", f"HEAD..refs/remotes/origin/{branch}",
+                       timeout=TARGET_POLICY["timeout"]) if _safe_branch(branch) else (1, "")
+    if code == 0 and behind.strip().isdigit() and int(behind) > TARGET_POLICY["max_behind"]:
+        problems.append((f"original checkout is {int(behind)} commits behind origin/{branch} "
+                         f"(limit {TARGET_POLICY['max_behind']})", "ORIGINAL_BEHIND",
+                         f"update it first (git -C <original> pull --ff-only) and rebase the feature onto origin/{branch}"))
+    if not problems:
+        return
+    message = "; ".join(item[0] for item in problems)
+    if TARGET_POLICY["mode"] == "warn":
+        print("WARNING: " + message, file=sys.stderr)
+        return
+    raise DeliveryError("BLOCKED_POLICY", "Original checkout is not a sane delivery target: " + message, code=2,
+                        reason=problems[0][1], hint="; ".join(item[2] for item in problems))
+
+
+def _safe_branch(branch):
+    return valid_identity_text(branch) and not branch.startswith("-")
 
 
 def ancestry(repo, older, newer):
@@ -452,8 +529,22 @@ class Workflow:
             raise DeliveryError("RECOVERY_REQUIRED", "Workflow generation or state changed during delivery")
 
     def facts(self):
-        return {"generation": self.generation, "state": str(self.directory / "journal.json"),
-                "checkout": str(self.original), "source_head": self.state["source_head"]}
+        facts = {"generation": self.generation, "state": str(self.directory / "journal.json"),
+                 "checkout": str(self.original), "source_head": self.state["source_head"]}
+        waivers = self.policy_waivers()
+        if waivers:
+            facts["commit_policy_waivers"] = waivers
+        return facts
+
+    def policy_waivers(self):
+        """Waivers the checked range used, so a reviewer of the prepare output sees every bypass."""
+        try:
+            record = json.loads(regular_bytes(self.directory / COMMIT_POLICY_RECORD))
+            items = record.get("waivers", [])
+            return [{key: str(item.get(key, ""))[:200] for key in ("kind", "subject", "id", "wal")}
+                    for item in items[:50] if isinstance(item, dict)] if isinstance(items, list) else []
+        except (OSError, ValueError, DeliveryError, AttributeError, TypeError):
+            return []
 
     def complete(self, mode, head, digest):
         self.save(target=head, checks_digest=digest)
@@ -506,6 +597,52 @@ def gh(*args, timeout=30):
     except DeliveryError as error:
         raise DeliveryError("REMOTE_UNCERTAIN", "GitHub command exceeded its output or time budget",
                             code=4, **error.facts) from None
+
+
+GH_STDERR_LIMIT = 4096
+GH_HINT_LIMIT = 300
+ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|.)")
+# A failure that names one of these may have happened after GitHub acted (or says nothing definite).
+GH_TRANSIENT = re.compile(r"(?i)\b(?:timed? ?out|timeout|connection (?:reset|refused|closed)|broken pipe|"
+                          r"unexpected eof|temporar|try again|rate limit|secondary rate|"
+                          r"http 5\d\d|50[0234]\b|bad gateway|service unavailable|no such host|"
+                          r"network is unreachable|tls)")
+# Failures GitHub reports before creating anything: auth, access, missing refs, validation.
+GH_DEFINITE = (
+    (re.compile(r"(?i)gh auth login|not logged in|authentication|bad credentials|http 401|requires authentication|"
+                r"token .*(?:expired|invalid)|insufficient.*scope|GH_TOKEN"),
+     "GitHub authentication failed; run `gh auth login` for this host, then re-run prepare with --new-generation"),
+    (re.compile(r"(?i)http 403|resource not accessible|permission|forbidden|saml"),
+     "GitHub denied access to this repository; check the account's write access, then re-run prepare with --new-generation"),
+    (re.compile(r"(?i)base ref must be a branch|base branch .*(?:not found|does not exist)|"
+                r"(?:no such|unknown) (?:base|branch)|could not resolve to a (?:ref|branch)"),
+     "The base branch does not exist on GitHub; push it or pass the right --original-branch, then re-run with --new-generation"),
+    (re.compile(r"(?i)http 404|could not resolve to a repository|repository not found|not found"),
+     "GitHub cannot find the repository (or you cannot see it); check origin and access, then re-run with --new-generation"),
+    (re.compile(r"(?i)validation failed|http 422|unprocessable|no commits between|head sha|"
+                r"must first push|head ref .*(?:invalid|must be)|is not a valid"),
+     "GitHub rejected the PR as invalid (for example no commits between base and head); fix it, then re-run with --new-generation"),
+)
+
+
+def sanitize_gh_text(text, limit=GH_HINT_LIMIT):
+    """One bounded printable line of gh stderr: escapes and controls stripped, secrets redacted."""
+    text = ANSI.sub(" ", text[:GH_STDERR_LIMIT])
+    text = redact_output(text)
+    text = "".join(char if char.isprintable() else " " for char in text)
+    return " ".join(text.split())[:limit]
+
+
+def classify_gh_failure(code, error_text):
+    """Return a hint for a failure GitHub reported before acting, or None when completion is unknown."""
+    if GH_TRANSIENT.search(error_text):
+        return None
+    if code == 4:
+        return GH_DEFINITE[0][1]
+    for pattern, hint in GH_DEFINITE:
+        if pattern.search(error_text):
+            return hint
+    return None
 
 
 def gh_json(*args, timeout=30):
@@ -659,6 +796,28 @@ def published_ref(original, url, state, timeout):
     return state["source_head"]
 
 
+def require_remote_base(flow, url):
+    """The PR base must exist on the remote; fail before any push or PR create when it does not."""
+    ref = "refs/heads/" + flow.branch
+    try:
+        code, output = transport(flow.original, url, flow.state["repository"], ["ls-remote", ref], flow.args.timeout)
+    except DeliveryError as error:
+        if error.status == "BLOCKED_POLICY":
+            raise
+        code, output = 1, ""
+    if code:
+        raise DeliveryError("REMOTE_BLOCKED", "Remote base branch could not be checked before publishing",
+                            code=4, hint="Check network and credentials for origin, then re-run prepare",
+                            **flow.facts())
+    # ls-remote tail-matches, so demand the exact ref name.
+    found = [row.split("\t")[-1] for row in output.splitlines() if row.strip()]
+    if ref not in found:
+        raise DeliveryError("BLOCKED_POLICY", "The base branch does not exist on the remote; nothing was pushed",
+                            code=2, reason="BASE_BRANCH_MISSING", base_branch=flow.branch[:200],
+                            hint="Push the base branch (git push origin <branch>) or pass the correct "
+                                 "--original-branch, then re-run prepare", **flow.facts())
+
+
 def source_inputs(args):
     require_arguments(args, "source", "original", "original_branch", "expected_source_head",
                       "expected_original_head", "kit_file")
@@ -719,13 +878,40 @@ def prepare_pr(flow, title, body):
             os.fsync(handle.fileno())
         flow.save(phase="PR_CREATING")
         try:
-            gh("pr", "create", "-R", flow.state["repository"], "--head", flow.state["source_branch"],
-               "--base", flow.branch, "--draft", "--title", title, "--body-file", str(staged),
-               timeout=flow.args.timeout)
+            env = git_environment()
+            env.update({"GH_PROMPT_DISABLED": "1", "GH_HOST": "github.com", "GIT_TERMINAL_PROMPT": "0"})
+            code, _, error_text = bounded_with_stderr(
+                ["gh", "pr", "create", "-R", flow.state["repository"], "--head", flow.state["source_branch"],
+                 "--base", flow.branch, "--draft", "--title", title, "--body-file", str(staged)],
+                env=env, timeout=min(flow.args.timeout, 30), stderr_limit=GH_STDERR_LIMIT)
+        except OSError:
+            flow.save(phase="REMOTE_BLOCKED")
+            raise DeliveryError("REMOTE_BLOCKED", "GitHub CLI (gh) could not be started",
+                                code=4, hint="Install gh and run `gh auth login`, then re-run prepare with --new-generation",
+                                **flow.facts()) from None
         except DeliveryError:
             flow.save(phase="REMOTE_UNCERTAIN")
             raise DeliveryError("REMOTE_UNCERTAIN", "PR creation outcome requires later positive reconciliation",
                                 code=4, **flow.facts()) from None
+        if code:
+            gh_error = sanitize_gh_text(error_text)
+            hint = classify_gh_failure(code, error_text)
+            try:
+                already = matching_pr(flow.state, flow.args.timeout)
+            except DeliveryError:
+                already = None
+                hint = None  # cannot disprove a create that landed; stay uncertain
+            if already:
+                return record_pr(flow, already)
+            if hint is None:
+                flow.save(phase="REMOTE_UNCERTAIN")
+                raise DeliveryError("REMOTE_UNCERTAIN", "PR creation failed without a definite GitHub verdict",
+                                    code=4, gh_exit=code, gh_error=gh_error,
+                                    hint="Check `gh pr list`, then run prepare --reconcile-only",
+                                    **flow.facts())
+            flow.save(phase="REMOTE_BLOCKED")
+            raise DeliveryError("REMOTE_BLOCKED", "GitHub refused to create the PR; nothing was created",
+                                code=4, gh_exit=code, gh_error=gh_error, hint=hint, **flow.facts())
     finally:
         staged.unlink(missing_ok=True)
     try:
@@ -871,6 +1057,9 @@ def _ticket_updates(flow, stage, head, pr_url):
 def prepare(args):
     if getattr(args, "reconcile_only", False):
         return reconcile(args)
+    if args.original is not None and isinstance(args.original_branch, str):
+        # Before any strict snapshot, so a huge dirty set gets a specific message, not a status timeout.
+        target_preflight(args.original.expanduser().absolute(), args.original_branch)
     source, branch, head, baseline, kit = source_inputs(args)
     local_only = getattr(args, "local_only", False)
     title, body = "", b""
@@ -923,6 +1112,7 @@ def prepare(args):
         if state["phase"] not in {"INITIAL", "PUBLISHING", "PR_LOOKUP", "PR_CREATING", "REMOTE_UNCERTAIN"}:
             raise DeliveryError("RECOVERY_REQUIRED", "Generation has pending checkout recovery", **flow.facts())
         if state["phase"] == "INITIAL":
+            require_remote_base(flow, url)
             flow.save(phase="PUBLISHING")
             try:
                 code, output = bounded([sys.executable, str(Path(__file__).with_name("publish_feature.py")),

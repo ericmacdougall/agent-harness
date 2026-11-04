@@ -175,6 +175,15 @@ Only known interrupted apply phases can make this transition. Exact clean HEAD, 
 
 No global Stop hook claims these steps occurred or blocks ordinary questions/background work. The main agent must call the helper and inspect the actual result. The run kit also needs useful user-facing instructions: verify a repository-native watcher or the installed dependency-free watcher (`~/.codex/agent-harness/watch-tests.py` or `~/.claude/tools/watch-tests.py`). Use `--once` to verify setup, omit it for continuous testing and Ctrl-C to stop. The helper cannot judge whether those commands are useful. Local scratch and remote checks execute repository code and are not an OS sandbox; same-user external mutations and changes reverted entirely between guards remain outside the guarantee.
 
+### Prepare preflights and failure verdicts
+
+`deliver.py prepare` refuses early, with a `reason` and a `hint` in its JSON, instead of failing late or generically:
+
+- **Target sanity (`TARGET_POLICY` in deliver.py):** the original checkout is refused (`BLOCKED_POLICY`, reasons `HUGE_STAGED`, `HUGE_UNTRACKED`, `ORIGINAL_BEHIND`) when it has more than 5000 staged or 5000 untracked paths, or is more than 1000 commits behind its local `origin/<branch>` tracking ref. Counts are bounded reads; a listing that exceeds the output or time bound counts as too many. Set `mode` to `warn` to print a warning instead. Behind-counts use the last fetched tracking ref, so fetch first for an accurate answer.
+- **Remote base branch:** before any push, `--original-branch` must exist on the remote (exact `refs/heads/<name>`); otherwise `BASE_BRANCH_MISSING` and nothing is pushed. A remote that cannot be queried gives `REMOTE_BLOCKED` without saving state, so a retry works.
+- **`gh pr create` failures:** a non-zero exit is classified from bounded, redacted stderr. Authentication, access, missing base and validation errors, when the follow-up lookup shows no PR, become `REMOTE_BLOCKED` with a hint (re-run with `--new-generation` once fixed). If a PR exists anyway, it is adopted. Timeouts, killed processes, gateway or network errors, and unrecognised failures stay `REMOTE_UNCERTAIN` and are never a local-fallback licence. Output carries `gh_exit` and a sanitised one-line `gh_error` (escapes and control characters stripped, secrets redacted, at most 300 characters).
+- **Waivers:** `commit_policy_waivers` in the prepare output lists every commit-policy waiver (kind, subject, id, WAL) the checked range used.
+
 ## Commit message policy
 
 Every agent commit uses one structured format, and the commits in ticket-tracked repositories must reference a ticket that was updated after the commit. The rules live in one file, `commit_policy.json`, installed beside the hooks: `~/.claude/hooks` for Claude Code and `~/.codex/agent-harness` for Codex. Edit that file to change the types, the sections, the boilerplate lists, the tracked repositories or the ticket systems.
