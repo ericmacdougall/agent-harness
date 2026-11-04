@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -55,8 +56,13 @@ class AdvisoryTests(HomeCase):
         durable_pad = str(self.scratch / "claude-501" / "-Users-x" / UUID / "scratchpad")
         self.assertEqual(self.paths("Write", {"file_path": durable_pad + "/run.sh"}, durable_pad),
                          [(durable_pad + "/run.sh", "scratch")])
-        elsewhere = f"/Volumes/x/claude-501/-Users-x/{UUID}/scratchpad/plan.md"
+        elsewhere = f"/Volumes/x/claude-501/-Users-x/{UUID}/scratchpad/plan.sh"
         self.assertEqual(self.paths("Write", {"file_path": elsewhere}), [(elsewhere, "scratch")])
+        # Notes and data in the reboot-surviving scratchpad are expected; kits and scripts are not.
+        for name in ("notes.md", "rows.tsv", "result.json"):
+            self.assertEqual(self.paths("Write", {"file_path": durable_pad + "/" + name}, durable_pad), [])
+        self.assertEqual(self.paths("Write", {"file_path": durable_pad + "/run-kit.json"}, durable_pad),
+                         [(durable_pad + "/run-kit.json", "scratch")])
 
     def test_bash_creation_forms(self):
         cases = {
@@ -71,6 +77,10 @@ class AdvisoryTests(HomeCase):
             "FOO=1 sudo tee /tmp/a.conf < in": ["/tmp/a.conf"],
             "printf x > \"$TMPDIR/k.json\"": ["/private/var/folders/zz/T/k.json"],
             "echo 'unterminated > /tmp/q.sh": ["/tmp/q.sh"],
+            "sudo -u svc tee /tmp/a.sh < in": ["/tmp/a.sh"],
+            "curl -o/tmp/a.json https://example.invalid": ["/tmp/a.json"],
+            "wget --output-document=/tmp/b.json https://example.invalid": ["/tmp/b.json"],
+            "cp -t /tmp/d a.py b.sh": ["/tmp/d/a.py", "/tmp/d/b.sh"],
         }
         for command, expected in cases.items():
             with self.subTest(command=command):
@@ -89,6 +99,16 @@ class AdvisoryTests(HomeCase):
         self.assertEqual(self.paths("Write", {"file_path": None}), [])
         huge = "cat > /tmp/a.sh <<'EOF'\n" + "x" * (workdir.MAX_ADVISORY_INPUT + 1) + "\nEOF"
         self.assertEqual(self.paths("Bash", {"command": huge}), [])
+
+    def test_many_targets_stay_fast_and_bounded(self):
+        command = "cp " + " ".join(f"s/abc{i}.sh" for i in range(9000)) + " /tmp/d"
+        command = command[:workdir.MAX_ADVISORY_INPUT - 10] + " /tmp/d"
+        started = time.monotonic()
+        found = self.paths("Bash", {"command": command})
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertLessEqual(len(found), workdir.MAX_ADVISORY_CANDIDATES)
+        self.assertEqual(len(found), workdir.MAX_ADVISORY_CANDIDATES)
+        self.assertEqual(found[0], ("/tmp/d/abc0.sh", "tmp"))
 
     def test_message_names_durable_dir_and_location(self):
         message = workdir.advisory_message([("/tmp/a.py", "tmp")], "Session-1")
@@ -232,7 +252,7 @@ class PruneTests(HomeCase):
         stray = base / "stray.sock"
         stray.write_text("")
         result = self.run_prune(True)
-        self.assertEqual(result["removed"], [str(old)])
+        self.assertEqual((result["removed"], result["partially_removed"]), ([], [str(old)]))
         # Claude task output is kept unless explicitly included; the scratchpad is removed.
         self.assertFalse((old / "scratchpad").exists())
         self.assertTrue((old / "tasks" / "b1.output").exists())
@@ -244,6 +264,30 @@ class PruneTests(HomeCase):
         self.assertEqual(unmanaged, {str(odd), str(stray)})
         for survivor in (recent, odd, stray):
             self.assertTrue(survivor.exists(), survivor)
+
+    def test_keep_file_protects_scratch_sessions(self):
+        old = self.scratch / f"claude-{os.getuid()}" / "-Users-x" / UUID
+        (old / "scratchpad").mkdir(parents=True)
+        (old / "scratchpad" / "kit.json").write_text("{}")
+        (old / workdir.KEEP).write_text("")
+        self.age(old, 30)
+        self.assertEqual(self.run_prune(True)["removed"], [])
+        self.assertTrue((old / "scratchpad" / "kit.json").exists())
+        self.assertEqual(workdir._quick_count(time.time(), None), (0, True))
+
+    def test_live_transcript_keeps_session(self):
+        old = self.scratch / f"claude-{os.getuid()}" / "-Users-x" / UUID
+        old.mkdir(parents=True)
+        self.age(old, 30)
+        transcript = self.home / ".claude" / "projects" / "-Users-x" / f"{UUID}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("{}\n")
+        self.assertEqual(self.run_prune(True)["removed"], [])
+        work = self.work_dir(OTHER_UUID, 100)
+        other = self.home / ".claude" / "projects" / "-Elsewhere" / f"{OTHER_UUID}.jsonl"
+        other.parent.mkdir(parents=True)
+        other.write_text("{}\n")
+        self.assertNotIn(str(work), [c["path"] for c in self.run_prune(False)["candidates"]])
 
     def test_scratch_session_with_recent_wal_is_kept(self):
         old = self.scratch / f"claude-{os.getuid()}" / "-p" / UUID
@@ -287,6 +331,75 @@ class PruneTests(HomeCase):
         self.assertIn("About 1 durable work or scratch directories", hint)
         self.assertEqual(workdir.retention_hint("current"), "")
         self.assertTrue(old.exists())
+
+
+class TaskOutputPruneTests(HomeCase):
+    def make(self, name, days, session=UUID):
+        tasks = self.scratch / f"claude-{os.getuid()}" / "-Users-x" / session / "tasks"
+        tasks.mkdir(parents=True, exist_ok=True)
+        path = tasks / name
+        path.write_text("secret-bearing output")
+        moment = time.time() - days * DAY
+        os.utime(path, (moment, moment))
+        return path
+
+    def test_removes_old_unopened_output_only(self):
+        old = self.make("b1.output", 20)
+        held = self.make("b2.output", 20)
+        recent = self.make("b3.output", 3)
+        other = self.make("notes.txt", 40)
+        result = workdir.prune_task_output(True, open_check=lambda paths: {os.path.realpath(held)})
+        self.assertEqual(result["removed"], [str(old)])
+        for survivor in (held, recent, other):
+            self.assertTrue(survivor.exists(), survivor)
+        self.assertFalse(old.exists())
+
+    def test_unknown_open_state_deletes_nothing(self):
+        old = self.make("b1.output", 20)
+        result = workdir.prune_task_output(True, open_check=lambda paths: None)
+        self.assertEqual(result["status"], "SKIPPED")
+        self.assertTrue(old.exists())
+
+    def test_dry_run_and_symlinked_tasks_are_untouched(self):
+        old = self.make("b1.output", 20)
+        self.assertEqual(workdir.prune_task_output(False, open_check=lambda p: set())["removed"], [])
+        self.assertTrue(old.exists())
+        outside = self.home / "outside"
+        outside.mkdir()
+        target = outside / "x.output"
+        target.write_text("keep")
+        os.utime(target, (0, 0))
+        link_session = self.scratch / f"claude-{os.getuid()}" / "-Users-x" / OTHER_UUID
+        link_session.mkdir(parents=True)
+        (link_session / "tasks").symlink_to(outside)
+        workdir.prune_task_output(True, open_check=lambda p: set())
+        self.assertTrue(target.exists())
+
+    def test_real_open_check_sees_a_held_file(self):
+        held = self.make("b1.output", 20)
+        free = self.make("b2.output", 20)
+        with open(held):
+            found = workdir.open_files([held, free])
+        if found is None:
+            self.skipTest("no /proc or lsof on this host")
+        self.assertEqual(found, {os.path.realpath(held)})
+
+    def test_lsof_errors_mean_unknown(self):
+        with patch.object(workdir.os.path, "isdir", lambda p: False if p == "/proc/self/fd" else os.path.isdir(p)):
+            result = workdir.open_files([Path("/x/a.output")], run=lambda *a, **k: subprocess.CompletedProcess(a[0], 2, "", "err"))
+        self.assertIsNone(result)
+
+    def test_session_start_spawn_is_daily_and_detached(self):
+        self.make("b1.output", 20)
+        calls = []
+        popen = lambda args, **kwargs: calls.append((args, kwargs))
+        self.assertTrue(workdir.spawn_task_output_prune(popen=popen))
+        self.assertFalse(workdir.spawn_task_output_prune(popen=popen))
+        self.assertEqual(len(calls), 1)
+        args, kwargs = calls[0]
+        self.assertEqual(args[2:4], ["prune-task-output", "--apply"])
+        self.assertTrue(kwargs["start_new_session"])
+        self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

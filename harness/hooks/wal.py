@@ -141,12 +141,13 @@ def work_dir_context(session_id: str, event: str, data: dict) -> str:
         agent = safe_id(data.get("agent_id"))
         text += f" Shared by this session's agents: keep your files in {path}/agent-{agent}/ or a task-named subfolder."
     if event == "session":
-        text += (" Resume keeps this directory; a fork starts a new one, and earlier session directories "
-                 "remain under ~/.agent-harness/work/.")
+        text += (" A resumed session keeps its session id and so this directory; a fork gets a new one, and "
+                 "earlier session directories remain under ~/.agent-harness/work/.")
         try:
             text += workdir.scratchpad_drift_warning(data.get("scratchpad_dir"))
             if data.get("source") == "startup":
                 text += workdir.retention_hint(session_id)
+            workdir.spawn_task_output_prune()  # detached and at most daily; never waited on
         except Exception:
             pass
     return text

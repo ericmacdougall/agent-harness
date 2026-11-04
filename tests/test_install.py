@@ -14,6 +14,11 @@ from install import (END, START, ROOT, durable_tmp_choice, install, merged_instr
 
 class InstallerTests(unittest.TestCase):
     def setUp(self):
+        # Sessions started after install export CLAUDE_CODE_TMPDIR; tests must not depend on the host.
+        isolate = patch.dict(os.environ)
+        isolate.start()
+        self.addCleanup(isolate.stop)
+        os.environ.pop("CLAUDE_CODE_TMPDIR", None)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name).resolve()
@@ -771,6 +776,11 @@ class InstallerTests(unittest.TestCase):
 
 class DurableScratchInstallTests(unittest.TestCase):
     def setUp(self):
+        # Sessions started after install export CLAUDE_CODE_TMPDIR; tests must not depend on the host.
+        isolate = patch.dict(os.environ)
+        isolate.start()
+        self.addCleanup(isolate.stop)
+        os.environ.pop("CLAUDE_CODE_TMPDIR", None)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name).resolve()
@@ -821,6 +831,32 @@ class DurableScratchInstallTests(unittest.TestCase):
         (self.claude / "settings.json").write_text(json.dumps(foreign))
         install(self.home, apply=True, durable_tmp=False)
         self.assertEqual(self.settings()["env"], foreign["env"])
+
+    def test_shell_exported_value_is_respected(self):
+        with patch.dict(os.environ, {"CLAUDE_CODE_TMPDIR": "/Volumes/fast"}):
+            install(self.home, apply=True)
+            self.assertIn("exported in the shell", scratch_status(self.home, True))
+        self.assertNotIn("CLAUDE_CODE_TMPDIR", self.settings().get("env", {}))
+
+    def test_saved_choice_is_parsed_strictly(self):
+        state = self.home / ".agent-harness" / "install-state.json"
+        state.parent.mkdir()
+        for raw, expected in (('{"durable_tmp": "false"}', True), ('{"durable_tmp": false}', False),
+                              ("not json", True), ("[]", True)):
+            state.write_text(raw)
+            self.assertEqual(durable_tmp_choice(self.home, None), expected, raw)
+
+    def test_symlinked_harness_root_fails_before_settings_change(self):
+        outside = self.home / "outside"
+        outside.mkdir()
+        (self.home / ".agent-harness").symlink_to(outside)
+        (self.claude / "settings.json").write_text("{}")
+        result = subprocess.run([sys.executable, str(ROOT / "install.py"), "--apply", "--no-durable-tmp",
+                                 "--home", str(self.home)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("could not save the durable-tmp choice", result.stderr)
+        self.assertEqual((self.claude / "settings.json").read_text(), "{}")
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_rejects_non_object_env(self):
         (self.claude / "settings.json").write_text(json.dumps({"env": ["bad"]}))

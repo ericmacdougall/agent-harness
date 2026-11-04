@@ -81,7 +81,9 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True) -> di
     if not isinstance(env, dict):
         raise ValueError("settings.json env must be an object")
     managed_tmp = str(durable_scratch(claude))
-    if durable_tmp and TMPDIR_KEY not in env:
+    shell_value = os.environ.get(TMPDIR_KEY)
+    if durable_tmp and TMPDIR_KEY not in env and shell_value in (None, "", managed_tmp):
+        # A value exported in the shell is the user's choice too; settings env would override it.
         # Never overwrite a user's value: setting it (even to /tmp) is the opt-out.
         settings["env"] = {**env, TMPDIR_KEY: managed_tmp}
     elif not durable_tmp and env.get(TMPDIR_KEY) == managed_tmp:
@@ -588,7 +590,7 @@ def durable_tmp_choice(home: Path, flag) -> bool:
         return flag
     try:
         state = json.loads((home.expanduser().resolve() / ".agent-harness" / INSTALL_STATE).read_text())
-        return bool(state.get("durable_tmp", True)) if isinstance(state, dict) else True
+        return not (isinstance(state, dict) and state.get("durable_tmp") is False)
     except (OSError, ValueError):
         return True
 
@@ -621,6 +623,9 @@ def scratch_status(home: Path, apply: bool, durable_tmp: bool = True, run=None) 
         if not durable_tmp:
             return f"durable scratch: off; would remove {TMPDIR_KEY} only if it is the harness value {scratch}"
         return f"durable scratch: would use {scratch} as {TMPDIR_KEY} unless one is already set"
+    if not configured and os.environ.get(TMPDIR_KEY) not in (None, "", str(scratch)):
+        return (f"durable scratch: {TMPDIR_KEY} is exported in the shell ({os.environ[TMPDIR_KEY]!r}); "
+                "settings left unchanged")
     if configured != str(scratch):
         return (f"durable scratch: {TMPDIR_KEY} is {configured!r}, not managed by the harness; left unchanged"
                 if configured else f"durable scratch: {TMPDIR_KEY} not set; scratchpad stays in system temp")
@@ -674,10 +679,16 @@ def main() -> None:
                         help=f"set {TMPDIR_KEY} to ~/.agent-harness/scratch when unset (the default; remembered)")
     args = parser.parse_args()
     durable_tmp = durable_tmp_choice(args.home, args.durable_tmp)
+    if args.apply and args.durable_tmp is not None:
+        # Save the choice first, so a later failure cannot let a plain reinstall undo an opt-out.
+        try:
+            save_durable_tmp_choice(args.home, durable_tmp)
+        except OSError as error:
+            parser.exit(1, f"Install failed: could not save the durable-tmp choice under "
+                           f"{args.home / '.agent-harness'} ({error.__class__.__name__}); it must be a "
+                           "real directory, not a symlink\n")
     try:
         changes = install(args.home, args.apply, durable_tmp=durable_tmp)
-        if args.apply and args.durable_tmp is not None:
-            save_durable_tmp_choice(args.home, durable_tmp)
     except DirectoryPublicationError as error:
         parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"

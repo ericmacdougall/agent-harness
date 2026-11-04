@@ -38,6 +38,9 @@ DAY = 86400
 DEFAULT_DONE_DAYS = 14
 DEFAULT_IDLE_DAYS = 45
 DEFAULT_SCRATCH_DAYS = 7
+DEFAULT_TASK_OUTPUT_DAYS = 14
+TASK_STAMP = ".task-output-pruned"
+TASK_REPORT = ".task-output-prune.json"
 SESSION_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SCRATCHPAD_PATTERN = re.compile(r"/claude-\d+/[^/]+/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/scratchpad(?:/|$)")
 DURABLE_SUFFIXES = {".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl",
@@ -45,6 +48,9 @@ DURABLE_SUFFIXES = {".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts",
                     ".conf", ".filter"}
 KIT_OR_PACKET = re.compile(r"(?:^|[-_.])(?:run-?)?(?:kit|packet)s?(?:[-_.]|$)")
 MAX_ADVISORY_INPUT = 65536  # larger inputs skip the advisory so the fail-closed hook stays fast
+MAX_ADVISORY_CANDIDATES = 32
+ADVISORY_SECONDS = 0.5
+SCRIPT_SUFFIXES = {".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl"}
 WALK_BUDGET = 20000
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 COPY_COMMANDS = {"cp", "mv", "install", "rsync", "ln"}
@@ -120,7 +126,18 @@ def durable_hint(session_id: str | None) -> str:
 
 # --------------------------------------------------------------------------- advisory
 
+_PREFIX_CACHE: dict = {}
+
+
 def _tmp_prefixes(scratchpad_dir: str | None) -> list[str]:
+    key = (os.environ.get("TMPDIR"), scratchpad_dir)
+    if key not in _PREFIX_CACHE:
+        _PREFIX_CACHE.clear()
+        _PREFIX_CACHE[key] = _compute_prefixes(scratchpad_dir)
+    return _PREFIX_CACHE[key]
+
+
+def _compute_prefixes(scratchpad_dir: str | None) -> list[str]:
     prefixes = ["/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/", "/dev/shm/"]
     for value in (os.environ.get("TMPDIR"), scratchpad_dir):
         if value and os.path.isabs(value):
@@ -200,7 +217,10 @@ def _bash_targets(command: str) -> list[str]:
         while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
             words = words[1:]
         while words and words[0] in {"sudo", "env", "command", "exec", "nohup", "time"}:
-            words = words[1:]
+            wrapper, words = words[0], words[1:]
+            while wrapper == "sudo" and words and words[0].startswith("-"):
+                takes_value = words[0] in {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"}
+                words = words[2:] if takes_value else words[1:]
         if not words:
             return
         name = os.path.basename(words[0])
@@ -211,7 +231,13 @@ def _bash_targets(command: str) -> list[str]:
             targets.extend(a for a in args if not a.startswith("-"))
         elif name in COPY_COMMANDS:
             plain = [a for a in args if not a.startswith("-")]
-            if len(plain) >= 2:
+            directory = next((b for a, b in zip(args, args[1:]) if a in {"-t", "--target-directory"}), None)
+            directory = directory or next((a.split("=", 1)[1] for a in args
+                                           if a.startswith("--target-directory=")), None)
+            if directory:
+                targets.extend(os.path.join(directory, os.path.basename(src))
+                               for src in plain if src != directory)
+            elif len(plain) >= 2:
                 destination = plain[-1]
                 if is_durable_state_name(destination):
                     targets.append(destination)
@@ -222,6 +248,11 @@ def _bash_targets(command: str) -> list[str]:
             for flag, value in zip(args, args[1:]):
                 if flag in {"-o", "--output", "-O", "--output-document"}:
                     targets.append(value)
+            for arg in args:  # attached forms: -o/tmp/x, --output=/tmp/x
+                if re.match(r"-[oO][^-]", arg):
+                    targets.append(arg[2:])
+                elif arg.startswith(("--output=", "--output-document=")):
+                    targets.append(arg.split("=", 1)[1])
 
     index = 0
     while index < len(tokens):
@@ -257,14 +288,28 @@ def tmp_advisory(tool_name: str, tool_input: object, scratchpad_dir: str | None 
     else:
         return []
     found: list[tuple[str, str]] = []
-    for raw in candidates:
-        if not isinstance(raw, str) or not raw or not is_durable_state_name(raw):
+    seen: set[str] = set()
+    deadline = time.monotonic() + ADVISORY_SECONDS
+    for raw in candidates[:MAX_ADVISORY_CANDIDATES]:
+        if time.monotonic() > deadline:
+            break
+        if not isinstance(raw, str) or not raw or raw in seen or not is_durable_state_name(raw):
             continue
+        seen.add(raw)
         kind = location_kind(raw, scratchpad_dir)
-        path = _expand(raw)
-        if kind and all(path != seen for seen, _ in found):
-            found.append((path, kind))
+        # In the relocated (reboot-surviving) scratchpad, ordinary notes and data are expected;
+        # only scripts, kits and packets, which outlive a 7-day prune, get the advisory there.
+        if kind == "scratch" and not _script_or_kit(raw):
+            continue
+        if kind:
+            found.append((_expand(raw), kind))
     return found
+
+
+def _script_or_kit(path: str) -> bool:
+    name = os.path.basename(path.rstrip("/")).lower()
+    stem, suffix = os.path.splitext(name)
+    return suffix in SCRIPT_SUFFIXES or bool(KIT_OR_PACKET.search(stem))
 
 
 def advisory_message(found: list[tuple[str, str]], session_id: str | None) -> str:
@@ -319,10 +364,25 @@ def _mtime(path: Path) -> float:
         return 0.0
 
 
-def _activity(directory: Path, wal: Path, budget: int | None = None) -> tuple[float, int, bool]:
+def _transcripts(session_id: str, project: str | None = None) -> list[Path]:
+    """Claude Code transcript files for a session: a live session keeps writing its transcript."""
+    if not SESSION_UUID.fullmatch(str(session_id)):
+        return []
+    projects = home() / ".claude" / "projects"
+    if project:
+        return [projects / project / f"{session_id}.jsonl"]
+    try:
+        return [Path(e.path) / f"{session_id}.jsonl" for e in os.scandir(projects)
+                if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return []
+
+
+def _activity(directory: Path, wal: Path, budget: int | None = None,
+              extra: list | None = None) -> tuple[float, int, bool]:
     """(latest mtime, total bytes, complete) over the tree, never following symlinks."""
     budget = WALK_BUDGET if budget is None else budget
-    latest = max(_mtime(directory), _mtime(wal), _mtime(wal.parent))
+    latest = max([_mtime(directory), _mtime(wal), _mtime(wal.parent)] + [_mtime(p) for p in extra or []])
     size, seen, stack = 0, 0, [str(directory)]
     while stack:
         current = stack.pop()
@@ -415,7 +475,7 @@ def candidates(now: float | None = None, *, done_days: float = DEFAULT_DONE_DAYS
         if not isinstance(recorded, str) or safe_name(recorded) != entry.name:
             continue
         wal = _wal_for(entry.name)
-        latest, size, complete = _activity(path, wal)
+        latest, size, complete = _activity(path, wal, extra=_transcripts(recorded))
         idle = (now - latest) / DAY
         done = os.path.lexists(path / DONE) or _marked_done(wal)
         if idle >= max(1.0, min(done_days if done else idle_days, idle_days)):
@@ -450,7 +510,10 @@ def candidates(now: float | None = None, *, done_days: float = DEFAULT_DONE_DAYS
                                   "reason": "not a session directory; never pruned"})
                     continue
                 path = Path(session.path)
-                latest, size, complete = _activity(path, _wal_for(session.name))
+                if os.path.lexists(path / KEEP):
+                    continue
+                latest, size, complete = _activity(path, _wal_for(session.name),
+                                                   extra=_transcripts(session.name, project.name))
                 idle = (now - latest) / DAY
                 if idle >= max(1.0, scratch_days):
                     found.append({"kind": "scratch", "path": str(path), "idle_days": round(idle, 1),
@@ -459,19 +522,34 @@ def candidates(now: float | None = None, *, done_days: float = DEFAULT_DONE_DAYS
     return found
 
 
+def _same_dir(path: Path, fd: int) -> bool:
+    try:
+        named, opened = os.stat(path, follow_symlinks=False), os.fstat(fd)
+    except OSError:
+        return False
+    return stat.S_ISDIR(named.st_mode) and (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino)
+
+
 def _remove_session_dir(path: Path, include_task_output: bool) -> list[str]:
-    """Remove a scratch session dir; keep its task output (Claude logs) unless explicitly included."""
+    """Remove a scratch session dir through a pinned fd; keep task output unless included."""
     kept = []
-    with os.scandir(path) as entries:
-        children = list(entries)
-    for child in children:
-        if child.name == TASK_OUTPUT and not include_task_output:
-            kept.append(child.path)
-            continue
-        if child.is_dir(follow_symlinks=False):
-            shutil.rmtree(child.path)
-        else:
-            os.unlink(child.path)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if not _same_dir(path, fd):
+            raise OSError("session directory changed")
+        for name in os.listdir(fd):
+            if name == TASK_OUTPUT and not include_task_output:
+                kept.append(str(path / name))
+                continue
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                if not _same_dir(path, fd):
+                    raise OSError("session directory changed")
+                shutil.rmtree(path / name)  # rmtree itself refuses to follow symlinks
+            else:
+                os.unlink(name, dir_fd=fd)
+    finally:
+        os.close(fd)
     if not kept:
         os.rmdir(path)
     return kept
@@ -479,7 +557,7 @@ def _remove_session_dir(path: Path, include_task_output: bool) -> list[str]:
 
 def prune(apply: bool, include_task_output: bool = False, **kwargs) -> dict:
     found = candidates(**kwargs)
-    removed, errors = [], []
+    removed, partial, errors = [], [], []
     eligible = [item for item in found if item.get("eligible")]
     if apply and eligible:
         if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
@@ -495,13 +573,15 @@ def prune(apply: bool, include_task_output: bool = False, **kwargs) -> dict:
                     kept = _remove_session_dir(path, include_task_output)
                     if kept:
                         item["kept"] = kept
+                        partial.append(item["path"])
+                        continue
                 else:
                     shutil.rmtree(path)
                 removed.append(item["path"])
             except OSError as exc:
                 errors.append({"path": item["path"], "error": exc.__class__.__name__})
     return {"status": "APPLIED" if apply else "DRY_RUN", "candidates": found,
-            "removed": removed, "errors": errors}
+            "removed": removed, "partially_removed": partial, "errors": errors}
 
 
 def retention_hint(session_id: str | None, now: float | None = None) -> str:
@@ -552,10 +632,135 @@ def _quick_count(now: float, current: str | None, budget: int = 2000, seconds: f
                     continue
                 if not needs_marker and not SESSION_UUID.fullmatch(entry.name):
                     continue
-                latest = max(_mtime(path), _mtime(_wal_for(entry.name)))
+                if os.path.lexists(path / KEEP):
+                    continue
+                latest = max(_mtime(path), _mtime(_wal_for(entry.name)),
+                             *(_mtime(t) for t in _transcripts(entry.name, None if needs_marker else root.name)))
                 if now - latest >= days * DAY:
                     count += 1
     return count, True
+
+
+# --------------------------------------------------------------------------- task output
+
+def _scratch_base() -> Path:
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    return scratch_root() / (f"claude-{uid}" if uid is not None else "claude")
+
+
+def task_output_candidates(now: float | None = None, days: float = DEFAULT_TASK_OUTPUT_DAYS) -> list[Path]:
+    """Old Claude Code background-task output files in the durable scratch root only."""
+    now = time.time() if now is None else now
+    base, found = _scratch_base(), []
+    if os.path.islink(scratch_root()) or os.path.islink(base) or _redirected_to_tmp(base):
+        return []
+    try:
+        projects = [e for e in os.scandir(base) if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return []
+    for project in projects:
+        try:
+            sessions = [e for e in os.scandir(project.path)
+                        if e.is_dir(follow_symlinks=False) and SESSION_UUID.fullmatch(e.name)]
+        except OSError:
+            continue
+        for session in sessions:
+            tasks = Path(session.path) / TASK_OUTPUT
+            if os.path.islink(tasks):
+                continue
+            try:
+                entries = list(os.scandir(tasks))
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if (entry.name.endswith(".output") and stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                        and now - info.st_mtime >= days * DAY):
+                    found.append(Path(entry.path))
+    return sorted(found)
+
+
+def open_files(paths: list[Path], run=None) -> set | None:
+    """Real paths among `paths` that a live process holds open; None when that cannot be determined."""
+    if not paths:
+        return set()
+    wanted = {os.path.realpath(p) for p in paths}
+    if os.path.isdir("/proc/self/fd"):
+        held = set()
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                fds = os.listdir(f"/proc/{pid}/fd")
+            except OSError:
+                continue  # another user's or an exited process
+            for fd in fds:
+                try:
+                    target = os.readlink(f"/proc/{pid}/fd/{fd}")
+                except OSError:
+                    continue
+                if target in wanted:
+                    held.add(target)
+        return held
+    import subprocess
+    run = run or subprocess.run
+    held = set()
+    for start in range(0, len(paths), 200):
+        batch = [str(p) for p in paths[start:start + 200]]
+        try:
+            result = run(["lsof", "-nP", "-Fn", "--", *batch], capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        # lsof exits 1 whenever any listed file is not open, while still listing the open ones.
+        if result.returncode not in (0, 1):
+            return None
+        held.update(os.path.realpath(line[1:]) for line in result.stdout.splitlines() if line.startswith("n"))
+    return held & wanted
+
+
+def prune_task_output(apply: bool, days: float = DEFAULT_TASK_OUTPUT_DAYS, now: float | None = None,
+                      open_check=open_files) -> dict:
+    found = task_output_candidates(now, days)
+    held = open_check(found)
+    if held is None:
+        return {"status": "SKIPPED", "reason": "could not determine which files are open; deleted nothing",
+                "candidates": [str(p) for p in found], "removed": []}
+    removable = [p for p in found if os.path.realpath(p) not in held]
+    removed, errors = [], []
+    if apply:
+        for path in removable:
+            try:
+                info = os.stat(path, follow_symlinks=False)
+                if stat.S_ISREG(info.st_mode) and not _protected(path):
+                    os.unlink(path)
+                    removed.append(str(path))
+            except OSError as exc:
+                errors.append({"path": str(path), "error": exc.__class__.__name__})
+    return {"status": "APPLIED" if apply else "DRY_RUN", "candidates": [str(p) for p in removable],
+            "open": sorted(held), "removed": removed, "errors": errors}
+
+
+def spawn_task_output_prune(now: float | None = None, popen=None) -> bool:
+    """At most daily, start a detached task-output prune so the session hook never waits on lsof."""
+    import subprocess
+    now = time.time() if now is None else now
+    stamp = work_root() / TASK_STAMP
+    try:
+        if not _scratch_base().is_dir() or os.path.islink(stamp) or now - _mtime(stamp) < DAY:
+            return False
+        work_root().mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.close(os.open(stamp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600))
+        os.utime(stamp, (now, now))
+        (popen or subprocess.Popen)([sys.executable, str(Path(__file__).resolve()), "prune-task-output", "--apply",
+                                     "--report", str(work_root() / TASK_REPORT)],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+        return True
+    except OSError:
+        return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -573,7 +778,24 @@ def main(argv: list[str] | None = None) -> int:
     cmd.add_argument("--current-session", help="session id that is never eligible")
     cmd.add_argument("--include-task-output", action="store_true",
                      help="also delete Claude Code task output (tasks/); only after a verified backup")
+    task = sub.add_parser("prune-task-output",
+                          help=f"remove Claude task output older than {DEFAULT_TASK_OUTPUT_DAYS} days that no "
+                               "live process holds open (runs daily from SessionStart)")
+    task.add_argument("--apply", action="store_true", help="delete; otherwise list")
+    task.add_argument("--days", type=float, default=DEFAULT_TASK_OUTPUT_DAYS)
+    task.add_argument("--report", type=Path, help="also write the JSON result to this private file")
     args = parser.parse_args(argv)
+    if args.action == "prune-task-output":
+        if args.days < 1:
+            parser.error("retention periods must be at least 1 day")
+        result = prune_task_output(args.apply, args.days)
+        text = json.dumps(result, indent=2)
+        print(text)
+        if args.report:
+            fd = os.open(args.report, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(text + "\n")
+        return 0 if not result.get("errors") else 1
     for value in (args.done_days, args.idle_days, args.scratch_days):
         if value < 1:
             parser.error("retention periods must be at least 1 day")
