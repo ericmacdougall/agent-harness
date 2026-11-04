@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "enforcement": "enforce",
-  "enforce_after": "2026-11-04T01:00:00+00:00",
+  "enforce_after": "2026-11-04T06:30:00+00:00",
   "remote_tickets_required": true,
   "backstop_repos": [
     "github\\.com[:/]ericmacdougall/"
