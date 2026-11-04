@@ -44,28 +44,65 @@ STATE_DIR = os.path.join(os.path.expanduser("~"), ".agent-harness", "state", "ru
 
 def snapshot():
     """[(pid, ppid, pgid, rss_kb, stat)] for every process."""
-    out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,rss=,stat="], capture_output=True, text=True, timeout=10).stdout
+    ps = subprocess.Popen(["ps", "-axo", "pid=,ppid=,pgid=,rss=,stat="], stdout=subprocess.PIPE, text=True)
+    out = ps.communicate(timeout=10)[0]
     rows = []
     for line in out.splitlines():
         parts = line.split()
         if len(parts) == 5 and all(p.isdigit() for p in parts[:4]):
-            rows.append(tuple(int(p) for p in parts[:4]) + (parts[4],))
+            row = tuple(int(p) for p in parts[:4]) + (parts[4],)
+            if row[0] != ps.pid and not row[4].startswith("Z"):  # not our own ps, not zombies
+                rows.append(row)
     return rows
 
 
+EXTRA_ROOTS = set()  # the runner itself once it is a subreaper: orphans reparent to it
+EXCLUDE = set()      # runner-owned helpers (guardian) that must never be counted or signalled
+
+
+def become_subreaper():
+    """Linux: orphaned/daemonized descendants reparent to us, so double-fork+setsid cannot hide from accounting."""
+    try:
+        import ctypes
+        if sys.platform.startswith("linux") and ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0:  # PR_SET_CHILD_SUBREAPER
+            EXTRA_ROOTS.add(os.getpid())
+            EXCLUDE.add(os.getpid())
+            return True
+    except (OSError, AttributeError, ImportError):
+        pass
+    return False
+
+
 def members(root_pid, pgid, rows=None):
-    """Processes in the group plus every descendant of root_pid (covers setsid escapes)."""
+    """Processes in the group plus every descendant of root_pid (and of the subreaper runner)."""
     rows = rows if rows is not None else snapshot()
     children = {}
     for pid, ppid, _pg, _rss, _st in rows:
         children.setdefault(ppid, []).append(pid)
-    tree, stack = set(), [root_pid]
+    tree, stack = set(), [root_pid] + list(EXTRA_ROOTS)
     while stack:
         pid = stack.pop()
         if pid not in tree:
             tree.add(pid)
             stack.extend(children.get(pid, []))
-    return [r for r in rows if r[0] in tree or r[2] == pgid]
+    return [r for r in rows if (r[0] in tree or r[2] == pgid) and r[0] not in EXCLUDE]
+
+
+def reap_orphans(root_pid):
+    """As a subreaper we inherit daemonized orphans; reap the dead ones (never the command itself)."""
+    if not EXTRA_ROOTS:
+        return
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,stat="], capture_output=True, text=True, timeout=10).stdout
+    except (subprocess.SubprocessError, OSError):
+        return
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[1] == str(os.getpid()) and parts[2].startswith("Z") and int(parts[0]) != root_pid:
+            try:
+                os.waitpid(int(parts[0]), os.WNOHANG)
+            except OSError:
+                pass
 
 
 def kill_tree(root_pid, pgid, own_pids=()):
@@ -87,6 +124,7 @@ def kill_tree(root_pid, pgid, own_pids=()):
                 pass
         deadline = time.time() + wait
         while time.time() < deadline:
+            reap_orphans(root_pid)
             if not [r for r in members(root_pid, pgid) if r[0] not in own_pids]:
                 return True
             time.sleep(0.05)
@@ -135,6 +173,11 @@ def guardian(wrapper_pid, child_pid, pgid):
             time.sleep(0.5)
             if not alive(wrapper_pid):
                 kill_tree(child_pid, pgid, me)
+                for suffix in (".json", ".alert"):  # the SIGKILLed wrapper cannot clean up its own sidecar
+                    try:
+                        os.unlink(os.path.join(STATE_DIR, f"{wrapper_pid}{suffix}"))
+                    except OSError:
+                        pass
                 break
             if not members(child_pid, pgid):
                 break
@@ -172,6 +215,7 @@ def main(argv=None):
     if not command or args.max_rss_gb <= 0:
         parser.error("need --max-rss-gb > 0 and a command after --")
 
+    become_subreaper()
     try:
         child = subprocess.Popen(command, start_new_session=True)
     except OSError as error:
@@ -192,6 +236,7 @@ def main(argv=None):
     guardian_pid = os.fork()
     if guardian_pid == 0:
         guardian(os.getppid(), child.pid, pgid)
+    EXCLUDE.add(guardian_pid)
     sidecar = write_sidecar(args, child.pid, pgid, command)
     cap_kb = args.max_rss_gb * 1024 * 1024
     started = time.time()

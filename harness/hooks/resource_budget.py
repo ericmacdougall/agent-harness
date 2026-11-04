@@ -44,18 +44,40 @@ FIELD = re.compile(r"(?m)^[ \t]*(?:[-*][ \t]+)?([A-Za-z][A-Za-z -]+?)[ \t]*:[ \t
 PLACEHOLDER = re.compile(r"<[^<>\n]{2,60}>")
 
 
+FENCE = re.compile(r"(?ms)^[ \t]*(```|~~~).*?^[ \t]*\1[ \t]*$")
+NUMBER = r"(\d+(?:\.\d+)?)"
+
+
 def extract(text: str):
-    match = SECTION.search(text)
+    """Fields of the first `## Resource budget` section outside code fences; (fields, duplicate-keys) or None."""
+    match = SECTION.search(FENCE.sub("", text))
     if not match:
         return None
-    fields = {}
+    fields, dupes = {}, []
     for key, value in FIELD.findall(match.group(1)):
-        fields.setdefault(key.strip().lower(), value.strip())
+        key = key.strip().lower()
+        if key in fields:
+            dupes.append(key)
+        fields.setdefault(key, value.strip())
+    fields["__dupes__"] = dupes
     return fields
 
 
+def head(value: str) -> str:
+    """The declared figure: everything before the `(method: ...)` note, so the note cannot supply the number."""
+    return value.split("(")[0]
+
+
+def clean_number(text: str):
+    """True when `text` holds no thousands separators, underscores or exponents that would misparse."""
+    return not re.search(r"\d[,_]\d|\d[eE][+-]?\d", text)
+
+
 def gb(value: str):
-    match = re.search(r"(\d+(?:\.\d+)?)\s*(TB|GB|GiB|G|MB|MiB|M)\b", value, re.I)
+    value = head(value)
+    if not clean_number(value):
+        return None
+    match = re.search(NUMBER + r"\s*(TB|GB|GiB|G|MB|MiB|M)\b", value, re.I)
     if not match:
         return None
     number, unit = float(match.group(1)), match.group(2).lower()
@@ -63,7 +85,10 @@ def gb(value: str):
 
 
 def minutes(value: str):
-    match = re.search(r"(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b", value, re.I)
+    value = head(value)
+    if not clean_number(value):
+        return None
+    match = re.search(NUMBER + r"\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b", value, re.I)
     if not match:
         return None
     number, unit = float(match.group(1)), match.group(2).lower()
@@ -71,8 +96,18 @@ def minutes(value: str):
 
 
 def fanout(value: str):
-    pairs = dict((k.lower(), int(v)) for k, v in re.findall(r"([A-Za-z_]+)\s*=\s*(\d+)", value))
-    return pairs
+    pairs, dupes, bad = {}, [], False
+    for key, number, tail in re.findall(r"([A-Za-z_]+)\s*=\s*(\d+)([^\s]*)", value):
+        if tail:
+            bad = True  # 1_000, 1e3, 5x ...
+        key = key.lower()
+        if key in pairs:
+            dupes.append(key)
+        pairs[key] = int(number)
+    return pairs, dupes, bad
+
+
+VM_HOST = re.compile(r"^vm:[A-Za-z0-9._-]+$")
 
 
 def lint_budget(text: str):
@@ -82,15 +117,28 @@ def lint_budget(text: str):
         return ["the packet has no `## Resource budget` section (expected fan-out, peak memory/CPU/disk/network with "
                 "estimate methods, wall time, host, cap and kill mechanism, checkpointing)"], None
     problems = []
-    parsed = {"host": fields.get("host", "").split()[0].lower() if fields.get("host") else ""}
-    if parsed["host"] not in HOST_LIMITS and not parsed["host"].startswith("vm"):
+    for key in fields["__dupes__"]:
+        problems.append(f"Resource budget: `{key}` is declared more than once")
+    host = fields.get("host", "").split()[0].lower() if fields.get("host") else ""
+    parsed = {"host": host}
+    if host not in HOST_LIMITS and not VM_HOST.match(host):
         problems.append("Resource budget: `Host:` must be mac, dev2 or vm:<name>")
-    if parsed["host"].startswith("vm") and not fields.get("capacity"):
-        problems.append("Resource budget: a vm host needs `Capacity:` stating its memory, cores and disk (it cannot be read live)")
-    pairs = fanout(fields.get("fan-out", ""))
+    parsed["capacity"] = None
+    if VM_HOST.match(host):
+        cap_text = fields.get("capacity", "")
+        cap_mem, cap_cores = gb(cap_text), re.search(NUMBER + r"\s*cores?\b", cap_text, re.I)
+        if cap_mem is None or not cap_cores:
+            problems.append("Resource budget: a vm host needs `Capacity:` with memory and cores, e.g. 16 GB memory, 8 cores, 100 GB disk")
+        else:
+            disk = re.search(NUMBER + r"\s*(GB|TB)\s*disk", cap_text, re.I)
+            parsed["capacity"] = {"host": host, "mem_available_gb": cap_mem, "cores": float(cap_cores.group(1)), "load1": 0.0,
+                                  "disk_free_gb": (float(disk.group(1)) * (1024 if disk.group(2).upper() == "TB" else 1)) if disk else 1e9,
+                                  "pressure_free_pct": None}
+    pairs, dupes, bad = fanout(fields.get("fan-out", ""))
     missing = [k for k in FANOUT_KEYS if k not in pairs]
-    if missing:
-        problems.append("Resource budget: `Fan-out:` must give " + " ".join(f"{k}=N" for k in missing))
+    if missing or bad or dupes:
+        problems.append("Resource budget: `Fan-out:` must give each of " + " ".join(f"{k}=N" for k in FANOUT_KEYS)
+                        + " once, as plain integers")
     parsed["fanout"] = pairs
     for name in ("peak memory", "cpu", "disk", "network"):
         value = fields.get(name, "")
@@ -99,14 +147,20 @@ def lint_budget(text: str):
         elif "method" not in value.lower():
             problems.append(f"Resource budget: `{name.title()}:` needs `(method: how you estimated it)`")
     parsed["mem_gb"] = gb(fields.get("peak memory", "")) or 0.0
-    if fields.get("peak memory") and gb(fields["peak memory"]) is None:
-        problems.append("Resource budget: `Peak memory:` needs a number with a unit, e.g. 6 GB")
-    cores = re.search(r"(\d+(?:\.\d+)?)", fields.get("cpu", ""))
+    if fields.get("peak memory") and not parsed["mem_gb"] > 0:
+        problems.append("Resource budget: `Peak memory:` needs one plain positive number with a unit before the method, e.g. 6 GB")
+    cpu_head = head(fields.get("cpu", ""))
+    cores = re.search(NUMBER, cpu_head) if clean_number(cpu_head) else None
     parsed["cores"] = float(cores.group(1)) if cores else 0.0
-    parsed["disk_gb"] = gb(fields.get("disk", "")) or 0.0
+    if fields.get("cpu") and not parsed["cores"] > 0:
+        problems.append("Resource budget: `CPU:` needs one plain positive number of cores before the method")
+    disk = fields.get("disk", "")
+    parsed["disk_gb"] = gb(disk) or 0.0
+    if disk and gb(disk) is None:
+        problems.append("Resource budget: `Disk:` needs one plain number with a unit before the method")
     parsed["wall_min"] = minutes(fields.get("wall time", ""))
-    if parsed["wall_min"] is None:
-        problems.append("Resource budget: `Wall time:` needs a number with a unit, e.g. 25 min")
+    if not parsed["wall_min"] or parsed["wall_min"] <= 0:
+        problems.append("Resource budget: `Wall time:` needs one plain positive number with a unit, e.g. 25 min")
     cap = fields.get("cap and kill", fields.get("cap", ""))
     if not cap or PLACEHOLDER.search(cap):
         problems.append("Resource budget: `Cap and kill:` must name the cap and kill mechanism for each heavy step")
@@ -192,21 +246,29 @@ def check(text: str, host=None, cap=None):
         try:
             cap = cap or capacity(host)
         except (OSError, subprocess.SubprocessError, ValueError, IndexError, AttributeError) as error:
-            return problems + [f"could not read {host} capacity ({type(error).__name__}); gate cannot compare numbers"]
+            # Fail open: an unreachable host must not stop planning. Reported as a warning, not a rejection.
+            return problems + [f"WARN: could not read {host} capacity ({type(error).__name__}); numbers not compared"]
         cap = dict(cap, host=host)
-        problems += ["Resource budget: " + p for p in check_numbers(parsed, cap)]
-    return problems
+    elif parsed.get("capacity"):
+        cap = parsed["capacity"]
+    else:
+        return problems
+    return problems + ["Resource budget: " + p for p in check_numbers(parsed, cap)]
 
 
 def plan_gate(packet: str, mode: str = "enforce", cap=None):
     """(exit_code, text) for peer_review.py plan and spec_flow lint."""
     if mode == "off":
         return 0, ""
-    problems = check(packet, cap=cap)
-    if not problems:
+    found = check(packet, cap=cap)
+    problems = [p for p in found if not p.startswith("WARN:")]
+    warnings = [p for p in found if p.startswith("WARN:")]
+    if not problems and not warnings:
         return 0, ""
-    text = "resource-budget gate:\n  - " + "\n  - ".join(problems)
-    return (2, text) if mode == "enforce" else (0, text + "\n(warn mode: continuing)")
+    text = "resource-budget gate:\n  - " + "\n  - ".join(problems + warnings)
+    if problems and mode == "enforce":
+        return 2, text
+    return 0, text + ("\n(warn mode: continuing)" if problems else "")
 
 
 def main(argv=None):
@@ -226,7 +288,11 @@ def main(argv=None):
     with open(args.packet) as handle:
         text = handle.read()
     cap = json.load(open(args.capacity_json)) if args.capacity_json else None
-    problems = check(text, host=args.host, cap=cap)
+    found = check(text, host=args.host, cap=cap)
+    problems = [p for p in found if not p.startswith("WARN:")]
+    for note in found:
+        if note.startswith("WARN:"):
+            print(note)
     if problems:
         print("REJECTED:\n  - " + "\n  - ".join(problems))
         return 2

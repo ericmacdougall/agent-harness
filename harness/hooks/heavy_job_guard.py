@@ -38,7 +38,7 @@ import sys
 
 MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
 MAX_JSON_DEPTH = 64
-MAX_COMMAND_CHARS = 100_000
+MAX_COMMAND_CHARS = 1_000_000
 MAX_SCRIPT_BYTES = 256 * 1024
 DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enforce",
                  "build": "enforce", "media": "warn", "fan-out": "warn"}
@@ -46,13 +46,6 @@ CAPPED_RULES = {"browser", "media", "fan-out"}  # memory hogs: hatch alone is no
 NEVER_BLOCK = {"adversarial"}  # red-team/fuzz work is legitimate: advise (dev2, group cleanup), never deny
 HATCH = "HARNESS_LOCAL_OK"
 LOG_PATH = os.path.join(os.path.expanduser("~"), ".agent-harness", "logs", "heavy-job-guard.jsonl")
-
-PREFILTER = re.compile(
-    r"playwright|puppeteer|chrom|selenium|cypress|pytest|py\.test|unittest|\bnpm\b|\bpnpm\b|\byarn\b|\bbun|"
-    r"vitest|jest|\bnext\b|\bvite\b|webpack|docker|cargo|dotnet|\bgo\b|ffmpeg|whisper|xargs|parallel|"
-    r"python|\bnode\b|\btsx\b|ts-node|deno|perl|ruby|\bsh\b|bash|zsh|run_capped|HARNESS_LOCAL_OK|npx|uvx?\b|"
-    r"poetry|pipenv|pdm|/dev/zero|/dev/u?random|mkfifo|\bcat\b",
-    re.I)
 
 RULE_HELP = {
     "browser": "browser automation (Playwright/Puppeteer/headless Chrome) can spawn dozens of renderers",
@@ -94,6 +87,7 @@ def extract_heredocs(text: str):
     """Return (text without heredoc bodies, [bodies]). Unterminated heredocs are left alone."""
     lines = text.split("\n")
     out, bodies, i = [], [], 0
+    missing = set()  # terminators already proven absent below this point: never rescan for them (was quadratic)
     while i < len(lines):
         line = lines[i]
         out.append(line)
@@ -102,12 +96,16 @@ def extract_heredocs(text: str):
             if line[max(0, match.start() - 1):match.start()] == "<":  # here-string <<<
                 continue
             strip_tabs, term = match.group(1) == "-", match.group(3)
+            if term in missing:
+                continue
             j = i
             while j < len(lines) and (lines[j].strip() if strip_tabs else lines[j]) != term:
                 j += 1
             if j < len(lines):
                 bodies.append("\n".join(lines[i:j]))
                 i = j + 1
+            else:
+                missing.add(term)
     return "\n".join(out), bodies
 
 
@@ -185,6 +183,8 @@ REMOTE_CMDS = {"ssh", "scp", "sftp", "rsync", "mosh", "sshpass"}
 PYTHON = re.compile(r"^(?:python|pypy)[\d.]*$")
 NODE_RUNNERS = {"node", "nodejs", "tsx", "ts-node", "deno", "esno"}
 PM = {"npm", "pnpm", "yarn", "bun", "bunx"}
+SHELL_KEYWORDS = {"do", "then", "else", "elif", "{", "}", "!", "if", "while", "until", "time", "coproc"}
+WRAPPER_VALUE_FLAGS = {"-u", "-g", "-n", "-C", "-S", "-p", "-t", "-o", "-i", "--user", "--group", "-U", "--unset"}
 WRAPPERS = {"env", "sudo", "nohup", "time", "command", "exec", "nice", "caffeinate", "stdbuf", "arch",
             "setsid", "builtin"}
 BROWSER_BINS = {"chromium", "chromium-browser", "chrome", "google-chrome", "google-chrome-stable",
@@ -206,6 +206,15 @@ PERL_EXEC = re.compile(r"\bexec\b")
 
 LIGHT_XARGS = {"grep", "egrep", "fgrep", "rg", "echo", "cat", "ls", "rm", "mv", "cp", "stat", "wc", "head", "tail",
                "file", "touch", "chmod", "chown", "basename", "dirname", "md5", "md5sum", "shasum", "sha256sum", "test", "true"}
+
+
+def xargs_inner(args):
+    """The command xargs will run: skip its own flags (and their values)."""
+    valued = {"-n", "-L", "-I", "-P", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--replace", "--delimiter"}
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in valued else 1
+    return args[i:]
 
 
 class Ctx:
@@ -277,6 +286,8 @@ def classify_pm(name, args):
     sub, rest = pos[0], pos[1:]
     if sub in ("exec", "dlx", "x") and rest:
         return ("recurse", rest)
+    if sub in ("playwright", "puppeteer", "vitest", "jest", "cypress", "next", "vite"):
+        return ("recurse", [sub] + rest)
     if sub in ("run", "run-script") and rest:
         sub, rest = rest[0], rest[1:]
     if re.match(r"^(?:test|t|tst)(?:[:_-].*)?$", sub):
@@ -290,6 +301,9 @@ def classify_pm(name, args):
 def classify(argv, ctx, depth=0):
     """Classify one command's argv. Returns (rule, detail) or None."""
     _assigns, argv = split_assignments(argv)
+    while argv and argv[0] in SHELL_KEYWORDS:
+        argv = argv[1:]
+        _assigns, argv = split_assignments(argv)
     if not argv or depth > 4:
         return None
     cmd = base(argv[0])
@@ -299,13 +313,15 @@ def classify(argv, ctx, depth=0):
     if low in REMOTE_CMDS:
         return None  # already off-box
     if cmd == "run_capped.py":
-        ctx.capped = True
+        ctx.capped = "--max-rss-gb" in args
         return classify(args[args.index("--") + 1:] if "--" in args else [], ctx, depth + 1)
     if low in WRAPPERS:
         rest = list(args)
         while rest and (rest[0].startswith("-") or ASSIGN.match(rest[0]) or rest[0].isdigit()):
-            rest = rest[1:]
+            rest = rest[2:] if rest[0] in WRAPPER_VALUE_FLAGS and low in ("sudo", "env", "nice", "stdbuf", "arch") else rest[1:]
         return classify(rest, ctx, depth + 1)
+    if low == "eval":
+        return classify_text(" ".join(args), ctx, depth + 1)
     if low in ("timeout", "gtimeout"):
         rest = list(args)
         while rest and rest[0].startswith("-"):
@@ -322,7 +338,7 @@ def classify(argv, ctx, depth=0):
     if low in ("uv", "poetry", "pipenv", "pdm", "hatch", "rye") and "run" in args:
         rest = args[args.index("run") + 1:]
         while rest and rest[0].startswith("-"):
-            rest = rest[1:]
+            rest = rest[2:] if rest[0] in ("--with", "--extra", "--python", "-p", "--project", "--directory") else rest[1:]
         return classify(rest, ctx, depth + 1)
     if low in ("uvx", "npx", "pipx", "bunx"):
         out, skip = [], False
@@ -360,9 +376,15 @@ def classify(argv, ctx, depth=0):
             return ("browser", f"headless {low}")
         return None
     if PYTHON.match(low):
+        glued = [a for a in args if re.match(r"^-m[A-Za-z_]", a)]
+        if glued:
+            args = [a if a is not glued[0] else "-m" for a in args]
+            args.insert(args.index("-m") + 1, glued[0][2:])
         if "-m" in args and args.index("-m") + 1 < len(args):
             module = args[args.index("-m") + 1]
             margs = args[args.index("-m") + 2:]
+            if module == "coverage" and margs[:1] == ["run"]:
+                return classify([a for a in margs[1:] if not a.startswith("--")][:0] + (["python3"] + margs[1:]), ctx, depth + 1)
             if module in ("pytest", "py.test"):
                 return classify(["pytest"] + margs, ctx, depth + 1)
             if module == "unittest":
@@ -373,10 +395,21 @@ def classify(argv, ctx, depth=0):
         first = (positional(args) or [""])[0]
         if base(first) == "run_capped.py":
             return classify([first] + args[args.index(first) + 1:], ctx, depth + 1)
+        if base(first) == "run_probe.py":
+            return None  # declared-bound probe runner: the probe's own bounds apply
         return python_findings(args, ctx)
     if cmd.endswith(".py"):  # direct ./script.py execution
         return python_findings([argv[0]], ctx)
+    if low == "coverage" and args[:1] == ["run"]:
+        return classify(["python3"] + [a for a in args[1:] if not a.startswith("--")], ctx, depth + 1)
+    if low in ("tox", "nox"):
+        return ("full-suite", f"{low} runs every environment")
     if low in NODE_RUNNERS:
+        for flag in ("-e", "--eval", "-p", "--print"):
+            if flag in args and args.index(flag) + 1 < len(args):
+                code = args[args.index(flag) + 1]
+                if JS_BROWSER_IMPORT.search(code) or re.search(r"require\(\s*['\"](?:playwright|puppeteer)", code):
+                    return ("browser", "node -e code that drives a browser")
         script = next(iter(positional(args)), None)
         if script and re.search(r"\.[cm]?[jt]s$", script):
             sources = script_sources(script, ctx)
@@ -451,7 +484,11 @@ def classify(argv, ctx, depth=0):
 
     # ---- fan-out
     if low == "xargs":
-        inner = [a for a in args if not a.startswith("-") and not a.isdigit()]
+        inner = xargs_inner(args)
+        if inner:
+            result = classify(inner, ctx, depth + 1)
+            if result:
+                return result  # xargs pytest / xargs npx playwright test
         if inner and base(inner[0]) in LIGHT_XARGS:
             return None  # parallel grep/echo/stat is cheap; only fan-out of real work matters
         for i, a in enumerate(args):
@@ -460,9 +497,9 @@ def classify(argv, ctx, depth=0):
                 value = args[i + 1]
             elif a.startswith("--max-procs="):
                 value = a.split("=", 1)[1]
-            elif re.match(r"^-P\d+$", a):
+            elif re.match(r"^-P[0-9]+$", a):
                 value = a[2:]
-            if value is not None and value.isdigit() and (int(value) == 0 or int(value) >= 3):
+            if value is not None and re.fullmatch(r"[0-9]{1,9}", value) and (int(value) == 0 or int(value) >= 3):
                 return ("fan-out", f"xargs -P {value}")
         return None
     if low == "parallel":
@@ -472,6 +509,8 @@ def classify(argv, ctx, depth=0):
 
 def scan_state(command: str, cwd: str):
     """Walk every segment. Returns (hatch_reason_or_None, [(rule, detail, capped, segment)])."""
+    if len(command) > MAX_COMMAND_CHARS:
+        log_event({"event": "truncated-command", "chars": len(command)})  # analysed up to the cap; logged, not silent
     text, heredocs = extract_heredocs(command[:MAX_COMMAND_CHARS])
     ctx = Ctx(cwd, heredocs)
     hatch, findings = None, []
@@ -533,23 +572,33 @@ def load_modes():
     return modes
 
 
+SEVERITY = {"allow": 0, "warn": 1, "deny": 2}
+
+
 def decide(command: str, cwd: str = None, modes=None):
-    """Pure decision: dict(action=allow|warn|deny, rule, detail, message, hatch_reason)."""
-    if not command or not PREFILTER.search(command):
+    """Pure decision: dict(action=allow|warn|deny, rule, detail, message, hatch_reason).
+
+    Every finding is judged on its own (the hatch and the cap apply per finding) and the most
+    severe outcome wins, so a warn-only or hatched first segment never hides a later denied one."""
+    if not command:
         return {"action": "allow"}
     modes = modes or load_modes()
     hatch, findings = scan_state(command, cwd)
+    best = {"action": "allow"}
     for rule, detail, capped, _segment in findings:
         mode = modes.get(rule, "enforce")
-        if mode == "off":
+        if mode == "off" or (rule in NEVER_BLOCK and capped):
             continue
-        if rule in NEVER_BLOCK and capped:
-            continue  # group cleanup is the requested safety; nothing to say
         if valid_reason(hatch) and (capped or rule not in CAPPED_RULES):
-            return {"action": "allow", "rule": rule, "detail": detail, "hatch_reason": hatch.strip()}
-        return {"action": "deny" if mode == "enforce" else "warn", "rule": rule, "detail": detail,
-                "message": deny_message(rule, detail, hatch, capped)}
-    return {"action": "allow"}
+            outcome = {"action": "allow", "rule": rule, "detail": detail, "hatch_reason": hatch.strip()}
+        else:
+            outcome = {"action": "deny" if mode == "enforce" else "warn", "rule": rule, "detail": detail,
+                       "message": deny_message(rule, detail, hatch, capped)}
+        if SEVERITY[outcome["action"]] > SEVERITY[best["action"]] or (
+                outcome["action"] == "allow" and best["action"] == "allow" and outcome.get("hatch_reason")
+                and not best.get("hatch_reason")):
+            best = outcome
+    return best
 
 
 def deny_message(rule, detail, hatch, capped):
@@ -584,10 +633,8 @@ def live_heavy_jobs() -> int:
                 try:
                     os.kill(int(name[:-5]), 0)
                     count += 1
-                except ProcessLookupError:
-                    pass
-                except PermissionError:
-                    count += 1
+                except OSError:
+                    pass  # gone, or a recycled pid owned by someone else: a stale sidecar must never block work
     except OSError:
         pass
     return count
@@ -671,7 +718,8 @@ def run(raw: str) -> int:
         return 0
     decision = decide(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None)
     action = decision["action"]
-    if action == "allow" and decision.get("hatch_reason") and live_heavy_jobs() >= max_heavy_jobs():
+    if (action == "allow" and decision.get("hatch_reason") and decision.get("rule") not in NEVER_BLOCK
+            and live_heavy_jobs() >= max_heavy_jobs()):
         sys.stderr.write(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
                          f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n")
         log_event({"event": "deny-concurrency", "rule": decision["rule"]})
@@ -681,7 +729,7 @@ def run(raw: str) -> int:
             log_hatch_to_wal(payload, decision)
             log_event({"event": "hatch", "rule": decision["rule"]})
         return 0
-    log_event({"event": action, "rule": decision["rule"], "argv0": command.strip().split(" ", 1)[0][:60]})
+    log_event({"event": action, "rule": decision["rule"]})  # never the command text: it may carry secrets
     if action == "warn":
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
                                                  "additionalContext": "WARNING (warn mode) " + decision["message"]}}))

@@ -89,7 +89,7 @@ def managed_hooks(claude: Path) -> dict[str, list[dict]]:
             "matcher": "Bash",
             "hooks": [heavy_guard],
         }, {
-            "matcher": "Agent|Task",
+            "matcher": "Agent|Task|Workflow",
             "hooks": [agent_gate],
         }, {
             "matcher": GOODQA_STATUS_TOOLS,

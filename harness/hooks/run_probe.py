@@ -18,6 +18,13 @@ Refused (exit 2) when the declaration is missing: --class, --worst-case, a wall-
 --max-file-mb, process -> --max-procs). Classes: memory, disk, cpu, process, network,
 external-write, sandbox-escape, hang.
 
+Honest limits: the disk bound counts the probe's sandbox directory only (RLIMIT_FSIZE bounds each file
+anywhere); HOME/TMPDIR are environment variables, not filesystem confinement, so a probe can still write
+elsewhere (class external-write/sandbox-escape probes should declare that and run on dev2 or a throwaway
+dir); bounds are polled, so memory and process counts overshoot by one poll interval. Daemonized
+(setsid) escapees are only accounted for on Linux, where the runner is a subreaper; the report says so.
+Every probe also gets a default RSS ceiling of 25% of physical memory when it declares none.
+
 Enforced: group+descendant RSS, wall clock, process count, RLIMIT_FSIZE plus the size
 of the sandbox directory, RLIMIT_CORE=0. The probe gets a private HOME/TMPDIR (removed
 afterwards). Network is denied unless --net (macOS sandbox-exec; elsewhere the report
@@ -71,6 +78,12 @@ def parse(argv):
     parser.add_argument("--poll-s", type=float, default=0.1)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    try:
+        phys_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2 ** 30
+    except (ValueError, OSError, AttributeError):
+        phys_gb = 8.0
+    args.phys_gb = phys_gb
+    args.rss_defaulted = False
     args.command = args.command[1:] if args.command[:1] == ["--"] else args.command
     missing = []
     if not args.klass:
@@ -84,6 +97,11 @@ def parse(argv):
         missing.append("--" + need.replace("_", "-") + f" (the bound for class {args.klass})")
     if not args.command:
         missing.append("-- <command>")
+    if args.max_rss_gb > phys_gb:
+        missing.append(f"--max-rss-gb must not exceed physical memory ({phys_gb:.0f} GB)")
+    if not missing and not args.max_rss_gb:
+        fraction = float(os.environ.get("HARNESS_PROBE_RSS_FRACTION", "0.25"))  # env override exists for tests
+        args.max_rss_gb, args.rss_defaulted = round(phys_gb * fraction, 2), True  # every class gets a memory ceiling
     if missing:
         parser.exit(2, "run_probe: REFUSED, declaration incomplete. Declare before running: " + "; ".join(missing) + "\n")
     return args
@@ -109,6 +127,7 @@ def main(argv=None):
             cap = int(args.max_file_mb * 1048576)
             resource.setrlimit(resource.RLIMIT_FSIZE, (cap, cap))
 
+    subreaper = run_capped.become_subreaper()
     started = time.time()
     finding, rc = None, None
     try:
@@ -123,6 +142,7 @@ def main(argv=None):
     guardian = os.fork()
     if guardian == 0:
         run_capped.guardian(os.getppid(), child.pid, pgid)
+    run_capped.EXCLUDE.add(guardian)
     peak_rss = peak_procs = 0.0
     try:
         while True:
@@ -178,6 +198,9 @@ def main(argv=None):
         "observed": {"peak_rss_gb": round(peak_rss, 3), "peak_procs": int(peak_procs),
                      "seconds": round(time.time() - started, 2)},
         "survivors": len(left),
+        "escape_detection": "subreaper (daemonized descendants are counted and killed)" if subreaper else
+                            "unavailable on this host: a double-forked setsid daemon may escape accounting",
+        "rss_bound_defaulted": args.rss_defaulted,
     }
     text = json.dumps(report, indent=1)
     if args.report:

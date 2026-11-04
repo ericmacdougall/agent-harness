@@ -95,6 +95,36 @@ class Budget(unittest.TestCase):
         self.assertEqual(rb.plan_gate("no section", "off", cap=DEV2), (0, ""))
 
 
+class BudgetParsing(unittest.TestCase):
+    MAC10 = dict(MAC, mem_available_gb=10)
+
+    def test_redteam_f8_bogus_numbers_do_not_pass(self):
+        base = packet(host="mac", mem="1 GB", wall="5 min", checkpoint="none")
+        for bad in ("1,000 GB", "2,048 MB", "unknown (method: last run used 2 GB)", "0 GB", "1e3 GB", "1_000 GB"):
+            text = base.replace("Peak memory: 1 GB", "Peak memory: " + bad)
+            self.assertTrue(rb.check(text, host="mac", cap=self.MAC10), bad)
+        self.assertEqual(rb.check(base, host="mac", cap=self.MAC10), [])  # control
+
+    def test_redteam_f8_vm_hosts_are_checked_and_decoys_ignored(self):
+        text = packet(host="vm:x", mem="900 GB", wall="5 min", checkpoint="none")
+        self.assertTrue(any("Capacity" in p for p in rb.check(text)))
+        self.assertTrue(any("exceeds" in p for p in rb.check(text.replace("Host: vm:x", "Host: vm:x\nCapacity: 8 GB memory, 4 cores, 50 GB disk"))))
+        self.assertTrue(rb.check(packet(host="vmware", mem="1 GB")))
+        fenced = "```\n" + packet(host="dev2", mem="1 GB", wall="5 min", checkpoint="none") + "```\n" + \
+                 packet(host="mac", mem="500 GB", wall="5 min", checkpoint="none")
+        self.assertTrue(rb.check(fenced, cap=self.MAC10))
+        duplicate = packet(host="dev2", mem="1 GB", wall="5 min", checkpoint="none").replace("processes=8", "processes=500 processes=1")
+        self.assertTrue(rb.check(duplicate, host="dev2", cap=DEV2))
+
+    def test_redteam_f9_unreachable_host_warns_instead_of_blocking(self):
+        original = rb.capacity
+        rb.capacity = lambda host: (_ for _ in ()).throw(OSError("ssh down"))
+        self.addCleanup(setattr, rb, "capacity", original)
+        code, text = rb.plan_gate(packet(host="dev2", mem="1 GB", wall="5 min", checkpoint="none"), "enforce")
+        self.assertEqual(code, 0)
+        self.assertIn("WARN", text)
+
+
 class AgentGate(unittest.TestCase):
     def wal(self, live, stopped=0, stale=0, now=None):
         tmp = tempfile.TemporaryDirectory()
@@ -115,15 +145,21 @@ class AgentGate(unittest.TestCase):
 
     def test_ninth_concurrent_agent_is_denied(self):
         root, now = self.wal(live=8)
-        result = agent_gate.decide("sess", now, root, 8)
+        result = agent_gate.decide("sess", now, root, 8, state_root=root + "/st")
         self.assertEqual((result["action"], result["live"]), ("deny", 8))
         self.assertIn("dev2", result["message"])
         root7, now7 = self.wal(live=7)
-        self.assertEqual(agent_gate.decide("sess", now7, root7, 8)["action"], "allow")  # 8th spawn is fine
+        self.assertEqual(agent_gate.decide("sess", now7, root7, 8, state_root=root7 + "/st")["action"], "allow")  # 8th spawn is fine
+
+    def test_redteam_f7_burst_of_parallel_spawns_is_limited(self):
+        root, now = self.wal(live=0)
+        results = [agent_gate.decide("sess", now, root, 8, state_root=root + "/st")["action"] for _ in range(12)]
+        self.assertEqual(results.count("allow"), 8)  # slots are reserved even before start records exist
+        self.assertEqual(results[8:], ["deny"] * 4)
 
     def test_stopped_and_stale_agents_do_not_count(self):
         root, now = self.wal(live=3, stopped=6, stale=6)
-        result = agent_gate.decide("sess", now, root, 8)
+        result = agent_gate.decide("sess", now, root, 8, state_root=root + "/st")
         self.assertEqual((result["action"], result["live"]), ("allow", 3))
 
     def test_hook_process_denies_and_fails_open(self):

@@ -138,6 +138,51 @@ class Classification(unittest.TestCase):
                 self.assertEqual(decide(command), {"action": "allow"})
             self.assertLess(time.time() - start, 5)
 
+    def test_redteam_f1_most_severe_finding_wins(self):
+        self.assertEqual(decide("ffmpeg -i a b; npx playwright test")["action"], "deny")
+        self.assertEqual(decide("xargs -P 9 python3 x; pytest")["action"], "deny")
+        self.assertEqual(decide("HARNESS_LOCAL_OK=reasonxx npm run build; npx playwright test")["rule"], "browser")
+        self.assertEqual(decide("HARNESS_LOCAL_OK=reasonxx npm run build; npx playwright test")["action"], "deny")
+
+    def test_redteam_f2_compound_forms_and_wrappers(self):
+        for command in ("for f in a b; do pytest $f; done", "if true; then npx playwright test; fi", "while :; do pytest; done",
+                        "{ pytest; }", "! pytest", "eval 'pytest'", "sudo -u eric npm run build", "env -u X pytest",
+                        "xargs pytest", "ls | xargs npx playwright test", "yarn playwright test", "pnpm playwright test",
+                        "uv run --with x pytest", "python3 -mpytest", "coverage run -m pytest", "tox",
+                        "node -e \"require('playwright').chromium.launch()\"", "podman build .", "nuxt build", "astro build"):
+            with self.subTest(command=command):
+                self.assertEqual(decide(command)["action"], "deny", command)
+
+    def test_redteam_f4_fail_open_triggers_do_not_hide_a_denied_command(self):
+        self.assertEqual(decide("xargs -P \u00b2 python3 x; pytest")["action"], "deny")
+        self.assertEqual(decide(": '" + "x" * 150000 + "'; pytest")["action"], "deny")
+        start = time.time()
+        decide("cat <<A\n" * 30000 + "pytest")
+        self.assertLess(time.time() - start, 3)
+
+    def test_redteam_f5_adversarial_hatch_never_denied_by_concurrency_and_stale_sidecars_ignored(self):
+        home = tempfile.mkdtemp()
+        state = Path(home, ".agent-harness", "state", "run_capped")
+        state.mkdir(parents=True)
+        for pid in (1, 2, 999999):  # pid 1 is alive but not ours; the others are gone
+            state.joinpath(f"{pid}.json").write_text("{}")
+        env = dict(os.environ, HOME=home, HARNESS_HEAVY_GUARD_FORCE="1")
+        for command in ("HARNESS_LOCAL_OK='redteam probe' python3 -c \"open('/dev/zero','rb').read(1)\"",
+                        "HARNESS_LOCAL_OK='xcode needs mac' npm run build"):
+            done = subprocess.run([sys.executable, str(HOOKS / "heavy_job_guard.py")], capture_output=True, text=True, env=env,
+                                  input=json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "session_id": "s"}))
+            self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_redteam_f10_log_never_holds_the_command_text(self):
+        home = tempfile.mkdtemp()
+        env = dict(os.environ, HOME=home, HARNESS_HEAVY_GUARD_FORCE="1")
+        subprocess.run([sys.executable, str(HOOKS / "heavy_job_guard.py")], capture_output=True, text=True, env=env,
+                       input=json.dumps({"tool_name": "Bash", "session_id": "s",
+                                         "tool_input": {"command": "OPENAI_API_KEY=sk-abcdefghijklmnop1234 npm run build"}}))
+        log = Path(home, ".agent-harness", "logs", "heavy-job-guard.jsonl").read_text()
+        self.assertIn("build", log)
+        self.assertNotIn("sk-abcdef", log)
+
     def test_off_mode(self):
         self.assertEqual(guard.decide("pytest", None, dict(MODES, **{"full-suite": "off"})), {"action": "allow"})
 
@@ -383,6 +428,25 @@ class RunProbe(unittest.TestCase):
         self.assertEqual(data["outcome"], "bound-hit:memory")
         self.assertLess(time.time() - started, 20)
         self.assertLess(data["observed"]["peak_rss_gb"], 3)  # stopped near its 1 GB bound, not at 66 GB
+        self.assertEqual(data["survivors"], 0)
+
+    def test_redteam_f6_every_class_gets_a_memory_bound(self):
+        code = "b=bytearray(1)\nimport time\nwhile True:\n    b+=bytes(64<<20); time.sleep(0.02)\n"
+        with unittest.mock.patch.dict(os.environ, {"HARNESS_PROBE_RSS_FRACTION": "0.004"}):
+            done, data = self.probe(["--class", "hang", "--worst-case", "spins and grows", "--timeout-s", "40"], code, timeout=90)
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertEqual(data["outcome"], "bound-hit:memory")  # not "time": the default ceiling caught it
+        self.assertTrue(data["rss_bound_defaulted"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "subreaper accounting is Linux-only")
+    def test_redteam_f6_daemonized_escapee_is_counted_and_killed(self):
+        code = ("import os,sys,time\nif os.fork()==0:\n    os.setsid()\n    if os.fork()==0:\n"
+                "        b=bytearray(int(0.9*2**30))\n        for i in range(0,len(b),4096): b[i]=1\n        time.sleep(60)\n"
+                "    os._exit(0)\nos.wait()\ntime.sleep(30)\n")
+        done, data = self.probe(["--class", "memory", "--worst-case", "daemon holds memory outside the group",
+                                 "--max-rss-gb", "0.5", "--timeout-s", "30"], code)
+        self.assertEqual(done.returncode, 3, done.stdout)
+        self.assertEqual(data["outcome"], "bound-hit:memory")
         self.assertEqual(data["survivors"], 0)
 
     def test_time_bound(self):
