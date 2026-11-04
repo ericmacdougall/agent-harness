@@ -217,6 +217,21 @@ class Classification(unittest.TestCase):
                 self.assertEqual(decide(command)["action"], "deny", command)
         self.assertEqual(decide("sudo -u root ls")["action"], "allow")  # control: wrappers around light commands stay allowed
 
+    def test_m2b_unparseable_wrapper_forms_scan_for_the_heavy_command(self):
+        for command in ("env -S 'pytest -x'", "env -S pytest", "env --split-string=pytest", "/usr/bin/env -S pytest",
+                        "sudo -iu root pytest", "sudo -nu root pytest", "sudo -Eu root pytest", "env -iu V pytest",
+                        "time -ao o pytest", "arch -arch arm64 pytest", "env -P /usr/bin pytest", "doas pytest",
+                        "doas -u root npm run build", "su -c pytest", "su -l eric -c 'npm test'", "taskpolicy -b pytest",
+                        "watch -n 5 pytest", "watch 'pytest -x'", "unbuffer pytest", "nohup sudo -iu root npx playwright test",
+                        "stdbuf -oL pytest", "caffeinate -dimsu pytest"):
+            with self.subTest(command=command):
+                self.assertEqual(decide(command)["action"], "deny", command)
+        for command in ("sudo -u root ls", "time ls", "env FOO=1 ls", "git status", "ssh dev2 pytest", "command -v pytest",
+                        "command -V pytest", "time grep -rn pytest .", "env FOO=1 grep pytest notes.txt", "sudo ls pytest",
+                        "nice -n 5 tail -f pytest.log", "watch -n 5 ls", "su -c 'ls -la'", "doas ls", "env -i HOME=/tmp ls"):
+            with self.subTest(allowed=command):
+                self.assertEqual(decide(command, cwd="/nonexistent")["action"], "allow", command)
+
     def test_off_mode(self):
         self.assertEqual(guard.decide("pytest", None, dict(MODES, **{"full-suite": "off"})), {"action": "allow"})
 
@@ -356,6 +371,24 @@ class BoundValidation(unittest.TestCase):
                 self.assertFalse(ran, ("probe ran", flag, bad))
         done, ran = self.run_script("run_probe.py", base + ["--max-rss-gb", "1", "--timeout-s", "5"])  # control: valid runs
         self.assertEqual((done.returncode, ran), (0, True), done.stdout + done.stderr)
+
+
+class AbsurdBounds(unittest.TestCase):
+    def test_finite_but_absurd_caps_are_refused(self):
+        for script, flags in (("run_capped.py", ["--max-rss-gb", "1e300"]), ("run_capped.py", ["--max-rss-gb", "1025"]),
+                              ("run_capped.py", ["--max-rss-gb", "1", "--timeout-s", "1e12"]),
+                              ("run_probe.py", ["--class", "memory", "--worst-case", "reads /dev/zero: unbounded",
+                                                "--max-rss-gb", "1e300", "--timeout-s", "5"]),
+                              ("run_probe.py", ["--class", "memory", "--worst-case", "reads /dev/zero: unbounded",
+                                                "--max-rss-gb", "1", "--timeout-s", "1e12"])):
+            done = subprocess.run([sys.executable, str(HOOKS / script)] + flags + ["--", "true"], capture_output=True, text=True,
+                                  timeout=20)
+            self.assertEqual(done.returncode, 2, (script, flags, done.stdout + done.stderr))
+
+    def test_max_heavy_mac_env_is_ascii_digits_only(self):
+        for value, expected in (("\u00b2", 2), ("\u0662", 2), ("1e3", 2), ("-3", 2), ("5", 5)):
+            with unittest.mock.patch.dict(os.environ, {"HARNESS_MAX_HEAVY_MAC": value}):
+                self.assertEqual(guard.max_heavy_jobs(), expected, value)
 
 
 class RunCapped(unittest.TestCase):

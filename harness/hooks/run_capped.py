@@ -41,19 +41,28 @@ import time
 
 def finite_non_negative(text):
     """--timeout-s: 0 means no limit; NaN, inf and negatives are refused."""
-    value = positive_finite(text) if float(text) != 0 else 0.0
-    return value
+    return seconds(text) if float(text) != 0 else 0.0
 
 
-def positive_finite(text):
-    """argparse type: a finite number > 0. NaN/inf would silently disable every comparison against the bound."""
+def positive_finite(text, maximum=None):
+    """argparse type: a finite number > 0 (and <= maximum). NaN/inf/1e300 would silently disable the bound."""
     try:
         value = float(text)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{text!r} is not a number")
     if not math.isfinite(value) or value <= 0:
         raise argparse.ArgumentTypeError(f"{text!r} must be a finite number greater than 0")
+    if maximum is not None and value > maximum:
+        raise argparse.ArgumentTypeError(f"{text!r} is above the sane maximum {maximum:g}")
     return value
+
+
+def rss_gb(text):
+    return positive_finite(text, 1024)  # no machine this runs on has more than 1 TB
+
+
+def seconds(text):
+    return positive_finite(text, 30 * 86400)
 
 
 GRACE_S = 2.0
@@ -222,10 +231,10 @@ def write_sidecar(args, child_pid, pgid, command, status="running", note=""):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--max-rss-gb", type=positive_finite, required=True)
+    parser.add_argument("--max-rss-gb", type=rss_gb, required=True)
     parser.add_argument("--max-procs", type=int, default=0, help="0 = no limit")
     parser.add_argument("--timeout-s", type=finite_non_negative, default=0, help="0 = no limit")
-    parser.add_argument("--poll-s", type=positive_finite, default=0.2)
+    parser.add_argument("--poll-s", type=lambda v: positive_finite(v, 3600), default=0.2)
     parser.add_argument("--on-breach", choices=("pause", "kill"), default="pause")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)

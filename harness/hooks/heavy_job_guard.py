@@ -174,20 +174,32 @@ PYTHON = re.compile(r"^(?:python|pypy)[\d.]*$")
 NODE_RUNNERS = {"node", "nodejs", "tsx", "ts-node", "deno", "esno"}
 PM = {"npm", "pnpm", "yarn", "bun", "bunx"}
 SHELL_KEYWORDS = {"do", "then", "else", "elif", "{", "}", "!", "if", "while", "until", "coproc"}
-# Flags that consume the NEXT token, per wrapper. Anything not listed takes no value, so an unknown flag can never
-# swallow the command it wraps (`env -i pytest`, `sudo -n pytest`, `time -p pytest`).
-WRAPPER_VALUE_FLAGS = {
-    "env": {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"},
-    "sudo": {"-u", "--user", "-g", "--group", "-C", "--close-from", "-h", "--host", "-p", "--prompt", "-r", "--role",
-             "-t", "--type", "-T", "--command-timeout", "-U", "--other-user", "-D", "--chdir", "-R", "--chroot"},
-    "nice": {"-n", "--adjustment"},
-    "time": {"-f", "--format", "-o", "--output"},
-    "caffeinate": {"-t", "-w"},
-    "stdbuf": {"-i", "-o", "-e"},
-    "exec": {"-a"},
+# Wrapper flag tables: (flags that take no value, flags that consume the next token). A flag in neither table
+# (unknown, bundled like -iu, or a value we cannot place) makes the parse UNCERTAIN, and the guard then scans every
+# remaining word for a heavy command instead of guessing which word is the command. A false denial of an odd wrapper
+# form is acceptable (the message names HARNESS_LOCAL_OK and dev2); a false allow is not.
+WRAPPER_FLAGS = {
+    "env": ({"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}, {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
+    "sudo": ({"-n", "--non-interactive", "-S", "--stdin", "-i", "--login", "-s", "--shell", "-E", "--preserve-env", "-H",
+              "--set-home", "-k", "-K", "-b", "--background", "-A", "-B", "-P", "-e", "-l", "-v"},
+             {"-u", "--user", "-g", "--group", "-C", "--close-from", "-h", "--host", "-p", "--prompt", "-r", "--role",
+              "-t", "--type", "-T", "--command-timeout", "-U", "--other-user", "-D", "--chdir", "-R", "--chroot"}),
+    "doas": ({"-n", "-s"}, {"-u", "-C"}),
+    "nice": (set(), {"-n", "--adjustment"}),
+    "time": ({"-p", "-v", "-a", "--portability", "--verbose", "--append"}, {"-f", "--format", "-o", "--output"}),
+    "caffeinate": ({"-d", "-i", "-m", "-s", "-u"}, {"-t", "-w"}),
+    "stdbuf": (set(), {"-i", "-o", "-e"}),
+    "exec": ({"-c", "-l"}, {"-a"}),
+    "watch": ({"-d", "-t", "-b", "-e", "-g", "-c", "-x", "-p", "-q"}, {"-n", "--interval"}),
+    "unbuffer": ({"-p"}, set()),
+    "taskpolicy": (set(), set()),
+    "arch": ({"-arm64", "-x86_64", "-i386", "-arm64e", "-x86_64h"}, set()),
+    "nohup": (set(), set()),
+    "setsid": ({"-f", "-w", "-c"}, set()),
+    "builtin": (set(), set()),
+    "command": ({"-p"}, set()),
 }
-WRAPPERS = {"env", "sudo", "nohup", "time", "command", "exec", "nice", "caffeinate", "stdbuf", "arch",
-            "setsid", "builtin"}
+WRAPPERS = set(WRAPPER_FLAGS)
 BROWSER_BINS = {"chromium", "chromium-browser", "chrome", "google-chrome", "google-chrome-stable",
                 "google chrome", "google chrome for testing", "chrome-headless-shell", "chromedriver",
                 "geckodriver", "msedge", "microsoft edge"}
@@ -299,6 +311,50 @@ def classify_pm(name, args):
     return None
 
 
+def scan_words(words, ctx, depth):
+    """Uncertain wrapper parse: judge every remaining word as if it started the command; first heavy finding wins."""
+    for j, word in enumerate(words):
+        if word.startswith("-") or ASSIGN.match(word):
+            continue
+        result = classify_text(word, ctx, depth + 1) if " " in word else None
+        result = result or classify(words[j:], ctx, depth + 1)
+        if result:
+            return result
+    return None
+
+
+def unwrap(low, args, ctx, depth):
+    """Skip a wrapper's own flags and classify the command it runs; fall back to scan_words when unsure."""
+    if low == "command" and args[:1] in (["-v"], ["-V"]):
+        return None  # `command -v pytest` only looks the name up
+    noval, val = WRAPPER_FLAGS[low]
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if token == "--":
+            i += 1
+            break
+        if low in ("env", "sudo", "doas") and ASSIGN.match(token):
+            i += 1
+            continue
+        if not token.startswith("-") or token == "-":
+            break
+        if low == "env" and token == "-S":
+            return classify_text(args[i + 1], ctx, depth + 1) if i + 1 < len(args) else None
+        if low == "env" and token.startswith("--split-string="):
+            return classify_text(token.split("=", 1)[1], ctx, depth + 1)
+        if token in val:
+            i += 2
+        elif token in noval or token.split("=", 1)[0] in val:
+            i += 1
+        else:
+            return scan_words(args[i + 1:], ctx, depth)  # unknown or bundled flag: do not guess where the command starts
+    rest = args[i:]
+    if len(rest) == 1 and " " in rest[0]:
+        return classify_text(rest[0], ctx, depth + 1)  # watch 'pytest -x'
+    return classify(rest, ctx, depth + 1)
+
+
 def classify(argv, ctx, depth=0):
     """Classify one command's argv. Returns (rule, detail) or None."""
     _assigns, argv = split_assignments(argv)
@@ -316,14 +372,15 @@ def classify(argv, ctx, depth=0):
     if cmd == "run_capped.py":
         ctx.capped = "--max-rss-gb" in args
         return classify(args[args.index("--") + 1:] if "--" in args else [], ctx, depth + 1)
+    if low == "su":
+        for i, a in enumerate(args):
+            if re.match(r"^-[a-zA-Z]*c$", a) and i + 1 < len(args):
+                return classify_text(args[i + 1], ctx, depth + 1)
+            if a.startswith("--command="):
+                return classify_text(a.split("=", 1)[1], ctx, depth + 1)
+        return None
     if low in WRAPPERS:
-        rest, valued = list(args), WRAPPER_VALUE_FLAGS.get(low, set())
-        while rest and (rest[0].startswith("-") or (low in ("env", "sudo") and ASSIGN.match(rest[0]))):
-            if rest[0] == "--":
-                rest = rest[1:]
-                break
-            rest = rest[2:] if rest[0] in valued else rest[1:]
-        return classify(rest, ctx, depth + 1)
+        return unwrap(low, list(args), ctx, depth)
     if low == "eval":
         return classify_text(" ".join(args), ctx, depth + 1)
     if low in ("timeout", "gtimeout"):
