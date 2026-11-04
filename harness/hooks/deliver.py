@@ -781,9 +781,9 @@ def commit_policy_gate(source, original_branch, branch, head, baseline, title, b
         raise DeliveryError("TICKETS_UNVERIFIED", "Referenced tickets could not be verified (ticket system "
                             "unreachable); retry, or record a tickets waiver for this head", code=6,
                             commit_policy=text)
-    if result["waivers"] or warn and result["status"] != "PASS":
+    if result["waivers"] or result.get("warnings") or warn and result["status"] != "PASS":
         print(text, file=sys.stderr)
-    return {"exclude": exclude, "waivers": result["waivers"],
+    return {"exclude": exclude, "waivers": result["waivers"], "warnings": result.get("warnings", []),
             "tickets": [item["ticket"] for item in result["tickets"]]}
 
 
@@ -854,10 +854,12 @@ def _ticket_updates(flow, stage, head, pr_url):
                  "`commit_policy.py notify --stage deployed`")
     for item in record.get("waivers", []):
         lines.append(f"- Waiver used: {item['kind']} {item['subject'][:12]} (id {item['id']})")
+    for item in record.get("warnings", []):
+        lines.append(f"- Not verified (project out of the credential's scope): {item['ticket']}")
     results = commit_policy.notify(str(flow.original), flow.state["baseline"], flow.state["source_head"], policy,
                                    operation_seed=flow.generation, evidence="\n".join(lines), stage=stage,
                                    exclude=record.get("exclude", []))
-    pending = [item for item in results if item["status"] != "COMMENTED"]
+    pending = [item for item in results if item["status"] not in commit_policy.NOTIFY_DONE]
     retry = (f"python3 {Path(__file__).with_name('commit_policy.py')} notify --repo {flow.original} "
              f"--base {flow.state['baseline']} --head {flow.state['source_head']} --seed {flow.generation} "
              f"--stage {stage} --evidence '<delivery evidence>'"

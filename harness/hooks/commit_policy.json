@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "enforcement": "enforce",
-  "enforce_after": "2026-11-04T01:00:00+00:00",
+  "enforce_after": "2026-11-04T06:30:00+00:00",
   "remote_tickets_required": true,
   "backstop_repos": [
     "github\\.com[:/]ericmacdougall/"
@@ -186,7 +186,7 @@
       "ref_pattern": "\\bGoodQA\\s+(?:(?P<project>[a-z0-9][a-z0-9-]{0,62})\\s*)?#(?P<number>[1-9]\\d{0,9})\\b",
       "endpoint": "https://goodqa.app/v1/mcp",
       "key_file": "~/.claude/goodqa-hive/member.key",
-      "org_id": null,
+      "org_id": "a19d343e-f162-4a05-849d-4565e90e4b3f",
       "default_project": "goodqa",
       "timeout_seconds": 15,
       "total_deadline_seconds": 90,
@@ -197,7 +197,9 @@
       "repos": [
         "github\\.com[:/]ericmacdougall/"
       ],
-      "on_deployed_status": null
+      "on_deployed_status": null,
+      "unreachable_projects": ["solve", "ai-course", "harness"],
+      "unreachable_reason": "the GoodQA member key reaches the FrameBright org only; Eric-org projects cannot be verified until durable cross-org access lands (empty unreachable_projects then)"
     }
   },
   "waivers": {

@@ -1139,7 +1139,7 @@ def wal_roots():
 
 def _read_lines(path: Path, limit: int = 64_000_000):
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # never wait on a FIFO
     except OSError:
         return []
     with os.fdopen(fd, "rb") as handle:
@@ -1194,10 +1194,7 @@ def record_waiver(wal: Path, kind: str, subject: str, reason: str, policy: dict)
     at = datetime.now(timezone.utc).isoformat()
     append(wal, {"at": at, "event": "waiver", "waiver_id": waiver_id, "kind": kind,
                  "subject": subject, "note": "COMMIT_POLICY_WAIVER: " + reason})
-    LEDGER.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(LEDGER.parent, 0o700)
-    fd = os.open(LEDGER, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as handle:
+    with _open_ledger(LEDGER) as handle:
         handle.write(json.dumps({"at": at, "id": waiver_id, "kind": kind, "subject": subject,
                                  "wal": str(wal)}, separators=(",", ":")) + "\n")
     return waiver_id
@@ -1551,6 +1548,13 @@ def evaluate(commits, policy, *, base, head, exclude, previous, tickets_required
                 entry.update(status="STALE", fix=adapter.update_instructions(ticket, naming))
                 report["status"] = "BLOCKED"
         except Exception as error:  # includes TicketSystemUnavailable; fail closed
+            if _out_of_scope_warns(error, policy, system, project):
+                reason = str(policy["ticket_systems"][system].get("unreachable_reason")
+                             or "credential cannot reach this project")[:300]
+                entry.update(status="OUT_OF_SCOPE", warning=f"not verified: {str(error)[:200]}; {reason}")
+                report.setdefault("warnings", []).append({"ticket": entry["ticket"], "reason": reason})
+                record_warning("ticket-out-of-scope", entry["ticket"], head, reason)
+                continue
             entry.update(status="UNVERIFIED", error=str(error)[:200])
             if report["status"] == "PASS":
                 report["status"] = "UNVERIFIED"
@@ -1570,6 +1574,8 @@ def format_report(report) -> str:
             lines.append(f"      fix: {item['fix']}")
         if item.get("error"):
             lines.append(f"      could not verify: {item['error']}")
+        if item.get("warning"):
+            lines.append(f"      WARNING {item['warning']}")
     for item in report.get("waivers", []):
         lines.append(f"  WAIVER used: {item['kind']} {item['subject'][:12]} (id {item['id']}, recorded in {item['wal']})")
     if report["status"] != "PASS":
@@ -1599,6 +1605,55 @@ STAGES = {
 }
 
 
+def warnings_ledger() -> Path:
+    return LEDGER.with_name("warnings.jsonl")
+
+
+def _open_ledger(path: Path):
+    """Append handle on a private regular file; a FIFO or other special file is refused, not waited on."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        os.set_blocking(fd, True)
+        return os.fdopen(fd, "a", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def record_warning(kind: str, ticket: str, head: str, reason: str):
+    """Audit trail for checks that passed with a warning instead of blocking (best effort, one row per head)."""
+    try:
+        path = warnings_ledger()
+        for line in _read_lines(path, 16_000_000):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if (row.get("kind"), row.get("ticket"), row.get("head")) == (kind, ticket, head):
+                return
+        with _open_ledger(path) as handle:
+            handle.write(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "kind": kind, "ticket": ticket,
+                                     "head": head, "reason": reason}, separators=(",", ":")) + "\n")
+    except OSError:
+        pass  # the warning is still printed in the report
+
+
+def list_warnings(since: datetime):
+    rows = []
+    for line in _read_lines(warnings_ledger(), 16_000_000):
+        try:
+            entry = json.loads(line)
+            if datetime.fromisoformat(entry["at"]) >= since:
+                rows.append(entry)
+        except (ValueError, KeyError, TypeError):
+            continue
+    return rows
+
+
 def list_waivers(since: datetime):
     """Every ledger waiver since a time, with whether its WAL record still exists."""
     rows = []
@@ -1616,6 +1671,22 @@ def list_waivers(since: datetime):
         rows.append({**entry, "wal_record": note is not None,
                      "reason": note[len("COMMIT_POLICY_WAIVER: "):] if note else None})
     return rows
+
+
+def _out_of_scope_warns(error, policy, system, project) -> bool:
+    """True only for a project explicitly listed as unreachable by this credential.
+
+    Any other project_not_found (a typo, an invented slug, or the default project after
+    the key's org changes) stays UNVERIFIED and fails closed.
+    """
+    config = (policy.get("ticket_systems") or {}).get(system) or {}
+    listed = config.get("unreachable_projects")
+    return (type(error).__name__ == "TicketOutOfScope" and isinstance(listed, list)
+            and project in listed and project != config.get("default_project"))
+
+
+# OUT_OF_SCOPE: the credential cannot see the ticket's project and policy says warn.
+NOTIFY_DONE = ("COMMENTED", "OUT_OF_SCOPE")
 
 
 def notify(repo, base, head, policy, *, operation_seed, evidence, stage="merged", adapters=None, exclude=()):
@@ -1649,6 +1720,9 @@ def notify(repo, base, head, policy, *, operation_seed, evidence, stage="merged"
                 adapter.set_status(ticket, config["on_deployed_status"])
             results.append({"ticket": label, "status": "COMMENTED"})
         except Exception as error:
+            if _out_of_scope_warns(error, policy, system, project):
+                results.append({"ticket": label, "status": "OUT_OF_SCOPE", "error": str(error)[:200]})
+                continue
             results.append({"ticket": label, "status": "FAILED", "error": str(error)[:200]})
     return results
 
@@ -1783,13 +1857,15 @@ def main(argv=None) -> int:
         results = notify(args.repo, args.base, args.head, policy, operation_seed=args.seed, evidence=args.evidence,
                          stage=args.stage, exclude=args.exclude)
         print(json.dumps({"tickets": results}, indent=1))
-        return 0 if all(item["status"] == "COMMENTED" for item in results) else 5
+        return 0 if all(item["status"] in NOTIFY_DONE for item in results) else 5
     if args.command == "report":
         since = datetime.fromisoformat(args.since)
         since = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
         rows = list_waivers(since)
+        warned = list_warnings(since)
         print(json.dumps({"since": since.isoformat(), "waivers": rows, "count": len(rows),
-                          "missing_wal_record": sum(1 for row in rows if not row["wal_record"])}, indent=1))
+                          "missing_wal_record": sum(1 for row in rows if not row["wal_record"]),
+                          "warnings": warned, "warning_count": len(warned)}, indent=1))
         return 0
     return 2
 

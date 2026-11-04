@@ -334,6 +334,11 @@ class Fixture(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "CLAUDE", "CODEX", "AI_AGENT"))}
         self.env.update(HOME=str(self.home), GIT_CONFIG_GLOBAL=str(self.gitconfig), GIT_CONFIG_NOSYSTEM="1",
                         PYTHONDONTWRITEBYTECODE="1")
+        # Range checks treat commits authored before the shipped enforce_after as legacy. Pin
+        # fixture author dates after it so the tests do not depend on the wall clock.
+        cutover = POLICY.get("enforce_after")
+        if cutover and datetime.fromisoformat(cutover) > datetime.now(timezone.utc) - timedelta(hours=1):
+            self.env["GIT_AUTHOR_DATE"] = (datetime.fromisoformat(cutover) + timedelta(hours=1)).isoformat()
         self.repo = self.root / "repo"
         git("init", "-q", str(self.repo), cwd=self.root, env=self.env)
         git("remote", "add", "origin", self.ORIGIN, cwd=self.repo, env=self.env)
@@ -433,10 +438,12 @@ class GitHubRoute(Fixture):
 
     def fake_gh(self, commits):
         state = self.root / "compare.json"
+        cutover = POLICY.get("enforce_after") or "2026-11-04T00:00:00+00:00"
+        when = (datetime.fromisoformat(cutover) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         state.write_text(json.dumps({"total_commits": len(commits), "commits": [
             {"sha": f"{index:040x}", "parents": [{"sha": "0" * 40}],
-             "commit": {"message": text, "author": {"date": "2026-11-04T05:00:00Z"},
-                        "committer": {"date": "2026-11-04T05:00:00Z"}}} for index, text in enumerate(commits, 1)]}))
+             "commit": {"message": text, "author": {"date": when},
+                        "committer": {"date": when}}} for index, text in enumerate(commits, 1)]}))
         bin_dir = self.root / "bin"
         bin_dir.mkdir(exist_ok=True)
         script = bin_dir / "gh"
@@ -623,6 +630,7 @@ class FakeGoodQA:
 
     def __init__(self):
         self.issues, self.comments, self.posted, self.fail = {}, {}, [], None
+        self.projects = {"goodqa"}
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -658,6 +666,8 @@ class FakeGoodQA:
         if name == "list_orgs":
             return {"orgs": [{"id": "org-1"}]}, None
         if name == "get_issue_by_number":
+            if args["projectSlug"] not in self.projects:
+                return None, "project_not_found"
             issue = self.issues.get((args["projectSlug"], args["number"]))
             return (issue, None) if issue else (None, "not_found")
         if name == "get_issue_comments":
@@ -778,6 +788,74 @@ class TicketVerification(Fixture):
         failed = cp.notify(str(self.repo), self.base, self.head, self.policy, operation_seed="gen-2",
                            evidence="x")
         self.assertEqual(failed[0]["status"], "FAILED")
+
+    def out_of_scope_head(self, slug="eric-app"):
+        self.assertEqual(self.commit(sub(GOOD, "GoodQA #14151", f"GoodQA {slug}#7")).returncode, 0)
+        self.head = git("rev-parse", "HEAD", cwd=self.repo, env=self.env)
+        self.fake.comment(self.issue, f"see {self.head[:9]}", datetime.now(timezone.utc))
+        self.base = git("rev-parse", "HEAD~1", cwd=self.repo, env=self.env)
+
+    def test_unreachable_project_blocks_by_default(self):
+        self.out_of_scope_head()
+        self.policy["ticket_systems"]["goodqa"].pop("unreachable_projects", None)
+        report = self.check()
+        self.assertEqual((report["status"], report["tickets"][0]["status"]), ("UNVERIFIED", "UNVERIFIED"))
+        self.assertIn("eric-app", report["tickets"][0]["error"])
+
+    def test_unreachable_project_warns_with_logged_reason(self):
+        self.out_of_scope_head()
+        self.policy["ticket_systems"]["goodqa"].update(unreachable_projects=["eric-app"],
+                                                       unreachable_reason="member key reaches FrameBright only")
+        report = self.check()
+        self.check()  # a second gate run on the same head must not add a second ledger row
+        self.assertEqual((report["status"], report["tickets"][0]["status"]), ("PASS", "OUT_OF_SCOPE"))
+        self.assertIn("FrameBright only", cp.format_report(report))
+        ledger = self.home / ".agent-harness" / "commit-policy" / "warnings.jsonl"
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        self.assertEqual([(r["kind"], r["ticket"], r["head"]) for r in rows],
+                         [("ticket-out-of-scope", "goodqa:eric-app#7", self.head)])
+        self.assertEqual([r["ticket"] for r in cp.list_warnings(datetime.now(timezone.utc) - timedelta(hours=1))],
+                         ["goodqa:eric-app#7"])
+        results = cp.notify(str(self.repo), self.base, self.head, self.policy, operation_seed="gen-oos",
+                            evidence="x")
+        self.assertEqual([r["status"] for r in results], ["OUT_OF_SCOPE"])
+        self.assertEqual(self.fake.posted, [])
+
+    def test_unlisted_or_default_project_stays_fail_closed(self):
+        self.out_of_scope_head("no-such-project")
+        self.policy["ticket_systems"]["goodqa"]["unreachable_projects"] = ["eric-app"]
+        report = self.check()
+        self.assertEqual((report["status"], report["tickets"][0]["status"]), ("UNVERIFIED", "UNVERIFIED"))
+        for value in ("warn", "block", None):
+            self.policy["ticket_systems"]["goodqa"]["unreachable_projects"] = value
+            self.assertEqual(self.check()["status"], "UNVERIFIED", value)
+        # The key's org changed: even the default project answers project_not_found.
+        self.fake.projects.clear()
+        self.policy["ticket_systems"]["goodqa"]["unreachable_projects"] = ["goodqa", "no-such-project"]
+        self.base = git("rev-parse", "HEAD~2", cwd=self.repo, env=self.env)
+        report = self.check()
+        statuses = {t["ticket"]: t["status"] for t in report["tickets"]}
+        self.assertEqual(statuses["goodqa:goodqa#14151"], "UNVERIFIED")
+        self.assertEqual(report["status"], "UNVERIFIED")
+
+    def test_warning_ledger_never_waits_on_a_fifo(self):
+        self.out_of_scope_head()
+        self.policy["ticket_systems"]["goodqa"]["unreachable_projects"] = ["eric-app"]
+        ledger = self.home / ".agent-harness" / "commit-policy" / "warnings.jsonl"
+        ledger.parent.mkdir(parents=True)
+        os.mkfifo(ledger)
+        result = {}
+        worker = threading.Thread(target=lambda: result.update(report=self.check()), daemon=True)
+        worker.start()
+        worker.join(20)
+        self.assertFalse(worker.is_alive(), "the gate hung opening a FIFO ledger")
+        self.assertEqual(result["report"]["status"], "PASS")
+
+    def test_missing_ticket_in_reachable_project_still_blocks_when_warning(self):
+        self.policy["ticket_systems"]["goodqa"]["unreachable_projects"] = ["eric-app"]
+        self.fake.issues.clear()
+        report = self.check()
+        self.assertEqual((report["status"], report["tickets"][0]["status"]), ("BLOCKED", "MISSING"))
 
     def test_credential_file_must_be_private(self):
         key = Path(self.policy["ticket_systems"]["goodqa"]["key_file"])
