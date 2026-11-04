@@ -40,6 +40,7 @@ DEFAULT_IDLE_DAYS = 45
 DEFAULT_SCRATCH_DAYS = 7
 DEFAULT_TASK_OUTPUT_DAYS = 14
 TASK_STAMP = ".task-output-pruned"
+TASK_OUTPUT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.output")  # plain names only: no newlines or path tricks
 TASK_REPORT = ".task-output-prune.json"
 SESSION_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SCRATCHPAD_PATTERN = re.compile(r"/claude-\d+/[^/]+/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/scratchpad(?:/|$)")
@@ -688,7 +689,7 @@ def task_output_candidates(now: float | None = None, days: float = DEFAULT_TASK_
                     info = entry.stat(follow_symlinks=False)
                 except OSError:
                     continue
-                if (entry.name.endswith(".output") and stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                if (TASK_OUTPUT_NAME.fullmatch(entry.name) and stat.S_ISREG(info.st_mode) and info.st_nlink == 1
                         and now - info.st_mtime >= days * DAY):
                     found.append(Path(entry.path))
     return sorted(found)
@@ -790,16 +791,19 @@ def rclone_backup(files: list[Path], base: Path, config: dict, run=None) -> tupl
         with os.fdopen(fd, "w") as handle:
             handle.write("\n".join(relative) + "\n")
         target = CRYPT_REMOTE.lower() + ":"
-        common = ["--files-from", str(listing), str(base), target]
+        common = ["--files-from-raw", str(listing), str(base), target]
         copy = run([rclone, "copy", "--no-traverse", *common], env=env,
                    capture_output=True, text=True, timeout=3600)
         if copy.returncode != 0:
             return set(), f"upload failed (rclone exit {copy.returncode}); deleted nothing"
-        check = run([rclone, "cryptcheck", "--one-way", *common], env=env,
+        check = run([rclone, "cryptcheck", "--one-way", "--combined", "-", *common], env=env,
                     capture_output=True, text=True, timeout=3600)
         if check.returncode != 0:
             return set(), f"verification failed (rclone exit {check.returncode}); deleted nothing"
-        return {str(base / r) for r in relative}, ""
+        # Trust only files cryptcheck itself reports as matching ("= path"), never the request list.
+        matched = {line[2:] for line in check.stdout.splitlines() if line.startswith("= ")}
+        verified = {str(base / r) for r in relative if r in matched}
+        return verified, "" if verified else "verification matched no files; deleted nothing"
     except (OSError, subprocess.SubprocessError) as exc:
         return set(), f"backup failed ({exc.__class__.__name__}); deleted nothing"
     finally:

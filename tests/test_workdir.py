@@ -497,13 +497,16 @@ class TaskOutputBackupTests(HomeCase):
             path.write_text(json.dumps(bad))
             self.assertIsNone(workdir.load_backup_config())
 
-    def fake_run(self, fail=None):
+    def fake_run(self, fail=None, matched=None):
         calls = []
         def run(args, **kwargs):
             calls.append((args, kwargs))
             name = "password" if args == ["pw-cmd"] else args[1]
             code = 1 if name == fail else 0
-            out = {"password": "s3cret-pass", "obscure": "OBSCURED"}.get(name, "")
+            listing = args[args.index("--files-from-raw") + 1] if "--files-from-raw" in args else None
+            names = open(listing).read().split() if listing else []
+            checked = "\n".join("= " + n for n in (names if matched is None else matched))
+            out = {"password": "s3cret-pass", "obscure": "OBSCURED", "cryptcheck": checked}.get(name, "")
             return subprocess.CompletedProcess(args, code, out, "")
         return run, calls
 
@@ -526,6 +529,16 @@ class TaskOutputBackupTests(HomeCase):
             self.assertNotIn("s3cret-pass", " ".join(args))  # the passphrase never appears in argv
         self.assertEqual(calls[1][1]["input"], "s3cret-pass")
         self.assertEqual(list(self.work.glob(".task-output-list-*")), [])
+        # Exit 0 is not enough: only files cryptcheck reports as matching count as verified.
+        run, calls = self.fake_run(matched=[])
+        self.assertEqual(workdir.rclone_backup(files, base, self.config, run=run)[0], set())
+
+    def test_unusual_task_file_names_are_never_candidates(self):
+        odd = self.make("a\nb.output", 30)
+        dotted = self.make("..output", 30)
+        plain = self.make("bx1.output", 30)
+        self.assertEqual(workdir.task_output_candidates(), [plain])
+        self.assertTrue(odd.exists() and dotted.exists())
 
     def test_real_rclone_crypt_round_trip(self):
         rclone = shutil.which("rclone")
