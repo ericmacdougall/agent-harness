@@ -244,6 +244,15 @@ func (m *mdlModel) eligible(f Fact) bool {
 			changesPaused := s.last() != ReceiptUnknown && !s.paused
 			newlyOwes := !s.pending && s.owed()
 			yes = changesPaused || newlyOwes
+			// Decide never emits a stop that changes nothing; only raw facts reach these.
+			switch {
+			case !yes && s.last() == ReceiptUnknown:
+				m.hit("t11.stop_changes_nothing.unknown")
+			case !yes:
+				m.hit("t11.stop_changes_nothing.paused")
+			case s.last() == ReceiptUnknown:
+				m.hit("t11.stop_newly_owes.unknown")
+			}
 		}
 	case FactControlOutcome:
 		// Section 10 item 45: a raw outcome with nothing pending is legal but ordinary.
@@ -1366,6 +1375,9 @@ func (g *mdlGen) next(m *mdlModel) mdlGenStep {
 	if len(g.queue) == 0 && g.rng.Intn(80) == 0 {
 		g.queue = g.scriptRepeatedControl()
 	}
+	if len(g.queue) == 0 && g.rng.Intn(80) == 0 {
+		g.queue = g.scriptIneligibleStops()
+	}
 	var gs mdlGenStep
 	for len(g.queue) > 0 && g.queue[0].expand != nil {
 		build := g.queue[0].expand
@@ -2226,6 +2238,43 @@ func (g *mdlGen) scriptFields() []mdlGenStep {
 
 // scriptReach puts the model in states that mutation of the table rows showed were missed.
 // It holds no restart, so next can repeat it on fresh sessions.
+// scriptIneligibleStops hands Reduce stop ControlRequested facts that change nothing, which
+// Decide never emits, so MustAppend must say false for each (section 11).
+func (g *mdlGen) scriptIneligibleStops() []mdlGenStep {
+	claudePaused, codexPending, codexIdle := g.fresh("is"), g.fresh("is"), g.fresh("is")
+	codexBoundPaused, unknownBound, unknownOwed, claudeUnknown := g.fresh("is"), g.fresh("is"), g.fresh("is"), g.fresh("is")
+	stop := func(sid string) mdlGenStep {
+		return mdlRawFact("legal", Fact{Kind: FactControlRequested, SessionID: sid, Control: "stop"})
+	}
+	var out []mdlGenStep
+	// Paused, and not owed: Claude never owes.
+	out = append(out, mdlClaudeNew(claudePaused), mdlSend(claudePaused, "r1"), mdlStep(InPause, claudePaused), stop(claudePaused), stop(claudePaused))
+	// Paused, with the interrupt already pending: Codex with no turn.
+	out = append(out, g.codexReady(codexPending)...)
+	out = append(out, mdlSend(codexPending, "r1"), mdlStep(InStop, codexPending), stop(codexPending))
+	// Paused with no request at all.
+	out = append(out, g.codexReady(codexIdle)...)
+	out = append(out, mdlStep(InPause, codexIdle), stop(codexIdle))
+	// Paused, turn bound, so nothing owed.
+	out = append(out, g.codexReady(codexBoundPaused)...)
+	out = append(out, mdlSend(codexBoundPaused, "r1"), mdlStep(ObTurnBound, codexBoundPaused, mdlReq("r1"), mdlTurn("t1")), mdlStep(InPause, codexBoundPaused), stop(codexBoundPaused))
+	// Unknown receipts: a stop never sets Paused there.
+	out = append(out, g.codexReady(unknownBound)...)
+	out = append(out, mdlSend(unknownBound, "r1"), mdlStep(ObTurnBound, unknownBound, mdlReq("r1"), mdlTurn("t1")), mdlStep(ObUnknown, unknownBound, mdlReq("r1")), stop(unknownBound), stop(unknownBound))
+	out = append(out, g.codexReady(unknownOwed)...)
+	out = append(out, mdlSend(unknownOwed, "r1"), mdlStep(ObUnknown, unknownOwed, mdlReq("r1")), stop(unknownOwed), stop(unknownOwed))
+	out = append(out, mdlClaudeNew(claudeUnknown), mdlSend(claudeUnknown, "r1"), mdlStep(ObUnknown, claudeUnknown, mdlReq("r1")), stop(claudeUnknown))
+	// Raw disconnects that Decide would treat as idempotent: writable, not connected, nothing
+	// open, so legal in Reduce and not eligible for the reserve.
+	neverConnected, wasConnected := g.fresh("is"), g.fresh("is")
+	disconnect := func(sid string) mdlGenStep {
+		return mdlRawFact("legal", Fact{Kind: FactProviderDisconnected, SessionID: sid})
+	}
+	out = append(out, mdlClaudeNew(neverConnected), disconnect(neverConnected))
+	out = append(out, g.codexReady(wasConnected)...)
+	return append(out, mdlStep(ObDisconnected, wasConnected), disconnect(wasConnected))
+}
+
 func (g *mdlGen) scriptReach() []mdlGenStep {
 	a, b, c, d, e, f, h := g.fresh("rc"), g.fresh("rc"), g.fresh("rc"), g.fresh("rc"), g.fresh("rc"), g.fresh("rc"), g.fresh("rc")
 	outcome := func(sid, control, result string) mdlGenStep {
@@ -2449,7 +2498,7 @@ func (g *mdlGen) regularScripts() []func() []mdlGenStep {
 	return []func() []mdlGenStep{
 		g.scriptCreateAndAuth, g.scriptSend, g.scriptControl, g.scriptCWD, g.scriptAbandon,
 		g.scriptConversation, g.scriptFrames, g.scriptTurns, g.scriptCompleted,
-		g.scriptControlOutcome, g.scriptBoundary, g.scriptQuarantine, g.scriptRestart, g.scriptRaw, g.scriptFields, g.scriptReach,
+		g.scriptControlOutcome, g.scriptBoundary, g.scriptQuarantine, g.scriptRestart, g.scriptRaw, g.scriptFields, g.scriptReach, g.scriptIneligibleStops,
 	}
 }
 
@@ -3342,7 +3391,7 @@ func mdlTableRows() []string {
 		"t4.control_requested.unknown", "t4.control_requested.other",
 		"t4.unknown.pending_survives", "t4.intended.clears_bound_turn",
 		"t4.control_outcome.unresolved_not_confirmed", "t4.control_outcome.abandoned_clears", "t4.control_outcome.abandoned_not_confirmed", "t4.control_outcome.resolved_not_confirmed",
-		"t11.limit.reached", "t11.limit.refused", "t11.limit.refused_whole_decision", "t11.limit.committed", "t11.ordinary", "t11.eligible.late_final_empty_request",
+		"t11.limit.reached", "t11.limit.refused", "t11.limit.refused_whole_decision", "t11.limit.committed", "t11.ordinary", "t11.eligible.late_final_empty_request", "t11.stop_changes_nothing.unknown", "t11.stop_changes_nothing.paused", "t11.stop_newly_owes.unknown",
 		"t11.not_eligible.ProviderDisconnected", "t11.not_eligible.ControlRequested", "t11.not_eligible.ControlOutcome", "t11.not_eligible.LateFrameObserved",
 		"t5.request.known", "t5.request.unknown", "t5.sticky", "t5.status.empty", "t5.status.valid", "t5.status.invalid", "t5.digest.valid", "t5.digest.empty",
 		"t8.unreadable.schema", "t8.unreadable.seq", "t8.unreadable.kind", "t8.unreadable.global", "t8.unreadable.reserved_no_session", "t8.unreadable.global_live_session", "t8.unreadable.global_ghost_session",
