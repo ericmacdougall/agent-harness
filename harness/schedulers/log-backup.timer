@@ -1,0 +1,8 @@
+[Unit]
+Description=Agent log backup every 15 min
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=true
+[Install]
+WantedBy=timers.target
