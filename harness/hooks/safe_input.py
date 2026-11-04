@@ -128,6 +128,21 @@ def read_stdin_bounded(max_bytes: int = DEFAULT_STDIN_BYTES) -> bytes:
     return b"".join(chunks)
 
 
+MAX_NUMBER_CHARS = 64  # int parsing is quadratic on 3.9: a 3 MB digit string takes minutes
+
+
+def _bounded_int(text: str):
+    if len(text) > MAX_NUMBER_CHARS:
+        raise ValueError("JSON number too long")
+    return int(text)
+
+
+def _bounded_float(text: str):
+    if len(text) > MAX_NUMBER_CHARS:
+        raise ValueError("JSON number too long")
+    return float(text)
+
+
 def safe_json_loads(text, max_depth: int = MAX_JSON_DEPTH, max_bytes: int = MAX_JSON_BYTES):
     """json.loads for untrusted text or bytes. Python 3.9 can abort the interpreter outright on deeply nested JSON
     instead of raising RecursionError, so size and nesting are checked first. Raises ValueError, never aborts."""
@@ -159,7 +174,7 @@ def safe_json_loads(text, max_depth: int = MAX_JSON_DEPTH, max_bytes: int = MAX_
             elif char in (b"]", b"}"):
                 depth -= 1
     try:
-        return json.loads(data)
+        return json.loads(data, parse_int=_bounded_int, parse_float=_bounded_float)
     except RecursionError:
         raise ValueError("JSON nested too deeply")
 

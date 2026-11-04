@@ -66,29 +66,38 @@ class HostileInputs:
 
 
 def run_capped(args, stdin_text="", env=None, timeout=8.0, mem_limit=1 << 30):
-    """Run a hook child in its own process group with a hard timeout (killpg) and, where the OS enforces it,
-    an address-space cap. Returns (returncode, stdout, stderr, seconds, peak_rss_bytes). Never leaves an orphan."""
-    clock = time
-
+    """Run a hook child in its own process group with a hard timeout (killpg) and, on Linux, an address-space cap.
+    Returns (returncode, stdout, stderr, seconds, peak_rss_bytes) where the peak is this child's own (wait4)."""
     def limits():
         os.setsid()
         if sys.platform.startswith("linux"):  # RLIMIT_AS is not enforced on macOS
             resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
 
-    start = clock.perf_counter()
-    child = subprocess.Popen([sys.executable, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             env=env, preexec_fn=limits)
-    try:
-        out, err = child.communicate(stdin_text.encode(), timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(child.pid, signal.SIGKILL)
-        child.communicate()
-        return None, "", "TIMEOUT", clock.perf_counter() - start, 0
-    finally:
+    start = time.perf_counter()
+    with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        stdin.write(stdin_text.encode())
+        stdin.seek(0)
+        child = subprocess.Popen([sys.executable, *args], stdin=stdin, stdout=out, stderr=err, env=env, preexec_fn=limits)
+        status = usage = None
         try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except OSError:
-            pass
-    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-    peak = usage.ru_maxrss if sys.platform == "darwin" else usage.ru_maxrss * 1024
-    return child.returncode, out.decode(), err.decode(), clock.perf_counter() - start, peak
+            while True:
+                pid, status, usage = os.wait4(child.pid, os.WNOHANG)
+                if pid:
+                    break
+                if time.perf_counter() - start > timeout:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    os.wait4(child.pid, 0)
+                    return None, "", "TIMEOUT", time.perf_counter() - start, 0
+                time.sleep(0.005)
+        finally:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)  # no orphans, whatever happened
+            except OSError:
+                pass
+        child.returncode = 0  # reaped by wait4 above
+        out.seek(0)
+        err.seek(0)
+        code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (
+            os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status))
+        peak = usage.ru_maxrss if sys.platform == "darwin" else usage.ru_maxrss * 1024
+        return code, out.read().decode("utf-8", "replace"), err.read().decode("utf-8", "replace"), time.perf_counter() - start, peak

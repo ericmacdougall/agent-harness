@@ -26,11 +26,15 @@ def violations(path: Path) -> list:
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
-        name, sized = node.func.attr, bool(node.args or node.keywords)
+        name = node.func.attr
+        first = node.args[0] if node.args else (node.keywords[0].value if node.keywords else None)
+        unbounded_arg = (isinstance(first, ast.Constant) and first.value in (None, -1)) \
+            or (isinstance(first, ast.UnaryOp) and isinstance(first.operand, ast.Constant) and first.operand.value == 1)
+        sized = first is not None and not unbounded_arg
         owner = node.func.value
         bad = ((name in ("read", "readline") and not sized)
                or name in ("readlines", "read_text", "read_bytes")
-               or (name == "load" and isinstance(owner, ast.Name) and owner.id == "json"))
+               or (name == "load" and isinstance(owner, ast.Name) and owner.id in ("json", "j")))
         if not bad:
             continue
         here = lines[node.lineno - 1] if node.lineno <= len(lines) else ""

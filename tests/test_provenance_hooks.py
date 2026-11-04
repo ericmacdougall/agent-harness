@@ -60,11 +60,36 @@ class DetectorRegressions(unittest.TestCase):
         self.assertIn("[ask:wgood00001]", items[0]["text"])
         self.assertIn("[ask:wgood00002]", items[1]["text"])
 
+    def test_adversarial_long_lines_stay_fast_and_closers_are_quiet(self):
+        import time
+        for text in ("a" + "." * 100_000 + "a", "- " + " " * 100_000 + "x", "#" * 100_000, "What I need from you:\n- " + "y " * 50_000):
+            start = time.perf_counter()
+            hooks.detect(text)
+            self.assertLess(time.perf_counter() - start, 1.0, text[:20])
+        for text in ("Let me know if you have any questions.", "Let me know if you run into issues.", "Let me know when you're ready.",
+                     "I don\u2019t need anything from you."):
+            self.assertEqual(self.flagged(text), [], text)
+
     def test_fences_cannot_hide_asks(self):
         self.assertEqual(len(self.flagged("```x```\nWhat I need from you:\n- the key\n")), 1)
         self.assertEqual(len(self.flagged("```\nunclosed fence\nWhat I need from you:\n- the key\n")), 1)
         self.assertEqual(self.flagged("```\nWhat I need from you:\n- the key\n```\nDone.\n"), [])
         self.assertEqual(len(hooks.detect("What I need from you:\n" + "- x item\n" * 500)), hooks.MAX_ITEMS)
+
+
+class SlowInputs(base.Env):
+    def test_huge_numbers_and_long_messages_exit_quickly(self):
+        env = dict(os.environ, HOME=str(self.home))
+        for payload in ('{"session_id":"%s","x":%s}' % (SID, "9" * 3_000_000),
+                        json.dumps({"session_id": SID, "last_assistant_message": "a" + "." * 100_000 + "a"})):
+            code, out, err, seconds, peak = run_capped([str(HOOKS / "provenance_hooks.py"), "stop-lint"], payload, env, timeout=10.0)
+            self.assertEqual(code, 0, err[-200:])
+            self.assertLess(seconds, 3.0)
+
+    def test_usage_errors_do_not_crash(self):
+        for args in (["show-message"], ["calibrate"], ["show-message", "x"]):
+            code, out, err, seconds, peak = run_capped([str(HOOKS / "provenance_hooks.py"), *args], timeout=10.0)
+            self.assertEqual(code, 3, err[-200:])
 
 
 class Hooks(base.Env):

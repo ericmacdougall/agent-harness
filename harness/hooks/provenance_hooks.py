@@ -53,16 +53,42 @@ NEGATED = re.compile(
     r"\bnothing (?:is )?(?:needed|required)\b|\bno (?:action|input|decision)s? (?:is |are )?(?:needed|required)\b|"
     r"\bif you(?:'d)? (?:want|like|prefer|need|have) (?:any )?(?:more|further|additional|another|other|me to (?:go deeper|elaborate|explain|expand|dig))|"
     r"\b(?:more|further|additional) (?:detail|details|info|information|context|help|explanation)\b|"
+    r"\b(?:let me know|tell me) (?:if|when) you(?:'re| are| have|'ve| run| hit| see| need any| want any| would like)[^.\n]{0,40}(?:question|issue|concern|problem|ready|anything else)|"
     r"\b(?:you asked me to|asked me to|the (?:log|error|message|output|docs?|file|prompt) (?:says?|reads?|shows?))\b")
 EMPTY_ITEM = re.compile(r"(?i)^\W*(?:none|nothing|n/?a|no(?:ne| \w+)?|nil|all clear|not applicable)\W*$")
-BULLET = re.compile(r"^(\s*)(?:[-*+]|\d{1,3}[.)])\s+(.*\S)")
+_BULLET_HEAD = re.compile(r"^(\s{0,40})(?:[-*+]|\d{1,3}[.)])\s")
+
+
+class _BulletMatch:
+    def __init__(self, indent, body):
+        self._indent, self._body = indent, body
+
+    def group(self, number):
+        return self._indent if number == 1 else self._body
+
+
+class _Bullet:
+    """Linear stand-in for a bullet regex: `match` returns None or an object with group(1) indent, group(2) body."""
+
+    @staticmethod
+    def match(line):
+        head = _BULLET_HEAD.match(line)
+        if not head:
+            return None
+        body = line[head.end():].strip()
+        return _BulletMatch(head.group(1), body) if body else None
+
+
+BULLET = _Bullet()
+MAX_LINE_CHARS = 2000  # a longer line is cut before any pattern runs: nothing here needs the rest of a 100 KB line
 FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 QUOTED = re.compile(r"`[^`\n]{0,200}`|\"[^\"\n]{0,200}\"|\u201c[^\u201d\n]{0,200}\u201d")
 MAX_ITEMS = 50
 
 
 def strip_md(line: str) -> str:
-    return re.sub(r"^[\s>#*_`|]+|[\s*_`|:.!?]+$", "", line).strip()
+    # str.strip is linear; the earlier regex form was quadratic on one very long line
+    return line.strip(" \t>#*_`|").rstrip(" \t*_`|:.!?").strip()
 
 
 def detect(text: str) -> list:
@@ -75,6 +101,7 @@ def detect(text: str) -> list:
 
 
 def _detect(lines: list, honour_fences: bool):
+    lines = [line[:MAX_LINE_CHARS] for line in lines]
     items, seen = [], set()
     fence = None  # (char, length) of the open fence
     i = 0
@@ -141,7 +168,7 @@ def _detect(lines: list, honour_fences: bool):
             i = max(j, i + 1)
             continue
         for sentence in re.split(r"(?<=[.!?])\s+", line.strip()):
-            plain = QUOTED.sub(" ", sentence)  # words inside quotes or code spans are not the agent's ask
+            plain = QUOTED.sub(" ", sentence).replace("\u2019", "'").replace("\u2018", "'")  # words inside quotes or code spans are not the agent's ask
             if INLINE.search(plain) and not NEGATED.search(plain):
                 add(i, sentence)
                 break
@@ -367,7 +394,7 @@ def assistant_messages(path: str) -> list:
 
 RSS_LIMIT_BYTES = 512 * 1024 * 1024
 WALL_LIMIT_SECONDS = 8.0
-CPU_LIMIT_SECONDS = 10
+CPU_LIMIT_SECONDS = 6
 
 
 def peak_rss_bytes() -> int:
@@ -398,6 +425,10 @@ def install_limits(rss_limit=RSS_LIMIT_BYTES, wall_limit=WALL_LIMIT_SECONDS):
             if rss > rss_limit or time.monotonic() - started > wall_limit:
                 print(f"provenance_hooks: limit exceeded (rss {rss >> 20} MiB, "
                       f"{time.monotonic() - started:.1f}s); skipped", file=sys.stderr, flush=True)
+                try:
+                    sys.stdout.flush()
+                except Exception:
+                    pass
                 os._exit(0)
 
     thread = threading.Thread(target=watch, daemon=True)
@@ -411,7 +442,10 @@ def main(argv=None) -> int:
         print(__doc__, file=sys.stderr)
         return 3
     command = argv[0]
-    if command == "show-message" and len(argv) == 3:
+    if command in ("show-message", "calibrate") and len(argv) < (3 if command == "show-message" else 2):
+        print(f"usage: provenance_hooks.py {command} <transcript> " + ("<uuid>" if command == "show-message" else "[limit]"), file=sys.stderr)
+        return 3
+    if command == "show-message":
         for message in assistant_messages(argv[1]):
             if message["uuid"] == argv[2]:
                 print(message["text"])

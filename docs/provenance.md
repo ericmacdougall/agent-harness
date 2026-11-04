@@ -64,7 +64,9 @@ Labels were assigned by the owner agent (not a second human), after tuning the p
 
 False positive rate on the 181 non-ask messages: 0 of 181 (the rule of three gives an upper bound near 2 percent at 95 percent confidence); the held-out set adds one false positive in 108 messages before the pattern fix. Recall on asks phrased as this agent usually phrases them is about 95 percent; asks phrased in other ways are not detected. The earlier version flagged two "nothing is waiting on you" status lines (4 percent of the 50-message sample) until negation handling was added, which is why that handling exists.
 
-Recommendation: `warn` stays the default. The measured false positive rate is under 5 percent, so `enforce` is reasonable once the agent habit of registering asks is in place; the cost of a miss is a single extra turn because the Stop block fires once.
+Independent check: a separate agent that had not seen these labels hand-labelled the 50-message sample. It agreed with the owner labels on 48 of 50 messages (96 percent, Cohen's kappa 0.81; each found 6 positives). Against the independent labels the detector had 5 true positives, 0 false positives, 1 miss and 44 true negatives. Fifty messages from one session is a small sample.
+
+Recommendation: `stop_lint` ships and stays `warn`. Enforcement needs a calibration on more sessions than one before it is switched on; the red-team also showed that the pre-fix detector nagged on status text, so the enforce-mode false positive rate is not yet established. The Stop block fires once per message when enforced.
 
 ### settings.json entries (not applied by this change; main wires them at integration)
 
@@ -85,9 +87,13 @@ These hooks are opt-in: `install.py` copies the files but does not register them
 - Provenance proves a quote exists in a user turn, not that it supports the claim.
 - A hostile agent can edit the transcript, the WAL, the hooks or the policy file.
 
+## Input validation standard (`safe_input.py`)
+
+Every hook treats paths, stdin and JSON text it did not write as hostile. `harness/hooks/safe_input.py` is the one implementation: `open_regular_file` (regular files only, optional allowed roots, re-checked after open, no blocking on FIFOs), `read_bounded`, `read_tail`, `read_stdin_bounded`, `safe_json_loads(text, max_depth=100, max_bytes)` (size, nesting and number-length limits, ValueError otherwise) and `iter_jsonl_lines` (per-line cap, optional byte and time budget). `tests/test_input_lint.py` fails on new unbounded `read()`, `readlines()`, `read_text()`, `json.load(f)` and `sys.stdin.read()` in `harness/hooks` (annotate a justified exception with `# input-ok: <reason>`; hooks that predate the module are held to a baseline that can only shrink, GoodQA #14414). `tests/hostile_inputs.py` is the reusable fixture (devices, FIFO, 5 GiB sparse file, symlinks to devices, deep JSON, invalid UTF-8, NUL bytes, a 9 MiB line); run it against a hook with `run_capped`, which puts the child in its own process group and kills the group on timeout. The Stop, AskUserQuestion and prompt hooks also run a watchdog that exits 0 when peak RSS passes 512 MiB or the run passes 8 s of wall time, with RLIMIT_CPU at 6 s as the last resort: RLIMIT_AS and RLIMIT_DATA are not enforced on macOS. The watchdog is a Python thread, so a single long C-level call can delay it; long lines are therefore cut to 2000 characters before any pattern runs.
+
 ## Fail-safe behaviour
 
-Malformed, oversized (over 8 MiB) or deeply nested (over 200 levels, checked by a linear scan) lines are skipped and counted, never parsed unguarded; one claim resolves at most 40 sources; because Python 3.9 can abort the interpreter on very deep JSON. Missing transcripts or WALs are rejection statuses (`transcript-missing`, `wal-missing`), not tracebacks; in enforce mode an unverifiable `user:` source is refused. On a host without the transcript, cite the main agent's sourced WAL entry or a ticket. Error text carries at most 60 characters of an excerpt, and `wal_note.py` applies its credential filter to `--source` and `--reason`. `trace` prints the exact user message on purpose; it is local terminal output.
+Malformed, oversized (over 8 MiB) or deeply nested (over 200 levels, checked by a linear scan) lines are skipped and counted, never parsed unguarded; one claim resolves at most 40 sources; because very deep JSON can abort or exhaust the interpreter. Missing transcripts or WALs are rejection statuses (`transcript-missing`, `wal-missing`), not tracebacks; in enforce mode an unverifiable `user:` source is refused. On a host without the transcript, cite the main agent's sourced WAL entry or a ticket. Error text carries at most 60 characters of an excerpt, and `wal_note.py` applies its credential filter to `--source` and `--reason`. `trace` prints the exact user message on purpose; it is local terminal output.
 
 ## Commands
 
