@@ -10,6 +10,7 @@ import http.server
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,9 @@ sys.path.insert(0, str(HOOKS))
 import commit_policy as cp  # noqa: E402
 import spec_flow as sf  # noqa: E402
 import ticket_adapters as ta  # noqa: E402
+
+sys.path.insert(0, str(HOOKS.parent.parent))
+import install  # noqa: E402
 
 ISSUE = "4e8e73fb-72e2-4604-bff5-56b75e4420f5"
 PROJECT = "75ebadd3-9b4c-4b8c-bc86-9a4c1cbd3a53"
@@ -891,6 +895,44 @@ class Hook(SpecFlowCase):
         code, _ = self.hook("call_api", {"method": "POST", "path": f"/v1/projects/{str(uuid.uuid4())}/issues",
                                          "body": {"title": "new bug", "type": "bug"}}, **self.enforce())
         self.assertEqual(code, 0)
+
+    def test_single_issue_writes_allow_only_known_fields(self):
+        stage = str(uuid.uuid4())
+        for tool_input in ({"method": "PATCH", "path": f"/v1/issues/{ISSUE}", "body": {"archivedAt": "2026-11-04"}},
+                           {"method": "PATCH", "path": f"/v1/issues/{ISSUE}",
+                            "body": {"closedAt": "2026-11-04", "resolution": "done"}},
+                           {"method": "POST", "path": f"/v1/issues/{ISSUE}", "body": {"action": "close"}},
+                           {"method": "POST", "path": f"/v1/projects/{PROJECT}/stages/{stage}/move",
+                            "body": {"issueIds": [ISSUE]}}):
+            with self.subTest(tool_input=tool_input):
+                self.assertEqual(self.hook("call_api", tool_input, **self.enforce())[0], 2)
+        code, _ = self.hook("call_api", {"method": "PATCH", "path": f"/v1/issues/{ISSUE}",
+                                         "body": {"title": "clearer title", "priority": "high"}}, **self.enforce())
+        self.assertEqual(code, 0)
+
+    def test_writes_outside_issue_routes_and_encoded_paths_are_unchecked(self):
+        for tool_input in ({"method": "POST", "path": f"/v1/tickets/{ISSUE}/close", "body": {}},
+                           {"method": "PATCH", "path": f"/%69ssues/{ISSUE}", "body": {"status": "done"}},
+                           {"method": "PATCH", "path": f"/v1/issues/{ISSUE}",
+                            "body": {"status": None, "patch": {"status": "done"}}}):
+            with self.subTest(tool_input=tool_input):
+                self.assertEqual(self.hook("call_api", tool_input, **self.enforce())[0], 2)
+        code, text = self.hook("call_api", {"method": "POST", "path": "/v1/projects", "body": {"name": "x"}},
+                               mode="warn", enforced_projects=[])
+        self.assertEqual(code, 0)
+
+    def test_bulk_with_malformed_items_and_mixed_case_server_are_gated(self):
+        self.assertEqual(self.hook("bulk_update_issues", {"items": {ISSUE: "done"}}, **self.enforce())[0], 2)
+        self.assertEqual(self.hook("bulk_update_issues", {"items": ["x"]}, **self.enforce())[0], 2)
+        self.assertTrue(sf.TOOL_PATTERN.match("mcp__GoodQA__update_issue"))
+        self.assertTrue(re.match(install.GOODQA_STATUS_TOOLS, "mcp__plugin_GoodQA_goodqa__call_api"))
+
+    def test_deeply_nested_record_is_ignored(self):
+        comment = {"id": str(uuid.uuid4()),
+                   "body": f"x\n\n```{sf.RECORD_FENCE}\n" + "[" * 5000 + "]" * 5000 + "\n```"}
+        records, ignored = sf.ticket_records([comment], 65536)
+        self.assertEqual(records, [])
+        self.assertIn("not JSON", ignored[0])
 
     def test_wal_path_with_dot_dot_is_refused(self):
         for path in ("~/.claude/wals/../x.jsonl", "~/.claude/wals/../x/y.jsonl"):

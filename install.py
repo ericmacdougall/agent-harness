@@ -40,7 +40,7 @@ def managed_scripts(claude: Path) -> set[str]:
 
 
 SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
-GOODQA_STATUS_TOOLS = (r"^mcp__.*goodqa.*__(close_issue_done|close_issue_wont_fix|update_issue|"
+GOODQA_STATUS_TOOLS = (r"^mcp__.*[Gg][Oo][Oo][Dd][Qq][Aa].*__(close_issue_done|close_issue_wont_fix|update_issue|"
                        r"bulk_update_issues|archive_issue|reassign_issue|call_api)$")
 
 

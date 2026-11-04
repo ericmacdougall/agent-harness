@@ -44,7 +44,7 @@ OPEN_STATUSES = {"triage", "backlog", "todo", "in_progress", "in_review", "on_de
 REASON_STATUSES = {"wont_fix", "duplicate"}
 SPEC_STATUSES = {"done"}
 TOOL_PATTERN = re.compile(r"^mcp__.*goodqa.*__(close_issue_done|close_issue_wont_fix|update_issue|"
-                          r"bulk_update_issues|archive_issue|reassign_issue|call_api)$")
+                          r"bulk_update_issues|archive_issue|reassign_issue|call_api)$", re.IGNORECASE)
 UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 MEDIA = {".png": ("image/png", (b"\x89PNG",)), ".jpg": ("image/jpeg", (b"\xff\xd8",)),
          ".jpeg": ("image/jpeg", (b"\xff\xd8",)), ".gif": ("image/gif", (b"GIF8",)),
@@ -539,7 +539,7 @@ def ticket_records(comments: list, max_bytes: int):
                 continue
             try:
                 record = json.loads(raw)
-            except ValueError:
+            except (ValueError, RecursionError):
                 ignored.append(f"comment {comment['id'][:8]}: record is not JSON")
                 continue
             if not isinstance(record, dict) or record.get("v") != 1 or record.get("kind") not in KINDS:
@@ -739,6 +739,9 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
                            f"Fix: spec_flow.py evidence --ticket '{label}' --ac {ac} --really-tested <RT id> --wal <WAL> "
                            "[--commit <sha> --repo <checkout>] [--log <file>]")
     current = [r for r in evidence if r.get("spec_core_sha") == core]
+    if any(r.get("really_tested") or (r.get("commits") and r.get("note")) for r in current):
+        attested.append("REALLY_TESTED notes, commit citations and notes in evidence records are checked when posted, "
+                        "not re-checked against the WAL or repository by done")
     if spec.get("ac") and not any(r.get("commits") for r in current):
         missing.append(f"commits: no evidence on the current spec cites a commit. Fix: spec_flow.py evidence "
                        f"--ticket '{label}' --ac <AC> --commit <sha> --repo <checkout> --note <check>")
@@ -846,10 +849,15 @@ def classify(tool: str, tool_input: dict, min_reason: int):
             # Moving an issue out of an enforced project (or across a pipeline) would escape the gate.
             yield tool_input.get("issueId"), "stage", "project/pipeline/stage move"
     elif tool == "bulk_update_issues":
-        for item in tool_input.get("items") or []:
+        items = tool_input.get("items")
+        if items is not None and not isinstance(items, list):
+            yield None, "scope", "bulk_update_issues with items that are not a list"
+        for item in items if isinstance(items, list) else []:
             if isinstance(item, dict):
                 yield item.get("issueId"), _status_action(item.get("status"), str(item.get("note") or ""),
                                                           min_reason), item.get("status")
+            else:
+                yield None, "scope", "bulk_update_issues with a malformed item"
     elif tool == "archive_issue":
         yield tool_input.get("issueId"), "archive", "archive"
     elif tool == "reassign_issue":
@@ -860,6 +868,10 @@ def classify(tool: str, tool_input: dict, min_reason: int):
 
 _SAFE_SUBRESOURCE = re.compile(r"(/v\d+)?/issues/(" + UUID + r")/(comments|attachments|time-entries)(/" + UUID + r")?")
 _ISSUE_PATH = re.compile(r"(/v\d+)?/issues/(" + UUID + r")")
+# Fields on a single-issue write that cannot change status, archive or location.
+_SINGLE_ISSUE_KEYS = {"status", "patch", "note", "projectId", "pipelineId", "stageId", "title", "description",
+                      "priority", "type", "labels", "tags", "assigneeId", "assigneeIds", "dueDate", "estimate",
+                      "severity", "operationId"}
 _NON_CREATE_KEYS = {"items", "status", "patch", "issueId", "issueIds", "ids", "projectId", "pipelineId", "stageId",
                     "filter", "where", "query", "set", "update"}
 _COLLECTION_PATH = re.compile(r"(/v\d+)?(/projects/" + UUID + r")?/issues(/bulk)?")
@@ -871,8 +883,6 @@ def _classify_call_api(tool_input: dict, min_reason: int):
     if method == "GET":
         return
     original = str(tool_input.get("path") or "")
-    if "issue" not in original.lower():
-        return  # not an issue route; other GoodQA resources do not carry issue status
     parsed = urllib.parse.urlsplit(original)
     path = parsed.path.lower()
     found = re.search(UUID, original)
@@ -882,10 +892,18 @@ def _classify_call_api(tool_input: dict, min_reason: int):
     if unusual:
         yield issue_id, ("unknown" if issue_id else "scope"), f"{method} {original} (unusual path)"
         return
+    if "issue" not in path:
+        # Not an issue route. Other routes (stages, tickets, batches) might still move or close issues, and the
+        # gate cannot read them, so every such write is unchecked: it warns, and blocks while anything is enforced.
+        yield None, "scope", f"{method} {original} (not an issue route)"
+        return
     raw = tool_input.get("body")
     body = raw if isinstance(raw, dict) else {}
     patch = body.get("patch") if isinstance(body.get("patch"), dict) else {}
-    status = body.get("status", patch.get("status"))
+    present = [src for src in (body, patch) if "status" in src]
+    status = next((src["status"] for src in present if src["status"] is not None), None)
+    if present and status is None:
+        status = "<null>"  # an explicit null status: unknown, so it is gated rather than ignored
     if _SAFE_SUBRESOURCE.fullmatch(path):
         return
     single = _ISSUE_PATH.fullmatch(path)
@@ -900,6 +918,9 @@ def _classify_call_api(tool_input: dict, min_reason: int):
                 yield issue_id, _status_action(status, str(body.get("note") or ""), min_reason), status
             if any(key in body or key in patch for key in ("projectId", "pipelineId", "stageId")):
                 yield issue_id, "stage", "project/pipeline/stage move"
+            other = (set(body) | set(patch)) - _SINGLE_ISSUE_KEYS
+            if other:  # archivedAt, closedAt, resolution, action, ...: effect on status is unknown
+                yield issue_id, "unknown", f"{method} {original} sets {', '.join(sorted(other)[:5])}"
         return
     if _COLLECTION_PATH.fullmatch(path) and method in ("POST", "PATCH", "PUT"):
         items = body.get("items") if isinstance(body.get("items"), list) else None
