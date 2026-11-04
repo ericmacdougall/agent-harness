@@ -629,7 +629,7 @@ def resolve(source: str, ctx=None, depth: int = 0, seen=()) -> dict:
     """Resolve one Source. Never raises: the result says ok, why not, and the chain to the origin."""
     ctx = ctx if ctx is not None else {}
     result = {"source": clip(source, 200), "kind": None, "ok": False, "assumption": False, "origin": None,
-              "deferred": False, "weak": False, "weak_reasons": [], "problems": [], "chain": [], "inputs": []}
+              "deferred": False, "weak": False, "weak_reasons": [], "backed": False, "problems": [], "chain": [], "inputs": []}
     ctx["_resolves"] = ctx.get("_resolves", 0) + 1
     try:
         if ctx["_resolves"] > MAX_RESOLVES:
@@ -646,13 +646,12 @@ def resolve(source: str, ctx=None, depth: int = 0, seen=()) -> dict:
 
 
 def weak_problem(result: dict):
-    """Message when a resolved source is only a syntax-level citation; asks and requirements refuse these.
-    A ticket that could not be checked because the tracker was unreachable is not refused (an outage must not
-    stop work): it stays marked unverified and callers warn."""
-    reasons = set(result.get("weak_reasons") or [])
-    if result.get("ok") and result.get("weak") and (reasons - {"ticket-unreachable"} or not reasons):
-        return ("source is an unverified citation (a ticket that could not be confirmed, a project the credential cannot see, "
-                "lookup off, or a file line without an excerpt); cite the user's words or a sourced WAL entry, add a file excerpt, or have main run "
+    """Message when a source rests only on an unverified citation; asks and requirements refuse these, outage or
+    not. A citation that is also backed by a verified user, wal or file source (an `inferred:` item with such an
+    input) is not refused: the unverified part only warns."""
+    if result.get("ok") and result.get("weak") and not result.get("backed"):
+        return ("the only cite is an unverified ticket or file line (ticket not confirmed, outage or not; file line "
+                "without an excerpt): add a `user:` or `wal:` source, which can be checked locally, or have main run "
                 "`provenance.py cache-ticket` after checking the ticket")
     return None
 
@@ -683,6 +682,8 @@ def store_ticket(project: str, number: int, title: str, checked_by: str) -> None
 def lookup_ticket(project: str, number: int):
     """('found', title) | ('missing', None) | ('unreachable', reason). Uses the harness ticket adapter with a
     hard deadline of TICKET_TIMEOUT seconds and one attempt; never raises."""
+    if os.environ.get("HARNESS_PROVENANCE_OFFLINE"):  # tightening only: tests and offline hosts never touch the network
+        return "unverified", "offline mode"
     try:
         import spec_flow
         import ticket_adapters as ta
@@ -691,14 +692,38 @@ def lookup_ticket(project: str, number: int):
         adapter = spec_flow.make_adapter(config, spec_policy, project, time.monotonic() + TICKET_TIMEOUT)
         adapter.timeout, adapter.attempts = min(float(adapter.timeout), TICKET_TIMEOUT), 1
         try:
-            ticket = adapter.lookup(project, number)
+            with direct_connections():
+                ticket = adapter.lookup(project, number)
         except ta.TicketOutOfScope:
             return "out-of-scope", "project not visible to this credential"
+        except ta.TicketSystemUnavailable as error:
+            # Only a genuine transport failure (connection, DNS, timeout, deadline) is an outage. Server errors,
+            # 4xx answers and credential problems are not: they stay `unverified` and never start the skip window.
+            text = str(error)
+            if text.startswith("GoodQA unreachable") or "total deadline" in text:
+                return "unreachable", "transport failure"
+            return "unverified", "tracker refused or credentials unusable"
         return ("missing", None) if ticket is None else ("found", str(getattr(ticket, "title", "") or ""))
     except BaseException as error:  # anything else is "could not check", never a crash or a guess
         if isinstance(error, (KeyboardInterrupt, SystemExit)):
             raise
-        return "unreachable", type(error).__name__
+        return "unverified", type(error).__name__
+
+
+class direct_connections:
+    """urllib.request.urlopen without proxies for the duration of a ticket lookup: an inline HTTPS_PROXY must not
+    be able to turn a lookup into a fake outage or a fake answer."""
+
+    def __enter__(self):
+        import urllib.request
+        self._request, self._saved = urllib.request, urllib.request.urlopen
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        urllib.request.urlopen = lambda *args, **kwargs: opener.open(*args, **kwargs)
+        return self
+
+    def __exit__(self, *exc):
+        self._request.urlopen = self._saved
+        return False
 
 
 TICKET_LOOKUP = lookup_ticket  # tests replace this
@@ -717,8 +742,8 @@ def check_ticket(project: str, number: int):
     memo = _TICKET_MEMO.get(key)
     if memo and now - memo[0] < 60:
         return memo[1]
-    if now < _OUTAGE["until"]:  # an outage was just seen: do not make 20 serial 4 s lookups
-        return "unreachable", "tracker unreachable (recent lookup failed)"
+    if now < _OUTAGE["until"]:  # a transport failure was just seen: skip the network call, never change a verdict
+        return "unverified", "lookup skipped after a recent tracker transport failure"
     outcome = TICKET_LOOKUP(project, number)
     if outcome[0] == "found":
         try:
@@ -756,7 +781,7 @@ def _resolve(source, ctx, depth, seen, result):
             node["text"] = turn["text"]
         node["excerpt"] = parsed["excerpt"]
         result["chain"].append(node)
-        result["origin"], result["ok"] = "user", True
+        result["origin"], result["ok"], result["backed"] = "user", True, True
     elif kind == "ticket":
         key = f"{parsed['project']}#{parsed['number']}"
         cached = ticket_cache(home).get(key)
@@ -786,7 +811,7 @@ def _resolve(source, ctx, depth, seen, result):
                 raise Problem("excerpt-not-found", reason)
         result["chain"].append({"kind": "file", "ref": f"{parsed['path']}:{parsed['line']}@{parsed['sha'][:12]}",
                                 "status": "verified", "text": text if ctx.get("want_text") else None})
-        result["origin"], result["ok"] = "file", True
+        result["origin"], result["ok"], result["backed"] = "file", True, not result["weak"]
     elif kind == "wal":
         path = resolve_wal_path(parsed["path"], home)
         marker = f"{path}#{parsed['entry']}"
@@ -810,7 +835,7 @@ def _resolve(source, ctx, depth, seen, result):
         result["problems"].extend(sub["problems"])
         result["assumption"] = sub["assumption"]
         result["origin"], result["ok"], result["deferred"] = sub["origin"], sub["ok"], sub["deferred"]
-        result["weak"], result["weak_reasons"] = sub["weak"], list(sub["weak_reasons"])
+        result["weak"], result["weak_reasons"], result["backed"] = sub["weak"], list(sub["weak_reasons"]), sub["backed"]
     elif kind == "inferred":
         grounded = 0
         result["assumption"] = True
@@ -833,6 +858,7 @@ def _resolve(source, ctx, depth, seen, result):
             result["problems"].append({"code": "inferred-ungrounded", "message": "inferred: has no input that traces to a user, ticket or file origin"})
         result["chain"].append({"kind": "inferred", "rationale": clip(parsed["rationale"], 300), "status": "assumption"})
         result["ok"] = not result["problems"]
+        result["backed"] = grounded > 0  # a verified user, wal or file input stands behind the claim
         result["deferred"] = any(sub["deferred"] for sub in result["inputs"])
         result["weak"] = any(sub["weak"] for sub in result["inputs"])
         result["weak_reasons"] = sorted({r for sub in result["inputs"] for r in sub["weak_reasons"]})

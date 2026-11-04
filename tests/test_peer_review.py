@@ -2,6 +2,7 @@ import importlib.util
 import hashlib
 import json
 import os
+os.environ.setdefault("HARNESS_PROVENANCE_OFFLINE", "1")  # tests never call the ticket tracker (tighten-only switch)
 import resource
 import shlex
 import subprocess

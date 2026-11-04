@@ -404,7 +404,7 @@ class RedTeamFixes(Env):
                               "--reason", "needed for deploy", "--source", "ticket:GoodQA nonexistent#99999"],
                              capture_output=True, text=True, env=env)
         self.assertEqual(out.returncode, 2, out.stdout)
-        self.assertIn("unverified citation", out.stderr)
+        self.assertIn("unverified ticket or file line", out.stderr)
         cli = lambda *a: subprocess.run([sys.executable, str(sandbox / "provenance.py"), *a], capture_output=True, text=True, env=env)  # noqa: E731
         self.assertEqual(cli("cache-ticket", "--ref", "GoodQA nonexistent#99999", "--title", "T", "--checked-by", "main").returncode, 0)
         self.assertFalse(provenance.resolve("ticket:GoodQA nonexistent#99999")["weak"])
@@ -443,16 +443,25 @@ class RedTeamFixes(Env):
                               str(self.write_spec("ticket:GoodQA harness#99999"))],
                              capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))
         self.assertIn("ticket-missing", out.stdout)  # spec lint (enforce) refuses a missing ticket cite
-        down = fresh(("unreachable", "URLError"), "ticket:GoodQA harness#7")  # outage: warn and mark unverified, never refuse
+        down = fresh(("unreachable", "URLError"), "ticket:GoodQA harness#7")  # outage: still only an unverified citation
         self.assertTrue(down["ok"] and down["weak"] and down["deferred"], down)
         self.assertEqual(down["chain"][0]["status"], "unverified")
-        self.assertIsNone(provenance.weak_problem(down))
-        self.assertIn("could not be verified", provenance.unreachable_warning(down))
+        self.assertIn("add a `user:` or `wal:` source", provenance.weak_problem(down))  # refused for ask and requirement, outage or not
+        # ...but an outage only warns when a verified user source also stands behind the claim
+        backed = fresh(("unreachable", "URLError"), f"inferred: from {self.user(HUMAN, QUOTE)} ; ticket:GoodQA harness#8 -- the ticket adds context")
+        self.assertTrue(backed["ok"] and backed["backed"], backed)
+        self.assertIsNone(provenance.weak_problem(backed))
+        self.assertIn("could not be verified", provenance.unreachable_warning(backed))
         note = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "ask", "--note", "n",
                                "--reason", "needed for the release", "--source", "ticket:GoodQA harness#7"],
                               capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))  # real adapter, no credentials
-        self.assertEqual(note.returncode, 0, note.stderr)
-        self.assertIn("could not be verified", note.stderr)
+        self.assertEqual(note.returncode, 2, note.stdout)  # missing credentials are refusable, never a warning
+        self.assertIn("add a `user:` or `wal:` source", note.stderr)
+        home_less = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "requirement",
+                                    "--note", "n", "--source", "ticket:GoodQA harness#424242"],
+                                   capture_output=True, text=True,
+                                   env=dict(os.environ, HOME=str(self.home), HTTPS_PROXY="http://127.0.0.1:9"))
+        self.assertEqual(home_less.returncode, 2, home_less.stdout)  # a proxy variable cannot turn a lookup into a pass
         self.policy_file(ticket_lookup="warn")  # loosening comes from the installed policy file only
         soft = fresh(("missing", None), "ticket:GoodQA harness#99998")
         self.assertTrue(soft["ok"] and soft["weak"])  # warn mode accepts a missing ticket in specs...
@@ -469,7 +478,7 @@ class RedTeamFixes(Env):
         with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: calls.append(n) or ("unreachable", "down")):
             for number in range(1, 8):
                 provenance.resolve(f"ticket:GoodQA harness#{number}")
-        self.assertEqual(len(calls), 1)  # after the first outage answer the rest of the process skips lookups
+        self.assertEqual(len(calls), 1)  # after the first outage answer the rest of the process skips the network call
         provenance._OUTAGE["until"] = 0.0
 
     def test_environment_can_only_tighten_modes(self):
@@ -503,10 +512,95 @@ class RedTeamFixes(Env):
                              env=dict(os.environ, HOME=str(self.home), HARNESS_PROVENANCE_POLICY=str(loose)))
         self.assertEqual(out.returncode, 2, out.stdout)  # the installed policy still enforces the ask despite env off
 
+    def test_n1_skip_window_never_changes_a_verdict(self):
+        provenance._TICKET_MEMO.clear()
+        provenance._OUTAGE["until"] = 0.0
+        answers = {777: ("unreachable", "down"), 424242: ("missing", None)}
+        calls = []
+        with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: calls.append(n) or answers[n]):
+            first = provenance.resolve("ticket:GoodQA harness#777")
+            skipped = provenance.resolve("ticket:GoodQA harness#424242")
+        self.assertEqual(calls, [777])  # the second lookup was skipped...
+        self.assertTrue(first["ok"] and skipped["ok"] and skipped["weak"])  # ...and is only an unverified citation...
+        self.assertEqual(skipped["weak_reasons"], ["ticket-unverified"])
+        self.assertIsNotNone(provenance.weak_problem(first))  # ...which a requirement or ask refuses, as it refuses the outage cite
+        self.assertIsNotNone(provenance.weak_problem(skipped))
+        provenance._OUTAGE["until"] = 0.0
+        provenance._TICKET_MEMO.clear()
+        with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: calls.append(n) or answers[n]):  # fresh process
+            self.assertEqual(provenance.resolve("ticket:GoodQA harness#424242")["problems"][0]["code"], "ticket-missing")
+
+    def test_n1_only_transport_failures_are_outages(self):
+        import spec_flow
+        import ticket_adapters as ta
+
+        class Stub:
+            timeout, attempts = 15, 2
+
+            def __init__(self, error=None, ticket="ok"):
+                self.error, self.ticket = error, ticket
+
+            def lookup(self, project, number):
+                if self.error:
+                    raise self.error
+                return self.ticket
+
+        def state(error=None, ticket="ok"):
+            provenance._OUTAGE["until"] = 0.0
+            with mock.patch.object(spec_flow, "make_adapter", lambda *a, **k: Stub(error, ticket)), \
+                    mock.patch.object(spec_flow, "ticket_config", lambda sp: (None, None, {})), \
+                    mock.patch.object(spec_flow, "load_spec_policy", lambda: {}):
+                return provenance.lookup_ticket("harness", 5)[0]
+
+        self.assertEqual(state(ta.TicketSystemUnavailable("GoodQA unreachable for get_issue_by_number (URLError)")), "unreachable")
+        self.assertEqual(state(ta.TicketSystemUnavailable("GoodQA verification exceeded its total deadline")), "unreachable")
+        for message in ("GoodQA HTTP 500 for get_issue_by_number", "GoodQA HTTP 401 for get_issue_by_number",
+                        "ticket credential file is missing or unreadable: /x", "GoodQA lookup failed (rate_limited)"):
+            self.assertEqual(state(ta.TicketSystemUnavailable(message)), "unverified", message)
+        self.assertEqual(state(ta.TicketOutOfScope("nope")), "out-of-scope")
+        self.assertEqual(state(RuntimeError("boom")), "unverified")
+        self.assertEqual(state(ticket=None), "missing")
+        calls = []
+        provenance._TICKET_MEMO.clear()
+        provenance._OUTAGE["until"] = 0.0
+        outcomes = iter([("unverified", "HTTP 500"), ("missing", None)])
+        with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: calls.append(n) or next(outcomes)):
+            provenance.resolve("ticket:GoodQA harness#1")
+            second = provenance.resolve("ticket:GoodQA harness#2")
+        self.assertEqual(calls, [1, 2])  # a non-transport error does not start the skip window
+        self.assertEqual(second["problems"][0]["code"], "ticket-missing")
+
+    def test_n1_proxy_environment_is_ignored_and_offline_switch(self):
+        import http.server
+        import threading
+        import urllib.request
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"direct")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}/"
+        with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9",
+                                          "HTTPS_PROXY": "http://127.0.0.1:9", "NO_PROXY": ""}):
+            saved = urllib.request.urlopen
+            with provenance.direct_connections():
+                self.assertEqual(urllib.request.urlopen(url, timeout=5).read(), b"direct")
+            self.assertIs(urllib.request.urlopen, saved)  # restored afterwards
+        with mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_OFFLINE": "1"}):
+            self.assertEqual(provenance.lookup_ticket("harness", 3)[0], "unverified")
+
     def test_m1_lookup_is_bounded_and_never_raises(self):
         start = time.perf_counter()
         state = provenance.lookup_ticket("harness", 1)  # temp HOME has no credentials: fails fast, offline
-        self.assertEqual(state[0], "unreachable")
+        self.assertEqual(state[0], "unverified")  # a credential problem is not an outage
         self.assertLess(time.perf_counter() - start, provenance.TICKET_TIMEOUT + 1.0)
 
     def write_spec(self, source):

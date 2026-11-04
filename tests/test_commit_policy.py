@@ -3,6 +3,7 @@
 import http.server
 import json
 import os
+os.environ.setdefault("HARNESS_PROVENANCE_OFFLINE", "1")  # tests never call the ticket tracker (tighten-only switch)
 import shlex
 import shutil
 import socket
