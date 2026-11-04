@@ -25,6 +25,12 @@ Contract
   HARNESS_HEAVY_GUARD=off|warn|enforce or heavy_job_guard.json next to this
   file: {"modes": {"media": "enforce"}}.
 
+Threat model: a CARELESS agent, not a hostile one. Wrapper and shell syntax (env/sudo/su/watch/nohup chains, ANSI-C
+quotes, eval) is parsed conservatively, with an unparseable form scanned word by word and denied on any heavy
+command (a false denial names HARNESS_LOCAL_OK and dev2; a false allow is the bug). Deliberate obfuscation is
+best-effort and out of scope: command substitution such as `$(which pytest)`, variable indirection (`p=pytest; $p`),
+scripts that launch heavy work internally, and aliases. The runtime backstops (run_capped.py, netwatch) cover those.
+
 Classification looks at the command word of each shell segment, never at quoted
 text, so `git commit -m "run pytest"` or `grep pytest` are never flagged.
 Stdlib only, Python 3.9 compatible, lazy imports to keep startup small.
@@ -132,8 +138,20 @@ def split_segments(text: str):
     return [s.strip() for s in segments if s.strip()]
 
 
+ANSI_C = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
+
+
 def tokenize(segment: str):
     import shlex
+    if "$'" in segment:  # bash ANSI-C quoting: $'pytest\t-x' is one word containing a tab
+        import codecs
+
+        def decode(match):
+            try:
+                return shlex.quote(codecs.decode(match.group(1).encode("latin-1", "replace"), "unicode_escape"))
+            except (UnicodeError, ValueError):
+                return shlex.quote(match.group(1))
+        segment = ANSI_C.sub(decode, segment)
     try:
         return shlex.split(segment)
     except ValueError:
@@ -230,6 +248,9 @@ def xargs_inner(args):
     return args[i:]
 
 
+MAX_WRAPPER_DEPTH = 12
+
+
 class Ctx:
     def __init__(self, cwd, heredocs):
         self.cwd = cwd or os.getcwd()
@@ -316,10 +337,36 @@ def scan_words(words, ctx, depth):
     for j, word in enumerate(words):
         if word.startswith("-") or ASSIGN.match(word):
             continue
-        result = classify_text(word, ctx, depth + 1) if " " in word else None
+        result = classify_text(word, ctx, depth + 1) if re.search(r"\s", word) else None
         result = result or classify(words[j:], ctx, depth + 1)
         if result:
             return result
+    return None
+
+
+COMMAND_FLAGS = {"env": ("-S", "--split-string"), "su": ("-c", "--command")}
+
+
+def command_flag_value(low, args, i):
+    """(value, tokens consumed) when args[i] is a flag whose value is a COMMAND, in any spelling: `-S x`, `-Sx`,
+    `--split-string x`, `--split-string=x`, and bundled short flags ending in the letter (su -lc x)."""
+    token = args[i]
+    for flag in COMMAND_FLAGS.get(low, ()):
+        if flag.startswith("--"):
+            if token == flag:
+                return (args[i + 1], 2) if i + 1 < len(args) else ("", 1)
+            if token.startswith(flag + "="):
+                return token.split("=", 1)[1], 1
+        else:
+            letter = flag[1]
+            if token == flag:
+                return (args[i + 1], 2) if i + 1 < len(args) else ("", 1)
+            if token.startswith("-") and not token.startswith("--") and len(token) > 2:
+                body = token[1:]
+                if low == "su" and re.fullmatch(r"[A-Za-z]*" + letter, body):  # -lc pytest
+                    return (args[i + 1], 2) if i + 1 < len(args) else ("", 1)
+                if body.startswith(letter):  # -Spytest, -cpytest
+                    return body[1:], 1
     return None
 
 
@@ -337,12 +384,14 @@ def unwrap(low, args, ctx, depth):
         if low in ("env", "sudo", "doas") and ASSIGN.match(token):
             i += 1
             continue
-        if not token.startswith("-") or token == "-":
-            break
-        if low == "env" and token == "-S":
-            return classify_text(args[i + 1], ctx, depth + 1) if i + 1 < len(args) else None
-        if low == "env" and token.startswith("--split-string="):
-            return classify_text(token.split("=", 1)[1], ctx, depth + 1)
+        if low == "env" and token == "-":  # legacy spelling of -i
+            i += 1
+            continue
+        if not token.startswith("-"):
+            break  # the wrapped command starts here
+        flagged = command_flag_value(low, args, i)
+        if flagged is not None:
+            return classify_text(flagged[0], ctx, depth + 1) if flagged[0] else None
         if token in val:
             i += 2
         elif token in noval or token.split("=", 1)[0] in val:
@@ -350,7 +399,7 @@ def unwrap(low, args, ctx, depth):
         else:
             return scan_words(args[i + 1:], ctx, depth)  # unknown or bundled flag: do not guess where the command starts
     rest = args[i:]
-    if len(rest) == 1 and " " in rest[0]:
+    if len(rest) == 1 and re.search(r"\s", rest[0]):
         return classify_text(rest[0], ctx, depth + 1)  # watch 'pytest -x'
     return classify(rest, ctx, depth + 1)
 
@@ -361,8 +410,10 @@ def classify(argv, ctx, depth=0):
     while argv and argv[0] in SHELL_KEYWORDS:
         argv = argv[1:]
         _assigns, argv = split_assignments(argv)
-    if not argv or depth > 4:
+    if not argv:
         return None
+    if depth > MAX_WRAPPER_DEPTH:
+        return ("full-suite", "wrapper nesting too deep to analyse (denied conservatively)")
     cmd = base(argv[0])
     low = cmd.lower()
     args = argv[1:]
@@ -373,11 +424,12 @@ def classify(argv, ctx, depth=0):
         ctx.capped = "--max-rss-gb" in args
         return classify(args[args.index("--") + 1:] if "--" in args else [], ctx, depth + 1)
     if low == "su":
-        for i, a in enumerate(args):
-            if re.match(r"^-[a-zA-Z]*c$", a) and i + 1 < len(args):
-                return classify_text(args[i + 1], ctx, depth + 1)
-            if a.startswith("--command="):
-                return classify_text(a.split("=", 1)[1], ctx, depth + 1)
+        i = 0
+        while i < len(args):
+            flagged = command_flag_value("su", args, i)
+            if flagged is not None:
+                return classify_text(flagged[0], ctx, depth + 1) if flagged[0] else None
+            i += 1
         return None
     if low in WRAPPERS:
         return unwrap(low, list(args), ctx, depth)

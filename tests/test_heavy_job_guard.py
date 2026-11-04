@@ -232,6 +232,21 @@ class Classification(unittest.TestCase):
             with self.subTest(allowed=command):
                 self.assertEqual(decide(command, cwd="/nonexistent")["action"], "allow", command)
 
+    def test_m2c_command_valued_flags_in_every_spelling_and_deep_nesting(self):
+        for command in ("env -Spytest", "env --split-string pytest", "env --split-string 'npm test'", "sudo env -Spytest",
+                        "sudo -u root env --split-string pytest", "env --split-string=pytest", "env -S'npm run build'",
+                        "su --command pytest", "su --command 'npm test'", "su -s /bin/sh --command pytest", "su -lc pytest",
+                        "su -cpytest", "su --command=pytest", "env - pytest", "env - FOO=1 pytest",
+                        "nohup nohup nohup nohup nohup pytest", "nice nice nice nice nice pytest",
+                        "nohup nohup nohup nohup nohup nohup nohup nohup nohup nohup nohup nohup nohup nohup pytest",
+                        "watch $'pytest\t-x'", "watch $'pytest\n-x'", "watch 'pytest\t-x'"):
+            with self.subTest(command=command):
+                self.assertEqual(decide(command)["action"], "deny", command)
+        for command in ("env -S 'ls -la'", "su --command 'ls -la'", "su -c ls", "env - ls", "nohup nohup nohup ls",
+                        "watch $'ls\t-la'", "env --split-string=ls"):
+            with self.subTest(allowed=command):
+                self.assertEqual(decide(command, cwd="/nonexistent")["action"], "allow", command)
+
     def test_off_mode(self):
         self.assertEqual(guard.decide("pytest", None, dict(MODES, **{"full-suite": "off"})), {"action": "allow"})
 
