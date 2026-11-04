@@ -943,5 +943,51 @@ class TicketVerification(Fixture):
         self.assertNotIn("test-key", json.dumps(report))
 
 
+class CrashFailsClosed(Fixture):
+    """GoodQA #35694: Codex and Claude let a PreToolUse call through on exit 1, so a crash must not be exit 1."""
+
+    RUNNER = """import sys
+sys.path.insert(0, sys.argv[1])
+import commit_policy as cp
+def boom(*args, **kwargs):
+    raise RuntimeError("injected crash")
+setattr(cp, sys.argv[2], boom)
+sys.exit(cp.entry(sys.argv[3:]))
+"""
+
+    def crash(self, where, command, *argv):
+        runner = self.root / "crash_runner.py"
+        runner.write_text(self.RUNNER)
+        payload = json.dumps({"session_id": "s", "cwd": str(self.repo), "tool_name": "Bash",
+                              "tool_input": {"command": command}})
+        return subprocess.run([sys.executable, str(runner), str(HOOKS), where, *(argv or ("hook",))],
+                              input=payload, text=True, capture_output=True, env=self.env, timeout=60)
+
+    def test_crash_on_a_commit_blocks(self):
+        result = self.crash("run_hook", "git commit -m x")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("internal error (RuntimeError); refusing", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_crash_in_prefilter_blocks_git_but_allows_ls(self):
+        self.assertEqual(self.crash("may_commit", "git commit -m x").returncode, 2)
+        self.assertEqual(self.crash("may_commit", "GIT status").returncode, 2)
+        allowed = self.crash("may_commit", "ls -la && npm test")
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertIn("not a commit, allowing it", allowed.stderr)
+
+    def test_non_commit_call_never_reaches_the_crash(self):
+        self.assertEqual(self.crash("run_hook", "ls -la").returncode, 0)
+
+    def test_other_subcommands_keep_the_traceback_exit(self):
+        result = self.crash("validate", "", "check-message")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Traceback", result.stderr)
+
+    def test_script_entry_point_uses_the_crash_boundary(self):
+        source = (HOOKS / "commit_policy.py").read_text(encoding="utf-8")
+        self.assertTrue(source.rstrip().endswith("sys.exit(entry())"))
+
+
 if __name__ == "__main__":
     unittest.main()

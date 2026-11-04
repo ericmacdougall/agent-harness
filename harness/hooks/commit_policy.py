@@ -1798,13 +1798,15 @@ def main(argv=None) -> int:
         return 0
     payload = None
     if args.command == "hook":
+        _HOOK_STATE["raw"] = sys.stdin.read()
         try:
-            payload = json.load(sys.stdin)
+            payload = json.loads(_HOOK_STATE["raw"])
         except ValueError:
             print("commit-policy: hook payload is not JSON", file=sys.stderr)
             return 2
         payload = payload if isinstance(payload, dict) else {}
-        if not may_commit(payload):
+        _HOOK_STATE["may_commit"] = may_commit(payload)
+        if not _HOOK_STATE["may_commit"]:
             return 0  # every non-commit tool call stays independent of the policy file
     try:
         policy = load_policy()
@@ -1872,5 +1874,44 @@ def main(argv=None) -> int:
     return 2
 
 
+# What the PreToolUse hook knew before a crash; read only by crash_exit_code.
+_HOOK_STATE = {"raw": None, "may_commit": None}
+
+
+def crash_exit_code(argv) -> int:
+    """Exit code after an unexpected exception (GoodQA #35694).
+
+    Codex and Claude treat a PreToolUse exit 1 (a traceback) as "allow", so a crash in `hook` would let a
+    commit through. Exit 2 blocks on both. A crash must not block every shell call either (red-team H2 on
+    #33: that would also block the command that fixes it), so only a call that may commit, or one that
+    names git/gh when the prefilter never finished, is refused. The fallback reads the raw text so it does
+    not depend on the code that crashed. Other subcommands keep their traceback and exit code 1; git aborts
+    on any non-zero commit-msg exit, so `git-hook` already fails closed.
+    """
+    if not argv or argv[0] != "hook":
+        return 1
+    if _HOOK_STATE["may_commit"] is not None:
+        return 2 if _HOOK_STATE["may_commit"] else 0
+    raw = _HOOK_STATE["raw"]
+    if raw is None or re.search(r"\b(?:git|gh)\b", raw, re.IGNORECASE):
+        return 2
+    return 0
+
+
+def entry(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        return main(argv)
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException as error:  # the boundary that turns a crash into a decision
+        code = crash_exit_code(argv)
+        if code == 1:
+            raise
+        verdict = "refusing the action (fail-closed)" if code == 2 else "not a commit, allowing it"
+        print(f"commit-policy: internal error ({type(error).__name__}); {verdict}", file=sys.stderr)
+        return code
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entry())
