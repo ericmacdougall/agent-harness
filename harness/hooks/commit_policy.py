@@ -937,7 +937,7 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
     for words, operator in simple_commands(tokenize(text)):
         piped, previous_op = previous_op in ("|", "|&"), operator
         stdin_body = stdin_raw = None
-        herestring = False
+        herestring = process_sub = False
         argv = []
         skip_next = write_next = False
         for index, token in enumerate(words):
@@ -953,7 +953,12 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
             if REDIRECTS.match(token[1]):
                 skip_next, write_next = True, ">" in token[1]
                 herestring = herestring or token[1] == "<<<"
+                # `cmd <(...)`: the "(" is an operator, so "<" is this segment's last word
+                process_sub = process_sub or (token[1] == "<" and index == len(words) - 1)
                 continue
+            if ("<<<" in token[1] or token[1].endswith("<")) and COMMIT_TEXT.search(command):
+                raise Unresolvable("a herestring or process substitution glued to a word cannot be checked; "
+                                   "run git commit directly")
             attached = re.match(r"^\d*(?:&?>>?|<>|>\|)(\S+)$", token[1])
             if attached:
                 writes.append(write_target((token[0], attached.group(1), token[2])))
@@ -995,6 +1000,8 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
         if name == "tee":
             writes.extend(write_target(w) for w in operands)
         elif name in ("cp", "mv", "install", "ln", "rsync") and len(operands) >= 2:
+            if name in ("rsync", "cp") and any(w[1].endswith("/") or w[1] in (".", "..") for w in operands[:-1]):
+                writes.append(None)  # copies directory contents: any file name may be written
             destination = write_target(operands[-1])
             writes.append(destination)
             if destination:
@@ -1015,7 +1022,7 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                 os.path.basename(w[1]) in SHELLS or os.path.basename(w[1]) == "git" for w in argv[1:]):
             raise Unresolvable(f"{name} around a shell or git commit cannot be checked; run git commit directly")
         if name in SHELLS:
-            hidden = piped or herestring or "<(" in text
+            hidden = piped or herestring or process_sub
             if ((hidden and COMMIT_TEXT.search(command))
                     or (stdin_raw and stdin_body is None and COMMIT_TEXT.search(stdin_raw))):
                 raise Unresolvable(f"{name} reads its script from a pipe or an unquoted heredoc the policy cannot "

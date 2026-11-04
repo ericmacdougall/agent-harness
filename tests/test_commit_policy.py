@@ -191,6 +191,7 @@ class ShellAnalysis(unittest.TestCase):
             "git -c core.quotepath=off commit -F msg.txt": GOOD,
             "GIT_AUTHOR_DATE=$(date) git commit -m wip": "wip",
             "git commit -m wip && sudo systemctl restart nginx": "wip",
+            "bash -c 'cat <(echo hi)' && git -C . commit -F msg.txt": GOOD,
             "timeout 30 git commit -m wip": "wip",
         }
         for command, expected in cases.items():
@@ -232,7 +233,9 @@ class ShellAnalysis(unittest.TestCase):
                         "echo \"$(gi''t commit -m wip)\"",
                         "bash <<< 'git commit -m wip'", "bash <(echo 'git commit -m wip')",
                         "echo 'git commit -m wip' | sudo bash", "echo wip 1<>msg.txt && git commit -F msg.txt",
-                        "git diff --output=msg.txt && git commit -F msg.txt"):
+                        "git diff --output=msg.txt && git commit -F msg.txt",
+                        "bash<<<\"git commit -m wip\"", "sh<<<'git commit -m wip'",
+                        "rsync -a src/ ./ && git commit -F msg.txt"):
             with self.subTest(command):
                 with self.assertRaises(cp.Unresolvable):
                     cp.analyze(command, self.dir)
