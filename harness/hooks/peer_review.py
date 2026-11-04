@@ -61,17 +61,23 @@ CODEX_RECONNECTING = re.compile(r'Reconnecting\.\.\. \d{1,3}/\d{1,3}\b')
 # Some Codex auth failures (e.g. a revoked refresh token) carry no structured
 # code. Only these explicit auth signals in a Codex error record's own message
 # may classify one as AUTH; model and tool output is never inspected.
-CODEX_AUTH_SIGNAL = re.compile(r'(?<![\w.])401(?![\w.])|\bunauthori[sz]ed\b|\brevoked\b', re.IGNORECASE)
+CODEX_AUTH_SIGNAL = re.compile(r'(?<![\w.])401(?!\w|\.\d)|\bunauthori[sz]ed\b|\brevoked\b', re.IGNORECASE)
+STRUCTURED_KEYS = {'code', 'type', 'subtype', 'scope'}
 
 
-def codex_failure(record):
-    """Classify a terminal Codex error record, allowing fallback for unstructured auth loss."""
+def codex_failure(record, *, terminal):
+    """Classify a Codex error record, allowing fallback for unstructured terminal auth loss.
+
+    Only the final record of a transcript that produced no completion or agent
+    message can be upgraded, so a non-fatal error (for example a tool server's
+    own 401) can never replace a finished review.
+    """
     result = provider_failure(record)
     error = record.get('error')
     message = error.get('message') if isinstance(error, dict) else record.get('message')
-    unstructured = not (isinstance(error, dict) and (error.get('code') or error.get('type'))) \
-        and not record.get('code') and not record.get('subtype')
-    if (result['reason'] == 'INVALID_OUTPUT' and unstructured and isinstance(message, str)
+    unstructured = (not (isinstance(error, dict) and STRUCTURED_KEYS & set(error))
+                    and not (STRUCTURED_KEYS - {'type'}) & set(record))
+    if (terminal and result['reason'] == 'INVALID_OUTPUT' and unstructured and isinstance(message, str)
             and len(message) <= 4096 and CODEX_AUTH_SIGNAL.search(message)):
         # Prose-derived, so it may unlock the independent fallback but never
         # places an account-pool cooldown.
@@ -135,7 +141,7 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                         and CODEX_RECONNECTING.match(record['message'])):
                     continue
                 if kind in {'error', 'turn.failed'} or record.get('is_error') is True or record.get('error') is not None:
-                    return codex_failure(record)
+                    return codex_failure(record, terminal=record is records[-1] and not completed and not messages)
                 if kind == 'turn.completed':
                     if (record.get('status') not in (None, 'success', 'completed')
                             or record.get('subtype') not in (None, 'success', 'completed')):

@@ -1138,7 +1138,8 @@ class ProviderEnvelopeTests(unittest.TestCase):
                                                     stderr='refresh token was revoked')
             self.assertEqual((result['result'], result['reason'], result['fallback_allowed'],
                               result['account_cooldown']), ('NO_RESULT', 'AUTH', True, False))
-        for message in ('Unauthorized', 'HTTP 401 from backend', 'refresh token was revoked'):
+        for message in ('Unauthorized', 'HTTP 401 from backend', 'refresh token was revoked',
+                        'unexpected status 401.'):
             with self.subTest(message=message):
                 result = self.module.normalize_provider('codex', 1, self.transcript(
                     [{'type': 'error', 'message': message}]))
@@ -1160,6 +1161,21 @@ class ProviderEnvelopeTests(unittest.TestCase):
             'structured code wins': self.transcript([{'type': 'turn.failed', 'error': {
                 'code': 'invalid_request', 'message': 'unauthorized'}}]),
             'malformed json': '{"type": "turn.failed", "error": {"message": "401"',
+            'record-level code': self.transcript([{'type': 'turn.failed', 'code': 'invalid_request',
+                                                   'error': {'message': 'unauthorized (401)'}}]),
+            'empty structured code': self.transcript([{'type': 'turn.failed', 'error': {'code': '', 'message': '401'}}]),
+            'malformed scope': self.transcript([{'type': 'error', 'message': '401', 'scope': ['a']}]),
+            'signal outside message': self.transcript([{'type': 'turn.failed', 'error': {
+                'message': 'internal error', 'detail': '401 unauthorized revoked'}}]),
+            'non-final auth error then completion': '\n'.join(json.dumps(record) for record in [
+                {'type': 'thread.started', 'thread_id': 'fixture'},
+                {'type': 'error', 'message': 'MCP client failed to start: handshake failed: 401 Unauthorized'},
+                {'type': 'turn.started'},
+                {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'VERDICT: BLOCK\nF1 bug'}},
+                {'type': 'turn.completed'}]),
+            'auth error after a message': self.transcript([
+                {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'VERDICT: BLOCK\nF1'}},
+                {'type': 'turn.failed', 'error': {'message': 'unauthorized (401)'}}]),
             'reconnecting with extra fields': self.transcript([{'type': 'error', 'message': 'Reconnecting... 1/5',
                                                                'code': 'invalid_request'}]),
         }
