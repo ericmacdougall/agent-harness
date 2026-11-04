@@ -422,7 +422,8 @@ GoodQA's own independent-acceptance rule for done transitions still applies.
    - **Unreachable GoodQA:** a transport failure blocks only in enforce mode when enforced projects are configured. The status write goes to the same service, so blocking it costs little.
    - **Refused key:** if any routed key gets `forbidden` reading the issue (a revoked or rotated key, or lost membership), the hook blocks in enforce mode while any project is enforced, and names `doctor`. Re-run `doctor` for each enforced project after any key or membership change.
    - **Non-uuid issue id:** a missing or non-uuid `issueId` blocks while any project is enforced. Only `update_issue` and `reassign_issue` declare `issueId` as a uuid; the other tools only describe it as one.
-   - **Issue not found:** an issue that every routed key reports `not_found` only warns, even in enforce mode. Enforcing a project requires a routed key that passes `doctor`, so such an issue is not in an enforced project.
+   - **Issue not found:** GoodQA also answers `not_found` to a key without membership. So when every routed key reports `not_found`, the hook first checks that each enforced project's key can still read its own project (`get_project`). If any cannot, it blocks and names `doctor`. If all can, the issue is outside every enforced project and the hook only warns.
+   - **Bulk calls while enforced:** one unresolvable item (a non-uuid id, or a not-found id while an enforced key is dead) blocks the whole call, including items in projects that are not enforced.
    - **Out of reach:** the GoodQA UI, REST calls made with curl or scripts, Codex and Cursor. Codex has no SubagentStop or MCP PreToolUse hook here, and Cursor is not wired, so on Codex and Cursor the commands are run by hand and `done` is advisory. Parity is tracked in GoodQA work-tracker-automatic#35670, to be absorbed by the harness Go port.
 
 ### Credentials and rollout
@@ -430,8 +431,9 @@ GoodQA's own independent-acceptance rule for done transitions still applies.
 - **Keys and routing.** A GoodQA key is bound to one organization. `spec_policy.json` `projects` maps a project slug to its `project_id` and `org_id`, and to `key_file` when it needs a different key. `doctor --project <slug>` checks that the routed key can create attachments, comment and transition in that project.
   - `member.key` reaches FrameBright, including the `work-tracker-automatic` tracker.
   - The Harness project lives in org Eric, and no key file reaches it yet.
-- **Shipped mode:** `mode: warn`, `plan_ticket_gate: warn`, `enforced_projects: []`.
-- **Enforcing on `harness`:** add `{"key_file": ...}` to its route, run `doctor --project harness`, then set `"enforced_projects": ["harness"]` and `"mode": "enforce"`.
+- **Shipped mode:** `mode: warn`, `plan_ticket_gate: warn`, `enforced_projects: []`. No project is enforced in this release.
+- **Before enforcing any project:** resolve the remaining items in GoodQA work-tracker-automatic#35672 (per-project plan ticket gate, a policy for tickets opened before enforcement, bulk timing with several routed keys). `doctor` reports the permissions GoodQA lists for the key; it does not try a write. Re-run it after any key or membership change.
+- **Enforcing on `harness`:** once #35672 is resolved, add `{"key_file": ...}` to its route, run `doctor --project harness`, then set `"enforced_projects": ["harness"]` and `"mode": "enforce"`.
 - **Rollback:** set the modes to `off`, or delete the `spec_flow.py hook` handler from `~/.claude/settings.json`.
 
 ## Lower-level publication and local integration

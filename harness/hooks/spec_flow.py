@@ -707,7 +707,8 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
                        "--kind agent|human --source <where it was given>")
     else:
         signer = valid[-1]
-        attested.append(f"sign-off by {signer.get('signer_kind')} {signer.get('by')!r} (identity is self-declared)")
+        attested.append(f"sign-off by {signer.get('signer_kind')} {signer.get('by')!r} (identity is self-declared; independence is checked only "
+                        "against the declared author, reviewer, poster and tester ids)")
     return {"ready": not missing, "missing": missing, "self_attested": attested, "notes": notes,
             "spec_core_sha": core}
 
@@ -776,6 +777,24 @@ def _status_action(status, note=None, min_reason=20):
     return "unknown"
 
 
+def dead_enforced_keys(config: dict, spec_policy: dict, deadline: float) -> list:
+    """Enforced projects whose routed key can no longer read the project itself (key liveness probe)."""
+    dead = []
+    routes = spec_policy.get("projects") or {}
+    for slug in spec_policy.get("enforced_projects") or []:
+        if not isinstance(slug, str):
+            continue
+        route = routes.get(slug.lower()) or {}
+        if not route.get("project_id"):
+            dead.append(f"{slug} (no route)")
+            continue
+        data = make_adapter(config, spec_policy, slug.lower(), deadline).call("get_project",
+                                                                              {"projectId": route["project_id"]})
+        if not isinstance(data, dict) or "__error__" in data:
+            dead.append(f"{slug} ({data.get('__error__') if isinstance(data, dict) else 'bad response'})")
+    return dead
+
+
 def resolve_issue(issue_id: str, config: dict, spec_policy: dict, deadline: float, refusals=None):
     """Find the issue with the default key, then each routed project's key.
 
@@ -811,7 +830,7 @@ def run_hook(payload: dict, spec_policy: dict, config_loader=None) -> tuple:
         return 0, ""
     enforced = enforced_ids(spec_policy)
     deadline = time.monotonic() + float(spec_policy.get("hook_deadline_seconds", 40))
-    blocking, warnings = [], []
+    blocking, warnings, dead_keys = [], [], None
     try:
         _, _, config = (config_loader or ticket_config)(spec_policy)
         for issue_id, action, detail in items:
@@ -837,10 +856,18 @@ def run_hook(payload: dict, spec_policy: dict, config_loader=None) -> tuple:
                         f"issue {issue_id}: a routed GoodQA key was refused (forbidden), so the spec gate cannot "
                         "check it; re-run spec_flow.py doctor --project <slug> for the enforced projects")
                 else:
-                    # not_found under every key: enforcing a project requires a routed key that passes doctor,
-                    # so this issue is not in an enforced project. Warn instead of blocking other projects.
-                    warnings.append(f"issue {issue_id} is not found with any routed key, so it is not in an "
-                                    "enforced project; not checked")
+                    # not_found under every key. GoodQA also answers not_found to a key without membership, so
+                    # first prove each enforced project's key still reads its own project; only then is the
+                    # issue known to be outside every enforced project.
+                    if enforced and dead_keys is None:
+                        dead_keys = dead_enforced_keys(config, spec_policy, deadline)
+                    if dead_keys:
+                        blocking.append(f"issue {issue_id} is not found, and the routed key for enforced "
+                                        f"project(s) {', '.join(dead_keys)} can no longer read its project; "
+                                        "fix the key and re-run spec_flow.py doctor")
+                    else:
+                        warnings.append(f"issue {issue_id} is not found with any routed key, and every enforced "
+                                        "project's key still reads its project; not checked")
                 continue
             target = blocking if str(issue.get("projectId") or "").lower() in enforced else warnings
             label = f"issue #{issue.get('number')} ({issue_id[:8]})"

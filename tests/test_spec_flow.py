@@ -73,6 +73,7 @@ class FakeGoodQA:
         self.comments, self.attachments, self.calls = {ISSUE: []}, {}, []
         self.delay, self.refuse_done, self.clock = 0, False, 0
         self.forbidden = set()  # issue ids whose reads are refused, as for a revoked key
+        self.lost_projects = set()  # project ids the key can no longer read (lost membership answers not_found)
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -178,6 +179,8 @@ class FakeGoodQA:
             self.issues[args["issueId"]]["status"] = args["status"]
             return {"issue": self.issues[args["issueId"]]}, None
         if name == "get_project":
+            if args["projectId"] in self.lost_projects:
+                return None, "not_found"
             return {"project": {"id": args["projectId"]}, "permissions": ["attachment:create", "comment:add",
                                                                           "issue:transition"]}, None
         return None, "unknown_tool"
@@ -719,7 +722,7 @@ class Hook(SpecFlowCase):
         other = str(uuid.uuid4())
         code, text = self.hook("update_issue", {"issueId": other, "patch": {"status": "done"}}, **self.enforce())
         self.assertEqual(code, 0)
-        self.assertIn("not in an enforced project", text)
+        self.assertIn("still reads its project", text)
 
     def test_non_uuid_issue_id_blocks_while_anything_is_enforced(self):
         for tool, tool_input in (("close_issue_done", {"issueId": "harness#168", "status": "done", "note": "x"}),
@@ -730,6 +733,17 @@ class Hook(SpecFlowCase):
                 self.assertIn("non-uuid issueId", text)
                 code, _ = self.hook(tool, tool_input, mode="enforce", enforced_projects=[])
                 self.assertEqual(code, 0)
+
+    def test_not_found_with_a_dead_enforced_key_blocks(self):
+        other = str(uuid.uuid4())
+        self.fake.lost_projects.add(PROJECT)  # membership removed after doctor: GoodQA says not_found
+        code, text = self.hook("update_issue", {"issueId": other, "patch": {"status": "done"}}, **self.enforce())
+        self.assertEqual(code, 2)
+        self.assertIn("can no longer read its project", text)
+        self.fake.lost_projects.clear()
+        code, text = self.hook("update_issue", {"issueId": other, "patch": {"status": "done"}}, **self.enforce())
+        self.assertEqual(code, 0)
+        self.assertIn("still reads its project", text)
 
     def test_refused_key_fails_closed_when_anything_is_enforced(self):
         self.fake.forbidden.add(ISSUE)  # the enforced project's key was revoked after doctor
