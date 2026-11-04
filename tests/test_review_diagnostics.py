@@ -93,12 +93,30 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(words[words.index('--event') + 1], 'blocker')
 
     def test_hostile_text_cannot_break_out_of_record_command(self):
-        diag = rd.diagnostic('EXEC_NOT_FOUND', detail="x'; rm -rf ~ #")
-        text = rd.render(diag, stage="pr'; touch /tmp/pwn #", head="h'$(id)")
-        record = next(line for line in text.splitlines() if line.startswith('Record: '))
-        words = shlex.split(record[len('Record: '):])
-        self.assertEqual(len(words), 8, words)  # python3 script --wal <p> --event blocker --note <one word>
-        self.assertIn('touch /tmp/pwn', words[-1])
+        hostile = json.loads((HERE / 'data/review_diagnostics_hostile.json').read_text())['shell_breakouts']
+        self.assertGreaterEqual(len(hostile), 5)
+        for value in hostile:
+            for field in ('stage', 'head', 'detail'):
+                with self.subTest(value=value, field=field):
+                    diag = rd.diagnostic('EXEC_NOT_FOUND', detail=value if field == 'detail' else 'x')
+                    text = rd.render(diag, stage=value if field == 'stage' else 'pr',
+                                     head=value if field == 'head' else HEAD)
+                    self.assertNotIn('\0', text)
+                    records = [line for line in text.splitlines() if line.startswith('Record: ')]
+                    self.assertEqual(len(records), 1, 'a value must not forge or split the Record line')
+                    words = shlex.split(records[0][len('Record: '):])
+                    # python3 script --wal <p> --event blocker --note <one word>
+                    self.assertEqual(len(words), 8, words)
+                    self.assertTrue(words[-1].startswith('PEER_REVIEW_INFRA code=EXEC_NOT_FOUND'), words[-1])
+
+    def test_next_steps_are_fixed_text(self):
+        """Steps never interpolate external values, so they cannot carry injected shell text."""
+        for code in rd.CONTRACT:
+            with self.subTest(code=code):
+                plain = rd.render(rd.diagnostic(code, detail='x'), stage='pr', head=HEAD)
+                hostile = rd.render(rd.diagnostic(code, detail='$(id)'), stage='pr', head=HEAD)
+                steps = [line for line in plain.splitlines() if line.startswith('Next ')]
+                self.assertEqual(steps, [line for line in hostile.splitlines() if line.startswith('Next ')])
 
     def test_documentation_names_every_code(self):
         docs = DOCS.read_text()
@@ -218,6 +236,26 @@ class ExecutableTrustTests(unittest.TestCase):
         self.assertIn('executable', rd.check_executable(plain, self.roots)[1])
         self.assertIsNone(rd.check_executable(self.root / 'missing', self.roots)[0])
         self.assertIsNone(rd.check_executable(self.root, self.roots)[0])
+
+    def test_world_writable_ancestor_rule(self):
+        """Non-sticky 0777 refused; sticky but not root-owned refused; root-owned sticky (/tmp) accepted."""
+        loose = self.root / 'loose777'
+        found = self.shim(loose)
+        loose.chmod(0o777)
+        self.assertIn('world-writable', rd.check_executable(found, self.roots)[1])
+        sticky_mine = self.root / 'sticky-mine'
+        found = self.shim(sticky_mine)
+        sticky_mine.chmod(0o1777)
+        if os.geteuid() != 0:
+            self.assertIn('world-writable', rd.check_executable(found, self.roots)[1])
+        info = os.stat('/tmp')
+        if not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX and info.st_mode & 0o002):
+            self.skipTest('SKIPPED, not passed: /tmp is not a root-owned sticky world-writable directory here')
+        under_tmp = Path(tempfile.mkdtemp(dir='/tmp'))
+        self.addCleanup(shutil.rmtree, str(under_tmp), True)
+        os.chmod(str(under_tmp), 0o700)
+        found = self.shim(under_tmp / 'bin')
+        self.assertEqual(rd.check_executable(found, self.roots), (os.path.realpath(str(found)), None))
 
     def test_relative_and_empty_path_entries_are_ignored(self):
         self.shim(self.repo / 'sub')

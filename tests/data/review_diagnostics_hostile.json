@@ -1,0 +1,14 @@
+{
+  "_comment": "Hostile values interpolated into printed diagnostics. Data only: read by tests/test_review_diagnostics.py, never passed to a shell (safety rule S1).",
+  "shell_breakouts": [
+    "pr'; touch /tmp/pwn #",
+    "h'$(id)",
+    "x\"; touch /tmp/pwn; echo \"",
+    "`id`",
+    "a;b|c&d>e<f",
+    "$(touch /tmp/pwn)",
+    "line\nforged: [ok] PASSED",
+    "tab\there\u0000nul",
+    "‮pwn‬"
+  ]
+}
