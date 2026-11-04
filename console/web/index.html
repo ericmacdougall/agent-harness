@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>
+      Agent Harness
+    </title>
+    <link rel="stylesheet" href="/style.css">
+    <script type="module" src="/app.js">
+    </script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar no-select">
+        <a class="brand" href="#" aria-label="Agent Harness home">
+          <span class="brand-mark" aria-hidden="true">
+            a
+            <span>
+              h
+            </span>
+          </span>
+          <span>
+            Agent Harness
+          </span>
+        </a>
+        <div class="session-tabs" id="session-tabs" role="tablist" aria-label="Sessions" data-testid="session-tabs">
+        </div>
+        <button class="icon-button new-session" id="new-session" title="New session (Alt/Option Shift N)" aria-label="New session" data-testid="new-session">
+          +
+        </button>
+        <div class="topbar-actions">
+          <button class="quiet-button" id="shortcuts-button" title="Keyboard shortcuts">
+            ⌨
+            <span>
+              Shortcuts
+            </span>
+          </button>
+          <button class="quiet-button" id="quit-console" title="Stop the console and its owned sessions" data-testid="quit-console">
+            Quit console
+          </button>
+          <button class="icon-button" id="settings-button" aria-label="Settings" title="Settings" data-testid="settings-button">
+            ⚙
+          </button>
+        </div>
+      </header>
+      <div class="connection-banner" id="connection-banner" role="status" hidden>
+      </div>
+      <main class="workspace">
+        <section class="chat-column" aria-label="Conversation">
+          <header class="conversation-header no-select">
+            <div>
+              <div class="eyebrow" id="conversation-eyebrow">
+                YOUR WORKSPACE
+              </div>
+              <h1 id="conversation-title">
+                Ready when you are
+              </h1>
+            </div>
+            <div class="conversation-actions">
+              <span class="status-pill" id="session-status">
+                No session
+              </span>
+              <button class="quiet-button" id="back-to-session" hidden>
+                ← Main session
+              </button>
+            </div>
+          </header>
+          <section id="recovery-banner" class="recovery-banner no-select" aria-label="Restored session recovery" hidden>
+            <div>
+              <strong id="recovery-title">Restored history is read-only</strong>
+              <p id="recovery-text">Continue in a new session with the prior context, profile and directory. Unresolved actions are not replayed; the new session waits for your next message.</p>
+            </div>
+            <button id="continue-as-new" type="button" class="primary-button" data-testid="continue-as-new">Continue in new session</button>
+          </section>
+          <section class="supervision no-select" id="supervision" aria-label="Work supervision" hidden>
+            <span class="supervision-dot">
+            </span>
+            <div>
+              <strong id="supervision-title">
+              </strong>
+              <span id="supervision-detail">
+              </span>
+            </div>
+          </section>
+          <div class="question-stack no-select" id="questions" aria-live="polite">
+          </div>
+          <div class="transcript" id="transcript" role="log" aria-label="Chat transcript" aria-live="polite" aria-relevant="additions text" data-testid="chat-transcript">
+            <div class="welcome" id="welcome">
+              <div class="welcome-symbol" aria-hidden="true">
+                ↗
+              </div>
+              <h2>
+                Make room for the work.
+              </h2>
+              <p>
+                Start a conversation with Codex or Claude Code. Keep the chat, its owners, and your working tree together.
+              </p>
+              <button class="primary-button" id="welcome-start">
+                Start a session
+                <span>
+                  +
+                </span>
+              </button>
+              <div class="welcome-hints">
+                <span>
+                  Local providers
+                </span>
+                <span>
+                  Live agent activity
+                </span>
+                <span>
+                  Recoverable work
+                </span>
+              </div>
+            </div>
+          </div>
+          <button class="new-output no-select" id="new-output" hidden>
+            ↓ New output
+          </button>
+          <div class="session-error no-select" id="session-error" role="alert" hidden>
+          </div>
+          <details id="input-queue" class="input-queue no-select" open hidden>
+            <summary id="input-queue-summary">Follow-ups</summary>
+            <div class="input-queue-content">
+              <p>FIFO admission is not delivery. Dispatched follow-ups update the objective and invalidate earlier reviews. Held inputs wait for the reason shown below to be resolved.</p>
+              <p class="queue-retention-notice">Payloads and attachment snapshots stay private on this computer until explicitly released. Discarding does not stop provider work; files may still be needed, and delivered text can remain in the current objective until that task ends.</p>
+              <small>Limits: 128 KiB/message · 256 KiB pending text · separate 256 KiB objective · 8 unsent inputs · 16 attachment snapshots / 16 MiB retained.</small>
+              <div id="pending-input-list"></div>
+            </div>
+          </details>
+          <p id="composer-hint" class="composer-hint no-select" role="status" hidden></p>
+          <form class="composer no-select" id="composer" data-testid="composer">
+            <div class="attachment-list" id="attachments">
+            </div>
+            <label class="sr-only" for="chat-input">
+              Message
+            </label>
+            <textarea id="chat-input" placeholder="What would you like to build?" rows="2" spellcheck="true" data-testid="chat-input"></textarea>
+            <div class="composer-footer">
+              <div class="composer-tools">
+                <button type="button" class="icon-button" id="attach-button" aria-label="Attach a file" title="Attach a file (Alt/Option Shift O)" data-testid="attach-file">
+                  ＋
+                </button>
+                <span id="composer-context">
+                  Choose a session to begin
+                </span>
+              </div>
+              <div class="composer-send">
+                <span class="key-hint">
+                  ⌘ / Ctrl ↵
+                </span>
+            <button type="button" class="quiet-button" id="pause-session" hidden>
+              Ⅱ Pause
+            </button>
+            <button type="button" class="quiet-button" id="resume-session" hidden>
+              ↻ Resume
+            </button>
+            <button type="button" class="quiet-button" id="discard-turn" data-testid="discard-turn" hidden>
+              Discard turn
+            </button>
+            <button type="button" class="stop-button" id="stop-session" hidden>
+                  ■ Stop
+                </button>
+                <button type="submit" class="send-button" id="send-message" aria-label="Send message" disabled data-testid="send-message">
+                  ↑
+                </button>
+              </div>
+            </div>
+          </form>
+        </section>
+        <aside class="sidebar no-select" aria-label="Agents and repository" data-testid="sidebar">
+          <section class="agents-panel">
+            <header class="panel-header">
+              <h2>
+                <span class="panel-icon">
+                  ◉
+                </span>
+                Agents
+                <span class="count" id="agent-count">
+                  0
+                </span>
+              </h2>
+              <span class="panel-caption">
+                Live
+              </span>
+            </header>
+            <div id="agent-tree" class="agent-tree" role="tree" aria-label="Owner agents" data-testid="agent-tree">
+            </div>
+            <div class="agent-detail" id="agent-detail" hidden>
+            </div>
+          </section>
+          <section class="repository-panel">
+            <header class="panel-header">
+              <h2>
+                <span class="panel-icon">
+                  ⑂
+                </span>
+                Repository
+              </h2>
+              <button class="icon-button small" id="refresh-git" title="Fetch and refresh repository" aria-label="Fetch and refresh repository" data-testid="refresh-git">
+                ↻
+              </button>
+            </header>
+            <div class="segmented-control" role="tablist" aria-label="Repository view">
+              <button role="tab" id="worktrees-tab" aria-selected="true" data-view="worktrees">
+                Worktrees
+              </button>
+              <button role="tab" id="branches-tab" aria-selected="false" data-view="branches">
+                Branches
+              </button>
+            </div>
+            <div class="repo-summary" id="repo-summary">
+            </div>
+            <div id="repository-list" class="repository-list" data-testid="repository-list">
+            </div>
+            <div class="repo-error" id="repo-error" role="status" hidden>
+            </div>
+          </section>
+          <div class="sidebar-bottom">
+            <span class="privacy-dot">
+            </span>
+            Runs on your computer
+          </div>
+        </aside>
+      </main>
+      <footer class="statusbar no-select">
+        <div class="runtime-stats">
+          <span class="transport-state" id="transport-state">
+            <i>
+            </i>
+            Connecting
+          </span>
+          <span id="usage-stat">
+            Usage unavailable
+          </span>
+          <span id="tool-stat">
+            No active tools
+          </span>
+        </div>
+        <button id="cwd-button" class="cwd-button" title="Change working directory (Alt/Option Shift W)" data-testid="cwd-button">
+          <span>
+            ⌁
+          </span>
+          <span id="cwd-label">
+            Choose working directory
+          </span>
+          <span class="cwd-chevron">
+            ⌄
+          </span>
+        </button>
+      </footer>
+    </div>
+    <div class="toast-region no-select" id="toasts" aria-live="polite" aria-atomic="false">
+    </div>
+    <dialog id="new-session-dialog" aria-labelledby="new-session-title" class="dialog compact-dialog">
+      <form id="new-session-form">
+        <div class="dialog-heading">
+          <div>
+            <div class="eyebrow">
+              A FRESH START
+            </div>
+            <h2 id="new-session-title">
+              New session
+            </h2>
+          </div>
+          <button type="button" class="icon-button" data-close aria-label="Close">
+            ×
+          </button>
+        </div>
+        <label class="field-label" for="provider-select">
+          Provider
+        </label>
+        <select id="provider-select" name="provider">
+          <option value="codex">
+            Codex
+          </option>
+          <option value="claude">
+            Claude Code
+          </option>
+        </select>
+        <p class="field-help" id="provider-help">
+        </p>
+        <label class="field-label" for="new-cwd">
+          Working directory
+        </label>
+        <div class="input-with-button">
+          <input id="new-cwd" name="cwd" autocomplete="off" required>
+          <button type="button" class="quiet-button" id="browse-new-cwd">
+            Browse
+          </button>
+        </div>
+        <div class="form-error" id="new-session-error" role="alert" hidden>
+        </div>
+        <div class="dialog-footer">
+          <button type="button" class="quiet-button" data-close>
+            Cancel
+          </button>
+          <button class="primary-button" type="submit" id="create-session">
+            Create session →
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="file-dialog" aria-labelledby="file-dialog-title" class="dialog file-dialog">
+      <div class="dialog-heading">
+        <div>
+          <div class="eyebrow" id="file-dialog-eyebrow">
+            EXPLICIT FILE ACCESS
+          </div>
+          <h2 id="file-dialog-title">
+            Choose files
+          </h2>
+        </div>
+        <button class="icon-button" data-close aria-label="Close">
+          ×
+        </button>
+      </div>
+      <form class="file-path-form" id="file-path-form">
+        <button type="button" class="icon-button" id="file-up" aria-label="Parent directory">
+          ↑
+        </button>
+        <label class="sr-only" for="file-path">
+          Directory path
+        </label>
+        <input id="file-path" autocomplete="off">
+        <button class="quiet-button" type="submit">
+          Go
+        </button>
+      </form>
+      <div class="file-list" id="file-list" role="list" aria-label="Files">
+      </div>
+      <div class="form-error" id="file-error" role="alert" hidden>
+      </div>
+      <div class="dialog-footer">
+        <span id="file-selection-count">
+          No files selected
+        </span>
+        <div>
+          <button class="quiet-button" data-close>
+            Cancel
+          </button>
+          <button class="primary-button" id="file-confirm">
+            Attach selected files
+          </button>
+        </div>
+      </div>
+    </dialog>
+    <dialog id="confirm-dialog" aria-labelledby="confirm-title" class="dialog compact-dialog">
+      <form id="confirm-form">
+        <div class="dialog-heading">
+          <h2 id="confirm-title">
+            Confirm action
+          </h2>
+          <button type="button" class="icon-button" data-close aria-label="Close">
+            ×
+          </button>
+        </div>
+        <p id="confirm-description">
+        </p>
+        <label id="confirm-label" class="field-label" for="confirm-input">
+          Confirm path
+        </label>
+        <input id="confirm-input" autocomplete="off">
+        <label id="confirm-reason-label" class="field-label" for="confirm-reason" hidden>
+          Reason
+        </label>
+        <textarea id="confirm-reason" rows="2" maxlength="500" autocomplete="off" hidden></textarea>
+        <div class="form-error" id="confirm-error" role="alert" hidden>
+        </div>
+        <div class="dialog-footer">
+          <button type="button" class="quiet-button" data-close>
+            Cancel
+          </button>
+          <button type="submit" class="danger-button" id="confirm-action">
+            Continue
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="shortcuts-dialog" aria-labelledby="shortcuts-title" class="dialog compact-dialog">
+      <div class="dialog-heading">
+        <h2 id="shortcuts-title">
+          Keyboard shortcuts
+        </h2>
+        <button class="icon-button" data-close aria-label="Close">
+          ×
+        </button>
+      </div>
+      <dl class="shortcut-list">
+        <dt>
+          Send message
+        </dt>
+        <dd>
+          ⌘ / Ctrl + Enter
+        </dd>
+        <dt>
+          New session
+        </dt>
+        <dd>
+          Alt / Option + Shift + N
+        </dd>
+        <dt>
+          Next / previous session
+        </dt>
+        <dd>
+          Alt / Option + Shift + ] / [
+        </dd>
+        <dt>
+          Attach a file
+        </dt>
+        <dd>
+          Alt / Option + Shift + O
+        </dd>
+        <dt>
+          Change working directory
+        </dt>
+        <dd>
+          Alt / Option + Shift + W
+        </dd>
+        <dt>
+          Open Codex at cwd
+        </dt>
+        <dd>
+          Alt / Option + Shift + K
+        </dd>
+        <dt>
+          Open Claude Code at cwd
+        </dt>
+        <dd>
+          Alt / Option + Shift + L
+        </dd>
+        <dt>
+          Navigate agent tree
+        </dt>
+        <dd>
+          ↑ ↓ ← → · Enter
+        </dd>
+        <dt>
+          Close a dialog
+        </dt>
+        <dd>
+          Escape
+        </dd>
+      </dl>
+    </dialog>
+    <dialog id="input-detail-dialog" class="dialog" aria-labelledby="input-detail-title">
+      <div class="dialog-heading">
+        <h2 id="input-detail-title">Stored follow-up</h2>
+        <button type="button" class="icon-button" data-close aria-label="Close follow-up details">×</button>
+      </div>
+      <p id="input-detail-status"></p>
+      <label class="field-label" for="input-detail-text">Stored message (read-only)</label>
+      <textarea id="input-detail-text" rows="10" readonly spellcheck="false"></textarea>
+      <button type="button" class="quiet-button" id="input-detail-select">Select text to copy</button>
+      <ul id="input-detail-files"></ul>
+    </dialog>
+    <dialog id="settings-dialog" aria-labelledby="settings-title" class="dialog settings-dialog">
+      <div class="dialog-heading">
+        <div>
+          <div class="eyebrow">
+            YOUR LOCAL WORKSPACE
+          </div>
+          <h2 id="settings-title">
+            Settings
+          </h2>
+        </div>
+        <button class="icon-button" data-close aria-label="Close settings">
+          ×
+        </button>
+      </div>
+      <div id="settings-content">
+      </div>
+    </dialog>
+  </body>
+</html>

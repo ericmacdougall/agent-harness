@@ -1523,7 +1523,9 @@ def evaluate(commits, policy, *, base, head, exclude, previous, tickets_required
             adapters[system] = adapter
             ticket = adapter.lookup(project, number)
             if ticket is None:
-                entry.update(status="MISSING", fix=f"{system} {project}#{number} does not exist; reference a real ticket")
+                shown = "GoodQA" if system == "goodqa" else system
+                entry.update(status="MISSING", fix=f"{shown} {project}#{number} does not exist; reference a real "
+                             f"ticket (if it lives in another project, write {shown} <project-slug>#{number})")
                 report["status"] = "BLOCKED"
                 continue
             newest = max(c["time"] for c in commits_for)

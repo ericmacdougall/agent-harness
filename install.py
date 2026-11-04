@@ -22,11 +22,14 @@ START = "<!-- agent-harness:start -->"
 END = "<!-- agent-harness:end -->"
 AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py",
-         "ticket_adapters.py", "commit_policy.py", "commit_policy.json",
+         "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
          "spec_flow.py", "spec_policy.json", "spec_template.md")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
+TMPDIR_KEY = "CLAUDE_CODE_TMPDIR"
+INSTALL_STATE = "install-state.json"
+MAX_SOCKET_PATH = 100  # macOS sun_path is 104 bytes; Claude Code puts sockets in <root>/cc-socks/
 NO_TARGET_CHECK = object()
 NO_CONTENT_CHECK = object()
 
@@ -83,8 +86,24 @@ def managed_hooks(claude: Path) -> dict[str, list[dict]]:
     }
 
 
-def merged_settings(current: dict, claude: Path) -> dict:
+def durable_scratch(claude: Path) -> Path:
+    """Reboot-surviving home for Claude Code's temp dir (scratchpad, task output)."""
+    return claude.parent / ".agent-harness" / "scratch"
+
+
+def merged_settings(current: dict, claude: Path, durable_tmp: bool = True) -> dict:
     settings = json.loads(json.dumps(current))
+    env = settings.get("env", {})
+    if not isinstance(env, dict):
+        raise ValueError("settings.json env must be an object")
+    managed_tmp = str(durable_scratch(claude))
+    shell_value = os.environ.get(TMPDIR_KEY)
+    if durable_tmp and TMPDIR_KEY not in env and shell_value in (None, "", managed_tmp):
+        # A value exported in the shell is the user's choice too; settings env would override it.
+        # Never overwrite a user's value: setting it (even to /tmp) is the opt-out.
+        settings["env"] = {**env, TMPDIR_KEY: managed_tmp}
+    elif not durable_tmp and env.get(TMPDIR_KEY) == managed_tmp:
+        settings["env"] = {key: value for key, value in env.items() if key != TMPDIR_KEY}
     hooks = settings.setdefault("hooks", {})
     scripts = managed_scripts(claude)
     for event, managed in managed_hooks(claude).items():
@@ -118,6 +137,9 @@ def merged_settings(current: dict, claude: Path) -> dict:
         rule = f"Bash(python3 ~/.claude/hooks/spec_flow.py {action} *)"
         if rule not in allowed:
             allowed.append(rule)
+    rule = "Bash(python3 ~/.claude/hooks/workdir.py prune)"  # dry run only; --apply still asks
+    if rule not in allowed:
+        allowed.append(rule)
     return settings
 
 
@@ -470,7 +492,7 @@ def read_regular(path: Path, *, pinned_parent=None, retain_fd=None):
         return None
 
 
-def install(home: Path, apply: bool) -> list[str]:
+def install(home: Path, apply: bool, durable_tmp: bool = True) -> list[str]:
     claude = home.expanduser().resolve() / ".claude"
     files = [
         *((ROOT / "harness" / folder / name, claude / folder / name)
@@ -502,7 +524,7 @@ def install(home: Path, apply: bool) -> list[str]:
         current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
         if not isinstance(current_settings, dict):
             raise ValueError("settings.json must contain an object")
-        settings = merged_settings(current_settings, claude)
+        settings = merged_settings(current_settings, claude, durable_tmp)
         # Read every payload before any managed write (also validate it in preview).
         payloads = [(destination, source.read_bytes()) for source, destination in files]
         payloads += [(instructions_path, instructions.encode()),
@@ -569,6 +591,98 @@ def install(home: Path, apply: bool) -> list[str]:
         pins.close()
 
 
+def _private_harness_dir(home: Path) -> int:
+    """Open (creating 0700) ~/.agent-harness without following symlinks; caller closes the fd."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent = os.open(home, flags)
+    try:
+        try:
+            os.mkdir(".agent-harness", 0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+        return os.open(".agent-harness", flags, dir_fd=parent)
+    finally:
+        os.close(parent)
+
+
+def durable_tmp_choice(home: Path, flag) -> bool:
+    """--durable-tmp/--no-durable-tmp win; otherwise the saved choice; otherwise on."""
+    if flag is not None:
+        return flag
+    try:
+        state = json.loads((home.expanduser().resolve() / ".agent-harness" / INSTALL_STATE).read_text())
+        return not (isinstance(state, dict) and state.get("durable_tmp") is False)
+    except (OSError, ValueError):
+        return True
+
+
+def save_durable_tmp_choice(home: Path, value: bool) -> None:
+    directory = _private_harness_dir(home.expanduser().resolve())
+    try:
+        temporary = f".{INSTALL_STATE}.{secrets.token_hex(4)}"
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"schema": 1, "durable_tmp": value}, handle)
+            handle.write("\n")
+        os.replace(temporary, INSTALL_STATE, src_dir_fd=directory, dst_dir_fd=directory)
+    finally:
+        os.close(directory)
+
+
+def scratch_status(home: Path, apply: bool, durable_tmp: bool = True, run=None) -> str:
+    """Create the durable scratch root (0700) when settings point at it; exclude it from Time Machine."""
+    import subprocess
+    home = home.expanduser().resolve()
+    claude = home / ".claude"
+    scratch = durable_scratch(claude)
+    try:
+        settings = json.loads((claude / "settings.json").read_text()) if apply else {}
+    except (OSError, ValueError):
+        settings = {}
+    configured = (settings.get("env") or {}).get(TMPDIR_KEY) if isinstance(settings, dict) else None
+    if not apply:
+        if not durable_tmp:
+            return f"durable scratch: off; would remove {TMPDIR_KEY} only if it is the harness value {scratch}"
+        return f"durable scratch: would use {scratch} as {TMPDIR_KEY} unless one is already set"
+    if not configured and os.environ.get(TMPDIR_KEY) not in (None, "", str(scratch)):
+        return (f"durable scratch: {TMPDIR_KEY} is exported in the shell ({os.environ[TMPDIR_KEY]!r}); "
+                "settings left unchanged")
+    if configured != str(scratch):
+        return (f"durable scratch: {TMPDIR_KEY} is {configured!r}, not managed by the harness; left unchanged"
+                if configured else f"durable scratch: {TMPDIR_KEY} not set; scratchpad stays in system temp")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fds = []
+    try:
+        fds.append(_private_harness_dir(home))
+        try:
+            os.mkdir("scratch", 0o700, dir_fd=fds[-1])
+        except FileExistsError:
+            pass
+        fds.append(os.open("scratch", flags, dir_fd=fds[-1]))
+        os.fchmod(fds[-1], 0o700)
+        # Keep Spotlight from indexing task output, which can contain command output.
+        os.close(os.open(".metadata_never_index", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600,
+                         dir_fd=fds[-1]))
+    except OSError as error:
+        return f"durable scratch: could not prepare {scratch} ({error.__class__.__name__}); inspect it"
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+    status = f"durable scratch: {TMPDIR_KEY}={scratch} (0700); restart running sessions to use it"
+    if len(str(scratch / "cc-socks" / "999999.sock").encode()) > MAX_SOCKET_PATH:
+        status += ("; WARNING: socket paths under this root exceed the macOS limit, "
+                   "rerun with --no-durable-tmp or set a shorter CLAUDE_CODE_TMPDIR")
+    if sys.platform == "darwin":
+        run = run or subprocess.run
+        try:
+            result = run(["tmutil", "addexclusion", str(scratch)], capture_output=True, text=True, timeout=10)
+            status += "; Time Machine exclusion " + ("set" if result.returncode == 0 else
+                                                      f"not set (tmutil exit {result.returncode})")
+        except (OSError, subprocess.SubprocessError):
+            status += "; Time Machine exclusion not set (tmutil unavailable)"
+    return status
+
+
 def install_git_backstop(home: Path, apply: bool) -> str:
     """Run after the file transaction: the hook command exits 0 if its script is missing."""
     home = home.expanduser().resolve()
@@ -579,9 +693,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
     parser.add_argument("--home", type=Path, default=Path.home(), help=argparse.SUPPRESS)
+    choice = parser.add_mutually_exclusive_group()
+    choice.add_argument("--no-durable-tmp", dest="durable_tmp", action="store_false", default=None,
+                        help=f"stop setting {TMPDIR_KEY} (remembered); remove it if it is the harness value")
+    choice.add_argument("--durable-tmp", dest="durable_tmp", action="store_true",
+                        help=f"set {TMPDIR_KEY} to ~/.agent-harness/scratch when unset (the default; remembered)")
     args = parser.parse_args()
+    durable_tmp = durable_tmp_choice(args.home, args.durable_tmp)
+    if args.apply and args.durable_tmp is not None:
+        # Save the choice first, so a later failure cannot let a plain reinstall undo an opt-out.
+        try:
+            save_durable_tmp_choice(args.home, durable_tmp)
+        except OSError as error:
+            parser.exit(1, f"Install failed: could not save the durable-tmp choice under "
+                           f"{args.home / '.agent-harness'} ({error.__class__.__name__}); it must be a "
+                           "real directory, not a symlink\n")
     try:
-        changes = install(args.home, args.apply)
+        changes = install(args.home, args.apply, durable_tmp=durable_tmp)
     except DirectoryPublicationError as error:
         parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"
@@ -589,6 +717,7 @@ def main() -> None:
     for path in changes:
         print(f"  {path}")
     print(f"  {install_git_backstop(args.home, args.apply)}")
+    print(f"  {scratch_status(args.home, args.apply, durable_tmp)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")
 

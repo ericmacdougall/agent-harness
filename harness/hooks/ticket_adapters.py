@@ -79,6 +79,36 @@ def read_key(path: str) -> str:
     return key
 
 
+# Tools a Secret Manager credential may call: the policy only verifies tickets with it.
+READ_ONLY_TOOLS = frozenset({"list_orgs", "list_projects", "get_issue_by_number", "get_issue_comments"})
+
+
+def read_secret(spec: dict, timeout: float = 30.0) -> str:
+    """Read a Secret Manager value in-process from gcloud's stdout.
+
+    The value never appears in argv, the environment or a file, and is never cached on disk.
+    """
+    import subprocess
+    name, project = (spec or {}).get("name"), (spec or {}).get("project")
+    if not (isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,255}", name)
+            and isinstance(project, str) and re.fullmatch(r"[a-z][a-z0-9-]{4,61}[a-z0-9]", project)):
+        raise TicketSystemUnavailable("key_secret needs a valid Secret Manager name and project")
+    try:
+        result = subprocess.run(["gcloud", "secrets", "versions", "access", "latest", "--secret=" + name,
+                                 "--project=" + project], capture_output=True, timeout=max(1.0, min(30.0, timeout)),
+                                stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        raise TicketSystemUnavailable(f"Secret Manager credential {name} could not be read (gcloud)") from None
+    if result.returncode != 0:
+        # gcloud's stderr is never echoed (it may quote the value); the exit code is enough to triage auth/IAM.
+        raise TicketSystemUnavailable(f"Secret Manager credential {name} could not be read (gcloud exit "
+                                      f"{result.returncode}; check gcloud auth and secretAccessor on {project})")
+    key = result.stdout.decode("utf-8", "replace").strip()
+    if not key or len(key) > 4096 or any(ch.isspace() for ch in key):
+        raise TicketSystemUnavailable(f"Secret Manager credential {name} is empty or malformed")
+    return key
+
+
 class GoodQAAdapter:
     """GoodQA through its MCP JSON-RPC endpoint (tools/call)."""
 
@@ -94,7 +124,17 @@ class GoodQAAdapter:
         total = float(config.get("total_deadline_seconds", 90))
         self.deadline = deadline if deadline is not None else time.monotonic() + total
         self._key = None
+        self._read_only = False
         self._org = config.get("org_id")
+
+    def _load_key(self):
+        """The private key file wins; without it, a configured Secret Manager key is read-only."""
+        path = self.config.get("key_file") or ""
+        secret = self.config.get("key_secret")
+        if secret and not Path(os.path.expanduser(path)).exists():
+            self._key, self._read_only = read_secret(secret, self._remaining()), True
+        else:
+            self._key = read_key(path)
 
     def _remaining(self):
         remaining = self.deadline - time.monotonic()
@@ -104,7 +144,11 @@ class GoodQAAdapter:
 
     def call(self, tool: str, arguments: dict):
         if self._key is None:
-            self._key = read_key(self.config.get("key_file") or "")
+            self._load_key()
+        if self._read_only and tool not in READ_ONLY_TOOLS:
+            raise TicketSystemUnavailable(
+                f"GoodQA {tool} refused: the Secret Manager credential is read-only for the commit policy; "
+                "post ticket comments from a host with the member key file (the Mac)")
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                            "params": {"name": tool, "arguments": arguments}}).encode()
         last = "no attempt"

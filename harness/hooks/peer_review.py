@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Independent read-only Codex review, with a blind Opus CLI fallback."""
 
+# Hooks run under the host python3, which is 3.9 on macOS; keep annotations lazy.
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
@@ -55,6 +58,36 @@ def provider_failure(record, *, trusted=True):
             'fallback_allowed': bool(quota or auth or unavailable), 'usage': None}
 
 
+# Codex CLI retries a lost connection with `error` records like
+# "Reconnecting... 2/5 (...)"; they are progress, not a terminal failure.
+CODEX_RECONNECTING = re.compile(r'Reconnecting\.\.\. \d{1,3}/\d{1,3}\b')
+# Some Codex auth failures (e.g. a revoked refresh token) carry no structured
+# code. Only these explicit auth signals in a Codex error record's own message
+# may classify one as AUTH; model and tool output is never inspected.
+CODEX_AUTH_SIGNAL = re.compile(r'(?<![\w.])401(?!\w|\.\d)|\bunauthori[sz]ed\b|\brevoked\b', re.IGNORECASE)
+STRUCTURED_KEYS = {'code', 'type', 'subtype', 'scope'}
+
+
+def codex_failure(record, *, terminal):
+    """Classify a Codex error record, allowing fallback for unstructured terminal auth loss.
+
+    Only the final record of a transcript that produced no completion or agent
+    message can be upgraded, so a non-fatal error (for example a tool server's
+    own 401) can never replace a finished review.
+    """
+    result = provider_failure(record)
+    error = record.get('error')
+    message = error.get('message') if isinstance(error, dict) else record.get('message')
+    unstructured = (not (isinstance(error, dict) and STRUCTURED_KEYS & set(error))
+                    and not (STRUCTURED_KEYS - {'type'}) & set(record))
+    if (terminal and result['reason'] == 'INVALID_OUTPUT' and unstructured and isinstance(message, str)
+            and len(message) <= 4096 and CODEX_AUTH_SIGNAL.search(message)):
+        # Prose-derived, so it may unlock the independent fallback but never
+        # places an account-pool cooldown.
+        return provider_failure({'code': 'unauthorized'}, trusted=False)
+    return result
+
+
 def provider_usage(record):
     """Keep reported numeric usage only; never copy an arbitrary provider object."""
     usage = record.get('usage')
@@ -107,8 +140,18 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                 kind = record.get('type')
                 if not isinstance(kind, str) or ('is_error' in record and type(record['is_error']) is not bool):
                     return invalid
+                if (kind == 'error' and set(record) == {'type', 'message'} and isinstance(record['message'], str)
+                        and CODEX_RECONNECTING.match(record['message'])):
+                    continue
+                if (kind == 'error' and set(record) == {'type', 'message'} and isinstance(record['message'], str)
+                        and len(records) >= 2 and record is records[-2] and records[-1].get('type') == 'turn.failed'
+                        and isinstance(records[-1].get('error'), dict)
+                        and records[-1]['error'].get('message') == record['message']):
+                    # Codex reports a fatal error once as `error`, then again as the
+                    # final `turn.failed`; classify the pair by that final record.
+                    continue
                 if kind in {'error', 'turn.failed'} or record.get('is_error') is True or record.get('error') is not None:
-                    return provider_failure(record)
+                    return codex_failure(record, terminal=record is records[-1] and not completed and not messages)
                 if kind == 'turn.completed':
                     if (record.get('status') not in (None, 'success', 'completed')
                             or record.get('subtype') not in (None, 'success', 'completed')):
@@ -719,8 +762,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("plan", "code-inspection", "pr"))
     parser.add_argument("--repo", type=Path, required=True)
-    parser.add_argument("--packet", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--packet", type=Path, required=True,
+                        help="private packet, e.g. ~/.agent-harness/work/<session-id>/<task>/plan.md (not /tmp)")
+    parser.add_argument("--output", type=Path, required=True,
+                        help="fresh report path, e.g. ~/.agent-harness/work/<session-id>/<task>/plan-review.md")
     parser.add_argument("--expected-head", help="full reviewed commit SHA; required for PR review")
     parser.add_argument('--packet-budget-bytes', type=int, default=PACKET_LIMIT,
                         help='Optional tighter packet ceiling; maximum 150000 bytes')
