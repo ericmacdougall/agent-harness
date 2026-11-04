@@ -1207,4 +1207,3 @@ class DocumentedCommands(unittest.TestCase):
             words = shlex.split(line.replace("[", " ").replace("]", " "))[2:]
             with self.subTest(line=line):
                 parser.parse_args(words)
-
