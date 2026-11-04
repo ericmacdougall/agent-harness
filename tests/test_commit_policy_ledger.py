@@ -203,7 +203,9 @@ class TrackedRepoRule(LedgerWorld):
 
     def test_case_and_port_variants_still_tracked(self):
         for url in ("https://GitHub.com/EricMacDougall/x.git", "ssh://git@ssh.github.com:443/ericmacdougall/x.git",
-                    "https://github.com:443/ericmacdougall/x.git"):
+                    "https://github.com:443/ericmacdougall/x.git", "git@github.com:/ericmacdougall/x.git",
+                    "https://github.com/./ericmacdougall/x.git", "https://github.com./ericmacdougall/x.git",
+                    "https://github.com/%65ricmacdougall/x.git", "https://github.com//ericmacdougall//x"):
             with self.subTest(url):
                 self.git("remote", "set-url", "origin", url)
                 self.assert_rejected()

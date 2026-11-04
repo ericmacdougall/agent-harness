@@ -180,6 +180,38 @@ def remote_urls(repo) -> list:
     return sorted({url for url in urls if url})
 
 
+SCP_URL = re.compile(r"^(?:[^@/\s]+@)?(?P<host>[^/:\s]+):(?P<path>.*)$")
+
+
+def normalized_urls(url: str) -> set:
+    """Canonical spellings of a remote URL for the tracked-repo match (only ever adds candidates).
+
+    Git and hosts treat these as the same repository, so none of them may hide a tracked path:
+    letter case and a trailing dot in the host, an explicit port, scp-style "host:/path",
+    percent-encoding, "." and ".." segments, doubled slashes and a trailing ".git".
+    """
+    from posixpath import normpath
+    from urllib.parse import unquote, urlsplit
+    url = url.strip()
+    if "://" in url:
+        try:
+            parts = urlsplit(url)
+            host, path = parts.hostname or "", parts.path
+        except ValueError:
+            return set()
+    else:
+        match = SCP_URL.match(url)
+        if not match or len(match.group("host")) == 1:  # "C:\..." is a local path, not scp syntax
+            return set()
+        host, path = match.group("host"), match.group("path")
+    host = host.lower().rstrip(".")
+    path = normpath("/" + unquote(path)).lstrip("/")
+    path = re.sub(r"(?:\.git)?/*$", "", path)
+    if not host:
+        return set()
+    return {f"https://{host}/{path}/", f"{host}:{path}/"}
+
+
 def repo_ticket_context(repo, policy: dict, *, push_url: str | None = None):
     """N11 tracked-repo rule. None outside a repository.
 
@@ -205,6 +237,8 @@ def repo_ticket_context(repo, policy: dict, *, push_url: str | None = None):
     # tracked path, so match each URL as written and with ":<port>/" removed, ignoring case. This only
     # makes more repositories tracked. SSH host aliases from ~/.ssh/config cannot be seen (known limit).
     variants = set(urls) | {re.sub(r":\d+/", "/", url) for url in urls}
+    for url in urls:
+        variants |= normalized_urls(url)
     tracked = any(re.search(pattern, url, re.I) for url in variants for pattern in patterns)
     allowed = False
     ledgers = [config for config in policy["ticket_systems"].values() if is_ledger_system(config)]
