@@ -49,6 +49,8 @@ def provenance_check(event, source):
         if not result['ok']:
             first = result['problems'][0] if result['problems'] else {'code': 'rejected', 'message': 'rejected'}
             return mode, f"source rejected ({first['code']}): {first['message']}", result['assumption']
+        if event in ('requirement', 'ask') and provenance.weak_problem(result):
+            return mode, provenance.weak_problem(result), result['assumption']
         return mode, None, result['assumption']
     except Exception as error:
         return 'enforce' if event in ('requirement', 'ask') else 'warn', f'provenance check failed ({type(error).__name__})', False
@@ -72,6 +74,8 @@ def main():
         parser.error('note must be 1 to 4000 characters')
     if SECRET_PATTERN.search(note):
         parser.error('note appears to contain a credential; redact it first')
+    if args.source and len(args.source.strip()) > 2000:
+        parser.error('source is longer than 2000 characters; shorten the excerpts')
     for label, value in (('source', args.source), ('reason', args.reason)):
         if value and SECRET_PATTERN.search(value):
             parser.error(label + ' appears to contain a credential; redact it first')

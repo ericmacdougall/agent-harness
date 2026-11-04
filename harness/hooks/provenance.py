@@ -31,8 +31,9 @@ HERE = Path(__file__).resolve().parent
 POLICY_FILE = HERE / "provenance_policy.json"
 MAX_LINE = 8 * 1024 * 1024        # a transcript or WAL line larger than this is never parsed
 MAX_HITS = 200                    # lines parsed per lookup
+MAX_RESOLVES = 40                 # sources resolved per top-level claim
 MAX_DEPTH = 8                     # wal: pointer chain depth
-EXCERPT_MIN, EXCERPT_MAX, EXCERPT_SEGMENTS = 8, 300, 3
+EXCERPT_MIN, EXCERPT_MAX, EXCERPT_SEGMENTS = 12, 300, 3
 RATIONALE_MIN = 10
 MODES = ("off", "warn", "enforce")
 DEFAULT_POLICY = {
@@ -55,7 +56,7 @@ class Problem(Exception):
 
 def clip(value, limit: int = 60) -> str:
     """Short, single-line, control-free text for errors and logs: never echo a whole excerpt."""
-    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value))
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]+", " ", str(value))
     return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
@@ -101,11 +102,13 @@ def norm(text: str) -> str:
 NOT_USER_TAGS = ("agent-message", "task-notification", "system-reminder", "pasted_content",
                  "local-command-stdout", "local-command-stderr", "local-command-caveat", "command-name",
                  "command-message", "command-args", "bash-input", "bash-stdout", "bash-stderr",
-                 "artifact-content-authored-by-others")
+                 "artifact-content-authored-by-others", "ide_opened_file", "ide_selection", "browser_instruction",
+                 "user-prompt-submit-hook", "teammate-message", "command-stdout")
 _TAGS = "|".join(re.escape(tag) for tag in NOT_USER_TAGS)
 _INNER = re.compile(r"<(" + _TAGS + r")\b[^>]*>(?:(?!<(?:" + _TAGS + r")\b[^>]*>).)*?</\1\s*>", re.S | re.I)
 _OPEN = re.compile(r"<(?:" + _TAGS + r")\b[^>]*>", re.I)
-SENTINEL = "￼"  # replaces a removed block so an excerpt cannot span text on both sides of it
+_WRAPPER = re.compile(r"^\s*<([A-Za-z][\w:-]*)\b[^>]*>.*</\1\s*>\s*$", re.S)
+SENTINEL = "\ufffc"  # replaces a removed block so an excerpt cannot span text on both sides of it
 
 
 def strip_blocks(text: str) -> str:
@@ -238,7 +241,7 @@ def find_transcript(session: str, home=None):
 
 CHUNK = 8 * 1024 * 1024
 MAX_JSON_DEPTH = 200
-_TOKENS = re.compile(rb'"(?:[^"\\]|\\.)*"|[\[{]|[\]}]', re.S)
+_TOKENS = re.compile(rb'["\\\[\]{}]')
 
 
 def loads_line(raw):
@@ -250,14 +253,24 @@ def loads_line(raw):
     if len(raw) > MAX_LINE:
         raise ValueError("line too large")
     if raw.count(b"[") + raw.count(b"{") > MAX_JSON_DEPTH:  # cheap bound first: depth <= bracket count
-        depth = 0
+        depth, in_string, skip = 0, False, -1  # linear: one pass over structural bytes only
         for token in _TOKENS.finditer(raw):
-            first = token.group()[:1]
-            if first in (b"[", b"{"):
+            at = token.start()
+            if at == skip:
+                continue
+            char = token.group()
+            if in_string:
+                if char == b"\\":
+                    skip = at + 1
+                elif char == b'"':
+                    in_string = False
+            elif char == b'"':
+                in_string = True
+            elif char in (b"[", b"{"):
                 depth += 1
                 if depth > MAX_JSON_DEPTH:
                     raise ValueError("nested too deeply")
-            elif first in (b"]", b"}"):
+            elif char in (b"]", b"}"):
                 depth -= 1
     try:
         return json.loads(raw)
@@ -390,6 +403,8 @@ def user_authorship(record: dict):
             if not isinstance(block, dict) or block.get("type") not in ("text", "image"):
                 return None, "turn carries non-text blocks (tool results)"
             if block.get("type") == "text" and isinstance(block.get("text"), str):
+                if _WRAPPER.match(block["text"]):
+                    continue  # a block that is one wrapper element was injected by the harness or an extension
                 pieces.append(strip_blocks(block["text"]))
         return "\n".join(pieces), None
     return None, "turn has no readable text"
@@ -397,6 +412,8 @@ def user_authorship(record: dict):
 
 def excerpt_in(text: str, excerpt: str):
     """None when the excerpt is a faithful quote of text, else a rejection reason."""
+    if SENTINEL in excerpt:
+        return "excerpt contains the removed-block marker"
     wanted = norm(excerpt)
     if any(re.search(r"<" + tag + r"\b", wanted, re.I) for tag in NOT_USER_TAGS):
         return "excerpt contains a non-user block tag"
@@ -411,6 +428,8 @@ def excerpt_in(text: str, excerpt: str):
         index = haystack.find(segment, pos)
         if index < 0:
             return f"excerpt not found in that turn: \"{clip(segment, 40)}\""
+        if pos and SENTINEL in haystack[pos:index]:
+            return "excerpt segments are separated by a removed non-user block"
         pos = index + len(segment)
     return None
 
@@ -465,9 +484,13 @@ def wal_entry(path: Path, entry: str):
     return load_record(path, "id", entry)
 
 
+def ticket_cache_path() -> Path:
+    return Path.home() / ".agent-harness" / "provenance" / "tickets.json"
+
+
 def ticket_cache(home=None) -> dict:
     try:
-        with open(Path.home() / ".agent-harness" / "provenance" / "tickets.json", encoding="utf-8") as handle:
+        with open(ticket_cache_path(), encoding="utf-8") as handle:
             data = json.load(handle)
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
@@ -489,10 +512,13 @@ def git_line(repo: Path, sha: str, path: str, start: int, end: int):
 
 def resolve(source: str, ctx=None, depth: int = 0, seen=()) -> dict:
     """Resolve one Source. Never raises: the result says ok, why not, and the chain to the origin."""
-    ctx = ctx or {}
+    ctx = ctx if ctx is not None else {}
     result = {"source": clip(source, 200), "kind": None, "ok": False, "assumption": False, "origin": None,
-              "deferred": False, "problems": [], "chain": [], "inputs": []}
+              "deferred": False, "weak": False, "problems": [], "chain": [], "inputs": []}
+    ctx["_resolves"] = ctx.get("_resolves", 0) + 1
     try:
+        if ctx["_resolves"] > MAX_RESOLVES:
+            raise Problem("too-many-sources", f"more than {MAX_RESOLVES} sources resolved for one claim")
         _resolve(source, ctx, depth, seen, result)
     except Problem as problem:
         result["problems"].append({"code": problem.code, "message": problem.message})
@@ -502,6 +528,15 @@ def resolve(source: str, ctx=None, depth: int = 0, seen=()) -> dict:
         result["ok"] = False
     result["label"] = label_of(result)
     return result
+
+
+def weak_problem(result: dict):
+    """Message when a resolved source is only a syntax-level citation; asks and requirements refuse these."""
+    if result.get("ok") and result.get("weak"):
+        return ("source is an unverified citation (ticket not in the local cache, or file line without an excerpt); "
+                "cite the user's words or a sourced WAL entry, add a file excerpt, or have main run "
+                "`provenance.py cache-ticket` after checking the ticket")
+    return None
 
 
 def label_of(result: dict) -> str:
@@ -537,9 +572,11 @@ def _resolve(source, ctx, depth, seen, result):
             node["title"] = clip(cached["title"], 120)
         result["chain"].append(node)
         result["origin"], result["ok"], result["deferred"] = "ticket", True, not cached
+        result["weak"] = not cached  # syntax only: nothing proves the ticket exists
     elif kind == "file":
         repo = Path(ctx.get("repo") or os.environ.get("HARNESS_PROVENANCE_REPO") or os.getcwd())
         text = git_line(repo, parsed["sha"], parsed["path"], parsed["line"], parsed["line_end"])
+        result["weak"] = parsed["excerpt"] is None  # a bare line number proves the line exists, not what it says
         if parsed["excerpt"] is not None:
             reason = excerpt_in(text, parsed["excerpt"])
             if reason:
@@ -570,6 +607,7 @@ def _resolve(source, ctx, depth, seen, result):
         result["problems"].extend(sub["problems"])
         result["assumption"] = sub["assumption"]
         result["origin"], result["ok"], result["deferred"] = sub["origin"], sub["ok"], sub["deferred"]
+        result["weak"] = sub["weak"]
     elif kind == "inferred":
         grounded = 0
         result["assumption"] = True
@@ -584,7 +622,7 @@ def _resolve(source, ctx, depth, seen, result):
                 continue
             sub = resolve(item, ctx, depth + 1, seen)
             result["inputs"].append(sub)
-            if sub["ok"] and not sub["assumption"]:
+            if sub["ok"] and not sub["assumption"] and not sub["weak"]:
                 grounded += 1
             elif not sub["ok"]:
                 result["problems"].extend({"code": p["code"], "message": "input: " + p["message"]} for p in sub["problems"])
@@ -593,6 +631,7 @@ def _resolve(source, ctx, depth, seen, result):
         result["chain"].append({"kind": "inferred", "rationale": clip(parsed["rationale"], 300), "status": "assumption"})
         result["ok"] = not result["problems"]
         result["deferred"] = any(sub["deferred"] for sub in result["inputs"])
+        result["weak"] = any(sub["weak"] for sub in result["inputs"])
     result["ok"] = bool(result["ok"]) and not result["problems"]
 
 
@@ -622,10 +661,28 @@ def render(result: dict, indent: str = "  ") -> list:
                 lines.extend(f"{indent}    | {line}" for line in node["text"].split("\n")[:20])
         elif kind == "inferred":
             lines.append(f"{indent}  ASSUMPTION (not a user requirement): {node['rationale']}")
+    if result.get("ok") and result.get("weak"):
+        lines.append(f"{indent}  note: UNVERIFIED citation (offline ticket or file line without an excerpt)")
     for sub in result["inputs"]:
         lines.append(f"{indent}  input:")
         lines.extend(render(sub, indent + "    "))
     return lines
+
+
+def context_of(text, excerpt: str) -> str:
+    """The user's own words around the quoted part, so a clipped quote cannot change the meaning unnoticed."""
+    if not text:
+        return excerpt
+    body = norm(text.replace(SENTINEL, " "))
+    first = norm(excerpt).split("...")[0].strip()
+    index = body.find(first)
+    if index < 0:
+        return excerpt
+    dot = body.rfind(". ", 0, index)
+    start = max(0 if dot < 0 else dot + 2, index - 160)
+    end = body.find(". ", index + len(first))
+    end = len(body) if end < 0 else end + 1
+    return body[start:min(end, index + len(first) + 160)]
 
 
 def status_word(result: dict) -> str:
@@ -637,7 +694,7 @@ def status_word(result: dict) -> str:
 # --------------------------------------------------------------------------- spec and packet linting
 
 SOURCE_RE = re.compile(r"(?<!\S)Source:\s*(.+)$", re.S)
-ITEM_RE = re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*)?((?:AC|NEG|REQ|ASK|DEC)-\d+)\b")
+ITEM_RE = re.compile(r"^\s*(?:(?:[>|]|[-*]|\d{1,3}[.)])\s*)*(?:\*\*|`)?((?:AC|NEG|REQ|ASK|DEC)-\d+)\b")
 GRANDFATHER_RE = re.compile(r"(?m)^Provenance:\s*grandfathered\s*\((.{10,})\)\s*$")
 
 
@@ -690,9 +747,18 @@ def spec_lint(text: str, mode=None, ctx=None):
             return ["provenance: `Provenance: grandfathered` is only valid with `Sign-off: human`"], []
         return [], ["provenance: GRANDFATHERED spec, origins not verified: " + clip(GRANDFATHER_RE.search(text).group(1), 80)]
     items = extract_items(text, sections={"Acceptance criteria", "Negative cases"})
-    problems = [p for _, _, _, p in check_items(items, ctx) if p]
+    reviewed = re.search(r"(?m)^## Reviews[ \t]*$", text) is not None
+    results = check_items(items, ctx)
+    problems = [p for _, _, _, p in results if p]
+    unverified = [f"{i} cites an unverified source (offline ticket or file line without excerpt)"
+                  for i, _, r, p in results if r and not p and r.get("weak")]
+    if reviewed:  # specs reviewed before provenance existed keep working until someone edits them
+        return [], ["provenance: spec already carries recorded reviews, not enforced: " + "; ".join(problems[:3])] if problems else []
     if not items:
         return [], []
+    if unverified:
+        warnings_extra = ["provenance: " + u for u in unverified]
+        return (problems, warnings_extra) if mode == "enforce" else ([], warnings_extra + ["provenance (warn mode): " + p for p in problems])
     return (problems, []) if mode == "enforce" else ([], ["provenance (warn mode): " + p for p in problems])
 
 
@@ -749,34 +815,35 @@ def ledger(session: str, home=None) -> list:
                         continue
                     if not isinstance(record, dict):
                         continue
-                    if record.get("event") == "ask" and record.get("id"):
+                    if record.get("event") == "ask" and isinstance(record.get("id"), str):
+                        record["at"] = str(record.get("at") or "")
                         record["_wal"] = path
                         asks[record["id"]] = record
-                    elif record.get("event") == "ask_resolved" and record.get("ref"):
+                    elif record.get("event") == "ask_resolved" and isinstance(record.get("ref"), str):
                         closed[record["ref"]] = record
-            except Problem:
+            except Exception:  # one unreadable WAL must not hide every other ask
                 continue
     for ident, record in asks.items():
         record["_closed"] = closed.get(ident)
-    return sorted(asks.values(), key=lambda r: r.get("at", ""))
+    return sorted(asks.values(), key=lambda r: r["at"])
 
 
 def render_asks(session: str, home=None, ctx=None) -> tuple:
     entries = ledger(session, home)
-    ctx = dict(ctx or {}, home=home)
+    ctx = dict(ctx or {}, home=home, want_text=True)
     traced, assumptions, blocked, unverified, closed = [], [], [], [], 0
     for record in entries:
         if record.get("_closed"):
             closed += 1
             continue
         source = record.get("source") or ""
-        result = resolve(source, ctx) if source else None
+        result = resolve(source, dict(ctx)) if source else None
         row = (record, result)
         if result is None or not result["ok"]:
             blocked.append(row)
         elif result["assumption"]:
             assumptions.append(row)
-        elif result["deferred"] or result["origin"] == "file":
+        elif result["weak"] or result["deferred"] or result["origin"] == "file":
             unverified.append(row)
         else:
             traced.append(row)
@@ -800,7 +867,7 @@ def render_asks(session: str, home=None, ctx=None) -> tuple:
                     lines.append(f"      ! {problem['code']}: {problem['message']}")
                 for node in result["chain"]:
                     if node["kind"] == "user":
-                        lines.append(f"      user said: \"{clip(node['excerpt'], 120)}\"")
+                        lines.append(f"      user said: \"{clip(context_of(node.get('text'), node['excerpt']), 240, )}\"")
                     elif node["kind"] == "inferred":
                         lines.append(f"      assumed because: {node['rationale']}")
 
@@ -853,6 +920,10 @@ def build_parser():
     find = sub.add_parser("find-user", help="find the user turn(s) containing some words, to cite them")
     find.add_argument("--session", required=True)
     find.add_argument("--text", required=True)
+    cache = sub.add_parser("cache-ticket", help="main records that it checked a ticket in the tracker (offline cache)")
+    cache.add_argument("--ref", required=True, help="GoodQA <project>#<n>")
+    cache.add_argument("--title", required=True)
+    cache.add_argument("--checked-by", required=True)
     asks = sub.add_parser("asks", help="list the session's open asks with citations")
     asks.add_argument("--session", required=True)
     asks.add_argument("--json", action="store_true")
@@ -880,16 +951,20 @@ def main(argv=None) -> int:
         if args.command == "check-spec":
             text = Path(args.spec).read_text(encoding="utf-8")
             if GRANDFATHERED_RE_SEARCH(text):
-                print("GRANDFATHERED: origins of this spec are not verified")
-                return 0
+                problems, warnings = spec_lint(text, mode="enforce")
+                print("\n".join(problems + warnings))
+                return 2 if problems else 0
             rows = check_items(extract_items(text, sections={"Acceptance criteria", "Negative cases"}))
             for ident, number, result, problem in rows:
                 print(f"{ident} line {number}: " + (problem or f"{status_word(result)}" + (" (deferred ticket check)" if result["deferred"] else "")))
             return 2 if any(p for *_, p in rows) or not rows else 0
         if args.command == "check-packet":
-            code, text = packet_gate(Path(args.packet).read_text(encoding="utf-8"), mode="enforce")
-            print(text or "ok: every packet item has a verifiable Source")
-            return code
+            body = Path(args.packet).read_text(encoding="utf-8")
+            code, text = packet_gate(body, mode="enforce")
+            found = len(extract_items(body))
+            print(text or (f"ok: {found} packet items, each with a verifiable Source" if found
+                           else "no AC/NEG/REQ/ASK/DEC items found in the packet: nothing was checked"))
+            return code if found or code else 2
         if args.command == "trace":
             ctx = {"want_text": True}
             if args.spec:
@@ -919,6 +994,19 @@ def main(argv=None) -> int:
             rows = find_user(args.session, args.text)
             print(json.dumps(rows, indent=1))
             return 0 if rows else 2
+        if args.command == "cache-ticket":
+            found = re.match(r"^GoodQA\s+([A-Za-z0-9_.-]{1,80})#(\d{1,9})$", args.ref.strip())
+            if not found:
+                raise Problem("bad-syntax", "--ref must look like `GoodQA <project>#<n>`")
+            cache_path = ticket_cache_path()
+            cache_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            data = ticket_cache()
+            data[f"{found.group(1)}#{found.group(2)}"] = {"title": clip(args.title, 160), "checked_by": clip(args.checked_by, 60)}
+            tmp = cache_path.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+            os.replace(tmp, cache_path)
+            print(f"cached {args.ref}")
+            return 0
         if args.command == "asks":
             text, counts = render_asks(args.session)
             print(json.dumps(counts) if args.json else text)

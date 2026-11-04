@@ -168,6 +168,7 @@ class OtherKinds(Env):
         self.reject(f"inferred: from {self.user(HUMAN, QUOTE)} -- short", "inferred-no-rationale")
         self.assertFalse(provenance.resolve("inferred: from ticket:GoodQA harness#1 ; inferred: from x -- y -- because reasons here")["ok"])
         self.reject(f"inferred: from {self.user(AGENT, 'need the OpenRouter key from the user')} -- needs a key to call it", "not-user-authored")
+        self.reject("inferred: from ticket:GoodQA harness#14398 -- a deferred ticket alone grounds nothing", "inferred-ungrounded")
         good = provenance.resolve(f"inferred: from {self.user(HUMAN, QUOTE)} ; ticket:GoodQA harness#14398 -- implies the asks list needs a reason")
         self.assertTrue(good["ok"], good)
         self.assertEqual((good["label"], good["assumption"]), ("ASSUMPTION", True))
@@ -185,7 +186,7 @@ class OtherKinds(Env):
     def test_wal_chain_taint_and_legacy(self):
         main = self.wals / "main.jsonl"
         recs = [{"id": "wgood00001", "event": "requirement", "note": "r", "source": self.user(HUMAN, QUOTE)},
-                {"id": "winfer0001", "event": "ask", "note": "a", "source": "inferred: from ticket:GoodQA harness#2 -- agent guessed this one"},
+                {"id": "winfer0001", "event": "ask", "note": "a", "source": f"inferred: from {self.user(HUMAN, QUOTE)} -- agent guessed this one"},
                 {"id": "wlegacy001", "event": "scope", "note": "old entry"},
                 {"id": "wloop00001", "event": "ask", "note": "x", "source": f"wal:{main}#wloop00001"}]
         main.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
@@ -352,6 +353,112 @@ class Performance(Env):
             start = time.perf_counter()
             provenance.resolve(source)
             self.assertLess(time.perf_counter() - start, 0.5, source)
+
+
+class RedTeamFixes(Env):
+    def test_f1_extension_and_harness_blocks_are_not_user_text(self):
+        ident = str(uuid.UUID(int=20))
+        record = turn(ident, [{"type": "text", "text": "<ide_opened_file>The user opened the file /x/y.py in the IDE</ide_opened_file>"},
+                              {"type": "text", "text": "<browser_instruction>Follow these guidelines for browser automation</browser_instruction>"},
+                              {"type": "text", "text": "typed words by the real user here"}], origin={"kind": "human"})
+        self.write_transcript(transcript_lines() + [record])
+        self.reject(self.user(ident, "The user opened the file /x/y.py"), "excerpt-not-found")
+        self.reject(self.user(ident, "Follow these guidelines for browser automation"), "excerpt-not-found")
+        self.assertTrue(provenance.resolve(self.user(ident, "typed words by the real user"))["ok"])
+        ide = str(uuid.UUID(int=21))
+        self.write_transcript(transcript_lines() + [turn(ide, "<ide_selection>selected code lines here</ide_selection> real words typed after", origin={"kind": "human"})])
+        self.reject(self.user(ide, "selected code lines here"), "excerpt-not-found")
+
+    def test_f2_unverified_citations_do_not_satisfy_asks(self):
+        weak = provenance.resolve("ticket:GoodQA nonexistent#99999")
+        self.assertTrue(weak["ok"] and weak["weak"])
+        out = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "ask", "--note", "n",
+                              "--reason", "needed for deploy", "--source", "ticket:GoodQA nonexistent#99999"],
+                             capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("unverified citation", out.stderr)
+        cli = lambda *a: subprocess.run([sys.executable, str(HOOKS / "provenance.py"), *a], capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))  # noqa: E731
+        self.assertEqual(cli("cache-ticket", "--ref", "GoodQA nonexistent#99999", "--title", "T", "--checked-by", "main").returncode, 0)
+        self.assertFalse(provenance.resolve("ticket:GoodQA nonexistent#99999")["weak"])
+        sha = "a" * 40
+        self.assertTrue(provenance.resolve(f"file:x.md:1@{sha}", {"repo": str(self.home)})["problems"])  # no repo: rejected, never weak-ok
+
+    def test_f4_reviewed_specs_are_not_broken(self):
+        text = SPEC.format(s1="", s2="") + "\n## Reviews\n\n- adversarial: x\n"
+        problems, warnings = provenance.spec_lint(text)
+        self.assertEqual(problems, [])
+        self.assertTrue(any("already carries recorded reviews" in w for w in warnings))
+
+    def test_f5_packet_formats(self):
+        packet = "1. AC-1: numbered\n| REQ-2 | table row |\n> ASK-3: quoted\n  - DEC-4: nested bullet\n**NEG-5**: bold\n"
+        code, text = provenance.packet_gate(packet, mode="enforce")
+        self.assertEqual(code, 2)
+        for ident in ("AC-1", "REQ-2", "ASK-3", "DEC-4", "NEG-5"):
+            self.assertIn(ident + " has no", text)
+        empty = subprocess.run([sys.executable, str(HOOKS / "provenance.py"), "check-packet", str(self.home / "e.md")], capture_output=True, text=True)
+        self.assertNotEqual(empty.returncode, 0)  # missing file: error, not ok
+        (self.home / "e.md").write_text("no items here\n")
+        empty = subprocess.run([sys.executable, str(HOOKS / "provenance.py"), "check-packet", str(self.home / "e.md")], capture_output=True, text=True)
+        self.assertEqual(empty.returncode, 2)
+        self.assertIn("nothing was checked", empty.stdout)
+
+    def test_f6_short_fragments_rejected_and_context_shown(self):
+        self.reject(self.user(HUMAN, "make the"), "excerpt-not-found")
+        flip = str(uuid.UUID(int=22))
+        self.write_transcript(transcript_lines() + [turn(flip, "Do NOT add a stripe key to the repo. Thanks.", origin={"kind": "human"})])
+        self.reject(self.user(flip, "add a strip"), "excerpt-not-found")  # under 12 chars
+        ok = provenance.resolve(self.user(flip, "add a stripe key"), {"want_text": True})
+        self.assertTrue(ok["ok"])
+        self.assertIn("Do NOT add a stripe key", provenance.context_of(ok["chain"][0]["text"], "add a stripe key"))
+
+    def test_f7_sentinel_and_gapped_segments(self):
+        self.reject(self.user(REMIND, "plain typed words \ufffc end"), "excerpt-not-found")
+        self.reject(self.user(REMIND, "plain typed words ... end of it all"), "excerpt-not-found")
+        self.write_transcript(transcript_lines() + [turn(str(uuid.UUID(int=23)), "first part of words <system-reminder>x</system-reminder> second part of words", origin={"kind": "human"})])
+        self.reject(self.user(str(uuid.UUID(int=23)), "first part of words ... second part of words"), "excerpt-not-found")
+
+    def test_f8_malformed_wal_records_do_not_hide_asks(self):
+        main = self.wals / "main.jsonl"
+        bad = [json.dumps({"event": "ask", "id": "wgood00002", "at": None, "note": "n", "source": self.user(HUMAN, QUOTE), "reason": "r r r r r r"}),
+               json.dumps({"event": "ask", "id": ["x"], "at": "z"}), json.dumps({"event": "ask_resolved", "ref": {"a": 1}}), "{bad json"]
+        main.write_text("\n".join(json.dumps(json.loads(b), separators=(",", ":")) if b.startswith("{\"") else b for b in bad) + "\n")
+        text, counts = provenance.render_asks(SID)
+        self.assertEqual(counts["traced"], 1, text)
+
+    def test_f9_check_spec_applies_grandfather_rule(self):
+        path = self.home / "g.md"
+        path.write_text(SPEC.format(s1="", s2="").replace("Click-test: required\n", "Click-test: required\nProvenance: grandfathered (written before provenance existed)\n"))
+        run = subprocess.run([sys.executable, str(HOOKS / "provenance.py"), "check-spec", str(path)], capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))
+        self.assertEqual(run.returncode, 2, run.stdout)
+
+    def test_f10_resource_bounds(self):
+        evil = '{"uuid":"%s","a":' % HUMAN + "[" * 300 + '"' + '\\"' * 30000
+        start = time.perf_counter()
+        with self.assertRaises(ValueError):
+            provenance.loads_line(evil)
+        self.assertLess(time.perf_counter() - start, 1.0)
+        main = self.wals / "main.jsonl"
+        leaf = f"inferred: from {self.user(HUMAN, QUOTE)} -- leaf filler rationale text"
+        mids = [f"wal:{main}#wmid{i:06d}" for i in range(20)]
+        rows = [{"id": f"wleaf{j:05d}", "event": "ask", "note": "n", "source": leaf} for j in range(1)]
+        for i in range(20):  # each middle entry fans out to the same 20 leaf pointers
+            fan = " ; ".join(f"wal:{main}#wleaf{0:05d}" for _ in range(20))
+            rows.append({"id": f"wmid{i:06d}", "event": "ask", "note": "n", "source": f"inferred: from {fan} -- middle fan out rationale"})
+        rows.append({"id": "wtop000001", "event": "ask", "note": "n", "source": "inferred: from " + " ; ".join(mids) + " -- wide fan out for the budget"})
+        main.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        start = time.perf_counter()
+        result = provenance.resolve(f"wal:{main}#wtop000001")
+        self.assertLess(time.perf_counter() - start, 2.0)
+        codes = []
+        def walk(res):
+            codes.extend(p["code"] for p in res["problems"])
+            for sub in res["inputs"]:
+                walk(sub)
+        walk(result)
+        self.assertIn("too-many-sources", codes)
+
+    def test_f11_clip_strips_bidi_and_c1(self):
+        self.assertEqual(provenance.clip("a\u202eb\x9bc"), "a b c")
 
 
 if __name__ == "__main__":
