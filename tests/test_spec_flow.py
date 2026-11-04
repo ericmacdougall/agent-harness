@@ -1059,6 +1059,8 @@ class Hook(SpecFlowCase):
                                    str(uuid.uuid4()))
         payload = json.dumps({"tool_name": "mcp__plugin_goodqa_goodqa__update_issue",
                               "tool_input": {"issueId": ISSUE, "patch": {"status": "done"}}})
+        import gc
+        gc.collect()  # stray ResourceWarnings from earlier tests must not be printed into the stderr captured below
         for policy, expected in (({"mode": "warn", "enforced_projects": []}, 0), (self.enforce(), 2)):
             with self.subTest(policy=policy), \
                     mock.patch.object(sf, "load_spec_policy", return_value=dict(self.spec_policy, **policy)), \

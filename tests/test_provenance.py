@@ -565,6 +565,7 @@ class RedTeamFixes(Env):
 
         server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)  # runs after shutdown: an unclosed listener raises ResourceWarning later
         self.addCleanup(server.shutdown)
         key = self.home / "key"
         key.write_text("k" * 40)
@@ -663,6 +664,7 @@ class RedTeamFixes(Env):
 
         server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)  # runs after shutdown: an unclosed listener raises ResourceWarning later
         self.addCleanup(server.shutdown)
         url = f"http://127.0.0.1:{server.server_address[1]}/"
         with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9",
