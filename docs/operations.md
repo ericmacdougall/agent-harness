@@ -15,6 +15,7 @@
 | `publish_feature.py` | Guarded feature branch push to `origin`. |
 | `integrate_local.py` | Checked scratch merge and protected fast-forward into the starting checkout. |
 | `watch-tests.py` | Polling test runner for source edits. |
+| `commit_policy.py`, `commit_policy.json`, `ticket_adapters.py` | Commit message policy: PreToolUse hook, git `commit-msg` backstop, range and GitHub checks, GoodQA ticket verification and delivery comments, waivers. |
 
 No background process is installed. Claude Code runs hooks, and the main agent invokes the other helpers when appropriate. The installer refuses symlinked managed files and directories, including its backup directory, before reading settings or writing files. Reinstallation preserves unrelated hooks even when they share an entry with a managed hook. The installer rejects non-regular managed files (including FIFOs) and files occupying managed directory paths. It reads all source payloads before writing, then backs up the captured original bytes in private files before replacing managed files. It keeps original directory and managed-file inodes open through installation and rollback. A missing directory is created under a random staging name, opened and checked while empty, then published under its final name; the installer does not infer that a newly opened final name is the directory it created. Each file write compares the captured parent and file identity; a replacement is refused before mutation. The published file inode is recorded before the directory `fsync`, so a later write error can still roll back that file. A descriptor for each published managed file remains open through rollback so its inode number cannot be recycled while the guard relies on it. Reads, replacements, and rollback traverse parents without following symlinks, and each replacement rechecks the visible parent after publication. A parent that moves during installation produces an error rather than a success report. On a caught write failure it attempts to restore the original bytes and permission bits of existing files and remove newly installed files. Restoration continues after an individual failure; an incomplete rollback reports affected paths and the backup directory. Backups and newly created empty directories remain. This is per-file atomic replacement with best-effort rollback, not a crash-safe transaction: power loss, process termination, or a second failure during recovery can still require manual restoration. In an eight-process disposable contention test, some installers may refuse an intervening directory creation and succeed on retry; the final installation remains coherent. Concurrent settings editors can still race over read-modify-write settings, so do not run them together.
 
@@ -172,6 +173,125 @@ python3 ~/.codex/agent-harness/deliver.py finish --task OWNER_TASK --original /a
 Only known interrupted apply phases can make this transition. Exact clean HEAD, passing nonvacuous checks, unchanged generation/state and no shared unresolved barriers are required. `RESOLVED_BASELINE` preserves every record/ref and writes no delivery receipt; start a new reviewed generation and finish with fresh proof. It cannot settle unknown push/PR outcomes.
 
 No global Stop hook claims these steps occurred or blocks ordinary questions/background work. The main agent must call the helper and inspect the actual result. The run kit also needs useful user-facing instructions: verify a repository-native watcher or the installed dependency-free watcher (`~/.codex/agent-harness/watch-tests.py` or `~/.claude/tools/watch-tests.py`). Use `--once` to verify setup, omit it for continuous testing and Ctrl-C to stop. The helper cannot judge whether those commands are useful. Local scratch and remote checks execute repository code and are not an OS sandbox; same-user external mutations and changes reverted entirely between guards remain outside the guarantee.
+
+## Commit message policy
+
+Every agent commit uses one structured format, and the commits in ticket-tracked repositories must reference a ticket that was updated after the commit. The rules live in one file, `commit_policy.json`, installed beside the hooks: `~/.claude/hooks` for Claude Code and `~/.codex/agent-harness` for Codex. Edit that file to change the types, the sections, the boilerplate lists, the tracked repositories or the ticket systems.
+
+```text
+fix(deliver): refuse non-compliant commit ranges before publication
+
+Why: an agent reverted two production auth fixes with no recorded reason.
+What: prepare checks the owner's commit range and blocks violations.
+Testing: `python3 -m unittest tests.test_commit_policy` -> 42 passed
+Refs: GoodQA #14151
+Risk: optional; migrations, rollback
+
+Co-Authored-By: ...
+```
+
+### Message rules
+
+- **Subject.** Write `<type>(<scope>): <imperative summary>`, at most 72 characters, with no trailing period.
+  - Allowed types: `feat fix refactor perf test docs build ci chore revert security`.
+  - Summaries in the boilerplate list are rejected, such as `wip`, `update` and `various fixes`.
+- **Body sections.** After a blank line, write `Why:`, `What:`, `Testing:` and `Refs:` in that order. `Risk:` is optional.
+  - A section is rejected if it is empty, holds a placeholder, or is too short.
+- **Testing.** Name the exact command and its result. Bare text like "tests pass" is rejected. If you didn't test, write `not run: <reason>`.
+- **Refs.** Reference a GoodQA ticket as `GoodQA #N` (project `goodqa`) or `GoodQA <project-slug>#N`.
+  - PR references and `R-NNNNNN` coordinator records are recognized. They do not count as a ticket, because they cannot be verified.
+  - In tracked repositories (origin matches `ticket_systems.*.repos`), only `chore` and `docs` may write `Refs: none (<reason>)`. Every other type needs a GoodQA ticket.
+  - Other repositories accept `none (<reason>)` for any type.
+- **Reverts.** A revert uses type `revert` and includes `Reason:` and `Authorized-by:` lines. In tracked repositories, `Authorized-by:` must cite the GoodQA ticket that records the authorization.
+  - A commit is treated as a revert if its body says "This reverts commit", even when its subject uses another type.
+  - The policy enforces a recorded and verifiable citation. It cannot prove that a human approved the revert.
+- **Trailers** such as Co-Authored-By and Signed-off-by come last, after a blank line.
+- **Repeats.** A message identical to the previous commit's message is rejected.
+- **Exemptions.**
+  - Merges are exempt: either a merge is in progress (`MERGE_HEAD`), or the subject is one git generated.
+  - `fixup!`, `squash!` and `amend!` commits are allowed only on an unpublished branch. The publication check always rejects them.
+
+### Enforcement points
+
+1. **PreToolUse hook** (`commit_policy.py hook`). It runs before each Claude Code Bash call and each Codex tool call.
+   - It reads the message from the forms it can check without running anything:
+     - `-m` (repeated) and `-am`;
+     - `--message=`;
+     - `-F <file>` and `-F -` with a quoted heredoc;
+     - `-m "$(cat <<'EOF' ... EOF)"`;
+     - `--amend --no-edit`, which checks HEAD's message;
+     - `-C <commit>`;
+     - `--fixup` and `--squash`;
+     - `gh pr merge --squash --subject --body`.
+   - It fails closed with an explanation when it cannot know the message:
+     - the message comes from `$VAR`, another `$()`, or an unquoted heredoc containing `$`;
+     - the commit would open an editor;
+     - `-F` names a file that does not exist yet;
+     - the command is a bare `git revert`, `git commit-tree`, `eval`, `xargs`, or `gh pr merge --squash` without a subject and body.
+
+   It also analyzes `ssh <host> '<remote command>'`, `ssh <host> bash -s <<'EOF'` and nested `bash -lc` strings, which is where most dev2/T2 commits run. A remote host's files, HEAD and repository are not visible, so a remote `-F <file>`, `--amend --no-edit` or `-C` fails closed. Pass the message inline instead: `ssh host 'cd repo && git commit -F - <<"EOF" ... EOF'`. Remote commits are held to the ticket rule (`remote_tickets_required`).
+
+   When it blocks, it lists the problems and prints a template that starts from your subject line.
+2. **Git `commit-msg` backstop** (`commit_policy.py git-hook`). It is a Git 2.54+ config-based hook registered as `hook.agent-harness-commit-policy` (Claude) and `hook.agent-harness-commit-policy-codex` (Codex) in `~/.gitconfig`.
+   - It runs alongside each repository's own hooks and never changes `core.hooksPath`.
+   - It enforces only when both of these hold:
+     - an agent marker is present (`CLAUDECODE`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_SANDBOX` or `AI_AGENT`);
+     - the repository's origin matches `backstop_repos`.
+   - Everywhere else it stays silent: human commits, test fixtures, and other repositories that agents run.
+   - The installer reports "backstop inactive" when Git is older than 2.54.
+   - If the script is removed, the hook command exits 0.
+   - Not verified live: that Codex shells carry a `CODEX_*` marker (Codex quota was exhausted while this was built). For Codex, the PreToolUse hook is the primary gate.
+   - dev2 and T2 run git 2.43, which has no backstop. A user-local git was not installed there, because the hosts are shared and a source-built git on agent PATHs risks breaking https push, LFS and credential helpers. On those hosts the protection is the ssh-aware PreToolUse hook plus the publication checks (`deliver.py prepare`, `gh pr create`, `peer_review.py pr`).
+3. **Publication check in `deliver.py prepare`.** It runs only when prepare is about to create a new generation. Re-entering an existing generation never repeats it.
+   - **Range checked:** commits reachable from the reviewed head, excluding the baseline and `refs/remotes/origin/<branch>`, so upstream commits written by others are never judged. If upstream moved, run `git fetch origin` first.
+   - **Ticket check:** each referenced GoodQA ticket must exist and must have a comment that names one of these:
+     - The commit SHA (7+ hex characters). Such a comment necessarily postdates the commit.
+     - The branch. This comment must be newer than the commit time minus `clock_skew_seconds`.
+   - **PR text:** prepare also checks the PR title (at most 64 characters, so `title (#N)` fits) and the PR body (the same sections), because GitHub squash uses them as the final message.
+   - **Results.** Neither failure creates delivery state.
+     - `BLOCKED_COMMIT_POLICY` (exit 2) lists each failing commit and stale ticket, with the fix.
+     - `TICKETS_UNVERIFIED` (exit 6) means GoodQA was unreachable or answered unexpectedly. The check fails closed.
+   - Local-only delivery verifies tickets too.
+   - **Legacy commits:** commits authored before `enforce_after` are reported as legacy and do not block.
+4. **Delivery comments in `deliver.py finish`.**
+   - After `DELIVERED`, `LOCAL_DELIVERED` or a repeat `ALREADY_DELIVERED`, finish comments on each referenced ticket once, with an idempotent operation id.
+   - The comment opens with the stage, "Merged (not yet deployed or live)" or "Delivered to the local checkout only". It then lists the delivered SHA, the PR, the checks that passed, and any waivers used.
+   - Exit 5 means the delivery succeeded but a ticket comment is still pending. Do not start recovery; re-run the same finish command or the printed `notify` command.
+   - Deployment happens outside `deliver.py`. After a deploy, post the evidence:
+
+     ```sh
+     python3 ~/.claude/hooks/commit_policy.py notify --repo <checkout> --base <baseline> --head <source-head> \
+       --seed <generation> --stage deployed --evidence '<where and how it was verified live>'
+     ```
+
+   - Status changes are off by default (`on_delivered_status` / `on_deployed_status`), because GoodQA's done states need independent acceptance.
+
+### Checks, waivers and audit
+
+- **Check a draft:** `python3 ~/.claude/hooks/commit_policy.py check-message --file msg.txt`
+- **Check a range:** `python3 ~/.claude/hooks/commit_policy.py check-range --repo . --base origin/main --head HEAD --branch <branch> --verify-tickets`
+- **Waivers.** A waiver is the only exception path. There is no environment-variable bypass.
+
+  ```sh
+  python3 ~/.claude/hooks/commit_policy.py waive --wal <your WAL> --kind message|commit|tickets --subject <digest-or-sha> --reason '<why and who authorized it>'
+  ```
+
+  - The waiver is appended to your WAL and indexed in `~/.agent-harness/commit-policy/waivers.jsonl`. A waiver counts only when both records exist. It expires after `max_age_hours`.
+  - A `message` waiver applies only in the session that recorded it. A `tickets` waiver applies to one range head, which is the offline delivery path.
+  - Waivers are self-attested. The threat model is careless or hurried agents, not adversarial ones: an agent can edit the installed hooks anyway. The `waive` command is not on the permission allow list, but Codex with `approval_policy = "never"` and Claude in bypass or broad-allow modes will not prompt.
+  - Every waiver that gets used is listed in the reports and in the delivery ticket comment.
+- **Audit:** `commit_policy.py report --since 2026-11-04` lists the waivers and flags any whose WAL record is missing.
+
+### Rollout and rollback
+
+- `enforcement` in `commit_policy.json` takes three values:
+  - `enforce` (the default) blocks.
+  - `warn` prints the problems and allows.
+  - `off` turns every enforcement point off.
+- **Remove the git backstop:** `python3 ~/.claude/hooks/commit_policy.py uninstall-git-hook`. For the Codex key, use `git config --global --remove-section hook.agent-harness-commit-policy-codex`.
+- **Remove the PreToolUse hook:**
+  - Claude Code: delete the `commit_policy.py hook` handler from `~/.claude/settings.json`.
+  - Codex: delete it from `~/.codex/hooks.json`.
 
 ## Lower-level publication and local integration
 

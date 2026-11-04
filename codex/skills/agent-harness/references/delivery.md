@@ -29,3 +29,13 @@ For substantive work, run `python3 ~/.codex/agent-harness/wal.py continuation --
 Before setting `complete`, verify the requested outcome and record exact source and evidence in the WAL. For `blocked`, record the concrete external condition and finish independent authorized work. For `handoff`, record and verify who or what will pick up the work, how it will wake, and what it checks next. A background job alone does not establish a handoff. The hook does not inspect transcripts, supervise detached jobs, bypass approval, or guarantee runtime delivery when hooks are unavailable or untrusted.
 
 The local Stop decision is made at its final interrupt-marker read, after durably spending the allowance. Codex owns cancellation of a live turn. A later interrupt can mark the checkpoint paused for subsequent checks, but the hook cannot retract an already issued response or provide a hard-cancel guarantee if the client dies abruptly. Hook protocol tests exercise the durable pause and lock contention. They do not establish native Codex interrupt/Stop ordering.
+
+## Commit policy at delivery
+
+- `deliver.py prepare` checks only when it creates a new generation. It checks the owner's commits (head minus baseline minus `origin/<branch>`), the PR title and body, and ticket freshness.
+  - `BLOCKED_COMMIT_POLICY` (exit 2) means you should fix the commits, the PR text or the ticket comments and re-run.
+  - `TICKETS_UNVERIFIED` (exit 6) means GoodQA was unreachable. Retry, or record a `tickets` waiver for that head.
+  - Neither result creates state.
+- `deliver.py finish` comments on each referenced ticket with the stage (merged or local only), the delivered SHA and the checks.
+  - Exit 5 means the delivery succeeded but a ticket comment is pending. Re-run finish, which is idempotent. Do not start recovery.
+- After a deploy, post evidence with `commit_policy.py notify --stage deployed`.

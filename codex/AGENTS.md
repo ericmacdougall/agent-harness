@@ -17,6 +17,20 @@ These are user-wide defaults. Follow higher-priority instructions and repository
 - Distinguish Browser-wide disablement from a site denial. If the tool reports `Local browser use is disabled in Work settings`, record that error; it does not identify a site rule to change. Inspect a Browser control if the app exposes one. If no Browser control is visible, report the capability mismatch as an app or workspace issue; a fresh chat or desktop-app restart is a diagnostic, not a promised fix. For a saved origin permission or managed-policy denial, record the origin and tool error and suggest checking that site's Browser permission. In either case, continue independent work and explain the blocker. Do not retry until the permission or session state changes. Do not use another browser or command surface to bypass the denial. Local Full Access does not grant Browser access.
 - A claim of completion must name the delivered checkout and commit, actual checks and results, review status, useful run/test/watch instructions, publication status, and relevant limits. A remote push failure does not stop local verification or delivery; report it promptly.
 
+## Commit messages
+
+- Every commit follows `~/.codex/agent-harness/commit_policy.json`.
+  - Format: `<type>(<scope>): <imperative summary>` (≤72 chars), a blank line, then `Why:`, `What:`, `Testing:` (exact command and result, or `not run: <reason>`), `Refs:` and an optional `Risk:`, with trailers last.
+  - In tracked repos, every type except chore and docs cites `GoodQA #N`.
+  - Reverts use type `revert` with `Reason:` and an `Authorized-by:` that cites the ticket recording the authorization.
+- Before publishing, comment on each referenced ticket naming the commit SHA or branch.
+  - `deliver.py prepare`, `gh pr create` and `peer_review.py pr` refuse stale or missing tickets.
+  - Prepare exit 6 means GoodQA was unreachable.
+  - Finish exit 5 means delivered with a ticket comment still pending; re-run finish.
+- The PreToolUse hook checks `git commit`, including over `ssh`, and prints a template when it blocks.
+  - Pass messages inline or with `-F <existing file>`.
+  - The only exception is `python3 ~/.codex/agent-harness/commit_policy.py waive --wal <WAL> ...` with a real reason. Waivers are audited.
+
 ## Engineering judgment
 
 - Choose simple, readable, secure designs. Validate inputs, handle failures safely, protect secrets and private data in logs, and document behavior and consequential tradeoffs. Add CI, observability, staging, canary, migration, caching, or statistical eval gates only where the system and risk call for them.
