@@ -1,0 +1,459 @@
+{
+ "comment": "Shared by internal/impl (Go) and compat/pyfront (Python). Each case builds a temp HOME; binary is written by the test with mode and content, and its sha256 placed where impl says \"$SHA\". Decision: go | python | refuse.",
+ "cases": [
+  {
+   "name": "missing file",
+   "impl": null,
+   "want": "python",
+   "reason": "missing"
+  },
+  {
+   "name": "flipped and valid",
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "go"
+  },
+  {
+   "name": "group not flipped",
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "python"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "group"
+  },
+  {
+   "name": "group absent",
+   "impl": {
+    "schema": 1,
+    "groups": {},
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "group"
+  },
+  {
+   "name": "unknown group value",
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "rust"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "invalid"
+  },
+  {
+   "name": "wrong schema",
+   "impl": {
+    "schema": 2,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "invalid"
+  },
+  {
+   "name": "not json",
+   "raw": "{",
+   "want": "python",
+   "reason": "invalid"
+  },
+  {
+   "name": "file mode 0644",
+   "file_mode": 420,
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "unsafe"
+  },
+  {
+   "name": "file is symlink",
+   "file_symlink": true,
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "unsafe"
+  },
+  {
+   "name": "host missing",
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "codex": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "host"
+  },
+  {
+   "name": "binary not the launcher path",
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$OTHER",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "binary"
+  },
+  {
+   "name": "binary group-writable",
+   "bin_mode": 504,
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "binary"
+  },
+  {
+   "name": "binary is symlink",
+   "bin_symlink": true,
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "binary"
+  },
+  {
+   "name": "binary missing",
+   "bin_missing": true,
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "binary"
+  },
+  {
+   "name": "sha mismatch",
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "sha"
+  },
+  {
+   "name": "pin python overrides go",
+   "env": {
+    "AGENT_HARNESS_IMPL_PIN": "wal:python:-"
+   },
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "pin"
+  },
+  {
+   "name": "pin go overrides python",
+   "env": {
+    "AGENT_HARNESS_IMPL_PIN": "wal:go:$SHA"
+   },
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "python"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "go",
+   "reason": "pin"
+  },
+  {
+   "name": "pin go with stale sha refuses",
+   "env": {
+    "AGENT_HARNESS_IMPL_PIN": "wal:go:1111111111111111111111111111111111111111111111111111111111111111"
+   },
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "refuse",
+   "reason": "pin"
+  },
+  {
+   "name": "pin for another group ignored",
+   "env": {
+    "AGENT_HARNESS_IMPL_PIN": "delivery:python:-"
+   },
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "go"
+  },
+  {
+   "name": "malformed pin refuses",
+   "env": {
+    "AGENT_HARNESS_IMPL_PIN": "wal:go"
+   },
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "refuse",
+   "reason": "pin"
+  },
+  {
+   "name": "hop marker would loop",
+   "env": {
+    "AGENT_HARNESS_DISPATCHED": "go->py"
+   },
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "refuse",
+   "reason": "loop"
+  },
+  {
+   "name": "hop marker with python decision runs here",
+   "env": {
+    "AGENT_HARNESS_DISPATCHED": "go->py"
+   },
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "python"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "group"
+  },
+  {
+   "name": "trailing data",
+   "raw_template": "{\"schema\": 1, \"groups\": {\"wal\": \"go\"}, \"hosts\": {\"claude\": {\"binary\": \"$BIN\", \"sha256\": \"$SHA\"}}} {}",
+   "want": "python",
+   "reason": "invalid"
+  },
+  {
+   "name": "uppercase key",
+   "impl": {
+    "SCHEMA": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "invalid"
+  },
+  {
+   "name": "float schema",
+   "raw_template": "{\"schema\": 1.0, \"groups\": {\"wal\": \"go\"}, \"hosts\": {\"claude\": {\"binary\": \"$BIN\", \"sha256\": \"$SHA\"}}}",
+   "want": "python",
+   "reason": "invalid"
+  },
+  {
+   "name": "bool schema",
+   "impl": {
+    "schema": true,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "invalid"
+  },
+  {
+   "name": "uppercase sha",
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA_UPPER"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "invalid"
+  },
+  {
+   "name": "relative binary",
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "harness",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "invalid"
+  }
+ ]
+}

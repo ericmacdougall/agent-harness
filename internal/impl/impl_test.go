@@ -1,0 +1,97 @@
+package impl
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+type tcase struct {
+	Name        string            `json:"name"`
+	Impl        json.RawMessage   `json:"impl"`
+	Raw         *string           `json:"raw"`
+	RawTemplate *string           `json:"raw_template"`
+	FileMode    *uint32           `json:"file_mode"`
+	FileSymlink bool              `json:"file_symlink"`
+	BinMode     *uint32           `json:"bin_mode"`
+	BinSymlink  bool              `json:"bin_symlink"`
+	BinMissing  bool              `json:"bin_missing"`
+	Env         map[string]string `json:"env"`
+	Want        string            `json:"want"`
+	Reason      string            `json:"reason"`
+}
+
+func TestSharedCases(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission rules are Unix-only; Windows has no Python front door")
+	}
+	raw, err := os.ReadFile("../../parity/switchfile/cases.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct{ Cases []tcase }
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Cases) < 20 {
+		t.Fatalf("only %d cases", len(doc.Cases))
+	}
+	for _, c := range doc.Cases {
+		t.Run(c.Name, func(t *testing.T) {
+			dir := t.TempDir()
+			bin := filepath.Join(dir, "launcher", "harness")
+			other := filepath.Join(dir, "other", "harness")
+			os.MkdirAll(filepath.Dir(bin), 0o700)
+			os.MkdirAll(filepath.Dir(other), 0o700)
+			content := []byte("#!fake harness binary\n")
+			sum := sha256.Sum256(content)
+			sha := hex.EncodeToString(sum[:])
+			os.WriteFile(other, content, 0o700)
+			switch {
+			case c.BinMissing:
+			case c.BinSymlink:
+				os.Symlink(other, bin)
+			default:
+				os.WriteFile(bin, content, 0o700)
+				if c.BinMode != nil {
+					os.Chmod(bin, os.FileMode(*c.BinMode))
+				}
+			}
+			file := filepath.Join(dir, "impl.json")
+			body := ""
+			if c.Raw != nil {
+				body = *c.Raw
+			} else if c.RawTemplate != nil {
+				body = strings.NewReplacer("$BIN", bin, "$OTHER", other, "$SHA", sha).Replace(*c.RawTemplate)
+			} else if string(c.Impl) != "null" && len(c.Impl) > 0 {
+				body = strings.NewReplacer("$BIN", bin, "$OTHER", other, "$SHA_UPPER", strings.ToUpper(sha), "$SHA", sha).Replace(string(c.Impl))
+			}
+			if body != "" {
+				target := file
+				if c.FileSymlink {
+					target = file + ".real"
+				}
+				os.WriteFile(target, []byte(body), 0o600)
+				if c.FileMode != nil {
+					os.Chmod(target, os.FileMode(*c.FileMode))
+				}
+				if c.FileSymlink {
+					os.Symlink(target, file)
+				}
+			}
+			env := map[string]string{}
+			for k, v := range c.Env {
+				env[k] = strings.ReplaceAll(v, "$SHA", sha)
+			}
+			d := Resolve(Request{Group: "wal", Host: "claude", Launcher: bin, File: file, Getenv: func(k string) string { return env[k] }})
+			if d.Impl != c.Want || d.Reason != c.Reason {
+				t.Fatalf("got %+v, want %s/%s", d, c.Want, c.Reason)
+			}
+		})
+	}
+}
