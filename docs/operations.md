@@ -229,9 +229,11 @@ Co-Authored-By: ...
      - `-F` names a file that does not exist yet;
      - the command is a bare `git revert`, `git commit-tree`, `eval`, or `gh pr merge --squash` without a subject and body;
      - git commit runs through another program (`xargs`, `find -exec`, `parallel`, `watch`, `sudo`, `env -S`), through `git -c alias.*`, or through a configured alias that expands to commit;
-     - the message could change after the check: `-e`/`--edit`, `--cleanup=strip|scissors`, or a `-F` file that the same command writes.
+     - the message could change after the check: `-e`/`--edit`, `--cleanup=strip|scissors`, or a `-F` file that the same command writes (redirect, `tee`, `cp`/`mv`/`install`, or a write to an unknown path);
+     - git commit runs inside `$(...)` or backticks (for example `OUT=$(git commit ...)`), or `git history` rewrites messages;
+     - an unknown git subcommand (possibly an alias) runs where the repository configuration is not visible: an unknown working directory, or over ssh.
 
-   Shell keywords (`if`/`then`/`else`/`for`/`do`/`while`/`{ }`/`!`), `timeout` and `caffeinate` are unwrapped and checked. A script file (`bash deploy.sh`) or a program such as `python3 -c` that commits is not visible to the hook. Outside dev2/T2 the git backstop covers those cases, and the publication checks cover them everywhere.
+   Shell keywords (`if`/`then`/`else`/`for`/`do`/`while`/`{ }`/`!`) and the wrappers `timeout`, `nice`, `ionice`, `stdbuf` and `caffeinate` (including their value flags) are unwrapped and checked. Shell options that take a value (`bash -o pipefail -c`, `--rcfile`, `-O`, `+o`) are understood. A remote alias whose command does not contain the word `commit` (`ssh dev2 'git ci -m x'`) is not detected; the publication checks catch it. A script file (`bash deploy.sh`) or a program such as `python3 -c` that commits is not visible to the hook. Outside dev2/T2 the git backstop covers those cases, and the publication checks cover them everywhere.
 
    It also analyzes `ssh <host> '<remote command>'`, `ssh <host> bash -s <<'EOF'` and nested `bash -lc` strings, which is where most dev2/T2 commits run. A remote host's files, HEAD and repository are not visible, so a remote `-F <file>`, `--amend --no-edit` or `-C` fails closed. Pass the message inline instead: `ssh host 'cd repo && git commit -F - <<"EOF" ... EOF'`. Remote commits are held to the ticket rule (`remote_tickets_required`).
 

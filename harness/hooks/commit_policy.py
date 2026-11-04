@@ -503,7 +503,15 @@ def tokenize(text: str):
                 word.append(f"\x00HD{placeholder.group(1)}\x00" if placeholder else inner)
                 dynamic = dynamic or not placeholder
                 i = j + 1
-            elif ch in "$`":
+            elif ch == "`":
+                # Backquoted command substitution is one word up to the closing backtick.
+                end = text.find("`", i + 1)
+                if end < 0:
+                    raise Unresolvable("unterminated backtick")
+                dynamic = True
+                word.append(text[i:end + 1])
+                i = end + 1
+            elif ch == "$":
                 dynamic = True
                 word.append(ch)
                 i += 1
@@ -783,19 +791,35 @@ def _gh_create(args, cwd, remote):
 
 WRAPPERS = {"env", "command", "exec", "time", "nohup", "nice", "builtin", "caffeinate", "timeout",
             "gtimeout", "stdbuf", "ionice", "chronic"}
+COMMIT_TEXT = re.compile(r"\bgit\b[^|;&]*\b(?:commit|commit-tree|revert)\b|\bgh\s+pr\s+(?:create|merge)\b")
+SHELL_VALUE_OPTIONS = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
+WRAPPER_VALUE_FLAGS = {"nice": {"-n", "--adjustment"}, "timeout": {"-s", "-k", "--signal", "--kill-after"},
+                       "gtimeout": {"-s", "-k", "--signal", "--kill-after"}, "ionice": {"-c", "-n", "-p", "-t"},
+                       "stdbuf": {"-i", "-o", "-e"}, "env": {"-u", "--unset", "-C", "--chdir"}}
 RESERVED = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time", "fi", "done", "in"}
 TEXT_TOOLS = {"echo", "printf", "grep", "egrep", "rg", "ag", "awk", "sed", "cat", "less", "man", "head", "tail"}
 SHELLS = {"bash", "sh", "zsh", "dash"}
 
 
 SSH_ARG_OPTIONS = set("BbcDEeFIiJLlmOoPpQRSWw")
-GIT_KNOWN = {"add", "am", "apply", "bisect", "blame", "branch", "checkout", "cherry-pick", "clean", "clone",
-             "commit", "commit-tree", "config", "diff", "fetch", "for-each-ref", "grep", "init", "log", "ls-files",
-             "ls-remote", "merge", "merge-base", "mv", "notes", "pull", "push", "rebase", "reflog", "remote", "reset",
-             "restore", "rev-list", "rev-parse", "revert", "rm", "show", "show-ref", "stash", "status", "switch",
-             "symbolic-ref", "tag", "update-ref", "worktree", "cat-file", "describe", "shortlog", "lfs", "submodule",
-             "sparse-checkout", "gc", "fsck", "bundle", "archive", "format-patch", "range-diff", "hash-object",
-             "write-tree", "read-tree", "update-index", "help", "version", "var", "check-ignore", "count-objects"}
+GIT_KNOWN = {"add", "am", "archive", "backfill", "bisect", "branch", "bundle", "checkout", "cherry-pick",
+             "citool", "clean", "clone", "commit", "describe", "diff", "fetch", "format-patch", "gc", "gitk",
+             "grep", "gui", "init", "log", "maintenance", "merge", "mv", "notes", "pull", "push",
+             "range-diff", "rebase", "reset", "restore", "revert", "rm", "scalar", "shortlog", "show",
+             "sparse-checkout", "stash", "status", "submodule", "switch", "tag", "worktree", "config",
+             "fast-export", "fast-import", "filter-branch", "mergetool", "pack-refs", "prune", "reflog",
+             "refs", "remote", "repack", "replace", "annotate", "blame", "bugreport", "count-objects",
+             "diagnose", "difftool", "fsck", "gitweb", "help", "instaweb", "merge-tree", "rerere",
+             "show-branch", "verify-commit", "verify-tag", "version", "whatchanged", "apply",
+             "checkout-index", "commit-graph", "commit-tree", "hash-object", "index-pack", "merge-file",
+             "merge-index", "mktag", "mktree", "multi-pack-index", "pack-objects", "prune-packed",
+             "read-tree", "replay", "symbolic-ref", "unpack-objects", "update-index", "update-ref",
+             "write-tree", "cat-file", "cherry", "diff-files", "diff-index", "diff-pairs", "diff-tree",
+             "for-each-ref", "for-each-repo", "get-tar-commit-id", "last-modified", "ls-files", "ls-remote",
+             "ls-tree", "merge-base", "name-rev", "pack-redundant", "repo", "rev-list", "rev-parse",
+             "show-index", "show-ref", "unpack-file", "var", "verify-pack", "check-attr", "check-ignore",
+             "check-mailmap", "check-ref-format", "column", "credential", "hook", "interpret-trailers",
+             "mailinfo", "mailsplit", "patch-id", "stripspace", "lfs"}
 
 
 def _shell_script(argv, stdin_body):
@@ -803,15 +827,23 @@ def _shell_script(argv, stdin_body):
     i = 1
     while i < len(argv):
         word = argv[i][1]
+        if word in SHELL_VALUE_OPTIONS:
+            i += 2
+            continue
         if word.startswith("--"):
             i += 1
             continue
-        if word.startswith("-") and len(word) > 1:
-            if "c" in word[1:]:
+        if word[:1] in "-+" and len(word) > 1:
+            if word[0] == "-" and "c" in word[1:]:
                 return (argv[i + 1][1], argv[i + 1][2]) if i + 1 < len(argv) else None
             i += 1
             continue
-        return None  # a script file: invisible here; the closing rule judges the segment
+        # A script file runs code the hook cannot see. Refuse only when the same
+        # invocation visibly mentions a commit; plain `bash deploy.sh` stays allowed.
+        if any(COMMIT_TEXT.search(w[1]) or w[1] == "commit" for w in argv[i:]):
+            raise Unresolvable(f"{os.path.basename(argv[0][1])} {word} hides its script from the policy; "
+                               "run git commit directly")
+        return None
     return (stdin_body, False) if stdin_body else None
 
 
@@ -855,11 +887,22 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
     if depth > 3:
         raise Unresolvable("nested shells are too deep to analyze")
     text, bodies = _heredocs(command)
-    found = []
+    found, writes = [], []  # writes: normalized paths this command may write (None = unknown)
+
+    def target(word):
+        if word[2]:
+            return None
+        path = os.path.expanduser(word[1])
+        if not os.path.isabs(path):
+            if not cwd:
+                return None
+            path = os.path.join(cwd, path)
+        return os.path.normpath(path)
+
     for words, _ in simple_commands(tokenize(text)):
         stdin_body = None
         argv = []
-        skip_next = False
+        skip_next = write_next = False
         for index, token in enumerate(words):
             if token[0] == "heredoc":
                 stdin_body = bodies[token[1]][0] if bodies[token[1]][1] or not re.search(
@@ -867,13 +910,23 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                 continue
             if skip_next:
                 skip_next = False
+                if write_next:
+                    writes.append(target(token))
                 continue
             if REDIRECTS.match(token[1]):
-                skip_next = True
+                skip_next, write_next = True, ">" in token[1]
                 continue
-            if re.match(r"^\d*(?:>>?|<)\S+$", token[1]) and not argv:
+            attached = re.match(r"^\d*&?>>?(\S+)$", token[1])
+            if attached:
+                writes.append(target((token[0], attached.group(1), token[2])))
+                continue
+            if re.match(r"^\d*<\S+$", token[1]) and not argv:
                 continue
             argv.append(token)
+        for word in argv:
+            if word[2] and re.search(r"\$\(|`", word[1]) and COMMIT_TEXT.search(word[1]):
+                raise Unresolvable("git commit inside $(...) or backticks cannot be checked; run git commit as "
+                                   "its own command (capture output with 2>&1 | tee if needed)")
         while argv and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0][1]) or argv[0][1] in RESERVED):
             argv = argv[1:]
         while argv and os.path.basename(argv[0][1]) in WRAPPERS:
@@ -882,8 +935,9 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                                         for w in argv[1:]):
                 raise Unresolvable("env -S splits a string the policy cannot follow; run git commit directly")
             argv = argv[1:]
+            takes_value = WRAPPER_VALUE_FLAGS.get(wrapper, set())
             while argv and (argv[0][1].startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0][1])):
-                argv = argv[1:]
+                argv = argv[2:] if argv[0][1] in takes_value else argv[1:]
             if wrapper in ("timeout", "gtimeout") and argv and re.match(r"^\d+(?:\.\d+)?[smhd]?$", argv[0][1]):
                 argv = argv[1:]
         # Closing rule: a git commit handed to another program (xargs, find -exec, parallel,
@@ -895,6 +949,14 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
         if not argv:
             continue
         name = os.path.basename(argv[0][1])
+        operands = [w for w in argv[1:] if not w[1].startswith("-")]
+        if name == "tee":
+            writes.extend(target(w) for w in operands)
+        elif name in ("cp", "mv", "install", "ln", "rsync") and len(operands) >= 2:
+            destination = target(operands[-1])
+            writes.append(destination)
+            if destination:
+                writes.extend(os.path.join(destination, os.path.basename(w[1])) for w in operands[:-1])
         if name in ("cd", "pushd") and len(argv) >= 2:
             if argv[1][2]:
                 cwd = None
@@ -954,6 +1016,11 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                for k in range(1, i)):
             raise Unresolvable("git -c alias... defines an alias the policy cannot follow; run git commit directly")
         sub = argv[i][1]
+        if sub == "history":
+            raise Unresolvable("git history rewrites commit messages in an editor; use git commit --amend -F")
+        if sub not in GIT_KNOWN and (remote or not repo):
+            raise Unresolvable(f"git {sub} is not a known git command here (an alias?) and its repository "
+                               "configuration is not visible; run the underlying git command directly")
         if sub not in GIT_KNOWN and repo and not remote:
             alias = git(repo, "config", "--get", f"alias.{sub}", check=False).strip()
             if alias and (alias.startswith("!") or re.search(r"\b(?:commit|commit-tree|revert|merge)\b", alias)):
@@ -973,10 +1040,9 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                                        "ssh host 'cd repo && git commit -F - <<\"EOF\"' with the message, or -m")
             facts = repo_facts(repo) if repo and not remote else None
             message, context = resolve_commit(values, repo, stdin_body, facts)
-            written = context.get("file")
-            if written not in (None, "-") and text.count(written) > 1:
-                raise Unresolvable(f"the message file {written} is also written by this command, so the checked "
-                                   "content may not be what git commits; write it in an earlier step")
+            if context.get("file") not in (None, "-"):
+                context["file_abs"] = target(("word", context["file"], False)) if not repo else os.path.normpath(
+                    os.path.join(repo, os.path.expanduser(context["file"])))
             if message is not None:
                 context["facts"] = facts
                 context["remote"] = remote
@@ -989,6 +1055,11 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                                    "then commit with a revert(<scope>): message including Reason: and Authorized-by:")
         elif sub == "commit-tree":
             raise Unresolvable("git commit-tree bypasses message checks; use git commit")
+    for _, _, context in found:
+        path = context.get("file_abs")
+        if path and (path in writes or None in writes):
+            raise Unresolvable(f"the message file {context['file']} may be written by this same command, so the "
+                               "checked content may not be what git commits; write it in an earlier step")
     return found
 
 

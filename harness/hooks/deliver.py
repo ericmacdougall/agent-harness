@@ -787,13 +787,27 @@ def commit_policy_gate(source, original_branch, branch, head, baseline, title, b
             "tickets": [item["ticket"] for item in result["tickets"]]}
 
 
-def write_policy_record(flow, record):
-    path = flow.directory / COMMIT_POLICY_RECORD
+COMMIT_POLICY_PENDING = "commit-policy-pending.json"
+
+
+def _write_private_json(path, data):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump({"schema": 1, "generation": flow.generation, **record}, handle)
+        json.dump(data, handle)
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def stage_policy_record(flow, record, source_head, baseline):
+    """Written before the generation exists, so a crash cannot lose the checked range."""
+    private_directory(flow.root)
+    _write_private_json(flow.root / COMMIT_POLICY_PENDING,
+                        {"schema": 1, "source_head": source_head, "baseline": baseline, **record})
+
+
+def write_policy_record(flow, record):
+    _write_private_json(flow.directory / COMMIT_POLICY_RECORD, {"schema": 1, "generation": flow.generation, **record})
+    (flow.root / COMMIT_POLICY_PENDING).unlink(missing_ok=True)
 
 
 def ticket_updates(flow, stage, head, pr_url=None):
@@ -812,14 +826,19 @@ def _ticket_updates(flow, stage, head, pr_url):
     try:
         record = json.loads(regular_bytes(flow.directory / COMMIT_POLICY_RECORD))
     except (OSError, ValueError, DeliveryError):
-        # No record: an older generation, or a crash between state creation and the record
-        # write. Never skip silently when the delivered commits reference tickets.
-        import commit_policy
-        policy = commit_policy.load_policy()
-        commits = commit_policy.range_commits(str(flow.original), flow.state["baseline"], flow.state["source_head"])
-        if any(commit_policy._commit_refs(c["message"], policy) for c in commits):
-            return {"status": "PENDING", "reason": "commit-policy record missing; review the referenced tickets "
-                    "and post delivery evidence with commit_policy.py notify"}
+        record = None
+    if record is None:
+        # Crash between staging and the generation write: adopt the staged record only
+        # when it describes exactly this generation's range.
+        try:
+            staged = json.loads(regular_bytes(flow.root / COMMIT_POLICY_PENDING))
+        except (OSError, ValueError, DeliveryError):
+            staged = None
+        if (isinstance(staged, dict) and staged.get("source_head") == flow.state["source_head"]
+                and staged.get("baseline") == flow.state["baseline"]):
+            record = {**staged, "generation": flow.generation}
+    if record is None:
+        # Neither record nor staged record: the generation was prepared before the policy.
         return {"status": "NOT_APPLICABLE", "reason": "generation predates the commit policy"}
     if record.get("generation") != flow.generation or not record.get("tickets"):
         return {"status": "NOT_APPLICABLE", "reason": "no referenced tickets"}
@@ -879,6 +898,7 @@ def prepare(args):
             policy_record = commit_policy_gate(source, args.original_branch, branch, head, baseline,
                                                title, body, local_only)
             phase = "LOCAL_READY" if local_only else ("REMOTE_BLOCKED" if origin_error else "INITIAL")
+            stage_policy_record(flow, policy_record, head, baseline)
             flow.create(source, branch, head, baseline, kit, repository, phase)
             write_policy_record(flow, policy_record)
             state = flow.state

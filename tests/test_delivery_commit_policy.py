@@ -83,12 +83,21 @@ class TicketDelivery(workflow.DeliveryWorkflow):
         self.fake.comment(self.issue, f'Implemented in {self.head[:10]}', datetime.now(timezone.utc))
         code, report = self.run_deliver(*self.prepare_args(), '--local-only')
         self.assertEqual((code, report['status']), (0, 'LOCAL_READY'), report)
-        record = Path(report['state']).parent / 'commit-policy.json'
+        generation_dir = Path(report['state']).parent
+        record = generation_dir / 'commit-policy.json'
+        staged = generation_dir.parent.parent / 'commit-policy-pending.json'
         self.assertTrue(record.exists())
-        record.unlink()  # simulate a crash between state creation and the record write
+        self.assertFalse(staged.exists(), 'the staged record is consumed once the generation has its own')
+        # Simulate a crash after flow.create but before the generation record write.
+        data = json.loads(record.read_text())
+        data.update(source_head=self.head, baseline=self.base)
+        staged.write_text(json.dumps(data))
+        staged.chmod(0o600)
+        record.unlink()
         code, report = self.run_deliver(*self.finish_args(mode='local'))
         self.assertEqual((code, report['status'], report['ticket_updates']['status']),
-                         (5, 'LOCAL_DELIVERED', 'PENDING'), report)
+                         (0, 'LOCAL_DELIVERED', 'UPDATED'), report)
+        self.assertEqual(len(self.fake.posted), 1)
 
     def test_missing_ticket_blocks(self):
         self.fake.issues.clear()

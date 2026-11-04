@@ -171,6 +171,13 @@ class ShellAnalysis(unittest.TestCase):
             "{ git add -A; git commit -m wip; }": "wip",
             "! git commit -m wip": "wip",
             "git commit --cleanup=verbatim -m wip": "wip",
+            "bash -o pipefail -c 'git commit -m wip'": "wip",
+            "bash --rcfile x -c 'git commit -m wip'": "wip",
+            "bash +o posix -c 'git commit -m wip'": "wip",
+            "nice -n 10 git commit -m wip": "wip",
+            "timeout --signal KILL 30 git commit -m wip": "wip",
+            "cat msg.txt && git commit -F msg.txt": GOOD,
+            "printf x > other.txt && git commit -F msg.txt": GOOD,
             "timeout 30 git commit -m wip": "wip",
         }
         for command, expected in cases.items():
@@ -196,7 +203,12 @@ class ShellAnalysis(unittest.TestCase):
                         "cd \"$REPO\" && git commit -F msg.txt",
                         "printf 'wip\\n' > msg.txt && git commit -F msg.txt",
                         "git commit --cleanup=strip -m x", "git commit -e -m x", "git commit --edit -m x",
-                        "env -S 'git commit -m wip'", "watch git commit -m wip"):
+                        "env -S 'git commit -m wip'", "watch git commit -m wip",
+                        "OUT=$(git commit -m 'wip' 2>&1)", "echo \"$(git commit -m wip)\"", "X=`git commit -m wip`",
+                        "bash -O extglob script.sh commit", "cd \"$R\" && git ci -m wip",
+                        "cp /tmp/m.txt msg.txt && git commit -F msg.txt",
+                        "printf x | tee msg.txt && git commit -F msg.txt",
+                        "printf x > \"$F\" && git commit -F msg.txt", "git history reword HEAD"):
             with self.subTest(command):
                 with self.assertRaises(cp.Unresolvable):
                     cp.analyze(command, self.dir)
