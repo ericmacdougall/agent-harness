@@ -221,19 +221,26 @@ REVIEW_SYSTEM = (
 )
 
 
-def git_environment() -> dict[str, str]:
-    """Ignore inherited Git routing and user configuration in all child processes."""
+def git_environment(*, snapshot: bool = False) -> dict[str, str]:
+    """Ignore inherited Git routing and user configuration in all child processes.
+
+    In the review snapshot, committed symlinks are materialized as regular files
+    holding the link-target text (core.symlinks=false), so a reviewer reading
+    them can never follow a link outside the snapshot.
+    """
     return safe_git_environment(isolated=True,
                                 settings=(('core.autocrlf', 'false'),
-                                          ('protocol.allow', 'never')))
+                                          ('protocol.allow', 'never'),
+                                          *((('core.symlinks', 'false'),) if snapshot else ())))
 
 
 DEFAULT_SNAPSHOT_TIMEOUT = 1800
 MAX_SNAPSHOT_TIMEOUT = 7200
 
 
-def git(repo: Path, *args: str, timeout: float = 120) -> str:
-    result = run_process(['git', '-C', str(repo), *args], env=git_environment(), timeout=timeout)
+def git(repo: Path, *args: str, timeout: float = 120, snapshot: bool = False) -> str:
+    result = run_process(['git', '-C', str(repo), *args], env=git_environment(snapshot=snapshot),
+                         timeout=timeout)
     if result.returncode:
         raise OSError('isolated Git operation failed')
     return result.stdout
@@ -261,7 +268,7 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
 
     def slow_git(target: Path, *args: str) -> str:
         try:
-            return git(target, *args, timeout=remaining())
+            return git(target, *args, timeout=remaining(), snapshot=target == snapshot)
         except subprocess.TimeoutExpired:
             raise OSError(f'review snapshot exceeded --snapshot-timeout of {timeout:g} seconds') from None
 
@@ -333,17 +340,19 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
             raise OSError('snapshot does not match reviewed commit')
     tree = slow_git(snapshot, 'ls-tree', '-r', '-z', head)
     for entry in tree.split('\0'):
-        if entry and entry.split(' ', 1)[0] not in ('100644', '100755'):
-            raise OSError('reviewed tree contains symlinks or unsupported entries')
+        # Symlinks (120000) are checked out as inert text files; gitlinks stay refused.
+        if entry and entry.split(' ', 1)[0] not in ('100644', '100755', '120000'):
+            raise OSError('reviewed tree contains gitlinks or unsupported entries')
     slow_git(snapshot, 'checkout', '--quiet', '--detach', head)
-    if repo_state(snapshot) != (head, ''):
+    if repo_state(snapshot, snapshot=True) != (head, ''):
         raise OSError('snapshot does not match reviewed commit')
     return base
 
 
 def run(cmd: list[str], prompt: str, cwd: Path, timeout=720) -> tuple[int, str, str]:
     try:
-        result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=git_environment(), timeout=timeout)
+        result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=git_environment(snapshot=True),
+                             timeout=timeout)
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
         return 124, '', 'HARNESS_PROVIDER_TIMEOUT'
@@ -424,29 +433,34 @@ def read_packet(path: Path) -> PacketEvidence:
         raise ValueError('packet invalid or changed while being read') from None
 
 
-def repo_state(repo: Path) -> tuple[str, str]:
-    """Capture a clean reviewed commit without reading untracked content."""
+def repo_state(repo: Path, *, snapshot: bool = False) -> tuple[str, str]:
+    """Capture a clean reviewed commit without reading untracked content.
+
+    A review snapshot is inspected with its own symlink representation and must
+    contain no filesystem symlink at all.
+    """
+    env = git_environment(snapshot=snapshot)
     head = run_process(['git', '-C', str(repo), 'rev-parse', '--verify', 'HEAD^{commit}'],
-                       env=git_environment(), timeout=30)
+                       env=env, timeout=30)
     if head.returncode:
         raise OSError('Git HEAD inspection failed')
-    require_safe_source(repo, git_environment())
+    require_safe_source(repo, env)
     status = run_process(['git', '-C', str(repo), 'status', '--porcelain=v1',
-                          '--untracked-files=all'], env=git_environment(), timeout=30)
+                          '--untracked-files=all'], env=env, timeout=30)
     if status.returncode:
         raise OSError('Git status inspection failed')
     if status.stdout:
         return head.stdout.strip(), status.stdout
     require_unflagged_index(repo)
-    require_no_special_entries(repo)
+    require_no_special_entries(repo, allow_symlinks=not snapshot)
     diff = run_process(['git', '-C', str(repo), 'diff', '--no-ext-diff', '--no-textconv',
-                        '--binary', 'HEAD', '--'], env=git_environment(), timeout=30)
+                        '--binary', 'HEAD', '--'], env=env, timeout=30)
     if diff.returncode or diff.stdout:
         raise OSError('worktree changed during state inspection')
     return head.stdout.strip(), status.stdout
 
 
-def require_no_special_entries(repo: Path) -> None:
+def require_no_special_entries(repo: Path, *, allow_symlinks: bool = True) -> None:
     """Git status omits FIFOs and sockets; reject them with bounded metadata reads."""
     inspected = [0]
     deadline = time.monotonic() + 5
@@ -473,7 +487,7 @@ def require_no_special_entries(repo: Path) -> None:
                         visit(child, depth + 1, child_relative)
                     finally:
                         os.close(child)
-                elif not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+                elif not (stat.S_ISREG(info.st_mode) or (allow_symlinks and stat.S_ISLNK(info.st_mode))):
                     raise OSError('worktree contains an unsafe special file')
 
     try:
@@ -811,7 +825,7 @@ def main() -> int:
             source, report, failure = review_snapshot(snapshot, before[0], args.stage,
                                                        stage_rules, evidence.content, options)
             report = stage_report(args.stage, report)
-            if repo_state(snapshot) != (before[0], ''):
+            if repo_state(snapshot, snapshot=True) != (before[0], ''):
                 raise OSError('snapshot changed during review')
         # Cleanup must succeed before any report is published.
     except (OSError, subprocess.TimeoutExpired, GuardError) as error:

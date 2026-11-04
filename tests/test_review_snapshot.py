@@ -2,6 +2,7 @@
 
 import importlib.util
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -237,6 +238,50 @@ class ReviewSnapshotTests(unittest.TestCase):
             self.review.review_snapshot(self.root, self.head, 'plan', 'rules', 'packet', {'base': self.first})
         self.assertIn('root commit', prompts[0])
         self.assertIn(f'git diff {self.first} HEAD', prompts[1])
+
+    def commit_links(self, links, directories=()):
+        for directory in directories:
+            (self.repo / directory).mkdir()
+            (self.repo / directory / 'inside.txt').write_text('inside\n')
+        for name, target in links.items():
+            (self.repo / name).symlink_to(target)
+        git(self.repo, 'add', '-A')
+        git(self.repo, 'commit', '-qm', 'links')
+        return git(self.repo, 'rev-parse', 'HEAD')
+
+    def test_symlinks_become_inert_link_text(self):
+        links = {'outside': '../../../etc/passwd', 'absolute': '/etc/passwd',
+                 'chain_a': 'chain_b', 'chain_b': 'app.txt', 'dirlink': 'subdir',
+                 'escape_dir': '../../..'}
+        head = self.commit_links(links, directories=('subdir',))
+        self.review.make_snapshot(self.repo, self.snapshot, head)
+        for name, target in links.items():
+            with self.subTest(name):
+                path = self.snapshot / name
+                self.assertTrue(stat.S_ISREG(os.lstat(path).st_mode), name)
+                self.assertEqual(path.read_text(), target)
+        self.assertEqual((self.snapshot / 'subdir/inside.txt').read_text(), 'inside\n')
+        real_links = [str(Path(root) / name) for root, dirs, files in os.walk(self.snapshot)
+                      for name in dirs + files if os.path.islink(Path(root) / name)]
+        self.assertEqual(real_links, [])
+        self.assertEqual(self.review.repo_state(self.snapshot, snapshot=True), (head, ''))
+
+    def test_planted_real_symlink_makes_snapshot_unclean(self):
+        head = self.commit_links({'outside': '../../../etc/passwd'})
+        self.review.make_snapshot(self.repo, self.snapshot, head)
+        (self.snapshot / 'outside').unlink()
+        (self.snapshot / 'outside').symlink_to('../../../etc/passwd')
+        try:
+            state = self.review.repo_state(self.snapshot, snapshot=True)
+        except OSError:
+            return
+        self.assertNotEqual(state, (head, ''))
+
+    def test_gitlink_is_refused(self):
+        git(self.repo, 'update-index', '--add', '--cacheinfo', f'160000,{self.first},vendored')
+        git(self.repo, 'commit', '-qm', 'gitlink')
+        with self.assertRaisesRegex(OSError, 'gitlinks'):
+            self.review.make_snapshot(self.repo, self.snapshot, git(self.repo, 'rev-parse', 'HEAD'))
 
     def test_cli_validates_snapshot_options(self):
         for args, message in ((['--snapshot-timeout', '7201'], 'snapshot-timeout must be between'),

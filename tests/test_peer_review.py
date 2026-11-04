@@ -300,10 +300,34 @@ else: print('PLAN_RESULT: ACCEPT')
                 self.assertFalse(Path(record['cwd']).exists(), 'snapshot cleanup before return')
                 self.assertEqual(secret.read_text(), 'synthetic ignored fixture')
 
-    def test_snapshot_rejects_committed_symlink_before_model(self):
+    def test_committed_symlink_reaches_reviewer_only_as_link_text(self):
         (self.repo / 'entry').symlink_to(self.packet)
         subprocess.run(['git', '-C', str(self.repo), 'add', 'entry'], check=True)
         subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', 'link'], check=True)
+        capture = self.root / 'model.capture'
+        self.fake('codex', """import json, os, subprocess, sys
+from pathlib import Path
+sys.stdin.read()
+entry = Path('entry')
+Path(os.environ['LINK_CAPTURE']).write_text(json.dumps({
+    'islink': entry.is_symlink(), 'text': entry.read_text(),
+    'status': subprocess.check_output(['git', 'status', '--porcelain'], text=True)}))
+Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT: PASS\\nReviewed.')
+""")
+        result = self.invoke(env={'LINK_CAPTURE': str(capture)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import json
+        record = json.loads(capture.read_text())
+        self.assertFalse(record['islink'])
+        self.assertEqual(record['text'], str(self.packet))
+        self.assertNotIn('Scope and evidence', record['text'])
+        self.assertEqual(record['status'], '')
+
+    def test_snapshot_rejects_committed_gitlink_before_model(self):
+        head = subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], text=True).strip()
+        subprocess.run(['git', '-C', str(self.repo), 'update-index', '--add', '--cacheinfo',
+                        f'160000,{head},vendored'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', 'gitlink'], check=True)
         capture = self.root / 'model.capture'
         result = self.invoke(env={'CAPTURE_CODEX_PROMPT': str(capture)})
         self.assertEqual(result.returncode, 2, result.stdout)
