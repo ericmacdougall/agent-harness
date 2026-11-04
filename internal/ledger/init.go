@@ -194,7 +194,7 @@ func (l *Ledger) initLocked(rootID string, now int64, o InitOptions) error {
 		return wrap(ErrUsage, "%v", err)
 	}
 	ref := store.RefName(l.Project, w)
-	commit, err := l.Git.WritePack("", []*op.Op{parsed}, lease, l.Git.ConfigBool("ledger.sign"))
+	commit, err := l.Git.WritePack("", []*op.Op{parsed}, lease)
 	if err != nil {
 		return err
 	}

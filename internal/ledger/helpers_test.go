@@ -26,7 +26,7 @@ func TestMain(m *testing.M) {
 	if runtime.GOOS == "windows" {
 		bin += ".exe"
 	}
-	out, err := exec.Command("go", "build", "-o", bin, "github.com/ericmacdougall/agent-harness/cmd/harness").CombinedOutput()
+	out, err := exec.Command("go", "build", "-tags", "ledgertest", "-o", bin, "github.com/ericmacdougall/agent-harness/cmd/harness").CombinedOutput()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "build failed: %v\n%s", err, out)
 		os.Exit(1)

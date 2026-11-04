@@ -63,7 +63,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	gate := isGate(g.Sub, g.Args)
 	// The commit-policy adapter calls `tickets show --min-version`: a crash there must fail closed (exit 2).
 	gate = gate || (g.Sub == "tickets" && len(g.Args) > 0 && g.Args[0] == "show" && hasFlag(g.Args, "--min-version"))
-	writer.TestHooksAllowed = version == "dev"
+	writer.TestHooksAllowed = version == "dev" && writer.TestBuild
 	if err != nil {
 		fmt.Fprintln(stderr, cli.Usage)
 		fmt.Fprintf(stderr, "harness: error: %s\n", err)

@@ -64,21 +64,21 @@ func TestCASRefusesStaleOldValue(t *testing.T) {
 	g := bare(t)
 	project, writer := ids(t)
 	ref := RefName(project, writer)
-	c1, err := g.WritePack("", []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base}, op.KindProjectCreate)}, "lease", false)
+	c1, err := g.WritePack("", []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base}, op.KindProjectCreate)}, "lease")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := g.CAS(ref, c1, ""); err != nil {
 		t.Fatal(err)
 	}
-	c2, err := g.WritePack(c1, []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base + 1}, op.KindTicketCreate)}, "lease", false)
+	c2, err := g.WritePack(c1, []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base + 1}, op.KindTicketCreate)}, "lease")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := g.CAS(ref, c2, ""); !errors.Is(err, ErrCASFailed) {
 		t.Fatalf("create over an existing ref: %v", err)
 	}
-	c3, _ := g.WritePack(c1, []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base + 2}, op.KindTicketCreate)}, "lease", false)
+	c3, _ := g.WritePack(c1, []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base + 2}, op.KindTicketCreate)}, "lease")
 	if err := g.CAS(ref, c2, c1); err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestPackShapeAndValidation(t *testing.T) {
 	ref := RefName(project, writer)
 	ops := []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base}, op.KindProjectCreate),
 		mkOp(t, project, writer, op.HLC{WallMs: base, Ctr: 1}, op.KindTicketCreate)}
-	c, err := g.WritePack("", ops, "lease", false)
+	c, err := g.WritePack("", ops, "lease")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,13 +124,13 @@ func TestPackShapeAndValidation(t *testing.T) {
 		t.Fatalf("TipHLC %v %v", h, err)
 	}
 	// A clock that does not increase across packs makes the whole ref invalid.
-	bad, _ := g.WritePack(c, []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base}, op.KindTicketCreate)}, "lease", false)
+	bad, _ := g.WritePack(c, []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base}, op.KindTicketCreate)}, "lease")
 	if _, err := g.ReadRef(project, writer, bad); err == nil {
 		t.Fatal("non-monotonic clock accepted")
 	}
 	// Ops for another writer on this ref are refused.
 	other2, _ := op.NewID(op.PrefixWriter, base+5)
-	alien, _ := g.WritePack(c, []*op.Op{mkOp(t, project, other2, op.HLC{WallMs: base + 9}, op.KindTicketCreate)}, "lease", false)
+	alien, _ := g.WritePack(c, []*op.Op{mkOp(t, project, other2, op.HLC{WallMs: base + 9}, op.KindTicketCreate)}, "lease")
 	if _, err := g.ReadRef(project, writer, alien); err == nil {
 		t.Fatal("foreign writer op accepted on this ref")
 	}
@@ -140,7 +140,7 @@ func TestPackShapeAndValidation(t *testing.T) {
 func TestExtraTreeEntryRejected(t *testing.T) {
 	g := bare(t)
 	project, writer := ids(t)
-	c, err := g.WritePack("", []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base}, op.KindProjectCreate)}, "lease", false)
+	c, err := g.WritePack("", []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base}, op.KindProjectCreate)}, "lease")
 	if err != nil {
 		t.Fatal(err)
 	}

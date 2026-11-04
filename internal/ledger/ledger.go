@@ -69,7 +69,7 @@ func CheckTestEnv() error {
 	}
 	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, writer.FakeMachineIDEnv} {
 		if _, ok := os.LookupEnv(k); ok {
-			return wrap(ErrUsage, "%s is a test-only variable and is refused by release builds", k)
+			return wrap(ErrUsage, "%s is a test-only variable, refused by builds without -tags ledgertest", k)
 		}
 	}
 	return nil
@@ -397,7 +397,18 @@ func (l *Ledger) readAll(s *snapshot) (fold.Input, error) {
 	for r := range s.tips {
 		names = append(names, r)
 	}
-	sort.Strings(names)
+	// Folded (self/trusted) refs are read first, so an op id that an unverified or blocked ref copies
+	// can only ever reject that ref, never the folded ref whose op it collides with.
+	folded := func(r string) bool {
+		_, w, _ := store.ParseRefName(r)
+		return fold.Folded(in.Class(w))
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if fi, fj := folded(names[i]), folded(names[j]); fi != fj {
+			return fi
+		}
+		return names[i] < names[j]
+	})
 	seen := map[string][]byte{} // op id -> bytes, across refs
 	for _, r := range names {
 		proj, w, _ := store.ParseRefName(r)
@@ -665,8 +676,17 @@ func scanDrafts(ds []op.Draft, redact bool) error {
 			}
 		}
 		for _, f := range ds[i].Payload {
-			if s, ok := f.V.(string); ok && len(scan.Scan([][2]string{{f.K, s}})) > 0 {
-				return wrap(ErrSecret, "masking left secret-shaped text in %s", f.K)
+			var vals []string
+			switch v := f.V.(type) {
+			case string:
+				vals = []string{v}
+			case []string:
+				vals = v
+			}
+			for _, s := range vals {
+				if len(scan.Scan([][2]string{{f.K, s}})) > 0 {
+					return wrap(ErrSecret, "masking left secret-shaped text in %s", f.K)
+				}
 			}
 		}
 	}
@@ -735,7 +755,7 @@ func (l *Ledger) appendLocked(drafts []op.Draft, opts AppendOptions, check func(
 		if err != nil {
 			return nil, err
 		}
-		commit, err := l.Git.WritePack(tip, ops, lease, l.Git.ConfigBool("ledger.sign"))
+		commit, err := l.Git.WritePack(tip, ops, lease)
 		if err != nil {
 			return nil, err
 		}
@@ -816,21 +836,29 @@ func (l *Ledger) recordMirrorWriter(w, lease string) {
 		return
 	}
 	defer d.Close()
-	cur := map[string]any{}
-	prior, err := d.Snapshot(mirrorWritersFile, 1<<20)
-	if err == nil {
-		b, _ := d.ReadRegular(mirrorWritersFile, 1<<20)
-		_ = json.Unmarshal(b, &cur)
-	} else {
-		prior = nil
-	}
-	if cur[w] == store.LeaseHash(lease) {
-		return
-	}
-	cur[w] = store.LeaseHash(lease)
-	b, err := pycompat.Canonical(cur)
-	if err == nil {
-		_ = d.Replace(mirrorWritersFile, append(b, '\n'), prior)
+	// Several checkouts of one project share this file without a common lock: Replace is a compare-and-swap
+	// against the snapshot, so re-read and retry when another writer got there first.
+	for attempt := 0; attempt < 5; attempt++ {
+		cur := map[string]any{}
+		prior, err := d.Snapshot(mirrorWritersFile, 1<<20)
+		if err == nil {
+			b, _ := d.ReadRegular(mirrorWritersFile, 1<<20)
+			_ = json.Unmarshal(b, &cur)
+		} else {
+			prior = nil
+		}
+		if cur[w] == store.LeaseHash(lease) {
+			return
+		}
+		cur[w] = store.LeaseHash(lease)
+		b, err := pycompat.Canonical(cur)
+		if err != nil {
+			return
+		}
+		err = d.Replace(mirrorWritersFile, append(b, '\n'), prior)
+		if err == nil || !(errors.Is(err, safefs.ErrChanged) || errors.Is(err, safefs.ErrExists)) {
+			return
+		}
 	}
 }
 

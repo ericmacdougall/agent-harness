@@ -85,7 +85,7 @@ ambiguous.
 |---|---|
 | `refs/goodqa/v1/<proj>/log/<writer>` | One ref per writer. Each commit is a pack whose tree holds exactly `version-1`, `hlc-<wall>-<ctr>` (the last op's clock) and `ops.jsonl` (canonical JSON ops). The ref moves only by compare-and-swap. |
 | `<git common dir>/goodqa/` (0700) | `projects.json`, `writer.json` (machine fingerprint to writer map), `trust.json`, `view.cache.json` and `writer.lock`, all 0600. A symlinked or group-readable directory is refused. Linked worktrees share it. |
-| `~/.agent-harness/ledgers/<proj>/mirror.git` | A bare local backup that receives the writer ref after every write. `init --from-mirror` restores from it. |
+| `~/.agent-harness/ledgers/<proj>/mirror.git` | A bare local backup that receives the writer ref after every write. `init --from-mirror` restores from it, and treats a restored writer as `self` only when its lease hash matches `mirror-writers.json` (0600) beside the mirror. That file, not the hash, is the trust anchor: the hash also appears in pack commit messages. |
 | `~/.agent-harness/ledgers/<proj>/repo.git` | The store for a repo-less ledger. |
 
 The view cache is only a cache. It is keyed by the exact set of ref tips and carries its own
@@ -97,7 +97,8 @@ SHA-256, and a missing, stale or corrupt cache is rebuilt from the refs.
 `Refs: Ledger <slug>#<8+ hex>` only in these two cases:
 
 - **Untracked repositories.** No remote `url` or `pushurl` of any remote matches a GoodQA
-  `repos` pattern. Raw and `insteadOf`-rewritten URLs are both checked.
+  `repos` pattern. Raw and `insteadOf`-rewritten URLs are both checked, ignoring case and any
+  explicit `:<port>`. SSH host aliases from `~/.ssh/config` are not visible to this check.
 - **Allowlisted remote-less repositories.** The repository has no remote, and its absolute
   top-level path fully matches a regex in `ticket_systems.ledger.allowed_repos`. The list is
   empty by default.
@@ -139,7 +140,8 @@ python3 testdata/mutants/run_mutants.py                         # every mutant m
 python3 ~/.claude/tools/watch-tests.py --root . -- go test ./internal/ledger/...
 ```
 
-The black-box tests build a development binary, which honors the test-only variables
+The black-box tests build `harness` with `-tags ledgertest`, which honors the test-only variables
 `HARNESS_LEDGER_FAKE_NOW_MS`, `HARNESS_LEDGER_FAKE_MACHINE_ID`,
-`HARNESS_LEDGER_TEST_CRASH_AFTER_CAS` and `HARNESS_LEDGER_TEST_LOCK_WAIT_MS`. A release build
-refuses to run while any of them is set.
+`HARNESS_LEDGER_TEST_CRASH_AFTER_CAS` and `HARNESS_LEDGER_TEST_LOCK_WAIT_MS`. Any other build,
+including a plain `go build` or `go install`, refuses to run while one of them is set. The commit
+policy also strips them from the environment it passes to `harness`.

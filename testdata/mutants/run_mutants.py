@@ -114,7 +114,8 @@ def main():
                             **({} if status == "KILLED" else {"tail": out[-800:]})})
         finally:
             shutil.rmtree(tree, ignore_errors=True)
-        print(json.dumps(results[-1]), flush=True)
+            if results and results[-1]["id"] == m["id"]:
+                print(json.dumps(results[-1]), flush=True)
     killed = sum(r["status"] == "KILLED" for r in results)
     print(json.dumps({"mutants": len(results), "killed": killed}))
     return 0 if killed == len(results) else 1

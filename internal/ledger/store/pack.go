@@ -81,8 +81,9 @@ func LeaseHash(lease string) string {
 }
 
 // WritePack stores ops as one commit on top of parent ("" for the first pack) and returns its id.
-// The tree is exactly version-1, hlc-<wall>-<ctr> (the last op's clock) and ops.jsonl.
-func (g *Git) WritePack(parent string, ops []*op.Op, lease string, sign bool) (string, error) {
+// The tree is exactly version-1, hlc-<wall>-<ctr> (the last op's clock) and ops.jsonl. Pack commits are
+// never signed: signing would run gpg.program (and possibly a pinentry prompt) inside the writer lock.
+func (g *Git) WritePack(parent string, ops []*op.Op, lease string) (string, error) {
 	if len(ops) == 0 {
 		return "", errors.New("empty pack")
 	}
@@ -131,12 +132,9 @@ func (g *Git) WritePack(parent string, ops []*op.Op, lease string, sign bool) (s
 	date := fmt.Sprintf("@%d +0000", last.WallMs/1000)
 	id := []string{"GIT_AUTHOR_NAME=" + CommitName, "GIT_AUTHOR_EMAIL=" + CommitEmail, "GIT_AUTHOR_DATE=" + date,
 		"GIT_COMMITTER_NAME=" + CommitName, "GIT_COMMITTER_EMAIL=" + CommitEmail, "GIT_COMMITTER_DATE=" + date}
-	args := []string{"commit-tree", treeID, "-F", "-"}
+	args := []string{"commit-tree", "--no-gpg-sign", treeID, "-F", "-"}
 	if parent != "" {
 		args = append(args, "-p", parent)
-	}
-	if sign {
-		args = append(args, "-S")
 	}
 	out, err = g.run(LocalTimeout, []byte(msg), id, args...)
 	if err != nil {
