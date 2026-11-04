@@ -89,7 +89,7 @@ def _clean(text, limit=EVIDENCE_CHARS):
     return re.sub(r"[^A-Za-z0-9._/@:+()#, -]", "?", str(text))[:limit]
 
 
-def _read_small(root: Path, rel: str, limit: int, budget=None):
+def _read_small(root: Path, rel: str, limit: int, budget=None, limited=None):
     """Read one regular file inside root without following symlinks; None when unsafe or too large."""
     try:
         path = root / rel
@@ -100,10 +100,16 @@ def _read_small(root: Path, rel: str, limit: int, budget=None):
         return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > limit or info.st_nlink > 50:
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink > 50:
+            return None
+        if info.st_size > limit:
+            if limited is not None:
+                limited.append(rel)
             return None
         if budget is not None:
             if budget[0] + info.st_size > MAX_TOTAL_READ:
+                if limited is not None:
+                    limited.append(rel)
                 return None
             budget[0] += info.st_size
         chunks, total = [], 0
@@ -113,7 +119,11 @@ def _read_small(root: Path, rel: str, limit: int, budget=None):
                 break
             chunks.append(chunk)
             total += len(chunk)
-        return b"".join(chunks).decode("utf-8", "replace") if total <= limit else None
+        if total > limit:
+            if limited is not None:
+                limited.append(rel)
+            return None
+        return b"".join(chunks).decode("utf-8", "replace")
     except OSError:
         return None
     finally:
@@ -131,7 +141,7 @@ def _skipped(path: str) -> bool:
     return bool(SKIP_COMPONENTS.intersection(parts[:-1])) or (len(parts) > 1 and parts[0] == "lib")
 
 
-def _tracked_files(root: Path, max_files: int, strict: bool = False):
+def _tracked_files(root: Path, max_files: int, strict: bool = False, limited=None):
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_GLOBAL": os.devnull,
            "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0"}
     try:
@@ -141,8 +151,13 @@ def _tracked_files(root: Path, max_files: int, strict: bool = False):
         return None if strict else []
     if done.returncode:
         return None if strict else []
+    if len(done.stdout) > 8_000_000 and limited is not None:
+        limited.append("ls-files output")
     names = [n.decode("utf-8", "replace") for n in done.stdout[:8_000_000].split(b"\0") if n]
-    return [n for n in sorted(names) if not _skipped(n)][:max_files]
+    kept = [n for n in sorted(names) if not _skipped(n)]
+    if len(kept) > max_files and limited is not None:
+        limited.append("file list")
+    return kept[:max_files]
 
 
 def _dep_present(text: str, name: str, kind: str, rejected=None) -> bool:
@@ -205,19 +220,20 @@ def _path_signals(path: str, found: _Found, tag: str):
         found.add("solana", "high", f"{tag}Anchor.toml")
 
 
-def detect(repo, changed_paths=None, max_files: int = MAX_FILES) -> list:
+def detect(repo, changed_paths=None, max_files=None) -> list:
     """Return [{domain, confidence, evidence[]}] from tracked files, small manifests and changed paths."""
     return detect_checked(repo, changed_paths, max_files)[0]
 
 
-def detect_checked(repo, changed_paths=None, max_files: int = MAX_FILES):
+def detect_checked(repo, changed_paths=None, max_files=None):
     """Like detect, but returns (domains, ok); ok is False when the repo scan could not run (not git, git failed)."""
     found, reason = detect_full(repo, changed_paths, max_files)
     return found, reason is None
 
 
-def detect_full(repo, changed_paths=None, max_files: int = MAX_FILES):
+def detect_full(repo, changed_paths=None, max_files=None):
     """Returns (domains, failure_reason or None); the reason names why the scan was incomplete."""
+    max_files = MAX_FILES if max_files is None else max_files
     found = _Found()
     try:
         root = Path(repo).resolve()
@@ -228,7 +244,8 @@ def detect_full(repo, changed_paths=None, max_files: int = MAX_FILES):
     for path in list(changed_paths or [])[:max_files]:
         if isinstance(path, str) and path and "\0" not in path:
             _path_signals(path, found, "diff: ")
-    files = _tracked_files(root, max_files, strict=True)
+    limited = []
+    files = _tracked_files(root, max_files, strict=True, limited=limited)
     ok = files is not None
     files = files or []
     rejected = []
@@ -240,9 +257,10 @@ def detect_full(repo, changed_paths=None, max_files: int = MAX_FILES):
             ledger_in.append(path)
         if base in MANIFESTS or REQUIREMENTS.match(base):
             if manifests >= MAX_MANIFESTS:
+                limited.append("manifest count")
                 continue
             manifests += 1
-            text = _read_small(root, path, MAX_MANIFEST_BYTES, budget)
+            text = _read_small(root, path, MAX_MANIFEST_BYTES, budget, limited)
             if text is None:
                 continue
             kind = base if base in MANIFESTS else "requirements.txt"
@@ -256,15 +274,23 @@ def detect_full(repo, changed_paths=None, max_files: int = MAX_FILES):
                     break
         elif base.endswith(".proto"):
             protos += 1
-            if protos <= MAX_PROTO_FILES:
-                text = _read_small(root, path, MAX_PROTO_BYTES, budget)
+            if protos > MAX_PROTO_FILES:
+                limited.append("proto count")
+            else:
+                text = _read_small(root, path, MAX_PROTO_BYTES, budget, limited)
                 if text is not None and LEDGER_WORDS.search(text):
                     ledger_in.append(path)
     proto_paths = [p for p in files if p.endswith(".proto")]
     if proto_paths and nats_in and ledger_in:
         found.add("ledger-messaging", "medium", f"proto {_base(proto_paths[0])} + nats ({nats_in[0]}) + ledger signal ({_base(ledger_in[0])})")
-    reason = (None if ok else "not a git checkout or git ls-files failed") if not rejected else \
-        "a manifest was rejected as too deeply nested"
+    if rejected:
+        reason = "a manifest was rejected as too deeply nested"
+    elif not ok:
+        reason = "not a git checkout or git ls-files failed"
+    elif limited:
+        reason = "scan truncated by a safety limit (" + ", ".join(sorted(set(limited))[:3]) + ")"
+    else:
+        reason = None
     return found.result(), reason
 
 

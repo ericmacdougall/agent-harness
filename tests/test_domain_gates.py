@@ -432,6 +432,24 @@ class SpecFlowTests(unittest.TestCase):
             _, problems = sf.domain_lint(with_line, repo, enforce)
         self.assertTrue(any("git ls-files failed" in p for p in problems), problems)
 
+    def test_truncated_scan_is_a_failure_reason(self):
+        files = {f"0/balance{i}.txt": "x" for i in range(60)}
+        files["src/T.sol"] = "contract T {}"
+        repo = make_repo(files)
+        found, reason = dg.detect_full(repo, max_files=50)
+        self.assertEqual(found, [])
+        self.assertIn("truncated", reason)
+        _, reason = dg.detect_full(repo, max_files=500)  # positive control: no cap hit, signal found
+        self.assertIsNone(reason)
+        with mock.patch.object(dg, "MAX_FILES", 50):
+            _, problems = sf.domain_lint(SPEC, repo, {"domain_gates": {"mode": "enforce"}})
+        self.assertTrue(any("truncated" in p for p in problems), problems)
+        big = make_repo({"package.json": json.dumps({"dependencies": {"ethers": "6"}, "pad": "x" * (dg.MAX_MANIFEST_BYTES + 5)})})
+        self.assertIn("truncated", dg.detect_full(big)[1])
+        with mock.patch.object(dg, "MAX_MANIFESTS", 1):
+            two = make_repo({"a/package.json": "{}", "b/package.json": "{}"})
+            self.assertIn("truncated", dg.detect_full(two)[1])
+
     def test_cargo_table_dependency_and_ledger_word_boundaries(self):
         self.assertIn("solana", names(dg.detect(make_repo({"Cargo.toml": '[dependencies.anchor-lang]\nversion = "0.30"\n'}))))
         lb = make_repo({"load_balancer.proto": "message A {}", "go.mod": "require nats.go v1\n"})
