@@ -23,3 +23,19 @@ jobs:
         run: python3 -m unittest discover -s tests -v
       - name: Whitespace
         run: git show --check --oneline HEAD
+  hooks-py39:
+    # The Mac runs the installed hooks on /usr/bin/python3 (3.9.6); keep them importable there.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Toolchain
+        run: python3 --version && git --version
+      - name: Hook syntax on 3.9
+        run: python3 -m compileall -q harness/hooks
+      - name: Import every hook module on 3.9
+        run: python3 .github/scripts/import_hooks.py
+      - name: Commit-policy tests on 3.9
+        run: python3 -m unittest discover -s tests -p test_commit_policy.py -v
