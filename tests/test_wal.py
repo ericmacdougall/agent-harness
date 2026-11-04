@@ -16,6 +16,19 @@ from unittest.mock import patch
 WAL = Path(__file__).resolve().parents[1] / "harness/hooks/wal.py"
 
 
+_OFFLINE = None
+
+
+def setUpModule():  # tests never call the ticket tracker; restored in tearDownModule so it cannot leak into other modules
+    global _OFFLINE
+    _OFFLINE = __import__("unittest.mock", fromlist=["patch"]).patch.dict(os.environ, {"HARNESS_PROVENANCE_OFFLINE": "1"})
+    _OFFLINE.start()
+
+
+def tearDownModule():
+    _OFFLINE.stop()
+
+
 class WalTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

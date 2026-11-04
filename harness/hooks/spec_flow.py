@@ -206,7 +206,7 @@ def parse_spec(text: str) -> dict:
 PLACEHOLDER = re.compile(r"<[^<>\n]{2,80}>")
 
 
-def lint(text: str, config: dict | None = None) -> list:
+def lint(text: str, config: dict | None = None, check_provenance: bool = True) -> list:
     spec = parse_spec(text)
     problems = []
     header = spec["header"]
@@ -255,6 +255,23 @@ def lint(text: str, config: dict | None = None) -> list:
             problems.append(f"{ident} must name existing criteria in parentheses (unknown: {', '.join(unknown) or 'none given'})")
     for line in spec["stray"]:
         problems.append(f"unrecognized bullet (use `- AC-n:` / `- NEG-n (AC-n):`): {line[:80]}")
+    if check_provenance:
+        problems.extend(provenance_problems(text))
+    return problems
+
+
+def provenance_problems(text: str) -> list:
+    """Every AC-n and NEG-n needs a resolvable `Source:` (provenance.py). Additive: needs provenance.py installed."""
+    try:
+        import provenance
+    except ImportError:
+        return []  # older install: no provenance module, no gate
+    try:
+        problems, warnings = provenance.spec_lint(text)
+    except Exception as error:  # a resolver bug must be visible, not silent
+        return [f"provenance check failed ({type(error).__name__}); fix provenance.py or the spec"]
+    for warning in warnings:
+        print(warning, file=sys.stderr)
     return problems
 
 

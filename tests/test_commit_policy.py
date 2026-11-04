@@ -118,6 +118,19 @@ GOOD_CASES = [
 ]
 
 
+_OFFLINE = None
+
+
+def setUpModule():  # tests never call the ticket tracker; restored in tearDownModule so it cannot leak into other modules
+    global _OFFLINE
+    _OFFLINE = __import__("unittest.mock", fromlist=["patch"]).patch.dict(os.environ, {"HARNESS_PROVENANCE_OFFLINE": "1"})
+    _OFFLINE.start()
+
+
+def tearDownModule():
+    _OFFLINE.stop()
+
+
 class Validator(unittest.TestCase):
     def test_good_messages_pass(self):
         self.assertGreater(len(GOOD_CASES), 5)

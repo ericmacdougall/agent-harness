@@ -11,3 +11,4 @@ dist/
 build/
 *.zip
 !testdata/mutants/LEDGER.jsonl
+console/console

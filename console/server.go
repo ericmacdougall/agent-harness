@@ -235,6 +235,10 @@ func (a *app) handler(host, token string) http.Handler {
 	mux.HandleFunc("POST /api/git/sync", a.gitSyncHTTP)
 	mux.HandleFunc("POST /api/git/remove", a.gitRemoveHTTP)
 	mux.HandleFunc("POST /api/launch", a.launchHTTP)
+	mux.HandleFunc("POST /api/prs", a.prListHTTP)
+	mux.HandleFunc("POST /api/prs/review-map", a.prMapHTTP)
+	mux.HandleFunc("POST /api/prs/review-map/attach", a.prAttachHTTP)
+	mux.HandleFunc("GET /review-map/{id}", a.reviewMapServe)
 	mux.HandleFunc("POST /api/shutdown", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]bool{"stopping": true})
 		if a.shutdown != nil {
