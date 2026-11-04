@@ -78,6 +78,18 @@ A cancel proof names `targets` and a `binding`: `same_message_retraction` (the a
 be a human message this ledger captured from a transcript it tracks, not older than the ask, and the transcript
 line is re-read at removal. Removal appends the full record to the archive and leaves a tombstone.
 
+## Backup
+
+The ledger can end up as the only surviving record of what the user asked for (GoodQA 1ae27b6b#14471: on 2026-11-04
+it was the one record that survived). Each hive must keep a copy-only, versioned off-machine backup of
+`work-ledger.json`, `work-ledger.events.jsonl`, `work-ledger.archive.jsonl`, `work-ledger.failures.jsonl`,
+`work-ledger.spool.jsonl` and the v1 `work-assignments.json` in `$AGENT_HARNESS_HOME`. The lock file is not needed. These files sit
+beside `~/.agent-harness/work`, not inside it, so a backup of the work directory alone misses them. On the Mac they are
+in the source list of `~/.agent-harness/bin/log-backup.sh`, which runs every 15 minutes and copies them to Dropbox.
+That job only copies: it never deletes the remote copy, and it keeps changed files under `versions/`. install.py
+does not set up this job; a hive without it has no backup of the ledger. The event log is the source of truth, so
+restoring `work-ledger.events.jsonl` and running `work_assignments.py recover` rebuilds the snapshot.
+
 ## Known limits
 
 A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt and no request cues. Request cues are English keyword heuristics: they miss requests phrased without them and flag some messages that are not requests. A superseded ask is removable only when its replacement, a different ask, is done with verified evidence.
