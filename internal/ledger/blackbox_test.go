@@ -1135,11 +1135,30 @@ func TestOwnWriterReadFromHomeMirror(t *testing.T) {
 	if got := strings.TrimSpace(w.git(w.repo, "rev-parse", ref)); got != mtip() {
 		t.Fatalf("control: the repository copy %s differs from the mirror %s after a write", got, mtip())
 	}
-	w.git(w.repo, "update-ref", ref, forgePack(t, w, w.repo, ref))
+	forged := forgePack(t, w, w.repo, ref)
+	w.git(w.repo, "update-ref", ref, forged)
 	if got := titles(w.jsonOK(w.repo, nil, "list")); len(got) != 1 || got[0] != "real" {
 		t.Fatalf("forged ops in the repository copy of an own ref were read: %v", got)
 	}
-	w.newTicket(w.repo, nil, "next")
+	// Repository config that would refuse the forced copy or run a command from receive-pack.
+	marker := filepath.Join(filepath.Dir(w.repo), "alternate-refs-ran")
+	alt := filepath.Join(filepath.Dir(w.repo), "alt.git")
+	w.git(filepath.Dir(w.repo), "init", "-q", "--bare", alt)
+	os.WriteFile(filepath.Join(w.repo, ".git", "objects", "info", "alternates"), []byte(filepath.Join(alt, "objects")+"\n"), 0o644)
+	w.git(w.repo, "config", "receive.denyNonFastForwards", "true")
+	w.git(w.repo, "config", "core.alternateRefsCommand", "echo ran >> "+marker+" #")
+	r := w.run(w.repo, nil, "tickets", "new", "--title", "next", "--json")
+	if r.code != 0 || !strings.Contains(r.stderr, "kept as "+ledger.DisplacedPrefix) {
+		t.Fatalf("next write: exit %d stderr %s", r.code, r.stderr)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		b, _ := os.ReadFile(marker)
+		t.Fatalf("receive-pack ran the repository's core.alternateRefsCommand: %s", b)
+	}
+	kept := strings.Fields(w.git(w.repo, "for-each-ref", "--format=%(objectname)", ledger.DisplacedPrefix))
+	if len(kept) != 1 || kept[0] != forged {
+		t.Fatalf("the replaced repository copy was not kept: %v", kept)
+	}
 	if got := titles(w.jsonOK(w.repo, nil, "list")); len(got) != 2 || strings.Contains(strings.Join(got, ","), "FORGED") {
 		t.Fatalf("after the next write: %v", got)
 	}
@@ -1148,6 +1167,32 @@ func TestOwnWriterReadFromHomeMirror(t *testing.T) {
 	}
 	if got := strings.TrimSpace(w.git(w.repo, "rev-parse", ref)); got != mtip() {
 		t.Fatal("the next write did not replace the repository copy with the mirror's ref")
+	}
+}
+
+// Delta review of 14efd89: once projects.json is published, a failed first fold is a warning and the new
+// ledger's HOME directory (its store of record) is kept.
+func TestInitKeepsHomeAfterPublication(t *testing.T) {
+	w := newWorld(t)
+	r := w.run(w.repo, []string{ledger.FailFirstFoldEnv + "=1"}, "tickets", "init", "--slug", "kept", "--json")
+	if r.code != 0 || !strings.Contains(r.stderr, "first view could not be built") {
+		t.Fatalf("init: exit %d stderr %s", r.code, r.stderr)
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(r.stdout), &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(w.home, ".agent-harness", "ledgers", m["project"].(string), "mirror.git")); err != nil {
+		t.Fatalf("the store of record was removed: %v", err)
+	}
+	w.newTicket(w.repo, nil, "works")
+	// Control: a refused init (nothing published) leaves no HOME directory behind.
+	before, _ := os.ReadDir(filepath.Join(w.home, ".agent-harness", "ledgers"))
+	if r := w.run(w.repo, nil, "tickets", "init", "--slug", "again"); r.code == 0 {
+		t.Fatal("second init accepted")
+	}
+	if after, _ := os.ReadDir(filepath.Join(w.home, ".agent-harness", "ledgers")); len(after) != len(before) {
+		t.Fatalf("a refused init left a HOME directory: %d -> %d", len(before), len(after))
 	}
 }
 

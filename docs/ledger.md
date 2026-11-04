@@ -86,8 +86,11 @@ ambiguous.
   overwritten with a copy. Every `self` writer, including one restored by `init --from-mirror`,
   is read from the mirror, never from the repository. Ops added to the repository's copy (for
   example in a `.git` that left this account and came back) are neither shown nor built on, and
-  the next write replaces that copy. A restored clone keeps up while the original checkout goes
-  on writing. If the copy into the repository fails, the write still succeeds with a warning.
+  the next write replaces that copy. A replaced copy that differed from the mirror is kept,
+  never folded, under `refs/goodqa-displaced/v1/<proj>/<writer>/<ns>` and the write warns;
+  inspect it with `git log -p <that ref>` and delete it with `git update-ref -d` when done. A
+  restored clone keeps up while the original checkout goes on writing. If the copy into the
+  repository fails, the write still succeeds with a warning.
   Without a mirror (it could not be created, or was removed) the repository is the only store
   and every write warns. A new writer is registered before `writer.json` records it; if
   registration fails, nothing is saved and the next command tries again.
@@ -99,8 +102,10 @@ ambiguous.
   sign (`--no-gpg-sign`), never auto-gc, never prompt and ignore commit-graph files; every
   pack commit must name the parent the chain walk found, so `info/grafts` cannot reshape a ref.
   Only the local `file` transport is allowed. The copy into the repository is a push run inside
-  the mirror with the mirror's own configuration (the repository side runs `receive-pack` with
-  hooks and auto-gc off), so a repository's `url.*.insteadOf` cannot redirect ledger data. Pack commits use a fixed identity
+  the mirror with the mirror's own configuration, so a repository's `url.*.insteadOf` cannot
+  redirect ledger data. The repository side runs `receive-pack` with hooks, auto-gc,
+  non-fast-forward refusal and alternates advertisement off, and `core.alternateRefsCommand`
+  pinned to a no-op. Pack commits use a fixed identity
   (`goodqa-ledger <ledger@goodqa.invalid>`).
 
 ## Layout

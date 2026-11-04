@@ -166,8 +166,9 @@ func Init(loc Location, o InitOptions) (*Ledger, error) {
 	err = l.initLocked(rootID, now, o)
 	lk.Close()
 	if err != nil {
-		if inRepo {
-			// The project id is new, so nothing else uses its HOME directory: do not leave it behind.
+		if _, perr := l.Dir.ReadRegular(projectsFile, 64*1024); inRepo && errors.Is(perr, fs.ErrNotExist) {
+			// Nothing was published, and the project id is new, so nothing else uses its HOME directory:
+			// do not leave it behind.
 			if mdir, merr := MirrorDir(project); merr == nil {
 				os.RemoveAll(filepath.Dir(mdir))
 			}
@@ -215,13 +216,21 @@ func (l *Ledger) initLocked(rootID string, now int64, o InitOptions) error {
 		return err
 	}
 	if mirror != nil {
-		l.syncRepo(mirror, ref, commit)
+		l.syncRepo(mirror, ref, "", commit)
 	}
 	if err := l.Dir.PublishNew(projectsFile, projectsBody(l.Project, o.Slug)); err != nil {
 		return err
 	}
+	// The ledger exists from here on (and Init must not remove its HOME directory): a failed first fold
+	// is only a warning, the next command folds again.
 	_, err = l.Rebuild()
-	return err
+	if os.Getenv(FailFirstFoldEnv) == "1" && writer.TestHooksAllowed {
+		err = errors.New("test hook: first fold failed")
+	}
+	if err != nil {
+		l.warn = append(l.warn, "ledger created, but its first view could not be built: "+err.Error())
+	}
+	return nil
 }
 
 func initFromMirror(common string, o InitOptions) (*Ledger, error) {

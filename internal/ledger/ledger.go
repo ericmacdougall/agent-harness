@@ -43,6 +43,7 @@ const (
 	CrashAfterCASEnv  = "HARNESS_LEDGER_TEST_CRASH_AFTER_CAS"
 	LockWaitEnv       = "HARNESS_LEDGER_TEST_LOCK_WAIT_MS"
 	ViewBudgetEnv     = "HARNESS_LEDGER_TEST_VIEW_BUDGET"
+	FailFirstFoldEnv  = "HARNESS_LEDGER_TEST_FAIL_FIRST_FOLD"
 	DirName           = "goodqa"
 	projectsFile      = "projects.json"
 	cacheFile         = "view.cache.json"
@@ -72,7 +73,7 @@ func CheckTestEnv() error {
 	if writer.TestHooksAllowed {
 		return nil
 	}
-	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, ViewBudgetEnv, writer.FakeMachineIDEnv} {
+	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, ViewBudgetEnv, FailFirstFoldEnv, writer.FakeMachineIDEnv} {
 		if _, ok := os.LookupEnv(k); ok {
 			return wrap(ErrUsage, "%s is a test-only variable, refused by builds without -tags ledgertest", k)
 		}
@@ -942,7 +943,7 @@ func (l *Ledger) appendLocked(drafts []op.Draft, opts AppendOptions, check func(
 			os.Exit(9) // test hook: simulate a crash between update-ref and the cache write
 		}
 		if mirror != nil {
-			l.syncRepo(mirror, ref, commit)
+			l.syncRepo(mirror, ref, tip, commit)
 		}
 		nv, err := l.View()
 		if err != nil {
@@ -1087,9 +1088,24 @@ func (l *Ledger) homeMirror() *store.Git {
 	return &store.Git{GitDir: mdir}
 }
 
+// DisplacedPrefix holds repository copies of own refs that differed from this HOME's mirror when a write
+// replaced them. They are never folded; they keep such commits reachable for inspection.
+const DisplacedPrefix = "refs/goodqa-displaced/v1/"
+
 // syncRepo copies an own ref from the mirror into the repository, warning (not failing) when it cannot:
-// the ops are safe in the mirror and the copy is retried on the next write.
-func (l *Ledger) syncRepo(mirror *store.Git, ref, tip string) {
+// the ops are safe in the mirror and the copy is retried on the next write. prev is the mirror tip the
+// write built on; a repository copy that is neither prev nor tip (ops added there, or written while the
+// mirror was missing) is kept under DisplacedPrefix before it is replaced.
+func (l *Ledger) syncRepo(mirror *store.Git, ref, prev, tip string) {
+	if cur, err := l.Git.Tip(ref); err == nil && cur != "" && cur != prev && cur != tip {
+		_, w, _ := store.ParseRefName(ref)
+		keep := fmt.Sprintf("%s%s/%s/%d", DisplacedPrefix, l.Project, w, time.Now().UnixNano())
+		if err := l.Git.CAS(keep, cur, ""); err != nil {
+			l.warn = append(l.warn, "the repository copy of this writer's ref differs from this HOME's mirror and could not be kept; not replaced")
+			return
+		}
+		l.warn = append(l.warn, "the repository copy of this writer's ref differed from this HOME's mirror; it was replaced and kept as "+keep)
+	}
 	if err := mirror.PushToRepo(l.Root, ref, tip); err != nil {
 		l.warn = append(l.warn, "repository copy of the ledger ref not updated (ops are safe in this HOME's mirror): "+err.Error())
 	}

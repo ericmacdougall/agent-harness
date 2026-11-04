@@ -15,13 +15,19 @@ import (
 // The transfer runs as a push from inside the mirror, so only the mirror's own configuration (created by
 // init, hooks off) applies: the repository's config, including any url.*.insteadOf or pushInsteadOf
 // rewrite, is never consulted for where the data goes. The repository side only runs receive-pack, with
-// hooks and auto-gc off.
+// hooks, auto-gc, non-fast-forward refusal and alternates advertisement off, and core.alternateRefsCommand
+// pinned.
 func (g *Git) PushToRepo(repo, ref, want string) error {
 	if !filepath.IsAbs(repo) || !filepath.IsAbs(g.GitDir) {
 		return errors.New("mirror and repository paths must be absolute")
 	}
 	_, err := g.run(TransportTimeout, nil, nil, "push", "--quiet", "--no-verify", "--porcelain",
-		"--receive-pack=git -c core.hooksPath="+gitx.DevNull+" -c receive.autogc=false receive-pack", repo, "+"+ref+":"+ref)
+		"--receive-pack=git -c core.hooksPath="+gitx.DevNull+" -c receive.autogc=false -c receive.denyNonFastForwards=false"+
+			" -c receive.denyDeletes=false -c receive.advertiseAlternates=false -c receive.fsckObjects=false"+
+			// receive-pack's connectivity check walks alternates' refs with this command (inherited by its
+			// rev-list): pin it to one that lists nothing.
+			" -c core.alternateRefsCommand=true receive-pack",
+		repo, "+"+ref+":"+ref)
 	r := &Git{GitDir: repo}
 	got, terr := r.Tip(ref)
 	if terr != nil {
