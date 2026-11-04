@@ -46,10 +46,10 @@ func install(t *testing.T, name string) string {
 		if err != nil {
 			return err
 		}
-		// The placeholder sits inside JSON strings, so substitute the escaped form
-		// (Windows paths carry backslashes).
-		quoted, _ := json.Marshal(dir)
-		data = bytes.ReplaceAll(data, []byte("@DATADIR@"), quoted[1:len(quoted)-1])
+		// The placeholder sits inside JSON strings, so substitute the escaped form.
+		// The fixtures were written on Linux; 0.1.0 joins with the host separator.
+		quoted, _ := json.Marshal(filepath.Join(dir, attachmentsDirName) + string(filepath.Separator))
+		data = bytes.ReplaceAll(data, []byte("@DATADIR@/attachments/"), quoted[1:len(quoted)-1])
 		target := filepath.Join(dir, rel)
 		if err = os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 			return err
