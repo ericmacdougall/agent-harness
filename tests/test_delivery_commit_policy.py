@@ -5,6 +5,7 @@ import shutil
 import sys
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 
 import test_delivery_workflow as workflow
 from commit_messages import message
@@ -77,6 +78,17 @@ class TicketDelivery(workflow.DeliveryWorkflow):
         self.assertEqual((code, report['status'], report['ticket_updates']['status']),
                          (5, 'ALREADY_DELIVERED', 'PENDING'), report)
         self.assertIn('notify', report['ticket_updates']['retry'])
+
+    def test_missing_policy_record_is_never_skipped_silently(self):
+        self.fake.comment(self.issue, f'Implemented in {self.head[:10]}', datetime.now(timezone.utc))
+        code, report = self.run_deliver(*self.prepare_args(), '--local-only')
+        self.assertEqual((code, report['status']), (0, 'LOCAL_READY'), report)
+        record = Path(report['state']).parent / 'commit-policy.json'
+        self.assertTrue(record.exists())
+        record.unlink()  # simulate a crash between state creation and the record write
+        code, report = self.run_deliver(*self.finish_args(mode='local'))
+        self.assertEqual((code, report['status'], report['ticket_updates']['status']),
+                         (5, 'LOCAL_DELIVERED', 'PENDING'), report)
 
     def test_missing_ticket_blocks(self):
         self.fake.issues.clear()

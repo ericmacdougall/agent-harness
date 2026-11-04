@@ -160,6 +160,12 @@ class ShellAnalysis(unittest.TestCase):
             msg_hd(GOOD): GOOD,
             "git commit --fixup HEAD~1": "fixup! HEAD~1",
             "gh pr merge 3 --squash --subject 's' --body 'b'": "s\n\nb",
+            "bash <<'EOF'\ngit commit -m wip\nEOF": "wip",
+            "sh -s <<'EOF'\ncd /tmp && git commit -m wip\nEOF": "wip",
+            "bash -l -c 'git commit -m wip'": "wip",
+            "bash -xc 'git commit -m wip'": "wip",
+            "sh -euc 'git commit -m wip'": "wip",
+            "timeout 30 git commit -m wip": "wip",
         }
         for command, expected in cases.items():
             with self.subTest(command):
@@ -178,7 +184,10 @@ class ShellAnalysis(unittest.TestCase):
                         "git commit -m \"$(git log -1 --format=%B)\"", "eval git commit -m x",
                         "git commit -m \"$(cat <<EOF\n$HOME\nEOF\n)\"", "git commit -m 'unterminated",
                         "git commit-tree HEAD^{tree} -m x", "gh pr merge 3 --squash",
-                        "git commit --allow-empty-message -m ''", "bash -c \"$CMD\" && git commit"):
+                        "git commit --allow-empty-message -m ''", "bash -c \"$CMD\" && git commit",
+                        "git -c alias.ci=commit ci -m wip", "xargs -I{} git commit -m {}",
+                        "find . -name x -exec git commit -m wip \\;", "parallel git commit -m ::: a", "sudo -u eric git commit -m wip",
+                        "cd \"$REPO\" && git commit -F msg.txt"):
             with self.subTest(command):
                 with self.assertRaises(cp.Unresolvable):
                     cp.analyze(command, self.dir)
@@ -197,6 +206,9 @@ class RemoteShell(unittest.TestCase):
             "ssh t2 'ssh dev2 \"git commit -m wip\"'": "wip",
             "ssh dev2 'bash -lc \"cd r && git commit -m wip\"'": "wip",
             "ssh dev2 bash -s <<'EOF'\ncd r && git commit -m wip\nEOF": "wip",
+            "ssh -qi ~/.ssh/k dev2 git commit -m wip": "wip",
+            "ssh -tp 22 dev2 'git commit -m wip'": "wip",
+            "ssh -o BatchMode=yes -J t2 dev2 'git commit -m wip'": "wip",
             "ssh dev2 'cd r && git commit -F - <<\"MSG\"\n" + GOOD + "\nMSG'": GOOD,
         }
         for command, expected in cases.items():
@@ -379,7 +391,9 @@ class GitHubRoute(Fixture):
         bin_dir = self.root / "bin"
         bin_dir.mkdir(exist_ok=True)
         script = bin_dir / "gh"
+        calls = self.root / "gh-calls.txt"
         script.write_text("#!" + sys.executable + "\nimport sys\nargs=sys.argv[1:]\n"
+                          f"open({str(calls)!r}, 'a').write(' '.join(args) + '\\n')\n"
                           "if '--jq' in args: print('main')\n"
                           f"elif 'compare/' in args[1]: print(open({str(state)!r}).read())\n"
                           "else: sys.exit(1)\n")
@@ -410,6 +424,10 @@ class GitHubRoute(Fixture):
         cli = self.run_cli("check-github", "--repo", "ericmacdougall/demo", "--base", "main", "--head", "feat/x",
                            extra_env=bad)
         self.assertEqual(cli.returncode, 2, cli.stdout + cli.stderr)
+        fork = self.run_cli("check-github", "--repo", "ericmacdougall/demo", "--base", "main", "--head",
+                            "someone:feat/x", "--no-tickets", extra_env=bad)
+        self.assertEqual(fork.returncode, 2, fork.stdout + fork.stderr)
+        self.assertIn("main...someone:feat/x", (self.root / "gh-calls.txt").read_text())
 
     def test_unpushed_branch_fails_closed(self):
         env = self.fake_gh([])
@@ -437,6 +455,42 @@ class PeerReviewGate(Fixture):
         self.assertEqual(peer_review.commit_policy_gate(self.repo, None)[0], 0, "no origin: nothing to publish")
 
 
+class InspectionRegressions(Fixture):
+    def test_git_alias_in_config_fails_closed(self):
+        git("config", "alias.ci", "commit", cwd=self.repo, env=self.env)
+        with self.assertRaises(cp.Unresolvable):
+            cp.analyze("git ci -m wip", str(self.repo))
+        git("config", "alias.st", "status", cwd=self.repo, env=self.env)
+        self.assertEqual(cp.analyze("git st && git log --grep commit", str(self.repo)), [])
+
+    def test_unknown_repo_requires_tickets(self):
+        none_feat = sub(GOOD, "GoodQA #14151", "none (no tracker reason given)")
+        payload = {"session_id": "sess-1", "cwd": str(self.repo),
+                   "tool_input": {"command": 'cd "$REPO" && ' + msg_hd(none_feat)}}
+        code, text = cp.run_hook(payload, POLICY)
+        self.assertEqual(code, 2, text)
+        self.assertIn("must reference a ticket", text)
+
+    def test_waiver_without_session_is_ignored(self):
+        old = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
+        self.addCleanup(os.environ.__setitem__, "HOME", old)
+        cp.LEDGER = self.home / ".agent-harness" / "commit-policy" / "waivers.jsonl"
+        self.addCleanup(setattr, cp, "LEDGER", Path.home() / ".agent-harness" / "commit-policy" / "waivers.jsonl")
+        digest = cp.digest("emergency: wip")
+        self.wal.parent.mkdir(parents=True, exist_ok=True)
+        cp.record_waiver(self.wal, "message", digest, "production outage hotfix authorized in GoodQA #14151", POLICY)
+        with_session = {"session_id": "sess-1", "cwd": str(self.repo), "tool_input": {"command": "git commit -m 'emergency: wip'"}}
+        self.assertEqual(cp.run_hook(with_session, POLICY)[0], 0)
+        self.assertEqual(cp.run_hook({**with_session, "session_id": None}, POLICY)[0], 2)
+
+    def test_agent_markers_exclude_codex_home(self):
+        self.assertIn("CODEX_TOOL_CALL_ID", cp.AGENT_MARKERS)
+        self.assertNotIn("CODEX_HOME", cp.AGENT_MARKERS)
+
+
+@unittest.skipUnless((cp.git_version() or (0, 0)) >= (2, 54),
+                     "config-based hooks need git 2.54+ (dev2/T2 run 2.43); the backstop is inactive there")
 class GitBackstop(Fixture):
     def install_hook(self):
         git("config", "--global", "hook.agent-harness-commit-policy.event", "commit-msg", cwd=self.repo, env=self.env)
@@ -457,6 +511,15 @@ class GitBackstop(Fixture):
         self.assertEqual(self.commit("human wip").returncode, 0, "humans are never blocked")
         git("remote", "set-url", "origin", "file:///tmp/fixture.git", cwd=self.repo, env=self.env)
         self.assertEqual(self.commit("fixture wip", agent).returncode, 0, "untracked repos stay silent")
+
+    def test_amend_no_edit_passes_and_codex_home_is_not_an_agent(self):
+        self.install_hook()
+        agent = {**self.env, "CLAUDECODE": "1"}
+        self.assertEqual(self.commit(GOOD, {"CLAUDECODE": "1"}).returncode, 0)
+        amend = subprocess.run(["git", "commit", "-q", "--amend", "--no-edit", "--allow-empty"], cwd=self.repo,
+                               env=agent, capture_output=True, text=True)
+        self.assertEqual(amend.returncode, 0, amend.stderr)
+        self.assertEqual(self.commit("person wip", {"CODEX_HOME": "/Users/x/.codex"}).returncode, 0)
 
     def test_merge_exempt_only_with_merge_head(self):
         self.install_hook()

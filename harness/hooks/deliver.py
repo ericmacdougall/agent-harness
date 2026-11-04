@@ -812,6 +812,14 @@ def _ticket_updates(flow, stage, head, pr_url):
     try:
         record = json.loads(regular_bytes(flow.directory / COMMIT_POLICY_RECORD))
     except (OSError, ValueError, DeliveryError):
+        # No record: an older generation, or a crash between state creation and the record
+        # write. Never skip silently when the delivered commits reference tickets.
+        import commit_policy
+        policy = commit_policy.load_policy()
+        commits = commit_policy.range_commits(str(flow.original), flow.state["baseline"], flow.state["source_head"])
+        if any(commit_policy._commit_refs(c["message"], policy) for c in commits):
+            return {"status": "PENDING", "reason": "commit-policy record missing; review the referenced tickets "
+                    "and post delivery evidence with commit_policy.py notify"}
         return {"status": "NOT_APPLICABLE", "reason": "generation predates the commit policy"}
     if record.get("generation") != flow.generation or not record.get("tickets"):
         return {"status": "NOT_APPLICABLE", "reason": "no referenced tickets"}

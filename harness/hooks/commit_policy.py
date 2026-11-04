@@ -668,6 +668,9 @@ def resolve_commit(args, cwd, stdin_body, facts):
             parts.append(stdin_body)
         else:
             path = Path(os.path.expanduser(opts["file"]))
+            if not path.is_absolute() and not cwd:
+                raise Unresolvable(f"the working directory is not known statically, so the relative message file "
+                                   f"{opts['file']} cannot be located; use an absolute -F path")
             path = path if path.is_absolute() else Path(cwd) / path
             try:
                 info = path.stat()
@@ -765,11 +768,37 @@ def _gh_create(args, cwd, remote):
     return values
 
 
-WRAPPERS = {"env", "command", "exec", "time", "nohup", "nice", "builtin"}
+WRAPPERS = {"env", "command", "exec", "time", "nohup", "nice", "builtin", "caffeinate", "timeout",
+            "gtimeout", "stdbuf", "ionice", "chronic"}
+TEXT_TOOLS = {"echo", "printf", "grep", "egrep", "rg", "ag", "awk", "sed", "cat", "less", "man", "head", "tail"}
 SHELLS = {"bash", "sh", "zsh", "dash"}
 
 
 SSH_ARG_OPTIONS = set("BbcDEeFIiJLlmOoPpQRSWw")
+GIT_KNOWN = {"add", "am", "apply", "bisect", "blame", "branch", "checkout", "cherry-pick", "clean", "clone",
+             "commit", "commit-tree", "config", "diff", "fetch", "for-each-ref", "grep", "init", "log", "ls-files",
+             "ls-remote", "merge", "merge-base", "mv", "notes", "pull", "push", "rebase", "reflog", "remote", "reset",
+             "restore", "rev-list", "rev-parse", "revert", "rm", "show", "show-ref", "stash", "status", "switch",
+             "symbolic-ref", "tag", "update-ref", "worktree", "cat-file", "describe", "shortlog", "lfs", "submodule",
+             "sparse-checkout", "gc", "fsck", "bundle", "archive", "format-patch", "range-diff", "hash-object",
+             "write-tree", "read-tree", "update-index", "help", "version", "var", "check-ignore", "count-objects"}
+
+
+def _shell_script(argv, stdin_body):
+    """(script text, dynamic) for `bash [-opts]c 'script'`, `bash -s`/`bash` reading a heredoc."""
+    i = 1
+    while i < len(argv):
+        word = argv[i][1]
+        if word.startswith("--"):
+            i += 1
+            continue
+        if word.startswith("-") and len(word) > 1:
+            if "c" in word[1:]:
+                return (argv[i + 1][1], argv[i + 1][2]) if i + 1 < len(argv) else None
+            i += 1
+            continue
+        return None  # a script file: invisible here; the closing rule judges the segment
+    return (stdin_body, False) if stdin_body else None
 
 
 def _ssh_remote(argv, stdin_body, bodies):
@@ -782,8 +811,14 @@ def _ssh_remote(argv, stdin_body, bodies):
             break
         if not word.startswith("-") or word == "-":
             break
-        flag = word[1:2]
-        i += 1 if (flag not in SSH_ARG_OPTIONS or len(word) > 2) else 2
+        i += 1
+        # Grouped flags (-qi key, -tp 22): a value-taking letter consumes the rest of the
+        # group, or the next argument when it is the last letter.
+        for position, letter in enumerate(word[1:], 1):
+            if letter in SSH_ARG_OPTIONS:
+                if position == len(word) - 1:
+                    i += 1
+                break
     if i >= len(argv):
         return None
     host, rest = argv[i][1], argv[i + 1:]
@@ -828,9 +863,18 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
         while argv and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0][1]):
             argv = argv[1:]
         while argv and os.path.basename(argv[0][1]) in WRAPPERS:
+            wrapper = os.path.basename(argv[0][1])
             argv = argv[1:]
             while argv and (argv[0][1].startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0][1])):
                 argv = argv[1:]
+            if wrapper in ("timeout", "gtimeout") and argv and re.match(r"^\d+(?:\.\d+)?[smhd]?$", argv[0][1]):
+                argv = argv[1:]
+        # Closing rule: a git commit handed to another program (xargs, find -exec, parallel,
+        # a script runner) cannot be seen; refuse instead of silently allowing it.
+        names = [os.path.basename(w[1]) for w in argv]
+        if argv and names[0] not in ("git", "gh", "ssh", *SHELLS, *TEXT_TOOLS) and "git" in names[1:] \
+                and "commit" in names[names.index("git", 1):]:
+            raise Unresolvable(f"git commit run through {names[0]} cannot be checked; run git commit directly")
         if not argv:
             continue
         name = os.path.basename(argv[0][1])
@@ -841,12 +885,12 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                 target = os.path.expanduser(argv[1][1])
                 cwd = target if os.path.isabs(target) else (os.path.join(cwd, target) if cwd else None)
             continue
-        if name in SHELLS and len(argv) >= 3 and argv[1][1] in ("-c", "-lc", "-ec"):
-            inner = argv[2]
-            if re.search(r"\b(?:commit|revert|merge)\b", inner[1]):
-                if inner[2]:
-                    raise Unresolvable(f"{name} -c with a dynamic script cannot be checked")
-                found.extend(analyze(expand(inner[1], bodies), cwd, depth + 1, remote))
+        if name in SHELLS:
+            script = _shell_script(argv, stdin_body)
+            if script is not None and re.search(r"\b(?:commit|revert|merge|pr)\b", script[0]):
+                if script[1]:
+                    raise Unresolvable(f"{name} with a dynamic script cannot be checked")
+                found.extend(analyze(expand(script[0], bodies), cwd, depth + 1, remote))
             continue
         if name == "ssh":
             target = _ssh_remote(argv, stdin_body, bodies)
@@ -889,7 +933,14 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                 break
         if i >= len(argv):
             continue
+        if any(argv[k][1].startswith("alias.") or argv[k][1].startswith("--config-env")
+               for k in range(1, i)):
+            raise Unresolvable("git -c alias... defines an alias the policy cannot follow; run git commit directly")
         sub = argv[i][1]
+        if sub not in GIT_KNOWN and repo and not remote:
+            alias = git(repo, "config", "--get", f"alias.{sub}", check=False).strip()
+            if alias and (alias.startswith("!") or re.search(r"\b(?:commit|commit-tree|revert|merge)\b", alias)):
+                raise Unresolvable(f"git {sub} is an alias for '{alias[:60]}'; run the git command directly")
         rest = argv[i + 1:]
         if sub == "commit":
             if any(w[2] for w in rest):
@@ -904,10 +955,11 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                                        "another commit), which cannot be checked from here; pass it inline: "
                                        "ssh host 'cd repo && git commit -F - <<\"EOF\"' with the message, or -m")
             facts = repo_facts(repo) if repo and not remote else None
-            message, context = resolve_commit(values, repo or ".", stdin_body, facts)
+            message, context = resolve_commit(values, repo, stdin_body, facts)
             if message is not None:
                 context["facts"] = facts
                 context["remote"] = remote
+                context["unknown_repo"] = repo is None
                 found.append((message, repo, context))
         elif sub == "revert":
             flags = {w[1] for w in rest}
@@ -1070,11 +1122,11 @@ def run_hook(payload: dict, policy: dict) -> tuple:
                             allow_autosquash=bool(facts and not facts["published"]
                                                   and facts["branch"] not in ("main", "master", "")),
                             tickets_required=(bool(policy.get("remote_tickets_required", True))
-                                              if context.get("remote")
+                                              if context.get("remote") or context.get("unknown_repo")
                                               else tickets_required_for(facts and facts["origin"], policy)))
         if problems:
             subject = digest(message)
-            if find_waiver("message", subject, policy, session_dir=session_dir):
+            if session_dir is not None and find_waiver("message", subject, policy, session_dir=session_dir):
                 continue
             text = block_text(problems, message, policy, wal=wal, subject=subject)
             if policy.get("enforcement") == "warn":
@@ -1085,8 +1137,7 @@ def run_hook(payload: dict, policy: dict) -> tuple:
 
 def _check_pr_create(target, policy, session_dir):
     """gh pr create publishes: check the branch range on GitHub and the PR text first."""
-    slug, head = target["repo"], target["head"]
-    head = head.split(":", 1)[-1]
+    slug, head = target["repo"], target["head"]  # keep owner:branch for forks
     base = target["base"]
     try:
         if base is None:
@@ -1131,9 +1182,13 @@ def command_text(tool_input) -> str:
     return ""
 
 
+# CODEX_HOME is deliberately absent: users export it in shell profiles, so it does not
+# distinguish an agent from a person.
+AGENT_MARKERS = ("CLAUDECODE", "CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_SANDBOX", "AI_AGENT")
+
+
 def agent_environment() -> bool:
-    return any(os.environ.get(name) for name in ("CLAUDECODE", "CODEX_THREAD_ID", "CODEX_SANDBOX",
-                                                  "CODEX_HOME", "AI_AGENT"))
+    return any(os.environ.get(name) for name in AGENT_MARKERS)
 
 
 def run_git_hook(path: str, policy: dict) -> tuple:
@@ -1150,8 +1205,11 @@ def run_git_hook(path: str, policy: dict) -> tuple:
         message = normalize(Path(path).read_text(encoding="utf-8", errors="replace"), strip_comments=True)
     except OSError:
         return 1, "commit-policy: cannot read the commit message file"
-    amending = os.environ.get("GIT_REFLOG_ACTION", "").startswith("commit (amend)")
-    problems = validate(message, policy=policy, previous=facts["parent"] if amending else facts["head"],
+    # git does not tell commit-msg hooks about --amend. A message equal to HEAD's is
+    # most likely an amend --no-edit, so compare with the parent; the PreToolUse hook
+    # and the publication range check still catch true consecutive duplicates.
+    same_as_head = facts["head"] is not None and normalize(facts["head"]) == message
+    problems = validate(message, policy=policy, previous=facts["parent"] if same_as_head else facts["head"],
                         is_merge=facts["merging"],
                         allow_autosquash=not facts["published"] and facts["branch"] not in ("main", "master", ""),
                         tickets_required=tickets_required_for(facts["origin"], policy))
@@ -1212,16 +1270,25 @@ def check_github(slug, base, head, policy, *, verify_tickets=True, adapters=None
         return {"base": base, "head": head, "commits": [], "tickets": [], "waivers": [], "status": "PASS",
                 "enforcement": "off"}
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", slug or "") or not all(
-            re.fullmatch(r"[\w./-]+", item or "") and ".." not in item for item in (base, head)):
+            re.fullmatch(r"[\w./:-]+", item or "") and ".." not in item for item in (base, head)):
         raise ValueError("invalid repository, base or head name")
-    result = subprocess.run(["gh", "api", f"repos/{slug}/compare/{base}...{head}?per_page=250"],
-                            capture_output=True, timeout=timeout)
-    if result.returncode:
-        raise OSError("GitHub compare failed (is the branch pushed? is gh authenticated?)")
-    data = json.loads(result.stdout)
-    items = data.get("commits") or []
-    if int(data.get("total_commits", len(items))) > len(items):
-        raise OSError("range exceeds 250 commits; check it locally with check-range")
+    items, total, page = [], None, 1
+    while total is None or len(items) < total:
+        result = subprocess.run(["gh", "api", f"repos/{slug}/compare/{base}...{head}?per_page=100&page={page}"],
+                                capture_output=True, timeout=timeout)
+        if result.returncode:
+            raise OSError("GitHub compare failed (is the branch pushed? is gh authenticated?)")
+        data = json.loads(result.stdout)
+        batch = data.get("commits") or []
+        total = int(data.get("total_commits", len(batch)))
+        if total > 1000:
+            raise OSError("range exceeds 1000 commits; check it locally with check-range")
+        items.extend(batch)
+        if not batch:
+            break
+        page += 1
+    if len(items) < (total or 0):
+        raise OSError("GitHub compare returned fewer commits than it reported")
     commits = []
     for item in items:
         def stamp(value):
@@ -1232,7 +1299,7 @@ def check_github(slug, base, head, policy, *, verify_tickets=True, adapters=None
                         "message": item["commit"]["message"]})
     return evaluate(commits, policy, base=base, head=commits[-1]["sha"] if commits else head, exclude=(),
                     previous=None, tickets_required=tickets_required_for(f"https://github.com/{slug}", policy),
-                    branch=head, pr=None, verify_tickets=verify_tickets, adapters=adapters)
+                    branch=head.split(":", 1)[-1], pr=None, verify_tickets=verify_tickets, adapters=adapters)
 
 
 def evaluate(commits, policy, *, base, head, exclude, previous, tickets_required, branch, pr,
