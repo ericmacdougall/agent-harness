@@ -660,7 +660,8 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
         latest = tests[-1] if tests else None
         if latest is None:
             missing.append("click-test: none recorded. Fix: spec_flow.py click-test --ticket '<ref>' --agent-id <id> "
-                           "--wal-dir <session WAL dir> --url <url> --result pass --report <click-tester report> --log <file>")
+                           "--wal-dir <session WAL dir> --url <url> --deployed-commit <sha> --repo <checkout> --result pass "
+                           "--report <click-tester report> --log <file>")
         elif latest.get("result") != "pass":
             missing.append("click-test: the latest click-test failed; fix and record a new passing click-test")
         elif not any(a.get("role") in ("log", "report") for a in latest.get("attachments") or []):
