@@ -138,6 +138,27 @@ class Classification(unittest.TestCase):
                 self.assertEqual(decide(command), {"action": "allow"})
             self.assertLess(time.time() - start, 5)
 
+    def test_deny_message_names_the_hatch_and_dev2_for_every_enforced_rule(self):
+        for command in ("pytest", "npm run build", "npx playwright test"):
+            result = decide(command)
+            self.assertEqual(result["action"], "deny", command)
+            self.assertIn("HARNESS_LOCAL_OK", result["message"], command)
+            self.assertIn("ssh dev2", result["message"], command)
+            self.assertIn("dev2", result["message"])
+
+    def test_guard_is_a_noop_off_the_mac_and_ssh_dev2_is_allowed_on_it(self):
+        import io
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "pytest"}, "session_id": "s"})
+        with unittest.mock.patch.object(sys, "platform", "linux"), unittest.mock.patch.dict(
+                os.environ, {"HARNESS_HEAVY_GUARD_FORCE": ""}), unittest.mock.patch.object(sys, "stdin", io.StringIO(payload)):
+            self.assertEqual(guard.main(), 0)  # dev2/Linux: nothing is ever denied
+        with unittest.mock.patch.object(sys, "platform", "darwin"), unittest.mock.patch.object(sys, "stdin", io.StringIO(payload)), \
+                unittest.mock.patch.object(guard, "log_event"), unittest.mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(guard.main(), 2)  # the same command on the Mac is denied
+        ssh = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ssh dev2 'cd repo && pytest && npm run build'"}, "session_id": "s"})
+        with unittest.mock.patch.object(sys, "platform", "darwin"), unittest.mock.patch.object(sys, "stdin", io.StringIO(ssh)):
+            self.assertEqual(guard.main(), 0)
+
     def test_redteam_f1_most_severe_finding_wins(self):
         self.assertEqual(decide("ffmpeg -i a b; npx playwright test")["action"], "deny")
         self.assertEqual(decide("xargs -P 9 python3 x; pytest")["action"], "deny")

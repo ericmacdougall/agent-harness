@@ -5,8 +5,8 @@ Counts live agents from the session WAL (plus slot reservations for spawns whose
 taken under flock so a burst of parallel spawns cannot all see zero live): an agent is live when it has a `subagent`
 record, no `subagent_stop`, and its WAL showed activity inside LIVE_WINDOW_S (the stop
 hook does not fire for every agent, so recent activity is the liveness signal).
-Default ceiling is 8 concurrent agents per session, configurable with
-HARNESS_MAX_AGENTS or {"max_agents": N} in resource_limits.json beside this file.
+Thresholds live in resource_limits.json beside this file: warn at {"warn_agents": 12} concurrent agents
+(advisory context, the spawn proceeds) and deny at {"max_agents": 20}. HARNESS_MAX_AGENTS overrides the deny limit.
 The denial tells the caller to queue the work or move it to dev2 (where heavy jobs
 belong). Fails OPEN on any error; register WITHOUT onFailure=block. Only acts on macOS
 (HARNESS_HEAVY_GUARD_FORCE=1 overrides for tests). Stdlib only, Python 3.9 compatible.
@@ -19,21 +19,27 @@ import sys
 import uuid
 from datetime import datetime, timezone
 
-DEFAULT_MAX_AGENTS = 8
+DEFAULT_MAX_AGENTS = 20  # deny; the replay of a real session showed 8 would block legitimate parallel owners
+DEFAULT_WARN_AGENTS = 12
 LIVE_WINDOW_S = 600
 RESERVE_TTL_S = 120  # a spawn is reserved here until its `subagent` start record appears (burst safety)
 
 
 def limits():
-    value = DEFAULT_MAX_AGENTS
+    """(warn, deny) thresholds from resource_limits.json; the file wins over code defaults."""
+    warn_at, deny_at = DEFAULT_WARN_AGENTS, DEFAULT_MAX_AGENTS
     try:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource_limits.json")
         if os.path.exists(path):
-            value = int(json.load(open(path)).get("max_agents", value))
+            data = json.load(open(path))
+            deny_at = int(data.get("max_agents", deny_at))
+            warn_at = int(data.get("warn_agents", warn_at))
     except (OSError, ValueError, TypeError):
         pass
     env = os.environ.get("HARNESS_MAX_AGENTS", "")
-    return int(env) if env.isdigit() and int(env) > 0 else value
+    if env.isdigit() and int(env) > 0:
+        deny_at = int(env)
+    return min(warn_at, deny_at), deny_at
 
 
 def _ts(text):
@@ -116,11 +122,14 @@ def reserve(session_id: str, now: float, state_root: str, wal_dir: str, live: in
         return total
 
 
-def decide(session_id: str, now: float = None, wal_root: str = None, max_agents: int = None, state_root: str = None):
+def decide(session_id: str, now: float = None, wal_root: str = None, max_agents: int = None, state_root: str = None,
+           warn_agents: int = None):
     now = now if now is not None else datetime.now(timezone.utc).timestamp()
     root = wal_root or os.path.join(os.path.expanduser("~"), ".claude", "wals")
     wal_dir = os.path.join(root, os.path.basename(session_id))
-    ceiling = max_agents or limits()
+    warn_at, ceiling = limits()
+    ceiling = max_agents or ceiling
+    warn_at = warn_agents if warn_agents is not None else min(warn_at, ceiling)
     live_ids = live_agents(wal_dir, now) if os.path.isdir(wal_dir) else []
     state = state_root or os.path.join(os.path.expanduser("~"), ".agent-harness", "state")
     try:
@@ -133,6 +142,10 @@ def decide(session_id: str, now: float = None, wal_root: str = None, max_agents:
                 "message": (f"Agent gate: {total} agents are already live in this session (limit {ceiling}). Queue this work "
                             "until one finishes, resume an existing owner with SendMessage instead of spawning, or move heavy "
                             "work to dev2. The Mac is the fragile host: unbounded fan-out reset it on 2026-11-04.")}
+    if total >= warn_at:
+        return {"action": "warn", "live": total, "max": ceiling,
+                "message": (f"Agent gate (warning): {total} agents are live in this session (deny at {ceiling}). Prefer resuming an "
+                            "existing owner with SendMessage, queue independent work, and run heavy jobs on dev2.")}
     return {"action": "allow", "live": total}
 
 
@@ -155,6 +168,8 @@ def main() -> int:
         if result["action"] == "deny":
             sys.stderr.write(result["message"] + "\n")
             return 2
+        if result["action"] == "warn":
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": result["message"]}}))
         return 0
     except Exception as error:  # fail open
         sys.stderr.write(f"agent_gate: warning: {type(error).__name__}; failing open\n")

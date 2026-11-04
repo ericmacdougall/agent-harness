@@ -119,6 +119,29 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual((self.claude / "CLAUDE.md").read_text().count(START), 1)
         self.assertTrue(list((self.claude / "agent-harness-backups").rglob("settings.json")))
 
+    def test_installs_resource_guards_wiring_and_red_team_idempotently(self):
+        install(self.home, apply=True)
+        for name in ("heavy_job_guard.py", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py",
+                     "resource_limits.json"):
+            self.assertEqual((self.claude / "hooks" / name).read_bytes(), (ROOT / "harness/hooks" / name).read_bytes(), name)
+        self.assertIn("run_probe.py", (self.claude / "agents" / "red-team.md").read_text())
+        settings = json.loads((self.claude / "settings.json").read_text())
+        groups = {tuple(group["hooks"][0].get("args", [""])[:1]): group for group in settings["hooks"]["PreToolUse"]}
+        heavy = groups[(str(self.claude / "hooks" / "heavy_job_guard.py"),)]
+        gate = groups[(str(self.claude / "hooks" / "agent_gate.py"),)]
+        self.assertEqual(heavy["matcher"], "Bash")
+        self.assertEqual(gate["matcher"], "Agent|Task|Workflow")
+        for group in (heavy, gate):  # fail-open: a guard bug must never block every Bash or Agent call
+            self.assertNotIn("onFailure", group["hooks"][0])
+        limits = json.loads((self.claude / "hooks" / "resource_limits.json").read_text())
+        self.assertEqual((limits["warn_agents"], limits["max_agents"]), (12, 20))
+        before = (self.claude / "settings.json").read_bytes()
+        hook_bytes = {n: (self.claude / "hooks" / n).read_bytes() for n in ("heavy_job_guard.py", "agent_gate.py")}
+        install(self.home, apply=True)  # second run changes nothing
+        self.assertEqual((self.claude / "settings.json").read_bytes(), before)
+        self.assertEqual(sum(1 for g in json.loads(before)["hooks"]["PreToolUse"] if g["hooks"][0].get("args", [""])[0].endswith("heavy_job_guard.py")), 1)
+        self.assertEqual(hook_bytes, {n: (self.claude / "hooks" / n).read_bytes() for n in hook_bytes})
+
     def test_tolerates_user_hook_with_empty_args(self):
         (self.claude / "settings.json").write_text(json.dumps(
             {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3", "args": []}]}]}}

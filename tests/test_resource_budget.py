@@ -162,6 +162,26 @@ class AgentGate(unittest.TestCase):
         result = agent_gate.decide("sess", now, root, 8, state_root=root + "/st")
         self.assertEqual((result["action"], result["live"]), ("allow", 3))
 
+    def test_thresholds_come_from_resource_limits_json_warn_12_deny_20(self):
+        warn_at, deny_at = agent_gate.limits()
+        self.assertEqual((warn_at, deny_at), (12, 20))
+        shipped = json.loads((HOOKS / "resource_limits.json").read_text())
+        self.assertEqual((shipped["warn_agents"], shipped["max_agents"]), (12, 20))
+        for live, expected in ((11, "allow"), (12, "warn"), (19, "warn"), (20, "deny")):
+            root, now = self.wal(live=live)
+            result = agent_gate.decide("sess", now, root, state_root=root + "/st")
+            self.assertEqual(result["action"], expected, live)
+        # changing the file (not the code) moves the thresholds
+        home = tempfile.mkdtemp()
+        shutil_dir = Path(home, "hooks")
+        shutil_dir.mkdir()
+        for name in ("agent_gate.py", "heavy_job_guard.py"):
+            Path(shutil_dir, name).write_text((HOOKS / name).read_text())
+        Path(shutil_dir, "resource_limits.json").write_text(json.dumps({"warn_agents": 3, "max_agents": 5}))
+        out = subprocess.run([sys.executable, "-c", "import agent_gate;print(agent_gate.limits())"], cwd=str(shutil_dir),
+                             capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(shutil_dir)))
+        self.assertEqual(out.stdout.strip(), "(3, 5)")
+
     def test_hook_process_denies_and_fails_open(self):
         home = tempfile.mkdtemp()
         wal_dir = Path(home, ".claude", "wals", "sess")
@@ -175,6 +195,7 @@ class AgentGate(unittest.TestCase):
 
         def run(stdin):
             return subprocess.run([sys.executable, str(HOOKS / "agent_gate.py")], input=stdin, capture_output=True, text=True, env=env)
+        env["HARNESS_MAX_AGENTS"] = "8"  # 9 live agents in the fixture; the shipped default is 20
         denied = run(json.dumps({"tool_name": "Agent", "session_id": "sess", "tool_input": {}}))
         self.assertEqual(denied.returncode, 2)
         self.assertIn("limit 8", denied.stderr)
