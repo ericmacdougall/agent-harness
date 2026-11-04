@@ -197,7 +197,9 @@
       "repos": [
         "github\\.com[:/]ericmacdougall/"
       ],
-      "on_deployed_status": null
+      "on_deployed_status": null,
+      "unreachable_projects": "warn",
+      "unreachable_reason": "the GoodQA member key reaches the FrameBright org only; Eric-org projects cannot be verified until durable cross-org access lands (set unreachable_projects to block then)"
     }
   },
   "waivers": {

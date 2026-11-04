@@ -25,6 +25,14 @@ class TicketSystemUnavailable(Exception):
     """The ticket system could not be reached or answered unexpectedly."""
 
 
+class TicketOutOfScope(Exception):
+    """The ticket system answered, but this credential cannot see the ticket's project.
+
+    Distinct from "ticket missing": a project in another organisation (for example the
+    Eric org while the member key reaches FrameBright only) cannot be verified at all.
+    """
+
+
 class Ticket:
     def __init__(self, system, project, number, ticket_id, title, status, url=None):
         self.system, self.project, self.number = system, project, number
@@ -148,6 +156,9 @@ class GoodQAAdapter:
                                                  "number": int(number)})
         if data.get("__error__") == "not_found":
             return None
+        if data.get("__error__") == "project_not_found":
+            raise TicketOutOfScope(f"GoodQA project {project!r} is not visible to this credential "
+                                   f"(org {self.org_id()})")
         if "__error__" in data:
             raise TicketSystemUnavailable(f"GoodQA lookup failed ({data['__error__']})")
         issue = data.get("issue", data)

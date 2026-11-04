@@ -623,6 +623,7 @@ class FakeGoodQA:
 
     def __init__(self):
         self.issues, self.comments, self.posted, self.fail = {}, {}, [], None
+        self.projects = {"goodqa"}
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -658,6 +659,8 @@ class FakeGoodQA:
         if name == "list_orgs":
             return {"orgs": [{"id": "org-1"}]}, None
         if name == "get_issue_by_number":
+            if args["projectSlug"] not in self.projects:
+                return None, "project_not_found"
             issue = self.issues.get((args["projectSlug"], args["number"]))
             return (issue, None) if issue else (None, "not_found")
         if name == "get_issue_comments":
@@ -778,6 +781,43 @@ class TicketVerification(Fixture):
         failed = cp.notify(str(self.repo), self.base, self.head, self.policy, operation_seed="gen-2",
                            evidence="x")
         self.assertEqual(failed[0]["status"], "FAILED")
+
+    def out_of_scope_head(self):
+        self.assertEqual(self.commit(sub(GOOD, "GoodQA #14151", "GoodQA eric-app#7")).returncode, 0)
+        self.head = git("rev-parse", "HEAD", cwd=self.repo, env=self.env)
+        self.fake.comment(self.issue, f"see {self.head[:9]}", datetime.now(timezone.utc))
+        self.base = git("rev-parse", "HEAD~1", cwd=self.repo, env=self.env)
+
+    def test_unreachable_project_blocks_by_default(self):
+        self.out_of_scope_head()
+        self.policy["ticket_systems"]["goodqa"].pop("unreachable_projects", None)
+        report = self.check()
+        self.assertEqual((report["status"], report["tickets"][0]["status"]), ("UNVERIFIED", "UNVERIFIED"))
+        self.assertIn("eric-app", report["tickets"][0]["error"])
+
+    def test_unreachable_project_warns_with_logged_reason(self):
+        self.out_of_scope_head()
+        self.policy["ticket_systems"]["goodqa"].update(unreachable_projects="warn",
+                                                       unreachable_reason="member key reaches FrameBright only")
+        report = self.check()
+        self.assertEqual((report["status"], report["tickets"][0]["status"]), ("PASS", "OUT_OF_SCOPE"))
+        self.assertIn("FrameBright only", cp.format_report(report))
+        ledger = self.home / ".agent-harness" / "commit-policy" / "warnings.jsonl"
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        self.assertEqual([(r["kind"], r["ticket"], r["head"]) for r in rows],
+                         [("ticket-out-of-scope", "goodqa:eric-app#7", self.head)])
+        self.assertEqual([r["ticket"] for r in cp.list_warnings(datetime.now(timezone.utc) - timedelta(hours=1))],
+                         ["goodqa:eric-app#7"])
+        results = cp.notify(str(self.repo), self.base, self.head, self.policy, operation_seed="gen-oos",
+                            evidence="x")
+        self.assertEqual([r["status"] for r in results], ["OUT_OF_SCOPE"])
+        self.assertEqual(self.fake.posted, [])
+
+    def test_missing_ticket_in_reachable_project_still_blocks_when_warning(self):
+        self.policy["ticket_systems"]["goodqa"]["unreachable_projects"] = "warn"
+        self.fake.issues.clear()
+        report = self.check()
+        self.assertEqual((report["status"], report["tickets"][0]["status"]), ("BLOCKED", "MISSING"))
 
     def test_credential_file_must_be_private(self):
         key = Path(self.policy["ticket_systems"]["goodqa"]["key_file"])
