@@ -6,9 +6,13 @@
 package pycompat
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,7 +24,10 @@ import (
 // outside the JSON data model.
 var ErrUnsupported = errors.New("pycompat: unsupported value")
 
-// Canonical encodes v. Supported: nil, bool, string, int/int64/uint64, float64, []any, map[string]any.
+// Canonical encodes v. Supported: nil, bool, string, int/int64/uint64, float64, json.Number, []any,
+// map[string]any. Data that came from JSON must be decoded with Decode (UseNumber): plain
+// encoding/json turns the integer 5 into float64 5, which would encode as "5.0" where Python writes "5",
+// and loses integers above 2^53.
 func Canonical(v any) ([]byte, error) {
 	var b strings.Builder
 	if err := encode(&b, v); err != nil {
@@ -50,6 +57,12 @@ func encode(b *strings.Builder, v any) error {
 		b.WriteString(strconv.FormatInt(x, 10))
 	case uint64:
 		b.WriteString(strconv.FormatUint(x, 10))
+	case json.Number:
+		s, err := numberRepr(string(x))
+		if err != nil {
+			return err
+		}
+		b.WriteString(s)
 	case float64:
 		s, err := FloatRepr(x)
 		if err != nil {
@@ -182,4 +195,39 @@ func FloatRepr(f float64) (string, error) {
 		return sign + digits + strings.Repeat("0", exp+1-len(digits)) + ".0", nil
 	}
 	return sign + digits[:exp+1] + "." + digits[exp+1:], nil
+}
+
+// numberRepr renders a JSON number literal the way json.dumps(json.loads(literal)) does: a literal with
+// a fraction or exponent is a Python float, anything else an exact int.
+func numberRepr(lit string) (string, error) {
+	if strings.ContainsAny(lit, ".eE") {
+		f, err := strconv.ParseFloat(lit, 64)
+		if err != nil { // out of range parses to +-Inf in Python, which allow_nan=False rejects
+			return "", fmt.Errorf("%w: number %s", ErrUnsupported, lit)
+		}
+		return FloatRepr(f)
+	}
+	n, ok := new(big.Int).SetString(lit, 10)
+	if !ok {
+		return "", fmt.Errorf("%w: number %s", ErrUnsupported, lit)
+	}
+	return n.String(), nil
+}
+
+// Decode parses one JSON document as Python's json.loads would for Canonical: numbers stay exact
+// (json.Number), invalid UTF-8 and trailing data are rejected.
+func Decode(raw []byte) (any, error) {
+	if !utf8.Valid(raw) {
+		return nil, fmt.Errorf("%w: invalid UTF-8", ErrUnsupported)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("%w: trailing data", ErrUnsupported)
+	}
+	return v, nil
 }

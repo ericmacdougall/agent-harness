@@ -112,3 +112,29 @@ func TestStdlibDiffersFromCPython(t *testing.T) {
 		t.Fatalf("expected encoding/json to differ; both gave %s", std)
 	}
 }
+
+// Round trips json.dumps(json.loads(src), sort_keys=True, separators=(",", ":")) from CPython 3.12.
+func TestDecodeRoundTripMatchesPython(t *testing.T) {
+	for src, want := range map[string]string{
+		"5": "5", "5.0": "5.0", "1e2": "100.0", "-0": "0", "12345678901234567890123": "12345678901234567890123",
+		"-0.0": "-0.0", "1E-7": "1e-07", "0.1": "0.1", `[1,2.5,{"a":10}]`: `[1,2.5,{"a":10}]`,
+	} {
+		v, err := Decode([]byte(src))
+		if err != nil {
+			t.Fatalf("%s: %v", src, err)
+		}
+		got, err := Canonical(v)
+		if err != nil || string(got) != want {
+			t.Errorf("%s: got %s %v, want %s", src, got, err, want)
+		}
+	}
+	for _, bad := range []string{"1E400", "{} {}", "\"\xff\""} {
+		v, err := Decode([]byte(bad))
+		if err == nil {
+			_, err = Canonical(v)
+		}
+		if err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
