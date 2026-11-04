@@ -208,7 +208,12 @@ def resolve_check_interpreter(name, env=None, timeout=30):
     return found
 
 
-SECRET_KEY = r"[A-Za-z0-9_.-]*(?:token|passw(?:or)?d|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential|session)[A-Za-z0-9_.-]*"
+# The lookbehind anchors each key at a word start, keeping matching linear per line.
+SECRET_WORD = (r"[A-Za-z0-9_.-]*"
+               r"(?:token|passw(?:or)?d|pwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential|session)"
+               r"[A-Za-z0-9_.-]*")
+SECRET_KEY = r"(?<![A-Za-z0-9_.-])" + SECRET_WORD
+CHECK_TAIL_LINE_CHARS = 4000
 
 
 def redact_output(text):
@@ -216,12 +221,14 @@ def redact_output(text):
     text = re.sub(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
                   "[redacted private key]", text, flags=re.S)
     text = re.sub(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@", r"\1[redacted]@", text)
-    text = re.sub(r"(?im)\b(authorization|proxy-authorization)(\s*[=:]\s*)[^\n]*", r"\1\2[redacted]", text)
+    text = re.sub(r"(?im)\b(authorization|proxy-authorization|cookie|set-cookie)(\s*[=:]\s*)[^\n]*", r"\1\2[redacted]", text)
     text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [redacted]", text)
     # Env, CLI, YAML and JSON forms: FOO_TOKEN=v, --password v, "secret": "v".
-    text = re.sub(r"(?i)([\"']?" + SECRET_KEY + r"[\"']?)(\s*[=:]\s*)([\"']?)[^\s\"',}]+",
-                  r"\1\2\3[redacted]", text)
-    text = re.sub(r"(?i)(--" + SECRET_KEY + r")(\s+)[^\s\"',}]+", r"\1\2[redacted]", text)
+    text = re.sub(r"(?i)([\"']?" + SECRET_KEY + r"[\"']?)(\s*[=:]\s*)([\"'])[^\"'\n]*\3",
+                  r"\1\2\3[redacted]\3", text)
+    text = re.sub(r"(?i)([\"']?" + SECRET_KEY + r"[\"']?)(\s*[=:]\s*)(?![\"']\[redacted\])[^\s\"',}]+",
+                  r"\1\2[redacted]", text)
+    text = re.sub(r"(?i)(--" + SECRET_WORD + r")(\s+)[^\s\"',}]+", r"\1\2[redacted]", text)
     text = re.sub(r"\b(gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]+"
                   r"|(?:AKIA|ASIA)[A-Z0-9]{16}|AIza[0-9A-Za-z_-]{35})\b", "[redacted]", text)
     return text
@@ -287,6 +294,9 @@ class CheckLog:
             if not text:
                 return {'check_log': str(self.path), 'check_tail': '[output tail omitted: one line exceeds the tail window]',
                         'check_log_truncated': self.truncated}
+        # Very long lines are omitted: they bound redaction cost and rarely help diagnosis.
+        text = '\n'.join(line if len(line) <= CHECK_TAIL_LINE_CHARS else '[long line omitted]'
+                         for line in text.split('\n'))
         # Redact before trimming, so the cut cannot expose a value whose key it drops.
         tail = redact_output(text)[-CHECK_TAIL_CHARS:]
         return {'check_log': str(self.path), 'check_tail': tail, 'check_log_truncated': self.truncated}

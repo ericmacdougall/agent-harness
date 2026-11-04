@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -193,6 +194,8 @@ class TailRedaction(unittest.TestCase):
                    'Authorization: Basic dXNlcjpwYXNz': 'dXNlcjpwYXNz', 'key AKIAABCDEFGHIJKLMNOP': 'AKIAABCDEFGHIJKLMNOP',
                    'ssh://user:pw9@host/repo': 'pw9', '--password hunter4': 'hunter4',
                    'bearer abc.def.ghi': 'abc.def.ghi', 'ghp_' + 'B' * 36: 'B' * 36,
+                   '{"password": "two words here"}': 'words', 'MYSQL_PWD=abc9': 'abc9',
+                   'Cookie: sid=abc8; theme=x': 'abc8',
                    '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaA\n-----END OPENSSH PRIVATE KEY-----': 'b3BlbnNzaA'}
         for line, secret in secrets.items():
             with self.subTest(line=line):
@@ -213,6 +216,16 @@ class TailRedaction(unittest.TestCase):
             with self.subTest(cut=cut), patch.object(self.integrate, 'CHECK_TAIL_CHARS', 10 ** 6):
                 self.assertNotIn('VALUE1234', log.facts()['check_tail'])
 
+
+    def test_long_lines_are_omitted_and_redaction_stays_fast(self):
+        log = self.integrate.CheckLog.__new__(self.integrate.CheckLog)
+        log.truncated, log.path = False, Path('/dev/null')
+        log.tail = bytearray(b'start\n' + b'tokenx' * 1500 + b'\nFAIL: test_last\n')
+        started = time.monotonic()
+        tail = log.facts()['check_tail']
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIn('[long line omitted]', tail)
+        self.assertIn('FAIL: test_last', tail)
 
     def test_single_oversized_line_is_omitted_not_leaked(self):
         log = self.integrate.CheckLog.__new__(self.integrate.CheckLog)
