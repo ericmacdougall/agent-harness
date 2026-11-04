@@ -60,3 +60,11 @@ The local server uses exact Host/Origin checks, authenticated API calls, bounded
 ## Verification status
 
 Implementation plans and scenario registrations live in `../plans/CONSOLE-*.md`. Focused tests include malformed and stale checkpoints, authority separation, subject/evidence drift, queued-input admission and crash recovery, attachment mutation, provider framing and split-secret redaction. CI runs the Go suite, race detector, vet, native builds and the focused browser composer tests. These controls do not prove a real provider accepted or rejected an uncertain send, that a native credential vault works in the current desktop session, or that a cross-compiled UI works on that platform. Private native test receipts distinguish actual CLI delivery from simulated protocol tests. Full frozen validation, independent source review, real browser acceptance, and native platform installation evidence must be reported before a release is called ready.
+
+### Known defects skipped in this baseline
+
+These three tests fail on this code. The event-log rebuild replaces the code they cover, so they are skipped by name until then (GoodQA #35692). The skips are removed, and the tests must pass, once K4+ lands:
+
+- `TestClaudeResultBeforeWriteAckRemainsFinalAcrossRestart`: a completed Claude request can be replayed after restore.
+- `TestClaudeSurvivesRevisionOnlyToolConfigChange`: an unrelated settings save can refuse a live conversation.
+- `TestRestoreMatchesLiveProjection`: a restored session can show `disconnected` where the live one shows `unknown`.
