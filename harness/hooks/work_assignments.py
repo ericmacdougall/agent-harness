@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -50,7 +51,8 @@ HOOK_SECONDS = 6.0
 DEFAULT_POLICY = {"schema": 1, "capture": "enforce", "stop": "enforce", "guard": "enforce",
                   "stale_hours": 12, "max_stop_blocks": 3}
 NO_OWNER = ("unassigned", "none", "")
-PROTECTED = re.compile(r"work-assignments(?:\.[A-Za-z0-9._-]+)?|work_assignments_policy\.json")
+PROTECTED = re.compile(r"work-assign[A-Za-z0-9._*?-]*|work_assignments_policy[A-Za-z0-9._*?-]*|work_assign[a-z]*[*?]")
+SAFE_CLI = re.compile(r"^\s*python3\s+(?:~|\$HOME|/[^\s;&|<>`$]*)?[^\s;&|<>`$]*/work_assignments\.py\s+[A-Za-z-]+(?:\s+[^;&|<>`$\n]*)?$")
 WRITEISH = re.compile(r"(?:>|\btee\b|\brm\b|\bmv\b|\bcp\b|sed\s+-i|\btruncate\b|\bpython3?\b|\bperl\b|\bruby\b|\bnode\b|"
                       r"\bdd\b|\bln\b|\bchmod\b|\binstall\b|\bgit\s+(?:checkout|restore|stash)\b)")
 
@@ -266,7 +268,7 @@ def record_failure(event: str, error) -> None:
 
 def pending_failures() -> list:
     try:
-        raw = prov.read_small(files()["fail"], 1 << 20)
+        raw = prov.read_tail(files()["fail"], 1 << 20)  # tail: a huge file must not hide the newest failures
     except prov.Problem:
         return []
     out = []
@@ -283,7 +285,9 @@ def pending_failures() -> list:
 def redact(text: str) -> str:
     try:
         from integrate_local import redact_output
-        return redact_output(text)
+        text = redact_output(text)
+        text = re.sub(r"(?i)\b(pass(?:word|wd)?|pwd|secret|token|api[_ -]?key)\s+(?![\[\"'])\S+", r"\1 [redacted]", text)
+        return re.sub(r"\b[0-9a-fA-F]{32,}\b", "[redacted]", text)
     except Exception:  # never store an unredacted excerpt when the redactor is unavailable
         return "[excerpt withheld: redactor unavailable]"
 
@@ -430,7 +434,7 @@ def sync_session(data: dict, session: str) -> int:
     cut = raw.rfind(b"\n") + 1  # complete lines only
     raw = raw[:cut]
     created = parse_ts(data.get("created_at"))
-    known = {m["uuid"] for m in data["messages"].values() if m.get("uuid")}
+    known = {m["uuid"] for m in data["messages"].values() if m.get("uuid")} | set(data.get("tombstones", []))
     for number, uid, ts, text, pasted in human_records(raw, runtime, rec["line"] + 1):
         if uid in known:
             continue
@@ -648,6 +652,8 @@ def hook_stop(payload: dict, runtime: str) -> dict:
     if policy["stop"] == "off" or not valid_session(session) or payload.get("agent_id"):
         return {}
     with transaction() as data:
+        if isinstance(payload.get("transcript_path"), str) and session in data["sessions"]:
+            data["sessions"][session]["transcript"] = payload["transcript_path"]
         sync_all(data, session)
         found = problems_for(data, session, policy)
         rec = data["sessions"].setdefault(session, {"runtime": runtime, "transcript": None, "offset": None, "line": 0,
@@ -692,7 +698,12 @@ def hook_guard(payload: dict, runtime: str) -> dict:
         return {}
     tool, tool_input = str(payload.get("tool_name") or ""), payload.get("tool_input")
     blob = json.dumps(tool_input, ensure_ascii=False) if tool_input is not None else ""
-    if not PROTECTED.search(blob) or "work_assignments.py" in blob:
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if isinstance(command, list):
+        command = " ".join(str(part) for part in command)
+    if not PROTECTED.search(blob):
+        return {}
+    if isinstance(command, str) and SAFE_CLI.match(command):  # exactly one CLI call: no redirection, chaining or substitution
         return {}
     writer = bool(re.search(r"(?i)write|edit|patch|notebook", tool)) or bool(WRITEISH.search(blob))
     if not writer:
@@ -737,12 +748,49 @@ EVIDENCE = (("commit", re.compile(r"^(?:commit:)?([0-9a-f]{7,40})$")), ("pr", re
             ("url", re.compile(r"^(https?://[^\s]{4,300})$")), ("tested", re.compile(r"^(?:tested:|REALLY_TESTED[: ]\s*)([A-Za-z0-9_-]{6,40})$")))
 
 
-def parse_evidence(text: str):
+def commit_exists(sha: str, repo=None) -> bool:
+    try:
+        run = subprocess.run(["git", "-C", str(repo or os.getcwd()), "cat-file", "-e", sha + "^{commit}"],
+                             capture_output=True, timeout=5, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+        return run.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def wal_has_test(entry: str) -> bool:
+    """A REALLY_TESTED WAL note with this id exists in a session or Codex WAL on this host (bounded scan)."""
+    roots = [Path.home() / ".claude" / "wals", base() / "codex-wals"]
+    deadline, needle = time.monotonic() + 4.0, f'"id":"{entry}"'.encode()
+    for root in roots:
+        try:
+            paths = [Path(e.path) for d in os.scandir(root) if d.is_dir() for e in os.scandir(d.path) if e.name.endswith(".jsonl")]
+        except OSError:
+            continue
+        for path in paths:
+            if time.monotonic() > deadline:
+                return False
+            try:
+                for line in prov._lines_containing(path, needle):
+                    if line and b"REALLY_TESTED" in line:
+                        return True
+            except prov.Problem:
+                continue
+    return False
+
+
+def parse_evidence(text: str, repo=None):
+    """Format plus what can be checked offline: a commit must exist locally, a tested id must be a REALLY_TESTED WAL
+    note. PR numbers and URLs cannot be checked here and are recorded as self-attested."""
     text = text.strip()
     for kind, pattern in EVIDENCE:
         found = pattern.match(text)
         if found:
-            return {"kind": kind, "ref": found.group(1), "at": iso(now())}
+            ref = found.group(1)
+            if kind == "commit" and not commit_exists(ref, repo):
+                raise WAError(f"commit {ref} not found in {repo or os.getcwd()} (pass --repo PATH)")
+            if kind == "tested" and not wal_has_test(ref):
+                raise WAError(f"no REALLY_TESTED WAL note with id {ref} on this host")
+            return {"kind": kind, "ref": ref, "at": iso(now()), "attested": kind in ("pr", "url")}
     raise WAError("evidence must be a commit sha, PR#<n>, https URL or tested:<WAL id>; got " + repr(prov.clip(text, 40)))
 
 
@@ -754,6 +802,8 @@ def verify_proof(file: str, line: int, uuid: str, quote: str) -> dict:
     """Read the actual transcript line: it must be that uuid, a genuine human turn, and contain the quote."""
     if len(quote.strip()) < prov.EXCERPT_MIN:
         raise WAError(f"quote needs {prov.EXCERPT_MIN}+ characters from the user's message")
+    if len(quote) > 120 or redact(quote) != quote:
+        raise WAError("quote must be at most 120 characters and free of secret-like text; choose other words")
     roots = [str(r) for r in transcript_roots()]
     target = None
     try:
@@ -785,10 +835,23 @@ def verify_proof(file: str, line: int, uuid: str, quote: str) -> dict:
     why = prov.excerpt_in(text, quote)
     if why:
         raise WAError("quote not in that human message: " + why)
-    return {"file": file, "line": line, "uuid": uuid, "quote": prov.clip(quote, 120), "verified_at": iso(now())}
+    return {"file": file, "line": line, "uuid": uuid, "quote": quote, "verified_at": iso(now())}
 
 
-def eligible(item: dict, ts: float) -> tuple:
+def bound_proof(data: dict, item: dict, proof: dict) -> None:
+    """The proving turn must be a human message this ledger captured (hook or sync) from a transcript it tracks,
+    not older than the item. A forged transcript file or a stranger's message cannot cancel an item."""
+    for msg in data["messages"].values():
+        if msg.get("uuid") == proof["uuid"] and msg.get("source") == "prompt":
+            tracked = data["sessions"].get(msg["session"], {}).get("transcript")
+            if tracked and os.path.realpath(tracked) == os.path.realpath(proof["file"]) \
+                    and parse_ts(msg["ts"]) >= parse_ts(item.get("created")) - 1:
+                return
+            raise WAError("proof message is not from a transcript this ledger tracks, or predates the item")
+    raise WAError("proof uuid is not a human message captured by this ledger (run `sync` first if it is recent)")
+
+
+def eligible(item: dict, ts: float, data=None) -> tuple:
     """(ok, reason). The 24h clock is state_since; done needs evidence, cancelled needs re-verifiable proof."""
     state = item["state"]
     if state not in CLOSED:
@@ -805,6 +868,8 @@ def eligible(item: dict, ts: float) -> tuple:
         return False, "cancelled without user proof"
     try:
         verify_proof(proof["file"], proof["line"], proof["uuid"], proof["quote"])
+        if data is not None:
+            bound_proof(data, item, proof)
     except (WAError, KeyError) as error:
         return False, f"cancel proof no longer verifies: {error}"
     return True, "cancelled with verified user proof for more than 24h"
@@ -843,9 +908,9 @@ def new_item(data, *, description, kind="request", owner="unassigned", message=N
              next_step="", tickets=(), branch="", prs=()):
     if kind not in KINDS:
         raise WAError("kind must be one of " + ", ".join(KINDS))
-    item = {"id": next_id(data, "i"), "description": prov.clip(description, 400), "kind": kind, "owner": owner,
+    item = {"id": next_id(data, "i"), "description": prov.clip(redact(description), 400), "kind": kind, "owner": owner,
             "message": message, "session": session, "state": "assigned" if owner not in NO_OWNER else "open",
-            "state_since": iso(now()), "last_checked": iso(now()), "created": iso(now()), "next_step": prov.clip(next_step, 300),
+            "state_since": iso(now()), "last_checked": iso(now()), "created": iso(now()), "next_step": prov.clip(redact(next_step), 300),
             "links": {"branch": branch, "tickets": list(tickets), "prs": list(prs)}, "evidence": [], "history": []}
     history(item, actor, "created", owner=owner)
     data["items"][item["id"]] = item
@@ -873,7 +938,7 @@ def cmd_no_ask(args):
         msg = find_message(data, args.msg)
         if msg["items"]:
             raise WAError("message already has items")
-        msg.update(triage="no-ask", reason=prov.clip(args.reason, 300), triaged_at=iso(now()), triaged_by=args.actor)
+        msg.update(triage="no-ask", reason=prov.clip(redact(args.reason), 300), triaged_at=iso(now()), triaged_by=args.actor)
         audit_line("no-ask", message=msg["id"], actor=args.actor, reason=msg["reason"])
     print(f"{msg['id']} marked no-ask")
 
@@ -884,7 +949,7 @@ def cmd_update(args):
         if args.state == "cancelled":
             raise WAError("use `cancel` with user proof to cancel an item")
         for text in args.evidence or ():
-            item["evidence"].append(parse_evidence(text))
+            item["evidence"].append(parse_evidence(text, args.repo))
             history(item, args.actor, "evidence", ref=item["evidence"][-1]["ref"])
         if args.state == "done" and not item["evidence"]:
             raise WAError("done requires evidence (--evidence commit sha, PR#n, https URL or tested:<WAL id>)")
@@ -898,16 +963,16 @@ def cmd_update(args):
             if item["state"] == "open" and args.owner not in NO_OWNER:
                 set_state(item, "assigned", args.actor)
         if args.next is not None:
-            item["next_step"] = prov.clip(args.next, 300)
+            item["next_step"] = prov.clip(redact(args.next), 300)
         if args.description:
-            item["description"] = prov.clip(args.description, 400)
+            item["description"] = prov.clip(redact(args.description), 400)
         if args.branch:
             item["links"]["branch"] = args.branch
         for ticket in args.ticket or ():
             if ticket not in item["links"]["tickets"]:
                 item["links"]["tickets"].append(ticket)
         if args.note:
-            history(item, args.actor, "note", text=prov.clip(args.note, 300))
+            history(item, args.actor, "note", text=prov.clip(redact(args.note), 300))
         item["last_checked"] = iso(now())
         audit_line("update", item=item["id"], actor=args.actor, state=item["state"], owner=item["owner"])
     print(f"{item['id']} {item['state']} owner={item['owner']}")
@@ -917,6 +982,8 @@ def cmd_cancel(args):
     proof = verify_proof(args.file, args.line, args.uuid, args.quote)
     with transaction() as data:
         item = find_item(data, args.id)
+        sync_all(data)
+        bound_proof(data, item, proof)
         set_state(item, "cancelled", args.actor)
         item["cancel_proof"] = proof
         item["last_checked"] = iso(now())
@@ -936,7 +1003,7 @@ def drop(data, item, why):
 def cmd_remove(args):
     with transaction() as data:
         item = find_item(data, args.id)
-        ok, why = eligible(item, now())
+        ok, why = eligible(item, now(), data)
         if not ok:
             raise WAError(f"refused: {why}")
         drop(data, item, why)
@@ -947,7 +1014,7 @@ def cmd_prune(args):
     ts, removed, kept = now(), [], 0
     with transaction() as data:
         for item in list(data["items"].values()):
-            ok, why = eligible(item, ts)
+            ok, why = eligible(item, ts, data)
             if ok and args.apply:
                 drop(data, item, why)
                 removed.append(item["id"])
@@ -960,6 +1027,9 @@ def cmd_prune(args):
                 done_noask = m["triage"] == "no-ask" and ts - parse_ts(m.get("triaged_at")) > GATE_SECONDS
                 if done_noask or (m["triage"] == "split" and not m["items"]):
                     audit_line("remove-message", message=m["id"], triage=m["triage"], reason=m.get("reason"))
+                    if m.get("uuid"):  # a removed message must not be re-caught from the transcript
+                        data.setdefault("tombstones", []).append(m["uuid"])
+                        data["tombstones"] = data["tombstones"][-20000:]
                     del data["messages"][m["id"]]
     print(f"{'removed' if args.apply else 'would remove'} {len(removed)}: {', '.join(removed[:20])}; kept {kept}")
 
@@ -1047,7 +1117,7 @@ def cmd_import(args):
             item["source_id"], item["imported"] = source_id, {"when": row.get("when"), "ledger_status": row.get("status"),
                                                               "excerpt": prov.clip(row.get("excerpt") or "", 300)}
             if row.get("evidence"):
-                item["evidence"].append({"kind": "imported", "ref": prov.clip(row["evidence"], 400), "at": iso(now())})
+                item["evidence"].append({"kind": "imported", "ref": prov.clip(redact(row["evidence"]), 400), "at": iso(now())})
             if state == "done" and not item["evidence"]:
                 state = "ready"
             if state == "cancelled":
@@ -1072,7 +1142,7 @@ def build_parser():
     s = sub.add_parser("no-ask"); s.add_argument("--msg", required=True); s.add_argument("--reason", required=True); s.add_argument("--actor", default="main")
     s = sub.add_parser("update"); s.add_argument("id"); s.add_argument("--state"); s.add_argument("--owner"); s.add_argument("--next")
     s.add_argument("--evidence", action="append"); s.add_argument("--branch"); s.add_argument("--ticket", action="append")
-    s.add_argument("--description"); s.add_argument("--note"); s.add_argument("--actor", default="main")
+    s.add_argument("--description"); s.add_argument("--note"); s.add_argument("--repo"); s.add_argument("--actor", default="main")
     s = sub.add_parser("cancel"); s.add_argument("id"); s.add_argument("--uuid", required=True); s.add_argument("--file", required=True)
     s.add_argument("--line", type=int, required=True); s.add_argument("--quote", required=True); s.add_argument("--actor", default="main")
     s = sub.add_parser("remove"); s.add_argument("id")

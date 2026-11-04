@@ -183,9 +183,11 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
         rule = f"Bash(python3 ~/.claude/hooks/spec_flow.py {action} *)"
         if rule not in allowed:
             allowed.append(rule)
-    rule = "Bash(python3 ~/.claude/hooks/work_assignments.py *)"  # the 24h removal gate lives in the script itself
-    if rule not in allowed:
-        allowed.append(rule)
+    # Triage and status are preapproved; cancel, remove, prune, import and recover deliberately are not.
+    for action in ("status", "split", "no-ask", "update", "show", "sync", "failures", "verify"):
+        rule = f"Bash(python3 ~/.claude/hooks/work_assignments.py {action} *)"
+        if rule not in allowed:
+            allowed.append(rule)
     rule = "Bash(python3 ~/.claude/hooks/workdir.py prune)"  # dry run only; --apply still asks
     if rule not in allowed:
         allowed.append(rule)

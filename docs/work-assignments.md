@@ -33,6 +33,12 @@ work_assignments.py remove WA-0001 | prune [--apply]
 work_assignments.py import LEDGER.jsonl | sync | failures [--ack] | recover | verify | show ID
 ```
 
+Evidence is checked where it can be: a commit must exist in the repo (`--repo PATH`, default cwd), a `tested:` id must be a
+REALLY_TESTED WAL note on this host; PR numbers and URLs cannot be checked offline and are stored as `attested`.
+Cancel proof must also be a human message this ledger itself captured, from a transcript it tracks, not older than the
+item, so a forged transcript file cannot cancel. `cancel`, `remove`, `prune`, `import` and `recover` are deliberately
+not in the installed permission allow list; triage and status commands are.
+
 States: open, assigned, in_progress, blocked, ready, done, cancelled. `done` needs evidence: commit sha, `PR#n`,
 https URL or `tested:<WAL id>`. Tickets are referenced as `GoodQA <project>#<n>` strings only; this file never calls
 GoodQA or copies ticket status (the GoodQA ledger stays the single source for tickets).
