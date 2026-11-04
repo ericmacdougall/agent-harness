@@ -252,6 +252,26 @@ class OptOutTests(unittest.TestCase):
         for value in ("off", "OFF", "0", "false"):
             self.assertEqual(dg.active_domains(repo, env={"HARNESS_DOMAIN_GATES": value}), [])
 
+    def test_env_off_cannot_loosen_policy_enforce(self):
+        repo = make_repo({"A.sol": "contract A {}"})
+        enforce = {"domain_gates": {"mode": "enforce"}}
+        self.assertTrue(dg.active_domains(repo, policy=enforce, env={"HARNESS_DOMAIN_GATES": "off"}))
+        self.assertIn("ignored", dg.settings(repo, enforce, {"HARNESS_DOMAIN_GATES": "off"})["warning"])
+        with mock.patch.dict(os.environ, {"HARNESS_DOMAIN_GATES": "off"}):
+            warnings, problems = sf.domain_lint(SPEC, repo, enforce)
+        self.assertTrue(problems)  # still enforcing
+        self.assertTrue(any("HARNESS_DOMAIN_GATES=off ignored" in w for w in warnings))
+        with mock.patch.dict(os.environ, {"HARNESS_DOMAIN_GATES": "off"}):
+            self.assertEqual(sf.domain_lint(SPEC, repo, {"domain_gates": {"mode": "warn"}}), ([], []))  # control: warn still honours env
+
+    def test_waiver_needs_three_words_and_neg_ignores_fences_and_comments(self):
+        for line in ("Domain-gate: reentrancy waived (abcdef ghijk)",):
+            self.assertIn("reentrancy", dg.missing_items(SPEC + "\n" + line + "\n", ["evm"]))
+        ok = SPEC + "\nDomain-gate: reentrancy waived (pure library, no external calls)\n"
+        self.assertNotIn("reentrancy", dg.missing_items(ok, ["evm"]))
+        hidden = SPEC.replace("a zero deposit is refused.", "a zero deposit is refused.\n<!-- NEG-9 reentrancy -->\n```\n- NEG-8 (AC-1): reentrancy\n```")
+        self.assertIn("reentrancy", dg.missing_items(hidden, ["evm"]))
+
     def test_policy_disabled(self):
         repo = make_repo({"foundry.toml": "x"})
         self.assertEqual(dg.active_domains(repo, policy={"domain_gates": {"disabled": True}}, env={}), [])
@@ -551,6 +571,23 @@ class PeerReviewTests(unittest.TestCase):
             section, source = pr.domain_section(repo, "b" * 40, changed_paths=[])
         self.assertEqual(section, "")
         self.assertIn("HARNESS_DOMAIN_GATES", source)
+
+    def test_enforce_refuses_review_when_checklist_unavailable(self):
+        repo = make_repo({"foundry.toml": "x"})
+        enforce = {"domain_gates": {"mode": "enforce"}}
+        bad = Path(tempfile.mkdtemp()) / "c.json"
+        bad.write_text("{not json")
+        with mock.patch.object(sf, "load_spec_policy", return_value=enforce), mock.patch.object(dg, "CHECKLIST_FILE", bad):
+            with self.assertRaises(OSError) as ctx:
+                pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])
+        self.assertIn("refusing to review", str(ctx.exception))
+        with mock.patch.object(sf, "load_spec_policy", return_value=enforce), mock.patch.object(dg, "MAX_FILES", 0):
+            with self.assertRaises(OSError):  # truncated scan
+                pr.domain_section(make_repo({"a.sol": "x", "b.sol": "x"}), "b" * 40, changed_paths=[])
+        warn = {"domain_gates": {"mode": "warn"}}  # control: warn keeps the warning behaviour
+        with mock.patch.object(sf, "load_spec_policy", return_value=warn), mock.patch.object(dg, "CHECKLIST_FILE", bad), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"]), ("", None))
 
     def test_both_domains_keep_their_own_guidance(self):
         section = dg.packet_section(["evm", "solana"], None)

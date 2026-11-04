@@ -307,6 +307,7 @@ def domain_lint(text: str, repo, spec_policy: dict):
         return [], []
     try:
         config = dg.settings(repo, spec_policy)
+        env_warning = [config["warning"]] if config.get("warning") else []
         if config["disabled"]:
             # stay silent for non-blockchain repos, but leave a trace when a blockchain repo is opted out
             found = dg.detect(Path(repo)) if config["source"] != "env HARNESS_DOMAIN_GATES" else []
@@ -319,14 +320,15 @@ def domain_lint(text: str, repo, spec_policy: dict):
         note = f"domain gates could not run ({type(error).__name__})"
         enforcing = isinstance(spec_policy.get("domain_gates"), dict) and spec_policy["domain_gates"].get("mode") == "enforce"
         return ([], [note + "; enforce mode fails closed"]) if enforcing else ([note + "; skipped"], [])
-    notes = []
+    notes = list(env_warning)
     if skipped:
         note = f"domain detection could not run: {failure} (pass --repo <worktree>)"
         if failure.startswith("scan truncated") and dg.allow_truncated(spec_policy):
-            notes = [note]  # a monorepo that legitimately exceeds the caps can opt in; still visible
+            notes.append(note)  # a monorepo that legitimately exceeds the caps can opt in; still visible
         elif config["mode"] == "enforce":  # a Domains: line in the spec never excuses a failed scan
-            return [], [note + "; enforce mode fails closed"]
-        notes = [note]
+            return env_warning, [note + "; enforce mode fails closed"]
+        else:
+            notes.append(note)
     if not missing:
         return notes, []
     note = (f"domain checklist items without a NEG case naming them or `Domain-gate: <id> waived (<reason>)`: "

@@ -264,6 +264,7 @@ def domain_section(repo: Path, base, changed_paths=None):
         import domain_gates
     except ImportError:
         return '', None
+    enforcing = False
     try:
         if changed_paths is None and base:
             changed_paths = [p for p in git(repo, 'diff', '--name-only', '--no-renames', '-z', f'{base}..HEAD').split('\0') if p][:5000]
@@ -276,13 +277,24 @@ def domain_section(repo: Path, base, changed_paths=None):
         except (ImportError, OSError, ValueError):
             policy, distrust = None, True  # unknown policy: never let the repo file switch the checklist off
         state = domain_gates.settings(repo, policy, ignore_repo_file=distrust)
+        enforcing = state['mode'] == 'enforce'
+        if state['warning']:
+            print('Warning: ' + state['warning'], file=sys.stderr)
         if state['disabled']:
             return '', state['source']
-        found = domain_gates.active_domains(repo, policy, changed_paths=paths, ignore_repo_file=distrust)
-        if not found:
+        detected, failure = domain_gates.detect_full(repo, paths)
+        if failure and not (failure.startswith('scan truncated') and domain_gates.allow_truncated(policy)):
+            raise RuntimeError('domain scan incomplete: ' + failure)
+        if not detected:
             return '', None
-        return domain_gates.packet_section(found, repo, DOMAIN_SECTION_LIMIT, ignore_repo_file=distrust), None
-    except Exception as error:  # guidance must never break a review
+        section = domain_gates.packet_section([d['domain'] for d in detected], repo, DOMAIN_SECTION_LIMIT,
+                                              ignore_repo_file=distrust)
+        if not section:
+            raise RuntimeError('domain checklist data unusable')
+        return section, None
+    except Exception as error:
+        if enforcing:  # enforce mode must never review without the checklist it requires
+            raise OSError(f'domain gates enforce mode: checklist unavailable ({error}); refusing to review') from None
         print(f'Warning: domain checklist skipped ({type(error).__name__})', file=sys.stderr)
         return '', None
 

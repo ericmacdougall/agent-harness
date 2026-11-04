@@ -459,11 +459,15 @@ def settings(repo=None, policy=None, env=None, ignore_repo_file: bool = False) -
     mode = config.get("mode") if config.get("mode") in ("warn", "enforce") else "warn"
     # a repo file is repo-controlled text: it can opt out in warn mode but never switch off a policy-level enforce
     repo_off = mode != "enforce" and repo_options(repo, ignore_repo_file).get("disabled") is True
-    disabled = (str(env.get("HARNESS_DOMAIN_GATES", "")).strip().lower() in DISABLE_VALUES
-                or config.get("disabled") is True or repo_off)
-    source = ("env HARNESS_DOMAIN_GATES" if str(env.get("HARNESS_DOMAIN_GATES", "")).strip().lower() in DISABLE_VALUES
+    # environment variables may only tighten: an agent can set one inline, so env off never loosens policy enforce
+    env_asked = str(env.get("HARNESS_DOMAIN_GATES", "")).strip().lower() in DISABLE_VALUES
+    env_off = env_asked and mode != "enforce"
+    disabled = env_off or config.get("disabled") is True or repo_off
+    source = ("env HARNESS_DOMAIN_GATES" if env_off
               else "spec_policy.json" if config.get("disabled") is True else OPT_OUT_FILE)
-    return {"disabled": disabled, "mode": mode, "source": source if disabled else None}
+    warning = ("HARNESS_DOMAIN_GATES=off ignored: spec_policy.json domain_gates.mode is enforce "
+               "(loosen it in the installed policy file)") if env_asked and not env_off else None
+    return {"disabled": disabled, "mode": mode, "source": source if disabled else None, "warning": warning}
 
 
 def active_domains(repo, policy=None, changed_paths=None, env=None, ignore_repo_file: bool = False) -> list:
@@ -515,8 +519,14 @@ def spec_domains(spec_text: str) -> list:
 
 def _negative_text(spec_text: str) -> str:
     """Bodies of `- NEG-n (AC-n): ...` bullets in the Negative cases section, placeholders removed."""
-    inside, found = False, []
+    inside, found, fenced = False, [], False
+    spec_text = re.sub(r"(?s)<!--.*?-->", " ", spec_text)  # hidden comments never count as a NEG case
     for line in spec_text.split("\n"):
+        if line.startswith("```") or line.startswith("~~~"):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
         if line.startswith("## "):
             inside = line.rstrip() == "## Negative cases"
         elif inside and re.match(r"^- NEG-\d+\s*\([^)]*\):\s*\S", line):
@@ -543,7 +553,8 @@ def waived_items(spec_text: str) -> set:
         elif not fenced:
             unfenced.append(line)
     return {m.group(1) for m in WAIVER.finditer("\n".join(unfenced))
-            if len(m.group(2).strip()) >= 10 and "<" not in m.group(2) and len(set(m.group(2).lower())) >= 6}
+            if len(m.group(2).strip()) >= 10 and "<" not in m.group(2) and len(set(m.group(2).lower())) >= 6
+            and len(re.findall(r"[A-Za-z]{2,}", m.group(2))) >= 3}  # a reason needs at least three real words
 
 
 def missing_items(spec_text: str, domains, repo=None, strict: bool = False) -> list:
