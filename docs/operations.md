@@ -323,7 +323,7 @@ python3 $S review ~/specs/168.md --role adversarial --report ~/specs/168.adv.md
 python3 $S review ~/specs/168.md --role acceptance --agent <red-team|task-owner|fixer id> --wal <main WAL> --verdict ACCEPT --report-file <its report>
 python3 $S attach ~/specs/168.md --actor 'agent:<id>'
 python3 $S evidence --ticket 'GoodQA harness#168' --actor 'agent:<id>' --ac AC-1 --really-tested RT1 --wal <WAL> [--commit <sha> --repo <checkout> --target origin/main] [--log run.log]
-python3 $S click-test --ticket 'GoodQA harness#168' --actor 'agent:<id>' --agent-id <click-tester id> --wal-dir ~/.claude/wals/<session> --url <url> --result pass --report <its report> [--log f] [--screenshot f.png]
+python3 $S click-test --ticket 'GoodQA harness#168' --actor 'agent:<id>' --agent-id <click-tester id> --wal-dir ~/.claude/wals/<session> --url <url> --deployed-commit <sha> --repo <checkout> --result pass --report <its report> [--log f] [--screenshot f.png]
 python3 $S signoff --ticket 'GoodQA harness#168' --actor 'agent:<main id>' --by <main id> --kind agent --source '<where it was given>'
 python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same report, never writes
 ```
@@ -368,6 +368,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
   - Screenshots and recordings (`png jpg gif webm mp4`, up to 15 MB) are checked by magic number and are not redacted.
 - **Click-tests:**
   - Logs or a report are mandatory.
+  - `--deployed-commit` names the commit that was deployed and tested. Every commit cited by evidence on the current spec must be reachable from it, or the record is refused. Evidence commits added later make `done` NOT READY until a new click-test covers them.
   - **Agent click-tester:**
     - The agent must be recorded as `click-tester` in the session's `main.jsonl`.
     - The start time is its SubagentStart record. The end time is its first `subagent_stop` record (from the SubagentStop hook). If there is none, `ended_at` is null and `last_activity_at` is recorded.

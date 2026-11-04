@@ -659,6 +659,14 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
             missing.append("click-test: the latest click-test failed; fix and record a new passing click-test")
         elif not any(a.get("role") in ("log", "report") for a in latest.get("attachments") or []):
             missing.append("click-test: the passing record has no log or report attached")
+        elif not (latest.get("deployed_commit") or {}).get("sha"):
+            missing.append("click-test: the passing record names no deployed commit; rerun click-test with "
+                           "--deployed-commit <sha> after deploy")
+        elif uncovered := sorted({c.get("sha") for r in evidence if r.get("spec_core_sha") == core
+                                  for c in r.get("commits") or [] if c.get("sha")}
+                                 - set(latest.get("covers_commits") or [])):
+            missing.append(f"click-test: evidence commits {', '.join(s[:12] for s in uncovered)} came after the "
+                           "deployed commit that was click-tested; deploy them and record a new click-test")
         else:
             tester = latest.get("tester") or {}
             if latest.get("pass_source") == "self-attested":
@@ -1080,6 +1088,14 @@ def cmd_click_test(args, spec_policy):
         files.append(("screenshot", Path(path).name, mime, data))
     if not any(role in ("log", "report") for role, *_ in files):
         raise SpecError("a click-test needs its logs: give --log and/or --report from the click-tester", EXIT_USAGE)
+    # "On deploy": bind the click-test to the deployed commit, which must contain every evidence commit so far.
+    repo = Path(args.repo or ".")
+    deployed = git_commit(repo, args.deployed_commit, None)
+    evidence_shas = sorted({c.get("sha") for r in records if r["kind"] == "evidence"
+                            and r.get("spec_core_sha") == spec["spec_core_sha"]
+                            for c in r.get("commits") or [] if c.get("sha")})
+    for sha in evidence_shas:  # raises "commit X is not reachable from <deployed>"
+        git_commit(repo, sha, deployed["sha"])
     if args.agent_id:
         if not args.wal_dir:
             raise SpecError("--agent-id needs --wal-dir <the session WAL directory>", EXIT_USAGE)
@@ -1119,9 +1135,11 @@ def cmd_click_test(args, spec_policy):
         raise SpecError("give --agent-id with --wal-dir, or --human", EXIT_USAGE)
     record = {"v": 1, "kind": "click_test", "ticket": session.ticket.label, "actor": parse_author(args.actor),
               "spec_core_sha": spec["spec_core_sha"], "result": args.result, "url": args.url, "tester": tester,
-              "pass_source": pass_source}
-    record["key"] = content_key("click_test", [tester, args.result, args.url, [sha256_bytes(f[3]) for f in files]])
+              "pass_source": pass_source, "deployed_commit": deployed, "covers_commits": evidence_shas}
+    record["key"] = content_key("click_test", [tester, args.result, args.url, deployed["sha"],
+                                               [sha256_bytes(f[3]) for f in files]])
     summary = (f"**Click-test {args.result.upper()}** by {tester['kind']} {tester['identity']} on {args.url} "
+               f"at deployed commit {deployed['sha'][:12]} "
                f"({tester['started_at']} to {tester.get('ended_at') or 'end not recorded'}), {len(files)} file(s).")
     session.post("click_test", summary, record, files, records)
     return EXIT_OK
@@ -1234,6 +1252,8 @@ def main(argv=None) -> int:
     evidence.add_argument("--note")
     click.add_argument("--result", choices=("pass", "fail"), required=True)
     click.add_argument("--url", required=True)
+    click.add_argument("--deployed-commit", required=True, help="the commit that was deployed and tested")
+    click.add_argument("--repo", help="checkout holding the deployed and evidence commits (default .)")
     click.add_argument("--agent-id")
     click.add_argument("--wal-dir")
     click.add_argument("--human")

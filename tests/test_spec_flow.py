@@ -394,12 +394,20 @@ class Evidence(SpecFlowCase):
 
     def test_logs_are_redacted_and_key_cut_is_refused(self):
         log = self.tmp / "run.log"
-        log.write_text("API_TOKEN=supersecretvalue123\nAuthorization: Bearer abc.def\nresult ok\n")
+        log.write_text("API_TOKEN=supersecretvalue123\nAuthorization: Bearer abc.def\n"
+                       "Cookie: session=cookievalue987\nGET https://bob:urlpassword55@example.test/x\nresult ok\n")
         code, _, err = self.ev("--ac", "AC-1", "--log", str(log))
         self.assertEqual(code, 0, err)
         uploaded = [a["bytes"] for a in self.fake.attachments.values() if a["metadata"]["filename"] == "run.log"][0]
-        self.assertNotIn(b"supersecretvalue123", uploaded)
-        self.assertNotIn(b"abc.def", uploaded)
+        for secret in (b"supersecretvalue123", b"abc.def", b"cookievalue987", b"urlpassword55"):
+            self.assertNotIn(secret, uploaded)
+        self.assertIn(b"result ok", uploaded)
+        whole = self.tmp / "key.log"
+        whole.write_text("start\n-----BEGIN OPENSSH PRIVATE KEY-----\n" + "B" * 64 + "\n-----END OPENSSH PRIVATE KEY-----\n")
+        self.assertEqual(self.ev("--ac", "AC-1", "--log", str(whole))[0], 0)
+        uploaded = [a["bytes"] for a in self.fake.attachments.values() if a["metadata"]["filename"] == "key.log"][0]
+        self.assertNotIn(b"B" * 64, uploaded)
+        self.assertIn(b"[redacted private key]", uploaded)
         cut = self.tmp / "cut.log"
         body = "".join("A" * 64 + "\n" for _ in range(40)) + "-----END RSA PRIVATE KEY-----\nafter\n"
         cut.write_text("x" * 5000 + "\n-----BEGIN RSA PRIVATE KEY-----\n" + body)
@@ -424,6 +432,18 @@ class Evidence(SpecFlowCase):
         self.assertEqual(code, 0, err)
 
 
+def git_repo(path, *subjects):
+    """A throwaway repo with one empty commit per subject, on a straight line; returns the shas in order."""
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    shas = []
+    for subject in subjects:
+        subprocess.run(["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                        "--allow-empty", "-m", subject], check=True)
+        shas.append(subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True,
+                                   text=True).stdout.strip())
+    return shas
+
+
 class ClickTest(SpecFlowCase):
     def setUp(self):
         super().setUp()
@@ -434,11 +454,13 @@ class ClickTest(SpecFlowCase):
         self.wal(self.agent_wal, {"at": "2026-11-04T05:03:00+00:00", "event": "pretool"})
         self.report = self.tmp / "click-report.md"
         self.report.write_text("CLICK_TEST_RESULT: PASS\n\nOpened http://127.0.0.1:3000, clicked Done.\n")
+        self.repo_dir = self.tmp / "deployed"
+        self.shas = git_repo(self.repo_dir, "feat: one", "feat: two")
 
     def ct(self, *extra):
         return self.run_cli("click-test", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
                             "--url", "http://127.0.0.1:3000", "--agent-id", "ct1", "--wal-dir", str(self.wal_dir),
-                            *extra)
+                            "--repo", str(self.repo_dir), "--deployed-commit", self.shas[-1], *extra)
 
     def test_pass_without_logs_is_refused(self):
         self.assertEqual(self.ct("--result", "pass")[0], 3)
@@ -477,10 +499,30 @@ class ClickTest(SpecFlowCase):
         self.assertIsNone(record["tester"]["ended_at"])
         self.assertEqual(record["tester"]["last_activity_at"], "2026-11-04T05:06:00+00:00")
 
+    def test_deployed_commit_must_contain_the_evidence_commits(self):
+        self.wal(self.agent_wal, {"at": "2026-11-04T05:06:00+00:00", "event": "check",
+                                  "note": "REALLY_TESTED CT1: clicked through Done flow, status 200"})
+        code, _, err = self.run_cli("evidence", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
+                                    "--ac", "AC-2", "--commit", self.shas[1], "--repo", str(self.repo_dir),
+                                    "--note", "unit tests ran")
+        self.assertEqual(code, 0, err)
+        code, _, err = self.run_cli("click-test", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
+                                    "--url", "u", "--agent-id", "ct1", "--wal-dir", str(self.wal_dir),
+                                    "--repo", str(self.repo_dir), "--deployed-commit", self.shas[0],
+                                    "--result", "pass", "--report", str(self.report), "--really-tested", "CT1")
+        self.assertEqual(code, 2)
+        self.assertIn("not reachable from", err)
+        code, _, err = self.ct("--result", "pass", "--report", str(self.report), "--really-tested", "CT1")
+        self.assertEqual(code, 0, err)
+        record = json.loads(sf.RECORD_BLOCK.search(self.fake.comments[ISSUE][-1]["body"]).group(1))
+        self.assertEqual(record["deployed_commit"]["sha"], self.shas[1])
+        self.assertEqual(record["covers_commits"], [self.shas[1]])
+
     def test_non_click_tester_agent_is_refused(self):
         self.wal(self.main_wal, {"at": "t", "event": "subagent", "agent_id": "fx1", "agent_type": "fixer"})
         code, _, _ = self.run_cli("click-test", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
                                   "--url", "u", "--agent-id", "fx1", "--wal-dir", str(self.wal_dir),
+                                  "--repo", str(self.repo_dir), "--deployed-commit", self.shas[-1],
                                   "--result", "pass", "--report", str(self.report))
         self.assertEqual(code, 2)
 
@@ -500,14 +542,28 @@ class DoneGate(SpecFlowCase):
         report.write_text("CLICK_TEST_RESULT: PASS\nok\n")
         self.wal(self.wal_dir / "agent-ct1.jsonl", {"at": "2026-11-04T05:01:00+00:00", "event": "result",
                                                     "note": "CLICK_TEST_REPORT sha256=" + hashlib.sha256(report.read_bytes()).hexdigest()})
+        self.repo_dir = self.tmp / "deployed"
+        self.shas = git_repo(self.repo_dir, "feat: one", "feat: later")
         code, _, err = self.run_cli("click-test", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
                                     "--url", "http://127.0.0.1:3000", "--agent-id", "ct1", "--wal-dir",
-                                    str(self.wal_dir), "--result", "pass", "--report", str(report))
+                                    str(self.wal_dir), "--repo", str(self.repo_dir), "--deployed-commit",
+                                    self.shas[0], "--result", "pass", "--report", str(report))
         self.assertEqual(code, 0, err)
         if signer:
             code, _, err = self.run_cli("signoff", "--ticket", "GoodQA harness#168", "--actor", f"agent:{signer[0]}",
                                         "--by", signer[0], "--kind", signer[1], "--source", "main review of #168")
             self.assertEqual(code, 0, err)
+
+    def test_evidence_commit_after_the_click_test_needs_a_new_click_test(self):
+        self.complete()
+        self.assertTrue(self.evaluate()["ready"])
+        code, _, err = self.run_cli("evidence", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
+                                    "--ac", "AC-1", "--commit", self.shas[1], "--repo", str(self.repo_dir),
+                                    "--note", "fix after click-test")
+        self.assertEqual(code, 0, err)
+        result = self.evaluate()
+        self.assertFalse(result["ready"])
+        self.assertTrue(any("came after the deployed commit" in m for m in result["missing"]), result["missing"])
 
     def test_missing_items_are_listed_with_fixes(self):
         self.attached()
