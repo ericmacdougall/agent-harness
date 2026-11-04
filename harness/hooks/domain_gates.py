@@ -547,6 +547,7 @@ WAIVER = re.compile(r"(?m)^Domain-gate:[ \t]*([a-z0-9-]+)[ \t]+waived[ \t]*\(([^
 
 def waived_items(spec_text: str) -> set:
     unfenced, fenced = [], False
+    spec_text = re.sub(r"(?s)<!--.*?-->", " ", spec_text)  # a waiver hidden in a comment never counts
     for line in spec_text.split("\n"):
         if line.startswith("```") or line.startswith("~~~"):
             fenced = not fenced

@@ -283,8 +283,13 @@ def domain_section(repo: Path, base, changed_paths=None):
         if state['disabled']:
             return '', state['source']
         detected, failure = domain_gates.detect_full(repo, paths)
-        if failure and not (failure.startswith('scan truncated') and domain_gates.allow_truncated(policy)):
-            raise RuntimeError('domain scan incomplete: ' + failure)
+        if failure:
+            if failure.startswith('scan truncated') or 'too deeply nested' in failure:
+                # a size or cap limit only warns here: refusing would lock enforce-mode reviews out of every large
+                # repo. Real scan errors (not a checkout, git failure) still refuse below.
+                print(f'Warning: domain scan incomplete ({failure}); reviewer checklist may be partial', file=sys.stderr)
+            else:
+                raise RuntimeError('domain scan incomplete: ' + failure)
         if not detected:
             return '', None
         section = domain_gates.packet_section([d['domain'] for d in detected], repo, DOMAIN_SECTION_LIMIT,

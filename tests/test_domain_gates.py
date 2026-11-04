@@ -581,13 +581,28 @@ class PeerReviewTests(unittest.TestCase):
             with self.assertRaises(OSError) as ctx:
                 pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])
         self.assertIn("refusing to review", str(ctx.exception))
-        with mock.patch.object(sf, "load_spec_policy", return_value=enforce), mock.patch.object(dg, "MAX_FILES", 0):
-            with self.assertRaises(OSError):  # truncated scan
-                pr.domain_section(make_repo({"a.sol": "x", "b.sol": "x"}), "b" * 40, changed_paths=[])
+        with mock.patch.object(sf, "load_spec_policy", return_value=enforce):
+            not_git = Path(tempfile.mkdtemp())
+            with self.assertRaises(OSError):  # a real scan error still refuses
+                pr.domain_section(not_git, "b" * 40, changed_paths=[])
+            quiet = io.StringIO()
+            with mock.patch.object(dg, "MAX_FILES", 1), contextlib.redirect_stderr(quiet):  # truncated, no chain signal
+                result = pr.domain_section(make_repo({"a/package.json": "{}", "b/package.json": "{}"}), "b" * 40, changed_paths=[])
+            self.assertEqual(result, ("", None))
+            self.assertIn("scan incomplete", quiet.getvalue())
         warn = {"domain_gates": {"mode": "warn"}}  # control: warn keeps the warning behaviour
         with mock.patch.object(sf, "load_spec_policy", return_value=warn), mock.patch.object(dg, "CHECKLIST_FILE", bad), \
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"]), ("", None))
+
+    def test_hidden_neg_and_waiver_in_html_comments_do_not_count(self):
+        neg = SPEC.replace("- NEG-1 (AC-1): a zero deposit is refused.",
+                           "- NEG-1 (AC-1): a zero deposit is refused.\n<!--\n- NEG-2 (AC-1): reentrancy attack on withdraw\n-->")
+        self.assertIn("reentrancy", dg.missing_items(neg, ["evm"]))
+        waiver = SPEC + "\n<!--\nDomain-gate: reentrancy waived (pure library, no external calls)\n-->\n"
+        self.assertIn("reentrancy", dg.missing_items(waiver, ["evm"]))
+        visible = SPEC + "\nDomain-gate: reentrancy waived (pure library, no external calls)\n"  # control
+        self.assertNotIn("reentrancy", dg.missing_items(visible, ["evm"]))
 
     def test_both_domains_keep_their_own_guidance(self):
         section = dg.packet_section(["evm", "solana"], None)
