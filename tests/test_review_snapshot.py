@@ -238,6 +238,7 @@ class ReviewSnapshotTests(unittest.TestCase):
             self.review.review_snapshot(self.root, self.head, 'plan', 'rules', 'packet', {'base': self.first})
         self.assertIn('root commit', prompts[0])
         self.assertIn(f'git diff {self.first} HEAD', prompts[1])
+        self.assertIn('regular files containing their target path', prompts[1])
 
     def commit_links(self, links, directories=()):
         for directory in directories:
@@ -276,6 +277,23 @@ class ReviewSnapshotTests(unittest.TestCase):
         except OSError:
             return
         self.assertNotEqual(state, (head, ''))
+
+    def test_snapshot_refuses_symlink_planted_by_checkout_even_in_ignored_directory(self):
+        (self.repo / '.gitignore').write_text('ign/\n')
+        git(self.repo, 'add', '.gitignore')
+        git(self.repo, 'commit', '-qm', 'ignore')
+        head = git(self.repo, 'rev-parse', 'HEAD')
+        real = self.review.run_process
+
+        def plant(command, **kwargs):
+            result = real(command, **kwargs)
+            if 'checkout' in command:
+                (Path(command[2]) / 'ign').mkdir()
+                (Path(command[2]) / 'ign/link').symlink_to('/etc/passwd')
+            return result
+        with patch.object(self.review, 'run_process', side_effect=plant):
+            with self.assertRaises(OSError):
+                self.review.make_snapshot(self.repo, self.snapshot, head)
 
     def test_gitlink_is_refused(self):
         git(self.repo, 'update-index', '--add', '--cacheinfo', f'160000,{self.first},vendored')
