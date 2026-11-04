@@ -1,0 +1,45 @@
+name: Release harness binary
+# Plan 3.9 trust root: anyone can rebuild a release byte-for-byte from the tag (-trimpath, no VCS stamp,
+# CGO off, toolchain pinned by go.mod), and each asset carries a GitHub build-provenance attestation that
+# `gh attestation verify <file> --repo ericmacdougall/agent-harness --signer-workflow
+# ericmacdougall/agent-harness/.github/workflows/release.yml` checks before an installer trusts it.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go vet ./... && go test ./...
+      - name: Build
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os=${target%/*}; arch=${target#*/}; ext=""; [ "$os" = windows ] && ext=.exe
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false \
+              -ldflags "-s -w -X main.version=${VERSION}" -o "dist/harness-${os}-${arch}${ext}" ./cmd/harness
+          done
+          # A second build must be byte-identical, or the release is not reproducible.
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false \
+            -ldflags "-s -w -X main.version=${VERSION}" -o /tmp/harness-check ./cmd/harness
+          cmp /tmp/harness-check dist/harness-linux-amd64
+          (cd dist && sha256sum harness-* > SHA256SUMS)
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/harness-*
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --draft --verify-tag --title "harness ${{ github.ref_name }}" --notes "Reproducible build of ${{ github.sha }}. Verify with gh attestation verify and SHA256SUMS."
