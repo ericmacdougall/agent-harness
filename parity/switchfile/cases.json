@@ -454,6 +454,144 @@
    },
    "want": "python",
    "reason": "invalid"
+  },
+  {
+   "name": "binary not executable",
+   "bin_mode": 384,
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "binary"
+  },
+  {
+   "name": "NaN constant",
+   "raw_template": "{\"schema\": 1, \"x\": NaN, \"groups\": {\"wal\": \"go\"}, \"hosts\": {\"claude\": {\"binary\": \"$BIN\", \"sha256\": \"$SHA\"}}}",
+   "want": "python",
+   "reason": "invalid"
+  },
+  {
+   "name": "Infinity constant",
+   "raw_template": "{\"schema\": 1, \"x\": -Infinity, \"groups\": {\"wal\": \"go\"}, \"hosts\": {\"claude\": {\"binary\": \"$BIN\", \"sha256\": \"$SHA\"}}}",
+   "want": "python",
+   "reason": "invalid"
+  },
+  {
+   "name": "invalid utf-8 byte",
+   "bad_byte": true,
+   "raw_template": "{\"schema\": 1, \"groups\": {\"wal\": \"go\"}, \"hosts\": {\"claude\": {\"binary\": \"$BIN\", \"sha256\": \"$SHA\"}, \"@BAD@\": {\"binary\": \"$BIN\", \"sha256\": \"$SHA\"}}}",
+   "want": "python",
+   "reason": "invalid"
+  },
+  {
+   "name": "leading double slash binary",
+   "raw_template": "{\"schema\": 1, \"groups\": {\"wal\": \"go\"}, \"hosts\": {\"claude\": {\"binary\": \"/$BIN\", \"sha256\": \"$SHA\"}}}",
+   "want": "python",
+   "reason": "binary"
+  },
+  {
+   "name": "lone surrogate binary",
+   "raw_template": "{\"schema\": 1, \"groups\": {\"wal\": \"go\"}, \"hosts\": {\"claude\": {\"binary\": \"/x\\ud800\", \"sha256\": \"$SHA\"}}}",
+   "want": "python",
+   "reason": "binary"
+  },
+  {
+   "name": "launcher dir group-writable",
+   "launcher_dir_mode": 504,
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "binary"
+  },
+  {
+   "name": "codex host flipped",
+   "host": "codex",
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "codex": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "go"
+  },
+  {
+   "name": "cursor host absent",
+   "host": "cursor",
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "host"
+  },
+  {
+   "name": "policy group flipped",
+   "group": "policy",
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "policy": "go",
+     "wal": "python"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "go"
+  },
+  {
+   "name": "policy group not flipped while wal is",
+   "group": "policy",
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "group"
   }
  ]
 }

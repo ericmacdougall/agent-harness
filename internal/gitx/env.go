@@ -59,9 +59,10 @@ func Environment(base []string, o Options) map[string]string {
 	env := map[string]string{}
 	for _, kv := range base {
 		k, v, ok := strings.Cut(kv, "=")
-		if !ok {
+		if !ok || k == "" { // Windows per-drive "=C:=C:\\" entries, which os.environ skips too
 			continue
 		}
+		k = envKey(k)
 		if !strings.HasPrefix(k, "GIT_") || retained[k] {
 			env[k] = v
 		}
@@ -88,6 +89,18 @@ func Environment(base []string, o Options) map[string]string {
 	}
 	return env
 }
+
+// envKey upper-cases keys on Windows as Python's os.environ does, so a "Git_Dir" cannot slip past the
+// GIT_ filter there; elsewhere keys are case-sensitive and kept as they are.
+func envKey(k string) string {
+	if goos == "windows" {
+		return strings.ToUpper(k)
+	}
+	return k
+}
+
+// goos is runtime.GOOS, a variable so the Windows rule is testable on any platform.
+var goos = runtime.GOOS
 
 // Environ is Environment as an exec.Cmd Env slice, sorted for determinism.
 func Environ(base []string, o Options) []string {

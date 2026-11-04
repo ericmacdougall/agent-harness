@@ -3,21 +3,27 @@ name: Release harness binary
 # CGO off, toolchain pinned by go.mod), and each asset carries a GitHub build-provenance attestation that
 # `gh attestation verify <file> --repo ericmacdougall/agent-harness --signer-workflow
 # ericmacdougall/agent-harness/.github/workflows/release.yml` checks before an installer trusts it.
+#
+# Tagged code (tests, build) runs only in read-only jobs. Only the publish job, which runs no repository
+# code, holds contents/id-token/attestations write. Actions are pinned to full commit SHAs.
 on:
   push:
     tags: ["v*"]
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sum.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
+          cache: false
       - name: Test
         run: go vet ./... && go test ./...
       - name: Build
@@ -31,15 +37,61 @@ jobs:
             CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false \
               -ldflags "-s -w -X main.version=${VERSION}" -o "dist/harness-${os}-${arch}${ext}" ./cmd/harness
           done
-          # A second build must be byte-identical, or the release is not reproducible.
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false \
-            -ldflags "-s -w -X main.version=${VERSION}" -o /tmp/harness-check ./cmd/harness
-          cmp /tmp/harness-check dist/harness-linux-amd64
           (cd dist && sha256sum harness-* > SHA256SUMS)
-      - uses: actions/attest-build-provenance@v2
+      - id: sum
+        run: echo "sha=$(sha256sum dist/harness-linux-amd64 | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+  rebuild:
+    # An independent rebuild on a different OS must match byte for byte, or the release is not reproducible.
+    runs-on: macos-latest
+    outputs:
+      sha: ${{ steps.sum.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - id: sum
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false \
+            -ldflags "-s -w -X main.version=${VERSION}" -o harness-check ./cmd/harness
+          echo "sha=$(shasum -a 256 harness-check | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+  publish:
+    needs: [build, rebuild]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Reproducible
+        env:
+          A: ${{ needs.build.outputs.sha }}
+          B: ${{ needs.rebuild.outputs.sha }}
+        run: test -n "$A" && test "$A" = "$B"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist
+      - name: Verify downloaded sums
+        run: cd dist && sha256sum -c SHA256SUMS
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: dist/harness-*
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" dist/* --draft --verify-tag --title "harness ${{ github.ref_name }}" --notes "Reproducible build of ${{ github.sha }}. Verify with gh attestation verify and SHA256SUMS."
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: gh release create "$TAG" dist/* --repo "$REPO" --draft --verify-tag --title "harness $TAG" --notes "Reproducible build of $SHA. Verify with gh attestation verify and SHA256SUMS."

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -20,7 +21,8 @@ CASES = json.loads((ROOT / "parity" / "switchfile" / "cases.json").read_text(enc
 @unittest.skipIf(os.name == "nt", "permission rules are POSIX-only; Windows has no Python front door")
 class SharedCases(unittest.TestCase):
     def test_case_table_is_meaningful(self):
-        self.assertGreaterEqual(len(CASES), 25)
+        self.assertGreaterEqual(len(CASES), 38)
+        self.assertGreater(len({c.get("host", "claude") for c in CASES}), 2)
         self.assertEqual({c["want"] for c in CASES}, {"go", "python", "refuse"})
 
     def test_every_case(self):
@@ -33,6 +35,9 @@ class SharedCases(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root, True)
         binary, other = root / "launcher" / "harness", root / "other" / "harness"
         binary.parent.mkdir(mode=0o700)
+        if "launcher_dir_mode" in case:
+            binary.parent.chmod(case["launcher_dir_mode"])
+            self.addCleanup(binary.parent.chmod, 0o700)
         other.parent.mkdir(mode=0o700)
         content = b"#!fake harness binary\n"
         sha = hashlib.sha256(content).hexdigest()
@@ -59,12 +64,16 @@ class SharedCases(unittest.TestCase):
             body = None
         if body is not None:
             target = root / "impl.json.real" if case.get("file_symlink") else path
-            target.write_text(body, encoding="utf-8")
+            data = body.encode("utf-8")
+            if case.get("bad_byte"):
+                data = data.replace(b"@BAD@", b"\xff")
+            target.write_bytes(data)
             target.chmod(case.get("file_mode", 0o600))
             if case.get("file_symlink"):
                 path.symlink_to(target)
         environ = {k: v.replace("$SHA", sha) for k, v in case.get("env", {}).items()}
-        impl, reason, _, _ = frontdoor.resolve("wal", "claude", str(binary), str(path), environ)
+        impl, reason, _, _ = frontdoor.resolve(case.get("group", "wal"), case.get("host", "claude"), str(binary),
+                                               str(path), environ)
         self.assertEqual((impl, reason), (case["want"], case.get("reason", "")))
 
 
@@ -113,12 +122,66 @@ class Dispatch(unittest.TestCase):
         self.write_switch("python")
         self.assertEqual(self.run_helper("x").stdout, "ran python\n")
 
+    def test_failed_exec_refuses_hook_with_exit_2(self):
+        # Passes every check (owner, 0700, sha) but is not executable code: execve raises OSError.
+        self.binary.write_bytes(b"\x00\x01 not an executable format\n")
+        self.binary.chmod(0o700)
+        self.write_switch("go")
+        result = self.run_helper("x")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("fail-closed", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("ran python", result.stdout)
+
     def test_loop_refuses_hook_with_exit_2(self):
         self.write_switch("go")
         result = self.run_helper("x", extra_env={"AGENT_HARNESS_DISPATCHED": "go->py"})
         self.assertEqual(result.returncode, 2)
         self.assertIn("harness dispatch loop", result.stderr)
         self.assertNotIn("ran python", result.stdout)
+
+
+GATES = json.loads((ROOT / "cmd" / "harness" / "gates.json").read_text(encoding="utf-8"))["gates"]
+SUBCOMMAND = {"wal.py": "wal", "commit_policy.py": "commit-policy", "spec_flow.py": "spec-flow"}
+
+
+class GateTable(unittest.TestCase):
+    """Every hook an installer registers as blocking is a fail-closed gate in the Go binary (gates.json)."""
+
+    def assert_gate(self, argv):
+        script, args = Path(argv[0]).name, argv[1:]
+        self.assertIn(script, SUBCOMMAND, f"unmapped hook script {script}")
+        verbs = GATES.get(SUBCOMMAND[script], [])
+        self.assertTrue(any(a in verbs for a in args), f"{script} {args} is not a gate in gates.json")
+
+    def test_claude_blocking_hooks_are_gates(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        checked = 0
+        for groups in install.managed_hooks(Path("/home/u/.claude")).values():
+            for group in groups:
+                for hook in group["hooks"]:
+                    if hook.get("onFailure") == "block":
+                        self.assert_gate(hook["args"])
+                        checked += 1
+        self.assertGreaterEqual(checked, 3)
+
+    def test_codex_hooks_are_gates(self):
+        sys.path.insert(0, str(ROOT))
+        try:
+            import install_codex
+        except (ImportError, SyntaxError, TypeError) as error:  # needs Python 3.11 (tomllib)
+            self.skipTest(f"install_codex not importable here: {error}")
+        merged = install_codex.merge_hooks({}, Path("/home/u/.codex"))
+        checked = 0
+        for event, groups in merged["hooks"].items():
+            if event not in ("PreToolUse", "UserPromptSubmit"):
+                continue  # Codex only blocks on these events
+            for group in groups:
+                for hook in group["hooks"]:
+                    self.assert_gate(shlex.split(hook["command"])[1:])
+                    checked += 1
+        self.assertGreaterEqual(checked, 3)
 
 
 if __name__ == "__main__":

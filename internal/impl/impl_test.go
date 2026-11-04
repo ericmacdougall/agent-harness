@@ -22,6 +22,10 @@ type tcase struct {
 	BinSymlink  bool              `json:"bin_symlink"`
 	BinMissing  bool              `json:"bin_missing"`
 	Env         map[string]string `json:"env"`
+	Group       string            `json:"group"`
+	Host        string            `json:"host"`
+	BadByte     bool              `json:"bad_byte"`
+	LauncherDir *uint32           `json:"launcher_dir_mode"`
 	Want        string            `json:"want"`
 	Reason      string            `json:"reason"`
 }
@@ -38,7 +42,7 @@ func TestSharedCases(t *testing.T) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatal(err)
 	}
-	if len(doc.Cases) < 20 {
+	if len(doc.Cases) < 38 {
 		t.Fatalf("only %d cases", len(doc.Cases))
 	}
 	for _, c := range doc.Cases {
@@ -48,6 +52,9 @@ func TestSharedCases(t *testing.T) {
 			other := filepath.Join(dir, "other", "harness")
 			os.MkdirAll(filepath.Dir(bin), 0o700)
 			os.MkdirAll(filepath.Dir(other), 0o700)
+			if c.LauncherDir != nil {
+				mustOK(t, os.Chmod(filepath.Dir(bin), os.FileMode(*c.LauncherDir)))
+			}
 			content := []byte("#!fake harness binary\n")
 			sum := sha256.Sum256(content)
 			sha := hex.EncodeToString(sum[:])
@@ -76,7 +83,11 @@ func TestSharedCases(t *testing.T) {
 				if c.FileSymlink {
 					target = file + ".real"
 				}
-				os.WriteFile(target, []byte(body), 0o600)
+				data := []byte(body)
+				if c.BadByte {
+					data = []byte(strings.ReplaceAll(body, "@BAD@", "\xff"))
+				}
+				mustOK(t, os.WriteFile(target, data, 0o600))
 				if c.FileMode != nil {
 					os.Chmod(target, os.FileMode(*c.FileMode))
 				}
@@ -88,10 +99,24 @@ func TestSharedCases(t *testing.T) {
 			for k, v := range c.Env {
 				env[k] = strings.ReplaceAll(v, "$SHA", sha)
 			}
-			d := Resolve(Request{Group: "wal", Host: "claude", Launcher: bin, File: file, Getenv: func(k string) string { return env[k] }})
+			group, host := c.Group, c.Host
+			if group == "" {
+				group = "wal"
+			}
+			if host == "" {
+				host = "claude"
+			}
+			d := Resolve(Request{Group: group, Host: host, Launcher: bin, File: file, Getenv: func(k string) string { return env[k] }})
 			if d.Impl != c.Want || d.Reason != c.Reason {
 				t.Fatalf("got %+v, want %s/%s", d, c.Want, c.Reason)
 			}
 		})
+	}
+}
+
+func mustOK(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
 	}
 }

@@ -159,6 +159,14 @@ func TestMkdirPrivate(t *testing.T) {
 		if fi.Mode().Perm() != 0o700 {
 			t.Fatalf("mode %v", fi.Mode().Perm())
 		}
+		// An existing directory wider than 0700 is not private (red-team: MkdirPrivate accepted any mode).
+		if err := os.Mkdir(filepath.Join(dir, "wide"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		os.Chmod(filepath.Join(dir, "wide"), 0o755)
+		if _, err := d.MkdirPrivate("wide"); !errors.Is(err, ErrUnsafe) {
+			t.Fatalf("0755 dir accepted: %v", err)
+		}
 		os.Symlink(t.TempDir(), filepath.Join(dir, "ln"))
 		if _, err := d.MkdirPrivate("ln"); !errors.Is(err, ErrUnsafe) {
 			t.Fatalf("symlink: %v", err)
