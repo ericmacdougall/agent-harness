@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_provenance as base  # noqa: E402
 from test_provenance import HOOKS, HUMAN, QUOTE, SID  # noqa: E402
 
+from hostile_inputs import run_capped  # noqa: E402
+
 sys.path.insert(0, str(HOOKS))
 import provenance_hooks as hooks  # noqa: E402
 from provenance import inline_source as provenance_inline  # noqa: E402
@@ -36,6 +38,33 @@ class Detector(unittest.TestCase):
                      "```\nWhat I need from you:\n- x\n```", "The agent needs the key from the vault."):
             self.assertEqual(self.flagged(text), [], text)
         self.assertEqual(len(self.flagged("The MSI is still waiting for you to sign in. Nothing needs you for the rest.")), 1)
+
+
+class DetectorRegressions(unittest.TestCase):
+    """Findings of the delta red-team: enforce must not nag on ordinary status text."""
+
+    def flagged(self, text):
+        return [item["text"] for item in hooks.detect(text)]
+
+    def test_status_text_is_quiet(self):
+        for text in ("Done. Tell me if you want more detail on any of it.", "Decisions made:\n- chose sqlite",
+                     "Decisions:\n- used sqlite\n- skipped tests", "Open questions:\n- none", "Blocked on you: nothing.",
+                     "Waiting on you: nothing", "You asked me to 'please send the report'.",
+                     'The log says: please provide credentials', "Questions for you:\n- n/a\n"):
+            self.assertEqual(self.flagged(text), [], text)
+
+    def test_cited_items_with_sub_bullets_and_wrapped_lines_are_one_item(self):
+        text = "What I need from you:\n- key [ask:wgood00001]\n  - why: because\n  - how: via vault\n- the production deploy key for\n  the staging box [ask:wgood00002]\n"
+        items = hooks.detect(text)
+        self.assertEqual(len(items), 2)
+        self.assertIn("[ask:wgood00001]", items[0]["text"])
+        self.assertIn("[ask:wgood00002]", items[1]["text"])
+
+    def test_fences_cannot_hide_asks(self):
+        self.assertEqual(len(self.flagged("```x```\nWhat I need from you:\n- the key\n")), 1)
+        self.assertEqual(len(self.flagged("```\nunclosed fence\nWhat I need from you:\n- the key\n")), 1)
+        self.assertEqual(self.flagged("```\nWhat I need from you:\n- the key\n```\nDone.\n"), [])
+        self.assertEqual(len(hooks.detect("What I need from you:\n" + "- x item\n" * 500)), hooks.MAX_ITEMS)
 
 
 class Hooks(base.Env):
@@ -97,6 +126,23 @@ class Hooks(base.Env):
     def stop_payload(self, text):
         return {"session_id": SID, "last_assistant_message": text, "stop_hook_active": False}
 
+    def test_reminder_lifecycle_and_session_ids(self):
+        message = "What I need from you:\n- the OpenRouter key\n"
+        self.run_hook("stop-lint", self.stop_payload(message))
+        self.assertTrue(hooks.reminder_path(SID).exists())
+        self.run_hook("stop-lint", self.stop_payload("All done."))  # a clean message clears the stale reminder
+        self.assertFalse(hooks.reminder_path(SID).exists())
+        for bad in ("..", ".", "../../etc"):
+            self.assertEqual(self.run_hook("stop-lint", {"session_id": bad, "last_assistant_message": message}), {})
+            self.assertEqual(self.run_hook("prompt", {"session_id": bad}), {})
+        self.assertEqual(self.run_hook("ask-gate", {"session_id": SID, "tool_name": "AskUserQuestion", "tool_input": "x"}), {})
+
+    def test_ask_gate_fails_open_when_the_ledger_is_unavailable(self):
+        import shutil
+        shutil.rmtree(self.wals)
+        out = self.run_hook("ask-gate", self.ask_payload("Which key? [ask:wnotreal0001]"))
+        self.assertEqual(out, {})  # no WAL directory at all: misconfiguration, not a reason to deny
+
     def test_stop_lint_modes(self):
         message = "Update.\n\nWhat I need from you:\n- the OpenRouter key\n- " + f"approve the plan [ask:{self.ask_id}]\n"
         warn = self.run_hook("stop-lint", self.stop_payload(message))
@@ -119,11 +165,14 @@ class Hooks(base.Env):
 
     def test_stop_lint_reads_the_transcript_tail_and_fails_open(self):
         record = {"type": "assistant", "uuid": "u", "message": {"content": [{"type": "text", "text": "Decisions needed:\n- the region\n"}]}}
-        path = self.home / "t.jsonl"
-        path.write_text(json.dumps({"type": "user"}) + "\n" + json.dumps(record, separators=(",", ":")) + "\n" + "{garbage\n")
+        path = self.home / ".claude" / "projects" / "-proj" / "t.jsonl"
+        path.write_text(json.dumps({"type": "user", "toolUseResult": {}}) + "\n" + json.dumps(record, separators=(",", ":")) + "\n" + "{garbage\n")
         self.set_policy(stop_lint="enforce")
         out = self.run_hook("stop-lint", {"session_id": SID, "transcript_path": str(path)})
         self.assertEqual(out["decision"], "block")
+        user_after = json.dumps({"type": "user", "message": {"content": "thanks"}}, separators=(",", ":"))
+        path.write_text(path.read_text().replace("{garbage\n", "") + user_after + "\n")
+        self.assertEqual(self.run_hook("stop-lint", {"session_id": SID, "transcript_path": str(path)}), {})  # stale message
         self.assertEqual(self.run_hook("stop-lint", None, raw="{not json"), {})
         self.assertEqual(self.run_hook("stop-lint", None, raw="[" * 5000 + "]" * 5000), {})
         self.assertEqual(self.run_hook("ask-gate", None, raw=""), {})
@@ -131,3 +180,83 @@ class Hooks(base.Env):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeviceAndHugeInputs(base.Env):
+    """transcript_path pointing at devices, FIFOs, symlinks and huge files must never be read unbounded (P0)."""
+
+    def setUp(self):
+        super().setUp()
+        self.env = dict(os.environ, HOME=str(self.home))
+        policy = self.home / "policy.json"
+        policy.write_text(json.dumps({"schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce",
+                                      "stop_lint": "enforce", "wal": {}}))
+        self.env["HARNESS_PROVENANCE_POLICY"] = str(policy)
+        self.projects = self.home / ".claude" / "projects" / "-proj"
+
+    def hook(self, transcript_path):
+        payload = json.dumps({"session_id": SID, "transcript_path": str(transcript_path), "stop_hook_active": False})
+        return run_capped([str(HOOKS / "provenance_hooks.py"), "stop-lint"], payload, self.env, timeout=8.0)
+
+    def assert_safe(self, path, label):
+        code, out, err, seconds, peak = self.hook(path)
+        self.assertEqual(code, 0, f"{label}: rc={code} err={err[:200]}")
+        self.assertNotIn("decision", out, label)
+        self.assertLess(seconds, 1.5, f"{label}: took {seconds:.2f}s")
+        self.assertLess(peak, 100 * 1024 * 1024, f"{label}: peak RSS {peak >> 20} MiB")
+        return err
+
+    def test_devices_are_rejected_quickly_and_cheaply(self):
+        for device in ("/dev/zero", "/dev/urandom", "/dev/null", "/dev/tty"):
+            if os.path.exists(device):
+                err = self.assert_safe(device, device)
+                self.assertIn("rejected", err)
+
+    def test_fifo_directory_and_symlinked_device(self):
+        fifo = self.home / "pipe"
+        os.mkfifo(fifo)
+        self.assertIn("rejected", self.assert_safe(fifo, "fifo"))
+        self.assertIn("rejected", self.assert_safe(self.projects, "directory"))
+        link = self.projects / "link.jsonl"
+        os.symlink("/dev/zero", link)
+        self.assertIn("rejected", self.assert_safe(link, "symlink to /dev/zero"))
+        outside = self.home / "outside.jsonl"
+        outside.write_text('{"type":"assistant","message":{"content":[{"type":"text","text":"Decisions needed:\\n- x\\n"}]}}\\n')
+        self.assertIn("outside", self.assert_safe(outside, "regular file outside ~/.claude/projects"))
+
+    def test_five_gigabyte_sparse_file_reads_only_a_tail_window(self):
+        big = self.projects / "huge.jsonl"
+        with open(big, "wb") as handle:
+            handle.truncate(5 * 1024 ** 3)
+            handle.seek(-200, os.SEEK_END)
+            handle.write(b'\n{"type":"assistant","message":{"content":[{"type":"text","text":"Decisions needed:\\n- the region\\n"}]}}\n')
+        code, out, err, seconds, peak = self.hook(big)
+        self.assertEqual(code, 0, err[:200])
+        self.assertEqual(json.loads(out)["decision"], "block")  # the tail was read and linted
+        self.assertLess(seconds, 1.5)
+        self.assertLess(peak, 100 * 1024 * 1024, f"peak RSS {peak >> 20} MiB")
+
+    def test_resolver_scans_are_bounded_too(self):
+        import provenance
+        link = self.projects / "dev.jsonl"
+        os.symlink("/dev/zero", link)
+        for call in (lambda: provenance.read_small("/dev/zero"), lambda: provenance.read_tail("/dev/zero", 1024),
+                     lambda: list(provenance._lines_containing(Path("/dev/zero"), b"x"))):
+            with self.assertRaises(provenance.Problem) as caught:
+                call()
+            self.assertEqual(caught.exception.code, "file-not-regular")
+        with self.assertRaises(provenance.Problem):
+            provenance.read_small(self.transcript, 100)  # larger than its limit
+        self.assertEqual(provenance.wal_entry(Path("/dev/zero"), "L5"), "malformed")
+        result = provenance.resolve(f'wal:{self.wals}/x.jsonl#wabcd1234')
+        self.assertFalse(result["ok"])
+
+    def test_watchdog_exits_zero_when_memory_runs_away(self):
+        code = ("import sys,time; sys.path.insert(0, %r); import provenance_hooks as h; "
+                "h.install_limits(rss_limit=150*1024*1024, wall_limit=20); keep=[]\n"
+                "for i in range(8):\n keep.append(bytearray(50*1024*1024)); time.sleep(0.05)\nprint('SURVIVED')" % str(HOOKS))
+        rc, out, err, seconds, peak = run_capped(["-c", code], env=self.env, timeout=20.0)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("SURVIVED", out)
+        self.assertIn("limit exceeded", err)
+        self.assertLess(peak, 400 * 1024 * 1024)

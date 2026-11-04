@@ -22,14 +22,20 @@ import json
 import os
 import re
 import sys
+import time
 import unicodedata
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))  # hooks live side by side; works when run as a script or imported
+import safe_input  # noqa: E402
 POLICY_FILE = HERE / "provenance_policy.json"
 MAX_LINE = 8 * 1024 * 1024        # a transcript or WAL line larger than this is never parsed
 MAX_HITS = 200                    # lines parsed per lookup
 MAX_TEXT = 2 * 1024 * 1024
+MAX_SCAN_BYTES = 1 << 30          # a transcript or WAL larger than this is not scanned
+SCAN_SECONDS = 3.0                # wall-clock budget for one scan
+SMALL_FILE = 1 << 20              # policy, cache and similar small files
 MAX_RESOLVES = 40                 # sources resolved per top-level claim
 MAX_DEPTH = 8                     # wal: pointer chain depth
 EXCERPT_MIN, EXCERPT_MAX, EXCERPT_SEGMENTS = 12, 300, 3
@@ -65,12 +71,39 @@ def clip(value, limit: int = 60) -> str:
 
 # --------------------------------------------------------------------------- policy
 
+def _roots(root):
+    return None if root is None else [root]
+
+
+def _translate(call, *args, **kwargs):
+    try:
+        return call(*args, **kwargs)
+    except safe_input.InputRejected as rejected:
+        raise Problem(rejected.code, rejected.message)
+
+
+def open_regular(path, root=None) -> int:
+    """fd of a regular file or Problem (see safe_input.open_regular_file: no devices, FIFOs, escapes, TOCTOU)."""
+    return _translate(safe_input.open_regular_file, path, _roots(root))
+
+
+def read_small(path, limit: int = SMALL_FILE, root=None) -> bytes:
+    return _translate(safe_input.read_bounded, path, limit, _roots(root))
+
+
+def read_tail(path, window: int, root=None) -> bytes:
+    return _translate(safe_input.read_tail, path, window, _roots(root))
+
+
+def read_text_arg(path, limit: int = 4 * SMALL_FILE) -> str:
+    return read_small(path, limit).decode("utf-8", "replace")
+
+
 def load_policy(path=None) -> dict:
     path = Path(path or os.environ.get("HARNESS_PROVENANCE_POLICY") or POLICY_FILE)
     policy = json.loads(json.dumps(DEFAULT_POLICY))
     try:
-        with open(path, encoding="utf-8") as handle:
-            loaded = json.load(handle)
+        loaded = loads_line(read_small(path, 1 << 16))
         if not isinstance(loaded, dict) or loaded.get("schema") != 1:
             raise ValueError("not a schema 1 provenance policy")
         for key in ("spec", "plan_packet", "ask_user_question", "stop_lint"):
@@ -80,8 +113,9 @@ def load_policy(path=None) -> dict:
             for event, mode in loaded["wal"].items():
                 if mode in MODES:
                     policy["wal"][event] = mode
-    except FileNotFoundError:
-        pass
+    except Problem as error:
+        if error.code != "file-unreadable" or Path(path).exists():
+            policy["policy_error"] = clip(error.message, 120)
     except (OSError, ValueError) as error:  # a broken policy must not silently disable the gate
         policy["policy_error"] = clip(error, 120)
     return policy
@@ -269,41 +303,11 @@ def find_transcript(session: str, home=None):
 
 CHUNK = 8 * 1024 * 1024
 MAX_JSON_DEPTH = 200
-_TOKENS = re.compile(rb'["\\\[\]{}]')
 
 
 def loads_line(raw):
-    """json.loads for untrusted lines. Python 3.9 aborts the whole interpreter (SIGABRT, not RecursionError)
-    on JSON nested about 1000 deep, so cap the size and pre-scan the nesting depth before parsing.
-    Raises ValueError for anything it will not parse; callers count that line as malformed and move on."""
-    if isinstance(raw, str):
-        raw = raw.encode("utf-8", "replace")
-    if len(raw) > MAX_LINE:
-        raise ValueError("line too large")
-    if raw.count(b"[") + raw.count(b"{") > MAX_JSON_DEPTH:  # cheap bound first: depth <= bracket count
-        depth, in_string, skip = 0, False, -1  # linear: one pass over structural bytes only
-        for token in _TOKENS.finditer(raw):
-            at = token.start()
-            if at == skip:
-                continue
-            char = token.group()
-            if in_string:
-                if char == b"\\":
-                    skip = at + 1
-                elif char == b'"':
-                    in_string = False
-            elif char == b'"':
-                in_string = True
-            elif char in (b"[", b"{"):
-                depth += 1
-                if depth > MAX_JSON_DEPTH:
-                    raise ValueError("nested too deeply")
-            elif char in (b"]", b"}"):
-                depth -= 1
-    try:
-        return json.loads(raw)
-    except RecursionError:
-        raise ValueError("nested too deeply")
+    """json.loads for untrusted lines (size and nesting limits; ValueError for anything it will not parse)."""
+    return safe_input.safe_json_loads(raw, MAX_JSON_DEPTH, MAX_LINE)
 
 
 def _line_around(fd: int, index: int, size: int):
@@ -330,14 +334,16 @@ def _line_around(fd: int, index: int, size: int):
 def _lines_containing(path: Path, needle: bytes):
     """Yield the line (or None when oversized) for each line containing needle. bytes.find on 8 MiB chunks:
     mmap.find is a naive loop on Python 3.9 and 5 to 10 times slower on a 75 MB transcript."""
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError as error:
-        raise Problem("file-unreadable", f"cannot read {clip(path.name, 60)} ({type(error).__name__})")
+    fd = open_regular(path)
     try:
         size = os.fstat(fd).st_size
+        if size > MAX_SCAN_BYTES:
+            raise Problem("file-too-large", f"{clip(path.name, 60)} is larger than {MAX_SCAN_BYTES >> 20} MiB; not scanned")
+        deadline = time.monotonic() + SCAN_SECONDS
         offset, hits, carry, next_line = 0, 0, b"", 0
         while offset < size and hits < MAX_HITS:
+            if time.monotonic() > deadline:
+                raise Problem("scan-timeout", f"scan of {clip(path.name, 60)} exceeded {SCAN_SECONDS:.0f}s")
             chunk = os.pread(fd, min(CHUNK, size - offset), offset)
             if not chunk:
                 return
@@ -381,9 +387,12 @@ def load_record(path: Path, key: str, value: str):
 def _compact_json(path: Path, key: str) -> bool:
     """True when the file's first megabyte already shows compact `"key":"` fields, so a miss is a real miss."""
     try:
-        with open(path, "rb") as handle:
-            return f'"{key}":"'.encode() in handle.read(1 << 20)
-    except OSError:
+        fd = open_regular(path)
+        try:
+            return f'"{key}":"'.encode() in os.pread(fd, 1 << 20, 0)
+        finally:
+            os.close(fd)
+    except (OSError, Problem):
         return False
 
 
@@ -502,11 +511,12 @@ def wal_entry(path: Path, entry: str):
     if entry.startswith("L") and entry[1:].isdigit():
         number = int(entry[1:])
         try:
-            with open(path, "rb") as handle:
-                for index, line in enumerate(handle, 1):
-                    if index == number:
-                        return loads_line(line)
-        except (OSError, ValueError):
+            for index, line in safe_input.iter_jsonl_lines(path, MAX_LINE, max_seconds=SCAN_SECONDS):
+                if index == number:
+                    return "malformed" if line is None else loads_line(line)
+                if index > number:
+                    break
+        except (safe_input.InputRejected, ValueError):
             return "malformed"
         return None
     return load_record(path, "id", entry)
@@ -518,22 +528,35 @@ def ticket_cache_path() -> Path:
 
 def ticket_cache(home=None) -> dict:
     try:
-        with open(ticket_cache_path(), encoding="utf-8") as handle:
-            data = json.load(handle)
+        data = loads_line(read_small(ticket_cache_path()))
         return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+    except (Problem, OSError, ValueError):
         return {}
 
 
 def git_line(repo: Path, sha: str, path: str, start: int, end: int):
+    import signal
     import subprocess
+    cap = MAX_LINE * 2
     try:
-        run = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{sha}:{path}"], capture_output=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
+        child = subprocess.Popen(["git", "-C", str(repo), "cat-file", "blob", f"{sha}:{path}"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+    except (OSError, ValueError):
         raise Problem("file-git", "git could not be run")
-    if run.returncode != 0:
+    try:
+        data = child.stdout.read(cap + 1)  # bounded: a huge blob is cut off, never buffered whole
+    finally:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)  # also reaps any helper git spawned
+        except OSError:
+            pass
+        child.stdout.close()
+        child.wait()
+    if len(data) > cap:
+        raise Problem("file-too-large", f"{clip(path, 50)} is larger than {cap} bytes")
+    if not data and child.returncode != 0:
         raise Problem("file-not-found", f"{clip(path, 50)} does not exist at {sha[:8]}")
-    lines = run.stdout[:MAX_LINE * 2].decode("utf-8", "replace").split("\n")
+    lines = data.decode("utf-8", "replace").split("\n")
     if start < 1 or end > len(lines) or end < start:
         raise Problem("file-line", f"{clip(path, 50)} has {len(lines)} lines at {sha[:8]}; cited {start}-{end}")
     return "\n".join(lines[start - 1:end])
@@ -976,7 +999,7 @@ def main(argv=None) -> int:
             print(json.dumps(result, indent=1) if args.json else "\n".join(render(result, "")))
             return 0 if result["ok"] else 2
         if args.command == "check-spec":
-            text = Path(args.spec).read_text(encoding="utf-8")
+            text = read_text_arg(args.spec)
             if GRANDFATHERED_RE_SEARCH(text):
                 problems, warnings = spec_lint(text, mode="enforce")
                 print("\n".join(problems + warnings))
@@ -986,7 +1009,7 @@ def main(argv=None) -> int:
                 print(f"{ident} line {number}: " + (problem or f"{status_word(result)}" + (" (deferred ticket check)" if result["deferred"] else "")))
             return 2 if any(p for *_, p in rows) or not rows else 0
         if args.command == "check-packet":
-            body = Path(args.packet).read_text(encoding="utf-8")
+            body = read_text_arg(args.packet)
             code, text = packet_gate(body, mode="enforce")
             found = len(extract_items(body))
             print(text or (f"ok: {found} packet items, each with a verifiable Source" if found
@@ -995,7 +1018,7 @@ def main(argv=None) -> int:
         if args.command == "trace":
             ctx = {"want_text": True}
             if args.spec:
-                text = Path(args.spec).read_text(encoding="utf-8")
+                text = read_text_arg(args.spec)
                 wanted = [row for row in extract_items(text, sections={"Acceptance criteria", "Negative cases"}) if row[0] == args.item]
                 if not wanted:
                     raise Problem("item-not-found", f"{clip(args.item, 20)} not in spec")
