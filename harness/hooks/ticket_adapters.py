@@ -144,7 +144,8 @@ class GoodQAAdapter:
             details = error.get("details") if isinstance(error, dict) else None
             reason = details.get("reason") if isinstance(details, dict) else None
             # Only machine codes are kept: messages can echo untrusted filenames or content.
-            found = {"__error__": str(code)}
+            code = str(code)
+            found = {"__error__": code if re.fullmatch(r"[a-z_]{1,40}", code) else "error"}
             if isinstance(reason, str) and re.fullmatch(r"[a-z_]{1,40}", reason):
                 found["__reason__"] = reason
             return found

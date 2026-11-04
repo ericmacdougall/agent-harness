@@ -529,6 +529,28 @@ def record_shape_problem(record: dict):
     return None
 
 
+def _nesting_depth(text: str) -> int:
+    depth = deepest = 0
+    in_string = escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string, escaped = True, False
+        elif ch in "[{":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif ch in "]}":
+            depth -= 1
+    return deepest
+
+
 def ticket_records(comments: list, max_bytes: int):
     records, ignored = [], []
     for comment in comments:
@@ -538,6 +560,8 @@ def ticket_records(comments: list, max_bytes: int):
                 ignored.append(f"comment {comment['id'][:8]}: record larger than {max_bytes} bytes")
                 continue
             try:
+                if _nesting_depth(raw) > 32:
+                    raise ValueError("nested too deeply")
                 record = json.loads(raw)
             except (ValueError, RecursionError):
                 ignored.append(f"comment {comment['id'][:8]}: record is not JSON")
@@ -843,8 +867,9 @@ def classify(tool: str, tool_input: dict, min_reason: int):
         yield tool_input.get("issueId"), "open" if len(note) >= min_reason else "reason", "wont_fix"
     elif tool == "update_issue":
         patch = tool_input.get("patch") if isinstance(tool_input.get("patch"), dict) else {}
-        if "status" in patch:
-            yield tool_input.get("issueId"), _status_action(patch.get("status"), ""), patch.get("status")
+        status = _one_status(tool_input, patch)
+        if status is not None:
+            yield tool_input.get("issueId"), _status_action(status, ""), status
         if any(key in patch for key in ("projectId", "pipelineId", "stageId")):
             # Moving an issue out of an enforced project (or across a pipeline) would escape the gate.
             yield tool_input.get("issueId"), "stage", "project/pipeline/stage move"
@@ -854,8 +879,8 @@ def classify(tool: str, tool_input: dict, min_reason: int):
             yield None, "scope", "bulk_update_issues with items that are not a list"
         for item in items if isinstance(items, list) else []:
             if isinstance(item, dict):
-                yield item.get("issueId"), _status_action(item.get("status"), str(item.get("note") or ""),
-                                                          min_reason), item.get("status")
+                yield item.get("issueId"), _status_action(_item_status(item), str(item.get("note") or ""),
+                                                          min_reason), _item_status(item)
             else:
                 yield None, "scope", "bulk_update_issues with a malformed item"
     elif tool == "archive_issue":
@@ -900,11 +925,10 @@ def _classify_call_api(tool_input: dict, min_reason: int):
     raw = tool_input.get("body")
     body = raw if isinstance(raw, dict) else {}
     patch = body.get("patch") if isinstance(body.get("patch"), dict) else {}
-    present = [src for src in (body, patch) if "status" in src]
-    status = next((src["status"] for src in present if src["status"] is not None), None)
-    if present and status is None:
-        status = "<null>"  # an explicit null status: unknown, so it is gated rather than ignored
+    status = _one_status(body, patch)
     if _SAFE_SUBRESOURCE.fullmatch(path):
+        if status is not None or "patch" in body:
+            yield issue_id, "unknown", f"{method} {original} carries a status"
         return
     single = _ISSUE_PATH.fullmatch(path)
     if single:
@@ -931,8 +955,8 @@ def _classify_call_api(tool_input: dict, min_reason: int):
         elif items is not None:
             for item in items:
                 if isinstance(item, dict):
-                    yield item.get("issueId"), _status_action(item.get("status"), str(item.get("note") or ""),
-                                                              min_reason), item.get("status")
+                    yield item.get("issueId"), _status_action(_item_status(item), str(item.get("note") or ""),
+                                                              min_reason), _item_status(item)
                 else:
                     yield None, "scope", f"{original} with a malformed item"
         elif (raw is not None and not isinstance(raw, dict)) or "status" in body or "patch" in body:
@@ -942,6 +966,22 @@ def _classify_call_api(tool_input: dict, min_reason: int):
         return
     # Any other write mentioning issues (sub-resources such as /close, unknown routes): unchecked.
     yield issue_id, ("unknown" if issue_id else "scope"), f"{method} {original} (unrecognised issue route)"
+
+
+def _item_status(item: dict):
+    status = _one_status(item, item.get("patch"))
+    return "<missing status>" if status is None else status
+
+
+def _one_status(*sources):
+    """The status a write sets, or None. Two different values, or an explicit null, are unknown."""
+    values = {repr(src["status"]) for src in sources if isinstance(src, dict) and "status" in src}
+    if not values:
+        return None
+    if len(values) > 1:
+        return "<conflicting statuses>"
+    value = next(src["status"] for src in sources if isinstance(src, dict) and "status" in src)
+    return "<null>" if value is None else value
 
 
 def _status_action(status, note=None, min_reason=20):
@@ -1007,7 +1047,7 @@ def run_hook(payload: dict, spec_policy: dict, config_loader=None) -> tuple:
     if not match or mode == "off":
         return 0, ""
     min_reason = int(spec_policy.get("close_reason_min_chars", 20))
-    items = [item for item in classify(match.group(1), payload.get("tool_input") or {}, min_reason)
+    items = [item for item in classify(match.group(1).lower(), payload.get("tool_input") or {}, min_reason)
              if item[1] != "open"]
     if not items:
         return 0, ""
@@ -1057,7 +1097,12 @@ def run_hook(payload: dict, spec_policy: dict, config_loader=None) -> tuple:
                         warnings.append(f"issue {issue_id} is not found with any routed key, and every enforced "
                                         "project's key still reads its project; not checked")
                 continue
-            target = blocking if str(issue.get("projectId") or "").lower() in enforced else warnings
+            project_id = str(issue.get("projectId") or "").lower()
+            if not project_id and enforced:
+                blocking.append(f"issue {issue_id[:8]} has no readable project id, so the gate cannot tell "
+                                "whether it is enforced")
+                continue
+            target = blocking if project_id in enforced else warnings
             label = f"issue #{issue.get('number')} ({issue_id[:8]})"
             if action == "done":
                 comments = adapter.all_comments(issue_id)
