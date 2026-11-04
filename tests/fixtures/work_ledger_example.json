@@ -1,0 +1,1068 @@
+{
+  "schema": 2,
+  "schemaUrl": "https://agent-harness.local/schemas/work-ledger/v2.schema.json",
+  "ledgerId": "ledger-example-0001",
+  "hiveId": "m2air",
+  "rev": 418,
+  "generatedAt": "2026-11-04T16:02:11Z",
+  "migratedFrom": {
+    "schema": 1,
+    "rev": 97,
+    "at": "2026-11-04T09:00:00Z",
+    "sourceFile": "/Users/example/.agent-harness/work-assignments.json",
+    "sourceSha256": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "writers": {
+    "m2air": {
+      "machineId": "mac-example-air",
+      "account": "anthropic:work",
+      "lastSeq": 1207,
+      "lastEventSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "lastSyncAt": "2026-11-04T16:02:11Z"
+    },
+    "dev2a": {
+      "machineId": "dev2-example",
+      "account": "openai:work",
+      "lastSeq": 88,
+      "lastEventSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "lastSyncAt": "2026-11-04T15:40:00Z"
+    }
+  },
+  "appliedThrough": {
+    "m2air": 1207,
+    "dev2a": 88
+  },
+  "sessions": {
+    "sess-aaaa1111-0000-4000-8000-000000000001": {
+      "provider": "claude-code",
+      "hiveId": "m2air",
+      "account": "anthropic:work",
+      "transcript": "/Users/example/.claude/projects/-Users-example/sess-aaaa1111-0000-4000-8000-000000000001.jsonl",
+      "syncOffset": 48213,
+      "syncLine": 214,
+      "firstSeenAt": "2026-11-04T10:00:00Z",
+      "lastSeenAt": "2026-11-04T16:01:50Z",
+      "stopBlocks": {
+        "ask:A-m2air-0042": {
+          "count": 1,
+          "lastAt": "2026-11-04T14:10:00Z"
+        }
+      },
+      "reinject": false
+    },
+    "codex-bbbb2222-0000-4000-8000-000000000002": {
+      "provider": "codex",
+      "hiveId": "dev2a",
+      "account": "openai:work",
+      "transcript": "/home/example/.codex/sessions/2026/11/04/rollout-bbbb2222.jsonl",
+      "syncOffset": 9000,
+      "syncLine": 61,
+      "firstSeenAt": "2026-11-04T11:30:00Z",
+      "lastSeenAt": "2026-11-04T15:39:00Z"
+    }
+  },
+  "messages": {
+    "M-m2air-0101": {
+      "id": "M-m2air-0101",
+      "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+      "writer": "m2air",
+      "origin": {
+        "actor": {
+          "kind": "human",
+          "provider": "claude-code",
+          "account": "anthropic:work",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "label": "user"
+        },
+        "at": "2026-11-04T10:05:00Z",
+        "log": {
+          "file": "/Users/example/.claude/projects/-Users-example/sess-aaaa1111-0000-4000-8000-000000000001.jsonl",
+          "lineStart": 12,
+          "lineEnd": 12,
+          "messageUuid": "u-0101-aaaa-bbbb",
+          "lineSha256": "4444444444444444444444444444444444444444444444444444444444444444"
+        },
+        "binding": {
+          "status": "bound",
+          "boundAt": "2026-11-04T10:05:40Z",
+          "attempts": 1
+        },
+        "attachments": [
+          {
+            "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            "bytes": 20480,
+            "mime": "image/png",
+            "name": "mock-screenshot.png"
+          }
+        ]
+      },
+      "capturedAt": "2026-11-04T10:05:01Z",
+      "capturedVia": "hook_prompt",
+      "pastedOnly": false,
+      "text": {
+        "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+        "chars": 212,
+        "words": 38,
+        "excerpt": "[fake] add a retry to the widget exporter and cover the timeout case",
+        "privateRef": {
+          "store": "local-private",
+          "key": "messages/M-m2air-0101.txt"
+        },
+        "redaction": {
+          "policy": "harness-redactor/1",
+          "applied": true,
+          "hits": 0
+        }
+      },
+      "triage": {
+        "status": "split",
+        "at": "2026-11-04T10:06:00Z",
+        "by": {
+          "kind": "agent",
+          "provider": "claude-code",
+          "account": "anthropic:work",
+          "model": "claude-sonnet-4-5",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "pid": 4100,
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "label": "main"
+        },
+        "askIds": [
+          "A-m2air-0042"
+        ]
+      },
+      "humanCheck": {
+        "isHuman": true,
+        "method": "claude_user_turn",
+        "providerItemId": "00000000-0000-4000-8000-000000000001"
+      }
+    },
+    "M-m2air-0102": {
+      "id": "M-m2air-0102",
+      "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+      "writer": "m2air",
+      "origin": {
+        "actor": {
+          "kind": "human",
+          "provider": "claude-code",
+          "account": "anthropic:work",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "label": "user"
+        },
+        "at": "2026-11-04T10:31:00Z",
+        "log": {
+          "file": "/Users/example/.claude/projects/-Users-example/sess-aaaa1111-0000-4000-8000-000000000001.jsonl",
+          "lineStart": 40,
+          "messageUuid": "u-0102-aaaa-bbbb",
+          "lineSha256": "7777777777777777777777777777777777777777777777777777777777777777"
+        },
+        "binding": {
+          "status": "bound",
+          "boundAt": "2026-11-04T10:31:30Z",
+          "attempts": 1
+        }
+      },
+      "capturedAt": "2026-11-04T10:31:01Z",
+      "capturedVia": "hook_post_tool",
+      "pastedOnly": false,
+      "text": {
+        "sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+        "chars": 31,
+        "words": 6,
+        "excerpt": "[fake] exponential, cap at three",
+        "privateRef": {
+          "store": "local-private",
+          "key": "messages/M-m2air-0102.txt"
+        },
+        "redaction": {
+          "policy": "harness-redactor/1",
+          "applied": true,
+          "hits": 0
+        }
+      },
+      "triage": {
+        "status": "answer",
+        "at": "2026-11-04T10:31:02Z",
+        "decisionIds": [
+          "D-m2air-0007"
+        ]
+      },
+      "humanCheck": {
+        "isHuman": true,
+        "method": "claude_user_turn",
+        "providerItemId": "00000000-0000-4000-8000-000000000001"
+      }
+    },
+    "M-m2air-0103": {
+      "id": "M-m2air-0103",
+      "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+      "writer": "m2air",
+      "origin": {
+        "actor": {
+          "kind": "human",
+          "provider": "claude-code",
+          "account": "anthropic:work",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "label": "user"
+        },
+        "at": "2026-11-02T09:00:00Z",
+        "log": {
+          "file": "/Users/example/.claude/projects/-Users-example/sess-aaaa1111-0000-4000-8000-000000000001.jsonl",
+          "lineStart": 3,
+          "messageUuid": "u-0103-aaaa-bbbb",
+          "lineSha256": "9999999999999999999999999999999999999999999999999999999999999999"
+        },
+        "binding": {
+          "status": "bound",
+          "boundAt": "2026-11-02T09:00:30Z",
+          "attempts": 1
+        }
+      },
+      "capturedAt": "2026-11-02T09:00:01Z",
+      "capturedVia": "hook_prompt",
+      "pastedOnly": false,
+      "text": {
+        "sha256": "aaaa000000000000000000000000000000000000000000000000000000000001",
+        "chars": 90,
+        "words": 16,
+        "excerpt": "[fake] drop the old csv export, nobody uses it",
+        "redaction": {
+          "policy": "harness-redactor/1",
+          "applied": true,
+          "hits": 0
+        }
+      },
+      "triage": {
+        "status": "split",
+        "at": "2026-11-02T09:01:00Z",
+        "by": {
+          "kind": "agent",
+          "provider": "claude-code",
+          "model": "claude-sonnet-4-5",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "label": "main"
+        },
+        "askIds": [
+          "A-m2air-0030"
+        ]
+      },
+      "humanCheck": {
+        "isHuman": true,
+        "method": "claude_user_turn",
+        "providerItemId": "00000000-0000-4000-8000-000000000001"
+      }
+    },
+    "M-m2air-0104": {
+      "id": "M-m2air-0104",
+      "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+      "writer": "m2air",
+      "origin": {
+        "actor": {
+          "kind": "human",
+          "provider": "claude-code",
+          "account": "anthropic:work",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "label": "user"
+        },
+        "at": "2026-11-03T08:00:00Z",
+        "log": {
+          "file": "/Users/example/.claude/projects/-Users-example/sess-aaaa1111-0000-4000-8000-000000000001.jsonl",
+          "lineStart": 7,
+          "messageUuid": "u-0104-aaaa-bbbb",
+          "lineSha256": "aaaa000000000000000000000000000000000000000000000000000000000002"
+        },
+        "binding": {
+          "status": "bound",
+          "boundAt": "2026-11-03T08:00:30Z",
+          "attempts": 1
+        }
+      },
+      "capturedAt": "2026-11-03T08:00:01Z",
+      "capturedVia": "hook_prompt",
+      "pastedOnly": false,
+      "text": {
+        "sha256": "aaaa000000000000000000000000000000000000000000000000000000000003",
+        "chars": 70,
+        "words": 13,
+        "excerpt": "[fake] never mind the csv removal, cancel it",
+        "redaction": {
+          "policy": "harness-redactor/1",
+          "applied": true,
+          "hits": 0
+        }
+      },
+      "triage": {
+        "status": "no_ask",
+        "at": "2026-11-03T08:00:20Z",
+        "by": {
+          "kind": "agent",
+          "provider": "claude-code",
+          "model": "claude-sonnet-4-5",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "label": "main"
+        },
+        "reason": "cancellation proof for A-m2air-0030, not a new request"
+      },
+      "humanCheck": {
+        "isHuman": true,
+        "method": "claude_user_turn",
+        "providerItemId": "00000000-0000-4000-8000-000000000001"
+      }
+    },
+    "M-dev2a-0012": {
+      "id": "M-dev2a-0012",
+      "sessionId": "codex-bbbb2222-0000-4000-8000-000000000002",
+      "writer": "dev2a",
+      "origin": {
+        "actor": {
+          "kind": "human",
+          "provider": "codex",
+          "account": "openai:work",
+          "hiveId": "dev2a",
+          "machineId": "dev2-example",
+          "sessionId": "codex-bbbb2222-0000-4000-8000-000000000002",
+          "label": "user"
+        },
+        "at": "2026-11-04T15:38:00Z",
+        "log": {
+          "file": "/home/example/.codex/sessions/2026/11/04/rollout-bbbb2222.jsonl"
+        },
+        "binding": {
+          "status": "pending",
+          "attempts": 2,
+          "lastAttemptAt": "2026-11-04T15:50:00Z"
+        }
+      },
+      "capturedAt": "2026-11-04T15:38:01Z",
+      "capturedVia": "hook_prompt",
+      "pastedOnly": false,
+      "text": {
+        "sha256": "aaaa000000000000000000000000000000000000000000000000000000000004",
+        "chars": 140,
+        "words": 24,
+        "excerpt": "[fake] also rename the export flag before the release",
+        "privateRef": {
+          "store": "local-private",
+          "key": "messages/M-dev2a-0012.txt"
+        },
+        "redaction": {
+          "policy": "harness-redactor/1",
+          "applied": true,
+          "hits": 0
+        }
+      },
+      "triage": {
+        "status": "untriaged"
+      },
+      "humanCheck": {
+        "isHuman": true,
+        "method": "claude_user_turn",
+        "providerItemId": "00000000-0000-4000-8000-000000000001"
+      }
+    }
+  },
+  "asks": {
+    "A-m2air-0042": {
+      "id": "A-m2air-0042",
+      "kind": "feature",
+      "writer": "m2air",
+      "lastEvent": {
+        "hiveId": "dev2a",
+        "seq": 88
+      },
+      "createdAt": "2026-11-04T10:06:00Z",
+      "updatedAt": "2026-11-04T15:39:00Z",
+      "origin": {
+        "actor": {
+          "kind": "human",
+          "provider": "claude-code",
+          "account": "anthropic:work",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "label": "user"
+        },
+        "at": "2026-11-04T10:05:00Z",
+        "messageId": "M-m2air-0101",
+        "log": {
+          "file": "/Users/example/.claude/projects/-Users-example/sess-aaaa1111-0000-4000-8000-000000000001.jsonl",
+          "lineStart": 12,
+          "messageUuid": "u-0101-aaaa-bbbb",
+          "lineSha256": "4444444444444444444444444444444444444444444444444444444444444444"
+        },
+        "binding": {
+          "status": "bound",
+          "boundAt": "2026-11-04T10:05:40Z",
+          "attempts": 1
+        },
+        "attachments": [
+          {
+            "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            "bytes": 20480,
+            "mime": "image/png",
+            "name": "mock-screenshot.png"
+          }
+        ]
+      },
+      "source": {
+        "kind": "user",
+        "ref": "M-m2air-0101"
+      },
+      "request": {
+        "detailed": "Add a bounded retry around the widget exporter's upload call and add a test that proves the timeout path retries and then fails loudly. Backoff policy per D-m2air-0007.",
+        "compressed": "Retry in widget exporter with timeout test"
+      },
+      "state": "in_progress",
+      "stateSince": "2026-11-04T10:40:00Z",
+      "times": {
+        "startedAt": "2026-11-04T10:08:00Z",
+        "lastCheckedAt": "2026-11-04T15:39:00Z",
+        "lastSyncAt": "2026-11-04T15:40:00Z",
+        "nextCheckDue": "2026-11-05T03:39:00Z"
+      },
+      "nextStep": "owner: finish timeout test, then request code-inspection",
+      "related": [
+        {
+          "kind": "decided_by",
+          "target": "D-m2air-0007",
+          "at": "2026-11-04T10:31:02Z"
+        }
+      ],
+      "externalRefs": [
+        {
+          "system": "goodqa",
+          "ref": "GoodQA example#1234"
+        },
+        {
+          "system": "branch",
+          "ref": "example/widgets@feat/exporter-retry"
+        }
+      ],
+      "prerequisites": [
+        {
+          "kind": "decision",
+          "ref": "D-m2air-0007",
+          "requiredState": "answered",
+          "status": "satisfied",
+          "checkedAt": "2026-11-04T10:31:02Z"
+        }
+      ],
+      "assignments": [
+        {
+          "spanId": "S-1",
+          "actor": {
+            "kind": "agent",
+            "provider": "claude-code",
+            "account": "anthropic:work",
+            "model": "claude-sonnet-4-5",
+            "hiveId": "m2air",
+            "machineId": "mac-example-air",
+            "pid": 4100,
+            "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+            "label": "main"
+          },
+          "role": "owner",
+          "startedAt": "2026-11-04T10:06:00Z",
+          "endedAt": "2026-11-04T10:08:00Z",
+          "status": "reassigned",
+          "walFile": "/Users/example/.claude/wals/sess-aaaa1111/main.jsonl"
+        },
+        {
+          "spanId": "S-2",
+          "actor": {
+            "kind": "agent",
+            "provider": "claude-code",
+            "account": "anthropic:work",
+            "model": "claude-sonnet-4-5",
+            "hiveId": "m2air",
+            "machineId": "mac-example-air",
+            "pid": 4210,
+            "parentPid": 4100,
+            "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+            "agentId": "agent-a0f8example",
+            "label": "task-owner"
+          },
+          "role": "owner",
+          "startedAt": "2026-11-04T10:08:00Z",
+          "lastSeenAt": "2026-11-04T15:39:00Z",
+          "status": "active",
+          "walFile": "/Users/example/.claude/wals/sess-aaaa1111/agent-a0f8example.jsonl",
+          "branch": "feat/exporter-retry",
+          "worktree": "/Users/example/.agent-harness/worktrees/exporter-retry"
+        },
+        {
+          "spanId": "S-3",
+          "actor": {
+            "kind": "agent",
+            "provider": "codex",
+            "account": "openai:work",
+            "model": "gpt-5-codex",
+            "hiveId": "dev2a",
+            "machineId": "dev2-example",
+            "pid": 77120,
+            "sessionId": "codex-bbbb2222-0000-4000-8000-000000000002",
+            "label": "fixer"
+          },
+          "role": "worker",
+          "startedAt": "2026-11-04T11:30:00Z",
+          "endedAt": "2026-11-04T12:10:00Z",
+          "lastSeenAt": "2026-11-04T12:10:00Z",
+          "status": "finished",
+          "log": {
+            "file": "/home/example/.codex/sessions/2026/11/04/rollout-bbbb2222.jsonl",
+            "lineStart": 1,
+            "lineEnd": 58
+          }
+        }
+      ],
+      "evidence": [
+        {
+          "id": "V-1",
+          "kind": "commit",
+          "ref": "c0ffee1234567890c0ffee1234567890c0ffee12",
+          "spanId": "S-3",
+          "claimedBy": {
+            "kind": "agent",
+            "provider": "codex",
+            "model": "gpt-5-codex",
+            "hiveId": "dev2a",
+            "machineId": "dev2-example",
+            "sessionId": "codex-bbbb2222-0000-4000-8000-000000000002",
+            "label": "fixer"
+          },
+          "claimedAt": "2026-11-04T12:09:00Z",
+          "verification": {
+            "status": "verified",
+            "method": "git-object",
+            "systemOfRecord": "/home/example/repos/widgets",
+            "verifiedAt": "2026-11-04T12:09:30Z",
+            "verifiedBy": {
+              "kind": "harness",
+              "provider": "harness",
+              "hiveId": "dev2a",
+              "machineId": "dev2-example",
+              "label": "work_ledger.py"
+            }
+          }
+        },
+        {
+          "id": "V-2",
+          "kind": "tested",
+          "ref": "REALLY_TESTED retry-timeout-1",
+          "spanId": "S-2",
+          "claimedBy": {
+            "kind": "agent",
+            "provider": "claude-code",
+            "model": "claude-sonnet-4-5",
+            "hiveId": "m2air",
+            "machineId": "mac-example-air",
+            "agentId": "agent-a0f8example",
+            "label": "task-owner"
+          },
+          "claimedAt": "2026-11-04T15:38:00Z",
+          "verification": {
+            "status": "attested",
+            "method": "none",
+            "detail": "WAL note not yet re-read by the harness"
+          }
+        }
+      ],
+      "completion": {
+        "status": "none",
+        "commits": [
+          {
+            "repo": "example/widgets",
+            "branch": "feat/exporter-retry",
+            "sha": "c0ffee1234567890c0ffee1234567890c0ffee12",
+            "command": "git commit -F /dev/fd/3",
+            "at": "2026-11-04T12:09:00Z",
+            "spanId": "S-3",
+            "subject": "fix(exporter): retry upload with bounded backoff",
+            "pr": {
+              "system": "github-pr",
+              "ref": "example/widgets#88"
+            },
+            "mergeStatus": "pr_open",
+            "verification": {
+              "status": "verified",
+              "method": "git-object",
+              "systemOfRecord": "/home/example/repos/widgets",
+              "verifiedAt": "2026-11-04T12:09:30Z",
+              "verifiedBy": {
+                "kind": "harness",
+                "provider": "harness",
+                "hiveId": "dev2a",
+                "machineId": "dev2-example",
+                "label": "work_ledger.py"
+              }
+            }
+          }
+        ]
+      },
+      "migratedFrom": {
+        "schema": 1,
+        "id": "WA-0042",
+        "sourceId": "ledger:42"
+      }
+    },
+    "A-m2air-0030": {
+      "id": "A-m2air-0030",
+      "kind": "chore",
+      "writer": "m2air",
+      "lastEvent": {
+        "hiveId": "m2air",
+        "seq": 990
+      },
+      "createdAt": "2026-11-02T09:01:00Z",
+      "updatedAt": "2026-11-03T08:02:00Z",
+      "origin": {
+        "actor": {
+          "kind": "human",
+          "provider": "claude-code",
+          "account": "anthropic:work",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "label": "user"
+        },
+        "at": "2026-11-02T09:00:00Z",
+        "messageId": "M-m2air-0103",
+        "log": {
+          "file": "/Users/example/.claude/projects/-Users-example/sess-aaaa1111-0000-4000-8000-000000000001.jsonl",
+          "lineStart": 3,
+          "messageUuid": "u-0103-aaaa-bbbb",
+          "lineSha256": "9999999999999999999999999999999999999999999999999999999999999999"
+        },
+        "binding": {
+          "status": "bound",
+          "boundAt": "2026-11-02T09:00:30Z",
+          "attempts": 1
+        }
+      },
+      "source": {
+        "kind": "user",
+        "ref": "M-m2air-0103"
+      },
+      "request": {
+        "compressed": "Remove legacy CSV export"
+      },
+      "state": "cancelled",
+      "stateSince": "2026-11-03T08:02:00Z",
+      "times": {
+        "startedAt": "2026-11-02T09:05:00Z",
+        "endedAt": "2026-11-03T08:02:00Z",
+        "lastCheckedAt": "2026-11-03T08:02:00Z"
+      },
+      "related": [],
+      "prerequisites": [],
+      "assignments": [
+        {
+          "spanId": "S-1",
+          "actor": {
+            "kind": "agent",
+            "provider": "claude-code",
+            "model": "claude-sonnet-4-5",
+            "hiveId": "m2air",
+            "machineId": "mac-example-air",
+            "pid": 3900,
+            "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+            "label": "main"
+          },
+          "role": "owner",
+          "startedAt": "2026-11-02T09:01:00Z",
+          "endedAt": "2026-11-03T08:02:00Z",
+          "status": "finished"
+        }
+      ],
+      "evidence": [],
+      "completion": {
+        "status": "none"
+      },
+      "cancellation": {
+        "at": "2026-11-03T08:02:00Z",
+        "by": {
+          "kind": "agent",
+          "provider": "claude-code",
+          "model": "claude-sonnet-4-5",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "pid": 3900,
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "label": "main"
+        },
+        "reason": "user withdrew the request",
+        "proof": {
+          "messageId": "M-m2air-0104",
+          "log": {
+            "file": "/Users/example/.claude/projects/-Users-example/sess-aaaa1111-0000-4000-8000-000000000001.jsonl",
+            "lineStart": 7,
+            "messageUuid": "u-0104-aaaa-bbbb",
+            "lineSha256": "aaaa000000000000000000000000000000000000000000000000000000000002"
+          },
+          "quoteSha256": "aaaa000000000000000000000000000000000000000000000000000000000003",
+          "quoteExcerpt": "[fake] never mind the csv removal, cancel it",
+          "verifiedAt": "2026-11-03T08:02:00Z",
+          "verifiedBy": {
+            "kind": "harness",
+            "provider": "harness",
+            "hiveId": "m2air",
+            "machineId": "mac-example-air",
+            "label": "work_ledger.py"
+          },
+          "targets": [
+            "A-m2air-0030"
+          ],
+          "binding": "explicit_reference"
+        }
+      },
+      "removableAfter": "2026-11-04T08:02:00Z"
+    },
+    "A-m2air-0031": {
+      "id": "A-m2air-0031",
+      "kind": "request",
+      "writer": "m2air",
+      "lastEvent": {
+        "hiveId": "m2air",
+        "seq": 1010
+      },
+      "createdAt": "2026-11-02T09:01:00Z",
+      "updatedAt": "2026-11-04T10:06:00Z",
+      "origin": {
+        "actor": {
+          "kind": "human",
+          "provider": "claude-code",
+          "account": "anthropic:work",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "label": "user"
+        },
+        "at": "2026-11-02T09:00:00Z",
+        "messageId": "M-m2air-0103",
+        "log": {
+          "file": "/Users/example/.claude/projects/-Users-example/sess-aaaa1111-0000-4000-8000-000000000001.jsonl",
+          "lineStart": 3,
+          "messageUuid": "u-0103-aaaa-bbbb"
+        },
+        "binding": {
+          "status": "bound",
+          "boundAt": "2026-11-02T09:00:30Z",
+          "attempts": 1
+        }
+      },
+      "source": {
+        "kind": "user",
+        "ref": "M-m2air-0103"
+      },
+      "request": {
+        "compressed": "Make exporter upload resilient (first phrasing)"
+      },
+      "state": "superseded",
+      "stateSince": "2026-11-04T10:06:00Z",
+      "times": {
+        "lastCheckedAt": "2026-11-04T10:06:00Z",
+        "endedAt": "2026-11-04T10:06:00Z"
+      },
+      "related": [
+        {
+          "kind": "superseded_by",
+          "target": "A-m2air-0042",
+          "at": "2026-11-04T10:06:00Z",
+          "by": {
+            "kind": "agent",
+            "provider": "claude-code",
+            "model": "claude-sonnet-4-5",
+            "hiveId": "m2air",
+            "machineId": "mac-example-air",
+            "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+            "label": "main"
+          },
+          "note": "M-m2air-0101 restates the ask with an explicit timeout case"
+        }
+      ],
+      "prerequisites": [],
+      "assignments": [],
+      "evidence": [],
+      "completion": {
+        "status": "none"
+      },
+      "removableAfter": "2026-11-05T10:06:00Z"
+    }
+  },
+  "decisions": {
+    "D-m2air-0007": {
+      "id": "D-m2air-0007",
+      "writer": "m2air",
+      "lastEvent": {
+        "hiveId": "m2air",
+        "seq": 1150
+      },
+      "createdAt": "2026-11-04T10:30:00Z",
+      "updatedAt": "2026-11-04T10:31:02Z",
+      "origin": {
+        "actor": {
+          "kind": "agent",
+          "provider": "claude-code",
+          "account": "anthropic:work",
+          "model": "claude-sonnet-4-5",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "pid": 4210,
+          "parentPid": 4100,
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "agentId": "agent-a0f8example",
+          "label": "task-owner"
+        },
+        "at": "2026-11-04T10:30:00Z",
+        "log": {
+          "file": "/Users/example/.claude/projects/-Users-example/sess-aaaa1111-0000-4000-8000-000000000001.jsonl",
+          "lineStart": 38,
+          "lineEnd": 39,
+          "messageUuid": "a-0007-tool-use"
+        },
+        "binding": {
+          "status": "bound",
+          "boundAt": "2026-11-04T10:31:30Z",
+          "attempts": 1
+        }
+      },
+      "source": {
+        "kind": "inferred",
+        "ref": "M-m2air-0101",
+        "why": "the request names a retry but not its backoff policy"
+      },
+      "question": {
+        "askedBy": {
+          "kind": "agent",
+          "provider": "claude-code",
+          "account": "anthropic:work",
+          "model": "claude-sonnet-4-5",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "pid": 4210,
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "agentId": "agent-a0f8example",
+          "label": "task-owner"
+        },
+        "tool": "AskUserQuestion",
+        "at": "2026-11-04T10:30:00Z",
+        "log": {
+          "file": "/Users/example/.claude/projects/-Users-example/sess-aaaa1111-0000-4000-8000-000000000001.jsonl",
+          "lineStart": 38,
+          "lineEnd": 39,
+          "messageUuid": "a-0007-tool-use"
+        },
+        "binding": {
+          "status": "bound",
+          "boundAt": "2026-11-04T10:31:30Z",
+          "attempts": 1
+        },
+        "walFile": "/Users/example/.claude/wals/sess-aaaa1111/agent-a0f8example.jsonl",
+        "askRef": "wask0007example",
+        "data": {
+          "summary": "Which backoff policy for the exporter retry?",
+          "header": "Backoff",
+          "options": [
+            {
+              "key": "exp3",
+              "label": "Exponential, cap 3 attempts",
+              "recommended": true
+            },
+            {
+              "key": "fixed5",
+              "label": "Fixed 1s, 5 attempts"
+            }
+          ],
+          "multiSelect": false,
+          "rawSha256": "bbbb000000000000000000000000000000000000000000000000000000000001"
+        }
+      },
+      "state": "answered",
+      "stateSince": "2026-11-04T10:31:02Z",
+      "related": [
+        {
+          "kind": "decides",
+          "target": "A-m2air-0042",
+          "at": "2026-11-04T10:31:02Z"
+        }
+      ],
+      "answer": {
+        "actor": {
+          "kind": "human",
+          "provider": "claude-code",
+          "account": "anthropic:work",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+          "label": "user"
+        },
+        "at": "2026-11-04T10:31:00Z",
+        "messageId": "M-m2air-0102",
+        "log": {
+          "file": "/Users/example/.claude/projects/-Users-example/sess-aaaa1111-0000-4000-8000-000000000001.jsonl",
+          "lineStart": 40,
+          "messageUuid": "u-0102-aaaa-bbbb",
+          "lineSha256": "7777777777777777777777777777777777777777777777777777777777777777"
+        },
+        "binding": {
+          "status": "bound",
+          "boundAt": "2026-11-04T10:31:30Z",
+          "attempts": 1
+        },
+        "text": {
+          "sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+          "chars": 31,
+          "words": 6,
+          "excerpt": "[fake] exponential, cap at three",
+          "redaction": {
+            "policy": "harness-redactor/1",
+            "applied": true,
+            "hits": 0
+          }
+        },
+        "selected": [
+          "exp3"
+        ]
+      },
+      "removableAfter": "2026-11-05T10:31:02Z"
+    }
+  },
+  "tombstones": {
+    "A-m2air-0009": {
+      "id": "A-m2air-0009",
+      "type": "ask",
+      "finalState": "done",
+      "stateSince": "2026-11-01T12:00:00Z",
+      "removedAt": "2026-11-03T09:00:00Z",
+      "removedBy": {
+        "kind": "harness",
+        "provider": "harness",
+        "hiveId": "m2air",
+        "machineId": "mac-example-air",
+        "label": "work_ledger.py prune"
+      },
+      "proofKind": "verified_evidence",
+      "proof": {
+        "id": "V-1",
+        "kind": "merge",
+        "ref": "deadbeef00000000deadbeef00000000deadbeef",
+        "claimedBy": {
+          "kind": "agent",
+          "provider": "claude-code",
+          "model": "claude-sonnet-4-5",
+          "hiveId": "m2air",
+          "machineId": "mac-example-air",
+          "label": "main"
+        },
+        "claimedAt": "2026-11-01T11:58:00Z",
+        "verification": {
+          "status": "verified",
+          "method": "git-merge-base",
+          "systemOfRecord": "/Users/example/repos/widgets",
+          "verifiedAt": "2026-11-03T09:00:00Z",
+          "verifiedBy": {
+            "kind": "harness",
+            "provider": "harness",
+            "hiveId": "m2air",
+            "machineId": "mac-example-air",
+            "label": "work_ledger.py prune"
+          }
+        }
+      },
+      "messageUuids": [
+        "u-0009-aaaa-bbbb"
+      ],
+      "archive": {
+        "file": "/Users/example/.agent-harness/work-ledger.archive.jsonl",
+        "line": 14
+      },
+      "snapshotSha256": "cccc000000000000000000000000000000000000000000000000000000000001"
+    }
+  },
+  "violations": [
+    {
+      "id": "X-dev2a-3",
+      "kind": "cannot_bind",
+      "at": "2026-11-04T17:38:01Z",
+      "sessionId": "codex-bbbb2222-0000-4000-8000-000000000002",
+      "hiveId": "dev2a",
+      "targets": [],
+      "detail": "M-dev2a-0012 unbound after 2h; still listed and blocking",
+      "surfaced": false
+    }
+  ],
+  "index": {
+    "builtAt": "2026-11-04T16:02:11Z",
+    "builtFromRev": 418,
+    "openAsks": [
+      {
+        "id": "A-m2air-0042",
+        "state": "in_progress",
+        "stateSince": "2026-11-04T10:40:00Z",
+        "owner": "agent-a0f8example",
+        "sessionId": "sess-aaaa1111-0000-4000-8000-000000000001",
+        "compressed": "Retry in widget exporter with timeout test",
+        "nextStep": "owner: finish timeout test, then request code-inspection",
+        "lastCheckedAt": "2026-11-04T15:39:00Z"
+      }
+    ],
+    "openDecisions": [],
+    "untriagedMessages": [
+      "M-dev2a-0012"
+    ],
+    "pendingBindings": [
+      "M-dev2a-0012"
+    ],
+    "bySession": {
+      "sess-aaaa1111-0000-4000-8000-000000000001": [
+        "A-m2air-0042",
+        "A-m2air-0030",
+        "A-m2air-0031",
+        "D-m2air-0007"
+      ],
+      "codex-bbbb2222-0000-4000-8000-000000000002": [
+        "A-m2air-0042"
+      ]
+    },
+    "byOwner": {
+      "agent-a0f8example": [
+        "A-m2air-0042"
+      ]
+    },
+    "blockedOn": {},
+    "staleAfter": [
+      {
+        "id": "A-m2air-0042",
+        "lastCheckedAt": "2026-11-04T15:39:00Z"
+      }
+    ],
+    "removable": [
+      {
+        "id": "A-m2air-0030",
+        "removableAfter": "2026-11-04T08:02:00Z"
+      },
+      {
+        "id": "A-m2air-0031",
+        "removableAfter": "2026-11-05T10:06:00Z"
+      },
+      {
+        "id": "D-m2air-0007",
+        "removableAfter": "2026-11-05T10:31:02Z"
+      }
+    ],
+    "unsurfacedViolations": 1
+  }
+}

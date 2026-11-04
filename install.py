@@ -24,7 +24,7 @@ AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py",
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
          "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py",
-         "work_assignments.py", "work_assignments_policy.json")
+         "work_assignments.py", "work_assignments_policy.json", "work_ledger.schema.json")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -184,7 +184,7 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
         if rule not in allowed:
             allowed.append(rule)
     # Triage and status are preapproved; cancel, remove, prune, import and recover deliberately are not.
-    for action in ("status", "split", "no-ask", "update", "show", "sync", "failures", "verify"):
+    for action in ("status", "split", "no-ask", "update", "show", "sync", "failures", "verify", "relate", "prereq", "decision"):
         rule = f"Bash(python3 ~/.claude/hooks/work_assignments.py {action} *)"
         if rule not in allowed:
             allowed.append(rule)

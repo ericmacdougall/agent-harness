@@ -1,0 +1,2811 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-harness.local/schemas/work-ledger/v2.schema.json",
+  "title": "Work ledger v2 (merged main + Fable)",
+  "description": "Snapshot document for ~/.agent-harness/work-ledger.json. The snapshot is a materialised fold of the append-only event file (work-ledger.events.jsonl, one $defs/event per line). Every human request (ask) and every question put to the human (decision) lives here until it has been done with verified evidence, or cancelled with human proof, for more than 24 hours; then it becomes a tombstone and its last snapshot is appended to work-ledger.archive.jsonl. Message text never enters this file: only hashes, bounded redacted excerpts and a pointer into the private text store.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "ledgerId",
+    "hiveId",
+    "rev",
+    "generatedAt",
+    "writers",
+    "appliedThrough",
+    "sessions",
+    "messages",
+    "asks",
+    "decisions",
+    "tombstones",
+    "violations",
+    "index"
+  ],
+  "properties": {
+    "schema": {
+      "const": 2
+    },
+    "schemaUrl": {
+      "type": "string",
+      "format": "uri"
+    },
+    "ledgerId": {
+      "$ref": "#/$defs/opaqueId",
+      "description": "Stable id of the logical ledger shared by all replicas (same across machines)."
+    },
+    "hiveId": {
+      "$ref": "#/$defs/hiveId",
+      "description": "The replica that wrote this snapshot. A hive is one harness installation (machine + OS account + home directory); every agent, hook and CLI run under it writes with this id."
+    },
+    "rev": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Local snapshot revision; increments on every fold. Not comparable across hives; use appliedThrough."
+    },
+    "generatedAt": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "migratedFrom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "at"
+      ],
+      "properties": {
+        "schema": {
+          "const": 1
+        },
+        "rev": {
+          "type": "integer"
+        },
+        "at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "sourceFile": {
+          "type": "string"
+        },
+        "sourceSha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "writers": {
+      "type": "object",
+      "description": "Version vector: every hive that has ever contributed events, with the highest seq this replica has seen from it.",
+      "propertyNames": {
+        "$ref": "#/$defs/hiveId"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "machineId",
+          "lastSeq"
+        ],
+        "properties": {
+          "machineId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "account": {
+            "$ref": "#/$defs/accountLabel"
+          },
+          "lastSeq": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lastEventSha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "lastSyncAt": {
+            "$ref": "#/$defs/timestamp"
+          }
+        }
+      }
+    },
+    "appliedThrough": {
+      "type": "object",
+      "description": "Per-hive event seq folded into this snapshot. Must equal writers[h].lastSeq for every h once the fold is complete; a gap means the snapshot is behind the event file.",
+      "propertyNames": {
+        "$ref": "#/$defs/hiveId"
+      },
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "sessions": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/sessionId"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/session"
+      }
+    },
+    "messages": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/messageId"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/message"
+      }
+    },
+    "asks": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/askId"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/ask"
+      }
+    },
+    "decisions": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/decisionId"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/decision"
+      }
+    },
+    "tombstones": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/recordId"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/tombstone"
+      }
+    },
+    "violations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/violation"
+      }
+    },
+    "index": {
+      "$ref": "#/$defs/index"
+    }
+  },
+  "x-transitions": {
+    "description": "Allowed state transitions; enforced by the CLI fold and re-checked by `verify`. Any other transition is rejected and recorded as a violation of kind invalid_transition.",
+    "ask": {
+      "open": [
+        "assigned",
+        "blocked",
+        "cancelled",
+        "superseded"
+      ],
+      "assigned": [
+        "in_progress",
+        "open",
+        "blocked",
+        "cancelled",
+        "superseded"
+      ],
+      "in_progress": [
+        "ready",
+        "blocked",
+        "assigned",
+        "open",
+        "cancelled",
+        "superseded"
+      ],
+      "blocked": [
+        "open",
+        "assigned",
+        "in_progress",
+        "cancelled",
+        "superseded"
+      ],
+      "ready": [
+        "done",
+        "in_progress",
+        "blocked",
+        "cancelled",
+        "superseded"
+      ],
+      "done": [
+        "in_progress"
+      ],
+      "cancelled": [],
+      "superseded": []
+    },
+    "askGuards": {
+      "-> blocked": "blockReason required; kind=prerequisite needs at least one unsatisfied prerequisite",
+      "-> ready": "at least one evidence item (attested is enough)",
+      "-> done": "completion.status=verified and at least one evidence item with verification.status=verified",
+      "done -> in_progress": "reopen: only by a human-sourced message (source.kind=user) and only before removal",
+      "-> cancelled": "cancellation.proof present and verified against the transcript as a human turn captured by this ledger",
+      "-> superseded": "related contains superseded_by whose target exists and is not closed"
+    },
+    "decision": {
+      "asked": [
+        "answered",
+        "assumed",
+        "withdrawn",
+        "superseded"
+      ],
+      "assumed": [
+        "answered",
+        "withdrawn",
+        "superseded"
+      ],
+      "answered": [
+        "superseded"
+      ],
+      "withdrawn": [],
+      "superseded": []
+    },
+    "decisionGuards": {
+      "-> answered": "answer.actor.kind=human and answer.log bound to a human-authored transcript line",
+      "-> assumed": "assumption present with source.kind=inferred; the question stays listed until answered, withdrawn or superseded",
+      "-> withdrawn": "reason of at least 10 characters and the withdrawing actor recorded",
+      "-> superseded": "related contains superseded_by"
+    },
+    "removal": "A record may be tombstoned only when state is done or cancelled, now - stateSince > 24h, and the done evidence (verified) or cancel proof (human turn) re-verifies at removal time."
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "opaqueId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$"
+    },
+    "hiveId": {
+      "type": "string",
+      "pattern": "^[a-z0-9]{4,12}$",
+      "description": "Short stable id minted once per harness installation and stored in ~/.agent-harness/hive.json."
+    },
+    "askId": {
+      "type": "string",
+      "pattern": "^A-[a-z0-9]{4,12}-[0-9]{4,}$",
+      "description": "A-<hiveId>-<per-hive counter>. Embedding the minting hive makes ids collision-free across machines without coordination."
+    },
+    "decisionId": {
+      "type": "string",
+      "pattern": "^D-[a-z0-9]{4,12}-[0-9]{4,}$"
+    },
+    "messageId": {
+      "type": "string",
+      "pattern": "^M-[a-z0-9]{4,12}-[0-9]{4,}$"
+    },
+    "eventId": {
+      "type": "string",
+      "pattern": "^E-[a-z0-9]{4,12}-[0-9]{1,}$"
+    },
+    "recordId": {
+      "type": "string",
+      "pattern": "^[AD]-[a-z0-9]{4,12}-[0-9]{4,}$"
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "accountLabel": {
+      "type": "string",
+      "maxLength": 80,
+      "pattern": "^[a-z0-9-]+:[A-Za-z0-9._-]+$",
+      "description": "Opaque alias <provider>:<label> (for example anthropic:work, openai:personal). Never an email address or a token."
+    },
+    "boundedText": {
+      "type": "string",
+      "maxLength": 2000,
+      "description": "Agent-written text that has passed the harness redactor. Never raw human message text."
+    },
+    "shortText": {
+      "type": "string",
+      "maxLength": 300
+    },
+    "excerpt": {
+      "type": "string",
+      "maxLength": 160,
+      "description": "At most 15 words of a human message, after redaction. The only fragment of human text allowed in this file."
+    },
+    "provider": {
+      "type": "string",
+      "enum": [
+        "claude-code",
+        "codex",
+        "cursor",
+        "terminal",
+        "goodqa",
+        "github",
+        "harness",
+        "other"
+      ]
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One reusable identity record for anyone or anything that acts on the ledger: the human who typed a request, the agent that owns it, a worker subagent, the hook that captured it, or the human who answered a question.",
+      "required": [
+        "kind",
+        "provider",
+        "hiveId",
+        "machineId"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "human",
+            "agent",
+            "harness"
+          ]
+        },
+        "provider": {
+          "$ref": "#/$defs/provider"
+        },
+        "account": {
+          "$ref": "#/$defs/accountLabel"
+        },
+        "model": {
+          "type": "string",
+          "maxLength": 80,
+          "description": "Model id for agents (claude-sonnet-4-5, gpt-5-codex). Absent for humans."
+        },
+        "hiveId": {
+          "$ref": "#/$defs/hiveId"
+        },
+        "machineId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "parentPid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "agentId": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Subagent id when the actor is a subagent (Claude agent_id, Codex child session)."
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 80,
+          "description": "Human-readable role, for example main, task-owner, click-tester, user."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "human"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "model"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "logPointer": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One reusable pointer into a transcript, rollout or WAL file. Line numbers are 1-based. lineSha256 is the hash of the raw line(s) so a later verifier can prove the pointer still points at the same bytes.",
+      "required": [
+        "file"
+      ],
+      "properties": {
+        "file": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "lineStart": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lineEnd": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "messageUuid": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Claude Code message uuid or Codex item id for the record at lineStart."
+        },
+        "lineSha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Hooks fire before the transcript line exists, so a record starts pending and binds to the uuid and line later (Stop, SessionStart, sync). Unbindable after 2h is a violation but keeps the record listed.",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "bound",
+            "unbindable"
+          ]
+        },
+        "boundAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lastAttemptAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "reason": {
+          "$ref": "#/$defs/shortText"
+        }
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "const": "bound"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "boundAt"
+        ]
+      }
+    },
+    "textRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Reference to human-typed text without carrying it. The full text lives only in the private store (mode 0600, never synced to a repo); sha256 lets any replica confirm it has the same text.",
+      "required": [
+        "sha256",
+        "chars",
+        "words",
+        "redaction"
+      ],
+      "properties": {
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "chars": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "words": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "excerpt": {
+          "$ref": "#/$defs/excerpt"
+        },
+        "privateRef": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "store",
+            "key"
+          ],
+          "properties": {
+            "store": {
+              "type": "string",
+              "enum": [
+                "local-private",
+                "transcript"
+              ]
+            },
+            "key": {
+              "type": "string",
+              "maxLength": 1024,
+              "description": "Path or key inside the private store on the hive that captured the text. Strip on export."
+            }
+          }
+        },
+        "redaction": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "policy",
+            "applied"
+          ],
+          "properties": {
+            "policy": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "Redactor id and version, for example harness-redactor/1."
+            },
+            "applied": {
+              "type": "boolean"
+            },
+            "hits": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "attachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Attachments are identified by content hash; the path is a private-store hint only and is stripped on export.",
+      "required": [
+        "sha256",
+        "bytes"
+      ],
+      "properties": {
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mime": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 255
+        },
+        "privatePath": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Requirement provenance, matching provenance.py kinds. kind=user is only valid when ref names a messageId whose origin.actor.kind is human and whose binding is bound.",
+      "required": [
+        "kind",
+        "ref"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "user",
+            "ticket",
+            "wal",
+            "file",
+            "inferred"
+          ]
+        },
+        "ref": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "user: M-<hive>-<n>; ticket: GoodQA <project>#<n>; wal: <path>#<entry>; file: <path>:<line>@<sha>; inferred: free text naming the sources it was inferred from."
+        },
+        "why": {
+          "$ref": "#/$defs/shortText"
+        }
+      },
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "user"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "ref": {
+            "$ref": "#/$defs/messageId"
+          }
+        }
+      }
+    },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Where a record came from: the actor, the moment, the transcript pointer and the message it was triaged from.",
+      "required": [
+        "actor",
+        "at"
+      ],
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "messageId": {
+          "$ref": "#/$defs/messageId"
+        },
+        "log": {
+          "$ref": "#/$defs/logPointer"
+        },
+        "binding": {
+          "$ref": "#/$defs/binding"
+        },
+        "attachments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/attachment"
+          },
+          "maxItems": 64
+        }
+      }
+    },
+    "processSpan": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "An actor working on a record for a span of time. Used for the owner and every worker.",
+      "required": [
+        "actor",
+        "role",
+        "startedAt",
+        "status"
+      ],
+      "properties": {
+        "spanId": {
+          "type": "string",
+          "pattern": "^S-[0-9]{1,6}$",
+          "description": "Unique within the record; commits and evidence refer to it."
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "click_tester",
+            "owner",
+            "red_team",
+            "rescue",
+            "reviewer",
+            "spec_reviewer",
+            "tester",
+            "worker"
+          ]
+        },
+        "startedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "endedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "lastSeenAt": {
+          "$ref": "#/$defs/timestamp",
+          "description": "Last hook event (tool call, Stop, SubagentStop) seen from this process; staleness is measured from here."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "failed",
+            "finished",
+            "idle",
+            "lost",
+            "rate_limited",
+            "reassigned",
+            "stopped",
+            "waiting"
+          ]
+        },
+        "walFile": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "log": {
+          "$ref": "#/$defs/logPointer"
+        },
+        "branch": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "worktree": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "nextCheckpoint": {
+          "type": "string",
+          "maxLength": 300
+        }
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "stopped",
+              "lost",
+              "finished",
+              "reassigned"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "endedAt"
+        ]
+      }
+    },
+    "relationKind": {
+      "type": "string",
+      "enum": [
+        "supersedes",
+        "superseded_by",
+        "extends",
+        "extended_by",
+        "duplicates",
+        "parent_of",
+        "child_of",
+        "decided_by",
+        "decides",
+        "follows",
+        "see_also"
+      ]
+    },
+    "relation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Directed link to another ledger record. Both directions are stored (the fold writes the inverse) so a hook can answer 'what supersedes me' without scanning.",
+      "required": [
+        "kind",
+        "target"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/relationKind"
+        },
+        "target": {
+          "$ref": "#/$defs/recordId"
+        },
+        "at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "by": {
+          "$ref": "#/$defs/actor"
+        },
+        "note": {
+          "$ref": "#/$defs/shortText"
+        }
+      }
+    },
+    "externalRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A reference into a system of record (GoodQA ticket, PR, branch). Only the identifier is stored; state is never copied from the external system.",
+      "required": [
+        "system",
+        "ref"
+      ],
+      "properties": {
+        "system": {
+          "type": "string",
+          "enum": [
+            "goodqa",
+            "github-pr",
+            "github-issue",
+            "branch",
+            "url"
+          ]
+        },
+        "ref": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "goodqa: 'GoodQA <project>#<n>'; github-pr: 'owner/repo#<n>'; branch: '<repo>@<branch>'; url: https URL."
+        }
+      }
+    },
+    "prerequisite": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Something that must reach a state before this ask can leave blocked. status is recomputed by the fold from the target's current state; it is cached here for the hook read path.",
+      "required": [
+        "kind",
+        "ref",
+        "requiredState",
+        "status"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "decision",
+            "external"
+          ]
+        },
+        "ref": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "askId, decisionId, or an externalRef ref string."
+        },
+        "requiredState": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "For asks: ready|done. For decisions: answered. For external: merged|closed|resolved."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "satisfied",
+            "failed",
+            "unknown"
+          ]
+        },
+        "checkedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "note": {
+          "$ref": "#/$defs/shortText"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ask"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "ref": {
+                "$ref": "#/$defs/askId"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "decision"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "ref": {
+                "$ref": "#/$defs/decisionId"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Distinguishes what an agent claims from what the harness checked against a system of record. attested = claimed only; verified = re-checked by the named method; failed = checked and wrong; stale = verified once but the system of record moved (for example the commit was rewritten).",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "attested",
+            "verified",
+            "failed",
+            "stale"
+          ]
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "git-object",
+            "git-merge-base",
+            "github-api",
+            "goodqa-api",
+            "wal-really-tested",
+            "file-sha256",
+            "transcript-line",
+            "human",
+            "none"
+          ]
+        },
+        "systemOfRecord": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Repo path, API host, WAL path or transcript path consulted."
+        },
+        "verifiedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "verifiedBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "detail": {
+          "$ref": "#/$defs/shortText"
+        }
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "verified",
+              "failed",
+              "stale"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "method",
+          "verifiedAt",
+          "verifiedBy"
+        ]
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "ref",
+        "claimedBy",
+        "claimedAt",
+        "verification"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^V-[0-9]{1,6}$"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "commit",
+            "merge",
+            "pr",
+            "ticket",
+            "tested",
+            "click_test",
+            "review",
+            "url",
+            "log",
+            "screenshot",
+            "file"
+          ]
+        },
+        "ref": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "commit/merge: sha; pr: owner/repo#n; tested: REALLY_TESTED WAL id; review: report path plus reviewed HEAD; file/screenshot: path@sha256."
+        },
+        "spanId": {
+          "type": "string",
+          "pattern": "^S-[0-9]{1,6}$",
+          "description": "The processSpan that produced it."
+        },
+        "claimedBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "claimedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "note": {
+          "$ref": "#/$defs/shortText"
+        },
+        "verification": {
+          "$ref": "#/$defs/verification"
+        }
+      }
+    },
+    "commit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repo",
+        "branch",
+        "sha",
+        "at",
+        "verification"
+      ],
+      "properties": {
+        "repo": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Repo identity (owner/name or absolute path on the writing hive)."
+        },
+        "branch": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{7,64}$"
+        },
+        "command": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "The git command that produced it, redacted."
+        },
+        "at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "spanId": {
+          "type": "string",
+          "pattern": "^S-[0-9]{1,6}$",
+          "description": "Worker span that made the commit."
+        },
+        "subject": {
+          "$ref": "#/$defs/shortText",
+          "description": "First line of the commit message only."
+        },
+        "pr": {
+          "$ref": "#/$defs/externalRef"
+        },
+        "mergeStatus": {
+          "type": "string",
+          "enum": [
+            "unknown",
+            "unpushed",
+            "pushed",
+            "pr_open",
+            "merged",
+            "closed",
+            "reverted"
+          ]
+        },
+        "verification": {
+          "$ref": "#/$defs/verification"
+        },
+        "deliveredTo": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "remote_default_branch",
+              "original_checkout",
+              "dev2",
+              "mac",
+              "staging",
+              "production"
+            ]
+          },
+          "description": "Verified delivery targets (deliver.py receipts), not intent."
+        }
+      }
+    },
+    "userProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Proof that a real human typed the message that cancels, reopens or answers. messageId must be a captured human message; log must bind to a human-authored transcript line; the quote is stored only as a hash plus bounded excerpt.",
+      "required": [
+        "messageId",
+        "log",
+        "quoteSha256",
+        "verifiedAt",
+        "verifiedBy",
+        "targets",
+        "binding"
+      ],
+      "properties": {
+        "messageId": {
+          "$ref": "#/$defs/messageId"
+        },
+        "log": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/logPointer"
+            },
+            {
+              "required": [
+                "lineStart",
+                "messageUuid",
+                "lineSha256"
+              ]
+            }
+          ]
+        },
+        "quoteSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "quoteExcerpt": {
+          "$ref": "#/$defs/excerpt"
+        },
+        "verifiedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "verifiedBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/recordId"
+          },
+          "description": "Records this proof acts on. A proof is valid only for these ids; an unrelated later human message cannot cancel anything."
+        },
+        "binding": {
+          "type": "string",
+          "enum": [
+            "answer_to_cancel_question",
+            "explicit_reference",
+            "same_message_retraction",
+            "answer_to_decision"
+          ],
+          "description": "How the human turn is tied to the targets: answered a decision whose relations list the target; text names the record (confirmed by a decision); retraction inside the ask's own origin message; or the answer to that decision."
+        },
+        "decisionId": {
+          "$ref": "#/$defs/decisionId"
+        }
+      }
+    },
+    "blockReason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "since"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "prerequisite",
+            "user_input",
+            "external",
+            "resource",
+            "review"
+          ]
+        },
+        "since": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "decisionId": {
+          "$ref": "#/$defs/decisionId",
+          "description": "When kind=user_input, the open decision we are waiting on."
+        },
+        "note": {
+          "$ref": "#/$defs/shortText"
+        }
+      },
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "user_input"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "decisionId"
+        ]
+      }
+    },
+    "recordMeta": {
+      "type": "object",
+      "description": "Sync bookkeeping present on every record.",
+      "required": [
+        "writer",
+        "lastEvent",
+        "createdAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "writer": {
+          "$ref": "#/$defs/hiveId",
+          "description": "Hive that minted the record."
+        },
+        "lastEvent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "hiveId",
+            "seq"
+          ],
+          "properties": {
+            "hiveId": {
+              "$ref": "#/$defs/hiveId"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "createdAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "migratedFrom": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "schema": {
+              "const": 1
+            },
+            "id": {
+              "type": "string",
+              "pattern": "^(WA|M)-[0-9]{4,}$"
+            },
+            "sourceId": {
+              "type": "string",
+              "maxLength": 200
+            }
+          }
+        }
+      }
+    },
+    "askState": {
+      "type": "string",
+      "enum": [
+        "open",
+        "assigned",
+        "in_progress",
+        "blocked",
+        "ready",
+        "done",
+        "cancelled",
+        "superseded"
+      ]
+    },
+    "ask": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/recordMeta"
+        },
+        {
+          "required": [
+            "id",
+            "kind",
+            "origin",
+            "source",
+            "request",
+            "state",
+            "stateSince",
+            "times",
+            "related",
+            "prerequisites",
+            "assignments",
+            "evidence",
+            "completion"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/askId"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "request",
+                "bug",
+                "feature",
+                "chore",
+                "question",
+                "follow_up"
+              ]
+            },
+            "origin": {
+              "$ref": "#/$defs/origin"
+            },
+            "source": {
+              "$ref": "#/$defs/source"
+            },
+            "request": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "compressed"
+              ],
+              "properties": {
+                "detailed": {
+                  "$ref": "#/$defs/boundedText",
+                  "description": "Agent's full restatement of the ask (what, where, acceptance). Not the user's words."
+                },
+                "compressed": {
+                  "$ref": "#/$defs/shortText",
+                  "description": "One line for status lists and injection."
+                }
+              }
+            },
+            "state": {
+              "$ref": "#/$defs/askState"
+            },
+            "stateSince": {
+              "$ref": "#/$defs/timestamp",
+              "description": "The 24h removal clock for done/cancelled."
+            },
+            "blockReason": {
+              "$ref": "#/$defs/blockReason"
+            },
+            "times": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "lastCheckedAt"
+              ],
+              "properties": {
+                "startedAt": {
+                  "$ref": "#/$defs/timestamp"
+                },
+                "endedAt": {
+                  "$ref": "#/$defs/timestamp"
+                },
+                "lastCheckedAt": {
+                  "$ref": "#/$defs/timestamp",
+                  "description": "Last time an actor confirmed owner and state; stale after policy stale_hours."
+                },
+                "lastSyncAt": {
+                  "$ref": "#/$defs/timestamp",
+                  "description": "Last time this record was reconciled with another hive."
+                },
+                "nextCheckDue": {
+                  "$ref": "#/$defs/timestamp"
+                }
+              }
+            },
+            "nextStep": {
+              "$ref": "#/$defs/shortText"
+            },
+            "related": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/relation"
+              },
+              "maxItems": 200
+            },
+            "externalRefs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/externalRef"
+              },
+              "maxItems": 100
+            },
+            "prerequisites": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/prerequisite"
+              },
+              "maxItems": 100
+            },
+            "assignments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/processSpan"
+              },
+              "maxItems": 500,
+              "description": "Owner and workers over time. The current owner is the span with role=owner and no endedAt; the index caches it."
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/evidence"
+              },
+              "maxItems": 500
+            },
+            "completion": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "status"
+              ],
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "none",
+                    "claimed",
+                    "verified",
+                    "failed"
+                  ]
+                },
+                "claimedAt": {
+                  "$ref": "#/$defs/timestamp"
+                },
+                "verifiedAt": {
+                  "$ref": "#/$defs/timestamp"
+                },
+                "verifiedBy": {
+                  "$ref": "#/$defs/actor"
+                },
+                "commits": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/commit"
+                  },
+                  "maxItems": 500
+                },
+                "summary": {
+                  "$ref": "#/$defs/shortText"
+                },
+                "pendingRealTests": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_.-]{1,64}$"
+                  },
+                  "description": "PENDING_REAL_TEST ids still open; done requires this to be empty."
+                }
+              },
+              "if": {
+                "properties": {
+                  "status": {
+                    "const": "verified"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "verifiedAt",
+                  "verifiedBy"
+                ]
+              }
+            },
+            "cancellation": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "at",
+                "by",
+                "proof"
+              ],
+              "properties": {
+                "at": {
+                  "$ref": "#/$defs/timestamp"
+                },
+                "by": {
+                  "$ref": "#/$defs/actor"
+                },
+                "reason": {
+                  "$ref": "#/$defs/shortText"
+                },
+                "proof": {
+                  "$ref": "#/$defs/userProof"
+                }
+              }
+            },
+            "removableAfter": {
+              "$ref": "#/$defs/timestamp",
+              "description": "stateSince + 24h, cached for the prune path."
+            },
+            "priority": {
+              "type": "string",
+              "enum": [
+                "p0",
+                "p1",
+                "p2",
+                "p3"
+              ]
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "state": {
+                    "const": "blocked"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "blockReason"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "state": {
+                    "enum": [
+                      "ready",
+                      "done"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "evidence": {
+                    "minItems": 1
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "state": {
+                    "const": "done"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "removableAfter"
+                ],
+                "properties": {
+                  "completion": {
+                    "properties": {
+                      "status": {
+                        "const": "verified"
+                      }
+                    }
+                  },
+                  "evidence": {
+                    "contains": {
+                      "properties": {
+                        "verification": {
+                          "properties": {
+                            "status": {
+                              "const": "verified"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "state": {
+                    "const": "cancelled"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "cancellation",
+                  "removableAfter"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "state": {
+                    "const": "superseded"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "related": {
+                    "contains": {
+                      "properties": {
+                        "kind": {
+                          "const": "superseded_by"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "source": {
+                    "properties": {
+                      "kind": {
+                        "const": "user"
+                      }
+                    }
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "origin": {
+                    "required": [
+                      "messageId"
+                    ],
+                    "properties": {
+                      "actor": {
+                        "properties": {
+                          "kind": {
+                            "const": "human"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "decisionState": {
+      "type": "string",
+      "enum": [
+        "asked",
+        "answered",
+        "assumed",
+        "withdrawn",
+        "superseded"
+      ]
+    },
+    "decision": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/recordMeta"
+        },
+        {
+          "required": [
+            "id",
+            "origin",
+            "question",
+            "state",
+            "stateSince",
+            "related"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/decisionId"
+            },
+            "origin": {
+              "$ref": "#/$defs/origin",
+              "description": "The agent turn that raised the question (actor.kind=agent) or the human message that asked for a decision to be made."
+            },
+            "source": {
+              "$ref": "#/$defs/source"
+            },
+            "question": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "askedBy",
+                "tool",
+                "at"
+              ],
+              "properties": {
+                "askedBy": {
+                  "$ref": "#/$defs/actor"
+                },
+                "tool": {
+                  "type": "string",
+                  "enum": [
+                    "AskUserQuestion",
+                    "request_user_input",
+                    "plain_text",
+                    "goodqa_ticket",
+                    "other"
+                  ]
+                },
+                "at": {
+                  "$ref": "#/$defs/timestamp"
+                },
+                "log": {
+                  "$ref": "#/$defs/logPointer"
+                },
+                "binding": {
+                  "$ref": "#/$defs/binding"
+                },
+                "walFile": {
+                  "type": "string",
+                  "maxLength": 1024
+                },
+                "askRef": {
+                  "type": "string",
+                  "maxLength": 64,
+                  "description": "The harness ask id ([ask:<id>]) the question carried, if any."
+                },
+                "data": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "description": "Redacted structure of the question. Free text is agent-written and bounded.",
+                  "required": [
+                    "summary"
+                  ],
+                  "properties": {
+                    "summary": {
+                      "$ref": "#/$defs/shortText"
+                    },
+                    "header": {
+                      "type": "string",
+                      "maxLength": 80
+                    },
+                    "options": {
+                      "type": "array",
+                      "maxItems": 20,
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "key",
+                          "label"
+                        ],
+                        "properties": {
+                          "key": {
+                            "type": "string",
+                            "maxLength": 40
+                          },
+                          "label": {
+                            "type": "string",
+                            "maxLength": 120
+                          },
+                          "recommended": {
+                            "type": "boolean"
+                          }
+                        }
+                      }
+                    },
+                    "multiSelect": {
+                      "type": "boolean"
+                    },
+                    "rawSha256": {
+                      "$ref": "#/$defs/sha256",
+                      "description": "Hash of the full tool input, kept in the private store."
+                    }
+                  }
+                }
+              }
+            },
+            "state": {
+              "$ref": "#/$defs/decisionState"
+            },
+            "stateSince": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "related": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/relation"
+              },
+              "maxItems": 200,
+              "description": "Asks this decides (kind=decides), and supersedes/extends links to other decisions."
+            },
+            "answer": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "actor",
+                "at",
+                "messageId",
+                "log",
+                "text"
+              ],
+              "properties": {
+                "actor": {
+                  "$ref": "#/$defs/actor"
+                },
+                "at": {
+                  "$ref": "#/$defs/timestamp"
+                },
+                "messageId": {
+                  "$ref": "#/$defs/messageId"
+                },
+                "log": {
+                  "$ref": "#/$defs/logPointer"
+                },
+                "binding": {
+                  "$ref": "#/$defs/binding"
+                },
+                "text": {
+                  "$ref": "#/$defs/textRef"
+                },
+                "selected": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "maxLength": 40
+                  },
+                  "maxItems": 20,
+                  "description": "Option keys chosen, when the question had options."
+                },
+                "attachments": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/attachment"
+                  },
+                  "maxItems": 64
+                }
+              }
+            },
+            "assumption": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Recorded when an agent proceeds without an answer. It is never a user requirement.",
+              "required": [
+                "text",
+                "source",
+                "by",
+                "at"
+              ],
+              "properties": {
+                "text": {
+                  "$ref": "#/$defs/shortText"
+                },
+                "source": {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/source"
+                    },
+                    {
+                      "properties": {
+                        "kind": {
+                          "const": "inferred"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "by": {
+                  "$ref": "#/$defs/actor"
+                },
+                "at": {
+                  "$ref": "#/$defs/timestamp"
+                },
+                "revisitTrigger": {
+                  "$ref": "#/$defs/shortText"
+                }
+              }
+            },
+            "withdrawal": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "at",
+                "by",
+                "reason"
+              ],
+              "properties": {
+                "at": {
+                  "$ref": "#/$defs/timestamp"
+                },
+                "by": {
+                  "$ref": "#/$defs/actor"
+                },
+                "reason": {
+                  "type": "string",
+                  "minLength": 10,
+                  "maxLength": 300
+                }
+              }
+            },
+            "removableAfter": {
+              "$ref": "#/$defs/timestamp"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "state": {
+                    "const": "answered"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "answer"
+                ],
+                "properties": {
+                  "answer": {
+                    "properties": {
+                      "actor": {
+                        "properties": {
+                          "kind": {
+                            "const": "human"
+                          }
+                        }
+                      },
+                      "binding": {
+                        "properties": {
+                          "status": {
+                            "const": "bound"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "state": {
+                    "const": "assumed"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "assumption"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "state": {
+                    "const": "withdrawn"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "withdrawal"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "state": {
+                    "const": "superseded"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "related": {
+                    "contains": {
+                      "properties": {
+                        "kind": {
+                          "const": "superseded_by"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One captured human turn (prompt or AskUserQuestion answer). Asks and decisions point at it; it carries no text.",
+      "required": [
+        "id",
+        "sessionId",
+        "origin",
+        "capturedAt",
+        "capturedVia",
+        "text",
+        "triage",
+        "writer",
+        "humanCheck"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/messageId"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "origin": {
+          "$ref": "#/$defs/origin"
+        },
+        "capturedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "capturedVia": {
+          "type": "string",
+          "enum": [
+            "hook_prompt",
+            "hook_post_tool",
+            "rollout_sync",
+            "transcript_sync",
+            "spool",
+            "import"
+          ]
+        },
+        "pastedOnly": {
+          "type": "boolean"
+        },
+        "text": {
+          "$ref": "#/$defs/textRef"
+        },
+        "triage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status"
+          ],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "untriaged",
+                "split",
+                "no_ask",
+                "answer"
+              ]
+            },
+            "at": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "by": {
+              "$ref": "#/$defs/actor"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 10,
+              "maxLength": 300
+            },
+            "askIds": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/askId"
+              },
+              "maxItems": 100
+            },
+            "decisionIds": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/decisionId"
+              },
+              "maxItems": 100
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "const": "no_ask"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "reason",
+                  "by",
+                  "at"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "const": "split"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "by",
+                  "at"
+                ],
+                "anyOf": [
+                  {
+                    "properties": {
+                      "askIds": {
+                        "minItems": 1
+                      }
+                    },
+                    "required": [
+                      "askIds"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "decisionIds": {
+                        "minItems": 1
+                      }
+                    },
+                    "required": [
+                      "decisionIds"
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "writer": {
+          "$ref": "#/$defs/hiveId"
+        },
+        "humanCheck": {
+          "$ref": "#/$defs/humanCheck"
+        }
+      },
+      "allOf": [
+        {
+          "properties": {
+            "origin": {
+              "required": [
+                "log",
+                "binding"
+              ],
+              "properties": {
+                "actor": {
+                  "properties": {
+                    "kind": {
+                      "const": "human"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "hiveId",
+        "firstSeenAt"
+      ],
+      "properties": {
+        "provider": {
+          "$ref": "#/$defs/provider"
+        },
+        "hiveId": {
+          "$ref": "#/$defs/hiveId"
+        },
+        "account": {
+          "$ref": "#/$defs/accountLabel"
+        },
+        "transcript": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "syncOffset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "syncLine": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "firstSeenAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "lastSeenAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "stopBlocks": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "lastAt": {
+                "$ref": "#/$defs/timestamp"
+              }
+            }
+          }
+        },
+        "reinject": {
+          "type": "boolean"
+        }
+      }
+    },
+    "tombstone": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "What remains after the 24h gate removes a record. Enough to refuse re-capture, prove why it was removed, and locate the archived snapshot.",
+      "required": [
+        "id",
+        "type",
+        "finalState",
+        "stateSince",
+        "removedAt",
+        "removedBy",
+        "proofKind",
+        "snapshotSha256"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/recordId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "decision"
+          ]
+        },
+        "finalState": {
+          "type": "string",
+          "enum": [
+            "done",
+            "cancelled",
+            "superseded",
+            "answered",
+            "withdrawn"
+          ]
+        },
+        "stateSince": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "removedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "removedBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "proofKind": {
+          "type": "string",
+          "enum": [
+            "verified_evidence",
+            "user_proof",
+            "superseded_by_closed"
+          ]
+        },
+        "proof": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/userProof"
+            },
+            {
+              "$ref": "#/$defs/evidence"
+            }
+          ]
+        },
+        "messageUuids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "maxItems": 100,
+          "description": "Transcript uuids whose re-capture by sync must be refused."
+        },
+        "archive": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "file",
+            "line"
+          ],
+          "properties": {
+            "file": {
+              "type": "string",
+              "maxLength": 1024
+            },
+            "line": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "snapshotSha256": {
+          "$ref": "#/$defs/sha256",
+          "description": "Hash of the archived record, so the archive line can be checked."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "proofKind": {
+                "const": "user_proof"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "proof"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "proofKind": {
+                "const": "verified_evidence"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "proof"
+            ]
+          }
+        }
+      ]
+    },
+    "violation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "at",
+        "surfaced"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^X-[a-z0-9]{4,12}-[0-9]{1,}$"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "stop_block_exhausted",
+            "cannot_bind",
+            "stale_owner",
+            "owner_stopped",
+            "capture_failed",
+            "invalid_transition",
+            "sync_conflict",
+            "policy_error",
+            "guard_bypass_attempt",
+            "audit_chain_break",
+            "removal_refused"
+          ]
+        },
+        "at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "hiveId": {
+          "$ref": "#/$defs/hiveId"
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/recordId"
+          },
+          "maxItems": 200
+        },
+        "signature": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Sorted kind:id set the Stop retry cap is keyed by."
+        },
+        "detail": {
+          "$ref": "#/$defs/shortText"
+        },
+        "surfaced": {
+          "type": "boolean"
+        },
+        "acknowledgedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "acknowledgedBy": {
+          "$ref": "#/$defs/actor"
+        }
+      }
+    },
+    "index": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Derived from asks/decisions/messages on every fold. Hooks read only this plus the records they need; a mismatch with the records is a verify failure, never a source of truth.",
+      "required": [
+        "builtAt",
+        "builtFromRev",
+        "openAsks",
+        "openDecisions",
+        "untriagedMessages",
+        "bySession",
+        "byOwner",
+        "removable"
+      ],
+      "properties": {
+        "builtAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "builtFromRev": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "openAsks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/indexEntry"
+          }
+        },
+        "openDecisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/indexEntry"
+          }
+        },
+        "untriagedMessages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/messageId"
+          }
+        },
+        "pendingBindings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/messageId"
+          }
+        },
+        "bySession": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/sessionId"
+          },
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/recordId"
+            }
+          }
+        },
+        "byOwner": {
+          "type": "object",
+          "description": "Key is actor.sessionId or actor.agentId of the current owner span.",
+          "propertyNames": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/askId"
+            }
+          }
+        },
+        "blockedOn": {
+          "type": "object",
+          "description": "prerequisite ref -> asks waiting on it; lets the fold flip blocked asks when a prerequisite closes.",
+          "propertyNames": {
+            "type": "string",
+            "maxLength": 512
+          },
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/askId"
+            }
+          }
+        },
+        "staleAfter": {
+          "type": "array",
+          "description": "Open asks ordered by times.lastCheckedAt ascending, so the Stop hook reads the head only.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "lastCheckedAt"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/askId"
+              },
+              "lastCheckedAt": {
+                "$ref": "#/$defs/timestamp"
+              }
+            }
+          }
+        },
+        "removable": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "removableAfter"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/recordId"
+              },
+              "removableAfter": {
+                "$ref": "#/$defs/timestamp"
+              }
+            }
+          }
+        },
+        "unsurfacedViolations": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "indexEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "state",
+        "stateSince"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/recordId"
+        },
+        "state": {
+          "type": "string",
+          "maxLength": 20
+        },
+        "stateSince": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "owner": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "actor.sessionId or agentId of the current owner, or 'unassigned'."
+        },
+        "sessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "compressed": {
+          "$ref": "#/$defs/shortText"
+        },
+        "nextStep": {
+          "$ref": "#/$defs/shortText"
+        },
+        "lastCheckedAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One line of work-ledger.events.jsonl. Events are the system of record; the snapshot is their fold. (hiveId, seq) is unique and dense per hive; prevSha256 chains lines written by the same hive.",
+      "required": [
+        "id",
+        "hiveId",
+        "seq",
+        "at",
+        "actor",
+        "target",
+        "op",
+        "data",
+        "prevSha256",
+        "sha256"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "hiveId": {
+          "$ref": "#/$defs/hiveId"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "actor": {
+          "$ref": "#/$defs/actor"
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "id"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "ask",
+                "decision",
+                "message",
+                "session",
+                "ledger"
+              ]
+            },
+            "id": {
+              "type": "string",
+              "maxLength": 128
+            }
+          }
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "captured",
+            "bound",
+            "unbindable",
+            "triaged",
+            "created",
+            "state",
+            "block",
+            "unblock",
+            "assign",
+            "span_status",
+            "relate",
+            "unrelate",
+            "prerequisite",
+            "prerequisite_status",
+            "evidence",
+            "evidence_verified",
+            "commit",
+            "commit_status",
+            "checked",
+            "next_step",
+            "answered",
+            "assumed",
+            "withdrawn",
+            "cancelled",
+            "reopened",
+            "tombstoned",
+            "violation",
+            "acknowledged",
+            "sync",
+            "migrated"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "description": "Op payload. For op=state: {from, to, reason?}. For op=assign: a processSpan. For op=evidence: an evidence record. For op=cancelled: a cancellation object. Shapes are the same $defs the snapshot uses."
+        },
+        "cause": {
+          "$ref": "#/$defs/source",
+          "description": "Why this happened, when it traces to a human message or ticket."
+        },
+        "prevSha256": {
+          "$ref": "#/$defs/sha256",
+          "description": "sha256 of the previous event from the same hive; 64 zeros for seq 1."
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256",
+          "description": "sha256 of the canonical JSON of this event without this field."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "state"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "required": [
+                  "from",
+                  "to"
+                ],
+                "properties": {
+                  "from": {
+                    "type": "string",
+                    "maxLength": 20
+                  },
+                  "to": {
+                    "type": "string",
+                    "maxLength": 20
+                  },
+                  "reason": {
+                    "$ref": "#/$defs/shortText"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "cancelled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "required": [
+                  "proof"
+                ],
+                "properties": {
+                  "proof": {
+                    "$ref": "#/$defs/userProof"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "answered"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "actor": {
+                "properties": {
+                  "kind": {
+                    "const": "human"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "humanCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "isHuman",
+        "method"
+      ],
+      "description": "Why the harness believes a human typed this turn. Injected context (CLAUDE.md/AGENTS.md, environment blocks, hook output, subagent or task notifications, system reminders, compaction summaries, pasted-only turns flagged separately) must give isHuman=false and is never captured as a message.",
+      "properties": {
+        "isHuman": {
+          "type": "boolean"
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "claude_user_turn",
+            "claude_queued_prompt",
+            "claude_ask_answer",
+            "codex_user_message_item",
+            "manual_review",
+            "import"
+          ]
+        },
+        "excludedReasons": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 80
+          }
+        },
+        "providerItemId": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Claude message uuid or Codex rollout item id, used for dedup."
+        }
+      }
+    }
+  }
+}
