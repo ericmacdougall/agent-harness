@@ -376,7 +376,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
     - A pass counts only if it comes from the click-tester: its report (first line `CLICK_TEST_RESULT: PASS|FAIL`, matching `--result`) has its sha256 noted in the agent's own WAL, or `--really-tested <id>` is found there.
   - **Human click-tests** are self-attested.
 - **Sign-off:**
-  - It must come from someone other than the spec author, either spec reviewer, or anyone who posted spec, evidence or click-test records. By default this is the main agent.
+  - It must come from someone other than the spec author, either spec reviewer, a click-tester, or anyone who posted spec, evidence or click-test records. By default this is the main agent. When the main agent directed the work, its independence is nominal; ask for `Sign-off: human` when that matters.
   - It must be `--kind human` when the spec says `Sign-off: human` or the ticket text says "human sign-off".
   - The sign-off identity is self-declared.
   - GoodQA labels agent comments made through a user token as human, so comment authorship never proves a human.
@@ -420,7 +420,8 @@ GoodQA's own independent-acceptance rule for done transitions still applies.
    - **Bulk calls:** every item in a bulk call is checked, and one failing item blocks the call.
    - **Where it blocks:** only in `mode: enforce`, and only for `enforced_projects`. Everywhere else it prints what is missing and allows the call.
    - **Unreachable GoodQA:** a transport failure blocks only in enforce mode when enforced projects are configured. The status write goes to the same service, so blocking it costs little.
-   - **Unreadable issue:** an issue that no routed key can read, or a malformed issue id, only warns, even in enforce mode. Enforcing a project requires a routed key that passes `doctor`, so an issue no key can read is not in an enforced project.
+   - **Refused key:** if any routed key gets `forbidden` reading the issue (a revoked or rotated key, or lost membership), the hook blocks in enforce mode while any project is enforced, and names `doctor`. Re-run `doctor` for each enforced project after any key or membership change.
+   - **Issue not found:** an issue that every routed key reports `not_found`, or a malformed issue id (GoodQA only accepts uuids), only warns, even in enforce mode. Enforcing a project requires a routed key that passes `doctor`, so such an issue is not in an enforced project.
    - **Out of reach:** the GoodQA UI, REST calls made with curl or scripts, Codex and Cursor. Codex has no SubagentStop or MCP PreToolUse hook here, and Cursor is not wired, so on Codex and Cursor the commands are run by hand and `done` is advisory. Parity is tracked in GoodQA work-tracker-automatic#35670, to be absorbed by the harness Go port.
 
 ### Credentials and rollout

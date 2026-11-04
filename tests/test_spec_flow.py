@@ -72,6 +72,7 @@ class FakeGoodQA:
                                "projectId": PROJECT, "description": "", "closedAt": None}}
         self.comments, self.attachments, self.calls = {ISSUE: []}, {}, []
         self.delay, self.refuse_done, self.clock = 0, False, 0
+        self.forbidden = set()  # issue ids whose reads are refused, as for a revoked key
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -125,6 +126,8 @@ class FakeGoodQA:
                     return {"issue": issue}, None
             return None, "not_found"
         if name == "get_issue":
+            if args["issueId"] in self.forbidden:
+                return None, "forbidden"
             issue = self.issues.get(args["issueId"])
             return ({"issue": issue}, None) if issue else (None, "not_found")
         if name == "get_issue_comments":
@@ -628,7 +631,7 @@ class DoneGate(SpecFlowCase):
         adapter.comment_with_files(ISSUE, sf.record_body("sign-off", record), str(uuid.uuid4()))
         result = self.evaluate()
         self.assertFalse(result["ready"])
-        self.assertTrue(any("owner, author or a spec reviewer" in m for m in result["missing"]), result["missing"])
+        self.assertTrue(any("owner, author, a spec reviewer" in m for m in result["missing"]), result["missing"])
 
     def test_evidence_for_an_older_spec_is_stale(self):
         self.complete()
@@ -645,6 +648,12 @@ class DoneGate(SpecFlowCase):
         result = self.evaluate()
         self.assertFalse(result["ready"])
         self.assertTrue(any("AC-1" in m and "stale" in m for m in result["missing"]), result["missing"])
+
+    def test_click_tester_cannot_sign_off(self):
+        self.complete(signer=("ct1", "agent"))
+        result = self.evaluate()
+        self.assertFalse(result["ready"])
+        self.assertTrue(any("click-tester" in m for m in result["missing"]), result["missing"])
 
     def test_human_required_rejects_agent_signoff(self):
         self.fake.issues[ISSUE]["description"] = "Needs human sign-off before close."
@@ -707,6 +716,38 @@ class Hook(SpecFlowCase):
         code, text = self.hook("update_issue", {"issueId": "not-a-uuid", "patch": {"status": "done"}}, **self.enforce())
         self.assertEqual(code, 0)
         self.assertIn("malformed", text)
+
+    def test_refused_key_fails_closed_when_anything_is_enforced(self):
+        self.fake.forbidden.add(ISSUE)  # the enforced project's key was revoked after doctor
+        code, text = self.hook("update_issue", {"issueId": ISSUE, "patch": {"status": "done"}}, **self.enforce())
+        self.assertEqual(code, 2)
+        self.assertIn("forbidden", text)
+        self.assertIn("doctor", text)
+        code, text = self.hook("update_issue", {"issueId": ISSUE, "patch": {"status": "done"}},
+                               mode="warn", enforced_projects=["harness"])
+        self.assertEqual(code, 0)
+
+    def test_call_api_collection_write_passes_unless_it_names_an_enforced_project(self):
+        code, _ = self.hook("call_api", {"method": "POST", "path": "/v1/issues/bulk", "body": {}}, **self.enforce())
+        self.assertEqual(code, 0)
+        code, text = self.hook("call_api", {"method": "POST", "path": f"/v1/projects/{PROJECT}/issues", "body": {}},
+                               **self.enforce())
+        self.assertEqual(code, 2)
+        self.assertIn("enforced project", text)
+
+    def test_unexpected_hook_error_fails_closed_only_when_enforcing(self):
+        payload = json.dumps({"tool_name": "mcp__plugin_goodqa_goodqa__update_issue",
+                              "tool_input": {"issueId": ISSUE, "patch": {"status": "done"}}})
+        for policy, expected in (({"mode": "enforce", "enforced_projects": ["harness"]}, 2),
+                                 ({"mode": "enforce", "enforced_projects": []}, 0),
+                                 ({"mode": "warn", "enforced_projects": ["harness"]}, 0)):
+            with self.subTest(policy=policy), \
+                    mock.patch.object(sf, "load_spec_policy", return_value=dict(self.spec_policy, **policy)), \
+                    mock.patch.object(sf, "run_hook", side_effect=RuntimeError("boom")), \
+                    mock.patch.object(sys, "stdin", io.StringIO(payload)), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(sf.main(["hook"]), expected)
+                self.assertIn("RuntimeError", err.getvalue())
 
     def test_unenforced_project_only_warns(self):
         code, text = self.hook("update_issue", {"issueId": ISSUE, "patch": {"status": "done"}},

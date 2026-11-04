@@ -211,15 +211,19 @@ class GoodQAAdapter:
 
     def issue(self, issue_id: str):
         """Return the issue dict, or None when this credential cannot see it."""
+        return self.issue_access(issue_id)[0]
+
+    def issue_access(self, issue_id: str):
+        """(issue, None) when readable, or (None, "not_found" | "forbidden") when this credential cannot see it."""
         data = self.call("get_issue", {"issueId": issue_id})
         if data.get("__error__") in ("not_found", "forbidden"):
-            return None
+            return None, data["__error__"]
         if "__error__" in data:
             raise TicketSystemUnavailable(f"GoodQA issue read failed ({data['__error__']})")
         issue = data.get("issue", data)
         if not isinstance(issue, dict) or issue.get("id") != issue_id:
             raise TicketSystemUnavailable("GoodQA returned an unexpected issue")
-        return issue
+        return issue, None
 
     def all_comments(self, issue_id: str, *, max_pages: int | None = None):
         """Every active comment, oldest first. Running out of pages fails closed."""

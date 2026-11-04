@@ -691,13 +691,14 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
     # sign-off
     human_required = spec.get("signoff") == "human" or "human sign-off" in str(issue.get("description") or "").lower()
     signoffs = [r for r in records if r["kind"] == "signoff" and r.get("spec_core_sha") == core]
-    excluded = owners | review_keys
+    testers = {tester_key(r.get("tester") or {}) for r in records if r["kind"] == "click_test"}
+    excluded = owners | review_keys | (testers - {""})
     valid = [r for r in signoffs if r.get("by") not in excluded
              and (not human_required or r.get("signer_kind") == "human")]
     if not valid:
         why = []
         if any(r.get("by") in excluded for r in signoffs):
-            why.append("a sign-off came from the owner, author or a spec reviewer")
+            why.append("a sign-off came from the owner, author, a spec reviewer, an evidence poster or a click-tester")
         if human_required and signoffs:
             why.append("this ticket requires a human sign-off")
         missing.append("sign-off: none valid on the current spec" + (f" ({'; '.join(why)})" if why else "")
@@ -774,8 +775,11 @@ def _status_action(status, note=None, min_reason=20):
     return "unknown"
 
 
-def resolve_issue(issue_id: str, config: dict, spec_policy: dict, deadline: float):
-    """Find the issue with the default key, then each routed project's key."""
+def resolve_issue(issue_id: str, config: dict, spec_policy: dict, deadline: float, refusals=None):
+    """Find the issue with the default key, then each routed project's key.
+
+    `refusals`, when given, collects the error ("not_found" / "forbidden") from each key that could not read it.
+    """
     tried = set()
     for project in [None] + sorted((spec_policy.get("projects") or {}).keys()):
         merged = ta.project_config(config, project, spec_policy.get("projects") or {})
@@ -785,9 +789,11 @@ def resolve_issue(issue_id: str, config: dict, spec_policy: dict, deadline: floa
         tried.add(key)
         adapter = ta.adapter_for(dict(merged, upload_host_suffixes=spec_policy.get("upload_host_suffixes")),
                                  deadline=deadline)
-        issue = adapter.issue(issue_id)
+        issue, refusal = adapter.issue_access(issue_id)
         if issue is not None:
             return adapter, issue
+        if refusals is not None:
+            refusals.append(refusal)
     return None, None
 
 
@@ -813,15 +819,24 @@ def run_hook(payload: dict, spec_policy: dict, config_loader=None) -> tuple:
                     blocking.append(f"call_api write to {detail} touches an enforced project and its effect on "
                                     "issue status can't be checked; use the named GoodQA tools")
                 continue
-            # An issue no routed key can read is not in an enforced project: enforcing a project requires a
-            # routed key that passes `doctor`. So these warn instead of blocking every other project's writes.
+            # GoodQA validates issueId as a uuid, so a malformed id cannot reach an issue: warn only.
             if not isinstance(issue_id, str) or not re.fullmatch(UUID, issue_id):
                 warnings.append(f"{detail}: missing or malformed issueId; not checked")
                 continue
-            adapter, issue = resolve_issue(issue_id, config, spec_policy, deadline)
+            refusals = []
+            adapter, issue = resolve_issue(issue_id, config, spec_policy, deadline, refusals)
             if issue is None:
-                warnings.append(f"issue {issue_id} is not readable with any routed key, so it is not in an "
-                                "enforced project; not checked")
+                if "forbidden" in refusals:
+                    # A key that can see the issue exists but is refused: revoked, rotated or lost membership.
+                    # That may be an enforced project's key, so fail closed wherever anything is enforced.
+                    (blocking if enforced else warnings).append(
+                        f"issue {issue_id}: a routed GoodQA key was refused (forbidden), so the spec gate cannot "
+                        "check it; re-run spec_flow.py doctor --project <slug> for the enforced projects")
+                else:
+                    # not_found under every key: enforcing a project requires a routed key that passes doctor,
+                    # so this issue is not in an enforced project. Warn instead of blocking other projects.
+                    warnings.append(f"issue {issue_id} is not found with any routed key, so it is not in an "
+                                    "enforced project; not checked")
                 continue
             target = blocking if str(issue.get("projectId") or "").lower() in enforced else warnings
             label = f"issue #{issue.get('number')} ({issue_id[:8]})"
@@ -937,7 +952,10 @@ def cmd_lint(args, spec_policy):
 
 def cmd_packet(args, spec_policy):
     text = Path(args.spec).read_text(encoding="utf-8")
-    _, _, config = ticket_config(spec_policy)
+    try:
+        _, _, config = ticket_config(spec_policy)
+    except (OSError, ValueError, ImportError) as error:
+        raise SpecError(f"cannot load the ticket configuration to lint the spec: {error}", EXIT_USAGE)
     problems = lint(text, config)
     if problems:  # reviewers should never be handed a spec that cannot be attached
         print(json.dumps({"status": "FAIL", "problems": problems}, indent=1))
