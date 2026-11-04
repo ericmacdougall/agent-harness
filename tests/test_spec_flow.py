@@ -465,7 +465,11 @@ class Evidence(SpecFlowCase):
         for record in ({"v": 1, "kind": "click_test", "tester": "x"},
                        {"v": 1, "kind": "evidence", "commits": ["abc"], "ac": ["AC-1"]},
                        {"v": 1, "kind": "spec", "ac": "AC-1", "attachments": []},
-                       {"v": 1, "kind": "signoff", "by": ["x"]}):
+                       {"v": 1, "kind": "signoff", "by": ["x"]},
+                       {"v": 1, "kind": "spec", "attachments": [{"id": ["a"]}], "ac": ["AC-1"]},
+                       {"v": 1, "kind": "spec", "reviews": [{"role": {"x": 1}}], "ac": ["AC-1"]},
+                       {"v": 1, "kind": "evidence", "commits": [{"sha": ["x"]}], "ac": ["AC-1"]},
+                       {"v": 1, "kind": "click_test", "tester": {"kind": ["agent"], "identity": "x"}}):
             adapter.comment_with_files(ISSUE, sf.record_body("x", record), str(uuid.uuid4()))
         code, out, err = self.run_cli("status", "--ticket", "GoodQA harness#168")
         self.assertEqual(code, 2, err)
@@ -839,8 +843,9 @@ class Hook(SpecFlowCase):
                                mode="warn", enforced_projects=["harness"])
         self.assertEqual(code, 0)
 
-    def test_call_api_collection_write_passes_unless_it_names_an_enforced_project(self):
-        code, _ = self.hook("call_api", {"method": "POST", "path": "/v1/issues/bulk", "body": {}}, **self.enforce())
+    def test_call_api_plain_create_passes_unless_it_names_an_enforced_project(self):
+        code, _ = self.hook("call_api", {"method": "POST", "path": "/v1/issues", "body": {"title": "x"}},
+                            **self.enforce())
         self.assertEqual(code, 0)
         code, text = self.hook("call_api", {"method": "POST", "path": f"/v1/projects/{PROJECT}/issues", "body": {}},
                                **self.enforce())
@@ -862,7 +867,9 @@ class Hook(SpecFlowCase):
                 self.assertEqual(code, 2)
         for path in (f"/issues/{ISSUE}/close?via=/comments/", f"/issues/{ISSUE}/comments/../close",
                      f"/issues/{ISSUE}/comments/%2e%2e/close", f"/v1/issues/{ISSUE}/attachments/x/../../transition",
-                     f"/v1/issues//{ISSUE}/close", f"/v1/issues/{ISSUE}/comments#x"):
+                     f"/v1/issues//{ISSUE}/close", f"/v1/issues/{ISSUE}/comments#x",
+                     f"/Issues/{ISSUE}/close", f"issues/{ISSUE}/close", f"/ISSUES/{ISSUE}",
+                     f"/v1/issue-actions/{ISSUE}/resolve", "/v1/issues/close-all", f"/v1/Issues/{ISSUE}"):
             with self.subTest(path=path):
                 code, _ = self.hook("call_api", {"method": "POST", "path": path, "body": {"status": "done"}},
                                     **self.enforce())
@@ -870,6 +877,25 @@ class Hook(SpecFlowCase):
         code, _ = self.hook("call_api", {"method": "POST", "path": f"/v1/issues/{ISSUE}/comments",
                                          "body": {"body": "hi"}}, **self.enforce())
         self.assertEqual(code, 0)
+
+    def test_collection_writes_allow_only_plain_creates(self):
+        blocked = [
+            {"method": "POST", "path": "/v1/issues/bulk", "body": {"items": {ISSUE: {"status": "done"}}}},
+            {"method": "POST", "path": "/v1/issues/bulk", "body": {}},
+            {"method": "PATCH", "path": "/v1/issues", "body": {"filter": {"id": ISSUE}, "set": {"state": "done"}}},
+            {"method": "PATCH", "path": "issues/" + ISSUE, "body": {"status": "done"}},
+        ]
+        for tool_input in blocked:
+            with self.subTest(tool_input=tool_input):
+                self.assertEqual(self.hook("call_api", tool_input, **self.enforce())[0], 2)
+        code, _ = self.hook("call_api", {"method": "POST", "path": f"/v1/projects/{str(uuid.uuid4())}/issues",
+                                         "body": {"title": "new bug", "type": "bug"}}, **self.enforce())
+        self.assertEqual(code, 0)
+
+    def test_wal_path_with_dot_dot_is_refused(self):
+        for path in ("~/.claude/wals/../x.jsonl", "~/.claude/wals/../x/y.jsonl"):
+            with self.subTest(path=path), self.assertRaises(sf.SpecError):
+                sf.checked_wal(Path(path))
 
     def test_update_issue_project_move_is_gated(self):
         code, text = self.hook("update_issue", {"issueId": ISSUE, "patch": {"projectId": str(uuid.uuid4())}},

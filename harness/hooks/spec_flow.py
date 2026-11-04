@@ -433,8 +433,9 @@ def wal_root() -> Path:
 
 
 def checked_wal(path: Path) -> Path:
-    path = Path(os.path.expanduser(str(path))).absolute()
-    if path.parent.parent != wal_root() or path.suffix != ".jsonl":
+    raw = Path(os.path.expanduser(str(path)))
+    path = raw.absolute().resolve()
+    if ".." in raw.parts or path.parent.parent != wal_root().resolve() or path.suffix != ".jsonl":
         raise SpecError("WAL path must be a per-session JSONL under ~/.claude/wals", EXIT_USAGE)
     return path
 
@@ -497,6 +498,8 @@ def record_body(summary: str, record: dict) -> str:
 
 _FIELD_TYPES = {"attachments": list, "commits": list, "ac": list, "reviews": list, "tester": dict,
                 "deployed_commit": dict, "covers_commits": list, "click_test": dict, "really_tested": dict}
+_NESTED_STRINGS = {"id", "role", "sha256", "name", "key", "verdict", "core_sha", "kind", "sha", "identity",
+                   "at", "text", "id_hint"}
 _STRING_FIELDS = ("key", "actor", "author", "spec_core_sha", "spec_file_sha", "by", "signer_kind", "result", "url",
                   "pass_source", "signoff", "note")
 
@@ -513,6 +516,16 @@ def record_shape_problem(record: dict):
                         ("covers_commits", str)):
         if any(not isinstance(item, inner) for item in record.get(name) or []):
             return f"field {name} holds an entry that is not a {inner.__name__}"
+    # Nested objects hold only scalars, and the fields the gate keys on are strings.
+    nested = [(name, item) for name in ("attachments", "commits", "reviews") for item in record.get(name) or []]
+    nested += [(name, record[name]) for name in ("tester", "deployed_commit", "click_test", "really_tested")
+               if isinstance(record.get(name), dict)]
+    for name, item in nested:
+        for field, value in item.items():
+            if not isinstance(value, (str, bool, int, float, type(None))):
+                return f"field {name}.{field} is not a scalar"
+            if field in _NESTED_STRINGS and value is not None and not isinstance(value, str):
+                return f"field {name}.{field} is not a string"
     return None
 
 
@@ -591,7 +604,10 @@ def verified(records: list, index: dict, kind: str):
     for record in records:
         if record["kind"] != kind:
             continue
-        problems = attachment_problems(record, index) + kind_problems(record)
+        try:
+            problems = attachment_problems(record, index) + kind_problems(record)
+        except Exception as exc:  # comments are untrusted: a shape the checks missed is ignored, not fatal
+            problems = [f"record could not be checked ({type(exc).__name__})"]
         (bad if problems else good).append((record, problems))
     return [record for record, _ in good], bad
 
@@ -688,6 +704,8 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
         return {"ready": False, "missing": missing, "self_attested": attested, "notes": notes}
     spec = specs[-1]
     core = spec.get("spec_core_sha")
+    attested.append("spec core sha, criteria and review verdicts are read from the spec record; the attached spec "
+                    "file is checked by sha256 but the core is not re-derived from it")
     author = spec.get("author")
     reviews = {entry.get("role"): entry for entry in spec.get("reviews") or [] if isinstance(entry, dict)}
     review_keys, valid_roles = set(), 0
@@ -813,6 +831,8 @@ def classify(tool: str, tool_input: dict, min_reason: int):
     """Yield (issue_id, action, detail). action in open|done|reason|unknown|archive|stage|delete|scope."""
     tool_input = tool_input if isinstance(tool_input, dict) else {}
     if tool == "close_issue_done":
+        # GoodQA's close_issue_done schema: status enum on_production|done, default on_production (deploy,
+        # not done). Pinned by Hook.test_other_tools_and_open_statuses_need_no_network.
         status = tool_input.get("status") or "on_production"
         yield tool_input.get("issueId"), _status_action(status), status
     elif tool == "close_issue_wont_fix":
@@ -836,51 +856,71 @@ def classify(tool: str, tool_input: dict, min_reason: int):
         if tool_input.get("stageId") or tool_input.get("pipelineId"):
             yield tool_input.get("issueId"), "stage", "pipeline/stage move"
     elif tool == "call_api":
-        method = str(tool_input.get("method") or "GET").upper()
-        if method == "GET":
-            return
-        path = str(tool_input.get("path") or "")
-        parsed = urllib.parse.urlsplit(path)
-        segments = parsed.path.split("/")[1:]
-        if "/issues" in path.lower() and (parsed.query or parsed.fragment or parsed.scheme or parsed.netloc
-                                          or "%" in path or "\\" in path
-                                          or any(seg in ("", ".", "..") for seg in segments)):
-            # Queries, dot or empty segments and escapes can make a path mean something other than it reads.
-            found = re.search(r"/issues/(" + UUID + r")", path)
-            yield (found.group(1) if found else None), ("unknown" if found else "scope"), f"{method} {path} (unusual path)"
-            return
-        path = parsed.path
-        raw = tool_input.get("body")
-        body = raw if isinstance(raw, dict) else {}
-        patch = body.get("patch") if isinstance(body.get("patch"), dict) else {}
-        status = body.get("status", patch.get("status"))
-        issue = re.search(r"/issues/(" + UUID + r")", path)
-        if issue and method == "DELETE":
-            yield issue.group(1), "delete", "DELETE issue"
-        elif issue and raw is not None and not isinstance(raw, dict):
-            yield issue.group(1), "unknown", f"{method} {path} with a non-object body"
-        elif issue and re.search(r"/issues/" + UUID + r"/.+", path):
-            # Sub-resources such as /close or /transition may change status in ways the gate cannot read.
-            if not re.fullmatch(r"(/v\d+)?/issues/" + UUID + r"/(comments|attachments|time-entries)(/" + UUID + r")?",
-                                path):
-                yield issue.group(1), "unknown", f"{method} {path}"
-        elif issue and status is not None:
-            yield issue.group(1), _status_action(status, str(body.get("note") or ""), min_reason), status
-        elif issue and any(key in body or key in patch for key in ("projectId", "pipelineId", "stageId")):
-            yield issue.group(1), "stage", "project/pipeline/stage move"
-        elif "/issues" in path and not issue:
-            items = body.get("items") if isinstance(body.get("items"), list) else None
-            if items is not None:
-                for item in items:
-                    if isinstance(item, dict):
-                        yield item.get("issueId"), _status_action(item.get("status"), str(item.get("note") or ""),
-                                                                  min_reason), item.get("status")
-                    else:
-                        yield None, "scope", f"{path} with a malformed item"
-            elif raw is not None and not isinstance(raw, dict) or "status" in body or "patch" in body:
-                yield None, "scope", path
-            else:
-                yield None, "scope-path", path  # e.g. creating an issue: only checked by the project in the path
+        yield from _classify_call_api(tool_input, min_reason)
+
+_SAFE_SUBRESOURCE = re.compile(r"(/v\d+)?/issues/(" + UUID + r")/(comments|attachments|time-entries)(/" + UUID + r")?")
+_ISSUE_PATH = re.compile(r"(/v\d+)?/issues/(" + UUID + r")")
+_NON_CREATE_KEYS = {"items", "status", "patch", "issueId", "issueIds", "ids", "projectId", "pipelineId", "stageId",
+                    "filter", "where", "query", "set", "update"}
+_COLLECTION_PATH = re.compile(r"(/v\d+)?(/projects/" + UUID + r")?/issues(/bulk)?")
+
+
+def _classify_call_api(tool_input: dict, min_reason: int):
+    """Default-deny for writes that mention issues: only known shapes are read, everything else is unchecked."""
+    method = str(tool_input.get("method") or "GET").upper()
+    if method == "GET":
+        return
+    original = str(tool_input.get("path") or "")
+    if "issue" not in original.lower():
+        return  # not an issue route; other GoodQA resources do not carry issue status
+    parsed = urllib.parse.urlsplit(original)
+    path = parsed.path.lower()
+    found = re.search(UUID, original)
+    issue_id = found.group(0).lower() if found else None
+    unusual = (not original.startswith("/") or parsed.query or parsed.fragment or parsed.scheme or parsed.netloc
+               or "%" in original or "\\" in original or any(seg in ("", ".", "..") for seg in path.split("/")[1:]))
+    if unusual:
+        yield issue_id, ("unknown" if issue_id else "scope"), f"{method} {original} (unusual path)"
+        return
+    raw = tool_input.get("body")
+    body = raw if isinstance(raw, dict) else {}
+    patch = body.get("patch") if isinstance(body.get("patch"), dict) else {}
+    status = body.get("status", patch.get("status"))
+    if _SAFE_SUBRESOURCE.fullmatch(path):
+        return
+    single = _ISSUE_PATH.fullmatch(path)
+    if single:
+        issue_id = single.group(2)
+        if method == "DELETE":
+            yield issue_id, "delete", "DELETE issue"
+        elif raw is not None and not isinstance(raw, dict):
+            yield issue_id, "unknown", f"{method} {original} with a non-object body"
+        else:
+            if status is not None:
+                yield issue_id, _status_action(status, str(body.get("note") or ""), min_reason), status
+            if any(key in body or key in patch for key in ("projectId", "pipelineId", "stageId")):
+                yield issue_id, "stage", "project/pipeline/stage move"
+        return
+    if _COLLECTION_PATH.fullmatch(path) and method in ("POST", "PATCH", "PUT"):
+        items = body.get("items") if isinstance(body.get("items"), list) else None
+        creates = (method == "POST" and not path.endswith("/bulk") and isinstance(raw, dict)
+                   and not set(body) & _NON_CREATE_KEYS)
+        if items is None and not creates:
+            yield None, "scope", f"{method} {original} (not a plain create)"
+        elif items is not None:
+            for item in items:
+                if isinstance(item, dict):
+                    yield item.get("issueId"), _status_action(item.get("status"), str(item.get("note") or ""),
+                                                              min_reason), item.get("status")
+                else:
+                    yield None, "scope", f"{original} with a malformed item"
+        elif (raw is not None and not isinstance(raw, dict)) or "status" in body or "patch" in body:
+            yield None, "scope", original
+        else:
+            yield None, "scope-path", original  # e.g. creating an issue: only checked by the project in the path
+        return
+    # Any other write mentioning issues (sub-resources such as /close, unknown routes): unchecked.
+    yield issue_id, ("unknown" if issue_id else "scope"), f"{method} {original} (unrecognised issue route)"
 
 
 def _status_action(status, note=None, min_reason=20):

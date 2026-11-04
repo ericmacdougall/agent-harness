@@ -114,7 +114,7 @@ def merged_settings(current: dict, claude: Path) -> dict:
         if rule not in allowed:
             allowed.append(rule)
     # Read-only spec checks are preapproved; commands that post to tickets are not.
-    for action in ("lint", "status", "packet"):
+    for action in ("lint", "status"):
         rule = f"Bash(python3 ~/.claude/hooks/spec_flow.py {action} *)"
         if rule not in allowed:
             allowed.append(rule)
