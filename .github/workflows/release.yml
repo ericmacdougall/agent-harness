@@ -39,14 +39,15 @@ jobs:
           done
           (cd dist && sha256sum harness-* > SHA256SUMS)
       - id: sum
-        run: echo "sha=$(sha256sum dist/harness-linux-amd64 | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(sha256sum dist/SHA256SUMS | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist
           path: dist/
           if-no-files-found: error
   rebuild:
-    # An independent rebuild on a different OS must match byte for byte, or the release is not reproducible.
+    # An independent rebuild of every target on a different OS must match byte for byte (compared through
+    # SHA256SUMS), or the release is not reproducible.
     runs-on: macos-latest
     outputs:
       sha: ${{ steps.sum.outputs.sha }}
@@ -63,9 +64,14 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false \
-            -ldflags "-s -w -X main.version=${VERSION}" -o harness-check ./cmd/harness
-          echo "sha=$(shasum -a 256 harness-check | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          mkdir dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os=${target%/*}; arch=${target#*/}; ext=""; [ "$os" = windows ] && ext=.exe
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false \
+              -ldflags "-s -w -X main.version=${VERSION}" -o "dist/harness-${os}-${arch}${ext}" ./cmd/harness
+          done
+          (cd dist && shasum -a 256 harness-* > SHA256SUMS)
+          echo "sha=$(shasum -a 256 dist/SHA256SUMS | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
   publish:
     needs: [build, rebuild]
     runs-on: ubuntu-latest

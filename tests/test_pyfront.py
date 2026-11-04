@@ -34,7 +34,18 @@ class SharedCases(unittest.TestCase):
         root = Path(tempfile.mkdtemp(prefix="pyfront-"))
         self.addCleanup(shutil.rmtree, root, True)
         binary, other = root / "launcher" / "harness", root / "other" / "harness"
-        binary.parent.mkdir(mode=0o700)
+        if case.get("launcher_via_shared_symlink") or case.get("launcher_via_safe_symlink"):
+            # launcher -> shared/x (shared 0777, not sticky) or -> real (0700): the resolved chain decides.
+            shared = case.get("launcher_via_shared_symlink")
+            real = root / "shared" / "x" if shared else root / "real"
+            real.parent.mkdir(mode=0o700, exist_ok=True)
+            if shared:
+                real.parent.chmod(0o777)
+                self.addCleanup(real.parent.chmod, 0o700)
+            real.mkdir(mode=0o700)
+            binary.parent.symlink_to(real)
+        else:
+            binary.parent.mkdir(mode=0o700)
         if "launcher_dir_mode" in case:
             binary.parent.chmod(case["launcher_dir_mode"])
             self.addCleanup(binary.parent.chmod, 0o700)
