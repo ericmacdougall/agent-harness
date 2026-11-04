@@ -1,0 +1,7 @@
+[Unit]
+Description=Copy-only agent log backup to Dropbox
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/bin/bash %h/.agent-harness/bin/log-backup.sh

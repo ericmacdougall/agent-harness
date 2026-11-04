@@ -31,7 +31,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py",
          "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
-         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py")
+         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -49,7 +49,7 @@ class DirectoryPublicationError(OSError):
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
-                         "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py")}
+                         "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -127,7 +127,10 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
         return hook
 
     managed = {
-        "SessionStart": [{"hooks": [command("session")]}],
+        "SessionStart": [{"hooks": [command("session")]}, {"hooks": [{
+            # Visible alert when the scheduled log backup has not succeeded for an hour; fails open.
+            "type": "command", "command": "python3", "args": [str(claude / "hooks" / "log_backup.py"), "session-start"],
+            "timeout": 10}]}],
         "UserPromptSubmit": [{"hooks": [command("prompt", True)]}],
         "SubagentStart": [{
             "matcher": SUBAGENT_MATCHER,
@@ -896,6 +899,15 @@ def command_guard_status(enabled: bool, runner=None) -> str:
     return "command guard: registered with onFailure block"
 
 
+def log_backup_status(home: Path, apply: bool) -> str:
+    """Scheduled log backup (script, excludes, launchd or systemd units); never fails the harness install."""
+    try:
+        import log_backup_install
+        return log_backup_install.status(home, apply)
+    except Exception as error:  # noqa: BLE001
+        return f"log backup: skipped ({error.__class__.__name__}: {error})"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
@@ -940,6 +952,7 @@ def main() -> None:
     print(f"  {netwatch_status(args.home, args.apply, args.netwatch)}")
     print(f"  {local_profile_status(args.home)}")
     print(f"  {command_guard_status(args.command_guard)}")
+    print(f"  {log_backup_status(args.home, args.apply)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")
 
