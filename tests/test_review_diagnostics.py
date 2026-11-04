@@ -70,7 +70,7 @@ class ContractTests(unittest.TestCase):
                 self.assertTrue(cause and steps)
                 text = rd.render(rd.diagnostic(code, provider='codex'), stage='pr', head=HEAD)
                 self.assertIn('code=' + code, text)
-                self.assertIn('wal_note.py --wal <hook-supplied-WAL-path> --event blocker --note', text)
+                self.assertIn("wal_note.py --wal '<hook-supplied-WAL-path>' --event blocker --note", text)
                 self.assertIn('native evidence', text)
                 self.assertIn('not a helper receipt', text)
                 for banned in rd.BANNED_PHRASES:
@@ -561,7 +561,7 @@ class EndToEndTests(unittest.TestCase):
     def test_codex_found_at_policy_location_and_recorded(self):
         codex = self.move('codex', self.root / 'installs')
         launches = self.root / 'launches.log'
-        result = self.invoke(env={**self.policy(codex=[str(codex)]), 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+        result = self.invoke(env={**self.policy(codex=[str(codex)]), 'PATH': str(self.bin) + os.pathsep + tpr.system_path(),
                                   'PROVIDER_LAUNCH_LOG': str(launches)})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(launches.read_text().split(), ['codex'])
@@ -600,7 +600,7 @@ class EndToEndTests(unittest.TestCase):
         marker, body = self.poison_codex(None)
         self.commit_file('bin/codex', body)
         (self.bin / 'codex').unlink()
-        env = {'PATH': os.pathsep.join([str(self.repo / 'bin'), '.', '', 'bin', str(self.bin), '/usr/bin:/bin'])}
+        env = {'PATH': os.pathsep.join([str(self.repo / 'bin'), '.', '', 'bin', str(self.bin), tpr.system_path()])}
         result = self.invoke(env=env, cwd=self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(marker.exists(), 'poisoned binary from the repository was executed')
@@ -732,6 +732,114 @@ class EndToEndTests(unittest.TestCase):
         result = self.invoke(stage='code-inspection')
         self.assertEqual(result.returncode, 2)
         self.assertIn('code=SNAPSHOT_HIDDEN_INDEX_FLAG', result.stderr)
+
+
+class RedTeamRound1Tests(unittest.TestCase):
+    """Regressions for the red-team findings on ef3d792 (B1, B2, W1, W2, W4, W6, W7)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_peer_review()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(os.path.realpath(self.temp.name))
+
+    # B1: the packet lint must stay linear on a hostile packet inside the 150 KB ceiling.
+    def test_lint_is_fast_on_hostile_whitespace_packet(self):
+        import time
+        packet = '$ cmd\n' * 11 + 'exit' + ' ' * 140000 + 'x\n'
+        self.assertLess(len(packet.encode()), 150000)
+        started = time.monotonic()
+        problems = rd.lint_packet('pr', packet, HEAD)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0, 'lint took %.2fs on a 140 KB whitespace line' % elapsed)
+        self.assertTrue(problems)
+
+    def test_lint_deadline_fails_closed(self):
+        ticks = iter(range(0, 10**6, 10))
+        packet = 'HEAD %s\n' % HEAD + 'filler\n' * 600 + '```\n$ python3 -m unittest\nRan 5 tests\nOK\nexit 0\n```\n'
+        problems = rd.lint_packet('pr', packet, HEAD, clock=lambda: next(ticks))
+        self.assertTrue(any('limit' in problem for problem in problems), problems)
+        # control: the same packet passes with a real clock
+        self.assertEqual(rd.lint_packet('pr', packet, HEAD), [])
+
+    def test_lint_still_accepts_exit_forms(self):
+        for line in ('exit 0', 'exit code 0', 'exit status: 0', 'exited 0', 'exit=0', 'rc=0', 'Exit Status 0'):
+            with self.subTest(line=line):
+                packet = 'HEAD %s\n```\n$ python3 -m unittest\nRan 5 tests\nOK\n%s\n```\n' % (HEAD, line)
+                self.assertEqual(rd.lint_packet('pr', packet, HEAD), [])
+
+    # B2: containment must hold when a PATH entry differs from the repo path only in case or Unicode form.
+    def test_containment_ignores_case_and_normalization_differences(self):
+        repo = self.root / 'Repo'
+        (repo / 'bin').mkdir(parents=True)
+        private_file(repo / 'bin' / 'codex', '#!/bin/sh\nexit 0\n')
+        roots = rd.untrusted_roots(repo=str(repo), cwd=str(self.root / 'elsewhere'))
+        variant = str(self.root / 'repo' / 'bin' / 'codex')
+        # string-level check works on every filesystem
+        self.assertTrue(rd._inside(os.path.realpath(variant), roots))
+        if rd.fs_is_case_insensitive(self.root):
+            found, reason = rd.check_executable(variant, roots)
+            self.assertIsNone(found)
+            self.assertIn('inside', reason)
+        nfd = self.root / 'Café'
+        self.assertTrue(rd._inside(str(nfd / 'codex'), [str(self.root / 'Café')]))
+        # positive control: a sibling directory sharing a prefix is not inside
+        self.assertFalse(rd._inside(str(self.root / 'Repo2' / 'codex'), [str(repo)]))
+
+    # W1: redaction must remove the secret value, not just its label.
+    def test_redaction_removes_secret_values(self):
+        cases = {
+            'Authorization: Bearer eyJabc.def.ghi123': 'eyJabc',
+            '{"api_key": "abcdefghij1234567890"}': 'abcdefghij1234567890',
+            'password = "hunter2 more"': 'hunter2',
+            'token=abc123def456ghi789': 'abc123def456ghi789',
+            'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY': 'wJalrXUtnFEMI',
+            'secret: s3cr3tvalue99': 's3cr3tvalue99',
+        }
+        for text, leaked in cases.items():
+            with self.subTest(text=text):
+                self.assertNotIn(leaked, rd.sanitize(text))
+        self.assertEqual(rd.sanitize('exit code 1, Ran 3 tests'), 'exit code 1, Ran 3 tests')
+
+    # W2: a command line just before a fenced result block is legitimate evidence.
+    def test_command_before_fenced_results_is_accepted(self):
+        packet = 'HEAD %s\n$ python3 -m unittest discover tests\n```\nRan 78 tests in 3s\nOK\nexit 0\n```\n' % HEAD
+        self.assertEqual(rd.lint_packet('pr', packet, HEAD), [])
+        # control: evidence after a second, unrelated fenced block is still not the command's
+        packet = ('HEAD %s\n```\n$ python3 -m unittest\n```\nprose\n```\nRan 78 tests\nexit 0\n```\n' % HEAD)
+        self.assertTrue(rd.lint_packet('pr', packet, HEAD))
+
+    # W6: free-text stderr only counts as quota for codex with no stdout.
+    def test_stderr_prose_requires_codex_and_empty_stdout(self):
+        msg = "ERROR: You've hit your usage limit"
+        self.assertEqual(self.module.normalize_provider('codex', 1, '', msg, '', 'pr')['reason'], 'QUOTA')
+        self.assertNotEqual(self.module.normalize_provider('claude', 1, '', msg, '', 'pr')['reason'], 'QUOTA')
+        self.assertNotEqual(self.module.normalize_provider('codex', 1, 'progress text', msg, '', 'pr')['reason'], 'QUOTA')
+
+    # W4: a lease refusal is reported with its own reason, never as a missing executable.
+    def test_lease_guard_error_is_not_exec_not_found(self):
+        resolution = {'name': 'codex', 'path': '/usr/bin/true', 'source': 'PATH', 'rejected': [], 'searched': []}
+        outcome = {**self.module.provider_failure({}), 'reason': 'QUOTA', 'fallback_allowed': True}
+        diag = rd.provider_attempt('codex', resolution, None, '', '', outcome)
+        self.assertNotIn(diag['code'], ('EXEC_NOT_FOUND', 'EXEC_UNTRUSTED'))
+        source = (HOOKS / 'peer_review.py').read_text()
+        lease = source.index('store.acquire_pool(provider, pool, run_record.run_id)')
+        lookup = source.index('diagnostics.discover_executable(\n                provider')
+        self.assertLess(lookup, lease, 'the executable must be resolved before the pool lease can raise')
+
+    # W7: invisible format characters are stripped and the WAL placeholder is shell-safe.
+    def test_invisible_format_chars_are_removed(self):
+        self.assertEqual(rd.sanitize('a​b⁠c\U000e0041d'), 'abcd')
+
+    def test_record_command_placeholder_is_quoted(self):
+        text = rd.render(rd.diagnostic('EXEC_NOT_FOUND', provider='codex', detail='x'), stage='pr', head=HEAD)
+        record = [line for line in text.splitlines() if line.startswith('Record: ')][0][len('Record: '):]
+        words = shlex.split(record)
+        self.assertEqual(words[words.index('--wal') + 1], '<hook-supplied-WAL-path>')
+        self.assertNotIn(' <hook', record)
 
 
 if __name__ == '__main__':

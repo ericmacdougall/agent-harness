@@ -19,6 +19,37 @@ import review_diagnostics  # noqa: E402
 
 
 _OFFLINE = None
+_SYSTEM_BIN = []
+REVIEWER_NAMES = frozenset({'codex', 'claude', 'codex.js'})
+
+
+def system_path():
+    """A PATH entry with the machine's tools but never a real reviewer CLI.
+
+    A real codex or claude in /usr/bin (dev2 has one) must not be discovered and
+    executed by a test that removes the fake reviewer to simulate absence.
+    """
+    if not _SYSTEM_BIN:
+        holder = tempfile.TemporaryDirectory(prefix='review-sysbin-')
+        target = Path(holder.name)
+        for source in ('/usr/bin', '/bin'):
+            try:
+                names = sorted(os.listdir(source))
+            except OSError:
+                continue
+            for name in names:
+                full = os.path.join(source, name)
+                if name in REVIEWER_NAMES or os.path.lexists(target / name) or os.path.isdir(full):
+                    continue
+                if os.access(full, os.X_OK):
+                    os.symlink(full, target / name)
+        empty = {'known_install_locations': {'codex': [], 'claude': []}}
+        for reviewer in ('codex', 'claude'):
+            found = review_diagnostics.discover_executable(reviewer, policy=empty, roots=[], path_env=holder.name)
+            if found['path'] is not None:
+                raise RuntimeError('test system PATH still reaches a real reviewer: %s' % found['path'])
+        _SYSTEM_BIN.append(holder)
+    return _SYSTEM_BIN[0].name
 
 
 def setUpModule():  # tests never call the ticket tracker; restored in tearDownModule so it cannot leak into other modules
@@ -141,7 +172,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         path.chmod(0o700)
 
     def invoke(self, *, packet=None, output=None, env=None, expected_head=None, stage='pr', extra=(), cwd=None):
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin', **(env or {})}
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + system_path(), **(env or {})}
         if expected_head is None:
             expected_head = subprocess.run(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'],
                                            check=True, capture_output=True, text=True).stdout.strip()
@@ -684,7 +715,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         with patch.object(sys, 'argv', ['review', 'code-inspection', '--repo', str(self.repo),
                 '--packet', str(self.packet), '--output', str(self.output),
                 '--expected-head', head, '--input-manifest', str(manifest)]), \
-             patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin'}), \
+             patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'CODE_INSPECTION_RESULT: ACCEPT', '')), \
              patch.object(usage_guard.Run, 'finish', finish_with_hook), \
              patch.object(module, 'print', side_effect=announce, create=True), \
@@ -1013,7 +1044,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         subdir = self.repo / 'subdir'
         subdir.mkdir()
         capture = self.root / 'model.capture'
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + system_path(),
                        'CAPTURE_CODEX_PROMPT': str(capture)}
         result = subprocess.run([sys.executable, str(REVIEW), 'pr', '--repo', str(subdir),
                                  '--packet', str(self.packet), '--output', str(self.output)],

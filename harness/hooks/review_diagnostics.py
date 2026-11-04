@@ -17,6 +17,7 @@ import re
 import shlex
 import stat
 import sys
+import time
 import unicodedata
 from pathlib import Path
 
@@ -105,9 +106,14 @@ CONTRACT = {
 BANNED_PHRASES = ('skip review', 'proceed without review', 'ignore the review')
 
 _ANSI = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]')
-_BIDI = dict.fromkeys(list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A)) + [0x200E, 0x200F, 0x061C, 0xFEFF])
-_SECRET = re.compile(r'(?:ghp_|github_pat_|sk-ant-|sk-|xox[a-z]-)[A-Za-z0-9_-]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|'
-                     r'(?i:api[_-]?key|password|access[_-]?token|authorization|bearer)\s*[:=]?\s*\S+')
+# Secrets are redacted with their value: a key=value or key: value pair (quoted or not, any key that names a
+# credential, including AWS_SECRET_ACCESS_KEY-style names), a bearer/basic token, or a known token prefix.
+# Each alternative starts at a fixed literal, so matching stays linear on the bounded input.
+_SECRET = re.compile(
+    r'(?:ghp_|github_pat_|sk-ant-|sk-|xox[a-z]-|AKIA)[A-Za-z0-9_-]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|'
+    r'(?i:(?:api[_-]?key|password|passwd|secret|access[_-]?token|auth[_-]?token|token|authorization|credential)'
+    r'[A-Za-z0-9_]*["\']?[ ]?[:=][ ]?(?:(?:bearer|basic)[ ])?(?:"[^"]*"|\'[^\']*\'|[^ ]+))|'
+    r'(?i:\b(?:bearer|basic)[ ][A-Za-z0-9._~+/=-]{8,})')
 
 
 def sanitize(value, limit=300):
@@ -117,8 +123,10 @@ def sanitize(value, limit=300):
     elif not isinstance(value, str):
         value = str(value)
     value = value[: limit * 8]
-    value = _ANSI.sub(' ', value).translate(_BIDI)
-    value = ''.join(' ' if (ord(c) < 32 or 0x7F <= ord(c) < 0xA0 or unicodedata.category(c) in ('Cc', 'Cs', 'Co'))
+    value = _ANSI.sub(' ', value)
+    # Format characters (bidi overrides, zero-width and tag characters) are dropped: they can hide or reorder text.
+    value = ''.join('' if unicodedata.category(c) == 'Cf' else
+                    ' ' if (ord(c) < 32 or 0x7F <= ord(c) < 0xA0 or unicodedata.category(c) in ('Cc', 'Cs', 'Co'))
                     else c for c in value)
     value = _SECRET.sub('[redacted]', re.sub(r'\s+', ' ', value)).strip()
     return value[:limit]
@@ -193,8 +201,45 @@ def _expand(location):
     return os.path.join(_home(), location[2:]) if location.startswith('~/') else location
 
 
+def _fold(path):
+    return unicodedata.normalize('NFC', path).casefold()
+
+
 def _inside(real, roots):
-    return any(real == root or real.startswith(root.rstrip(os.sep) + os.sep) for root in roots)
+    """True when real is a root or below one.
+
+    Path text is compared NFC-normalized and case-folded, because macOS volumes are usually case-insensitive
+    and realpath keeps the spelling it was given. Ancestors are also compared by device and inode, which
+    catches any alias the text comparison misses. On a case-sensitive volume the folding can only refuse
+    more, never accept a path inside a root.
+    """
+    folded = _fold(real)
+    for root in roots:
+        base = _fold(root).rstrip(os.sep)
+        if folded == base or folded.startswith(base + os.sep) or (not base and folded.startswith(os.sep)):
+            return True
+    identities = set()
+    for root in roots:
+        try:
+            info = os.stat(root)
+        except (OSError, ValueError):
+            continue
+        identities.add((info.st_dev, info.st_ino))
+    if not identities:
+        return False
+    current = real
+    for _ in range(256):  # bounded walk to the filesystem root
+        try:
+            info = os.stat(current)
+        except (OSError, ValueError):
+            info = None
+        if info is not None and (info.st_dev, info.st_ino) in identities:
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return False
 
 
 def untrusted_roots(repo=None, snapshot=None, cwd=None):
@@ -400,7 +445,7 @@ def final_diagnostic(attempts, error, outcome_reason=None):
 
 
 def render(diag, *, stage=None, head=None):
-    note = ('python3 ~/.claude/hooks/wal_note.py --wal <hook-supplied-WAL-path> --event blocker --note '
+    note = ("python3 ~/.claude/hooks/wal_note.py --wal '<hook-supplied-WAL-path>' --event blocker --note "
             + shlex.quote('PEER_REVIEW_INFRA code=%s reason=%s stage=%s head=%s' % (
                 diag['code'], diag['reason'], sanitize(stage or 'unknown', 20), sanitize((head or 'unknown')[:64], 64))))
     lines = ['REVIEW_DIAGNOSTIC code=%s reason=%s%s' % (diag['code'], diag['reason'],
@@ -432,29 +477,48 @@ def usage_limit_prose(message, policy=None):
 # ---------------------------------------------------------------- packet lint
 
 _COMMAND = re.compile(r'^\s*(?:\$ |> ?\$ |Command:|Testing:|Ran:)|`[^`\n]{2,}`')
-_EXIT = re.compile(r'\b(?:exit(?:ed)?(?:\s+(?:code|status))?\s*[:=]?\s*|rc\s*[:=]\s*)(\d{1,3})\b', re.IGNORECASE)
+# No two unbounded whitespace runs are adjacent, so a long blank run after "exit" is scanned in linear time.
+_EXIT = re.compile(r'\b(?:exit(?:ed)?(?:[ \t]+(?:code|status))?[ \t]*(?:[:=][ \t]*)?|rc[ \t]*[:=][ \t]*)(\d{1,3})\b',
+                   re.IGNORECASE)
 _COUNT = re.compile(r'\bRan (\d+) tests?\b|\b(\d+) (?:passed|tests?|checks?)\b', re.IGNORECASE)
+_FENCE = re.compile(r'^[ \t]*(?:`{3,}|~{3,})')
 EVIDENCE_WINDOW = 12
+LINT_LINE_CHARS = 2048   # evidence lines are short; longer lines are inspected only up to this length
+LINT_SECONDS = 5.0       # fail closed if the lint ever runs this long
 
 
-def lint_packet(stage, content, expected_head):
+def lint_packet(stage, content, expected_head, *, clock=time.monotonic):
     """Problems (empty list when acceptable). Format guard only: it cannot prove a run happened."""
     if stage not in ('code-inspection', 'pr'):
         return []
     problems = []
+    deadline = clock() + LINT_SECONDS
     head = (expected_head or '').strip().lower()
     if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', head) or not re.search(
             r'(?<![0-9a-fA-F])' + re.escape(head) + r'(?![0-9a-fA-F])', content, re.IGNORECASE):
         problems.append('The packet must contain the full expected HEAD commit SHA (not an abbreviation): ' + head[:64])
-    lines = content.replace('\0', ' ').splitlines()
+    lines = [line[:LINT_LINE_CHARS] for line in content.replace('\0', ' ').splitlines()]
+    fenced, open_before = False, []
+    for line in lines:  # fence state before each line
+        open_before.append(fenced)
+        if _FENCE.match(line):
+            fenced = not fenced
     passing, failing = False, False
     for index, line in enumerate(lines):
-        if not _COMMAND.search(line):
+        if index % 256 == 0 and clock() > deadline:
+            problems.append('Packet lint stopped at its %d-second limit; shorten the packet.' % LINT_SECONDS)
+            return problems
+        if _FENCE.match(line) or not _COMMAND.search(line):
             continue
-        block = []
-        for follower in lines[index:index + EVIDENCE_WINDOW + 1]:
-            if block and re.match(r'^\s*(?:`{3,}|~{3,})', follower):
-                break  # evidence must sit in the same fenced block as its command
+        # Evidence belongs to the command's own fenced block. A command written just above a fence may have
+        # its output in that fence; any other fence boundary ends the block.
+        block, inside, opened = [line], open_before[index], False
+        for follower in lines[index + 1:index + EVIDENCE_WINDOW + 1]:
+            if _FENCE.match(follower):
+                if inside or opened or any(item.strip() for item in block[1:]):
+                    break
+                opened = True
+                continue
             block.append(follower)
         window = '\n'.join(block)
         exits = [int(m[1]) for m in _EXIT.finditer(window)]

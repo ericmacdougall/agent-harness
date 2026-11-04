@@ -227,7 +227,8 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                                   stderr.strip() or stripped)
             if marker:
                 return provider_failure({'code': marker[1].lower()})
-            return prose_quota_failure(stderr.strip()) or invalid
+            # Free-text stderr counts only for codex with no stdout: other output may echo packet or model text.
+            return (prose_quota_failure(stderr.strip()) if provider == 'codex' and not stripped else None) or invalid
     if code != 0:
         return invalid
     try:
@@ -672,11 +673,12 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         leased = False
         resolution, code, stdout, stderr = None, None, '', ''
         try:
+            # Resolve before the lease, so a lease refusal is reported with its own reason, not as a missing CLI.
+            resolution = (options.get('resolutions') or {}).get(provider) or diagnostics.discover_executable(
+                provider, policy=review_policy(), roots=diagnostics.untrusted_roots(repo=options.get('repo'), snapshot=snapshot))
             if store is not None:
                 store.acquire_pool(provider, pool, run_record.run_id)
                 leased = True
-            resolution = (options.get('resolutions') or {}).get(provider) or diagnostics.discover_executable(
-                provider, policy=review_policy(), roots=diagnostics.untrusted_roots(repo=options.get('repo'), snapshot=snapshot))
             if not resolution['path']:
                 outcome = normalize_provider(provider, 127, '', 'HARNESS_PROVIDER_UNAVAILABLE')
             else:

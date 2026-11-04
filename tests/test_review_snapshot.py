@@ -232,7 +232,8 @@ class ReviewSnapshotTests(unittest.TestCase):
             prompts.append(prompt)
             Path(cmd[cmd.index('--output-last-message') + 1]).write_text('PLAN_RESULT: ACCEPT\nok')
             return 0, '', ''
-        with patch.object(self.review.shutil, 'which', return_value='/bin/true'), \
+        found = {'name': 'codex', 'path': '/bin/true', 'source': 'PATH', 'rejected': [], 'searched': []}
+        with patch.object(self.review.diagnostics, 'discover_executable', return_value=found), \
                 patch.object(self.review, 'run', side_effect=provider):
             self.review.review_snapshot(self.root, self.head, 'plan', 'rules', 'packet', {})
             self.review.review_snapshot(self.root, self.head, 'plan', 'rules', 'packet', {'base': self.first})
