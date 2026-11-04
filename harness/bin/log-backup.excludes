@@ -1,0 +1,29 @@
+# Credential-named files never leave the machine (rclone filter syntax, one pattern per line).
+# Kept as a file, not shell arguments, so no pattern is ever glob-expanded by a shell.
+# Residual risk: secrets pasted INTO transcripts or WALs cannot be found by name; encryption at rest is the control.
+*.secret
+.env
+.env.*
+.credentials*
+credentials*
+member.key
+*.key
+*.pem
+*.p12
+*.pfx
+*.kdbx
+*.token
+auth.json
+rclone.conf
+id_rsa*
+id_ed25519*
+id_ecdsa*
+.netrc
+.npmrc
+.git-credentials
+kit.json
+goodqa-hive/**
+# Dependency and cache trees inside worktrees under .agent-harness/work are rebuildable.
+node_modules/**
+.venv/**
+__pycache__/**
