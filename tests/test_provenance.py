@@ -53,6 +53,9 @@ class Env(unittest.TestCase):
         self.home = Path(self.tmp.name)
         patcher = mock.patch.dict(os.environ, {"HOME": str(self.home)})
         patcher.start()
+        os.environ.pop("HARNESS_PROVENANCE_OFFLINE", None)  # other modules set it; restored by the patch.dict cleanup
+        self.addCleanup(self.reset_ticket_state)
+        self.reset_ticket_state()
         self.addCleanup(patcher.stop)
         self.addCleanup(self.tmp.cleanup)
         project = self.home / ".claude" / "projects" / "-proj"
@@ -61,6 +64,12 @@ class Env(unittest.TestCase):
         self.write_transcript(transcript_lines())
         self.wals = self.home / ".claude" / "wals" / SID
         self.wals.mkdir(parents=True)
+
+    @staticmethod
+    def reset_ticket_state():
+        """Process-wide lookup memo and outage window must not leak between tests or into other test modules."""
+        provenance._TICKET_MEMO.clear()
+        provenance._OUTAGE["until"] = 0.0
 
     def sandbox(self, **policy):
         """A private copy of the hook scripts with its own installed policy: the only way a test may LOOSEN a mode
@@ -512,6 +521,74 @@ class RedTeamFixes(Env):
                              env=dict(os.environ, HOME=str(self.home), HARNESS_PROVENANCE_POLICY=str(loose)))
         self.assertEqual(out.returncode, 2, out.stdout)  # the installed policy still enforces the ask despite env off
 
+    def test_n4_offline_switch_cannot_turn_a_refusal_into_a_warning(self):
+        only_ticket = f"Source: ticket:GoodQA harness#31337"
+        backed = f"Source: inferred: from {self.user(HUMAN, QUOTE)} ; ticket:GoodQA harness#31337 -- the ticket adds context"
+        for value in (None, "1", "true", "YES"):
+            env = {"HARNESS_PROVENANCE_OFFLINE": value} if value else {}
+            with mock.patch.dict(os.environ, env):
+                provenance._TICKET_MEMO.clear()
+                provenance._OUTAGE["until"] = 0.0
+                with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: provenance.lookup_ticket(p, n) if value else ("unverified", "no tracker")):
+                    problems, warnings = provenance.spec_lint(SPEC.format(s1=only_ticket, s2=only_ticket))
+                    self.assertTrue(any("add a `user:` or `wal:` source" in p for p in problems), (value, problems))
+                    problems, warnings = provenance.spec_lint(SPEC.format(s1=backed, s2=backed))  # verified user source behind it: warns
+                    self.assertEqual(problems, [], (value, problems))
+                    self.assertTrue(any("also cites an unverified source" in w for w in warnings), (value, warnings))
+        # only 1, true and yes enable the switch: "0" and junk leave the lookup alone
+        for value, enabled in (("0", False), ("no", False), ("false", False), ("", False), ("1", True), ("true", True), ("Yes", True)):
+            with mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_OFFLINE": value}):
+                got = provenance.lookup_ticket("harness", 1)
+                self.assertEqual(got == ("unverified", "offline mode"), enabled, value)
+
+    def test_n5_real_lookup_ignores_proxy_variables(self):
+        """The real lookup_ticket against a loopback GoodQA, with dead proxy variables set. Failing control: with the
+        direct-connection wiring removed the same call cannot reach the server and reports an outage."""
+        import http.server
+        import threading
+        import spec_flow
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("content-length", 0))
+                arguments = json.loads(self.rfile.read(length))["params"]["arguments"]
+                issue = {"issue": {"id": "i-1", "number": arguments["number"], "projectId": "p-1", "title": "Loopback ticket", "status": "todo"}}
+                body = json.dumps({"result": {"content": [{"text": json.dumps(issue)}]}}).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        key = self.home / "key"
+        key.write_text("k" * 40)
+        key.chmod(0o600)
+        config = {"adapter": "goodqa", "endpoint": f"http://127.0.0.1:{server.server_address[1]}/", "key_file": str(key),
+                  "org_id": "org-1", "timeout_seconds": 3, "attempts": 1}
+        proxies = {name: "http://127.0.0.1:9" for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")}
+        proxies.update({"NO_PROXY": "", "no_proxy": ""})
+
+        def lookup():
+            provenance._OUTAGE["until"] = 0.0
+            with mock.patch.object(spec_flow, "ticket_config", lambda sp: (None, None, config)), \
+                    mock.patch.object(spec_flow, "load_spec_policy", lambda: {}), mock.patch.dict(os.environ, proxies):
+                return provenance.lookup_ticket("harness", 4242)
+
+        import urllib.request
+        self.addCleanup(setattr, urllib.request, "_opener", None)  # urlopen caches the first opener it builds, proxies included
+        self.assertEqual(lookup(), ("found", "Loopback ticket"))  # the wiring works with dead proxies set
+        urllib.request._opener = None
+        with mock.patch.object(provenance, "direct_connections", lambda: __import__("contextlib").nullcontext()):
+            control = lookup()
+        urllib.request._opener = None  # drop the proxy-configured opener the control just made
+        self.assertEqual(control[0], "unreachable", control)  # control: without the wiring the proxy variables break it
+
     def test_n1_skip_window_never_changes_a_verdict(self):
         provenance._TICKET_MEMO.clear()
         provenance._OUTAGE["until"] = 0.0
@@ -591,6 +668,7 @@ class RedTeamFixes(Env):
         with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9",
                                           "HTTPS_PROXY": "http://127.0.0.1:9", "NO_PROXY": ""}):
             saved = urllib.request.urlopen
+            self.addCleanup(setattr, urllib.request, "_opener", None)
             with provenance.direct_connections():
                 self.assertEqual(urllib.request.urlopen(url, timeout=5).read(), b"direct")
             self.assertIs(urllib.request.urlopen, saved)  # restored afterwards

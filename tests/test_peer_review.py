@@ -2,7 +2,6 @@ import importlib.util
 import hashlib
 import json
 import os
-os.environ.setdefault("HARNESS_PROVENANCE_OFFLINE", "1")  # tests never call the ticket tracker (tighten-only switch)
 import resource
 import shlex
 import subprocess
@@ -15,6 +14,19 @@ from unittest.mock import patch
 
 
 REVIEW = Path(__file__).resolve().parents[1] / 'harness/hooks/peer_review.py'
+
+
+_OFFLINE = None
+
+
+def setUpModule():  # tests never call the ticket tracker; restored in tearDownModule so it cannot leak into other modules
+    global _OFFLINE
+    _OFFLINE = __import__("unittest.mock", fromlist=["patch"]).patch.dict(os.environ, {"HARNESS_PROVENANCE_OFFLINE": "1"})
+    _OFFLINE.start()
+
+
+def tearDownModule():
+    _OFFLINE.stop()
 
 
 class PeerReviewTests(unittest.TestCase):
@@ -1293,3 +1305,4 @@ class ProviderEnvelopeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

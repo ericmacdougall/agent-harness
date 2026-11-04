@@ -10,7 +10,6 @@ import http.server
 import io
 import json
 import os
-os.environ.setdefault("HARNESS_PROVENANCE_OFFLINE", "1")  # tests never call the ticket tracker (tighten-only switch)
 import re
 import subprocess
 import sys
@@ -25,9 +24,6 @@ from unittest import mock
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import provenance  # noqa: E402
-# Specs cite tickets and the tracker must never be called from tests: an injected stub answers "tracker down"
-# (a warning, no refusal, no cache write). Environment variables cannot do this: they may only tighten modes.
-provenance.TICKET_LOOKUP = lambda project, number: ("unreachable", "tests are offline")
 sys.path.insert(0, str(HOOKS))
 import commit_policy as cp  # noqa: E402
 import spec_flow as sf  # noqa: E402
@@ -77,6 +73,32 @@ def report_text(packet_sha, verdict="ACCEPT", reviewer="Blind Claude Opus fallba
             "Review input: isolated committed snapshot (ancestor history available)\nWorktree status: clean\n"
             "Fallback reason: Primary reviewer unavailable (TRANSIENT_INFRA); used authorized independent fallback.\n\n"
             f"PLAN_RESULT: {verdict}\n\nFindings follow.\n")
+
+
+_OFFLINE = None
+_STUBS = []
+
+
+def setUpModule():  # tests never call the ticket tracker; restored in tearDownModule so it cannot leak into other modules
+    global _OFFLINE, _STUBS
+    provenance._TICKET_MEMO.clear()
+    provenance._OUTAGE["until"] = 0.0
+    _OFFLINE = mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_OFFLINE": "1"})
+    _OFFLINE.start()
+    # Specs cite tickets and the tracker must never be called from tests: an injected stub answers "found" without
+    # the network or a cache write. Environment variables cannot do this: they may only tighten modes.
+    _STUBS = [mock.patch.object(provenance, "TICKET_LOOKUP", lambda project, number: ("found", "stubbed ticket")),
+              mock.patch.object(provenance, "store_ticket", lambda *args, **kwargs: None)]
+    for stub in _STUBS:
+        stub.start()
+
+
+def tearDownModule():
+    for stub in _STUBS:
+        stub.stop()
+    _OFFLINE.stop()
+    provenance._TICKET_MEMO.clear()
+    provenance._OUTAGE["until"] = 0.0
 
 
 class FakeGoodQA:

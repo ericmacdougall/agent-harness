@@ -682,7 +682,7 @@ def store_ticket(project: str, number: int, title: str, checked_by: str) -> None
 def lookup_ticket(project: str, number: int):
     """('found', title) | ('missing', None) | ('unreachable', reason). Uses the harness ticket adapter with a
     hard deadline of TICKET_TIMEOUT seconds and one attempt; never raises."""
-    if os.environ.get("HARNESS_PROVENANCE_OFFLINE"):  # tightening only: tests and offline hosts never touch the network
+    if os.environ.get("HARNESS_PROVENANCE_OFFLINE", "").strip().lower() in ("1", "true", "yes"):  # tightening only
         return "unverified", "offline mode"
     try:
         import spec_flow
@@ -979,14 +979,16 @@ def spec_lint(text: str, mode=None, ctx=None):
     items = extract_items(text, sections={"Acceptance criteria", "Negative cases"})
     results = check_items(items, ctx)
     problems = [p for _, _, _, p in results if p]
-    unverified = [f"{i} cites an unverified source (offline ticket or file line without excerpt)"
-                  for i, _, r, p in results if r and not p and r.get("weak")]
+    # An AC or NEG whose only cite is unverified (ticket not confirmed, outage or not; file line without excerpt) is
+    # refused in enforce mode, as for asks; it only warns when a verified user, wal or file source also backs it.
+    refused = [f"{i} {weak_problem(r)}" for i, _, r, p in results if r and not p and weak_problem(r)]
+    backed = [f"provenance: {i} also cites an unverified source (ticket not confirmed or file line without excerpt)"
+              for i, _, r, p in results if r and not p and r.get("weak") and not weak_problem(r)]
     if not items:
         return [], []
-    if unverified:
-        warnings_extra = ["provenance: " + u for u in unverified]
-        return (problems, warnings_extra) if mode == "enforce" else ([], warnings_extra + ["provenance (warn mode): " + p for p in problems])
-    return (problems, []) if mode == "enforce" else ([], ["provenance (warn mode): " + p for p in problems])
+    if mode == "enforce":
+        return problems + refused, backed
+    return [], backed + ["provenance (warn mode): " + p for p in problems + refused]
 
 
 def GRANDFATHERED_RE_SEARCH(text: str):

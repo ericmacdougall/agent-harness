@@ -3,7 +3,6 @@
 import http.server
 import json
 import os
-os.environ.setdefault("HARNESS_PROVENANCE_OFFLINE", "1")  # tests never call the ticket tracker (tighten-only switch)
 import shlex
 import shutil
 import socket
@@ -117,6 +116,19 @@ GOOD_CASES = [
     ("risk section", sub(GOOD, "Refs: GoodQA #14151\n", "Refs: GoodQA #14151\nRisk: none beyond a new publish gate; revert the commit.\n"), {}),
     ("breaking bang", sub(GOOD, "fix(deliver):", "fix(deliver)!:"), {}),
 ]
+
+
+_OFFLINE = None
+
+
+def setUpModule():  # tests never call the ticket tracker; restored in tearDownModule so it cannot leak into other modules
+    global _OFFLINE
+    _OFFLINE = __import__("unittest.mock", fromlist=["patch"]).patch.dict(os.environ, {"HARNESS_PROVENANCE_OFFLINE": "1"})
+    _OFFLINE.start()
+
+
+def tearDownModule():
+    _OFFLINE.stop()
 
 
 class Validator(unittest.TestCase):
