@@ -450,6 +450,27 @@ class SpecFlowTests(unittest.TestCase):
             two = make_repo({"a/package.json": "{}", "b/package.json": "{}"})
             self.assertIn("truncated", dg.detect_full(two)[1])
 
+    def test_irrelevant_caps_do_not_fail_plain_repos(self):
+        grpc = make_repo({f"api/s{i}.proto": "message A {}" for i in range(dg.MAX_PROTO_FILES + 5)})
+        self.assertEqual(dg.detect_full(grpc), ([], None))
+        nats = make_repo({**{f"api/s{i}.proto": "message A {}" for i in range(dg.MAX_PROTO_FILES + 5)},
+                          "go.mod": "require nats.go v1\n"})
+        self.assertIn("proto count", dg.detect_full(nats)[1])  # cap can hide the ledger signal here
+
+    def test_allow_truncated_turns_failure_into_visible_warning(self):
+        repo = make_repo({"0/a.sol": "x", "1/b.sol": "x", "2/c.sol": "x"})
+        policy = {"domain_gates": {"mode": "enforce", "allow_truncated": True}}
+        with mock.patch.object(dg, "MAX_FILES", 2):
+            warnings, problems = sf.domain_lint(SPEC, repo, policy)
+        self.assertTrue(any("truncated" in w for w in warnings))
+        self.assertFalse(any("truncated" in p for p in problems))
+
+    def test_symlinked_manifest_is_reported_not_silent(self):
+        outside = Path(tempfile.mkdtemp()) / "package.json"
+        outside.write_text(json.dumps({"dependencies": {"ethers": "6"}}))
+        repo = make_repo({"README.md": "x"}, symlinks={"package.json": str(outside)})
+        self.assertIn("truncated", dg.detect_full(repo)[1])
+
     def test_cargo_table_dependency_and_ledger_word_boundaries(self):
         self.assertIn("solana", names(dg.detect(make_repo({"Cargo.toml": '[dependencies.anchor-lang]\nversion = "0.30"\n'}))))
         lb = make_repo({"load_balancer.proto": "message A {}", "go.mod": "require nats.go v1\n"})

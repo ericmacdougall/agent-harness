@@ -305,7 +305,9 @@ def domain_lint(text: str, repo, spec_policy: dict):
     notes = []
     if skipped:
         note = f"domain detection could not run: {failure} (pass --repo <worktree>)"
-        if config["mode"] == "enforce":  # a Domains: line in the spec never excuses a failed scan
+        if failure.startswith("scan truncated") and dg.allow_truncated(spec_policy):
+            notes = [note]  # a monorepo that legitimately exceeds the caps can opt in; still visible
+        elif config["mode"] == "enforce":  # a Domains: line in the spec never excuses a failed scan
             return [], [note + "; enforce mode fails closed"]
         notes = [note]
     if not missing:

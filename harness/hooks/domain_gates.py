@@ -93,14 +93,22 @@ def _read_small(root: Path, rel: str, limit: int, budget=None, limited=None):
     """Read one regular file inside root without following symlinks; None when unsafe or too large."""
     try:
         path = root / rel
+        if not os.path.lexists(path):
+            return None  # tracked but deleted: nothing to read, nothing hidden
         if os.path.realpath(path) != os.path.join(os.path.realpath(root), *Path(rel).parts):
+            if limited is not None:
+                limited.append(rel)
             return None  # a component is a symlink or the path escapes the repo
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except (OSError, ValueError):
+        if limited is not None:
+            limited.append(rel)
         return None
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink > 50:
+            if limited is not None:
+                limited.append(rel)
             return None
         if info.st_size > limit:
             if limited is not None:
@@ -274,13 +282,13 @@ def detect_full(repo, changed_paths=None, max_files=None):
                     break
         elif base.endswith(".proto"):
             protos += 1
-            if protos > MAX_PROTO_FILES:
-                limited.append("proto count")
-            else:
+            if protos <= MAX_PROTO_FILES:
                 text = _read_small(root, path, MAX_PROTO_BYTES, budget, limited)
                 if text is not None and LEDGER_WORDS.search(text):
                     ledger_in.append(path)
     proto_paths = [p for p in files if p.endswith(".proto")]
+    if len(proto_paths) > MAX_PROTO_FILES and nats_in and not ledger_in:
+        limited.append("proto count")  # only matters when NATS is present and no ledger signal was seen
     if proto_paths and nats_in and ledger_in:
         found.add("ledger-messaging", "medium", f"proto {_base(proto_paths[0])} + nats ({nats_in[0]}) + ledger signal ({_base(ledger_in[0])})")
     if rejected:
@@ -456,6 +464,11 @@ def suggested_prompts(domains) -> list:
 
 
 # --------------------------------------------------------------------------- settings
+
+def allow_truncated(policy) -> bool:
+    config = (policy or {}).get("domain_gates")
+    return isinstance(config, dict) and config.get("allow_truncated") is True
+
 
 def settings(repo=None, policy=None, env=None, ignore_repo_file: bool = False) -> dict:
     env = os.environ if env is None else env
