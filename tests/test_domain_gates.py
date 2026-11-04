@@ -15,7 +15,32 @@ HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import domain_gates as dg  # noqa: E402
 import peer_review as pr  # noqa: E402
+import provenance  # noqa: E402
 import spec_flow as sf  # noqa: E402
+
+_STUBS = []
+_OFFLINE = None
+
+
+def setUpModule():  # tests never call the ticket tracker; stubs are removed in tearDownModule so they cannot leak
+    global _OFFLINE
+    provenance._TICKET_MEMO.clear()
+    provenance._OUTAGE["until"] = 0.0
+    _OFFLINE = mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_OFFLINE": "1"})
+    _OFFLINE.start()
+    _STUBS[:] = [mock.patch.object(provenance, "TICKET_LOOKUP", lambda project, number: ("found", "stubbed ticket")),
+                 mock.patch.object(provenance, "store_ticket", lambda *args, **kwargs: None)]
+    for stub in _STUBS:
+        stub.start()
+
+
+def tearDownModule():
+    for stub in _STUBS:
+        stub.stop()
+    _OFFLINE.stop()
+    provenance._TICKET_MEMO.clear()
+    provenance._OUTAGE["until"] = 0.0
+
 
 ITEM_IDS = {"reentrancy", "access-control", "precision", "replay-chainid", "nonce-idempotency",
             "finality-reorg", "key-custody", "gas-dos", "upgradeability", "oracle-trust"}
@@ -295,10 +320,12 @@ Users can deposit.
 ## Acceptance criteria
 
 - AC-1: deposits credit shares. Verify by: forge test.
+  Source: ticket:GoodQA harness#14388
 
 ## Negative cases
 
 - NEG-1 (AC-1): a zero deposit is refused.
+  Source: ticket:GoodQA harness#14388
 
 ## Risks
 
@@ -309,9 +336,9 @@ Users can deposit.
 def full_neg_spec():
     lines = []
     for n, item in enumerate(sorted(ITEM_IDS), start=2):
-        lines.append(f"- NEG-{n} (AC-1): covers {item.replace('-', ' ')} for the vault.")
-    return SPEC.replace("- NEG-1 (AC-1): a zero deposit is refused.\n",
-                        "- NEG-1 (AC-1): a zero deposit is refused.\n" + "\n".join(lines) + "\n")
+        lines.append(f"- NEG-{n} (AC-1): covers {item.replace('-', ' ')} for the vault.\n  Source: ticket:GoodQA harness#14388")
+    anchor = "- NEG-1 (AC-1): a zero deposit is refused.\n  Source: ticket:GoodQA harness#14388\n"
+    return SPEC.replace(anchor, anchor + "\n".join(lines) + "\n")
 
 
 class SpecFlowTests(unittest.TestCase):
@@ -393,7 +420,7 @@ class SpecFlowTests(unittest.TestCase):
         self.assertEqual(set(dg.missing_items(decoy, ["evm"])), ITEM_IDS)
 
     def test_only_neg_bullets_count(self):
-        text = SPEC.replace("- NEG-1 (AC-1): a zero deposit is refused.", "reentrancy and precision and access control\n- loose bullet about oracle")
+        text = SPEC.replace("- NEG-1 (AC-1): a zero deposit is refused.\n  Source: ticket:GoodQA harness#14388", "reentrancy and precision and access control\n- loose bullet about oracle")
         self.assertEqual(set(dg.missing_items(text, ["evm"])), ITEM_IDS)
 
     def test_waivers_in_fences_or_low_entropy_do_not_count(self):

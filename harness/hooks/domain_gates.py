@@ -22,6 +22,9 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:  # run by path from any cwd: the shared input helpers sit beside this file
+    sys.path.insert(0, str(HERE))
+import safe_input  # noqa: E402
 CHECKLIST_FILE = HERE / "domain_checklists.json"
 OPT_OUT_FILE = ".harness/domain-gates.json"
 MAX_FILES = 20000
@@ -58,30 +61,9 @@ MAX_JSON_DEPTH = 100
 
 
 def safe_json_loads(text, max_depth: int = MAX_JSON_DEPTH):
-    """json.loads for untrusted text: deep nesting can abort CPython 3.9 outright (fatal recursion, not
-    RecursionError), so the bracket depth is pre-scanned (strings skipped) before parsing.
-    Raises ValueError for too-deep or invalid input; callers treat that as a rejected file, never a pass."""
-    depth, in_string, escaped = 0, False, False
-    for ch in text:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-        elif ch == '"':
-            in_string = True
-        elif ch in "[{":
-            depth += 1
-            if depth > max_depth:
-                raise ValueError("manifest too deeply nested")
-        elif ch in "]}":
-            depth -= 1
-    try:
-        return json.loads(text)
-    except RecursionError:
-        raise ValueError("manifest too deeply nested") from None
+    """json.loads for untrusted text: the shared safe_input implementation (size, nesting and number-length
+    limits). Raises ValueError for too-deep, oversized or invalid input; callers treat that as a rejected file."""
+    return safe_input.safe_json_loads(text, max_depth=max_depth)
 
 
 def _clean(text, limit=EVIDENCE_CHARS):
@@ -317,8 +299,8 @@ def _load_json(path: Path, limit: int):
         info = os.lstat(path)
         if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
             raise ValueError(f"{path.name} is not a regular file of at most {limit} bytes")
-        return safe_json_loads(path.read_text(encoding="utf-8"))
-    except OSError as error:
+        return safe_json_loads(safe_input.read_bounded(path, limit).decode("utf-8"))
+    except (OSError, safe_input.InputRejected, UnicodeDecodeError) as error:
         raise ValueError(f"cannot read {path.name}: {error}")
 
 
