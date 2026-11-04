@@ -50,10 +50,48 @@ func TestUsageErrorExit2(t *testing.T) {
 }
 
 func TestPanicIsRecovered(t *testing.T) {
-	t.Setenv("HARNESS_TEST_PANIC", "1")
-	var out, errb bytes.Buffer
-	if c := run([]string{"--host", "codex", "--config-dir", cfgDir(), "__panic_for_test"}, &out, &errb); c != 1 || out.Len() != 0 {
-		t.Fatalf("exit %d stdout %q", c, out.String())
+	testPanic = true
+	defer func() { testPanic = false }()
+	cases := []struct {
+		args []string
+		want int
+	}{
+		{[]string{"deliver", "prepare"}, 1},
+		{[]string{"commit-policy", "hook"}, 2},
+		{[]string{"wal", "pretool"}, 2},
+		{[]string{"wal", "--verbose", "prompt"}, 2},
+		{[]string{"wal", "session"}, 1},
+	}
+	for _, c := range cases {
+		var out, errb bytes.Buffer
+		argv := append([]string{"--host", "codex", "--config-dir", cfgDir()}, c.args...)
+		if got := run(argv, &out, &errb); got != c.want || out.Len() != 0 {
+			t.Errorf("%v: exit %d (want %d) stdout %q", c.args, got, c.want, out.String())
+		}
+	}
+}
+
+func TestGateTable(t *testing.T) {
+	for sub, verbs := range map[string][]string{"commit-policy": {"hook"}, "spec-flow": {"hook"}, "wal": {"hook", "prompt", "pretool"}} {
+		for _, v := range verbs {
+			if !isGate(sub, []string{v}) {
+				t.Errorf("%s %s is not a gate", sub, v)
+			}
+		}
+	}
+	for _, args := range [][]string{{"wal", "session"}, {"wal", "subagent"}, {"commit-policy", "check-message"}, {"deliver", "hook"}} {
+		if isGate(args[0], args[1:]) {
+			t.Errorf("%v must not be a gate", args)
+		}
+	}
+}
+
+func TestUnportedWalGatesBlock(t *testing.T) {
+	for _, verb := range []string{"hook", "prompt", "pretool"} {
+		var out, errb bytes.Buffer
+		if c := run([]string{"--host", "claude", "--config-dir", cfgDir(), "wal", verb}, &out, &errb); c != 2 {
+			t.Errorf("wal %s: exit %d", verb, c)
+		}
 	}
 }
 

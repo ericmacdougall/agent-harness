@@ -1,9 +1,13 @@
 // Package lock takes the private exclusive file locks the Python helpers take, on the same files, so a
 // Go and a Python process exclude each other during the strangler migration.
 //
-// Python (usage_guard._lock, integrate_local, wal.py): open O_RDWR|O_CREAT|O_NOFOLLOW 0600, require a
-// regular file owned by us with one link and mode 0600, flock(LOCK_EX [|LOCK_NB]), then confirm the path
-// still names the locked inode. flock on Unix; LockFileEx on Windows (no Python helper locks there).
+// Python (usage_guard._lock, integrate_local): open O_RDWR|O_CREAT|O_NOFOLLOW 0600, require a regular
+// file owned by us with one link and mode 0600, flock(LOCK_EX [|LOCK_NB]), then confirm the path still
+// names the locked inode. flock on Unix; LockFileEx on Windows (no Python helper locks there).
+//
+// wal.py differs: it fchmods the WAL to 0600 before flock instead of refusing a wider mode. Acquire
+// refuses such a file (ErrUnsafe); the flock itself still excludes wal.py. The wal group port (P2) must
+// choose between repairing the mode and refusing before it uses Acquire on a WAL.
 package lock
 
 import (

@@ -1,13 +1,19 @@
-// Package proc ports harness/hooks/process.py: run a command with a deadline and, on timeout or
-// cancellation, terminate its whole process group (TERM, a 2 s grace so git can drop its lock files,
-// then KILL), and never let a descendant that escaped the group hold the caller on a pipe.
+// Package proc ports harness/hooks/process.py: run a command with a deadline and, on timeout, terminate
+// its whole process group (TERM, a 2 s grace so git can drop its lock files, then KILL).
+//
+// Like process.run (communicate), a call finishes only when the leader has exited AND every holder of the
+// output pipes has closed them. A descendant that keeps a pipe open therefore keeps the call running
+// until the deadline, which then kills the group and reports ErrTimeout; it is never reported as success.
+// A descendant that escaped the group cannot hold the caller longer than PipeGrace after the kill.
 package proc
 
 import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
+	"sync"
 	"time"
 )
 
@@ -27,7 +33,7 @@ type Result struct {
 	Stdout, Stderr []byte
 }
 
-// Options configure Run. Timeout 0 means no deadline.
+// Options configure Run. Timeout 0 means no deadline (and, as in Python, no bound on a pipe holder).
 type Options struct {
 	Dir     string
 	Env     []string
@@ -35,27 +41,102 @@ type Options struct {
 	Timeout time.Duration
 }
 
+// lockedBuffer lets the timeout path snapshot output while a reader goroutine may still be writing.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
 // Run executes argv[0] with argv[1:] (no shell) and captures stdout and stderr.
-func Run(argv []string, o Options) (Result, error) {
+func Run(argv []string, o Options) (res Result, err error) {
 	if len(argv) == 0 {
 		return Result{}, errors.New("proc: empty argv")
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir, cmd.Env = o.Dir, o.Env
-	if o.Stdin != nil {
-		cmd.Stdin = bytes.NewReader(o.Stdin)
+	var closers []*os.File
+	defer func() {
+		// Close off the caller's path: on Windows Close waits for a write blocked on a pipe that an
+		// escaped descendant holds, which must not hold the caller.
+		for _, f := range closers {
+			go f.Close()
+		}
+	}()
+	pipe := func() (r, w *os.File, err error) {
+		r, w, err = os.Pipe()
+		if err == nil {
+			closers = append(closers, r, w)
+		}
+		return
 	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	cmd.WaitDelay = PipeGrace // an escaped descendant holding our pipes cannot block Wait forever
+	outR, outW, err := pipe()
+	if err != nil {
+		return Result{Code: -1}, err
+	}
+	errR, errW, err := pipe()
+	if err != nil {
+		return Result{Code: -1}, err
+	}
+	cmd.Stdout, cmd.Stderr = outW, errW
+	var inW *os.File
+	if o.Stdin != nil {
+		var inR *os.File
+		if inR, inW, err = pipe(); err != nil {
+			return Result{Code: -1}, err
+		}
+		cmd.Stdin = inR
+	}
 	newGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		return Result{Code: -1}, err
 	}
-	done := make(chan error, 1)
+	// The child holds its own copies; ours must close or EOF never arrives.
+	outW.Close()
+	errW.Close()
+	if cmd.Stdin != nil {
+		cmd.Stdin.(*os.File).Close()
+	}
+	var stdout, stderr lockedBuffer
+	var readers sync.WaitGroup
+	for _, p := range []struct {
+		r *os.File
+		w io.Writer
+	}{{outR, &stdout}, {errR, &stderr}} {
+		readers.Add(1)
+		go func(r *os.File, w io.Writer) {
+			defer readers.Done()
+			defer func() { recover() }() // no goroutine may crash the harness (plan 3.1, F9)
+			io.Copy(w, r)
+		}(p.r, p.w)
+	}
+	if inW != nil {
+		go func() {
+			defer func() { recover() }()
+			inW.Write(o.Stdin) // EPIPE when the child exits without reading is expected
+			inW.Close()
+		}()
+	}
+	exited := make(chan error, 1)
 	go func() {
-		defer func() { recover() }() // no goroutine may crash the harness (plan 3.1, F9)
-		done <- cmd.Wait()
+		defer func() { recover() }()
+		exited <- cmd.Wait()
+	}()
+	drained := make(chan struct{})
+	go func() {
+		readers.Wait()
+		close(drained)
 	}()
 	var timer <-chan time.Time
 	if o.Timeout > 0 {
@@ -63,48 +144,52 @@ func Run(argv []string, o Options) (Result, error) {
 		defer t.Stop()
 		timer = t.C
 	}
-	select {
-	case err := <-done:
-		return finish(cmd, err, &stdout, &stderr)
-	case <-timer:
+	var waitErr error
+	leaderDone := false
+	for !leaderDone || drained != nil {
+		select {
+		case waitErr = <-exited:
+			leaderDone = true
+			exited = nil
+		case <-drained:
+			drained = nil
+		case <-timer:
+			terminate(cmd.Process.Pid, exited, leaderDone, &readers)
+			return Result{Code: -1, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, ErrTimeout
+		}
 	}
-	pid := cmd.Process.Pid
+	r := Result{Code: cmd.ProcessState.ExitCode(), Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
+	var exitErr *exec.ExitError
+	if waitErr == nil || errors.As(waitErr, &exitErr) {
+		return r, nil
+	}
+	return r, waitErr
+}
+
+// terminate signals the group TERM, waits up to TerminationGrace for it to empty, KILLs it, then waits
+// a bounded time for the leader and the pipe readers. The deferred Close of the read ends unblocks any
+// reader still held by an escaped descendant; Result reads a locked snapshot, so a late write is no race.
+func terminate(pid int, exited <-chan error, leaderDone bool, readers *sync.WaitGroup) {
 	signalGroup(pid, sigTerm)
 	deadline := time.Now().Add(TerminationGrace)
-	exited := false
-	for time.Now().Before(deadline) {
-		if !exited {
-			select {
-			case <-done:
-				exited = true // keep waiting: descendants may still be handling TERM
-			default:
-			}
-		}
-		if !groupAlive(pid) {
-			break
-		}
+	for time.Now().Before(deadline) && groupAlive(pid) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	signalGroup(pid, sigKill)
-	if !exited {
+	bound := time.After(PipeGrace)
+	if !leaderDone {
 		select {
-		case <-done:
-		case <-time.After(PipeGrace + time.Second):
+		case <-exited:
+		case <-bound:
 		}
 	}
-	return Result{Code: -1, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, ErrTimeout
-}
-
-func finish(cmd *exec.Cmd, err error, stdout, stderr *bytes.Buffer) (Result, error) {
-	r := Result{Code: cmd.ProcessState.ExitCode(), Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
-	var exitErr *exec.ExitError
-	if err == nil || errors.As(err, &exitErr) {
-		return r, nil
+	done := make(chan struct{})
+	go func() {
+		readers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-bound:
 	}
-	if errors.Is(err, exec.ErrWaitDelay) {
-		return r, nil // the command finished; only an escaped descendant kept a pipe open
-	}
-	return r, err
 }
-
-var _ io.Writer = (*bytes.Buffer)(nil)
