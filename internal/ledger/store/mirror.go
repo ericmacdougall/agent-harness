@@ -8,21 +8,22 @@ import (
 	"github.com/ericmacdougall/agent-harness/internal/gitx"
 )
 
-// PushMirror copies one own ref into the local bare mirror (fast-forward only) and verifies the result by
-// reading the mirror ref directly, so a silent failure is never reported as success.
+// PushToRepo copies one ref from this HOME mirror (the receiver g is the mirror) into the repository at
+// repo, replacing whatever the repository holds there, and verifies the result by reading the repository
+// ref directly. The mirror is where own writers append; the repository copy is what travels with it.
 //
-// The transfer runs as a fetch inside the mirror, so only the mirror's own configuration (created by
+// The transfer runs as a push from inside the mirror, so only the mirror's own configuration (created by
 // init, hooks off) applies: the repository's config, including any url.*.insteadOf or pushInsteadOf
-// rewrite of the mirror path, is never consulted for where the data goes. The repository side only runs
-// upload-pack, with hooks off.
-func (g *Git) PushMirror(mirror, ref, want string) error {
-	if !filepath.IsAbs(mirror) || !filepath.IsAbs(g.GitDir) {
+// rewrite, is never consulted for where the data goes. The repository side only runs receive-pack, with
+// hooks and auto-gc off.
+func (g *Git) PushToRepo(repo, ref, want string) error {
+	if !filepath.IsAbs(repo) || !filepath.IsAbs(g.GitDir) {
 		return errors.New("mirror and repository paths must be absolute")
 	}
-	m := &Git{GitDir: mirror}
-	_, err := m.run(TransportTimeout, nil, nil, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-		"--upload-pack=git -c core.hooksPath="+gitx.DevNull+" upload-pack", g.GitDir, ref+":"+ref)
-	got, terr := m.Tip(ref)
+	_, err := g.run(TransportTimeout, nil, nil, "push", "--quiet", "--no-verify", "--porcelain",
+		"--receive-pack=git -c core.hooksPath="+gitx.DevNull+" -c receive.autogc=false receive-pack", repo, "+"+ref+":"+ref)
+	r := &Git{GitDir: repo}
+	got, terr := r.Tip(ref)
 	if terr != nil {
 		return terr
 	}
@@ -30,7 +31,7 @@ func (g *Git) PushMirror(mirror, ref, want string) error {
 		if err != nil {
 			return err
 		}
-		return errors.New("mirror ref does not match after copy")
+		return errors.New("repository ref does not match the mirror after copy")
 	}
 	return nil
 }

@@ -627,7 +627,8 @@ func TestRootRule(t *testing.T) {
 	project := init["project"].(string)
 	st := w.jsonOK(w.repo, nil, "status")
 	me := st["writer"].(string)
-	g := &store.Git{GitDir: w.commonDir()}
+	// Own writers append to (and are read from) this HOME's mirror.
+	g := &store.Git{GitDir: filepath.Join(w.home, ".agent-harness", "ledgers", project, "mirror.git")}
 	ref := store.RefName(project, me)
 	tip, _ := g.Tip(ref)
 	last, _ := g.TipHLC(tip)
@@ -1076,28 +1077,7 @@ func TestRestoredWriterReadFromHomeMirror(t *testing.T) {
 	}
 	// Extend the clone's copy of that writer's ref with a well-formed forged pack: right project, right
 	// writer, later clock. Read from the repository it would fold; read from the mirror it cannot.
-	_, oldWriter, _ := store.ParseRefName(old)
-	cg := &store.Git{GitDir: filepath.Join(clone, ".git")}
-	parent := strings.TrimSpace(w.git(clone, "rev-parse", old))
-	wall := time.Now().UnixMilli()
-	id, _ := op.NewID(op.PrefixOp, wall)
-	fo := &op.Op{V: 1, ID: id, Project: project, Writer: oldWriter, HLC: op.HLC{WallMs: wall},
-		Actor: op.Actor{Kind: "agent", Label: "forger"}, Ticket: op.PrefixTicket + id[len(op.PrefixOp):],
-		Kind: op.KindTicketCreate, Payload: op.TicketCreate("FORGED", "", "task", "low", nil, "todo", "unstarted")}
-	line, err := fo.Encode()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fo, err = op.Parse(line); err != nil {
-		t.Fatal(err)
-	}
-	ftip, err := cg.WritePack(parent, []*op.Op{fo}, "forged-lease")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := cg.ReadRef(project, oldWriter, ftip); err != nil {
-		t.Fatalf("control: the forged chain must be valid when read from the repository: %v", err)
-	}
+	ftip := forgePack(t, w, clone, old)
 	w.git(clone, "update-ref", old, ftip)
 	list := titles(w.jsonOK(clone, nil, "list"))
 	if len(list) != 3 || strings.Contains(strings.Join(list, ","), "FORGED") {
@@ -1107,6 +1087,67 @@ func TestRestoredWriterReadFromHomeMirror(t *testing.T) {
 	w.newTicket(w.repo, nil, "t3 from the original")
 	if got := titles(w.jsonOK(clone, nil, "list")); len(got) != 4 {
 		t.Fatalf("restored clone after the original wrote again: %v", got)
+	}
+}
+
+// forgePack appends to repo's copy of ref a well-formed pack (right project, right writer, later clock)
+// with a ticket titled FORGED, as someone holding a copy of the .git could, and returns its commit.
+func forgePack(t *testing.T, w *world, repo, ref string) string {
+	t.Helper()
+	project, writerID, _ := store.ParseRefName(ref)
+	g := &store.Git{GitDir: filepath.Join(repo, ".git")}
+	parent := strings.TrimSpace(w.git(repo, "rev-parse", ref))
+	wall := time.Now().UnixMilli()
+	id, _ := op.NewID(op.PrefixOp, wall)
+	fo := &op.Op{V: 1, ID: id, Project: project, Writer: writerID, HLC: op.HLC{WallMs: wall},
+		Actor: op.Actor{Kind: "agent", Label: "forger"}, Ticket: op.PrefixTicket + id[len(op.PrefixOp):],
+		Kind: op.KindTicketCreate, Payload: op.TicketCreate("FORGED", "", "task", "low", nil, "todo", "unstarted")}
+	line, err := fo.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fo, err = op.Parse(line); err != nil {
+		t.Fatal(err)
+	}
+	tip, err := g.WritePack(parent, []*op.Op{fo}, "forged-lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.ReadRef(project, writerID, tip); err != nil {
+		t.Fatalf("control: the forged chain must be valid when read from the repository: %v", err)
+	}
+	return tip
+}
+
+// Delta review of ff02afe: an own (leased, not restored) writer appends to this HOME's mirror and is read
+// from it, so ops added to the repository's copy of its ref (a .git that left this account and came back)
+// are neither shown nor built on, and never reach the mirror.
+func TestOwnWriterReadFromHomeMirror(t *testing.T) {
+	w := newWorld(t)
+	project := w.jsonOK(w.repo, nil, "init", "--slug", "own")["project"].(string)
+	w.newTicket(w.repo, nil, "real")
+	ref := w.ownRefs()[0]
+	mirror := filepath.Join(w.home, ".agent-harness", "ledgers", project, "mirror.git")
+	mtip := func() string {
+		out, _ := exec.Command("git", "--git-dir="+mirror, "rev-parse", ref).Output()
+		return strings.TrimSpace(string(out))
+	}
+	if got := strings.TrimSpace(w.git(w.repo, "rev-parse", ref)); got != mtip() {
+		t.Fatalf("control: the repository copy %s differs from the mirror %s after a write", got, mtip())
+	}
+	w.git(w.repo, "update-ref", ref, forgePack(t, w, w.repo, ref))
+	if got := titles(w.jsonOK(w.repo, nil, "list")); len(got) != 1 || got[0] != "real" {
+		t.Fatalf("forged ops in the repository copy of an own ref were read: %v", got)
+	}
+	w.newTicket(w.repo, nil, "next")
+	if got := titles(w.jsonOK(w.repo, nil, "list")); len(got) != 2 || strings.Contains(strings.Join(got, ","), "FORGED") {
+		t.Fatalf("after the next write: %v", got)
+	}
+	if out, _ := exec.Command("git", "--git-dir="+mirror, "log", "-p", ref).Output(); bytes.Contains(out, []byte("FORGED")) {
+		t.Fatal("forged ops reached this HOME's mirror")
+	}
+	if got := strings.TrimSpace(w.git(w.repo, "rev-parse", ref)); got != mtip() {
+		t.Fatal("the next write did not replace the repository copy with the mirror's ref")
 	}
 }
 

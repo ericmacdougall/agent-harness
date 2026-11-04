@@ -7,7 +7,7 @@ Phase 0a ships the local ledger only. Sharing between machines (`travel`, `trust
 import are later phases.
 
 **This ledger travels with this machine only.** Its refs live under `refs/goodqa/` in this
-clone's git directory, and its backup lives under `~/.agent-harness`. Nothing pushes them
+clone's git directory, and their store of record lives under `~/.agent-harness`. Nothing pushes them
 anywhere, and `git push` of your branches does not include them. The ledger is never meant to
 travel in public repositories.
 
@@ -81,10 +81,15 @@ ambiguous.
   accept writes. Every other ref is `unverified`, excluded from every view and from the commit
   policy, and shown by `writers --show` for review. `trust.json` is not read in 0a. If you
   remove `~/.agent-harness/ledgers/<proj>`, this checkout's writer is no longer trusted.
-  A writer restored by `init --from-mirror` is `self` only through this HOME's mirror: its
-  packs are always read from the mirror, never from the repository, so a `writer.json` entry
-  naming a registered writer cannot vouch for a forged ref, and a restored clone keeps up while
-  the original checkout goes on writing. A new writer is registered before `writer.json` records it; if
+- **This HOME's mirror is the store of record.** A repository ledger's own writers append to
+  `~/.agent-harness/ledgers/<proj>/mirror.git` first, and the repository's ref is then
+  overwritten with a copy. Every `self` writer, including one restored by `init --from-mirror`,
+  is read from the mirror, never from the repository. Ops added to the repository's copy (for
+  example in a `.git` that left this account and came back) are neither shown nor built on, and
+  the next write replaces that copy. A restored clone keeps up while the original checkout goes
+  on writing. If the copy into the repository fails, the write still succeeds with a warning.
+  Without a mirror (it could not be created, or was removed) the repository is the only store
+  and every write warns. A new writer is registered before `writer.json` records it; if
   registration fails, nothing is saved and the next command tries again.
 - **Bounded reads.** A ref from a writer that is not `self` is read with at most 16 MiB and
   4096 commits. All such refs in one view share a 64 MiB budget, and at most 64 of them are
@@ -92,9 +97,10 @@ ambiguous.
   is refused before it is read.
 - **Git isolation.** Ledger git calls ignore user and system git config, run no hooks, never
   sign (`--no-gpg-sign`), never auto-gc, never prompt and ignore commit-graph files; every
-  pack commit must name the parent the chain walk found, so `info/grafts` cannot reshape a ref. Only the local `file` transport is
-  allowed, and the mirror copies from the repository with its own configuration, so a
-  repository's `url.*.insteadOf` cannot redirect ledger data. Pack commits use a fixed identity
+  pack commit must name the parent the chain walk found, so `info/grafts` cannot reshape a ref.
+  Only the local `file` transport is allowed. The copy into the repository is a push run inside
+  the mirror with the mirror's own configuration (the repository side runs `receive-pack` with
+  hooks and auto-gc off), so a repository's `url.*.insteadOf` cannot redirect ledger data. Pack commits use a fixed identity
   (`goodqa-ledger <ledger@goodqa.invalid>`).
 
 ## Layout
@@ -103,7 +109,7 @@ ambiguous.
 |---|---|
 | `refs/goodqa/v1/<proj>/log/<writer>` | One ref per writer. Each commit is a pack whose tree holds exactly `version-1`, `hlc-<wall>-<ctr>` (the last op's clock) and `ops.jsonl` (canonical JSON ops). The ref moves only by compare-and-swap. |
 | `<git common dir>/goodqa/` (0700) | `projects.json`, `writer.json` (machine fingerprint to writer map), `view.cache.json` and `writer.lock`, all 0600. A symlinked or group-readable directory is refused. Linked worktrees share it. |
-| `~/.agent-harness/ledgers/<proj>/mirror.git` | A bare local backup that copies the writer ref after every write. `init --from-mirror` restores from it and requires every restored ref to equal the mirror's tip. Refs the mirror lacks are left alone and stay `unverified`. A restored writer is `self` only when it is in `mirror-writers.json`, and its packs are then read from the mirror. |
+| `~/.agent-harness/ledgers/<proj>/mirror.git` | The store of record for this HOME's writers: each write lands here first and is then copied into the repository. `init --from-mirror` restores from it and requires every restored ref to equal the mirror's tip. Refs the mirror lacks are left alone and stay `unverified`. A restored writer is `self` only when it is in `mirror-writers.json`. |
 | `~/.agent-harness/ledgers/<proj>/mirror-writers.json` (0600) | This HOME's registry of the writers minted here (writer to lease hash). It is the trust anchor for `self`. A new writer is recorded before its first write. |
 | `~/.agent-harness/ledgers/<proj>/cache.key` (0600) | 32 random bytes, created on first use. The view cache is used only when its MAC under this key matches. |
 | `~/.agent-harness/ledgers/<proj>/repo.git` | The store for a repo-less ledger. |

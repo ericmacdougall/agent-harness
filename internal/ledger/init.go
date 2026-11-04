@@ -154,27 +154,29 @@ func Init(loc Location, o InitOptions) (*Ledger, error) {
 		l.Close()
 		return nil, err
 	}
-	err = l.initLocked(rootID, now, o)
-	lk.Close()
-	if err != nil {
-		l.Close()
-		return nil, err
-	}
 	role := "ledger"
 	if inRepo {
+		// The mirror comes first: own writers append to it and the repository holds a copy.
 		role = "mirror"
 		mdir, _ := MirrorDir(project)
 		if err := store.InitBare(mdir, "mirror"); err != nil {
 			l.warn = append(l.warn, "mirror could not be created: "+err.Error())
 		}
 	}
+	err = l.initLocked(rootID, now, o)
+	lk.Close()
+	if err != nil {
+		if inRepo {
+			// The project id is new, so nothing else uses its HOME directory: do not leave it behind.
+			if mdir, merr := MirrorDir(project); merr == nil {
+				os.RemoveAll(filepath.Dir(mdir))
+			}
+		}
+		l.Close()
+		return nil, err
+	}
 	if err := writeMeta(project, o.Slug, role); err != nil {
 		l.warn = append(l.warn, "ledger registry entry could not be written: "+err.Error())
-	}
-	if inRepo {
-		if w, _, err := l.currentWriter(now); err == nil {
-			l.pushMirror(w)
-		}
 	}
 	return l, nil
 }
@@ -201,12 +203,19 @@ func (l *Ledger) initLocked(rootID string, now int64, o InitOptions) error {
 		return wrap(ErrUsage, "%v", err)
 	}
 	ref := store.RefName(l.Project, w)
-	commit, err := l.Git.WritePack("", []*op.Op{parsed}, lease)
+	src, mirror := l.Git, l.homeMirror()
+	if mirror != nil {
+		src = mirror
+	}
+	commit, err := src.WritePack("", []*op.Op{parsed}, lease)
 	if err != nil {
 		return err
 	}
-	if err := l.Git.CAS(ref, commit, ""); err != nil {
+	if err := src.CAS(ref, commit, ""); err != nil {
 		return err
+	}
+	if mirror != nil {
+		l.syncRepo(mirror, ref, commit)
 	}
 	if err := l.Dir.PublishNew(projectsFile, projectsBody(l.Project, o.Slug)); err != nil {
 		return err

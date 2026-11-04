@@ -323,7 +323,7 @@ func findRepoless(slug string) (string, error) {
 	return "", wrap(ErrAmbiguous, "several repo-less ledgers have slug %q", slug)
 }
 
-// MirrorDir is the bare backup mirror of a repository ledger.
+// MirrorDir is the bare mirror of a repository ledger: the store of record for this HOME's writers.
 func MirrorDir(project string) (string, error) {
 	home, err := LedgersHome()
 	if err != nil {
@@ -334,10 +334,11 @@ func MirrorDir(project string) (string, error) {
 
 // ---------------------------------------------------------------------------------------- view
 
-// classes gives each writer of this checkout its fold class. restored maps each restored writer that counts as self to its tip in this HOME's mirror: its packs are
-// read from the mirror, never from the repository, whose objects, commit-graph and grafts travel with a
-// copied .git.
-func (l *Ledger) classes() (classes map[string]string, restored map[string]string, mirror *store.Git, err error) {
+// classes gives each writer of this checkout its fold class. mirrored maps each self writer of a
+// repository ledger to its tip in this HOME's mirror ("" when the mirror holds nothing for it): those refs
+// are read from the mirror, never from the repository, whose refs, objects, commit-graph and grafts travel
+// with a copied .git.
+func (l *Ledger) classes() (classes map[string]string, mirrored map[string]string, mirror *store.Git, err error) {
 	m, _, err := writer.Load(l.Dir)
 	if err != nil {
 		return nil, nil, nil, err
@@ -347,13 +348,11 @@ func (l *Ledger) classes() (classes map[string]string, restored map[string]strin
 	// registry recorded it (with the same lease); writer.json alone proves nothing. A repo-less ledger
 	// already lives under this HOME.
 	out := map[string]string{}
-	restored = map[string]string{}
+	mirrored = map[string]string{}
 	var reg map[string]string
 	if l.InRepo {
 		reg = l.registry()
-		if mdir, err := MirrorDir(l.Project); err == nil {
-			mirror = &store.Git{GitDir: mdir}
-		}
+		mirror = l.homeMirror()
 	}
 	for _, e := range m.Writers {
 		if !l.InRepo {
@@ -369,13 +368,18 @@ func (l *Ledger) classes() (classes map[string]string, restored map[string]strin
 			// and that copy is what is read (the original checkout may still be appending to it).
 			if tip := mirrorTip(mirror, l.Project, e.Writer); tip != "" {
 				out[e.Writer] = fold.ClassSelf
-				restored[e.Writer] = tip
+				mirrored[e.Writer] = tip
 			}
 		case h == store.LeaseHash(e.Lease):
 			out[e.Writer] = fold.ClassSelf
+			if mirror != nil {
+				// Read from the mirror, where this writer appends ("" = nothing written yet), never from
+				// the repository's copy.
+				mirrored[e.Writer] = mirrorTip(mirror, l.Project, e.Writer)
+			}
 		}
 	}
-	return out, restored, mirror, nil
+	return out, mirrored, mirror, nil
 }
 
 func mirrorTip(mirror *store.Git, project, w string) string {
@@ -395,7 +399,7 @@ type snapshot struct {
 	classes    map[string]string
 	key        string
 	mirror     *store.Git
-	fromMirror map[string]bool // refs read from the HOME mirror (restored writers)
+	fromMirror map[string]bool // refs read from the HOME mirror (own writers of a repository ledger)
 }
 
 func (l *Ledger) snapshot() (*snapshot, error) {
@@ -403,14 +407,19 @@ func (l *Ledger) snapshot() (*snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	classes, restored, mirror, err := l.classes()
+	classes, mirrored, mirror, err := l.classes()
 	if err != nil {
 		return nil, err
 	}
 	fromMirror := map[string]bool{}
 	src := map[string]any{}
-	for w, tip := range restored {
+	for w, tip := range mirrored {
 		r := store.RefName(l.Project, w)
+		if tip == "" {
+			delete(refs, r) // the mirror has nothing for this writer, so neither does the view
+			src[r] = "mirror"
+			continue
+		}
 		refs[r], fromMirror[r], src[r] = tip, true, "mirror"
 	}
 	tips := map[string]any{}
@@ -851,8 +860,8 @@ func scanDrafts(ds []op.Draft, redact bool) error {
 }
 
 // Append validates drafts against the current view, assigns clocks and ids under the writer lock, writes
-// one pack commit, moves the writer ref with compare-and-swap, refreshes the cache and then pushes the ref
-// to the local mirror. check runs under the lock against the fresh view (e.g. "ticket exists").
+// one pack commit into this HOME's mirror (the repository itself when there is none), moves the writer ref
+// there with compare-and-swap, copies it into the repository and refreshes the cache. check runs under the lock against the fresh view (e.g. "ticket exists").
 func (l *Ledger) Append(drafts []op.Draft, opts AppendOptions, check func(*fold.View, []op.Draft) error) (*Result, error) {
 	if err := scanDrafts(drafts, opts.RedactSecrets); err != nil {
 		return nil, err
@@ -866,7 +875,6 @@ func (l *Ledger) Append(drafts []op.Draft, opts AppendOptions, check func(*fold.
 	if err != nil {
 		return nil, err
 	}
-	l.pushMirror(res.Writer)
 	return res, nil
 }
 
@@ -880,6 +888,14 @@ func (l *Ledger) appendLocked(drafts []op.Draft, opts AppendOptions, check func(
 		return nil, err
 	}
 	ref := store.RefName(l.Project, w)
+	// Own writers append to this HOME's mirror (the repository only holds a copy); without a mirror the
+	// repository is the only store.
+	src, mirror := l.Git, l.homeMirror()
+	if mirror != nil {
+		src = mirror
+	} else if l.InRepo {
+		l.warn = append(l.warn, "mirror missing; ops are stored only in this repository")
+	}
 	for attempt := 0; attempt < 3; attempt++ {
 		v, err := l.View()
 		if err != nil {
@@ -898,13 +914,13 @@ func (l *Ledger) appendLocked(drafts []op.Draft, opts AppendOptions, check func(
 				return nil, err
 			}
 		}
-		tip, err := l.Git.Tip(ref)
+		tip, err := src.Tip(ref)
 		if err != nil {
 			return nil, err
 		}
 		var last op.HLC
 		if tip != "" {
-			if last, err = l.Git.TipHLC(tip); err != nil { // authoritative last clock (N10)
+			if last, err = src.TipHLC(tip); err != nil { // authoritative last clock (N10)
 				return nil, wrap(ErrRefused, "own ref tip unreadable: %v", err)
 			}
 		}
@@ -912,11 +928,11 @@ func (l *Ledger) appendLocked(drafts []op.Draft, opts AppendOptions, check func(
 		if err != nil {
 			return nil, err
 		}
-		commit, err := l.Git.WritePack(tip, ops, lease)
+		commit, err := src.WritePack(tip, ops, lease)
 		if err != nil {
 			return nil, err
 		}
-		if err := l.Git.CAS(ref, commit, tip); err != nil {
+		if err := src.CAS(ref, commit, tip); err != nil {
 			if errors.Is(err, store.ErrCASFailed) {
 				continue
 			}
@@ -924,6 +940,9 @@ func (l *Ledger) appendLocked(drafts []op.Draft, opts AppendOptions, check func(
 		}
 		if os.Getenv(CrashAfterCASEnv) == "1" && writer.TestHooksAllowed {
 			os.Exit(9) // test hook: simulate a crash between update-ref and the cache write
+		}
+		if mirror != nil {
+			l.syncRepo(mirror, ref, commit)
 		}
 		nv, err := l.View()
 		if err != nil {
@@ -1051,25 +1070,28 @@ func (l *Ledger) registerWriter(w, lease string) error {
 	return wrap(ErrBusy, "the ledger registry kept changing; try again")
 }
 
-func (l *Ledger) pushMirror(w string) {
+// homeMirror returns this HOME's mirror of a repository ledger, or nil for a repo-less ledger or when the
+// mirror is missing. Own writers append to the mirror first and are read from it: the repository's copy of
+// their refs (and its objects) travels with a copied .git, so it is never what this HOME trusts.
+func (l *Ledger) homeMirror() *store.Git {
 	if !l.InRepo {
-		return
+		return nil
 	}
 	mdir, err := MirrorDir(l.Project)
 	if err != nil {
-		return
+		return nil
 	}
-	if _, err := os.Stat(mdir); err != nil {
-		l.warn = append(l.warn, "mirror missing; ops are stored only in this repository")
-		return
+	if fi, err := os.Stat(mdir); err != nil || !fi.IsDir() {
+		return nil
 	}
-	ref := store.RefName(l.Project, w)
-	tip, err := l.Git.Tip(ref)
-	if err != nil || tip == "" {
-		return
-	}
-	if err := l.Git.PushMirror(mdir, ref, tip); err != nil {
-		l.warn = append(l.warn, "mirror push failed (ops are safe in this repository): "+err.Error())
+	return &store.Git{GitDir: mdir}
+}
+
+// syncRepo copies an own ref from the mirror into the repository, warning (not failing) when it cannot:
+// the ops are safe in the mirror and the copy is retried on the next write.
+func (l *Ledger) syncRepo(mirror *store.Git, ref, tip string) {
+	if err := mirror.PushToRepo(l.Root, ref, tip); err != nil {
+		l.warn = append(l.warn, "repository copy of the ledger ref not updated (ops are safe in this HOME's mirror): "+err.Error())
 	}
 }
 
