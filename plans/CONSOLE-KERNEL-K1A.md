@@ -319,6 +319,14 @@ The independent model listed 34 places these tables left open. None changes a ta
 36. If `Decide`'s own pre-check finds a fact `Reduce` refuses for a precondition, that is a kernel bug and returns a plain error, not a refusal. Only a value out of shape is `bad_value`.
 37. A `quarantine` input with a code out of shape is `bad_value` with no effects: only the adapter sends it, so this is an adapter bug.
 38. A disconnect ends the Codex turn: K4 stops the provider's process group whenever its stream ends, so clearing `TurnID` is correct. K6 must keep this true.
+42. `create` checks, in order: session exists, bad provider, `no_owner`, `session_limit`, then shape.
+43. `disconnected` on a read-only session is late `disconnected`, whatever its connection state: read-only is checked first.
+44. `quarantine` checks, in order: empty code gives `bad_value`; already quarantined is idempotent with no facts and no effects; then shape.
+45. Raw `ControlOutcome` with `ControlPending` false is legal in `Reduce`, and not eligible for the reserve.
+46. A late `final` normalized to an empty request, on a session whose `LastRequest` is empty, is eligible: still once per key.
+47. In a multi-fact decision, each fact's eligibility is judged against the projection with the earlier facts of that decision applied.
+48. The 22,001 bound covers facts from `Decide`. The importer's facts are bounded by K3's own rules, and `MustAppend` is defined only for legal facts.
+49. At the limit, if any fact of a decision is refused as ineligible, the whole decision is refused and nothing of it commits.
 41. Changed in K2: a writable pause or stop that would change nothing records no fact, so repeated presses cannot grow the log or spend the must-append reserve. Its stop effects still fire.
 40. Changed in K2 after a secrets canary found an API-key-shaped value stored as late evidence: a late frame's digest must be 64 lowercase hex characters. `Reduce` refuses a raw `LateFrameObserved` whose digest is neither empty nor that hex form. Identity fields such as provider and turn IDs are identities by design and are stored as given; adapters must never put secrets in them.
 39. Superseded by section 11: repeated `disconnected` frames record only when connected or a request is open, and `control-outcome` frames only while a control request is pending.
