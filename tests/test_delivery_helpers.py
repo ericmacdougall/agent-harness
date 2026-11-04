@@ -2030,11 +2030,14 @@ class DeliveryHelpers(unittest.TestCase):
         self.add_feature_test()
         marker = self.root / 'post-commit-started'
         hook = self.repo / '.git/hooks/post-commit'
+        # The hook outlives any helper deadline, so only the helper's timeout can
+        # end it. The deadline is generous so load cannot expire it before the
+        # commit reaches the hook (a 4-second deadline did on busy hosts).
         hook.write_text('#!/bin/sh\n' + shlex.join([sys.executable, '-c',
-                         f'from pathlib import Path; import time; Path({str(marker)!r}).touch(); time.sleep(12)']) + '\n')
+                         f'from pathlib import Path; import time; Path({str(marker)!r}).touch(); time.sleep(600)']) + '\n')
         hook.chmod(0o700)
-        p = subprocess.run(self.integrate_args('--timeout', '4'), text=True, capture_output=True,
-                           env=isolated_env(), timeout=25)
+        p = subprocess.run(self.integrate_args('--timeout', '20'), text=True, capture_output=True,
+                           env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         data = json.loads(p.stdout)
         self.assertTrue(marker.exists())
         self.assertEqual((p.returncode, data['status']), (3, 'BLOCKED_LOCAL'))
@@ -2603,7 +2606,9 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual((code, json.loads(output.getvalue())['status']),
                          (0, 'INTEGRATED'), output.getvalue())
         git_calls = [kwargs for command, kwargs in calls if command[0] == 'git']
-        verification_calls = [kwargs for command, kwargs in calls if command[0] in {'npm', 'python3'}]
+        # Checks now run a pinned absolute interpreter after a version probe (`-I -c`).
+        verification_calls = [kwargs for command, kwargs in calls
+                              if Path(command[0]).name in {'npm', 'python3'} and command[1:3] != ['-I', '-c']]
         self.assertTrue(git_calls)
         self.assertEqual(len(verification_calls), 4, 'prepare and check must run in scratch and original')
         self.assertTrue(any(kwargs.get('discard_output') is True for kwargs in git_calls),

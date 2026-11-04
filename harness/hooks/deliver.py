@@ -26,8 +26,9 @@ from urllib.parse import quote
 
 from github_identity import github_repository, repository_name
 from git_safety import git_environment, require_safe_source
-from integrate_local import (ALLOWED_GIT_ENV, ExternalApplyError, OriginalScope,
-                             acquire_scope_lock, approved_check, approved_prepare,
+from integrate_local import (ALLOWED_GIT_ENV, CheckInterpreterError, CheckLog, ExternalApplyError,
+                             OriginalScope, acquire_scope_lock, approved_check, approved_prepare,
+                             require_check_interpreters,
                              checkout_identity, git_common_directory, journal_key,
                              fsync_directory, private_directory, read_journal, run as run_check,
                              scope_key, valid_identity_text, write_journal)
@@ -38,6 +39,9 @@ OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 HEX32 = re.compile(r"[0-9a-f]{32}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 TASK = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+# A full test suite routinely needs minutes; Git/GitHub commands keep --timeout.
+DEFAULT_CHECK_TIMEOUT = 1800
+MAX_CHECK_TIMEOUT = 7200
 MAX_OUTPUT = 1_000_000
 MAX_PRIVATE = 32_768
 GH_FIELDS = "number,state,headRefOid,headRefName,baseRefName,url,isDraft,mergeCommit,isCrossRepository,headRepository,headRepositoryOwner"
@@ -214,14 +218,45 @@ def checks_digest(preparations, checks):
     return hashlib.sha256(json.dumps([preparations, checks], separators=(",", ":")).encode()).hexdigest()
 
 
-def run_checks(repo, preparations, checks, timeout):
-    for command in (*preparations, *checks):
-        try:
-            result = run_check(repo, command, timeout=timeout, discard_output=True)
-        except (OSError, subprocess.TimeoutExpired):
-            raise DeliveryError("DELIVERED_CHECK_FAILED", "Delivered checkout check could not complete") from None
-        if result.returncode:
-            raise DeliveryError("DELIVERED_CHECK_FAILED", "Delivered checkout check failed")
+CHECK_FACTS = ("check_log", "check_tail", "check_log_truncated", "check_status")
+
+
+def check_facts(error):
+    """Carry only the bounded check evidence across recovery wrappers."""
+    facts = getattr(error, "facts", None) or {}
+    return {name: facts[name] for name in CHECK_FACTS if name in facts}
+
+
+def run_checks(repo, preparations, checks, timeout, log_directory):
+    # Output goes to an owner-only bounded log; failures report its path and a
+    # redacted tail, so a failed delivery check is diagnosable without rerunning.
+    try:
+        log = CheckLog(log_directory)
+    except OSError:
+        raise DeliveryError("DELIVERED_CHECK_FAILED", "Check log could not be created", check_status="log") from None
+    try:
+        for command in (*preparations, *checks):
+            log.header(command)
+            try:
+                result = run_check(repo, command, timeout=timeout, discard_output=True, sink=log)
+            except subprocess.TimeoutExpired:
+                log.close()
+                raise DeliveryError("DELIVERED_CHECK_FAILED", f"Delivered checkout check exceeded {timeout} seconds",
+                                    check_status="timeout", **log.facts()) from None
+            except CheckInterpreterError as error:
+                log.close()
+                raise DeliveryError("DELIVERED_CHECK_FAILED", str(error), check_status="interpreter",
+                                    **log.facts()) from None
+            except OSError:
+                log.close()
+                raise DeliveryError("DELIVERED_CHECK_FAILED", "Delivered checkout check could not complete",
+                                    check_status="error", **log.facts()) from None
+            if result.returncode:
+                log.close()
+                raise DeliveryError("DELIVERED_CHECK_FAILED", "Delivered checkout check failed",
+                                    check_status=f"exit {result.returncode}", **log.facts())
+    finally:
+        log.close()
 
 
 def origin_destination(repo):
@@ -857,9 +892,10 @@ def observed_head(original):
         return None
 
 
-def recovery_error(flow, message, base, *, journal=None, cause=None):
+def recovery_error(flow, message, base, *, journal=None, cause=None, evidence=None):
     head = observed_head(flow.original)
-    facts = {**flow.facts(), "head": head, "original_advanced": head is not None and head != base}
+    facts = {**flow.facts(), **(evidence or {}), "head": head,
+             "original_advanced": head is not None and head != base}
     if journal is not None:
         facts["recovery_journal"] = str(journal)
     if cause is not None:
@@ -993,7 +1029,7 @@ def resume_remote_finish(flow, preparations, checks):
         write_journal(attempt / "start", start, first=True)
         try:
             revalidate()
-            run_checks(flow.original, preparations, checks, args.timeout)
+            run_checks(flow.original, preparations, checks, args.check_timeout, flow.directory / "checks")
             revalidate()
             if origin_destination(flow.original)[0] != state["repository"]:
                 raise DeliveryError("BLOCKED_POLICY", "Original repository changed after checks", code=2)
@@ -1007,10 +1043,12 @@ def resume_remote_finish(flow, preparations, checks):
             guard = scope.complete_external(guard)
             revalidate()
             flow.complete("remote", state["target"], digest)
-        except (DeliveryError, ExternalApplyError, OSError, subprocess.TimeoutExpired):
+        except (DeliveryError, ExternalApplyError, OSError, subprocess.TimeoutExpired) as error:
             # An incomplete attempt is evidence for diagnosis, never cached success.
             raise recovery_error(flow, "Resume did not complete; preserved transaction requires inspection",
-                                 state["apply_base"], journal=guard.journal) from None
+                                 state["apply_base"], journal=guard.journal,
+                                 cause=error.status if isinstance(error, DeliveryError) else None,
+                                 evidence=check_facts(error)) from None
         private_directory(attempt / "final")
         write_journal(attempt / "final", {"schema": 1, "kind": "delivery_resume_result",
                       "generation": flow.generation, "status": "DELIVERED", "target": state["target"]}, first=True)
@@ -1086,7 +1124,7 @@ def remote_finish(flow, preparations, checks):
                         raise DeliveryError("BLOCKED_LOCAL", "Protected fast-forward was refused")
             if snapshot(flow.original, flow.branch) != target:
                 raise DeliveryError("DELIVERED_CHECK_FAILED", "Original changed during sync")
-            run_checks(flow.original, preparations, checks, args.timeout)
+            run_checks(flow.original, preparations, checks, args.check_timeout, flow.directory / "checks")
             if snapshot(flow.original, flow.branch) != target:
                 raise DeliveryError("DELIVERED_CHECK_FAILED", "Checks changed the delivered checkout")
             if origin_destination(flow.original)[0] != state["repository"]:
@@ -1121,7 +1159,8 @@ def remote_finish(flow, preparations, checks):
             if flow.state["phase"] == "REMOTE_APPLYING":
                 raise recovery_error(flow, "External apply requires recovery; no completion was recorded",
                                      flow.state["apply_base"], journal=guard.journal if guard else None,
-                                     cause=error.status if isinstance(error, DeliveryError) else "IO_FAILURE") from None
+                                     cause=error.status if isinstance(error, DeliveryError) else "IO_FAILURE",
+                                     evidence=check_facts(error)) from None
             raise
     report("DELIVERED", "Merged PR is present in the checked original checkout", head=target,
            receipt=str(flow.receipt), pr=pr["url"], remote_observed_head=observed_remote, **flow.facts())
@@ -1146,7 +1185,7 @@ def local_completion(flow, preparations, checks):
             return False
         if not ancestry(flow.original, flow.state["source_head"], current):
             raise recovery_error(flow, "Local delivery is absent from current checkout", flow.state["baseline"])
-        run_checks(flow.original, preparations, checks, flow.args.timeout)
+        run_checks(flow.original, preparations, checks, flow.args.check_timeout, flow.directory / "checks")
         if snapshot(flow.original, flow.branch) != current:
             raise recovery_error(flow, "Local checks changed the delivered checkout", flow.state["baseline"])
         flow.complete("local", current, checks_digest(preparations, checks))
@@ -1182,12 +1221,15 @@ def local_finish(flow, preparations, checks):
     # The child owns the original scope lock; the parent holds only its task lock.
     command = [sys.executable, str(Path(__file__).with_name("integrate_local.py")), "--repo", str(flow.original),
                "--original-branch", flow.branch, "--expected-head", current, "--source", state["source_branch"],
-               "--expected-source-head", state["source_head"], "--timeout", str(flow.args.timeout)]
+               "--expected-source-head", state["source_head"],
+               "--timeout", str(flow.args.timeout), "--check-timeout", str(flow.args.check_timeout)]
     for name in ("prepare", "check"):
         for value in getattr(flow.args, name):
             command.extend(("--" + name, value))
     try:
-        code, output = bounded(command, timeout=(len(checks) + len(preparations) + 10) * flow.args.timeout + 15)
+        # Each preparation/check gets its check deadline; Git steps keep --timeout.
+        code, output = bounded(command, timeout=2 * (len(checks) + len(preparations)) * flow.args.check_timeout
+                               + 10 * flow.args.timeout + 15)
         result = json.loads(output)
         if not isinstance(result, dict):
             raise ValueError
@@ -1203,6 +1245,12 @@ def local_finish(flow, preparations, checks):
 
 def finish(args):
     preparations, checks = approved_commands(args.prepare, prepare=True), approved_commands(args.check)
+    try:
+        # Before any checkout effect: a bare python3 that resolves to an
+        # unsupported interpreter would only fail after the fast-forward.
+        require_check_interpreters(checks)
+    except CheckInterpreterError as error:
+        raise DeliveryError("BLOCKED_POLICY", str(error), code=2) from None
     with Workflow(args) as flow:
         state = flow.load()
         if state is None:
@@ -1244,9 +1292,10 @@ def resolve_baseline(flow, preparations, checks):
         if snapshot(flow.original, flow.branch) != confirmed:
             raise DeliveryError("RECOVERY_REQUIRED", "Confirmed baseline HEAD changed")
         try:
-            run_checks(flow.original, preparations, checks, flow.args.timeout)
-        except DeliveryError:
-            raise DeliveryError("RECOVERY_REQUIRED", "Baseline checks did not validate the confirmed checkout") from None
+            run_checks(flow.original, preparations, checks, flow.args.check_timeout, flow.directory / "checks")
+        except DeliveryError as error:
+            raise DeliveryError("RECOVERY_REQUIRED", "Baseline checks did not validate the confirmed checkout",
+                                **check_facts(error)) from None
         if snapshot(flow.original, flow.branch) != confirmed:
             raise DeliveryError("RECOVERY_REQUIRED", "Baseline checks changed the confirmed checkout")
         # save rereads both the exact generation pointer and loaded state.
@@ -1336,7 +1385,7 @@ def parse_args():
         part.add_argument("--original-branch", required=True)
         part.add_argument("--generation", help="Require this exact current generation")
         part.add_argument("--kit-file", type=Path)
-        part.add_argument("--timeout", type=int, default=120)
+        part.add_argument("--timeout", type=int, default=120, help="Seconds for each Git and GitHub command")
     prep = sub.choices["prepare"]
     prep.add_argument("--source", type=Path)
     prep.add_argument("--expected-source-head")
@@ -1352,11 +1401,15 @@ def parse_args():
     finish_mode.add_argument("--resolve-baseline", help="Accept only this full clean tested HEAD; never delivery")
     end.add_argument("--check", action="append", default=[])
     end.add_argument("--prepare", action="append", default=[])
+    end.add_argument("--check-timeout", type=int, default=DEFAULT_CHECK_TIMEOUT,
+                     help="Seconds allowed for each preparation and check command (default 1800)")
     end.add_argument("--resume", action="store_true", help="Explicitly resume this pending remote delivery at its pinned target")
     end.add_argument("--resume-reason", help="Bounded private explanation for resuming an interrupted attempt")
     args = parser.parse_args()
     if not 1 <= args.timeout <= 3600:
         parser.error("--timeout must be between 1 and 3600 seconds")
+    if args.phase == "finish" and not 1 <= args.check_timeout <= MAX_CHECK_TIMEOUT:
+        parser.error(f"--check-timeout must be between 1 and {MAX_CHECK_TIMEOUT} seconds")
     if args.phase == "finish":
         if args.resume and (args.mode != "remote" or not args.generation or args.kit_file is None):
             parser.error("--resume requires --mode remote, --generation and --kit-file")

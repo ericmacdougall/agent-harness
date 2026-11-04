@@ -21,8 +21,12 @@ def signal_group(pid, signum):
         pass
 
 
-def drain_discarded(pipe, deadline):
-    """Discard fixed-size chunks until every inherited writer closes or time runs out."""
+def drain_discarded(pipe, deadline, sink=None):
+    """Discard fixed-size chunks until every inherited writer closes or time runs out.
+
+    An optional sink receives each chunk (for a bounded caller-owned log); the
+    pipe is still drained here, so a slow or failing sink cannot block writers.
+    """
     with selectors.DefaultSelector() as poller:
         poller.register(pipe, selectors.EVENT_READ)
         while True:
@@ -31,16 +35,19 @@ def drain_discarded(pipe, deadline):
                 return False
             if not poller.select(remaining):
                 return False
-            if not os.read(pipe.fileno(), DISCARD_CHUNK_BYTES):
+            chunk = os.read(pipe.fileno(), DISCARD_CHUNK_BYTES)
+            if not chunk:
                 return True
+            if sink is not None:
+                sink(chunk)
 
 
-def cleanup_discarded(process):
+def cleanup_discarded(process, sink=None):
     """Drain without retaining output while the process group exits."""
     grace_deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
     signal_group(process.pid, signal.SIGTERM)
     try:
-        drain_discarded(process.stdout, grace_deadline)
+        drain_discarded(process.stdout, grace_deadline, sink)
     except (OSError, ValueError):
         pass
     while time.monotonic() < grace_deadline:
@@ -56,7 +63,7 @@ def cleanup_discarded(process):
         time.sleep(min(0.05, remaining))
     signal_group(process.pid, signal.SIGKILL)
     try:
-        drain_discarded(process.stdout, time.monotonic() + DISCARD_CLEANUP_SECONDS)
+        drain_discarded(process.stdout, time.monotonic() + DISCARD_CLEANUP_SECONDS, sink)
     except (OSError, ValueError):
         pass
     try:
@@ -66,7 +73,7 @@ def cleanup_discarded(process):
 
 
 def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True,
-        stream=False, discard_output=False):
+        stream=False, discard_output=False, sink=None):
     # Git and test runners spawn children that subprocess.run(timeout=...) leaves alive.
     # Malformed output from a child must not bypass a caller's rollback path.
     # Keep binary mode exact for callers that inspect Git object bytes.
@@ -74,6 +81,8 @@ def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True,
         raise ValueError('stream and discard_output are mutually exclusive')
     if discard_output and input is not None:
         raise ValueError('discard_output does not accept input')
+    if sink is not None and not discard_output:
+        raise ValueError('sink requires discard_output')
     decoding = {'errors': 'replace'} if text else {}
     # The discard path drains one merged pipe to preserve descendant EOF semantics.
     output = None if stream else subprocess.PIPE
@@ -85,7 +94,7 @@ def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True,
     if discard_output:
         deadline = None if timeout is None else time.monotonic() + timeout
         try:
-            if not drain_discarded(process.stdout, deadline):
+            if not drain_discarded(process.stdout, deadline, sink):
                 raise subprocess.TimeoutExpired(command, timeout)
             remaining = None if deadline is None else max(0, deadline - time.monotonic())
             process.wait(timeout=remaining)
@@ -93,7 +102,10 @@ def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True,
             return subprocess.CompletedProcess(command, process.returncode, None, None)
         except BaseException as failure:
             try:
-                cleanup_discarded(process)
+                if sink is None:
+                    cleanup_discarded(process)
+                else:
+                    cleanup_discarded(process, sink)
             except (OSError, subprocess.TimeoutExpired):
                 failure.cleanup_incomplete = True
             raise

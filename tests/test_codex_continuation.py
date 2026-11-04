@@ -9,6 +9,9 @@ import unittest
 
 
 HOOK = Path(__file__).resolve().parents[1] / 'codex/hooks/wal.py'
+# Hang guard for one hook process, not a latency assertion: the hook never
+# waits on locks, but interpreter start-up can take seconds on a loaded runner.
+HOOK_WATCHDOG_SECONDS = 60
 
 
 class ContinuationTests(unittest.TestCase):
@@ -23,7 +26,7 @@ class ContinuationTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(HOOK), *args],
             input=json.dumps(payload) if payload is not None else '',
-            env=self.env, capture_output=True, text=True, timeout=4,
+            env=self.env, capture_output=True, text=True, timeout=HOOK_WATCHDOG_SECONDS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
