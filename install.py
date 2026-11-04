@@ -23,7 +23,7 @@ END = "<!-- agent-harness:end -->"
 AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py",
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
-         "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py")
+         "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py", "log_backup.py")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -40,7 +40,7 @@ class DirectoryPublicationError(OSError):
 
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
-            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py")}
+            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "log_backup.py")}
 
 
 SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
@@ -78,7 +78,10 @@ def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]
         return hook
 
     managed = {
-        "SessionStart": [{"hooks": [command("session")]}],
+        "SessionStart": [{"hooks": [command("session")]}, {"hooks": [{
+            # Visible alert when the scheduled log backup has not succeeded for an hour; fails open.
+            "type": "command", "command": "python3", "args": [str(claude / "hooks" / "log_backup.py"), "session-start"],
+            "timeout": 10}]}],
         "UserPromptSubmit": [{"hooks": [command("prompt", True)]}],
         "SubagentStart": [{
             "matcher": SUBAGENT_MATCHER,
@@ -735,6 +738,15 @@ def netwatch_status(home: Path, apply: bool, flag) -> str:
         return f"netwatch: skipped ({error.__class__.__name__}: {error})"
 
 
+def log_backup_status(home: Path, apply: bool) -> str:
+    """Scheduled log backup (script, excludes, launchd or systemd units); never fails the harness install."""
+    try:
+        import log_backup_install
+        return log_backup_install.status(home, apply)
+    except Exception as error:  # noqa: BLE001
+        return f"log backup: skipped ({error.__class__.__name__}: {error})"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
@@ -773,6 +785,7 @@ def main() -> None:
     print(f"  {install_git_backstop(args.home, args.apply)}")
     print(f"  {scratch_status(args.home, args.apply, durable_tmp)}")
     print(f"  {netwatch_status(args.home, args.apply, args.netwatch)}")
+    print(f"  {log_backup_status(args.home, args.apply)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")
 
