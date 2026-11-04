@@ -69,7 +69,7 @@ Independent check: a separate agent that had not seen these labels hand-labelled
 
 Recommendation: `stop_lint` ships and stays `warn`. Enforcement needs a calibration on more sessions than one before it is switched on; the red-team also showed that the pre-fix detector nagged on status text, so the enforce-mode false positive rate is not yet established. The Stop block fires once per message when enforced.
 
-### settings.json entries (not applied by this change; main wires them at integration)
+### settings.json entries (registered by install.py)
 
 ```json
 "PreToolUse": [ { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "python3",
@@ -80,7 +80,7 @@ Recommendation: `stop_lint` ships and stays `warn`. Enforcement needs a calibrat
     "args": ["/Users/eric/.claude/hooks/provenance_hooks.py", "prompt"], "timeout": 10 } ] } ]
 ```
 
-These hooks are opt-in: `install.py` copies the files but does not register them, so `ask_user_question: enforce` does nothing until the entries are added. Replace `/Users/eric` with your home directory and add them as extra groups next to the existing `wal.py` entries. Typical cost on a 75 MB transcript: `stop-lint` about 30 ms, `ask-gate` about 60 ms (interpreter start is about 24 ms of each).
+`install.py` registers these three entries on every install (replacing an earlier registration of the same script, so a re-install neither drops nor duplicates them). `python3 install.py --apply --no-provenance-hooks` unregisters them and leaves the files installed; the next plain install registers them again. Modes still come from `provenance_policy.json`. Typical cost on a 75 MB transcript: `stop-lint` about 30 ms, `ask-gate` about 60 ms (interpreter start is about 24 ms of each).
 
 ## Known gaps
 

@@ -39,7 +39,8 @@ class DirectoryPublicationError(OSError):
 
 
 def managed_scripts(claude: Path) -> set[str]:
-    return {str(claude / "hooks" / name) for name in ("wal.py", "commit_policy.py", "spec_flow.py")}
+    return {str(claude / "hooks" / name)
+            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py")}
 
 
 SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
@@ -47,7 +48,22 @@ GOODQA_STATUS_TOOLS = (r"^mcp__.*[Gg][Oo][Oo][Dd][Qq][Aa].*__(close_issue_done|c
                        r"bulk_update_issues|archive_issue|reassign_issue|call_api)$")
 
 
-def managed_hooks(claude: Path) -> dict[str, list[dict]]:
+def provenance_hook_groups(claude: Path) -> dict[str, list[dict]]:
+    """Requirement-provenance gates (docs/provenance.md). Modes live in provenance_policy.json, not here:
+    ask-gate enforces, stop-lint warns. Each hook fails open on its own errors, so none sets onFailure."""
+    script = str(claude / "hooks" / "provenance_hooks.py")
+
+    def hook(name: str) -> dict:
+        return {"type": "command", "command": "python3", "args": [script, name], "timeout": 10}
+
+    return {
+        "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [hook("ask-gate")]}],
+        "Stop": [{"hooks": [hook("stop-lint")]}],
+        "UserPromptSubmit": [{"hooks": [hook("prompt")]}],
+    }
+
+
+def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]]:
     script = str(claude / "hooks" / "wal.py")
     policy = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "commit_policy.py"), "hook"],
               "timeout": 60, "onFailure": "block"}  # gh pr create checks GitHub and GoodQA
@@ -61,7 +77,7 @@ def managed_hooks(claude: Path) -> dict[str, list[dict]]:
             hook["onFailure"] = "block"
         return hook
 
-    return {
+    managed = {
         "SessionStart": [{"hooks": [command("session")]}],
         "UserPromptSubmit": [{"hooks": [command("prompt", True)]}],
         "SubagentStart": [{
@@ -84,6 +100,10 @@ def managed_hooks(claude: Path) -> dict[str, list[dict]]:
             "hooks": [spec_gate],
         }],
     }
+    if provenance:
+        for event, groups in provenance_hook_groups(claude).items():
+            managed.setdefault(event, []).extend(groups)
+    return managed
 
 
 def durable_scratch(claude: Path) -> Path:
@@ -91,7 +111,7 @@ def durable_scratch(claude: Path) -> Path:
     return claude.parent / ".agent-harness" / "scratch"
 
 
-def merged_settings(current: dict, claude: Path, durable_tmp: bool = True) -> dict:
+def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, provenance: bool = True) -> dict:
     settings = json.loads(json.dumps(current))
     env = settings.get("env", {})
     if not isinstance(env, dict):
@@ -106,8 +126,11 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True) -> di
         settings["env"] = {key: value for key, value in env.items() if key != TMPDIR_KEY}
     hooks = settings.setdefault("hooks", {})
     scripts = managed_scripts(claude)
-    for event, managed in managed_hooks(claude).items():
+    wanted = managed_hooks(claude, provenance)
+    for event in sorted(set(wanted) | set(managed_hooks(claude, True))):
+        managed = wanted.get(event, [])
         entries = hooks.setdefault(event, [])
+        had_entries = bool(entries)
         preserved = []
         for item in entries:
             remaining = [
@@ -122,6 +145,8 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True) -> di
                 preserved.append({**item, "hooks": remaining})
         entries[:] = preserved
         entries.extend(managed)
+        if not entries and had_entries:
+            del hooks[event]  # an uninstalled gate leaves no empty event behind; a user's own empty list stays
     allowed = settings.setdefault("permissions", {}).setdefault("allow", [])
     for name in ("wal_note.py", "publish_feature.py", "integrate_local.py", "deliver.py"):
         rule = f"Bash(python3 ~/.claude/hooks/{name} *)"
@@ -492,7 +517,7 @@ def read_regular(path: Path, *, pinned_parent=None, retain_fd=None):
         return None
 
 
-def install(home: Path, apply: bool, durable_tmp: bool = True) -> list[str]:
+def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool = True) -> list[str]:
     claude = home.expanduser().resolve() / ".claude"
     files = [
         *((ROOT / "harness" / folder / name, claude / folder / name)
@@ -524,7 +549,7 @@ def install(home: Path, apply: bool, durable_tmp: bool = True) -> list[str]:
         current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
         if not isinstance(current_settings, dict):
             raise ValueError("settings.json must contain an object")
-        settings = merged_settings(current_settings, claude, durable_tmp)
+        settings = merged_settings(current_settings, claude, durable_tmp, provenance)
         # Read every payload before any managed write (also validate it in preview).
         payloads = [(destination, source.read_bytes()) for source, destination in files]
         payloads += [(instructions_path, instructions.encode()),
@@ -724,6 +749,9 @@ def main() -> None:
                           help="do not install or upgrade the netwatch monitor (remembered)")
     netwatch.add_argument("--netwatch", dest="netwatch", action="store_true",
                           help="install or upgrade the pinned netwatch monitor (the default; remembered)")
+    parser.add_argument("--no-provenance-hooks", dest="provenance", action="store_false",
+                        help="do not register the provenance hooks (ask-gate, stop-lint, prompt) and remove any "
+                             "registered by an earlier install; the files stay installed; not remembered")
     args = parser.parse_args()
     durable_tmp = durable_tmp_choice(args.home, args.durable_tmp)
     if args.apply and args.durable_tmp is not None:
@@ -735,7 +763,7 @@ def main() -> None:
                            f"{args.home / '.agent-harness'} ({error.__class__.__name__}); it must be a "
                            "real directory, not a symlink\n")
     try:
-        changes = install(args.home, args.apply, durable_tmp=durable_tmp)
+        changes = install(args.home, args.apply, durable_tmp=durable_tmp, provenance=args.provenance)
     except DirectoryPublicationError as error:
         parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"
