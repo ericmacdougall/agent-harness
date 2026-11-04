@@ -186,6 +186,11 @@ class ShellAnalysis(unittest.TestCase):
             "bash -c -- 'git commit -m wip'": "wip",
             "ksh -c 'git commit -m wip'": "wip",
             "git commit -F m": GOOD,
+            "git -C . commit -F msg.txt": GOOD,
+            "git -C . add msg.txt && git -C . commit -F msg.txt": GOOD,
+            "git -c core.quotepath=off commit -F msg.txt": GOOD,
+            "GIT_AUTHOR_DATE=$(date) git commit -m wip": "wip",
+            "git commit -m wip && sudo systemctl restart nginx": "wip",
             "timeout 30 git commit -m wip": "wip",
         }
         for command, expected in cases.items():
@@ -224,7 +229,10 @@ class ShellAnalysis(unittest.TestCase):
                         "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.zz GIT_CONFIG_VALUE_0=commit git zz -m wip",
                         "echo 'git commit -m wip' | bash", "bash <<EOF\ngit commit -m $X\nEOF",
                         "G=git; $G commit -m wip", "$(echo git) commit -m wip",
-                        "echo \"$(gi''t commit -m wip)\""):
+                        "echo \"$(gi''t commit -m wip)\"",
+                        "bash <<< 'git commit -m wip'", "bash <(echo 'git commit -m wip')",
+                        "echo 'git commit -m wip' | sudo bash", "echo wip 1<>msg.txt && git commit -F msg.txt",
+                        "git diff --output=msg.txt && git commit -F msg.txt"):
             with self.subTest(command):
                 with self.assertRaises(cp.Unresolvable):
                     cp.analyze(command, self.dir)

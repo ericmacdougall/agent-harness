@@ -340,7 +340,7 @@ def repo_facts(repo):
 # --------------------------------------------------------------------------- shell analysis
 
 OPERATORS = ("&&", "||", ";;", "|&", ";", "|", "&", "(", ")", "\n")
-REDIRECTS = re.compile(r"^(?:\d*(?:>>|>|<|>&|<&|&>|&>>)|<<<)$")
+REDIRECTS = re.compile(r"^(?:\d*(?:>>|>|<|>&|<&|&>|&>>|<>|>\|)|<<<)$")
 
 
 def _heredocs(command: str):
@@ -828,6 +828,22 @@ GIT_KNOWN = {"add", "am", "archive", "backfill", "bisect", "branch", "bundle", "
              "mailinfo", "mailsplit", "patch-id", "stripspace", "lfs"}
 
 
+GIT_VALUE_OPTIONS = ("-C", "-c", "--namespace", "--exec-path", "--git-dir", "--work-tree", "--config-env")
+
+
+def _git_subcommand(argv):
+    i = 1
+    while i < len(argv):
+        word = argv[i][1]
+        if word in GIT_VALUE_OPTIONS:
+            i += 2
+        elif word.startswith("-"):
+            i += 1
+        else:
+            return word
+    return ""
+
+
 def _mentions_commit(text, depth):
     try:
         return bool(analyze(text, None, depth + 1))
@@ -921,6 +937,7 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
     for words, operator in simple_commands(tokenize(text)):
         piped, previous_op = previous_op in ("|", "|&"), operator
         stdin_body = stdin_raw = None
+        herestring = False
         argv = []
         skip_next = write_next = False
         for index, token in enumerate(words):
@@ -935,8 +952,9 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                 continue
             if REDIRECTS.match(token[1]):
                 skip_next, write_next = True, ">" in token[1]
+                herestring = herestring or token[1] == "<<<"
                 continue
-            attached = re.match(r"^\d*&?>>?(\S+)$", token[1])
+            attached = re.match(r"^\d*(?:&?>>?|<>|>\|)(\S+)$", token[1])
             if attached:
                 writes.append(write_target((token[0], attached.group(1), token[2])))
                 continue
@@ -949,10 +967,10 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                 if COMMIT_TEXT.search(word[1]) or any(_mentions_commit(part, depth) for part in inner):
                     raise Unresolvable("git commit inside $(...) or backticks cannot be checked; run git commit "
                                        "as its own command (capture output with 2>&1 | tee if needed)")
-        if argv and argv[0][2] and any(w[1] == "commit" for w in argv[1:]):
-            raise Unresolvable("the command name is computed at run time ($VAR or $(...)); run git commit directly")
         while argv and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0][1]) or argv[0][1] in RESERVED):
             argv = argv[1:]
+        if argv and argv[0][2] and any(w[1] == "commit" for w in argv[1:]):
+            raise Unresolvable("the command name is computed at run time ($VAR or $(...)); run git commit directly")
         while argv and os.path.basename(argv[0][1]) in WRAPPERS:
             wrapper = os.path.basename(argv[0][1])
             if wrapper == "env" and any(w[1] in ("-S", "--split-string") or w[1].startswith("--split-string=")
@@ -981,7 +999,10 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
             writes.append(destination)
             if destination:
                 writes.extend(os.path.join(destination, os.path.basename(w[1])) for w in operands[:-1])
-        sub_name = next((w[1] for w in argv[1:] if not w[1].startswith("-")), "") if name == "git" else ""
+        sub_name = _git_subcommand(argv) if name == "git" else ""
+        if name == "git" and sub_name in ("diff", "log", "show") and any(
+                w[1].startswith("--output") for w in argv):
+            sub_name = "diff-to-file"  # writes a file: not read-only
         segments.append(([w[1] for w in argv], name, sub_name))
         if name in ("cd", "pushd") and len(argv) >= 2:
             if argv[1][2]:
@@ -990,8 +1011,12 @@ def analyze(command: str, cwd: str, depth: int = 0, remote: str | None = None):
                 target = os.path.expanduser(argv[1][1])
                 cwd = target if os.path.isabs(target) else (os.path.join(cwd, target) if cwd else None)
             continue
+        if name in ("sudo", "doas") and COMMIT_TEXT.search(command) and any(
+                os.path.basename(w[1]) in SHELLS or os.path.basename(w[1]) == "git" for w in argv[1:]):
+            raise Unresolvable(f"{name} around a shell or git commit cannot be checked; run git commit directly")
         if name in SHELLS:
-            if ((piped and COMMIT_TEXT.search(text))
+            hidden = piped or herestring or "<(" in text
+            if ((hidden and COMMIT_TEXT.search(command))
                     or (stdin_raw and stdin_body is None and COMMIT_TEXT.search(stdin_raw))):
                 raise Unresolvable(f"{name} reads its script from a pipe or an unquoted heredoc the policy cannot "
                                    "see exactly; run git commit directly or use a quoted heredoc (<<'EOF')")
