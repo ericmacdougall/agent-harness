@@ -71,6 +71,8 @@ line is re-read at removal. Removal appends the full record to the archive and l
 
 ## Known limits
 
+A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt. A superseded ask is removable only when its replacement, a different ask, is done with verified evidence.
+
 The guard is best effort against shell tricks (a safety net for careless edits, not a sandbox); the event chain has
 no external anchor; a payload over 8 MB is rejected and recorded as a failure; messages are not pruned (a triaged
 message could be archived later); decisions have no removal path yet; session caches (sync offsets, stop-block

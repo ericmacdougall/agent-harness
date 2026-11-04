@@ -511,9 +511,13 @@ def catch_up(data: dict) -> None:
         return
     applied = data["appliedThrough"]
     missing = [e for e in tail if e["seq"] > applied.get(e["hiveId"], 0)]
-    first = min((e["seq"] for e in missing), default=0)
-    if missing and first != applied.get(missing[0]["hiveId"], 0) + 1:  # gap: replay everything
+    firsts = {}
+    for e in missing:
+        firsts[e["hiveId"]] = min(firsts.get(e["hiveId"], e["seq"]), e["seq"])
+    if any(first != applied.get(hive, 0) + 1 for hive, first in firsts.items()):  # gap in any hive: replay everything
+        sessions = data["sessions"]  # session caches are not part of the fold; keep them
         replayed = fold(read_events())
+        replayed["sessions"] = sessions
         data.clear()
         data.update(replayed)
         return
@@ -554,10 +558,13 @@ def transaction(timeout: float = LOCK_SECONDS):
         drain_spool(data)
         yield data
         unlink = data.pop("_unlink_draining", False)
+        drained = data.pop("_draining_size", None)
         commit(data)
         if unlink:
+            draining = files()["spool"].with_name(files()["spool"].name + ".draining")
             try:
-                files()["spool"].with_name(files()["spool"].name + ".draining").unlink()
+                if draining.stat().st_size == drained:  # a late writer's line would be lost with the file: keep it, dedupe next time
+                    draining.unlink()
             except OSError:
                 pass
 
@@ -626,6 +633,7 @@ def drain_spool(data: dict) -> None:
         raw = prov.read_small(draining, 32 << 20)
     except (OSError, prov.Problem):
         return
+    data["_draining_size"] = len(raw)
     seen = {m["humanCheck"].get("providerItemId") for m in data["messages"].values()}
     for line in raw.split(b"\n"):
         try:
@@ -663,10 +671,14 @@ def excerpt_of(text: str) -> str:
     return prov.clip(redact(" ".join(text[:65536].split()[:15])), 160)
 
 
-def text_ref(text: str) -> dict:
-    ex = excerpt_of(text)
-    return {"sha256": sha(prov.norm(text[:prov.MAX_TEXT])), "chars": len(text), "words": len(text.split()), "excerpt": ex,
-            "redaction": {"policy": "harness-redactor/1", "applied": True, "hits": ex.count("[redacted]")}}
+def text_ref(text: str, pasted=False) -> dict:
+    """sha256, counts and a redacted 15-word excerpt; pasted content gets no excerpt (the redactor is heuristic)."""
+    ex = "" if pasted else excerpt_of(text)
+    ref = {"sha256": sha(prov.norm(text[:prov.MAX_TEXT])), "chars": len(text), "words": len(text.split()),
+           "redaction": {"policy": "harness-redactor/1", "applied": True, "hits": ex.count("[redacted]")}}
+    if ex:
+        ref["excerpt"] = ex
+    return ref
 
 
 def classify_prompt(prompt: str):
@@ -714,7 +726,7 @@ def build_capture(data, runtime, session, transcript, text, pasted, source="prom
         binding = {"status": "bound", "boundAt": iso(now()), "attempts": 1} if line else binding
     msg = {"id": mid, "sessionId": session, "writer": who["hiveId"],
            "origin": {"actor": who, "at": at or iso(now()), "log": log, "binding": binding}, "capturedAt": iso(now()),
-           "capturedVia": via, "pastedOnly": pasted, "text": tref or text_ref(text), "triage": {"status": "untriaged"},
+           "capturedVia": via, "pastedOnly": pasted, "text": tref or text_ref(text, pasted), "triage": {"status": "untriaged"},
            "humanCheck": {"isHuman": True, "method": method}}
     if provider_item:
         msg["humanCheck"]["providerItemId"] = str(provider_item)[:200]
@@ -743,7 +755,7 @@ def prompt_capture_fields(payload: dict, runtime: str):
 def spoolable(fields: dict) -> dict:
     """Spool the redacted text reference only: raw human text never reaches disk outside the transcript."""
     out = {k: v for k, v in fields.items() if k != "text"}
-    out["tref"] = text_ref(fields["text"])
+    out["tref"] = text_ref(fields["text"], fields["pasted"])
     return out
 
 
@@ -916,7 +928,7 @@ def problems_for(data: dict, session: str, policy: dict, ts=None) -> list:
     ts, found = ts or now(), []
     for mid, m in data["messages"].items():
         if m["triage"]["status"] == "untriaged" and m["sessionId"] == session:
-            found.append(("untriaged", mid, f"{mid}: \"{m['text']['excerpt']}\"" + (" [pasted]" if m.get("pastedOnly") else "")))
+            found.append(("untriaged", mid, f"{mid}: \"{m['text'].get('excerpt', '[pasted content]')}\"" + (" [pasted]" if m.get("pastedOnly") else "")))
     for rid, ask in data["asks"].items():
         if ask["origin"]["actor"].get("sessionId") == session:
             flags = ask_flags(ask, policy, ts)
@@ -935,7 +947,7 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
     lines = [f"Work assignments: {len(ix['untriagedMessages'])} untriaged message(s), {len(asks)} open ask(s), "
              f"{len(flagged)} flagged (no owner, stopped owner or stale), {len(ix['openDecisions'])} open decision(s)."]
     for mid in ix["untriagedMessages"][:8]:
-        lines.append(f"  UNTRIAGED {mid}: \"{data['messages'][mid]['text']['excerpt']}\" -> work_assignments.py split --msg {mid} --item '...' | no-ask")
+        lines.append(f"  UNTRIAGED {mid}: \"{data['messages'][mid]['text'].get('excerpt', '[pasted content]')}\" -> work_assignments.py split --msg {mid} --item '...' | no-ask")
     for ask in ordered[:limit]:
         flag = ",".join(ask_flags(ask, policy, ts))
         lines.append(f"  {ask['id']} [{ask['state']}] owner={owner_of(ask) or 'none'}{' !' + flag if flag else ''}: "
@@ -1308,6 +1320,8 @@ def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, de
     if binding == "same_message_retraction":
         if ask["origin"].get("messageId") != msg["id"]:
             raise WAError("same_message_retraction needs the ask's own origin message")
+        if not re.search(r"(?i)cancel|never ?mind|forget|scrap|drop|stop|no wait|instead|retract|ignore|don'?t", quote):
+            raise WAError("same_message_retraction: the quote must be the retracting words")
     elif binding == "explicit_reference":
         ref = {ask["id"].lower(), (ask.get("migratedFrom", {}).get("id") or "").lower()} - {""}
         if not (any(r in quote.lower() for r in ref) or len(words_of(quote) & words_of(ask["request"]["compressed"])) >= 3):
@@ -1389,9 +1403,10 @@ def eligible(ask: dict, ts: float, data=None) -> tuple:
             return False, f"cancel proof no longer verifies: {error}"
         return True, "cancelled with verified user proof for more than 24h"
     target = next((r["target"] for r in ask.get("related", []) if r["kind"] == "superseded_by"), None)
-    if data is not None and target in data["asks"] and data["asks"][target]["state"] in CLOSED:
-        return True, "superseded by a closed ask"
-    return False, "superseding ask is not closed"
+    other = data["asks"].get(target) if data is not None and target != ask["id"] else None
+    if other is not None and other["state"] == "done":  # the replacement itself passed the done gate (verified evidence)
+        return True, "superseded by a done ask"
+    return False, "the superseding ask is not a different ask that is done"
 
 
 # --------------------------------------------------------------------------- ask construction and cli
@@ -1648,6 +1663,8 @@ def cmd_relate(args):
                "decides": "decided_by", "follows": "see_also", "see_also": "see_also"}
     if args.kind not in inverse:
         raise WAError("kind must be one of " + ", ".join(sorted(inverse)))
+    if args.a == args.b:
+        raise WAError("a record cannot be related to itself")
     with transaction() as data:
         left = data["asks"].get(args.a) or data["decisions"].get(args.a)
         right = data["asks"].get(args.b) or data["decisions"].get(args.b)

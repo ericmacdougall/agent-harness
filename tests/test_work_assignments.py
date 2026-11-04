@@ -132,8 +132,8 @@ class CaptureTest(Base):
         text = "please fix the login page sk-secretsecretsecret1 " + "word " * 40
         msg = self.capture(text)
         self.assertEqual(msg["triage"]["status"], "untriaged")
-        self.assertLessEqual(len(msg["text"]["excerpt"].split()), 15)
-        self.assertNotIn("sk-secret", msg["text"]["excerpt"])
+        self.assertLessEqual(len(msg["text"].get("excerpt", "").split()), 15)
+        self.assertNotIn("sk-secret", msg["text"].get("excerpt", ""))
         self.assertEqual(msg["sessionId"], SID)
         log = msg["origin"]["log"]
         self.assertEqual((log["lineStart"], msg["origin"]["binding"]["status"]), (1, "bound"))
@@ -169,10 +169,14 @@ class CaptureTest(Base):
         self.capture("real ask here <system-reminder>injected</system-reminder> and more")
         self.assertEqual(len(self.data()["messages"]), 1)
 
-    def test_pasted_only_is_captured_and_flagged(self):
-        self.hook("prompt", self.payload('<pasted_content id="1">a pasted log line</pasted_content>'))
+    def test_pasted_only_is_captured_flagged_and_has_no_excerpt(self):
+        """Red-team MINOR: the redactor is heuristic, so pasted content leaves no excerpt behind."""
+        self.hook("prompt", self.payload('<pasted_content id="1">a pasted log line with token hunter2xyz</pasted_content>'))
         msg = next(iter(self.data()["messages"].values()))
         self.assertTrue(msg["pastedOnly"])
+        self.assertNotIn("excerpt", msg["text"])
+        self.assertNotIn("pasted log line", wa.files()["events"].read_text())
+        self.check_schema()
 
     def test_subagent_payload_creates_no_request(self):
         """NEG-12."""
@@ -216,7 +220,7 @@ class CaptureTest(Base):
         started = time.monotonic()
         msg = self.capture(big)
         self.assertLess(time.monotonic() - started, 5)
-        self.assertLessEqual(len(msg["text"]["excerpt"].split()), 15)
+        self.assertLessEqual(len(msg["text"].get("excerpt", "").split()), 15)
 
     def test_unbound_pending_gets_cannot_bind_notice_and_violation(self):
         self.hook("prompt", self.payload("ask whose transcript line never appears"))
@@ -531,6 +535,18 @@ class RemovalTest(Base):
             self.assertEqual(self.cli("remove", aid)[0], 2)
         self.assertEqual(self.cli("remove", aid)[0], 0)
 
+    def test_self_supersession_cannot_remove_an_ask(self):
+        """Code-inspection MAJOR: an ask superseded by itself (or by anything not done) used to be removable."""
+        _, aid = self.split("old thing", "the old approach to exporting")
+        self.assertEqual(self.cli("relate", aid, "superseded_by", aid)[0], 2)
+        _, other = self.split("new thing", "the new approach to exporting")
+        self.cli("relate", aid, "superseded_by", other)
+        self.cli("update", aid, "--state", "superseded")
+        self.cli("update", other, "--owner", "main")
+        self.cli("update", other, "--state", "cancelled")  # refused: cancelling needs proof
+        CLOCK[0] += 25 * 3600
+        self.assertEqual(self.cli("remove", aid)[0], 2)
+
     def test_removal_boundary_is_24h_plus_a_second(self):
         aid = self.done_ask(24)
         self.assertEqual(self.cli("remove", aid)[0], 2)  # exactly 24h is not "more than 24h"
@@ -551,6 +567,14 @@ class RemovalTest(Base):
         uid = msg["origin"]["log"]["messageUuid"]
         args = self.cancel_args(aid, uid, 1, "cancel that, forget dark mode", "same_message_retraction")
         self.assertEqual(self.cli(*args)[0], 0)
+
+    def test_retraction_binding_needs_retracting_words(self):
+        msg = self.capture("please add a dark mode toggle to the settings page")
+        self.cli("split", "--msg", msg["id"], "--item", "add dark mode toggle")
+        aid = sorted(self.asks())[-1]
+        uid = msg["origin"]["log"]["messageUuid"]
+        args = self.cancel_args(aid, uid, 1, "add a dark mode toggle to the settings page", "same_message_retraction")
+        self.assertEqual(self.cli(*args)[0], 2)
 
     def test_decision_answer_binding(self):
         aid, uid, line = self.setup_cancel(ask_text="refactor the billing exporter module")
