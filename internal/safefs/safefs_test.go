@@ -106,3 +106,66 @@ func TestReadRegularLimits(t *testing.T) {
 		}
 	}
 }
+
+func TestReplaceRequiresUnchangedPrior(t *testing.T) {
+	dir := t.TempDir()
+	d, _ := OpenDir(dir)
+	defer d.Close()
+	if err := d.Replace("s.json", []byte("v1"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Replace("s.json", []byte("v1b"), nil); !errors.Is(err, ErrExists) {
+		t.Fatalf("absent precondition: %v", err)
+	}
+	snap, err := d.Snapshot("s.json", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Someone else replaces the file between our read and our write.
+	os.WriteFile(filepath.Join(dir, "other"), []byte("v1"), 0o600)
+	os.Rename(filepath.Join(dir, "other"), filepath.Join(dir, "s.json"))
+	if err := d.Replace("s.json", []byte("v2"), snap); !errors.Is(err, ErrChanged) {
+		t.Fatalf("stale snapshot: %v", err)
+	}
+	snap, _ = d.Snapshot("s.json", 100)
+	if err := d.Replace("s.json", []byte("v2"), snap); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := d.ReadRegular("s.json", 10); string(b) != "v2" {
+		t.Fatalf("got %q", b)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("leftovers: %v", entries)
+	}
+}
+
+func TestMkdirPrivate(t *testing.T) {
+	dir := t.TempDir()
+	d, _ := OpenDir(dir)
+	defer d.Close()
+	sub, err := d.MkdirPrivate("cache")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub.Close()
+	again, err := d.MkdirPrivate("cache")
+	if err != nil {
+		t.Fatalf("existing dir: %v", err)
+	}
+	again.Close()
+	if runtime.GOOS != "windows" {
+		fi, _ := os.Stat(filepath.Join(dir, "cache"))
+		if fi.Mode().Perm() != 0o700 {
+			t.Fatalf("mode %v", fi.Mode().Perm())
+		}
+		os.Symlink(t.TempDir(), filepath.Join(dir, "ln"))
+		if _, err := d.MkdirPrivate("ln"); !errors.Is(err, ErrUnsafe) {
+			t.Fatalf("symlink: %v", err)
+		}
+	}
+	os.WriteFile(filepath.Join(dir, "f"), nil, 0o600)
+	if _, err := d.MkdirPrivate("f"); !errors.Is(err, ErrUnsafe) {
+		t.Fatalf("file: %v", err)
+	}
+}
