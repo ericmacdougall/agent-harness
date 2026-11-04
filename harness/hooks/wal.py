@@ -123,6 +123,53 @@ def append(path: Path, record: dict) -> None:
             raise ValueError("WAL target changed during append")
 
 
+def work_dir_context(session_id: str, event: str, data: dict) -> str:
+    """Announce the durable per-session work directory; never fail the WAL hook over it."""
+    try:
+        import workdir
+        path = workdir.ensure_session_dir(session_id)
+    except Exception as exc:  # the WAL is the fail-closed record, not the work dir
+        return (f" Durable work dir unavailable ({exc.__class__.__name__}); keep scripts, run kits, packets, "
+                "TSVs, filters and job state in a private directory under ~/.agent-harness/work, not /tmp.")
+    if event == "prompt":  # repeated every turn: keep it short
+        return (f" Durable work dir: {path}/ for anything needed after a restart; /tmp and the scratchpad "
+                "are disposable.")
+    text = (f" Durable work dir: {path}/ (mode 0700). Put scripts, run kits, review packets, TSVs, filters, "
+            "job state and anything needed after a restart there; /tmp and the session scratchpad are "
+            "for disposable output only, and a reboot or retention pruning can delete them.")
+    if event == "subagent":
+        agent = safe_id(data.get("agent_id"))
+        text += f" Shared by this session's agents: keep your files in {path}/agent-{agent}/ or a task-named subfolder."
+    if event == "session":
+        text += (" A resumed session keeps its session id and so this directory; a fork gets a new one, and "
+                 "earlier session directories remain under ~/.agent-harness/work/.")
+        try:
+            text += workdir.scratchpad_drift_warning(data.get("scratchpad_dir"))
+            if data.get("source") == "startup":
+                text += workdir.retention_hint(session_id)
+            workdir.spawn_task_output_prune(session_id=session_id)  # detached, at most daily
+        except Exception:
+            pass
+    return text
+
+
+def tmp_advisory_output(data: dict) -> tuple:
+    """Advisory only: count and message for durable state written under /tmp; never raises."""
+    try:
+        import workdir
+        paths = workdir.tmp_advisory(str(data.get("tool_name", "")), data.get("tool_input"),
+                                     data.get("scratchpad_dir"))
+        if not paths:
+            return 0, None
+        message = workdir.advisory_message(paths, data.get("session_id"))
+        output = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": message}}
+        if workdir.first_advisory(data.get("session_id")):
+            output["systemMessage"] = message  # shown to the user once per session
+        return len(paths), json.dumps(output)
+    except Exception:
+        return 0, None
+
+
 def main() -> None:
     event = sys.argv[1]
     data = json.load(sys.stdin)
@@ -138,12 +185,12 @@ def main() -> None:
     if event == "session":
         record["source"] = data.get("source", "")
         append(main_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": f"Session WAL: {main_wal}. Record task ownership, decisions, changes, checks, commits and handoffs; omit secrets and PII."}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": f"Session WAL: {main_wal}. Record task ownership, decisions, changes, checks, commits and handoffs; omit secrets and PII." + work_dir_context(session_id, event, data)}}))
     elif event == "prompt":
         prompt = str(data.get("prompt", ""))
         record["prompt_chars"] = len(prompt)
         append(main_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": f"Session WAL: {main_wal}. Follow Agent Harness triage. Record a human-readable intent before edits; the hook metadata alone is insufficient. Use the fast path for small fixes. For substantive work, brief and reuse a background owner, then review, test, publish the feature branch and integrate locally. Ask about material ambiguity and keep the user updated. Never log secrets or PII."}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": f"Session WAL: {main_wal}. Follow Agent Harness triage. Record a human-readable intent before edits; the hook metadata alone is insufficient. Use the fast path for small fixes. For substantive work, brief and reuse a background owner, then review, test, publish the feature branch and integrate locally. Ask about material ambiguity and keep the user updated. Never log secrets or PII." + work_dir_context(session_id, event, data)}}))
     elif event == "subagent":
         agent_id = safe_id(data.get("agent_id"))
         agent_type = safe_id(data.get("agent_type"))
@@ -151,7 +198,7 @@ def main() -> None:
         record.update({"agent_id": agent_id, "agent_type": agent_type})
         append(main_wal, record)
         append(agent_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": f"Your private WAL: {agent_wal}. Read the main scope brief and decision log in {main_wal}; challenge omissions and harmful shortcuts. Before editing, record intent, assumptions, domain invariants, a risk table and negative acceptance cases. Then log decisions, tests, commits, blockers and handoff. Do not log secrets or PII."}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": f"Your private WAL: {agent_wal}. Read the main scope brief and decision log in {main_wal}; challenge omissions and harmful shortcuts. Before editing, record intent, assumptions, domain invariants, a risk table and negative acceptance cases. Then log decisions, tests, commits, blockers and handoff. Do not log secrets or PII." + work_dir_context(session_id, event, data)}}))
     elif event == "pretool":
         agent_id = data.get("agent_id")
         wal = root / f"agent-{safe_id(agent_id)}.jsonl" if agent_id else main_wal
@@ -163,7 +210,12 @@ def main() -> None:
             "tool_use_id": data.get("tool_use_id", ""),
             "target_chars": len(str(target)),
         })
+        advisories, output = tmp_advisory_output(data)
+        if advisories:
+            record["tmp_advisory"] = advisories  # a count only: paths stay out of the WAL
         append(wal, record)
+        if output:
+            print(output)
     else:
         raise ValueError(f"unknown event: {event}")
 

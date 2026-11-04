@@ -1523,14 +1523,16 @@ def parse_args():
         part.add_argument("--original", type=Path, required=True)
         part.add_argument("--original-branch", required=True)
         part.add_argument("--generation", help="Require this exact current generation")
-        part.add_argument("--kit-file", type=Path)
+        part.add_argument("--kit-file", type=Path,
+                          help="mode-0600 run kit, e.g. ~/.agent-harness/work/<session-id>/<task>/kit.json (not /tmp)")
         part.add_argument("--timeout", type=int, default=120, help="Seconds for each Git and GitHub command")
     prep = sub.choices["prepare"]
     prep.add_argument("--source", type=Path)
     prep.add_argument("--expected-source-head")
     prep.add_argument("--expected-original-head")
     prep.add_argument("--pr-title")
-    prep.add_argument("--pr-body-file", type=Path)
+    prep.add_argument("--pr-body-file", type=Path,
+                      help="mode-0600 PR body, e.g. ~/.agent-harness/work/<session-id>/<task>/pr-body.md")
     prep.add_argument("--reconcile-only", action="store_true", help="Query a pending remote outcome without publishing or changing checkout")
     prep.add_argument("--local-only", action="store_true", help="Explicitly choose guarded local delivery")
     prep.add_argument("--new-generation", action="store_true", help="Supersede only a settled generation")

@@ -3,9 +3,11 @@ import importlib.util
 import json
 import hashlib
 import os
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -578,6 +580,114 @@ class WalTests(unittest.TestCase):
                                         env={**os.environ, 'HOME': str(self.home)}, capture_output=True, text=True, timeout=5)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(path.exists())
+
+
+class DurableWorkDirHookTests(unittest.TestCase):
+    """The WAL hook announces a durable work dir and warns, never blocks, on /tmp scripts."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name).resolve()
+        self.hooks = WAL.parent
+
+    def invoke(self, event, data, script=None, env=None):
+        return subprocess.run([sys.executable, str(script or WAL), event], input=json.dumps(data),
+                              text=True, capture_output=True,
+                              env={**os.environ, "HOME": str(self.home), **(env or {})}, timeout=30)
+
+    def context(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+
+    def test_session_prompt_and_subagent_announce_private_work_dir(self):
+        work = self.home / ".agent-harness/work/durable-1"
+        text = self.context(self.invoke("session", {"session_id": "durable-1", "source": "startup"}))
+        self.assertIn(f"Durable work dir: {work}/", text)
+        self.assertIn("/tmp and the session scratchpad are for disposable output only", text)
+        self.assertEqual(stat.S_IMODE(work.stat().st_mode), 0o700)
+        self.assertTrue((work / ".agent-harness-session.json").is_file())
+        self.assertIn(f"Durable work dir: {work}/",
+                      self.context(self.invoke("prompt", {"session_id": "durable-1", "prompt": "x"})))
+        sub = self.context(self.invoke("subagent", {"session_id": "durable-1", "agent_id": "a1",
+                                                    "agent_type": "task-owner"}))
+        self.assertIn(f"{work}/agent-a1/", sub)
+
+    def test_session_warns_when_scratchpad_is_still_in_tmp(self):
+        pad = "/private/tmp/claude-501/-Users-x/0f8fad5b-d9cb-469f-a165-70867728950e/scratchpad"
+        text = self.context(self.invoke("session", {"session_id": "drift", "source": "resume",
+                                                    "scratchpad_dir": pad}))
+        self.assertIn("relocation is not in effect", text)
+        durable = str(self.home / ".agent-harness/scratch/claude-501/p/0f8fad5b-d9cb-469f-a165-70867728950e/scratchpad")
+        self.assertNotIn("not in effect", self.context(self.invoke(
+            "session", {"session_id": "drift", "source": "resume", "scratchpad_dir": durable})))
+
+    def test_pretool_tmp_script_gets_non_blocking_advisory_without_logging_path(self):
+        result = self.invoke("pretool", {"session_id": "adv", "tool_name": "Write", "tool_use_id": "w1",
+                                         "tool_input": {"file_path": "/tmp/cleanup-plan.py", "content": "x"}})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        hook = output["hookSpecificOutput"]
+        self.assertEqual(hook["hookEventName"], "PreToolUse")
+        self.assertNotIn("permissionDecision", hook)
+        self.assertNotIn("decision", output)
+        self.assertIn(str(self.home / ".agent-harness/work/adv") + "/", hook["additionalContext"])
+        self.assertIn("/tmp/cleanup-plan.py", output["systemMessage"])
+        wal = (self.home / ".claude/wals/adv/main.jsonl").read_text()
+        self.assertEqual(json.loads(wal.splitlines()[-1])["tmp_advisory"], 1)
+        self.assertNotIn("cleanup-plan", wal)
+        # The user-facing message is shown once per session; Claude still gets context each time.
+        again = json.loads(self.invoke("pretool", {"session_id": "adv", "tool_name": "Bash", "tool_use_id": "b1",
+                                                   "tool_input": {"command": "cat > /tmp/k.sh <<'EOF'\nx\nEOF"}}).stdout)
+        self.assertNotIn("systemMessage", again)
+        self.assertIn("/tmp/k.sh", again["hookSpecificOutput"]["additionalContext"])
+
+    def test_pretool_quiet_for_ordinary_and_disposable_writes(self):
+        for tool_input in ({"file_path": "/Users/someone/repo/app.py"}, {"file_path": "/tmp/run.log"},
+                           {"file_path": str(self.home / ".agent-harness/work/q/kit.json")}):
+            with self.subTest(tool_input=tool_input):
+                result = self.invoke("pretool", {"session_id": "q", "tool_name": "Write",
+                                                 "tool_use_id": "w", "tool_input": tool_input})
+                self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+
+    def test_pretool_kill_switch_disables_advisory(self):
+        result = self.invoke("pretool", {"session_id": "k", "tool_name": "Write", "tool_use_id": "w",
+                                         "tool_input": {"file_path": "/tmp/a.py"}},
+                             env={"AGENT_HARNESS_TMP_ADVISORY": "0"})
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+
+    def test_oversized_and_malformed_inputs_stay_fast_and_silent(self):
+        huge = "cat > /tmp/a.sh <<'EOF'\n" + ("echo x > /tmp/y.py\n" * 110000) + "EOF"
+        started = time.monotonic()
+        result = self.invoke("pretool", {"session_id": "big", "tool_name": "Bash", "tool_use_id": "b",
+                                         "tool_input": {"command": huge}})
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        # A non-object tool_input already fails closed in the WAL record itself; not covered here.
+        for tool_input in (None, {"command": ["list"]}, {"file_path": 7}, {"command": "echo 'open > /tmp/q"}):
+            result = self.invoke("pretool", {"session_id": "big", "tool_name": "Bash", "tool_use_id": "m",
+                                             "tool_input": tool_input})
+            self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+
+    def test_missing_workdir_module_never_blocks_hooks(self):
+        isolated = self.home / "hooks"
+        isolated.mkdir()
+        (isolated / "wal.py").write_bytes(WAL.read_bytes())
+        text = self.context(self.invoke("prompt", {"session_id": "nomod", "prompt": "x"}, script=isolated / "wal.py"))
+        self.assertIn("Durable work dir unavailable", text)
+        result = self.invoke("pretool", {"session_id": "nomod", "tool_name": "Write", "tool_use_id": "w",
+                                         "tool_input": {"file_path": "/tmp/a.py"}}, script=isolated / "wal.py")
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+
+    def test_symlinked_work_dir_is_refused_and_hook_still_succeeds(self):
+        outside = self.home / "outside"
+        outside.mkdir()
+        (self.home / ".agent-harness/work").mkdir(parents=True)
+        (self.home / ".agent-harness/work/evil").symlink_to(outside)
+        text = self.context(self.invoke("session", {"session_id": "evil", "source": "startup"}))
+        self.assertIn("Durable work dir unavailable", text)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertTrue((self.home / ".claude/wals/evil/main.jsonl").exists())
 
 
 if __name__ == "__main__":

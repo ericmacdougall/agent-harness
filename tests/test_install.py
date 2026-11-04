@@ -8,11 +8,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from install import END, START, ROOT, install, merged_instructions
+from install import (END, START, ROOT, durable_tmp_choice, install, merged_instructions,
+                     save_durable_tmp_choice, scratch_status)
 
 
 class InstallerTests(unittest.TestCase):
     def setUp(self):
+        # Sessions started after install export CLAUDE_CODE_TMPDIR; tests must not depend on the host.
+        isolate = patch.dict(os.environ)
+        isolate.start()
+        self.addCleanup(isolate.stop)
+        os.environ.pop("CLAUDE_CODE_TMPDIR", None)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name).resolve()
@@ -766,6 +772,96 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(after.pop('CLAUDE.md'), before['CLAUDE.md'])
         self.assertEqual(after.pop('settings.json'), before['settings.json'])
         self.assertEqual(set(after), {'agents/task-owner.md'})
+
+
+class DurableScratchInstallTests(unittest.TestCase):
+    def setUp(self):
+        # Sessions started after install export CLAUDE_CODE_TMPDIR; tests must not depend on the host.
+        isolate = patch.dict(os.environ)
+        isolate.start()
+        self.addCleanup(isolate.stop)
+        os.environ.pop("CLAUDE_CODE_TMPDIR", None)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name).resolve()
+        self.claude = self.home / ".claude"
+        self.claude.mkdir()
+        self.scratch = self.home / ".agent-harness" / "scratch"
+
+    def settings(self):
+        return json.loads((self.claude / "settings.json").read_text())
+
+    def test_sets_managed_tmpdir_and_prepares_private_root(self):
+        (self.claude / "settings.json").write_text(json.dumps({"env": {"EXAMPLE": "1"}}))
+        install(self.home, apply=True)
+        env = self.settings()["env"]
+        self.assertEqual(env, {"EXAMPLE": "1", "CLAUDE_CODE_TMPDIR": str(self.scratch)})
+        self.assertIn("Bash(python3 ~/.claude/hooks/workdir.py prune)", self.settings()["permissions"]["allow"])
+        self.assertEqual((self.claude / "hooks/workdir.py").read_bytes(),
+                         (ROOT / "harness/hooks/workdir.py").read_bytes())
+        calls = []
+        status = scratch_status(self.home, True, run=lambda *a, **k: calls.append(a[0]) or
+                                subprocess.CompletedProcess(a[0], 0))
+        self.assertEqual(stat.S_IMODE(self.scratch.stat().st_mode), 0o700)
+        self.assertTrue((self.scratch / ".metadata_never_index").exists())
+        self.assertIn("restart running sessions", status)
+        if sys.platform == "darwin":
+            self.assertEqual(calls, [["tmutil", "addexclusion", str(self.scratch)]])
+
+    def test_user_value_is_never_overwritten(self):
+        (self.claude / "settings.json").write_text(json.dumps({"env": {"CLAUDE_CODE_TMPDIR": "/tmp"}}))
+        install(self.home, apply=True)
+        self.assertEqual(self.settings()["env"]["CLAUDE_CODE_TMPDIR"], "/tmp")
+        self.assertIn("not managed", scratch_status(self.home, True))
+        self.assertFalse(self.scratch.exists())
+
+    def test_opt_out_removes_only_managed_value_and_is_remembered(self):
+        install(self.home, apply=True)
+        self.assertIn("CLAUDE_CODE_TMPDIR", self.settings()["env"])
+        install(self.home, apply=True, durable_tmp=False)
+        self.assertNotIn("CLAUDE_CODE_TMPDIR", self.settings().get("env", {}))
+        save_durable_tmp_choice(self.home, False)
+        self.assertFalse(durable_tmp_choice(self.home, None))
+        install(self.home, apply=True, durable_tmp=durable_tmp_choice(self.home, None))
+        self.assertNotIn("CLAUDE_CODE_TMPDIR", self.settings().get("env", {}))
+        state = self.home / ".agent-harness" / "install-state.json"
+        self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o600)
+        self.assertTrue(durable_tmp_choice(self.home, True))
+        foreign = {"env": {"CLAUDE_CODE_TMPDIR": "/Volumes/fast/tmp"}}
+        (self.claude / "settings.json").write_text(json.dumps(foreign))
+        install(self.home, apply=True, durable_tmp=False)
+        self.assertEqual(self.settings()["env"], foreign["env"])
+
+    def test_shell_exported_value_is_respected(self):
+        with patch.dict(os.environ, {"CLAUDE_CODE_TMPDIR": "/Volumes/fast"}):
+            install(self.home, apply=True)
+            self.assertIn("exported in the shell", scratch_status(self.home, True))
+        self.assertNotIn("CLAUDE_CODE_TMPDIR", self.settings().get("env", {}))
+
+    def test_saved_choice_is_parsed_strictly(self):
+        state = self.home / ".agent-harness" / "install-state.json"
+        state.parent.mkdir()
+        for raw, expected in (('{"durable_tmp": "false"}', True), ('{"durable_tmp": false}', False),
+                              ("not json", True), ("[]", True)):
+            state.write_text(raw)
+            self.assertEqual(durable_tmp_choice(self.home, None), expected, raw)
+
+    def test_symlinked_harness_root_fails_before_settings_change(self):
+        outside = self.home / "outside"
+        outside.mkdir()
+        (self.home / ".agent-harness").symlink_to(outside)
+        (self.claude / "settings.json").write_text("{}")
+        result = subprocess.run([sys.executable, str(ROOT / "install.py"), "--apply", "--no-durable-tmp",
+                                 "--home", str(self.home)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("could not save the durable-tmp choice", result.stderr)
+        self.assertEqual((self.claude / "settings.json").read_text(), "{}")
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_rejects_non_object_env(self):
+        (self.claude / "settings.json").write_text(json.dumps({"env": ["bad"]}))
+        with self.assertRaises(ValueError):
+            install(self.home, apply=True)
 
 
 if __name__ == "__main__":
