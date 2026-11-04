@@ -283,20 +283,24 @@ def domain_section(repo: Path, base, changed_paths=None):
         if state['disabled']:
             return '', state['source']
         detected, failure = domain_gates.detect_full(repo, paths)
+        notice = ''
         if failure:
-            if failure.startswith('scan truncated') or 'too deeply nested' in failure:
-                # a size or cap limit only warns here: refusing would lock enforce-mode reviews out of every large
-                # repo. Real scan errors (not a checkout, git failure) still refuse below.
-                print(f'Warning: domain scan incomplete ({failure}); reviewer checklist may be partial', file=sys.stderr)
-            else:
+            hiding = failure.startswith('scan truncated') or 'too deeply nested' in failure
+            allowed = domain_gates.allow_truncated(policy)
+            if not hiding:
                 raise RuntimeError('domain scan incomplete: ' + failure)
+            if enforcing and not detected and not allowed:
+                raise RuntimeError(f'the scan was incomplete ({failure}) and found no domain, so a signal may be hidden; '
+                                   'set domain_gates.allow_truncated in the installed spec_policy.json to review anyway')
+            notice = domain_gates.incomplete_notice(failure)
+            print('Warning: ' + notice.strip().splitlines()[-1], file=sys.stderr)
         if not detected:
-            return '', None
+            return notice, None
         section = domain_gates.packet_section([d['domain'] for d in detected], repo, DOMAIN_SECTION_LIMIT,
                                               ignore_repo_file=distrust)
         if not section:
             raise RuntimeError('domain checklist data unusable')
-        return section, None
+        return section + notice, None
     except Exception as error:
         if enforcing:  # enforce mode must never review without the checklist it requires
             raise OSError(f'domain gates enforce mode: checklist unavailable ({error}); refusing to review') from None

@@ -324,6 +324,7 @@ def repo_options(repo, ignore: bool = False) -> dict:
     options = {}
     if data.get("disabled") is True:
         options["disabled"] = True
+    options["ignored_keys"] = [k for k in ("allow_truncated", "mode") if k in data]  # loosening keys a repo may not set
     extra = data.get("extra_checklists")
     if isinstance(extra, dict):
         options["extra"] = _valid_extra(extra)
@@ -447,6 +448,12 @@ def suggested_prompts(domains) -> list:
 
 # --------------------------------------------------------------------------- settings
 
+def incomplete_notice(failure: str) -> str:
+    """Visible text for packets and spec blocks when a scan limit may have hidden a blockchain signal."""
+    return ("\n### Domain scan incomplete\nBlockchain detection hit a safety limit (" + _clean(failure, 120) +
+            "), so the checklist may be missing. Review for blockchain risks manually.\n")
+
+
 def allow_truncated(policy) -> bool:
     config = (policy or {}).get("domain_gates")
     return isinstance(config, dict) and config.get("allow_truncated") is True
@@ -465,9 +472,21 @@ def settings(repo=None, policy=None, env=None, ignore_repo_file: bool = False) -
     disabled = env_off or config.get("disabled") is True or repo_off
     source = ("env HARNESS_DOMAIN_GATES" if env_off
               else "spec_policy.json" if config.get("disabled") is True else OPT_OUT_FILE)
-    warning = ("HARNESS_DOMAIN_GATES=off ignored: spec_policy.json domain_gates.mode is enforce "
-               "(loosen it in the installed policy file)") if env_asked and not env_off else None
-    return {"disabled": disabled, "mode": mode, "source": source if disabled else None, "warning": warning}
+    warnings = []
+    if env_asked and not env_off:
+        warnings.append("HARNESS_DOMAIN_GATES=off ignored: spec_policy.json domain_gates.mode is enforce "
+                        "(loosen it in the installed policy file)")
+    if str(env.get("HARNESS_DOMAIN_GATES_ALLOW_TRUNCATED", "")).strip():
+        warnings.append("environment HARNESS_DOMAIN_GATES_ALLOW_TRUNCATED ignored: allow_truncated comes only from "
+                        "the installed spec_policy.json")
+    repo_opts = repo_options(repo, ignore_repo_file)
+    for key in repo_opts.get("ignored_keys", []):
+        warnings.append(f"{OPT_OUT_FILE} key {key} ignored: repo files cannot loosen gates; set domain_gates.{key} "
+                        "in the installed spec_policy.json")
+    if mode == "enforce" and repo_opts.get("disabled") is True:
+        warnings.append(f"{OPT_OUT_FILE} disabled ignored: spec_policy.json domain_gates.mode is enforce")
+    return {"disabled": disabled, "mode": mode, "source": source if disabled else None,
+            "warning": "; ".join(warnings) or None}
 
 
 def active_domains(repo, policy=None, changed_paths=None, env=None, ignore_repo_file: bool = False) -> list:

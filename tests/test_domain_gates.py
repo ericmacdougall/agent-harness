@@ -585,15 +585,66 @@ class PeerReviewTests(unittest.TestCase):
             not_git = Path(tempfile.mkdtemp())
             with self.assertRaises(OSError):  # a real scan error still refuses
                 pr.domain_section(not_git, "b" * 40, changed_paths=[])
-            quiet = io.StringIO()
-            with mock.patch.object(dg, "MAX_FILES", 1), contextlib.redirect_stderr(quiet):  # truncated, no chain signal
-                result = pr.domain_section(make_repo({"a/package.json": "{}", "b/package.json": "{}"}), "b" * 40, changed_paths=[])
-            self.assertEqual(result, ("", None))
-            self.assertIn("scan incomplete", quiet.getvalue())
+            clean = make_repo({"a/package.json": "{}", "b/package.json": "{}"})  # clean scan, no signal: unaffected
+            self.assertEqual(pr.domain_section(clean, "b" * 40, changed_paths=[]), ("", None))
         warn = {"domain_gates": {"mode": "warn"}}  # control: warn keeps the warning behaviour
         with mock.patch.object(sf, "load_spec_policy", return_value=warn), mock.patch.object(dg, "CHECKLIST_FILE", bad), \
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"]), ("", None))
+
+    def evasion_repos(self):
+        ethers = json.dumps({"dependencies": {"ethers": "6"}})
+        deep = '{"dependencies": {"ethers": "6"}, "x": ' + "[" * 5000 + "]" * 5000 + "}"
+        cases = {
+            "oversized manifest": (make_repo({"package.json": ethers[:-1] + ', "pad": "' + "x" * 3000 + '"}'}), {"MAX_MANIFEST_BYTES": 2000}),
+            "deep nesting": (make_repo({"package.json": deep}), {}),
+            "manifest cap": (make_repo({**{f"a{i:03d}/package.json": "{}" for i in range(5)}, "z/package.json": ethers}), {"MAX_MANIFESTS": 3}),
+            "file cap": (make_repo({**{f"0/ledger{i}.txt": "x" for i in range(8)}, "z/A.sol": "contract A {}"}), {"MAX_FILES": 3}),
+        }
+        return cases
+
+    def test_enforce_refuses_when_a_limit_may_hide_the_signal(self):
+        enforce = {"domain_gates": {"mode": "enforce"}}
+        allow = {"domain_gates": {"mode": "enforce", "allow_truncated": True}}
+        for name, (repo, limits) in self.evasion_repos().items():
+            with self.subTest(case=name):
+                with mock.patch.multiple(dg, **{"MAX_FILES": dg.MAX_FILES, **limits}):
+                    with mock.patch.object(sf, "load_spec_policy", return_value=enforce):
+                        with self.assertRaises(OSError) as ctx:
+                            pr.domain_section(repo, "b" * 40, changed_paths=[])
+                    self.assertIn("allow_truncated", str(ctx.exception))
+                    with mock.patch.object(sf, "load_spec_policy", return_value=allow), contextlib.redirect_stderr(io.StringIO()):
+                        section, _ = pr.domain_section(repo, "b" * 40, changed_paths=[])
+                    self.assertIn("Domain scan incomplete", section)  # visible in the review prompt, not only stderr
+                    with mock.patch.object(sf, "load_spec_policy", return_value={"domain_gates": {"mode": "warn"}}), \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        section, _ = pr.domain_section(repo, "b" * 40, changed_paths=[])
+                    self.assertIn("Domain scan incomplete", section)
+                    block = sf.append_domain_block("# Spec\n", repo, {})
+                    self.assertIn("Domain scan incomplete", block)  # and in the spec block
+
+    def test_allow_truncated_only_from_installed_policy(self):
+        enforce = {"domain_gates": {"mode": "enforce"}}
+        repo, limits = self.evasion_repos()["oversized manifest"]
+        (repo / ".harness").mkdir()
+        (repo / ".harness" / "domain-gates.json").write_text(json.dumps({"allow_truncated": True, "disabled": True, "mode": "warn"}))
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        with mock.patch.multiple(dg, **{"MAX_FILES": dg.MAX_FILES, **limits}), \
+                mock.patch.dict(os.environ, {"HARNESS_DOMAIN_GATES_ALLOW_TRUNCATED": "1"}), \
+                mock.patch.object(sf, "load_spec_policy", return_value=enforce):
+            with self.assertRaises(OSError) as ctx:  # repo file and env var cannot allow the truncated scan
+                pr.domain_section(repo, "b" * 40, changed_paths=[".github/x"])
+            self.assertIn("allow_truncated", str(ctx.exception))
+            state = dg.settings(repo, enforce)
+            self.assertFalse(state["disabled"])
+            for fragment in ("HARNESS_DOMAIN_GATES_ALLOW_TRUNCATED ignored", "allow_truncated ignored",
+                             "key mode ignored", "disabled ignored"):
+                self.assertIn(fragment, state["warning"])
+            warnings, problems = sf.domain_lint(SPEC, repo, enforce)
+            self.assertTrue(problems)  # lint also stays closed
+            self.assertTrue(any("allow_truncated ignored" in w for w in warnings))
+        self.assertFalse(dg.allow_truncated(enforce))
+        self.assertFalse(any("allow_truncated" in a for a in sys.argv))  # no CLI flag exists to set it
 
     def test_hidden_neg_and_waiver_in_html_comments_do_not_count(self):
         neg = SPEC.replace("- NEG-1 (AC-1): a zero deposit is refused.",

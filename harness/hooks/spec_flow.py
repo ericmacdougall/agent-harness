@@ -293,8 +293,10 @@ def append_domain_block(text: str, repo, spec_policy: dict) -> str:
     try:
         if dg.settings(repo, spec_policy)["disabled"]:
             return text
-        detected = dg.detect(Path(repo))
+        detected, failure = dg.detect_full(Path(repo))
         block = dg.render_block([d["domain"] for d in detected], repo, detected) if detected else ""
+        if failure and (failure.startswith("scan truncated") or "too deeply nested" in failure):
+            block = (block or "## Domain checklist\n") + dg.incomplete_notice(failure)
     except Exception:  # guidance must never block writing a spec
         return text
     return text.rstrip("\n") + "\n\n" + block if block else text
