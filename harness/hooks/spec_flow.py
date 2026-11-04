@@ -492,6 +492,17 @@ def git_commit(repo: Path, sha: str, target: str | None):
 
 # --------------------------------------------------------------------------- ticket records
 
+_SAFE_CHARS = re.compile(r"[^A-Za-z0-9 ._:@/#()+=,-]")
+MAX_HOOK_TEXT = 4000
+
+
+def safe(value, limit: int = 80) -> str:
+    """Comment-derived text shown to an agent: a narrow character set and a length cap, so a forged record
+    cannot smuggle instructions into hook output or CLI reports."""
+    text = _SAFE_CHARS.sub("?", str(value))
+    return text if len(text) <= limit else text[:limit] + "...(cut)"
+
+
 def record_body(summary: str, record: dict) -> str:
     return f"{summary}\n\n```{RECORD_FENCE}\n{json.dumps(record, sort_keys=True, separators=(',', ':'))}\n```"
 
@@ -523,9 +534,9 @@ def record_shape_problem(record: dict):
     for name, item in nested:
         for field, value in item.items():
             if not isinstance(value, (str, bool, int, float, type(None))):
-                return f"field {name}.{field} is not a scalar"
+                return f"field {name}.{safe(field, 40)} is not a scalar"
             if field in _NESTED_STRINGS and value is not None and not isinstance(value, str):
-                return f"field {name}.{field} is not a string"
+                return f"field {name}.{safe(field, 40)} is not a string"
     return None
 
 
@@ -592,13 +603,13 @@ def attachment_problems(record: dict, index: dict) -> list:
         row = index.get(item.get("id"))
         name = item.get("name") or item.get("id")
         if row is None:
-            problems.append(f"attachment {name} is not on the ticket")
+            problems.append(f"attachment {safe(name)} is not on the ticket")
         elif row.get("commentId") != record["_comment"]:
-            problems.append(f"attachment {name} belongs to a different comment")
+            problems.append(f"attachment {safe(name)} belongs to a different comment")
         elif row.get("completionState") != "completed" or row.get("deletedAt") or row.get("archivedAt"):
-            problems.append(f"attachment {name} is not a completed upload")
+            problems.append(f"attachment {safe(name)} is not a completed upload")
         elif row.get("sha256") != item.get("sha256"):
-            problems.append(f"attachment {name} sha256 differs from the record (replaced or tampered)")
+            problems.append(f"attachment {safe(name)} sha256 differs from the record (replaced or tampered)")
     return problems
 
 
@@ -607,6 +618,8 @@ def kind_problems(record: dict) -> list:
     attachments = [item for item in record.get("attachments") or [] if isinstance(item, dict)]
     roles = {item.get("role"): item for item in attachments}
     problems = []
+    if any(not re.fullmatch(r"AC-[0-9]{1,3}", str(ac)) for ac in record.get("ac") or []):
+        problems.append("criteria ids must look like AC-<n>")
     if record["kind"] == "spec":
         if (roles.get("spec") or {}).get("sha256") != record.get("spec_file_sha") or not record.get("spec_file_sha"):
             problems.append("no attached spec file matches the record's spec_file_sha")
@@ -742,7 +755,7 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
         review_keys.add(entry.get("key"))
         valid_roles += 1
         if entry.get("kind") in ("human",):
-            attested.append(f"{role} review by human {entry.get('identity')!r} (name not verified)")
+            attested.append(f"{role} review by human {safe(entry.get('identity'))!r} (name not verified)")
     if valid_roles == 2 and len(review_keys) == 1:
         missing.append("both spec reviews come from the same reviewer/model")
     if author in review_keys:
@@ -805,15 +818,15 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
                            "an independent click-tester must run it")
         else:
             tester = latest.get("tester") or {}
-            attested.append(f"deployed commit {str(latest['deployed_commit'].get('sha'))[:12]} at "
-                            f"{latest.get('url')} is declared by the recorder, not read back from the deployment")
+            attested.append(f"deployed commit {safe(latest['deployed_commit'].get('sha'), 12)} at "
+                            f"{safe(latest.get('url'), 160)} is declared by the recorder, not read back from the deployment")
             if latest.get("pass_source") == "self-attested":
-                attested.append(f"click-test pass by {tester.get('kind')} {tester.get('identity')!r} is self-attested")
+                attested.append(f"click-test pass by {safe(tester.get('kind'))} {safe(tester.get('identity'))!r} is self-attested")
             if not tester.get("ended_at"):
                 notes.append("click-test end time not recorded (no subagent_stop event); last activity "
-                             f"{tester.get('last_activity_at')}")
+                             f"{safe(tester.get('last_activity_at'))}")
     else:
-        notes.append(f"click-test not applicable: {click.get('reason')}")
+        notes.append(f"click-test not applicable: {safe(click.get('reason'), 160)}")
     # sign-off
     human_required = spec.get("signoff") == "human" or "human sign-off" in str(issue.get("description") or "").lower()
     signoffs = [r for r in records if r["kind"] == "signoff" and r.get("spec_core_sha") == core]
@@ -832,7 +845,7 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
                        "--kind agent|human --source <where it was given>")
     else:
         signer = valid[-1]
-        attested.append(f"sign-off by {signer.get('signer_kind')} {signer.get('by')!r} (identity is self-declared; independence is checked only "
+        attested.append(f"sign-off by {safe(signer.get('signer_kind'))} {safe(signer.get('by'))!r} (identity is self-declared; independence is checked only "
                         "against the declared author, reviewer, poster and tester ids)")
     return {"ready": not missing, "missing": missing, "self_attested": attested, "notes": notes,
             "spec_core_sha": core}
@@ -1611,6 +1624,8 @@ def main(argv=None) -> int:
         except Exception as error:  # never crash into an unexplained block
             code = 2 if spec_policy.get("mode") == "enforce" and enforced_ids(spec_policy) else 0
             text = f"spec-flow hook error ({type(error).__name__}); {'blocking' if code else 'allowing'}"
+        if len(text) > MAX_HOOK_TEXT:
+            text = text[:MAX_HOOK_TEXT] + "\n...(spec-flow output cut; run spec_flow.py status for the full list)"
         if text:
             print(text, file=sys.stderr)  # exit 2: Claude Code feeds stderr to the model
             if code == 0:
