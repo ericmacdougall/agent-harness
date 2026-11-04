@@ -247,6 +247,13 @@ class SpecFlowCase(unittest.TestCase):
 
 
 class Lint(SpecFlowCase):
+    def test_packet_refuses_a_spec_that_fails_lint(self):
+        spec = self.tmp / "bad.md"
+        spec.write_text(SPEC.replace("Verify by:", "Check:", 1))
+        out = self.tmp / "bad.packet.md"
+        self.assertEqual(self.run_cli("packet", str(spec), "--out", str(out))[0], 2)
+        self.assertFalse(out.exists())
+
     def test_good_spec_passes_and_template_fails(self):
         self.assertEqual(sf.lint(SPEC, self.config), [])
         template = (HOOKS / "spec_template.md").read_text().format(

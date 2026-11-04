@@ -937,6 +937,11 @@ def cmd_lint(args, spec_policy):
 
 def cmd_packet(args, spec_policy):
     text = Path(args.spec).read_text(encoding="utf-8")
+    _, _, config = ticket_config(spec_policy)
+    problems = lint(text, config)
+    if problems:  # reviewers should never be handed a spec that cannot be attached
+        print(json.dumps({"status": "FAIL", "problems": problems}, indent=1))
+        return EXIT_MISSING
     out = Path(args.out)
     if out.exists():
         raise SpecError(f"{out} exists; write the packet to a fresh path outside the worktree", EXIT_USAGE)
