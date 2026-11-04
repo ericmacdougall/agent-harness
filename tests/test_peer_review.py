@@ -368,9 +368,11 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                     stack.enter_context(patch.object(module, 'make_snapshot', side_effect=snapshot))
                     model = stack.enter_context(patch.object(module, 'review_snapshot', side_effect=review))
                     stack.enter_context(patch.object(module.tempfile.TemporaryDirectory, 'cleanup', cleanup))
-                    stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
-                    self.assertEqual(module.main(), 2)
-                self.assertTrue(seen)
+                    captured = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                    self.assertEqual(module.main(), 2, captured.getvalue())
+                # A refusal before the snapshot names its cause, so an
+                # intermittent failure here is diagnosable from one run.
+                self.assertTrue(seen, captured.getvalue())
                 self.assertFalse(seen[0].exists())
                 self.assertFalse(output.exists())
                 if failure in ('validation', 'source-race'):
