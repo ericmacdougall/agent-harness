@@ -17,7 +17,8 @@ try:
 except ModuleNotFoundError:  # Codex installer requires Python 3.11+.
     tomllib = None
 
-from install import DirectoryPins, atomic_write, markdown_marker_lines, read_regular, safe_unlink
+from install import (DirectoryPins, atomic_write, git_hook_status, markdown_marker_lines, read_regular,
+                     safe_unlink)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -31,7 +32,9 @@ AGENTS = ('harness_owner.toml', 'harness_reviewer.toml', 'harness_red_team.toml'
 SKILL_FILES = ('SKILL.md', 'references/owner-workflow.md',
                'references/testing-and-evals.md', 'references/delivery.md')
 DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report_file.py',
-                    'usage_guard.py', 'publish_feature.py', 'integrate_local.py', 'deliver.py')
+                    'usage_guard.py', 'publish_feature.py', 'integrate_local.py', 'deliver.py',
+                    'ticket_adapters.py', 'commit_policy.py', 'commit_policy.json')
+GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
 
@@ -54,6 +57,10 @@ def managed_command(codex_home: Path) -> str:
     return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'wal.py')) + ' hook'
 
 
+def policy_command(codex_home: Path) -> str:
+    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'commit_policy.py')) + ' hook'
+
+
 def merge_hooks(existing: dict, codex_home: Path) -> dict:
     if not isinstance(existing, dict):
         raise ValueError('hooks.json must contain an object')
@@ -62,6 +69,7 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
     if not isinstance(hooks, dict):
         raise ValueError('hooks.json hooks must be an object')
     command = managed_command(codex_home)
+    policy = policy_command(codex_home)
     for event in HOOK_EVENTS:
         lifecycle = event in {'Stop', 'Interrupt'}
         managed = {'hooks': [{'type': 'command', 'command': command,
@@ -75,13 +83,16 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
                 raise ValueError(f'hooks.json {event} has an invalid hook group')
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
-                                and handler.get('command') == command)]
+                                and handler.get('command') in (command, policy))]
             if lifecycle and len(handlers) != len(group['hooks']) and group != managed:
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')
             if handlers:
                 preserved.append({**group, 'hooks': handlers})
         preserved.append(managed)
+        if event == 'PreToolUse':
+            # Commit message policy for every tool (no matcher): shell argv, strings, stdin writes.
+            preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 15}]})
         hooks[event] = preserved
     return result
 
@@ -314,6 +325,11 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False) -> li
         pins.close()
 
 
+def install_git_backstop(home: Path, apply: bool) -> str:
+    home = home.expanduser().resolve()
+    return git_hook_status(home, GIT_HOOK_KEY, home / '.codex' / 'agent-harness' / 'commit_policy.py', apply=apply)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--apply', action='store_true')
@@ -330,6 +346,7 @@ def main() -> None:
         print('Full Access default requested: unrestricted local filesystem and network; approval prompts disabled.')
     for path in changes:
         print(f'  {path}')
+    print(f'  {install_git_backstop(args.home, args.apply)}')
     if args.apply:
         print('Review and trust the new user hooks with /hooks in a new Codex session.')
 

@@ -21,7 +21,10 @@ ROOT = Path(__file__).resolve().parent
 START = "<!-- agent-harness:start -->"
 END = "<!-- agent-harness:end -->"
 AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
-HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py")
+HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py",
+         "ticket_adapters.py", "commit_policy.py", "commit_policy.json")
+GIT_HOOK_KEY = "agent-harness-commit-policy"
+MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
 NO_TARGET_CHECK = object()
 NO_CONTENT_CHECK = object()
@@ -31,8 +34,14 @@ class DirectoryPublicationError(OSError):
     """An exclusive directory publish could not be completed safely."""
 
 
-def managed_hooks(claude: Path) -> dict[str, dict]:
+def managed_scripts(claude: Path) -> set[str]:
+    return {str(claude / "hooks" / "wal.py"), str(claude / "hooks" / "commit_policy.py")}
+
+
+def managed_hooks(claude: Path) -> dict[str, list[dict]]:
     script = str(claude / "hooks" / "wal.py")
+    policy = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "commit_policy.py"), "hook"],
+              "timeout": 15, "onFailure": "block"}
 
     def command(event: str, fail_closed: bool = False) -> dict:
         hook = {"type": "command", "command": "python3", "args": [script, event], "timeout": 10}
@@ -41,45 +50,97 @@ def managed_hooks(claude: Path) -> dict[str, dict]:
         return hook
 
     return {
-        "SessionStart": {"hooks": [command("session")]},
-        "UserPromptSubmit": {"hooks": [command("prompt", True)]},
-        "SubagentStart": {
+        "SessionStart": [{"hooks": [command("session")]}],
+        "UserPromptSubmit": [{"hooks": [command("prompt", True)]}],
+        "SubagentStart": [{
             "matcher": "^(task-owner|click-tester|fixer|red-team)$",
             "hooks": [command("subagent")],
-        },
-        "PreToolUse": {
+        }],
+        "PreToolUse": [{
             "matcher": "Agent|Task|Workflow|Bash|PowerShell|Write|Edit|MultiEdit|NotebookEdit",
             "hooks": [command("pretool", True)],
-        },
+        }, {
+            # Commit message policy: validates git commit / gh pr merge --squash before they run.
+            "matcher": "Bash",
+            "hooks": [policy],
+        }],
     }
 
 
 def merged_settings(current: dict, claude: Path) -> dict:
     settings = json.loads(json.dumps(current))
     hooks = settings.setdefault("hooks", {})
-    for event, entry in managed_hooks(claude).items():
+    scripts = managed_scripts(claude)
+    for event, managed in managed_hooks(claude).items():
         entries = hooks.setdefault(event, [])
-        script = str(claude / "hooks" / "wal.py")
         preserved = []
         for item in entries:
             remaining = [
                 hook for hook in item.get("hooks", [])
                 if not (hook.get("type") == "command"
                         and hook.get("command") == "python3"
-                        and (hook.get("args") or [None])[0] == script)
+                        and (hook.get("args") or [None])[0] in scripts)
             ]
             if remaining == item.get("hooks", []):
                 preserved.append(item)
             elif remaining:
                 preserved.append({**item, "hooks": remaining})
         entries[:] = preserved
-        entries.append(entry)
+        entries.extend(managed)
     allowed = settings.setdefault("permissions", {}).setdefault("allow", [])
     for name in ("wal_note.py", "publish_feature.py", "integrate_local.py", "deliver.py"):
         rule = f"Bash(python3 ~/.claude/hooks/{name} *)"
         if rule not in allowed:
             allowed.append(rule)
+    # Read-only policy checks are preapproved; `waive` deliberately is not.
+    for action in ("check-message", "check-range", "report"):
+        rule = f"Bash(python3 ~/.claude/hooks/commit_policy.py {action} *)"
+        if rule not in allowed:
+            allowed.append(rule)
     return settings
+
+
+def git_hook_status(home: Path, key: str, script: Path, *, apply: bool, git: str = "git") -> str:
+    """Register the commit-msg backstop as an additive config-based hook.
+
+    Never touches core.hooksPath, so repository hooks keep running. Prior values
+    are restored if any write fails. Older Git ignores hook.<name> keys, so the
+    result says the backstop is inactive instead of claiming protection.
+    """
+    import shlex
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["HOME"] = str(home)
+    config = ["--file", str(home / ".gitconfig")]
+    try:
+        out = subprocess.run([git, "--version"], capture_output=True, text=True, timeout=10, env=env).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return "commit-msg backstop inactive: git not found"
+    match = re.search(r"(\d+)\.(\d+)", out)
+    version = (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+    if version < MIN_GIT_HOOKS:
+        return f"commit-msg backstop inactive: git {out.strip()} lacks config-based hooks (needs 2.54+)"
+    command = f'f={shlex.quote(str(script))}; [ -f "$f" ] || exit 0; exec python3 "$f" git-hook'
+    if not apply:
+        return f"would register git hook.{key} (commit-msg)"
+    def get(name):
+        result = subprocess.run([git, "config", *config, "--get-all", f"hook.{key}.{name}"],
+                                capture_output=True, text=True, env=env, timeout=10)
+        return result.stdout.splitlines() if result.returncode == 0 else []
+    prior = {name: get(name) for name in ("event", "command")}
+    try:
+        for name, value in (("event", "commit-msg"), ("command", command)):
+            subprocess.run([git, "config", *config, "--replace-all", f"hook.{key}.{name}", value],
+                           check=True, capture_output=True, env=env, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        for name, values in prior.items():
+            subprocess.run([git, "config", *config, "--unset-all", f"hook.{key}.{name}"],
+                           capture_output=True, env=env, timeout=10)
+            for value in values:
+                subprocess.run([git, "config", *config, "--add", f"hook.{key}.{name}", value],
+                               capture_output=True, env=env, timeout=10)
+        raise
+    return f"registered git hook.{key} (commit-msg) in {home / '.gitconfig'}"
 
 
 def merged_instructions(existing: str, instructions: str) -> str:
@@ -487,6 +548,12 @@ def install(home: Path, apply: bool) -> list[str]:
         pins.close()
 
 
+def install_git_backstop(home: Path, apply: bool) -> str:
+    """Run after the file transaction: the hook command exits 0 if its script is missing."""
+    home = home.expanduser().resolve()
+    return git_hook_status(home, GIT_HOOK_KEY, home / ".claude" / "hooks" / "commit_policy.py", apply=apply)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
@@ -500,6 +567,7 @@ def main() -> None:
     print(f"{action} Agent Harness in {args.home.expanduser() / '.claude'}")
     for path in changes:
         print(f"  {path}")
+    print(f"  {install_git_backstop(args.home, args.apply)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")
 
