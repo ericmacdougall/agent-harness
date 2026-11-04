@@ -174,10 +174,19 @@ func TestBaselineAdmitsOnlyItsOwnDirectories(t *testing.T) {
 	if _, err = os.Stat(filepath.Join(empty, baselineMarker)); err != nil {
 		t.Fatal("empty dir not marked")
 	}
-	// A name that only starts like the protected root is outside it.
+	// A name that only starts like the protected root is outside it while there is
+	// no configuration directory; once there is one, anything inside it is refused.
 	near := filepath.Join(root, "config", "agent-harness-scratch")
 	if _, err = baselineDataDir(near, protected); err != nil {
 		t.Fatalf("neighbour refused: %v", err)
+	}
+	inConfig := filepath.Join(root, "config", "elsewhere")
+	if _, err = baselineDataDir(inConfig, protected); !errors.Is(err, errRealDataDir) {
+		t.Fatalf("directory inside the configuration directory admitted: %v", err)
+	}
+	// With no protected root at all, nothing is admitted.
+	if _, err = baselineDataDir(filepath.Join(root, "unprotected"), ""); !errors.Is(err, errRealDataDir) {
+		t.Fatalf("admitted with no protected root: %v", err)
 	}
 	// A marked directory moved under the protected root is refused anyway.
 	inside := filepath.Join(protected, "moved")

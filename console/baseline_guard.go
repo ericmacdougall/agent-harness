@@ -115,26 +115,28 @@ func marked(dir string) error {
 	return nil
 }
 
-// outside refuses path when it is, or lies under, protected. It compares two ways,
-// so that neither a link, a case variant, a short name nor a missing directory gets
-// through: canonical spellings (links resolved over the longest existing prefix, case
-// folded where the filesystem usually ignores case), and file identity of every
-// existing ancestor of path against protected.
+// outside refuses path when it is, or lies under, protected's parent: the user's
+// configuration directory, which exists on any machine that has run a console.
+// Anchoring on that existing directory's identity, not on protected's spelling,
+// covers every way a filesystem can fold a name (case, Unicode case such as U+017F,
+// NFD and NFC, 8.3 short names, links, junctions) even before protected exists.
+// Canonical spellings are compared too, for a machine with no configuration
+// directory yet. With no protected root at all, everything is refused.
 func outside(path, protected string) error {
 	if protected == "" {
-		return nil
+		return fmt.Errorf("%w: the user configuration directory cannot be located", errRealDataDir)
 	}
-	refuse := fmt.Errorf("%w: it is inside the agent-harness configuration directory", errRealDataDir)
+	refuse := fmt.Errorf("%w: it is inside the user configuration directory", errRealDataDir)
 	p, root := canonical(path), canonical(protected)
 	if p == root || strings.HasPrefix(p, root+string(filepath.Separator)) {
 		return refuse
 	}
-	rootInfo, err := os.Stat(protected)
+	anchor, err := os.Stat(filepath.Dir(protected))
 	if err != nil {
 		return nil
 	}
 	for dir := filepath.Clean(path); ; {
-		if info, err := os.Stat(dir); err == nil && os.SameFile(info, rootInfo) {
+		if info, err := os.Stat(dir); err == nil && os.SameFile(info, anchor) {
 			return refuse
 		}
 		parent := filepath.Dir(dir)
