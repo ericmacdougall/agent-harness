@@ -32,8 +32,10 @@ Each field belongs to exactly one table.
 | `CwdChanged` | Writable, last receipt not unresolved | `CWD` set |
 | `SessionClosed` | Last receipt not unresolved and no quarantine, unless `Abandoned` is set | `Closed` true |
 | `ProcessRestarted` (global) | None | Every session not closed: `ReadOnly` true, `Connected` false; rows in tables 3 and 4. Then trim below |
-| `LegacyImportCompleted` (global) | Nonempty digest, not already completed | `LegacyImported` on the projection set to the digest. No session changes |
-| `LegacyImported` | Session absent, revision 1, receipt in `final`, `rejected`, `unknown`, `abandoned` or none, with a request exactly when there is a receipt | `ReadOnly` true, `Connected` false, `ConversationStarted` is `ProviderID != ""`. If receipt: `LastRequest`, `Requests`, `RequestOrder` set, `ProviderFinal` true only for `final`, and for `abandoned`, `Abandoned` set |
+| `LegacyImportCompleted` (global) | Nonempty `Digest` (the journal digest), `ImportGeneration` equal to `LegacyGeneration + 1` | `LegacyImported` set to `Digest`, `LegacyQueueDigest` set to `QueueDigest` (may be empty), `LegacyGeneration` set to `ImportGeneration`. No session changes |
+| `LegacyImported` | `ImportGeneration` equal to `LegacyGeneration + 1`, session absent, revision 1, receipt in `final`, `rejected`, `unknown`, `abandoned` or none, with a request exactly when there is a receipt | `ReadOnly` true, `Connected` false, `ConversationStarted` is `ProviderID != ""`. If receipt: `LastRequest`, `Requests`, `RequestOrder` set, `ProviderFinal` true only for `final`, and for `abandoned`, `Abandoned` set |
+
+`ImportGeneration` and `QueueDigest` must be zero and empty on every other kind, and `QueueDigest` is also empty on `LegacyImported`. `QueueDigest` has the digest shape. `LegacyGeneration` and `LegacyQueueDigest` start at 0 and empty, and only `LegacyImportCompleted` changes them (K3).
 
 A closed session accepts no fact. Besides the global restart, a read-only session accepts only `LateFrameObserved`, `ControlOutcome`, `SessionClosed`, `Abandoned`, `SessionQuarantined` and `TurnBound`.
 

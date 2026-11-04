@@ -372,11 +372,30 @@ func TestQuotaKeepsReserveForMustAppend(t *testing.T) {
 		}
 		d.log.count = count
 		d.p.LastSeq += gap
+		d.log.p.LastSeq += gap
 	}
 	set(MaxFacts - Reserve)
 	_, err := d.do(kernel.In{Kind: kernel.InCreate, Principal: user, SessionID: "b", Provider: kernel.ProviderClaude})
 	if !errors.Is(err, ErrQuota) || d.log.Latched() {
 		t.Fatalf("ordinary fact past the limit: %v", err)
+	}
+	// The log judges against its own projection. A caller's copy that claims the idle
+	// session has a control request pending, with the right sequence, cannot make a
+	// control outcome eligible.
+	forged := d.p
+	forged.Sessions = map[string]*kernel.Session{}
+	for id, s := range d.p.Sessions {
+		forged.Sessions[id] = s
+	}
+	idle := *d.p.Sessions["idle"]
+	idle.ControlPending = true
+	forged.Sessions["idle"] = &idle
+	if d.p.Sessions["idle"].ControlPending {
+		t.Fatal("the control needs a session with no pending request")
+	}
+	outcome := kernel.Fact{Seq: d.p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(8000), Kind: kernel.FactControlOutcome, SessionID: "idle", SessionRevision: idle.Revision + 1, Control: "pause", Outcome: "confirmed"}
+	if _, _, err = d.log.Append(ctx, forged, "", "", []kernel.Fact{outcome}); !errors.Is(err, ErrQuota) {
+		t.Fatalf("a forged projection made a control outcome eligible: %v", err)
 	}
 	// An outcome still records, from the reserve.
 	if _, err = d.do(kernel.In{Kind: kernel.ObUnknown, Principal: provider, SessionID: "a", RequestID: "r1", ReasonCode: "deadline"}); err != nil {
@@ -938,6 +957,7 @@ func TestFloodsAtTheLimitCannotSpendTheReserve(t *testing.T) {
 	}
 	d.log.count = MaxFacts - Reserve
 	d.p.LastSeq += gap
+	d.log.p.LastSeq += gap
 	d.log.mu.Unlock()
 	start := d.log.Count()
 	for i := 0; i < 2000; i++ {

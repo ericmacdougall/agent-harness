@@ -657,7 +657,7 @@ func TestCatalogV1(t *testing.T) {
 }
 
 func TestCatalogV3(t *testing.T) {
-	f := Fact{Seq: 7, SchemaVersion: SchemaVersion, At: "2026-11-03T10:00:00.123456789Z", Kind: FactLegacyImported, SessionID: "s", SessionRevision: 1, Passes: map[string]string{"plan": "d"}, Receipt: ReceiptFinal}
+	f := Fact{Seq: 7, SchemaVersion: SchemaVersion, At: "2026-11-03T10:00:00.123456789Z", Kind: FactLegacyImported, ImportGeneration: 1, SessionID: "s", SessionRevision: 1, Passes: map[string]string{"plan": "d"}, Receipt: ReceiptFinal}
 	data, err := EncodeFact(f)
 	if err != nil {
 		t.Fatal(err)
@@ -701,7 +701,7 @@ func TestCatalogI9(t *testing.T) {
 	}{{ReceiptFinal, "A"}, {ReceiptRejected, "A"}, {ReceiptUnknown, "A"}, {ReceiptAbandoned, "A"}, {ReceiptNone, ""}} {
 		r := newRig(t)
 		var err error
-		r.p, err = Reduce(r.p, Fact{Seq: 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactLegacyImported, SessionID: "s", SessionRevision: 1, Provider: ProviderClaude, ProviderID: "conv", RequestID: row.request, Receipt: row.receipt, TaskID: "t", Reason: "old"})
+		r.p, err = Reduce(r.p, Fact{Seq: 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactLegacyImported, ImportGeneration: 1, SessionID: "s", SessionRevision: 1, Provider: ProviderClaude, ProviderID: "conv", RequestID: row.request, Receipt: row.receipt, TaskID: "t", Reason: "old"})
 		if err != nil || !r.session("s").ReadOnly {
 			t.Fatalf("%q not imported read-only: %v", row.receipt, err)
 		}
@@ -719,7 +719,7 @@ func TestCatalogI9(t *testing.T) {
 	r.must(In{Kind: InAbandon, SessionID: "s", Reason: rr("stuck")})
 	r.must(In{Kind: InClose, SessionID: "s"})
 	for _, bad := range []Receipt{ReceiptIntent, ReceiptAccepted} {
-		if _, err := Reduce(NewProjection(), Fact{Seq: 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactLegacyImported, SessionID: "s", SessionRevision: 1, RequestID: "A", Receipt: bad}); !errors.Is(err, ErrIllegalFact) {
+		if _, err := Reduce(NewProjection(), Fact{Seq: 1, SchemaVersion: SchemaVersion, At: testAt, Kind: FactLegacyImported, ImportGeneration: 1, SessionID: "s", SessionRevision: 1, RequestID: "A", Receipt: bad}); !errors.Is(err, ErrIllegalFact) {
 			t.Fatalf("imported %q as if confirmed: %v", bad, err)
 		}
 	}
@@ -923,6 +923,63 @@ func TestCatalogCoverage(t *testing.T) {
 	for _, id := range owned {
 		if !present["TestCatalog"+id] {
 			t.Errorf("catalog entry %s has no TestCatalog%s", id, id)
+		}
+	}
+}
+
+// K3: each import is one generation. Its sessions and its completion carry the next
+// generation number, and nothing of an earlier or later generation is legal.
+func TestImportGenerations(t *testing.T) {
+	p := NewProjection()
+	seq := uint64(0)
+	apply := func(f Fact) error {
+		seq++
+		f.Seq, f.SchemaVersion, f.At = seq, SchemaVersion, testAt
+		next, err := Reduce(p, f)
+		if err == nil {
+			p = next
+		} else {
+			seq--
+		}
+		return err
+	}
+	session := func(id string, gen uint64) Fact {
+		return Fact{Kind: FactLegacyImported, ImportGeneration: gen, SessionID: id, SessionRevision: 1, Provider: ProviderClaude}
+	}
+	done := func(digest, queue string, gen uint64) Fact {
+		return Fact{Kind: FactLegacyImportCompleted, Digest: digest, QueueDigest: queue, ImportGeneration: gen}
+	}
+	for name, f := range map[string]Fact{"generation 0": session("a", 0), "generation 2": session("a", 2), "completion 2": done("j1", "q1", 2), "no digest": done("", "q1", 1)} {
+		if err := apply(f); !errors.Is(err, ErrIllegalFact) {
+			t.Fatalf("%s accepted at generation 0: %v", name, err)
+		}
+	}
+	if err := apply(session("a", 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := apply(done("j1", "q1", 1)); err != nil {
+		t.Fatal(err)
+	}
+	if p.LegacyImported != "j1" || p.LegacyQueueDigest != "q1" || p.LegacyGeneration != 1 {
+		t.Fatalf("completion not recorded: %+v", p)
+	}
+	for name, f := range map[string]Fact{"late generation 1 session": session("b", 1), "repeat completion": done("j2", "q2", 1)} {
+		if err := apply(f); !errors.Is(err, ErrIllegalFact) {
+			t.Fatalf("%s accepted after generation 1 completed: %v", name, err)
+		}
+	}
+	if err := apply(session("a:g2", 2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := apply(done("j2", "", 2)); err != nil || p.LegacyGeneration != 2 || p.LegacyQueueDigest != "" {
+		t.Fatalf("generation 2: %v %+v", err, p)
+	}
+	for name, f := range map[string]Fact{
+		"import fields on another kind": {Kind: FactProcessRestarted, ImportGeneration: 3},
+		"queue digest on a session":     {Kind: FactLegacyImported, ImportGeneration: 3, QueueDigest: "q", SessionID: "c", SessionRevision: 1},
+	} {
+		if err := apply(f); !errors.Is(err, ErrIllegalFact) {
+			t.Fatalf("%s accepted: %v", name, err)
 		}
 	}
 }

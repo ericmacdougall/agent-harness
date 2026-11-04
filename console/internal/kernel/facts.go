@@ -111,6 +111,9 @@ type Fact struct {
 	ObjectiveHash string            `json:"objectiveHash,omitempty"`
 	State         string            `json:"state,omitempty"`
 	Passes        map[string]string `json:"passes,omitempty"`
+	// Import generation and queue digest, only on LegacyImported and LegacyImportCompleted.
+	ImportGeneration uint64 `json:"importGeneration,omitempty"`
+	QueueDigest      string `json:"queueDigest,omitempty"`
 }
 
 var factFields = func() map[string]bool {

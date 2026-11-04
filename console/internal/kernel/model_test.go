@@ -155,6 +155,8 @@ type mdlModel struct {
 	lastSeq  uint64
 	lastKind FactKind
 	legacy   string
+	legacyQ  string // LegacyQueueDigest.
+	legacyG  uint64 // LegacyGeneration.
 	cov      map[string]int
 	notes    map[int]bool
 }
@@ -337,7 +339,15 @@ func (m *mdlModel) apply(f Fact) {
 		m.restart()
 		return
 	case FactLegacyImportCompleted:
-		m.legacy = f.Digest
+		m.legacy, m.legacyQ, m.legacyG = f.Digest, f.QueueDigest, f.ImportGeneration
+		if f.ImportGeneration > 1 {
+			m.hit("t2.import.later_generation")
+		}
+		if f.QueueDigest != "" {
+			m.hit("t2.import.queue_digest_set")
+		} else {
+			m.hit("t2.import.queue_digest_empty")
+		}
 		return
 	case FactSessionCreated:
 		m.addSession(f)
@@ -513,6 +523,16 @@ func mdlFactInShape(f Fact) bool {
 		!named(f.State, FactLegacyImported) {
 		return false
 	}
+	// K3: import fields only on the importer's kinds, and QueueDigest only on the completion.
+	if f.Kind != FactLegacyImportCompleted && f.Kind != FactLegacyImported && (f.ImportGeneration != 0 || f.QueueDigest != "") {
+		return false
+	}
+	if f.Kind == FactLegacyImported && f.QueueDigest != "" {
+		return false
+	}
+	if f.QueueDigest != "" && !mdlDigestShape.MatchString(f.QueueDigest) {
+		return false
+	}
 	// SPEC-AMBIGUOUS: 28
 	if f.Provider != "" && !mdlKnownProvider(f.Provider) {
 		return false
@@ -531,6 +551,19 @@ func mdlFactInShape(f Fact) bool {
 		return false
 	}
 	return mdlContains([]Receipt{ReceiptNone, ReceiptIntent, ReceiptAccepted, ReceiptFinal, ReceiptUnknown, ReceiptRejected, ReceiptAbandoned}, f.Receipt)
+}
+
+// importGeneration is K3's rule for both importer kinds: the next generation exactly.
+func (m *mdlModel) importGeneration(f Fact) bool {
+	switch {
+	case f.ImportGeneration == m.legacyG+1:
+		return true
+	case f.Kind == FactLegacyImportCompleted && f.ImportGeneration == m.legacyG && m.legacyG > 0:
+		m.hit("t2.import.repeat_completion")
+	default:
+		m.hit("t2.import.wrong_generation." + string(f.Kind))
+	}
+	return false
 }
 
 type mdlVerdict int
@@ -553,6 +586,13 @@ func (m *mdlModel) mdlVerdict(f Fact) mdlVerdict {
 		return mdlVUnreadable
 	}
 	if !mdlFactInShape(f) {
+		importer := f.Kind == FactLegacyImportCompleted || f.Kind == FactLegacyImported
+		if !importer && (f.ImportGeneration != 0 || f.QueueDigest != "") {
+			m.hit("t2.import.fields_on_other_kind")
+		}
+		if f.Kind == FactLegacyImported && f.QueueDigest != "" {
+			m.hit("t2.import.queue_on_legacy_imported")
+		}
 		return mdlVIllegal
 	}
 	ok := false
@@ -561,12 +601,12 @@ func (m *mdlModel) mdlVerdict(f Fact) mdlVerdict {
 	case FactProcessRestarted:
 		ok = true
 	case FactLegacyImportCompleted:
-		ok = f.Digest != "" && m.legacy == ""
+		ok = f.Digest != "" && m.importGeneration(f)
 	case FactSessionCreated:
 		ok = s == nil && f.SessionID != "" && f.SessionRevision == 1 && mdlKnownProvider(f.Provider)
 	case FactLegacyImported:
 		okReceipt := mdlContains([]Receipt{ReceiptNone, ReceiptFinal, ReceiptRejected, ReceiptUnknown, ReceiptAbandoned}, f.Receipt)
-		ok = s == nil && f.SessionID != "" && f.SessionRevision == 1 && okReceipt && (f.RequestID != "") == (f.Receipt != ReceiptNone)
+		ok = m.importGeneration(f) && s == nil && f.SessionID != "" && f.SessionRevision == 1 && okReceipt && (f.RequestID != "") == (f.Receipt != ReceiptNone)
 	default:
 		// Section 10 item 10: the compare-and-swap on the session revision.
 		ok = s != nil && !s.closed && f.SessionRevision == s.revision+1 && m.sessionFactOK(s, f)
@@ -1223,6 +1263,8 @@ type mdlGenStep struct {
 	schema  *int
 	keepRev bool
 	tag     string
+	genSet  bool // ImportGeneration is LegacyGeneration+1+genOff, not the default next one.
+	genOff  int
 	expand  func(*mdlModel) []mdlGenStep // Built when reached, from the model state then.
 }
 
@@ -1272,6 +1314,15 @@ func (gs mdlGenStep) kernelIn() In {
 func (m *mdlModel) stampRaw(gs mdlGenStep, at string) Fact {
 	f := *gs.raw
 	f.At = at
+	importer := f.Kind == FactLegacyImported || f.Kind == FactLegacyImportCompleted
+	switch {
+	case gs.genSet:
+		if g := int64(m.legacyG) + 1 + int64(gs.genOff); g > 0 {
+			f.ImportGeneration = uint64(g)
+		}
+	case importer && f.ImportGeneration == 0:
+		f.ImportGeneration = m.legacyG + 1
+	}
 	f.SchemaVersion = SchemaVersion
 	if gs.schema != nil {
 		f.SchemaVersion = *gs.schema
@@ -2464,6 +2515,51 @@ func (g *mdlGen) writableFocus(m *mdlModel) string {
 	return g.focus
 }
 
+// scriptImports drives K3's generations: imports and completions across three generations,
+// then each illegal form. Generations are stamped from the model when the step runs.
+func (g *mdlGen) scriptImports() []mdlGenStep {
+	l, w := g.fresh("ki"), g.fresh("ki")
+	at := func(tag string, off int, f Fact) mdlGenStep {
+		gs := mdlRawFact(tag, f)
+		gs.genSet, gs.genOff = true, off
+		return gs
+	}
+	imported := func(suffix string) Fact {
+		return Fact{Kind: FactLegacyImported, SessionID: l + suffix, Provider: ProviderCodex, Receipt: ReceiptFinal, RequestID: "r1"}
+	}
+	done := func(digest, queue string) Fact {
+		return Fact{Kind: FactLegacyImportCompleted, Digest: digest, QueueDigest: queue}
+	}
+	withGen := func(f Fact) Fact { f.ImportGeneration = 1; return f }
+	withQueue := func(f Fact) Fact { f.QueueDigest = "q1"; return f }
+	return []mdlGenStep{
+		// One generation: imports, then its completion with a queue digest.
+		at("legal", 0, imported("-a")), at("legal", 0, imported("-b")),
+		at("legal", 0, done("sha256:one", "queue:one")),
+		// Repeating or skipping a generation, on either kind.
+		at("illegal", -1, done("sha256:again", "")),
+		at("illegal", 1, done("sha256:skip", "")),
+		at("illegal", -1, imported("-stale")),
+		at("illegal", 1, imported("-ahead")),
+		at("illegal", 0, done("", "queue:one")),
+		// QueueDigest on LegacyImported, and out of shape on the completion.
+		at("illegal", 0, withQueue(imported("-queued"))),
+		at("illegal", 0, done("sha256:two", "bad queue!")),
+		// A second generation without a queue, then a third with one.
+		at("legal", 0, imported("-c")),
+		at("legal", 0, done("sha256:two", "")),
+		at("legal", 0, done("sha256:three", "queue:three")),
+		// Import fields on every other kind.
+		mdlRawFact("illegal", withGen(Fact{Kind: FactSessionCreated, SessionID: w + "-gen", Provider: ProviderCodex})),
+		mdlRawFact("illegal", withQueue(Fact{Kind: FactSessionCreated, SessionID: w + "-queue", Provider: ProviderCodex})),
+		mdlRawFact("legal", Fact{Kind: FactSessionCreated, SessionID: w, Provider: ProviderCodex}),
+		mdlRawFact("illegal", withGen(Fact{Kind: FactProviderConnected, SessionID: w})),
+		mdlRawFact("illegal", withQueue(Fact{Kind: FactProviderConnected, SessionID: w})),
+		mdlRawFact("illegal", withGen(Fact{Kind: FactProcessRestarted})),
+		mdlRawFact("illegal", withQueue(Fact{Kind: FactProcessRestarted})),
+	}
+}
+
 func (g *mdlGen) scriptManySessions() []mdlGenStep {
 	var out []mdlGenStep
 	var idle []string
@@ -2505,7 +2601,7 @@ func (g *mdlGen) regularScripts() []func() []mdlGenStep {
 	return []func() []mdlGenStep{
 		g.scriptCreateAndAuth, g.scriptSend, g.scriptControl, g.scriptCWD, g.scriptAbandon,
 		g.scriptConversation, g.scriptFrames, g.scriptTurns, g.scriptCompleted,
-		g.scriptControlOutcome, g.scriptBoundary, g.scriptQuarantine, g.scriptRestart, g.scriptRaw, g.scriptFields, g.scriptReach, g.scriptIneligibleStops,
+		g.scriptControlOutcome, g.scriptBoundary, g.scriptQuarantine, g.scriptRestart, g.scriptRaw, g.scriptFields, g.scriptReach, g.scriptIneligibleStops, g.scriptImports,
 	}
 }
 
@@ -2596,6 +2692,10 @@ func mdlCompareProjection(m *mdlModel, p Projection) string {
 			expected = m.lastKind
 		case "LegacyImported":
 			expected = m.legacy
+		case "LegacyQueueDigest":
+			expected = m.legacyQ
+		case "LegacyGeneration":
+			expected = m.legacyG
 		default:
 			return "Projection field " + name + " has no model value"
 		}
@@ -3402,7 +3502,9 @@ func mdlRunModelAlone(seed int64, steps int, cov map[string]int) string {
 func mdlTableRows() []string {
 	rows := []string{
 		"t2.trim.budget_exhausted", "t2.trim.protected", "t2.trim.hidden",
-		"t2.legacy.", "t2.legacy.final", "t2.legacy.rejected", "t2.legacy.unknown", "t2.legacy.abandoned",
+		"t2.legacy.", "t2.import.later_generation", "t2.import.queue_digest_set", "t2.import.queue_digest_empty",
+		"t2.import.repeat_completion", "t2.import.wrong_generation.LegacyImportCompleted", "t2.import.wrong_generation.LegacyImported",
+		"t2.import.fields_on_other_kind", "t2.import.queue_on_legacy_imported", "t2.legacy.final", "t2.legacy.rejected", "t2.legacy.unknown", "t2.legacy.abandoned",
 		"t3.restart.open_to_unknown", "t3.abandoned.overwrites", "t3.abandoned.keeps", "t3.trim256", "t3.refused.default_code",
 		"t4.control_requested.unknown", "t4.control_requested.other",
 		"t4.unknown.pending_survives", "t4.intended.clears_bound_turn",

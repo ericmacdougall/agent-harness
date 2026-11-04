@@ -82,7 +82,11 @@ func validateFact(f Fact) error {
 			return fail(name)
 		}
 	}
-	for name, value := range map[string]string{"digest": f.Digest, "objectiveHash": f.ObjectiveHash, "runtimeIdentity": f.RuntimeIdentity} {
+	legacy := f.Kind == FactLegacyImported || f.Kind == FactLegacyImportCompleted
+	if !legacy && (f.ImportGeneration != 0 || f.QueueDigest != "") || f.Kind == FactLegacyImported && f.QueueDigest != "" {
+		return fail("import fields")
+	}
+	for name, value := range map[string]string{"digest": f.Digest, "objectiveHash": f.ObjectiveHash, "runtimeIdentity": f.RuntimeIdentity, "queueDigest": f.QueueDigest} {
 		if value != "" && !digestPattern.MatchString(value) {
 			return fail(name)
 		}

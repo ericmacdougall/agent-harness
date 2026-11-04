@@ -82,6 +82,9 @@ type Projection struct {
 	LastSeq        uint64
 	LastKind       FactKind
 	LegacyImported string
+	// LegacyQueueDigest and LegacyGeneration belong to the latest completed import.
+	LegacyQueueDigest string
+	LegacyGeneration  uint64
 }
 
 func NewProjection() Projection { return Projection{Sessions: map[string]*Session{}} }
@@ -162,10 +165,10 @@ func reduce(p Projection, f Fact, copyShell bool) (Projection, error) {
 		reduceRestart(&next)
 		return next, nil
 	case FactLegacyImportCompleted:
-		if p.LegacyImported != "" || f.Digest == "" {
-			return p, illegal(f, "import already completed or has no digest")
+		if f.Digest == "" || f.ImportGeneration != p.LegacyGeneration+1 {
+			return p, illegal(f, "import has no digest or is not the next generation")
 		}
-		next.LegacyImported = f.Digest
+		next.LegacyImported, next.LegacyQueueDigest, next.LegacyGeneration = f.Digest, f.QueueDigest, f.ImportGeneration
 		return next, nil
 	}
 	if f.SessionID == "" {
@@ -178,6 +181,9 @@ func reduce(p Projection, f Fact, copyShell bool) (Projection, error) {
 		}
 		created := &Session{ID: f.SessionID, Provider: f.Provider, ProviderID: f.ProviderID, ProfileID: f.ProfileID, CWD: f.CWD, RuntimeIdentity: f.RuntimeIdentity, Revision: 1, Requests: map[string]Receipt{}, ConversationStarted: f.ProviderID != ""}
 		if f.Kind == FactLegacyImported {
+			if f.ImportGeneration != p.LegacyGeneration+1 {
+				return p, illegal(f, "not the next import generation")
+			}
 			if err := reduceLegacy(created, f); err != nil {
 				return p, err
 			}

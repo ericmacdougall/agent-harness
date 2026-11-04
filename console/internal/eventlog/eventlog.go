@@ -72,6 +72,10 @@ type Log struct {
 	key     []byte
 	latched bool
 	count   uint64
+	// p is the projection this log last published: every stored fact reduced, plus
+	// the in-memory restart of a latched open. Append judges facts against it, never
+	// against the caller's copy.
+	p kernel.Projection
 }
 
 func dsn(path string) string {
@@ -80,17 +84,57 @@ func dsn(path string) string {
 	return "file:" + filepath.ToSlash(path) + "?_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=fullfsync(1)&_pragma=checkpoint_fullfsync(1)&_pragma=busy_timeout(5000)"
 }
 
-// Open locks dir, opens or creates its log, replays it and records the restart. A
-// restart that cannot commit leaves the log latched with the replayed projection.
-func Open(ctx context.Context, dir string, now string) (*Log, kernel.Projection, []kernel.Quarantined, error) {
-	empty := kernel.NewProjection()
+// DirLock is the data directory's console lock, held before anything in the
+// directory is read. The legacy importer holds it to decode without writing, then
+// hands it to OpenLocked.
+type DirLock struct {
+	dir    string
+	unlock func()
+}
+
+// LockDir takes the console lock on dir, the same lock the 0.1 console takes. It
+// creates console.lock if absent and writes nothing else.
+func LockDir(dir string) (*DirLock, error) {
 	if info, err := os.Lstat(dir); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, empty, nil, errors.New("data directory must be an existing real directory")
+		return nil, errors.New("data directory must be an existing real directory")
 	}
 	unlock, err := lockDir(filepath.Join(dir, LockName))
 	if err != nil {
-		return nil, empty, nil, err
+		return nil, err
 	}
+	return &DirLock{dir: dir, unlock: unlock}, nil
+}
+
+// Dir is the locked directory.
+func (d *DirLock) Dir() string { return d.dir }
+
+// Release drops a lock that was not handed to OpenLocked.
+func (d *DirLock) Release() {
+	if d.unlock != nil {
+		d.unlock()
+		d.unlock = nil
+	}
+}
+
+// Open locks dir, opens or creates its log, replays it and records the restart. A
+// restart that cannot commit leaves the log latched with the replayed projection.
+func Open(ctx context.Context, dir string, now string) (*Log, kernel.Projection, []kernel.Quarantined, error) {
+	lock, err := LockDir(dir)
+	if err != nil {
+		return nil, kernel.NewProjection(), nil, err
+	}
+	return OpenLocked(ctx, lock, now)
+}
+
+// OpenLocked is Open on a directory whose lock the caller already holds. It takes
+// ownership of the lock: the log's Close releases it, and so does any failure here.
+func OpenLocked(ctx context.Context, lock *DirLock, now string) (*Log, kernel.Projection, []kernel.Quarantined, error) {
+	empty := kernel.NewProjection()
+	if lock == nil || lock.unlock == nil {
+		return nil, empty, nil, errors.New("open needs a held directory lock")
+	}
+	dir, unlock := lock.dir, lock.unlock
+	lock.unlock = nil
 	path := filepath.Join(dir, fileName)
 	marker := filepath.Join(dir, markerName)
 	// The DSN is a URI, so these would make SQLite open a different file than the one
@@ -146,6 +190,7 @@ func Open(ctx context.Context, dir string, now string) (*Log, kernel.Projection,
 	if open > maxOpenAtOpen {
 		return fail(fmt.Errorf("%w: %d open sessions is more than the reserve covers", kernel.ErrUnreadableLog, open))
 	}
+	l.p = p
 	decision, err := kernel.Decide(p, kernel.In{Kind: kernel.ObRestart, Principal: kernel.Principal{Class: kernel.PrincipalSystem}, At: now})
 	if err != nil {
 		return fail(err)
@@ -162,6 +207,7 @@ func Open(ctx context.Context, dir string, now string) (*Log, kernel.Projection,
 					return fail(err)
 				}
 			}
+			l.p = p
 			return l, p, quarantined, nil
 		}
 		for _, f := range stored {
@@ -286,11 +332,9 @@ func (l *Log) latch() {
 // and whether they were already committed by an earlier call, in which case they
 // are already in any projection that saw that call.
 //
-// Contract: p must be the projection this log last published, reduced from every
-// stored fact. Append checks only p.LastSeq against its own count; it trusts the
-// rest of p for kernel.MustAppend and kernel.Reduce. A caller that passes another
-// projection with the right sequence can misjudge eligibility. TODO(K3): decide
-// whether the log should hold its own projection instead of trusting the caller's.
+// Only p.LastSeq is read: it is the compare-and-swap value. Eligibility and legality
+// are judged against the log's own projection, so a caller's stale or altered copy
+// cannot misjudge them. Projection returns the log's copy.
 //
 // Outcomes follow the plan's log health table: a definite failure writes nothing
 // and returns its error; any commit error not known to precede commit, or a revoking
@@ -307,6 +351,17 @@ func (l *Log) Append(ctx context.Context, p kernel.Projection, commandID, digest
 	stored, replayed, err := l.append(ctx, p, commandID, digest, facts)
 	switch {
 	case err == nil:
+		if !replayed {
+			// Advance only from what a replay will decode, and only on a new commit.
+			next := l.p
+			for _, f := range stored {
+				if next, err = kernel.Reduce(next, f); err != nil {
+					l.latched = true
+					return nil, false, fmt.Errorf("%w: a committed fact does not reduce: %v", ErrLatched, err)
+				}
+			}
+			l.p = next
+		}
 		return stored, replayed, nil
 	case errors.Is(err, errAmbiguous), errors.Is(err, errReserveSpent):
 		l.latched = true
@@ -367,14 +422,14 @@ func (l *Log) append(ctx context.Context, p kernel.Projection, commandID, digest
 	if err = tx.QueryRowContext(ctx, `SELECT fact_count FROM metadata`).Scan(&count); err != nil {
 		return nil, false, err
 	}
-	if count != expectedSeq {
+	if count != expectedSeq || l.p.LastSeq != expectedSeq {
 		return nil, false, ErrConflict
 	}
 	// Each fact must apply to the projection it was decided on, and past the ordinary
 	// limit each must be one the kernel admits to the reserve. A refusal at the limit
 	// is final for that decision: nothing of it commits, and the caller drops it.
 	limit := uint64(MaxFacts - Reserve)
-	folded := p
+	folded := l.p
 	for i, f := range facts {
 		if count+uint64(i)+1 > limit && !kernel.MustAppend(folded, f) {
 			return nil, false, ErrQuota
@@ -477,6 +532,13 @@ func readRange(ctx context.Context, tx *sql.Tx, first, last uint64) ([]kernel.Fa
 }
 
 // Count is the number of committed facts.
+// Projection is the projection the log last published.
+func (l *Log) Projection() kernel.Projection {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.p
+}
+
 func (l *Log) Count() uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
