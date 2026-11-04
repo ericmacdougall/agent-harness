@@ -611,6 +611,8 @@ func TestRandomKillsLoseNoAcknowledgedFact(t *testing.T) {
 		var buf bytes.Buffer
 		var walAtAck int64
 		done := make(chan struct{})
+		firstAck := make(chan struct{})
+		var once sync.Once
 		var mu sync.Mutex
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
@@ -626,6 +628,9 @@ func TestRandomKillsLoseNoAcknowledgedFact(t *testing.T) {
 					if info, statErr := os.Stat(filepath.Join(dir, fileName+"-wal")); statErr == nil && bytes.Contains(chunk[:n], []byte("ACK")) {
 						walAtAck = info.Size()
 					}
+					if bytes.Contains(buf.Bytes(), []byte("ACK")) {
+						once.Do(func() { close(firstAck) })
+					}
 					mu.Unlock()
 				}
 				if err != nil {
@@ -633,7 +638,22 @@ func TestRandomKillsLoseNoAcknowledgedFact(t *testing.T) {
 				}
 			}
 		}()
-		time.Sleep(time.Duration(20+rng.Intn(500)) * time.Millisecond)
+		// Child startup varies widely (the race detector, a loaded host), so most
+		// kills are timed from the first acknowledgement; every fourth is timed
+		// from start and may land before any acknowledgement at all.
+		delay := time.Duration(rng.Intn(500)) * time.Millisecond
+		if trial%4 == 0 {
+			delay += 20 * time.Millisecond
+		} else {
+			select {
+			case <-firstAck:
+			case <-done:
+			case <-time.After(2 * time.Minute):
+				_ = cmd.Process.Kill()
+				t.Fatalf("seed=%d trial=%d: child gave no acknowledgement within 2m", seed, trial)
+			}
+		}
+		time.Sleep(delay)
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		<-done
