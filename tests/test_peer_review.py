@@ -1181,13 +1181,15 @@ class ProviderEnvelopeTests(unittest.TestCase):
                 {'type': 'turn.started'},
                 {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'VERDICT: BLOCK\nF1 bug'}},
                 {'type': 'turn.completed'}]),
+            # A different non-final error must not be skipped just because a 401 follows.
             'error then different turn.failed': self.transcript([
+                {'type': 'error', 'message': 'internal error'},
+                {'type': 'turn.failed', 'error': {'message': 'unauthorized (401)'}}]),
+            # Only the record directly before the final turn.failed may be skipped.
+            'matching error not adjacent': self.transcript([
                 {'type': 'error', 'message': 'unauthorized (401)'},
-                {'type': 'turn.failed', 'error': {'message': 'internal error'}}]),
-            'paired error not last': self.transcript([
-                {'type': 'error', 'message': 'unauthorized (401)'},
-                {'type': 'turn.failed', 'error': {'message': 'unauthorized (401)'}},
-                {'type': 'turn.started'}]),
+                {'type': 'item.completed', 'item': {'type': 'command_execution', 'aggregated_output': '', 'exit_code': 0}},
+                {'type': 'turn.failed', 'error': {'message': 'unauthorized (401)'}}]),
             'auth error after a message': self.transcript([
                 {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'VERDICT: BLOCK\nF1'}},
                 {'type': 'turn.failed', 'error': {'message': 'unauthorized (401)'}}]),
