@@ -13,9 +13,13 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strings"
 
 	"github.com/ericmacdougall/agent-harness/internal/cli"
 	"github.com/ericmacdougall/agent-harness/internal/guard"
+	ledgercli "github.com/ericmacdougall/agent-harness/internal/ledger/cli"
+	"github.com/ericmacdougall/agent-harness/internal/ledger/mcp"
+	"github.com/ericmacdougall/agent-harness/internal/ledger/writer"
 	"github.com/ericmacdougall/agent-harness/internal/pycompat"
 )
 
@@ -57,6 +61,9 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	g, err := cli.Parse(argv)
 	surface := g.Sub
 	gate := isGate(g.Sub, g.Args)
+	// The commit-policy adapter calls `tickets show --min-version`: a crash there must fail closed (exit 2).
+	gate = gate || (g.Sub == "tickets" && len(g.Args) > 0 && g.Args[0] == "show" && hasFlag(g.Args, "--min-version"))
+	writer.TestHooksAllowed = version == "dev"
 	if err != nil {
 		fmt.Fprintln(stderr, cli.Usage)
 		fmt.Fprintf(stderr, "harness: error: %s\n", err)
@@ -68,6 +75,12 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		}
 		if g.Sub == "version" {
 			return versionCmd(g.Args, stdout, stderr)
+		}
+		switch g.Sub {
+		case "tickets":
+			return ledgercli.Main(g.Args, ledgerEnv(stdout, stderr))
+		case "ledger-mcp":
+			return ledgerMCP(g.Args, stdout, stderr)
 		}
 		if gate {
 			// Exit 2 blocks on all three hosts; exit 1/3 would let the action through on Codex and Claude.
@@ -113,5 +126,47 @@ func versionCmd(args []string, stdout, stderr io.Writer) int {
 		panic(err)
 	}
 	fmt.Fprintln(stdout, string(out))
+	return 0
+}
+
+func hasFlag(args []string, name string) bool {
+	for _, a := range args {
+		if a == name || strings.HasPrefix(a, name+"=") {
+			return true
+		}
+		if a == "--" {
+			break
+		}
+	}
+	return false
+}
+
+func ledgerEnv(stdout, stderr io.Writer) ledgercli.Env {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "."
+	}
+	return ledgercli.Env{Cwd: cwd, Stdin: os.Stdin, Stdout: stdout, Stderr: stderr, Getenv: os.Getenv}
+}
+
+func ledgerMCP(args []string, stdout, stderr io.Writer) int {
+	slug := ""
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; {
+		case strings.HasPrefix(a, "--slug="):
+			slug = a[len("--slug="):]
+		case a == "--slug" && i+1 < len(args):
+			slug = args[i+1]
+			i++
+		default:
+			fmt.Fprintln(stderr, "usage: harness ledger-mcp [--slug S]")
+			return 2
+		}
+	}
+	s := &mcp.Server{Env: ledgerEnv(io.Discard, io.Discard), Slug: slug}
+	if err := s.Serve(os.Stdin, stdout); err != nil {
+		fmt.Fprintln(stderr, "harness ledger-mcp: stdin error")
+		return 1
+	}
 	return 0
 }
