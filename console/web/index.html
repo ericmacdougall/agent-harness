@@ -218,6 +218,34 @@
             <div class="repo-error" id="repo-error" role="status" hidden>
             </div>
           </section>
+          <section class="pr-panel" aria-labelledby="pr-heading">
+            <header class="panel-header">
+              <h2 id="pr-heading">
+                <span class="panel-icon">
+                  ⇄
+                </span>
+                Pull requests
+              </h2>
+              <label class="sr-only" for="pr-state">
+                Pull request state
+              </label>
+              <select id="pr-state" data-testid="pr-state">
+                <option value="open">Open</option>
+                <option value="merged">Merged</option>
+                <option value="all">All</option>
+              </select>
+              <button class="icon-button small" id="pr-refresh" title="Reload pull requests" aria-label="Reload pull requests" data-testid="pr-refresh">
+                ↻
+              </button>
+            </header>
+            <div id="pr-list" class="pr-list" role="listbox" aria-label="Pull requests" data-testid="pr-list">
+            </div>
+            <div class="repo-error" id="pr-status" role="status" hidden>
+            </div>
+            <button class="primary-button" id="pr-open-map" data-testid="pr-open-map" disabled>
+              Open review map
+            </button>
+          </section>
           <div class="sidebar-bottom">
             <span class="privacy-dot">
             </span>
@@ -346,6 +374,29 @@
           </button>
         </div>
       </div>
+    </dialog>
+    <dialog id="review-map-dialog" aria-labelledby="review-map-title" class="dialog review-map-dialog">
+      <div class="dialog-heading">
+        <div>
+          <div class="eyebrow">
+            PAIR-PROGRAMMING VIEW
+          </div>
+          <h2 id="review-map-title">
+            Review map
+          </h2>
+        </div>
+        <a id="review-map-newtab" class="quiet-button" target="_blank" rel="noopener noreferrer" href="#">Open in new tab</a>
+        <button class="icon-button" data-close aria-label="Close">
+          ×
+        </button>
+      </div>
+      <iframe id="review-map-frame" title="Pull request review map" sandbox="allow-scripts" allow="clipboard-write" referrerpolicy="no-referrer" data-testid="review-map-frame"></iframe>
+      <fieldset class="review-map-attach">
+        <legend>Attach to GoodQA</legend>
+        <div id="review-map-tickets"></div>
+        <div id="review-map-result" role="status" data-testid="review-map-result"></div>
+        <button class="primary-button" id="review-map-attach" data-testid="review-map-attach">Attach to GoodQA tickets</button>
+      </fieldset>
     </dialog>
     <dialog id="confirm-dialog" aria-labelledby="confirm-title" class="dialog compact-dialog">
       <form id="confirm-form">
