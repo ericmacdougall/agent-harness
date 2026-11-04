@@ -47,6 +47,12 @@ class GhCreateVerdict(workflow.DeliveryWorkflow):
         'gateway': ('HTTP 502: Bad Gateway', 'REMOTE_UNCERTAIN', None),
         'reset': ('dial tcp: connection reset by peer', 'REMOTE_UNCERTAIN', None),
         'mixed': ('HTTP 404 but also i/o timeout', 'REMOTE_UNCERTAIN', None),
+        'deadline': ('Post graphql: context deadline exceeded; repository not found', 'REMOTE_UNCERTAIN', None),
+        'eof': ('Post https://api.github.com/graphql: EOF permission', 'REMOTE_UNCERTAIN', None),
+        'label': ("pull request create failed: could not add label: 'x' not found", 'REMOTE_UNCERTAIN', None),
+        'echoed_branch': ('Creating draft pull request for fix/permission-denied-not-found into main in o/r',
+                          'REMOTE_UNCERTAIN', None),
+        'rate': ('HTTP 429: Too Many Requests; not found', 'REMOTE_UNCERTAIN', None),
     }
 
     def test_a_create_that_landed_despite_nonzero_exit_is_adopted(self):
@@ -65,6 +71,11 @@ class GhCreateVerdict(workflow.DeliveryWorkflow):
         self.assertNotIn(secret, text)
         self.assertNotIn('\x1b', text)
         self.assertLessEqual(len(data['gh_error']), 300)
+
+    def test_controls_cannot_split_a_token_past_redaction(self):
+        module = load_deliver()
+        text = module.sanitize_gh_text('ghp_abcdef\x01ghijklmnopSECRETTAIL0123456789')
+        self.assertNotIn('SECRETTAIL', text)
 
     def test_missing_gh_executable_is_blocked_not_uncertain(self):
         self.configure_github()
@@ -187,6 +198,7 @@ class WaiverVisibility(workflow.DeliveryWorkflow):
         code, data = self.prepare_with([waiver])
         self.assertEqual((code, data['status']), (0, 'LOCAL_READY'), data)
         self.assertEqual([item['id'] for item in data['commit_policy_waivers']], ['w123'])
+        self.assertEqual(data['commit_policy_waivers'][0]['wal'], 'wal.jsonl')
 
     def test_no_waivers_means_no_key(self):
         code, data = self.prepare_with([])

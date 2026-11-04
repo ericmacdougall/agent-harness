@@ -541,7 +541,10 @@ class Workflow:
         try:
             record = json.loads(regular_bytes(self.directory / COMMIT_POLICY_RECORD))
             items = record.get("waivers", [])
-            return [{key: str(item.get(key, ""))[:200] for key in ("kind", "subject", "id", "wal")}
+            return [{"kind": sanitize_gh_text(str(item.get("kind", "")), 40),
+                     "subject": sanitize_gh_text(str(item.get("subject", "")), 64),
+                     "id": sanitize_gh_text(str(item.get("id", "")), 64),
+                     "wal": os.path.basename(sanitize_gh_text(str(item.get("wal", "")), 200))}
                     for item in items[:50] if isinstance(item, dict)] if isinstance(items, list) else []
         except (OSError, ValueError, DeliveryError, AttributeError, TypeError):
             return []
@@ -602,25 +605,25 @@ def gh(*args, timeout=30):
 GH_STDERR_LIMIT = 4096
 GH_HINT_LIMIT = 300
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|.)")
-# A failure that names one of these may have happened after GitHub acted (or says nothing definite).
-GH_TRANSIENT = re.compile(r"(?i)\b(?:timed? ?out|timeout|connection (?:reset|refused|closed)|broken pipe|"
-                          r"unexpected eof|temporar|try again|rate limit|secondary rate|"
-                          r"http 5\d\d|50[0234]\b|bad gateway|service unavailable|no such host|"
-                          r"network is unreachable|tls)")
-# Failures GitHub reports before creating anything: auth, access, missing refs, validation.
+# Anything ambiguous, transient or from a later step (labels, reviewers) may have happened after
+# GitHub already created the PR, so it can never be a definite verdict.
+GH_TRANSIENT = re.compile(r"(?i)(?:timed? ?out|timeout|deadline exceeded|connection (?:reset|refused|closed)|"
+                          r"broken pipe|\beof\b|temporar|try again|rate limit|too many requests|\b429\b|"
+                          r"something went wrong|internal server error|\b50[0234]\b|bad gateway|"
+                          r"service unavailable|no such host|network is unreachable|\btls\b|"
+                          r"could not add|could not request|after (?:creating|the pull request))")
+# Failures GitHub reports before creating anything. Anchored to gh's own message shapes, never to
+# free words such as "not found" or "permission" that a label, branch or later step could contain.
 GH_DEFINITE = (
-    (re.compile(r"(?i)gh auth login|not logged in|authentication|bad credentials|http 401|requires authentication|"
-                r"token .*(?:expired|invalid)|insufficient.*scope|GH_TOKEN"),
+    (re.compile(r"(?im)gh auth login|^\s*(?:gh: )?(?:HTTP 401\b|bad credentials)|authentication required"),
      "GitHub authentication failed; run `gh auth login` for this host, then re-run prepare with --new-generation"),
-    (re.compile(r"(?i)http 403|resource not accessible|permission|forbidden|saml"),
-     "GitHub denied access to this repository; check the account's write access, then re-run prepare with --new-generation"),
-    (re.compile(r"(?i)base ref must be a branch|base branch .*(?:not found|does not exist)|"
-                r"(?:no such|unknown) (?:base|branch)|could not resolve to a (?:ref|branch)"),
+    (re.compile(r"(?im)^\s*(?:gh: )?(?:graphql: )?(?:HTTP 403\b|resource not accessible)"),
+     "GitHub denied write access to this repository; check the account's write access, then re-run prepare with --new-generation"),
+    (re.compile(r"(?im)base ref must be a branch|^\s*(?:gh: )?(?:graphql: )?could not resolve to a (?:ref|branch)\b"),
      "The base branch does not exist on GitHub; push it or pass the right --original-branch, then re-run with --new-generation"),
-    (re.compile(r"(?i)http 404|could not resolve to a repository|repository not found|not found"),
+    (re.compile(r"(?im)^\s*(?:gh: )?(?:HTTP 404\b|(?:graphql: )?could not resolve to a repository\b)"),
      "GitHub cannot find the repository (or you cannot see it); check origin and access, then re-run with --new-generation"),
-    (re.compile(r"(?i)validation failed|http 422|unprocessable|no commits between|head sha|"
-                r"must first push|head ref .*(?:invalid|must be)|is not a valid"),
+    (re.compile(r"(?im)^\s*(?:gh: )?(?:graphql: )?(?:validation failed|HTTP 422\b)|no commits between|must first push"),
      "GitHub rejected the PR as invalid (for example no commits between base and head); fix it, then re-run with --new-generation"),
 )
 
@@ -628,13 +631,16 @@ GH_DEFINITE = (
 def sanitize_gh_text(text, limit=GH_HINT_LIMIT):
     """One bounded printable line of gh stderr: escapes and controls stripped, secrets redacted."""
     text = ANSI.sub(" ", text[:GH_STDERR_LIMIT])
-    text = redact_output(text)
-    text = "".join(char if char.isprintable() else " " for char in text)
-    return " ".join(text.split())[:limit]
+    # Controls first: they could otherwise split a token and defeat the redaction patterns.
+    text = "".join(char for char in text if char.isprintable() or char in " \t\r\n")
+    return " ".join(redact_output(text).split())[:limit]
 
 
 def classify_gh_failure(code, error_text):
     """Return a hint for a failure GitHub reported before acting, or None when completion is unknown."""
+    # gh echoes "Creating draft pull request for <branch> into <base>"; the branch name is not evidence.
+    error_text = ANSI.sub("", error_text[:GH_STDERR_LIMIT])
+    error_text = "\n".join(line for line in error_text.splitlines() if not line.lstrip().startswith("Creating "))
     if GH_TRANSIENT.search(error_text):
         return None
     if code == 4:
@@ -884,12 +890,16 @@ def prepare_pr(flow, title, body):
                 ["gh", "pr", "create", "-R", flow.state["repository"], "--head", flow.state["source_branch"],
                  "--base", flow.branch, "--draft", "--title", title, "--body-file", str(staged)],
                 env=env, timeout=min(flow.args.timeout, 30), stderr_limit=GH_STDERR_LIMIT)
-        except OSError:
+        except (FileNotFoundError, PermissionError) as launch:
+            if launch.filename != "gh":
+                flow.save(phase="REMOTE_UNCERTAIN")
+                raise DeliveryError("REMOTE_UNCERTAIN", "PR creation outcome requires later positive reconciliation",
+                                    code=4, **flow.facts()) from None
             flow.save(phase="REMOTE_BLOCKED")
             raise DeliveryError("REMOTE_BLOCKED", "GitHub CLI (gh) could not be started",
                                 code=4, hint="Install gh and run `gh auth login`, then re-run prepare with --new-generation",
                                 **flow.facts()) from None
-        except DeliveryError:
+        except (DeliveryError, OSError):
             flow.save(phase="REMOTE_UNCERTAIN")
             raise DeliveryError("REMOTE_UNCERTAIN", "PR creation outcome requires later positive reconciliation",
                                 code=4, **flow.facts()) from None
