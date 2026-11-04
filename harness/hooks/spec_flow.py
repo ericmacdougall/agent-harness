@@ -1487,6 +1487,9 @@ def cmd_done(args, spec_policy, apply=False):
     if not apply:
         return EXIT_OK
     if getattr(session.ticket, "closed", False):
+        if session.ticket.status == "done":  # a retry after a lost response: the transition already happened
+            print(json.dumps({"status": "ALREADY_DONE", "ticket": session.ticket.label}))
+            return EXIT_OK
         print(f"{session.ticket.label} is already closed ({session.ticket.status}); nothing to apply")
         return EXIT_MISSING
     note = (f"Spec gate READY (spec core {result['spec_core_sha'][:16]}): every acceptance criterion has "
@@ -1609,7 +1612,11 @@ def main(argv=None) -> int:
             code = 2 if spec_policy.get("mode") == "enforce" and enforced_ids(spec_policy) else 0
             text = f"spec-flow hook error ({type(error).__name__}); {'blocking' if code else 'allowing'}"
         if text:
-            print(text, file=sys.stderr)
+            print(text, file=sys.stderr)  # exit 2: Claude Code feeds stderr to the model
+            if code == 0:
+                # Claude never sees stderr from an exit-0 PreToolUse hook; additionalContext reaches the model
+                # without making a permission decision, so the normal permission flow still applies.
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}}))
         return code
     try:
         spec_policy = load_spec_policy()

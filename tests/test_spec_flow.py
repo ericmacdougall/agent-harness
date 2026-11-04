@@ -776,6 +776,9 @@ class DoneGate(SpecFlowCase):
         self.fake.refuse_done = False
         self.assertEqual(self.run_cli("done", "--ticket", "GoodQA harness#168", "--apply")[0], 0)
         self.assertEqual(self.fake.issues[ISSUE]["status"], "done")
+        code, out, _ = self.run_cli("done", "--ticket", "GoodQA harness#168", "--apply")  # retry after lost reply
+        self.assertEqual(code, 0)
+        self.assertIn("ALREADY_DONE", out)
 
     def test_comment_page_budget_fails_closed(self):
         self.attached()
@@ -1004,6 +1007,18 @@ class Hook(SpecFlowCase):
                     contextlib.redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(sf.main(["hook"]), expected)
                 self.assertIn("RuntimeError", err.getvalue())
+
+    def test_warn_text_reaches_claude_as_additional_context(self):
+        payload = json.dumps({"tool_name": "mcp__plugin_goodqa_goodqa__update_issue",
+                              "tool_input": {"issueId": ISSUE, "patch": {"status": "done"}}})
+        with mock.patch.object(sf, "load_spec_policy", return_value=dict(self.spec_policy, mode="warn")), \
+                mock.patch.object(sys, "stdin", io.StringIO(payload)), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(sf.main(["hook"]), 0)
+        hso = json.loads(out.getvalue())["hookSpecificOutput"]
+        self.assertEqual(hso["hookEventName"], "PreToolUse")
+        self.assertIn("No verified spec", hso["additionalContext"])
+        self.assertNotIn("permissionDecision", hso)
 
     def test_unenforced_project_only_warns(self):
         code, text = self.hook("update_issue", {"issueId": ISSUE, "patch": {"status": "done"}},

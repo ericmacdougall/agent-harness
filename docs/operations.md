@@ -398,9 +398,9 @@ Otherwise it lists each missing item with the command that fixes it. Under "Self
 
 | Code | Meaning |
 |---|---|
-| 0 | READY |
-| 2 | Missing or refused |
-| 3 | Usage or spec error |
+| 0 | READY, or `--apply` on a ticket that is already done (`ALREADY_DONE`, safe to retry) |
+| 2 | Missing items, a refused record, a `lint` failure, or a command-line error from the argument parser |
+| 3 | Spec or input error found after parsing (for example a stale review, a refused log file, an unknown criterion) |
 | 4 | GoodQA unreachable, or the page budget ran out (fail closed) |
 | 5 | `--apply` was refused by GoodQA (`TRACKER_REFUSED`); the ticket is left unchanged |
 
@@ -417,6 +417,7 @@ GoodQA's own independent-acceptance rule for done transitions still applies.
    - **Allowed without a network call:** open statuses (triage through `on_production`, which GoodQA documents as nonterminal) and `update_issue` without a status.
    - **Gated by the spec:** `done`.
    - **Need a reason:** `wont_fix` and `duplicate` need one of at least 20 characters.
+   - **Warn mode:** the hook allows the call and returns its findings as `additionalContext`, which Claude Code shows the agent next to the tool result (plain stderr from an allowing hook is never shown to the agent). It makes no permission decision, so normal permission rules still apply.
    - **Blocked:** an unknown status, archiving an open ticket, a project, pipeline or stage move (`reassign_issue`, or `projectId`, `pipelineId` or `stageId` in an `update_issue` patch), and a `call_api` DELETE on an issue.
    - **`call_api` writes:** every non-GET `call_api` call is unchecked unless the hook recognises it, and an unchecked call warns, or blocks while any project is enforced. The path is lowercased first, so a mixed-case path is gated like the canonical one; a path without a leading `/`, or with a query, fragment, `%` escape, backslash, or empty or dot segment, is unchecked. Recognised shapes: an exact `/issues/<uuid>` path with an object body whose fields are all known (`status` and `patch.status` are gated like `update_issue`, and two different values or an explicit null are an unknown status, `projectId`/`pipelineId`/`stageId` as a move, and descriptive fields such as `title`, `priority` and `labels` pass; any other field, such as `archivedAt` or `action`, is unchecked); the exact `/comments`, `/attachments` and `/time-entries` sub-paths (allowed unless the body carries a status); a collection write with an `items` list (checked like `bulk_update_issues`); and a plain create (`POST /v1/issues` or `/v1/projects/<uuid>/issues` with no status, patch, items, id or filter keys), which blocks only when the path names an enforced project. Routes that do not name issues (projects, stages, other resources) are unchecked too, because the hook cannot tell whether they move or close issues.
    - **Bulk calls:** every item in a bulk call is checked, and one failing item blocks the call.
