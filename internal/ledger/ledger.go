@@ -40,7 +40,6 @@ const (
 	LockWaitEnv       = "HARNESS_LEDGER_TEST_LOCK_WAIT_MS"
 	DirName           = "goodqa"
 	projectsFile      = "projects.json"
-	trustFile         = "trust.json"
 	cacheFile         = "view.cache.json"
 	lockFile          = "writer.lock"
 	metaFile          = "meta.json"
@@ -194,6 +193,10 @@ func openGoodqa(root string, create bool) (*safefs.Dir, error) {
 	return d, nil
 }
 
+// MaxUnverifiedRefs caps how many refs from writers that are not this machine's are read per view; the
+// rest are listed as rejected without being read (anyone who can write the repository can plant refs).
+const MaxUnverifiedRefs = 64
+
 // Open opens the ledger for loc. It does not create anything.
 func Open(loc Location) (*Ledger, error) {
 	common, inRepo, err := store.CommonDir(loc.Cwd)
@@ -323,32 +326,29 @@ func MirrorDir(project string) (string, error) {
 
 // ---------------------------------------------------------------------------------------- view
 
-type trustEntry struct {
-	Class string `json:"class"`
-}
-
 func (l *Ledger) classes() (map[string]string, *writer.Map, error) {
 	m, _, err := writer.Load(l.Dir)
 	if err != nil {
 		return nil, nil, err
 	}
+	// 0a folds only this machine's own writers. trust.json is not read: no 0a command writes it, and it
+	// would travel with a copied .git. A repository ledger's writer counts as self only when this HOME's
+	// registry recorded it (with the same lease); writer.json alone proves nothing. A repo-less ledger
+	// already lives under this HOME.
 	out := map[string]string{}
-	if b, err := l.Dir.ReadRegular(trustFile, 1<<20); err == nil {
-		var t struct {
-			Writers map[string]trustEntry `json:"writers"`
-		}
-		if json.Unmarshal(b, &t) == nil {
-			for w, e := range t.Writers {
-				if op.ValidID(w, op.PrefixWriter) && (e.Class == fold.ClassTrusted || e.Class == fold.ClassBlocked) {
-					out[w] = e.Class
-				}
-			}
-		} else {
-			l.warn = append(l.warn, "trust.json is malformed; every foreign writer is treated as unverified")
-		}
+	var reg map[string]string
+	if l.InRepo {
+		reg = l.registry()
 	}
-	for w := range m.Self() {
-		out[w] = fold.ClassSelf // self always wins over trust.json
+	for _, e := range m.Writers {
+		if !l.InRepo {
+			out[e.Writer] = fold.ClassSelf
+			continue
+		}
+		h, ok := reg[e.Writer]
+		if ok && ((e.Restored && e.Lease == "") || h == store.LeaseHash(e.Lease)) {
+			out[e.Writer] = fold.ClassSelf
+		}
 	}
 	return out, m, nil
 }
@@ -410,13 +410,23 @@ func (l *Ledger) readAll(s *snapshot) (fold.Input, error) {
 		return names[i] < names[j]
 	})
 	seen := map[string][]byte{} // op id -> bytes, across refs
+	unfolded := 0
 	for _, r := range names {
 		proj, w, _ := store.ParseRefName(r)
 		if proj != l.Project {
 			continue
 		}
 		ref := fold.Ref{Writer: w}
-		packs, err := l.Git.ReadRef(proj, w, s.tips[r])
+		budget := store.FoldedBudget
+		if !folded(r) {
+			if unfolded++; unfolded > MaxUnverifiedRefs {
+				ref.Rejected = fmt.Sprintf("more than %d refs from writers that are not this machine's; not read", MaxUnverifiedRefs)
+				in.Refs = append(in.Refs, ref)
+				continue
+			}
+			budget = store.UnverifiedBudget
+		}
+		packs, err := l.Git.ReadRefBudget(proj, w, s.tips[r], budget)
 		if err != nil {
 			ref.Rejected = err.Error()
 			in.Refs = append(in.Refs, ref)
@@ -636,13 +646,40 @@ func (l *Ledger) currentWriter(now int64) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	w, lease, _, err := writer.Resolve(l.Dir, writer.Fingerprint(mid, ino), now)
-	return w, lease, err
+	w, lease, minted, err := writer.Resolve(l.Dir, writer.Fingerprint(mid, ino), now)
+	if err != nil || !l.InRepo {
+		return w, lease, err
+	}
+	if minted {
+		return w, lease, l.registerWriter(w, lease)
+	}
+	if l.registry()[w] != store.LeaseHash(lease) {
+		return "", "", wrap(ErrRefused, "this checkout's writer %s is not registered in ~/.agent-harness/ledgers/%s: "+
+			"the ledger was not created on this machine (or that directory was removed), so it is not trusted", w, l.Project)
+	}
+	return w, lease, nil
 }
 
-// scanDrafts refuses (or masks) secret-shaped text in every string payload member.
+// scanEnvelope refuses secret-shaped text in values that live outside an op's payload (the claimed actor
+// label, project.create names). They are never masked: a masked label would not be a valid label.
+func scanEnvelope(fields [][2]string) error {
+	found := scan.Scan(fields)
+	if len(found) == 0 {
+		return nil
+	}
+	parts := make([]string, len(found))
+	for j, f := range found {
+		parts[j] = f.String()
+	}
+	return wrap(ErrSecret, "refusing to store secret-shaped text: %s", strings.Join(parts, "; "))
+}
+
+// scanDrafts refuses (or masks) secret-shaped text in every string payload member and the actor label.
 func scanDrafts(ds []op.Draft, redact bool) error {
 	for i := range ds {
+		if err := scanEnvelope([][2]string{{"actor_label", ds[i].Actor.Label}}); err != nil {
+			return err
+		}
 		var fields [][2]string
 		for _, f := range ds[i].Payload {
 			switch v := f.V.(type) {
@@ -768,7 +805,6 @@ func (l *Ledger) appendLocked(drafts []op.Draft, opts AppendOptions, check func(
 		if os.Getenv(CrashAfterCASEnv) == "1" && writer.TestHooksAllowed {
 			os.Exit(9) // test hook: simulate a crash between update-ref and the cache write
 		}
-		l.recordMirrorWriter(w, lease)
 		nv, err := l.View()
 		if err != nil {
 			return nil, err
@@ -821,19 +857,46 @@ func (l *Ledger) mint(drafts []op.Draft, w string, last op.HLC, now int64, witne
 	return ops, nil
 }
 
-// recordMirrorWriter notes (writer, lease hash) beside the mirror so --from-mirror can restore exactly
-// this machine's writers as self.
-func (l *Ledger) recordMirrorWriter(w, lease string) {
-	if !l.InRepo {
-		return
-	}
+// registry returns this HOME's record of the writers minted on this machine for the ledger
+// (~/.agent-harness/ledgers/<proj>/mirror-writers.json: writer -> sha256(lease)[:16]). It is the trust
+// anchor for the self class of a repository ledger: writer.json travels with a copied .git, this file
+// does not. A missing file is an empty registry.
+func (l *Ledger) registry() map[string]string {
+	out := map[string]string{}
 	mdir, err := MirrorDir(l.Project)
 	if err != nil {
-		return
+		return out
 	}
 	d, err := safefs.OpenDir(filepath.Dir(mdir))
 	if err != nil {
-		return
+		return out
+	}
+	defer d.Close()
+	raw := map[string]any{}
+	if b, err := d.ReadRegular(mirrorWritersFile, 1<<20); err == nil && json.Unmarshal(b, &raw) == nil {
+		for w, v := range raw {
+			if h, ok := v.(string); ok && op.ValidID(w, op.PrefixWriter) && h != "" {
+				out[w] = h
+			}
+		}
+	}
+	return out
+}
+
+// registerWriter records (writer, lease hash) in this HOME's registry. It must succeed before a newly
+// minted writer appends anything, or that writer's ops would not count as self.
+func (l *Ledger) registerWriter(w, lease string) error {
+	mdir, err := MirrorDir(l.Project)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(mdir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return wrap(ErrRefused, "cannot create the ledger registry: %v", err)
+	}
+	d, err := safefs.OpenDir(dir)
+	if err != nil {
+		return wrap(ErrRefused, "cannot open the ledger registry: %v", err)
 	}
 	defer d.Close()
 	// Several checkouts of one project share this file without a common lock: Replace is a compare-and-swap
@@ -843,23 +906,29 @@ func (l *Ledger) recordMirrorWriter(w, lease string) {
 		prior, err := d.Snapshot(mirrorWritersFile, 1<<20)
 		if err == nil {
 			b, _ := d.ReadRegular(mirrorWritersFile, 1<<20)
-			_ = json.Unmarshal(b, &cur)
+			if json.Unmarshal(b, &cur) != nil {
+				return wrap(ErrRefused, "%s is malformed", mirrorWritersFile)
+			}
 		} else {
 			prior = nil
 		}
 		if cur[w] == store.LeaseHash(lease) {
-			return
+			return nil
 		}
 		cur[w] = store.LeaseHash(lease)
 		b, err := pycompat.Canonical(cur)
 		if err != nil {
-			return
+			return err
 		}
 		err = d.Replace(mirrorWritersFile, append(b, '\n'), prior)
-		if err == nil || !(errors.Is(err, safefs.ErrChanged) || errors.Is(err, safefs.ErrExists)) {
-			return
+		if err == nil {
+			return nil
+		}
+		if !(errors.Is(err, safefs.ErrChanged) || errors.Is(err, safefs.ErrExists)) {
+			return wrap(ErrRefused, "cannot write the ledger registry: %v", err)
 		}
 	}
+	return wrap(ErrBusy, "the ledger registry kept changing; try again")
 }
 
 func (l *Ledger) pushMirror(w string) {

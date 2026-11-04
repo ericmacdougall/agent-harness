@@ -5,19 +5,26 @@ package term
 import (
 	"fmt"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
 // MaxLine is the longest line rendered; longer lines are cut and marked.
 const MaxLine = 2000
 
-// visible lists format characters that are rendered as \uXXXX instead of being passed through:
-// bidi embeddings/overrides/isolates and zero-width characters (they can hide or reorder text).
+// visible lists characters that are rendered as \u{...} instead of being passed through because they can
+// hide, smuggle or reorder text: every format character (Unicode category Cf: bidi controls, zero-width
+// characters, tags, invisible operators, musical and shorthand format controls), line/paragraph
+// separators, soft hyphen, interlinear annotation, variation selectors other than the emoji/text
+// presentation pair U+FE0E/U+FE0F (U+FE00-FE0D and the 240 supplementary selectors used for "emoji
+// smuggling"), Mongolian free variation selectors, the combining grapheme joiner, Khmer inherent vowels,
+// Hangul fillers and the blank braille pattern.
 func visible(r rune) bool {
 	switch {
-	case r >= 0x202A && r <= 0x202E, r >= 0x2066 && r <= 0x2069, r >= 0x200B && r <= 0x200F,
-		r == 0x2060, r == 0xFEFF, r == 0x061C, r == 0x180E, r >= 0x2061 && r <= 0x2064,
-		r == 0x2028, r == 0x2029, r == 0x00AD, r >= 0xFFF9 && r <= 0xFFFB, r >= 0xE0000 && r <= 0xE007F:
+	case unicode.Is(unicode.Cf, r),
+		r == 0x2028, r == 0x2029, r == 0x00AD, r >= 0xFFF9 && r <= 0xFFFB, r >= 0xE0000 && r <= 0xE007F,
+		r >= 0xFE00 && r <= 0xFE0D, r >= 0xE0100 && r <= 0xE01EF, r >= 0x180B && r <= 0x180F,
+		r == 0x034F, r == 0x17B4, r == 0x17B5, r == 0x115F, r == 0x1160, r == 0x3164, r == 0xFFA0, r == 0x2800:
 		return true
 	}
 	return false

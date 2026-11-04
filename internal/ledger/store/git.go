@@ -32,7 +32,10 @@ const (
 
 // Settings added on top of gitx.BaseSettings for every ledger git call.
 var ledgerSettings = []gitx.Setting{{Key: "maintenance.auto", Value: "false"}, {Key: "gc.auto", Value: "0"},
-	{Key: "protocol.version", Value: "2"}, {Key: "core.askPass", Value: ""}, {Key: "credential.helper", Value: ""}}
+	{Key: "protocol.version", Value: "2"}, {Key: "core.askPass", Value: ""}, {Key: "credential.helper", Value: ""},
+	// The ledger only ever moves objects between local repositories: refuse every other transport, so a
+	// repository's url.*.insteadOf cannot turn a mirror transfer into a network request.
+	{Key: "protocol.allow", Value: "never"}, {Key: "protocol.file.allow", Value: "always"}}
 
 // GitError is a failed git invocation. Its text names the subcommand and exit code only (stderr can
 // carry paths and remote URLs).
@@ -50,6 +53,7 @@ type Git struct {
 	// Env, when set, replaces the computed environment (tests use it to prove isolation); never set in
 	// production.
 	extraEnv []string
+	objFmt   int // cached ObjectFormat result
 }
 
 // Env returns the environment every ledger git call uses.
@@ -101,17 +105,22 @@ func CommonDir(cwd string) (string, bool, error) {
 
 // ObjectFormat returns the hex length of object ids (40 for sha1, 64 for sha256).
 func (g *Git) ObjectFormat() (int, error) {
+	if g.objFmt != 0 {
+		return g.objFmt, nil
+	}
 	out, err := g.run(LocalTimeout, nil, nil, "rev-parse", "--show-object-format")
 	if err != nil {
 		return 0, err
 	}
 	switch strings.TrimSpace(string(out)) {
 	case "sha1":
-		return 40, nil
+		g.objFmt = 40
 	case "sha256":
-		return 64, nil
+		g.objFmt = 64
+	default:
+		return 0, errors.New("unknown object format")
 	}
-	return 0, errors.New("unknown object format")
+	return g.objFmt, nil
 }
 
 // Config reads a repository-local boolean config value (false if unset).

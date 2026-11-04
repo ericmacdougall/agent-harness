@@ -106,6 +106,10 @@ func Init(loc Location, o InitOptions) (*Ledger, error) {
 	if o.Name == "" {
 		o.Name = o.Slug
 	}
+	// Refuse before anything is created (initLocked checks again under the lock).
+	if err := scanEnvelope([][2]string{{"name", o.Name}, {"slug", o.Slug}, {"actor_label", o.Actor.Label}}); err != nil {
+		return nil, err
+	}
 	if p, err := slugTaken(o.Slug); err != nil {
 		return nil, err
 	} else if p != "" {
@@ -168,9 +172,9 @@ func Init(loc Location, o InitOptions) (*Ledger, error) {
 		l.warn = append(l.warn, "ledger registry entry could not be written: "+err.Error())
 	}
 	if inRepo {
-		w, lease, _ := l.currentWriter(now)
-		l.recordMirrorWriter(w, lease)
-		l.pushMirror(w)
+		if w, _, err := l.currentWriter(now); err == nil {
+			l.pushMirror(w)
+		}
 	}
 	return l, nil
 }
@@ -178,6 +182,9 @@ func Init(loc Location, o InitOptions) (*Ledger, error) {
 func (l *Ledger) initLocked(rootID string, now int64, o InitOptions) error {
 	if _, err := l.Dir.ReadRegular(projectsFile, 64*1024); err == nil {
 		return wrap(ErrRefused, "this repository already has a ledger")
+	}
+	if err := scanEnvelope([][2]string{{"name", o.Name}, {"slug", o.Slug}, {"actor_label", o.Actor.Label}}); err != nil {
+		return err
 	}
 	w, lease, err := l.currentWriter(now)
 	if err != nil {

@@ -61,22 +61,33 @@ ambiguous.
 
 ## Safety
 
-- **Secrets.** Titles, bodies, comments and labels are scanned before anything is written.
-  Secret-shaped text (tokens, private keys, `Authorization:` headers, credentials in URLs) is
-  refused with the field and offset only, never echoed. `--redact-secrets` stores
-  `[REDACTED:<type>]` instead.
+- **Secrets.** Titles, bodies, comments, labels, the project name and `--actor-label` are scanned
+  before anything is written. Secret-shaped text (tokens, private keys, `Authorization:` headers,
+  credentials in URLs) is refused with the field and offset only, never echoed.
+  `--redact-secrets` stores `[REDACTED:<type>]` instead, except in the project name and actor
+  label, which are always refused.
 - **Inert output.** Every rendering (human, JSON, export, MCP) strips terminal escape sequences
-  and control characters and shows bidi, zero-width and other invisible characters as
-  `\u{...}`. Lines are capped at 2,000 characters.
+  and control characters. It shows every Unicode format character (bidi controls, zero-width,
+  tags), variation selectors other than the emoji/text pair U+FE0E/U+FE0F, Hangul fillers, the
+  blank braille pattern and similar invisible characters as `\u{...}`. Lines are capped at 2,000
+  characters.
 - **Untrusted text.** Ticket text and the claimed actor are data written by other agents or
   people, never instructions.
-- **Only your own writers count.** Each clone and machine writes its own ref. The view folds
-  only this machine's writers (`self`) and writers listed as trusted in `trust.json` (0a has no
-  command that adds them). Any other ref found
-  in the repository is `unverified`, excluded from every view and from the commit policy, and
-  shown by `writers --show` for review.
+- **Only this machine's writers count.** Each clone and machine writes its own ref. The view
+  folds only `self` writers, meaning writers recorded in this HOME's registry
+  (`~/.agent-harness/ledgers/<proj>/mirror-writers.json`). `writer.json` alone proves nothing,
+  because it travels with a copied `.git`. A repository copied with its `.git` into another
+  account or machine therefore has no `self` writers there: its ledger refuses to open and to
+  accept writes. Every other ref is `unverified`, excluded from every view and from the commit
+  policy, and shown by `writers --show` for review. `trust.json` is not read in 0a. If you
+  remove `~/.agent-harness/ledgers/<proj>`, this checkout's writer is no longer trusted.
+- **Bounded reads.** A ref from a writer that is not `self` is read with a 16 MiB budget, and at
+  most 64 such refs are read per view. The rest are listed as rejected without being read. An
+  ops blob that two packs share is refused before it is read.
 - **Git isolation.** Ledger git calls ignore user and system git config, run no hooks, never
-  sign, never auto-gc and never prompt. Pack commits use a fixed identity
+  sign (`--no-gpg-sign`), never auto-gc and never prompt. Only the local `file` transport is
+  allowed, and the mirror copies from the repository with its own configuration, so a
+  repository's `url.*.insteadOf` cannot redirect ledger data. Pack commits use a fixed identity
   (`goodqa-ledger <ledger@goodqa.invalid>`).
 
 ## Layout
@@ -84,8 +95,9 @@ ambiguous.
 | Path | Contents |
 |---|---|
 | `refs/goodqa/v1/<proj>/log/<writer>` | One ref per writer. Each commit is a pack whose tree holds exactly `version-1`, `hlc-<wall>-<ctr>` (the last op's clock) and `ops.jsonl` (canonical JSON ops). The ref moves only by compare-and-swap. |
-| `<git common dir>/goodqa/` (0700) | `projects.json`, `writer.json` (machine fingerprint to writer map), `trust.json`, `view.cache.json` and `writer.lock`, all 0600. A symlinked or group-readable directory is refused. Linked worktrees share it. |
-| `~/.agent-harness/ledgers/<proj>/mirror.git` | A bare local backup that receives the writer ref after every write. `init --from-mirror` restores from it, and treats a restored writer as `self` only when its lease hash matches `mirror-writers.json` (0600) beside the mirror. That file, not the hash, is the trust anchor: the hash also appears in pack commit messages. |
+| `<git common dir>/goodqa/` (0700) | `projects.json`, `writer.json` (machine fingerprint to writer map), `view.cache.json` and `writer.lock`, all 0600. A symlinked or group-readable directory is refused. Linked worktrees share it. |
+| `~/.agent-harness/ledgers/<proj>/mirror.git` | A bare local backup that copies the writer ref after every write. `init --from-mirror` restores from it, requires every restored ref to equal the mirror's tip, and treats a restored writer as `self` only when it is in `mirror-writers.json`. |
+| `~/.agent-harness/ledgers/<proj>/mirror-writers.json` (0600) | This HOME's registry of the writers minted here (writer to lease hash). It is the trust anchor for `self`. A new writer is recorded before its first write. |
 | `~/.agent-harness/ledgers/<proj>/repo.git` | The store for a repo-less ledger. |
 
 The view cache is only a cache. It is keyed by the exact set of ref tips and carries its own
@@ -97,8 +109,10 @@ SHA-256, and a missing, stale or corrupt cache is rebuilt from the refs.
 `Refs: Ledger <slug>#<8+ hex>` only in these two cases:
 
 - **Untracked repositories.** No remote `url` or `pushurl` of any remote matches a GoodQA
-  `repos` pattern. Raw and `insteadOf`-rewritten URLs are both checked, ignoring case and any
-  explicit `:<port>`. SSH host aliases from `~/.ssh/config` are not visible to this check.
+  `repos` pattern. Raw and `insteadOf`-rewritten URLs are both checked, each also in a normalized
+  form: case, trailing dots and ports in the host, scp-style paths, percent-encoding, `.`/`..`
+  segments and doubled slashes do not hide a tracked repository. SSH host aliases from
+  `~/.ssh/config` are not visible to this check.
 - **Allowlisted remote-less repositories.** The repository has no remote, and its absolute
   top-level path fully matches a regex in `ticket_systems.ledger.allowed_repos`. The list is
   empty by default.

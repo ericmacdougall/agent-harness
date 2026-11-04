@@ -1,6 +1,7 @@
 package term
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -51,5 +52,21 @@ func TestSanitizeInert(t *testing.T) {
 	}
 	if got := Sanitize("ok\xffbad"); !strings.Contains(got, "\ufffd") {
 		t.Errorf("invalid utf-8 not replaced: %q", got)
+	}
+}
+
+// RT-6: invisible characters outside the bidi/zero-width set are shown, not passed through; the emoji
+// presentation selector and ordinary text are left alone.
+func TestSanitizeMoreInvisibles(t *testing.T) {
+	for _, r := range []rune{0x1D173, 0x1BCA0, 0x3164, 0x115F, 0x034F, 0x2800, 0xFFA0, 0xFE00, 0xE0100, 0x180B, 0x17B4} {
+		got := Sanitize("a" + string(r) + "b")
+		if strings.ContainsRune(got, r) || !strings.Contains(got, fmt.Sprintf(`\u{%x}`, r)) {
+			t.Errorf("U+%04X passed through: %q", r, got)
+		}
+	}
+	for _, s := range []string{"ok ❤️", "café", "日本"} {
+		if got := Sanitize(s); got != s {
+			t.Errorf("%q changed to %q", s, got)
+		}
 	}
 }

@@ -162,3 +162,38 @@ func TestExtraTreeEntryRejected(t *testing.T) {
 		t.Fatal("extra tree entry accepted")
 	}
 }
+
+// RT-5: a ref whose commits share one ops blob is refused before the blob is read, and a ref larger than
+// its read budget is refused from the --batch-check sizes alone.
+func TestReadBudgetAndReusedBlob(t *testing.T) {
+	g := bare(t)
+	project, writer := ids(t)
+	c1, err := g.WritePack("", []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base}, op.KindProjectCreate)}, "lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := g.WritePack(c1, []*op.Op{mkOp(t, project, writer, op.HLC{WallMs: base + 1}, op.KindTicketCreate)}, "lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.ReadRefBudget(project, writer, c2, FoldedBudget); err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	if _, err := g.ReadRefBudget(project, writer, c2, 300); err == nil || !strings.Contains(err.Error(), "budget") {
+		t.Fatalf("over-budget ref read: %v", err)
+	}
+	// A commit that reuses c1's tree (and so its ops blob) on top of c1.
+	tree, err := exec.Command("git", "--git-dir="+g.GitDir, "rev-parse", c1+"^{tree}").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "--git-dir="+g.GitDir, "commit-tree", strings.TrimSpace(string(tree)), "-p", c1, "-m", "ledger: 1 ops")
+	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=x", "GIT_AUTHOR_EMAIL=x@x", "GIT_COMMITTER_NAME=x", "GIT_COMMITTER_EMAIL=x@x")
+	reuse, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.ReadRef(project, writer, strings.TrimSpace(string(reuse))); err == nil || !strings.Contains(err.Error(), "reused") {
+		t.Fatalf("reused ops blob: %v", err)
+	}
+}

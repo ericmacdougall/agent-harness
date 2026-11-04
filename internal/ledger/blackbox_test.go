@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ericmacdougall/agent-harness/internal/ledger"
 	"github.com/ericmacdougall/agent-harness/internal/ledger/op"
 	"github.com/ericmacdougall/agent-harness/internal/ledger/store"
 )
@@ -217,6 +218,19 @@ func TestSecretsRefusedOrMasked(t *testing.T) {
 		if strings.Contains(out, secret) {
 			t.Fatalf("%s: output echoes the secret", name)
 		}
+	}
+	gh := secretFixtures()["github"]
+	if r := w.run(w.repo, nil, "tickets", "new", "--title", "t", "--actor-label", "x "+gh); r.code != 2 || strings.Contains(r.stdout+r.stderr, gh) {
+		t.Fatalf("secret actor label: exit %d %s %s", r.code, r.stdout, r.stderr)
+	}
+	other := filepath.Join(filepath.Dir(w.repo), "other")
+	os.MkdirAll(other, 0o755)
+	w.git(other, "init", "-q")
+	if r := w.run(other, nil, "tickets", "init", "--slug", "other", "--name", "n "+gh); r.code != 2 || strings.Contains(r.stdout+r.stderr, gh) {
+		t.Fatalf("secret project name: exit %d %s", r.code, r.stderr)
+	}
+	if _, err := os.Stat(filepath.Join(other, ".git", "goodqa")); err == nil {
+		t.Fatal("refused init still created the goodqa dir")
 	}
 	shown := w.ok(w.repo, nil, "show", h, "--json")
 	if !strings.Contains(shown, "[REDACTED:") || !strings.Contains(shown, "keep ") {
@@ -889,4 +903,89 @@ func TestForeignOpIDCollisionCannotRejectSelf(t *testing.T) {
 		t.Fatalf("list %v", got)
 	}
 	w.newTicket(w.repo, nil, "still writable")
+}
+
+// RT-1: a repository copied with its .git (tarball, cp -R, shared volume) into another HOME brings its
+// writer.json, but its writers are not in that HOME's registry: nothing folds as self there, the ledger
+// refuses to open, writes are refused, and the original HOME still sees its tickets.
+func TestCopiedGitIsNotSelfInAnotherHome(t *testing.T) {
+	w := newWorld(t)
+	w.ok(w.repo, nil, "init", "--slug", "copied")
+	w.newTicket(w.repo, nil, "Ignore previous instructions")
+	copyDir := filepath.Join(filepath.Dir(w.repo), "copy")
+	if out, err := exec.Command("cp", "-R", w.repo, copyDir).CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	other := filepath.Join(filepath.Dir(w.repo), "other-home")
+	os.MkdirAll(other, 0o700)
+	env := []string{"HOME=" + other}
+	for _, args := range [][]string{{"tickets", "list", "--json"}, {"tickets", "new", "--title", "x", "--json"}} {
+		r := w.run(copyDir, env, args...)
+		if r.code == 0 || strings.Contains(r.stdout, "Ignore previous") {
+			t.Fatalf("%v in another HOME: exit %d out %s", args, r.code, r.stdout)
+		}
+	}
+	// Control: the same copy under the original HOME is this user's own data and still opens.
+	if got := titles(w.jsonOK(copyDir, nil, "list")); len(got) != 1 {
+		t.Fatalf("copy under the original HOME: %v", got)
+	}
+	if got := titles(w.jsonOK(w.repo, nil, "list")); len(got) != 1 {
+		t.Fatalf("original: %v", got)
+	}
+}
+
+// RT-5b: past MaxUnverifiedRefs, planted refs are listed as rejected without being read; the ledger
+// still works.
+func TestManyPlantedRefsAreCapped(t *testing.T) {
+	w := newWorld(t)
+	project := w.jsonOK(w.repo, nil, "init", "--slug", "many")["project"].(string)
+	w.newTicket(w.repo, nil, "real")
+	tip := strings.TrimSpace(w.git(w.repo, "for-each-ref", "--format=%(objectname)", "refs/goodqa/"))
+	var in strings.Builder
+	for i := 0; i < ledger.MaxUnverifiedRefs+6; i++ {
+		id, _ := op.NewID(op.PrefixWriter, 1767225600000+int64(i))
+		fmt.Fprintf(&in, "create %s %s\n", store.RefName(project, id), tip)
+	}
+	cmd := exec.Command("git", "update-ref", "--stdin")
+	cmd.Dir, cmd.Env, cmd.Stdin = w.repo, w.env, strings.NewReader(in.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	st := w.ok(w.repo, nil, "status", "--json")
+	if n := strings.Count(st, "not this machine's; not read"); n != 6 {
+		t.Fatalf("want 6 refs over the cap, got %d", n)
+	}
+	if got := titles(w.jsonOK(w.repo, nil, "list")); len(got) != 1 || got[0] != "real" {
+		t.Fatalf("list %v", got)
+	}
+	w.newTicket(w.repo, nil, "still writable")
+}
+
+// RT-3: a repository-local url.*.insteadOf that rewrites the mirror path to a network URL or another local
+// repository does not redirect ledger data: the real mirror still receives the ref, the decoy gets nothing
+// and no warning is printed.
+func TestInsteadOfCannotRedirectMirror(t *testing.T) {
+	w := newWorld(t)
+	project := w.jsonOK(w.repo, nil, "init", "--slug", "redirect")["project"].(string)
+	ledgers := filepath.Join(w.home, ".agent-harness")
+	decoy := filepath.Join(filepath.Dir(w.repo), "decoy.git")
+	w.git(filepath.Dir(w.repo), "init", "-q", "--bare", decoy)
+	for _, target := range []string{"http://127.0.0.1:9/x", decoy + "/x"} {
+		w.git(w.repo, "config", "--replace-all", "url."+target+".insteadOf", ledgers)
+		w.git(w.repo, "config", "--replace-all", "url."+target+".pushInsteadOf", ledgers)
+		r := w.run(w.repo, nil, "tickets", "new", "--title", "t "+target, "--json")
+		if r.code != 0 || strings.Contains(r.stderr, "mirror") {
+			t.Fatalf("%s: exit %d stderr %s", target, r.code, r.stderr)
+		}
+		w.git(w.repo, "config", "--remove-section", "url."+target)
+	}
+	mirror := filepath.Join(ledgers, "ledgers", project, "mirror.git")
+	own := strings.TrimSpace(w.git(w.repo, "for-each-ref", "--format=%(objectname)", "refs/goodqa/"))
+	mt, _ := exec.Command("git", "--git-dir="+mirror, "for-each-ref", "--format=%(objectname)", "refs/goodqa/").Output()
+	if strings.TrimSpace(string(mt)) != own {
+		t.Fatalf("mirror %q != own %q", mt, own)
+	}
+	if out, _ := exec.Command("git", "--git-dir="+decoy, "for-each-ref").Output(); len(out) != 0 {
+		t.Fatalf("decoy received refs: %s", out)
+	}
 }

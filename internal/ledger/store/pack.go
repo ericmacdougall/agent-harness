@@ -176,9 +176,10 @@ type object struct {
 	body []byte
 }
 
-// batch reads objects by name with one cat-file process, refusing any object larger than its limit
-// (sizes are checked with --batch-check before any content is read).
-func (g *Git) batch(names []string, limit func(i int, typ string) int64) ([]object, error) {
+// batch reads objects by name with one cat-file process, refusing any object larger than its limit and
+// any request whose objects together exceed total (sizes are checked with --batch-check before any
+// content is read).
+func (g *Git) batch(names []string, limit func(i int, typ string) int64, total int64) ([]object, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
@@ -199,6 +200,9 @@ func (g *Git) batch(names []string, limit func(i int, typ string) int64) ([]obje
 		}
 		if sz > limit(i, typ) {
 			return nil, fmt.Errorf("object %d (%s) exceeds its size limit", i, typ)
+		}
+		if total -= sz; total < 0 {
+			return nil, errors.New("writer ref exceeds its read budget")
 		}
 	}
 	out, err = g.run(LocalTimeout, in, nil, "cat-file", "--batch")
@@ -252,9 +256,22 @@ func parseTree(body []byte, n int) ([]treeEntry, error) {
 // MaxChain bounds the commits read from one writer ref.
 const MaxChain = 100000
 
-// ReadRef reads and validates every pack on a writer ref, oldest first. Any defect rejects the whole
-// ref (the returned error says why); nothing from a rejected ref is used.
+// Read budgets: the bytes of commits, trees and blobs one writer ref may make the ledger read. A folded
+// (self) ref gets room for years of use; a ref from an unverified or blocked writer, which anyone who can
+// write the repository can plant, gets a small one so it cannot exhaust memory or time.
+const (
+	FoldedBudget     = int64(1) << 30
+	UnverifiedBudget = int64(16) << 20
+)
+
+// ReadRef reads and validates every pack on a writer ref with the folded budget.
 func (g *Git) ReadRef(project, writer, tip string) ([]Pack, error) {
+	return g.ReadRefBudget(project, writer, tip, FoldedBudget)
+}
+
+// ReadRefBudget reads and validates every pack on a writer ref, oldest first, reading at most budget
+// bytes. Any defect rejects the whole ref (the returned error says why); nothing from a rejected ref is used.
+func (g *Git) ReadRefBudget(project, writer, tip string, budget int64) ([]Pack, error) {
 	n, err := g.ObjectFormat()
 	if err != nil {
 		return nil, err
@@ -283,7 +300,7 @@ func (g *Git) ReadRef(project, writer, tip string) ([]Pack, error) {
 	for _, c := range commits {
 		names = append(names, c, c+"^{tree}")
 	}
-	objs, err := g.batch(names, func(i int, typ string) int64 { return 64 * 1024 })
+	objs, err := g.batch(names, func(i int, typ string) int64 { return 64 * 1024 }, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -291,6 +308,10 @@ func (g *Git) ReadRef(project, writer, tip string) ([]Pack, error) {
 	var blobNames []string
 	type want struct{ ops, hlc, ver string }
 	wants := make([]want, len(commits))
+	seenOps := map[string]bool{}
+	for _, o := range objs {
+		budget -= int64(len(o.body))
+	}
 	for i, c := range commits {
 		co, tr := objs[2*i], objs[2*i+1]
 		if co.typ != "commit" || tr.typ != "tree" {
@@ -330,6 +351,12 @@ func (g *Git) ReadRef(project, writer, tip string) ([]Pack, error) {
 			return nil, errors.New("pack tree incomplete")
 		}
 		wants[i] = w
+		if seenOps[w.ops] {
+			// Every pack carries new ops with strictly larger clocks, so a reused ops blob is never valid:
+			// refuse it before reading (one large blob shared by many commits would be read many times).
+			return nil, errors.New("ops blob reused by two packs")
+		}
+		seenOps[w.ops] = true
 		blobNames = append(blobNames, w.ver, w.ops)
 	}
 	blobs, err := g.batch(blobNames, func(i int, typ string) int64 {
@@ -337,7 +364,7 @@ func (g *Git) ReadRef(project, writer, tip string) ([]Pack, error) {
 			return 16
 		}
 		return op.MaxPackBytes
-	})
+	}, budget)
 	if err != nil {
 		return nil, err
 	}
