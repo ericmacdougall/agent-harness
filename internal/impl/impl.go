@@ -176,7 +176,9 @@ func parse(raw []byte) (switchFile, bool) {
 		}
 		bin, bok := m["binary"].(string)
 		sum, sok := m["sha256"].(string)
-		if !bok || !sok || !filepath.IsAbs(bin) || !hexSHA.MatchString(sum) {
+		// A path that is not already clean ("..", "//", trailing "/") is invalid on both sides, so the Go
+		// and Python ancestor walks visit the same directories.
+		if !bok || !sok || !filepath.IsAbs(bin) || filepath.Clean(bin) != bin || !hexSHA.MatchString(sum) {
 			return switchFile{}, false
 		}
 		sf.Hosts[h] = hostEntry{Binary: bin, SHA256: sum}

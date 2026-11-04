@@ -46,9 +46,19 @@ def _open_regular(path):
     return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
 
 
+def _clean(path):
+    """Already normalised, so dirname walks the same directories as Go's filepath.Dir (no "..", "//")."""
+    return os.path.normpath(path) == path and not path.startswith("//")
+
+
 def _safe_ancestors(path):
-    """Every directory above path is owned by us or root and not group/other-writable unless sticky."""
-    current = os.path.dirname(path)
+    """Both the lexical and the symlink-resolved directory chains above path are safe (see _safe_chain)."""
+    directory = os.path.dirname(path)
+    return _safe_chain(directory) and _safe_chain(os.path.realpath(directory))
+
+
+def _safe_chain(current):
+    """current and every directory above it are owned by us or root, not group/other-writable unless sticky."""
     while True:
         try:
             info = os.stat(current)
@@ -97,7 +107,8 @@ def _load(path):
             return None, "invalid"
     for entry in data["hosts"].values():
         if (not isinstance(entry, dict) or not isinstance(entry.get("binary"), str)
-                or not os.path.isabs(entry["binary"]) or not isinstance(entry.get("sha256"), str)
+                or not os.path.isabs(entry["binary"]) or not _clean(entry["binary"])
+                or not isinstance(entry.get("sha256"), str)
                 or not HEX_SHA.fullmatch(entry["sha256"])):
             return None, "invalid"
     return data, ""
@@ -174,8 +185,11 @@ def dispatch(group, host, launcher, helper, sub, argv, *, hook=False, on_fallbac
     except SystemExit:
         raise
     except BaseException as error:  # noqa: BLE001 - a hook must never fail open on exit 1
-        print(f"agent-harness: front door failed for {group} ({type(error).__name__}); "
-              + ("refusing the action (fail-closed)" if hook else "aborting"), file=sys.stderr)
+        try:
+            print(f"agent-harness: front door failed for {group} ({type(error).__name__}); "
+                  + ("refusing the action (fail-closed)" if hook else "aborting"), file=sys.stderr)
+        except Exception:  # noqa: BLE001 - e.g. BrokenPipeError on a closed stderr must not exit 1
+            pass
         sys.exit(2 if hook else 1)
 
 

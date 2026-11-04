@@ -69,7 +69,8 @@ func Run(argv []string, o Options) (res Result, err error) {
 	var closers []*os.File
 	defer func() {
 		// Close off the caller's path: on Windows Close waits for a write blocked on a pipe that an
-		// escaped descendant holds, which must not hold the caller.
+		// escaped descendant holds, which must not hold the caller. There that Close goroutine and the
+		// blocked stdin writer stay alive until the holding descendant exits (bounded by the process).
 		for _, f := range closers {
 			go f.Close()
 		}
