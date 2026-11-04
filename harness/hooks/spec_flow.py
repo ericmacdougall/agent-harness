@@ -331,6 +331,13 @@ def render_reviews(entries: list, core: str) -> str:
 def write_spec_with_reviews(spec_path: Path, entries: list):
     text = spec_path.read_text(encoding="utf-8")
     core = spec_core(text)
+    tail = normalize_text(text)[len(core):]
+    lines = tail.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.startswith("## Reviews")), len(lines))
+    later = [line for line in lines[start + 1:] if line.startswith("## ")]
+    if later:  # the Reviews section is regenerated, so anything after it would be lost
+        raise SpecError(f"{spec_path} has content after `## Reviews` ({later[0]}); move it above the Reviews "
+                        "section", EXIT_USAGE)
     rendered = core + "\n" + render_reviews(entries, core_sha(text))
     atomic_write(spec_path, rendered.encode("utf-8"))
     atomic_write(reviews_path(spec_path), json.dumps({"v": 1, "reviews": entries}, indent=1).encode("utf-8"))
@@ -532,12 +539,33 @@ def attachment_problems(record: dict, index: dict) -> list:
     return problems
 
 
+def kind_problems(record: dict) -> list:
+    """Shape rules beyond attachment integrity: a record must carry the files its kind is trusted for."""
+    attachments = [item for item in record.get("attachments") or [] if isinstance(item, dict)]
+    roles = {item.get("role"): item for item in attachments}
+    problems = []
+    if record["kind"] == "spec":
+        if (roles.get("spec") or {}).get("sha256") != record.get("spec_file_sha") or not record.get("spec_file_sha"):
+            problems.append("no attached spec file matches the record's spec_file_sha")
+        if "reviews" not in roles:
+            problems.append("no reviews file is attached")
+        if not record.get("ac"):
+            problems.append("the spec record lists no acceptance criteria")
+    elif record["kind"] == "evidence":
+        if not (record.get("really_tested") or roles.get("log") or (record.get("commits") and record.get("note"))):
+            problems.append("the evidence record carries no proof")
+    elif record["kind"] == "click_test":
+        if not (roles.get("log") or roles.get("report")):
+            problems.append("the click-test record has no log or report attached")
+    return problems
+
+
 def verified(records: list, index: dict, kind: str):
     good, bad = [], []
     for record in records:
         if record["kind"] != kind:
             continue
-        problems = attachment_problems(record, index)
+        problems = attachment_problems(record, index) + kind_problems(record)
         (bad if problems else good).append((record, problems))
     return [record for record, _ in good], bad
 
@@ -579,7 +607,10 @@ class Session:
 
     def post(self, kind: str, summary: str, record: dict, files, records):
         """files: [(role, name, mime, bytes)]. Idempotent on the record key."""
-        if any(item.get("key") == record["key"] for item in records):
+        index = {row.get("id"): row for row in self.adapter.attachments(self.ticket.id)}
+        trusted = verified(records, index, record["kind"])[0] if record["kind"] != "signoff" else \
+            [item for item in records if item["kind"] == "signoff"]
+        if any(item.get("key") == record["key"] for item in trusted):
             print(json.dumps({"status": "ALREADY_RECORDED", "kind": kind, "key": record["key"]}))
             return None
         if not self.project_id:
@@ -651,14 +682,25 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
             missing.append(f"{ac}: no evidence on the current spec{' (only stale evidence for an older spec)' if stale else ''}. "
                            f"Fix: spec_flow.py evidence --ticket '{label}' --ac {ac} --really-tested <RT id> --wal <WAL> "
                            "[--commit <sha> --repo <checkout>] [--log <file>]")
+    current = [r for r in evidence if r.get("spec_core_sha") == core]
+    if spec.get("ac") and not any(r.get("commits") for r in current):
+        missing.append(f"commits: no evidence on the current spec cites a commit. Fix: spec_flow.py evidence "
+                       f"--ticket '{label}' --ac <AC> --commit <sha> --repo <checkout> --note <check>")
+    if spec.get("ac") and not any(any(a.get("role") == "log" for a in r.get("attachments") or []) for r in current):
+        missing.append(f"execution logs: no evidence on the current spec attaches a log. Fix: spec_flow.py "
+                       f"evidence --ticket '{label}' --ac <AC> --log <test or run output>")
     # click test
     click = spec.get("click_test") or {}
     if click.get("required", True):
-        tests, bad_tests = verified(records, index, "click_test")
+        all_tests, bad_tests = verified(records, index, "click_test")
+        tests = [r for r in all_tests if r.get("spec_core_sha") == core]
         for record, problems in bad_tests:
             notes.append(f"click-test record {record['_comment'][:8]} ignored: {'; '.join(problems)}")
         latest = tests[-1] if tests else None
-        if latest is None:
+        if latest is None and all_tests:
+            missing.append("click-test: only click-tests of an older spec version exist (stale); record a new "
+                           "click-test after deploying the current spec's work")
+        elif latest is None:
             missing.append("click-test: none recorded. Fix: spec_flow.py click-test --ticket '<ref>' --agent-id <id> "
                            "--wal-dir <session WAL dir> --url <url> --deployed-commit <sha> --repo <checkout> --result pass "
                            "--report <click-tester report> --log <file>")
@@ -742,6 +784,9 @@ def classify(tool: str, tool_input: dict, min_reason: int):
         patch = tool_input.get("patch") if isinstance(tool_input.get("patch"), dict) else {}
         if "status" in patch:
             yield tool_input.get("issueId"), _status_action(patch.get("status"), ""), patch.get("status")
+        if any(key in patch for key in ("projectId", "pipelineId", "stageId")):
+            # Moving an issue out of an enforced project (or across a pipeline) would escape the gate.
+            yield tool_input.get("issueId"), "stage", "project/pipeline/stage move"
     elif tool == "bulk_update_issues":
         for item in tool_input.get("items") or []:
             if isinstance(item, dict):
@@ -757,14 +802,36 @@ def classify(tool: str, tool_input: dict, min_reason: int):
         if method == "GET":
             return
         path = str(tool_input.get("path") or "")
-        body = tool_input.get("body") if isinstance(tool_input.get("body"), dict) else {}
+        raw = tool_input.get("body")
+        body = raw if isinstance(raw, dict) else {}
+        patch = body.get("patch") if isinstance(body.get("patch"), dict) else {}
+        status = body.get("status", patch.get("status"))
         issue = re.search(r"/issues/(" + UUID + r")", path)
         if issue and method == "DELETE":
             yield issue.group(1), "delete", "DELETE issue"
-        elif issue and "status" in body:
-            yield issue.group(1), _status_action(body.get("status"), str(body.get("note") or ""), min_reason), body.get("status")
+        elif issue and raw is not None and not isinstance(raw, dict):
+            yield issue.group(1), "unknown", f"{method} {path} with a non-object body"
+        elif issue and re.search(r"/issues/" + UUID + r"/.+", path):
+            # Sub-resources such as /close or /transition may change status in ways the gate cannot read.
+            if not re.search(r"/(comments|attachments|time-entries)(/|$)", path):
+                yield issue.group(1), "unknown", f"{method} {path}"
+        elif issue and status is not None:
+            yield issue.group(1), _status_action(status, str(body.get("note") or ""), min_reason), status
+        elif issue and any(key in body or key in patch for key in ("projectId", "pipelineId", "stageId")):
+            yield issue.group(1), "stage", "project/pipeline/stage move"
         elif "/issues" in path and not issue:
-            yield None, "scope", path
+            items = body.get("items") if isinstance(body.get("items"), list) else None
+            if items is not None:
+                for item in items:
+                    if isinstance(item, dict):
+                        yield item.get("issueId"), _status_action(item.get("status"), str(item.get("note") or ""),
+                                                                  min_reason), item.get("status")
+                    else:
+                        yield None, "scope", f"{path} with a malformed item"
+            elif raw is not None and not isinstance(raw, dict) or "status" in body or "patch" in body:
+                yield None, "scope", path
+            else:
+                yield None, "scope-path", path  # e.g. creating an issue: only checked by the project in the path
 
 
 def _status_action(status, note=None, min_reason=20):
@@ -781,17 +848,23 @@ def dead_enforced_keys(config: dict, spec_policy: dict, deadline: float) -> list
     """Enforced projects whose routed key can no longer read the project itself (key liveness probe)."""
     dead = []
     routes = spec_policy.get("projects") or {}
-    for slug in spec_policy.get("enforced_projects") or []:
-        if not isinstance(slug, str):
+    for entry in spec_policy.get("enforced_projects") or []:
+        if isinstance(entry, dict):
+            project_id = str(entry.get("project_id") or "")
+            slug = next((name for name, route in routes.items()
+                         if str(route.get("project_id") or "").lower() == project_id.lower()), None)
+            label = slug or project_id
+        else:
+            slug = str(entry).lower()
+            project_id = str((routes.get(slug) or {}).get("project_id") or "")
+            label = slug
+        if not project_id:
+            dead.append(f"{label} (no route)")
             continue
-        route = routes.get(slug.lower()) or {}
-        if not route.get("project_id"):
-            dead.append(f"{slug} (no route)")
-            continue
-        data = make_adapter(config, spec_policy, slug.lower(), deadline).call("get_project",
-                                                                              {"projectId": route["project_id"]})
+        data = make_adapter(config, spec_policy, slug, deadline).call("get_project", {"projectId": project_id})
+        slug = label
         if not isinstance(data, dict) or "__error__" in data:
-            dead.append(f"{slug} ({data.get('__error__') if isinstance(data, dict) else 'bad response'})")
+            dead.append(f"{label} ({data.get('__error__') if isinstance(data, dict) else 'bad response'})")
     return dead
 
 
@@ -834,10 +907,15 @@ def run_hook(payload: dict, spec_policy: dict, config_loader=None) -> tuple:
     try:
         _, _, config = (config_loader or ticket_config)(spec_policy)
         for issue_id, action, detail in items:
-            if action == "scope":
+            if action == "scope-path":
                 if any(pid in detail.lower() for pid in enforced):
                     blocking.append(f"call_api write to {detail} touches an enforced project and its effect on "
                                     "issue status can't be checked; use the named GoodQA tools")
+                continue
+            if action == "scope":
+                (blocking if enforced else warnings).append(
+                    f"call_api write to {detail} may change issue status in ways the spec gate can't check; "
+                    "use the named GoodQA tools")
                 continue
             # update_issue and reassign_issue declare issueId as a uuid, but close_issue_done, bulk_update_issues
             # and archive_issue only describe it as one. An id the gate cannot resolve might still reach an issue,
@@ -919,6 +997,14 @@ def plan_ticket_gate(repo: Path, packet: str, *, spec_policy: dict | None = None
         commit_policy, policy, config = (config_loader or ticket_config)(spec_policy)
     except (ImportError, OSError, ValueError) as error:
         return (2 if mode == "enforce" else 0), f"spec-flow: commit policy unavailable ({error})"
+    try:
+        return _plan_ticket_gate(repo, packet, mode, commit_policy, policy, config, spec_policy, config_loader)
+    except Exception as error:  # never let a gate bug decide silently
+        text = f"spec-flow: plan ticket gate failed ({type(error).__name__}: {str(error)[:160]})"
+        return (2, text + "; enforce mode stops here") if mode == "enforce" else (0, text + "; warn mode continues")
+
+
+def _plan_ticket_gate(repo, packet, mode, commit_policy, policy, config, spec_policy, config_loader):
     origin = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True,
                             text=True, timeout=30).stdout.strip()
     if not commit_policy.tickets_required_for(origin, policy):

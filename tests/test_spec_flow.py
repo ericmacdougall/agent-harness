@@ -260,6 +260,14 @@ class SpecFlowCase(unittest.TestCase):
 
 
 class Lint(SpecFlowCase):
+    def test_attach_refuses_content_after_the_reviews_section(self):
+        spec = self.reviewed_spec()
+        spec.write_text(spec.read_text() + "\n## Notes\n\nlate section\n")
+        code, _, err = self.run_cli("attach", str(spec), "--actor", "agent:owner1")
+        self.assertEqual(code, 3)
+        self.assertIn("after `## Reviews`", err)
+        self.assertIn("late section", spec.read_text())
+
     def test_packet_refuses_a_spec_that_fails_lint(self):
         spec = self.tmp / "bad.md"
         spec.write_text(SPEC.replace("Verify by:", "Check:", 1))
@@ -434,6 +442,18 @@ class Evidence(SpecFlowCase):
         self.spec_policy["max_log_bytes"] = len(body) + 10
         self.assertEqual(self.ev("--ac", "AC-1", "--log", str(cut))[0], 2)
 
+    def test_retry_after_a_rejected_record_posts_again(self):
+        log = self.tmp / "retry.log"
+        log.write_text("Ran 3 tests\nOK\n")
+        self.assertEqual(self.ev("--ac", "AC-1", "--log", str(log))[0], 0)
+        for attachment in self.fake.attachments.values():  # the log upload was later deleted
+            if attachment["metadata"]["filename"] == "retry.log":
+                attachment["deletedAt"] = "2026-11-04T06:00:00Z"
+        code, out, err = self.ev("--ac", "AC-1", "--log", str(log))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("ALREADY_RECORDED", out)
+        self.assertEqual(json.loads(out.strip().splitlines()[-1])["status"], "RECORDED")
+
     def test_symlinked_log_is_refused(self):
         real = self.tmp / "real.log"
         real.write_text("ok\n")
@@ -548,13 +568,26 @@ class ClickTest(SpecFlowCase):
 
 
 class DoneGate(SpecFlowCase):
-    def complete(self, signer=("main1", "agent"), tester="ct1"):
+    def complete(self, signer=("main1", "agent"), tester="ct1", commits=True, logs=True):
         self.attached()
+        self.repo_dir = self.tmp / "deployed"
+        self.shas = git_repo(self.repo_dir, "feat: one", "feat: later")
         owner_wal = self.wal_dir / "agent-owner1.jsonl"
         self.wal(owner_wal, {"at": "2026-11-04T02:00:00+00:00", "event": "check", "note": "REALLY_TESTED RT1: ok exit 0"})
         for ac in ("AC-1", "AC-2"):
             code, _, err = self.run_cli("evidence", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
                                         "--ac", ac, "--really-tested", "RT1", "--wal", str(owner_wal))
+            self.assertEqual(code, 0, err)
+        extra = []
+        if commits:
+            extra += ["--commit", self.shas[0], "--repo", str(self.repo_dir), "--note", "unit tests ran"]
+        if logs:
+            log = self.tmp / "unit.log"
+            log.write_text("Ran 61 tests\nOK\n")
+            extra += ["--log", str(log)]
+        if extra:
+            code, _, err = self.run_cli("evidence", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
+                                        "--ac", "AC-1", *extra)
             self.assertEqual(code, 0, err)
         self.wal(self.main_wal, {"at": "2026-11-04T05:00:00+00:00", "event": "subagent", "agent_id": tester,
                                  "agent_type": "click-tester"})
@@ -562,8 +595,6 @@ class DoneGate(SpecFlowCase):
         report.write_text("CLICK_TEST_RESULT: PASS\nok\n")
         self.wal(self.wal_dir / f"agent-{tester}.jsonl", {"at": "2026-11-04T05:01:00+00:00", "event": "result",
                                                     "note": "CLICK_TEST_REPORT sha256=" + hashlib.sha256(report.read_bytes()).hexdigest()})
-        self.repo_dir = self.tmp / "deployed"
-        self.shas = git_repo(self.repo_dir, "feat: one", "feat: later")
         code, _, err = self.run_cli("click-test", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
                                     "--url", "http://127.0.0.1:3000", "--agent-id", tester, "--wal-dir",
                                     str(self.wal_dir), "--repo", str(self.repo_dir), "--deployed-commit",
@@ -573,6 +604,42 @@ class DoneGate(SpecFlowCase):
             code, _, err = self.run_cli("signoff", "--ticket", "GoodQA harness#168", "--actor", f"agent:{signer[0]}",
                                         "--by", signer[0], "--kind", signer[1], "--source", "main review of #168")
             self.assertEqual(code, 0, err)
+
+    def test_commits_and_execution_logs_are_required(self):
+        self.complete(commits=False, logs=False)
+        result = self.evaluate()
+        self.assertFalse(result["ready"])
+        self.assertTrue(any(m.startswith("commits:") for m in result["missing"]), result["missing"])
+        self.assertTrue(any(m.startswith("execution logs:") for m in result["missing"]), result["missing"])
+
+    def test_click_test_of_an_older_spec_is_stale(self):
+        self.complete()
+        self.assertTrue(self.evaluate()["ready"])
+        revised = SPEC.replace("cannot mark", "can never mark")
+        spec = self.tmp / "spec.md"
+        spec.write_text(revised)
+        (self.tmp / "spec.md.reviews.json").unlink()
+        report = self.tmp / "adv3.md"
+        report.write_text(report_text(sf.core_sha(revised)))
+        self.run_cli("review", str(spec), "--role", "adversarial", "--report", str(report))
+        self.run_cli("review", str(spec), "--role", "acceptance", "--agent", "acc1", "--wal", str(self.main_wal),
+                     "--verdict", "ACCEPT", "--report-file", str(self.tmp / "acc-report.md"))
+        self.assertEqual(self.run_cli("attach", str(spec), "--actor", "agent:owner1")[0], 0)
+        result = self.evaluate()
+        self.assertTrue(any("stale" in m and m.startswith("click-test") for m in result["missing"]), result["missing"])
+
+    def test_forged_spec_record_without_files_is_not_verified(self):
+        adapter = sf.make_adapter(self.config, self.spec_policy, "harness", time.monotonic() + 30)
+        forged = {"v": 1, "kind": "spec", "attachments": [], "ac": [], "spec_core_sha": "x", "author": "agent:a",
+                  "click_test": {"required": False}, "key": "spec:forged",
+                  "reviews": [{"role": "adversarial", "verdict": "ACCEPT", "core_sha": "x", "key": "k1"},
+                              {"role": "acceptance", "verdict": "ACCEPT", "core_sha": "x", "key": "k2"}]}
+        adapter.comment_with_files(ISSUE, sf.record_body("spec", forged), str(uuid.uuid4()))
+        adapter.comment_with_files(ISSUE, sf.record_body("sign-off", {"v": 1, "kind": "signoff", "spec_core_sha": "x",
+                                                                       "by": "z", "key": "signoff:f"}), str(uuid.uuid4()))
+        result = self.evaluate()
+        self.assertFalse(result["ready"])
+        self.assertIn("No verified spec", result["missing"][0])
 
     def test_click_test_by_the_owner_does_not_count(self):
         self.complete(tester="owner1")
@@ -763,6 +830,37 @@ class Hook(SpecFlowCase):
         self.assertEqual(code, 2)
         self.assertIn("enforced project", text)
 
+    def test_call_api_status_writes_in_any_shape_are_gated(self):
+        cases = [
+            {"method": "PATCH", "path": f"/v1/issues/{ISSUE}", "body": {"patch": {"status": "done"}}},
+            {"method": "PATCH", "path": f"/v1/issues/{ISSUE}", "body": "status=done"},
+            {"method": "POST", "path": f"/v1/issues/{ISSUE}/close", "body": {}},
+            {"method": "POST", "path": "/v1/issues/bulk", "body": {"items": [{"issueId": ISSUE, "status": "done"}]}},
+            {"method": "PATCH", "path": "/v1/issues", "body": {"status": "done"}},
+            {"method": "PATCH", "path": f"/v1/issues/{ISSUE}", "body": {"projectId": str(uuid.uuid4())}},
+        ]
+        for tool_input in cases:
+            with self.subTest(tool_input=tool_input):
+                code, _ = self.hook("call_api", tool_input, **self.enforce())
+                self.assertEqual(code, 2)
+        code, _ = self.hook("call_api", {"method": "POST", "path": f"/v1/issues/{ISSUE}/comments",
+                                         "body": {"body": "hi"}}, **self.enforce())
+        self.assertEqual(code, 0)
+
+    def test_update_issue_project_move_is_gated(self):
+        code, text = self.hook("update_issue", {"issueId": ISSUE, "patch": {"projectId": str(uuid.uuid4())}},
+                               **self.enforce())
+        self.assertEqual(code, 2)
+        self.assertIn("move", text)
+
+    def test_dict_form_enforced_project_is_probed(self):
+        other = str(uuid.uuid4())
+        self.fake.lost_projects.add(PROJECT)
+        code, text = self.hook("update_issue", {"issueId": other, "patch": {"status": "done"}},
+                               mode="enforce", enforced_projects=[{"project_id": PROJECT}])
+        self.assertEqual(code, 2)
+        self.assertIn("can no longer read its project", text)
+
     def test_unexpected_hook_error_fails_closed_only_when_enforcing(self):
         payload = json.dumps({"tool_name": "mcp__plugin_goodqa_goodqa__update_issue",
                               "tool_input": {"issueId": ISSUE, "patch": {"status": "done"}}})
@@ -866,6 +964,15 @@ class PlanGate(SpecFlowCase):
         self.assertEqual(self.gate("Ticket: GoodQA Harness#168\n", "enforce"), (0, ""))
         self.assertEqual(self.gate("Ticket: GoodQA #168\n", "enforce")[0], 2)
         self.assertEqual(self.gate("Ticket: GoodQA harness#999\n", "enforce")[0], 2)
+
+    def test_gate_bug_fails_closed_only_in_enforce(self):
+        broken = mock.Mock(tickets_required_for=mock.Mock(side_effect=KeyError("ref_pattern")))
+        for mode, expected in (("enforce", 2), ("warn", 0)):
+            code, text = sf.plan_ticket_gate(self.repo(), "Ticket: GoodQA harness#168\n",
+                                             spec_policy=dict(self.spec_policy, plan_ticket_gate=mode),
+                                             config_loader=lambda _sp: (broken, self.policy, self.config))
+            self.assertEqual(code, expected, text)
+            self.assertIn("KeyError", text)
 
     def test_untracked_repo_and_spec_packet(self):
         self.assertEqual(self.gate("# no ticket\n", "enforce", origin="https://gitlab.com/other/x.git"), (0, ""))

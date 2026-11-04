@@ -339,7 +339,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
   - Each criterion is written `- AC-n: <observable result>. Verify by: <check>.`
   - Each negative case is written `- NEG-n (AC-n): ...`.
   - `lint` rejects a spec that has no criteria, duplicate ids, a criterion without `Verify by:`, a negative case that names an unknown criterion, an unedited `<placeholder>`, or an unrecognized bullet.
-- **Reviews section:** `## Reviews` is generated from the sidecar `<spec>.reviews.json`. The *spec core* is everything above it, normalized to NFC and LF with trailing spaces trimmed. Reviews bind to the core's sha256. Editing the spec after review therefore makes its reviews stale, while regenerating the reviews table does not.
+- **Reviews section:** `## Reviews` is generated from the sidecar `<spec>.reviews.json`. The *spec core* is everything above it, normalized to NFC and LF with trailing spaces trimmed. Reviews bind to the core's sha256. Editing the spec after review therefore makes its reviews stale, while regenerating the reviews table does not. Keep `## Reviews` last: `attach` refuses a spec with a section after it, since that section would be lost.
 
 ### Reviews
 
@@ -385,10 +385,11 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
 
 `done` reports READY only when all of the following hold:
 
-- a verified spec is attached;
+- a verified spec is attached: its record carries the spec file (matching `spec_file_sha`), the reviews file and at least one criterion;
 - both reviews `ACCEPT` that spec's core;
 - every criterion has evidence on that core;
-- the latest click-test passed with logs (unless the spec says not-applicable);
+- the evidence on that core cites at least one commit and attaches at least one execution log;
+- the latest click-test on that core passed with logs, by an independent tester, at a deployed commit containing every evidence commit (unless the spec says not-applicable); a click-test of an older spec version is stale;
 - a valid sign-off exists on that core.
 
 Otherwise it lists each missing item with the command that fixes it. Under "Self-attested" it lists every check that rests on a name the helper cannot verify.
@@ -416,7 +417,8 @@ GoodQA's own independent-acceptance rule for done transitions still applies.
    - **Allowed without a network call:** open statuses (triage through `on_production`, which GoodQA documents as nonterminal) and `update_issue` without a status.
    - **Gated by the spec:** `done`.
    - **Need a reason:** `wont_fix` and `duplicate` need one of at least 20 characters.
-   - **Blocked:** an unknown status, archiving an open ticket, a pipeline or stage move, and a `call_api` DELETE on an issue.
+   - **Blocked:** an unknown status, archiving an open ticket, a project, pipeline or stage move (`reassign_issue`, or `projectId`, `pipelineId` or `stageId` in an `update_issue` patch), and a `call_api` DELETE on an issue.
+   - **`call_api` writes:** a status in `body.status` or `body.patch.status` is gated like `update_issue`; `items` in a collection write are checked like `bulk_update_issues`. A non-object body or an issue sub-resource other than comments, attachments and time entries (for example `/close`) is treated as an unknown status change. Other status-bearing collection writes block while anything is enforced; writes without one (such as creating an issue) block only when the path names an enforced project.
    - **Bulk calls:** every item in a bulk call is checked, and one failing item blocks the call.
    - **Where it blocks:** only in `mode: enforce`, and only for `enforced_projects`. Everywhere else it prints what is missing and allows the call.
    - **Unreachable GoodQA:** a transport failure blocks only in enforce mode when enforced projects are configured. The status write goes to the same service, so blocking it costs little.
