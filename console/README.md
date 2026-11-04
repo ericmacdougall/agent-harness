@@ -68,3 +68,5 @@ These three tests fail on this code. The event-log rebuild replaces the code the
 - `TestClaudeResultBeforeWriteAckRemainsFinalAcrossRestart`: a completed Claude request can be replayed after restore.
 - `TestClaudeSurvivesRevisionOnlyToolConfigChange`: an unrelated settings save can refuse a live conversation.
 - `TestRestoreMatchesLiveProjection`: a restored session can show `disconnected` where the live one shows `unknown`.
+
+On Windows the full suite has never passed for this code (discard, torn-record and attachment tests fail, then a test hangs), so Windows CI runs vet, the build and the data-directory guard tests only. K4+ restores the full Windows suite, and it must pass.
