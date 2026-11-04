@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -45,7 +46,10 @@ func install(t *testing.T, name string) string {
 		if err != nil {
 			return err
 		}
-		data = bytes.ReplaceAll(data, []byte("@DATADIR@"), []byte(dir))
+		// The placeholder sits inside JSON strings, so substitute the escaped form
+		// (Windows paths carry backslashes).
+		quoted, _ := json.Marshal(dir)
+		data = bytes.ReplaceAll(data, []byte("@DATADIR@"), quoted[1:len(quoted)-1])
 		target := filepath.Join(dir, rel)
 		if err = os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 			return err
@@ -139,6 +143,9 @@ func TestDecoderMatchesObservedRestore(t *testing.T) {
 		t.Fatalf("fixtures missing: %v %d", err, len(entries))
 	}
 	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
 		name := e.Name()
 		t.Run(name, func(t *testing.T) {
 			dir := install(t, name)
