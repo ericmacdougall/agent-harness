@@ -387,7 +387,18 @@ class SpecFlowTests(unittest.TestCase):
 
     def test_not_a_git_checkout_warns_instead_of_silent_pass(self):
         warnings, _ = sf.domain_lint(SPEC, Path(tempfile.mkdtemp()), {})
-        self.assertTrue(any("not a git checkout" in w for w in warnings))
+        self.assertTrue(any("could not run" in w for w in warnings))
+
+    def test_enforce_fails_closed_when_detection_cannot_run(self):
+        enforce = {"domain_gates": {"mode": "enforce"}}
+        _, problems = sf.domain_lint(SPEC, Path(tempfile.mkdtemp()), enforce)
+        self.assertTrue(problems)
+        repo = make_repo({"foundry.toml": "x"})
+        with mock.patch.object(dg.subprocess, "run", return_value=mock.Mock(returncode=128, stdout=b"")):
+            _, problems = sf.domain_lint(SPEC, repo, enforce)
+            warnings, soft = sf.domain_lint(SPEC, repo, {})
+        self.assertTrue(problems)
+        self.assertTrue(warnings and not soft)
 
     def test_cargo_table_dependency_and_ledger_word_boundaries(self):
         self.assertIn("solana", names(dg.detect(make_repo({"Cargo.toml": '[dependencies.anchor-lang]\nversion = "0.30"\n'}))))
@@ -457,6 +468,16 @@ class PeerReviewTests(unittest.TestCase):
             self.assertIsNone(source)
         section, source = pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])  # trusted: file existed before the diff
         self.assertEqual((section, source), ("", ".harness/domain-gates.json"))
+
+    def test_peer_review_honours_policy_enforce_over_repo_file(self):
+        repo = make_repo({"foundry.toml": "x", ".harness/domain-gates.json": json.dumps({"disabled": True})})
+        with mock.patch.object(sf, "load_spec_policy", return_value={"domain_gates": {"mode": "enforce"}}):
+            section, source = pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])
+        self.assertIn("Domain checklist", section)
+        with mock.patch.object(sf, "load_spec_policy", return_value={"domain_gates": {"disabled": True}}):
+            section, source = pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])
+        self.assertEqual(section, "")
+        self.assertEqual(source, "spec_policy.json")
 
     def test_case_variant_opt_out_file_is_distrusted(self):
         repo = make_repo({"foundry.toml": "x"})

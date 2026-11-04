@@ -64,9 +64,6 @@ class SpecReadTests(unittest.TestCase):
         self.assertEqual(sf.read_spec_text(ok), "# Spec: x\n")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class CommitMessageFileTests(unittest.TestCase):
     def test_fifo_message_file_is_unresolvable_not_a_hang(self):
@@ -91,3 +88,7 @@ class CommitMessageFileTests(unittest.TestCase):
             thread.join(5)
             self.fail("resolve_commit blocked reading a FIFO message file")
         self.assertTrue(outcome and "regular file" in outcome[0], outcome)
+
+
+if __name__ == "__main__":
+    unittest.main()

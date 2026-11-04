@@ -270,10 +270,15 @@ def domain_section(repo: Path, base, changed_paths=None):
         paths = changed_paths or []
         distrust = (not base or len(paths) >= 5000 or any(
             unicodedata.normalize('NFC', p).casefold().startswith('.harness/') for p in paths))  # case-insensitive volumes
-        state = domain_gates.settings(repo, ignore_repo_file=distrust)
+        try:
+            import spec_flow
+            policy = spec_flow.load_spec_policy()
+        except (ImportError, OSError, ValueError):
+            policy = None
+        state = domain_gates.settings(repo, policy, ignore_repo_file=distrust)
         if state['disabled']:
             return '', state['source']
-        found = domain_gates.active_domains(repo, changed_paths=paths, ignore_repo_file=distrust)
+        found = domain_gates.active_domains(repo, policy, changed_paths=paths, ignore_repo_file=distrust)
         if not found:
             return '', None
         return domain_gates.packet_section(found, repo, DOMAIN_SECTION_LIMIT, ignore_repo_file=distrust), None

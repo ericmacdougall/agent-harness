@@ -101,16 +101,16 @@ def _skipped(path: str) -> bool:
     return bool(SKIP_COMPONENTS.intersection(parts[:-1])) or (len(parts) > 1 and parts[0] == "lib")
 
 
-def _tracked_files(root: Path, max_files: int):
+def _tracked_files(root: Path, max_files: int, strict: bool = False):
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_GLOBAL": os.devnull,
            "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0"}
     try:
         done = subprocess.run(["git", "-C", str(root), "-c", "core.fsmonitor=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", *SIGNAL_PATHSPECS],
                               capture_output=True, timeout=15, env=env)
     except (OSError, subprocess.SubprocessError):
-        return []
+        return None if strict else []
     if done.returncode:
-        return []
+        return None if strict else []
     names = [n.decode("utf-8", "replace") for n in done.stdout[:8_000_000].split(b"\0") if n]
     return [n for n in sorted(names) if not _skipped(n)][:max_files]
 
@@ -175,17 +175,24 @@ def _path_signals(path: str, found: _Found, tag: str):
 
 def detect(repo, changed_paths=None, max_files: int = MAX_FILES) -> list:
     """Return [{domain, confidence, evidence[]}] from tracked files, small manifests and changed paths."""
+    return detect_checked(repo, changed_paths, max_files)[0]
+
+
+def detect_checked(repo, changed_paths=None, max_files: int = MAX_FILES):
+    """Like detect, but returns (domains, ok); ok is False when the repo scan could not run (not git, git failed)."""
     found = _Found()
     try:
         root = Path(repo).resolve()
         if not root.is_dir():
-            return []
+            return [], False
     except OSError:
-        return []
+        return [], False
     for path in list(changed_paths or [])[:max_files]:
         if isinstance(path, str) and path and "\0" not in path:
             _path_signals(path, found, "diff: ")
-    files = _tracked_files(root, max_files)
+    files = _tracked_files(root, max_files, strict=True)
+    ok = files is not None
+    files = files or []
     budget, manifests, protos, nats_in, ledger_in = [0], 0, 0, [], []
     for path in files:
         _path_signals(path, found, "")
@@ -217,7 +224,7 @@ def detect(repo, changed_paths=None, max_files: int = MAX_FILES) -> list:
     proto_paths = [p for p in files if p.endswith(".proto")]
     if proto_paths and nats_in and ledger_in:
         found.add("ledger-messaging", "medium", f"proto {_base(proto_paths[0])} + nats ({nats_in[0]}) + ledger signal ({_base(ledger_in[0])})")
-    return found.result()
+    return found.result(), ok
 
 
 # --------------------------------------------------------------------------- data
@@ -395,15 +402,6 @@ def settings(repo=None, policy=None, env=None, ignore_repo_file: bool = False) -
     source = ("env HARNESS_DOMAIN_GATES" if str(env.get("HARNESS_DOMAIN_GATES", "")).strip().lower() in DISABLE_VALUES
               else "spec_policy.json" if config.get("disabled") is True else OPT_OUT_FILE)
     return {"disabled": disabled, "mode": mode, "source": source if disabled else None}
-
-
-def is_git_repo(repo) -> bool:
-    try:
-        done = subprocess.run(["git", "-C", str(repo), "rev-parse", "--is-inside-work-tree"], capture_output=True, timeout=10,
-                              env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_GLOBAL": os.devnull})
-        return done.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
 
 
 def active_domains(repo, policy=None, changed_paths=None, env=None, ignore_repo_file: bool = False) -> list:
