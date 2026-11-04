@@ -45,6 +45,7 @@ MAX_HTML_BYTES = 8 * 1024 * 1024
 MAX_WAL_BYTES = 40 * 1024 * 1024
 MAX_FINDINGS_PER_REPORT = 40
 MAX_LINE = 3000
+MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_SCAN = 30000
 GIT_TIMEOUT = 60
 
@@ -70,6 +71,36 @@ LEAK_SHAPES = re.compile(r"(?:-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|\bgh[pousr]_
 
 CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 HIGH_ENTROPY = re.compile(r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[a-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_-])")
+
+
+def safe_json_loads(text, max_depth=100):
+    """json.loads with a bracket-depth pre-scan: deeply nested input from a repo, PR or WAL must not
+    recurse into the interpreter (on 3.9 that can abort the process rather than raise)."""
+    if isinstance(text, (bytes, bytearray)):
+        text = bytes(text).decode("utf-8", "replace")
+    if len(text) > MAX_JSON_BYTES:
+        raise ValueError("JSON input too large")
+    depth, in_string, escaped = 0, False, False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            if depth > max_depth:
+                raise ValueError("JSON nesting too deep")
+        elif ch in "]}":
+            depth -= 1
+    try:
+        return json.loads(text)
+    except RecursionError:
+        raise ValueError("JSON nesting too deep") from None
 
 
 def scrub(value) -> str:
@@ -169,7 +200,7 @@ def collect_pr(repo: Path, pr, branch, use_gh=True) -> dict:
                        "mergeCommit,statusCheckRollup"], cwd=str(repo), timeout=30)
         if rc == 0:
             try:
-                data = json.loads(out)
+                data = safe_json_loads(out)
             except ValueError:
                 data = {}
             meta.update(title=data.get("title"), state=data.get("state"), url=data.get("url"),
@@ -494,7 +525,7 @@ def find_wal(shas, branch, tickets, since, until) -> list:
                 if '"note"' not in line:
                     continue
                 try:
-                    row = json.loads(line)
+                    row = safe_json_loads(line)
                 except ValueError:
                     continue
                 note = row.get("note")
@@ -950,7 +981,7 @@ def cmd_list(args) -> int:
     if rc != 0:
         raise MapError("gh pr list failed; is gh installed and authenticated for this repository?")
     try:
-        rows = json.loads(out)
+        rows = safe_json_loads(out)
     except ValueError:
         raise MapError("gh pr list returned unreadable output")
     directory = default_out_dir()
@@ -978,7 +1009,7 @@ def cmd_attach(args) -> int:
     meta = {}
     if meta_path.is_file():
         try:
-            meta = json.loads(meta_path.read_text())
+            meta = safe_json_loads(meta_path.read_text())
         except ValueError:
             meta = {}
         if meta.get("sha256") != digest:

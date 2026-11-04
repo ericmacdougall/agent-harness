@@ -326,5 +326,24 @@ class InspectionTwoRegressions(Base):
             rm.collect_diff(self.repo, "f" * 40, "e" * 40)
 
 
+class DeepJsonTests(unittest.TestCase):
+    def test_deep_nesting_is_refused_not_crashed(self):
+        deep = "[" * 5000 + "]" * 5000
+        with self.assertRaises(ValueError):
+            rm.safe_json_loads(deep)
+        self.assertEqual(rm.safe_json_loads('{"a": ["]"]}'), {"a": ["]"]})
+        code = ("import sys; sys.path.insert(0, %r); import review_map as rm\n"
+                "try:\n    rm.safe_json_loads('{\"a\":' * 20000 + '1' + '}' * 20000)\nexcept ValueError:\n    print('refused')\n") % str(HOOKS)
+        done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "refused"))
+
+    def test_wal_line_with_deep_nesting_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wals = Path(tmp) / "s"; wals.mkdir()
+            (wals / "main.jsonl").write_text('{"note": "x", "event": "decision", "x": ' + "[" * 5000 + "]" * 5000 + "}\n")
+            with mock.patch.object(rm, "wal_root", return_value=Path(tmp)):
+                self.assertEqual(rm.find_wal(["a" * 40], "feat/some-branch", ["GoodQA goodqa#1"], 0, 0), [])
+
+
 if __name__ == "__main__":
     unittest.main()
