@@ -282,7 +282,7 @@ else: print('PLAN_RESULT: ACCEPT')
                 # The named base is the only history a reviewer receives.
                 result = self.invoke(stage='plan', output=self.root / f'review-{fallback}.md',
                                      env={'ISOLATION_CAPTURE': str(capture), 'REVIEW_BASE': baseline},
-                                     extra=('--base', baseline))
+                                     extra=('--snapshot-base', baseline))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 record = json.loads(capture.read_text())
                 self.assertFalse(record['exposed'])
@@ -351,11 +351,12 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                 output = self.root / f'{failure}.report'
                 def snapshot(repo, destination, head, **options):
                     seen.append(destination)
-                    real_snapshot(repo, destination, head, **options)
+                    base = real_snapshot(repo, destination, head, **options)
                     if failure == 'validation':
                         raise OSError('synthetic validation failure')
                     if failure == 'source-race':
                         (repo / 'app.txt').write_text('changed source')
+                    return base
                 def review(*args):
                     if failure == 'timeout':
                         raise subprocess.TimeoutExpired('fixture', 1)

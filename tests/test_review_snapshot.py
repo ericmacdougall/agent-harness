@@ -61,19 +61,29 @@ class ReviewSnapshotTests(unittest.TestCase):
         return subprocess.run(['git', '-C', str(self.snapshot), 'cat-file', '-e', object_id],
                               capture_output=True).returncode == 0
 
-    def test_snapshot_copies_only_the_reviewed_commit(self):
-        self.review.make_snapshot(self.repo, self.snapshot, self.head)
+    def test_snapshot_copies_only_the_reviewed_commit_and_its_parent(self):
+        base = self.review.make_snapshot(self.repo, self.snapshot, self.head)
+        self.assertEqual(base, self.middle)
         self.assertEqual(git(self.snapshot, 'rev-parse', 'HEAD'), self.head)
         self.assertEqual(git(self.snapshot, 'rev-parse', 'HEAD^{tree}'),
                          git(self.repo, 'rev-parse', 'HEAD^{tree}'))
         self.assertEqual((self.snapshot / 'app.txt').read_text(), 'reviewed\n')
         self.assertTrue(self.has_object(self.head))
         self.assertFalse(self.has_object(self.history_blob), 'old history was copied')
-        self.assertFalse(self.has_object(self.middle), 'parent commit was copied')
-        self.assertEqual((self.snapshot / '.git/shallow').read_text().split(), [self.head])
+        self.assertFalse(self.has_object(self.first), 'history beyond the parent was copied')
+        self.assertEqual(sorted((self.snapshot / '.git/shallow').read_text().split()),
+                         sorted([self.head, self.middle]))
+        # The default base lets a reviewer check the packet's diff.
+        self.assertEqual(git(self.snapshot, 'diff', '--name-only', self.middle, 'HEAD').split(), ['app.txt'])
+
+    def test_root_commit_snapshot_has_no_base_or_boundary(self):
+        self.assertIsNone(self.review.make_snapshot(self.repo, self.snapshot, self.first))
+        self.assertTrue(set((self.snapshot / '.git/shallow').read_text().split()) <= {self.first})
+        self.assertTrue((self.snapshot / 'history.bin').exists())
 
     def test_base_is_copied_for_diffs_without_intermediate_history(self):
-        self.review.make_snapshot(self.repo, self.snapshot, self.head, base=self.first)
+        self.assertEqual(self.review.make_snapshot(self.repo, self.snapshot, self.head, base=self.first),
+                         self.first)
         self.assertTrue(self.has_object(self.first))
         self.assertFalse(self.has_object(self.middle))
         self.assertEqual(git(self.snapshot, 'diff', '--name-only', self.first, 'HEAD').split(),
@@ -149,6 +159,40 @@ class ReviewSnapshotTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, r'--snapshot-timeout of 5 seconds'):
                 self.review.make_snapshot(self.repo, self.root / 'slow', self.head, timeout=5)
 
+    def test_slow_steps_share_one_deadline(self):
+        clock = [1000.0]
+        seen = []
+        real = self.review.run_process
+        slow = ('merge-base', 'fetch', 'ls-tree', 'checkout')
+
+        def advancing(command, **kwargs):
+            step = next((name for name in slow if name in command), None)
+            if step:
+                seen.append((step, kwargs['timeout']))
+            result = real(command, **kwargs)
+            if step:
+                clock[0] += 100  # each slow step consumes 100 fake seconds
+            return result
+        with patch.object(self.review.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(self.review, 'run_process', side_effect=advancing):
+            self.review.make_snapshot(self.repo, self.snapshot, self.head, base=self.first, timeout=1000)
+        self.assertEqual([step for step, _ in seen], list(slow))
+        self.assertEqual([timeout for _, timeout in seen], [1000, 900, 800, 700])
+
+        clock[0], seen[:] = 1000.0, []
+
+        def expires_after_fetch(command, **kwargs):
+            result = advancing(command, **kwargs)
+            if 'fetch' in command:
+                clock[0] += 10_000
+            return result
+        with patch.object(self.review.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(self.review, 'run_process', side_effect=expires_after_fetch):
+            with self.assertRaisesRegex(OSError, '--snapshot-timeout of 1000 seconds'):
+                self.review.make_snapshot(self.repo, self.root / 'expired', self.head, timeout=1000)
+        self.assertNotIn('checkout', [step for step, _ in seen])
+        self.assertNotIn('ls-tree', [step for step, _ in seen])
+
     def test_snapshot_rejects_tree_or_boundary_mismatch(self):
         real = self.review.run_process
 
@@ -165,11 +209,20 @@ class ReviewSnapshotTests(unittest.TestCase):
             result = real(command, **kwargs)
             if 'fetch' in command:
                 with open(Path(command[2]) / '.git/shallow', 'a') as stream:
-                    stream.write(self.middle + '\n')
+                    stream.write(self.first + '\n')
             return result
         with patch.object(self.review, 'run_process', side_effect=extra_boundary):
             with self.assertRaisesRegex(OSError, 'history boundary'):
                 self.review.make_snapshot(self.repo, self.root / 'boundary', self.head)
+
+        def missing_boundary(command, **kwargs):
+            result = real(command, **kwargs)
+            if 'fetch' in command:
+                (Path(command[2]) / '.git/shallow').write_text(self.head + '\n')
+            return result
+        with patch.object(self.review, 'run_process', side_effect=missing_boundary):
+            with self.assertRaisesRegex(OSError, 'history boundary'):
+                self.review.make_snapshot(self.repo, self.root / 'missing', self.head)
 
     def test_reviewer_prompt_describes_snapshot_history(self):
         prompts = []
@@ -182,13 +235,13 @@ class ReviewSnapshotTests(unittest.TestCase):
                 patch.object(self.review, 'run', side_effect=provider):
             self.review.review_snapshot(self.root, self.head, 'plan', 'rules', 'packet', {})
             self.review.review_snapshot(self.root, self.head, 'plan', 'rules', 'packet', {'base': self.first})
-        self.assertIn('only the reviewed commit (depth 1)', prompts[0])
+        self.assertIn('root commit', prompts[0])
         self.assertIn(f'git diff {self.first} HEAD', prompts[1])
 
     def test_cli_validates_snapshot_options(self):
         for args, message in ((['--snapshot-timeout', '7201'], 'snapshot-timeout must be between'),
                               (['--snapshot-timeout', '0'], 'snapshot-timeout must be between'),
-                              (['--base', 'HEAD~1'], 'base must be a full commit SHA')):
+                              (['--snapshot-base', 'HEAD~1'], 'snapshot-base must be a full commit SHA')):
             with self.subTest(args):
                 result = subprocess.run([sys.executable, str(REVIEW), 'plan', '--repo', str(self.repo),
                                          '--packet', str(self.root / 'packet.md'),
