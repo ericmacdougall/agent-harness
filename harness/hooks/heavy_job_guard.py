@@ -24,6 +24,15 @@ Contract
   is the red team's job; the advice is dev2 or run_capped.py group cleanup). Override with
   HARNESS_HEAVY_GUARD=off|warn|enforce or heavy_job_guard.json next to this
   file: {"modes": {"media": "enforce"}}.
+- Build tools (goodqa#14459): make/gmake (test|tests|check targets = full-suite; all|build|install|package|dist|release
+  and a bare `make` = build), gradle/gradlew (test/check/verify/connected*Test = full-suite; build/assemble/bundle/
+  install*/jar/war/publish* = build), mvn/mvnw/mvnd (test, verify, integration-test = full-suite; package, install,
+  compile, deploy, site = build), bazel/bazelisk (test, coverage = full-suite; build = build) and xcodebuild (test =
+  full-suite; build, archive, or no action = build). Light forms stay allowed: help, clean, version/info/query
+  output, `gradle tasks`, `xcodebuild -list`. Filtered forms (`gradle test --tests X`, `mvn -Dtest=X test`) are still
+  denied because these tools configure the whole project first. `make -n`/`--dry-run`/`--just-print` is allowed: it only
+  prints the recipe (GNU make still executes recipe lines that invoke $(MAKE) under -n; accepted for a careless agent).
+  Wrapper chains deeper than MAX_WRAPPER_DEPTH (12) are denied as "too deep to analyse", even when they end in `ls`.
 
 Threat model: a CARELESS agent, not a hostile one. Wrapper and shell syntax (env/sudo/su/watch/nohup chains, ANSI-C
 quotes, eval) is parsed conservatively, with an unparseable form scanned word by word and denied on any heavy
@@ -332,6 +341,99 @@ def classify_pm(name, args):
     return None
 
 
+MAKE_NAMES = {"make", "gmake"}
+GRADLE_NAMES = {"gradle", "gradlew", "gradlew.bat", "gradle.bat"}
+MVN_NAMES = {"mvn", "mvnw", "mvnw.cmd", "mvnw.bat", "mvnd"}
+BAZEL_NAMES = {"bazel", "bazelisk"}
+BUILD_TOOLS = MAKE_NAMES | GRADLE_NAMES | MVN_NAMES | BAZEL_NAMES | {"xcodebuild"}
+
+MAKE_TEST = re.compile(r"^(?:test|tests|check)(?:[_.-].*)?$")
+MAKE_BUILD = re.compile(r"^(?:all|build|install|package|dist|release)(?:[_.-].*)?$")
+# -n/--dry-run/--just-print: bundles of value-less make flags (digits cover -j4) containing n.
+MAKE_DRY = re.compile(r"^-[kBeiLpqrRsStwj0-9]*n[kBeiLpqrRsStwj0-9]*$")
+GRADLE_TEST = re.compile(r"^(?:test|check|verify|integrationTest|connected\w*|test[A-Z]\w*|\w+Test|\w+Check)$")
+GRADLE_BUILD = re.compile(r"^(?:build\w*|assemble\w*|bundle\w*|install\w*|jar|war|dist\w+|publish\w*|compile\w*|package\w*)$")
+MVN_TEST = {"test", "verify", "integration-test", "surefire:test", "failsafe:integration-test"}
+MVN_BUILD = {"package", "install", "compile", "test-compile", "deploy", "site"}
+XCODE_TEST = {"test", "test-without-building"}
+XCODE_BUILD = {"build", "build-for-testing", "archive", "install", "installsrc"}
+XCODE_INFO = {"-version", "-list", "-showBuildSettings", "-showsdks", "-showdestinations", "-help", "-usage",
+              "-showBuildSettingsForIndex", "-showTestPlans", "-checkFirstLaunchStatus", "-runFirstLaunch"}
+
+
+def classify_build_tool(low, args):
+    """make/gradle/mvn/bazel/xcodebuild: test and build targets are heavy; help, clean, version, query forms are not.
+
+    Any heavy target on the line decides (`gradle -x test build` still builds); filtered forms such as
+    `gradle test --tests Foo` or `mvn -Dtest=Foo test` are denied too: these tools configure the whole project
+    first. `make -n` (dry run) is allowed. Returns (rule, detail) or None."""
+    if low in MAKE_NAMES:
+        if any(a in ("--version", "-v", "--help", "-h", "--dry-run", "--just-print", "--recon") or MAKE_DRY.match(a)
+               for a in args):
+            return None
+        targets = [t for t in positional(args, ("-C", "--directory", "-f", "--file", "--makefile", "-I", "--include-dir",
+                                                "-o", "--old-file", "-W", "--what-if", "-l", "--load-average", "-E"))
+                   if "=" not in t]
+        if not targets:
+            return ("build", f"{low} (default target)")
+        for t in targets:
+            if MAKE_TEST.match(t):
+                return ("full-suite", f"{low} {t}")
+        for t in targets:
+            if MAKE_BUILD.match(t):
+                return ("build", f"{low} {t}")
+        return None
+    if low in GRADLE_NAMES:
+        if any(a in ("--version", "-v", "--help", "-h", "-?", "--dry-run", "-m") for a in args):
+            return None
+        tasks = [t.split(":")[-1] for t in positional(args, (
+            "-x", "--exclude-task", "-p", "--project-dir", "-c", "--settings-file", "-b", "--build-file", "-g",
+            "--gradle-user-home", "-I", "--init-script", "--tests", "--test", "--max-workers", "--console", "--warning-mode"))]
+        for t in tasks:
+            if GRADLE_TEST.match(t):
+                return ("full-suite", f"{low} {t}")
+        for t in tasks:
+            if GRADLE_BUILD.match(t):
+                return ("build", f"{low} {t}")
+        return None
+    if low in MVN_NAMES:
+        if any(a in ("--version", "-v", "-V", "--help", "-h") for a in args):
+            return None
+        goals = positional(args, ("-f", "--file", "-pl", "--projects", "-rf", "--resume-from", "-T", "--threads", "-s",
+                                  "--settings", "-gs", "--global-settings", "-P", "--activate-profiles", "-l", "--log-file",
+                                  "-t", "--toolchains", "-b", "--builder"))
+        for g in goals:
+            if g in MVN_TEST:
+                return ("full-suite", f"{low} {g}")
+        for g in goals:
+            if g in MVN_BUILD:
+                return ("build", f"{low} {g}")
+        return None
+    if low in BAZEL_NAMES:
+        sub = (positional(args) or [""])[0]
+        if sub in ("test", "coverage"):
+            return ("full-suite", f"{low} {sub}")
+        if sub == "build":
+            return ("build", f"{low} build")
+        return None
+    # xcodebuild
+    if any(a in XCODE_INFO or a == "--help" for a in args):
+        return None
+    actions = positional(args, ("-project", "-scheme", "-target", "-configuration", "-sdk", "-destination", "-workspace",
+                                "-derivedDataPath", "-arch", "-xcconfig", "-resultBundlePath", "-testPlan", "-toolchain",
+                                "-jobs", "-archivePath", "-exportPath", "-exportOptionsPlist", "-xctestrun",
+                                "-testProductsPath", "-resultStreamPath", "-clonedSourcePackagesDirPath",
+                                "-destination-timeout", "-parallelizeTargets"))
+    actions = [a for a in actions if "=" not in a]
+    for a in actions:
+        if a in XCODE_TEST:
+            return ("full-suite", f"xcodebuild {a}")
+    for a in actions:
+        if a in XCODE_BUILD:
+            return ("build", f"xcodebuild {a}")
+    return ("build", "xcodebuild (default build action)") if not actions else None
+
+
 def scan_words(words, ctx, depth):
     """Uncertain wrapper parse: judge every remaining word as if it started the command; first heavy finding wins."""
     for j, word in enumerate(words):
@@ -569,6 +671,10 @@ def classify(argv, ctx, depth=0):
         if sub in ("build", "publish", "pack"):
             return ("build", f"dotnet {sub}")
         return ("full-suite", "dotnet test") if sub == "test" else None
+
+    # ---- build tools (make/gradle/mvn/bazel/xcodebuild)
+    if low in BUILD_TOOLS:
+        return classify_build_tool(low, args)
 
     # ---- builds
     if low in ("next", "vite", "webpack", "nuxt", "astro"):

@@ -251,6 +251,127 @@ class Classification(unittest.TestCase):
         self.assertEqual(guard.decide("pytest", None, dict(MODES, **{"full-suite": "off"})), {"action": "allow"})
 
 
+class BuildTools(unittest.TestCase):
+    """goodqa#14459 B1/L1: make/gradle/mvn/bazel/xcodebuild and the wrapper-depth limit.
+
+    decide() only: these strings are classified, never executed."""
+
+    DENY_FULL = [
+        "make test", "make check", "make tests", "make test-unit", "make -j8 check", "make -C sub test", "gmake test",
+        "make CC=clang test", "make -f build/Makefile check", "gradle test", "gradle check", "./gradlew test",
+        "./gradlew :app:test", "gradlew testDebugUnitTest", "gradle clean test", "gradle test --tests FooTest",
+        "gradle connectedAndroidTest", "gradlew.bat check", "mvn test", "mvn verify", "./mvnw test", "mvn clean verify",
+        "mvn -q -pl core test", "mvn integration-test", "mvnd test", "bazel test //...", "bazel test //pkg:foo_test",
+        "bazelisk test //...", "bazel coverage //...", "xcodebuild test -scheme App",
+        "xcodebuild -scheme App -destination 'platform=iOS Simulator,name=iPhone' test",
+        "xcodebuild test-without-building -scheme App",
+    ]
+    DENY_BUILD = [
+        "make", "make all", "make build", "make -j8", "make -j 8 all", "make install", "gmake all",
+        "gradle build", "./gradlew build", "gradle assemble", "./gradlew assembleRelease", "gradle clean build",
+        "gradle -x test build", "./gradlew bundleRelease", "gradle :app:build", "mvn package", "mvn install",
+        "mvn clean install", "./mvnw -DskipTests package", "mvn compile", "bazel build //...", "bazel build //app:app",
+        "xcodebuild build -scheme App", "xcodebuild -scheme App archive", "xcodebuild", "xcodebuild -project A.xcodeproj",
+    ]
+    WRAPPED = ["make test", "gradle build", "mvn verify", "bazel test //...", "xcodebuild test"]
+    ALLOW = [
+        "make help", "make clean", "make --version", "make -v", "make -n test", "make --dry-run all", "make -kn build",
+        "make distclean", "make -C sub clean", "make lint", "git commit -m \"make test\"", "git commit -m 'gradle build'",
+        "grep -rn \"gradle build\" .", "grep -rn 'mvn test' docs", "ls Makefile", "cat build.gradle", "cat pom.xml",
+        "echo make test", "ls gradlew mvnw", "gradle --version", "gradle tasks", "gradle clean", "gradle help",
+        "gradle dependencies", "./gradlew --version", "./gradlew -v", "gradle --dry-run build", "gradle -m build",
+        "mvn --version", "mvn -v", "mvn clean", "mvn help:effective-pom", "mvn dependency:tree", "./mvnw -v",
+        "bazel version", "bazel info", "bazel query //...", "bazel clean", "xcodebuild -version", "xcodebuild -list",
+        "xcodebuild -showBuildSettings", "xcodebuild -showsdks", "xcodebuild -scheme test -list",
+        "ssh dev2 'make test'", "ssh dev2 'cd repo && ./gradlew build'", "ssh eric@100.86.166.93 'mvn verify'",
+        "rsync -a Makefile dev2:repo/", "cd /nonexistent && ls Makefile", "which make gradle mvn",
+    ]
+
+    def wrap(self, command):
+        return [
+            "env FOO=1 " + command, "sudo " + command, "sudo -u root " + command, "nohup " + command, "time " + command,
+            "nice -n 5 " + command, "bash -lc '" + command + "'", "sh -c \"" + command + "\"",
+            "su -c '" + command + "'", "sudo nohup env A=1 " + command, "nohup bash -c '" + command + "'",
+            "bash -c 'nohup env X=1 " + command + "'", "bash -c \"sudo bash -lc '" + command + "'\"",
+            "env -S '" + command + "'", "watch -n 5 '" + command + "'", "cd /nonexistent && " + command,
+        ]
+
+    def test_corpus_not_vacuous(self):
+        for corpus in (self.DENY_FULL, self.DENY_BUILD, self.WRAPPED, self.ALLOW):
+            self.assertGreater(len(corpus), 4)
+
+    def test_b1_test_targets_are_full_suite(self):
+        for command in self.DENY_FULL:
+            with self.subTest(command=command):
+                result = decide(command, cwd="/nonexistent")
+                self.assertEqual(result["action"], "deny", command)
+                self.assertEqual(result["rule"], "full-suite", command)
+                self.assertIn("HARNESS_LOCAL_OK", result["message"])
+                self.assertIn("dev2", result["message"])
+
+    def test_b1_build_targets_are_build(self):
+        for command in self.DENY_BUILD:
+            with self.subTest(command=command):
+                result = decide(command, cwd="/nonexistent")
+                self.assertEqual(result["action"], "deny", command)
+                self.assertEqual(result["rule"], "build", command)
+
+    def test_b1_denied_through_every_wrapper_and_nesting(self):
+        seen = 0
+        for command in self.WRAPPED:
+            for wrapped in self.wrap(command):
+                seen += 1
+                with self.subTest(command=wrapped):
+                    self.assertEqual(decide(wrapped, cwd="/nonexistent")["action"], "deny", wrapped)
+        self.assertGreater(seen, 40)
+
+    def test_b1_hatch_alone_allows_build_tools_and_modes_apply(self):
+        self.assertEqual(decide("HARNESS_LOCAL_OK=needs-mac-keychain make test", cwd="/nonexistent")["action"], "allow")
+        self.assertEqual(decide("HARNESS_LOCAL_OK=needs-xcode xcodebuild test", cwd="/nonexistent")["action"], "allow")
+        self.assertEqual(guard.decide("make test", "/nonexistent", dict(MODES, **{"full-suite": "off"})), {"action": "allow"})
+        self.assertEqual(guard.decide("mvn package", "/nonexistent", dict(MODES, **{"build": "off"})), {"action": "allow"})
+
+    def test_b1_light_forms_never_denied(self):
+        for command in self.ALLOW:
+            with self.subTest(command=command):
+                self.assertEqual(decide(command, cwd="/nonexistent")["action"], "allow", command)
+        for command in ("make help", "make clean", "make --version", "gradle tasks", "mvn -v", "xcodebuild -version"):
+            for wrapped in self.wrap(command):
+                with self.subTest(command=wrapped):
+                    self.assertEqual(decide(wrapped, cwd="/nonexistent")["action"], "allow", wrapped)
+
+    def test_b1_make_dry_run_is_allowed_by_design(self):
+        # -n/--dry-run/--just-print prints the recipe without running it; a nested $(MAKE) line can still execute in
+        # GNU make, which is accepted for a careless-agent threat model and documented in the module docstring.
+        for command in ("make -n test", "make --dry-run test", "make --just-print build", "make -n", "make -nj4 check"):
+            with self.subTest(command=command):
+                self.assertEqual(decide(command, cwd="/nonexistent")["action"], "allow", command)
+        self.assertEqual(decide("make test -n", cwd="/nonexistent")["action"], "allow")
+
+    def chain(self, depth, tail="ls"):
+        return "nohup " * depth + tail
+
+    def test_l1_deep_wrapper_chain_is_denied_with_the_too_deep_reason(self):
+        for depth in (13, 14, 20):
+            result = decide(self.chain(depth), cwd="/nonexistent")
+            self.assertEqual(result["action"], "deny", depth)
+            self.assertIn("too deep", result["message"], depth)
+        mixed = decide("nohup env A=1 sudo nice time " * 4 + "ls", cwd="/nonexistent")
+        self.assertEqual(mixed["action"], "deny")
+        self.assertIn("too deep", mixed["message"])
+
+    def test_l1_chain_at_the_limit_is_allowed(self):
+        self.assertEqual(guard.MAX_WRAPPER_DEPTH, 12)
+        for depth in (1, 11, 12):
+            self.assertEqual(decide(self.chain(depth), cwd="/nonexistent")["action"], "allow", depth)
+        self.assertEqual(decide(self.chain(12, "pytest"), cwd="/nonexistent")["action"], "deny")
+
+    def test_l1_limit_is_tight_not_merely_present(self):
+        # fails if MAX_WRAPPER_DEPTH is raised (12 -> 40 mutation): 14 wrappers must still be refused
+        self.assertEqual(decide(self.chain(14), cwd="/nonexistent")["action"], "deny")
+        self.assertLessEqual(guard.MAX_WRAPPER_DEPTH, 13)
+
+
 class HookProcess(unittest.TestCase):
     def run_hook(self, stdin, home=None, extra=None):
         env = dict(os.environ, HARNESS_HEAVY_GUARD_FORCE="1", HOME=home or tempfile.mkdtemp())
