@@ -86,7 +86,8 @@ ambiguous.
   overwritten with a copy. Every `self` writer, including one restored by `init --from-mirror`,
   is read from the mirror, never from the repository. Ops added to the repository's copy (for
   example in a `.git` that left this account and came back) are neither shown nor built on, and
-  the next write replaces that copy. A replaced copy that differed from the mirror is kept,
+  the next write replaces that copy. A copy that is only behind the mirror (after a crash or a
+  failed copy) is simply brought up to date. A replaced copy that is not on the mirror's chain is kept,
   never folded, under `refs/goodqa-displaced/v1/<proj>/<writer>/<ns>` and the write warns;
   inspect it with `git log -p <that ref>` and delete it with `git update-ref -d` when done. A
   restored clone keeps up while the original checkout goes on writing. If the copy into the

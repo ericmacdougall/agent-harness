@@ -218,6 +218,9 @@ func (l *Ledger) initLocked(rootID string, now int64, o InitOptions) error {
 	if mirror != nil {
 		l.syncRepo(mirror, ref, "", commit)
 	}
+	if os.Getenv(FailPublishEnv) == "1" && writer.TestHooksAllowed {
+		return errors.New("test hook: failure before projects.json is published")
+	}
 	if err := l.Dir.PublishNew(projectsFile, projectsBody(l.Project, o.Slug)); err != nil {
 		return err
 	}

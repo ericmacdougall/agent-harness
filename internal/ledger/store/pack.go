@@ -162,6 +162,13 @@ func (g *Git) CAS(ref, newID, old string) error {
 	return nil
 }
 
+// IsAncestor reports whether commit a is an ancestor of (or equal to) b in this repository. A missing
+// object or any other failure reports false.
+func (g *Git) IsAncestor(a, b string) bool {
+	_, err := g.run(LocalTimeout, nil, nil, "merge-base", "--is-ancestor", a, b)
+	return err == nil
+}
+
 // Pack is one validated pack commit.
 type Pack struct {
 	Commit string

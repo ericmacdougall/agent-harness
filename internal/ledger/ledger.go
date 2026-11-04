@@ -44,6 +44,7 @@ const (
 	LockWaitEnv       = "HARNESS_LEDGER_TEST_LOCK_WAIT_MS"
 	ViewBudgetEnv     = "HARNESS_LEDGER_TEST_VIEW_BUDGET"
 	FailFirstFoldEnv  = "HARNESS_LEDGER_TEST_FAIL_FIRST_FOLD"
+	FailPublishEnv    = "HARNESS_LEDGER_TEST_FAIL_BEFORE_PUBLISH"
 	DirName           = "goodqa"
 	projectsFile      = "projects.json"
 	cacheFile         = "view.cache.json"
@@ -73,7 +74,7 @@ func CheckTestEnv() error {
 	if writer.TestHooksAllowed {
 		return nil
 	}
-	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, ViewBudgetEnv, FailFirstFoldEnv, writer.FakeMachineIDEnv} {
+	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, ViewBudgetEnv, FailFirstFoldEnv, FailPublishEnv, writer.FakeMachineIDEnv} {
 		if _, ok := os.LookupEnv(k); ok {
 			return wrap(ErrUsage, "%s is a test-only variable, refused by builds without -tags ledgertest", k)
 		}
@@ -1094,10 +1095,11 @@ const DisplacedPrefix = "refs/goodqa-displaced/v1/"
 
 // syncRepo copies an own ref from the mirror into the repository, warning (not failing) when it cannot:
 // the ops are safe in the mirror and the copy is retried on the next write. prev is the mirror tip the
-// write built on; a repository copy that is neither prev nor tip (ops added there, or written while the
-// mirror was missing) is kept under DisplacedPrefix before it is replaced.
+// write built on. A repository copy that is only behind (an earlier commit of the mirror's chain, left by
+// a crash or a failed copy) is simply brought up to date; one that is not on the mirror's chain (ops added
+// there, or written while the mirror was missing) is kept under DisplacedPrefix before it is replaced.
 func (l *Ledger) syncRepo(mirror *store.Git, ref, prev, tip string) {
-	if cur, err := l.Git.Tip(ref); err == nil && cur != "" && cur != prev && cur != tip {
+	if cur, err := l.Git.Tip(ref); err == nil && cur != "" && cur != tip && (prev == "" || !mirror.IsAncestor(cur, prev)) {
 		_, w, _ := store.ParseRefName(ref)
 		keep := fmt.Sprintf("%s%s/%s/%d", DisplacedPrefix, l.Project, w, time.Now().UnixNano())
 		if err := l.Git.CAS(keep, cur, ""); err != nil {

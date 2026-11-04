@@ -603,7 +603,15 @@ func TestCrashThenClockStepBack(t *testing.T) {
 	st := w.jsonOK(w.repo, at(now+1000), "status")
 	me := st["writer"].(string)
 	before := ownTipHLC(t, w, me)
-	w.newTicket(w.repo, at(now-3600*1000), "after step back")
+	// The repository copy is only behind the mirror after the crash: the next write brings it up to date
+	// without calling it a divergence (delta review of 31c409e).
+	r = w.run(w.repo, at(now-3600*1000), "tickets", "new", "--title", "after step back", "--json")
+	if r.code != 0 || strings.Contains(r.stderr, "differ") {
+		t.Fatalf("write after the crash: exit %d stderr %s", r.code, r.stderr)
+	}
+	if kept := w.git(w.repo, "for-each-ref", ledger.DisplacedPrefix); strings.TrimSpace(kept) != "" {
+		t.Fatalf("a copy that was only behind was displaced: %s", kept)
+	}
 	after := ownTipHLC(t, w, me)
 	if !before.Less(after) {
 		t.Fatalf("clock did not increase: %v then %v", before, after)
@@ -1186,13 +1194,19 @@ func TestInitKeepsHomeAfterPublication(t *testing.T) {
 		t.Fatalf("the store of record was removed: %v", err)
 	}
 	w.newTicket(w.repo, nil, "works")
-	// Control: a refused init (nothing published) leaves no HOME directory behind.
+	// Control: an init that fails after creating its mirror but before publishing projects.json leaves no
+	// HOME directory and no ledger behind.
+	other := filepath.Join(filepath.Dir(w.repo), "other")
+	w.git(filepath.Dir(w.repo), "init", "-q", other)
 	before, _ := os.ReadDir(filepath.Join(w.home, ".agent-harness", "ledgers"))
-	if r := w.run(w.repo, nil, "tickets", "init", "--slug", "again"); r.code == 0 {
-		t.Fatal("second init accepted")
+	if r := w.run(other, []string{ledger.FailPublishEnv + "=1"}, "tickets", "init", "--slug", "failed"); r.code == 0 {
+		t.Fatal("init with the pre-publish fault succeeded")
 	}
 	if after, _ := os.ReadDir(filepath.Join(w.home, ".agent-harness", "ledgers")); len(after) != len(before) {
-		t.Fatalf("a refused init left a HOME directory: %d -> %d", len(before), len(after))
+		t.Fatalf("a failed init left a HOME directory: %d -> %d", len(before), len(after))
+	}
+	if _, err := os.Stat(filepath.Join(other, ".git", "goodqa", "projects.json")); err == nil {
+		t.Fatal("a failed init published projects.json")
 	}
 }
 
