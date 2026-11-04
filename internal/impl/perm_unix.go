@@ -23,10 +23,17 @@ func safeBinary(fi fs.FileInfo) bool {
 	return owner(fi) && fi.Mode().Perm()&0o022 == 0 && fi.Mode().Perm()&0o100 != 0
 }
 
-// safeAncestors: every directory above path is owned by us or root and not group/other-writable unless
-// sticky, so nobody else can swap the binary between hashing and exec.
+// safeAncestors: every directory above path, along both the lexical chain and the symlink-resolved one,
+// is owned by us or root and not group/other-writable unless sticky, so nobody else can swap the binary
+// between hashing and exec (a symlinked ancestor into a shared tree is caught by the resolved chain).
 func safeAncestors(path string) bool {
-	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+	dir := filepath.Dir(path)
+	resolved, err := filepath.EvalSymlinks(dir)
+	return err == nil && safeChain(dir) && safeChain(resolved)
+}
+
+func safeChain(dir string) bool {
+	for ; ; dir = filepath.Dir(dir) {
 		fi, err := os.Stat(dir)
 		if err != nil || !fi.IsDir() {
 			return false
