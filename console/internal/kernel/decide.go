@@ -259,6 +259,10 @@ func Decide(p Projection, in In) (Decision, error) {
 		if s.ReadOnly {
 			return b.late(s, in, "disconnected")
 		}
+		// Only a connection or an open request can be lost, so repeats record nothing.
+		if !s.Connected && !s.Requests[s.LastRequest].open() {
+			return idempotent, nil
+		}
 		b.add(Fact{Kind: FactProviderDisconnected, SessionID: s.ID})
 		return b.finish()
 	case ObAccepted, ObRefused, ObUnknown:
@@ -272,6 +276,9 @@ func Decide(p Projection, in In) (Decision, error) {
 	case ObQuarantine:
 		if in.ReasonCode == "" {
 			return refuse("bad_value", "a reason is required")
+		}
+		if s.Quarantine != "" {
+			return idempotent, nil
 		}
 		b.add(Fact{Kind: FactSessionQuarantined, SessionID: s.ID, ReasonCode: in.ReasonCode})
 		b.effects = stopEffects(s)
@@ -289,6 +296,15 @@ func decideCreate(b *builder, in In) (Decision, error) {
 	}
 	if in.ProviderID != "" && in.RuntimeIdentity == "" {
 		return refuse("no_owner", "an existing conversation needs its owner")
+	}
+	open := 0
+	for _, s := range b.p.Sessions {
+		if !s.Closed {
+			open++
+		}
+	}
+	if open >= MaxOpenSessions {
+		return refuse("session_limit", "too many open sessions; close some first")
 	}
 	b.add(Fact{Kind: FactSessionCreated, SessionID: in.SessionID, Provider: in.Provider, ProviderID: in.ProviderID, ProfileID: in.ProfileID, CWD: in.CWD, RuntimeIdentity: in.RuntimeIdentity})
 	return b.finish()
@@ -543,6 +559,11 @@ func decideCompleted(b *builder, s *Session, in In) (Decision, error) {
 }
 
 func decideControlOutcome(b *builder, s *Session, in In) (Decision, error) {
+	// An outcome with no request awaiting it is evidence only, so alternating outcome
+	// frames cannot grow the log or spend the reserve.
+	if !s.ControlPending {
+		return b.late(s, in, "control_outcome")
+	}
 	if !oneOfValues(in.Control, "pause", "stop") || !oneOfValues(in.Outcome, "confirmed", "rejected", "unconfirmed") {
 		return b.late(s, in, "control_outcome")
 	}

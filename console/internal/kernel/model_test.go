@@ -7,13 +7,9 @@ package kernel
 // A comment `SPEC-AMBIGUOUS: n` marks a place the tables left open. Every failure message
 // carries the numbers touched in that step, so a disagreement caused by a reading can be
 // told apart from a defect. Numbers 1 to 36 are settled by SPEC.md section 10; 1 to 34 use
-// its numbers, and 35 and 36 were closed by its items 30 and 31. Still open:
-// section 10 names no error for Quarantined.Err, so it is only required to be non-nil; and
-// 37. Item 39 says repeated control-outcome frames append facts, but table 7 makes a frame that
-// would not change PauseUnconfirmed idempotent. Table 7 is coded, so an exact repeat is idempotent.
-// 38. Item 40 narrows the stored late digest, but section 7's fact digest shape is unchanged, so
-// whether Reduce refuses a raw LateFrameObserved with a non-hex in-shape Digest is open. Raw late
-// facts are generated only with a 64-hex or empty Digest.
+// its numbers, and 35 and 36 were closed by its items 30 and 31. 37 was closed by item 39 and
+// section 11, 38 by item 40. Section 11's readings are section 10 items 41 to 49. Still open:
+// section 10 names no error for Quarantined.Err, so it is only required to be non-nil.
 
 import (
 	"errors"
@@ -92,6 +88,7 @@ type mdlMSession struct {
 
 	abandoned       *Abandonment
 	controlFacts    int // Decided ControlRequested facts since the last RequestIntended.
+	controlPending  bool
 	revision, epoch uint64
 	receipts        map[string]Receipt
 	order           []string
@@ -195,7 +192,7 @@ func (m *mdlModel) restart() {
 			s.providerFinal = false
 			m.hit("t3.restart.open_to_unknown")
 		}
-		s.mdlTurn, s.pending, s.paused, s.unconfirmed = "", false, false, false
+		s.mdlTurn, s.pending, s.paused, s.unconfirmed, s.controlPending = "", false, false, false, false
 	}
 	protected := map[string]bool{}
 	for _, id := range m.order {
@@ -229,6 +226,80 @@ func (m *mdlModel) restart() {
 }
 
 // apply folds one fact the model already knows to be legal.
+// eligible is section 11's table, judged against the model before f. Only legal facts
+// are asked (section 10 item 48).
+func (m *mdlModel) eligible(f Fact) bool {
+	s := m.sessions[f.SessionID]
+	yes := false
+	switch f.Kind {
+	case FactProcessRestarted:
+		yes = true
+	case FactProviderCompleted, FactOutcomeUnknown, FactProviderRefused,
+		FactAbandoned, FactSessionClosed, FactAuthBoundaryCrossed, FactSessionQuarantined:
+		yes = s != nil
+	case FactProviderDisconnected:
+		yes = s != nil && (s.connected || s.open())
+	case FactControlRequested:
+		if s != nil && f.Control == "stop" {
+			changesPaused := s.last() != ReceiptUnknown && !s.paused
+			newlyOwes := !s.pending && s.owed()
+			yes = changesPaused || newlyOwes
+		}
+	case FactControlOutcome:
+		// Section 10 item 45: a raw outcome with nothing pending is legal but ordinary.
+		yes = s != nil && s.controlPending
+	case FactLateFrameObserved:
+		// Section 10 item 46: an empty request matches an empty LastRequest.
+		yes = s != nil && f.LateKind == "final" && f.RequestID == s.lastReq
+		if yes && f.RequestID == "" {
+			m.hit("t11.eligible.late_final_empty_request")
+		}
+	}
+	conditional := map[FactKind]bool{FactProviderDisconnected: true, FactControlRequested: true, FactControlOutcome: true, FactLateFrameObserved: true}
+	switch {
+	case yes:
+		m.hit("t11.eligible." + string(f.Kind))
+	case conditional[f.Kind]:
+		m.hit("t11.not_eligible." + string(f.Kind))
+	default:
+		m.hit("t11.ordinary")
+	}
+	return yes
+}
+
+// cloneFor copies the model with deep copies of the named sessions, enough to apply facts
+// on those sessions without touching the original.
+func (m *mdlModel) cloneFor(ids []string) *mdlModel {
+	c := *m
+	c.sessions = make(map[string]*mdlMSession, len(m.sessions))
+	for id, s := range m.sessions {
+		c.sessions[id] = s
+	}
+	c.order = append([]string(nil), m.order...)
+	for _, id := range ids {
+		s := m.sessions[id]
+		if s == nil {
+			continue
+		}
+		copied := *s
+		copied.receipts = make(map[string]Receipt, len(s.receipts))
+		for k, v := range s.receipts {
+			copied.receipts[k] = v
+		}
+		copied.evidence = make(map[string]string, len(s.evidence))
+		for k, v := range s.evidence {
+			copied.evidence[k] = v
+		}
+		copied.order = append([]string(nil), s.order...)
+		if s.abandoned != nil {
+			a := *s.abandoned
+			copied.abandoned = &a
+		}
+		c.sessions[id] = &copied
+	}
+	return &c
+}
+
 func (m *mdlModel) applyDecided(f Fact) {
 	// Section 7: Decide never returns a fact Reduce would refuse. A hit here is a model bug,
 	// and fails the row check because this counter is not declared.
@@ -308,9 +379,6 @@ func (m *mdlModel) apply(f Fact) {
 	case FactSessionQuarantined:
 		// SPEC-AMBIGUOUS: 13
 		m.note(13)
-		if s.quarantine != "" && f.ReasonCode == "illegal_fact" {
-			m.hit("t2.quarantine.overwrite_with_illegal_fact")
-		}
 		s.quarantine = f.ReasonCode
 		s.readOnly, s.connected, s.hidden = true, false, false
 		s.pending = sticky
@@ -337,6 +405,7 @@ func (m *mdlModel) apply(f Fact) {
 		if s.mdlTurn != "" {
 			m.hit("t4.intended.clears_bound_turn")
 		}
+		s.controlPending = false
 		s.receipts[f.RequestID] = ReceiptIntent
 		s.lastReq = f.RequestID
 		s.order = append(s.order, f.RequestID)
@@ -351,6 +420,7 @@ func (m *mdlModel) apply(f Fact) {
 		s.receipts[s.lastReq] = ReceiptAccepted
 	case FactProviderRefused:
 		s.receipts[s.lastReq] = ReceiptRejected
+		s.controlPending = false
 		s.lastRefusal = f.ReasonCode
 		if s.lastRefusal == "" {
 			s.lastRefusal = "provider_refused"
@@ -359,6 +429,7 @@ func (m *mdlModel) apply(f Fact) {
 		s.mdlTurn, s.pending = "", false
 	case FactProviderCompleted:
 		s.receipts[s.lastReq] = ReceiptFinal
+		s.controlPending = false
 		s.providerFinal, s.finalStatus = true, f.Status
 		s.mdlTurn, s.pending, s.unconfirmed = "", false, false
 	case FactOutcomeUnknown:
@@ -373,6 +444,7 @@ func (m *mdlModel) apply(f Fact) {
 	case FactLateFrameObserved:
 		s.evidence[f.RequestID+"\x00"+f.LateKind] = f.Status + "|" + f.Digest
 	case FactControlRequested:
+		s.controlPending = true
 		s.pending = sticky
 		if s.last() == ReceiptUnknown {
 			m.hit("t4.control_requested.unknown")
@@ -395,6 +467,7 @@ func (m *mdlModel) apply(f Fact) {
 			}
 		}
 		s.unconfirmed = s.wouldBeUnconfirmed(f.Outcome)
+		s.controlPending = false
 	}
 }
 
@@ -510,7 +583,7 @@ func (m *mdlModel) sessionFactOK(s *mdlMSession, f Fact) bool {
 	case FactProviderConnected, FactProviderDisconnected, FactAuthBoundaryCrossed:
 		return true
 	case FactSessionQuarantined:
-		return f.ReasonCode != ""
+		return f.ReasonCode != "" && s.quarantine == ""
 	case FactAbandoned:
 		// SPEC-AMBIGUOUS: 31
 		return f.Reason != "" && s.abandoned == nil && isLast
@@ -534,7 +607,9 @@ func (m *mdlModel) sessionFactOK(s *mdlMSession, f Fact) bool {
 	case FactLateFrameObserved:
 		// Section 10 item 8: a repeated key is illegal, and the request is stored as given.
 		_, seen := s.evidence[f.RequestID+"\x00"+f.LateKind]
-		return mdlContains(mdlLateKinds, f.LateKind) && !seen
+		// Section 10 item 40: a stored late digest is empty or 64 lowercase hex.
+		hexOK := f.Digest == "" || mdlLateDigest.MatchString(f.Digest)
+		return mdlContains(mdlLateKinds, f.LateKind) && !seen && hexOK
 	case FactControlRequested:
 		// SPEC-AMBIGUOUS: 20
 		m.note(20)
@@ -734,6 +809,11 @@ func (m *mdlModel) predict(gs mdlGenStep) mdlOutcome {
 		if s.readOnly {
 			return m.late(s, in, "disconnected")
 		}
+		// Section 11 and item 43: nothing to record without a connection or an open request.
+		if !s.connected && !s.open() {
+			m.hit("t7.disconnected.idempotent")
+			return mdlOutcome{}
+		}
 		m.hit("t7.disconnected.fact")
 		d := m.newDraft(in.At)
 		d.add(s.id, Fact{Kind: FactProviderDisconnected})
@@ -749,6 +829,11 @@ func (m *mdlModel) predict(gs mdlGenStep) mdlOutcome {
 		m.note(13)
 		if in.ReasonCode == "" {
 			return m.refuse("quarantine.empty", "bad_value")
+		}
+		// Section 10 item 44: no facts and no effects.
+		if s.quarantine != "" {
+			m.hit("t7.quarantine.idempotent")
+			return mdlOutcome{}
 		}
 		if !mdlCodeShape.MatchString(in.ReasonCode) {
 			return m.refuse("quarantine.shape", "bad_value")
@@ -779,6 +864,16 @@ func (m *mdlModel) predictCreate(in In) mdlOutcome {
 	}
 	if in.ProviderID != "" && in.RuntimeIdentity == "" {
 		return m.refuse("create", "no_owner")
+	}
+	// Section 11 and section 10 item 42: hidden sessions count, closed ones do not.
+	open := 0
+	for _, id := range m.order {
+		if !m.sessions[id].closed {
+			open++
+		}
+	}
+	if open >= MaxOpenSessions {
+		return m.refuse("create", "session_limit")
 	}
 	// SPEC-AMBIGUOUS: 25
 	m.note(25)
@@ -1062,6 +1157,11 @@ func (m *mdlModel) predictCompleted(s *mdlMSession, in In) mdlOutcome {
 }
 
 func (m *mdlModel) predictControlOutcome(s *mdlMSession, in In) mdlOutcome {
+	// Section 11: an outcome needs a pending control request.
+	if !s.controlPending {
+		m.hit("t7.control_outcome.not_pending")
+		return m.late(s, in, "control_outcome")
+	}
 	if (in.Control != "pause" && in.Control != "stop") || !mdlContains([]string{"confirmed", "rejected", "unconfirmed"}, in.Outcome) {
 		return m.late(s, in, "control_outcome")
 	}
@@ -1113,6 +1213,7 @@ type mdlGenStep struct {
 	schema  *int
 	keepRev bool
 	tag     string
+	expand  func(*mdlModel) []mdlGenStep // Built when reached, from the model state then.
 }
 
 // SPEC-AMBIGUOUS: 32
@@ -1196,6 +1297,10 @@ type mdlGen struct {
 	queue    []mdlGenStep
 	pending  []func() []mdlGenStep
 	reqCount int
+	limited  bool       // Section 11: the log has reached its ordinary limit.
+	previous mdlGenStep // The last limit-mode step, for repeats.
+	focus    string     // The session limit mode keeps returning to.
+	entry    []mdlGenStep
 }
 
 const (
@@ -1262,9 +1367,16 @@ func (g *mdlGen) next(m *mdlModel) mdlGenStep {
 		g.queue = g.scriptRepeatedControl()
 	}
 	var gs mdlGenStep
-	if len(g.queue) > 0 {
+	for len(g.queue) > 0 && g.queue[0].expand != nil {
+		build := g.queue[0].expand
+		g.queue = append(build(m), g.queue[1:]...)
+	}
+	switch {
+	case g.limited:
+		gs = g.limitStep(m)
+	case len(g.queue) > 0:
 		gs, g.queue = g.queue[0], g.queue[1:]
-	} else {
+	default:
 		gs = g.random(m)
 	}
 	if !gs.atSet {
@@ -1841,9 +1953,17 @@ func (g *mdlGen) scriptControlOutcome() []mdlGenStep {
 		mdlStep(ObControlOutcome, a, mdlCtl("pause", "rejected")),
 		mdlSend(a, "r1"),
 		mdlStep(ObControlOutcome, a, mdlCtl("stop", "rejected")),
+		mdlStep(InStop, a),
+		mdlStep(ObControlOutcome, a, mdlCtl("stop", "rejected")),
 		mdlStep(ObControlOutcome, a, mdlCtl("stop", "unconfirmed")),
+		mdlStep(ObTurnBound, a, mdlReq("r1"), mdlTurn("t1")),
+		mdlStep(ObCompleted, a, mdlReq("r1"), mdlTurn("t1"), mdlStatus("completed")),
+		mdlSend(a, "r2"),
+		mdlStep(InStop, a),
 		mdlStep(ObControlOutcome, a, mdlCtl("stop", "confirmed")),
 		mdlStep(ObControlOutcome, a, mdlCtl("stop", "unconfirmed")),
+		mdlStep(ObControlOutcome, a, mdlCtl("stop", "unconfirmed")),
+		mdlStep(InPause, a),
 		mdlStep(ObRestart, ""),
 		mdlStep(ObControlOutcome, a, mdlCtl("stop", "unconfirmed")),
 	)
@@ -1874,8 +1994,8 @@ func (g *mdlGen) scriptQuarantine() []mdlGenStep {
 	out = append(out, mdlStep(ObQuarantine, "ghost-"+a, mdlCode("x")),
 		mdlStep(ObQuarantine, a), mdlStep(ObQuarantine, a, mdlCode("BAD CODE")),
 		mdlStep(ObQuarantine, a, mdlCode("first_code")), mdlStep(ObQuarantine, a, mdlCode("second_code")),
-		// Section 10 item 13: the code replay would use still overwrites when it arrives as a fact.
-		mdlStep(ObQuarantine, a, mdlCode("illegal_fact")), mdlStep(ObQuarantine, a, mdlCode("after_illegal")))
+		// Section 10 items 13 and 44: quarantined once, and the first code stands.
+		mdlStep(ObQuarantine, a, mdlCode("illegal_fact")), mdlStep(ObQuarantine, a), mdlStep(ObQuarantine, a, mdlCode("BAD CODE")))
 	out = append(out, g.codexReady(b)...)
 	out = append(out, mdlSend(b, "r1"), mdlStep(ObQuarantine, b, mdlCode("q")), mdlStep(ObTurnBound, b, mdlReq("r1"), mdlTurn("t1")))
 	out = append(out, mdlClaudeNew(c), mdlSend(c, "r1"), mdlStep(ObQuarantine, c, mdlCode("q")), mdlStep(InStop, c))
@@ -1995,6 +2115,8 @@ func (g *mdlGen) scriptRaw() []mdlGenStep {
 		mdlRawFact("illegal", Fact{Kind: FactLateFrameObserved, SessionID: d, RequestID: "r1", LateKind: "not_a_kind"}),
 		mdlRawFact("illegal", Fact{Kind: FactLateFrameObserved, SessionID: d, RequestID: "r1", LateKind: "final", Status: "Free Text!"}),
 		mdlRawFact("illegal", Fact{Kind: FactLateFrameObserved, SessionID: d, RequestID: "r1", LateKind: "final", Digest: "bad digest!"}),
+		mdlRawFact("illegal", Fact{Kind: FactLateFrameObserved, SessionID: d, RequestID: "r1", LateKind: "final", Digest: "sha256:abc"}),
+		mdlRawFact("illegal", Fact{Kind: FactLateFrameObserved, SessionID: d, RequestID: "r1", LateKind: "final", Digest: mdlCanary}),
 		mdlRawFact("legal", Fact{Kind: FactProviderCompleted, SessionID: d, RequestID: "r1", Status: "completed", TurnID: "t2"}),
 		mdlRawFact("legal", Fact{Kind: FactTurnBound, SessionID: d, RequestID: "r1", TurnID: "t3"}),
 		mdlRawFact("legal", Fact{Kind: FactConversationBound, SessionID: d, ProviderID: "conv-1"}),
@@ -2114,7 +2236,7 @@ func (g *mdlGen) scriptReach() []mdlGenStep {
 	out = append(out, mdlSend(a, "r1"), mdlStep(InPause, a), mdlStep(ObUnknown, a, mdlReq("r1")), mdlStep(ObTurnBound, a, mdlReq("r1"), mdlTurn("t1")))
 	// Abandoned, with PauseUnconfirmed true going in, then false going in.
 	out = append(out, g.codexReady(b)...)
-	out = append(out, mdlSend(b, "r1"), mdlStep(ObControlOutcome, b, mdlCtl("stop", "rejected")), mdlStep(InPause, b),
+	out = append(out, mdlSend(b, "r1"), mdlStep(InPause, b), mdlStep(ObControlOutcome, b, mdlCtl("stop", "rejected")),
 		mdlStep(InAbandon, b, mdlExpect("r1"), mdlBecause("discard it")),
 		outcome(b, "stop", "rejected"), outcome(b, "pause", "unconfirmed"), outcome(b, "stop", "rejected"))
 	// Resolved receipts: final, rejected and none.
@@ -2132,6 +2254,158 @@ func (g *mdlGen) scriptReach() []mdlGenStep {
 		mdlStep(ObCompleted, h, mdlReq("r1"), mdlTurn("t1"), mdlStatus("completed")),
 		mdlRawFact("legal", Fact{Kind: FactTurnBound, SessionID: h, RequestID: "r1", TurnID: "t2"}),
 		mdlSend(h, "r2"))
+}
+
+// scriptSessionLimit fills the open sessions to MaxOpenSessions, from whatever is open when
+// it is reached, and probes the refusal order of section 10 item 42.
+func (g *mdlGen) scriptSessionLimit(m *mdlModel) []mdlGenStep {
+	open := 0
+	for _, id := range m.order {
+		if !m.sessions[id].closed {
+			open++
+		}
+	}
+	var out, ids []mdlGenStep
+	var names []string
+	for i := open; i < MaxOpenSessions; i++ {
+		id := g.fresh("sl")
+		names = append(names, id)
+		ids = append(ids, mdlClaudeNew(id))
+	}
+	out = append(out, ids...)
+	out = append(out, mdlClaudeNew(g.fresh("sl")))
+	if len(names) > 1 {
+		out = append(out,
+			mdlClaudeNew(names[0]),
+			mdlStep(InCreate, g.fresh("sl"), mdlProv("codexx")),
+			mdlStep(InCreate, g.fresh("sl"), mdlProv(ProviderCodex), mdlConv("c1")),
+			mdlStep(InCreate, g.fresh("sl"), mdlProv(ProviderCodex), mdlCwd("a\nb")),
+			mdlStep(ObRestart, ""),
+			mdlClaudeNew(g.fresh("sl")),
+			mdlStep(InClose, names[1]),
+			mdlClaudeNew(g.fresh("sl")),
+			mdlClaudeNew(g.fresh("sl")),
+		)
+		// Room again for anything generated afterwards.
+		for i := 2; i < len(names) && i < 102; i++ {
+			out = append(out, mdlStep(InClose, names[i]))
+		}
+	}
+	return out
+}
+
+// limitStep is the hostile generator for limit mode: every provider frame, repeated and
+// alternated, stop and pause, restarts, abandon and close, on any session.
+func (g *mdlGen) limitStep(m *mdlModel) mdlGenStep {
+	if len(g.entry) > 0 {
+		gs := g.entry[0]
+		g.entry = g.entry[1:]
+		return gs
+	}
+	if g.previous.in.Kind != "" && g.rng.Intn(10) < 3 {
+		return g.previous
+	}
+	sid := g.foreignSession(m)
+	if w := g.writableFocus(m); w != "" && g.rng.Intn(10) < 6 {
+		sid = w
+	}
+	s := m.sessions[sid]
+	// Cycles of ordinary frames: under the real table they are refused at the limit, and a
+	// MustAppend that let them through would grow a session without bound.
+	if s != nil && !s.closed && !s.readOnly && g.rng.Intn(10) < 4 {
+		var gs mdlGenStep
+		switch {
+		case g.rng.Intn(2) == 0 && s.connected:
+			gs = mdlStep(ObDisconnected, sid)
+		case g.rng.Intn(2) == 0:
+			gs = mdlStep(ObConnected, sid)
+		case s.open() && s.provider == ProviderClaude:
+			gs = mdlStep(ObCompleted, sid, mdlReq(s.lastReq), mdlStatus("completed"))
+		case s.open():
+			gs = mdlStep(ObTurnBound, sid, mdlReq(s.lastReq), mdlTurn(g.fresh("t")))
+		default:
+			g.reqCount++
+			gs = mdlStep(InSend, sid, mdlReq("r-"+strconv.Itoa(g.reqCount)), mdlIdentity(mdlRtOne))
+		}
+		g.previous = gs
+		return gs
+	}
+	last, old, cur := "", "", g.fresh("t")
+	if s != nil {
+		last = s.lastReq
+		if len(s.order) > 0 {
+			old = s.order[g.rng.Intn(len(s.order))]
+		}
+		if s.mdlTurn != "" {
+			cur = s.mdlTurn
+		}
+	}
+	var gs mdlGenStep
+	switch g.rng.Intn(21) {
+	case 0, 1:
+		gs = mdlStep(ObDisconnected, sid)
+	case 2:
+		gs = mdlStep(ObConnected, sid)
+	case 3, 4:
+		gs = mdlStep(ObControlOutcome, sid, mdlCtl(g.pick("pause", "stop"), g.pick("confirmed", "unconfirmed", "rejected")))
+	case 5:
+		gs = mdlStep(ObCompleted, sid, mdlReq(last), mdlTurn(cur), mdlStatus(g.pick("completed", "failed", "interrupted", "bogus")))
+	case 6:
+		gs = mdlStep(ObCompleted, sid, mdlReq(old), mdlTurn(cur), mdlStatus("completed"), mdlDigest(g.pick("", mdlHexA)))
+	case 7:
+		gs = mdlStep(ObCompleted, sid, mdlReq(g.fresh("r-new")), mdlStatus("completed"))
+	case 8:
+		gs = mdlStep(g.pickKind(ObAccepted, ObRefused, ObUnknown), sid, mdlReq(last))
+	case 9:
+		gs = mdlStep(ObTurnBound, sid, mdlReq(last), mdlTurn(cur))
+	case 10, 11:
+		gs = mdlStep(InStop, sid)
+	case 12:
+		gs = mdlStep(InPause, sid)
+	case 13:
+		gs = mdlStep(InStop, sid)
+		if g.rng.Intn(5) == 0 {
+			gs = mdlStep(ObRestart, "")
+		}
+	case 14:
+		gs = mdlStep(InAbandon, sid, mdlExpect(last), mdlBecause("limit discard"))
+	case 15:
+		gs = mdlStep(InClose, sid)
+	case 16:
+		gs = mdlStep(ObQuarantine, sid, mdlCode(g.pick("q", "q_two")))
+	case 17:
+		gs = mdlStep(InPause, sid)
+		if g.rng.Intn(5) == 0 {
+			gs = mdlStep(ObAuthBoundary, "", mdlProv(g.pick(ProviderCodex, ProviderClaude)), mdlProf(g.pick("", "p1", "p2")))
+		}
+	case 18:
+		g.reqCount++
+		gs = mdlStep(InSend, sid, mdlReq("r-"+strconv.Itoa(g.reqCount)), mdlIdentity(mdlRtOne))
+	case 19:
+		gs = mdlStep(ObConversationBound, sid, mdlConv(g.fresh("conv")), mdlIdentity(mdlRtOne))
+	default:
+		gs = mdlStep(InCreate, g.fresh("s"), mdlProv(ProviderClaude))
+	}
+	g.previous = gs
+	return gs
+}
+
+// writableFocus keeps limit mode on one writable session while it stays writable.
+func (g *mdlGen) writableFocus(m *mdlModel) string {
+	if s := m.sessions[g.focus]; s != nil && !s.closed && !s.readOnly {
+		return g.focus
+	}
+	g.focus = ""
+	var writable []string
+	for _, id := range m.order {
+		if s := m.sessions[id]; !s.closed && !s.readOnly {
+			writable = append(writable, id)
+		}
+	}
+	if len(writable) > 0 {
+		g.focus = writable[g.rng.Intn(len(writable))]
+	}
+	return g.focus
 }
 
 func (g *mdlGen) scriptManySessions() []mdlGenStep {
@@ -2194,6 +2468,9 @@ func mdlNewGen(seed int64) *mdlGen {
 		for _, build := range scripts {
 			g.queue = append(g.queue, build()...)
 		}
+		if seed == 0 {
+			g.queue = append(g.queue, mdlGenStep{expand: g.scriptSessionLimit})
+		}
 		return g
 	}
 	if seed%7 == 3 {
@@ -2222,7 +2499,7 @@ func (s *mdlMSession) fieldValues() map[string]any {
 		"FinalStatus": s.finalStatus, "LastRefusal": s.lastRefusal, "TurnID": s.mdlTurn,
 		"ConversationStarted": s.started, "Connected": s.connected, "ReadOnly": s.readOnly, "Closed": s.closed,
 		"Hidden": s.hidden, "ProviderFinal": s.providerFinal, "PendingInterrupt": s.pending, "Paused": s.paused,
-		"PauseUnconfirmed": s.unconfirmed, "Abandoned": s.abandoned, "Revision": s.revision, "ControlEpoch": s.epoch,
+		"PauseUnconfirmed": s.unconfirmed, "ControlPending": s.controlPending, "Abandoned": s.abandoned, "Revision": s.revision, "ControlEpoch": s.epoch,
 		"Requests": s.receipts, "RequestOrder": s.order, "Evidence": s.evidence,
 	}
 }
@@ -2636,7 +2913,20 @@ type modelHooks struct {
 	afterDecode func(Fact) Fact   // A dropped field in the codec.
 	afterStep   func(*Projection) // A value set outside Reduce.
 	cov         map[string]int
+	// limitAt is the step from which the log is at its ordinary limit (section 11); 0 picks
+	// one by seed, negative never.
+	limitAt int
+	// eligible replaces the model's own reading of section 11, for a failing control.
+	eligible func(*mdlModel, Fact) bool
+	// modelOnly runs without calling any kernel function.
+	modelOnly bool
 }
+
+// Section 11's proof: per session, and in total.
+const (
+	mdlReservePerSession = 11
+	mdlReserveTotal      = 22001
+)
 
 type mdlModelRun struct {
 	seed      int64
@@ -2649,11 +2939,17 @@ type mdlModelRun struct {
 	replayRng *rand.Rand
 	noKernel  bool
 	trace     strings.Builder
+	limitAt   int
+	limited   bool
+	afterCap  map[string]int // Eligible facts per session since the limit, by the model's reading.
+	restarts  int            // Restarts since the limit.
+	others    int            // Other eligible facts since the limit.
 }
 
 func mdlNewModelRun(seed int64, hooks modelHooks, noKernel bool) *mdlModelRun {
-	r := &mdlModelRun{seed: seed, m: mdlNewModel(hooks.cov), g: mdlNewGen(seed), hooks: hooks, noKernel: noKernel,
-		replayRng: rand.New(rand.NewSource(seed ^ 0x5eed))}
+	r := &mdlModelRun{seed: seed, m: mdlNewModel(hooks.cov), g: mdlNewGen(seed), hooks: hooks, noKernel: noKernel || hooks.modelOnly,
+		replayRng: rand.New(rand.NewSource(seed ^ 0x5eed)), afterCap: map[string]int{}}
+	noKernel = r.noKernel
 	if !noKernel {
 		r.p = NewProjection()
 	}
@@ -2684,6 +2980,60 @@ func (r *mdlModelRun) commit(f Fact) string {
 	return ""
 }
 
+func (r *mdlModelRun) eligible(m *mdlModel, f Fact) bool {
+	if r.hooks.eligible != nil {
+		return r.hooks.eligible(m, f)
+	}
+	return m.eligible(f)
+}
+
+// setLimit picks the step at which the simulated limit is reached.
+func (r *mdlModelRun) setLimit(total int) {
+	switch {
+	case r.hooks.limitAt > 0:
+		r.limitAt = r.hooks.limitAt
+	case r.hooks.limitAt == 0 && !mdlTourSeed(r.seed) && r.seed%5 == 4:
+		r.limitAt = total / 2
+	}
+}
+
+func (r *mdlModelRun) maybeLimit() {
+	if r.limitAt > 1 && r.mdlStep == r.limitAt-1 {
+		// Two-fact decisions at the limit: RuntimeIdentityBound first, so refused whole (item 49).
+		id := r.g.fresh("lim")
+		r.g.queue = append([]mdlGenStep{mdlClaudeNew(id)}, r.g.queue...)
+		r.g.entry = []mdlGenStep{
+			mdlStep(ObConversationBound, id, mdlConv("conv-"+id), mdlIdentity(mdlRtOne)),
+			mdlStep(InSend, id, mdlReq("r-"+id), mdlIdentity(mdlRtOne)),
+		}
+	}
+	if r.limitAt > 0 && r.mdlStep == r.limitAt && !r.limited {
+		r.limited, r.g.limited = true, true
+		r.g.queue, r.g.pending = nil, nil
+		r.m.hit("t11.limit.reached")
+	}
+}
+
+// countReserve applies section 11's bound to one committed fact, by the model's reading.
+func (r *mdlModelRun) countReserve(f Fact) string {
+	if f.Kind == FactProcessRestarted {
+		r.restarts++
+	} else {
+		r.others++
+		r.afterCap[f.SessionID]++
+		if n := r.afterCap[f.SessionID]; n > mdlReservePerSession {
+			return fmt.Sprintf("reserve bound: session %s has %d eligible facts since the limit, over %d", f.SessionID, n, mdlReservePerSession)
+		}
+	}
+	if r.restarts > r.others+1 {
+		return fmt.Sprintf("reserve bound: %d restarts since the limit against %d other eligible facts", r.restarts, r.others)
+	}
+	if total := r.restarts + r.others; total > mdlReserveTotal {
+		return fmt.Sprintf("reserve bound: %d eligible facts since the limit, over %d", total, mdlReserveTotal)
+	}
+	return ""
+}
+
 func (r *mdlModelRun) doRaw(gs mdlGenStep) string {
 	f := r.m.stampRaw(gs, gs.in.At)
 	v := r.m.mdlVerdict(f)
@@ -2694,7 +3044,11 @@ func (r *mdlModelRun) doRaw(gs mdlGenStep) string {
 	}
 	fmt.Fprintf(&r.trace, "raw %s %s seq=%d %s\n", f.Kind, f.SessionID, f.Seq, name)
 	if v == mdlVLegal {
+		want := r.eligible(r.m, f)
 		if !r.noKernel {
+			if got := MustAppend(r.p, f); got != want {
+				return fmt.Sprintf("MustAppend(%s raw): model %v, kernel %v", f.Kind, want, got)
+			}
 			if msg := r.commit(f); msg != "" {
 				return msg
 			}
@@ -2738,11 +3092,7 @@ func (r *mdlModelRun) doInput(gs mdlGenStep) string {
 	want := r.m.predict(gs)
 	fmt.Fprintf(&r.trace, "in %q %q refusal=%q facts=%d\n", gs.in.Kind, gs.in.SessionID, want.refusal, len(want.facts))
 	if r.noKernel {
-		for _, wf := range want.facts {
-			r.m.applyDecided(wf.Fact)
-			r.log = append(r.log, wf.Fact)
-		}
-		return ""
+		return r.commitDecision(want, nil)
 	}
 	d, err := Decide(r.p, gs.kernelIn())
 	if want.refusal != "" {
@@ -2775,14 +3125,78 @@ func (r *mdlModelRun) doInput(gs mdlGenStep) string {
 			return msg
 		}
 	}
+	return r.commitDecision(want, d.Facts)
+}
+
+// commitDecision judges each fact's eligibility with the decision's earlier facts applied
+// (section 10 item 47), compares MustAppend, and at the limit refuses the whole decision if
+// any fact is ineligible (item 49). kernelFacts is nil without a kernel.
+func (r *mdlModelRun) commitDecision(want mdlOutcome, kernelFacts []Fact) string {
+	n := len(want.facts)
+	if n == 0 {
+		return ""
+	}
+	eligible := make([]bool, n)
+	judge := r.m
+	if n > 1 {
+		var ids []string
+		for _, wf := range want.facts {
+			ids = append(ids, wf.SessionID)
+		}
+		judge = r.m.cloneFor(ids)
+	}
+	all := true
 	for i, wf := range want.facts {
-		got := d.Facts[i]
-		if msg := r.commit(got); msg != "" {
-			return msg
+		eligible[i] = r.eligible(judge, wf.Fact)
+		all = all && eligible[i]
+		if n > 1 {
+			judge.apply(wf.Fact)
+		}
+	}
+	if r.limited && !all {
+		r.m.hit("t11.limit.refused")
+		if n > 1 {
+			r.m.hit("t11.limit.refused_whole_decision")
+		}
+		if kernelFacts == nil {
+			return ""
+		}
+		// Nothing commits, so the kernel is asked against a disposable copy.
+		scratch, _, err := Replay(r.log)
+		if err != nil {
+			return fmt.Sprintf("Replay for a refused decision: %v", err)
+		}
+		for i, got := range kernelFacts {
+			if m := MustAppend(scratch, got); m != eligible[i] {
+				return fmt.Sprintf("MustAppend(%s, fact %d of %d): model %v, kernel %v", got.Kind, i+1, n, eligible[i], m)
+			}
+			if scratch, err = Reduce(scratch, got); err != nil {
+				return fmt.Sprintf("Reduce on the refused decision's copy: %v", err)
+			}
+		}
+		return ""
+	}
+	for i, wf := range want.facts {
+		if kernelFacts != nil {
+			got := kernelFacts[i]
+			if m := MustAppend(r.p, got); m != eligible[i] {
+				return fmt.Sprintf("MustAppend(%s, fact %d of %d): model %v, kernel %v", got.Kind, i+1, n, eligible[i], m)
+			}
+			if msg := r.commit(got); msg != "" {
+				return msg
+			}
+		} else {
+			r.log = append(r.log, wf.Fact)
 		}
 		r.m.applyDecided(wf.Fact)
-		if s := r.m.sessions[got.SessionID]; s != nil && s.controlFacts > 2 {
+		if s := r.m.sessions[wf.SessionID]; s != nil && s.controlFacts > 2 {
 			return fmt.Sprintf("session %s has %d ControlRequested facts for request %q", s.id, s.controlFacts, s.lastReq)
+		}
+		if r.limited {
+			r.m.hit("t11.limit.committed")
+			if msg := r.countReserve(wf.Fact); msg != "" {
+				return msg
+			}
 		}
 	}
 	return ""
@@ -2816,6 +3230,10 @@ func (r *mdlModelRun) doStep() string {
 	}
 	if msg := mdlCompareProjection(r.m, r.p); msg != "" {
 		return r.describe(gs, msg)
+	}
+	// With the session-limit script's thousand sessions, replay-against-live runs every 25 steps.
+	if len(r.m.sessions) > 300 && r.mdlStep%25 != 0 {
+		return ""
 	}
 	replayed, q, err := Replay(r.log)
 	if err != nil {
@@ -2857,7 +3275,11 @@ func (r *mdlModelRun) replayTable() string {
 }
 
 func (r *mdlModelRun) steps(steps int) int {
-	if need := len(r.g.queue) + 20; mdlTourSeed(r.seed) && need > steps {
+	need := len(r.g.queue) + 20
+	if r.seed == 0 {
+		need += MaxOpenSessions + 20 // The session-limit expansion.
+	}
+	if mdlTourSeed(r.seed) && need > steps {
 		return need
 	}
 	return steps
@@ -2872,7 +3294,9 @@ func runModel(seed int64, steps int, hooks modelHooks) (failure string) {
 		}
 	}()
 	total := r.steps(steps)
+	r.setLimit(total)
 	for r.mdlStep = 0; r.mdlStep < total; r.mdlStep++ {
+		r.maybeLimit()
 		if msg := r.doStep(); msg != "" {
 			return msg
 		}
@@ -2890,7 +3314,9 @@ func runModel(seed int64, steps int, hooks modelHooks) (failure string) {
 func mdlRunModelAlone(seed int64, steps int, cov map[string]int) string {
 	r := mdlNewModelRun(seed, modelHooks{cov: cov}, true)
 	total := r.steps(steps)
+	r.setLimit(total)
 	for r.mdlStep = 0; r.mdlStep < total; r.mdlStep++ {
+		r.maybeLimit()
 		r.m.notes = map[int]bool{}
 		gs := r.g.next(r.m)
 		if gs.raw != nil {
@@ -2916,8 +3342,10 @@ func mdlTableRows() []string {
 		"t4.control_requested.unknown", "t4.control_requested.other",
 		"t4.unknown.pending_survives", "t4.intended.clears_bound_turn",
 		"t4.control_outcome.unresolved_not_confirmed", "t4.control_outcome.abandoned_clears", "t4.control_outcome.abandoned_not_confirmed", "t4.control_outcome.resolved_not_confirmed",
+		"t11.limit.reached", "t11.limit.refused", "t11.limit.refused_whole_decision", "t11.limit.committed", "t11.ordinary", "t11.eligible.late_final_empty_request",
+		"t11.not_eligible.ProviderDisconnected", "t11.not_eligible.ControlRequested", "t11.not_eligible.ControlOutcome", "t11.not_eligible.LateFrameObserved",
 		"t5.request.known", "t5.request.unknown", "t5.sticky", "t5.status.empty", "t5.status.valid", "t5.status.invalid", "t5.digest.valid", "t5.digest.empty",
-		"t8.unreadable.schema", "t8.unreadable.seq", "t8.unreadable.kind", "t8.unreadable.global", "t8.unreadable.reserved_no_session", "t8.unreadable.global_live_session", "t8.unreadable.global_ghost_session", "t2.quarantine.overwrite_with_illegal_fact",
+		"t8.unreadable.schema", "t8.unreadable.seq", "t8.unreadable.kind", "t8.unreadable.global", "t8.unreadable.reserved_no_session", "t8.unreadable.global_live_session", "t8.unreadable.global_ghost_session",
 		"t8.reserved_follows_rows", "t8.ghost", "t8.ghost_once", "t8.ghost_then_created", "t8.ghost_created_quarantined", "t8.first", "t8.first_on_closed", "t8.first_on_quarantined", "t8.later_applied", "t8.later_skipped",
 		"raw.verdict.legal", "raw.verdict.illegal", "raw.verdict.unreadable",
 		"raw.tag.legal.legal", "raw.tag.repeat.legal", "raw.tag.gap.legal", "raw.tag.illegal.illegal", "raw.tag.receipt_transition.illegal",
@@ -2930,13 +3358,17 @@ func mdlTableRows() []string {
 	for _, k := range mdlLateKinds {
 		rows = append(rows, "t5.kind."+k)
 	}
+	for _, k := range []FactKind{FactProcessRestarted, FactProviderCompleted, FactOutcomeUnknown, FactProviderRefused, FactAbandoned, FactSessionClosed,
+		FactAuthBoundaryCrossed, FactSessionQuarantined, FactProviderDisconnected, FactControlRequested, FactControlOutcome, FactLateFrameObserved} {
+		rows = append(rows, "t11.eligible."+string(k))
+	}
 	for _, s := range []string{"closed", "abandoned", "unknown_quarantine", "unknown_receipt", "read_only", "open_paused", "running", "rejected", "failed", "paused", "interrupted", "codex_offline", "idle"} {
 		rows = append(rows, "t6."+s)
 	}
 	for _, s := range []string{
 		"auth.unknown_kind.forbidden", "auth.class.forbidden", "auth.session.forbidden", "time.bad_time",
 		"closed.not_found", "missing.not_found", "restart.idempotent", "restart.fact",
-		"create.empty.session_exists", "create.closed.session_exists", "create.used.session_exists", "create.bad_provider", "create.no_owner", "create.bad_value", "create.fact",
+		"create.empty.session_exists", "create.closed.session_exists", "create.used.session_exists", "create.bad_provider", "create.no_owner", "create.session_limit", "create.bad_value", "create.fact",
 		"send.replay.intent", "send.replay.accepted", "send.replay.final", "send.not_replayed", "send.bad_request", "send.read_only", "send.unresolved", "send.disconnected",
 		"send.no_identity", "send.runtime_changed", "send.no_owner", "send.bad_value", "send.binds_identity", "send.fact",
 		"control.read_only", "control.read_only_effects", "control.unknown_owed", "control.nothing_to_stop", "control.unknown_effects", "control.pause", "control.stop", "control.already_paused.pause", "control.already_paused.stop", "control.second_fact",
@@ -2944,13 +3376,13 @@ func mdlTableRows() []string {
 		"close.unresolved", "close.fact",
 		"abandon.bad_reason", "abandon.idempotent", "abandon.discarded_other", "abandon.turn_changed", "abandon.stop_first", "abandon.nothing_to_discard", "abandon.no_receipt", "abandon.limit_after_trim", "abandon.bad_value", "abandon.fact",
 		"conversation.runtime_changed", "conversation.no_owner", "conversation.idempotent", "conversation.not_replaced", "conversation.binds_identity", "conversation.fact",
-		"connected.idempotent", "connected.fact", "disconnected.fact",
+		"connected.idempotent", "connected.fact", "disconnected.fact", "disconnected.idempotent",
 		"frame.reason_dropped", "accepted.idempotent", "accepted.fact", "refused.fact", "unknown.fact",
 		"turn_missing.not_found", "turn_closed.not_found", "turn.closed_pending", "turn.claude_late", "turn.guard_late", "turn.idempotent", "turn.different_late", "turn.pending", "turn.fact", "turn.resolved_late",
 		"completed.unbound", "completed.empty_late", "completed.guard_late", "completed.turn_late", "completed.invalid_status", "completed.fact.completed", "completed.fact.failed", "completed.fact.interrupted",
-		"control_outcome.idempotent", "control_outcome.fact",
+		"control_outcome.idempotent", "control_outcome.not_pending", "control_outcome.fact",
 		"auth_boundary.bad_provider", "auth_boundary.idempotent", "auth_boundary.fact", "auth_boundary.several",
-		"quarantine.empty.bad_value", "quarantine.shape.bad_value", "quarantine.fact",
+		"quarantine.empty.bad_value", "quarantine.shape.bad_value", "quarantine.fact", "quarantine.idempotent",
 	} {
 		rows = append(rows, "t7."+s)
 	}
@@ -3084,4 +3516,55 @@ func TestControlTamperedProjection(t *testing.T) {
 	if !strings.Contains(failure, "seed=1 step=") {
 		t.Fatalf("failure does not name the seed and step: %s", failure)
 	}
+}
+
+// Section 11's bound, under the hostile limit generator, against the kernel's MustAppend too.
+func TestModelReserveBound(t *testing.T) {
+	seeds := modelSeedCountFor(t, 40)
+	for seed := int64(1); seed <= seeds; seed++ {
+		hooks := modelHooks{limitAt: 150 + int(seed%100)}
+		if failure := runModel(seed, 900, hooks); failure != "" {
+			t.Fatal(failure)
+		}
+	}
+}
+
+// The same bound with the model alone, so it can be checked without the kernel.
+func TestModelAloneReserveBound(t *testing.T) {
+	for seed := int64(1); seed <= 40; seed++ {
+		hooks := modelHooks{limitAt: 150 + int(seed%100), modelOnly: true}
+		if failure := runModel(seed, 900, hooks); failure != "" {
+			t.Fatal(failure)
+		}
+	}
+}
+
+// A MustAppend that calls every kind eligible must break the bound.
+func TestControlAllEligible(t *testing.T) {
+	const seed = 7
+	clean := modelHooks{limitAt: 150, modelOnly: true}
+	if failure := runModel(seed, 900, clean); failure != "" {
+		t.Fatalf("clean model-only run must pass before the control means anything: %s", failure)
+	}
+	faulty := clean
+	faulty.eligible = func(*mdlModel, Fact) bool { return true }
+	failure := runModel(seed, 900, faulty)
+	if !strings.Contains(failure, "reserve bound") {
+		t.Fatalf("an every-kind-eligible MustAppend was not caught by the bound: %q", failure)
+	}
+	if !strings.Contains(failure, "seed=7 step=") {
+		t.Fatalf("failure does not name the seed and step: %s", failure)
+	}
+}
+
+// modelSeedCountFor scales KERNEL_MODEL_SEEDS down for the longer limit runs.
+func modelSeedCountFor(t *testing.T, fallback int64) int64 {
+	t.Helper()
+	if os.Getenv("KERNEL_MODEL_SEEDS") == "" {
+		return fallback
+	}
+	if n := mdlModelSeedCount(t) / 8; n > 0 {
+		return n
+	}
+	return 1
 }

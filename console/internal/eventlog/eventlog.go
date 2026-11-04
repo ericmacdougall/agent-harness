@@ -28,9 +28,13 @@ const (
 	// on the reference Mac, so this is the stated limit. Recovery at the limit is an
 	// export and a new data directory.
 	MaxFacts = 1_000_000
-	// Reserve is the headroom kept for must-append facts once ordinary facts reach
-	// MaxFacts - Reserve, so the console can still start, record outcomes, discard and close.
+	// Reserve is the headroom kept once ordinary facts reach MaxFacts - Reserve, for
+	// facts kernel.MustAppend admits, so the console can still start, record outcomes,
+	// discard and close. Section 11 of the K1a tables proves at most 22,001 are needed
+	// with up to 1,000 open sessions.
 	Reserve = 50_000
+	// maxOpenAtOpen is the most open sessions the reserve proof covers: 2,000 × 11 × 2 + 1.
+	maxOpenAtOpen = 2000
 	// LockName is the lock the 0.1 console also holds, so the two can never share a
 	// data directory.
 	LockName = "console.lock"
@@ -38,25 +42,6 @@ const (
 	// markerName records that this directory has held a log.
 	markerName = "facts.db.created"
 )
-
-// mustAppend kinds record an outcome, a release, a close or a restart. They may use
-// the reserve. A full reserve latches the log.
-var mustAppend = map[kernel.FactKind]bool{
-	kernel.FactProcessRestarted: true, kernel.FactProviderCompleted: true, kernel.FactOutcomeUnknown: true,
-	kernel.FactProviderRefused: true, kernel.FactAbandoned: true, kernel.FactSessionClosed: true,
-	kernel.FactControlOutcome: true, kernel.FactAuthBoundaryCrossed: true, kernel.FactSessionQuarantined: true,
-	kernel.FactProviderDisconnected: true,
-}
-
-// isMustAppend classifies by fact. A stop request may use the reserve; the kernel
-// records one only when it changes something, so repeats cannot drain it. Of late
-// frames only a final may, since a discard must be able to show it was seen. A
-// disconnect may, since it settles an open request as unknown. A turn binding may
-// not: at the limit a Codex completion then records as unknown, which is safe.
-func isMustAppend(f kernel.Fact) bool {
-	return mustAppend[f.Kind] || f.Kind == kernel.FactControlRequested && f.Control == "stop" ||
-		f.Kind == kernel.FactLateFrameObserved && f.LateKind == "final"
-}
 
 // revoking kinds take authority away. If one cannot commit, authority must not
 // outlive the failure, so the log latches.
@@ -152,12 +137,21 @@ func Open(ctx context.Context, dir string, now string) (*Log, kernel.Projection,
 	if err != nil {
 		return fail(err)
 	}
+	open := 0
+	for _, s := range p.Sessions {
+		if !s.Closed {
+			open++
+		}
+	}
+	if open > maxOpenAtOpen {
+		return fail(fmt.Errorf("%w: %d open sessions is more than the reserve covers", kernel.ErrUnreadableLog, open))
+	}
 	decision, err := kernel.Decide(p, kernel.In{Kind: kernel.ObRestart, Principal: kernel.Principal{Class: kernel.PrincipalSystem}, At: now})
 	if err != nil {
 		return fail(err)
 	}
 	if len(decision.Facts) > 0 {
-		stored, _, err := l.Append(ctx, p.LastSeq, "", "", decision.Facts)
+		stored, _, err := l.Append(ctx, p, "", "", decision.Facts)
 		if err != nil {
 			// The restart rule could not be recorded, so nothing may be admitted. The
 			// projection still shows that rule applied, so no session looks live; it is
@@ -285,8 +279,8 @@ func (l *Log) latch() {
 	l.mu.Unlock()
 }
 
-// Append commits facts decided against a projection whose last sequence was
-// expectedSeq. commandID and digest are optional; with them a retry of the same
+// Append commits facts decided against projection p; its last sequence is the
+// compare-and-swap value. commandID and digest are optional; with them a retry of the same
 // command returns the facts it already committed, and a different command under the
 // same identity is refused. It returns the facts as stored, which the caller reduces,
 // and whether they were already committed by an earlier call, in which case they
@@ -295,7 +289,7 @@ func (l *Log) latch() {
 // Outcomes follow the plan's log health table: a definite failure writes nothing
 // and returns its error; any commit error not known to precede commit, or a revoking
 // fact that cannot commit, latches the log.
-func (l *Log) Append(ctx context.Context, expectedSeq uint64, commandID, digest string, facts []kernel.Fact) ([]kernel.Fact, bool, error) {
+func (l *Log) Append(ctx context.Context, p kernel.Projection, commandID, digest string, facts []kernel.Fact) ([]kernel.Fact, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.latched {
@@ -304,7 +298,7 @@ func (l *Log) Append(ctx context.Context, expectedSeq uint64, commandID, digest 
 	if l.db == nil {
 		return nil, false, errors.New("event log is closed")
 	}
-	stored, replayed, err := l.append(ctx, expectedSeq, commandID, digest, facts)
+	stored, replayed, err := l.append(ctx, p, commandID, digest, facts)
 	switch {
 	case err == nil:
 		return stored, replayed, nil
@@ -332,7 +326,8 @@ func hasRevoking(facts []kernel.Fact) bool {
 	return false
 }
 
-func (l *Log) append(ctx context.Context, expectedSeq uint64, commandID, digest string, facts []kernel.Fact) ([]kernel.Fact, bool, error) {
+func (l *Log) append(ctx context.Context, p kernel.Projection, commandID, digest string, facts []kernel.Fact) ([]kernel.Fact, bool, error) {
+	expectedSeq := p.LastSeq
 	if len(facts) == 0 {
 		return nil, false, errors.New("nothing to append")
 	}
@@ -369,13 +364,20 @@ func (l *Log) append(ctx context.Context, expectedSeq uint64, commandID, digest 
 	if count != expectedSeq {
 		return nil, false, ErrConflict
 	}
+	// Each fact must apply to the projection it was decided on, and past the ordinary
+	// limit each must be one the kernel admits to the reserve. A refusal at the limit
+	// is final for that decision: nothing of it commits, and the caller drops it.
 	limit := uint64(MaxFacts - Reserve)
-	for _, f := range facts {
-		if !isMustAppend(f) {
-			if count+uint64(len(facts)) > limit {
-				return nil, false, ErrQuota
-			}
+	folded := p
+	for i, f := range facts {
+		if count+uint64(i)+1 > limit && !kernel.MustAppend(folded, f) {
+			return nil, false, ErrQuota
 		}
+		next, err := kernel.Reduce(folded, f)
+		if err != nil {
+			return nil, false, err
+		}
+		folded = next
 	}
 	if count+uint64(len(facts)) > MaxFacts {
 		return nil, false, errReserveSpent

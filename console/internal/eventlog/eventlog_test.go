@@ -57,7 +57,7 @@ func (d *driver) do(in kernel.In) (kernel.Decision, error) {
 	if err != nil || len(decision.Facts) == 0 {
 		return decision, err
 	}
-	stored, _, err := d.log.Append(ctx, d.p.LastSeq, "", "", decision.Facts)
+	stored, _, err := d.log.Append(ctx, d.p, "", "", decision.Facts)
 	if err != nil {
 		return decision, err
 	}
@@ -146,7 +146,7 @@ func TestSequenceCompareAndSwap(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := d.log.Count()
-	if _, _, err = d.log.Append(ctx, stale.LastSeq, "", "", decision.Facts); !errors.Is(err, ErrConflict) {
+	if _, _, err = d.log.Append(ctx, stale, "", "", decision.Facts); !errors.Is(err, ErrConflict) {
 		t.Fatalf("stale decision committed: %v", err)
 	}
 	if d.log.Count() != before || d.log.Latched() {
@@ -154,7 +154,7 @@ func TestSequenceCompareAndSwap(t *testing.T) {
 	}
 	// A sequence that skips ahead is a conflict too.
 	decision.Facts[0].Seq = d.p.LastSeq + 5
-	if _, _, err = d.log.Append(ctx, d.p.LastSeq, "", "", decision.Facts); !errors.Is(err, ErrConflict) {
+	if _, _, err = d.log.Append(ctx, d.p, "", "", decision.Facts); !errors.Is(err, ErrConflict) {
 		t.Fatalf("gap committed: %v", err)
 	}
 }
@@ -176,7 +176,7 @@ func TestConcurrentAppendsOneWinsNoGap(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			_, _, err = d.log.Append(ctx, base.LastSeq, "", "", decision.Facts)
+			_, _, err = d.log.Append(ctx, base, "", "", decision.Facts)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -206,7 +206,7 @@ func TestCommandReceiptsAreIdempotentAndBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := d.log.CommandDigest([]byte(`{"kind":"create","sessionId":"a"}`))
-	first, replayed, err := d.log.Append(ctx, d.p.LastSeq, "cmd-1", digest, decision.Facts)
+	first, replayed, err := d.log.Append(ctx, d.p, "cmd-1", digest, decision.Facts)
 	if replayed {
 		t.Fatal("first append reported as replayed")
 	}
@@ -215,12 +215,12 @@ func TestCommandReceiptsAreIdempotentAndBound(t *testing.T) {
 	}
 	count := d.log.Count()
 	// A lost response retries with the old expected sequence: same facts, nothing new.
-	again, replayed, err := d.log.Append(ctx, d.p.LastSeq, "cmd-1", digest, decision.Facts)
+	again, replayed, err := d.log.Append(ctx, d.p, "cmd-1", digest, decision.Facts)
 	if err != nil || !replayed || len(again) != len(first) || again[0].Seq != first[0].Seq || d.log.Count() != count {
 		t.Fatalf("retry: %v %+v", err, again)
 	}
 	other := d.log.CommandDigest([]byte(`{"kind":"create","sessionId":"b"}`))
-	if _, _, err = d.log.Append(ctx, d.p.LastSeq, "cmd-1", other, decision.Facts); !errors.Is(err, ErrCommandConflict) {
+	if _, _, err = d.log.Append(ctx, d.p, "cmd-1", other, decision.Facts); !errors.Is(err, ErrCommandConflict) {
 		t.Fatalf("reused identity: %v", err)
 	}
 	if strings.Contains(digest, "sessionId") || len(digest) != 64 {
@@ -387,8 +387,16 @@ func TestQuotaKeepsReserveForMustAppend(t *testing.T) {
 		t.Fatalf("pause used the reserve: %v", err)
 	}
 	// A stop still records, from the reserve: here it owes the unbound turn's interrupt.
-	if _, err = d.do(kernel.In{Kind: kernel.InStop, Principal: user, SessionID: "a"}); err != nil {
+	stop, err := d.do(kernel.In{Kind: kernel.InStop, Principal: user, SessionID: "a"})
+	if err != nil {
 		t.Fatalf("stop refused at quota: %v", err)
+	}
+	// The log judges eligibility itself: the same stop again changes nothing, so a
+	// caller that skips Decide cannot spend the reserve with it.
+	again := stop.Facts[0]
+	again.Seq, again.At, again.SessionRevision = d.p.LastSeq+1, stamp(9000), d.p.Sessions["a"].Revision+1
+	if _, _, err = d.log.Append(ctx, d.p, "", "", []kernel.Fact{again}); !errors.Is(err, ErrQuota) {
+		t.Fatalf("a stop that changes nothing used the reserve: %v", err)
 	}
 	set(MaxFacts)
 	if _, err = d.do(kernel.In{Kind: kernel.InAbandon, Principal: user, SessionID: "a", ExpectedRequest: "r1", Reason: kernel.Redact("done", func(s string) string { return s })}); !errors.Is(err, ErrLatched) || !d.log.Latched() {
@@ -422,7 +430,7 @@ func TestSecretsNeverReachTheFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err = d.log.Append(ctx, d.p.LastSeq, "cmd-canary", d.log.CommandDigest([]byte(canary)), decision.Facts); err != nil {
+	if _, _, err = d.log.Append(ctx, d.p, "cmd-canary", d.log.CommandDigest([]byte(canary)), decision.Facts); err != nil {
 		t.Fatal(err)
 	}
 	var receipts int
@@ -626,7 +634,7 @@ func TestOpenTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	batch := []kernel.Fact{}
-	expected := d.p.LastSeq
+	expected := d.p
 	for i := 0; d.p.LastSeq < uint64(total); i++ {
 		id := fmt.Sprintf("s%07d", i)
 		for _, in := range []kernel.In{
@@ -662,11 +670,17 @@ func TestOpenTime(t *testing.T) {
 				batch = append(batch, decision.Facts...)
 			}
 		}
+		// Close each session after its requests, as users do, so the open-session limit holds.
+		closing, _ := kernel.Decide(d.p, kernel.In{Kind: kernel.InClose, Principal: user, At: stamp(i*1000 + 999), SessionID: id})
+		for _, f := range closing.Facts {
+			d.p, _ = kernel.Reduce(d.p, f)
+		}
+		batch = append(batch, closing.Facts...)
 		if len(batch) >= 5000 {
 			if _, _, err = d.log.Append(ctx, expected, "", "", batch); err != nil {
 				t.Fatal(err)
 			}
-			expected = d.p.LastSeq
+			expected = d.p
 			batch = batch[:0]
 		}
 	}
@@ -711,7 +725,7 @@ func TestRestartThatCannotCommitLatches(t *testing.T) {
 	if p.Sessions["a"] == nil || !p.Sessions["a"].ReadOnly || p.Sessions["a"].Connected {
 		t.Fatal("a latched open must show every session read-only")
 	}
-	if _, _, err = l.Append(ctx, p.LastSeq, "", "", []kernel.Fact{{Seq: p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(1), Kind: kernel.FactProcessRestarted}}); !errors.Is(err, ErrLatched) {
+	if _, _, err = l.Append(ctx, p, "", "", []kernel.Fact{{Seq: p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(1), Kind: kernel.FactProcessRestarted}}); !errors.Is(err, ErrLatched) {
 		t.Fatalf("latched log admitted: %v", err)
 	}
 }
@@ -747,7 +761,7 @@ func TestAppendReturnsTheDecodedFacts(t *testing.T) {
 	d := open(t, t.TempDir())
 	defer d.log.Close()
 	f := kernel.Fact{Seq: d.p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(3), Kind: kernel.FactSessionCreated, SessionID: "a", SessionRevision: 1, Provider: kernel.ProviderClaude, Passes: map[string]string{}}
-	stored, _, err := d.log.Append(ctx, d.p.LastSeq, "", "", []kernel.Fact{f})
+	stored, _, err := d.log.Append(ctx, d.p, "", "", []kernel.Fact{f})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -766,7 +780,7 @@ func TestAppendRefusesAFactOutOfShape(t *testing.T) {
 	s := d.p.Sessions["a"]
 	bad := kernel.Fact{Seq: d.p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(9), Kind: kernel.FactLateFrameObserved, SessionID: "a", SessionRevision: s.Revision + 1, LateKind: "final", Digest: canary}
 	before := d.log.Count()
-	if _, _, err := d.log.Append(ctx, d.p.LastSeq, "", "", []kernel.Fact{bad}); err == nil || d.log.Count() != before || d.log.Latched() {
+	if _, _, err := d.log.Append(ctx, d.p, "", "", []kernel.Fact{bad}); err == nil || d.log.Count() != before || d.log.Latched() {
 		t.Fatalf("out-of-shape fact stored: %v", err)
 	}
 	d.log.Close()
@@ -788,7 +802,7 @@ func TestRevokingConflictLatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err = d.log.Append(ctx, stale.LastSeq, "", "", decision.Facts); !errors.Is(err, ErrLatched) || !d.log.Latched() {
+	if _, _, err = d.log.Append(ctx, stale, "", "", decision.Facts); !errors.Is(err, ErrLatched) || !d.log.Latched() {
 		t.Fatalf("revoking conflict: %v", err)
 	}
 }
@@ -871,7 +885,7 @@ func TestRepeatedControlsRecordOnce(t *testing.T) {
 func TestAppendAfterCloseRefuses(t *testing.T) {
 	d := open(t, t.TempDir())
 	d.log.Close()
-	if _, _, err := d.log.Append(ctx, d.p.LastSeq, "", "", []kernel.Fact{{Seq: d.p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(1), Kind: kernel.FactProcessRestarted}}); err == nil {
+	if _, _, err := d.log.Append(ctx, d.p, "", "", []kernel.Fact{{Seq: d.p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(1), Kind: kernel.FactProcessRestarted}}); err == nil {
 		t.Fatal("append after close")
 	}
 }
@@ -887,5 +901,97 @@ func TestMissingLogIsNotAFreshStart(t *testing.T) {
 	if l, _, _, err := Open(ctx, dir, stamp(0)); err == nil {
 		l.Close()
 		t.Fatal("a deleted log opened as a new one")
+	}
+}
+
+// At the limit, floods of every provider frame and every user control spend only a
+// bounded part of the reserve, and an outcome, a discard, a close and a restart still
+// record afterwards.
+func TestFloodsAtTheLimitCannotSpendTheReserve(t *testing.T) {
+	dir := t.TempDir()
+	d := open(t, dir)
+	d.session("codex")
+	d.must(kernel.In{Kind: kernel.InSend, Principal: user, SessionID: "codex", RequestID: "r1", RuntimeIdentity: "owner"})
+	d.must(kernel.In{Kind: kernel.InCreate, Principal: user, SessionID: "claude", Provider: kernel.ProviderClaude})
+	d.must(kernel.In{Kind: kernel.InSend, Principal: user, SessionID: "claude", RequestID: "r1", RuntimeIdentity: "owner"})
+	d.log.mu.Lock()
+	gap := uint64(MaxFacts-Reserve) - d.log.count
+	if _, err := d.log.db.Exec(`UPDATE metadata SET fact_count = ?`, MaxFacts-Reserve); err != nil {
+		t.Fatal(err)
+	}
+	d.log.count = MaxFacts - Reserve
+	d.p.LastSeq += gap
+	d.log.mu.Unlock()
+	start := d.log.Count()
+	for i := 0; i < 2000; i++ {
+		for _, id := range []string{"codex", "claude"} {
+			for _, in := range []kernel.In{
+				{Kind: kernel.ObDisconnected, Principal: provider, SessionID: id},
+				{Kind: kernel.ObConnected, Principal: provider, SessionID: id},
+				{Kind: kernel.ObControlOutcome, Principal: provider, SessionID: id, Control: "pause", Outcome: []string{"confirmed", "unconfirmed", "rejected"}[i%3]},
+				{Kind: kernel.InStop, Principal: user, SessionID: id},
+				{Kind: kernel.InPause, Principal: user, SessionID: id},
+				{Kind: kernel.ObCompleted, Principal: provider, SessionID: id, RequestID: fmt.Sprintf("old%d", i), TurnID: "x", Status: "completed"},
+				{Kind: kernel.ObTurnBound, Principal: provider, SessionID: id, RequestID: "r1", TurnID: fmt.Sprintf("t%d", i)},
+				{Kind: kernel.ObQuarantine, Principal: system, SessionID: id, ReasonCode: "flood"},
+			} {
+				if _, err := d.do(in); err != nil && !errors.Is(err, ErrQuota) {
+					var refusal *kernel.Refusal
+					if !errors.As(err, &refusal) {
+						t.Fatalf("%s on %s: %v", in.Kind, id, err)
+					}
+				}
+			}
+		}
+	}
+	spent := d.log.Count() - start
+	if spent > 2*11 || d.log.Latched() {
+		t.Fatalf("floods spent %d reserve facts, latched=%v", spent, d.log.Latched())
+	}
+	reason := kernel.Redact("done", func(s string) string { return s })
+	for _, id := range []string{"codex", "claude"} {
+		if s := d.p.Sessions[id]; s.Abandoned == nil && kernel.Status(s) != "closed" {
+			if _, err := d.do(kernel.In{Kind: kernel.InAbandon, Principal: user, SessionID: id, ExpectedRequest: s.LastRequest, Reason: reason}); err != nil {
+				t.Fatalf("discard after floods on %s: %v", id, err)
+			}
+		}
+		if _, err := d.do(kernel.In{Kind: kernel.InClose, Principal: user, SessionID: id}); err != nil {
+			t.Fatalf("close after floods on %s: %v", id, err)
+		}
+	}
+	// The counter was moved past rows that do not exist, so a reopen would rightly
+	// refuse the gap. The restart is checked as the open path would append it.
+	if _, err := d.do(kernel.In{Kind: kernel.ObRestart, Principal: system}); err != nil || d.p.LastKind != kernel.FactProcessRestarted {
+		t.Fatalf("restart after floods: %v", err)
+	}
+	// Windows cannot remove the temp dir while the lock is held.
+	if err := d.log.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTooManyOpenSessionsRefusesOpen(t *testing.T) {
+	dir := t.TempDir()
+	d := open(t, dir)
+	facts := []kernel.Fact{}
+	p := d.p
+	// Raw creations past the limit, as only a foreign writer could produce.
+	for i := 0; i <= maxOpenAtOpen; i++ {
+		f := kernel.Fact{Seq: p.LastSeq + 1, SchemaVersion: kernel.SchemaVersion, At: stamp(i + 10), Kind: kernel.FactSessionCreated, SessionID: fmt.Sprintf("s%05d", i), SessionRevision: 1, Provider: kernel.ProviderClaude}
+		var err error
+		if p, err = kernel.Reduce(p, f); err != nil {
+			t.Fatal(err)
+		}
+		facts = append(facts, f)
+	}
+	if _, _, err := d.log.Append(ctx, d.p, "", "", facts); err != nil {
+		t.Fatal(err)
+	}
+	d.log.Close()
+	if l, _, _, err := Open(ctx, dir, stamp(0)); !errors.Is(err, kernel.ErrUnreadableLog) {
+		if l != nil {
+			l.Close()
+		}
+		t.Fatalf("opened a log with more open sessions than the reserve covers: %v", err)
 	}
 }

@@ -35,6 +35,9 @@ const (
 	maxReceiptsKept = 256
 	// MaxVisibleSessions bounds resolved history shown after a restart.
 	MaxVisibleSessions = 24
+	// MaxOpenSessions bounds sessions that are not closed, which bounds what can draw
+	// on the event log's reserve (section 11 of the K1a tables).
+	MaxOpenSessions = 1000
 )
 
 type Abandonment struct {
@@ -63,7 +66,10 @@ type Session struct {
 	PendingInterrupt bool
 	Paused           bool
 	PauseUnconfirmed bool
-	ControlEpoch     uint64
+	// ControlPending is a control request awaiting its outcome; only then may an
+	// outcome be recorded, so outcome frames cannot grow the log.
+	ControlPending bool
+	ControlEpoch   uint64
 
 	Evidence map[string]string
 }
@@ -270,6 +276,9 @@ func reduceSession(s *Session, f Fact) error {
 		s.ReadOnly, s.Connected = true, false
 		s.ControlEpoch++
 	case FactSessionQuarantined:
+		if s.Quarantine != "" {
+			return illegal(f, "a session is quarantined once")
+		}
 		quarantine(s, f.ReasonCode)
 	case FactCwdChanged:
 		if s.Requests[s.LastRequest].unresolved() {
@@ -302,7 +311,7 @@ func reduceSession(s *Session, f Fact) error {
 		if s.LastRefusal == "" {
 			s.LastRefusal = "provider_refused"
 		}
-		s.TurnID, s.PendingInterrupt = "", false
+		s.TurnID, s.PendingInterrupt, s.ControlPending = "", false, false
 	case FactProviderCompleted:
 		if err := requireRequest(s, f); err != nil {
 			return err
@@ -311,7 +320,7 @@ func reduceSession(s *Session, f Fact) error {
 			return err
 		}
 		s.ProviderFinal, s.FinalStatus = true, f.Status
-		s.TurnID, s.PendingInterrupt, s.PauseUnconfirmed = "", false, false
+		s.TurnID, s.PendingInterrupt, s.PauseUnconfirmed, s.ControlPending = "", false, false, false
 	case FactOutcomeUnknown:
 		if err := requireRequest(s, f); err != nil {
 			return err
@@ -340,6 +349,7 @@ func reduceSession(s *Session, f Fact) error {
 		s.Evidence[key] = f.Status + "|" + f.Digest
 	case FactControlRequested:
 		owed := stickyOwed(s)
+		s.ControlPending = true
 		if s.Requests[s.LastRequest] == ReceiptUnknown {
 			s.PendingInterrupt = owed
 			return nil
@@ -347,6 +357,7 @@ func reduceSession(s *Session, f Fact) error {
 		s.PendingInterrupt, s.Paused = owed, true
 		s.ControlEpoch++
 	case FactControlOutcome:
+		s.ControlPending = false
 		s.PauseUnconfirmed = f.Outcome != "confirmed" && s.Requests[s.LastRequest].unresolved() && s.Abandoned == nil
 	default:
 		return illegal(f, "not a session fact")
@@ -372,7 +383,7 @@ func reduceIntended(s *Session, f Fact) error {
 		s.RequestOrder = s.RequestOrder[1:]
 	}
 	s.ProviderFinal, s.FinalStatus, s.LastRefusal = false, "", ""
-	s.TurnID, s.PendingInterrupt, s.Paused, s.PauseUnconfirmed = "", false, false, false
+	s.TurnID, s.PendingInterrupt, s.Paused, s.PauseUnconfirmed, s.ControlPending = "", false, false, false, false
 	return nil
 }
 
@@ -433,7 +444,7 @@ func reduceRestart(p *Projection) {
 			s.ProviderFinal = false
 		}
 		s.ReadOnly, s.Connected = true, false
-		s.TurnID, s.PendingInterrupt, s.Paused, s.PauseUnconfirmed = "", false, false, false
+		s.TurnID, s.PendingInterrupt, s.Paused, s.PauseUnconfirmed, s.ControlPending = "", false, false, false, false
 		p.Sessions[id] = s
 	}
 	trimResolved(p)
