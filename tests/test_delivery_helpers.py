@@ -2606,7 +2606,9 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertEqual((code, json.loads(output.getvalue())['status']),
                          (0, 'INTEGRATED'), output.getvalue())
         git_calls = [kwargs for command, kwargs in calls if command[0] == 'git']
-        verification_calls = [kwargs for command, kwargs in calls if command[0] in {'npm', 'python3'}]
+        # Checks now run a pinned absolute interpreter after a version probe (`-I -c`).
+        verification_calls = [kwargs for command, kwargs in calls
+                              if Path(command[0]).name in {'npm', 'python3'} and command[1:3] != ['-I', '-c']]
         self.assertTrue(git_calls)
         self.assertEqual(len(verification_calls), 4, 'prepare and check must run in scratch and original')
         self.assertTrue(any(kwargs.get('discard_output') is True for kwargs in git_calls),

@@ -98,7 +98,7 @@ class DeliveryCheckEvidence(unittest.TestCase):
             logs = list(self.logs.iterdir())
             self.assertEqual(len(logs), 1)
             self.assertLessEqual(logs[0].stat().st_size, 1000)
-            error = self.run_failing('print("z" * 50000)\nraise SystemExit(1)\n')
+            error = self.run_failing('for _ in range(600):\n    print("z" * 100)\nraise SystemExit(1)\n')
         self.assertTrue(error.facts['check_log_truncated'])
         self.assertTrue(error.facts['check_tail'].endswith('z' * 100 + '\n'))
 
@@ -146,13 +146,28 @@ class CheckInterpreter(unittest.TestCase):
         with self.assertRaises(self.integrate.CheckInterpreterError):
             self.integrate.resolve_check_interpreter('python3', {'PATH': str(broken)})
 
-    def test_run_executes_the_resolved_interpreter_not_a_later_path_entry(self):
-        marker = self.root / 'ran'
-        script = f'from pathlib import Path; Path({str(marker)!r}).write_text(__import__("sys").executable)'
+    def test_run_refuses_unsupported_python_even_without_preflight(self):
+        # Without run()-time pinning the fake 3.9 "python3" would execute and exit 0.
+        old = fake_python(self.root / 'old-bin', '3.9')
+        with self.assertRaises(self.integrate.CheckInterpreterError):
+            self.integrate.run(self.root, ['python3', '-m', 'unittest', 'discover', '-s', 'tests'],
+                               timeout=60, discard_output=True, env={**os.environ, 'PATH': str(old.parent)})
+
+    def test_run_executes_the_pinned_absolute_interpreter(self):
+        seen = []
+        real = self.integrate.run_process
+
+        def record(command, **kwargs):
+            seen.append(command)
+            return real(command, **kwargs)
         env = {**os.environ, 'PATH': str(Path(sys.executable).parent) + os.pathsep + os.environ.get('PATH', '')}
-        result = self.integrate.run(self.root, ['python3', '-c', script], timeout=60, discard_output=True, env=env)
+        with patch.object(self.integrate, 'run_process', side_effect=record):
+            result = self.integrate.run(self.root, ['python3', '-c', 'pass'], timeout=60, discard_output=True, env=env)
         self.assertEqual(result.returncode, 0)
-        self.assertTrue(Path(marker.read_text()).is_absolute())
+        executed = [command for command in seen if command[1:3] != ['-I', '-c']]
+        self.assertEqual(len(executed), 1)
+        self.assertTrue(Path(executed[0][0]).is_absolute())
+        self.assertEqual(executed[0][1:], ['-c', 'pass'])
 
     def test_finish_refuses_unsupported_interpreter_before_any_checkout_effect(self):
         old = fake_python(self.root / 'old-bin', '3.9')
@@ -165,6 +180,45 @@ class CheckInterpreter(unittest.TestCase):
         self.assertEqual((raised.exception.status, raised.exception.code), ('BLOCKED_POLICY', 2))
         self.assertIn('Python 3.9', raised.exception.message)
         self.assertFalse((self.root / 'absent').exists())
+
+
+class TailRedaction(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.integrate = load('integrate_redaction_test', 'integrate_local.py')
+
+    def test_common_secret_forms_are_redacted_but_test_names_survive(self):
+        secrets = {'GITHUB_TOKEN=gho1secretvalue': 'gho1secretvalue', 'DB_PASSWORD=hunter2': 'hunter2',
+                   'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI': 'wJalrXUtnFEMI', '{"password": "hunter3"}': 'hunter3',
+                   'Authorization: Basic dXNlcjpwYXNz': 'dXNlcjpwYXNz', 'key AKIAABCDEFGHIJKLMNOP': 'AKIAABCDEFGHIJKLMNOP',
+                   'ssh://user:pw9@host/repo': 'pw9', '--password hunter4': 'hunter4',
+                   'bearer abc.def.ghi': 'abc.def.ghi', 'ghp_' + 'B' * 36: 'B' * 36,
+                   '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaA\n-----END OPENSSH PRIVATE KEY-----': 'b3BlbnNzaA'}
+        for line, secret in secrets.items():
+            with self.subTest(line=line):
+                self.assertNotIn(secret, self.integrate.redact_output(line))
+        for benign in ('FAIL: test_token_refresh (tests.test_auth.Auth)', 'token budget exceeded', 'Ran 12 tests in 1.0s'):
+            self.assertEqual(self.integrate.redact_output(benign), benign)
+
+    def test_tail_window_never_starts_after_a_secret_key(self):
+        log = self.integrate.CheckLog.__new__(self.integrate.CheckLog)
+        log.truncated, log.path = False, Path('/dev/null')
+        size = self.integrate.CHECK_TAIL_BYTES
+        secret = b'password=S3CRETVALUE1234\n'
+        for cut in range(len(secret)):
+            rest = (('\u2713' * 40 + '\n').encode() * size)[:size - (len(secret) - cut)]
+            log.tail = bytearray(secret[cut:] + rest)
+            self.assertEqual(len(log.tail), size)
+            # A large character budget isolates the byte-window guard from the trim guard.
+            with self.subTest(cut=cut), patch.object(self.integrate, 'CHECK_TAIL_CHARS', 10 ** 6):
+                self.assertNotIn('VALUE1234', log.facts()['check_tail'])
+
+
+    def test_single_oversized_line_is_omitted_not_leaked(self):
+        log = self.integrate.CheckLog.__new__(self.integrate.CheckLog)
+        log.truncated, log.path = False, Path('/dev/null')
+        log.tail = bytearray(b'Y' * self.integrate.CHECK_TAIL_BYTES)
+        self.assertIn('omitted', log.facts()['check_tail'])
 
 
 class CheckTimeoutOption(unittest.TestCase):

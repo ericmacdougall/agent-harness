@@ -230,7 +230,10 @@ def check_facts(error):
 def run_checks(repo, preparations, checks, timeout, log_directory):
     # Output goes to an owner-only bounded log; failures report its path and a
     # redacted tail, so a failed delivery check is diagnosable without rerunning.
-    log = CheckLog(log_directory)
+    try:
+        log = CheckLog(log_directory)
+    except OSError:
+        raise DeliveryError("DELIVERED_CHECK_FAILED", "Check log could not be created", check_status="log") from None
     try:
         for command in (*preparations, *checks):
             log.header(command)
@@ -1219,13 +1222,14 @@ def local_finish(flow, preparations, checks):
     command = [sys.executable, str(Path(__file__).with_name("integrate_local.py")), "--repo", str(flow.original),
                "--original-branch", flow.branch, "--expected-head", current, "--source", state["source_branch"],
                "--expected-source-head", state["source_head"],
-               "--timeout", str(max(flow.args.timeout, flow.args.check_timeout))]
+               "--timeout", str(flow.args.timeout), "--check-timeout", str(flow.args.check_timeout)]
     for name in ("prepare", "check"):
         for value in getattr(flow.args, name):
             command.extend(("--" + name, value))
     try:
-        code, output = bounded(command, timeout=(len(checks) + len(preparations) + 10)
-                               * max(flow.args.timeout, flow.args.check_timeout) + 15)
+        # Each preparation/check gets its check deadline; Git steps keep --timeout.
+        code, output = bounded(command, timeout=2 * (len(checks) + len(preparations)) * flow.args.check_timeout
+                               + 10 * flow.args.timeout + 15)
         result = json.loads(output)
         if not isinstance(result, dict):
             raise ValueError

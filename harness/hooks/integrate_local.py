@@ -172,7 +172,8 @@ def inspect_git(repo, *args, timeout=600):
 MIN_CHECK_PYTHON = (3, 10)
 CHECK_PYTHON_NAMES = {'python', 'python3'}
 CHECK_LOG_LIMIT = 32 * 1024 * 1024
-CHECK_TAIL_BYTES = 4096
+CHECK_TAIL_BYTES = 16384  # redacted as whole lines before the reported tail is cut
+CHECK_LOGS_KEPT = 5
 CHECK_TAIL_CHARS = 2000
 
 
@@ -180,7 +181,7 @@ class CheckInterpreterError(OSError):
     """A Python check would run an absent or unsupported interpreter."""
 
 
-def resolve_check_interpreter(name, env=None, timeout=15):
+def resolve_check_interpreter(name, env=None, timeout=30):
     """Pin a check's `python`/`python3` to one absolute, supported executable.
 
     Bare names resolve through PATH at run time, so a system Python 3.9 could
@@ -207,12 +208,22 @@ def resolve_check_interpreter(name, env=None, timeout=15):
     return found
 
 
+SECRET_KEY = r"[A-Za-z0-9_.-]*(?:token|passw(?:or)?d|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential|session)[A-Za-z0-9_.-]*"
+
+
 def redact_output(text):
-    text = re.sub(r"(https?://)[^/@\s]+@", r"\1[redacted]@", text)
-    text = re.sub(r"(?i)\b(token|password|passwd|secret|api[_-]?key|access[_-]?key|authorization)(\s*[=:]\s*)(\S+)",
-                  r"\1\2[redacted]", text)
+    """Best-effort redaction of the reported tail; the private log stays complete."""
+    text = re.sub(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
+                  "[redacted private key]", text, flags=re.S)
+    text = re.sub(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@", r"\1[redacted]@", text)
+    text = re.sub(r"(?im)\b(authorization|proxy-authorization)(\s*[=:]\s*)[^\n]*", r"\1\2[redacted]", text)
     text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [redacted]", text)
-    text = re.sub(r"\b(gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{16,})\b", "[redacted]", text)
+    # Env, CLI, YAML and JSON forms: FOO_TOKEN=v, --password v, "secret": "v".
+    text = re.sub(r"(?i)([\"']?" + SECRET_KEY + r"[\"']?)(\s*[=:]\s*)([\"']?)[^\s\"',}]+",
+                  r"\1\2\3[redacted]", text)
+    text = re.sub(r"(?i)(--" + SECRET_KEY + r")(\s+)[^\s\"',}]+", r"\1\2[redacted]", text)
+    text = re.sub(r"\b(gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]+"
+                  r"|(?:AKIA|ASIA)[A-Z0-9]{16}|AIza[0-9A-Za-z_-]{35})\b", "[redacted]", text)
     return text
 
 
@@ -224,6 +235,14 @@ class CheckLog:
     """
     def __init__(self, directory):
         private_directory(directory)
+        # Keep the newest few attempts only; each log may approach the size cap.
+        old = sorted(entry for entry in directory.iterdir()
+                     if entry.name.endswith('.log') and not entry.is_symlink() and entry.is_file())
+        for entry in old[:max(0, len(old) - (CHECK_LOGS_KEPT - 1))]:
+            try:
+                entry.unlink()
+            except OSError:
+                pass
         name = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + secrets.token_hex(4) + '.log'
         self.path = directory / name
         self.fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -261,7 +280,15 @@ class CheckLog:
             os.close(fd)
 
     def facts(self):
-        tail = redact_output(self.tail.decode('utf-8', 'replace'))[-CHECK_TAIL_CHARS:]
+        text = self.tail.decode('utf-8', 'replace')
+        if len(self.tail) >= CHECK_TAIL_BYTES:
+            # The window may start mid-line, after a secret's key name: drop it.
+            text = text.partition('\n')[2]
+            if not text:
+                return {'check_log': str(self.path), 'check_tail': '[output tail omitted: one line exceeds the tail window]',
+                        'check_log_truncated': self.truncated}
+        # Redact before trimming, so the cut cannot expose a value whose key it drops.
+        tail = redact_output(text)[-CHECK_TAIL_CHARS:]
         return {'check_log': str(self.path), 'check_tail': tail, 'check_log_truncated': self.truncated}
 
 
@@ -280,6 +307,12 @@ def run(repo, command, *, timeout=None, discard_output=False, env=None, sink=Non
         # the same CLI parser once, then require its result to be nonempty.
         executed = [executed[0], '-c', NONEMPTY_UNITTEST, *command[3:]]
     return run_process(executed, cwd=repo, timeout=timeout, env=environment, **output_options)
+
+
+def check_timeout(args):
+    """Checks may need far longer than Git commands; older callers share --timeout."""
+    value = getattr(args, 'check_timeout', None)
+    return args.timeout if value is None else value
 
 
 def require_check_interpreters(commands):
@@ -368,10 +401,14 @@ def main():
     parser.add_argument("--resolve-journal", help="Accept the tested current checkout as the recovery baseline; preserve artifacts")
     parser.add_argument("--prepare", action="append", default=[], help="Lockfile install after merge, before checks")
     parser.add_argument("--check", action="append", required=True, help="One argv command, quoted as a single argument; no shell")
-    parser.add_argument("--timeout", type=int, default=600, help="Seconds allowed for each Git command, preparation, check, and abort")
+    parser.add_argument("--timeout", type=int, default=600, help="Seconds allowed for each Git command and abort")
+    parser.add_argument("--check-timeout", type=int,
+                        help="Seconds allowed for each preparation and check (default: --timeout)")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be a positive number of seconds")
+    if args.check_timeout is not None and not 1 <= args.check_timeout <= 7200:
+        parser.error("--check-timeout must be between 1 and 7200 seconds")
     if not args.resolve_journal and (not args.source or not args.expected_source_head):
         parser.error("--source and --expected-source-head are required for integration")
     if args.resolve_journal and (args.source or args.expected_source_head or args.prepare):
@@ -1011,10 +1048,18 @@ def resolve_journal(args, repo, identity, root, common, common_info, root_info, 
         for command in checks:
             log.header(command)
             try:
-                result = run(repo, command, timeout=args.timeout, discard_output=True, sink=log)
+                result = run(repo, command, timeout=check_timeout(args), discard_output=True, sink=log)
             except subprocess.TimeoutExpired:
                 log.close()
-                report('RECOVERY_REQUIRED', f'Recovery baseline check exceeded {args.timeout} seconds; journal remains unresolved',
+                report('RECOVERY_REQUIRED',
+                       f'Recovery baseline check exceeded {check_timeout(args)} seconds; journal remains unresolved',
+                       journal=str(directory / 'journal.json'), head=observed_head(repo),
+                       phase='check', **log.facts())
+                return 3
+            except OSError as error:
+                log.close()
+                reason = str(error) if isinstance(error, CheckInterpreterError) else 'Recovery baseline check could not start'
+                report('RECOVERY_REQUIRED', reason + '; journal remains unresolved',
                        journal=str(directory / 'journal.json'), head=observed_head(repo),
                        phase='check', **log.facts())
                 return 3
@@ -1496,18 +1541,18 @@ def integrate_scratch(args, preparations, checks):
             for command in commands:
                 phase = kind
                 try:
-                    result = run(scratch, command, timeout=args.timeout, discard_output=True)
+                    result = run(scratch, command, timeout=check_timeout(args), discard_output=True)
                 except (OSError, subprocess.TimeoutExpired) as error:
                     if getattr(error, 'cleanup_incomplete', False):
                         return scratch_failure(repo, scratch, directory / 'journal.json',
                                                f'Scratch {kind} cleanup incomplete', phase=kind,
                                                merge_aborted=False, original_head=observed_head(repo),
                                                command=command)
-                    reason = (f'Scratch {kind} exceeded {args.timeout} seconds'
+                    reason = (f'Scratch {kind} exceeded {check_timeout(args)} seconds'
                               if isinstance(error, subprocess.TimeoutExpired)
                               else f'Scratch {kind} could not start')
                     return scratch_abort(repo, scratch, directory / 'journal.json',
-                                         reason, phase=kind, command=command, timeout=args.timeout)
+                                         reason, phase=kind, command=command, timeout=check_timeout(args))
                 if result.returncode:
                     return scratch_abort(repo, scratch, directory / 'journal.json',
                                          f'Scratch {kind} failed', phase=kind,
@@ -1588,7 +1633,7 @@ def integrate_scratch(args, preparations, checks):
             for command in commands:
                 phase = kind
                 try:
-                    result = run(repo, command, timeout=args.timeout, discard_output=True)
+                    result = run(repo, command, timeout=check_timeout(args), discard_output=True)
                 except (OSError, subprocess.TimeoutExpired):
                     return scratch_failure(repo, scratch, directory / 'journal.json',
                                            'Delivered checkout check could not complete; HEAD advanced',

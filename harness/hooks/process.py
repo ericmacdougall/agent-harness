@@ -102,7 +102,10 @@ def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True,
             return subprocess.CompletedProcess(command, process.returncode, None, None)
         except BaseException as failure:
             try:
-                cleanup_discarded(process, sink)
+                if sink is None:
+                    cleanup_discarded(process)
+                else:
+                    cleanup_discarded(process, sink)
             except (OSError, subprocess.TimeoutExpired):
                 failure.cleanup_incomplete = True
             raise
