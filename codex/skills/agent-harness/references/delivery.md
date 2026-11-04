@@ -2,10 +2,10 @@
 
 Main first checks scope, exact reviewed HEAD, actual tests/live evidence, reviewer findings and affected docs. Preserve a changed original checkout; ask about a consequential conflict without resetting it. Fast-path fixes still finish directly.
 
-Use `python3 ~/.codex/agent-harness/deliver.py`. It and its Git/process dependencies are installed independently of Claude. Write a private mode-0600 JSON run kit with useful `run`, `test`, `watch`, and relevant `logs`/`stop` instructions, and a private reviewed PR body without secrets. Verify the commands. Keep the original path, branch and captured HEAD in the owner ledger.
+Use `python3 ~/.codex/agent-harness/deliver.py`. It and its Git/process dependencies are installed independently of Claude. In a durable private directory such as `~/.agent-harness/work/<task-or-thread>/` (never `/tmp`, which a reboot wipes before a later resume needs the same kit), write a private mode-0600 JSON run kit with useful `run`, `test`, `watch`, and relevant `logs`/`stop` instructions, and a private reviewed PR body without secrets. Verify the commands. Keep the original path, branch and captured HEAD in the owner ledger.
 
 ```sh
-python3 ~/.codex/agent-harness/deliver.py prepare --task OWNER_TASK --source /absolute/feature --original /absolute/original --original-branch main --expected-source-head FULL_REVIEWED_SHA --expected-original-head FULL_CAPTURED_SHA --kit-file /private/kit.json --pr-title 'Reviewed scope' --pr-body-file /private/pr-body.md
+python3 ~/.codex/agent-harness/deliver.py prepare --task OWNER_TASK --source /absolute/feature --original /absolute/original --original-branch main --expected-source-head FULL_REVIEWED_SHA --expected-original-head FULL_CAPTURED_SHA --kit-file ~/.agent-harness/work/TASK/kit.json --pr-title 'Reviewed scope' --pr-body-file ~/.agent-harness/work/TASK/pr-body.md
 ```
 
 Prepare verifies matching supported GitHub identities before pushing the exact feature commit and creating/reusing the matching draft PR. Save its generation and state path. `PR_READY` leaves the original checkout unchanged pending repository review and authorized remote merge. The helper never merges a remote PR. After that merge:

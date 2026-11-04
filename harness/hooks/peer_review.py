@@ -706,8 +706,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("plan", "code-inspection", "pr"))
     parser.add_argument("--repo", type=Path, required=True)
-    parser.add_argument("--packet", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--packet", type=Path, required=True,
+                        help="private packet, e.g. ~/.agent-harness/work/<session-id>/<task>/plan.md (not /tmp)")
+    parser.add_argument("--output", type=Path, required=True,
+                        help="fresh report path, e.g. ~/.agent-harness/work/<session-id>/<task>/plan-review.md")
     parser.add_argument("--expected-head", help="full reviewed commit SHA; required for PR review")
     parser.add_argument('--packet-budget-bytes', type=int, default=PACKET_LIMIT,
                         help='Optional tighter packet ceiling; maximum 150000 bytes')
