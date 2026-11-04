@@ -820,9 +820,12 @@ def run_hook(payload: dict, spec_policy: dict, config_loader=None) -> tuple:
                     blocking.append(f"call_api write to {detail} touches an enforced project and its effect on "
                                     "issue status can't be checked; use the named GoodQA tools")
                 continue
-            # GoodQA validates issueId as a uuid, so a malformed id cannot reach an issue: warn only.
+            # update_issue and reassign_issue declare issueId as a uuid, but close_issue_done, bulk_update_issues
+            # and archive_issue only describe it as one. An id the gate cannot resolve might still reach an issue,
+            # so it fails closed wherever anything is enforced.
             if not isinstance(issue_id, str) or not re.fullmatch(UUID, issue_id):
-                warnings.append(f"{detail}: missing or malformed issueId; not checked")
+                (blocking if enforced else warnings).append(
+                    f"{detail}: missing or non-uuid issueId; the spec gate only checks issues by uuid")
                 continue
             refusals = []
             adapter, issue = resolve_issue(issue_id, config, spec_policy, deadline, refusals)

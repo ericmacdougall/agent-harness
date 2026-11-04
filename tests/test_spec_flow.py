@@ -720,9 +720,16 @@ class Hook(SpecFlowCase):
         code, text = self.hook("update_issue", {"issueId": other, "patch": {"status": "done"}}, **self.enforce())
         self.assertEqual(code, 0)
         self.assertIn("not in an enforced project", text)
-        code, text = self.hook("update_issue", {"issueId": "not-a-uuid", "patch": {"status": "done"}}, **self.enforce())
-        self.assertEqual(code, 0)
-        self.assertIn("malformed", text)
+
+    def test_non_uuid_issue_id_blocks_while_anything_is_enforced(self):
+        for tool, tool_input in (("close_issue_done", {"issueId": "harness#168", "status": "done", "note": "x"}),
+                                 ("bulk_update_issues", {"items": [{"issueId": "168", "status": "done"}]})):
+            with self.subTest(tool=tool):
+                code, text = self.hook(tool, tool_input, **self.enforce())
+                self.assertEqual(code, 2)
+                self.assertIn("non-uuid issueId", text)
+                code, _ = self.hook(tool, tool_input, mode="enforce", enforced_projects=[])
+                self.assertEqual(code, 0)
 
     def test_refused_key_fails_closed_when_anything_is_enforced(self):
         self.fake.forbidden.add(ISSUE)  # the enforced project's key was revoked after doctor
