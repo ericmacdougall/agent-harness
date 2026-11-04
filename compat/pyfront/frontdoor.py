@@ -8,8 +8,9 @@ whether the Go binary serves this switch group, and if so execs it with the cano
 
 Missing, invalid or unsafe state runs Python. A pin that cannot be honoured, or a dispatch that would
 bounce back across a hop, is refused: hook surfaces exit 2 (Codex and Claude let a tool call through on
-exit 1), CLI surfaces exit 1. Nothing imports this module at import time of a helper, so importing
-helpers never execs.
+exit 1), CLI surfaces exit 1. Any unexpected error inside dispatch (a failed exec, an I/O error while
+hashing) is refused the same way, never surfaced as a traceback exit 1. Nothing imports this module at
+import time of a helper, so importing helpers never execs.
 """
 
 import hashlib
@@ -36,6 +37,33 @@ def _owner(info):
     return info.st_uid == os.geteuid()
 
 
+def _reject_constant(name):
+    raise ValueError(f"non-standard JSON constant {name}")  # NaN/Infinity: Go's encoding/json rejects them
+
+
+def _open_regular(path):
+    # O_NONBLOCK: a FIFO swapped in after lstat must not hang the hook (a hook timeout is fail-open).
+    return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+
+
+def _safe_ancestors(path):
+    """Every directory above path is owned by us or root and not group/other-writable unless sticky."""
+    current = os.path.dirname(path)
+    while True:
+        try:
+            info = os.stat(current)
+        except OSError:
+            return False
+        mode = stat.S_IMODE(info.st_mode)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid())
+                or (mode & 0o022 and not mode & stat.S_ISVTX)):
+            return False
+        parent = os.path.dirname(current)
+        if parent == current:
+            return True
+        current = parent
+
+
 def _load(path):
     """Return (data, state); state is "" or missing, unsafe, invalid."""
     try:
@@ -47,7 +75,7 @@ def _load(path):
     if not stat.S_ISREG(info.st_mode) or not _owner(info) or stat.S_IMODE(info.st_mode) & 0o077:
         return None, "unsafe"
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = _open_regular(path)
     except OSError:
         return None, "unsafe"
     with os.fdopen(fd, "rb") as handle:
@@ -58,7 +86,7 @@ def _load(path):
     if len(raw) > MAX_FILE:
         return None, "invalid"
     try:
-        data = json.loads(raw.decode("utf-8"))
+        data = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
     except (ValueError, UnicodeDecodeError):
         return None, "invalid"
     if (not isinstance(data, dict) or data.get("schema") != 1 or type(data.get("schema")) is not int
@@ -81,13 +109,15 @@ def _verified_binary(data, host, launcher):
     if entry is None:
         return None, None, "host"
     binary = entry["binary"]
-    if os.path.normpath(binary) != os.path.normpath(launcher):
+    if binary != launcher:  # exact: normpath and filepath.Clean disagree on a leading "//"
         return None, None, "binary"
     try:
         info = os.lstat(binary)
-        if not stat.S_ISREG(info.st_mode) or not _owner(info) or stat.S_IMODE(info.st_mode) & 0o022:
+        mode = stat.S_IMODE(info.st_mode)
+        if (not stat.S_ISREG(info.st_mode) or not _owner(info) or mode & 0o022 or not mode & stat.S_IXUSR
+                or not _safe_ancestors(binary)):
             return None, None, "binary"
-        fd = os.open(binary, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = _open_regular(binary)
     except OSError:
         return None, None, "binary"
     digest = hashlib.sha256()
@@ -138,7 +168,18 @@ def _resolve(group, host, launcher, path, environ):
 
 
 def dispatch(group, host, launcher, helper, sub, argv, *, hook=False, on_fallback=None):
-    """Exec Go when it serves this group; return normally to run Python; exit on refusal."""
+    """Exec Go when it serves this group; return normally to run Python; exit on refusal or error."""
+    try:
+        _dispatch(group, host, launcher, helper, sub, argv, hook, on_fallback)
+    except SystemExit:
+        raise
+    except BaseException as error:  # noqa: BLE001 - a hook must never fail open on exit 1
+        print(f"agent-harness: front door failed for {group} ({type(error).__name__}); "
+              + ("refusing the action (fail-closed)" if hook else "aborting"), file=sys.stderr)
+        sys.exit(2 if hook else 1)
+
+
+def _dispatch(group, host, launcher, helper, sub, argv, hook, on_fallback):
     impl, reason, binary, _ = resolve(group, host, launcher)
     if impl == REFUSE:
         print(f"agent-harness: refusing to dispatch {group} ({reason}): "

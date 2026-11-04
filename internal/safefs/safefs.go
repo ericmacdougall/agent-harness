@@ -158,8 +158,9 @@ func syncDir(r *os.Root) {
 	}
 }
 
-// MkdirPrivate creates name (mode 0700) inside d, or accepts an existing real directory, and pins it.
-// A symlink, or anything else at that name, is refused.
+// MkdirPrivate creates name (mode 0700) inside d, or accepts an existing real directory that is ours with
+// mode exactly 0700 (usage_guard's rule), and pins it. A symlink, a foreign or wider directory, or
+// anything else at that name, is refused, as is a directory swapped between the check and the pin.
 func (d *Dir) MkdirPrivate(name string) (*Dir, error) {
 	if err := validName(name); err != nil {
 		return nil, err
@@ -177,7 +178,18 @@ func (d *Dir) MkdirPrivate(name string) (*Dir, error) {
 	if !li.IsDir() {
 		return nil, fmt.Errorf("%w: %s is not a directory", ErrUnsafe, name)
 	}
-	return OpenDir(filepath.Join(d.path, name))
+	if !privateDir(li) {
+		return nil, fmt.Errorf("%w: %s is not a private directory of this user", ErrUnsafe, name)
+	}
+	sub, err := OpenDir(filepath.Join(d.path, name))
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(sub.id, li) {
+		sub.Close()
+		return nil, fmt.Errorf("%w: %s changed while opening", ErrChanged, name)
+	}
+	return sub, nil
 }
 
 // Identity is what Replace requires the current file to still be; nil means "must not exist yet".

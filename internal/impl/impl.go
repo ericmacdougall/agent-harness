@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -126,7 +127,7 @@ func load(path string) (switchFile, string) {
 	if err != nil || !li.Mode().IsRegular() || !private(li) {
 		return sf, "unsafe"
 	}
-	f, err := os.Open(path)
+	f, err := openRegular(path)
 	if err != nil {
 		return sf, "unsafe"
 	}
@@ -150,7 +151,8 @@ func load(path string) (switchFile, string) {
 // matches keys case-insensitively and Decoder ignores trailing data, both of which Python rejects.
 func parse(raw []byte) (switchFile, bool) {
 	var top map[string]any
-	if json.Unmarshal(raw, &top) != nil {
+	// encoding/json replaces invalid UTF-8 with U+FFFD; Python's strict decode rejects the file.
+	if !utf8.Valid(raw) || json.Unmarshal(raw, &top) != nil {
 		return switchFile{}, false
 	}
 	schema, ok := top["schema"].(float64)
@@ -206,14 +208,14 @@ func verifiedBinary(sf switchFile, r Request) (bin, sum, why string) {
 	if !ok {
 		return "", "", "host"
 	}
-	if filepath.Clean(h.Binary) != filepath.Clean(r.Launcher) {
+	if h.Binary != r.Launcher { // exact: filepath.Clean and os.path.normpath disagree on a leading "//"
 		return "", "", "binary"
 	}
 	li, err := os.Lstat(h.Binary)
-	if err != nil || !li.Mode().IsRegular() || !safeBinary(li) {
+	if err != nil || !li.Mode().IsRegular() || !safeBinary(li) || !safeAncestors(h.Binary) {
 		return "", "", "binary"
 	}
-	f, err := os.Open(h.Binary)
+	f, err := openRegular(h.Binary)
 	if err != nil {
 		return "", "", "binary"
 	}

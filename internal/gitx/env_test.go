@@ -78,3 +78,20 @@ func TestScrubsRoutingButKeepsAuth(t *testing.T) {
 		t.Errorf("count %s", env["GIT_CONFIG_COUNT"])
 	}
 }
+
+func TestWindowsKeysFoldLikeOsEnviron(t *testing.T) {
+	defer func(old string) { goos = old }(goos)
+	goos = "windows"
+	env := Environment([]string{"Git_Dir=/evil", "git_index_file=/x", "=C:=C:\\w", "Path=C:\\bin"}, Options{})
+	if _, ok := env["GIT_DIR"]; ok {
+		t.Fatalf("mixed-case GIT_DIR survived: %v", env)
+	}
+	for k := range env {
+		if strings.EqualFold(k, "git_dir") || strings.EqualFold(k, "git_index_file") || k == "" {
+			t.Fatalf("unexpected key %q in %v", k, env)
+		}
+	}
+	if env["PATH"] != "C:\\bin" {
+		t.Fatalf("PATH not kept upper-cased: %v", env)
+	}
+}
