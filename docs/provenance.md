@@ -30,7 +30,7 @@ NFC normalisation, smart quotes, dashes and the ellipsis character folded to ASC
 
 | Surface | Rule | Start mode | Move to enforce when |
 | --- | --- | --- | --- |
-| spec_flow lint (`new`, `lint`, `packet`, `review`, `attach`) | every AC-n and NEG-n has a resolvable `Source:`; `Provenance: grandfathered (reason)` is accepted only in the header with `Sign-off: human` | enforce (new specs only; a spec that already carries a `## Reviews` section is only warned about, until it is edited) | already |
+| spec_flow lint (`lint`, `packet`, `attach`) | every AC-n and NEG-n has a resolvable `Source:`; `Provenance: grandfathered (reason)` is accepted only in the header with `Sign-off: human`. The `## Reviews` section never exempts a spec (`attach` rewrites it before linting), so an in-flight spec without Sources must gain them (its reviews go stale) or be grandfathered | enforce | already |
 | `wal_note.py --event requirement` / `ask` | `--source` required; ask also needs `--reason` | enforce (new events, nothing to break) | already |
 | `wal_note.py --event blocker` / `scope` / `decision` | `--source` expected | warn (existing flows) | after one release with under 5 percent of warnings in `provenance: missing` entries (`provenance.py asks`, WAL grep) |
 | `peer_review.py plan` packets | AC/NEG/REQ/ASK/DEC lines need `Source:` | warn | after the owners' packets carry sources routinely |
@@ -77,7 +77,7 @@ Recommendation: `warn` stays the default. The measured false positive rate is un
     "args": ["/Users/eric/.claude/hooks/provenance_hooks.py", "prompt"], "timeout": 10 } ] } ]
 ```
 
-Add them as extra groups next to the existing `wal.py` entries. Typical cost on a 75 MB transcript: `stop-lint` about 30 ms, `ask-gate` about 60 ms (interpreter start is about 24 ms of each).
+These hooks are opt-in: `install.py` copies the files but does not register them, so `ask_user_question: enforce` does nothing until the entries are added. Replace `/Users/eric` with your home directory and add them as extra groups next to the existing `wal.py` entries. Typical cost on a 75 MB transcript: `stop-lint` about 30 ms, `ask-gate` about 60 ms (interpreter start is about 24 ms of each).
 
 ## Known gaps
 

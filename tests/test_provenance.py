@@ -383,11 +383,12 @@ class RedTeamFixes(Env):
         sha = "a" * 40
         self.assertTrue(provenance.resolve(f"file:x.md:1@{sha}", {"repo": str(self.home)})["problems"])  # no repo: rejected, never weak-ok
 
-    def test_f4_reviewed_specs_are_not_broken(self):
+    def test_f4_reviews_section_is_not_an_enforcement_exemption(self):
         text = SPEC.format(s1="", s2="") + "\n## Reviews\n\n- adversarial: x\n"
-        problems, warnings = provenance.spec_lint(text)
-        self.assertEqual(problems, [])
-        self.assertTrue(any("already carries recorded reviews" in w for w in warnings))
+        problems, _ = provenance.spec_lint(text)
+        self.assertTrue(any("AC-1 has no `Source:`" in p for p in problems), problems)
+        # attach rewrites the Reviews section before linting, so the heading must never exempt a spec
+        self.assertTrue(any("AC-1 has no" in p for p in spec_flow.lint(text)))
 
     def test_f5_packet_formats(self):
         packet = "1. AC-1: numbered\n| REQ-2 | table row |\n> ASK-3: quoted\n  - DEC-4: nested bullet\n**NEG-5**: bold\n"

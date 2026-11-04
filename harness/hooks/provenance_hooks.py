@@ -24,7 +24,6 @@ from pathlib import Path
 import provenance as prov
 
 ASK_ID = re.compile(r"\[ask:\s*([A-Za-z0-9_-]{4,40})\s*\]")
-INLINE_SRC = re.compile(r"\[src:\s*(.+)\]")
 TAIL_BYTES = 4 * 1024 * 1024
 
 # A heading or label line that introduces a list of things the agent wants from the user.
@@ -121,9 +120,9 @@ def cite(item_text: str, session: str, home=None) -> dict:
         if not result["ok"] or prov.weak_problem(result):
             return {"ok": False, "problem": f"[ask:{found.group(1)}] has an untraceable source"}
         return {"ok": True, "how": "ask", "label": result["label"]}
-    inline = INLINE_SRC.search(item_text)
+    inline = prov.inline_source(item_text)
     if inline:
-        result = prov.resolve(inline.group(1).strip(), {"home": home})
+        result = prov.resolve(inline, {"home": home})
         if result["ok"] and not prov.weak_problem(result):
             return {"ok": True, "how": "src", "label": result["label"]}
         first = result["problems"][0]["message"] if result["problems"] else (prov.weak_problem(result) or "rejected")
@@ -263,8 +262,9 @@ def cmd_ask_gate(payload: dict) -> dict:
         return {}
     problems = []
     for index, question in enumerate(questions, 1):
-        body = json.dumps(question, ensure_ascii=False) if not isinstance(question, str) else question
-        outcome = cite(body.replace("\\\"", "\""), session)
+        body = question if isinstance(question, str) else str((question or {}).get("question", "")) \
+            if isinstance(question, dict) else ""
+        outcome = cite(body, session)
         if not outcome["ok"]:
             problems.append(f"question {index}: {outcome['problem']}")
     if not problems:

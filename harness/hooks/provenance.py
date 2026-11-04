@@ -29,6 +29,7 @@ HERE = Path(__file__).resolve().parent
 POLICY_FILE = HERE / "provenance_policy.json"
 MAX_LINE = 8 * 1024 * 1024        # a transcript or WAL line larger than this is never parsed
 MAX_HITS = 200                    # lines parsed per lookup
+MAX_TEXT = 2 * 1024 * 1024
 MAX_RESOLVES = 40                 # sources resolved per top-level claim
 MAX_DEPTH = 8                     # wal: pointer chain depth
 EXCERPT_MIN, EXCERPT_MAX, EXCERPT_SEGMENTS = 12, 300, 3
@@ -116,6 +117,8 @@ SENTINEL = "\ufffc"  # replaces a removed block so an excerpt cannot span text o
 
 def strip_blocks(text: str) -> str:
     """Remove every non-user-authored block; an unclosed opener removes the rest of the text."""
+    if len(text) > MAX_TEXT:
+        text = text[:MAX_TEXT] + SENTINEL  # bound regex work on absurdly long turns
     for _ in range(100):
         new = _INNER.sub(SENTINEL, text)
         if new == text:
@@ -151,6 +154,28 @@ def split_outside_quotes(text: str, separator: str) -> list:
         i += 1
     parts.append("".join(current))
     return parts
+
+
+def inline_source(text: str):
+    """The source inside `[src: ...]`, ending at the first `]` outside quotes; None when absent or unterminated."""
+    start = text.find("[src:")
+    if start < 0:
+        return None
+    body = text[start + 5:]
+    closer, i = None, 0
+    while i < len(body):
+        char = body[i]
+        if char == "\\" and i + 1 < len(body):
+            i += 2
+            continue
+        if closer is None and char in _QUOTES:
+            closer = _QUOTES[char]
+        elif closer is not None and (char == closer or (closer == "\u201d" and char == '"')):
+            closer = None
+        elif closer is None and char == "]":
+            return body[:i].strip() or None
+        i += 1
+    return None
 
 
 def parse_excerpt(rest: str):
@@ -330,7 +355,7 @@ def _lines_containing(path: Path, needle: bytes):
                 start, line = _line_around(fd, absolute, size)
                 hits += 1
                 if line is None:
-                    next_line = absolute + len(needle)
+                    next_line = absolute + MAX_LINE  # skip the rest of an oversized line, do not re-read it per hit
                     yield None
                 else:
                     next_line = start + len(line) + 1
@@ -751,13 +776,10 @@ def spec_lint(text: str, mode=None, ctx=None):
             return ["provenance: `Provenance: grandfathered` is only valid with `Sign-off: human`"], []
         return [], ["provenance: GRANDFATHERED spec, origins not verified: " + clip(GRANDFATHER_RE.search(text).group(1), 80)]
     items = extract_items(text, sections={"Acceptance criteria", "Negative cases"})
-    reviewed = re.search(r"(?m)^## Reviews[ \t]*$", text) is not None
     results = check_items(items, ctx)
     problems = [p for _, _, _, p in results if p]
     unverified = [f"{i} cites an unverified source (offline ticket or file line without excerpt)"
                   for i, _, r, p in results if r and not p and r.get("weak")]
-    if reviewed:  # specs reviewed before provenance existed keep working until someone edits them
-        return [], ["provenance: spec already carries recorded reviews, not enforced: " + "; ".join(problems[:3])] if problems else []
     if not items:
         return [], []
     if unverified:

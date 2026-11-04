@@ -14,6 +14,7 @@ from test_provenance import HOOKS, HUMAN, QUOTE, SID  # noqa: E402
 
 sys.path.insert(0, str(HOOKS))
 import provenance_hooks as hooks  # noqa: E402
+from provenance import inline_source as provenance_inline  # noqa: E402
 
 
 class Detector(unittest.TestCase):
@@ -76,6 +77,14 @@ class Hooks(base.Env):
         self.set_policy(ask_user_question="off")
         self.assertEqual(self.run_hook("ask-gate", self.ask_payload("Which key?")), {})
         self.assertEqual(self.run_hook("ask-gate", {"session_id": SID, "tool_name": "Bash"}), {})
+
+    def test_inline_src_with_trailing_brackets_and_options(self):
+        self.assertEqual(provenance_inline(f'x [src: {self.user(HUMAN, QUOTE)}] (see [docs])'), self.user(HUMAN, QUOTE))
+        payload = self.ask_payload(f"Which? [src: {self.user(HUMAN, QUOTE)}]")
+        payload["tool_input"]["questions"][0]["options"] = [{"label": "a [x]"}, {"label": "b"}]
+        self.assertEqual(self.run_hook("ask-gate", payload), {})
+        stop = "Decisions needed:\n- pick [src: " + self.user(HUMAN, QUOTE) + "] (see [docs])\n"
+        self.assertEqual(self.run_hook("stop-lint", self.stop_payload(stop)), {})
 
     def test_ask_gate_rejects_ledger_ask_with_untraceable_source(self):
         main = self.wals / "main.jsonl"
