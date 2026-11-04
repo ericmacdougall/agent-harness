@@ -1,0 +1,208 @@
+{
+  "schema": 1,
+  "enforcement": "enforce",
+  "enforce_after": "2026-11-04T01:00:00+00:00",
+  "remote_tickets_required": true,
+  "backstop_repos": [
+    "github\\.com[:/]ericmacdougall/"
+  ],
+  "subject": {
+    "max_length": 72,
+    "types": [
+      "feat",
+      "fix",
+      "refactor",
+      "perf",
+      "test",
+      "docs",
+      "build",
+      "ci",
+      "chore",
+      "revert",
+      "security"
+    ],
+    "scope_pattern": "^[a-z0-9][a-z0-9._/-]{0,39}$",
+    "non_imperative_first_words": [
+      "added",
+      "adds",
+      "adding",
+      "fixed",
+      "fixes",
+      "fixing",
+      "updated",
+      "updates",
+      "updating",
+      "changed",
+      "changes",
+      "changing",
+      "removed",
+      "removes",
+      "removing",
+      "made",
+      "makes",
+      "making",
+      "implemented",
+      "implements",
+      "implementing",
+      "refactored",
+      "refactors",
+      "reverted",
+      "reverts",
+      "improved",
+      "improves",
+      "moved",
+      "moves",
+      "renamed",
+      "renames",
+      "created",
+      "creates"
+    ],
+    "boilerplate_summaries": [
+      "update",
+      "updates",
+      "wip",
+      "fix",
+      "fixes",
+      "various fixes",
+      "misc",
+      "minor changes",
+      "changes",
+      "stuff",
+      "cleanup",
+      "tweaks",
+      "more fixes",
+      "work in progress",
+      "temp"
+    ],
+    "min_summary_words": 2,
+    "non_imperative_suffixes": [
+      "ed",
+      "ing"
+    ],
+    "imperative_exceptions": [
+      "embed",
+      "need",
+      "seed",
+      "feed",
+      "shed",
+      "speed",
+      "proceed",
+      "exceed",
+      "succeed",
+      "bed",
+      "red",
+      "shred",
+      "bring",
+      "ping",
+      "string",
+      "sing",
+      "ring",
+      "wing"
+    ]
+  },
+  "body": {
+    "required_sections": [
+      "Why",
+      "What",
+      "Testing",
+      "Refs"
+    ],
+    "optional_sections": [
+      "Risk"
+    ],
+    "placeholder_values": [
+      "none",
+      "n/a",
+      "na",
+      "tbd",
+      "todo",
+      "wip",
+      "update",
+      "updates",
+      "various fixes",
+      "misc",
+      "-",
+      "...",
+      "see diff",
+      "see code",
+      "same as above",
+      "fixes",
+      "changes"
+    ],
+    "min_section_chars": 12,
+    "testing_vague_values": [
+      "tests pass",
+      "tests passed",
+      "all tests pass",
+      "all tests passed",
+      "passed",
+      "pass",
+      "ok",
+      "works",
+      "it works",
+      "tested",
+      "tested locally",
+      "manually tested",
+      "green",
+      "ci green"
+    ],
+    "testing_not_run_prefix": "not run:",
+    "revert_required_fields": [
+      "Reason",
+      "Authorized-by"
+    ],
+    "revert_detect": "^This reverts commit [0-9a-f]{7,}"
+  },
+  "refs": {
+    "none_allowed_types": [
+      "chore",
+      "docs"
+    ],
+    "ticket_required_types": [
+      "feat",
+      "fix",
+      "security",
+      "perf",
+      "revert",
+      "refactor",
+      "test",
+      "build",
+      "ci"
+    ],
+    "unverifiable_patterns": [
+      "\\bR-\\d{6}\\b"
+    ]
+  },
+  "exempt": {
+    "generated_merge_subject": "^Merge (?:branch|branches|pull request|remote-tracking branch|tag|commit) ",
+    "autosquash_prefixes": [
+      "fixup! ",
+      "squash! ",
+      "amend! "
+    ]
+  },
+  "ticket_systems": {
+    "goodqa": {
+      "adapter": "goodqa",
+      "ref_pattern": "\\bGoodQA\\s+(?:(?P<project>[a-z0-9][a-z0-9-]{0,62})\\s*)?#(?P<number>[1-9]\\d{0,9})\\b",
+      "endpoint": "https://goodqa.app/v1/mcp",
+      "key_file": "~/.claude/goodqa-hive/member.key",
+      "org_id": null,
+      "default_project": "goodqa",
+      "timeout_seconds": 15,
+      "total_deadline_seconds": 90,
+      "attempts": 2,
+      "clock_skew_seconds": 120,
+      "max_comment_pages": 5,
+      "on_delivered_status": null,
+      "repos": [
+        "github\\.com[:/]ericmacdougall/"
+      ],
+      "on_deployed_status": null
+    }
+  },
+  "waivers": {
+    "min_reason_chars": 20,
+    "max_age_hours": 72
+  }
+}

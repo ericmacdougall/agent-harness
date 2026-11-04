@@ -13,6 +13,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from commit_messages import message
+
 
 DELIVER = Path(__file__).resolve().parents[1] / 'harness/hooks/deliver.py'
 CHECK = 'python3 -m unittest discover -s tests'
@@ -53,7 +55,7 @@ class DeliveryWorkflow(unittest.TestCase):
             '    def test_dependency_ready(self):\n'
             '        self.assertNotEqual(os.environ.get("FIXTURE_DEPENDENCY"), "unavailable")\n')
         command('git', 'add', 'app.txt', 'tests', cwd=self.original, env=self.env)
-        command('git', 'commit', '-qm', 'base', cwd=self.original, env=self.env)
+        command('git', 'commit', '-qm', message('record the fixture base'), cwd=self.original, env=self.env)
         self.base = command('git', 'rev-parse', 'HEAD', cwd=self.original, env=self.env).stdout.strip()
         self.source = self.root / 'source'
         command('git', 'worktree', 'add', '-qb', 'codex/feature', str(self.source), cwd=self.original, env=self.env)
@@ -65,7 +67,7 @@ class DeliveryWorkflow(unittest.TestCase):
                                                '        self.assertEqual(2 + 2, 4)\n')
         (self.source / 'app.txt').write_text('feature\n')
         command('git', 'add', 'app.txt', 'tests', cwd=self.source, env=self.env)
-        command('git', 'commit', '-qm', 'feature', cwd=self.source, env=self.env)
+        command('git', 'commit', '-qm', message('record the fixture feature'), cwd=self.source, env=self.env)
         self.head = command('git', 'rev-parse', 'HEAD', cwd=self.source, env=self.env).stdout.strip()
         self.remote = self.root / 'remote.git'
         command('git', 'init', '-q', '--bare', str(self.remote), env=self.env)
@@ -77,7 +79,7 @@ class DeliveryWorkflow(unittest.TestCase):
                                         'watch': 'watch-tests -- python3 -m unittest discover -s tests'}))
         self.kit.chmod(0o600)
         self.body = self.root / 'pr-body.md'
-        self.body.write_text('Reviewed feature scope and test result.\n')
+        self.body.write_text(message('record the fixture feature').split('\n', 2)[2])
         self.body.chmod(0o600)
 
     def cleanup_owned_scratch(self):
@@ -232,7 +234,7 @@ exec "$FIXTURE_REAL_GIT" "$@"
             path.unlink()
         (self.source / 'tests' / 'test_change.py').write_text(body)
         command('git', 'add', '-A', 'tests', cwd=self.source, env=self.env)
-        command('git', 'commit', '-qm', 'Test failure scenario', cwd=self.source, env=self.env)
+        command('git', 'commit', '-qm', message('record the failing scenario'), cwd=self.source, env=self.env)
         self.head = command('git', 'rev-parse', 'HEAD', cwd=self.source, env=self.env).stdout.strip()
 
     def invoke(self, *args):
@@ -244,7 +246,7 @@ exec "$FIXTURE_REAL_GIT" "$@"
         return ('prepare', '--task', 'fixture',
                 '--source', str(self.source), '--original', str(self.original),
                 '--original-branch', 'main', '--expected-source-head', self.head,
-                '--expected-original-head', self.base, '--pr-title', 'Feature fixture',
+                '--expected-original-head', self.base, '--pr-title', 'chore(fixture): record the fixture feature',
                 '--pr-body-file', str(self.body), '--kit-file', str(self.kit))
 
     def test_unsupported_origin_is_rejected_before_any_publication(self):
@@ -310,7 +312,7 @@ exec "$FIXTURE_REAL_GIT" "$@"
         before = Path(outcome['receipt']).read_bytes()
         (self.original / 'later.txt').write_text('later reviewed work\n')
         command('git', 'add', 'later.txt', cwd=self.original, env=self.env)
-        command('git', 'commit', '-qm', 'Later work', cwd=self.original, env=self.env)
+        command('git', 'commit', '-qm', message('record later original work'), cwd=self.original, env=self.env)
         later = command('git', 'rev-parse', 'HEAD', cwd=self.original, env=self.env).stdout.strip()
         self.change_github(target=later)
         repeated, data = self.invoke(*self.finish_args())
@@ -424,7 +426,7 @@ exec "$FIXTURE_REAL_GIT" "$@"
         self.change_github(list_fail=False)
         (self.source / 'later.txt').write_text('next reviewed scope\n')
         command('git', 'add', 'later.txt', cwd=self.source, env=self.env)
-        command('git', 'commit', '-qm', 'Next scope', cwd=self.source, env=self.env)
+        command('git', 'commit', '-qm', message('record the next scope'), cwd=self.source, env=self.env)
         reconciled, old = self.invoke('prepare', '--task', 'fixture', '--original', str(self.original),
                                      '--original-branch', 'main', '--reconcile-only')
         self.assertEqual((reconciled.returncode, old['status']), (0, 'PR_READY'), reconciled.stdout)
@@ -529,7 +531,7 @@ exec "$FIXTURE_REAL_GIT" "$@"
             def advance(*unused):
                 (self.original / 'user.txt').write_text('user-owned advance\n')
                 command('git', 'add', 'user.txt', cwd=self.original, env=self.env)
-                command('git', 'commit', '-qm', 'User advance', cwd=self.original, env=self.env)
+                command('git', 'commit', '-qm', message('record a user advance'), cwd=self.original, env=self.env)
             return mock.patch.object(module, 'run_checks', side_effect=advance)
         code, _ = self.direct_finish(moved_head, self.baseline_args(self.base))
         self.assertEqual(code, 3)
