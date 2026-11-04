@@ -14,6 +14,15 @@ from unittest.mock import patch
 HOOKS = Path(__file__).resolve().parents[1] / 'harness/hooks'
 ROOT = HOOKS.parents[1]
 
+# Reasons install.py may legitimately abort one of several simultaneous installers.
+CONCURRENT_ABORT_REASONS = (
+    'Directory appeared during installation', 'Directory replaced during installation',
+    'New directory changed before publication',
+    'Parent directory changed', 'Parent directory replaced', 'Unexpected parent directory',
+    'User settings or instructions changed',
+    'Managed file changed since snapshot', 'Managed file contents or mode changed since snapshot',
+    'Managed file changed after replacement', 'FileExistsError')
+
 
 class ChaosProcesses(unittest.TestCase):
     def test_competing_directory_at_publish_is_never_replaced(self):
@@ -75,6 +84,14 @@ class ChaosProcesses(unittest.TestCase):
             self.assertNotIn('Traceback', errors.getvalue())
             self.assertFalse(list((home / '.claude').glob('.agent-harness-dir-*')))
 
+    def test_allowlist_covers_every_changed_or_replaced_abort_in_installer(self):
+        import re
+        source = (ROOT / 'install.py').read_text()
+        raised = re.findall(r"raise OSError\(f?'([^'{]*(?:changed|appeared|replaced|Unexpected)[^'{]*)", source)
+        self.assertGreaterEqual(len(raised), 10, raised)
+        uncovered = [m for m in raised if not any(m.startswith(r) or r in m for r in CONCURRENT_ABORT_REASONS)]
+        self.assertEqual(uncovered, [])
+
     def test_eight_simultaneous_installs_keep_one_policy_block_and_valid_settings(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary).resolve()
@@ -109,12 +126,7 @@ class ChaosProcesses(unittest.TestCase):
             for streams, code in results:
                 if code:
                     self.assertEqual(code, 1, streams)
-                    self.assertTrue(any(reason in streams[1] for reason in
-                                        ('Directory appeared during installation', 'Directory replaced during installation',
-                                         'Parent directory replaced', 'Unexpected parent directory',
-                                         'User settings or instructions changed',
-                                         'Managed file changed since snapshot',
-                                         'Managed file changed after replacement', 'FileExistsError')), streams)
+                    self.assertTrue(any(reason in streams[1] for reason in CONCURRENT_ABORT_REASONS), streams)
             retry = subprocess.run([sys.executable, str(ROOT / 'install.py'), '--apply', '--home', str(home)],
                                    capture_output=True, text=True, timeout=20,
                                    env={k: v for k, v in os.environ.items() if k != 'CLAUDE_CODE_TMPDIR'})
