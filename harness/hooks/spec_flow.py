@@ -1038,7 +1038,7 @@ def cmd_attach(args, spec_policy):
     records, _, _ = session.records()
     latest = current_reviews(entries, core)
     files = [("spec", spec_path.name, "text/markdown", spec_path.read_bytes()),
-             ("reviews", reviews_path(spec_path).name, "application/json", reviews_path(spec_path).read_bytes())]
+             ("reviews", reviews_path(spec_path).name, "text/plain", reviews_path(spec_path).read_bytes())]
     for role in ROLES:
         report = latest[role].get("report")
         if report:

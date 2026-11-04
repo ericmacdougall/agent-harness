@@ -137,9 +137,17 @@ class GoodQAAdapter:
         except (ValueError, KeyError, IndexError, TypeError):
             raise TicketSystemUnavailable(f"GoodQA returned an unexpected shape for {tool}") from None
         if result.get("isError"):
-            error = data.get("error") if isinstance(data, dict) else None
+            # GoodQA wraps payloads as {"dataTrust": ..., "data": {...}}; errors sit under data.error.
+            inner = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+            error = inner.get("error") if isinstance(inner, dict) else None
             code = error.get("code") if isinstance(error, dict) else "error"
-            return {"__error__": str(code)}
+            details = error.get("details") if isinstance(error, dict) else None
+            reason = details.get("reason") if isinstance(details, dict) else None
+            # Only machine codes are kept: messages can echo untrusted filenames or content.
+            found = {"__error__": str(code)}
+            if isinstance(reason, str) and re.fullmatch(r"[a-z_]{1,40}", reason):
+                found["__reason__"] = reason
+            return found
         return data
 
     def org_id(self):
@@ -277,7 +285,8 @@ class GoodQAAdapter:
         done = self.call("file_upload_complete", {"id": attachment["id"], "expectedSha256": sha256})
         done = done.get("data", done) if isinstance(done, dict) else {}
         if "__error__" in done:
-            raise TicketSystemUnavailable(f"GoodQA upload verification failed ({done['__error__']})")
+            raise TicketSystemUnavailable(f"GoodQA upload verification failed ({done['__error__']}"
+                                          f"{', ' + done['__reason__'] if '__reason__' in done else ''})")
         row = done.get("attachment") or {}
         if row.get("completionState") != "completed" or row.get("sha256") != sha256:
             raise TicketSystemUnavailable("GoodQA did not verify the uploaded bytes")
