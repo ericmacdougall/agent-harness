@@ -264,6 +264,11 @@ Co-Authored-By: ...
      - Any other `project_not_found` fails closed as `TICKETS_UNVERIFIED`. That covers a typo, an invented slug, an Eric-org project not yet listed, and the default project `goodqa`, which is never treated as out of scope. A missing ticket in a project the key can see is still `MISSING` and blocks.
      - Adding a confirmed slug is a config change. Empty the list once durable cross-org access lands.
    - Local-only delivery verifies tickets too.
+   - **Credentials.** The member key file `~/.claude/goodqa-hive/member.key` (mode 600) is used first and keeps full access: verification, plus the finish and `notify` comments. Never copy it to another host.
+     - A host without that file (dev2) reads `key_secret` (Secret Manager `goodqa-api-key-framebright` in project `goodqa-28dd3`) in-process through `gcloud secrets versions access`. The value is never passed in argv or the environment, and never written to disk.
+     - That credential is **read-only** in code: only `list_orgs`, `list_projects`, `get_issue_by_number` and `get_issue_comments` are allowed. Any write (a comment, a status change) is refused before a request is sent. On dev2, `prepare` and PR review therefore verify tickets, but finish's ticket comment stays pending (exit 5). Post it from the Mac with the printed `notify` command.
+     - If gcloud cannot read the secret, verification fails closed (`TICKETS_UNVERIFIED`).
+   - **Project-qualified refs.** `GoodQA #N` means the default project `goodqa`. Tickets in another project need its slug, for example `GoodQA work-tracker-automatic#35633`. A `MISSING` result says so.
    - **Legacy commits:** commits authored before `enforce_after` are reported as legacy and do not block.
 4. **Delivery comments in `deliver.py finish`.**
    - After `DELIVERED`, `LOCAL_DELIVERED` or a repeat `ALREADY_DELIVERED`, finish comments on each referenced ticket once, with an idempotent operation id.

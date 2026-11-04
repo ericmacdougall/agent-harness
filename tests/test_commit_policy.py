@@ -3,6 +3,7 @@
 import http.server
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -19,6 +20,18 @@ import commit_policy as cp  # noqa: E402
 import ticket_adapters  # noqa: E402
 
 POLICY = cp.load_policy()
+
+# Hermetic: no test may reach the real Secret Manager. A fake gcloud first on PATH fails and
+# logs each call; tests that need a secret point GCLOUD_FAKE_KEY at a value.
+FAKE_BIN = Path(tempfile.mkdtemp(prefix="cp-fake-bin-"))
+GCLOUD_LOG = FAKE_BIN / "gcloud-calls.txt"
+(FAKE_BIN / "gcloud").write_text(
+    "#!/bin/sh\n"
+    f"echo \"$*\" >> {shlex.quote(str(GCLOUD_LOG))}\n"
+    "[ -n \"$GCLOUD_FAKE_KEY\" ] || exit 1\n"
+    "printf '%s\\n' \"$GCLOUD_FAKE_KEY\"\n")
+(FAKE_BIN / "gcloud").chmod(0o755)
+os.environ["PATH"] = str(FAKE_BIN) + os.pathsep + os.environ["PATH"]
 GOOD = """fix(deliver): refuse non-compliant commit ranges before publication
 
 Why: an agent reverted two production auth fixes with no recorded reason.
@@ -856,6 +869,59 @@ class TicketVerification(Fixture):
         self.fake.issues.clear()
         report = self.check()
         self.assertEqual((report["status"], report["tickets"][0]["status"]), ("BLOCKED", "MISSING"))
+
+    def secret_source(self, value):
+        Path(self.policy["ticket_systems"]["goodqa"]["key_file"]).unlink()
+        self.policy["ticket_systems"]["goodqa"]["key_secret"] = {"name": "goodqa-api-key-framebright",
+                                                                  "project": "goodqa-28dd3"}
+        if value is None:
+            os.environ.pop("GCLOUD_FAKE_KEY", None)
+        else:
+            os.environ["GCLOUD_FAKE_KEY"] = value
+        self.addCleanup(os.environ.pop, "GCLOUD_FAKE_KEY", None)
+        GCLOUD_LOG.unlink(missing_ok=True)
+
+    def test_secret_manager_key_verifies_tickets_read_only(self):
+        self.secret_source("test-key")
+        self.fake.comment(self.issue, f"Fixed in {self.head[:9]}", datetime.now(timezone.utc))
+        before = sorted(str(path) for path in self.home.rglob("*"))
+        report = self.check()
+        self.assertEqual((report["status"], report["tickets"][0]["status"]), ("PASS", "UPDATED"))
+        calls = GCLOUD_LOG.read_text()
+        self.assertIn("secrets versions access latest --secret=goodqa-api-key-framebright --project=goodqa-28dd3",
+                      calls)
+        self.assertNotIn("test-key", calls, "the secret value never appears in argv")
+        self.assertEqual(sorted(str(path) for path in self.home.rglob("*")), before, "nothing cached on disk")
+        adapter = ticket_adapters.adapter_for(self.policy["ticket_systems"]["goodqa"])
+        ticket = adapter.lookup("goodqa", 14151)
+        for write in (lambda: adapter.comment(ticket, "x", "00000000-0000-4000-8000-000000000001"),
+                      lambda: adapter.set_status(ticket, "done"),
+                      lambda: adapter.call("create_issue", {})):
+            with self.assertRaisesRegex(ticket_adapters.TicketSystemUnavailable, "read-only"):
+                write()
+        self.assertEqual(self.fake.posted, [], "no write reached GoodQA")
+        results = cp.notify(str(self.repo), self.base, self.head, self.policy, operation_seed="gen-sm",
+                            evidence="x", adapters={"goodqa": adapter})
+        self.assertEqual([r["status"] for r in results], ["FAILED"])
+        self.assertIn("read-only", results[0]["error"])
+
+    def test_key_file_wins_and_unreadable_secret_fails_closed(self):
+        self.secret_source(None)
+        report = self.check()
+        self.assertEqual(report["status"], "UNVERIFIED")
+        self.assertIn("Secret Manager credential", report["tickets"][0]["error"])
+        key = self.home / "member.key"
+        key.write_text("test-key\n")
+        key.chmod(0o600)
+        GCLOUD_LOG.unlink(missing_ok=True)
+        adapter = ticket_adapters.adapter_for(self.policy["ticket_systems"]["goodqa"])
+        adapter.comment(adapter.lookup("goodqa", 14151), "y", "00000000-0000-4000-8000-000000000002")
+        self.assertEqual(len(self.fake.posted), 1, "the member key file keeps write access")
+        self.assertFalse(GCLOUD_LOG.exists(), "gcloud is not consulted when the key file exists")
+
+    def test_missing_ticket_hint_names_project_qualified_form(self):
+        self.fake.issues.clear()
+        self.assertIn("GoodQA <project-slug>#14151", self.check()["tickets"][0]["fix"])
 
     def test_credential_file_must_be_private(self):
         key = Path(self.policy["ticket_systems"]["goodqa"]["key_file"])
