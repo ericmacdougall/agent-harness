@@ -325,7 +325,7 @@ def load_reviews(spec_path: Path) -> list:
     path = reviews_path(spec_path)
     if not path.exists():
         return []
-    data = json.loads(read_spec_text(path))
+    data = (_domain_gates().safe_json_loads if _domain_gates() else json.loads)(read_spec_text(path))
     if not isinstance(data, dict) or data.get("v") != 1 or not isinstance(data.get("reviews"), list):
         raise SpecError(f"{path} is not a v1 reviews file", EXIT_USAGE)
     return data["reviews"]

@@ -113,10 +113,31 @@ class DetectTests(unittest.TestCase):
             self.assertEqual(dg.detect(make_repo({path: "contract A {}"})), [], path)
         self.assertIn("evm", names(dg.detect(make_repo({"src/lib/Math.sol": "library M {}"}))))
 
-    def test_hostile_json_does_not_crash(self):
-        deep = "[" * 100000 + "]" * 100000
-        self.assertEqual(dg.detect(make_repo({"package.json": deep})), [])
-        self.assertEqual(dg.detect(make_repo({"package.json": json.dumps(["ethers"])})), [])
+    def test_deeply_nested_json_cannot_crash_the_interpreter(self):
+        """5,000-deep JSON aborts CPython 3.9 (fatal recursion), so each case runs in a subprocess."""
+        script = (
+            "import json, subprocess, sys, tempfile, os\n"
+            "sys.path.insert(0, %r)\n"
+            "import domain_gates as dg\n"
+            "deep = '[' * 5000 + ']' * 5000\n"
+            "root = tempfile.mkdtemp(); subprocess.run(['git','init','-q',root], check=True)\n"
+            "os.makedirs(root + '/.harness')\n"
+            "open(root + '/package.json','w').write(deep)\n"
+            "open(root + '/.harness/domain-gates.json','w').write(deep)\n"
+            "subprocess.run(['git','-C',root,'add','-A'], check=True)\n"
+            "found, ok = dg.detect_checked(root)\n"
+            "assert found == [] and ok is False, (found, ok)\n"  # rejected manifest is a visible failure, not a pass
+            "assert dg.repo_options(root) == {}\n"
+            "try:\n"
+            "    dg.safe_json_loads(deep)\n"
+            "except ValueError as error:\n"
+            "    assert 'nested' in str(error)\n"
+            "else:\n"
+            "    raise SystemExit('no ValueError')\n"
+            "print('SURVIVED')\n" % str(HOOKS))
+        done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(done.returncode, 0, (done.returncode, done.stderr[-500:]))
+        self.assertIn("SURVIVED", done.stdout)
 
     def test_not_a_repo_and_missing_dir(self):
         self.assertEqual(dg.detect(Path(tempfile.mkdtemp())), [])

@@ -54,6 +54,36 @@ DEPENDENCIES = (
 )
 
 
+MAX_JSON_DEPTH = 100
+
+
+def safe_json_loads(text, max_depth: int = MAX_JSON_DEPTH):
+    """json.loads for untrusted text: deep nesting can abort CPython 3.9 outright (fatal recursion, not
+    RecursionError), so the bracket depth is pre-scanned (strings skipped) before parsing.
+    Raises ValueError for too-deep or invalid input; callers treat that as a rejected file, never a pass."""
+    depth, in_string, escaped = 0, False, False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            if depth > max_depth:
+                raise ValueError("manifest too deeply nested")
+        elif ch in "]}":
+            depth -= 1
+    try:
+        return json.loads(text)
+    except RecursionError:
+        raise ValueError("manifest too deeply nested") from None
+
+
 def _clean(text, limit=EVIDENCE_CHARS):
     """Evidence and repo-supplied text: no control characters, backticks or fences, bounded length."""
     return re.sub(r"[^A-Za-z0-9._/@:+()#, -]", "?", str(text))[:limit]
@@ -115,9 +145,9 @@ def _tracked_files(root: Path, max_files: int, strict: bool = False):
     return [n for n in sorted(names) if not _skipped(n)][:max_files]
 
 
-def _dep_present(text: str, name: str, kind: str) -> bool:
+def _dep_present(text: str, name: str, kind: str, rejected=None) -> bool:
     if kind == "package.json":
-        return name in _package_deps(text)
+        return name in _package_deps(text, rejected)
     if kind == "go.mod":
         return re.search(r"(?m)^\s*(?:require\s+)?(?:\S*/)?" + re.escape(name) + r"(?:/\S*)?\s+v\d", text) is not None
     if re.search(r"(?m)^\s*\[[\w.-]*dependencies\." + re.escape(name) + r"\]", text):
@@ -126,10 +156,12 @@ def _dep_present(text: str, name: str, kind: str) -> bool:
     return re.search(pattern, text) is not None
 
 
-def _package_deps(text: str) -> set:
+def _package_deps(text: str, rejected=None) -> set:
     try:
-        data = json.loads(text)
-    except Exception:  # deeply nested input raises RecursionError, not ValueError
+        data = safe_json_loads(text)
+    except ValueError as error:
+        if rejected is not None and "nested" in str(error):
+            rejected.append(1)
         return set()
     found = set()
     if isinstance(data, dict):
@@ -193,6 +225,7 @@ def detect_checked(repo, changed_paths=None, max_files: int = MAX_FILES):
     files = _tracked_files(root, max_files, strict=True)
     ok = files is not None
     files = files or []
+    rejected = []
     budget, manifests, protos, nats_in, ledger_in = [0], 0, 0, [], []
     for path in files:
         _path_signals(path, found, "")
@@ -209,7 +242,7 @@ def detect_checked(repo, changed_paths=None, max_files: int = MAX_FILES):
             kind = base if base in MANIFESTS else "requirements.txt"
             for domain, confidence, names in DEPENDENCIES:
                 for name in names:
-                    if _dep_present(text, name, kind):
+                    if _dep_present(text, name, kind, rejected):
                         found.add(domain, confidence, f"dependency {name} in {_base(path)}")
             for name in NATS_NAMES:
                 if kind != "foundry.toml" and _dep_present(text, name, kind):
@@ -224,7 +257,7 @@ def detect_checked(repo, changed_paths=None, max_files: int = MAX_FILES):
     proto_paths = [p for p in files if p.endswith(".proto")]
     if proto_paths and nats_in and ledger_in:
         found.add("ledger-messaging", "medium", f"proto {_base(proto_paths[0])} + nats ({nats_in[0]}) + ledger signal ({_base(ledger_in[0])})")
-    return found.result(), ok
+    return found.result(), ok and not rejected  # a manifest rejected as too deep is a visible failure
 
 
 # --------------------------------------------------------------------------- data
@@ -242,7 +275,7 @@ def _load_json(path: Path, limit: int):
         info = os.lstat(path)
         if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
             raise ValueError(f"{path.name} is not a regular file of at most {limit} bytes")
-        return json.loads(path.read_text(encoding="utf-8"))
+        return safe_json_loads(path.read_text(encoding="utf-8"))
     except OSError as error:
         raise ValueError(f"cannot read {path.name}: {error}")
 
@@ -259,7 +292,7 @@ def repo_options(repo, ignore: bool = False) -> dict:
     if text is None:
         return {}
     try:
-        data = json.loads(text)
+        data = safe_json_loads(text)
     except Exception:
         return {}
     if not isinstance(data, dict):
