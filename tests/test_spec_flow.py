@@ -23,6 +23,8 @@ from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
+import provenance  # noqa: E402
+sys.path.insert(0, str(HOOKS))
 import commit_policy as cp  # noqa: E402
 import spec_flow as sf  # noqa: E402
 import ticket_adapters as ta  # noqa: E402
@@ -51,11 +53,14 @@ An agent cannot mark a harness ticket done without proof.
 ## Acceptance criteria
 
 - AC-1: done refuses a ticket without evidence. Verify by: tests.test_spec_flow DoneGate.
+  Source: ticket:GoodQA harness#14398
 - AC-2: done passes a complete ticket. Verify by: live check RT2.
+  Source: ticket:GoodQA harness#14398
 
 ## Negative cases
 
 - NEG-1 (AC-1): a tampered attachment is not accepted.
+  Source: ticket:GoodQA harness#14398
 
 ## Risks
 
@@ -68,6 +73,32 @@ def report_text(packet_sha, verdict="ACCEPT", reviewer="Blind Claude Opus fallba
             "Review input: isolated committed snapshot (ancestor history available)\nWorktree status: clean\n"
             "Fallback reason: Primary reviewer unavailable (TRANSIENT_INFRA); used authorized independent fallback.\n\n"
             f"PLAN_RESULT: {verdict}\n\nFindings follow.\n")
+
+
+_OFFLINE = None
+_STUBS = []
+
+
+def setUpModule():  # tests never call the ticket tracker; restored in tearDownModule so it cannot leak into other modules
+    global _OFFLINE, _STUBS
+    provenance._TICKET_MEMO.clear()
+    provenance._OUTAGE["until"] = 0.0
+    _OFFLINE = mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_OFFLINE": "1"})
+    _OFFLINE.start()
+    # Specs cite tickets and the tracker must never be called from tests: an injected stub answers "found" without
+    # the network or a cache write. Environment variables cannot do this: they may only tighten modes.
+    _STUBS = [mock.patch.object(provenance, "TICKET_LOOKUP", lambda project, number: ("found", "stubbed ticket")),
+              mock.patch.object(provenance, "store_ticket", lambda *args, **kwargs: None)]
+    for stub in _STUBS:
+        stub.start()
+
+
+def tearDownModule():
+    for stub in _STUBS:
+        stub.stop()
+    _OFFLINE.stop()
+    provenance._TICKET_MEMO.clear()
+    provenance._OUTAGE["until"] = 0.0
 
 
 class FakeGoodQA:
@@ -1028,6 +1059,8 @@ class Hook(SpecFlowCase):
                                    str(uuid.uuid4()))
         payload = json.dumps({"tool_name": "mcp__plugin_goodqa_goodqa__update_issue",
                               "tool_input": {"issueId": ISSUE, "patch": {"status": "done"}}})
+        import gc
+        gc.collect()  # stray ResourceWarnings from earlier tests must not be printed into the stderr captured below
         for policy, expected in (({"mode": "warn", "enforced_projects": []}, 0), (self.enforce(), 2)):
             with self.subTest(policy=policy), \
                     mock.patch.object(sf, "load_spec_policy", return_value=dict(self.spec_policy, **policy)), \
