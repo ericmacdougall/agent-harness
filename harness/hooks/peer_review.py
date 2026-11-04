@@ -55,6 +55,30 @@ def provider_failure(record, *, trusted=True):
             'fallback_allowed': bool(quota or auth or unavailable), 'usage': None}
 
 
+# Codex CLI retries a lost connection with `error` records like
+# "Reconnecting... 2/5 (...)"; they are progress, not a terminal failure.
+CODEX_RECONNECTING = re.compile(r'Reconnecting\.\.\. \d{1,3}/\d{1,3}\b')
+# Some Codex auth failures (e.g. a revoked refresh token) carry no structured
+# code. Only these explicit auth signals in a Codex error record's own message
+# may classify one as AUTH; model and tool output is never inspected.
+CODEX_AUTH_SIGNAL = re.compile(r'(?<![\w.])401(?![\w.])|\bunauthori[sz]ed\b|\brevoked\b', re.IGNORECASE)
+
+
+def codex_failure(record):
+    """Classify a terminal Codex error record, allowing fallback for unstructured auth loss."""
+    result = provider_failure(record)
+    error = record.get('error')
+    message = error.get('message') if isinstance(error, dict) else record.get('message')
+    unstructured = not (isinstance(error, dict) and (error.get('code') or error.get('type'))) \
+        and not record.get('code') and not record.get('subtype')
+    if (result['reason'] == 'INVALID_OUTPUT' and unstructured and isinstance(message, str)
+            and len(message) <= 4096 and CODEX_AUTH_SIGNAL.search(message)):
+        # Prose-derived, so it may unlock the independent fallback but never
+        # places an account-pool cooldown.
+        return provider_failure({'code': 'unauthorized'}, trusted=False)
+    return result
+
+
 def provider_usage(record):
     """Keep reported numeric usage only; never copy an arbitrary provider object."""
     usage = record.get('usage')
@@ -107,8 +131,11 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                 kind = record.get('type')
                 if not isinstance(kind, str) or ('is_error' in record and type(record['is_error']) is not bool):
                     return invalid
+                if (kind == 'error' and set(record) == {'type', 'message'} and isinstance(record['message'], str)
+                        and CODEX_RECONNECTING.match(record['message'])):
+                    continue
                 if kind in {'error', 'turn.failed'} or record.get('is_error') is True or record.get('error') is not None:
-                    return provider_failure(record)
+                    return codex_failure(record)
                 if kind == 'turn.completed':
                     if (record.get('status') not in (None, 'success', 'completed')
                             or record.get('subtype') not in (None, 'success', 'completed')):

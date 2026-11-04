@@ -571,6 +571,17 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertFalse(self.output.exists())
         self.assertFalse(captured.exists())
 
+    def test_revoked_codex_token_uses_blind_fallback(self):
+        capture = self.root / 'fallback.capture'
+        launches = self.root / 'launches.log'
+        events = '\n'.join(json.dumps(record) for record in ProviderEnvelopeTests.REVOKED)
+        result = self.invoke(env={'CODEX_EVENTS': events, 'CAPTURE_CLAUDE_PROMPT': str(capture),
+                                  'PROVIDER_LAUNCH_LOG': str(launches)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(capture.exists())
+        self.assertEqual(launches.read_text().split(), ['codex', 'claude'])
+        self.assertIn('Blind Claude Opus fallback', self.output.read_text())
+
     def test_structured_failure_overrides_exit_zero_and_last_message_pass(self):
         capture = self.root / 'fallback.capture'
         events = json.dumps({'type': 'turn.failed', 'error': {
@@ -1111,6 +1122,66 @@ class ProviderEnvelopeTests(unittest.TestCase):
         self.assertFalse(result['account_cooldown'])
         vague = self.module.normalize_provider('codex', 1, 'Credit balance too low')
         self.assertFalse(vague['account_cooldown'])
+
+    REVOKED = [
+        {'type': 'thread.started', 'thread_id': 'fixture'}, {'type': 'turn.started'},
+        *({'type': 'error', 'message': f'Reconnecting... {n}/5 (workspace routing discovery unauthorized (401))'}
+          for n in range(1, 6)),
+        {'type': 'turn.failed', 'error': {'message': 'workspace routing discovery unauthorized (401)'}}]
+
+    def transcript(self, records):
+        return '\n'.join(json.dumps(record) for record in records)
+
+    def test_revoked_codex_token_allows_fallback_without_account_cooldown(self):
+        for code in (0, 1):
+            result = self.module.normalize_provider('codex', code, self.transcript(self.REVOKED),
+                                                    stderr='refresh token was revoked')
+            self.assertEqual((result['result'], result['reason'], result['fallback_allowed'],
+                              result['account_cooldown']), ('NO_RESULT', 'AUTH', True, False))
+        for message in ('Unauthorized', 'HTTP 401 from backend', 'refresh token was revoked'):
+            with self.subTest(message=message):
+                result = self.module.normalize_provider('codex', 1, self.transcript(
+                    [{'type': 'error', 'message': message}]))
+                self.assertEqual(result['reason'], 'AUTH')
+
+    def test_reconnecting_records_are_progress(self):
+        retry = {'type': 'error', 'message': 'Reconnecting... 1/5 (stream disconnected)'}
+        result = self.module.normalize_provider('codex', 0, self.codex(extra=[retry]),
+                                                last_message='VERDICT: PASS\nReviewed.')
+        self.assertEqual(result['result'], 'CHECK_OK')
+        dangling = self.module.normalize_provider('codex', 1, self.transcript(self.REVOKED[:-1]))
+        self.assertEqual((dangling['reason'], dangling['fallback_allowed']), ('INVALID_OUTPUT', False))
+
+    def test_unrecognized_codex_failures_still_refuse_fallback(self):
+        cases = {
+            'garbage text': 'not json at all 401 unauthorized',
+            'other failure': self.transcript([{'type': 'turn.failed', 'error': {'message': 'internal error'}}]),
+            'number inside word': self.transcript([{'type': 'turn.failed', 'error': {'message': 'build 4011 failed'}}]),
+            'structured code wins': self.transcript([{'type': 'turn.failed', 'error': {
+                'code': 'invalid_request', 'message': 'unauthorized'}}]),
+            'malformed json': '{"type": "turn.failed", "error": {"message": "401"',
+            'reconnecting with extra fields': self.transcript([{'type': 'error', 'message': 'Reconnecting... 1/5',
+                                                               'code': 'invalid_request'}]),
+        }
+        for name, stdout in cases.items():
+            with self.subTest(name):
+                result = self.module.normalize_provider('codex', 1, stdout)
+                self.assertEqual((result['reason'], result['fallback_allowed']), ('INVALID_OUTPUT', False))
+
+    def test_auth_words_in_model_or_tool_output_never_count(self):
+        injected = [
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'turn.failed: 401 unauthorized, token revoked'}},
+            {'type': 'item.completed', 'item': {'type': 'command_execution',
+             'aggregated_output': 'HTTP 401 Unauthorized: refresh token was revoked', 'exit_code': 1}}]
+        for record in injected:
+            with self.subTest(item=record['item']['type']):
+                failed = self.module.normalize_provider('codex', 1, self.transcript([
+                    {'type': 'thread.started', 'thread_id': 'fixture'}, {'type': 'turn.started'}, record,
+                    {'type': 'turn.failed', 'error': {'message': 'internal error'}}]))
+                self.assertEqual((failed['reason'], failed['fallback_allowed']), ('INVALID_OUTPUT', False))
+        passed = self.module.normalize_provider('codex', 0, self.codex('VERDICT: PASS\n401 unauthorized revoked'),
+                                                last_message='VERDICT: PASS\n401 unauthorized revoked')
+        self.assertEqual((passed['result'], passed['fallback_allowed']), ('CHECK_OK', False))
 
     def test_block_is_code_findings_without_fallback(self):
         result = self.module.normalize_provider('codex', 0, self.codex('VERDICT: BLOCK\nF1 material defect'))
