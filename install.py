@@ -676,7 +676,7 @@ def netwatch_status(home: Path, apply: bool, flag) -> str:
     try:
         import netwatch_install
         home = home.expanduser().resolve()
-        if home != Path.home().resolve() and flag is None:
+        if home != netwatch_install.real_home() and flag is None:
             return "netwatch: skipped (non-default --home; pass --netwatch to place the binary)"
         enabled = netwatch_install.choice(home, flag)
         if apply and flag is not None:

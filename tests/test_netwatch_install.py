@@ -126,14 +126,39 @@ class NetwatchInstallTests(unittest.TestCase):
         self.assertEqual(len(self.urls), 1)
         self.assertEqual(binary.read_bytes(), VERSION.encode())
 
-    def test_newer_user_binary_is_not_downgraded(self):
+    def test_unverified_binary_claiming_newer_version_is_replaced_unrun(self):
         binary = self.home / ".agent-harness" / "bin" / "netwatch"
         binary.parent.mkdir(parents=True)
         binary.write_bytes(b"v10.0.0")
         run = FakeRun()
-        self.assertIn("kept newer v10.0.0", self.status(run))
-        self.assertEqual(self.urls, [])
-        self.assertNotIn(["install"], run.calls)
+        self.assertIn(f"installed {VERSION}", self.status(run))
+        self.assertEqual(binary.read_bytes(), VERSION.encode())
+        self.assertEqual(run.calls[0], ["version"])  # only the new, verified binary ran
+        self.assertEqual(len([c for c in run.calls if c == ["version"]]), 1)
+
+    def test_running_detection_is_exact(self):
+        for line, running in [("service: loaded, state running, pid 42", True),
+                              ("service: loaded, state not running, pid -", False),
+                              ("service: netwatch.service active/running (enabled), pid 7", True),
+                              ("service: netwatch.service inactive/dead (enabled), pid 0", False),
+                              ("service: Scheduled Task netwatch: Running", True),
+                              ("service: Scheduled Task netwatch: Ready", False)]:
+            self.assertEqual(bool(nw.RUNNING.search(line)), running, line)
+        self.status()
+        run = FakeRun(status_out="service: loaded, state not running, pid -\n")
+        self.status(run)
+        self.assertEqual(run.calls[-1], ["install"])
+
+    def test_real_home_ignores_home_override(self):
+        old = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
+        try:
+            self.assertNotEqual(nw.real_home(), self.home)
+        finally:
+            if old is None:
+                os.environ.pop("HOME")
+            else:
+                os.environ["HOME"] = old
 
     def test_non_default_home_never_registers_the_service(self):
         run = FakeRun()

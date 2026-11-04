@@ -216,7 +216,21 @@ def place_binary(binary: Path, data: bytes) -> None:
             temporary.unlink()
 
 
-RUNNING = re.compile(r"(?i)\brunning\b")
+# Exact `netwatch status` first lines for a running service, per platform:
+# macOS "loaded, state running, pid 123" (launchd also says "state not
+# running"), Linux "netwatch.service active/running (...)", Windows
+# "Scheduled Task netwatch: Running".
+RUNNING = re.compile(r"(state running, pid \d+$)|( active/running )|(: Running$)")
+
+
+def real_home() -> Path:
+    """The account's home from the password database, not $HOME: launchd and
+    systemd --user domains are per user, so a HOME override must not count."""
+    try:
+        import pwd
+        return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    except (ImportError, KeyError):
+        return Path.home().resolve()
 
 
 def status(home: Path, apply: bool, enabled: bool = True, *, pin_path: Path = PIN_FILE,
@@ -230,7 +244,7 @@ def status(home: Path, apply: bool, enabled: bool = True, *, pin_path: Path = PI
         return "netwatch: skipped (opted out; rerun with --netwatch to install)"
     home = home.expanduser().resolve()
     if register is None:
-        register = home == Path.home().resolve()
+        register = home == real_home()
     key = key or platform_key()
     try:
         pin = load_pin(pin_path)
@@ -249,11 +263,7 @@ def status(home: Path, apply: bool, enabled: bool = True, *, pin_path: Path = PI
         changed = current_digest != asset["binary_sha256"]
         if changed:
             # Never run an unverified binary: its own version output is not
-            # evidence. A newer binary the user installed is kept, not downgraded.
-            if current_digest is not None:
-                found = version_tuple(installed_version(binary, run))
-                if found and version_tuple(version) and found > version_tuple(version):
-                    return f"netwatch: kept newer v{'.'.join(map(str, found))} at {binary} (pin is {version})"
+            # evidence, so any binary that differs from the pin is replaced.
             name = archive_name(version, key)
             url = f"https://github.com/{pin['repo']}/releases/download/{version}/{name}"
             archive = download(url)
@@ -273,7 +283,8 @@ def status(home: Path, apply: bool, enabled: bool = True, *, pin_path: Path = PI
             # Re-registering would restart the service and drop a custom
             # --config or --log-dir, so leave a running service alone.
             st = run([str(binary), "status"], capture_output=True, text=True, timeout=60)
-            if st.returncode == 0 and RUNNING.search(st.stdout.splitlines()[0] if st.stdout else ""):
+            first = st.stdout.splitlines()[0].strip() if st.stdout else ""
+            if st.returncode == 0 and RUNNING.search(first):
                 return f"netwatch: {action} at {binary}; service running"
         result = run([str(binary), "install"], capture_output=True, text=True, timeout=180)
     except Exception as error:  # noqa: BLE001 - never fail the harness install
