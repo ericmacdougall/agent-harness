@@ -1,5 +1,5 @@
 {
- "comment": "Shared by internal/impl (Go) and compat/pyfront (Python). Each case builds a temp HOME; binary is written by the test with mode and content, and its sha256 placed where impl says \"$SHA\". Decision: go | python | refuse.",
+ "comment": "Shared by internal/impl (Go) and compat/pyfront (Python). Each case builds a temp HOME; binary is written by the test with mode and content, and its sha256 placed where impl says \"$SHA\". Decision: go | python | refuse. launcher_link builds dir/launcher as a symlink: shared -> shared/x (shared 0777), safe -> real, two_hop_shared -> shared/lnk -> real, relative_safe -> ./real.",
  "cases": [
   {
    "name": "missing file",
@@ -607,7 +607,42 @@
   },
   {
    "name": "symlinked ancestor into shared dir",
-   "launcher_via_shared_symlink": true,
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "python",
+   "reason": "binary",
+   "launcher_link": "shared"
+  },
+  {
+   "name": "symlinked ancestor into safe dir",
+   "impl": {
+    "schema": 1,
+    "groups": {
+     "wal": "go"
+    },
+    "hosts": {
+     "claude": {
+      "binary": "$BIN",
+      "sha256": "$SHA"
+     }
+    }
+   },
+   "want": "go",
+   "launcher_link": "safe"
+  },
+  {
+   "name": "two-hop link through shared dir",
+   "launcher_link": "two_hop_shared",
    "impl": {
     "schema": 1,
     "groups": {
@@ -624,8 +659,8 @@
    "reason": "binary"
   },
   {
-   "name": "symlinked ancestor into safe dir",
-   "launcher_via_safe_symlink": true,
+   "name": "relative link into safe dir",
+   "launcher_link": "relative_safe",
    "impl": {
     "schema": 1,
     "groups": {

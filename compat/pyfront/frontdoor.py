@@ -51,27 +51,51 @@ def _clean(path):
     return os.path.normpath(path) == path and not path.startswith("//")
 
 
+MAX_LINK_HOPS = 40
+
+
+def _safe_dir(info):
+    """Ours or root's, and not group/other-writable unless sticky."""
+    mode = stat.S_IMODE(info.st_mode)
+    return (stat.S_ISDIR(info.st_mode) and info.st_uid in (0, os.geteuid())
+            and not (mode & 0o022 and not mode & stat.S_ISVTX))
+
+
 def _safe_ancestors(path):
-    """Both the lexical and the symlink-resolved directory chains above path are safe (see _safe_chain)."""
-    directory = os.path.dirname(path)
-    return _safe_chain(directory) and _safe_chain(os.path.realpath(directory))
+    """Resolve dirname(path) one component at a time from "/" (internal/impl safeAncestors, line for line).
 
-
-def _safe_chain(current):
-    """current and every directory above it are owned by us or root, not group/other-writable unless sticky."""
-    while True:
-        try:
-            info = os.stat(current)
-        except OSError:
+    Every directory entered must be safe. A symlink met on the way must be ours or root's and sits in a
+    directory already verified, so nobody else can retarget it; its target (relative to that directory)
+    is walked the same way, up to MAX_LINK_HOPS. Nobody else can then swap the binary between hash and exec.
+    """
+    try:
+        if not _safe_dir(os.lstat("/")):
             return False
-        mode = stat.S_IMODE(info.st_mode)
-        if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid())
-                or (mode & 0o022 and not mode & stat.S_ISVTX)):
-            return False
-        parent = os.path.dirname(current)
-        if parent == current:
-            return True
-        current = parent
+        current, todo, hops = "/", [p for p in os.path.dirname(path).split("/") if p], 0
+        while todo:
+            name = todo.pop(0)
+            if name == ".":
+                continue
+            if name == "..":
+                current = os.path.dirname(current)
+                continue
+            following = os.path.join(current, name)
+            info = os.lstat(following)
+            if stat.S_ISLNK(info.st_mode):
+                hops += 1
+                if hops > MAX_LINK_HOPS or info.st_uid not in (0, os.geteuid()):
+                    return False
+                target = os.readlink(following)
+                if target.startswith("/"):
+                    current = "/"
+                todo = [p for p in target.split("/") if p] + todo
+                continue
+            if not _safe_dir(info):
+                return False
+            current = following
+        return True
+    except OSError:
+        return False
 
 
 def _load(path):
