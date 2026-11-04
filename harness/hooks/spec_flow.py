@@ -600,6 +600,12 @@ class Session:
 
 # --------------------------------------------------------------------------- the done gate
 
+def tester_key(tester: dict) -> str:
+    kind = tester.get("kind")
+    identity = str(tester.get("identity") or "")
+    return identity_key(kind, safe_id(identity) if kind == "agent" else identity) if kind else ""
+
+
 def evaluate(records: list, index: dict, issue: dict, ignored=()):
     """Return {"ready", "missing", "self_attested", "notes"} for one ticket."""
     missing, attested, notes = [], [], list(ignored)
@@ -667,8 +673,14 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
                                  - set(latest.get("covers_commits") or [])):
             missing.append(f"click-test: evidence commits {', '.join(s[:12] for s in uncovered)} came after the "
                            "deployed commit that was click-tested; deploy them and record a new click-test")
+        elif tester_key(latest.get("tester") or {}) in (
+                {author} | review_keys | {r.get("actor") for r in evidence if r.get("actor")}):
+            missing.append("click-test: the tester is the spec author, a spec reviewer or posted the evidence; "
+                           "an independent click-tester must run it")
         else:
             tester = latest.get("tester") or {}
+            attested.append(f"deployed commit {str(latest['deployed_commit'].get('sha'))[:12]} at "
+                            f"{latest.get('url')} is declared by the recorder, not read back from the deployment")
             if latest.get("pass_source") == "self-attested":
                 attested.append(f"click-test pass by {tester.get('kind')} {tester.get('identity')!r} is self-attested")
             if not tester.get("ended_at"):
@@ -801,12 +813,15 @@ def run_hook(payload: dict, spec_policy: dict, config_loader=None) -> tuple:
                     blocking.append(f"call_api write to {detail} touches an enforced project and its effect on "
                                     "issue status can't be checked; use the named GoodQA tools")
                 continue
+            # An issue no routed key can read is not in an enforced project: enforcing a project requires a
+            # routed key that passes `doctor`. So these warn instead of blocking every other project's writes.
             if not isinstance(issue_id, str) or not re.fullmatch(UUID, issue_id):
-                (blocking if enforced else warnings).append(f"{detail}: missing or malformed issueId")
+                warnings.append(f"{detail}: missing or malformed issueId; not checked")
                 continue
             adapter, issue = resolve_issue(issue_id, config, spec_policy, deadline)
             if issue is None:
-                (blocking if enforced else warnings).append(f"issue {issue_id} could not be read with any configured key")
+                warnings.append(f"issue {issue_id} is not readable with any routed key, so it is not in an "
+                                "enforced project; not checked")
                 continue
             target = blocking if str(issue.get("projectId") or "").lower() in enforced else warnings
             label = f"issue #{issue.get('number')} ({issue_id[:8]})"
@@ -1207,7 +1222,7 @@ def cmd_doctor(args, spec_policy):
     return EXIT_OK if needed <= permissions else EXIT_MISSING
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("hook", help="Claude Code PreToolUse hook for GoodQA status changes")
@@ -1275,7 +1290,11 @@ def main(argv=None) -> int:
             item.add_argument("--apply", action="store_true", help="request status done when READY")
     doctor = sub.add_parser("doctor", help="check that the routed key can work in a project")
     doctor.add_argument("--project", required=True)
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
 
     if args.command == "hook":
         try:

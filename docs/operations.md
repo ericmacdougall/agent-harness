@@ -368,7 +368,8 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
   - Screenshots and recordings (`png jpg gif webm mp4`, up to 15 MB) are checked by magic number and are not redacted.
 - **Click-tests:**
   - Logs or a report are mandatory.
-  - `--deployed-commit` names the commit that was deployed and tested. Every commit cited by evidence on the current spec must be reachable from it, or the record is refused. Evidence commits added later make `done` NOT READY until a new click-test covers them.
+  - `--deployed-commit` names the commit that was deployed and tested. Every commit cited by evidence on the current spec must be reachable from it, or the record is refused. Evidence commits added later make `done` NOT READY until a new click-test covers them. This is a membership check, so it also applies when the later commit was already inside the deployed commit; rerun the click-test. The deployed commit is declared by whoever records the click-test and is not read back from the deployment, so `done` lists it under Self-attested.
+  - The tester must be independent: a click-test whose tester is the spec author, a spec reviewer or anyone who posted evidence does not count toward READY.
   - **Agent click-tester:**
     - The agent must be recorded as `click-tester` in the session's `main.jsonl`.
     - The start time is its SubagentStart record. The end time is its first `subagent_stop` record (from the SubagentStop hook). If there is none, `ended_at` is null and `last_activity_at` is recorded.
@@ -418,8 +419,9 @@ GoodQA's own independent-acceptance rule for done transitions still applies.
    - **Blocked:** an unknown status, archiving an open ticket, a pipeline or stage move, and a `call_api` DELETE on an issue.
    - **Bulk calls:** every item in a bulk call is checked, and one failing item blocks the call.
    - **Where it blocks:** only in `mode: enforce`, and only for `enforced_projects`. Everywhere else it prints what is missing and allows the call.
-   - **Unreachable GoodQA:** blocks only in enforce mode when enforced projects are configured.
-   - **Out of reach:** the GoodQA UI, REST calls made with curl or scripts, and Codex. Codex has no SubagentStop or MCP PreToolUse hook here, so on Codex the commands are run by hand.
+   - **Unreachable GoodQA:** a transport failure blocks only in enforce mode when enforced projects are configured. The status write goes to the same service, so blocking it costs little.
+   - **Unreadable issue:** an issue that no routed key can read, or a malformed issue id, only warns, even in enforce mode. Enforcing a project requires a routed key that passes `doctor`, so an issue no key can read is not in an enforced project.
+   - **Out of reach:** the GoodQA UI, REST calls made with curl or scripts, Codex and Cursor. Codex has no SubagentStop or MCP PreToolUse hook here, and Cursor is not wired, so on Codex and Cursor the commands are run by hand and `done` is advisory. Parity is tracked in GoodQA work-tracker-automatic#35670, to be absorbed by the harness Go port.
 
 ### Credentials and rollout
 

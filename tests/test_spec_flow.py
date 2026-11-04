@@ -528,7 +528,7 @@ class ClickTest(SpecFlowCase):
 
 
 class DoneGate(SpecFlowCase):
-    def complete(self, signer=("main1", "agent")):
+    def complete(self, signer=("main1", "agent"), tester="ct1"):
         self.attached()
         owner_wal = self.wal_dir / "agent-owner1.jsonl"
         self.wal(owner_wal, {"at": "2026-11-04T02:00:00+00:00", "event": "check", "note": "REALLY_TESTED RT1: ok exit 0"})
@@ -536,16 +536,16 @@ class DoneGate(SpecFlowCase):
             code, _, err = self.run_cli("evidence", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
                                         "--ac", ac, "--really-tested", "RT1", "--wal", str(owner_wal))
             self.assertEqual(code, 0, err)
-        self.wal(self.main_wal, {"at": "2026-11-04T05:00:00+00:00", "event": "subagent", "agent_id": "ct1",
+        self.wal(self.main_wal, {"at": "2026-11-04T05:00:00+00:00", "event": "subagent", "agent_id": tester,
                                  "agent_type": "click-tester"})
         report = self.tmp / "click.md"
         report.write_text("CLICK_TEST_RESULT: PASS\nok\n")
-        self.wal(self.wal_dir / "agent-ct1.jsonl", {"at": "2026-11-04T05:01:00+00:00", "event": "result",
+        self.wal(self.wal_dir / f"agent-{tester}.jsonl", {"at": "2026-11-04T05:01:00+00:00", "event": "result",
                                                     "note": "CLICK_TEST_REPORT sha256=" + hashlib.sha256(report.read_bytes()).hexdigest()})
         self.repo_dir = self.tmp / "deployed"
         self.shas = git_repo(self.repo_dir, "feat: one", "feat: later")
         code, _, err = self.run_cli("click-test", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
-                                    "--url", "http://127.0.0.1:3000", "--agent-id", "ct1", "--wal-dir",
+                                    "--url", "http://127.0.0.1:3000", "--agent-id", tester, "--wal-dir",
                                     str(self.wal_dir), "--repo", str(self.repo_dir), "--deployed-commit",
                                     self.shas[0], "--result", "pass", "--report", str(report))
         self.assertEqual(code, 0, err)
@@ -553,6 +553,18 @@ class DoneGate(SpecFlowCase):
             code, _, err = self.run_cli("signoff", "--ticket", "GoodQA harness#168", "--actor", f"agent:{signer[0]}",
                                         "--by", signer[0], "--kind", signer[1], "--source", "main review of #168")
             self.assertEqual(code, 0, err)
+
+    def test_click_test_by_the_owner_does_not_count(self):
+        self.complete(tester="owner1")
+        result = self.evaluate()
+        self.assertFalse(result["ready"])
+        self.assertTrue(any("independent click-tester" in m for m in result["missing"]), result["missing"])
+
+    def test_declared_deployed_commit_is_listed_as_self_attested(self):
+        self.complete()
+        result = self.evaluate()
+        self.assertTrue(result["ready"], result["missing"])
+        self.assertTrue(any("deployed commit" in a for a in result["self_attested"]), result["self_attested"])
 
     def test_evidence_commit_after_the_click_test_needs_a_new_click_test(self):
         self.complete()
@@ -679,6 +691,15 @@ class Hook(SpecFlowCase):
                                mode="warn", enforced_projects=["harness"])
         self.assertEqual(code, 0)
         self.assertIn("not blocking", text)
+
+    def test_issue_no_routed_key_can_read_warns_even_in_enforce(self):
+        other = str(uuid.uuid4())
+        code, text = self.hook("update_issue", {"issueId": other, "patch": {"status": "done"}}, **self.enforce())
+        self.assertEqual(code, 0)
+        self.assertIn("not in an enforced project", text)
+        code, text = self.hook("update_issue", {"issueId": "not-a-uuid", "patch": {"status": "done"}}, **self.enforce())
+        self.assertEqual(code, 0)
+        self.assertIn("malformed", text)
 
     def test_unenforced_project_only_warns(self):
         code, text = self.hook("update_issue", {"issueId": ISSUE, "patch": {"status": "done"}},
@@ -820,3 +841,21 @@ class Install(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DocumentedCommands(unittest.TestCase):
+    def test_every_documented_example_parses(self):
+        import re
+        import shlex
+        doc = (HOOKS.parents[1] / "docs" / "operations.md").read_text()
+        lines = [line.split("  #")[0] for line in doc.splitlines() if line.startswith("python3 $S ")]
+        self.assertGreaterEqual(len(lines), 10)
+        parser = sf.build_parser()
+        for line in lines:
+            # Optional parts are shown in [brackets]; check the line with them included.
+            # A <placeholder> stands for one argument even when it contains spaces.
+            line = re.sub(r"<[^<>]*>", lambda m: "PLACEHOLDER", line)
+            words = shlex.split(line.replace("[", " ").replace("]", " "))[2:]
+            with self.subTest(line=line):
+                parser.parse_args(words)
+
