@@ -201,6 +201,15 @@
       "on_deployed_status": null,
       "unreachable_projects": ["solve", "ai-course", "harness"],
       "unreachable_reason": "the GoodQA member key reaches the FrameBright org only; Eric-org projects cannot be verified until durable cross-org access lands (empty unreachable_projects then)"
+    },
+    "ledger": {
+      "adapter": "ledger",
+      "ref_pattern": "\\bLedger\\s+(?P<project>[a-z0-9][a-z0-9-]{0,62})#(?P<id>[0-9a-f]{8,64})\\b",
+      "allowed_repos": [],
+      "binary": "harness",
+      "min_version": "0.1.0",
+      "timeout_seconds": 5,
+      "note": "Local ledger refs count only in repos no ticket system tracks (any remote url/pushurl checked) and, for repos with no remote, only when the absolute top-level path fully matches an allowed_repos regex. They never satisfy a tracked repo's ticket rule."
     }
   },
   "waivers": {
