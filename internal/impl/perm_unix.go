@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -23,32 +24,76 @@ func safeBinary(fi fs.FileInfo) bool {
 	return owner(fi) && fi.Mode().Perm()&0o022 == 0 && fi.Mode().Perm()&0o100 != 0
 }
 
-// safeAncestors: every directory above path, along both the lexical chain and the symlink-resolved one,
-// is owned by us or root and not group/other-writable unless sticky, so nobody else can swap the binary
-// between hashing and exec (a symlinked ancestor into a shared tree is caught by the resolved chain).
-func safeAncestors(path string) bool {
-	dir := filepath.Dir(path)
-	resolved, err := filepath.EvalSymlinks(dir)
-	return err == nil && safeChain(dir) && safeChain(resolved)
+// maxLinkHops bounds symlink resolution in safeAncestors (MAX_LINK_HOPS in frontdoor.py).
+const maxLinkHops = 40
+
+// safeDir: ours or root's, and not group/other-writable unless sticky.
+func safeDir(fi fs.FileInfo) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !fi.IsDir() || !ok || (int(st.Uid) != os.Geteuid() && st.Uid != 0) {
+		return false
+	}
+	return fi.Mode().Perm()&0o022 == 0 || fi.Mode()&fs.ModeSticky != 0
 }
 
-func safeChain(dir string) bool {
-	for ; ; dir = filepath.Dir(dir) {
-		fi, err := os.Stat(dir)
-		if err != nil || !fi.IsDir() {
+// safeAncestors resolves filepath.Dir(path) one component at a time from "/" (frontdoor._safe_ancestors,
+// line for line). Every directory entered must be safe. A symlink met on the way must be ours or root's
+// and sits in a directory already verified, so nobody else can retarget it; its target (relative to that
+// directory) is walked the same way, up to maxLinkHops. Nobody else can then swap the binary between
+// hashing and exec.
+func safeAncestors(path string) bool {
+	if fi, err := os.Lstat("/"); err != nil || !safeDir(fi) {
+		return false
+	}
+	current, todo, hops := "/", components(filepath.Dir(path)), 0
+	for len(todo) > 0 {
+		name := todo[0]
+		todo = todo[1:]
+		switch name {
+		case ".":
+			continue
+		case "..":
+			current = filepath.Dir(current)
+			continue
+		}
+		following := filepath.Join(current, name)
+		fi, err := os.Lstat(following)
+		if err != nil {
 			return false
 		}
-		st, ok := fi.Sys().(*syscall.Stat_t)
-		if !ok || (int(st.Uid) != os.Geteuid() && st.Uid != 0) {
+		if fi.Mode()&fs.ModeSymlink != 0 {
+			hops++
+			st, ok := fi.Sys().(*syscall.Stat_t)
+			if hops > maxLinkHops || !ok || (int(st.Uid) != os.Geteuid() && st.Uid != 0) {
+				return false
+			}
+			target, err := os.Readlink(following)
+			if err != nil {
+				return false
+			}
+			if strings.HasPrefix(target, "/") {
+				current = "/"
+			}
+			todo = append(components(target), todo...)
+			continue
+		}
+		if !safeDir(fi) {
 			return false
 		}
-		if fi.Mode().Perm()&0o022 != 0 && fi.Mode()&fs.ModeSticky == 0 {
-			return false
-		}
-		if filepath.Dir(dir) == dir {
-			return true
+		current = following
+	}
+	return true
+}
+
+// components splits a slash path into its non-empty names, as [p for p in path.split("/") if p].
+func components(p string) []string {
+	var out []string
+	for _, c := range strings.Split(p, "/") {
+		if c != "" {
+			out = append(out, c)
 		}
 	}
+	return out
 }
 
 // openRegular never follows a link and never blocks on a FIFO swapped in after Lstat.
