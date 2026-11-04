@@ -579,6 +579,32 @@ def finding_ids(report):
     return sorted(set(values))[:128] or ['UNSPECIFIED']
 
 
+def commit_policy_gate(repo, base):
+    """PR review spends a paid review only on a branch whose commits and tickets pass policy."""
+    try:
+        import commit_policy
+        policy = commit_policy.load_policy()
+    except (ImportError, OSError, ValueError):
+        return 2, 'commit policy could not be loaded; refusing PR review'
+    if base is None and not commit_policy.git(repo, 'remote', 'get-url', 'origin', check=False).strip():
+        return 0, ''  # no origin: nothing can be published from here; deliver prepare checks later
+    if base is None:
+        for candidate in ('refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master'):
+            if commit_policy.git(repo, 'rev-parse', '-q', '--verify', candidate + '^{commit}', check=False).strip():
+                base = candidate
+                break
+    if base is None:
+        return 2, 'commit policy: cannot find the PR base (origin/HEAD or origin/main); pass --base'
+    branch = commit_policy.git(repo, 'symbolic-ref', '--quiet', '--short', 'HEAD', check=False).strip() or None
+    try:
+        report = commit_policy.check_range(str(repo), base, 'HEAD', policy, branch=branch, verify_tickets=True)
+    except (OSError, subprocess.TimeoutExpired):
+        return 2, 'commit policy: the commit range could not be inspected'
+    if report['status'] == 'PASS':
+        return 0, commit_policy.format_report(report) if report['waivers'] else ''
+    return (6 if report['status'] == 'UNVERIFIED' else 2), commit_policy.format_report(report)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("plan", "code-inspection", "pr"))
@@ -594,6 +620,7 @@ def main() -> int:
     parser.add_argument('--pool', default='default', help='Opaque Codex auth-pool alias; never a credential')
     parser.add_argument('--fallback-pool', default='default', help='Opaque independent Claude auth-pool alias')
     parser.add_argument('--owner', default='peer-review', help='Safe owner identifier for execution receipts')
+    parser.add_argument('--base', help='PR base for the commit-policy range check (default origin/HEAD or origin/main)')
     args = parser.parse_args()
     if not 1 <= args.packet_budget_bytes <= PACKET_LIMIT:
         parser.error('--packet-budget-bytes must be between 1 and 150000')
@@ -646,6 +673,15 @@ def main() -> int:
         target.close()
         evidence.close()
         parser.error('review requires a clean worktree')
+    if args.stage == 'pr':
+        code, text = commit_policy_gate(repo, args.base)
+        if text:
+            print(text, file=sys.stderr)
+        if code:
+            target.close()
+            evidence.close()
+            print('PR review not started: fix the commit policy findings above first.', file=sys.stderr)
+            return code
     stage_rules = (
         "Planning gate: judge the proposed design, acceptance criteria, edge cases, test strategy, "
         "and rollout/rollback plan. You may read repository context. Do not BLOCK solely for an "

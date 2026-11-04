@@ -741,6 +741,131 @@ def prepare_pr(flow, title, body):
     return record_pr(flow, found)
 
 
+COMMIT_POLICY_RECORD = "commit-policy.json"
+
+
+def commit_policy_gate(source, original_branch, branch, head, baseline, title, body, local_only):
+    """Refuse a new generation whose owner commits, PR text, or tickets break the policy.
+
+    The range is the owner's own work: head minus baseline minus the tracked
+    upstream tip, so upstream commits written by others are never judged here.
+    Runs only before a generation is created; re-entry never repeats network checks.
+    """
+    try:
+        import commit_policy
+        policy = commit_policy.load_policy()
+    except (ImportError, OSError, ValueError):
+        raise DeliveryError("BLOCKED_COMMIT_POLICY", "Commit policy could not be loaded; refusing to publish",
+                            code=2) from None
+    tip_ref = f"refs/remotes/origin/{original_branch}"
+    tip = commit_policy.git(source, "rev-parse", "-q", "--verify", tip_ref + "^{commit}", check=False).strip()
+    exclude = [tip] if OID.match(tip) else []
+    try:
+        result = commit_policy.check_range(str(source), baseline, head, policy, branch=branch,
+                                           verify_tickets=True, exclude=exclude)
+    except (OSError, subprocess.TimeoutExpired):
+        raise DeliveryError("BLOCKED_COMMIT_POLICY", "Commit range could not be inspected", code=2) from None
+    origin = commit_policy.git(source, "remote", "get-url", "origin", check=False).strip() or None
+    pr_problems = [] if local_only or policy.get("enforcement") == "off" else commit_policy.validate_pr(
+        title, body.decode("utf-8", "replace"), policy,
+        tickets_required=commit_policy.tickets_required_for(origin, policy))
+    text = commit_policy.format_report(result)
+    if pr_problems and policy.get("enforcement") != "warn":
+        text += "\n  PR title/body (GitHub squash uses them as the final commit message):\n" + "\n".join(
+            "      - " + item for item in pr_problems)
+    warn = policy.get("enforcement") == "warn"
+    if not warn and (result["status"] == "BLOCKED" or pr_problems):
+        raise DeliveryError("BLOCKED_COMMIT_POLICY", "Commit messages, PR text or tickets break the commit policy; "
+                            "fix them and run prepare again", code=2, commit_policy=text)
+    if not warn and result["status"] == "UNVERIFIED":
+        raise DeliveryError("TICKETS_UNVERIFIED", "Referenced tickets could not be verified (ticket system "
+                            "unreachable); retry, or record a tickets waiver for this head", code=6,
+                            commit_policy=text)
+    if result["waivers"] or warn and result["status"] != "PASS":
+        print(text, file=sys.stderr)
+    return {"exclude": exclude, "waivers": result["waivers"],
+            "tickets": [item["ticket"] for item in result["tickets"]]}
+
+
+COMMIT_POLICY_PENDING = "commit-policy-pending.json"
+
+
+def _write_private_json(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def stage_policy_record(flow, record, source_head, baseline):
+    """Written before the generation exists, so a crash cannot lose the checked range."""
+    private_directory(flow.root)
+    _write_private_json(flow.root / COMMIT_POLICY_PENDING,
+                        {"schema": 1, "source_head": source_head, "baseline": baseline, **record})
+
+
+def write_policy_record(flow, record):
+    _write_private_json(flow.directory / COMMIT_POLICY_RECORD, {"schema": 1, "generation": flow.generation, **record})
+    (flow.root / COMMIT_POLICY_PENDING).unlink(missing_ok=True)
+
+
+def ticket_updates(flow, stage, head, pr_url=None):
+    """Comment delivery evidence on each referenced ticket; never undoes a delivery.
+
+    Exit 5 from finish means delivered with a ticket update still pending.
+    """
+    try:
+        return _ticket_updates(flow, stage, head, pr_url)
+    except Exception as error:  # delivery already completed; report, never mask it
+        return {"status": "PENDING", "error": type(error).__name__,
+                "retry": "re-run the same deliver.py finish command (idempotent)"}
+
+
+def _ticket_updates(flow, stage, head, pr_url):
+    try:
+        record = json.loads(regular_bytes(flow.directory / COMMIT_POLICY_RECORD))
+    except (OSError, ValueError, DeliveryError):
+        record = None
+    if record is None:
+        # Crash between staging and the generation write: adopt the staged record only
+        # when it describes exactly this generation's range.
+        try:
+            staged = json.loads(regular_bytes(flow.root / COMMIT_POLICY_PENDING))
+        except (OSError, ValueError, DeliveryError):
+            staged = None
+        if (isinstance(staged, dict) and staged.get("source_head") == flow.state["source_head"]
+                and staged.get("baseline") == flow.state["baseline"]):
+            record = {**staged, "generation": flow.generation}
+    if record is None:
+        # Neither record nor staged record: the generation was prepared before the policy.
+        return {"status": "NOT_APPLICABLE", "reason": "generation predates the commit policy"}
+    if record.get("generation") != flow.generation or not record.get("tickets"):
+        return {"status": "NOT_APPLICABLE", "reason": "no referenced tickets"}
+    import commit_policy
+    policy = commit_policy.load_policy()
+    lines = [f"- Mode: {flow.args.mode}", f"- Delivered head: `{head}`",
+             f"- Source head: `{flow.state['source_head']}` on `{flow.state['source_branch']}`"]
+    if pr_url:
+        lines.append(f"- PR: {pr_url}")
+    for check in flow.args.check:
+        lines.append(f"- Check passed: `{check}`")
+    lines.append("- Deploy: not observed by deliver.py; post deploy evidence with "
+                 "`commit_policy.py notify --stage deployed`")
+    for item in record.get("waivers", []):
+        lines.append(f"- Waiver used: {item['kind']} {item['subject'][:12]} (id {item['id']})")
+    results = commit_policy.notify(str(flow.original), flow.state["baseline"], flow.state["source_head"], policy,
+                                   operation_seed=flow.generation, evidence="\n".join(lines), stage=stage,
+                                   exclude=record.get("exclude", []))
+    pending = [item for item in results if item["status"] != "COMMENTED"]
+    retry = (f"python3 {Path(__file__).with_name('commit_policy.py')} notify --repo {flow.original} "
+             f"--base {flow.state['baseline']} --head {flow.state['source_head']} --seed {flow.generation} "
+             f"--stage {stage} --evidence '<delivery evidence>'"
+             + "".join(f" --exclude {tip}" for tip in record.get("exclude", [])))
+    return {"status": "PENDING" if pending else "UPDATED", "tickets": results,
+            **({"retry": retry} if pending else {})}
+
+
 def prepare(args):
     if getattr(args, "reconcile_only", False):
         return reconcile(args)
@@ -770,8 +895,12 @@ def prepare(args):
                     or state["repository"] != repository):
                 raise DeliveryError("BLOCKED_POLICY", "Prepared scope differs; explicitly request a new generation", code=2)
         else:
+            policy_record = commit_policy_gate(source, args.original_branch, branch, head, baseline,
+                                               title, body, local_only)
             phase = "LOCAL_READY" if local_only else ("REMOTE_BLOCKED" if origin_error else "INITIAL")
+            stage_policy_record(flow, policy_record, head, baseline)
             flow.create(source, branch, head, baseline, kit, repository, phase)
+            write_policy_record(flow, policy_record)
             state = flow.state
         if state["phase"] == "LOCAL_READY":
             report("LOCAL_READY", "Explicit local-only generation prepared", **flow.facts())
@@ -1052,10 +1181,11 @@ def resume_remote_finish(flow, preparations, checks):
         private_directory(attempt / "final")
         write_journal(attempt / "final", {"schema": 1, "kind": "delivery_resume_result",
                       "generation": flow.generation, "status": "DELIVERED", "target": state["target"]}, first=True)
+        tickets = ticket_updates(flow, "merged", state["target"])
         report("DELIVERED", "Pending remote delivery passed fresh checks at its pinned target",
                head=state["target"], receipt=str(flow.receipt), resume_record=str(attempt / "final" / "journal.json"),
-               remote_observed_head=observed, **flow.facts())
-        return 0
+               remote_observed_head=observed, ticket_updates=tickets, **flow.facts())
+        return 5 if tickets["status"] == "PENDING" else 0
 
 
 def remote_finish(flow, preparations, checks):
@@ -1162,9 +1292,11 @@ def remote_finish(flow, preparations, checks):
                                      cause=error.status if isinstance(error, DeliveryError) else "IO_FAILURE",
                                      evidence=check_facts(error)) from None
             raise
+    tickets = ticket_updates(flow, "merged", target, pr["url"])
     report("DELIVERED", "Merged PR is present in the checked original checkout", head=target,
-           receipt=str(flow.receipt), pr=pr["url"], remote_observed_head=observed_remote, **flow.facts())
-    return 0
+           receipt=str(flow.receipt), pr=pr["url"], remote_observed_head=observed_remote,
+           ticket_updates=tickets, **flow.facts())
+    return 5 if tickets["status"] == "PENDING" else 0
 
 
 def local_completion(flow, preparations, checks):
@@ -1189,8 +1321,10 @@ def local_completion(flow, preparations, checks):
         if snapshot(flow.original, flow.branch) != current:
             raise recovery_error(flow, "Local checks changed the delivered checkout", flow.state["baseline"])
         flow.complete("local", current, checks_digest(preparations, checks))
+        tickets = ticket_updates(flow, "delivered-local", current)
+        flow.ticket_exit = 5 if tickets["status"] == "PENDING" else 0
         report("LOCAL_DELIVERED", "Checked local integration complete; remote publication remains outstanding",
-               head=current, receipt=str(flow.receipt), **flow.facts())
+               head=current, receipt=str(flow.receipt), ticket_updates=tickets, **flow.facts())
         return True
 
 
@@ -1204,7 +1338,7 @@ def local_finish(flow, preparations, checks):
         if state["local_key"] != key:
             raise DeliveryError("RECOVERY_REQUIRED", "Local attempt identity changed")
         if local_completion(flow, preparations, checks):
-            return 0
+            return getattr(flow, "ticket_exit", 0)
     verify_source(flow)
     if git_common_directory(source, 30)[0] != flow.common:
         raise DeliveryError("BLOCKED_POLICY", "Local delivery requires worktrees of the same repository", code=2)
@@ -1215,7 +1349,7 @@ def local_finish(flow, preparations, checks):
               checks_digest=checks_digest(preparations, checks))
     if ancestry(flow.original, state["source_head"], state["baseline"]):
         if local_completion(flow, preparations, checks):
-            return 0
+            return getattr(flow, "ticket_exit", 0)
     # A fresh generation must let the child retire an older resolved tuple.
     # Only resumed generations interpret their resolved journal as acceptance.
     # The child owns the original scope lock; the parent holds only its task lock.
@@ -1240,7 +1374,7 @@ def local_finish(flow, preparations, checks):
                              journal=result.get("journal") if isinstance(result.get("journal"), str) else None)
     if not local_completion(flow, preparations, checks):
         raise recovery_error(flow, "Local helper has no verified completion proof", current)
-    return 0
+    return getattr(flow, "ticket_exit", 0)
 
 
 def finish(args):
@@ -1265,10 +1399,13 @@ def finish(args):
         if old is not None:
             if old["mode"] != args.mode:
                 raise DeliveryError("BLOCKED_POLICY", "Generation was delivered using another mode", code=2)
+            # Idempotent: a repeat retries any pending ticket comment without duplicating it.
+            tickets = ticket_updates(flow, "delivered-local" if args.mode == "local" else "merged", old["head"])
             report("ALREADY_DELIVERED", "Historical delivery remains present; no new remote work was synchronized",
                    head=old["head"], current_head=old["current_head"], receipt=str(flow.receipt),
-                   remote_publication="outstanding" if args.mode == "local" else "previously_merged", **flow.facts())
-            return 0
+                   remote_publication="outstanding" if args.mode == "local" else "previously_merged",
+                   ticket_updates=tickets, **flow.facts())
+            return 5 if tickets["status"] == "PENDING" else 0
         if state["phase"] == "RESOLVED_BASELINE":
             raise DeliveryError("RESOLVED_BASELINE", "Baseline accepted; review and prepare a new generation", **flow.facts())
         return remote_finish(flow, preparations, checks) if args.mode == "remote" else local_finish(flow, preparations, checks)
