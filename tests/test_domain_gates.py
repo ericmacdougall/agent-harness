@@ -627,11 +627,12 @@ class PeerReviewTests(unittest.TestCase):
         ethers = json.dumps({"dependencies": {"ethers": "6"}})
         decoy = make_repo({"Anchor.toml": "[programs]", "package.json": ethers[:-1] + ', "pad": "' + "x" * 3000 + '"}'})
         deep = make_repo({"Anchor.toml": "[programs]",
-                          "package.json": '{"dependencies": {"ethers": "6"}, "x": ' + "[" * 5000 + "]" * 5000 + "}"})
+                          "package.json": '{"dependencies": {"ethers": "6"}, "x": ' + "[" * 500 + "]" * 500 + "}"})
         enforce = {"domain_gates": {"mode": "enforce"}}
         allow = {"domain_gates": {"mode": "enforce", "allow_truncated": True}}
-        for name, repo in (("padded", decoy), ("deep", deep)):
-            with self.subTest(case=name), mock.patch.object(dg, "MAX_MANIFEST_BYTES", 2000):
+        self.assertIn("too deeply nested", dg.detect_full(deep)[1])  # deep case runs at default limits, not the size cap
+        for name, repo, limits in (("padded", decoy, {"MAX_MANIFEST_BYTES": 2000}), ("deep", deep, {})):
+            with self.subTest(case=name), mock.patch.multiple(dg, **{"MAX_FILES": dg.MAX_FILES, **limits}):
                 with mock.patch.object(sf, "load_spec_policy", return_value=enforce):
                     with self.assertRaises(OSError):
                         pr.domain_section(repo, "b" * 40, changed_paths=[])
@@ -652,6 +653,11 @@ class PeerReviewTests(unittest.TestCase):
         with mock.patch.object(sf, "load_spec_policy", side_effect=ValueError("bad")), contextlib.redirect_stderr(err):
             pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])
         self.assertIn("enforce refusals are OFF", err.getvalue())
+        padded = make_repo({"package.json": json.dumps({"dependencies": {"ethers": "6"}, "pad": "x" * 3000})})
+        with mock.patch.object(sf, "load_spec_policy", side_effect=ValueError("bad")), \
+                mock.patch.object(dg, "MAX_MANIFEST_BYTES", 2000), contextlib.redirect_stderr(io.StringIO()):
+            section, _ = pr.domain_section(padded, "b" * 40, changed_paths=[])  # really off: no refusal despite the hidden signal
+        self.assertIn("Domain scan incomplete", section)
 
     def test_allow_truncated_only_from_installed_policy(self):
         enforce = {"domain_gates": {"mode": "enforce"}}
