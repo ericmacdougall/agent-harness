@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -451,6 +452,50 @@ class CoverageTests(Fixture):
         for l in calls:
             self.assertIn("core.fsmonitor=false", l)
             self.assertIn("log.showSignature=false", l)
+
+    def test_r5_n1_global_filter_config_does_not_block_clean_repo(self):
+        (self.home / ".gitconfig").write_text('[filter "lfs"]\n\tclean = git-lfs clean -- %f\n\tprocess = git-lfs filter-process\n')
+        (self.noremote / "n1").write_text("modified")
+        r = self.scan()
+        self.assertFalse(any(e["path"] == str(self.noremote) for e in r["errors"]), r["errors"])
+        self.assertTrue(any(x["class"] == "dirty_worktree" and str(self.noremote) in x["path"] for x in r["rows"]))
+
+    def test_r5_n1_local_and_worktree_config_filters_still_block(self):
+        git(self.noremote, "config", "filter.y.process", "true")
+        (self.noremote / "n1").write_text("modified")
+        r = self.scan()
+        self.assertTrue(any(e["path"] == str(self.noremote) and "filter" in e["error"] for e in r["errors"]), r["errors"])
+
+    def test_r5_f7_submodule_local_filter_never_runs_from_parent_status(self):
+        src = self.home.parent / ("subsrc-%d" % os.getpid())
+        src.mkdir()
+        self.addCleanup(shutil.rmtree, str(src), True)
+        git(src, "init", "-q", "-b", "main")
+        commit(src, "s1")
+        git(self.noremote, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(src), "sub")
+        git(self.noremote, "commit", "-qm", "add sub")
+        marker = self.home.parent / ("sub-filter-ran-%d" % os.getpid())
+        self.addCleanup(lambda: marker.exists() and marker.unlink())
+        sub = self.noremote / "sub"
+        git(sub, "config", "filter.x.clean", "touch %s; cat" % marker)
+        (sub / ".gitattributes").write_text("* filter=x\n")
+        time.sleep(1.1)  # same size, newer mtime: git must hash the content, which runs the clean filter
+        (sub / "s1").write_text("xx")
+        self.scan()
+        self.assertFalse(marker.exists(), "submodule filter command was executed by the parent's status")
+
+    def test_r5_f2_allow_symlink_target_is_realpath_matched(self):
+        out = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, str(out))
+        alias_dir = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, str(alias_dir))
+        alias = alias_dir / "alias"
+        os.symlink(str(out), str(alias))  # like /var -> /private/var
+        os.symlink(str(out), str(self.home / "linkdir"))
+        r = json.loads(self.run_cli("scan", "--root", str(self.home), "--allow-symlink-target", str(alias), "--json", expect=0).stdout)
+        self.assertEqual(r["skipped_symlinks"], [])
+        self.assertEqual([a["path"] for a in r["acked_symlinks"]], [str(self.home / "linkdir")])
+        self.assertEqual(r["symlink_allow"], [str(out)])
 
     def test_crontab_failure_is_an_error_not_empty(self):
         ct = self.fakebin / "crontab"

@@ -111,7 +111,7 @@ class Scan:
         self.prune = PRUNE | self.extra_prune
         self.cross = args.cross_devices
         self.no_crontab = args.no_crontab
-        self.symlink_allow = [os.path.abspath(os.path.expanduser(x)) for x in (args.allow_symlink_target or [])]
+        self.symlink_allow = [os.path.realpath(os.path.expanduser(x)) for x in (args.allow_symlink_target or [])]
         self.roots_real = []
         self.rows = []
         self.errors = []
@@ -275,12 +275,21 @@ class Scan:
     def check_dirty(self, repo):
         """Count of changed/untracked entries only (git status --porcelain, no index write)."""
         # a clean/process filter would make status run a command from the repo's config: skip, fail closed
-        rc, flt, _ = self.git(repo, "config", "--get-regexp", r"^filter\..*\.(clean|process)$")
+        # only the repo's own config (local + worktree): global/system filters such as git-lfs are
+        # configured on every host and are not repo-defined commands
+        pat = r"^filter\..*\.(clean|process)$"
+        rc, flt, _ = self.git(repo, "config", "--local", "--includes", "--get-regexp", pat)
+        rcw, wt, _ = self.git(repo, "config", "--local", "--get", "extensions.worktreeConfig")
+        if rcw == 0 and wt.strip().lower() in ("true", "yes", "on", "1"):
+            rc2, flt2, _ = self.git(repo, "config", "--worktree", "--includes", "--get-regexp", pat)
+            if rc2 == 0:
+                flt += flt2
+                rc = 0
         if rc == 0 and flt.strip():
             raise RuntimeError("repo config defines a clean/process filter; git status skipped "
                                "(it would run a repo-defined command); dirty state not inventoried")
         # explicit flags: user/repo config (status.showUntrackedFiles=no) must not hide files
-        rc, out, er = self.git(repo, "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none")
+        rc, out, er = self.git(repo, "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=all")
         if rc != 0:
             raise RuntimeError("git status failed: %s" % er.strip()[:120])
         fields = out.split("\0")  # -z: no path quoting; a rename/copy record is followed by its source path
