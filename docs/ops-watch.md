@@ -29,6 +29,18 @@ Disk sizes come from `du -skx`, run round-robin with the least recently tried di
 
 The Codex trust hash is the sha256 of the sorted-key, compact JSON of `{"event_name": <snake_case event>, "hooks": [handler with async defaulting to false, and only type, command, timeout, async and statusMessage kept], "matcher"?}`. That follows the sidekick crate's mirror of codex-rs hook discovery, and it was checked against live trusted entries on the Mac and dev2 (the dev2 entry carries extra, unhashed fields). Groups with a `matcher` have not been checked against a live entry.
 
+### Per-process memory (`footprint` check)
+
+- `mem:footprint:<pid>`: warning at 8 GiB, critical at 20 GiB, and warning when a process of at least 2 GiB grows 20 GiB/h or faster between runs. macOS reads the MEM column of `top` (physical footprint), because RSS read 4.9 MB for a 76 GB orphan. Linux reads RSS from `ps`. The alert names the pid, the cwd and the owner: the user, the task taken from the cwd, and whether the process is an orphan.
+- `mem:jetsam`: JetsamEvent reports in `/Library/Logs/DiagnosticReports` in the last hour: warning at 1, high at 3. Only file names and times are read.
+- This check only reports. To stop a process, use `netwatch orphans --kill --pid <pid>`, or the process's owner. With a 10-minute cadence, a fast runaway can do damage between runs.
+
+### Comment rate and uninstall
+
+Each host posts at most one digest comment per 30 minutes (`sinks.comment_min_interval_s`). A digest holds the latest transition per key. Stop and remove the timer with `ops_watch.py uninstall --apply`; unit files move to `~/.agent-harness/state/ops-watch/uninstalled/`, and the ring and state stay.
+
+Alert text is redacted when written to the ring and again when injected. The context line neutralizes instruction words, and a peer's alerts appear there as severity, host and key only.
+
 ## Alert path (canonical)
 
 `~/.agent-harness/state/alerts.jsonl` is a preallocated ring of 1024 slots of 1024 bytes each. Every slot is one JSON object padded with spaces, followed by `\n`. Empty slots read `{"empty":true}`.
