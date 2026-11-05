@@ -558,7 +558,7 @@ class OwnerLiveness(StoreFixture):
         # The wiring peer_review.review_snapshot -> run(..., on_spawn=run_record.note_child) is what records
         # the real reviewer process; a dropped argument would leave every other test green.
         source = (HOOKS / 'peer_review.py').read_text()
-        self.assertIn('on_spawn=run_record.note_child if run_record else None', source)
+        self.assertIn("**({'on_spawn': run_record.note_child} if run_record else {})", source)
         self.assertIn('def run(cmd: list[str], prompt: str, cwd: Path, timeout=720, on_spawn=None)', source)
         import peer_review
         recorded = []
