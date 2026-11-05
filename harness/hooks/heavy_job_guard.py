@@ -53,9 +53,10 @@ import stat
 import sys
 
 MAX_COMMAND_CHARS = 1_000_000
+MAX_SCAN_CHARS = 256 * 1024  # command text left after heredoc bodies are removed; ~0.3 s worst case, linear
 MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enforce",
-                 "build": "enforce", "media": "warn", "fan-out": "warn"}
+                 "build": "enforce", "media": "warn", "fan-out": "warn", "oversize": "enforce"}
 CAPPED_RULES = {"browser", "media", "fan-out"}  # memory hogs: hatch alone is not enough
 NEVER_BLOCK = {"adversarial"}  # red-team/fuzz work is legitimate: advise (dev2, group cleanup), never deny
 HATCH = "HARNESS_LOCAL_OK"
@@ -68,6 +69,7 @@ RULE_HELP = {
     "build": "a production build is CPU/memory heavy",
     "media": "large media work (ffmpeg/whisper) is CPU/memory heavy",
     "fan-out": "parallel fan-out multiplies memory use",
+    "oversize": "the guard cannot scan the whole command, so a heavy job could hide past the cap; put the work in a script file",
 }
 
 
@@ -151,6 +153,59 @@ def split_segments(text: str):
 ANSI_C = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
 
 
+_WS = " \t\r\n"
+
+
+def posix_split(text: str):
+    """Linear equivalent of shlex.split(text) (posix, whitespace_split, no comments); same ValueError cases.
+
+    GoodQA #14505: shlex builds a token with `self.token += ch`, which is quadratic in CPython 3.9, so a
+    single 1 MB token hung every hook for 100 s+. This keeps the same quoting rules with list appends."""
+    out, buf, have, i, n = [], [], False, 0, len(text)
+    while i < n:
+        ch = text[i]
+        i += 1
+        if ch in _WS:
+            if have:
+                out.append("".join(buf))
+                buf, have = [], False
+        elif ch == "\\":
+            if i >= n:
+                raise ValueError("No escaped character")
+            buf.append(text[i])
+            i += 1
+            have = True
+        elif ch == "'":
+            end = text.find("'", i)
+            if end < 0:
+                raise ValueError("No closing quotation")
+            buf.append(text[i:end])
+            i, have = end + 1, True
+        elif ch == '"':
+            have = True
+            while True:
+                if i >= n:
+                    raise ValueError("No closing quotation")
+                c = text[i]
+                i += 1
+                if c == '"':
+                    break
+                if c == "\\":
+                    if i >= n:
+                        raise ValueError("No escaped character")
+                    nxt = text[i]
+                    i += 1
+                    buf.append(nxt if nxt in '"\\' else "\\" + nxt)
+                else:
+                    buf.append(c)
+        else:
+            buf.append(ch)
+            have = True
+    if have:
+        out.append("".join(buf))
+    return out
+
+
 def tokenize(segment: str):
     import shlex
     if "$'" in segment:  # bash ANSI-C quoting: $'pytest\t-x' is one word containing a tab
@@ -163,7 +218,7 @@ def tokenize(segment: str):
                 return shlex.quote(match.group(1))
         segment = ANSI_C.sub(decode, segment)
     try:
-        return shlex.split(segment)
+        return posix_split(segment)
     except ValueError:
         return segment.split()
 
@@ -743,11 +798,18 @@ def classify(argv, ctx, depth=0):
 
 def scan_state(command: str, cwd: str):
     """Walk every segment. Returns (hatch_reason_or_None, [(rule, detail, capped, segment)])."""
-    if len(command) > MAX_COMMAND_CHARS:
-        log_event({"event": "truncated-command", "chars": len(command)})  # analysed up to the cap; logged, not silent
     text, heredocs = extract_heredocs(command[:MAX_COMMAND_CHARS])
+    oversize = len(command) > MAX_COMMAND_CHARS or len(text) > MAX_SCAN_CHARS
+    if oversize:
+        log_event({"event": "truncated-command", "chars": len(command)})  # logged, not silent
+        text = text[:MAX_SCAN_CHARS]
     ctx = Ctx(cwd, heredocs)
     hatch, findings = None, []
+    if oversize:
+        # GoodQA #14505 NEG-1: the tail past the cap is never scanned, so fail closed instead of allowing it.
+        # Heredoc bodies do not count toward the scan cap, so a long legitimate heredoc is still fine.
+        findings.append(("oversize", f"command is {len(command)} characters ({len(text)} scanned after heredoc "
+                         f"bodies; the guard scans at most {MAX_SCAN_CHARS})", False, ""))
     for segment in split_segments(text):
         argv = tokenize(segment)
         assigns, rest = split_assignments(argv)

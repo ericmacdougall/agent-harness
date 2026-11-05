@@ -515,6 +515,78 @@ def state(pid):
     return out
 
 
+class PathologicalInput(unittest.TestCase):
+    """GoodQA #14505: shlex is quadratic in CPython 3.9, so a 1 MB token hung every hook for 100 s+.
+
+    Each case builds its string inside a child process with a hard timeout, so a regression fails the test
+    instead of hanging the suite. The strings are only ever passed to decide(); nothing executes them."""
+
+    def timed(self, expression, limit=5):
+        code = ("import sys,time; sys.path.insert(0, %r); import heavy_job_guard as g\n"
+                "cmd = %s\nt = time.time(); r = g.decide(cmd, '/tmp'); "
+                "print(round(time.time() - t, 3), r['action'], r.get('rule'))" % (str(HOOKS), expression))
+        try:
+            done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=limit)
+        except subprocess.TimeoutExpired:
+            self.fail("no decision within %ss for %s" % (limit, expression))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        elapsed, action, rule = done.stdout.split()
+        return float(elapsed), action, rule
+
+    def test_ac1_one_megabyte_token_decides_in_under_a_second(self):
+        for expression in ("'echo ' + 'a' * 1000000", "'echo \"' + 'a' * 1000000 + '\"'",
+                           "\"echo $'\" + 'a' * 1000000 + \"'\"", "'echo ' + 'a\\\\' * 500000"):
+            elapsed, action, rule = self.timed(expression)
+            self.assertLess(elapsed, 1.0, expression)
+            self.assertEqual((action, rule), ("deny", "oversize"), expression)
+
+    def test_ac1_million_character_command_of_many_segments_decides_in_under_a_second(self):
+        elapsed, action, rule = self.timed("'ls; ' * 250000")
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual((action, rule), ("deny", "oversize"))
+
+    def test_ac1_large_token_under_the_cap_is_scanned_linearly_and_allowed(self):
+        elapsed, action, _rule = self.timed("'echo ' + 'a' * 250000")
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(action, "allow")
+
+    def test_neg1_heavy_invocation_past_the_cap_is_not_silently_allowed(self):
+        _e, action, rule = self.timed("'echo ' + 'a' * 300000 + '; pytest'")
+        self.assertEqual((action, rule), ("deny", "oversize"))
+        _e, action, rule = self.timed("'HARNESS_LOCAL_OK=needs-the-mac echo ' + 'a' * 300000 + '; pytest'")
+        self.assertEqual(action, "allow")  # the documented hatch still works, and is logged to the WAL
+
+    def test_neg1_long_heredoc_body_does_not_count_toward_the_cap(self):
+        body = "x" * 400000
+        result = decide("cat > big.txt <<'EOF'\n" + body + "\nEOF\nls")
+        self.assertEqual(result["action"], "allow", result)
+
+    def test_neg2_nested_wrappers_with_long_tokens_stay_bounded(self):
+        elapsed, action, _rule = self.timed("'bash -c ' + repr('sudo ' * 50 + 'x' * 1000000)")
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(action, "deny")
+        elapsed, action, _rule = self.timed("'bash -c ' + repr('env ' * 200 + 'x' * 200000)")
+        self.assertLess(elapsed, 1.0)
+
+    def test_ac2_linear_split_matches_shlex_on_seeded_random_input(self):
+        import random
+        import shlex
+        rng, alphabet, cases = random.Random(14505), "ab '\"\\\t\n\r$#;", 0
+        for _ in range(20000):
+            text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 12)))
+            try:
+                want = shlex.split(text)
+            except ValueError:
+                want = "ValueError"
+            try:
+                got = guard.posix_split(text)
+            except ValueError:
+                got = "ValueError"
+            self.assertEqual(got, want, "seed 14505, input %r" % text)
+            cases += 1
+        self.assertEqual(cases, 20000)
+
+
 class BoundValidation(unittest.TestCase):
     def run_script(self, script, flags):
         with tempfile.TemporaryDirectory() as tmp:
