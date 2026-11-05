@@ -180,5 +180,95 @@ class GateTests(Base):
         self.assertIn("dropowner", out.get("systemMessage", ""))
 
 
+class SubagentStopGate(Base):
+    """I7: a sub-agent cannot end its turn with pending work and no armed waiter (desktop release owner, 2026-11-05)."""
+
+    def sstop(self, agent, active=False, now=NOW):
+        payload = {"session_id": SESSION, "hook_event_name": "SubagentStop", "agent_id": agent, "stop_hook_active": active}
+        return dropped_gate.cmd_subagent_stop(payload, now=now)
+
+    def test_pending_intent_blocks_once_then_marks_dropped_without_grace(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 600), "event": "subagent", "agent_id": "pendingowner", "agent_type": "task-owner"}])
+        jl(w / "agent-pendingowner.jsonl", [{"at": iso(NOW - 30), "event": "intent", "note": "running the dev2 suite"}])
+        first = self.sstop("pendingowner")
+        self.assertEqual(first.get("decision"), "block")
+        self.assertIn("pending work", first["reason"])
+        second = self.sstop("pendingowner", active=True)
+        self.assertNotEqual(second.get("decision"), "block")
+        self.assertIn("DROPPED", second.get("systemMessage", ""))
+        # the stop arrives in main.jsonl; the owner is DROPPED at once, not "finishing" for 30 min
+        jl(w / "main.jsonl", [{"at": iso(NOW), "event": "subagent_stop", "agent_id": "pendingowner", "agent_type": "task-owner"}])
+        by = {r["agent_id"]: r for r in self.owners(now=NOW + 5)["owners"]}
+        self.assertEqual(by["pendingowner"]["state"], "DROPPED")
+        self.assertTrue(by["pendingowner"]["decision_required"])
+
+    def test_handoff_or_named_wait_does_not_block(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 600), "event": "subagent", "agent_id": "doneowner", "agent_type": "task-owner"},
+                              {"at": iso(NOW - 600), "event": "subagent", "agent_id": "waitowner", "agent_type": "task-owner"}])
+        jl(w / "agent-doneowner.jsonl", [{"at": iso(NOW - 30), "event": "handoff", "note": "handed to main: see PR"}])
+        jl(w / "agent-waitowner.jsonl", [{"at": iso(NOW - 30), "event": "blocker", "note": "waiting on wa5b00000001"}])
+        self.assertEqual(self.sstop("doneowner"), {})
+        self.assertEqual(self.sstop("waitowner"), {})
+
+    def test_armed_waiter_does_not_block(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "agent-jobowner.jsonl", [{"at": iso(NOW - 30), "event": "intent", "note": "suite started under ah-run"}])
+        with mock.patch.object(dropped_gate, "armed_waiter", return_value=True):
+            self.assertEqual(self.sstop("jobowner"), {})
+        with mock.patch.object(dropped_gate, "armed_waiter", return_value=False):
+            self.assertEqual(self.sstop("jobowner").get("decision"), "block")
+
+
+class TaskWalOwners(Base):
+    """I8: task-named WALs are owners in the same view, with the same gate."""
+
+    def test_abandoned_task_wal_is_dropped_and_gated(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "fable-review.jsonl", [{"at": iso(NOW - 7 * 3600), "event": "intent", "note": "review GoodQA goodqa#14791"}])
+        jl(w / "finished-task.jsonl", [{"at": iso(NOW - 8 * 3600), "event": "intent", "note": "x"},
+                                       {"at": iso(NOW - 7 * 3600), "event": "status", "note": "WORKDIR_DONE: shipped"},
+                                       {"at": iso(NOW - 7 * 3600), "event": "result", "note": "done"}])
+        jl(w / "quiet-task.jsonl", [{"at": iso(NOW - 90 * 60), "event": "intent", "note": "still mine"}])
+        data = self.owners()
+        by = {r["agent_id"]: r for r in data["owners"]}
+        self.assertEqual(by["fable-review"]["state"], "DROPPED")
+        self.assertEqual(by["fable-review"]["type"], "task-wal")
+        self.assertEqual(by["finished-task"]["state"], "done")
+        self.assertEqual(by["quiet-task"]["state"], "SILENT-HIGH")
+        self.assertEqual(data["undisposed"], ["dropowner", "fable-review"])
+        self.dispose_task("fable-review")
+        self.assertEqual(self.owners()["undisposed"], ["dropowner"])
+
+    def dispose_task(self, name):
+        return ah.write(self.home, "task.dispose", {"agent": name, "session": SESSION, "kind": "closed", "at": iso(NOW),
+                                                    "reason": "review delivered elsewhere", "evidence": "GoodQA goodqa#14791"},
+                        SESSION, "disp-task-" + name)
+
+    def test_scan_wrapper_exit_code_follows_the_gate(self):
+        """The wrapper runs `ah owners --gate` in a subprocess on the real clock, so this fixture uses real time."""
+        import subprocess
+        scan = Path(__file__).resolve().parents[1] / "harness" / "skills" / "check-dropped-workstreams" / "scan.py"
+        real = time.time()
+        sess = "sess-scan-real01"
+        w = self.home / ".claude" / "wals" / sess
+        jl(w / "main.jsonl", [{"at": iso(real - 9000), "event": "subagent", "agent_id": "realdrop", "agent_type": "task-owner"},
+                              {"at": iso(real - 3700), "event": "subagent_stop", "agent_id": "realdrop", "agent_type": "task-owner"}])
+        jl(w / "agent-realdrop.jsonl", [{"at": iso(real - 7200), "event": "intent", "note": "work"}])
+        os.utime(w / "agent-realdrop.jsonl", (real - 7200, real - 7200))
+        env = dict(os.environ, AH_HOME=str(self.home), HOME=str(self.home))
+        p = subprocess.run([sys.executable, "-I", str(scan), "--session", sess], capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        doc = json.loads(p.stdout)
+        self.assertEqual([u["agent"] for u in doc["sessions"][0]["undisposed"]], ["realdrop"])
+        ah.write(self.home, "task.dispose", {"agent": "realdrop", "session": sess, "kind": "closed", "at": iso(real),
+                                             "reason": "superseded in test", "evidence": "GoodQA goodqa#14791"}, sess, "disp-realdrop-01")
+        p = subprocess.run([sys.executable, "-I", str(scan), "--session", sess, "--text"], capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("gate clear", p.stdout)
+        self.assertNotIn("0 dropped", p.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

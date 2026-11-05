@@ -35,6 +35,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
+SKILLS = ("check-dropped-workstreams/SKILL.md", "check-dropped-workstreams/scan.py")  # thin wrappers over ah
 TMPDIR_KEY = "CLAUDE_CODE_TMPDIR"
 INSTALL_STATE = "install-state.json"
 MAX_SOCKET_PATH = 100  # macOS sun_path is 104 bytes; Claude Code puts sockets in <root>/cc-socks/
@@ -181,6 +182,9 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     # owner has no recorded disposition; bounded per problem signature; fails open on its own errors.
     managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3",
                                                        "args": [str(claude / "hooks" / "dropped_gate.py")], "timeout": 15}]})
+    managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "subagent-stop"],
+        "timeout": 15}]})
     # Local-ledger reminder (docs/ledger.md): rate limited and dismissible; fails open, so no onFailure.
     reminder = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "ledger_reminder.py")], "timeout": 3}
     for event in ("SessionStart", "UserPromptSubmit"):
@@ -620,7 +624,7 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         log_backup = log_backup_alert(home, None)
     files = [
         *((ROOT / "harness" / folder / name, claude / folder / name)
-          for folder, names in (("agents", AGENTS), ("hooks", HOOKS), ("tools", TOOLS))
+          for folder, names in (("agents", AGENTS), ("hooks", HOOKS), ("tools", TOOLS), ("skills", SKILLS))
           for name in names),
     ]
     managed = [destination for _, destination in files] + [claude / "CLAUDE.md", claude / "settings.json"]
@@ -635,7 +639,7 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
     pins = DirectoryPins()
     try:
         for directory in (claude.parent, claude, claude / 'agents', claude / 'hooks',
-                          claude / 'tools', backup_root):
+                          claude / 'tools', claude / 'skills', claude / 'skills' / 'check-dropped-workstreams', backup_root):
             pins.capture(directory)
         instructions_path = claude / "CLAUDE.md"
         existing_instructions = read_regular(instructions_path, pinned_parent=pins.fd(claude),
@@ -664,7 +668,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         if originals[instructions_path] != existing_instructions or originals[settings_path] != existing_settings:
             raise OSError('User settings or instructions changed during installation preflight; retry')
         # Exclusive creation rejects a real directory that appears after snapshot.
-        for directory in (claude, claude / 'agents', claude / 'hooks', claude / 'tools', backup_root):
+        for directory in (claude, claude / 'agents', claude / 'hooks', claude / 'tools',
+                          claude / 'skills', claude / 'skills' / 'check-dropped-workstreams', backup_root):
             pins.create(directory)
         os.fchmod(pins.fd(backup_root), 0o700)  # backups can include env values
         pins.verify(backup_root)
@@ -676,8 +681,10 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         for path in managed:
             if originals[path] is not None:
                 saved = backups / path.relative_to(claude)
-                if saved.parent != backups:
-                    pins.create(saved.parent)
+                if saved.parent != backups:  # create each level under the backup root (skills/<name>/ is two deep)
+                    rel = saved.parent.relative_to(backups)
+                    for i in range(1, len(rel.parts) + 1):
+                        pins.create(backups.joinpath(*rel.parts[:i]))
                 atomic_write(saved, originals[path][0], pinned_parent=pins.fd(saved.parent),
                              expected_target=None)
         installed = {}

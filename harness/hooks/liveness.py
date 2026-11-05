@@ -68,9 +68,31 @@ def disposition_live(disp: dict | None, now: float, last_activity: float = 0.0, 
     return (last_activity > at) or (now - at < RESUMED_GRACE_S)
 
 
+TASK_ABANDON_S = 6 * 3600  # a task-named WAL (no process behind it) silent this long without a terminal note is DROPPED
+
+
+def classify_task_wal(now: float, last_at: float, outcome: str | None, last_note: str = "") -> dict:
+    """The one rule for task-named WALs (goodqa#14791 I8): shared by `ah owners`, ops-watch and the dropped scan."""
+    idle = max(0.0, now - last_at) if last_at else float("inf")
+    if outcome in ("result", "done", "delivered"):
+        return {"state": "done", "idle_s": idle, "severity": "info"}
+    if outcome == "handoff":
+        return {"state": "handoff", "idle_s": idle, "severity": "info"}
+    wait = waiting_on(last_note)
+    if wait:
+        return {"state": f"waiting-on-{wait}", "idle_s": idle, "severity": "info"}
+    if idle >= TASK_ABANDON_S:
+        return {"state": "DROPPED", "idle_s": idle, "severity": "high"}
+    if idle >= HIGH_S:
+        return {"state": "SILENT-HIGH", "idle_s": idle, "severity": "high"}
+    if idle >= SILENT_S:
+        return {"state": "SILENT", "idle_s": idle, "severity": "warning"}
+    return {"state": "live" if idle <= LIVE_WAL_S else "quiet", "idle_s": idle, "severity": "info"}
+
+
 def classify(now: float, last_wal: float, transcript_mtime: float, stopped: bool, outcome: str | None,
              last_note: str = "", agent_type: str | None = None, registered: bool = False,
-             owner: bool | None = None) -> dict:
+             owner: bool | None = None, finish_grace: float | None = None) -> dict:
     """Return {"state", "idle_s", "severity"}; `outcome` is the last done/handoff/result kind or None."""
     last = max(last_wal or 0.0, transcript_mtime or 0.0)
     idle = max(0.0, now - last) if last else float("inf")
@@ -87,7 +109,8 @@ def classify(now: float, last_wal: float, transcript_mtime: float, stopped: bool
                 is_owner = owner if owner is not None else (registered or (agent_type or "task-owner") in OWNER_TYPES)
                 state = "returned"
                 if is_owner:
-                    state = "finishing" if idle < FINISH_GRACE_S else "DROPPED"
+                    grace = FINISH_GRACE_S if finish_grace is None else finish_grace
+                    state = "finishing" if idle < grace else "DROPPED"
         return {"state": state, "idle_s": idle, "severity": "high" if state == "DROPPED" else "info"}
     wal_idle = now - last_wal if last_wal else float("inf")
     tr_idle = now - transcript_mtime if transcript_mtime else float("inf")

@@ -90,13 +90,84 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
     return {"decision": "block", "reason": text}
 
 
+PENDING_EVENTS = ("intent", "scope", "status", "check", "risk", "decision", "commit", "blocker")
+
+
+def pending_work(home: Path, session: str, agent: str) -> str | None:
+    """Why the agent's own WAL says its work is unfinished, or None (handoff/result/named wait/empty)."""
+    import ah  # noqa: PLC0415
+    import liveness  # noqa: PLC0415
+    path = home / ".claude" / "wals" / session / f"agent-{agent}.jsonl"
+    if not path.is_file():
+        return None
+    last = None
+    with open(path, "rb") as fh:
+        for raw in fh:
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("event") and not rec.get("by"):
+                last = rec
+    if not last:
+        return None
+    event, note = str(last.get("event")), str(last.get("note") or "")
+    if event in ("handoff", "result") or liveness.waiting_on(note):
+        return None
+    if event in PENDING_EVENTS:
+        return f"last WAL entry is an open {event}"
+    return None
+
+
+def armed_waiter(agent: str) -> bool:
+    """A live ah-run job attributed to the agent counts as an armed waiter (its completion record will notify)."""
+    try:
+        import ah_run  # noqa: PLC0415 - G10 launcher, optional
+        return any(True for _ in ah_run.Ledger().live_rows(agent=agent))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
+    session = str(payload.get("session_id") or "")
+    agent = str(payload.get("agent_id") or "")
+    if not session or not agent or "/" in session or "/" in agent:
+        return {}
+    home = Path(os.environ.get("AH_HOME") or Path.home())
+    try:
+        why = pending_work(home, session, agent)
+    except Exception:  # noqa: BLE001
+        return {}
+    if not why or armed_waiter(agent):
+        return {}
+    state = load_state(session)
+    seen = state.setdefault("subagent_blocks", {})
+    text = (f"Sub-agent {agent} is ending its turn with pending work ({why}) and no armed waiter (goodqa#14791 I7). "
+            f"Before stopping: write a handoff or result WAL entry, or name the wait with `ah task dispose --agent {agent} "
+            f"--kind waiting --ref <ask id or GoodQA ticket> --until <ISO>`, or arm a waiter with `ah job wait`.")
+    if not payload.get("stop_hook_active") and not seen.get(agent):
+        seen[agent] = (now or time.time())
+        save_state(session, state)
+        return {"decision": "block", "reason": text}
+    try:  # second stop: let it end, but the owner is DROPPED now, not after the finishing grace
+        import ah  # noqa: PLC0415
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now or time.time()))
+        ah.write(home, "task.pending", {"agent": agent, "session": session, "at": ts}, session,
+                 f"pending:{session[:16]}:{agent}:{int((now or time.time()) // 600)}")
+    except Exception:  # noqa: BLE001 - the marker is best effort; the message still says what happened
+        pass
+    return {"systemMessage": "dropped-owner gate: " + text + " It is now DROPPED and needs a disposition."}
+
+
 def main(argv=None) -> int:
     try:
         payload = json.load(sys.stdin)
     except ValueError:
         payload = {}
+    mode = (argv or sys.argv[1:] or ["stop"])[0]
     try:
-        out = cmd_stop(payload if isinstance(payload, dict) else {})
+        payload = payload if isinstance(payload, dict) else {}
+        out = cmd_subagent_stop(payload) if mode == "subagent-stop" else cmd_stop(payload)
     except Exception as exc:  # noqa: BLE001 - a gate crash must not block the turn silently
         out = {"systemMessage": f"dropped-owner gate failed open ({type(exc).__name__})"}
     if out:
