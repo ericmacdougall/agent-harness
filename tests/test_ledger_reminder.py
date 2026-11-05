@@ -97,6 +97,10 @@ class States(unittest.TestCase):
             with self.subTest(report=report):
                 self.assertEqual(Env(self, report).hook(), "")
 
+    def test_an_unusable_ledger_is_never_reminded_about(self):
+        env = Env(self, {"state": "none", "ledger": "unusable", "tracked": False}, commits=5)
+        self.assertEqual(env.hook(), "")
+
     def test_none_needs_three_commits_and_an_untracked_repository(self):
         self.assertEqual(Env(self, {"state": "none", "tracked": False}, commits=2).hook(), "")
         env = Env(self, {"state": "none", "tracked": False}, commits=3)

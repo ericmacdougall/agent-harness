@@ -206,7 +206,7 @@ function renderTabs() {
       await loadState();
     }));
     const ledgerIcon = ledgerTracker ? renderLedgerIcon(el, ledgerTracker.get(item.cwd)) : null;
-    if (ledgerIcon) wrapper.append(button, ledgerIcon, close); else wrapper.append(button, close);
+    if (ledgerIcon) { wrapper.classList.add('has-ledger'); wrapper.append(button, ledgerIcon, close); } else wrapper.append(button, close);
     $('#session-tabs').append(wrapper);
   }
 }

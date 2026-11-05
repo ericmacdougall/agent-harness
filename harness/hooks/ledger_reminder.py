@@ -190,6 +190,8 @@ def decide(report: dict, top: str, env, remaining: float, runner=subprocess.run)
         return None
     if state in ("synced", "tracked"):
         return None
+    if report.get("ledger") == "unusable":
+        return None  # e.g. an adopted ledger whose writers still need review: "init a ledger" would mislead
     if state == "none":
         if report.get("tracked") is True:
             return None

@@ -1992,12 +1992,13 @@ h1 {
 .ledger-icon.ledger-diverged { color: var(--danger); border-color: var(--danger) }
 .ledger-icon.ledger-synced, .ledger-icon.ledger-tracked { color: var(--accent); border-color: var(--border) }
 .ledger-icon:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px }
-.ledger-icon:hover::after, .ledger-icon:focus-visible::after {
-  content: attr(aria-label);
-  position: absolute;
-  top: 22px;
-  left: 0;
-  z-index: 20;
+/* In a tab the icon sits in the strip's right padding, left of the close button, never under it. */
+.session-tab-wrap .ledger-icon { position: absolute; right: 32px; top: 50%; margin: 0; transform: translateY(-50%) }
+.session-tab-wrap.has-ledger .session-tab { padding-right: 54px }
+/* The label is one fixed-position element (not clipped by the tab strip's overflow). */
+.ledger-tooltip {
+  position: fixed;
+  z-index: 1000;
   padding: 3px 7px;
   white-space: nowrap;
   font-size: 11px;
@@ -2007,3 +2008,4 @@ h1 {
   border-radius: 6px;
   pointer-events: none
 }
+.ledger-tooltip[hidden] { display: none }

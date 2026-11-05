@@ -29,6 +29,36 @@ export function ledgerState(info) {
   return GLYPH[state] || state === 'none' ? state : 'unknown';
 }
 
+// One shared, fixed-position label element: the tab strip clips overflow, so a label drawn inside it would be cut off.
+function attachTooltip(icon, label) {
+  if (typeof document === 'undefined' || typeof icon.addEventListener !== 'function') return; // no DOM (node tests)
+  const tip = () => {
+    let node = document.getElementById('ledger-tooltip');
+    if (!node) {
+      node = document.createElement('div');
+      node.id = 'ledger-tooltip';
+      node.className = 'ledger-tooltip';
+      node.hidden = true;
+      document.body.append(node);
+    }
+    return node;
+  };
+  const show = () => {
+    const node = tip();
+    node.textContent = label; // text only, never markup
+    const box = icon.getBoundingClientRect();
+    node.hidden = false;
+    node.style.top = `${Math.round(box.bottom + 4)}px`;
+    node.style.left = `${Math.max(4, Math.min(Math.round(box.left), window.innerWidth - node.offsetWidth - 4))}px`;
+  };
+  const hide = () => { tip().hidden = true; };
+  icon.addEventListener('mouseenter', show);
+  icon.addEventListener('focus', show);
+  icon.addEventListener('mouseleave', hide);
+  icon.addEventListener('blur', hide);
+  icon.addEventListener('keydown', event => { if (event.key === 'Escape') hide(); });
+}
+
 // An element for the state, or null when there is nothing to show. `el(tag, className, text)` is the app's
 // element helper.
 export function renderLedgerIcon(el, info) {
@@ -41,6 +71,7 @@ export function renderLedgerIcon(el, info) {
   icon.setAttribute('aria-label', label);
   icon.title = label;
   icon.tabIndex = 0; // reachable by keyboard; the label shows on focus as well as on hover
+  attachTooltip(icon, label);
   return icon;
 }
 
