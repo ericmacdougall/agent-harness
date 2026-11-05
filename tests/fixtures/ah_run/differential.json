@@ -5743,7 +5743,14 @@
 "group": "r7-M2",
 "kind": "hidden",
 "name": "tilde-dotdot-program",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "~/../../../../../../../../bin/%s",
 "unstable": [],
