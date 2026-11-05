@@ -61,12 +61,28 @@ class Budget(unittest.TestCase):
             big.write_bytes(b"x" * (2 * 1024 * 1024))
             bad = Path(tmp, "bad.md")
             bad.write_bytes(b"## Resource budget\n\xff\xfe\n")
+            # A fixture capacity keeps the bad.md case (decoded with replacement, then linted) from sshing to dev2.
+            capacity_file = Path(tmp, "dev2.json")
+            capacity_file.write_text(json.dumps(DEV2))
             for packet_path in (fifo, big, bad):
                 started = time.time()
                 done = subprocess.run([sys.executable, str(HOOKS / "resource_budget.py"), "check", "--host", "dev2", "--packet",
-                                       str(packet_path)], capture_output=True, text=True, timeout=20)
+                                       str(packet_path), "--capacity-json", str(capacity_file)],
+                                      capture_output=True, text=True, timeout=20)
                 self.assertEqual(done.returncode, 2, packet_path.name + done.stdout)
                 self.assertLess(time.time() - started, 10)
+
+    def test_live_dev2_capacity_parses_ssh_output_without_a_real_ssh(self):
+        seen = []
+
+        def fake_run(argv, timeout=15):
+            seen.append(argv)
+            return "134000\n192\n4.00\n943718400\n"
+        with unittest.mock.patch.object(rb, "_run", fake_run):
+            cap = rb.capacity("dev2")
+        self.assertEqual(seen[0][0], "ssh")
+        self.assertEqual((cap["host"], cap["cores"], cap["load1"]), ("dev2", 192, 4.0))
+        self.assertAlmostEqual(cap["mem_available_gb"], 130.86, places=2)
 
     def test_agent_gate_config_fifo_keeps_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:

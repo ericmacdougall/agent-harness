@@ -627,6 +627,141 @@ class LivenessV2Tests(LivenessTests):
         self.assertIn("units:failed", text)
 
 
+# Shapes of real `ah owners` rows. The installed copy with its own OWNER_TYPES raised 99 "owner dropped" for one
+# session where this rule raises 9 (GoodQA goodqa#14740).
+REAL_ROWS = [
+    {"agent_id": "a1", "type": "general-purpose", "owner": False, "state": "returned", "severity": "info", "idle_s": 62361},
+    {"agent_id": "a2", "type": None, "owner": False, "state": "idle-helper", "severity": "info", "idle_s": 62380},
+    {"agent_id": "a3", "type": "general-purpose", "owner": True, "state": "finishing", "severity": "info", "idle_s": 1173},
+    {"agent_id": "a4", "type": "task-owner", "owner": True, "state": "done", "severity": "info", "idle_s": 90000},
+    {"agent_id": "a5", "type": "general-purpose", "owner": True, "state": "DROPPED", "severity": "high", "idle_s": 42619},
+    # not produced today; only the owner check keeps a helper with an alerting state quiet
+    {"agent_id": "a6", "type": "general-purpose", "owner": False, "state": "DROPPED", "severity": "high", "idle_s": 42619},
+]
+
+
+class SharedOwnerRuleTests(Base):
+    def test_only_the_real_drop_alerts(self):
+        class NoTickets:
+            def quiet_h(self, ref):
+                return 0
+        import ah
+        with mock.patch.object(ah, "owners", return_value={"owners": REAL_ROWS}):
+            got = ow._owner_alerts(self.home, "b" * 36, NoTickets(), time.time())
+        self.assertEqual([a["detail"]["agent"] for a in got], ["a5"])
+        self.assertEqual(got[0]["severity"], "high")
+
+
+class SharedRuleClassifyTests(unittest.TestCase):
+    """What the installed copy got wrong: a stopped unnamed helper, and an owner that has only just stopped."""
+
+    def test_stopped_helper_returned_and_new_stop_is_not_a_drop(self):
+        import liveness
+        now = 1_800_000_000.0
+        helper = liveness.classify(now, now - 60, now - 60, True, None, agent_type="general-purpose", owner=False)
+        self.assertEqual((helper["state"], helper["severity"]), ("returned", "info"))
+        just = liveness.classify(now, now - 60, now - 60, True, None, agent_type="general-purpose", owner=True)
+        self.assertEqual((just["state"], just["severity"]), ("finishing", "info"))
+        late = liveness.classify(now, now - liveness.FINISH_GRACE_S - 1, 0, True, None, owner=True)
+        self.assertEqual((late["state"], late["severity"]), ("DROPPED", "high"))
+
+
+class AlertTextRefreshTests(Base):
+    """The drift alert said "4 changed, 1 missing" for 9 h while the real answer moved on (GoodQA goodqa#14740)."""
+
+    KEY = "drift:hooks"
+    T0 = 1_800_000_000.0
+
+    def run_with(self, message, now, severity="warning"):
+        a = {"check": "drift", "key": self.KEY, "severity": severity, "message": message, "detail": {}}
+        cfg = dict(self.cfg)
+        cfg["sinks"] = {"comment": {"mode": "none"}, "deadman": []}
+        ow.run_once(cfg, self.home, runner=FakeRunner(), checks={"drift": lambda *x: [a]}, now=now)
+
+    def rows(self):
+        return [e for e in ow.read_ring(ow.ring_path(self.home)) if e.get("key") == self.KEY]
+
+    def test_changed_words_refresh_the_active_alert(self):
+        self.run_with("differ: process; missing: loss_inventory", self.T0)
+        self.run_with("differ: process, wal; missing: ahd", self.T0 + 600)
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[-1]["message"], "differ: process, wal; missing: ahd")
+        self.assertEqual(rows[-1]["event"], "raise")
+        self.assertTrue(rows[-1]["detail"]["updated"])
+
+    def test_unchanged_text_writes_nothing(self):
+        for i in range(6):
+            self.run_with("installed hooks differ: 4 changed, 1 missing", self.T0 + i * 3600)
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_number_only_changes_refresh_at_most_hourly_and_never_get_lost(self):
+        self.run_with("owner silent 31m", self.T0)
+        for i in range(1, 6):
+            self.run_with(f"owner silent {31 + i * 10}m", self.T0 + i * 600)
+        self.assertEqual(len(self.rows()), 1)
+        # the number stops moving before the hour is up: the ring must still catch up to it
+        self.run_with("owner silent 81m", self.T0 + 3000)
+        self.run_with("owner silent 81m", self.T0 + 3700)
+        self.assertEqual([e["message"] for e in self.rows()], ["owner silent 31m", "owner silent 81m"])
+
+    def test_a_refresh_is_not_a_new_alert_for_digests_or_mail(self):
+        self.run_with("first text", self.T0)
+        before = ow.load_state(self.home).get("pending_comment") or []
+        self.run_with("second text", self.T0 + 600)
+        self.assertEqual(ow.load_state(self.home).get("pending_comment") or [], before)
+
+    def test_a_refresh_sends_no_deadman_mail(self):
+        a = {"check": "drift", "key": self.KEY, "severity": "critical", "message": "first text", "detail": {}}
+        cfg = dict(self.cfg)
+        cfg["sinks"] = {"comment": {"mode": "none"}, "deadman": ["ops@example.invalid"]}
+        ow.run_once(cfg, self.home, runner=FakeRunner(), checks={"drift": lambda *x: [a]}, now=self.T0)
+        first = ow.load_state(self.home)["deadman_sent"][self.KEY]
+        b = dict(a, message="second text")
+        later = self.T0 + 7 * 3600  # past the 6 h limit, so only the refresh rule can keep this quiet
+        ow.run_once(cfg, self.home, runner=FakeRunner(), checks={"drift": lambda *x: [b]}, now=later)
+        self.assertEqual(self.rows()[-1]["message"], "second text")
+        self.assertEqual(ow.load_state(self.home)["deadman_sent"][self.KEY], first)
+
+    def test_a_failed_refresh_is_written_by_a_later_run(self):
+        self.run_with("first words", self.T0)
+        real = ow.emit
+
+        def fail_once(event, path=None, home=None):
+            raise OSError("disk full")
+        with mock.patch.object(ow, "emit", fail_once), contextlib.redirect_stderr(io.StringIO()):
+            self.run_with("second words", self.T0 + 600)
+        self.assertIs(ow.emit, real)
+        self.assertEqual(self.rows()[-1]["message"], "first words")
+        self.run_with("second words", self.T0 + 1200)
+        self.assertEqual(self.rows()[-1]["message"], "second words")
+
+    def test_non_string_ring_message_does_not_break_a_run(self):
+        ow.emit({"host": "testhost", "source": ow.SOURCE, "event": "raise", "severity": "warning", "key": self.KEY,
+                 "message": "text", "check": "drift"}, path=ow.ring_path(self.home))
+        path = ow.ring_path(self.home)
+        raw = path.read_bytes()
+        path.write_bytes(raw.replace(b'"message":"text"', b'"message":77777 '))
+        self.run_with("current text", self.T0)
+        self.assertEqual(self.rows()[-1]["message"], "current text")
+
+    def test_alert_active_before_this_fix_catches_up_on_the_first_run(self):
+        self.run_with("4 changed, 1 missing", self.T0)
+        state = ow.load_state(self.home)  # a state file written by the older code holds the current text, not the ring's
+        state["active"][self.KEY]["message"] = "18 changed, 9 missing"
+        for field in ("written", "refreshed_at"):
+            state["active"][self.KEY].pop(field, None)
+        ow.save_state(self.home, state)
+        self.run_with("18 changed, 9 missing", self.T0 + 7200)
+        self.assertEqual(self.rows()[-1]["message"], "18 changed, 9 missing")
+
+    def test_flapping_text_is_bounded(self):
+        self.run_with("text v0", self.T0)
+        for i in range(1, 11):
+            self.run_with(f"text {'ab'[i % 2]}", self.T0 + i * 60)
+        self.assertLessEqual(len(self.rows()), 3)
+
+
 class ReviewRound2Tests(Base):
     def test_default_sinks_critical_does_not_wedge(self):  # N1
         a = {"check": "disk", "key": "disk:volume:/", "severity": "critical", "message": "98%", "detail": {}}
