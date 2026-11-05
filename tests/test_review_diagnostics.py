@@ -1006,5 +1006,52 @@ class PrReviewRound1Tests(unittest.TestCase):
         self.assertEqual(self.module.normalize_provider('codex', 1, '', final, '', 'pr')['reason'], 'QUOTA')
 
 
+class MergeCompositionTests(unittest.TestCase):
+    """After merging main (#51 domain gates): domain guidance and reviewer discovery/fallback both survive."""
+
+    invoke = tpr.PeerReviewTests.invoke
+    fake = tpr.PeerReviewTests.fake
+    evidence = staticmethod(tpr.PeerReviewTests.evidence)
+    policy = EndToEndTests.policy
+    move = EndToEndTests.move
+    finals = EndToEndTests.finals
+    commit_file = EndToEndTests.commit_file
+    GUIDANCE = 'Harness-generated domain guidance'
+
+    def setUp(self):
+        tpr.PeerReviewTests.setUp(self)
+        self.base = subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], text=True).strip()
+        self.commit_file('src/A.sol', 'contract A {}\n', mode=0o644)  # an EVM signal in the reviewed diff
+
+    def test_domain_guidance_reaches_codex_found_at_policy_location(self):
+        codex = self.move('codex', self.root / 'installs')
+        capture, launches = self.root / 'codex.prompt', self.root / 'launches.log'
+        result = self.invoke(env={**self.policy(codex=[str(codex)]), 'CAPTURE_CODEX_PROMPT': str(capture),
+                                  'PATH': str(self.bin) + os.pathsep + tpr.system_path(),
+                                  'PROVIDER_LAUNCH_LOG': str(launches)},
+                             extra=('--snapshot-base', self.base))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(launches.read_text().split(), ['codex'])
+        self.assertEqual(capture.read_text().count(self.GUIDANCE), 1)
+        self.assertEqual(self.finals()[-1]['usage']['executables']['codex']['source'], 'policy')
+
+    def test_domain_guidance_reaches_the_quota_fallback_exactly_once(self):
+        message = "You've hit your usage limit. Try again later."
+        events = '\n'.join(json.dumps(r) for r in (
+            {'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'},
+            {'type': 'error', 'message': message}, {'type': 'turn.failed', 'error': {'message': message}}))
+        codex_prompt, claude_prompt = self.root / 'codex.prompt', self.root / 'claude.prompt'
+        launches = self.root / 'launches.log'
+        result = self.invoke(env={'CODEX_EVENTS': events, 'CODEX_EXIT': '1', 'PROVIDER_LAUNCH_LOG': str(launches),
+                                  'CAPTURE_CODEX_PROMPT': str(codex_prompt),
+                                  'CAPTURE_CLAUDE_PROMPT': str(claude_prompt)},
+                             extra=('--snapshot-base', self.base))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(launches.read_text().split(), ['codex', 'claude'])
+        self.assertEqual(codex_prompt.read_text().count(self.GUIDANCE), 1)
+        self.assertEqual(claude_prompt.read_text().count(self.GUIDANCE), 1)
+        self.assertIn('QUOTA', self.output.read_text())
+
+
 if __name__ == '__main__':
     unittest.main()

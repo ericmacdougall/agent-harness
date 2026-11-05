@@ -1,0 +1,5 @@
+{
+  "max_agents": 20,
+  "warn_agents": 12,
+  "max_heavy_mac": 2
+}
