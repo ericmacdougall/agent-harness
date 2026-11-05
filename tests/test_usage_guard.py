@@ -646,6 +646,54 @@ class OwnerLiveness(StoreFixture):
         with self.future(): self.assertTrue(self.store.auto_reconcile(run.run_id)['reconciled'])
         with self.assertRaises(guard.GuardError): run.note_child(2 ** 40)
 
+    def test_child_with_live_group_members_is_not_dead(self):
+        supervisor = self.child()
+        # A child that forks a grandchild: the leader dies, the grandchild stays in the leader's group.
+        program = ('import subprocess, sys, time\n'
+                   'subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])\n'
+                   'time.sleep(30)\n')
+        leader = subprocess.Popen([sys.executable, '-c', program], start_new_session=True)
+        def cleanup():
+            try: os.killpg(leader.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+        self.addCleanup(cleanup)
+        run = self.begin_owned(self.facts_for(supervisor))
+        run.note_child(leader)
+        supervisor.kill(); supervisor.wait(timeout=5)
+        time.sleep(.5)
+        leader.kill(); leader.wait(timeout=5)
+        self.assertIs(guard.pid_exists(leader.pid), False); self.assertIs(guard.group_empty(leader.pid), False)
+        with self.future(): report = self.store.auto_reconcile(run.run_id)
+        self.assertFalse(report['reconciled']); self.assertIn('process group still has members', report['liveness']['why'])
+        os.killpg(leader.pid, signal.SIGKILL)
+        for _ in range(100):
+            if guard.group_empty(leader.pid): break
+            time.sleep(.05)
+        with self.future(): self.assertTrue(self.store.auto_reconcile(run.run_id)['reconciled'])
+
+    def test_failed_child_record_kills_the_child(self):
+        import process as process_module
+        run = self.begin()
+        seen = {}
+        def failing(child):
+            seen['pid'] = child.pid
+            raise guard.GuardError('TRANSIENT_INFRA', 'Metadata lock is busy; no command was launched')
+        with self.assertRaises(guard.GuardError):
+            process_module.run([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=5, on_spawn=failing)
+        for _ in range(100):
+            if guard.pid_exists(seen['pid']) is False: break
+            time.sleep(.05)
+        self.assertIs(guard.pid_exists(seen['pid']), False)
+        self.assertFalse((self.store.root / 'runs' / run.run_id / 'children.json').exists())
+
+    def test_malformed_owner_facts_never_crash_a_sweep(self):
+        alive = self.child()
+        for label, facts in {'pid-overflow': self.facts_for(alive, pid=2 ** 40), 'host-oversize': self.facts_for(alive, host='h' * 10000),
+                             'boot-odd': self.facts_for(alive, boot_id=['x'])}.items():
+            self.begin_owned(facts, label=label)
+        with self.future(): reports = self.store.sweep()
+        self.assertEqual(len(reports), 3); self.assertFalse(any(r['reconciled'] for r in reports))
+
     def test_finish_after_reconciliation_discards_the_late_result(self):
         child = self.child()
         run = self.begin_owned(self.facts_for(child))

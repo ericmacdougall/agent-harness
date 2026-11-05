@@ -190,9 +190,10 @@ def boot_identity():
     except OSError:
         pass
     try:
-        probe = subprocess.run(['sysctl', '-n', 'kern.boottime'], capture_output=True, text=True, timeout=5)
+        # kern.boottime moves when the wall clock is stepped; the boot session UUID does not.
+        probe = subprocess.run(['sysctl', '-n', 'kern.bootsessionuuid'], capture_output=True, text=True, timeout=5)
         if probe.returncode == 0 and probe.stdout.strip():
-            return ' '.join(probe.stdout.split())[:128]
+            return probe.stdout.strip()[:64]
     except (OSError, subprocess.SubprocessError, ValueError):
         pass
     return None
@@ -217,7 +218,21 @@ def process_start_token(pid):
     return None
 
 
-def incarnation_state(pid, recorded_token, recorded_boot, current_boot):
+def group_empty(pid):
+    """True when no process remains in the group led by pid (children start as session leaders)."""
+    if not valid_pid(pid): return None
+    try:
+        os.killpg(pid, 0)
+        return False
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def incarnation_state(pid, recorded_token, recorded_boot, current_boot, *, whole_group=False):
     """DEAD, ALIVE or UNCERTAIN for one recorded (pid, start token) on this host."""
     if isinstance(recorded_boot, str) and isinstance(current_boot, str) and recorded_boot != current_boot:
         return 'DEAD', 'host rebooted since the reservation'
@@ -227,6 +242,10 @@ def incarnation_state(pid, recorded_token, recorded_boot, current_boot):
     if exists is None:
         return 'UNCERTAIN', 'pid probe failed'
     if not exists:
+        if whole_group:
+            empty = group_empty(pid)
+            if empty is None: return 'UNCERTAIN', 'process group probe failed'
+            if not empty: return 'UNCERTAIN', 'pid gone but its process group still has members'
         return 'DEAD', 'pid gone'
     current = process_start_token(pid)
     if not isinstance(recorded_token, str) or current is None:
@@ -280,7 +299,7 @@ def owner_liveness(start, children=()):
             facts.update(state='UNCERTAIN', why='child record malformed')
             return facts
         child_state, child_why = incarnation_state(child['pid'], child.get('process_started'),
-                                                   owner.get('boot_id'), current_boot)
+                                                   owner.get('boot_id'), current_boot, whole_group=True)
         if child_state != 'DEAD':
             facts.update(state='UNCERTAIN', why='child pid %d %s: %s' % (child['pid'], child_state.lower(), child_why))
             return facts

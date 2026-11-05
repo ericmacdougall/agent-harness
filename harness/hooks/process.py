@@ -93,7 +93,20 @@ def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True,
                                start_new_session=True, **decoding)
     if on_spawn is not None:
         # Lets a supervisor record the child it is responsible for (usage guard liveness).
-        on_spawn(process)
+        # If recording fails the child must not outlive the record: kill its group and re-raise.
+        try:
+            on_spawn(process)
+        except BaseException:
+            try:
+                signal_group(process.pid, signal.SIGKILL)
+                process.wait(timeout=TERMINATION_GRACE_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    try: stream.close()
+                    except OSError: pass
+            raise
     if discard_output:
         deadline = None if timeout is None else time.monotonic() + timeout
         try:
