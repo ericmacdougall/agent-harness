@@ -130,6 +130,30 @@ class InstallerTests(unittest.TestCase):
                         found.append((event, group.get("matcher"), hook["args"][1]))
         return sorted(found, key=str)
 
+    def test_ledger_reminder_hook_is_registered_failopen_once_and_preserves_foreign_hooks(self):
+        foreign = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "other-start"}]}]}}
+        (self.claude / "settings.json").write_text(json.dumps(foreign))
+        install(self.home, apply=True)
+        install(self.home, apply=True)
+
+        def entries():
+            hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+            return {event: [h for g in hooks.get(event, []) for h in g["hooks"]
+                            if (h.get("args") or [""])[0].endswith("ledger_reminder.py")]
+                    for event in ("SessionStart", "UserPromptSubmit")}
+
+        found = entries()
+        for event, hooks in found.items():
+            self.assertEqual(len(hooks), 1, event)  # registered once, not duplicated by a reinstall
+            self.assertNotIn("onFailure", hooks[0])
+            self.assertLessEqual(hooks[0]["timeout"], 3)
+        start = json.loads((self.claude / "settings.json").read_text())["hooks"]["SessionStart"]
+        self.assertTrue(any(h.get("command") == "other-start" for g in start for h in g["hooks"]))
+        before = (self.claude / "settings.json").read_bytes()
+        install(self.home, apply=True)
+        self.assertEqual((self.claude / "settings.json").read_bytes(), before)  # a further run changes nothing
+        self.assertTrue((self.claude / "hooks" / "ledger_reminder.py").exists())
+
     def test_provenance_gates_are_registered_once_and_survive_reinstall(self):
         foreign = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other-stop"}]}]}}
         (self.claude / "settings.json").write_text(json.dumps(foreign))
