@@ -863,7 +863,7 @@
    "why": "%job-spec joined to a zsh word-splitting expansion"
   },
   {
-   "cmd": "kill %\u00e9",
+   "cmd": "kill %é",
    "expect": "block",
    "id": "F6-21",
    "shape": "F6",
@@ -1638,6 +1638,251 @@
    "id": "R2-OK-06",
    "shape": "R2",
    "why": "a variable and a parenthesis, no kill anywhere"
+  },
+  {
+   "cmd": "gkill 4001(N) 4004",
+   "expect": "block",
+   "id": "R3-00",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "gkill -0 4001(N) 4004",
+   "expect": "block",
+   "id": "R3-01",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "sudo gkill 4001(N) 4004",
+   "expect": "block",
+   "id": "R3-02",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "gkill 4001 (4004)",
+   "expect": "block",
+   "id": "R3-03",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=kill; echo $($K 4001(N) 4004)",
+   "expect": "block",
+   "id": "R3-04",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=kill; echo $($K -0 4001(N) 4004)",
+   "expect": "block",
+   "id": "R3-05",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=kill; echo `$K 4001(N) 4004`",
+   "expect": "block",
+   "id": "R3-06",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=kill; eval '$K 4001(N) 4004'",
+   "expect": "block",
+   "id": "R3-07",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=kill; eval '$K -0 4001(N) 4004'",
+   "expect": "block",
+   "id": "R3-08",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=ki; L=ll; $K$L 4001(N) 4004",
+   "expect": "block",
+   "id": "R3-09",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=ki; L=ll; $K$L -0 4001(N) 4004",
+   "expect": "block",
+   "id": "R3-10",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=kil; ${K}l 4001(N) 4004",
+   "expect": "block",
+   "id": "R3-11",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=kil; ${K}l -0 4001(N) 4004",
+   "expect": "block",
+   "id": "R3-12",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=kill; $K -0 4001(N) 4004",
+   "expect": "block",
+   "id": "R3-13",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=gkill; $K 4001(N) 4004",
+   "expect": "block",
+   "id": "R3-14",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=kill; sudo $K 4001(N) 4004",
+   "expect": "block",
+   "id": "R3-15",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=kill; env $K 4001(N) 4004",
+   "expect": "block",
+   "id": "R3-16",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=kil; (${K}l 4001(N) 4004)",
+   "expect": "block",
+   "id": "R3-17",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "x=$(echo kill); $x 4001(N) 4004",
+   "expect": "block",
+   "id": "R3-18",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "kill() { :; }",
+   "expect": "allow",
+   "id": "R3OK-00",
+   "shape": "R3OK",
+   "why": "a parenthesis elsewhere in the input, or a definition, is not a kill word before a parenthesis"
+  },
+  {
+   "cmd": "function kill() { :; }",
+   "expect": "allow",
+   "id": "R3OK-01",
+   "shape": "R3OK",
+   "why": "a parenthesis elsewhere in the input, or a definition, is not a kill word before a parenthesis"
+  },
+  {
+   "cmd": "kill() { kill 4001; }",
+   "expect": "allow",
+   "id": "R3OK-02",
+   "shape": "R3OK",
+   "why": "a parenthesis elsewhere in the input, or a definition, is not a kill word before a parenthesis"
+  },
+  {
+   "cmd": "K=kill; $K 4001",
+   "expect": "allow",
+   "id": "R3OK-03",
+   "shape": "R3OK",
+   "why": "a parenthesis elsewhere in the input, or a definition, is not a kill word before a parenthesis"
+  },
+  {
+   "cmd": "K=kil; ${K}l -0 4004",
+   "expect": "allow",
+   "id": "R3OK-04",
+   "shape": "R3OK",
+   "why": "a parenthesis elsewhere in the input, or a definition, is not a kill word before a parenthesis"
+  },
+  {
+   "cmd": "gkill 4001",
+   "expect": "allow",
+   "id": "R3OK-05",
+   "shape": "R3OK",
+   "why": "a parenthesis elsewhere in the input, or a definition, is not a kill word before a parenthesis"
+  },
+  {
+   "cmd": "[[ \"$s\" =~ ^(a|b)$ ]] && kill 4001",
+   "expect": "allow",
+   "id": "R3OK-06",
+   "shape": "R3OK",
+   "why": "a parenthesis elsewhere in the input, or a definition, is not a kill word before a parenthesis"
+  },
+  {
+   "cmd": "case \"$x\" in (a) kill 4001;; esac",
+   "expect": "allow",
+   "id": "R3OK-07",
+   "shape": "R3OK",
+   "why": "a parenthesis elsewhere in the input, or a definition, is not a kill word before a parenthesis"
+  },
+  {
+   "cmd": "case $x in (a) kill -0 4004;; esac",
+   "expect": "allow",
+   "id": "R3OK-08",
+   "shape": "R3OK",
+   "why": "a parenthesis elsewhere in the input, or a definition, is not a kill word before a parenthesis"
+  },
+  {
+   "cmd": "arr=($y); kill 4001",
+   "expect": "allow",
+   "id": "R3OK-09",
+   "shape": "R3OK",
+   "why": "a parenthesis elsewhere in the input, or a definition, is not a kill word before a parenthesis"
+  },
+  {
+   "cmd": "(sleep 1); kill 4001",
+   "expect": "allow",
+   "id": "R3OK-10",
+   "shape": "R3OK",
+   "why": "a parenthesis elsewhere in the input, or a definition, is not a kill word before a parenthesis"
+  },
+  {
+   "cmd": "f() { kill 4001; }; f",
+   "expect": "allow",
+   "id": "R3OK-11",
+   "shape": "R3OK",
+   "why": "a parenthesis elsewhere in the input, or a definition, is not a kill word before a parenthesis"
+  },
+  {
+   "cmd": "K=kil; A=4001; ${K}l $A(N) 4004",
+   "expect": "block",
+   "id": "R3-19",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=ki; L=ll; A=4001; $K$L -0 $A(N) 4004",
+   "expect": "block",
+   "id": "R3-20",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=kil; ${K}l(N) 4004",
+   "expect": "block",
+   "id": "R3-21",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "read x <<< kill; $x 4001(N) 4004",
+   "expect": "block",
+   "id": "R3-22",
+   "shape": "R3",
+   "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
   }
  ]
 }

@@ -454,7 +454,7 @@ Once the shared command parser has handed the guard a `kill` command, the guard 
 - target: a literal integer, a job spec `%N`, `%%`, `%+`, `%-` or `%name` matching `[A-Za-z_][A-Za-z0-9_.-]*`, unquoted or wholly inside one pair of quotes;
 - `kill -0` only: one target that is exactly `"$NAME"` or `"${NAME}"`.
 
-Everything else fails closed, whatever it would expand to: `$!`, `PID=4001; kill $PID`, `{4001,4016}`, `\\4001`, `$'4001'`, `$x""`, `%a$=x`, `%?str`, and a parenthesis after a kill word (`kill 4001(N) 4004`, where zsh drops the first word). After a background job use `kill %1`, or start it with `kill_guard.py spawn` and use the printed PID.
+Everything else fails closed, whatever it would expand to: `$!`, `PID=4001; kill $PID`, `{4001,4016}`, `\\4001`, `$'4001'`, `$x""`, `%a$=x`, `%?str`, and a parenthesis after a kill word (`kill 4001(N) 4004`, where zsh drops the first word). The parenthesis rule follows the command the analyser resolves, so `gkill`, `K=kil; ${K}l`, `$(...)` and `eval` forms count. A parenthesis in another command does not (`[[ "$s" =~ ^(a|b)$ ]] && kill 4001`, `case "$x" in (a) kill 4001;; esac`), and neither does the definition `kill() { ...; }`. A command whose name holds an expansion is also refused at a parenthesis when the input mentions kill anywhere, because its value may never be visible. After a background job use `kill %1`, or start it with `kill_guard.py spawn` and use the printed PID.
 
 ### Starting processes you will need to stop
 
@@ -490,6 +490,8 @@ The registered command is `kill_guard.py hook`, a launcher that runs the analysi
 | 12 | local stdin shells | `source /dev/stdin <<< 'kill ...'` |
 | 13 | a literal PID rewritten at parse time | `alias -g 4001=4004; eval "kill -9 4001"` |
 | 14 | wrappers and remote tools the guard does not list | `xcrun kill`, `tailscale ssh`, `pdsh`, `ansible -a`, `fd -x` |
+| 15 | an alias of the kill verb, because `_alias()` in `command_guard.py` does nothing | `alias K=kill` then `K -9 4004` on the next line |
+| 16 | interpreter code in a heredoc given to a remote command; the body is read as shell, not as interpreter code (a local `python3 - <<PY` is blocked) | `ssh dev2 python3 - <<'PY'` with `os.kill(4004, 9)` in the body |
 
 The guard therefore does not close the incident class. It closes the kill words it is shown.
 

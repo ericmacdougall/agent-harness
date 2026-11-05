@@ -110,7 +110,7 @@ def judge_rows(rows, decide_fn):
 
 class GrammarCorpus(WorldCase):
     """The closed kill grammar: every shape that ever got past the guard, plus what must keep working."""
-    SHAPES = {'cc473a3', 'ce11b1e', '1949bbc', 'a9432ef', '4a6982f', 'a03f8ac', 'F6', 'F7', 'F8', 'F9', 'R2', 'PKILL', 'OK'}
+    SHAPES = {'cc473a3', 'ce11b1e', '1949bbc', 'a9432ef', '4a6982f', 'a03f8ac', 'F6', 'F7', 'F8', 'F9', 'R2', 'R3', 'R3OK', 'PKILL', 'OK'}
 
     @classmethod
     def setUpClass(cls):
@@ -489,6 +489,7 @@ class Policy(unittest.TestCase):
                     'ssh': ['self', 'args', 'depth'],
                     'container': ['self', 'name', 'args', 'words', 'depth', 'pl', 'idx'],
                     'check_tokens': ['self', 'tokens'],
+                    'resolve': ['self', 'word'],
                     'bind_loop_var': ['self', 'words']}
         self.assertEqual(sorted(expected), sorted(kg.OVERRIDDEN))
         for name, params in expected.items():

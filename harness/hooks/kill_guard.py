@@ -68,7 +68,7 @@ STOP_COMMANDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'echo', 'printf', 'cat', 
                  'cp', 'mv', 'rm', 'mkdir', 'touch', 'chmod', 'chown', 'make', 'cargo', 'go', 'docker', 'kubectl',
                  'python', 'python3', 'node', 'ruby', 'perl', 'sleep', 'true', 'false', 'test', 'wc', 'sort', 'uniq',
                  'tee', 'diff', 'find', 'curl', 'wget', 'pytest', 'ssh', 'scp', 'rsync', 'tar', 'zip', 'unzip', 'date'}
-OVERRIDDEN = ('apply', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'bind_loop_var')
+OVERRIDDEN = ('apply', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve', 'bind_loop_var')
 
 DEFAULT_POLICY = {
     'mode': 'enforce',
@@ -92,6 +92,7 @@ INTEGER = re.compile(r'0|[1-9][0-9]{0,9}')
 JOB_SPEC = re.compile(r'%(?:[0-9]{1,10}|[%+-]|[A-Za-z_][A-Za-z0-9_.-]*)')
 SIGNAL_OPTION = re.compile(r'-(?:[Ss][Ii][Gg])?([A-Za-z0-9+]{1,32})')
 SIGNAL_VALUE = re.compile(r'[A-Za-z0-9+]{1,32}')
+PAREN_REASON = 'a kill word is followed by a parenthesis, which zsh reads as a glob qualifier that can drop the word or run code'
 QUOTED_VARIABLE = re.compile(r'"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})"')
 FUNCTION_KW = re.compile(r'\bfunction\s+([A-Za-z_][\w.:-]*)\s*(?:\(\s*\))?\s*\{')
 COPROC_KW = re.compile(r'\bcoproc\s+(?:[A-Za-z_]\w*\s*)?\{')
@@ -518,6 +519,7 @@ def make_analyzer_class(cg):
             self.kf = []          # (rule, reason, pids)
             self.remote = 0
             self.xargs = 0
+            self.before_paren = {}  # id -> word, holding the word so its id stays unique
             self.broad = set(policy['broad_verbs'])
             self.windows = set(policy['windows_verbs'])
             self.script_kill = re.compile(policy['script_kill_pattern']) if policy['script_kill_pattern'] else None
@@ -544,21 +546,35 @@ def make_analyzer_class(cg):
         def check_tokens(self, tokens):
             # parse() ends a command at `(`, so the words after it never reach check_kill. `kill 4001(N) 4004` is a syntax
             # error in bash, but in zsh (N) is a glob qualifier: the word vanishes and 4004 is signalled, and (e:...:) runs
-            # code. Only `kill() {` (the name alone, then an empty pair) defines a function.
+            # code. Tokens come before variables are bound, so tag every word in front of a `(` and let inspect() refuse
+            # once the analyser knows the command really is a kill. Only `name()` defines a function.
             words = []
-            held = []  # words of this command that hold an expansion: a variable may carry the verb (K=kill; $K 4001(N) 4004)
-            kill_mentioned = any('kill' in (value.text or '').lower() for kind, value in tokens if kind == 'w')
             for k, (kind, value) in enumerate(tokens):
                 if kind == 'w':
-                    words.append(cg.norm_name(value.text))
-                    held.append(bool(value.dynamic or value.subs or '$' in (value.raw or value.text) or '`' in (value.raw or '')))
+                    words.append(value)
                 elif kind == 'op':
-                    if value == '(' and ('kill' in words or (kill_mentioned and any(held))):
-                        defines = len(words) == 1 and tokens[k + 1:k + 2] == [('op', ')')]
-                        if not defines:
-                            self.block('unprovable-target', 'a kill word is followed by a parenthesis, which zsh reads '
-                                       'as a glob qualifier that can drop the word or run code')
-                    words, held = [], []
+                    if value == '(' and words and not (len(words) == 1 and tokens[k + 1:k + 2] == [('op', ')')]):
+                        for w in words:
+                            self.before_paren[id(w)] = w
+                        self.refuse_paren_early(words)
+                    words = []
+
+        def refuse_paren_early(self, words):
+            # Extra layer for a head the analyser may never resolve (x=$(echo kill); $x 4001(N) 4004). Only the head counts:
+            # any expansion in the command would also refuse [[ "$s" =~ ^(a|b)$ ]] && kill 4001.
+            names = [cg.norm_name(w.text) for w in words]
+            head = (self._skip_assigns(cg.strip_reserved(words))[1] or [None])[0]
+            hidden = head is not None and not self.ctx.ps and bool(
+                head.dynamic or head.subs or '$' in (head.raw or head.text) or '`' in (head.raw or ''))
+            if 'kill' in names or (hidden and KILLISH.search(norm_raw(self.raw))):
+                self.block('unprovable-target', PAREN_REASON)
+
+        def resolve(self, word):
+            # resolve() builds a new Word for any word holding a variable, so the tag has to follow it.
+            out = super().resolve(word)
+            if out is not word and word is not None and id(word) in self.before_paren:
+                self.before_paren[id(out)] = out
+            return out
 
         def bind_loop_var(self, words):
             # `for p in A B; do kill $p`: the base binds only one item; make the variable unresolvable instead so
@@ -728,6 +744,8 @@ def make_analyzer_class(cg):
             elif name == 'kill':
                 if self.ctx.ps:
                     self.block('windows-kill', 'PowerShell kill is Stop-Process and cannot be checked for ownership')
+                elif any(id(w) in self.before_paren for w in words):
+                    self.block('unprovable-target', PAREN_REASON)
                 else:
                     self.check_kill(args, pl, idx)
             elif name == 'fuser':
