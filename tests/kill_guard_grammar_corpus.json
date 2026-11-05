@@ -1,5 +1,5 @@
 {
- "_doc": "Data only (rule S1): judged by decide() in the fake world of kill_guard_corpus.json, never executed or fed to a shell. shape names the BLOCK that found it: a commit hash for the six earlier fixes, with only rows that fix's parent let through, F6-F9 for the closed grammar, R2-R5 for later reviews, PKILL for goodqa#14617, OK for commands that must keep working.",
+ "_doc": "Data only (rule S1): judged by decide() in the fake world of kill_guard_corpus.json, never executed or fed to a shell. shape names the BLOCK that found it: a commit hash for the six earlier fixes, with only rows that fix's parent let through, F6-F9 for the closed grammar, R2-R5 for later reviews, PKILL for goodqa#14617, OK for commands that must keep working. RR, TC, AH and RROK cover tag loss on re-parse, text-carried kills and array heads (goodqa#14691, goodqa#14683).",
  "rows": [
   {
    "cmd": "kill -9 -0 4004",
@@ -2597,6 +2597,1602 @@
    "id": "R4OK-33",
    "shape": "R4OK",
    "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "K=kill; eval $K 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-001",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=kill; env -S $K 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-002",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=kil; eval ${K}l 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-003",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=kil; env -S ${K}l 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-004",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=ki; L=ll; eval $K$L 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-005",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=gkill; env -S $K 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-006",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=kill; watch $K 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-007",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=\"kill 4001\"; eval $K 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-008",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=kil; eval \"${K}l 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-009",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=kill; read x; eval $x 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-010",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "read x; eval $x 4001(N) 4004; kill 4001",
+   "expect": "block",
+   "id": "RR-011",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "A=ki; B=ll; R=\"$A$B -9\"; $R 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-012",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=kill; timeout 5 env -S $K 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-013",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=kill; command eval $K 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-014",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=kill; (eval $K 4001(N) 4004)",
+   "expect": "block",
+   "id": "RR-015",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=kill; echo $(eval $K 4001(N) 4004)",
+   "expect": "block",
+   "id": "RR-016",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "K=kill; if eval $K 4001(N) 4004; then :; fi",
+   "expect": "block",
+   "id": "RR-017",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "eval \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "TC-001",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "eval 'kill 4001' 4001(N) 4004",
+   "expect": "block",
+   "id": "TC-002",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "eval \"kill -9 4001\" x(N) 4004",
+   "expect": "block",
+   "id": "TC-003",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "eval \"gkill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "TC-004",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "eval kill\\ 4001 4001(N) 4004",
+   "expect": "block",
+   "id": "TC-005",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "builtin eval \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "TC-006",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "time eval \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "TC-007",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "if eval \"kill 4001\" 4001(N) 4004; then :; fi",
+   "expect": "block",
+   "id": "TC-008",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "eval eval \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "TC-009",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "env -S \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "TC-010",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "env -S \"gkill 4001\" x(N) 4004",
+   "expect": "block",
+   "id": "TC-011",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "timeout 5 env -S \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "TC-012",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4001\" 4001(N) 4004 | sh",
+   "expect": "block",
+   "id": "TC-013",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4001\" x(N) 4004 | bash",
+   "expect": "block",
+   "id": "TC-014",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"gkill 4001\" 4001(N) 4004 | sh",
+   "expect": "block",
+   "id": "TC-015",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4001\" 4001(N) 4004 | sudo sh",
+   "expect": "block",
+   "id": "TC-016",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "print -r -- \"kill 4001\" x(N) 4004 | zsh",
+   "expect": "block",
+   "id": "TC-017",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "print -r -- \"kill 4001\" 4001(N) 4004 | bash",
+   "expect": "block",
+   "id": "TC-018",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "printf \"%s \" \"kill 4001\" x(N) 4004 | bash",
+   "expect": "block",
+   "id": "TC-019",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "printf '%s\\n' \"kill 4001\" 4001(N) 4004 | sh",
+   "expect": "block",
+   "id": "TC-020",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "printf '%s ' \"kill 4001\" 4001(N) 4004 | zsh",
+   "expect": "block",
+   "id": "TC-021",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "sh -c \"$(print -r -- \"kill 4001\" x(N) 4004)\"",
+   "expect": "block",
+   "id": "TC-022",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "sh -c 'kill 4001 $0' 4001(N) 4004",
+   "expect": "block",
+   "id": "TC-023",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "printf 'kill %s\\n' 4001 4004 | sh",
+   "expect": "block",
+   "id": "TC-024",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "printf 'kill %s\\n' 4001 4004 | zsh",
+   "expect": "block",
+   "id": "TC-025",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4001\" | tee /dev/null | sh",
+   "expect": "block",
+   "id": "TC-026",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo kill 4001 | cat | bash",
+   "expect": "block",
+   "id": "TC-027",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "K=kill; echo \"$K 4004\" | sh",
+   "expect": "block",
+   "id": "TC-028",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "K=ki; L=ll; echo \"$K$L 4004\" | sh",
+   "expect": "block",
+   "id": "TC-029",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "read x; echo \"$x\" | sh; kill 4001",
+   "expect": "block",
+   "id": "TC-030",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | sudo sh",
+   "expect": "block",
+   "id": "TC-031",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | env sh",
+   "expect": "block",
+   "id": "TC-032",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | timeout 5 bash -s",
+   "expect": "block",
+   "id": "TC-033",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | /bin/sh",
+   "expect": "block",
+   "id": "TC-034",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | xargs -I{} sh -c {}",
+   "expect": "block",
+   "id": "TC-035",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | parallel",
+   "expect": "block",
+   "id": "TC-036",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"pkill -f x\" | sh",
+   "expect": "block",
+   "id": "TC-037",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "ps aux | awk '{print \"kill \" $2}' | sh",
+   "expect": "block",
+   "id": "TC-038",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "pgrep foo | sed 's/^/kill /' | sh",
+   "expect": "block",
+   "id": "TC-039",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "cat <<EOF | sh\nkill 4004\nEOF",
+   "expect": "block",
+   "id": "TC-040",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "cat <<'EOF' | bash\nkill 4004\nEOF",
+   "expect": "block",
+   "id": "TC-041",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "K=kill\ncat <<EOF | sh\n$K 4004\nEOF",
+   "expect": "block",
+   "id": "TC-042",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "cat <<< \"kill 4004\" | sh",
+   "expect": "block",
+   "id": "TC-043",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "for p in 4001 4004; do echo \"kill $p\"; done | sh",
+   "expect": "block",
+   "id": "TC-044",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "for p in 4001 4004; do echo \"kill $p\"; done | zsh",
+   "expect": "block",
+   "id": "TC-045",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "for p in 4001 4004; do echo \"kill $p\"; done | bash",
+   "expect": "block",
+   "id": "TC-046",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "for p in 4001 4004; do print -r -- \"kill $p\"; done | zsh",
+   "expect": "block",
+   "id": "TC-047",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "for p in 4001 4004; do printf 'kill %s\\n' $p; done | sh",
+   "expect": "block",
+   "id": "TC-048",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "for p in 4001 4004; do echo kill $p; done | sudo sh",
+   "expect": "block",
+   "id": "TC-049",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "for p in 4001 4004; do echo kill $p; done | tee /dev/null | sh",
+   "expect": "block",
+   "id": "TC-050",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "for k in kill; do echo $k 4004; done | sh",
+   "expect": "block",
+   "id": "TC-051",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "for k in \"kill 4001\"; do echo $k 4004; done | sh",
+   "expect": "block",
+   "id": "TC-052",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "while read p; do echo \"kill $p\"; done < pids | sh",
+   "expect": "block",
+   "id": "TC-053",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "until false; do echo kill 4004; break; done | sh",
+   "expect": "block",
+   "id": "TC-054",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "if true; then echo kill 4004; fi | sh",
+   "expect": "block",
+   "id": "TC-055",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "{ echo kill 4004; } | sh",
+   "expect": "block",
+   "id": "TC-056",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "{ echo a; echo kill 4004; } | bash",
+   "expect": "block",
+   "id": "TC-057",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "(echo kill 4004) | sh",
+   "expect": "block",
+   "id": "TC-058",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "(echo a; echo kill 4004) | zsh",
+   "expect": "block",
+   "id": "TC-059",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "(for p in 4001 4004; do echo \"kill $p\"; done) | sh",
+   "expect": "block",
+   "id": "TC-060",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "for a in 1; do for b in 2; do echo \"kill 4004\"; done; done | sh",
+   "expect": "block",
+   "id": "TC-061",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "case x in x) echo kill 4004;; esac | sh",
+   "expect": "block",
+   "id": "TC-062",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "eval 'for p in 4001 4004; do echo \"kill $p\"; done | sh'",
+   "expect": "block",
+   "id": "TC-063",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "true; for p in 4001 4004; do echo \"kill $p\"; done | sh",
+   "expect": "block",
+   "id": "TC-064",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "eval \"$(for p in 4001 4004; do echo \"kill $p\"; done)\"",
+   "expect": "block",
+   "id": "TC-065",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "sh -c \"$(for p in 4001 4004; do echo \"kill $p\"; done)\"",
+   "expect": "block",
+   "id": "TC-066",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "bash <(for p in 4001 4004; do echo \"kill $p\"; done)",
+   "expect": "block",
+   "id": "TC-067",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "K=(kill); $K 4004",
+   "expect": "block",
+   "id": "AH-001",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "a=(kill 4001); $a 4004",
+   "expect": "block",
+   "id": "AH-002",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(gkill); $K 4004",
+   "expect": "block",
+   "id": "AH-003",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(pkill); $K foo",
+   "expect": "block",
+   "id": "AH-004",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); \"$K\" 4004",
+   "expect": "block",
+   "id": "AH-005",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); ${K} 4004",
+   "expect": "block",
+   "id": "AH-006",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); ${K[1]} 4004",
+   "expect": "block",
+   "id": "AH-007",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); ${K[0]} 4004",
+   "expect": "block",
+   "id": "AH-008",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); ${K[@]} 4004",
+   "expect": "block",
+   "id": "AH-009",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); \"${K[@]}\" 4004",
+   "expect": "block",
+   "id": "AH-010",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); $K[1] 4004",
+   "expect": "block",
+   "id": "AH-011",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); $K[@] 4004",
+   "expect": "block",
+   "id": "AH-012",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "a=(kill 4001); $a[@] 4004",
+   "expect": "block",
+   "id": "AH-013",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "a=(kill 4001); \"$a\" 4004",
+   "expect": "block",
+   "id": "AH-014",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "a=(kill 4001); \"${a[@]}\" 4004",
+   "expect": "block",
+   "id": "AH-015",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(ki); ${K}ll 4004",
+   "expect": "block",
+   "id": "AH-016",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); sudo $K 4004",
+   "expect": "block",
+   "id": "AH-017",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); env $K 4004",
+   "expect": "block",
+   "id": "AH-018",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "a=(kill 4001); sudo $a 4004",
+   "expect": "block",
+   "id": "AH-019",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "a=(kill 4001); sudo \"${a[@]}\" 4004",
+   "expect": "block",
+   "id": "AH-020",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); eval $K 4004",
+   "expect": "block",
+   "id": "AH-021",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); (echo $($K 4004))",
+   "expect": "block",
+   "id": "AH-022",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(\nkill\n)\n$K 4004",
+   "expect": "block",
+   "id": "AH-023",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "declare -a K=(kill); $K 4004",
+   "expect": "block",
+   "id": "AH-024",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "typeset -a a=(kill 4001); $a 4004",
+   "expect": "block",
+   "id": "AH-025",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "local K=(kill); $K 4004",
+   "expect": "block",
+   "id": "AH-026",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(); K+=(kill); $K 4004",
+   "expect": "block",
+   "id": "AH-027",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); K+=(4001); $K 4004",
+   "expect": "block",
+   "id": "AH-028",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "a=([0]=kill); $a 4004",
+   "expect": "block",
+   "id": "AH-029",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "x=(1) K=(kill); $K 4004",
+   "expect": "block",
+   "id": "AH-030",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=kill; a=($K 4001); $a 4004",
+   "expect": "block",
+   "id": "AH-031",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(kill); $K 4001(N) 4004",
+   "expect": "block",
+   "id": "AH-032",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=(ki); ${K}ll 4001(N) 4004",
+   "expect": "block",
+   "id": "AH-033",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "a[1]=kill; $a 4004",
+   "expect": "block",
+   "id": "AH-034",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "a[1]=(kill) ; $a 4004",
+   "expect": "block",
+   "id": "AH-035",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "K=($(echo kill)); $K 4004",
+   "expect": "block",
+   "id": "AH-036",
+   "shape": "AH",
+   "why": "an array literal binds the variable used as the command name"
+  },
+  {
+   "cmd": "kill() { :; }",
+   "expect": "allow",
+   "id": "RROK-001",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "function kill() { :; }",
+   "expect": "allow",
+   "id": "RROK-002",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "kill() { kill 4001; }",
+   "expect": "allow",
+   "id": "RROK-003",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "gkill () { :; }",
+   "expect": "allow",
+   "id": "RROK-004",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "f() { kill 4001; }; f",
+   "expect": "allow",
+   "id": "RROK-005",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "f() { echo kill; }",
+   "expect": "allow",
+   "id": "RROK-006",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "foo() kill 4001",
+   "expect": "allow",
+   "id": "RROK-007",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "[[ \"$s\" =~ ^(a|b)$ ]] && kill 4001",
+   "expect": "allow",
+   "id": "RROK-008",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "[[ \"$s\" =~ ^(kill|stop)$ ]] && echo ok",
+   "expect": "allow",
+   "id": "RROK-009",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "[[ \"$s\" =~ ^kill(a|b)$ ]] && echo ok",
+   "expect": "allow",
+   "id": "RROK-010",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "if [[ $x == (a|b) ]]; then kill 4001; fi",
+   "expect": "allow",
+   "id": "RROK-011",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "case \"$x\" in (a) kill 4001;; esac",
+   "expect": "allow",
+   "id": "RROK-012",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "case $x in (a) kill -0 4004;; esac",
+   "expect": "allow",
+   "id": "RROK-013",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "case $x in (kill) echo x;; esac",
+   "expect": "allow",
+   "id": "RROK-014",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "case kill in (a) echo x;; esac",
+   "expect": "allow",
+   "id": "RROK-015",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "case $x in kill|stop) echo x;; esac",
+   "expect": "allow",
+   "id": "RROK-016",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "arr=($y); kill 4001",
+   "expect": "allow",
+   "id": "RROK-017",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "K=(a b); echo $K",
+   "expect": "allow",
+   "id": "RROK-018",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "K=(kill); echo $K",
+   "expect": "allow",
+   "id": "RROK-019",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "K=(kill); echo \"${K[@]}\"",
+   "expect": "allow",
+   "id": "RROK-020",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "files=(a b c); ls \"${files[@]}\"",
+   "expect": "allow",
+   "id": "RROK-021",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "files=(*.log(N)); kill 4001",
+   "expect": "allow",
+   "id": "RROK-022",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "a=(1 2); y=${a[1]}; kill 4001",
+   "expect": "allow",
+   "id": "RROK-023",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "(sleep 1); kill 4001",
+   "expect": "allow",
+   "id": "RROK-024",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "(kill 4001)",
+   "expect": "allow",
+   "id": "RROK-025",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "( kill 4001 ) && echo ok",
+   "expect": "allow",
+   "id": "RROK-026",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "kill 4001 && (sleep 1)",
+   "expect": "allow",
+   "id": "RROK-027",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "kill 4001; echo (a)",
+   "expect": "allow",
+   "id": "RROK-028",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "x=$(echo a); kill 4001",
+   "expect": "allow",
+   "id": "RROK-029",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo $(date); kill 4001",
+   "expect": "allow",
+   "id": "RROK-030",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo a(N) ; kill 4001",
+   "expect": "allow",
+   "id": "RROK-031",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "ls *(N); kill 4001",
+   "expect": "allow",
+   "id": "RROK-032",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "for f in *(N); do echo $f; done; kill 4001",
+   "expect": "allow",
+   "id": "RROK-033",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "print -l *.log(N) ; kill 4001",
+   "expect": "allow",
+   "id": "RROK-034",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "ls *.log(N); echo \"kill 4001\"",
+   "expect": "allow",
+   "id": "RROK-035",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "ls kill_guard*(N)",
+   "expect": "allow",
+   "id": "RROK-036",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "rg -l skills foo(N)",
+   "expect": "allow",
+   "id": "RROK-037",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "eval \"echo hi\" x(N); kill 4001",
+   "expect": "allow",
+   "id": "RROK-038",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "eval \"ls\" *(N)",
+   "expect": "allow",
+   "id": "RROK-039",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "env -S \"ls\" *(N)",
+   "expect": "allow",
+   "id": "RROK-040",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "eval \"ls\" $d(N)",
+   "expect": "allow",
+   "id": "RROK-041",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo \"a\" x(N); kill 4001",
+   "expect": "allow",
+   "id": "RROK-042",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4001\"",
+   "expect": "allow",
+   "id": "RROK-043",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4001\" | cat",
+   "expect": "allow",
+   "id": "RROK-044",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4001\" | grep kill",
+   "expect": "allow",
+   "id": "RROK-045",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4001\" > notes.txt",
+   "expect": "allow",
+   "id": "RROK-046",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "for p in 4001 4004; do echo \"kill $p\"; done",
+   "expect": "allow",
+   "id": "RROK-047",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "for p in 4001 4004; do echo \"kill $p\"; done | cat",
+   "expect": "allow",
+   "id": "RROK-048",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "for p in 4001 4004; do echo \"kill $p\"; done > notes.txt",
+   "expect": "allow",
+   "id": "RROK-049",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "for p in 1 2; do echo $p; done | sh",
+   "expect": "allow",
+   "id": "RROK-050",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo ls | sh",
+   "expect": "allow",
+   "id": "RROK-051",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo ls | sh; kill 4001",
+   "expect": "allow",
+   "id": "RROK-052",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "kill 4001; echo ls | bash",
+   "expect": "allow",
+   "id": "RROK-053",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "kill 4001 && curl -s example.com | sh",
+   "expect": "allow",
+   "id": "RROK-054",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "if true; then kill 4001; fi; echo ls | sh",
+   "expect": "allow",
+   "id": "RROK-055",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "{ kill 4001; }; echo ls | sh",
+   "expect": "allow",
+   "id": "RROK-056",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "for p in 1 2; do echo $p; done 2>/dev/null; echo ls | sh; kill 4001",
+   "expect": "allow",
+   "id": "RROK-057",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "rg -l kill src | xargs grep -l sh",
+   "expect": "allow",
+   "id": "RROK-058",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "rg -l kill src | xargs wc -l",
+   "expect": "allow",
+   "id": "RROK-059",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "grep -rl kill . | sudo tee list.txt",
+   "expect": "allow",
+   "id": "RROK-060",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "grep kill log | sh -c 'wc -l'",
+   "expect": "allow",
+   "id": "RROK-061",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "grep kill log | bash -c 'wc -l'",
+   "expect": "allow",
+   "id": "RROK-062",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "grep kill log | bash count.sh",
+   "expect": "allow",
+   "id": "RROK-063",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "grep kill log | python3 count.py",
+   "expect": "allow",
+   "id": "RROK-064",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo \"$x\" | sh",
+   "expect": "allow",
+   "id": "RROK-065",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "sh -c \"$(echo ls)\"; kill 4001",
+   "expect": "allow",
+   "id": "RROK-066",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "eval \"$(ssh-agent)\"; kill 4001",
+   "expect": "allow",
+   "id": "RROK-067",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "source <(kubectl completion zsh); kill 4001",
+   "expect": "allow",
+   "id": "RROK-068",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "kill -0 \"$PID\" && echo alive",
+   "expect": "allow",
+   "id": "RROK-069",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "kill -l",
+   "expect": "allow",
+   "id": "RROK-070",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "kill 4001",
+   "expect": "allow",
+   "id": "RROK-071",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "K=kill; $K 4001",
+   "expect": "allow",
+   "id": "RROK-072",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "S=sh; echo \"kill 4004\" | $S",
+   "expect": "block",
+   "id": "TC-068",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "S=bash; for p in 4001 4004; do echo \"kill $p\"; done | $S",
+   "expect": "block",
+   "id": "TC-069",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "find . -exec gkill 4001(N) 4004 \\;",
+   "expect": "block",
+   "id": "TC-070",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | ssh dev2 bash",
+   "expect": "block",
+   "id": "TC-071",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "grep kill log | $PAGER",
+   "expect": "allow",
+   "id": "RROK-073",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "P=less; grep kill log | $P",
+   "expect": "allow",
+   "id": "RROK-074",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "foo kill 4001(N) 4004",
+   "expect": "block",
+   "id": "RR-018",
+   "shape": "RR",
+   "why": "the word was tagged but the command re-read it as text, so the words after the parenthesis were lost"
+  },
+  {
+   "cmd": "pnpm exec kill 4001(N) 4004",
+   "expect": "block",
+   "id": "TC-072",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "cmd /c \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "TC-073",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo kill x(N)",
+   "expect": "allow",
+   "id": "RROK-075",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "grep -n \"kill 4004\" src/*(N)",
+   "expect": "allow",
+   "id": "RROK-076",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "cat kill*(N)",
+   "expect": "allow",
+   "id": "RROK-077",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "printf 'cd /tmp\\npkill -f x\\n' | ssh dev2 bash",
+   "expect": "block",
+   "id": "TC-074",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "printf 'cd /tmp\\nkill 4004\\n' | sudo sh",
+   "expect": "block",
+   "id": "TC-075",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "printf 'cd /tmp\\nkill 4004\\n' | tee /dev/null | sh",
+   "expect": "block",
+   "id": "TC-076",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo -e 'cd /tmp\\nkill 4004' | sudo bash",
+   "expect": "block",
+   "id": "TC-077",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | ssh dev2 'bash -s'",
+   "expect": "block",
+   "id": "TC-078",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | ssh dev2 \"sudo bash\"",
+   "expect": "block",
+   "id": "TC-079",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | ssh dev2 'cd /srv && bash'",
+   "expect": "block",
+   "id": "TC-080",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "for p in 4001 4004; do\n  echo \"kill $p\"\ndone |\n  sh",
+   "expect": "block",
+   "id": "TC-081",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4004\" |\n  cat |\n  sh",
+   "expect": "block",
+   "id": "TC-082",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\n' |\n  ssh dev2 bash",
+   "expect": "block",
+   "id": "TC-083",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | bash -euo pipefail",
+   "expect": "block",
+   "id": "TC-084",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | ssh dev2 bash -euo pipefail",
+   "expect": "block",
+   "id": "TC-085",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | zsh -fo extendedglob",
+   "expect": "block",
+   "id": "TC-086",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | xargs -I% sh -c %",
+   "expect": "block",
+   "id": "TC-087",
+   "shape": "TC",
+   "why": "text naming a kill is run as shell code, through a cut word or a pipe into a shell"
+  },
+  {
+   "cmd": "rg -l kill src | xargs -I{} sh -c 'wc -l {}'",
+   "expect": "allow",
+   "id": "RROK-078",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "rm -f /tmp/kill/*(N)",
+   "expect": "allow",
+   "id": "RROK-079",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "for f in kill/*(N); do echo \"$f\"; done",
+   "expect": "allow",
+   "id": "RROK-080",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "git add src/kill/*.py(N)",
+   "expect": "allow",
+   "id": "RROK-081",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo 'ls skill' | sh",
+   "expect": "allow",
+   "id": "RROK-082",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "cat <<EOF | ssh dev2 bash\ncd /srv/skill\nls\nEOF",
+   "expect": "allow",
+   "id": "RROK-083",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4001\" | bash -n",
+   "expect": "allow",
+   "id": "RROK-084",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "printf 'a\\nb\\n' | ssh dev2 'cat > f'",
+   "expect": "allow",
+   "id": "RROK-085",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo kill |\n  cat",
+   "expect": "allow",
+   "id": "RROK-086",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "echo a |\n  sh",
+   "expect": "allow",
+   "id": "RROK-087",
+   "shape": "RROK",
+   "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
   }
  ]
 }

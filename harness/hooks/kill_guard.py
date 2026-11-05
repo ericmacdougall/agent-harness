@@ -8,6 +8,8 @@ What it blocks, before the command runs, on Claude Code (Bash, PowerShell) and C
   * pkill, killall, killall5, skill, slay, fuser -k, taskkill, Stop-Process, systemctl/launchctl kill, interpreter
     code that signals processes (os.kill, process.kill, psutil ...), find -exec / parallel running those verbs;
   * kill whose targets come from a pid finder (xargs, $(...), backticks, read or for loops with a variable);
+  * text that names a kill and is run as shell code: the left side of a pipe into a shell, or a substitution given to
+    eval or a shell; the guard does not compute what that text becomes;
   * a plain `kill PID` unless every target is a literal PID that is provably the caller's own: its cwd, or argv[0]
     or argv[1], is inside the caller's own git worktree (the toplevel of the tool call's cwd), or it is in the
     per-worktree spawn ledger written by `kill_guard.py spawn -- CMD...`;
@@ -68,7 +70,7 @@ STOP_COMMANDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'echo', 'printf', 'cat', 
                  'cp', 'mv', 'rm', 'mkdir', 'touch', 'chmod', 'chown', 'make', 'cargo', 'go', 'docker', 'kubectl',
                  'python', 'python3', 'node', 'ruby', 'perl', 'sleep', 'true', 'false', 'test', 'wc', 'sort', 'uniq',
                  'tee', 'diff', 'find', 'curl', 'wget', 'pytest', 'ssh', 'scp', 'rsync', 'tar', 'zip', 'unzip', 'date'}
-OVERRIDDEN = ('apply', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve', 'bind_loop_var', 'pipeline', 'program_text')
+OVERRIDDEN = ('apply', 'command', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve', 'bind_loop_var')
 
 DEFAULT_POLICY = {
     'mode': 'enforce',
@@ -93,6 +95,11 @@ JOB_SPEC = re.compile(r'%(?:[0-9]{1,10}|[%+-]|[A-Za-z_][A-Za-z0-9_.-]*)')
 SIGNAL_OPTION = re.compile(r'-(?:[Ss][Ii][Gg])?([A-Za-z0-9+]{1,32})')
 SIGNAL_VALUE = re.compile(r'[A-Za-z0-9+]{1,32}')
 PAREN_REASON = 'a kill word is followed by a parenthesis, which zsh reads as a glob qualifier that can drop the word or run code'
+FEED_REASON = 'text that names a kill is run as shell code, so the guard cannot tell which targets it reaches'
+WORDS_NOT_VERBS_IN_TEXT = {'skill', 'slay', 'spps', 'wmic'}
+TEXT_ESCAPE = re.compile(r'\\(?:[abefnrtv]|[0-7]{1,3}|x[0-9a-fA-F]{1,2})')
+INERT_COMMANDS = {'echo', 'printf', 'print', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack'}
+ASSIGNMENT_WORD = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?(\+?)=(.*)', re.S)
 QUOTED_VARIABLE = re.compile(r'"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})"')
 FUNCTION_KW = re.compile(r'\bfunction\s+([A-Za-z_][\w.:-]*)\s*(?:\(\s*\))?\s*\{')
 COPROC_KW = re.compile(r'\bcoproc\s+(?:[A-Za-z_]\w*\s*)?\{')
@@ -520,11 +527,14 @@ def make_analyzer_class(cg):
             self.remote = 0
             self.xargs = 0
             self.before_paren = {}  # id -> word, holding the word so its id stays unique
-            self.paren_scope = 0    # >0 while judging a pipeline holding such a word, including text re-read from it
+            self.fed = {}           # id -> (word, sink stage): its text goes down a pipe, maybe into a shell
             self.broad = set(policy['broad_verbs'])
             self.windows = set(policy['windows_verbs'])
             self.script_kill = re.compile(policy['script_kill_pattern']) if policy['script_kill_pattern'] else None
             self.finders = set(policy['pid_finders'])
+            verbs = (self.broad | self.windows | {'kill', 'gkill', 'fuser'}) - WORDS_NOT_VERBS_IN_TEXT
+            self.kill_word = re.compile(r'(?<![\w.*?\[\]-])(?:%s)(?![\w.*?\[\]/-])' % '|'.join(
+                map(re.escape, sorted(verbs, key=len, reverse=True))))
 
         # ---- findings
         def block(self, rule, reason, pids=()):
@@ -544,127 +554,214 @@ def make_analyzer_class(cg):
             finally:
                 self.xargs = saved
 
+        def names_kill(self, text):
+            # norm_raw deletes a backslash so k\\ill still reads kill; a printf escape in front of a verb must split instead.
+            return bool(self.kill_word.search(norm_raw(text)) or self.kill_word.search(norm_raw(TEXT_ESCAPE.sub(' ', text))))
+
         def check_tokens(self, tokens):
-            # parse() ends a command at `(`, so the words after it never reach check_kill. `kill 4001(N) 4004` is a syntax
-            # error in bash, but in zsh (N) is a glob qualifier: the word vanishes and 4004 is signalled, and (e:...:) runs
-            # code. Tokens come before variables are bound, so tag every word in front of a `(` and let inspect() refuse
-            # once the analyser knows the command really is a kill. Only `name()` defines a function.
+            # Tokens come before variables are bound, so this only tags words and normalises assignments; command() judges
+            # the tagged words once their values are known. PowerShell parentheses and pipes mean something else.
+            if self.ctx.ps:
+                return
+            flat = cg._strip_case_patterns(tokens)
+            self.tag_paren_cuts(flat)
+            self.normalize_assignments(flat)
+            self.tag_shell_feeders(flat)
+
+        def tag_paren_cuts(self, tokens):
+            # parse() ends a command at `(`, so the words after it are never seen. `kill 4001(N) 4004` is a syntax error in
+            # bash, but in zsh (N) is a glob qualifier: the word vanishes and 4004 is signalled, and (e:...:) runs code. Not a
+            # cut: `name()` defines a function, `name=(` is an array, and `[[ ]]` groups with parentheses.
             words = []
             for k, (kind, value) in enumerate(tokens):
                 if kind == 'w':
                     words.append(value)
                 elif kind == 'op':
-                    if value == '(' and words and not (len(words) == 1 and tokens[k + 1:k + 2] == [('op', ')')]):
-                        for w in words:
-                            self.before_paren[id(w)] = w
-                        self.refuse_paren_early(words)
+                    if value == '(' and words:
+                        definition = len(words) == 1 and tokens[k + 1:k + 2] == [('op', ')')]
+                        array = bool(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=', words[-1].raw or ''))
+                        conditional = cg.strip_reserved(words)[:1] and cg.strip_reserved(words)[0].text == '[['
+                        if not (definition or array or conditional):
+                            for w in words:
+                                self.before_paren[id(w)] = w
                     words = []
-            if not self.ctx.ps:
-                tokens[:] = self.with_whole_commands(tokens)
 
-        def with_whole_commands(self, tokens):
-            # parse() ends a command at `(`, so eval, env -S, echo | sh and friends join and re-read only the words in front
-            # of it: `eval "kill 4001" 4001(N) 4004` reads as `kill 4001`, and in `echo .. x(N) 4004 | sh` the echo never
-            # meets the sh. After each statement holding a qualifier, add the same statement with the parentheses taken out,
-            # so the analyser sees every word that can reach the command. The original stays in the stream because
-            # `foo(N) kill 4004` really runs the kill when the first word vanishes.
-            out, whole, current, i = [], None, [], 0
+        def normalize_assignments(self, tokens):
+            # The base reads NAME=value only. `K=(kill)` would leave K empty and `$K 4004` unjudged, so give the first word
+            # of an array literal, an append and a subscripted assignment the value the variable holds afterwards; the head
+            # resolution every other variable gets then applies. The literal's own words still parse as a command, as before.
+            for k, (kind, word) in enumerate(tokens):
+                if kind != 'w':
+                    continue
+                match = ASSIGNMENT_WORD.fullmatch(word.text)
+                if not match or not (word.raw or '').startswith(match.group(1)):
+                    continue
+                name, subscript, plus, value = match.groups()
+                items = self.array_items(tokens, k) if not value else None
+                prev = tokens[k - 1] if k else None
+                at_start = prev is None or prev[0] == 'op' or (prev[0] == 'w' and (
+                    prev[1].text in cg.RESERVED or ASSIGNMENT_WORD.fullmatch(prev[1].text)))
+                if items is None and not ((subscript or plus) and at_start):
+                    continue
+                parts = [] if items is None else [re.sub(r'^\[[^\]]*\]\+?=', '', it.text) for it in items]
+                text = ' '.join(parts) if items is not None else value
+                if subscript or plus:  # keeps what the variable held; when that is unknown the value stays a hint
+                    joiner = ' ' if subscript or items is not None else ''
+                    text = cg.VAR_OPEN + name + cg.VAR_CLOSE + joiner + text
+                    word.vars.append(name)
+                word.alts = ['%s=%s' % (name, text)]
+                word.glob = False
+                for it in items or ():
+                    word.vars.extend(it.vars)
+                    word.subs.extend(it.subs)
+                    word.dynamic = word.dynamic or it.dynamic
 
-            def flush():
-                nonlocal whole
-                if whole is not None:
-                    out.append(('op', ';'))
-                    out.extend(whole)
-                    whole = None
+        @staticmethod
+        def array_items(tokens, k):
+            if tokens[k + 1:k + 2] != [('op', '(')]:
+                return None
+            items = []
+            for kind, value in tokens[k + 2:]:
+                if kind == 'w':
+                    items.append(value)
+                elif kind == 'op' and value == ')':
+                    return items
+                elif not (kind == 'op' and value == '\n'):
+                    return None
+            return None
 
-            while i < len(tokens):
-                kind, value = tokens[i]
-                if kind != 'op':
-                    current.append(tokens[i])
-                    if whole is not None:
-                        whole.append(tokens[i])
-                elif value == '(':
-                    end = qualifier_end(tokens, i)
-                    if end is not None and (whole is not None or self.takes_qualifier(current)):
-                        if whole is None:
-                            whole = list(current)
-                        whole.extend(t for t in tokens[i + 1:end] if t[0] == 'w')
-                        out.extend(tokens[i:end + 1])
-                        i = end + 1
+        def tag_shell_feeders(self, tokens):
+            # `for p in A B; do echo "kill $p"; done | sh`: what comes out of the left side is the program, and the guard
+            # does not compute program output. Every word on that side is judged by command(), however it is nested.
+            for k, (kind, value) in enumerate(tokens):
+                if kind == 'op' and value in ('|', '|&'):
+                    stage = []
+                    for later_kind, later in tokens[k + 1:]:
+                        if later_kind == 'op' and later == '\n' and not stage:
+                            continue  # a newline after a pipe continues the pipeline
+                        if later_kind == 'op':
+                            break
+                        if later_kind == 'w':
+                            stage.append(later)
+                    if self.reads_program(stage) or (stage and cg.VAR_OPEN in stage[0].text):  # S=sh; ... | $S
+                        for w in self.feeder_words(tokens, k):
+                            self.fed[id(w)] = (w, stage)
+
+        @staticmethod
+        def feeder_words(tokens, pipe):
+            """The words left of a pipe, back to the start of the statement it belongs to."""
+            out, depth = [], 0
+            for j in range(pipe - 1, -1, -1):
+                kind, value = tokens[j]
+                if kind == 'w':
+                    out.append(value)
+                    prev = tokens[j - 1] if j else None
+                    keyword = not value.quoted and (prev is None or prev[0] == 'op' or (
+                        prev[0] == 'w' and not prev[1].quoted and prev[1].text in cg.RESERVED))
+                    if keyword and value.text in ('done', 'fi', 'esac', '}'):
+                        depth += 1
+                    elif keyword and value.text in ('for', 'select', 'while', 'until', 'if', 'case', '{'):
+                        if depth == 0:
+                            break
+                        depth -= 1
+                elif kind == 'op':
+                    if value == ')':
+                        depth += 1
+                    elif value == '(':
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    elif value == '\n' and j and tokens[j - 1] in (('op', '|'), ('op', '|&')):
                         continue
-                    flush()
-                    current = []
-                elif value in ('|', '|&') and whole is not None:
-                    whole.append(tokens[i])
-                    current = []
-                else:
-                    flush()
-                    current = []
-                out.append(tokens[i])
-                i += 1
-            flush()
+                    elif depth == 0 and value in (';', '\n', '&&', '||', '&'):
+                        break
             return out
 
-        def takes_qualifier(self, current):
-            # A head alone is left to the original stream (see above). The other exclusions are not glob words: [[ a =~ (b) ]],
-            # case and for lists, a=(1 2), and `then (cmd)`, which strip_reserved leaves empty.
-            words = self._skip_assigns(cg.strip_reserved([t[1] for t in current if t[0] == 'w']))[1]
-            return len(words) >= 2 and words[0].text not in cg.NONEXEC_HEADS and words[0].text != '[[' \
-                and words[-1].text != 'in' and not words[-1].text.endswith('=')
+        def reads_program(self, words):
+            """True when this pipeline stage runs its stdin as shell code."""
+            words = self._skip_assigns(cg.strip_reserved(words))[1]
+            if not words:
+                return False
+            name, args = cg.norm_name(words[0].text), words[1:]
+            if name.startswith('g') and name[1:] in GNU_PREFIXED:
+                name = name[1:]
+            if name in cg.SHELLS and name != 'busybox':
+                i = 0
+                while i < len(args):
+                    t = args[i].text
+                    if t in ('-s', '-', '/dev/stdin', '/dev/fd/0'):
+                        return True
+                    if re.fullmatch(r'-[a-zA-Z]*[cn][a-zA-Z]*', t) or t.startswith('--command') or not t.startswith(('-', '+')):
+                        return False  # -c gives the program, -n only parses, and a first operand is a script file
+                    i += 2 if re.fullmatch(r'[-+][a-zA-Z]*[oO]', t) or t in ('--rcfile', '--init-file') else 1
+                return True
+            if name in ('at', 'batch'):
+                return not any(a.text == '-f' for a in args)
+            if name == 'parallel' and all(a.text.startswith('-') for a in args):
+                return True
+            if name in WRAPPER_NAMES or name in REMOTE_EXEC or name in REMOTE_WRAPPERS:
+                for i, a in enumerate(args):
+                    n = cg.norm_name(a.text)
+                    if n in cg.SHELLS:
+                        if name in ('xargs', 'parallel'):  # the text reaches the shell only when it is the whole -c program
+                            marks = {args[j + 1].text for j in range(i) if args[j].text == '-I'} | {'{}'} | {
+                                t.text[2:] for t in args[:i] if t.text.startswith('-I') and len(t.text) > 2}
+                            return any(re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', args[j].text) and args[j + 1].text.strip() in marks
+                                       for j in range(i + 1, len(args) - 1))
+                        return self.reads_program(args[i:])
+                    if re.search(r'\s', a.text.strip()) and name not in ('xargs', 'parallel'):  # ssh host 'cd /srv && bash -s'
+                        lexed = cg.Lexer(self.ctx, self.ctx.ps).lex(a.text)
+                        if any(self.reads_program(c.words) for pl in cg.parse(lexed) for c in pl.cmds):
+                            return True
+                    if n in STOP_COMMANDS:
+                        return False
+            return False
 
-        def pipeline(self, pl, depth):
-            # Everything judged in here comes from a command whose word list the parser cut short, including text that
-            # eval, env -S, sh -c or echo | sh re-read as new words. Those words carry no tag, so the scope carries it.
-            tagged = any(id(w) in self.before_paren for c in pl.cmds for w in c.words)
-            self.paren_scope += 1 if tagged else 0
-            try:
-                result = super().pipeline(pl, depth)
-                if tagged:
-                    for idx in range(len(pl.cmds) - 1):
-                        if any(cg.norm_name(w.text) in cg.SHELLS for c in pl.cmds[idx + 1:] for w in c.words):
-                            self.printed_words(pl.cmds[idx], depth)  # | sudo sh, and printf whose format is not the program
-                return result
-            finally:
-                self.paren_scope -= 1 if tagged else 0
+        def command(self, cmd, pl, idx, depth):
+            self.judge_reread(cmd)
+            return super().command(cmd, pl, idx, depth)
 
-        def program_text(self, word, depth):
-            # sh -c "$(print -r -- "kill 4001" x(N) 4004)": the base reads the printer's flags as the program's first words.
-            super().program_text(word, depth)
-            for inner in word.subs:
-                tokens = cg.Lexer(self.ctx, self.ctx.ps).lex(inner)
-                self.check_tokens(tokens)
-                for pl in cg.parse(tokens):
-                    if any(id(w) in self.before_paren for c in pl.cmds for w in c.words):
-                        self.paren_scope += 1
-                        try:
-                            for cmd in pl.cmds:
-                                self.printed_words(cmd, depth)
-                        finally:
-                            self.paren_scope -= 1
+        def judge_reread(self, cmd):
+            """The one rule for words that can be read again as code after this parse, whatever the command is called:
+            they were cut at a parenthesis, or their text goes down a pipe into a shell. If they name a kill, or may hold
+            one because the value is unknown and the input names one, nothing about the targets can be proven. A command
+            that only prints or searches its words, with no pipe into a shell, leaves them as data."""
+            cut = any(id(w) in self.before_paren for w in cmd.words)
+            fed = any(id(w) in self.fed and self.reads_program([self.resolve(s) for s in self.fed[id(w)][1]])
+                      for w in cmd.words)
+            if not (cut or fed):
+                return
+            words = [self.resolve(w) for w in cg.strip_reserved(cmd.words)]
+            reason = FEED_REASON if fed else PAREN_REASON
+            rule = 'text-to-shell' if fed else 'unprovable-target'
+            bodies = []
+            if fed:
+                bodies = [r.body or (r.target.text if r.op == '<<<' and r.target is not None else '') for r in cmd.redirs]
+            rest = self._skip_assigns(words)[1]
+            name = cg.norm_name(rest[0].text) if rest else ''
+            if not fed and (not rest or name in INERT_COMMANDS):
+                return
+            if self.names_kill(' '.join([p for w in words for p in (w.text, w.raw or '', *w.subs)] + bodies)):
+                self.block(rule, reason)
+                return
+            unknown = any(w.dynamic or w.subs for w in words) or any('$' in b or '`' in b for b in bodies)
+            runs_text = fed or (rest and (rest[0].dynamic or rest[0].subs or self.runs_text(name)))
+            if unknown and runs_text and self.names_kill(self.raw):
+                self.block(rule, reason)
 
-        def printed_words(self, cmd, depth):
-            # Each word a printer emits may be the program, so read each one. Only called under paren_scope.
-            words = self._skip_assigns(cg.strip_reserved(cmd.words))[1]
-            if words and cg.norm_name(words[0].text) in ('echo', 'printf', 'print'):
-                for w in words[1:]:
-                    if not w.text.startswith('-'):
-                        self.script(self.resolve(w).text, depth + 1)
-
-        def refuse_paren_early(self, words):
-            # Extra layer for a head the analyser may never resolve (x=$(echo kill); $x 4001(N) 4004). Only the head counts:
-            # any expansion in the command would also refuse [[ "$s" =~ ^(a|b)$ ]] && kill 4001.
-            names = [cg.norm_name(w.text) for w in words]
-            head = (self._skip_assigns(cg.strip_reserved(words))[1] or [None])[0]
-            hidden = head is not None and not self.ctx.ps and bool(
-                head.dynamic or head.subs or '$' in (head.raw or head.text) or '`' in (head.raw or ''))
-            if 'kill' in names or (hidden and KILLISH.search(norm_raw(self.raw))):
-                self.block('unprovable-target', PAREN_REASON)
+        @staticmethod
+        def runs_text(name):
+            return name in cg.SHELLS or name in ('eval', 'source', '.', 'trap') or name in WRAPPER_NAMES \
+                or name in REMOTE_EXEC or name in REMOTE_WRAPPERS
 
         def resolve(self, word):
-            # resolve() builds a new Word for any word holding a variable, so the tag has to follow it.
+            # resolve() builds a new Word for any word holding a variable, so a tag has to follow it.
             out = super().resolve(word)
-            if out is not word and word is not None and id(word) in self.before_paren:
-                self.before_paren[id(out)] = out
+            if out is not word and word is not None:
+                if id(word) in self.before_paren:
+                    self.before_paren[id(out)] = out
+                if id(word) in self.fed:
+                    self.fed[id(out)] = (out, self.fed[id(word)][1])
             return out
 
         def bind_loop_var(self, words):
@@ -727,6 +824,8 @@ def make_analyzer_class(cg):
                 self.remote -= 1
 
         def apply(self, name, words, cmd, pl, idx, depth):
+            if words[0].vars and name.endswith(']'):
+                name = re.sub(r'\[[^\]]*\]$', '', name)  # zsh subscript on an array head: $K[1], $K[@]
             if name.startswith('g') and name[1:] in GNU_PREFIXED:
                 return self.apply(name[1:], words, cmd, pl, idx, depth)  # Homebrew coreutils: gtimeout, gxargs ...
             args = words[1:]
@@ -813,10 +912,9 @@ def make_analyzer_class(cg):
             head = words[0]
             if re.fullmatch(r'\$[@*0-9]', head.text) and KILLISH.search(norm_raw(self.raw)):
                 self.block('dynamic-head', 'positional parameters run a command and the input mentions kill')
-            if head.dynamic and self.paren_scope and KILLISH.search(norm_raw(self.raw)):
-                self.block('unprovable-target', PAREN_REASON)  # K=kill; read x; eval $x 4001(N) 4004
             if head.dynamic:
-                hints = ' '.join(self.ctx.var_hints.values()) + ' ' + ' '.join(head.subs)
+                hints = ' '.join(self.ctx.var_hints.values()) + ' ' + ' '.join(head.subs) + ' ' + ' '.join(
+                    self.ctx.vars.get(v, '') for v in head.vars)  # ${K[@]} reads a variable the guard does know
                 try:
                     hints += ' ' + cg.decode_ansi(hints)
                 except Exception:  # noqa: BLE001
@@ -837,7 +935,7 @@ def make_analyzer_class(cg):
             elif name == 'kill':
                 if self.ctx.ps:
                     self.block('windows-kill', 'PowerShell kill is Stop-Process and cannot be checked for ownership')
-                elif self.paren_scope or any(id(w) in self.before_paren for w in words):
+                elif any(id(w) in self.before_paren for w in words):
                     self.block('unprovable-target', PAREN_REASON)
                 else:
                     self.check_kill(args, pl, idx)
@@ -852,6 +950,8 @@ def make_analyzer_class(cg):
             elif name in cg.SHELLS or name in ('eval', 'source', '.'):
                 if any(INDIRECT.search(' '.join(a.subs)) for a in args if a.subs):
                     self.block('obfuscated-input', 'a shell is fed decoded text, so the guard cannot see what runs')
+                elif any(self.names_kill(' '.join(a.subs)) for a in args if a.subs):
+                    self.block('text-to-shell', FEED_REASON)  # eval "$(for p in A B; do echo "kill $p"; done)"
             elif name == 'trap':
                 rest = [t for t in texts if t not in ('--',)]
                 if rest and rest[0] not in ('-p', '-l', '-', ''):
@@ -1035,21 +1135,6 @@ def make_analyzer_class(cg):
 
     return KillAnalyzer
 
-
-
-def qualifier_end(tokens, start):
-    """Index of the `)` closing the `(` at start when the group holds only words and `|`, as a glob qualifier or (a|b) does,
-    with at least one word. None otherwise: a subshell, a list, or the `()` of a function definition."""
-    words = 0
-    for k in range(start + 1, len(tokens)):
-        kind, value = tokens[k]
-        if kind == 'w':
-            words += 1
-        elif kind != 'op' or value not in ('|', ')'):
-            return None
-        elif value == ')':
-            return k if words else None
-    return None
 
 
 def leading_lookup(args):
