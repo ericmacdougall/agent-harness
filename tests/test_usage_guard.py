@@ -544,6 +544,29 @@ class OwnerLiveness(StoreFixture):
         started = datetime.fromisoformat(start['started_at']); deadline = datetime.fromisoformat(owner['deadline'])
         self.assertAlmostEqual((deadline - started).total_seconds(), start['timeout'] + guard.DEADLINE_GRACE, delta=1)
 
+    def test_deadline_grace_env_is_validated(self):
+        cases = {'0': 0, '3600': 3600, '3601': guard.DEADLINE_GRACE, '-1': guard.DEADLINE_GRACE,
+                 'soon': guard.DEADLINE_GRACE, '': guard.DEADLINE_GRACE, '1.5': guard.DEADLINE_GRACE}
+        for raw, expected in cases.items():
+            with self.subTest(raw), mock.patch.dict(os.environ, {'AGENT_HARNESS_DEADLINE_GRACE': raw}):
+                self.assertEqual(guard.deadline_grace(), expected)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('AGENT_HARNESS_DEADLINE_GRACE', None)
+            self.assertEqual(guard.deadline_grace(), guard.DEADLINE_GRACE)
+
+    def test_peer_review_records_its_reviewer_child(self):
+        # The wiring peer_review.review_snapshot -> run(..., on_spawn=run_record.note_child) is what records
+        # the real reviewer process; a dropped argument would leave every other test green.
+        source = (HOOKS / 'peer_review.py').read_text()
+        self.assertIn('on_spawn=run_record.note_child if run_record else None', source)
+        self.assertIn('def run(cmd: list[str], prompt: str, cwd: Path, timeout=720, on_spawn=None)', source)
+        import peer_review
+        recorded = []
+        run = self.begin()
+        with mock.patch.object(peer_review, 'run_process', side_effect=lambda *a, **k: (recorded.append(k.get('on_spawn')), subprocess.CompletedProcess(a[0], 0, '', ''))[1]):
+            peer_review.run(['true'], 'prompt', self.repo, 5, on_spawn=run.note_child)
+        self.assertEqual(recorded, [run.note_child])
+
     def test_boot_identity_is_a_tagged_boot_session_id(self):
         value = guard.boot_identity()
         if value is None: self.skipTest('no boot identity source on this platform')
