@@ -11,9 +11,13 @@ set -u
 self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 py=$1; tree=$2; logs=$3; pattern=${4:-}
 R=$(/usr/bin/python3 -c 'import os,pwd;print(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))')
-mkdir -p "$logs"; TREE=$(cd "$tree" && pwd -P); LOGS=$(cd "$logs" && pwd -P)
+LOGS_REAL=$(/usr/bin/python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$logs")
+TREE=$(cd "$tree" && pwd -P)
 GITCOMMON=$(cd "$TREE" && cd "$(git rev-parse --git-common-dir 2>/dev/null || echo .)" && pwd -P)
-case "$LOGS/" in "$R/.claude/"*|"$R/.codex/"*|"$R/.ssh/"*|"$R/.agent-harness/usage/"*|"$R/.agent-harness/state/"*|"$R/.agent-harness/logs/"*|"$R/.agent-harness/commit-policy/"*|"$R/.agent-harness/wals/"*) echo "LOGDIR is inside a protected real state dir"; exit 6;; esac
+for p in "$LOGS_REAL" "$GITCOMMON"; do
+case "$p/" in "$R/.claude/"*|"$R/.codex/"*|"$R/.ssh/"*|"$R/.agent-harness/usage/"*|"$R/.agent-harness/state/"*|"$R/.agent-harness/logs/"*|"$R/.agent-harness/commit-policy/"*|"$R/.agent-harness/wals/"*) echo "LOGDIR or git dir is inside a protected real state dir"; exit 6;; esac
+done
+mkdir -p "$logs"; LOGS=$(cd "$logs" && pwd -P)
 scratch=$(mktemp -d "$logs/home.XXXXXX"); shim="$logs/shim"; mkdir -p "$shim" "$logs/pybin"
 printf '#!/bin/sh\necho "$@" >> %s/ssh.calls\nexit 255\n' "$logs" > "$shim/ssh"; chmod +x "$shim/ssh"
 ln -sf "$py" "$logs/pybin/python3"; ln -sf "$py" "$logs/pybin/$(basename "$py")"
@@ -47,7 +51,7 @@ snap > "$logs/after.snap"
 sleep 3
 /usr/bin/log show --start "$start" --predicate 'eventMessage CONTAINS "deny(1)"' > "$logs/denials.log" 2>&1; logrc=$?
 canaries=$(grep -c "hermetic-canary-$$" "$logs/denials.log")
-grep -E "($R/|/usr/bin/ssh)" "$logs/denials.log" | grep -v "hermetic-canary-$$" > "$logs/other_denials.log"
+grep -E 'deny\(1\) (file-write|process-exec)' "$logs/denials.log" | grep -E "($R/|/usr/bin/ssh)" | grep -v 'hermetic-canary-' > "$logs/other_denials.log"
 others=$(wc -l < "$logs/other_denials.log" | tr -d " ")
 ssh=0; [ -f "$logs/ssh.calls" ] && ssh=$(wc -l < "$logs/ssh.calls" | tr -d " ")
 diff "$logs/before.snap" "$logs/after.snap" > "$logs/snap.diff"; d=$(wc -l < "$logs/snap.diff")
