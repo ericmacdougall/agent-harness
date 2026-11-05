@@ -24,6 +24,7 @@ id_ecdsa*
 kit.json
 goodqa-hive/**
 # Quarantined deletions (the goodqa trash folder) are not logs and can be many GB.
+.goodqa-trash
 .goodqa-trash/**
 # More credential stores (names are matched case-insensitively: the script passes --ignore-case).
 key

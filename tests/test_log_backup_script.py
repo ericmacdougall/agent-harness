@@ -287,6 +287,10 @@ class Exclusion(Case):
         files = self.remote_files()
         self.assertEqual(files, set(ORDINARY))  # exact, non-empty set
         self.assertFalse([f for f in files if ".goodqa-trash" in f])
+        # rsync anchors patterns that contain a slash, so the snapshot stage must be checked too (nested trash)
+        staged = [str(p) for p in (self.home / ".agent-harness/backup-stage").rglob("*")]
+        self.assertTrue([s for s in staged if "p1" in s], "stage empty: the check would be vacuous")
+        self.assertFalse([s for s in staged if ".goodqa-trash" in s], staged)
         self.assertIn(".goodqa-trash/**", (ROOT / "harness" / "bin" / "log-backup.excludes").read_text().split())
 
     def test_vm_dumps_never_appear_in_the_remote(self):
