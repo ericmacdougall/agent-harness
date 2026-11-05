@@ -1,10 +1,13 @@
 """ah-run launcher core (goodqa#14548): exit pass-through, ledger digests, signals, parent death, kill, mask."""
 
+import base64
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -17,6 +20,7 @@ from unittest import mock
 HOOKS = Path(__file__).resolve().parents[1] / 'harness/hooks'
 sys.path.insert(0, str(HOOKS))
 import ah_run
+import host_table
 
 AH = str(HOOKS / 'ah_run.py')
 
@@ -618,6 +622,306 @@ class Equivalence(Fixture):
 
     def test_cwd_is_inherited(self):
         self.assertEqual(Path(self.both('pwd').stdout.strip()).resolve(), Path(self.temp.name).resolve())
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Slice 2b: ssh through the host table (goodqa#14548 AC-4 ssh rows, AC-19 --readonly travel)
+# ---------------------------------------------------------------------------------------------------------
+
+RIG_SSH = '''#!/bin/sh
+# `ssh -G` answers from $FAKE_SSH_DIR/<target>.txt; any other call behaves like ssh: skip options and the
+# host, then hand the remaining arguments, joined with spaces, to a shell (what a remote login shell does)
+[ -n "$FAKE_SSH_LOG" ] && echo "$@" >> "$FAKE_SSH_LOG"
+if [ "$1" = "-G" ]; then
+  for last; do :; done
+  [ -n "$FAKE_SSH_SLEEP" ] && sleep "$FAKE_SSH_SLEEP"
+  [ -f "$FAKE_SSH_DIR/$last.txt" ] || exit 255
+  cat "$FAKE_SSH_DIR/$last.txt"; exit 0
+fi
+while [ $# -gt 0 ]; do case "$1" in -p|-o|-J|-l|-i|-F) shift 2;; -*) shift;; *) break;; esac; done
+shift
+exec sh -c "$*"
+'''
+
+
+def _ssh_g(hostname, port=22):
+    return 'user eric\nhostname %s\nport %d\n' % (hostname, port)
+
+
+class SshRewrite(HookFixture):
+    REMOTE_PATH = '/opt/ah/ah_run.py'
+
+    def setUp(self):
+        super().setUp()
+        root = Path(self.temp.name)
+        self.bin = root / 'bin'; self.bin.mkdir()
+        (self.bin / 'ssh').write_text(RIG_SSH); (self.bin / 'ssh').chmod(0o755)
+        self.stubs = root / 'stubs'; self.stubs.mkdir()
+        self.remote_reserve = root / 'remote-reserve'; self.remote_reserve.mkdir(mode=0o700)
+        self.ssh_log = root / 'ssh.log'
+        self.policy = root / 'resource_policy.json'
+        self.write_policy()
+        patcher = mock.patch.dict(os.environ, {'PATH': '%s:%s' % (self.bin, os.environ['PATH']), 'FAKE_SSH_DIR': str(self.stubs),
+                                               'FAKE_SSH_LOG': str(self.ssh_log)})
+        patcher.start(); self.addCleanup(patcher.stop)
+        os.environ.pop('FAKE_SSH_SLEEP', None)
+        for alias, host in (('dev2', 'dev2.example.test'), ('rig', 'rig.example.test'), ('pve', 'pve.example.test'),
+                            ('mac2', 'mac2.example.test'), ('localhost', 'localhost'), ('unwrapped', 'unwrapped.example.test'),
+                            ('badpath', 'badpath.example.test')):
+            (self.stubs / (alias + '.txt')).write_text(_ssh_g(host))
+
+    def write_policy(self, **hosts):
+        table = {'dev2.example.test': {'role': 'worker', 'ah_run': self.REMOTE_PATH},
+                 # the rig host runs the real launcher, with its own reserve directory standing in for the remote one
+                 'rig.example.test': {'role': 'worker', 'ah_run': str(Path(ah_run.__file__).resolve()),
+                                      'remote_env': {'AGENT_HARNESS_RESERVE_DIR': str(self.remote_reserve), 'PATH': '/evil'}},
+                 'mac2.example.test': {'role': 'interactive', 'ah_run': False},
+                 'unwrapped.example.test': {'role': 'worker', 'ah_run': False},
+                 'badpath.example.test': {'role': 'worker', 'ah_run': '/opt/a b/ah_run.py;x'},
+                 'pve.example.test': {'role': 'external'}}
+        table.update(hosts)
+        self.policy.write_text(json.dumps({'modes': {'escapes': 'enforce'}, 'hosts': table, 'self': ['this-mac']}))
+
+    def ssh(self, command, **extra):
+        return ah_run.decide(self.payload(command, **extra), home=str(self.home),
+                             env={'AGENT_HARNESS_RESOURCE_POLICY': str(self.policy)}, ancestors=lambda: [])['hookSpecificOutput']
+
+    @staticmethod
+    def inner(out):
+        words = shlex.split(out['updatedInput']['command'])
+        return words[words.index('--') + 1]
+
+    @staticmethod
+    def b64_of(line):
+        return base64.b64decode(re.search(r'--cmd-b64 (\S+)', line).group(1)).decode('utf-8')
+
+    def contacted(self):
+        return self.ssh_log.exists() and bool(self.ssh_log.read_text().strip())
+
+    def exec_wrapped(self, out, **env):
+        env = {**self.env, 'PATH': os.environ['PATH'], 'AGENT_HARNESS_RESERVE_DIR': str(self.reserve), **env}
+        return subprocess.run(['/bin/sh', '-c', out['updatedInput']['command']], env=env, capture_output=True, text=True, timeout=30)
+
+    def remote_rows(self):
+        return list(ah_run.Ledger(self.remote_reserve).rows())
+
+    # -- the rewrite --------------------------------------------------------------------------------------
+
+    def test_plain_rewrite(self):
+        line = self.inner(self.ssh("ssh dev2 'git log'"))
+        self.assertTrue(line.startswith('ssh dev2 python3 %s run --task auto-' % self.REMOTE_PATH), line)
+        self.assertIn('--agent main --session s-1 --token via-hook-ssh --cmd-b64 ', line)
+        self.assertNotIn('--readonly', line)
+        self.assertEqual(self.b64_of(line), 'git log')
+
+    def test_readonly_travels_for_the_review_set_only(self):
+        for kind in ('red-team', 'click-tester', 'reviewer', 'Explore', 'Plan'):
+            line = self.inner(self.ssh("ssh dev2 'git log'", agent_type=kind, agent_id='ag1'))
+            self.assertIn(' --agent ag1 ', line); self.assertIn('--token via-hook-ssh --readonly --cmd-b64 ', line, kind)
+        for kind in ('task-owner', 'general-purpose', None):
+            extra = {'agent_type': kind} if kind else {}
+            self.assertNotIn('--readonly', self.inner(self.ssh("ssh dev2 'git log'", **extra)), kind)
+
+    def test_ticket_travels_and_unsafe_ticket_does_not(self):
+        out = ah_run.decide(self.payload("ssh dev2 'ls'"), home=str(self.home), ancestors=lambda: [],
+                            env={'AGENT_HARNESS_RESOURCE_POLICY': str(self.policy), 'AGENT_HARNESS_TICKET': 'goodqa#14548'})
+        self.assertIn('--ticket goodqa#14548 --session', self.inner(out['hookSpecificOutput']))
+        out = ah_run.decide(self.payload("ssh dev2 'ls'"), home=str(self.home), ancestors=lambda: [],
+                            env={'AGENT_HARNESS_RESOURCE_POLICY': str(self.policy), 'AGENT_HARNESS_TICKET': 'a; reboot'})
+        self.assertNotIn('--ticket', self.inner(out['hookSpecificOutput']))
+
+    def test_prefix_stripped_inside_the_ssh_argument(self):
+        for command in ("ssh dev2 'ah-run run --task x --agent y -- git log'", 'ssh dev2 "ah-run --task x -- git log"',
+                        "ssh dev2 'python3 /x/ah_run.py run --task x -- git log'"):
+            self.assertEqual(self.b64_of(self.inner(self.ssh(command))), 'git log', command)
+
+    def test_prefix_in_remote_does_not_hide_an_escape(self):
+        self.assertEqual(self.ssh("ssh dev2 'ah-run run --task x -- nohup sleep 9'")['permissionDecision'], 'deny')
+
+    def test_options_with_values_are_parsed(self):
+        line = self.inner(self.ssh("ssh -p 2222 -o StrictHostKeyChecking=no -J jump dev2 'git log'"))
+        self.assertTrue(line.startswith('ssh -p 2222 -o StrictHostKeyChecking=no -J jump dev2 python3 %s run' % self.REMOTE_PATH), line)
+        self.assertEqual(self.b64_of(line), 'git log')
+        self.assertIn('-G -p 2222 -o StrictHostKeyChecking=no -J jump -- dev2', self.ssh_log.read_text())
+        line = self.inner(self.ssh("ssh -p2222 -oBatchMode=yes -l eric dev2 git -C /x log -1"))
+        self.assertEqual(self.b64_of(line), 'git -C /x log -1')
+
+    def test_prefix_and_pipeline_stages_are_kept(self):
+        line = self.inner(self.ssh("printf data | ssh dev2 'cat' | wc -c"))
+        self.assertTrue(line.startswith('printf data | ssh dev2 python3 '), line); self.assertTrue(line.endswith(' | wc -c'), line)
+        line = self.inner(self.ssh("timeout 20 ssh dev2 'ls'"))
+        self.assertTrue(line.startswith('timeout 20 ssh dev2 python3 '), line)
+        line = self.inner(self.ssh("cd /tmp && ssh dev2 'ls' && echo done"))
+        self.assertTrue(line.startswith('cd /tmp && ssh dev2 python3 ') and line.endswith(' && echo done'), line)
+
+    def test_stdin_pipe_is_preserved_end_to_end(self):
+        out = self.ssh("printf 'a b\\nc\\n' | ssh rig 'cat'")
+        self.assertRegex(self.inner(out), r"^printf 'a b\\nc\\n' \| ssh rig ")
+        done = self.exec_wrapped(out)
+        self.assertEqual((done.returncode, done.stdout), (0, 'a b\nc\n'), done.stderr)
+        rows = self.remote_rows()
+        self.assertEqual(len(rows), 1); self.assertEqual((rows[0]['attribution'], rows[0]['exit_code']), ('hook-ssh', 0))
+
+    def test_base64_round_trip_with_quotes_dollar_backticks_and_non_ascii(self):
+        remote = 'printf %s \'$HOME `date` "q" it\'"\'"\'s é ü 日本 \\n\''
+        line = self.inner(self.ssh('ssh dev2 ' + shlex.quote(remote)))
+        self.assertEqual(self.b64_of(line), remote)
+        out = self.ssh('ssh rig ' + shlex.quote(remote))
+        done = self.exec_wrapped(out)
+        self.assertEqual(done.stdout, '$HOME `date` "q" it\'s é ü 日本 \\n', done.stderr)
+
+    def test_local_expansion_happens_before_ssh_like_the_unwrapped_command(self):
+        out = self.ssh('ssh rig "echo $LOCALVAR"')
+        self.assertIn('"$(set -- ', self.inner(out))
+        self.assertEqual(self.exec_wrapped(out, LOCALVAR='seen-locally').stdout, 'seen-locally\n')
+        plain = subprocess.run(['/bin/sh', '-c', 'ssh rig "echo $LOCALVAR"'], capture_output=True, text=True,
+                               env={**os.environ, 'LOCALVAR': 'seen-locally'})
+        self.assertEqual(plain.stdout, 'seen-locally\n')
+
+    def test_redirections_stay_local(self):
+        target = Path(self.temp.name) / 'out.txt'
+        out = self.ssh("ssh rig 'echo hi' > %s 2>&1" % target)
+        self.assertRegex(self.inner(out), r'--cmd-b64 \S+ > \S+out\.txt 2>&1$')
+        self.assertEqual(self.exec_wrapped(out).returncode, 0)
+        self.assertEqual(target.read_text(), 'hi\n')
+
+    def test_remote_row_records_attribution_readonly_and_exit(self):
+        out = self.ssh("ssh rig 'exit 7'", agent_type='red-team', agent_id='rt1')
+        self.assertEqual(self.exec_wrapped(out).returncode, 7)
+        row = self.remote_rows()[0]
+        self.assertEqual((row['attribution'], row['readonly'], row['agent'], row['exit_code']), ('hook-ssh', True, 'rt1', 7))
+        self.assertEqual(row['command_sha256'], hashlib.sha256(b'exit 7').hexdigest())
+
+    def test_remote_env_is_limited_to_agent_harness_keys(self):
+        line = self.inner(self.ssh("ssh rig 'ls'"))
+        self.assertIn(' env AGENT_HARNESS_RESERVE_DIR=%s ' % self.remote_reserve, line); self.assertNotIn('/evil', line)
+
+    # -- escapes, refusals and what stays untouched --------------------------------------------------------
+
+    def test_escape_in_remote_command_is_refused_without_contacting_the_host(self):
+        for command in ("ssh dev2 'sleep 30 &'", "ssh dev2 'nohup sleep 30'", "ssh pve 'make test &'", "ssh unknown 'make test &'",
+                        "ssh dev2 'setsid sleep 9'", "ssh dev2 'cd /x && nohup make'", "ssh dev2 'tmux new -d make'"):
+            out = self.ssh(command)
+            self.assertEqual(out['permissionDecision'], 'deny', command)
+            self.assertIn('escapes tracking', out['permissionDecisionReason'])
+            self.assertNotIn('updatedInput', out)
+        self.assertFalse(self.contacted())
+
+    def test_foreground_parallelism_in_the_remote_command_is_not_an_escape(self):
+        self.assertEqual(self.b64_of(self.inner(self.ssh("ssh dev2 'sleep 1 & wait'"))), 'sleep 1 & wait')
+
+    def test_ssh_f_is_an_escape(self):
+        for command in ("ssh -f dev2 'sleep 1'", "ssh -fN -L 8080:x:80 dev2", "ssh -o BatchMode=yes -f dev2 ls"):
+            self.assertEqual(self.ssh(command)['permissionDecision'], 'deny', command)
+
+    def test_no_command_is_untouched(self):
+        for command in ('ssh dev2', 'ssh -t dev2', 'ssh -N -L 8080:x:80 dev2', 'ssh -W host:22 dev2'):
+            self.assertEqual(self.inner(self.ssh(command)), command)
+        self.assertFalse(self.contacted())
+
+    def test_scp_sftp_rsync_are_untouched(self):
+        for command in ('scp a.txt dev2:/tmp/', 'sftp dev2', 'rsync -a src/ dev2:/tmp/src/', 'rsync -e ssh -a src/ dev2:/tmp/src/',
+                        "rsync -e 'ssh -p 2222' dev2:/x ."):
+            self.assertEqual(self.inner(self.ssh(command)), command)
+        self.assertFalse(self.contacted())
+
+    def test_over_64kib_is_refused_naming_the_limit_and_the_alternative(self):
+        out = self.ssh("ssh dev2 'echo %s'" % ('x' * (64 * 1024 + 1)))
+        self.assertEqual(out['permissionDecision'], 'deny')
+        reason = out['permissionDecisionReason']
+        self.assertIn('64 KiB', reason); self.assertIn('scp', reason); self.assertIn('rsync', reason)
+        self.assertNotEqual(self.ssh("ssh dev2 'echo %s'" % ('x' * 60000)).get('permissionDecision'), 'deny')
+
+    def test_external_host_is_untouched_and_recorded_remote_unattributed(self):
+        out = self.ssh("ssh pve 'qm list'")
+        self.assertEqual(self.inner(out), "ssh pve 'qm list'")
+        wrapped = out['updatedInput']['command']
+        host_digest = hashlib.sha256(b'pve.example.test').hexdigest()
+        self.assertIn('--command-class remote-unattributed --remote-host-sha256 ' + host_digest, wrapped)
+        done = self.exec_wrapped(self.ssh("ssh pve 'echo listed'"))
+        self.assertEqual(done.stdout, 'listed\n', done.stderr)
+        row = self.rows()[0]
+        self.assertEqual((row['command_class'], row['remote_host_sha256']), ('remote-unattributed', host_digest))
+        self.assertNotIn('pve.example.test', json.dumps(row)); self.assertEqual(self.remote_rows(), [])
+
+    def test_unknown_host_is_external(self):
+        (self.stubs / 'mystery.txt').write_text(_ssh_g('mystery.example.test'))
+        out = self.ssh("ssh mystery 'uptime'")
+        self.assertEqual(self.inner(out), "ssh mystery 'uptime'"); self.assertIn('remote-unattributed', out['updatedInput']['command'])
+
+    def test_worker_without_remote_ah_run_is_untouched_and_recorded_remote_unwrapped(self):
+        for alias, name in (('mac2', 'mac2.example.test'), ('unwrapped', 'unwrapped.example.test')):
+            out = self.ssh("ssh %s 'ls'" % alias)
+            self.assertEqual(self.inner(out), "ssh %s 'ls'" % alias)
+            self.assertIn('--command-class remote-unwrapped --remote-host-sha256 ' + hashlib.sha256(name.encode()).hexdigest(),
+                          out['updatedInput']['command'])
+
+    def test_an_unsafe_table_path_is_not_used(self):
+        out = self.ssh("ssh badpath 'ls'")
+        self.assertEqual(self.inner(out), "ssh badpath 'ls'"); self.assertIn('remote-unwrapped', out['updatedInput']['command'])
+        self.assertIn('not a plain path', out['additionalContext'])
+
+    def test_local_loopback_is_not_rewritten_or_classed_remote(self):
+        out = self.ssh("ssh localhost 'ls'")
+        self.assertEqual(self.inner(out), "ssh localhost 'ls'"); self.assertNotIn('remote-', out['updatedInput']['command'])
+
+    def test_loopback_on_a_tunnel_port_is_external(self):
+        (self.stubs / 'localhost.txt').write_text(_ssh_g('localhost', 2222))
+        out = self.ssh("ssh -p 2222 localhost 'ls'")
+        self.assertIn('--command-class remote-unattributed', out['updatedInput']['command'])
+
+    def test_resolution_failure_is_external_and_logged_without_the_name(self):
+        out = self.ssh("ssh nowhere.example.test 'ls'")
+        self.assertEqual(self.inner(out), "ssh nowhere.example.test 'ls'"); self.assertIn('remote-unattributed', out['updatedInput']['command'])
+        rows = [json.loads(line) for line in (self.reserve / 'warn.jsonl').read_text().splitlines()]
+        self.assertEqual(rows[0]['guard'], 'ssh-resolve')
+        self.assertNotIn('nowhere', json.dumps(rows))
+
+    def test_a_missing_table_leaves_every_host_untouched(self):
+        self.policy.unlink()
+        out = self.ssh("ssh dev2 'ls'")
+        self.assertEqual(self.inner(out), "ssh dev2 'ls'"); self.assertIn('remote-unattributed', out['updatedInput']['command'])
+
+    def test_ssh_inside_a_substitution_or_other_form_that_cannot_be_rewritten_is_recorded_unwrapped(self):
+        out = self.ssh('ssh dev2 "echo $(date)"')
+        self.assertEqual(self.inner(out), 'ssh dev2 "echo $(date)"')
+        self.assertIn('remote-unwrapped', out['updatedInput']['command'])
+
+    def test_non_ssh_commands_never_resolve(self):
+        self.ssh('git status && ls | wc -l')
+        self.assertFalse(self.contacted())
+
+    # -- failing-first controls ---------------------------------------------------------------------------
+
+    def alias_row_rewrites(self):
+        return 'python3 %s run' % self.REMOTE_PATH in self.inner(self.ssh("ssh dev2 'git log'"))
+
+    def nohup_row_refused(self):
+        return self.ssh("ssh dev2 'nohup sleep 30'").get('permissionDecision') == 'deny'
+
+    def test_control_real_code_passes_both_rows(self):
+        self.assertTrue(self.alias_row_rewrites()); self.assertTrue(self.nohup_row_refused())
+
+    def test_control_mutant_keying_the_table_by_the_alias_fails_the_alias_row(self):
+        # the alias `dev2` resolves to dev2.example.test; a table keyed by the alias would look up `dev2`
+        real = host_table.resolve
+        mutant = lambda target, args=(), run=None: host_table.Resolved(target, 22)
+        with mock.patch.object(host_table, 'resolve', mutant):
+            self.assertFalse(self.alias_row_rewrites())
+        self.write_policy(**{'dev2': {'role': 'worker', 'ah_run': self.REMOTE_PATH}})
+        with mock.patch.object(host_table, 'resolve', mutant):
+            self.assertTrue(self.alias_row_rewrites())   # the mutant only passes with an alias-keyed table: the row discriminates
+        self.assertIs(host_table.resolve, real)
+
+    def test_control_mutant_skipping_the_remote_command_escape_check_fails_the_nohup_row(self):
+        original = ah_run._classify_ssh
+
+        def skip_remote(args, reasons, notes, depth):
+            call = host_table.parse_ssh(args)
+            original(call.opts + [call.target] if call else args, reasons, notes, depth)
+        with mock.patch.object(ah_run, '_classify_ssh', skip_remote):
+            self.assertFalse(self.nohup_row_refused())
+            self.assertFalse(self.ssh("ssh dev2 'sleep 30 &'").get('permissionDecision') == 'deny')
 
 
 if __name__ == '__main__':

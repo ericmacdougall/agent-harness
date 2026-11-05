@@ -31,6 +31,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import usage_guard  # noqa: E402  (SECRET detector; liveness helpers when the guard has them)
+import host_table  # noqa: E402  (ssh target resolution and the host table, shared with the placement guard)
 
 
 def host_identity():
@@ -111,6 +112,10 @@ def mask_argv(text, limit=512):
 
 def digest(value):
     return hashlib.sha256(value if isinstance(value, bytes) else str(value).encode('utf-8', 'replace')).hexdigest()
+
+
+def safe_hex(value):
+    return value if isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) else None
 
 
 def safe_key(value, default):
@@ -315,6 +320,7 @@ def launch(args):
     row = {'schema': SCHEMA, 'run_id': run_id, 'task': task, 'agent': agent, 'ticket': ticket, 'session': session,
            'attribution': attribution, 'attribution_reason': why, 'readonly': bool(args.readonly), 'host': host_identity(),
            'command_sha256': digest(command), 'command_class': args.command_class or 'unclassified',
+           'remote_host_sha256': safe_hex(args.remote_host_sha256),
            'cwd_sha256': digest(os.getcwd()), 'started_at': now(), 'supervisor_pid': os.getpid(),
            'supervisor_start': process_start_token(os.getpid()), 'unit': unit, 'end': None}
     try:
@@ -882,8 +888,7 @@ def _classify_words(words, reasons, notes, depth):
         if any(re.fullmatch(r'-[A-Za-z]*a[A-Za-z]*', word) for word in rest):
             reasons.append('open -a starts an untracked application')
     elif name == 'ssh':
-        # TODO(AC-4 ssh rows, later slice): ssh -G host resolution, the host table and the --cmd-b64 remote
-        # rewrite; this slice only classifies escapes inside the ssh options and the remote command string.
+        # host resolution, the table and the remote rewrite live in rewrite_ssh (decide); this only finds escapes
         _classify_ssh(rest, reasons, notes, depth)
     elif name in ('bash', 'sh', 'zsh', 'dash', 'ksh'):
         for position, word in enumerate(rest):
@@ -895,7 +900,7 @@ def _classify_words(words, reasons, notes, depth):
 
 
 def _classify_ssh(args, reasons, notes, depth):
-    with_arg = set('bcDEeFIiJLlmOopQRSWw')
+    with_arg = set('bcDEeFIiJLlmOopQRSWwBP')
     index, host = 0, None
     while index < len(args):
         word = args[index]
@@ -917,7 +922,8 @@ def _classify_ssh(args, reasons, notes, depth):
     if index < len(args):
         host, remote = args[index], args[index + 1:]
         if remote:
-            _classify_text(' '.join(remote), reasons, notes, depth + 1, 'ssh remote: ')
+            # a model-supplied `ah-run ... --` prefix in the remote command is replaced by the hook, so look past it
+            _classify_text(strip_ah_run_prefix(' '.join(remote)), reasons, notes, depth + 1, 'ssh remote: ')
 
 
 def _classify_text(command, reasons, notes, depth, prefix=''):
@@ -974,7 +980,7 @@ def classify_escapes(command):
 
 def escape_mode(home, env):
     """enforce|warn for the escape guard: warn when the policy file is missing, enforce when it is unreadable."""
-    path = Path(env.get('AGENT_HARNESS_POLICY_FILE') or Path(home) / '.agent-harness' / 'resource_policy.json')
+    path = host_table.policy_path(home, env)
     try:
         data = json.loads(path.read_bytes()[:1 << 20])
     except FileNotFoundError:
@@ -1047,6 +1053,170 @@ def strip_ah_run_prefix(command):
     return command
 
 
+# -- ssh: host table, remote rewrite (AC-4 ssh rows, AC-19 --readonly travel) ---------------------------------
+
+REVIEW_TYPES = frozenset(('red-team', 'click-tester', 'reviewer', 'Explore', 'Plan'))
+SSH_WORD = re.compile(r'^(?:\S*/)?ssh(?=\s)')
+REDIRECT = re.compile(r'^(?:\d*|&)(?:<<<|<<-?|<>|>>|>&|<&|>\||>|<)(.*)$', re.S)
+REMOTE_PATH = re.compile(r'^[A-Za-z0-9_./~-]+$')
+REMOTE_ENV_KEY = re.compile(r'^AGENT_HARNESS_[A-Z_]{1,40}$')
+REMOTE_ENV_VALUE = re.compile(r'^[A-Za-z0-9_./~:-]{1,200}$')
+
+
+def agent_is_readonly(payload):
+    """True for a review-set agent. TODO(slice 7, AC-19): fall back to the SubagentStart record for `agent_id`
+    when the hook input carries no `agent_type`; until then only the hook input's own `agent_type` counts."""
+    return payload.get('agent_type') in REVIEW_TYPES
+
+
+def raw_words(text):
+    """[(raw, value, dynamic)] for one simple command: quotes removed in `value`; `dynamic` when the local
+    shell would expand it (`$`, backticks, globs, a leading `~`). Raises ValueError on an unbalanced quote."""
+    words, i, n = [], 0, len(text)
+    while i < n:
+        while i < n and text[i] in ' \t':
+            i += 1
+        if i >= n:
+            break
+        start, quote, value, dynamic = i, None, [], False
+        while i < n and (quote or text[i] not in ' \t'):
+            ch = text[i]
+            if quote == "'":
+                if ch == "'":
+                    quote = None
+                else:
+                    value.append(ch)
+            elif quote == '"':
+                if ch == '"':
+                    quote = None
+                elif ch == '\\' and i + 1 < n and text[i + 1] in '"\\$`':
+                    i += 1; value.append(text[i])
+                else:
+                    dynamic = dynamic or ch in '$`'
+                    value.append(ch)
+            elif ch in '\'"':
+                quote = ch
+            elif ch == '\\' and i + 1 < n:
+                i += 1; value.append(text[i])
+            else:
+                dynamic = dynamic or ch in '$`*?[{' or (ch == '~' and i == start)
+                value.append(ch)
+            i += 1
+        if quote:
+            raise ValueError('unbalanced quote')
+        words.append((text[start:i], ''.join(value), dynamic))
+    return words
+
+
+def _warn_row(reason, target):
+    """Append to <reserve>/warn.jsonl (AC-18 triage); a digest of the target, never the name."""
+    try:
+        root = reserve_root()
+        row = json.dumps({'at': now(), 'guard': 'ssh-resolve', 'reason': reason, 'target_sha256': digest(target)}, sort_keys=True)
+        fd = os.open(root / 'warn.jsonl', os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'a') as handle:
+            handle.write(row + '\n')
+    except (OSError, RuntimeError):
+        pass
+
+
+def _ssh_form(segment):
+    for form in match_candidates(segment):
+        if SSH_WORD.match(form) and segment.endswith(form):
+            return segment[:len(segment) - len(form)], form
+    return None
+
+
+def rewrite_ssh(command, parsed, payload, env, home, context):
+    """(command, remote): each `ssh HOST CMD` simple command whose resolved host has `ah_run: "<path>"` in the
+    table becomes `ssh HOST python3 <path> run ... --token via-hook-ssh [--readonly] --cmd-b64 B64` (stdin stays
+    inherited). `remote` is (command_class, host_digest) for the local ledger row when the host is external
+    (`remote-unattributed`) or has no remote ah-run (`remote-unwrapped`). Raises ValueError to deny."""
+    segments = [s for s in dict.fromkeys(parsed.segments)]
+    candidates = [(s, _ssh_form(s)) for s in segments]
+    if not any(form for _s, form in candidates):
+        return command, None
+    policy = host_table.policy_path(home, env)
+    table = host_table.load(policy)
+    remote = None
+    for segment, found in candidates:
+        if not found:
+            continue
+        prefix, form = found
+        try:
+            words = raw_words(form)
+        except ValueError:
+            continue
+        args, redirects, skip = [], [], False
+        for position, word in enumerate(words):
+            if skip:
+                redirects.append(word[0]); skip = False
+            elif position and REDIRECT.match(word[0]):
+                redirects.append(word[0]); skip = not REDIRECT.match(word[0]).group(1)
+            else:
+                args.append(word)
+        call = host_table.parse_ssh([w[1] for w in args[1:]])
+        if call is None or not call.remote:
+            continue  # `ssh HOST` with no command, `ssh -N`, `-W`: nothing to wrap
+        raws = [w[0] for w in args[1:]]
+        count = len(call.opts)
+        target_dynamic = args[1 + count][2]
+        if target_dynamic:
+            cls = host_table.HostClass('external', None, None, None, reason='dynamic-target')
+        else:
+            cls = host_table.classify(call.target, call.resolve_args, table=table, policy=policy,
+                                      warn=lambda text, t=call.target: _warn_row(text, t))
+        if cls.kind == 'local':
+            continue
+        who = cls.name or cls.host or call.target
+        if cls.kind == 'external':
+            remote = remote or ('remote-unattributed', digest(who))
+            continue
+        path = cls.ah_run
+        if not path or not REMOTE_PATH.fullmatch(path):
+            remote = remote or ('remote-unwrapped', digest(who))
+            if path:
+                context.append('ah-run: host table ah_run path for %s is not a plain path; the ssh line was left unwrapped' % cls.name)
+            continue
+        task = task_key(payload, env)
+        agent = safe_key(payload.get('agent_id'), 'main')
+        session = safe_key(payload.get('session_id'), 'none')
+        ticket = env.get('AGENT_HARNESS_TICKET')
+        remote_raw = raws[count + 1:]
+        remote_words = args[2 + count:]
+        if any(w[2] for w in remote_words):
+            # the local shell expands this text before ssh sees it: build the base64 from the same words at run time
+            b64 = '"$(set -- %s; printf %%s "$*" | base64 | tr -d \'\\n\')"' % ' '.join(remote_raw)
+        else:
+            text = strip_ah_run_prefix(' '.join(w[1] for w in remote_words))
+            if len(text.encode('utf-8')) > INLINE_LIMIT:
+                raise ValueError('the remote command is %d bytes; the ssh limit is %d bytes (64 KiB). scp or rsync the payload '
+                                 'to the host, then run a short remote command (for example `ssh HOST bash /path/script.sh`)'
+                                 % (len(text.encode('utf-8')), INLINE_LIMIT))
+            b64 = base64.b64encode(text.encode('utf-8')).decode('ascii')
+        tail = ['python3', path] if path.endswith('.py') else [path]
+        entry_env = cls.entry.get('remote_env')  # AGENT_HARNESS_* only: the rig points the remote reserve at a private dir
+        pairs = []
+        if isinstance(entry_env, dict):
+            pairs = ['%s=%s' % (k, v) for k, v in sorted(entry_env.items())
+                     if isinstance(k, str) and isinstance(v, str) and REMOTE_ENV_KEY.fullmatch(k) and REMOTE_ENV_VALUE.fullmatch(v)]
+        tail = (['env'] + pairs if pairs else []) + tail
+        tail += ['run', '--task', task, '--agent', agent]
+        if ticket and SAFE_KEY.fullmatch(ticket):
+            tail += ['--ticket', ticket]
+        tail += ['--session', session, '--token', 'via-hook-ssh']
+        if agent_is_readonly(payload):
+            tail.append('--readonly')
+        tail += ['--cmd-b64', b64]
+        new_form = ' '.join([args[0][0], *raws[:count + 1], *tail, *redirects])
+        if command.count(segment) != parsed.segments.count(segment):
+            remote = remote or ('remote-unwrapped', digest(who))
+            context.append('ah-run: an ssh line could not be rewritten safely (its text repeats inside another command); it runs unwrapped')
+            continue
+        command = command.replace(segment, prefix + new_form)
+    return command, remote
+
+
 # -- the hook -----------------------------------------------------------------------------------------------
 
 def _out(decision=None, reason=None, updated=None, context=None):
@@ -1094,7 +1264,7 @@ def task_key(payload, env):
     return 'auto-' + digest(seed)[:12]
 
 
-def build_rewrite(command, payload, env, notes, context):
+def build_rewrite(command, payload, env, notes, context, remote=None):
     """The wrapped command and, when the pending row could be written, its token. Raises ValueError to deny."""
     raw = command.encode('utf-8')
     if len(raw) > PAYLOAD_CAP:
@@ -1116,7 +1286,9 @@ def build_rewrite(command, payload, env, notes, context):
     parts += ['--session', session]
     if token:
         parts += ['--token', token]
-    if 'pgid-split' in notes:
+    if remote:
+        parts += ['--command-class', remote[0], '--remote-host-sha256', remote[1]]
+    elif 'pgid-split' in notes:
         parts += ['--command-class', 'pgid-split']
     if len(raw) > INLINE_LIMIT:
         if root is None or token is None:
@@ -1175,7 +1347,8 @@ def decide(payload, home=None, env=None, ancestors=None):
     allows = [rule for rule in rules['allow'] if not rule.is_ah_run()]
 
     try:
-        wrapped = build_rewrite(command, payload, env, notes, context)
+        command, remote = rewrite_ssh(command, parsed, payload, env, home, context)
+        wrapped = build_rewrite(command, payload, env, notes, context, remote)
     except ValueError as error:
         return _out('deny', 'ah-run: %s' % error)
     updated = {**(payload.get('tool_input') or {}), 'command': wrapped}
@@ -1219,7 +1392,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action')
     run = sub.add_parser('run')
-    for name in ('--task', '--agent', '--ticket', '--session', '--token', '--cmd-file', '--cmd-b64', '--command-class'):
+    for name in ('--task', '--agent', '--ticket', '--session', '--token', '--cmd-file', '--cmd-b64', '--command-class', '--remote-host-sha256'):
         run.add_argument(name)
     run.add_argument('--readonly', action='store_true'); run.add_argument('--no-unit', action='store_true')
     run.add_argument('command', nargs=argparse.REMAINDER)
