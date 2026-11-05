@@ -62,6 +62,18 @@ An agent cannot mark a harness ticket done without proof.
 - NEG-1 (AC-1): a tampered attachment is not accepted.
   Source: ticket:GoodQA harness#14398
 
+
+## Resource budget
+Host: vm:fixture
+Capacity: fixture VM, 8 GB memory, 4 cores, 50 GB disk
+Fan-out: agents=1 jobs=1 processes=2 browser_pages=0 test_workers=1
+Peak memory: 1 GB (method: fixture)
+CPU: 1 cores (method: fixture)
+Disk: 1 GB (method: fixture)
+Network: 1 MB (method: fixture)
+Wall time: 1 min
+Cap and kill: none needed for a fixture; run_capped.py would pause on breach
+Checkpoint: none
 ## Risks
 
 - Hook breaks MCP calls: narrow matcher, warn first.
@@ -388,6 +400,21 @@ class Reviews(SpecFlowCase):
         self.wal(self.main_wal, {"at": "t", "event": "subagent", "agent_id": "x9", "agent_type": "fixer"})
         self.assertEqual(self.run_cli(*args, "--role", "adversarial")[0], 2)
         self.assertEqual(self.run_cli(*args, "--role", "acceptance")[0], 0)
+        # Each reviewer type is accepted on the acceptance path (a removed type would fail safe but is still a regression).
+        for agent_type in ("task-owner", "click-tester", "red-team"):
+            agent = "ok-" + agent_type
+            self.wal(self.main_wal, {"at": "t", "event": "subagent", "agent_id": agent, "agent_type": agent_type})
+            code, _, err = self.run_cli("review", str(spec), "--agent", agent, "--wal", str(self.main_wal), "--verdict",
+                                        "ACCEPT", "--report-file", str(report), "--role", "acceptance")
+            self.assertEqual(code, 0, (agent_type, err))
+        # Every agent type is logged now (goodqa#14613); only the reviewer types may record a review.
+        for agent_type in ("Explore", "statusline-setup", "claude-code-guide", "general-purpose"):
+            agent = "r-" + agent_type.lower()
+            self.wal(self.main_wal, {"at": "t", "event": "subagent", "agent_id": agent, "agent_type": agent_type})
+            code, _, err = self.run_cli("review", str(spec), "--agent", agent, "--wal", str(self.main_wal), "--verdict",
+                                        "ACCEPT", "--report-file", str(report), "--role", "acceptance")
+            self.assertEqual(code, 2, agent_type)
+            self.assertIn("may record a review", err)
 
     def test_edit_after_review_makes_reviews_stale_and_attach_refuses(self):
         spec = self.reviewed_spec()
@@ -1213,6 +1240,10 @@ class Install(unittest.TestCase):
         pre = [h for entry in settings["hooks"]["PreToolUse"] for h in entry["hooks"]
                if (h.get("args") or [""])[0].endswith("spec_flow.py")]
         stops = [h for entry in settings["hooks"]["SubagentStop"] for h in entry["hooks"]]
+        # The model ladder (tier_gate.py stop) is a second, separate SubagentStop hook; each must appear once.
+        ladder = [h for h in stops if (h.get("args") or [""])[0].endswith("tier_gate.py")]
+        stops = [h for h in stops if h not in ladder]
+        self.assertEqual(len(ladder), 1)
         self.assertEqual(len(pre), 1)
         self.assertEqual((pre[0]["timeout"], pre[0]["onFailure"]), (60, "block"))
         self.assertEqual(len(stops), 1)

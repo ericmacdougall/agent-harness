@@ -131,7 +131,7 @@ def require_safe_source(repo: Path, env: dict[str, str], *, timeout: int = 5,
             budget()
         if (count > 250_000 or len(record) < 3
                 or record[:2] not in ((b'H ', b'M ') if allow_unmerged else (b'H ',))):
-            raise OSError('source Git index has hidden or unsupported flags')
+            raise OSError('source Git index has hidden or unsupported flags (%r)' % record[:1].decode('ascii', 'replace'))
     code, config = _bounded_git(repo, ['config', '--includes', '--show-scope',
                                       '--name-only', '--null', '--get-regexp', FILTER_PATTERN],
                                 env, timeout=budget(), limit=1_000_000)

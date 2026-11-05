@@ -38,7 +38,8 @@ RECORD_BLOCK = re.compile(r"```" + RECORD_FENCE + r"\n(.*?)\n```", re.S)
 NAMESPACE = uuid.UUID("8f2a4f2e-3c1b-4b7e-9d55-6a1f0c2b7e10")
 KINDS = ("spec", "evidence", "click_test", "signoff")
 ROLES = ("adversarial", "acceptance")
-LOGGED_AGENT_TYPES = ("task-owner", "click-tester", "fixer", "red-team")
+# Every agent type is logged by SubagentStart (goodqa#14613); only these may record a spec review.
+REVIEWER_AGENT_TYPES = ("task-owner", "click-tester", "fixer", "red-team")
 OPEN_STATUSES = {"triage", "backlog", "todo", "in_progress", "in_review", "on_dev", "verified_on_dev",
                  "on_staging", "verified_on_staging", "on_production"}
 REASON_STATUSES = {"wont_fix", "duplicate"}
@@ -206,7 +207,7 @@ def parse_spec(text: str) -> dict:
 PLACEHOLDER = re.compile(r"<[^<>\n]{2,80}>")
 
 
-def lint(text: str, config: dict | None = None, check_provenance: bool = True) -> list:
+def lint(text: str, config: dict | None = None, check_provenance: bool = True, spec_policy: dict | None = None) -> list:
     spec = parse_spec(text)
     problems = []
     header = spec["header"]
@@ -235,6 +236,9 @@ def lint(text: str, config: dict | None = None, check_provenance: bool = True) -
             problems.append(f"section `## {name}` is empty")
         elif PLACEHOLDER.search(body):
             problems.append(f"section `## {name}` still holds a template placeholder like <...>")
+    if spec_policy and spec_policy.get("resource_budget_gate", "off") == "enforce":
+        import resource_budget  # structure only here; peer_review.py plan also compares the numbers to live capacity
+        problems.extend(resource_budget.lint_budget(text)[0])
     ids = [ident for ident, _ in spec["criteria"]]
     if not ids:
         problems.append("no acceptance criteria: add `- AC-1: <observable result>. Verify by: <check>.`")
@@ -275,6 +279,69 @@ def provenance_problems(text: str) -> list:
     return problems
 
 
+# --------------------------------------------------------------------------- blockchain domain gates
+
+def _domain_gates():
+    try:
+        import domain_gates
+        return domain_gates
+    except ImportError:  # older install without the domain gates: behave as before
+        return None
+
+
+def append_domain_block(text: str, repo, spec_policy: dict) -> str:
+    """Append the `## Domain checklist` block when blockchain work is detected; otherwise return text unchanged."""
+    dg = _domain_gates()
+    if dg is None:
+        return text
+    try:
+        if dg.settings(repo, spec_policy)["disabled"]:
+            return text
+        detected, failure = dg.detect_full(Path(repo))
+        block = dg.render_block([d["domain"] for d in detected], repo, detected) if detected else ""
+        if failure and (failure.startswith("scan truncated") or "too deeply nested" in failure):
+            block = (block or "## Domain checklist\n") + dg.incomplete_notice(failure, [d["domain"] for d in detected])
+    except Exception:  # guidance must never block writing a spec
+        return text
+    return text.rstrip("\n") + "\n\n" + block if block else text
+
+
+def domain_lint(text: str, repo, spec_policy: dict):
+    """Return (warnings, problems) for the domain checklist; problems only when domain_gates.mode is enforce."""
+    dg = _domain_gates()
+    if dg is None:
+        return [], []
+    try:
+        config = dg.settings(repo, spec_policy)
+        env_warning = [config["warning"]] if config.get("warning") else []
+        if config["disabled"]:
+            # stay silent for non-blockchain repos, but leave a trace when a blockchain repo is opted out
+            found = dg.detect(Path(repo)) if config["source"] != "env HARNESS_DOMAIN_GATES" else []
+            return ([f"domain gates disabled by {config['source']} although blockchain work was detected"] if found else []), []
+        detected, failure = dg.detect_full(Path(repo))
+        domains = [d["domain"] for d in detected]
+        missing = dg.missing_items(text, domains, repo, strict=config["mode"] == "enforce")
+        skipped = failure is not None
+    except Exception as error:
+        note = f"domain gates could not run ({type(error).__name__})"
+        enforcing = isinstance(spec_policy.get("domain_gates"), dict) and spec_policy["domain_gates"].get("mode") == "enforce"
+        return ([], [note + "; enforce mode fails closed"]) if enforcing else ([note + "; skipped"], [])
+    notes = list(env_warning)
+    if skipped:
+        note = f"domain detection could not run: {failure} (pass --repo <worktree>)"
+        if (failure.startswith("scan truncated") or "too deeply nested" in failure) and dg.allow_truncated(spec_policy):
+            notes.append(note)  # a monorepo that legitimately exceeds the caps can opt in; still visible
+        elif config["mode"] == "enforce":  # a Domains: line in the spec never excuses a failed scan
+            return env_warning, [note + "; enforce mode fails closed"]
+        else:
+            notes.append(note)
+    if not missing:
+        return notes, []
+    note = (f"domain checklist items without a NEG case naming them or `Domain-gate: <id> waived (<reason>)`: "
+            f"{', '.join(missing)}")
+    return (notes + [note], []) if config["mode"] != "enforce" else (notes, [note])
+
+
 # --------------------------------------------------------------------------- reviews (local sidecar)
 
 def reviews_path(spec_path: Path) -> Path:
@@ -285,7 +352,7 @@ def load_reviews(spec_path: Path) -> list:
     path = reviews_path(spec_path)
     if not path.exists():
         return []
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = (_domain_gates().safe_json_loads if _domain_gates() else json.loads)(read_spec_text(path))
     if not isinstance(data, dict) or data.get("v") != 1 or not isinstance(data.get("reviews"), list):
         raise SpecError(f"{path} is not a v1 reviews file", EXIT_USAGE)
     return data["reviews"]
@@ -347,7 +414,7 @@ def render_reviews(entries: list, core: str) -> str:
 
 
 def write_spec_with_reviews(spec_path: Path, entries: list):
-    text = spec_path.read_text(encoding="utf-8")
+    text = read_spec_text(spec_path)
     core = spec_core(text)
     tail = normalize_text(text)[len(core):]
     lines = tail.splitlines()
@@ -380,7 +447,7 @@ def parse_review_report(path: Path):
 
 def read_regular(path: Path, limit: int, *, tail: bool = False):
     try:
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))  # never wait on a FIFO
     except OSError as error:
         raise SpecError(f"cannot open {path} ({error.strerror}); symlinks are refused", EXIT_USAGE) from None
     try:
@@ -404,6 +471,21 @@ def read_regular(path: Path, limit: int, *, tail: bool = False):
     if tail:
         return data, info.st_size
     return data
+
+
+MAX_SPEC_BYTES = 1_000_000
+
+
+def read_spec_bytes(path: Path) -> bytes:
+    """Spec and review sidecar files: one regular, unlinked, bounded file (they are uploaded to the ticket)."""
+    return read_regular(Path(path), MAX_SPEC_BYTES)
+
+
+def read_spec_text(path: Path) -> str:
+    try:
+        return read_spec_bytes(path).decode("utf-8")
+    except UnicodeDecodeError:
+        raise SpecError(f"{path} is not valid UTF-8", EXIT_USAGE) from None
 
 
 KEY_FRAGMENT = re.compile(r"-----(?:BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----")
@@ -1238,27 +1320,30 @@ def cmd_new(args, spec_policy):
         title=session.ticket.title or f"{session.project}#{session.number}", project=session.project,
         number=session.number, author=args.author,
         signoff="human" if "human sign-off" in description.lower() else "main")
+    text = append_domain_block(text, getattr(args, "repo", None) or ".", spec_policy)
     atomic_write(out, text.encode("utf-8"))
     print(json.dumps({"status": "CREATED", "spec": str(out), "ticket": session.ticket.label}))
     return EXIT_OK
 
 
 def cmd_lint(args, spec_policy):
-    text = Path(args.spec).read_text(encoding="utf-8")
+    text = read_spec_text(Path(args.spec))
     _, _, config = ticket_config(spec_policy)
-    problems = lint(text, config)
-    print(json.dumps({"status": "FAIL" if problems else "PASS", "problems": problems,
+    problems = lint(text, config, spec_policy=spec_policy)
+    warnings, domain_problems = domain_lint(text, getattr(args, "repo", None) or ".", spec_policy)
+    problems = problems + domain_problems
+    print(json.dumps({"status": "FAIL" if problems else "PASS", "problems": problems, "warnings": warnings,
                       "spec_core_sha": core_sha(text)}, indent=1))
     return EXIT_MISSING if problems else EXIT_OK
 
 
 def cmd_packet(args, spec_policy):
-    text = Path(args.spec).read_text(encoding="utf-8")
+    text = read_spec_text(Path(args.spec))
     try:
         _, _, config = ticket_config(spec_policy)
     except (OSError, ValueError, ImportError) as error:
         raise SpecError(f"cannot load the ticket configuration to lint the spec: {error}", EXIT_USAGE)
-    problems = lint(text, config)
+    problems = lint(text, config, spec_policy=spec_policy)
     if problems:  # reviewers should never be handed a spec that cannot be attached
         print(json.dumps({"status": "FAIL", "problems": problems}, indent=1))
         return EXIT_MISSING
@@ -1272,7 +1357,7 @@ def cmd_packet(args, spec_policy):
 
 def cmd_review(args, spec_policy):
     spec_path = Path(args.spec)
-    text = spec_path.read_text(encoding="utf-8")
+    text = read_spec_text(spec_path)
     core = core_sha(text)
     entries = load_reviews(spec_path)
     now = datetime.now(timezone.utc).isoformat()
@@ -1296,8 +1381,10 @@ def cmd_review(args, spec_policy):
         types = [e.get("agent_type") for e in wal_entries(checked_wal(Path(args.wal)))
                  if e.get("event") == "subagent" and e.get("agent_id") == agent]
         if not types:
-            raise SpecError(f"agent {args.agent} has no subagent record in {args.wal}; only "
-                            f"{', '.join(LOGGED_AGENT_TYPES)} agents are logged")
+            raise SpecError(f"agent {args.agent} has no subagent record in {args.wal}")
+        if types[0] not in REVIEWER_AGENT_TYPES:
+            raise SpecError(f"agent {args.agent} is a {types[0] or 'typeless'} agent; only "
+                            f"{', '.join(REVIEWER_AGENT_TYPES)} agents may record a review")
         if args.role == "adversarial" and types[0] != "red-team":
             raise SpecError("the adversarial review must come from a red-team agent, a helper receipt or a human")
         data = read_regular(Path(args.report_file), 1_000_000)
@@ -1327,20 +1414,24 @@ def cmd_attach(args, spec_policy):
     spec_path = Path(args.spec)
     entries = load_reviews(spec_path)
     write_spec_with_reviews(spec_path, entries)  # refresh the rendered Reviews section first
-    text = spec_path.read_text(encoding="utf-8")
+    text = read_spec_text(spec_path)
     spec = parse_spec(text)
     _, _, config = ticket_config(spec_policy)
     problems = lint(text, config)
     core = core_sha(text)
     author = parse_author(spec["header"].get("Author", ""))
+    domain_warnings, domain_problems = domain_lint(text, getattr(args, "repo", None) or ".", spec_policy)
+    problems += domain_problems  # only fails in enforce mode
+    for warning in domain_warnings:
+        print(f"spec-flow: warning: {warning}", file=sys.stderr)
     problems += review_problems(entries, core, author)
     if problems:
         raise SpecError("spec not attached:\n" + "\n".join("  - " + p for p in problems))
     session = Session(spec["header"]["Ticket"], spec_policy)
     records, _, _ = session.records()
     latest = current_reviews(entries, core)
-    files = [("spec", spec_path.name, "text/markdown", spec_path.read_bytes()),
-             ("reviews", reviews_path(spec_path).name, "text/plain", reviews_path(spec_path).read_bytes())]
+    files = [("spec", spec_path.name, "text/markdown", read_spec_bytes(spec_path)),
+             ("reviews", reviews_path(spec_path).name, "text/plain", read_spec_bytes(reviews_path(spec_path)))]
     for role in ROLES:
         report = latest[role].get("report")
         if report:
@@ -1352,7 +1443,7 @@ def cmd_attach(args, spec_policy):
     reason = re.match(r"^not-applicable\s*\((.+)\)$", click)
     record = {"v": 1, "kind": "spec", "ticket": session.ticket.label, "issue_id": session.ticket.id,
               "actor": parse_author(args.actor), "author": author, "spec_core_sha": core,
-              "spec_file_sha": sha256_bytes(spec_path.read_bytes()),
+              "spec_file_sha": sha256_bytes(read_spec_bytes(spec_path)),
               "ac": [ident for ident, _ in spec["criteria"]], "neg": [ident for ident, _, _ in spec["negatives"]],
               "click_test": {"required": not reason, "reason": reason.group(1) if reason else None},
               "signoff": spec["header"].get("Sign-off", "main"),
@@ -1561,9 +1652,12 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("--ticket", required=True)
     new.add_argument("--out", required=True)
     new.add_argument("--author", required=True, help="agent:<id> (model), human:<name> or model:<name>")
+    new.add_argument("--repo", default=".", help="repo scanned for blockchain signals (default .)")
     for name in ("lint", "packet"):
         item = sub.add_parser(name)
         item.add_argument("spec")
+        if name == "lint":
+            item.add_argument("--repo", default=".", help="repo scanned for blockchain signals (default .)")
         if name == "packet":
             item.add_argument("--out", required=True)
     review = sub.add_parser("review", help="record an adversarial or acceptance review of the spec")
@@ -1578,6 +1672,7 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--report-file")
     attach = sub.add_parser("attach", help="attach the reviewed spec to its ticket")
     attach.add_argument("spec")
+    attach.add_argument("--repo", default=".", help="repo scanned for blockchain signals (default .)")
     evidence = sub.add_parser("evidence", help="attach proof for acceptance criteria")
     click = sub.add_parser("click-test", help="attach a click-test record")
     signoff = sub.add_parser("signoff", help="record a sign-off on the current spec")
@@ -1653,7 +1748,7 @@ def main(argv=None) -> int:
     try:
         spec_policy = load_spec_policy()
         if args.command == "plan-gate":
-            code, text = plan_ticket_gate(Path(args.repo), Path(args.packet).read_text(encoding="utf-8"),
+            code, text = plan_ticket_gate(Path(args.repo), read_spec_text(Path(args.packet)),
                                           spec_policy=spec_policy)
             if text:
                 print(text, file=sys.stderr)
