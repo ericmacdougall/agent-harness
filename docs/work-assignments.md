@@ -48,13 +48,16 @@ outside `~/.agent-harness/work`). Turns caught up from a transcript or Codex rol
 hook loses nothing, but with `verified: false`. They show in the digest as `[unverified: transcript only]`, and an ask
 split from one has source kind `inferred`, not `user`. A cancel proof, a decision answer and `--reopen-by` all need a
 verified message. A cancel proof also records the captured event id and its MAC, and both are re-checked against the
-event log at removal. A transcript line alone never proves anything. A decision answer must be the AskUserQuestion
-answer or the first hook-captured message in that session after the question, never an agent's pick. An
-`answer_to_decision` cancel needs retraction words plus the ask named (id or 3+ shared words), or a yes or a
-retraction to a question that is itself about cancelling that ask. Superseding is allowed only between asks split
-from the same human message; a request the user replaced is cancelled with their words as proof. The guard
-refuses tool calls that name the key or a glob that could expand to it, recursive reads of the store directory,
-in-process use (`import work_assignments`, `capture_key`, `hook_prompt(`) and agent calls of `work_assignments.py hook`.
+event log at removal. A transcript line alone never proves anything. A decision answer must be the first
+hook-captured message (typed or an AskUserQuestion answer) in that session after the question was recorded, never an
+agent's pick. A cancel through an answer needs the user's own words to retract the ask and name it (id or 3+ of its
+words); the question text does not count, because the agent wrote it. An ask has at most one `superseded_by`
+relation, and superseding is allowed only to an ask split from the same human message (one request refined); it is
+removable once that ask is done. A request the user replaced is cancelled with their words as proof. The guard looks
+at paths and shell commands, not file contents. It refuses a path or shell word that names the key or a glob that
+could expand to it (a bare `*` does not count unless it is inside the store directory), recursive reads of the
+store directory, in-process use (`import work_assignments`, `capture_key`, `hook_prompt(`) and agent calls of
+`work_assignments.py hook`.
 
 ## CLI
 
@@ -89,7 +92,7 @@ contain a cue stays flagged until it is split.
 ## Removal gate
 
 `remove` and `prune` refuse unless the ask has been `done` with re-verifying verified evidence, or `cancelled` with a
-user proof, for more than 24 hours (clock `stateSince`, cached as `removableAfter`), or `superseded` by a closed ask.
+user proof, for more than 24 hours (clock `stateSince`, cached as `removableAfter`), or `superseded` by a done ask split from the same human message.
 A cancel proof names `targets` and a `binding`: `same_message_retraction` (the ask's own message),
 `explicit_reference` (the quote names the ask id or shares 3 or more words with its request),
 `answer_to_decision` or `answer_to_cancel_question` (the human answer to a decision tied to the ask). It must also
@@ -128,7 +131,8 @@ altered attestation are refused. A hand-written event that copies a real attesta
 session and text, so it can only duplicate a message the human really sent. The guard deters accidental reads and
 casual forging only: an agent that writes a script file and runs it, or otherwise works around a pattern match, can
 read the key or call the hook code with forged input. The attestation is not a cryptographic boundary; that needs a
-separate Unix user or a key the OS holds. The guard is best effort against shell tricks (a safety net for careless edits, not a sandbox); the event chain has
+separate Unix user or a key the OS holds. A capture spooled while a decision is open is ordered by when it is drained,
+not when it was typed, so in that narrow window it can count as the decision's first answer. The guard is best effort against shell tricks (a safety net for careless edits, not a sandbox); the event chain has
 no external anchor; a payload over 8 MB is rejected and recorded as a failure; `prune` archives a triaged message (with a tombstone that refuses re-capture) once its asks and decisions are gone and
 24 hours have passed, or after 30 days for a no-ask; decisions have no removal path yet; session caches (sync offsets, stop-block
 counters) are outside the fold by design. The first-touch sync window is the last 64 KB.

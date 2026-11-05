@@ -77,25 +77,64 @@ RECURSIVE = re.compile(r"\b(?:grep|egrep|rg|ag|ack)\b[^|;&]*\s-[A-Za-z]*[rR]|\br
                        r"\bcp\s+-[A-Za-z]*[rR]|\bstrings\b|\bxxd\b|\bod\b")
 
 
-def names_key(blob: str) -> bool:
-    """The key's name, or a glob that could expand to it (work-led*, work-ledger.ke?, [w]ork-ledger.key)."""
-    if KEY_FILE.search(blob):
-        return True
+def store_dir_forms() -> set:
+    home = str(base()).rstrip("/")
+    return {home, home.replace(str(Path.home()), "~", 1), home.replace(str(Path.home()), "$HOME", 1),
+            "$AGENT_HARNESS_HOME", "${AGENT_HARNESS_HOME}"}
+
+
+CONTENT_KEYS = {"content", "old_string", "new_string", "new_source", "edits"}
+PATCH_HEADER = re.compile(r"(?m)^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$")
+
+
+def guard_targets(tool_input) -> tuple:
+    """(paths, command): what a tool call reads or writes, never the text it writes. An apply_patch body counts only
+    for its file headers, so editing a file whose text mentions the ledger (its docs, its tests) is not a write to it."""
+    if not isinstance(tool_input, dict):
+        return [], (tool_input if isinstance(tool_input, str) else "")
+    command = tool_input.get("command")
+    if isinstance(command, list):
+        command = " ".join(str(part) for part in command)
+    paths = []
+    for key, value in tool_input.items():
+        if key in CONTENT_KEYS or key == "command" or not isinstance(value, str):
+            continue
+        paths.extend(PATCH_HEADER.findall(value) if key == "input" else [value])
+    return paths, command if isinstance(command, str) else ""
+
+
+def protected_hit(text: str) -> bool:
+    """A store name, or a glob that could become one; the repo's own work-assignments.md or .py are not the store."""
+    return any("*" in m.group(0) or "?" in m.group(0) or not re.search(r"\.(?:md|rst|txt|py|html)$", m.group(0))
+               for m in PROTECTED.finditer(text))
+
+
+def glob_could_name_key(token: str) -> bool:
+    """A shell word that could expand to the key: its last part matches the key's name but not an arbitrary name
+    (so `*`, `src/*` and `2 * 3` do not count), or it is any glob directly inside the store directory."""
     import fnmatch
-    for token in GLOB_TOKEN.findall(blob):
-        name = token.rstrip("/").rsplit("/", 1)[-1]
-        if name and fnmatch.fnmatchcase("work-ledger.key", name):
-            return True
-    return False
+    token = token.strip("'\"")
+    head, _, name = token.rstrip("/").rpartition("/")
+    if not name:
+        return False
+    if head and head.rstrip("/") in store_dir_forms():
+        return True
+    return fnmatch.fnmatchcase("work-ledger.key", name) and not fnmatch.fnmatchcase("zz9-unrelated.py", name)
+
+
+def names_key(tool_input) -> bool:
+    """Only paths and shell commands count: editing a file whose text mentions the key (these docs) is fine."""
+    paths, command = guard_targets(tool_input)
+    if any(KEY_FILE.search(v) or (GLOB_TOKEN.fullmatch(v) and glob_could_name_key(v)) for v in paths):
+        return True
+    return bool(KEY_FILE.search(command)) or any(glob_could_name_key(t) for t in GLOB_TOKEN.findall(command))
 
 
 def reads_store_recursively(command: str) -> bool:
     """A recursive reader pointed at the store directory itself (not a subdirectory such as work/)."""
     if not RECURSIVE.search(command):
         return False
-    home = str(base()).rstrip("/")
-    targets = {home, home.replace(str(Path.home()), "~", 1), home.replace(str(Path.home()), "$HOME", 1),
-               "$AGENT_HARNESS_HOME", "${AGENT_HARNESS_HOME}"}
+    targets = store_dir_forms()
     for token in re.split(r"[\s'\"=;&|<>()]+", command):
         if token.rstrip("/") in targets or token.rstrip("/*") in targets and token.endswith("*"):
             return True
@@ -784,6 +823,16 @@ def drain_spool(data: dict) -> None:
         bad = [k for k, t in types.items() if not isinstance(rec.get(k), t)]
         if not bad and not (isinstance(rec["tref"].get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", rec["tref"]["sha256"])):
             bad = ["tref.sha256"]
+        if not bad:
+            t = rec["tref"]
+            ok = (set(t) <= {"sha256", "chars", "words", "redaction", "excerpt", "requestCues"}
+                  and all(isinstance(t.get(k), int) and not isinstance(t.get(k), bool) for k in ("chars", "words"))
+                  and isinstance(t.get("redaction"), dict)
+                  and (t.get("excerpt") is None or (isinstance(t["excerpt"], str) and len(t["excerpt"]) <= 160))
+                  and (t.get("requestCues") is None or (isinstance(t["requestCues"], list) and len(t["requestCues"]) <= MAX_CUES
+                                                         and all(isinstance(c, str) and len(c) <= 40 for c in t["requestCues"]))))
+            if not ok:
+                bad = ["tref fields"]
         if not bad and not (rec.get("item") is None or isinstance(rec["item"], str)) or \
                 not bad and not (rec.get("transcript") is None or isinstance(rec["transcript"], str)):
             bad = ["item/transcript"]
@@ -1187,14 +1236,27 @@ def no_ask_line(row: dict) -> str:
             + (f" -> reopen with work_assignments.py split --msg {row['id']} --item '...'" if row["cues"] else ""))
 
 
+def supersede_target(data: dict, ask: dict):
+    """The single superseding ask, or None. Valid only if there is exactly one superseded_by relation and the target
+    is a different ask split from the same human message (a refinement of one request, never a different request)."""
+    targets = [r["target"] for r in ask.get("related", []) if r["kind"] == "superseded_by"]
+    if len(targets) != 1 or targets[0] == ask["id"]:
+        return None
+    other = data["asks"].get(targets[0])
+    origin = ask["origin"].get("messageId")
+    if other is None or not origin or other["origin"].get("messageId") != origin:
+        return None
+    return other
+
+
 def pending_supersessions(data: dict, limit: int = 8) -> list:
     """Superseded asks whose replacement is not done yet: superseding is not proof the work happened."""
     out = []
     for ask in data["asks"].values():
         if ask["state"] != "superseded":
             continue
-        target = next((r["target"] for r in ask.get("related", []) if r["kind"] == "superseded_by"), None)
-        if not target or data["asks"].get(target, {}).get("state") != "done":
+        target = supersede_target(data, ask)
+        if target is None or target["state"] != "done":
             out.append(ask)
     return sorted(out, key=lambda a: a["id"])[:limit]
 
@@ -1222,8 +1284,8 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
         lines.append(f"  DECISION {d['id']} [{d['state']}]: {prov.clip(d['compressed'], 80)}")
     pending = pending_supersessions(data, limit=10 ** 6)
     for ask in pending[:8]:
-        target = next(r["target"] for r in ask["related"] if r["kind"] == "superseded_by")
-        repl = data["asks"].get(target)
+        repl = supersede_target(data, ask)
+        target = repl["id"] if repl else "?"
         lines.append(f"  SUPERSEDED {ask['id']} -> {target} [{repl['state'] if repl else 'missing'}]: "
                      f"{prov.clip(ask['request']['compressed'], 60)} (shown until {target} is done)")
     if len(pending) > 8:
@@ -1437,12 +1499,11 @@ def hook_guard(payload: dict, runtime: str) -> dict:
     if mode == "off":
         return {}
     tool, tool_input = str(payload.get("tool_name") or ""), payload.get("tool_input")
-    blob = json.dumps(tool_input, ensure_ascii=False) if tool_input is not None else ""
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if isinstance(command, list):
         command = " ".join(str(part) for part in command)
     reason = None
-    if names_key(blob):
+    if names_key(tool_input):
         reason = "The capture key is read and written only by work_assignments.py; tools may not touch it."
     elif isinstance(command, str) and HOOK_CALL.search(command) and re.search(r"work.?assign|\[|\*|\?", command):
         reason = "Hooks take their input from the harness; agents may not run `work_assignments.py hook`."
@@ -1454,11 +1515,14 @@ def hook_guard(payload: dict, runtime: str) -> dict:
         if mode == "enforce":
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
         return context("PreToolUse", "(warn mode) " + reason)
-    if not PROTECTED.search(blob):
+    # Paths and the command only: text that merely mentions the ledger (its docs, its tests) is not a write to it.
+    paths, cmd = guard_targets(tool_input)
+    targets = " ".join(paths + [cmd])
+    if not protected_hit(targets):
         return {}
     if isinstance(command, str) and SAFE_CLI.match(command):  # exactly one CLI call: no redirection, chaining or substitution
         return {}
-    writer = bool(re.search(r"(?i)write|edit|patch|notebook", tool)) or bool(WRITEISH.search(blob))
+    writer = bool(re.search(r"(?i)write|edit|patch|notebook", tool)) or bool(WRITEISH.search(targets))
     if not writer:
         return {}
     reason = ("The work ledger, its event log, archive, lock, spool, hive identity and policy are changed only through "
@@ -1629,7 +1693,6 @@ def words_of(text: str) -> set:
 
 RETRACTION = re.compile(r"(?i)cancel|never ?mind|forget|scrap|\bdrop|\bstop|no wait|instead|retract|ignore|don'?t|"
                         r"no longer|not needed|skip|abandon|withdraw|call (?:it|that) off")
-AFFIRM = re.compile(r"(?i)^\W*(?:yes|yep|yeah|y|ok(?:ay)?|sure|correct|confirmed?|do it|go ahead|please do)\b")
 
 
 def captured_after(mid: str, did: str, asked_at: float) -> bool:
@@ -1642,15 +1705,13 @@ def captured_after(mid: str, did: str, asked_at: float) -> bool:
 
 
 def answer_problem(data: dict, dec: dict, msg: dict):
-    """The answer to a decision is not the agent's pick of any human message: it is the AskUserQuestion answer, or
-    the first verified human message in the asking session after the question was asked."""
+    """The answer to a decision is not the agent's pick of any human message: it is the first verified human
+    message (typed, or an AskUserQuestion answer) in that session after the question was recorded."""
     if not verified_human(msg):
         return "the answer must be a hook-captured human message"
     asked_at = parse_ts(dec.get("createdAt") or dec["stateSince"])
     if not captured_after(msg["id"], dec["id"], asked_at):
         return "the answer was captured before the question was asked"
-    if msg["humanCheck"]["method"] == "claude_ask_answer":
-        return None
     session = (dec.get("question", {}).get("actor") or {}).get("sessionId") or dec.get("origin", {}).get("actor", {}).get("sessionId")
     later = sorted((m for m in data["messages"].values()
                     if m["sessionId"] == msg["sessionId"] and verified_human(m) and captured_after(m["id"], dec["id"], asked_at)),
@@ -1686,7 +1747,6 @@ def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, de
             raise WAError(f"{binding}: decision {decision_id} is not answered by this message")
         if not any(r["target"] == ask["id"] for r in dec.get("related", [])):
             raise WAError(f"{binding}: decision {decision_id} is not related to {ask['id']}")
-        asked = json.dumps(dec.get("question", {}), ensure_ascii=False)
         if parse_ts(msg["origin"]["at"]) < parse_ts(dec.get("createdAt") or dec.get("stateSince") or msg["origin"]["at"]) - 1:
             raise WAError(f"{binding}: the answer predates the decision")
         if dec["answer"]["messageId"] != msg["id"]:
@@ -1694,11 +1754,9 @@ def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, de
         why = answer_problem(data, dec, msg)
         if why:
             raise WAError(f"{binding}: {why}")
-        names_it = names_ask(ask, quote)
-        cancel_question = bool(RETRACTION.search(asked)) and names_ask(ask, asked)
-        if not ((RETRACTION.search(quote) and (names_it or cancel_question)) or (cancel_question and AFFIRM.search(quote))):
-            raise WAError(f"{binding}: the answer must retract this ask by name or words, or say yes to a question "
-                          f"that asks about cancelling this ask")
+        # The question text is the agent's; nothing proves the user saw it. Only the user's own words count.
+        if not (RETRACTION.search(quote) and names_ask(ask, quote)):
+            raise WAError(f"{binding}: the answer must itself retract this ask, naming it (id or 3+ of its words)")
     else:
         raise WAError("unknown binding " + str(binding))
 
@@ -1786,11 +1844,10 @@ def eligible(ask: dict, ts: float, data=None) -> tuple:
         except (WAError, KeyError) as error:
             return False, f"cancel proof no longer verifies: {error}"
         return True, "cancelled with verified user proof for more than 24h"
-    target = next((r["target"] for r in ask.get("related", []) if r["kind"] == "superseded_by"), None)
-    other = data["asks"].get(target) if data is not None and target != ask["id"] else None
+    other = supersede_target(data, ask) if data is not None else None
     if other is not None and other["state"] == "done":  # the replacement itself passed the done gate (verified evidence)
         return True, "superseded by a done ask"
-    return False, "the superseding ask is not a different ask that is done"
+    return False, "the superseding ask is not a single done ask split from the same human message"
 
 
 # --------------------------------------------------------------------------- ask construction and cli
@@ -1916,14 +1973,12 @@ def cmd_update(args):
         if args.state == "cancelled":
             raise WAError("use `cancel` with user proof to cancel an ask")
         if args.state == "superseded":
-            targets = [data["asks"][r["target"]] for r in ask["related"]
-                       if r["kind"] == "superseded_by" and r["target"] in data["asks"] and data["asks"][r["target"]]["state"] not in CLOSED]
-            if not targets:
-                raise WAError("superseding needs `relate A superseded_by B` where B exists and is not closed")
-            origin = ask["origin"].get("messageId")
-            if not origin or not any(b["origin"].get("messageId") == origin for b in targets):
-                raise WAError("an ask can be superseded only by an ask split from the same human message; for a request "
-                              "the user replaced, `cancel` it with their words as proof")
+            target = supersede_target(data, ask)
+            if target is None:
+                raise WAError("superseding needs exactly one `relate A superseded_by B`, with B split from the same human "
+                              "message; for a request the user replaced, `cancel` it with their words as proof")
+            if target["state"] in CLOSED:
+                raise WAError("the superseding ask is already closed")
         for text in args.evidence or ():
             item = parse_evidence(text, who, args.repo)
             item["id"] = f"V-{len(ask['evidence']) + 1}"
@@ -2111,6 +2166,10 @@ def cmd_relate(args):
         right = data["asks"].get(args.b) or data["decisions"].get(args.b)
         if not left or not right:
             raise WAError("both ids must exist")
+        if args.kind in ("superseded_by", "supersedes"):
+            old = left if args.kind == "superseded_by" else right
+            if any(r["kind"] == "superseded_by" for r in old.get("related", [])):
+                raise WAError(f"{old['id']} already has a superseded_by relation; an ask has at most one replacement")
         for src, dst, kind in ((left, right, args.kind), (right, left, inverse[args.kind])):
             ttype = "ask" if src["id"] in data["asks"] else "decision"
             emit(data, "relate", ttype, src["id"], {"relation": {"kind": kind, "target": dst["id"], "at": iso(now()), "by": who}}, who)

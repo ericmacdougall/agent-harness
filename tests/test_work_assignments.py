@@ -746,6 +746,21 @@ class RemovalTest(Base):
         a, b = sorted(self.asks())[-2:]
         return a, b
 
+    def test_second_superseded_by_relation_is_refused(self):
+        """PR review R3: relate A->Z (other request) then A->B (sibling) passed the gate, and A was removed when Z was done."""
+        a, b = self.split2("billing", "deploy the billing migration", "deploy billing migration in two steps")
+        _, z = self.split("other", "unrelated cleanup chore")
+        self.assertEqual(self.cli("relate", a, "superseded_by", z)[0], 0)
+        self.assertEqual(self.cli("relate", a, "superseded_by", b)[0], 2)
+        self.assertEqual(self.cli("update", a, "--state", "superseded")[0], 2)  # its one target is another request
+        with wa.transaction() as data:  # even a forged second relation is not enough at removal
+            data["asks"][a]["related"].append({"kind": "superseded_by", "target": b, "at": wa.iso(CLOCK[0]),
+                                               "by": data["asks"][a]["origin"]["actor"]})
+            data["asks"][a]["state"] = "superseded"
+        self.advance(z)
+        CLOCK[0] += 25 * 3600
+        self.assertEqual(self.cli("remove", a)[0], 2)
+
     def test_supersede_across_requests_is_refused(self):
         """PR review P3: any unrelated open ask could supersede, and so drop, a request."""
         _, old = self.split("old", "deploy the billing migration")
@@ -833,12 +848,25 @@ class RemovalTest(Base):
     def test_decision_answer_binding(self):
         _, aid = self.split("start something", "refactor the billing exporter module")
         did = self.ask_decision(aid, "Cancel the billing exporter refactor?")
-        msg = self.capture("yes, cancel that whole thing please")
+        msg = self.capture("yes, cancel the billing exporter refactor")
         self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", msg["id"])[0], 0)
         uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
-        args = self.cancel_args(aid, uid, 2, "yes, cancel that whole thing please", "answer_to_decision", "--decision", did)
+        args = self.cancel_args(aid, uid, 2, "yes, cancel the billing exporter refactor", "answer_to_decision", "--decision", did)
         self.assertEqual(self.cli(*args)[0], 0)
         self.check_schema()
+
+    def test_silent_cancel_question_does_not_let_an_unrelated_reply_cancel(self):
+        """PR review R2: the agent wrote "Cancel the billing exporter refactor?" without asking the user; the next
+        unrelated message ("ok now please fix the flaky CI pipeline deploy job") cancelled the ask."""
+        _, aid = self.split("start something", "refactor the billing exporter module")
+        did = self.ask_decision(aid, "Cancel the billing exporter refactor?")
+        msg = self.capture("ok now please fix the flaky CI pipeline deploy job")
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", msg["id"])[0], 0)
+        uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
+        for binding in ("answer_to_cancel_question", "answer_to_decision"):
+            args = self.cancel_args(aid, uid, 2, "ok now please fix the flaky CI pipeline deploy job", binding, "--decision", did)
+            self.assertEqual(self.cli(*args)[0], 2, binding)
+        self.assertEqual(self.asks()[aid]["state"], "open")
 
     def test_unrelated_message_cannot_answer_a_decision_or_cancel(self):
         """PR review P2: any human message containing "don't" answered a decision and cancelled the ask."""
@@ -1133,6 +1161,21 @@ class AttestGuardTest(Base):
         for cmd in (f"ls {home}", f"grep -r TODO {home}/work", "python3 -m unittest tests.test_work_assignments",
                     "git diff harness/hooks/work_assignments.py", "cat docs/work-assignments.md"):
             self.assertEqual(self.guard("Bash", {"command": cmd}), {}, cmd)
+        self.assertEqual(self.guard("Bash", {"command": f"cat {home}/*"}).get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+
+    def test_guard_allows_ordinary_globs_and_code(self):
+        """PR review R1 (regression): a bare `*` counted as naming the key, so `ls *` and `x = 2 * 3` were denied."""
+        for cmd in ("ls *", "git add *", "rm -rf build/*", "grep -r foo src/*", "echo 2 * 3", 'find . -name "*.py"',
+                    "ls ~/.agent-harness/work/*", "cat *.md", "python3 -c 'print(2 * 3)'"):
+            self.assertEqual(self.guard("Bash", {"command": cmd}), {}, cmd)
+        self.assertEqual(self.guard("Write", {"file_path": "/repo/a.py", "content": "x = 2 * 3\n"}), {})
+        self.assertEqual(self.guard("Edit", {"file_path": "/repo/a.c", "old_string": "a", "new_string": "/* comment */"}), {})
+        self.assertEqual(self.guard("Edit", {"file_path": "/repo/docs/work-assignments.md", "old_string": "a",
+                                             "new_string": "the key is `work-ledger.key`"}), {})
+        snap = str(wa.files()["snap"])
+        self.assertEqual(self.guard("Write", {"file_path": "/repo/notes.txt", "content": f"echo x > {snap}"}), {})
+        for blocked in ({"file_path": snap, "content": "{}"}, {"file_path": str(wa.files()["key"]), "content": "x"}):
+            self.assertEqual(self.guard("Write", blocked)["hookSpecificOutput"]["permissionDecision"], "deny", blocked)
 
 
 class SpoolTest(Base):
