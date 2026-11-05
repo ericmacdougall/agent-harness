@@ -332,7 +332,8 @@
    "stop_lints:stop",
    "stop_lints:subagent-stop"
   ],
-  "static_mode": "warn"
+  "static_mode": "warn",
+  "partial_reason": "uncommitted tracked changes are not checked: git status runs a repo's own clean filters, so only unpushed commits are reported"
  },
  {
   "id": "S19",

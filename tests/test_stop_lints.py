@@ -171,11 +171,35 @@ class Unpushed(unittest.TestCase):  # S18
         self.assertEqual(len(out), 1)
         self.assertIn("1 commit(s) on main", out[0])
 
-    def test_uncommitted_tracked_change_warns_but_untracked_file_does_not(self):
+    def test_uncommitted_changes_are_deliberately_not_checked_and_status_never_runs(self):
         (self.repo / "new.txt").write_text("x")
-        self.assertEqual(sl.lint_unpushed(str(self.repo)), [])
         (self.repo / "a.txt").write_text("changed")
-        self.assertIn("1 tracked file(s)", sl.lint_unpushed(str(self.repo))[0])
+        calls = []
+        real = subprocess.run
+
+        def spy(cmd, *a, **k):
+            calls.append(cmd)
+            return real(cmd, *a, **k)
+        with mock.patch.object(subprocess, "run", spy):
+            self.assertEqual(sl.lint_unpushed(str(self.repo)), [])
+        self.assertTrue(calls)
+        self.assertFalse(any("status" in c or "diff-index" in c or "diff-files" in c for c in calls), calls)
+        self.assertTrue(all(c[0] == "git" for c in calls))
+
+    def test_git_is_run_without_lazy_fetch_and_with_a_clean_environment(self):
+        seen = []
+        real = subprocess.run
+
+        def spy(cmd, *a, **k):
+            seen.append(k.get("env"))
+            return real(cmd, *a, **k)
+        with mock.patch.object(subprocess, "run", spy), mock.patch.dict(os.environ, {"GIT_DIR": "/nonexistent", "GIT_EXTERNAL_DIFF": "x"}):
+            sl.lint_unpushed(str(self.repo))
+        self.assertTrue(seen)
+        for env in seen:
+            self.assertEqual(env["GIT_NO_LAZY_FETCH"], "1")
+            self.assertFalse([k for k in env if k.startswith("GIT_") and k not in ("GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS",
+                                                                                    "GIT_NO_LAZY_FETCH")])
 
     def test_not_a_repo_or_missing_dir_is_clean(self):
         with tempfile.TemporaryDirectory() as d:
@@ -303,7 +327,7 @@ class ReviewRegressions(WalFixture):
         self.assertEqual(self.lint(message="It is all done: REALLY_TESTED r1b recorded."), [])
 
     def test_pending_ids_ignore_prose_and_trailing_periods(self):  # F5
-        self.wal([row("check", 1, note="a PENDING_REAL_TEST note; REALLY_TESTED T1."),
+        self.wal([row("check", 1, note="a PENDING_REAL_TEST note; REALLY_TESTED T1: ok."),
                   row("check", 2, note="PENDING_REAL_TEST T1: x")])
         self.assertEqual(self.lint(), [])
 
@@ -343,8 +367,9 @@ class UnpushedNoise(Unpushed):
         run_git(self.repo, "commit", "-q", "-m", "attrs")
         (self.repo / "a.txt").write_text("changed")
         marker.unlink(missing_ok=True)  # setup commands above may have run the filter themselves
-        self.assertEqual(sl.lint_unpushed(str(self.repo)), [])
+        out = sl.lint_unpushed(str(self.repo))
         self.assertFalse(marker.exists())
+        self.assertEqual(len(out), 1)  # the unpushed attrs commit is still reported
 
 
 class SecondRound(WalFixture):
@@ -443,6 +468,23 @@ class ThirdRound(WalFixture):
         self.assertEqual(self.lint(), [])
         self.wal([row("check", 1, note="PENDING_REAL_TEST a1: will append REALLY_TESTED a1: later")])
         self.assertEqual(len(self.lint()), 1)
+
+
+class FourthRound(WalFixture):
+    def test_prose_mentions_of_reallytested_never_close_an_id(self):
+        for prose in ("REALLY_TESTED t1 NOT run, failed", "Still pending: REALLY_TESTED t1 is outstanding",
+                      "reconcile: need REALLY_TESTED t1 before handoff"):
+            self.wal([row("check", 1, note="PENDING_REAL_TEST t1: x"), row("check", 2, note=prose)])
+            self.assertEqual(len(self.lint()), 1, prose)
+        for good in ("REALLY_TESTED t1: ran make test, 12 passed", "ok; REALLY_TESTED t1: done", "x\nREALLY_TESTED t1: done"):
+            self.wal([row("check", 1, note="PENDING_REAL_TEST t1: x"), row("check", 2, note=good)])
+            self.assertEqual(self.lint(), [], good)
+
+    def test_rules_registry_records_the_s18_gap(self):
+        rules = json.loads((ROOT / "harness" / "hooks" / "rules.json").read_text())
+        rules = rules if isinstance(rules, list) else rules["rules"]
+        s18 = [r for r in rules if r["id"] == "S18"][0]
+        self.assertIn("uncommitted", s18.get("partial_reason", ""))
 
 
 if __name__ == "__main__":

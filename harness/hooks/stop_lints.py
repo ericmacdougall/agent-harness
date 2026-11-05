@@ -11,7 +11,7 @@ Lints (all warn-only; modes live in stop_lints_policy.json, "off" disables one):
   W12  the final message claims done/complete/shipped/merged without a cite (commit SHA, REALLY_TESTED id, PR number
        or URL).
   W17  the final message hands the user a chore (run, install, click, sign in ...) without saying no agent path exists.
-  S18  the working tree has tracked uncommitted changes or commits that are on no remote branch.
+  S18  commits that are on no remote branch (uncommitted changes are deliberately not checked: see lint_unpushed).
   S26  a red-team subagent's final report lacks its Worst-case or Bound declaration.
 
 It is a standalone entry: it never edits other hooks' state, and fails open (prints nothing, exits 0) on any error
@@ -44,7 +44,7 @@ SESSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{7,63}$")
 AGENT_RE = re.compile(r"^[0-9A-Za-z]{6,64}$")
 ID_BODY = r"([A-Za-z0-9_][A-Za-z0-9_.\-]*[A-Za-z0-9_]|[A-Za-z0-9_])"
 PENDING_RE = re.compile(r"PENDING_REAL_TEST\s+" + ID_BODY + r"(?=:)")  # the convention is `PENDING_REAL_TEST <id>:`
-REALLY_RE = re.compile(r"REALLY_TESTED\s+" + ID_BODY + r"(?=[:\s,;)]|\.(?:\s|$)|$)")
+REALLY_RE = re.compile(r"(?:^|[;\n])[ \t]*REALLY_TESTED[ \t]+" + ID_BODY + r"(?=:)")  # `REALLY_TESTED <id>:` opens a note or a clause
 DONE_WINDOW = 12_000  # the end of the message is where the claim is; also bounds every regex below
 DONE_RE = re.compile(
     r"(?im)\b(?:the (?:work|task|change|fix|feature|batch|pr|migration) (?:is|are)|it(?:'s| is)|all (?:is|are)|now|all)"
@@ -192,8 +192,6 @@ def lint_red_team(message: str, agent_type: str) -> list[str]:
     return []
 
 
-RISKY_CONFIG = re.compile(r"^(filter\..*|core\.fsmonitor|core\.sshcommand|core\.hookspath|core\.pager|diff\.external|"
-                          r"diff\..*\.(command|textconv)|include\.path|includeif\..*)\b", re.I | re.M)
 DEADLINE = [0.0]
 
 
@@ -202,7 +200,7 @@ def git(cwd: str, *args: str) -> str | None:
     if left <= 0.2:
         return None
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path.home()), "GIT_TERMINAL_PROMPT": "0",
-           "GIT_OPTIONAL_LOCKS": "0"}
+           "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1"}  # no promisor fetch, so no remote-controlled command
     try:
         done = subprocess.run(["git", "-C", cwd, "-c", "core.fsmonitor=false", *args], capture_output=True, text=True,
                               timeout=min(5.0, left), env=env)
@@ -212,27 +210,20 @@ def git(cwd: str, *args: str) -> str | None:
 
 
 def lint_unpushed(cwd: str) -> list[str]:
-    """S18."""
+    """S18, commits only. Uncommitted tracked changes are NOT checked on purpose: `git status` refreshes the index, and
+    that runs clean filters, fsmonitor and lazy fetches named in a repo's own config. Reviews found three such ways in
+    three rounds (config, config.worktree, submodule gitdir, promisor remotes), so the class is removed instead. The
+    commands used here (rev-parse, remote, rev-list over refs, branch --show-current) read refs and never touch the
+    working tree, a filter or a blob."""
     if not cwd or not os.path.isdir(cwd) or git(cwd, "rev-parse", "--is-inside-work-tree") is None:
-        return []
-    # git status runs clean filters, fsmonitor and similar commands named in the repo's own config; do not run it
-    # in a repo whose local config names any (a repo an agent or an archive wrote)
-    scoped = git(cwd, "config", "--show-scope", "--list", "--name-only")
-    if scoped is None or any(  # repo-controlled scopes only: local and worktree (config.worktree); our own -c is the command scope
-            RISKY_CONFIG.search(line.split(None, 1)[1]) for line in scoped.splitlines()
-            if line.split(None, 1)[0] in ("local", "worktree") and len(line.split(None, 1)) == 2):
         return []
     if not (git(cwd, "remote") or "").strip():
         return []  # nowhere to push: every commit would be "unpushed" on every turn
-    out = []
-    dirty = git(cwd, "status", "--porcelain=v1", "--untracked-files=no", "--ignore-submodules=all")
-    if dirty and dirty.strip():
-        out.append(f"S18: {len(dirty.strip().splitlines())} tracked file(s) have uncommitted changes")
     ahead = git(cwd, "rev-list", "--count", "HEAD", "--not", "--remotes")
     if ahead and ahead.strip().isdigit() and int(ahead) > 0:
         branch = (git(cwd, "branch", "--show-current") or "").strip() or "detached HEAD"
-        out.append(f"S18: {int(ahead)} commit(s) on {branch} are on no remote branch (push the feature branch)")
-    return out
+        return [f"S18: {int(ahead)} commit(s) on {branch} are on no remote branch (push the feature branch)"]
+    return []
 
 
 def last_message(payload: dict) -> str:
