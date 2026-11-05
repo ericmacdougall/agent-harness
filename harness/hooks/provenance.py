@@ -296,7 +296,7 @@ def parse_source(text: str) -> dict:
         raise Problem("bad-syntax", "Source longer than 4000 characters")
     match = re.match(r"(?is)^([A-Za-z]+)\s*:\s*(.*)$", value)
     if not match:
-        raise Problem("bad-syntax", "Source must start with user:, ticket:, wal:, file: or inferred:")
+        raise Problem("bad-syntax", "Source must start with user:, answer:, queue:, ticket:, wal:, file: or inferred:")
     kind, rest = match.group(1).lower(), match.group(2).strip()
     if kind == "user":
         found = re.match(r"^([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})\s*(.*)$", rest, re.S)
@@ -306,6 +306,23 @@ def parse_source(text: str) -> dict:
         if excerpt is None:
             raise Problem("excerpt-missing", "a user: source needs a verbatim quoted excerpt of the user's words")
         return {"kind": "user", "session": found.group(1).lower(), "uuid": found.group(2).lower(), "excerpt": excerpt}
+    if kind in ("answer", "queue"):
+        # Same trust class as user:, different record kind (see ah user-msg and docs/provenance.md).
+        if kind == "answer":
+            found = re.match(r"^([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})\s*(.*)$", rest, re.S)
+            ok = found and UUID_RE.match(found.group(1)) and UUID_RE.match(found.group(2))
+            ident = found.group(2).lower() if found else None
+        else:
+            found = re.match(r"^([0-9a-fA-F-]{36})/(\d{4}-\d\d-\d\dT[\d:.]{8,16}Z)#([0-9a-f]{12})\s*(.*)$", rest, re.S)
+            ok = found and UUID_RE.match(found.group(1))
+            ident = (found.group(2), found.group(3)) if found else None
+        if not ok:
+            raise Problem("bad-syntax", "answer: needs <session>/<uuid>; queue: needs <session>/<timestamp>#<sha12>; then a quoted excerpt")
+        excerpt = parse_excerpt(found.group(found.lastindex))
+        if excerpt is None:
+            raise Problem("excerpt-missing", f"a {kind}: source needs a verbatim quoted excerpt of the user's words")
+        return {"kind": "user", "variant": kind, "session": found.group(1).lower(), "ident": ident, "excerpt": excerpt,
+                "uuid": ident if kind == "answer" else f"{ident[0]}#{ident[1]}"}
     if kind == "ticket":
         found = re.match(r"^GoodQA\s+([A-Za-z0-9_.-]{1,80})#(\d{1,9})(?:\s+comment\s+([0-9A-Za-z-]{4,64}))?$", rest)
         if not found:
@@ -510,6 +527,52 @@ def user_authorship(record: dict):
     return None, "turn has no readable text"
 
 
+QUEUE_WRAPPER = re.compile(r"^\s*<[A-Za-z][\w:-]*[\s>/]")
+ANSWER_TRUST = "AskUserQuestion tool result bound to an AskUserQuestion tool_use in the same transcript"
+QUEUE_TRUST = "transcript queue-operation record without an origin marker (accidental-damage threat model)"
+
+
+def queue_user_text(record):
+    """Text of a queued mid-turn user message record, else None. Harness wrapper elements (task notifications,
+    agent messages, reminders) are never user text."""
+    if not isinstance(record, dict) or record.get("type") != "queue-operation":
+        return None
+    if record.get("operation") not in ("enqueue", "popAll"):
+        return None
+    content = record.get("content")
+    if not isinstance(content, str) or not content.strip() or QUEUE_WRAPPER.match(content):
+        return None
+    return content
+
+
+def askuser_use_ids(record) -> set:
+    """tool_use ids of AskUserQuestion calls made by the main conversation in an assistant record."""
+    out = set()
+    if isinstance(record, dict) and record.get("type") == "assistant" and not record.get("isSidechain"):
+        content = (record.get("message") or {}).get("content")
+        for block in content if isinstance(content, list) else []:
+            if (isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "AskUserQuestion"
+                    and isinstance(block.get("id"), str)):
+                out.add(block["id"])
+    return out
+
+
+def answer_text(record, ask_ids):
+    """Text of the user's answer to an AskUserQuestion, else None. The result must answer an AskUserQuestion
+    tool_use (ask_ids), so another tool's output can never stand in for the user."""
+    if not isinstance(record, dict) or record.get("type") != "user" or record.get("isSidechain"):
+        return None
+    blocks = (record.get("message") or {}).get("content")
+    if ("toolUseResult" not in record or not isinstance(blocks, list) or len(blocks) != 1
+            or not isinstance(blocks[0], dict) or blocks[0].get("type") != "tool_result"
+            or blocks[0].get("tool_use_id") not in ask_ids):
+        return None
+    content = blocks[0].get("content")
+    if isinstance(content, list):
+        content = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and isinstance(b.get("text"), str))
+    return content if isinstance(content, str) else None
+
+
 def excerpt_in(text: str, excerpt: str):
     """None when the excerpt is a faithful quote of text, else a rejection reason."""
     if SENTINEL in excerpt:
@@ -546,6 +609,45 @@ def user_turn(session: str, uid: str, home=None) -> dict:
     if text is None:
         raise Problem("not-user-authored", reason)
     return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session}
+
+
+def answer_turn(session: str, uid: str, home=None) -> dict:
+    path = find_transcript(session, home)
+    record = load_record(path, "uuid", uid)
+    if record == "malformed":
+        raise Problem("transcript-malformed", "only malformed or oversized lines mention that uuid")
+    if record is None:
+        raise Problem("message-not-found", f"no message {uid[:8]}... in session {clip(session, 40)}")
+    blocks = (record.get("message") or {}).get("content") if isinstance(record, dict) else None
+    use_id = blocks[0].get("tool_use_id") if isinstance(blocks, list) and blocks and isinstance(blocks[0], dict) else None
+    ids = set()
+    if isinstance(use_id, str):
+        for line in _lines_containing(path, use_id.encode()):
+            try:
+                ids |= askuser_use_ids(loads_line(line)) if line is not None else set()
+            except ValueError:
+                continue
+    text = answer_text(record, ids)
+    if text is None:
+        raise Problem("not-user-authored", "record is not an AskUserQuestion answer bound to an AskUserQuestion tool_use")
+    return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session}
+
+
+def queue_turn(session: str, ident, home=None) -> dict:
+    import hashlib
+    stamp, sha = ident
+    path = find_transcript(session, home)
+    for line in _lines_containing(path, stamp.encode()):
+        if line is None:
+            continue
+        try:
+            record = loads_line(line)
+        except ValueError:
+            continue
+        text = queue_user_text(record)
+        if text is not None and record.get("timestamp") == stamp and hashlib.sha256(text.encode()).hexdigest()[:12] == sha:
+            return {"text": text, "timestamp": stamp, "uuid": f"{stamp}#{sha}", "session": session}
+    raise Problem("message-not-found", f"no queued user message {stamp}#{sha} in session {clip(session, 40)}")
 
 
 # --------------------------------------------------------------------------- resolution
@@ -771,12 +873,21 @@ def _resolve(source, ctx, depth, seen, result):
     kind = result["kind"] = parsed["kind"]
     home = ctx.get("home")
     if kind == "user":
-        turn = user_turn(parsed["session"], parsed["uuid"], home)
+        variant = parsed.get("variant", "user")
+        if variant == "answer":
+            turn = answer_turn(parsed["session"], parsed["ident"], home)
+        elif variant == "queue":
+            turn = queue_turn(parsed["session"], parsed["ident"], home)
+        else:
+            turn = user_turn(parsed["session"], parsed["uuid"], home)
         reason = excerpt_in(turn["text"], parsed["excerpt"])
         if reason:
             raise Problem("excerpt-not-found", reason)
         node = {"kind": "user", "session": parsed["session"], "uuid": parsed["uuid"],
                 "timestamp": turn["timestamp"], "status": "verified"}
+        if variant != "user":
+            node["variant"] = variant
+            node["trust"] = ANSWER_TRUST if variant == "answer" else QUEUE_TRUST
         if ctx.get("want_text"):
             node["text"] = turn["text"]
         node["excerpt"] = parsed["excerpt"]
@@ -877,6 +988,8 @@ def render(result: dict, indent: str = "  ") -> list:
         kind = node["kind"]
         if kind == "user":
             lines.append(f"{indent}  user turn {node['uuid']} in session {node['session']} at {node.get('timestamp')}")
+            if node.get("trust"):
+                lines.append(f"{indent}  trust [{node['variant']}]: {node['trust']}")
             lines.append(f"{indent}  excerpt: \"{clip(node['excerpt'], 200)}\"")
             if node.get("text") is not None:
                 lines.append(f"{indent}  message:")
