@@ -1500,6 +1500,14 @@ class StoreTest(Base):
 
 
 class GuardTest(Base):
+    def test_a_bad_bracket_range_does_not_crash_the_guard(self):
+        """Fixer finding: fnmatch raised re.error on Python 3.9, so the guard failed open for the whole command."""
+        for token in ("s[i-30:i+30]", "x[z-a]"):
+            self.assertFalse(wa.glob_could_name_key(token))
+        store = str(wa.base())
+        reply = self.hook("guard", {"tool_name": "Bash", "tool_input": {"command": f"rm -rf {store} s[i-30:i+30]"}, "cwd": self.tmp.name})
+        self.assertEqual(reply["hookSpecificOutput"]["permissionDecision"], "deny")
+
     def test_guard_denies_direct_edits_but_allows_cli_and_reads(self):
         snap = str(wa.files()["snap"])
         deny = self.hook("guard", {"tool_name": "Write", "tool_input": {"file_path": snap, "content": "{}"}})

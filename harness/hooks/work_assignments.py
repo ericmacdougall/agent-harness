@@ -131,7 +131,10 @@ def glob_could_name_key(token: str) -> bool:
         return False
     if head and head.rstrip("/") in store_dir_forms():
         return True
-    return fnmatch.fnmatchcase("work-ledger.key", name) and not fnmatch.fnmatchcase("zz9-unrelated.py", name)
+    try:
+        return fnmatch.fnmatchcase("work-ledger.key", name) and not fnmatch.fnmatchcase("zz9-unrelated.py", name)
+    except re.error:  # a bad bracket range such as s[i-30:i+30] on Python 3.9; it must not skip the guard's other checks
+        return False
 
 
 def names_key(tool_input, tool: str = "") -> bool:
