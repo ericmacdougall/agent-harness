@@ -428,6 +428,8 @@ def main():
     parser.add_argument("--baseline-compare", action="store_true",
                         help="With --resolve-journal: pass the whole-suite check when its failing ids are an exact subset of "
                              "the baseline recorded for the confirmed HEAD (test_scope.py run-baseline)")
+    parser.add_argument("--pinned-head", help="With --baseline-compare: the generation's pinned original HEAD; when it differs "
+                        "from --expected-head the result must also stay within that HEAD's baseline")
     parser.add_argument("--prepare", action="append", default=[], help="Lockfile install after merge, before checks")
     parser.add_argument("--check", action="append", required=True, help="One argv command, quoted as a single argument; no shell")
     parser.add_argument("--timeout", type=int, default=600, help="Seconds allowed for each Git command and abort")
@@ -1124,8 +1126,28 @@ def resolve_journal(args, repo, identity, root, common, common_info, root_info, 
     report('RESOLVED', 'Tested current checkout accepted as recovery baseline; artifacts retained',
            head=args.expected_head, journal=str(directory / 'journal.json'),
            scratch=record.get('scratch'), recovery_ref=record.get('ref'),
-           artifacts_unknown=missing_record, **pin_details)
+           artifacts_unknown=missing_record, baseline_compare=getattr(args, 'compare_result', None), **pin_details)
     return 0
+
+
+def helper_identity():
+    here = Path(__file__).resolve().parent
+    out = {'tree': str(here), 'files': {}}
+    for name in ('integrate_local.py', 'suite_compare.py', 'suite_report.py', 'test_scope.py'):
+        try:
+            out['files'][name] = hashlib.sha256((here / name).read_bytes()).hexdigest()
+        except OSError:
+            out['files'][name] = 'missing'
+    return out
+
+
+def write_compare_result(directory, result):
+    path = Path(directory) / 'baseline-compare.json'
+    tmp = path.with_name(path.name + f'.tmp.{os.getpid()}')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+        json.dump(result, handle, indent=1, sort_keys=True)
+    os.replace(tmp, path)
 
 
 def baseline_compare_gate(args, repo, directory, checks, log):
@@ -1138,8 +1160,13 @@ def baseline_compare_gate(args, repo, directory, checks, log):
         report('BLOCKED_POLICY', "--baseline-compare needs exactly one check, the whole suite "
                "'python3 -m unittest discover -s tests'")
         return 2
+    suite_compare.scrub_store_env()  # the store comes from the policy, never from the caller's environment
     try:
-        suite_compare.run_compare(repo, args.expected_head, check_timeout(args), directory / 'checks', run, log)
+        result = suite_compare.run_compare(repo, args.expected_head, check_timeout(args), directory / 'checks', run, log,
+                                           pinned_sha=getattr(args, 'pinned_head', None))
+        result['helper'] = helper_identity()
+        write_compare_result(directory, result)
+        args.compare_result = result
     except suite_compare.CompareFailure as failure:
         log.close()
         report('RECOVERY_REQUIRED', 'Baseline comparison failed: ' + '; '.join(failure.problems[:4])

@@ -375,16 +375,30 @@ def compare_failure(problems, **facts):
 
 def helper_source():
     """Which code produced a baseline-compare receipt: this helper's tree and its git HEAD."""
-    tree = Path(__file__).resolve().parent.parent.parent
-    code, head = git(tree, "rev-parse", "HEAD")
-    return {"tree": str(tree), "head": head.strip() if not code else "unknown"}
+    here = Path(__file__).resolve().parent
+    tree = next((p for p in (here, here.parent, here.parent.parent) if (p / ".git").exists()), None)
+    source = {"tree": str(tree or here), "head": "unknown"}
+    if tree is not None:
+        code, head = git(tree, "rev-parse", "HEAD")
+        if not code:
+            source["head"] = head.strip()
+    else:
+        source["head"] = "installed-copy"  # no checkout: the file digests below identify the code
+    source["files"] = {}
+    for name in ("deliver.py", "suite_compare.py", "suite_report.py", "test_scope.py", "integrate_local.py"):
+        try:
+            source["files"][name] = hashlib.sha256((here / name).read_bytes()).hexdigest()
+        except OSError:
+            source["files"][name] = "missing"
+    return source
 
 
 def run_suite_compare(repo, log, timeout, log_directory):
     """Run the whole suite through suite_report.py and compare it with the baseline recorded for the pinned HEAD."""
     import suite_compare
     try:
-        ACTIVE_COMPARE["result"] = suite_compare.run_compare(repo, ACTIVE_COMPARE["expected_sha"], timeout, log_directory, run_check, log)
+        ACTIVE_COMPARE["result"] = suite_compare.run_compare(repo, ACTIVE_COMPARE["expected_sha"], timeout, log_directory, run_check, log,
+                                                                pinned_sha=ACTIVE_COMPARE.get("pinned_sha"))
     except suite_compare.CompareFailure as failure:
         raise compare_failure(failure.problems, **{k: v for k, v in failure.facts.items() if k != "baseline_compare_problems"}) from None
     ACTIVE_COMPARE["result"]["helper"] = helper_source()

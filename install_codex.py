@@ -39,7 +39,9 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'provenance_hooks.py', 'safe_input.py', 'domain_gates.py', 'domain_checklists.json',
                     'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
-                    'command_guard.py', 'command_guard_hook.py', 'redact.py', 'merge_gate.py')
+                    'command_guard.py', 'command_guard_hook.py', 'redact.py', 'merge_gate.py',
+                    # Baseline-compare finish check (GoodQA #14582): deliver.py imports these when the flag is used.
+                    'suite_report.py', 'suite_compare.py', 'test_scope.py', 'test_scope_policy.json')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 

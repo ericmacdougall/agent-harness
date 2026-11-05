@@ -360,7 +360,9 @@ class Wiring(unittest.TestCase):
                                            ids=[], ran=1, nonce="old")))
         os.chmod(stale, 0o600)
         deliver.ACTIVE_COMPARE.update(expected_sha=SHA, recorded_only=False)
-        with mock.patch.object(deliver, "run_check", lambda r, c, **k: subprocess.CompletedProcess(c, 0)):  # runner "succeeds", writes nothing
+        import suite_compare as sc
+        with mock.patch.object(deliver, "run_check", lambda r, c, **k: subprocess.CompletedProcess(c, 0)), \
+                mock.patch.object(sc, "baseline_record_for", return_value=record()):  # runner "succeeds", writes nothing
             with self.assertRaises(deliver.DeliveryError) as ctx:
                 deliver.run_checks(repo, [], self.WHOLE, 60, checks)
         self.assertIn("no readable suite report", ctx.exception.message)
@@ -514,8 +516,12 @@ class Round2(unittest.TestCase):
     def test_gate_passes_when_compare_passes(self):
         import integrate_local as il, suite_compare as sc
         args = SimpleNamespace(expected_head=SHA, baseline_compare=True, check_timeout=None, timeout=60)
-        with mock.patch.object(sc, "run_compare", return_value={}):
-            self.assertEqual(il.baseline_compare_gate(args, Path("."), Path("/x"), [sc.WHOLE_SUITE_ARGV], mock.Mock()), 0)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(sc, "run_compare", return_value={"baseline_sha": SHA}):
+            self.assertEqual(il.baseline_compare_gate(args, Path("."), Path(d), [sc.WHOLE_SUITE_ARGV], mock.Mock()), 0)
+            saved = json.loads((Path(d) / "baseline-compare.json").read_text())
+            self.assertEqual(saved["baseline_sha"], SHA)
+            self.assertIn("integrate_local.py", saved["helper"]["files"])
+            self.assertEqual(args.compare_result["baseline_sha"], SHA)
 
     def test_accept_recorded_rejects_ids_outside_pinned_baseline(self):
         import suite_compare as sc
@@ -581,3 +587,140 @@ class Round2b(unittest.TestCase):
         out = compare(rep=report(ran=10, skipped=5), rec=record(ran=10, skipped=0))
         self.assertFalse(out["ok"])
         self.assertTrue(any("non-skipped" in p for p in out["problems"]), out["problems"])
+
+
+class Round3(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name).resolve()
+
+    # F1: the pinned-HEAD bound applies on the run path and carries a count floor
+    def pinned_run(self, ran=10, ids=("t.a",), pinned_ids=("t.a",), pinned_ran=10, base_ids=("t.a", "t.new"), base_ran=10, drop_pinned=False, pinned_skipped=0):
+        import suite_compare as sc
+        recs = {SHA: record(sha=SHA, ran=base_ran, ids=list(base_ids)), OTHER: None if drop_pinned else record(sha=OTHER, ran=pinned_ran, ids=list(pinned_ids), skipped=pinned_skipped)}
+
+        def run_fn(repo, argv, **kw):
+            nonce = argv[argv.index("--nonce") + 1]
+            out = argv[argv.index("--out") + 1]
+            rep = report(head=SHA, ran=ran, ids=list(ids), nonce=nonce)
+            fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                json.dump(rep, handle)
+            return subprocess.CompletedProcess(argv, 0)
+
+        log = mock.Mock()
+        log.facts.return_value = {}
+        with mock.patch.object(sc, "baseline_record_for", side_effect=lambda r, s: recs[s]), \
+                mock.patch.object(sc, "head_of", return_value=SHA):
+            return sc.run_compare(".", SHA, 60, self.dir, run_fn, log, pinned_sha=OTHER)
+
+    def test_run_path_refuses_a_failure_outside_the_pinned_baseline(self):
+        import suite_compare as sc
+        self.assertEqual(self.pinned_run()["pinned_sha"], OTHER)
+        with self.assertRaises(sc.CompareFailure) as ctx:
+            self.pinned_run(ids=("t.a", "t.new"))  # known in the re-pin's own baseline, but not in the pinned HEAD's
+        self.assertIn("t.new", str(ctx.exception))
+
+    def test_run_path_and_recorded_path_apply_the_pinned_count_floor(self):
+        import suite_compare as sc
+        with self.assertRaises(sc.CompareFailure) as ctx:  # the re-pin's own baseline is low, so only the pinned floor can catch it
+            self.pinned_run(ran=4, base_ran=4, pinned_ran=10)
+        self.assertIn("pinned HEAD baseline", str(ctx.exception))
+        with self.assertRaises(sc.CompareFailure) as ctx:  # total below the pinned total although the active count is above its
+            self.pinned_run(ran=4, base_ran=4, pinned_ran=10, pinned_skipped=8)
+        self.assertIn("fewer than the pinned HEAD baseline's 10", str(ctx.exception))
+        with self.assertRaises(sc.CompareFailure) as ctx:
+            self.pinned_run(drop_pinned=True)
+        self.assertIn("pinned original HEAD has no complete", str(ctx.exception))
+        suite = {"failing_ids": ["t.a"], "ran": 1, "skipped": 0}
+        pinned = {"failing_ids": ["t.a"], "ran": 4, "skipped": 0}
+        with mock.patch.object(sc, "baseline_record_for", return_value="r"), \
+                mock.patch.object(ts, "baseline_suite_for", side_effect=lambda rec, sha: (suite if sha == "X" else pinned, [])):
+            with self.assertRaises(sc.CompareFailure):
+                sc.accept_recorded(".", "X", "P")
+
+    def test_result_carries_the_baseline_provenance_and_reads_it_once(self):
+        import suite_compare as sc
+        base = record(sha=SHA)
+        base["suite"]["note"] = {"reason": "accepted"}
+        calls = []
+        def lookup(repo, sha):
+            calls.append(sha)
+            return base
+        def run_fn(repo, argv, **kw):
+            nonce = argv[argv.index("--nonce") + 1]
+            fd = os.open(argv[argv.index("--out") + 1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                json.dump(report(head=SHA, nonce=nonce), handle)
+            return subprocess.CompletedProcess(argv, 0)
+        log = mock.Mock()
+        with mock.patch.object(sc, "baseline_record_for", side_effect=lookup), mock.patch.object(sc, "head_of", return_value=SHA):
+            out = sc.run_compare(".", SHA, 60, self.dir, run_fn, log)
+        self.assertEqual(calls, [SHA])
+        self.assertEqual(out["baseline_provenance"]["note"], {"reason": "accepted"})
+        self.assertIn("report_sha256", out["baseline_provenance"])
+
+    def test_a_directory_in_place_of_the_report_fails_closed(self):
+        import suite_compare as sc
+        (self.dir / "suite-report.json").mkdir()
+        (self.dir / "suite-report.json" / "x").write_text("x")
+        with mock.patch.object(sc, "baseline_record_for", return_value=record()):
+            with self.assertRaises(sc.CompareFailure):
+                sc.run_compare(".", SHA, 60, self.dir, mock.Mock(), mock.Mock())
+
+    # F2: the resolve path ignores a caller-supplied store
+    def test_resolve_gate_scrubs_the_store_override_and_takes_the_pinned_head(self):
+        import integrate_local as il, suite_compare as sc
+        seen = {}
+        def fake(repo, expected, timeout, d, run_fn, log, pinned_sha=None):
+            seen.update(root=os.environ.get("HARNESS_TEST_SCOPE_ROOT"), host=os.environ.get("HARNESS_TEST_SCOPE_HOST"), pinned=pinned_sha)
+            return {"baseline_sha": expected}
+        args = SimpleNamespace(expected_head=SHA, baseline_compare=True, check_timeout=None, timeout=60, pinned_head=OTHER)
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_SCOPE_ROOT": "/x", "HARNESS_TEST_SCOPE_HOST": "evil"}), \
+                mock.patch.object(sc, "run_compare", side_effect=fake):
+            self.assertEqual(il.baseline_compare_gate(args, Path("."), self.dir, [sc.WHOLE_SUITE_ARGV], mock.Mock()), 0)
+        self.assertEqual(seen, {"root": None, "host": None, "pinned": OTHER})
+
+    # F3: the helper source is real on a checkout and on an installed copy
+    def test_helper_source_identifies_the_code_in_both_layouts(self):
+        here = deliver.helper_source()
+        self.assertRegex(here["head"], r"^[0-9a-f]{40}$")
+        self.assertTrue(all(len(v) == 64 for v in here["files"].values()), here)
+        import shutil
+        copy = self.dir / "hooks"
+        shutil.copytree(HOOKS, copy, ignore=shutil.ignore_patterns("__pycache__"))
+        spec = importlib.util.spec_from_file_location("deliver_installed_copy", copy / "deliver.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        installed = module.helper_source()
+        self.assertEqual(installed["head"], "installed-copy")
+        self.assertEqual(installed["files"], here["files"])  # same bytes, identified by digest
+        self.assertEqual(installed["tree"], str(copy))
+
+    # F5: the Codex install ships every runtime file the mode imports
+    def test_codex_install_ships_the_baseline_compare_files(self):
+        import install_codex
+        for name in ("suite_report.py", "suite_compare.py", "test_scope.py", "test_scope_policy.json"):
+            self.assertIn(name, install_codex.DELIVERY_HELPERS)
+
+    # F7 / F9: runner
+    def test_an_ignored_test_file_makes_the_run_not_clean(self):
+        repo = make_repo(self.dir, {"test_a.py": PASS})
+        (repo / ".git" / "info" / "exclude").write_text("test_pad.py\n")
+        (repo / "tests" / "test_pad.py").write_text(PASS.replace("class", "class Pad", 1) if "class" in PASS else PASS)
+        out = self.dir / "r.json"
+        self.assertEqual(run_runner(repo, out).returncode, 0)
+        rep = json.loads(out.read_text())
+        self.assertFalse(rep["clean"])
+        self.assertFalse(ts._report_problems(rep, "r") == [])
+
+    def test_skipped_subtests_count_once_and_never_exceed_ran(self):
+        body = ("import unittest\nclass S(unittest.TestCase):\n    def test_s(self):\n        for i in range(5):\n"
+                "            with self.subTest(i=i):\n                self.skipTest('no')\n")
+        repo = make_repo(self.dir, {"test_s.py": body, "test_a.py": PASS})
+        out = self.dir / "r.json"
+        self.assertEqual(run_runner(repo, out).returncode, 0)
+        rep = json.loads(out.read_text())
+        self.assertLessEqual(rep["skipped"], rep["ran"], rep)
+        self.assertEqual(rep["skipped"], 1)

@@ -10,8 +10,10 @@ too). `complete` is true only for a run that reached the end; a crash, a kill or
 leaves no report, so a missing or incomplete report never counts as a result. Failures are recorded, not signalled:
 the exit code is 0 for any completed run, 4 when the runner itself could not run.
 
-The report is the only accepted source of a baseline (test_scope.py run-baseline / baseline-from-report) and the only
-thing deliver.py --baseline-compare compares. Stdlib only; Python 3.9 compatible.
+The report is the only accepted source of a baseline (test_scope.py run-baseline) and the only thing deliver.py
+--baseline-compare compares. The nonce keeps a stale or foreign report out; it does not protect against code in the tested
+tree that itself writes a report (such a tree could equally neuter its own tests), so the guarantee is against accident,
+not against a hostile tree. Stdlib only; Python 3.9 compatible.
 """
 from __future__ import annotations
 
@@ -29,6 +31,15 @@ SCHEMA = 1
 RUNNER = "suite_report"
 RUNNER_VERSION = 1
 WHOLE_SUITE_COMMAND = "python3 -m unittest discover -s tests"
+
+
+def _case_id(test) -> str:
+    """The id of the test method, so skipped subTests of one test count once (testsRun counts the method once)."""
+    case = getattr(test, "test_case", test)
+    try:
+        return str(case.id())
+    except Exception:  # noqa: BLE001
+        return str(case)
 
 
 class Collect(unittest.TextTestResult):
@@ -82,20 +93,23 @@ def write_report(path: Path, report: dict) -> None:
     os.replace(str(tmp), str(path))
 
 
-def _tree_state(repo: str) -> tuple:
-    """(HEAD, clean). Clean means no tracked change, no untracked file (ignored files excepted) and no assume-unchanged
-    or skip-worktree entry hiding a change."""
+def _tree_state(repo: str, start: str = "tests") -> tuple:
+    """(HEAD, clean). Clean means no tracked change, no untracked file, no assume-unchanged or skip-worktree entry hiding a
+    change, and no git-ignored test*.py file under the start directory (an ignored file would add tests that are not in the
+    commit). Other ignored files are excepted."""
     head = _git(repo, "rev-parse", "HEAD").strip()
     dirty = _git(repo, "status", "--porcelain", "--untracked-files=all").strip()
     hidden = [line for line in _git(repo, "ls-files", "-v").splitlines() if line[:1].islower() or line[:1] == "S"]
-    return head, not dirty and not hidden
+    ignored = [line for line in _git(repo, "ls-files", "--others", "--ignored", "--exclude-standard", "--", start).splitlines()
+               if Path(line).name.startswith("test") and line.endswith(".py")]
+    return head, not dirty and not hidden and not ignored
 
 
 def run_suite(repo: str, start: str = "tests") -> dict:
     """Discover and run; returns the report dict (complete only when the run reached its end)."""
     repo = str(Path(repo).resolve())
     sys.dont_write_bytecode = True
-    head, clean = _tree_state(repo)
+    head, clean = _tree_state(repo, start)
     started = time.time()
     os.chdir(repo)
     start_dir = str(Path(repo) / start)
@@ -106,13 +120,13 @@ def run_suite(repo: str, start: str = "tests") -> dict:
     suite = unittest.TestLoader().discover(start_dir)
     runner = unittest.TextTestRunner(stream=sys.stderr, verbosity=1, resultclass=Collect)
     result = runner.run(suite)
-    head_after, _ = _tree_state(repo)
+    head_after, _ = _tree_state(repo, start)
     changed = head_after != head or bool(_git(repo, "status", "--porcelain", "--untracked-files=no").strip())
     return {
         "schema": SCHEMA, "kind": "suite-report", "runner": RUNNER, "runner_version": RUNNER_VERSION,
         "command": WHOLE_SUITE_COMMAND, "whole_suite": True, "start": start, "head": head, "clean": clean,
         "python": "%d.%d.%d" % sys.version_info[:3], "host": socket.gethostname().split(".")[0],
-        "ran": int(result.testsRun), "skipped": len(result.skipped), "failures": len(result.failures),
+        "ran": int(result.testsRun), "skipped": min(len({_case_id(t) for t, _ in result.skipped}), int(result.testsRun)), "failures": len(result.failures),
         "errors": len(result.errors), "unexpected_successes": len(result.unexpectedSuccesses),
         "failing_ids": sorted(set(result.bad_ids)), "failing_count": len(result.bad_ids),
         "started_at": started, "ended_at": time.time(),

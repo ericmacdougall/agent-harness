@@ -41,6 +41,37 @@ def read_private_json(path: Path):
         os.close(fd)
 
 
+def scrub_store_env():
+    """The store location and host come from the policy, never from the caller's environment (deliver.py does the same)."""
+    for name in ("HARNESS_TEST_SCOPE_ROOT", "HARNESS_TEST_SCOPE_HOST"):
+        os.environ.pop(name, None)
+
+
+def bound_by_pinned(repo, failing_ids, ran: int, active: int, pinned_sha: str) -> list:
+    """When the commit being checked is not the generation's pinned original HEAD (a recovery re-pin), whatever is accepted
+    must still stay within the pinned HEAD's complete baseline: no failing id outside it and no fewer tests. A regression can
+    therefore never become a known failure by recording a new baseline. CompareFailure when the pinned HEAD has none."""
+    import test_scope
+    pinned, why = test_scope.baseline_suite_for(baseline_record_for(repo, pinned_sha), pinned_sha)
+    if pinned is None:
+        raise CompareFailure(["the pinned original HEAD has no complete suite baseline to bound the result with: " + "; ".join(why)])
+    problems = []
+    new = sorted(i for i in failing_ids if i not in set(pinned["failing_ids"]))
+    if new:
+        problems.append(f"{len(new)} failing test(s) are not in the baseline of the pinned HEAD: " + ", ".join(new[:10]))
+    if ran < pinned["ran"]:
+        problems.append(f"the suite ran {ran} tests, fewer than the pinned HEAD baseline's {pinned['ran']}")
+    pinned_active = pinned["ran"] - pinned.get("skipped", 0)
+    if active < pinned_active:
+        problems.append(f"the suite ran {active} non-skipped tests, fewer than the pinned HEAD baseline's {pinned_active}")
+    return problems
+
+
+def baseline_provenance(suite: dict) -> dict:
+    """Why/how the baseline was recorded, so a waiver or replacement is visible in every receipt."""
+    return {key: suite[key] for key in ("report_sha256", "note", "replaces", "host", "python") if key in suite}
+
+
 def head_of(repo) -> str:
     done = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30,
                           env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path.home()),
@@ -68,16 +99,23 @@ def preflight(repo, sha: str) -> dict:
     return suite
 
 
-def run_compare(repo, expected_sha: str, timeout, report_dir, run_fn, log) -> dict:
+def run_compare(repo, expected_sha: str, timeout, report_dir, run_fn, log, pinned_sha=None) -> dict:
     """Run suite_report.py in repo (never trusting an old report: a fresh nonce is issued and the file is removed first)
     and compare. run_fn(repo, argv, timeout=, discard_output=, sink=) is integrate_local.run. Returns the result dict."""
     import test_scope
     report_dir = Path(report_dir)
     report_path = report_dir / "suite-report.json"
+    # The baseline is read once, before the long run, so a replacement during the run cannot change what is compared.
+    base_record = baseline_record_for(repo, expected_sha)
+    base_suite, base_problems = test_scope.baseline_suite_for(base_record, expected_sha)
+    if base_suite is None:
+        raise CompareFailure(base_problems)
     try:
         os.unlink(report_path)
     except FileNotFoundError:
         pass
+    except OSError as error:
+        raise CompareFailure([f"the previous suite report could not be removed ({error.__class__.__name__})"]) from None
     nonce = secrets.token_hex(16)
     command = ["python3", str(HERE / "suite_report.py"), "--repo", str(repo), "--out", str(report_path), "--nonce", nonce]
     log.header(command)
@@ -100,13 +138,19 @@ def run_compare(repo, expected_sha: str, timeout, report_dir, run_fn, log) -> di
     head = head_of(repo)
     if not head:
         raise CompareFailure(["the checked checkout's HEAD could not be read"], **log.facts())
-    outcome = test_scope.compare_suite(report, baseline_record_for(repo, expected_sha), expected_sha, head)
+    outcome = test_scope.compare_suite(report, base_record, expected_sha, head)
     if not outcome["ok"]:
         raise CompareFailure(outcome["problems"], baseline_sha=expected_sha, checked_ran=outcome["checked_ran"],
                              baseline_ran=outcome["baseline_ran"], **log.facts())
+    if pinned_sha and pinned_sha != expected_sha:
+        problems = bound_by_pinned(repo, report["failing_ids"], report["ran"], outcome["checked_active"], pinned_sha)
+        if problems:
+            raise CompareFailure(problems, baseline_sha=expected_sha, checked_ran=outcome["checked_ran"],
+                                 baseline_ran=outcome["baseline_ran"], **log.facts())
     summary = {key: outcome[key] for key in ("baseline_sha", "baseline_ran", "checked_ran", "accepted_failing_ids")}
     summary.update(source="run", checked_head=head, baseline_active=outcome["baseline_active"],
-                   checked_active=outcome["checked_active"])
+                   checked_active=outcome["checked_active"], pinned_sha=pinned_sha or expected_sha,
+                   baseline_provenance=baseline_provenance(base_suite))
     return summary
 
 
@@ -119,14 +163,10 @@ def accept_recorded(repo, sha: str, pinned_sha: str | None = None) -> dict:
     if suite is None:
         raise CompareFailure(problems)
     if pinned_sha and pinned_sha != sha:
-        pinned, why = test_scope.baseline_suite_for(baseline_record_for(repo, pinned_sha), pinned_sha)
-        if pinned is None:
-            raise CompareFailure(["the pinned original HEAD has no complete suite baseline to compare the recorded run with: "
-                                  + "; ".join(why)])
-        new = sorted(i for i in suite["failing_ids"] if i not in set(pinned["failing_ids"]))
-        if new:
-            raise CompareFailure([f"{len(new)} failing test(s) in the recorded run are not in the baseline of the pinned HEAD: "
-                                  + ", ".join(new[:10])])
+        problems = bound_by_pinned(repo, suite["failing_ids"], suite["ran"], suite["ran"] - suite.get("skipped", 0), pinned_sha)
+        if problems:
+            raise CompareFailure(problems)
     return {"baseline_sha": sha, "baseline_ran": suite["ran"], "checked_ran": suite["ran"],
             "accepted_failing_ids": sorted(suite["failing_ids"]), "source": "recorded", "checked_head": sha,
-            "baseline_active": suite["ran"] - suite.get("skipped", 0), "checked_active": suite["ran"] - suite.get("skipped", 0)}
+            "baseline_active": suite["ran"] - suite.get("skipped", 0), "checked_active": suite["ran"] - suite.get("skipped", 0),
+            "pinned_sha": pinned_sha or sha, "baseline_provenance": baseline_provenance(suite)}
