@@ -368,6 +368,18 @@ def report(status, message, **extra):
     print(json.dumps({"status": status, "message": message, **extra}))
 
 
+FOCUSED_TEST_FILE = re.compile(r"test_[A-Za-z0-9_]{1,100}\.py")
+
+
+def focused_unittest(options):
+    """`-m unittest discover -s tests -p <one literal test_*.py name>`: a single file, no glob, path or extra argv.
+
+    A name that matches no file is still safe: run() wraps every `-m unittest discover` check so that an empty or
+    all-skipped discovery fails (Python before 3.12 would otherwise exit zero)."""
+    return (len(options) == 7 and options[:6] == ["-m", "unittest", "discover", "-s", "tests", "-p"]
+            and FOCUSED_TEST_FILE.fullmatch(options[6]) is not None)
+
+
 def approved_check(argv):
     if not argv:
         return False
@@ -387,7 +399,7 @@ def approved_check(argv):
             ["-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"],
             ["-m", "pytest"],
             ["-m", "pytest", "-q"],
-        )
+        ) or focused_unittest(argv[1:])
     if argv in (["pytest"], ["pytest", "-q"]):
         return True
     return False
