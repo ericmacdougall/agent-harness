@@ -655,65 +655,12 @@ def focused_scope(repo: str, base: str, head: str) -> dict:
             "note": "" if tests else "no mapped tests: run the tests your plan names for the changed paths"}
 
 
-# ---- focused checks for deliver.py finish -----------------------------------------------------------------------
-
-FOCUSED_MODULE_RE = re.compile(r"tests\.test_[A-Za-z0-9_]+")  # used with fullmatch; same shape integrate_local accepts
-
-
-def focused_modules(argv):
-    """The modules of `python3 -m unittest [-v] tests.test_x ...` and nothing else, else None."""
-    if len(argv) >= 4 and argv[0] in ("python", "python3") and list(argv[1:3]) == ["-m", "unittest"]:
-        modules = [a for a in argv[3:] if a != "-v"]
-        if modules and len(modules) <= 60 and len(set(modules)) == len(modules) \
-                and all(FOCUSED_MODULE_RE.fullmatch(a) for a in modules):
-            return modules
-    return None
-
-
-def whole_suite_command(argv) -> bool:
-    """True for the whole-suite shapes deliver.py already approves (never the focused form)."""
-    sys.path.insert(0, str(HERE))
-    from integrate_local import approved_check
-    return bool(approved_check(list(argv), False))
+# ---- full-run record lookup -------------------------------------------------------------------------------------
 
 
 def full_get(store: Store, repo_id: str, head: str):
     full_sha(head, "head")
     return store.read(repo_id, f"full-{head}.json", {"repo_id": repo_id, "head": head, "kind": "full"})
-
-
-def approve_focused(repo: str, base: str, head: str, argv, policy: dict = None, call=None) -> dict:
-    """Approve a focused unittest command as a delivery check. It must name every test mapped to the changed files and
-    their dependents (focused_scope of base..head), and the store must hold a finished PASSING full run for this
-    frozen head, so the focused run only re-checks the delta of the already proven suite. Raises Refused."""
-    policy = policy or load_policy()
-    modules = focused_modules(list(argv))
-    if modules is None:
-        raise Refused("bad-focused-command", "a focused check is `python3 -m unittest tests.test_<name> ...` and nothing "
-                      "else (no options besides -v, no other arguments)")
-    full_sha(head, "head")
-    scope = focused_scope(repo, base, head)
-    required = sorted("tests." + t for t in scope["tests"])
-    if not required:
-        raise Refused("no-mapped-tests", "no test is mapped to the changed files, so a focused check proves nothing: use a "
-                      "whole-suite check", required=[])
-    missing = [m for m in required if m not in modules]
-    if missing:
-        raise Refused("scope-incomplete", "the focused check omits tests mapped to the changed files and their dependents: "
-                      + " ".join(missing), required=required)
-    ctx = repo_context(repo)
-    got = (call or store_call)(policy, ["full-get", f"--repo-id={ctx['repo_id']}", f"--head={head}"])
-    if got is None:
-        raise Refused("store-unreachable", "the full run at this head can not be verified: the test-scope store is unreachable")
-    _code, data = got
-    record = data.get("record") if isinstance(data, dict) else None
-    if not isinstance(record, dict) or record.get("head") != head or record.get("state") != "finished" \
-            or record.get("result") != "pass":
-        raise Refused("no-full-run", "a focused delivery check needs a finished passing full run at this frozen head "
-                      f"(run `test_scope.py run-full --repo <checkout> -- <suite>` on dev2); found: "
-                      f"{'none' if not record else record.get('state', '?') + '/' + str(record.get('result', '-'))}")
-    return {"approved": True, "command": " ".join(argv), "tests": modules, "required": required, "base": base, "head": head,
-            "full_run": {k: record.get(k) for k in ("head", "state", "result", "summary", "finished_at")}}
 
 
 # ---- hook -------------------------------------------------------------------------------------------------------
@@ -1035,13 +982,6 @@ def cli(argv: list, capture: bool = False):
     p.add_argument("--base", required=True)
     p.add_argument("--head", required=True)
     p = add("full-get", "--repo-id", "--head")
-    p = sub.add_parser("approve-check")
-    for flag in ("--base", "--head", "--command"):
-        p.add_argument(flag, required=True)
-    p.add_argument("--repo", default=".")
-    p = sub.add_parser("run-full")
-    p.add_argument("--repo", default=".")
-    p.add_argument("command", nargs=argparse.REMAINDER)
     p = sub.add_parser("run-baseline")
     p.add_argument("--repo", default=".")
     p.add_argument("--replace", action="store_true")
@@ -1139,32 +1079,6 @@ def cli(argv: list, capture: bool = False):
         if args.cmd == "full-get":
             rec = full_get(store, args.repo_id, args.head)
             return out(0 if rec else 1, {"found": bool(rec), "record": rec})
-        if args.cmd == "approve-check":
-            return out(0, approve_focused(args.repo, args.base, args.head, shlex.split(args.command), policy))
-        if args.cmd == "run-full":
-            if remote:
-                return out(3, {"error": "run-full records into the store: run it on the store host (dev2/T2)"})
-            cmd = [c for c in args.command if c != "--"]
-            if not cmd:
-                return out(3, {"error": "usage: run-full --repo R -- <suite command>"})
-            if not whole_suite_command(cmd):
-                return out(3, {"error": "run-full records a FULL run: the command must be a whole-suite command "
-                                        "(unittest discover, pytest, go test ./..., npm test), not a subset"})
-            ctx = repo_context(args.repo)
-            if git(ctx["top"], "status", "--porcelain", "--untracked-files=no").strip():
-                return out(3, {"error": "the working tree is not clean: a full run is recorded against HEAD only"})
-            token = f"run-full:{os.getpid()}:{uuid.uuid4().hex[:8]}"
-            reserve_full(store, ctx["repo_id"], ctx["head"], token, source="run-full")
-            confirm_reservation(store, ctx["repo_id"], "full", ctx["head"], token)
-            started, code = now(), 1
-            try:
-                code = subprocess.run(cmd, cwd=ctx["top"], timeout=int(os.environ.get("HARNESS_RUN_FULL_TIMEOUT_S", "7200"))).returncode
-            except BaseException:  # interrupted, timed out or could not start: record it so the head is not stuck
-                finish_full(store, ctx["repo_id"], ctx["head"], "fail", f"did not complete after {int(now() - started)} s")
-                raise
-            finish_full(store, ctx["repo_id"], ctx["head"], "pass" if code == 0 else "fail",
-                        f"exit {code}, {int(now() - started)} s: {' '.join(cmd)[:160]}")
-            return out(code, {"finished": True, "head": ctx["head"], "exit": code})
         if args.cmd == "confirm":
             return out(0, confirm_reservation(store, args.repo_id, args.kind, args.key, args.token))
         if args.cmd == "register-accepted":

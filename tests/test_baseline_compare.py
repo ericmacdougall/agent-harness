@@ -459,16 +459,34 @@ class Wiring(unittest.TestCase):
                 with self.assertRaises(deliver.DeliveryError, msg=sha):
                     deliver.accept_recorded_baseline(repo, sha)
 
+    def completed(self, **extra):
+        """Workflow.completed() on a receipt file with the given extra keys (the receipt shape check)."""
+        head = "b" * 40
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+        os.chmod(directory, 0o700)
+        receipt = directory / "receipt.json"
+        value = {"schema": 1, "kind": "delivery_receipt", "scope": "s", "task": "t", "generation": "g", "source_head": "a" * 40,
+                 "head": head, "mode": "remote", "repository": "r", "pr_number": 7, "checks_digest": "c" * 64,
+                 "guard_key": "k", **extra}
+        receipt.write_text(json.dumps(value))
+        os.chmod(receipt, 0o600)
+        state = {"phase": "DELIVERED", "source_head": "a" * 40, "repository": "r", "pr_number": 7, "guard_key": "k",
+                 "baseline": "a" * 40, "target": head, "checks_digest": "c" * 64}
+        flow = SimpleNamespace(receipt=receipt, state=state, scope="s", task="t", generation="g", original=Path("/o"), branch="main")
+        with mock.patch.object(deliver, "snapshot", return_value=head), mock.patch.object(deliver, "ancestry", return_value=True):
+            return deliver.Workflow.completed(flow)
+
     def test_receipt_accepts_a_compare_record_and_only_a_dict(self):
-        from tests.test_finish_focused import ReceiptShape
-        case = ReceiptShape()
-        case.addCleanup = lambda f: None
-        ok = case.completed(baseline_compare={"baseline_sha": SHA, "baseline_ran": 3, "checked_ran": 4, "accepted_failing_ids": []})
+        self.assertEqual(self.completed()["head"], "b" * 40)  # an old receipt without the key still loads
+        ok = self.completed(baseline_compare={"baseline_sha": SHA, "baseline_ran": 3, "checked_ran": 4, "accepted_failing_ids": []})
         self.assertEqual(ok["baseline_compare"]["baseline_ran"], 3)
         for bad in ("text", [1], 5):
-            with self.assertRaises(Exception, msg=str(bad)) as ctx:
-                case.completed(baseline_compare=bad)
-            self.assertEqual(type(ctx.exception).__name__, "DeliveryError")
+            with self.assertRaises(deliver.DeliveryError, msg=str(bad)):
+                self.completed(baseline_compare=bad)
+        for extra in ({"surprise": 1}, {"focused_checks": []}):  # the old focused key is no longer part of a receipt
+            with self.assertRaises(deliver.DeliveryError, msg=str(extra)):
+                self.completed(**extra)
 
 
 def hashlib_digest(preparations, checks):
@@ -573,7 +591,7 @@ class Round2b(unittest.TestCase):
         with mock.patch.object(deliver, "Workflow", lambda a: Flow()), mock.patch.object(deliver, "require_check_interpreters"), \
                 mock.patch.object(sc, "preflight", side_effect=sc.CompareFailure(["no baseline recorded"])):
             with self.assertRaises(deliver.DeliveryError) as ctx:
-                deliver._finish(args, [], [deliver.WHOLE_SUITE_ARGV], [])
+                deliver._finish(args, [], [deliver.WHOLE_SUITE_ARGV])
         self.assertEqual(ctx.exception.status, "BLOCKED_POLICY")
         self.assertIn("cannot start", ctx.exception.message)
         self.assertEqual(Flow.effects, [])
