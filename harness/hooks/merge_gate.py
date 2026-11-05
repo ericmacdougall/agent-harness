@@ -15,7 +15,11 @@ Policy decisions (docs/operations.md, "Merge gate"):
   * the required set is the union of branch protection (base branch), rulesets and `gh pr checks --required`, and it
     must be known. When `gh pr checks --required` is the only readable source the PR must also report
     mergeStateStatus CLEAN or HAS_HOOKS, because that source only lists checks that already reported.
-  * zero reported checks block unless the repository has no workflows at all.
+  * zero reported checks (the repository has no GitHub CI; checks run locally) block unless a valid local validation
+    receipt exists for the exact head: a 0600 file written only by `merge_gate.py receipt` (main agent) that binds the
+    head, the full-suite log (sha256, exit 0) and the peer_review `pr` report (sha256, Reviewed HEAD, VERDICT: PASS).
+    The gate re-reads and re-hashes that evidence at merge time and never writes a receipt. A receipt never overrides
+    a reported failing or pending check or a required check that has not reported.
   * the merge command must carry the verified full head SHA (--match-head-commit, REST sha, GraphQL expectedHeadOid),
     so GitHub itself refuses a head that moved after the check.
   * waiver: `waive` records repo, PR, head, ticket, reason and approver; it is single use, expires in 24 hours and is
@@ -35,6 +39,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -72,6 +77,10 @@ STAMP_TTL_SECONDS = 600
 WAIVER_FILE = "merge-gate-waivers.jsonl"
 WAIVER_HEAD_FILE = "merge-gate-waivers.head"
 AUDIT_FILE = "merge-gate-audit.jsonl"
+RECEIPTS_DIR = "merge-gate-receipts"
+MAX_RECEIPT_BYTES = 16 * 1024
+MAX_REPORT_BYTES = 1024 * 1024
+MAX_LOG_BYTES = 512 * 1024 * 1024
 APPROVALS_DIR = "merge-gate-approvals"
 LOCK_FILE = "merge-gate.lock"
 ZERO = "0" * 64
@@ -99,10 +108,10 @@ WRAPPER_WORDS = {"env", "command", "sudo", "time", "nohup", "nice", "exec", "bui
 MERGE_HINT = re.compile(r"\bgh\b|merge|pulls|graphql|api\.github", re.I)
 DYNAMIC_WORD = re.compile(r"^(?:\$|\$\w+|\$\{[^}]*\}\w*)$")  # a command word that is only a variable or substitution
 GH_HINT = re.compile(r"\bgh\b|merge|curl|wget|\bhttps?\b|python|node|perl|ruby|ssh|eval|graphql|pulls|api\.github", re.I)
-STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals)", re.I)
-STATE_GLOB = re.compile(r"merge-gate-[wa*?\[]", re.I)  # subagents: globs and split spellings of the state files
+STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals|receipts)", re.I)
+STATE_GLOB = re.compile(r"merge-gate-[war*?\[]", re.I)  # subagents: globs and split spellings of the state files
 WAIVE_CMD = re.compile(r"merge_gate(?:\.py)?['\"]?\s+(?:--\S+\s+\S+\s+)*waive\b")
-WAIVE_ANY = re.compile(r"waive|add_waiver|consume_waiver|put_stamp|take_stamp", re.I)
+WAIVE_ANY = re.compile(r"waive|add_waiver|consume_waiver|put_stamp|take_stamp|receipt", re.I)
 GRAPHQL_MERGE = re.compile(r"mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest", re.I)
 REST_MERGE = re.compile(r"(?:repos/([^/\s'\"]+)/([^/\s'\"]+)/)?pulls/(\d+)/merge\b")
 CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -732,7 +741,7 @@ def _pr_required(client, slug, number):
         return "error", None
 
 
-def evaluate_pr(client, slug, number, target=None):
+def evaluate_pr(client, slug, number, target=None, state_dir=None):
     """Return (info, reasons) where info has slug, number, head and reasons list the (waivable) check problems."""
     ref = [str(number)] if number else ([target] if target else [])
     if target and not re.match(r"^[A-Za-z0-9._/-]+$", target) or (target or "").startswith("-"):
@@ -799,17 +808,19 @@ def evaluate_pr(client, slug, number, target=None):
             reasons.append(f"required check '{clean(name)}' has not reported on this head")
         elif name in apps and not any(e["src"] == "api" and e["app"] in apps[name] and e["v"] == "ok" for e in mine):
             reasons.append(f"required check '{clean(name)}' has no success from the required app")
+    receipt_used = False
     if not entries and known and not required:
-        try:
-            wf = client.json(["api", f"repos/{slug}/actions/workflows?per_page=1"], "workflows")
-            if int(wf.get("total_count", 1)) > 0:
-                reasons.append("no checks have reported yet but the repository has workflows")
-        except (GateError, ValueError, TypeError, AttributeError):
-            reasons.append("no checks reported and the workflow list could not be read")
+        # No GitHub CI reported anything: the evidence is the local validation receipt for this exact head.
+        problems = verify_receipt(state_dir, slug, number, head) if state_dir else ["no state directory"]
+        if problems:
+            reasons.append("no check reported and the local validation receipt is missing or invalid: "
+                           + "; ".join(problems))
+        else:
+            receipt_used = True
     again = client.json(["pr", "view", str(number), "-R", slug, "--json", "headRefOid"], "the pull request head")
     if str((again or {}).get("headRefOid") or "").lower() != head:
         raise GateError("the pull request head moved while the checks were read")
-    return {"slug": slug, "number": number, "head": head}, reasons
+    return {"slug": slug, "number": number, "head": head, "receipt": receipt_used}, reasons
 
 
 def _resolve_graphql(client, node_ids):
@@ -838,8 +849,8 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
         slug, number = merge.slug, merge.number
         if merge.kind == "graphql":
             slug, number = _resolve_graphql(client, merge.node_ids)
-        details, soft = evaluate_pr(client, slug, number, merge.target)
-        info.update(repo=details["slug"], pr=details["number"], head=details["head"])
+        details, soft = evaluate_pr(client, slug, number, merge.target, state_dir)
+        info.update(repo=details["slug"], pr=details["number"], head=details["head"], receipt=details["receipt"])
         if merge.kind != "check":
             if merge.head_unknown or not merge.head_vals:
                 hard.append(f"the merge must carry the verified head: add {merge.binding.replace('<full head sha>', details['head'])}")
@@ -1022,6 +1033,205 @@ def take_stamp(state_dir, key, now=None):
         return None
 
 
+# ------------------------------------------------------------------------------------- local validation receipts
+
+REPORT_KEYS = ("Stage", "Reviewed HEAD", "Reviewed packet SHA-256")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _open_evidence(path):
+    """fd of a regular, non-symlink file at an absolute path (the final component is not followed)."""
+    if not isinstance(path, str) or not path or "\x00" in path or not os.path.isabs(path):
+        raise ValueError("evidence path must be absolute")
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("is not a regular file (a symlink, directory or device)")
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        raise ValueError("does not exist")
+    except OSError:
+        raise ValueError("cannot be opened")
+    after = os.fstat(fd)
+    if not stat.S_ISREG(after.st_mode) or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+        os.close(fd)
+        raise ValueError("changed while it was opened")
+    return fd
+
+
+def _hash_file(path, limit, keep=False):
+    """(sha256 hex, bytes or None) of a file, read once; ValueError when unreadable or over the limit."""
+    fd = _open_evidence(path)
+    digest, chunks, total = hashlib.sha256(), [], 0
+    try:
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise ValueError("is larger than the limit")
+            digest.update(chunk)
+            if keep:
+                chunks.append(chunk)
+    except OSError:
+        raise ValueError("cannot be read")
+    finally:
+        os.close(fd)
+    return digest.hexdigest(), (b"".join(chunks) if keep else None)
+
+
+def parse_review_report(data):
+    """(stage, reviewed head, packet sha) of a peer_review.py report; ValueError unless it is a PR PASS.
+
+    The report is `Key: value` header lines, a blank line, then the model text. Only the header block can name the
+    head, and only a first body line `VERDICT: PASS` is a pass (the marker peer_review.py publishes for the pr stage).
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("is not text")
+    header, sep, body = text.partition("\n\n")
+    found = {}
+    for line in header.split("\n"):
+        key, colon, value = line.partition(": ")
+        if colon and key in REPORT_KEYS:
+            if key in found:
+                raise ValueError("repeats the " + key + " header")
+            found[key] = value.strip()
+    if not sep or any(k not in found for k in REPORT_KEYS):
+        raise ValueError("has no complete Stage, Reviewed HEAD and packet header")
+    stage, head, packet = (found[k] for k in REPORT_KEYS)
+    if stage != "pr":
+        raise ValueError("is for stage " + clean(stage, 30) + ", not pr")
+    if not SHA.match(head):
+        raise ValueError("Reviewed HEAD is not a full SHA")
+    if not HEX64.match(packet):
+        raise ValueError("packet SHA-256 is malformed")
+    if not re.match(r"^VERDICT: PASS\b", body.lstrip()):
+        raise ValueError("does not begin its verdict with VERDICT: PASS")
+    return stage, head, packet
+
+
+def _check_record(record, repo, pr, head):
+    """Reasons (empty list = valid) why a receipt record does not prove local validation of this exact head."""
+    if not isinstance(record, dict) or record.get("v") != 1:
+        return ["receipt is not a version 1 record"]
+    suite, review = record.get("suite"), record.get("review")
+    if not isinstance(suite, dict) or not isinstance(review, dict):
+        return ["receipt lacks its suite or review section"]
+    if str(record.get("repo", "")).lower() != repo.lower() or record.get("pr") != pr or record.get("head") != head:
+        return ["receipt is for a different repository, PR or head"]
+    if review.get("reviewed_head") != head:
+        return ["receipt names a Reviewed HEAD that is not the head"]
+    exit_code = suite.get("exit_code")
+    if isinstance(exit_code, bool) or exit_code != 0:
+        return ["the recorded suite exit code is not 0"]
+    if not isinstance(suite.get("summary"), str) or not suite["summary"].strip():
+        return ["receipt has no suite summary"]
+    problems = []
+    try:
+        digest, _ = _hash_file(suite.get("log_path"), MAX_LOG_BYTES)
+        if digest != suite.get("log_sha256"):
+            problems.append("the suite log changed since the receipt (sha256 mismatch)")
+    except ValueError as error:
+        problems.append("the suite log " + str(error))
+    try:
+        digest, data = _hash_file(review.get("report_path"), MAX_REPORT_BYTES, keep=True)
+        if digest != review.get("report_sha256"):
+            problems.append("the review report changed since the receipt (sha256 mismatch)")
+        else:
+            _, reviewed, packet = parse_review_report(data)
+            if reviewed != head:
+                problems.append("the review report's Reviewed HEAD " + reviewed[:12] + " is not the head " + head[:12])
+            elif packet != review.get("packet_sha256"):
+                problems.append("the review report's packet SHA-256 differs from the receipt")
+    except ValueError as error:
+        problems.append("the review report " + str(error))
+    return problems
+
+
+def receipt_path(state_dir, repo, pr, head):
+    return Path(state_dir) / RECEIPTS_DIR / (stamp_key(repo, pr, head, "receipt") + ".json")
+
+
+def verify_receipt(state_dir, repo, pr, head):
+    """Reasons (empty list = a valid receipt) for the exact repo, PR and head. Reads only; never writes."""
+    path = receipt_path(state_dir, repo, pr, head)
+    try:
+        before = os.lstat(str(path))
+    except FileNotFoundError:
+        return ["no receipt for this head (the main agent records one with merge_gate.py receipt)"]
+    except OSError:
+        return ["the receipt cannot be read"]
+    if not stat.S_ISREG(before.st_mode):
+        return ["the receipt is not a regular file"]
+    if before.st_uid != os.geteuid():
+        return ["the receipt file owner is not the current user"]
+    if before.st_mode & 0o077:
+        return ["the receipt file permissions are not 0600"]
+    if before.st_size > MAX_RECEIPT_BYTES:
+        return ["the receipt file is too large"]
+    try:
+        data = safe_input.read_bounded(str(path), MAX_RECEIPT_BYTES)
+        record = json.loads(data.decode("utf-8"))
+    except (safe_input.InputRejected, OSError, ValueError):
+        return ["the receipt file is unreadable or not JSON"]
+    return _check_record(record, repo, pr, head)
+
+
+def write_receipt(state_dir, repo, pr, head, suite_log, suite_exit, suite_summary, review_report, approved_by, now=None):
+    """Record a local validation receipt. Called only by the `receipt` CLI (main agent); the hook never calls it.
+
+    Refuses unless the evidence already proves what the gate will re-check at merge time."""
+    state_dir = Path(state_dir)
+    if not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", str(repo)):
+        raise ValueError("repo must be owner/name")
+    if not isinstance(pr, int) or isinstance(pr, bool) or pr <= 0:
+        raise ValueError("pr must be a positive integer")
+    if not SHA.match(str(head)):
+        raise ValueError("head must be the full lowercase SHA")
+    if isinstance(suite_exit, bool) or suite_exit != 0:
+        raise ValueError("the full suite must have exited 0")
+    if not (3 <= len(str(suite_summary)) <= 300) or CTRL.search(str(suite_summary)):
+        raise ValueError("suite summary must be 3 to 300 printable characters")
+    if not re.match(r"^main:[A-Za-z0-9_.:()-]{3,80}$", str(approved_by)):
+        raise ValueError("approved_by must be a main-prefixed agent id")
+    try:
+        log_sha, _ = _hash_file(suite_log, MAX_LOG_BYTES)
+    except ValueError as error:
+        raise ValueError("suite log " + str(error))
+    try:
+        report_sha, data = _hash_file(review_report, MAX_REPORT_BYTES, keep=True)
+        _, reviewed, packet = parse_review_report(data)
+    except ValueError as error:
+        raise ValueError("review report " + str(error))
+    if reviewed != head:
+        raise ValueError("review report Reviewed HEAD " + reviewed[:12] + " is not the head " + head[:12])
+    record = {"v": 1, "repo": repo.lower(), "pr": pr, "head": head, "approved_by": approved_by,
+              "ts": now or time.time(),
+              "suite": {"log_path": suite_log, "log_sha256": log_sha, "exit_code": 0,
+                        "summary": str(suite_summary).strip()},
+              "review": {"report_path": review_report, "report_sha256": report_sha, "reviewed_head": reviewed,
+                         "packet_sha256": packet}}
+    problems = _check_record(record, repo, pr, head)
+    if problems:
+        raise ValueError("; ".join(problems))
+    folder = state_dir / RECEIPTS_DIR
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(str(folder), 0o700)
+    final = receipt_path(state_dir, repo, pr, head)
+    tmp = folder / (final.name + "." + uuid.uuid4().hex[:8] + ".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, json.dumps(record, sort_keys=True, indent=1).encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(str(tmp), str(final))
+    return record
+
+
 def _audit(state_dir, record):
     try:
         state_dir = Path(state_dir)
@@ -1138,7 +1348,7 @@ def decide(payload, runner, state_dir, now=None):
         outcome = "waived" if info.get("waiver") else ("allow" if allowed else "block")
         _audit(state_dir, {"ts": now, "outcome": outcome, "repo": info.get("repo"), "pr": info.get("pr"),
                            "head": info.get("head"), "kind": merge.kind, "command_sha256": command_hash,
-                           "waiver": info.get("waiver"), "session": clean(payload.get("session_id") or "", 40)})
+                           "waiver": info.get("waiver"), "receipt": info.get("receipt"), "session": clean(payload.get("session_id") or "", 40)})
         if not allowed:
             blocks.append(text)
     if blocks:
@@ -1220,18 +1430,25 @@ def _fault(error, text, stderr):
 
 def main(argv=None, runner=None, stdin=None, stdout=None, stderr=None):
     stdout, stderr = stdout or sys.stdout, stderr or sys.stderr
-    parser = argparse.ArgumentParser(description="PR merge gate: hook, check, waive, report.")
+    parser = argparse.ArgumentParser(description="PR merge gate: hook, check, waive, receipt, report.")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("hook", "report", "check", "waive"):
+    for name in ("hook", "report", "check", "waive", "receipt"):
         p = sub.add_parser(name)
         p.add_argument("--state-dir", default=None)
-        if name in ("check", "waive"):
+        if name in ("check", "waive", "receipt"):
             p.add_argument("--repo", required=True)
             p.add_argument("--pr", type=int, required=True)
         if name == "waive":
             p.add_argument("--head", required=True)
             p.add_argument("--ticket", required=True)
             p.add_argument("--reason", required=True)
+            p.add_argument("--approved-by", default=None)
+        if name == "receipt":
+            p.add_argument("--head", required=True)
+            p.add_argument("--suite-log", required=True)
+            p.add_argument("--suite-exit", type=int, required=True)
+            p.add_argument("--suite-summary", required=True)
+            p.add_argument("--review-report", required=True)
             p.add_argument("--approved-by", default=None)
     try:
         args = parser.parse_args(argv)
@@ -1249,6 +1466,16 @@ def main(argv=None, runner=None, stdin=None, stdout=None, stderr=None):
                                              time.time(), "check")
         stdout.write(("merge-gate: all checks green on " + str(info.get("head")) + "\n") if allowed else text + "\n")
         return 0 if allowed else 2
+    if args.command == "receipt":
+        try:
+            record = write_receipt(state_dir, args.repo, args.pr, args.head, args.suite_log, args.suite_exit,
+                                   args.suite_summary, args.review_report, args.approved_by or "")
+        except (ValueError, OSError) as error:
+            stderr.write(f"merge-gate: receipt refused: {error}\n")
+            return 3
+        stdout.write(f"merge-gate: receipt recorded for {record['repo']}#{record['pr']} head {record['head'][:12]}; "
+                     "bound to the suite log and the pr review report by sha256.\n")
+        return 0
     approved, source = args.approved_by, "asserted"
     if re.match(r"^[0-9a-f]{40}", args.head or ""):
         stamped = take_stamp(state_dir, stamp_key(args.repo, args.pr, args.head, args.ticket))

@@ -9,6 +9,15 @@
       "test": "Decisions.test_decision_corpus",
       "test_file": "tests/test_merge_gate.py",
       "source": "ticket:GoodQA goodqa#14502 (matrix D11); incident: netwatch PR #1 merged with red CI, coordinator relay 2026-11-04"
+    },
+    {
+      "id": "merge-gate-local-receipt",
+      "rule": "With no GitHub CI reporting on a head, a PR merge needs a local validation receipt for that exact repo, PR and head: a 0600 file written only by the main agent via merge_gate.py receipt, binding the full-suite log (sha256, exit 0) and the peer_review pr report (sha256, Reviewed HEAD, VERDICT: PASS), re-verified at merge time.",
+      "mechanism": "merge_gate.py verify_receipt in evaluate_pr; write_receipt only from the receipt CLI; subagent and state-path guards in decide().",
+      "enforcement": "ENFORCED",
+      "test": "Receipts.test_valid_receipt_allows_both_zero_check_shapes",
+      "test_file": "tests/test_merge_gate.py",
+      "source": "wal:/Users/eric/.claude/wals/baab765b-d85c-46b4-b7b9-588eb912c770/main.jsonl#wcd8fbf6db24"
     }
   ]
 }

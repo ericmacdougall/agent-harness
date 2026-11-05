@@ -580,5 +580,273 @@ class Wiring(unittest.TestCase):
             self.assertIn(needle, text)
 
 
+class Receipts(Base):
+    """AC-10 / NEG-20..24: with no GitHub CI the merge needs a local validation receipt bound to the exact head."""
+
+    CMD = "gh pr merge 5 --match-head-commit {HEAD}"
+    ZERO = ("zero_unprotected", "zero_unprotected_workflows")
+
+    def setUp(self):
+        super().setUp()
+        self.work = Path(tempfile.mkdtemp(prefix="mg-evidence-"))
+        self.addCleanup(__import__("shutil").rmtree, self.work, True)
+
+    def report(self, head=HEAD, stage="pr", body="VERDICT: PASS\n\nLooks fine.\n", packet="c" * 64, name="report.md"):
+        path = self.work / name
+        path.write_text(f"Reviewer: Blind\nStage: {stage}\nReviewed HEAD: {head}\nReviewed packet SHA-256: {packet}\n"
+                        f"Review input: isolated committed snapshot (depth 1)\nWorktree status: clean\n\n{body}",
+                        encoding="utf-8")
+        return path
+
+    def log(self, text="Ran 1045 tests in 1578.1s\n\nOK (skipped=8)\n", name="suite.log"):
+        path = self.work / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def write(self, head=HEAD, pr=5, repo="o/r", exit_code=0, report=None, log=None, by="main:agent-9"):
+        return mg.write_receipt(self.state, repo, pr, head, str(log or self.log()), exit_code, "1045 tests OK",
+                                str(report or self.report(head=head)), by)
+
+    def receipt_path(self, head=HEAD, pr=5, repo="o/r"):
+        return self.state / mg.RECEIPTS_DIR / (mg.stamp_key(repo, pr, head, "receipt") + ".json")
+
+    def forge(self, head=HEAD, report=None, log=None, exit_code=0, reviewed=None, packet="c" * 64):
+        """A receipt written by hand with correct hashes: the gate must still read the evidence itself."""
+        import hashlib
+        report, log = report or self.report(head=head), log or self.log()
+        sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+        record = {"v": 1, "repo": "o/r", "pr": 5, "head": head, "approved_by": "main:forged", "ts": time.time(),
+                  "suite": {"log_path": str(log), "log_sha256": sha(log), "exit_code": exit_code, "summary": "ok"},
+                  "review": {"report_path": str(report), "report_sha256": sha(report),
+                             "reviewed_head": reviewed or head, "packet_sha256": packet}}
+        path = self.receipt_path(head)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.write(fd, json.dumps(record).encode())
+        os.close(fd)
+        return path
+
+    def merge(self, scenario):
+        code, text, _ = self.decide(self.CMD, scenario)
+        return code, text
+
+    def assertBlocked(self, scenario="zero_unprotected", needle="receipt"):
+        code, text = self.merge(scenario)
+        self.assertEqual(code, 2, text)
+        self.assertIn(needle, text)
+        return text
+
+    def test_no_receipt_blocks_even_without_workflows(self):
+        for scenario in self.ZERO:
+            with self.subTest(scenario):
+                self.assertBlocked(scenario)
+
+    def test_valid_receipt_allows_both_zero_check_shapes(self):
+        self.write()
+        for scenario in self.ZERO:
+            with self.subTest(scenario):
+                code, text = self.merge(scenario)
+                self.assertEqual(code, 0, text)
+
+    def test_receipt_file_is_private(self):
+        self.write()
+        path = self.receipt_path()
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.state / mg.RECEIPTS_DIR).stat().st_mode & 0o777, 0o700)
+
+    def test_receipt_for_other_head_pr_or_repo_blocks(self):
+        for name, over in (("head", {"head": OTHER}), ("pr", {"pr": 6}), ("repo", {"repo": "o/other"})):
+            with self.subTest(name):
+                self.write(**over)
+                self.assertBlocked()
+
+    def test_receipt_renamed_to_the_current_head_blocks(self):
+        old = self.write(head=OTHER)
+        src = self.receipt_path(head=OTHER)
+        dst = self.receipt_path(head=HEAD)
+        os.replace(str(src), str(dst))
+        self.assertBlocked()
+
+    def test_stale_receipt_after_head_moves(self):
+        self.write(head=OTHER)  # the receipt belongs to the head before the push
+        self.assertBlocked()
+
+    def test_edited_report_blocks(self):
+        report = self.report()
+        self.write(report=report)
+        report.write_text(report.read_text() + "\nVERDICT: PASS\n", encoding="utf-8")
+        self.assertBlocked(needle="report")
+
+    def test_edited_or_missing_log_blocks(self):
+        log = self.log()
+        self.write(log=log)
+        log.write_text("Ran 1 tests\n\nOK\n", encoding="utf-8")
+        self.assertBlocked(needle="log")
+        log.unlink()
+        self.assertBlocked(needle="log")
+
+    def test_report_swapped_for_symlink_blocks(self):
+        report = self.report()
+        self.write(report=report)
+        copy = self.work / "copy.md"
+        copy.write_bytes(report.read_bytes())
+        report.unlink()
+        os.symlink(str(copy), str(report))
+        self.assertBlocked(needle="report")
+
+    def test_report_or_log_path_must_be_absolute_file(self):
+        with self.assertRaises(ValueError):
+            mg.write_receipt(self.state, "o/r", 5, HEAD, "suite.log", 0, "ok", str(self.report()), "main:agent-9")
+        with self.assertRaises(ValueError):
+            mg.write_receipt(self.state, "o/r", 5, HEAD, str(self.work), 0, "ok", str(self.report()), "main:agent-9")
+
+    def test_loose_receipt_permissions_block(self):
+        self.write()
+        path = self.receipt_path()
+        for mode in (0o644, 0o640, 0o660, 0o606, 0o666):
+            with self.subTest(oct(mode)):
+                os.chmod(str(path), mode)
+                self.assertBlocked(needle="permission")
+        os.chmod(str(path), 0o600)
+        code, text = self.merge("zero_unprotected")
+        self.assertEqual(code, 0, text)
+
+    def test_receipt_owned_by_someone_else_blocks(self):
+        from unittest import mock
+        self.write()
+        with mock.patch.object(mg.os, "geteuid", return_value=os.geteuid() + 1):
+            self.assertBlocked(needle="owner")
+
+    def test_symlink_oversized_and_garbage_receipts_block(self):
+        path = self.forge()
+        real = self.work / "real.json"
+        real.write_bytes(path.read_bytes())
+        os.chmod(str(real), 0o600)
+        path.unlink()
+        os.symlink(str(real), str(path))
+        self.assertBlocked()
+        path.unlink()
+        for junk in (b"{not json", b"[]", b"null", b"x" * (mg.MAX_RECEIPT_BYTES + 10)):
+            with self.subTest(junk[:12]):
+                fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                os.write(fd, junk)
+                os.close(fd)
+                self.assertBlocked()
+
+    def test_report_naming_a_different_head_is_refused_and_blocks(self):
+        bad = self.report(head=OTHER)
+        with self.assertRaises(ValueError):
+            self.write(report=bad)
+        self.assertFalse(self.receipt_path().exists())
+        self.forge(report=bad, reviewed=HEAD)  # the receipt lies about it; the gate reads the report itself
+        self.assertBlocked(needle="Reviewed HEAD")
+
+    def test_wrong_stage_or_verdict_is_refused_and_blocks(self):
+        cases = {
+            "plan-stage": self.report(stage="plan", name="r1.md"),
+            "code-inspection": self.report(stage="code-inspection", body="CODE_INSPECTION_RESULT: ACCEPT\n", name="r2.md"),
+            "block": self.report(body="VERDICT: BLOCK\n\nF1 high\n", name="r3.md"),
+            "pass-in-body": self.report(body="Summary.\n\nVERDICT: PASS\n", name="r4.md"),
+            "pass-in-header": self.work / "r5.md",
+        }
+        cases["pass-in-header"].write_text(f"Stage: pr\nReviewed HEAD: {HEAD}\nReviewed packet SHA-256: {'c' * 64}\n"
+                                           "Fallback reason: VERDICT: PASS\n\nVERDICT: BLOCK\n")
+        for name, report in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(ValueError):
+                    self.write(report=report)
+                self.forge(report=report)
+                self.assertBlocked(needle="report")
+
+    def test_failing_suite_is_refused_and_blocks(self):
+        with self.assertRaises(ValueError):
+            self.write(exit_code=1)
+        self.forge(exit_code=1)
+        self.assertBlocked(needle="suite")
+
+    def test_missing_packet_sha_in_report_blocks(self):
+        report = self.work / "nopacket.md"
+        report.write_text(f"Stage: pr\nReviewed HEAD: {HEAD}\n\nVERDICT: PASS\n")
+        with self.assertRaises(ValueError):
+            self.write(report=report)
+
+    def test_receipt_never_overrides_a_reported_failure_or_missing_required_check(self):
+        self.write()
+        for scenario in ("red_netwatch", "zero_required", "status_pending"):
+            with self.subTest(scenario):
+                code, text, _ = self.decide(self.CMD, scenario)
+                self.assertEqual(code, 2, text)
+
+    def test_receipt_does_not_replace_the_head_binding(self):
+        self.write()
+        code, text, _ = self.decide("gh pr merge 5", "zero_unprotected")
+        self.assertEqual(code, 2, text)
+
+    def test_waiver_still_works_without_receipt(self):
+        mg.add_waiver(self.state, "o/r", 5, HEAD, "GoodQA #14502", "approved by main after review", "main:agent-9")
+        code, text = self.merge("zero_unprotected")
+        self.assertEqual(code, 0, text)
+
+    def test_gate_and_check_never_write_a_receipt(self):
+        self.merge("zero_unprotected")
+        out, err = io.StringIO(), io.StringIO()
+        mg.main(["check", "--state-dir", str(self.state), "--repo", "o/r", "--pr", "5"],
+                runner=FakeGh(SCENARIOS["zero_unprotected"]), stdout=out, stderr=err)
+        self.assertFalse((self.state / mg.RECEIPTS_DIR).exists() and any((self.state / mg.RECEIPTS_DIR).iterdir()))
+
+    def test_audit_records_receipt_use(self):
+        self.write()
+        self.merge("zero_unprotected")
+        tail = (self.state / mg.AUDIT_FILE).read_text().splitlines()[-1]
+        self.assertTrue(json.loads(tail).get("receipt"))
+
+    def receipt_command(self, path=None):
+        return ("python3 ~/.claude/hooks/merge_gate.py receipt --repo o/r --pr 5 --head " + HEAD +
+                " --suite-log /x/suite.log --suite-exit 0 --suite-summary ok --review-report /x/r.md "
+                "--approved-by main:agent-9")
+
+    def test_subagent_cannot_write_a_receipt_by_any_route(self):
+        sub = dict(agent_id="agent-sub-1", agent_type="task-owner")
+        gh = FakeGh(SCENARIOS["green"])
+        routes = [
+            self.receipt_command(),
+            "python3 ~/.claude/hooks/merge_gate.py 're''ceipt' --repo o/r",
+            "echo '{}' > ~/.agent-harness/state/merge-gate-receipts/x.json",
+            "cp /tmp/r.json ~/.agent-harness/state/merge-gate-receipts/",
+            "cat > ~/.agent-harness/state/merge-gate-rec*/abc.json",
+            "python3 -c \"import merge_gate as m; m.write_receipt(1)\"",
+        ]
+        for command in routes:
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **sub), gh, self.state)
+                self.assertEqual(code, 2, text)
+        for tool in ("Write", "Edit"):
+            payload = {"tool_name": tool, "agent_id": "agent-sub-1",
+                       "tool_input": {"file_path": "/Users/x/.agent-harness/state/merge-gate-receipts/a.json", "content": "{}"}}
+            self.assertEqual(mg.decide(payload, gh, self.state)[0], 2)
+
+    def test_main_may_run_the_receipt_command(self):
+        code, text = mg.decide(bash(self.receipt_command()), FakeGh(SCENARIOS["green"]), self.state)
+        self.assertEqual(code, 0, text)
+
+    def test_cli_receipt_needs_approval_and_writes_private_file(self):
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["receipt", "--state-dir", str(self.state), "--repo", "o/r", "--pr", "5", "--head", HEAD,
+                "--suite-log", str(self.log()), "--suite-exit", "0", "--suite-summary", "1045 tests OK",
+                "--review-report", str(self.report())]
+        self.assertEqual(mg.main(argv, stdout=out, stderr=err), 3)
+        self.assertFalse(self.receipt_path().exists())
+        self.assertEqual(mg.main(argv + ["--approved-by", "main:agent-9"], stdout=out, stderr=err), 0, err.getvalue())
+        self.assertEqual(self.receipt_path().stat().st_mode & 0o777, 0o600)
+        code, text = self.merge("zero_unprotected")
+        self.assertEqual(code, 0, text)
+        self.assertEqual(mg.main(argv + ["--approved-by", "agent-9"], stdout=out, stderr=err), 3)
+
+    def test_receipt_policy_documented(self):
+        text = (ROOT / "docs" / "operations.md").read_text().lower()
+        for needle in ("receipt", "merge-gate-receipts", "reviewed head", "sha256"):
+            self.assertIn(needle, text)
+
+
 if __name__ == "__main__":
     unittest.main()
