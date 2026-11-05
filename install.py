@@ -101,7 +101,7 @@ def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]
             "matcher": GOODQA_STATUS_TOOLS,
             "hooks": [spec_gate],
         }, {
-            # Holds (yates, Petfiliate, OptinRouter), credential paths, force pushes. Fails open on its own crash.
+            # Holds (yates, Petfiliate, OptinRouter), credential paths, force pushes. Fails CLOSED (denies) on its own crash or input it can not parse.
             "matcher": HOLDS_TOOLS,
             "hooks": [{"type": "command", "command": "python3", "args": [str(claude / "hooks" / "holds_guard.py")],
                        "timeout": 10}],

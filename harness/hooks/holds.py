@@ -7,14 +7,15 @@
 `lift` parses the source with provenance.py, then looks the message up in that session's transcript
 (provenance.find_user) and requires the same uuid to be a human-typed message containing the excerpt. Anything
 else (ticket, wal, inferred, agent text, a uuid that is not found) is refused, so an agent cannot lift a hold on
-its own say-so. holds_guard.py denies Write/Edit of holds.json and holds.state.json, so this command, run by the
-user or by main with a real user source, is the only path.
+its own say-so. The quoted words must name the hold and say lift. holds_guard.py refuses `holds.py lift` when an
+agent runs it and protects the policy files, so the user running it in their own terminal is the only path.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -43,8 +44,12 @@ def write_state(state: dict, path: Path = STATE) -> None:
     os.replace(tmp, path)
 
 
-def verify_user_source(source: str, finder=None) -> dict:
-    """Parsed user source whose uuid really is a human message with that excerpt, else ValueError."""
+LIFT_WORDS = re.compile(r"\b(lift|lifted|release|unhold|un-hold|remove|drop)\b", re.I)
+
+
+def verify_user_source(source: str, finder=None, hold_id: str = None) -> dict:
+    """Parsed user source whose uuid really is a human message with that excerpt, else ValueError. With a hold id
+    the words must also name that hold and say lift, so an unrelated human message can not lift anything."""
     import provenance
     try:
         parsed = provenance.parse_source(source)
@@ -59,6 +64,8 @@ def verify_user_source(source: str, finder=None) -> dict:
         raise ValueError(f"cannot verify: {exc}") from None
     if parsed["uuid"] not in {str(f.get("uuid", "")).lower() for f in found}:
         raise ValueError("that message uuid is not a human message containing the excerpt in that session")
+    if hold_id is not None and (hold_id.lower() not in parsed["excerpt"].lower() or not LIFT_WORDS.search(parsed["excerpt"])):
+        raise ValueError(f"the quoted words must name the hold {hold_id!r} and say to lift it")
     return parsed
 
 
@@ -66,7 +73,7 @@ def lift(hold_id: str, source: str, policy: Path = POLICY, state_path: Path = ST
     ids = {h["id"] for h in json.loads(policy.read_text())["holds"]}
     if hold_id not in ids:
         raise ValueError(f"unknown hold {hold_id!r}; known: {', '.join(sorted(ids))}")
-    parsed = verify_user_source(source, finder)
+    parsed = verify_user_source(source, finder, hold_id)
     state = load_state(state_path)
     state["lifted"][hold_id] = {"source_uuid": parsed["uuid"], "session": parsed["session"],
                                 "excerpt": parsed["excerpt"][:200], "at": int(time.time() if now is None else now)}
