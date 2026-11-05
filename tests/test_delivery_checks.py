@@ -205,6 +205,40 @@ class CheckInterpreter(unittest.TestCase):
                 self.assertFalse((self.root / 'absent').exists())
 
 
+    def run_checks_in(self, tests, pattern):
+        """deliver.run_checks (the finish path) with a focused check, on a supported python3 first on PATH."""
+        repo = self.root / 'repo'
+        (repo / 'tests').mkdir(parents=True, exist_ok=True)
+        for name, body in tests.items():
+            (repo / 'tests' / name).write_text(body)
+        bindir = self.root / 'bin'
+        bindir.mkdir(exist_ok=True)
+        if not (bindir / 'python3').exists():
+            os.symlink(sys.executable, bindir / 'python3')
+        command = ['python3', '-m', 'unittest', 'discover', '-s', 'tests', '-p', pattern]
+        self.assertTrue(self.integrate.approved_check(command))
+        with patch.dict(os.environ, {'PATH': str(bindir) + os.pathsep + os.environ['PATH']}):
+            if sys.version_info < (3, 10):
+                self.skipTest('the suite interpreter is older than the supported check Python (3.10)')
+            self.delivery.run_checks(repo, [], [command], 60, self.root / 'logs')
+
+    GOOD = 'import unittest\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n'
+
+    def test_finish_run_checks_passes_a_focused_check_that_runs_a_test(self):
+        self.run_checks_in({'test_a.py': self.GOOD, 'test_b.py': 'import unittest\nraise SystemExit(3)\n'}, 'test_a.py')
+
+    def test_finish_run_checks_fails_a_focused_check_matching_no_file(self):
+        with self.assertRaises(self.delivery.DeliveryError) as raised:
+            self.run_checks_in({'test_a.py': self.GOOD}, 'test_missing.py')
+        self.assertEqual(raised.exception.status, 'DELIVERED_CHECK_FAILED')
+
+    def test_finish_run_checks_fails_a_focused_check_that_fails(self):
+        bad = 'import unittest\nclass T(unittest.TestCase):\n    def test_no(self):\n        self.fail("intentional")\n'
+        with self.assertRaises(self.delivery.DeliveryError) as raised:
+            self.run_checks_in({'test_a.py': bad}, 'test_a.py')
+        self.assertEqual(raised.exception.status, 'DELIVERED_CHECK_FAILED')
+
+
 class TailRedaction(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
