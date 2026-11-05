@@ -419,7 +419,8 @@ def ring_wrap_alert(events: list, ts: float, hostname: str) -> dict:
 
 def plan_transitions(desired: dict, ring: dict, hold=frozenset(), now=None) -> list:
     """Deterministic diff: [(op, key, flag, ring_event)]. Keys in `hold` get no transition at all this tick.
-    `now` also refreshes an active alert whose ring text or severity no longer matches, marked detail.updated."""
+    `now` also refreshes an active alert whose ring text no longer matches, or lowers its severity, marked
+    detail.updated and rate limited by liveness. A rise is never delayed. Every raise carries the text's marks."""
     ops = []
     for k in sorted(desired):
         if k in hold:
@@ -427,11 +428,16 @@ def plan_transitions(desired: dict, ring: dict, hold=frozenset(), now=None) -> l
         f = desired[k]
         cur = ring.get(k)
         active = cur is not None and cur.get("event") == "raise"
-        if not active or SEV.get(f["severity"], 0) > SEV.get(cur.get("severity"), 0):
-            ops.append(("raise", k, f, cur))
-        elif now is not None and (f["severity"] != cur.get("severity") or liveness.alert_text_stale(
-                cur.get("message", ""), str(f.get("message", ""))[:MESSAGE_MAX], parse_ts(cur.get("at")) or 0, now)):
-            ops.append(("raise", k, dict(f, detail={**(f.get("detail") or {}), "updated": True}), cur))
+        marks = liveness.alert_marks(f.get("message"))
+        new_sev, old_sev = SEV.get(f["severity"], 0), SEV.get(cur.get("severity"), 0) if active else 0
+        if not active or new_sev > old_sev:
+            ops.append(("raise", k, dict(f, detail={**(f.get("detail") or {}), **marks}), cur))
+        elif now is not None:
+            at = parse_ts(cur.get("at")) or 0
+            lower = new_sev < old_sev and now - at >= liveness.ALERT_REFRESH_MIN_S
+            if lower or (new_sev == old_sev and liveness.ring_text_stale(cur.get("detail"), cur.get("message"),
+                                                                         f.get("message"), at, now)):
+                ops.append(("raise", k, dict(f, detail={**(f.get("detail") or {}), **marks, "updated": True}), cur))
     for k in sorted(ring):
         if k in hold:
             continue
@@ -627,6 +633,8 @@ class Daemon:
             return write_key(self.host, kind, key.split(":", 1)[-1], "clear" + extra, since)
         if (flag.get("detail") or {}).get("updated"):  # one ring write per distinct text, not one per alert
             extra = "-u" + hashlib.sha256(str(flag.get("message", "")).encode()).hexdigest()[:8] + extra
+        if cur and cur.get("event") == "raise":  # text or severity can return to an earlier value: the row it replaces
+            extra = f"-s{cur.get('seq', 0)}" + extra  # tells those writes apart, and a retry repeats the same key
         return write_key(self.host, flag.get("kind") or key.split(":", 1)[0], flag.get("subject") or key,
                          f"raise-{flag['severity']}{extra}", flag.get("since", 0))
 

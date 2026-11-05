@@ -11,6 +11,7 @@ transcript, and whether the harness recorded it as stopped.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 
 LIVE_WAL_S = 20 * 60
@@ -34,10 +35,33 @@ NAMEABLE_TYPES = ("general-purpose", "claude")
 
 def alert_text_stale(written: str, current: str, written_at: float, now: float) -> bool:
     """Should an active alert whose ring entry says `written` (written at `written_at`) be rewritten to `current`?"""
+    written, current = str(written or ""), str(current or "")
     if written == current:
         return False
-    words_changed = _NUMBER.sub("#", written or "") != _NUMBER.sub("#", current or "")
+    words_changed = _NUMBER.sub("#", written) != _NUMBER.sub("#", current)
     return now - (written_at or 0) >= (ALERT_REFRESH_MIN_S if words_changed else ALERT_REFRESH_S)
+
+
+def alert_marks(message) -> dict:
+    """Hashes of an alert's text before the ring redacts or cuts it, for a writer that keeps no state of its own."""
+    text = str(message or "")
+    return {"text_sha": hashlib.sha256(text.encode()).hexdigest()[:16],
+            "text_shape": hashlib.sha256(_NUMBER.sub("#", text).encode()).hexdigest()[:16]}
+
+
+def ring_text_stale(detail, ring_message, current, written_at, now) -> bool:
+    """alert_text_stale for a writer that can only read the ring back. The ring's text may be redacted or cut, so its
+    marks decide. An overflowed slot has lost them and can't be compared, so it refreshes at most hourly."""
+    detail = detail if isinstance(detail, dict) else {}
+    age = now - (written_at or 0)
+    if detail.get("text_sha"):
+        marks = alert_marks(current)
+        if marks["text_sha"] == detail["text_sha"]:
+            return False
+        return age >= (ALERT_REFRESH_S if marks["text_shape"] == detail.get("text_shape") else ALERT_REFRESH_MIN_S)
+    if detail.get("truncated"):
+        return age >= ALERT_REFRESH_S
+    return alert_text_stale(ring_message, current, written_at, now)
 
 
 def waiting_on(note: str):

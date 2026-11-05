@@ -711,6 +711,40 @@ class AlertTextRefreshTests(Base):
         self.run_with("second text", self.T0 + 600)
         self.assertEqual(ow.load_state(self.home).get("pending_comment") or [], before)
 
+    def test_a_refresh_sends_no_deadman_mail(self):
+        a = {"check": "drift", "key": self.KEY, "severity": "critical", "message": "first text", "detail": {}}
+        cfg = dict(self.cfg)
+        cfg["sinks"] = {"comment": {"mode": "none"}, "deadman": ["ops@example.invalid"]}
+        ow.run_once(cfg, self.home, runner=FakeRunner(), checks={"drift": lambda *x: [a]}, now=self.T0)
+        first = ow.load_state(self.home)["deadman_sent"][self.KEY]
+        b = dict(a, message="second text")
+        later = self.T0 + 7 * 3600  # past the 6 h limit, so only the refresh rule can keep this quiet
+        ow.run_once(cfg, self.home, runner=FakeRunner(), checks={"drift": lambda *x: [b]}, now=later)
+        self.assertEqual(self.rows()[-1]["message"], "second text")
+        self.assertEqual(ow.load_state(self.home)["deadman_sent"][self.KEY], first)
+
+    def test_a_failed_refresh_is_written_by_a_later_run(self):
+        self.run_with("first words", self.T0)
+        real = ow.emit
+
+        def fail_once(event, path=None, home=None):
+            raise OSError("disk full")
+        with mock.patch.object(ow, "emit", fail_once), contextlib.redirect_stderr(io.StringIO()):
+            self.run_with("second words", self.T0 + 600)
+        self.assertIs(ow.emit, real)
+        self.assertEqual(self.rows()[-1]["message"], "first words")
+        self.run_with("second words", self.T0 + 1200)
+        self.assertEqual(self.rows()[-1]["message"], "second words")
+
+    def test_non_string_ring_message_does_not_break_a_run(self):
+        ow.emit({"host": "testhost", "source": ow.SOURCE, "event": "raise", "severity": "warning", "key": self.KEY,
+                 "message": "text", "check": "drift"}, path=ow.ring_path(self.home))
+        path = ow.ring_path(self.home)
+        raw = path.read_bytes()
+        path.write_bytes(raw.replace(b'"message":"text"', b'"message":77777 '))
+        self.run_with("current text", self.T0)
+        self.assertEqual(self.rows()[-1]["message"], "current text")
+
     def test_alert_active_before_this_fix_catches_up_on_the_first_run(self):
         self.run_with("4 changed, 1 missing", self.T0)
         state = ow.load_state(self.home)  # a state file written by the older code holds the current text, not the ring's

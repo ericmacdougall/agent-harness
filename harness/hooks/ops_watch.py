@@ -1618,6 +1618,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
             except (OSError, ValueError) as exc:
                 rc = 2
                 print(f"ops-watch: alert ring write failed ({type(exc).__name__}): {e['key']}", file=sys.stderr)
+                active.get(e["key"], {}).pop("written", None)  # not written: next run reads what the ring really says
         news = [e for e in evs if not (e.get("detail") or {}).get("updated")]  # a text refresh alerts nobody
         state["pending_comment"] = ((state.get("pending_comment") or []) + [compact(e) for e in news])[-500:]
         sent = state.setdefault("deadman_sent", {})

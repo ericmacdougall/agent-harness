@@ -27,7 +27,7 @@ Alert keys:
 - `ask:<id>:stale` and `ask:<id>:no-evidence`: warning.
 - `wal:unsafe:<session8>`: high; see Unsafe WALs below.
 
-An active alert whose text or severity no longer matches is raised again with `detail.updated`, under the rule in `liveness.alert_text_stale`. A refresh posts no ticket comment. Only rows that `ah owners` marks as owners raise anything, so helpers never alert.
+An active alert whose text no longer matches, or whose severity has fallen, is raised again with `detail.updated`. Changed words and lower severity wait at least 5 minutes since the last write; number-only changes wait an hour. Rises are immediate. ahd keeps no state, so every raise carries hashes of its raw text (`detail.text_sha`, `detail.text_shape`) and the rule in `liveness.ring_text_stale` compares those, because the ring's own text may be redacted or cut. A slot that overflowed has lost them and refreshes at most hourly. A refresh posts no ticket comment. Only rows that `ah owners` marks as owners raise anything, so helpers never alert.
 
 If ahd cannot read a session's owners, it does not clear that session's liveness alerts. A missing `ah` verb is skipped for 10 min and logged once.
 
