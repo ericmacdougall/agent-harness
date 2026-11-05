@@ -1962,7 +1962,11 @@
                       "binding": {
                         "properties": {
                           "status": {
-                            "const": "bound"
+                            "enum": [
+                              "bound",
+                              "pending"
+                            ],
+                            "description": "pending only for an AskUserQuestion answer, a tool result with no transcript line of its own"
                           }
                         }
                       }
