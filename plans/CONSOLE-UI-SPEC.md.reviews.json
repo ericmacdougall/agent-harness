@@ -1,0 +1,37 @@
+{
+ "v": 1,
+ "reviews": [
+  {
+   "kind": "agent",
+   "identity": "a053fe1922db381dc",
+   "model": "red-team",
+   "verdict": "ACCEPT",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/console-platform/console/../review-adversarial-r3.md",
+    "sha256": "99a30f8986e6a2ed3e890f05fde139410088774c892ddc7e00a5bc5ef3c2e3ec"
+   },
+   "role": "adversarial",
+   "core_sha": "b035b06483b23295687045effdc1d076bce971a97fd280a0d0ba2cb43220651d",
+   "at": "2026-11-05T00:28:40.346999+00:00",
+   "key": "agent:a053fe1922db381dc"
+  },
+  {
+   "kind": "agent",
+   "identity": "a4f2b8afa5ba5e70f",
+   "model": "red-team",
+   "verdict": "ACCEPT",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/console-platform/console/../review-acceptance-r3b.md",
+    "sha256": "fbb0c245715f3b8424cc68b22b299610e043ca89c94e8bce511fa01adefc4cec"
+   },
+   "role": "acceptance",
+   "core_sha": "b035b06483b23295687045effdc1d076bce971a97fd280a0d0ba2cb43220651d",
+   "at": "2026-11-05T00:30:24.627273+00:00",
+   "key": "agent:a4f2b8afa5ba5e70f"
+  }
+ ]
+}

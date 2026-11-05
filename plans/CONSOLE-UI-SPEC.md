@@ -169,3 +169,12 @@ Useful additions chosen by the owner (assumptions, each removable): a read-only 
 - Hooks editor can weaken harness safety: typed confirmation, backup, fact record, fixtures only in tests.
 - Provider usage endpoints are undocumented or change: usage is shown only when the provider reports it, else explicit unavailable.
 - Model of the user's intent is assumed from relayed text: mitigation is the provenance note and the review of the text by two independent reviewers.
+
+## Reviews
+
+Spec core sha256: `b035b06483b23295687045effdc1d076bce971a97fd280a0d0ba2cb43220651d`
+
+| Role | Verdict | Reviewer | Kind | Source | Bound to |
+|---|---|---|---|---|---|
+| adversarial | ACCEPT | a053fe1922db381dc (red-team) | agent | WAL-verified red-team agent | current |
+| acceptance | ACCEPT | a4f2b8afa5ba5e70f (red-team) | agent | WAL-verified red-team agent | current |
