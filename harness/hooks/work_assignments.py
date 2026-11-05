@@ -23,6 +23,7 @@ import json
 import os
 import random
 import re
+import shlex
 import socket
 import stat
 import string
@@ -174,15 +175,48 @@ def searches_store(tool: str, tool_input, cwd=None) -> bool:
     return True
 
 
-def reads_store_recursively(command: str) -> bool:
-    """A recursive reader pointed at the store directory itself (not a subdirectory such as work/)."""
-    if not RECURSIVE.search(command):
-        return False
-    targets = store_dir_forms() | {"~", "$HOME", "${HOME}", str(Path.home()).rstrip("/")}
-    for token in re.split(r"[\s'\"=;&|<>()]+", command):
-        if token.rstrip("/") in targets or token.rstrip("/*") in targets and token.endswith("*"):
-            return True
+GREP_FAMILY = {"grep", "egrep", "fgrep", "rgrep", "rg", "ag", "ack"}
+ALWAYS_RECURSIVE = {"rgrep", "rg", "ag", "ack", "find", "tar", "zip", "rsync", "du", "tree"}
+READERS = GREP_FAMILY | ALWAYS_RECURSIVE | {"cp", "strings", "xxd", "od", "cat", "head", "tail", "less", "more"}
+
+
+def reads_store_recursively(command: str, cwd=None) -> bool:
+    """A reader whose path argument is the store directory, or a recursive reader whose path (or default cwd) is the
+    store or an ancestor of it. Words are parsed per simple command, so `provenance.py find-user` is not `find`."""
+    fold = (lambda x: x.lower()) if sys.platform == "darwin" else (lambda x: x)
+    home = fold(os.path.realpath(str(base())))
+    here = cwd or os.getcwd()
+    for segment in re.split(r"\|\||&&|[;|&\n()`]", command):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            words = segment.split()
+        while words and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]) or words[0] in ("sudo", "env", "nice", "command", "exec", "xargs", "time")):
+            words = words[1:]
+        if not words:
+            continue
+        prog = os.path.basename(words[0])
+        if prog not in READERS:
+            continue
+        flags = [w for w in words[1:] if w.startswith("-")]
+        args = [w for w in words[1:] if not w.startswith("-")]
+        recursive = prog in ALWAYS_RECURSIVE or (
+            prog in GREP_FAMILY and any(re.fullmatch(r"-[A-Za-z]*[rR][A-Za-z]*|--recursive|--dereference-recursive", f) for f in flags)) or (
+            prog == "cp" and any(re.fullmatch(r"-[A-Za-z]*[rRa][A-Za-z]*|--recursive|--archive", f) for f in flags))
+        if prog in GREP_FAMILY and args and not any(f in ("-e", "-f", "--regexp", "--file") or f.startswith(("--regexp=", "--file=")) for f in flags):
+            args = args[1:]  # the first operand is the pattern
+        if not args and recursive and prog in GREP_FAMILY | {"find", "du", "tree"}:
+            args = ["."]
+        for arg in args:
+            literal = re.split(r"[*?\[{]", arg, 1)[0]
+            if literal != arg:
+                literal = literal if literal.endswith("/") else literal.rpartition("/")[0] or "."
+            root = fold(os.path.realpath(os.path.join(here, os.path.expanduser(os.path.expandvars(literal or ".")))))
+            if root == home or (recursive and home.startswith(root.rstrip("/") + "/")):
+                return True
     return False
+
+
 WRITEISH = re.compile(r"(?:>|\btee\b|\brm\b|\bmv\b|\bcp\b|sed\s+-i|\btruncate\b|\bpython3?\b|\bperl\b|\bruby\b|\bnode\b|"
                       r"\bdd\b|\bln\b|\bchmod\b|\binstall\b|\bgit\s+(?:checkout|restore|stash)\b)")
 
@@ -1042,6 +1076,8 @@ def prompt_capture_fields(payload: dict, runtime: str):
     session = str(payload.get("session_id") or "")
     if not valid_session(session) or payload.get("agent_id") or not isinstance(payload.get("prompt"), str):
         return None
+    if runtime == "claude" and os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"):
+        return None  # headless run: `claude -p` sets sdk-cli (checked); its prompt comes from a program
     found = classify_prompt(payload["prompt"])
     if found is None:
         return None
@@ -1079,6 +1115,8 @@ def human_records(raw: bytes, runtime: str, first_line: int):
         if not isinstance(record, dict):
             continue
         if runtime == "claude":
+            if str(record.get("entrypoint") or "").startswith("sdk"):
+                continue  # a headless turn, written by a program
             text, _ = prov.user_authorship(record)
             if text is None:
                 continue
@@ -1560,7 +1598,7 @@ def hook_guard(payload: dict, runtime: str) -> dict:
         reason = ("This search would reach the agent-harness store and could expose the capture key (Claude Code searches "
                   "hidden directories). Pass a `path` that does not contain the store, or a `glob`/`type` filter such as "
                   "`*.py`, or read a named file.")
-    elif isinstance(command, str) and reads_store_recursively(command):
+    elif isinstance(command, str) and reads_store_recursively(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None):
         reason = "Recursive reads of the agent-harness store would expose the capture key; read a named file instead."
     if reason:
         if mode == "enforce":
@@ -1745,14 +1783,14 @@ def words_of(text: str) -> set:
 RETRACTION = re.compile(r"(?i)cancel|never ?mind|forget|scrap|\bdrop|\bstop|no wait|instead|retract|ignore|"
                         r"don'?t (?:do|bother|need|want)|no longer|not needed|skip|abandon|withdraw|call (?:it|that) off")
 # Cancel proof is a command, not a sentiment: the user's whole message must be `cancel <ask-id>` (or drop/withdraw),
-# optionally followed by `:` or a dash and a reason. Word lists lost every round ("don't cancel", "instead of
+# nothing more (a trailing "- no wait, keep it" refused too). Word lists lost every round ("don't cancel", "instead of
 # cancelling", "cancel A? no", curly quotes), and a sentence could retract one ask while naming another.
-CANCEL_COMMAND = re.compile(r"(?is)\s*(?:please\s+)?(?:cancel|drop|withdraw)\s+([a-z]-[a-z0-9-]+?)\s*(?:[.!]\s*|[:\u2013\u2014-]\s+\S.*)?")
+CANCEL_COMMAND = re.compile(r"(?i)(?:please )?(?:cancel|drop|withdraw) ([a-z]{1,3}-[a-z0-9-]*[a-z0-9])[.!]?")
 
 
 def cancel_target(text: str):
     """The ask id an explicit cancel command names, or None."""
-    m = CANCEL_COMMAND.fullmatch(text or "")
+    m = CANCEL_COMMAND.fullmatch(prov.norm(text or "").strip("`'\" "))  # nothing may follow: no "- no wait, keep it"
     return m.group(1).lower() if m else None
 
 
@@ -1796,13 +1834,12 @@ def names_ask(ask: dict, text: str) -> bool:
 
 
 def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, decision_id=None, full: str = "") -> None:
-    """The proving turn must relate to THIS ask: its own origin message, a quote that names it, or the answer to a
-    decision tied to it. A stranger's human message cannot cancel an unrelated ask. Whether it retracts is judged on
-    the user's whole message (`full`), so a quote cut out of "don't cancel A" cannot pass."""
+    """The proving turn must be the user's own `cancel <this ask's id>` command, typed as a later message or as the
+    answer to a decision tied to this ask; the whole message (`full`) is judged, never a quote cut out of it."""
     whole = full or quote
-    if full and quote not in full:
+    if full and prov.norm(quote).strip("`") not in prov.norm(full):
         raise WAError("the quote must come from the user's message")
-    explicit = f"the user's message must be exactly `cancel {ask['id']}` (or drop/withdraw), optionally followed by `: reason`"
+    explicit = f"the user's message must be exactly `cancel {ask['id']}` (or drop/withdraw), with nothing after it"
     if binding == "same_message_retraction":
         raise WAError("same_message_retraction is no longer accepted: a message cannot both ask and retract; record it as a "
                       "no-ask instead, or have the user send `cancel <ask-id>`")
@@ -1829,6 +1866,16 @@ def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, de
         raise WAError("unknown binding " + str(binding))
 
 
+def attested_text_problem(msg: dict, text: str, line: int):
+    """A transcript line can be rewritten or appended by any same-user process; the hook-attested text hash cannot."""
+    if sha(prov.norm(text[:prov.MAX_TEXT])) != (msg.get("text") or {}).get("sha256"):
+        return "the transcript text differs from what the hook captured for that message (edited or forged line)"
+    bound = (msg.get("origin") or {}).get("log") or {}
+    if bound.get("lineStart") and bound["lineStart"] != line:
+        return f"that message was captured at line {bound['lineStart']}, not line {line}"
+    return None
+
+
 def capture_event(mid: str) -> dict:
     """The `captured` event that created message `mid`, from the event log (not the snapshot)."""
     for ev in read_events():
@@ -1844,6 +1891,9 @@ def proof_for(data: dict, ask: dict, file: str, line: int, uuid: str, quote: str
         raise WAError("proof uuid is not a human message captured by this ledger (run `sync` first if it is recent)")
     if not verified_human(msg):
         raise WAError("proof message was not captured by a hook (transcript-only or unattested); it cannot cancel")
+    why = attested_text_problem(msg, verified.get("text") or "", line)
+    if why:
+        raise WAError("proof refused: " + why)
     tracked = data["sessions"].get(msg["sessionId"], {}).get("transcript")
     if not tracked or os.path.realpath(tracked) != os.path.realpath(file):
         raise WAError("proof message is not from a transcript this ledger tracks")
@@ -1873,6 +1923,9 @@ def reverify_proof(data: dict, ask: dict) -> None:
         raise WAError("proof message is no longer in the ledger")
     if not verified_human(msg) or msg["humanCheck"]["attestation"]["mac"] != proof.get("attestationMac"):
         raise WAError("proof message is no longer a verified hook capture")
+    why = attested_text_problem(msg, verified.get("text") or "", log["lineStart"])
+    if why:
+        raise WAError(why)
     ev = capture_event(msg["id"])
     if ev["id"] != proof.get("eventId") or (ev["data"].get("message") or {}).get("humanCheck", {}).get("attestation", {}).get("mac") \
             != proof.get("attestationMac"):

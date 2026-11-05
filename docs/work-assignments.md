@@ -50,8 +50,8 @@ split from one has source kind `inferred`, not `user`. A cancel proof, a decisio
 verified message. A cancel proof also records the captured event id and its MAC, and both are re-checked against the
 event log at removal. A transcript line alone never proves anything. A decision answer must be the first
 hook-captured message (typed or an AskUserQuestion answer) in that session after the question was recorded, never an
-agent's pick. A cancel through an answer needs the user's own words to retract the ask and name it (id or 3+ of its
-words); the question text does not count, because the agent wrote it. An ask has at most one `superseded_by`
+agent's pick. A cancel through an answer needs the answer itself to be `cancel <ask-id>`; the question text does not count,
+because the agent wrote it. An ask has at most one `superseded_by`
 relation, to an ask split from the same human message. Superseding only marks the link for the digest: it never
 makes an ask removable, because which asks a message holds is the agent's own split. The older ask leaves only
 when the user cancels it. A request the user replaced is cancelled with their words as proof. The guard runs on Write, Edit, MultiEdit, NotebookEdit, Bash, Read, Grep, Glob and LS on Claude Code, and on every
@@ -100,8 +100,8 @@ contain a cue stays flagged until it is split.
 user proof, for more than 24 hours (clock `stateSince`, cached as `removableAfter`). A `superseded` ask is not removable; it can be cancelled with user proof.
 A cancel proof names `targets` and a `binding`: `explicit_reference` (a later typed message) or
 `answer_to_decision` / `answer_to_cancel_question` (the typed reply to a recorded decision about this ask). In every
-case the user's whole message must be the command `cancel <ask-id>` (or `drop` / `withdraw`), optionally followed by
-`: reason`; to cancel, the agent asks the user to send exactly that. A sentence that only sounds like a retraction,
+case the user's whole message must be the command `cancel <ask-id>` (or `drop` / `withdraw`), with nothing after
+it; to cancel, the agent asks the user to send exactly that. A sentence that only sounds like a retraction,
 a refusal, or a message naming another ask never counts, and an AskUserQuestion answer is a tool result, not a typed
 turn, so it cannot be cancel proof. `same_message_retraction` is no longer accepted.
 
@@ -128,8 +128,9 @@ A verified commit proves the commit exists (and still resolves at removal), not 
 That check is a keyword heuristic too: a secret with none of those words nearby can still reach the excerpt, the
 event log and its backup. Request cues are English keyword heuristics: they miss requests phrased without them and flag some messages that are not requests. A superseded ask is never removed on the agent's word; it waits for a user cancel.
 
-Agents run as the same Unix user as the hooks. A forged transcript line, a hand-written spool line and an invented or
-altered attestation are refused. A hand-written event that copies a real attestation is accepted only for the same
+Agents run as the same Unix user as the hooks. A forged or edited transcript line (cancel proof must match the
+hook-attested text hash and line), a hand-written spool line and an invented or altered attestation are refused.
+Headless `claude -p` prompts (`CLAUDE_CODE_ENTRYPOINT=sdk-*`, transcript `entrypoint: sdk-*`) are not captured as human. A hand-written event that copies a real attestation is accepted only for the same
 session and text, so it can only duplicate a message the human really sent. The guard deters accidental reads and
 casual forging only: an agent that writes a script file and runs it, or otherwise works around a pattern match, can
 read the key or call the hook code with forged input. The attestation is not a cryptographic boundary; that needs a

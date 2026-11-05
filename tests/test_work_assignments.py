@@ -58,7 +58,8 @@ class Base(unittest.TestCase):
         self.transcript = self.projects / f"{SID}.jsonl"
         self.transcript.write_text("")
         patches = [mock.patch.dict(os.environ, {"AGENT_HARNESS_HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(root / "claude"),
-                                                "CODEX_HOME": str(root / "codex"), "HOME": str(root)}),
+                                                "CODEX_HOME": str(root / "codex"), "HOME": str(root),
+                                                "CLAUDE_CODE_ENTRYPOINT": "cli"}),
                    mock.patch.object(wa, "now", lambda: CLOCK[0]),
                    mock.patch.object(wa, "commit_exists", lambda sha, repo=None: sha.startswith("abc")),
                    mock.patch.object(wa, "wal_has_test", lambda entry: entry.startswith("wal")),
@@ -602,7 +603,7 @@ class RemovalTest(Base):
     def setup_cancel(self, ask_text="finish the whole thing please", say=None):
         """The cancelling turn arrives through the prompt hook (verified), then sync binds it to its transcript line."""
         _, aid = self.split("start something", ask_text)
-        msg = self.capture(say or f"cancel {aid}: I changed my mind")
+        msg = self.capture(say or f"cancel {aid}")
         uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
         return aid, uid, 2
 
@@ -820,7 +821,7 @@ class RemovalTest(Base):
         # PR review 7d0fb89 #1: it also must not vanish from status and Stop once the replacement is done.
         self.assertIn(f"SUPERSEDED {old}", self.cli("status")[1])
         self.assertEqual(self.hook("stop", {"session_id": SID, "transcript_path": str(self.transcript)}).get("decision"), "block")
-        msg = self.capture(f"cancel {old}: the rotation is not needed")
+        msg = self.capture(f"cancel {old}")
         uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
         line = len(self.transcript.read_text().splitlines())
         self.assertEqual(self.cli(*self.cancel_args(old, uid, line))[0], 0)
@@ -902,7 +903,8 @@ class RemovalTest(Base):
                      "please reinstate {a} instead", "don\u2019t cancel {a}", "cancel {a}? no, it's still needed",
                      "instead of cancelling {a}, finish it", "cancelling {a} would be a mistake",
                      "don't do anything that would cancel {a}", "drop {o}, but {a} stays", "cancel {a} and {o}",
-                     "cancel {o}"):
+                     "cancel {o}", "cancel {a} - no wait, keep it", "cancel {a}:\nactually no", "cancel {a}: not needed",
+                     "drop {a}: not needed any more", "withdraw {a} \u2014 done elsewhere"):
             _, aid = self.split("start something", "refactor the billing exporter module")
             text = said.format(a=aid, o=other)
             msg = self.capture(text)
@@ -910,13 +912,51 @@ class RemovalTest(Base):
             line = len(self.transcript.read_text().splitlines())
             self.assertEqual(self.cli(*self.cancel_args(aid, uid, line, text[:120], "explicit_reference"))[0], 2, text)
             self.assertEqual(self.asks()[aid]["state"], "open", text)
-        for said in ("cancel {a}", "Please cancel {a}.", "drop {a}: not needed any more", "withdraw {a} \u2014 done elsewhere"):
+        for said in ("cancel {a}", "Please cancel {a}.", "`cancel {a}`", "cancel\u00a0{a}", "drop {a}", "withdraw {a}!"):
             _, aid = self.split("start something", "refactor the billing exporter module")
             text = said.format(a=aid)
             msg = self.capture(text)
             uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
             line = len(self.transcript.read_text().splitlines())
-            self.assertEqual(self.cli(*self.cancel_args(aid, uid, line, text))[0], 0, text)
+            self.assertEqual(self.cli(*self.cancel_args(aid, uid, line, f"cancel {aid}" if "cancel" in said else text.strip("`!")))[0], 0, text)
+        self.assertEqual(wa.cancel_target("cancel WA-0001"), "wa-0001")  # legacy v1 ids
+
+    def test_forged_or_edited_proof_line_is_refused(self):
+        """PR review 8ebc559 #1: a line reusing a genuine message's uuid with the text `cancel <id>`, appended or
+        rewritten in place, cancelled the ask and passed removal."""
+        _, aid = self.split("start something", "refactor the billing exporter module")
+        msg = self.capture("thanks, please carry on with the other work")
+        uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
+        self.append(human(f"cancel {aid}", uid))  # appended duplicate uuid with the command text
+        self.assertEqual(self.cli(*self.cancel_args(aid, uid, 3))[0], 2)
+        lines = self.transcript.read_text().splitlines()
+        lines[1] = json.dumps(human(f"cancel {aid}", uid))  # the genuine line rewritten in place
+        self.transcript.write_text("\n".join(lines[:2]) + "\n")
+        self.assertEqual(self.cli(*self.cancel_args(aid, uid, 2))[0], 2)
+        self.assertEqual(self.asks()[aid]["state"], "open")
+
+    def test_edited_proof_line_blocks_removal(self):
+        aid, uid, line = self.setup_cancel()
+        self.assertEqual(self.cli(*self.cancel_args(aid, uid, line))[0], 0)
+        lines = self.transcript.read_text().splitlines()
+        record = json.loads(lines[line - 1])
+        record["message"]["content"] = f"cancel {aid}."  # same command, different bytes: not what the hook attested
+        lines[line - 1] = json.dumps(record)
+        self.transcript.write_text("\n".join(lines) + "\n")
+        CLOCK[0] += 25 * 3600
+        self.assertEqual(self.cli("remove", aid)[0], 2)
+
+    def test_headless_prompts_are_not_human(self):
+        """PR review 8ebc559 #2: a `claude -p` prompt (CLAUDE_CODE_ENTRYPOINT=sdk-cli) was attested as a human message."""
+        before = len(self.data().get("messages", {})) if (self.home / "work-ledger.json").exists() else 0
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}):
+            self.append(human("please refactor the billing exporter module"))
+            self.hook("prompt", self.payload("please refactor the billing exporter module"))
+        self.assertEqual(len(self.data().get("messages", {})) if (self.home / "work-ledger.json").exists() else 0, before)
+        record = human("please refactor the billing exporter module")
+        self.assertEqual(len(list(wa.human_records(json.dumps(record).encode(), "claude", 1))), 1)
+        record["entrypoint"] = "sdk-cli"
+        self.assertEqual(list(wa.human_records(json.dumps(record).encode(), "claude", 1)), [])
 
     def test_silent_cancel_question_does_not_let_an_unrelated_reply_cancel(self):
         """PR review R2: the agent wrote "Cancel the billing exporter refactor?" without asking the user; the next
@@ -1276,6 +1316,22 @@ class AttestGuardTest(Base):
                                    ("Grep", {"pattern": "/.*", "path": "/repo"}, user_home), ("Grep", {"pattern": "~/"}, "/repo"),
                                    ("LS", {"path": user_home}, user_home), ("Grep", {"pattern": "x", "path": "work"}, str(hidden))):
                 self.assertIsNone(call(tool, inp, cwd), (tool, inp, cwd))
+
+    def test_guard_bash_recursive_readers_parse_arguments(self):
+        """PR review 8ebc559 #3: a bare ~ anywhere denied 179 ordinary commands (`provenance.py find-user`), while
+        `grep -rn x .` from home and `rg -uu x ..` passed."""
+        home = str(wa.base())
+        user_home = str(Path(home).parent)
+        deny = lambda r: r.get("hookSpecificOutput", {}).get("permissionDecision")
+        call = lambda cmd, cwd: deny(self.hook("guard", {"session_id": SID, "tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd}))
+        for cmd, cwd in (("grep -rn x .", user_home), ("grep -rn x ~", "/repo"), ("rg x", user_home), ("rg -uu x ..", home + "/work"),
+                         ("find ~ -name '*.json'", "/repo"), ("grep -R secret $HOME", "/repo"), (f"tar czf /tmp/x.tgz {home}", "/repo"),
+                         ("cd /repo && grep -rn TODO ~", "/repo"), (f"strings {home}", "/repo")):
+            self.assertEqual(call(cmd, cwd), "deny", (cmd, cwd))
+        for cmd, cwd in (("python3 ~/.claude/hooks/provenance.py find-user --session x --text 'y'", user_home), ("grep -rn x src", "/repo"),
+                         ("rg x", "/repo"), ("ls ~", user_home), ("grep -n x ~/notes.txt", "/repo"), ("cat ~/README.md", "/repo"),
+                         (f"grep -rn x {home}/work", "/repo"), ("echo ~ && git status", user_home)):
+            self.assertIsNone(call(cmd, cwd), (cmd, cwd))
 
     def test_guard_allows_ordinary_globs_and_code(self):
         """PR review R1 (regression): a bare `*` counted as naming the key, so `ls *` and `x = 2 * 3` were denied."""
