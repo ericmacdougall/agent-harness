@@ -40,7 +40,8 @@ def desired_files(home: Path, system: str) -> list[tuple[Path, bytes, int, bool]
     """[(destination, bytes, mode, is_unit)] for this platform."""
     bin_dir = home / ".agent-harness" / "bin"
     out = [(bin_dir / "log-backup.sh", (ROOT / "harness" / "bin" / "log-backup.sh").read_bytes(), 0o755, False),
-           (bin_dir / "log-backup.excludes", (ROOT / "harness" / "bin" / "log-backup.excludes").read_bytes(), 0o644, False)]
+           (bin_dir / "log-backup.excludes", (ROOT / "harness" / "bin" / "log-backup.excludes").read_bytes(), 0o644, False),
+           (bin_dir / "log-backup.work-excludes", (ROOT / "harness" / "bin" / "log-backup.work-excludes").read_bytes(), 0o644, False)]
     sched = ROOT / "harness" / "schedulers"
     if system == "Darwin":
         plist = (sched / f"{LABEL}.plist").read_text().replace("@HOME@", escape(str(home)))
