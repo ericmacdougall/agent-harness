@@ -166,6 +166,30 @@ class WiringIsReal(Check):
         self.assertEqual(doctor.check_host("dev2"), "dev2")
 
 
+class Remote(unittest.TestCase):
+    def test_tilde_means_the_remote_home_not_the_local_one(self):
+        class R:
+            returncode, stdout = 0, "/home/remoteuser"
+        calls = []
+        orig = doctor.subprocess.run
+        doctor.subprocess.run = lambda argv, **k: (calls.append(argv), R())[1]
+        try:
+            self.assertEqual(doctor.remote_path("dev2", "~/.claude/hooks"), "/home/remoteuser/.claude/hooks")
+            self.assertEqual(doctor.remote_path("dev2", "/abs/path"), "/abs/path")
+        finally:
+            doctor.subprocess.run = orig
+        self.assertEqual(len(calls), 1)  # only the ~ path needed a lookup
+        self.assertEqual(calls[0][calls[0].index("--") + 1], "dev2")
+
+    def test_remote_wired_paths_match_the_remote_hooks_dir(self):
+        hooks = {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3",
+                 "args": ["/home/remoteuser/.claude/hooks/commit_policy.py", "hook"]}]}]}
+        self.assertIsNotNone(doctor.find_hook(hooks, "PreToolUse", "commit_policy.py", "hook", ["Bash"],
+                                              Path("/home/remoteuser/.claude/hooks")))
+        self.assertIsNone(doctor.find_hook(hooks, "PreToolUse", "commit_policy.py", "hook", ["Bash"],
+                                           Path("/Users/local/.claude/hooks")))
+
+
 class Canary(unittest.TestCase):
     def script(self, body):
         d = tempfile.TemporaryDirectory()
@@ -201,6 +225,10 @@ class RulesRegistry(unittest.TestCase):
     def test_partial_rule_never_reports_enforced(self):
         rule = {"id": "R", "mechanisms": ["a"], "partial_reason": "only part"}
         self.assertEqual(doctor.rules_report([rule], [{"id": "a", "state": doctor.WIRED}], ROOT)[0]["state"], "PARTIAL")
+
+    def test_warn_only_hook_is_alert_only_even_when_wired(self):
+        rule = {"id": "R", "mechanisms": ["a"], "static_mode": "warn"}
+        self.assertEqual(doctor.rules_report([rule], [{"id": "a", "state": doctor.WIRED}], ROOT)[0]["state"], "ALERT-ONLY")
 
     def test_known_overclaims_are_flagged_partial(self):
         by_id = {r["id"]: r for r in RULES}

@@ -583,7 +583,8 @@
   "mechanisms": [
    "wal:pretool"
   ],
-  "partial_reason": "wal.py pretool only warns about durable-state drift"
+  "partial_reason": "wal.py pretool only warns about durable-state drift",
+  "static_mode": "warn"
  },
  {
   "id": "W06",

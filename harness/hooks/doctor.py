@@ -154,6 +154,22 @@ def check_host(host: str) -> str:
     return host
 
 
+def remote_home(ssh: str) -> str:
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", check_host(ssh),
+                        'printf "%s" "$HOME"'], capture_output=True, text=True, timeout=30)
+    home = r.stdout.strip()
+    if r.returncode != 0 or not home.startswith("/"):
+        raise OSError(f"ssh {ssh} home lookup failed")
+    return home
+
+
+def remote_path(ssh: str, path: str) -> str:
+    """Absolute path on the remote host: a leading ~ means the REMOTE home, never the local one."""
+    if path == "~" or path.startswith("~/"):
+        return remote_home(ssh) + path[1:]
+    return path
+
+
 def read_live(path: str, ssh: str | None) -> dict:
     if ssh:
         r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", check_host(ssh),
@@ -202,6 +218,8 @@ def rules_report(rules: list[dict], findings: list[dict], hooks_dir: Path) -> li
                 state = "ALERT-ONLY"
             else:
                 state = "PARTIAL" if rule.get("partial_reason") else "ENFORCED"
+            if wired and rule.get("static_mode") == "warn":
+                state = "ALERT-ONLY"  # the hook can only warn by design
         elif rule.get("advisory_reason"):
             state = "ADVISORY"
         elif rule.get("planned_batch"):
@@ -230,8 +248,11 @@ def main(argv=None) -> int:
     r.add_argument("--fail-on-p0", action="store_true", help="exit 1 when any P0 rule is not ENFORCED/PARTIAL")
     a = ap.parse_args(argv)
     manifest = load_json(MANIFEST)
+    ssh = getattr(a, "ssh", None)
     try:
-        live = read_live(a.settings, getattr(a, "ssh", None))
+        if ssh:
+            a.settings, a.hooks_dir = remote_path(ssh, a.settings), remote_path(ssh, a.hooks_dir)
+        live = read_live(a.settings, ssh)
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         print(f"doctor: cannot read {a.settings}: {type(exc).__name__}", file=sys.stderr)
         return 2
