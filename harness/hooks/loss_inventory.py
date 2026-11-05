@@ -663,7 +663,10 @@ def load_last():
     if not isinstance(d, dict) or not isinstance(d.get("rows"), list):
         print("error: %s does not hold a saved scan" % path, file=sys.stderr)
         return None
-    d["rows"] = [r for r in d["rows"] if isinstance(r, dict) and isinstance(r.get("path"), str) and r.get("class")]
+    # refuse rather than drop: dropping a damaged row would let report count it as nothing left to decide
+    if not all(isinstance(r, dict) and isinstance(r.get("path"), str) and r.get("class") for r in d["rows"]):
+        print("error: %s has malformed rows" % path, file=sys.stderr)
+        return None
     return d
 
 

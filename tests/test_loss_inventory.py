@@ -645,6 +645,17 @@ class DecideReportTests(Fixture):
             self.assertIn(b"not valid JSON", p.stderr, argv)
             self.assertNotIn(b"undecided", p.stdout, argv)
 
+    def test_corrupt_rows_in_last_scan_cannot_read_as_zero_losses(self):
+        self.scan()
+        saved = self.home / ".agent-harness/state/loss-inventory/last-scan.json"
+        d = json.loads(saved.read_text())
+        self.assertTrue(d["rows"])  # the fixture really has rows to lose
+        d["rows"] = [1, {"path": "x"}, {"class": "no_remote_repo"}]
+        saved.write_text(json.dumps(d))
+        p = self.run_cli("report", expect=2)
+        self.assertIn(b"malformed rows", p.stderr)
+        self.assertNotIn(b"undecided", p.stdout)
+
     def test_oversized_last_scan_is_refused_without_reading_it_all(self):
         self.scan()
         saved = self.home / ".agent-harness/state/loss-inventory/last-scan.json"
