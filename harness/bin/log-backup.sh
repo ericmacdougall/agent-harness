@@ -29,6 +29,9 @@ LOG="$LOGDIR/log-backup.log"
 LOCKD="$LOGDIR/log-backup.lock.d"
 EXCLUDES=${LOG_BACKUP_EXCLUDES:-$SELF_DIR/log-backup.excludes}
 STALE_LOCK_SECONDS=86400
+WORK_EXCLUDES=${LOG_BACKUP_WORK_EXCLUDES:-$SELF_DIR/log-backup.work-excludes}
+BUDGET_SECONDS=${LOG_BACKUP_BUDGET_SECONDS:-780}   # one run must end inside the 15 minute period
+RUN_START=$(date +%s)
 
 mkdir -p "$LOGDIR" || { echo "log-backup: cannot create $LOGDIR" >&2; exit 1; }
 chmod 700 "$LOGDIR" 2>/dev/null
@@ -90,6 +93,7 @@ fi
 trap '[ "$(cat "$LOCKD/pid" 2>/dev/null)" = "$$" ] && { rm -f "$LOCKD/pid"; rmdir "$LOCKD" 2>/dev/null; }' EXIT
 
 command -v "$RCLONE" >/dev/null 2>&1 || fail "rclone not found (set LOG_BACKUP_RCLONE or fix PATH)" 127
+[ -r "$WORK_EXCLUDES" ] || fail "work exclude file missing: $WORK_EXCLUDES" 2
 [ -r "$EXCLUDES" ] || fail "exclude file missing: $EXCLUDES (refusing to run without credential excludes)" 2
 for anchor in auth.json rclone.conf member.key '*.secret' '.env'; do
   grep -qxF -- "$anchor" "$EXCLUDES" || fail "exclude file lacks required pattern $anchor (refusing to run)" 2
@@ -157,11 +161,21 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   args=(copy --dropbox-batch-mode sync --dropbox-batch-size 100 --tpslimit 2 --transfers 2 --checkers 4
     --retries 10 --retries-sleep 30s --low-level-retries 20 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE --exclude-from "$EXCLUDES" --ignore-case "$@")
   if [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ]; then args+=(--backup-dir "$R/versions/$STAMP/$rel"); fi
+  local remaining
   # Dropbox can rate-limit (too_many_write_operations): retry the source with a pause before calling it a failure.
   # A source that still fails makes the whole run non-fresh.
   attempt=0 copied=0
   while :; do
-    if "$RCLONE" "${args[@]}" -- "$p" "$dst" </dev/null; then copied=1; break; fi
+    remaining=$(( BUDGET_SECONDS - ($(date +%s) - RUN_START) ))
+    if [ $remaining -lt 20 ]; then
+      say "run time budget (${BUDGET_SECONDS}s) used up before $rel; the next run continues"; ok=1; return
+    fi
+    "$RCLONE" "${args[@]}" --max-duration "${remaining}s" -- "$p" "$dst" </dev/null; rc=$?
+    if [ $rc -eq 0 ]; then copied=1; break; fi
+    if [ $rc -eq 8 ] || [ $rc -eq 10 ]; then
+      # --max-transfer (8) or --max-duration (10) reached: partial progress is kept, the next run continues.
+      say "budget reached for $rel (rclone exit $rc); partial, last-ok withheld"; ok=1; return
+    fi
     attempt=$((attempt + 1))
     [ $attempt -le "${LOG_BACKUP_RETRIES:-2}" ] || break
     say "copy of $rel failed; retry $attempt after ${LOG_BACKUP_RETRY_SLEEP:-30}s (file changed mid-copy or rate limit)"
@@ -206,7 +220,22 @@ done
 for src in "${DIRECT[@]}"; do
   [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
   if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
-  upload "$HOME/$src" "$src" --min-age 2m
+  extra=(--min-age 2m)
+  if [ "$src" = .agent-harness/work ]; then
+    # The work tree holds git worktrees, checkouts, screenshots and mutation trees (hundreds of GB). Back up only
+    # the small durable state: skip every directory that has a .git entry, media files, and files over the size cap.
+    gen="$LOGDIR/log-backup.worktrees.excludes"
+    : > "$gen"
+    find "$HOME/$src" -maxdepth 8 -name .git -prune -print 2>/dev/null | while IFS= read -r g; do
+      d=${g%/.git}; rel=${d#"$HOME/$src"}
+      case "$rel" in ''|*[\*?\[\]{}]*) continue ;; esac   # root itself or glob characters: cannot express safely
+      printf '%s/**\n' "$rel" >> "$gen"
+    done
+    say "work: $(wc -l < "$gen" | tr -d ' ') git trees excluded"
+    extra+=(--exclude-from "$WORK_EXCLUDES" --exclude-from "$gen" --max-size "${LOG_BACKUP_WORK_MAX_SIZE:-25M}"
+            --max-transfer "${LOG_BACKUP_WORK_MAX_TRANSFER:-5G}")
+  fi
+  upload "$HOME/$src" "$src" "${extra[@]}"
 done
 [ $primary -gt 0 ] || { say "no primary source (.claude/projects or .codex/sessions) was copied"; ok=1; }
 
