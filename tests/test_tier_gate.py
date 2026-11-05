@@ -243,6 +243,19 @@ class ModesAndCap(GateFixture):
         log = [json.loads(l) for l in (self.root / 'gate.jsonl').read_text().splitlines()]
         self.assertEqual([entry['mode'] for entry in log], ['warn', 'enforce'])
 
+    def test_unusable_state_dir_never_blocks_plain_shell_use(self):
+        # onFailure: block means the hook must always answer: a symlinked or unwritable state dir is not a lockout.
+        link = Path(self.temp.name) / 'linked'; link.symlink_to(self.root)
+        env = {**os.environ, 'AGENT_HARNESS_ESCALATION_DIR': str(link)}
+        plain = subprocess.run([sys.executable, str(HOOKS / 'tier_gate.py'), 'hook'], input=json.dumps(
+            {'tool_name': 'Bash', 'tool_input': {'command': 'ls -la'}, 'session_id': 's'}), capture_output=True, text=True, timeout=20, env=env)
+        self.assertEqual((plain.returncode, plain.stdout.strip()), (0, ''))
+        spawn = subprocess.run([sys.executable, str(HOOKS / 'tier_gate.py'), 'hook'], input=json.dumps(
+            {'tool_name': 'Agent', 'tool_input': {'prompt': 'x [task:k15]', 'model': 'sonnet'}, 'session_id': 's'}), capture_output=True, text=True, timeout=20, env=env)
+        self.assertEqual(spawn.returncode, 0)
+        out = json.loads(spawn.stdout)['hookSpecificOutput']
+        self.assertIn('ladder state unusable', out.get('additionalContext', '') + out.get('permissionDecisionReason', ''))
+
     def test_live_agent_cap_counts_starts_and_stops(self):
         for n in range(gate.LIVE_CAP_DEFAULT):
             gate.live_update('s2', 'agent-%d' % n, start=True)

@@ -855,10 +855,12 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
     def test_top_rung_launches_astra_only_with_approve_top(self):
         import escalation as ladder, model_tiers as tiers
         state = self.root / 'ladder'; state.mkdir(mode=0o700)
-        wal = self.root / 'main.jsonl'
-        wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'permission for task rescue-t top rung',
+        wals = self.root / 'wals'; (wals / 's1').mkdir(parents=True)
+        os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
+        wal = wals / 's1' / 'main.jsonl'
+        wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'permission for [task:rescue-t] top rung',
                                    'source': 'user:s/u "yes, use fable for rescue-t"'}) + '\n'
-                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1'}) + '\n')
+                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'approved by the user'}) + '\n')
         ladder.Ledger(state, tiers.load_policy()).approve_top('rescue-t', 'w1', wal)
         capture = self.root / 'astra-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
@@ -880,7 +882,9 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
                             'usage': {'provider_launches': 1, 'reported': []},
                             'review': {'stage': 'CODE_INSPECTION', 'verdict': 'BLOCK', 'findings': ['F1']}}, sort_keys=True)
         for salt in ('1', '2', '3', '4'):
-            ledger.record('rescue-r2', (block[:-1] + ', "salt": "%s"}' % salt).encode(), kind='review', source='test')
+            # Each failure at a new HEAD: a repeat at the same HEAD without a claimed fix counts once.
+            receipt = json.loads(block); receipt['salt'] = salt; receipt['subject'] = {'head': salt * 40}
+            ledger.record('rescue-r2', json.dumps(receipt, sort_keys=True).encode(), kind='review', source='test')
         self.assertEqual(ledger.status('rescue-r2')['rung'], 'R2')
         capture = self.root / 'r2-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),

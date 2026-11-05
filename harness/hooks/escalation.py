@@ -342,7 +342,9 @@ class Ledger:
                      'rung_at': before['rung']}
             launched = isinstance(receipt, dict) and isinstance(receipt.get('usage'), dict) \
                 and type(receipt['usage'].get('provider_launches')) is int and receipt['usage']['provider_launches'] >= 1
-            if kind == 'review' and launched:
+            if kind == 'review' and launched and klass != 'PASS':
+                # Only failing or not-counted paid launches spend the launch ceiling; accepted reviews are
+                # the healthy path and never block a task (assumption, recorded in the spec).
                 state['launches'] = state.get('launches', 0) + 1
                 # Until helpers report real cost, each counted launch spends the rung's review budget
                 # as a conservative upper bound so the ceiling has effect.
@@ -577,8 +579,11 @@ def main(argv=None):
             value = ledger.gate_digest(args.limit)
         else:
             value = ledger.digest()
-    except (LedgerError, tiers.TierError, OSError) as error:
+    except (LedgerError, tiers.TierError, OSError, ValueError) as error:
         print(json.dumps({'error': getattr(error, 'code', type(error).__name__), 'message': str(error)[:300]}))
+        return 2
+    except Exception as error:  # noqa: BLE001  usage_guard.GuardError and friends: still a JSON refusal
+        print(json.dumps({'error': getattr(error, 'reason', type(error).__name__), 'message': str(error)[:300]}))
         return 2
     print(json.dumps(value, sort_keys=True, indent=1))
     return 0

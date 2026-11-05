@@ -263,16 +263,33 @@ def main(argv=None):
         data = {}
     if not isinstance(data, dict):
         data = {}
-    session_id = data.get('session_id')
     tool = str(data.get('tool_name') or '')
     command = str((data.get('tool_input') or {}).get('command') or '') if isinstance(data.get('tool_input'), dict) else ''
+    applies = tool in SPAWN_TOOLS or (tool == 'Bash' and LAUNCH.search(command))
+    try:
+        return _main(action, data, tool, command, applies)
+    except BaseException as error:  # noqa: BLE001  the hook runs with onFailure block: it must always answer
+        if action == 'hook' and applies:
+            mode = 'enforce'
+            try: mode = tiers.load_policy().get('mode', 'enforce')
+            except Exception: pass  # noqa: BLE001
+            reason = 'ladder state unusable (%s): %s' % (type(error).__name__, str(error)[:160])
+            if mode == 'warn':
+                print(json.dumps(hook_result('context', context='ladder (warn mode): would deny: ' + reason)))
+            else:
+                print(json.dumps(hook_result('deny', reason)))
+        return 0
+
+
+def _main(action, data, tool, command, applies):
+    session_id = data.get('session_id')
     try:
         policy = tiers.load_policy()
         mode = policy['mode']
         ledger = esc.Ledger(policy=policy)
     except tiers.TierError as error:
         # Fail closed on an unreadable table, but only where the ladder applies: spawns and launch lines.
-        if tool in SPAWN_TOOLS or (tool == 'Bash' and LAUNCH.search(command)):
+        if applies:
             print(json.dumps(hook_result('deny', 'tier table error: %s' % error)))
         return 0
     if action in ('start', 'stop'):

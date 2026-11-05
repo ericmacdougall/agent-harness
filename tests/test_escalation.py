@@ -174,7 +174,7 @@ class Transitions(LedgerFixture):
         self.ledger.add_spend('t7', 61)
         self.assertIn('max_total_review_usd', self.ledger.status('t7')['blocked_by'])
         for n in range(8):
-            self.ledger.record('t8', final(verdict='ACCEPT', salt=str(n)), kind='review', source='test')
+            self.ledger.record('t8', final(verdict='BLOCK', findings=['F%d' % n], salt=str(n)), kind='review', source='test')
         self.assertIn('max_review_launches', self.ledger.status('t8')['blocked_by'])
 
 
@@ -235,6 +235,38 @@ class Concurrency(LedgerFixture):
         state = self.ledger.load('t12')
         self.assertEqual(len(state['events']), 2)
         self.assertEqual(self.ledger.status('t12')['rung'], 'R1')
+
+
+class RecordFromStore(LedgerFixture):
+    def test_record_reads_a_verified_final_by_run_id_and_refuses_a_bogus_one(self):
+        import usage_guard as guard
+        usage = Path(self.temp.name) / 'usage'
+        env = {**os.environ, 'AGENT_HARNESS_USAGE_DIR': str(usage), 'AGENT_HARNESS_ESCALATION_DIR': str(self.root)}
+        store = guard.UsageStore(usage)
+        repo = Path(self.temp.name) / 'repo'; repo.mkdir()
+        subject = guard.Subject(schema=1, fingerprint='a' * 64, reusable=True, head='b' * 40, tree='c' * 40)
+        subject.repo, subject.manifest = repo, {}; subject.probe = lambda: subject
+        identity = guard.invocation_identity(subject, purpose='review', argv=['x'], cwd=repo)
+        run = store.begin(subject, identity, owner='fixture', label='review', timeout=10, kind='review', minimum_bytes=0)
+        reference = run.finish(execution='COMPLETED', result='CHECK_FAILED', reason='CODE_FINDINGS', exit_code=0,
+                               review={'stage': 'CODE_INSPECTION', 'verdict': 'BLOCK', 'findings': ['F1']},
+                               usage={'provider_launches': 1, 'reported': []})
+        result = subprocess.run([sys.executable, str(HOOKS / 'escalation.py'), 'record', '--task', 'rs1', '--run-id', run.run_id,
+                                 '--kind', 'review', '--source', 'test'], capture_output=True, text=True, timeout=30, env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)['event']['class'], 'FAIL')
+        bogus = subprocess.run([sys.executable, str(HOOKS / 'escalation.py'), 'record', '--task', 'rs1', '--run-id', 'f' * 32,
+                                '--kind', 'review', '--source', 'test'], capture_output=True, text=True, timeout=30, env=env)
+        self.assertEqual(bogus.returncode, 2); self.assertIn('error', json.loads(bogus.stdout))
+        no_id = subprocess.run([sys.executable, str(HOOKS / 'escalation.py'), 'record', '--task', 'rs1', '--kind', 'review', '--source', 'test'],
+                               capture_output=True, text=True, timeout=30, env=env)
+        self.assertEqual(no_id.returncode, 2)
+
+    def test_accepted_reviews_do_not_spend_the_launch_ceiling(self):
+        for n in range(10):
+            self.ledger.record('ok', final(verdict='ACCEPT', salt=str(n)), kind='review', source='test')
+        self.assertEqual(self.ledger.load('ok')['launches'], 0)
+        self.assertEqual(self.ledger.status('ok')['blocked_by'], [])
 
 
 class TopPermission(LedgerFixture):
