@@ -29,7 +29,7 @@ SECRET_NAMES = re.compile(r"(\.secret$|^\.env(\..*)?$|^member\.key$|^credentials
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 TICKET_RE = re.compile(r"^GoodQA\s+(?:([a-z0-9][a-z0-9-]{0,62})\s*)?#([1-9]\d{0,9})$")
 # The forms owners actually write: goodqa#N, GoodQA goodqa#N, GoodQA 1ae27b6b#N (project id prefix), GoodQA #N, #N, N.
-_REF_FORMS = re.compile(r"(?:(?i:goodqa)(?:\s+([A-Za-z0-9][A-Za-z0-9-]{0,62}))?\s*)?#?([1-9]\d{0,9})")
+_REF_FORMS = re.compile(r"(?:(?i:goodqa)(?:\s+([A-Za-z0-9][A-Za-z0-9-]{0,62})\s*#|\s*#)|#)?([1-9][0-9]{0,9})", re.ASCII)
 PROJECT_ID_PREFIXES = {"1ae27b6b": "goodqa"}  # GoodQA project id (first 8 hex) -> slug
 DEFAULT_PROJECT = "goodqa"
 KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
@@ -531,13 +531,15 @@ def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limi
 
 # ------------------------------------------------------------------ tickets
 
-def load_adapter(home: Path | None = None):
+def load_adapter(home: Path | None = None, quick: bool = False):
     import ticket_adapters
     cfg = json.loads(_bounded(Path(__file__).with_name("commit_policy.json")))["ticket_systems"]["goodqa"]
     if os.environ.get("AH_GOODQA_ENDPOINT"):  # loopback endpoints only (tests); the adapter enforces the scheme
         cfg = dict(cfg, endpoint=os.environ["AH_GOODQA_ENDPOINT"])
     if os.environ.get("AH_GOODQA_KEY_FILE"):
         cfg = dict(cfg, key_file=os.environ["AH_GOODQA_KEY_FILE"])
+    if quick:  # pre-checks must not stall a write: one attempt, short deadline
+        return ticket_adapters.adapter_for(dict(cfg, attempts=1, timeout_seconds=6, total_deadline_seconds=10)), ticket_adapters
     return ticket_adapters.adapter_for(dict(cfg, max_comment_pages=1000, total_deadline_seconds=120)), ticket_adapters
 
 
@@ -561,14 +563,17 @@ def canonical_ref(value: str) -> str:
 
 def check_ticket_exists(ref: str) -> None:
     """Refuse a ticket GoodQA says is missing or out of scope before anything is queued. Offline: nothing to check."""
-    adapter, mod = load_adapter()
     slug, number = ticket_ref(ref)
     try:
+        policy = json.loads(_bounded(Path(__file__).with_name("commit_policy.json")))["ticket_systems"]["goodqa"]
+        if slug in (policy.get("unreachable_projects") or []):
+            return  # the member key cannot see these projects: nothing to verify (commit policy treats them as warn-only)
+        adapter, mod = load_adapter(quick=True)
         ticket = adapter.lookup(slug, number)
-    except mod.TicketOutOfScope:
-        raise AhError("ticket_out_of_scope", f"project {slug!r} is not visible to this credential; use its slug", 2) from None
-    except mod.TicketSystemUnavailable:
-        return  # cannot tell; the comment is queued and the drain settles it
+    except Exception as e:  # only a definite answer refuses; anything else (outage, odd response) queues the comment
+        if type(e).__name__ == "TicketOutOfScope":
+            raise AhError("ticket_out_of_scope", f"project {slug!r} is not visible to this credential", 2) from None
+        return
     if ticket is None:
         raise AhError("not_found", f"ticket {slug}#{number} does not exist", 2)
 
@@ -892,7 +897,7 @@ def spool_drain(home: Path, only_opid: str | None = None, limit: int | None = No
             fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return {"ok": True, "drained": 0, "pending": len(list(spool.glob("*.json"))), "busy": True}
-        done, failed, dead = 0, 0, 0
+        done, failed, dead, dead_names = 0, 0, 0, []
         stop_at_ = time.monotonic() + budget_s if budget_s else None
         for n_, f in enumerate(sorted(spool.glob(f"*-{hashlib.sha256(only_opid.encode()).hexdigest()[:16]}.json" if only_opid else "*.json"))):
             if (limit is not None and n_ >= limit) or (stop_at_ and time.monotonic() > stop_at_):
@@ -905,8 +910,15 @@ def spool_drain(home: Path, only_opid: str | None = None, limit: int | None = No
                     (spool / "dead").mkdir(exist_ok=True, mode=0o700)
                     os.replace(f, spool / "dead" / f.name)
                     dead += 1
+                    dead_names.append(f.name)
                 else:
                     failed += 1
+                continue
+            except (ValueError, KeyError, TypeError):  # an unreadable or malformed job can never succeed
+                (spool / "dead").mkdir(exist_ok=True, mode=0o700)
+                os.replace(f, spool / "dead" / f.name)
+                dead += 1
+                dead_names.append(f.name)
                 continue
             except Exception:  # one bad job must never change another caller's result
                 failed += 1
@@ -915,7 +927,8 @@ def spool_drain(home: Path, only_opid: str | None = None, limit: int | None = No
             done += 1
         if done or dead:
             _append_line(store_dir(home) / "audit.jsonl", {"at": iso(time.time()), "op": "spool.drain",
-                                                           "result": "drained", "drained": done, "dead": dead})
+                                                           "result": "drained", "drained": done, "dead": dead,
+                                                           "dead_jobs": dead_names[:50]})
         return {"ok": True, "drained": done, "pending": failed, "dead": dead}
     finally:
         os.close(lockfd)
@@ -942,17 +955,23 @@ def spool_ack(home: Path, jobs: list, evidence: str | None) -> dict:
         except OSError:
             raise AhError("lock_timeout", "a spool drain is running; retry", 3) from None
         moved, absent = [], []
-        (spool / "delivered").mkdir(exist_ok=True, mode=0o700)
+        (spool / "delivered").mkdir(parents=True, exist_ok=True, mode=0o700)
+        details = []
         for name in jobs:
             src = spool / name
             if src.is_file() and not src.is_symlink():
+                try:
+                    job = json.loads(_bounded(src, 1 << 20))
+                    details.append({"job": name, "ticket": job.get("ticket"), "operation_id": job.get("operation_id")})
+                except (OSError, ValueError, AttributeError):
+                    details.append({"job": name})
                 os.replace(src, spool / "delivered" / name)
                 moved.append(name)
             else:
                 absent.append(name)
         if moved:
             _append_line(store_dir(home) / "audit.jsonl", {"at": iso(time.time()), "op": "spool.ack", "result": "acked",
-                                                           "jobs": moved, "evidence": evidence.strip()[:500],
+                                                           "jobs": details, "evidence": _redact_args(evidence.strip()[:500], __import__("redact").redact),
                                                            "actor": actor(None)})
         return {"ok": True, "acked": moved, "not_found": absent}
     finally:
@@ -1112,20 +1131,26 @@ def task_list(home: Path, open_only: bool = False) -> dict:
 
 def write(home: Path, op: str, args: dict, session: str, key: str | None = None) -> dict:
     precheck(op, args)
+    legacy_args = args  # the spelling earlier builds hashed and keyed (kept so retries across the upgrade still match)
     if args.get("ticket"):
         args = dict(args, ticket=canonical_ref(args["ticket"]))  # one spelling in the key, the ledger and the spool
-        if op in ("ticket.comment", "task.register"):
-            check_ticket_exists(args["ticket"])
     import redact
     if isinstance(args.get("source"), str):
         import wal_note
         if wal_note.SECRET_PATTERN.search(args["source"]):
             raise AhError("bad_request", "source appears to contain a credential; cite it without the secret", 2)
     args = {k: (v if k == "source" else _redact_args(v, redact.redact)) for k, v in args.items()}  # source is checked as typed
+    legacy_args = {k: (v if k == "source" else _redact_args(v, redact.redact)) for k, v in legacy_args.items()}
+    explicit = key is not None
     key = key or derive_key(op, args, session)
     if not KEY_RE.match(key):
         raise AhError("bad_request", "idempotency key must be 8-128 chars of [A-Za-z0-9._:-]")
     body_sha = hashlib.sha256(canonical([op, args]).encode()).hexdigest()
+    shas = {body_sha, hashlib.sha256(canonical([op, legacy_args]).encode()).hexdigest()}
+    keys = {key} if explicit else {key, derive_key(op, legacy_args, session)}
+    if args.get("ticket") and (op == "ticket.comment" or (op == "task.status" and "ticket" in legacy_args)):
+        if not any(r.get("key") in keys and r.get("state", "applied") == "applied" for r in _ledger(home)):
+            check_ticket_exists(args["ticket"])  # a retry of an applied write needs no network
     who = actor(session)
     audit = store_dir(home) / "audit.jsonl"
     with StoreLock(home):
@@ -1133,8 +1158,8 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
         ledger = [r for r in everything if r.get("state", "applied") == "applied"]
         intent = None
         for row in everything:
-            if row.get("key") == key:
-                if row.get("sha") != body_sha:
+            if row.get("key") in keys:
+                if row.get("sha") not in shas:
                     _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who,
                                          "result": "key_conflict"})
                     raise AhError("key_conflict", "that key was used with a different request", 3)

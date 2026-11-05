@@ -58,6 +58,14 @@ class FakeGoodQA(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(out)
             return
+        if name == "get_issue_by_number" and a.get("number") == 404:
+            err = json.dumps({"data": {"error": {"code": "not_found"}}})
+            out = json.dumps({"result": {"isError": True, "content": [{"text": err}]}}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(out)
+            return
         if name == "get_issue_by_number":
             data = {"issue": issue}
         elif name == "get_issue":
@@ -893,6 +901,91 @@ class TicketRefTests(GoodQABase):
         audit = (self.home / ".agent-harness" / "state" / "ah" / "store" / "audit.jsonl").read_text()
         self.assertIn('"op":"spool.ack"', audit)
         self.assertEqual(FakeGoodQA.state["posted"], {})  # acked, not posted
+
+
+class TicketRefReview(WriteTests):
+    """Review round 1 of goodqa#14658."""
+
+    def spool_files(self, sub=""):
+        d = self.home / ".agent-harness" / "state" / "ah" / "store" / "spool" / sub
+        return sorted(d.glob("*.json")) if d.exists() else []
+
+    def test_f1_ref_parse_exact_values(self):
+        for ref, want in (("goodqa#77", ("goodqa", 77)), ("GoodQA goodqa#77", ("goodqa", 77)),
+                          ("GoodQA 1ae27b6b#77", ("goodqa", 77)), ("GoodQA #77", ("goodqa", 77)), ("#77", ("goodqa", 77)),
+                          ("77", ("goodqa", 77)), ("GoodQA proj-2#5", ("proj-2", 5)), ("GOODQA Solve#9", ("solve", 9))):
+            self.assertEqual(ah.ticket_ref(ref), want, ref)
+        for bad in ("GoodQA 14658", "goodqa 14658", "GoodQA 77", "GoodQA goodqa77", "GoodQA proj-25", "1٣", "0", "#0", "", "GoodQA deadbeef#1"):
+            with self.assertRaises(ah.AhError, msg=bad):
+                ah.ticket_ref(bad)
+
+    def test_f2_retries_across_the_upgrade_match_the_old_spelling(self):
+        with mock.patch.object(ah, "canonical_ref", side_effect=lambda v: v):  # what the previous build did
+            old = ah.write(self.home, "ticket.comment", {"ticket": "GoodQA #77", "body": "same"}, SESSION)
+            oldk = ah.write(self.home, "ticket.comment", {"ticket": "GoodQA #77", "body": "explicit"}, SESSION, "upgrade-key-0001")
+        again = ah.write(self.home, "ticket.comment", {"ticket": "GoodQA #77", "body": "same"}, SESSION)
+        self.assertEqual((again["result"], again["id"]), ("duplicate", old["id"]))
+        keyed = ah.write(self.home, "ticket.comment", {"ticket": "GoodQA #77", "body": "explicit"}, SESSION, "upgrade-key-0001")
+        self.assertEqual((keyed["result"], keyed["id"]), ("duplicate", oldk["id"]))  # not key_conflict
+        self.assertEqual(len(FakeGoodQA.state["posted"]), 2)
+
+    def test_f3_register_is_not_refused_for_projects_the_key_cannot_see(self):
+        (self.home / ".claude" / "wals" / SESSION).mkdir(parents=True, exist_ok=True)
+        r = ah.write(self.home, "task.register", {"task": "tp", "owner_agent": "o", "session": SESSION, "ticket": "GoodQA harness#5",
+                                                  "scope": "s", "source": "inferred: ok fixture source"}, SESSION, "reg-harness-001")
+        self.assertEqual(r["result"], "applied")
+        c = ah.write(self.home, "ticket.comment", {"ticket": "GoodQA solve#5", "body": "x"}, SESSION, "cmt-solve-0001")
+        self.assertEqual(c["result"], "applied")  # unreachable by policy: queued, not refused
+
+    def test_f4_task_status_with_an_explicit_bad_ticket_is_refused(self):
+        self.reg()
+        with self.assertRaises(ah.AhError) as c:
+            ah.write(self.home, "task.status", {"task": "t1", "stage": "x", "note": "n", "ticket": "GoodQA nosuchproj#77"},
+                     SESSION, "status-bad-0001")
+        self.assertEqual(c.exception.code, "ticket_out_of_scope")
+        self.assertEqual(self.spool_files(), [])
+        self.assertFalse((self.home / ".claude" / "wals" / SESSION / "agent-ownerx.jsonl").exists())  # nothing written
+
+    def test_missing_ticket_is_refused_before_spooling(self):
+        with self.assertRaises(ah.AhError) as c:
+            ah.write(self.home, "ticket.comment", {"ticket": "goodqa#404", "body": "x"}, SESSION, "missing-key-0001")
+        self.assertEqual(c.exception.code, "not_found")
+        self.assertEqual(self.spool_files(), [])
+
+    def test_f5_odd_responses_queue_instead_of_crashing(self):
+        with mock.patch.object(ah, "load_adapter", side_effect=RuntimeError("bad config")):
+            r = ah.write(self.home, "ticket.comment", {"ticket": "goodqa#77", "body": "x"}, SESSION, "odd-key-000001")
+        self.assertEqual(r["result"], "applied")
+
+    def test_f6_ack_redacts_evidence_and_works_on_a_fresh_store(self):
+        job = "1793866419170-aaaaaaaaaaaaaaaa.json"
+        self.assertEqual(ah.spool_ack(self.home, [job], "delivered, token ghp_abcdefghijklmnopqrstuvwxyz0123456789")["not_found"], [job])
+        ah._spool_comment(self.home, {"ticket": "GoodQA goodqa#77", "body": "b", "operation_id": "ah:ack-1"})
+        (real,) = self.spool_files()
+        ah.spool_ack(self.home, [real.name], "delivered, token ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+        audit = (self.home / ".agent-harness" / "state" / "ah" / "store" / "audit.jsonl").read_text()
+        self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz0123456789", audit)
+        self.assertIn('"ticket":"GoodQA goodqa#77"', audit)
+
+    def test_f6_ack_refuses_a_symlinked_job(self):
+        ah._spool_comment(self.home, {"ticket": "GoodQA goodqa#77", "body": "b", "operation_id": "ah:ack-2"})
+        (real,) = self.spool_files()
+        link = real.parent / "1793866419170-bbbbbbbbbbbbbbbb.json"
+        link.symlink_to(real)
+        r = ah.spool_ack(self.home, [link.name], "delivered and confirmed on the ticket")
+        self.assertEqual((r["acked"], r["not_found"]), ([], [link.name]))
+        self.assertTrue(real.exists())
+
+    def test_f7_corrupt_jobs_go_dead_and_do_not_starve_good_ones(self):
+        spool = self.home / ".agent-harness" / "state" / "ah" / "store" / "spool"
+        spool.mkdir(parents=True, exist_ok=True)
+        (spool / "1793866419170-cccccccccccccccc.json").write_text("{not json")
+        (spool / "1793866419171-dddddddddddddddd.json").write_text(json.dumps({"ticket": "GoodQA goodqa#77"}))
+        ah._spool_comment(self.home, {"ticket": "GoodQA goodqa#77", "body": "real", "operation_id": "ah:ok-1"})
+        r = ah.spool_drain(self.home, limit=2)
+        self.assertEqual((r["dead"], len(self.spool_files("dead"))), (2, 2))
+        self.assertEqual(ah.spool_drain(self.home)["drained"], 1)
+        self.assertEqual(len(FakeGoodQA.state["posted"]), 1)
 
 
 if __name__ == "__main__":
