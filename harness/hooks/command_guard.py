@@ -39,6 +39,7 @@ import posixpath
 import re
 import secrets as _secrets
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -135,6 +136,58 @@ DEFAULT_POLICY = {
 SECRET_DUMP, LOG_DELETE, BROAD_KILL = 'secret_dump', 'log_delete', 'broad_kill'
 PARSE = 'parse'  # warn-only notes: input the guard could not fully parse
 ALWAYS_ENFORCED = (SECRET_DUMP, LOG_DELETE)
+
+
+# --------------------------------------------------------------------------- one-off pinned routes
+
+# Two credential tools the user chose to allow for the pve evacuation (GoodQA goodqa#14518). A route is the whole command
+# string, a file with this exact SHA-256 at this exact path, and a time before the expiry. This is a fixed table on purpose:
+# no policy file, flag or environment variable can add to it, and a later change removes it.
+# Paths are relative to HOME's work folder so no home name is published. The tools check their own names and values, so the
+# argument shapes only need to rule out shell syntax.
+PINNED_ROUTE_BASE = '.agent-harness/work/dev-decom'
+PINNED_ROUTE_EXPIRES = 1794182400  # 2026-11-09T00:00:00Z, the day the host these routes serve shuts down
+PINNED_ROUTES = (
+    ('unit-mig/t2-rclone/user-run-store-dropbox-secret.sh',
+     '32bbbfa1eda1ac160517e492f612b19b6005262726aace3fe20f12bb70f31465',
+     r'/bin/bash {path}'),
+    ('unit-mig/cf-dns/cf_dns_prod_move.py',
+     '95cdc8963a61f5ced79696aab564d37f490ab0973018cfcb460537a64f8391da',
+     r'/usr/bin/python3 -I {path} (?:list'
+     r'|set-ttl --name [a-z.]{{1,40}} --ttl [0-9]{{1,5}} --expect-ttl [0-9]{{1,5}}'
+     r'|set-content --name [a-z.]{{1,40}} --content [0-9.]{{7,15}} --expect-content [0-9.]{{7,15}})'),
+)
+# Existing scripts are otherwise judged only for log deletion, so a credential read inside one would pass. This refuses
+# scripts whose own text names these credentials. It matches text only: a script that builds the name at runtime, calls
+# another script, or names it past the read limit is not caught.
+CREDENTIAL_SCRIPT_TEXT = re.compile(rb'rclone\.conf|\.config/rclone\b|GOODQA_CLOUDFLARE_API_TOKEN')
+CREDENTIAL_SCRIPT_READ = 1048576
+
+
+def _read_prefix(path, limit):
+    with open(path, 'rb') as handle:
+        return handle.read(limit)
+
+
+def pinned_route(command, now=None):
+    """True only for the exact command string of an unexpired route whose file is a regular file with the pinned hash."""
+    if not isinstance(command, str) or (time.time() if now is None else now) >= PINNED_ROUTE_EXPIRES:
+        return False
+    home = os.environ.get('HOME')
+    if not home or not os.path.isabs(home):
+        return False
+    for rel, digest, shape in PINNED_ROUTES:
+        path = os.path.join(home, PINNED_ROUTE_BASE, rel)
+        if not re.fullmatch(shape.format(path=re.escape(path)), command):
+            continue
+        try:
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                return False
+            data = _read_prefix(path, CREDENTIAL_SCRIPT_READ + 1)
+        except (OSError, ValueError):
+            return False
+        return len(data) <= CREDENTIAL_SCRIPT_READ and hashlib.sha256(data).hexdigest() == digest
+    return False
 
 
 # --------------------------------------------------------------------------- policy
@@ -1987,6 +2040,7 @@ class Analyzer:
         if key in ctx.written:
             self.script(ctx.written[key], depth + 1, tail_visible=True)
             return
+        self.credential_script(path)
         ctx.files_read = getattr(ctx, 'files_read', 0) + 1
         if ctx.files_read > 8:
             return
@@ -2016,6 +2070,22 @@ class Analyzer:
             for k, v in keep.items():
                 setattr(ctx, k, v)
         ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
+
+    def credential_script(self, path):
+        """Refuse running an existing text file that names a credential the pinned routes cover (goodqa#14518)."""
+        ctx = self.ctx
+        ctx.credential_reads = getattr(ctx, 'credential_reads', 0) + 1
+        if ctx.credential_reads > 32:
+            return
+        try:
+            if _realpath(path) == _realpath(os.path.abspath(__file__)) or not os.path.isfile(path):
+                return
+            data = _read_prefix(path, CREDENTIAL_SCRIPT_READ)
+        except (OSError, ValueError):
+            return
+        if b'\0' not in data and CREDENTIAL_SCRIPT_TEXT.search(data):
+            ctx.add(SECRET_DUMP, 'credential-script', 'this script names a credential file or secret, and only a pinned '
+                    'route may run one', 'ask the user to run it in their own terminal')
 
     def launcher(self, name, args, depth, pl, idx):
         """Commands that run another command given as text or as trailing words. True when handled."""
@@ -2892,6 +2962,8 @@ class Analyzer:
                 text = self.ctx.written.get(norm_path(nd[0].text, self.ctx).casefold())
                 if text:
                     self.code(text, depth)
+                elif not nd[0].dynamic:
+                    self.credential_script(norm_path(nd[0].text, self.ctx))
 
     def code(self, code, depth):
         ctx = self.ctx
@@ -3750,6 +3822,8 @@ KNOWN_NAMES = ['rclone', 'goodqa', 'gcloud', 'security', 'printenv', 'env', 'pki
 
 def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
     """Return the list of Findings for a command string. Raises Blocked when it cannot be analysed in budget."""
+    if pinned_route(command):
+        return []
     compiled = compiled or Compiled(load_policy())
     if isinstance(command, (list, tuple)):
         command = ' '.join(_quote_for_rebuild(str(c)) for c in command)
