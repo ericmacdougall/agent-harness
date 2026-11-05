@@ -1,0 +1,400 @@
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "cd ~ && find repos -name '*.py' | head"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "cd ~ && rg -n TODO repos/proj/src"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "ls ~ ; rg --files repos/proj | head"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "cd @HOME@ && tar czf /tmp/x.tgz repos/proj"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "echo $HOME && find . -maxdepth 1 -name '*.md'"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh host 'cd ~ && find repos -maxdepth 1'"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "cd @HOME@/repos/proj && grep -rn TODO ."}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "cd @HOME@/repos/proj && grep -rn TODO"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "cd @HOME@/repos/proj && find . -name '*.py'"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "git -C @HOME@/repos/proj grep -n TODO"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "python3 ~/.claude/hooks/provenance.py find-user --session x --text 'y'"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -n x ~/notes.txt"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "cat ~/README.md"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "echo ~ && git status"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "ls ~"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "rg x repos/proj"}
+{"category": "d1", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn x repos"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd repos/proj && grep -rn TODO ."}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd repos/proj; rg TODO"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd ~/repos/proj && grep -rln TODO ."}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd \"$HOME/repos/proj\" && rg x"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd \"${HOME}/repos/proj\" && tar czf /tmp/x.tgz ."}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd '@HOME@/repos/my proj' && grep -rn x ."}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd \"@HOME@/repos/my proj\" && rg x"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd repos/proj || exit 1; grep -rn x ."}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd repos/proj || exit; rg x ."}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "if cd repos/proj; then grep -rn x .; fi"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "pushd repos/proj && rg x"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "pushd repos/proj; grep -rn x .; popd"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd /tmp && cd - && cd repos && rg x"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd repos && cd proj && grep -rn x ."}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd -P repos && rg x"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "D=~/repos/proj; cd $D && rg x"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd repos && (cd proj && rg x) && rg y"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd /tmp && rsync -a . /tmp/y"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd repos/proj && find . -name '*.py' -exec cat {} +"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd /tmp/$(date +%s) 2>/dev/null; ls"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find . -maxdepth 1 -name '*.md'"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find . -name '*.py' | head"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find ~ -maxdepth 2 -name x"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find ~ -type d -name .git -not -path '*/x/*' 2>/dev/null | head"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find ~ -name '*.json' -newer ~/x.md"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find . -print0"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find ~ -ls"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find ~ -printf '%p'"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find . -maxdepth 1 -type f | wc -l"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find ~ -name x | sort | uniq"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find ~ -name x | grep y | head -1"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find \"$HOME\" -name x"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find -E . -regex x"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find ."}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "if [ \"$(find . -name y | wc -l)\" -gt 0 ]; then echo y; fi"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find . -name x | xargs -n1 basename"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -name '*.conf'"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -iname '*.conf'"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -path '/x*'"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -ipath '/x*'"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -regex '.*'"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -iregex '.*'"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -newer ~"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -newer ."}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -perm 644"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -user root"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -group wheel"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -type f"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -size +1k"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -name ."}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -path ~"}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc -not -name ."}
+{"category": "find-predicate", "expect": "allow", "cwd": "/", "cmd": "find /etc \\( -name . \\)"}
+{"category": "find-predicate", "expect": "allow", "cwd": "@HOME@", "cmd": "find repos -name . -o -name .."}
+{"category": "find-predicate", "expect": "allow", "cwd": "@HOME@", "cmd": "find repos -regex . -type f"}
+{"category": "du-tree", "expect": "allow", "cwd": "@HOME@", "cmd": "du -sh *"}
+{"category": "du-tree", "expect": "allow", "cwd": "@HOME@", "cmd": "du -sh ."}
+{"category": "du-tree", "expect": "allow", "cwd": "@HOME@", "cmd": "du -sh ~"}
+{"category": "du-tree", "expect": "allow", "cwd": "@HOME@", "cmd": "du -d 1 ~"}
+{"category": "du-tree", "expect": "allow", "cwd": "@HOME@", "cmd": "du -xsh ~ 2>/dev/null | tail -1"}
+{"category": "du-tree", "expect": "allow", "cwd": "@HOME@", "cmd": "tree -L 2"}
+{"category": "du-tree", "expect": "allow", "cwd": "@HOME@", "cmd": "tree"}
+{"category": "rg-files", "expect": "allow", "cwd": "@HOME@", "cmd": "rg --files"}
+{"category": "rg-files", "expect": "allow", "cwd": "@HOME@", "cmd": "rg --files | head"}
+{"category": "rg-files", "expect": "allow", "cwd": "@HOME@", "cmd": "rg --files ."}
+{"category": "rg-files", "expect": "allow", "cwd": "@HOME@", "cmd": "rg --files ~"}
+{"category": "rg-files", "expect": "allow", "cwd": "@HOME@", "cmd": "rg --files --hidden ~ | wc -l"}
+{"category": "no-path-stdin", "expect": "allow", "cwd": "@HOME@", "cmd": "git log | rg x"}
+{"category": "no-path-stdin", "expect": "allow", "cwd": "@HOME@", "cmd": "echo a | rg x"}
+{"category": "no-path-stdin", "expect": "allow", "cwd": "@HOME@", "cmd": "rg x < /tmp/f"}
+{"category": "no-path-stdin", "expect": "allow", "cwd": "@HOME@", "cmd": "rg x <<< \"$y\""}
+{"category": "no-path-stdin", "expect": "allow", "cwd": "@HOME@", "cmd": "git log | rg -n x | head"}
+{"category": "no-path-stdin", "expect": "allow", "cwd": "@HOME@", "cmd": "cat f | ag x"}
+{"category": "no-path-stdin", "expect": "allow", "cwd": "@HOME@", "cmd": "ps | grep -c x"}
+{"category": "no-path-stdin", "expect": "allow", "cwd": "@HOME@", "cmd": "find repos -name '*.py' | xargs grep -r x"}
+{"category": "version-flag", "expect": "allow", "cwd": "@HOME@", "cmd": "rg --version"}
+{"category": "version-flag", "expect": "allow", "cwd": "@HOME@", "cmd": "rg -V"}
+{"category": "version-flag", "expect": "allow", "cwd": "@HOME@", "cmd": "rg --help"}
+{"category": "version-flag", "expect": "allow", "cwd": "@HOME@", "cmd": "rg --type-list | grep x"}
+{"category": "version-flag", "expect": "allow", "cwd": "@HOME@", "cmd": "command -v rg"}
+{"category": "flag-values", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn -e x repos"}
+{"category": "flag-values", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rnA3 x repos"}
+{"category": "flag-values", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn -A 3 x repos"}
+{"category": "flag-values", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn --context=3 x repos"}
+{"category": "flag-values", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn --exclude-dir .git x repos"}
+{"category": "flag-values", "expect": "allow", "cwd": "@HOME@", "cmd": "rg -r y x repos"}
+{"category": "quoted-text", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn 'a|b' repos"}
+{"category": "quoted-text", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn \"a;b\" repos"}
+{"category": "quoted-text", "expect": "allow", "cwd": "@HOME@", "cmd": "rg 'foo(bar)' repos"}
+{"category": "quoted-text", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn 'x && y' repos"}
+{"category": "quoted-text", "expect": "allow", "cwd": "@HOME@", "cmd": "rg \"x || y\" repos"}
+{"category": "quoted-text", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn 'a&b' repos"}
+{"category": "quoted-text", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rE '(a|b)' repos"}
+{"category": "quoted-text", "expect": "allow", "cwd": "@HOME@", "cmd": "rg \"\\$x\" repos"}
+{"category": "quoted-text", "expect": "allow", "cwd": "@HOME@", "cmd": "echo \"grep -r x ~ | head\""}
+{"category": "quoted-text", "expect": "allow", "cwd": "@HOME@", "cmd": "python3 -c \"print('grep -r x .'); print(1 | 2)\""}
+{"category": "quoted-text", "expect": "allow", "cwd": "@HOME@", "cmd": "awk '{print $1; print $2}' f"}
+{"category": "quoted-text", "expect": "allow", "cwd": "@HOME@", "cmd": "echo \"it's; rm -rf ~\""}
+{"category": "heredoc-text", "expect": "allow", "cwd": "@HOME@", "cmd": "cat > f <<'EOF'\ngrep -r x ~\nEOF"}
+{"category": "heredoc-text", "expect": "allow", "cwd": "@HOME@", "cmd": "cat > f <<EOF\nrm -rf ~\nfind ~ -exec cat {} +\nEOF"}
+{"category": "heredoc-text", "expect": "allow", "cwd": "@HOME@", "cmd": "python3 - <<'PY'\nimport os # rm -rf ~\nprint('a | b; c')\nPY"}
+{"category": "heredoc-text", "expect": "allow", "cwd": "@HOME@", "cmd": "git commit -q -F - <<'EOF'\nfix: x\n\nWhy: grep -r x ~ was denied; rm -rf ~ too\nEOF"}
+{"category": "heredoc-text", "expect": "allow", "cwd": "@HOME@", "cmd": "git commit -m \"$(cat <<'EOF'\nfix: x\n\nrm -rf ~ and grep -r x .\nEOF\n)\""}
+{"category": "heredoc-text", "expect": "allow", "cwd": "@HOME@", "cmd": "cat <<EOF | head\nfind ~ -exec cat {} +\nEOF"}
+{"category": "heredoc-text", "expect": "allow", "cwd": "@HOME@", "cmd": "cat > a <<'X'\nrm -rf ~\nX\ncat > b <<'Y'\ngrep -r x ~\nY"}
+{"category": "comment", "expect": "allow", "cwd": "@HOME@", "cmd": "ls # grep -r x ~"}
+{"category": "comment", "expect": "allow", "cwd": "@HOME@", "cmd": "ls # don't; rm -rf ~"}
+{"category": "comment", "expect": "allow", "cwd": "@HOME@", "cmd": "# grep -r x ~\nls"}
+{"category": "redirect", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn x repos 2>/dev/null"}
+{"category": "redirect", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn x repos > ~/out"}
+{"category": "redirect", "expect": "allow", "cwd": "@HOME@", "cmd": "ls > ~/out"}
+{"category": "redirect", "expect": "allow", "cwd": "@HOME@", "cmd": "cat f > ~"}
+{"category": "remote", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh host 'grep -r x ~'"}
+{"category": "remote", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh host \"cd ~ && rm -rf ~/.agent-harness\""}
+{"category": "remote", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh -o BatchMode=yes host 'find ~ -exec cat {} +'"}
+{"category": "remote", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh host 'cd ~/repos/proj && grep -rIl -i \"a b\\|c\" --exclude-dir=.git . | head'"}
+{"category": "remote", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh host 'cd ~ && rm -rf .agent-harness'"}
+{"category": "remote", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh host rg --version"}
+{"category": "copy-dest", "expect": "allow", "cwd": "@HOME@", "cmd": "cp -r repos/x ~/"}
+{"category": "copy-dest", "expect": "allow", "cwd": "@HOME@", "cmd": "cp -r repos/x ~"}
+{"category": "copy-dest", "expect": "allow", "cwd": "@HOME@", "cmd": "cp -r repos/x ."}
+{"category": "copy-dest", "expect": "allow", "cwd": "@HOME@", "cmd": "cp -a repos/x ~/backup"}
+{"category": "copy-dest", "expect": "allow", "cwd": "@HOME@", "cmd": "rsync -a repos/x ~/"}
+{"category": "copy-dest", "expect": "allow", "cwd": "@HOME@", "cmd": "rsync -avze 'ssh -p 22' repos/x host:y"}
+{"category": "tar-modes", "expect": "allow", "cwd": "@HOME@", "cmd": "tar czf /tmp/x.tgz repos/proj"}
+{"category": "tar-modes", "expect": "allow", "cwd": "@HOME@", "cmd": "tar -czf /tmp/x.tgz repos/proj"}
+{"category": "tar-modes", "expect": "allow", "cwd": "@HOME@", "cmd": "tar -C ~ -czf /tmp/x.tgz repos/proj"}
+{"category": "tar-modes", "expect": "allow", "cwd": "@HOME@", "cmd": "tar czf /tmp/x.tgz -C ~ repos/proj"}
+{"category": "tar-modes", "expect": "allow", "cwd": "@HOME@", "cmd": "tar --directory=~ -czf /tmp/x.tgz repos/proj"}
+{"category": "tar-modes", "expect": "allow", "cwd": "@HOME@", "cmd": "tar xzf /tmp/x.tgz -C ~"}
+{"category": "tar-modes", "expect": "allow", "cwd": "@HOME@", "cmd": "tar --list -f ~/x.tgz"}
+{"category": "tar-modes", "expect": "allow", "cwd": "@HOME@", "cmd": "tar --exclude=. -czf /tmp/x.tgz repos/proj"}
+{"category": "glob-hidden", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn x *"}
+{"category": "glob-hidden", "expect": "allow", "cwd": "@HOME@", "cmd": "rg x *"}
+{"category": "glob-hidden", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn x repos/*"}
+{"category": "glob-hidden", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn x */src"}
+{"category": "glob-hidden", "expect": "allow", "cwd": "@HOME@", "cmd": "rg x ~/r*"}
+{"category": "store-child", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn x @STORE@/work"}
+{"category": "store-child", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn x @STORE@/work/*"}
+{"category": "store-child", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn x ~/.agent-harness/work"}
+{"category": "store-child", "expect": "allow", "cwd": "@HOME@", "cmd": "find ~/.agent-harness/work -name x"}
+{"category": "store-child", "expect": "allow", "cwd": "@HOME@", "cmd": "find ~/.agent-harness/work -exec cat {} +"}
+{"category": "store-child", "expect": "allow", "cwd": "@HOME@", "cmd": "rg x ~/.agent-harness/scratch"}
+{"category": "store-child", "expect": "allow", "cwd": "@HOME@", "cmd": "ls ~/.agent-harness"}
+{"category": "store-child", "expect": "allow", "cwd": "@HOME@", "cmd": "tar czf /tmp/x.tgz ~/.agent-harness/work"}
+{"category": "store-child", "expect": "allow", "cwd": "@STORE@/work/task", "cmd": "rg x"}
+{"category": "removal-safe", "expect": "allow", "cwd": "@HOME@", "cmd": "rm -rf build"}
+{"category": "removal-safe", "expect": "allow", "cwd": "@HOME@", "cmd": "rm -rf build/*"}
+{"category": "removal-safe", "expect": "allow", "cwd": "@HOME@", "cmd": "mv a b"}
+{"category": "removal-safe", "expect": "allow", "cwd": "@HOME@", "cmd": "rm -f ~/x.log"}
+{"category": "removal-safe", "expect": "allow", "cwd": "@HOME@", "cmd": "mv notes.txt ~/"}
+{"category": "removal-safe", "expect": "allow", "cwd": "@HOME@", "cmd": "rm -rf ~/repos/x"}
+{"category": "removal-safe", "expect": "allow", "cwd": "@HOME@", "cmd": "rm -rf ~/.agent-harness/scratch/old-run"}
+{"category": "removal-safe", "expect": "allow", "cwd": "@HOME@", "cmd": "rm -rf ~/.agent-harness/work/x"}
+{"category": "removal-safe", "expect": "allow", "cwd": "@HOME@", "cmd": "mv @STORE@/work/a.txt @STORE@/work/b.txt"}
+{"category": "removal-safe", "expect": "allow", "cwd": "@HOME@", "cmd": "cd /tmp && rm -rf *"}
+{"category": "removal-safe", "expect": "allow", "cwd": "@HOME@", "cmd": "cd \"$HOME/repos/x\" && rm -rf ."}
+{"category": "removal-safe", "expect": "allow", "cwd": "@HOME@", "cmd": "cp -r src ~/backup"}
+{"category": "wrappers", "expect": "allow", "cwd": "@HOME@", "cmd": "sudo ls ~"}
+{"category": "wrappers", "expect": "allow", "cwd": "@HOME@", "cmd": "env A=b ls"}
+{"category": "wrappers", "expect": "allow", "cwd": "@HOME@", "cmd": "nice -n 5 ls"}
+{"category": "shell-c", "expect": "allow", "cwd": "@HOME@", "cmd": "bash -c 'grep -rn x repos'"}
+{"category": "shell-c", "expect": "allow", "cwd": "@HOME@", "cmd": "bash -lc 'cd repos && grep -rn x .'"}
+{"category": "shell-c", "expect": "allow", "cwd": "@HOME@", "cmd": "sh -c 'cd /tmp && rm -rf *'"}
+{"category": "shell-c", "expect": "allow", "cwd": "@HOME@", "cmd": "zsh -c 'ls ~'"}
+{"category": "shell-c", "expect": "allow", "cwd": "@HOME@", "cmd": "bash <<'EOF'\ncd repos && grep -rn x .\nEOF"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "grep -r PAT ~"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "grep -rn PAT $HOME"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "grep -R PAT ${HOME}"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "grep --recursive PAT @HOME@"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "grep -d recurse PAT @HOME@/"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "egrep -r PAT \"$HOME\""}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "fgrep -r PAT ~/.agent-harness"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "rgrep PAT ~/.agent-harness/"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "rg PAT @STORE@"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "rg -uu PAT \"@STORE@\""}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "rg -l PAT $AGENT_HARNESS_HOME"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "ag PAT ~"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "ack PAT $HOME"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "tar czf /tmp/x.tgz ${HOME}"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "tar -cf - @HOME@"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "zip -r /tmp/x.zip @HOME@/"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "rsync -a \"$HOME\" /tmp/y"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "cp -r ~/.agent-harness /tmp/y"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "cp -a ~/.agent-harness/ /tmp/y"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "cp -R @STORE@ /tmp/y"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "find \"@STORE@\" -exec cat {} +"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "find $AGENT_HARNESS_HOME -type f -exec grep -l PAT {} \\;"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "find ~ -execdir cat {} \\;"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "find $HOME -ok cat {} \\;"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "find ${HOME} -okdir cat {} \\;"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "find @HOME@ -fprint /tmp/out"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "find @HOME@/ -fprint0 /tmp/out"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "find \"$HOME\" -fls /tmp/out"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "find ~/.agent-harness -type f | xargs cat"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "find ~/.agent-harness/ -print0 | xargs -0 grep PAT"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "find @STORE@ -type f | tar czf /tmp/x.tgz -T -"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "find \"@STORE@\" -type f | while read f; do cat \"$f\"; done"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "cat $(find $AGENT_HARNESS_HOME -type f)"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "for f in $(find ~ -type f); do cat \"$f\"; done"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "rg --files $HOME | xargs cat"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "grep -rn PAT ~"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "grep -rn PAT ${HOME}"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "grep -rn PAT @HOME@"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "grep -rn PAT @HOME@/"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "grep -rn PAT \"$HOME\""}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "grep -rn PAT ~/.agent-harness"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "grep -rn PAT @STORE@"}
+{"category": "content-read", "expect": "deny", "cwd": "/tmp", "cmd": "grep -rn PAT $AGENT_HARNESS_HOME"}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "grep -rn x ./"}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "rg x ."}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "ag x"}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "tar czf /tmp/x.tgz ."}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "cp -r . /tmp/y"}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "rsync -a ./ host:y"}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "find -exec cat {} +"}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "git log | grep -r x"}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "grep -rn --include='*.py' --include='*.key' x ."}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "tar czf /tmp/x.tgz -C ~ ."}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "tar -C / -czf /tmp/x.tgz ."}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "cp --target-directory=/tmp/y -r ."}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "grep -rne x ~"}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "grep -rnA3 x ~"}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "grep -r --color=auto x ~"}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "rg --hidden x ~"}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "grep -rn -- x ~"}
+{"category": "content-read", "expect": "deny", "cwd": "@STORE@/work/task", "cmd": "grep -rn x ../.."}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~ && grep -rn x ."}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~; rg x"}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd && grep -rn x ."}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd; rg x"}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd $HOME && grep -rn x ."}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd \"$HOME\" && rg x"}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~ && tar czf /tmp/x.tgz ."}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~ && cp -r . /tmp/y"}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~ && rsync -a . /tmp/y"}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~ && find . -exec cat {} +"}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~/.agent-harness && grep -rn x ."}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd /tmp && cd ~ && rg x"}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "D=~; cd \"$D\" && grep -rn x ."}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~ || exit 1; grep -rn x ."}
+{"category": "via-cd", "expect": "deny", "cwd": "/tmp", "cmd": "cd /tmp/a; cd ~; tar czf /tmp/x.tgz ."}
+{"category": "via-cd", "expect": "deny", "cwd": "/tmp", "cmd": "export D=~; cd $D; rg x"}
+{"category": "subshell-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "(cd /tmp) ; grep -rn x ."}
+{"category": "subshell-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "(cd /tmp && ls); rg x"}
+{"category": "subshell-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "$(cd /tmp); rg x"}
+{"category": "subshell-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "x=$(cd /tmp && pwd); grep -rn x ."}
+{"category": "subshell-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd /tmp | ls; rg x"}
+{"category": "subshell-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd /tmp & rg x"}
+{"category": "subshell-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "bash -c 'cd /tmp'; rg x"}
+{"category": "subshell-cd", "expect": "deny", "cwd": "/tmp", "cmd": "(cd ~; rg x)"}
+{"category": "subshell-cd", "expect": "deny", "cwd": "/tmp", "cmd": "cd repos && (cd ~ && rg x)"}
+{"category": "unknown-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd \"$NO_SUCH_VAR\" && grep -rn x ."}
+{"category": "unknown-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd $NO_SUCH_VAR; rg x"}
+{"category": "unknown-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~nosuchuser_x && rg x"}
+{"category": "unknown-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd \"$(git rev-parse --show-toplevel)\" && rg x"}
+{"category": "unknown-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd `pwd` && rg x"}
+{"category": "unknown-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd $1 && rg x"}
+{"category": "unknown-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd - && rg x"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "sudo grep -r x ~"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "sudo -u root grep -r x ~"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "sudo -n rg x ~"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "nice rg x ~"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "nice -n 5 rg x ~"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "time rg x ~"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "nohup rg x ~"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "env rg x ~"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "env A=b rg x ~"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "env -i A=b grep -r x ~"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "xargs grep -r x ~"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "until rg x ~; do sleep 1; done"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "echo a; grep -r x ~"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "grep -r x \\\n ~"}
+{"category": "shell-c", "expect": "deny", "cwd": "/tmp", "cmd": "bash -c 'grep -r x ~'"}
+{"category": "shell-c", "expect": "deny", "cwd": "/tmp", "cmd": "bash -lc 'cd ~ && grep -r x .'"}
+{"category": "shell-c", "expect": "deny", "cwd": "/tmp", "cmd": "sh -c \"rg x ~\""}
+{"category": "shell-c", "expect": "deny", "cwd": "/tmp", "cmd": "zsh -c 'cd ~; rg x'"}
+{"category": "shell-c", "expect": "deny", "cwd": "/tmp", "cmd": "dash -c 'grep -r x ~'"}
+{"category": "shell-c", "expect": "deny", "cwd": "/tmp", "cmd": "bash -e -c 'rg x ~'"}
+{"category": "shell-c", "expect": "deny", "cwd": "/tmp", "cmd": "bash -o pipefail -c 'rg x ~'"}
+{"category": "shell-c", "expect": "deny", "cwd": "/tmp", "cmd": "cd ~; eval 'rg x'"}
+{"category": "shell-c", "expect": "deny", "cwd": "/tmp", "cmd": "nohup sh -c 'rg x ~' &"}
+{"category": "shell-c", "expect": "deny", "cwd": "/tmp", "cmd": "cat <<'EOF' | bash\ngrep -r x ~\nEOF"}
+{"category": "filter-no-exemption", "expect": "deny", "cwd": "@HOME@", "cmd": "rg -t py x"}
+{"category": "filter-no-exemption", "expect": "deny", "cwd": "@HOME@", "cmd": "rg -t py x ~"}
+{"category": "filter-no-exemption", "expect": "deny", "cwd": "@HOME@", "cmd": "rg --type py x ."}
+{"category": "filter-no-exemption", "expect": "deny", "cwd": "@HOME@", "cmd": "rg x -g '*.py'"}
+{"category": "filter-no-exemption", "expect": "deny", "cwd": "@HOME@", "cmd": "rg x --glob '*.py'"}
+{"category": "filter-no-exemption", "expect": "deny", "cwd": "@HOME@", "cmd": "grep -rn --include='*.py' x ."}
+{"category": "filter-no-exemption", "expect": "deny", "cwd": "@HOME@", "cmd": "grep -rn --include=*.py x ~"}
+{"category": "filter-no-exemption", "expect": "deny", "cwd": "@HOME@", "cmd": "grep -r --include='*.k?y' x ."}
+{"category": "filter-no-exemption", "expect": "deny", "cwd": "@HOME@", "cmd": "rg -g '*.key' x"}
+{"category": "filter-no-exemption", "expect": "deny", "cwd": "@HOME@", "cmd": "rg --type-add 'k:*.key' -t k x"}
+{"category": "glob-reach", "expect": "deny", "cwd": "@HOME@", "cmd": "grep -r x ~/.*"}
+{"category": "glob-reach", "expect": "deny", "cwd": "@HOME@", "cmd": "grep -r x .*"}
+{"category": "glob-reach", "expect": "deny", "cwd": "@HOME@", "cmd": "rg x ~/.a*"}
+{"category": "glob-reach", "expect": "deny", "cwd": "@HOME@", "cmd": "grep -r x ~/.agent*/"}
+{"category": "glob-reach", "expect": "deny", "cwd": "@HOME@", "cmd": "rg x .[a]*"}
+{"category": "key-file", "expect": "deny", "cwd": "@HOME@", "cmd": "cat ~/.agent-harness/work-ledger.key"}
+{"category": "key-file", "expect": "deny", "cwd": "@HOME@", "cmd": "base64 ~/.agent-harness/work-ledger.k*"}
+{"category": "key-file", "expect": "deny", "cwd": "@HOME@", "cmd": "grep . ~/.agent-harness/work-ledger.key"}
+{"category": "key-file", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~/.agent-harness && cat work-ledger.key"}
+{"category": "key-file", "expect": "deny", "cwd": "@HOME@", "cmd": "cat @STORE@/work-ledger.ke?"}
+{"category": "key-file", "expect": "deny", "cwd": "@HOME@", "cmd": "cat @STORE@/work-led*"}
+{"category": "key-file", "expect": "deny", "cwd": "@HOME@", "cmd": "head -c 5 ~/.agent-harness/*"}
+{"category": "key-file", "expect": "deny", "cwd": "@HOME@", "cmd": "less ~/.agent-harness/*"}
+{"category": "names-only-store", "expect": "deny", "cwd": "@HOME@", "cmd": "find ~/.agent-harness -name x"}
+{"category": "names-only-store", "expect": "deny", "cwd": "@HOME@", "cmd": "find @STORE@ -name x | head"}
+{"category": "names-only-store", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~/.agent-harness && find . -name x"}
+{"category": "names-only-store", "expect": "deny", "cwd": "@HOME@", "cmd": "du -sh ~/.agent-harness"}
+{"category": "names-only-store", "expect": "deny", "cwd": "@HOME@", "cmd": "du -sh ~/.agent-harness/*"}
+{"category": "names-only-store", "expect": "deny", "cwd": "@HOME@", "cmd": "cat ~/.agent-harness"}
+{"category": "names-only-store", "expect": "deny", "cwd": "@STORE@", "cmd": "tree"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "rm -rf @STORE@"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "rm -rf @STORE@/"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "rm -rf \"@STORE@\""}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "rm -rf ~/.agent-harness"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "rm -rf ~/.agent-harness/"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "rm -rf \"$HOME/.agent-harness\""}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "rm -rf ${HOME}/.agent-harness"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "rm -rf $AGENT_HARNESS_HOME"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "rm -rf ~"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "rm -rf $HOME"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "rm -rf ~/.agent-harness/."}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "mv ~ /tmp/y"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "sudo rm -rf @STORE@"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "true && rm -rf ~/.agent-harness"}
+{"category": "removal-cd", "expect": "deny", "cwd": "/tmp", "cmd": "cd ~ && rm -rf .agent-harness"}
+{"category": "removal-cd", "expect": "deny", "cwd": "/tmp", "cmd": "cd ~; rm -rf .agent-harness"}
+{"category": "removal-cd", "expect": "deny", "cwd": "/tmp", "cmd": "cd && rm -rf .agent-harness"}
+{"category": "removal-cd", "expect": "deny", "cwd": "/tmp", "cmd": "cd ~/.agent-harness && rm -rf *"}
+{"category": "removal-cd", "expect": "deny", "cwd": "/tmp", "cmd": "cd ~/.agent-harness && rm -rf ./*"}
+{"category": "removal-cd", "expect": "deny", "cwd": "/tmp", "cmd": "cd ~/.agent-harness; rm -rf ."}
+{"category": "removal-cd", "expect": "deny", "cwd": "/tmp", "cmd": "cd ~/.agent-harness && rm -rf ../.agent-harness"}
+{"category": "removal-cd", "expect": "deny", "cwd": "/tmp", "cmd": "pushd ~ && rm -rf .agent-harness"}
+{"category": "removal-cd", "expect": "deny", "cwd": "/tmp", "cmd": "pushd ~/.agent-harness; rm -rf ./*"}
+{"category": "removal-cd", "expect": "deny", "cwd": "/tmp", "cmd": "cd ~/.agent-harness/work && rm -rf .."}
+{"category": "removal-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "rm -rf *"}
+{"category": "removal-cd", "expect": "deny", "cwd": "@STORE@", "cmd": "rm -rf *"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "find ~/.agent-harness/work/x -name \"x*.sh\" 0>/dev/null | head;"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "cat ~/.x/x/-x/x.md; grep -rn -i \"x\\|x\" ~/.x/x/-x/x/ 0>/dev/null | head"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh x 'cd ~/tmp/x && sed -n 0,x harness/x/x.py; x rg; rg --version | head -0'"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh x 'cd ~/repos/x/x/src && grep -rn \"x\\|x\" x/user-x x/user-x/*.x x/x | head -0'"}
+{"category": "real-shape", "expect": "allow", "cwd": "/tmp", "cmd": "cd ~; grep -rhoE \"x\\(['\\\"][a-x]*x[a-x]*['\\\"]\" ~/.x/x ~/.x/x 0>/dev/null | sort -u"}
+{"category": "real-shape", "expect": "allow", "cwd": "@STORE@/work/task", "cmd": "ssh x 'ls ~/x* ~/x* 0>&0 | head; find ~ -maxdepth 0 -name x.py 0>/dev/null | head'"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rhoE \"(x|x)[^\\x]{0}\" ~/.x/x/-x/x 0>/dev/null | grep -E \"x|x|x\" | head -0 | x -x-0"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh x 'cd ~/repos/x-0/x/x && grep -rn \"x\\|x\" src --include=*.x --include=*.x | head -0'"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "ls; find @HOME@ -maxdepth 0 -name x -type d 0>/dev/null | head; ls @STORE@/work/x 0>/dev/null"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh x 'cd /x/x/repos/x-0 && sed -n 0,x x/x/src/x/user-x/x; grep -rn \"x\\|x(\" x/x/src | head -0'"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh x 'cd ~/repos/x/x/src; grep -rn \"x\\|x\" --include=*.x . | grep -v \"^./x/x-count-x\" | x -x-0'"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh x 'ls -la ~/.x/x.py; python3 ~/.x/x.py --help 0>&0 | head -0; x rg; rg --version | head -0'"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh x 'cd ~/repos/x-0/x/x; grep -rln \"x\\|x\\[\\|x\\|x .*x x\" src | head; sed -n 0,x src/x/x | x -x-0'"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh x 'cd ~/repos/x-0/x/x/src && grep -rn \"x/:x/x.*{\" x/x x/x | head -0; grep -rln \"x(x)\" x | head'"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh x 'cd ~/tmp/x && sed -n 0,x harness/x/x.py; python3 --version; x rg; rg --version | head -0; x'"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rhoE \"(x|x)[^\\x]{0}\" @HOME@/.x/x @STORE@/work/x/*.sh @STORE@/work/x/*.py 0>/dev/null | head -0"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -rn \"x(\\\"[x]*x\\|x('[x]*x\\|x\\|x\" ~/.x/x/*.py | head -0; grep -n \"x x\\|x x\\|--wal\" ~/.x/x.py | head"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "cd @HOME@ && ls; find @HOME@ -maxdepth 0 -name x -type d 0>/dev/null | head; ls @STORE@/work/x 0>/dev/null"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "cat @HOME@/.x/x/-x/x.md | head -0; grep -rih -x \"x-test\\|x\\|x\" @STORE@/x.md @STORE@/x.md 0>/dev/null | head"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "x=@STORE@/work/x/harness-x/x-test-x; x -a 0 $x/x.md; cat $x/x.md; ls -la $x; find $x -maxdepth 0 -name 'x*'"}
+{"category": "real-shape", "expect": "allow", "cwd": "/tmp", "cmd": "x x.py x 0>&0; ls ~/.x/x | grep -i x; find ~ -maxdepth 0 -name 'x.py' -not -path '*/x/*' 0>/dev/null | head;"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "x=@STORE@/work/x; ls $x/work-x | head -0; grep -rn -i -l -E \"x|x|x|x.?(x|x)\" $x/work-x $x/x 0>/dev/null | head"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -n \"^x \\|^x \" ~/.x/x.py | head -0; grep -rn \"x.*x\\|x\\|x\\|x.*x\" ~/.x/x ~/.x/x/-x/x 0>/dev/null | head -0 | x -x-0"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "ls @STORE@/work/*/scratch-x/x.md 0>/dev/null; find @STORE@/work -maxdepth 0 -path '*scratch-x/x.md' 0>/dev/null | head"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "sed -n 0,x ~/.x/x.py | grep -v -i \"key\\|x\" ; grep -rn \"x\\|\\\"x\" ~/.x/x/*.py @STORE@/work/x/x/*.py 0>/dev/null | head -0"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "ls -d */agent-harness* ~/*/agent-harness 0>/dev/null; find ~ -maxdepth 0 -name agent-harness -type d 0>/dev/null | head"}
+{"category": "real-shape", "expect": "allow", "cwd": "/tmp", "cmd": "cd ~/.agent-harness/work/x/x; sed -n 0,x x.md; cat x.sh | head -0; grep -ril x @HOME@/x* 0>/dev/null | grep -v x | head"}
+{"category": "real-shape", "expect": "allow", "cwd": "@HOME@", "cmd": "find ~ -name x.py -not -path '*/x/*' 0>/dev/null | head; ls ~/.agent-harness/work/*/ 0>/dev/null | grep -i -E '0|x|x' | head"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "cd -- repos && rg x"}
+{"category": "cd-followed", "expect": "allow", "cwd": "@HOME@", "cmd": "D=repos/proj; cd \"$D\" && grep -rn x ."}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find -f ~ -name x"}
+{"category": "find-names-only", "expect": "allow", "cwd": "@HOME@", "cmd": "find ~ -name x | xargs ls -la"}
+{"category": "du-tree", "expect": "allow", "cwd": "@HOME@", "cmd": "tree -L 2 ~"}
+{"category": "rg-files", "expect": "allow", "cwd": "@HOME@", "cmd": "rg --files repos/proj"}
+{"category": "content-read", "expect": "deny", "cwd": "@HOME@", "cmd": "tar -C ~ -czf /tmp/x.tgz ."}
+{"category": "via-cd", "expect": "deny", "cwd": "@HOME@", "cmd": "cd /tmp; cd -; grep -rn x ."}
+{"category": "via-cd", "expect": "deny", "cwd": "/tmp", "cmd": "cd \"$HOME\" && rg x"}
+{"category": "subshell-cd", "expect": "deny", "cwd": "/tmp", "cmd": "(cd ~ && grep -rn x .)"}
+{"category": "subshell-cd", "expect": "deny", "cwd": "/tmp", "cmd": "x=$(cd ~ && rg x)"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "f() { grep -r x ~; }; f"}
+{"category": "wrappers", "expect": "deny", "cwd": "/tmp", "cmd": "function f { rg x ~; }; f"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "mv ~/.agent-harness /tmp/y"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "find ~/.agent-harness -delete"}
+{"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "find ~ -delete"}

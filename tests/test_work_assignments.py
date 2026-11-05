@@ -1569,6 +1569,80 @@ class GuardTest(Base):
         ok = "python3 ~/.claude/hooks/work_assignments.py update A-abcd1234-0001 --state done --evidence abc1234"
         self.assertEqual(self.hook("guard", {"tool_name": "Bash", "tool_input": {"command": ok}}), {})
 
+    def corpus_home(self):
+        """A home with a hidden store, as on a real machine: Base's store is not hidden, and a shell `*` skips hidden names."""
+        user = Path(self.tmp.name) / "u"
+        store = user / ".agent-harness"
+        (store / "work" / "task").mkdir(parents=True, exist_ok=True)
+        patch = mock.patch.dict(os.environ, {"HOME": str(user), "AGENT_HARNESS_HOME": str(store)})
+        patch.start()
+        self.addCleanup(patch.stop)
+        return user, store
+
+    def bash_guard(self, command, cwd):
+        return self.hook("guard", {"session_id": SID, "tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd})
+
+    def test_guard_corpus_regression(self):
+        """PR review 2a1da45 #2 and 8ebc559 #3: false denials tripled to 819 of 27,030 real calls, because an earlier cd was
+        ignored, quoted text and here-documents were read as commands, predicate values as paths and names-only listings as
+        reads. Every row of the corpus goes through the real hook: real false denies (redacted to shapes) must pass and every
+        adversarial shape must stay denied. Failing control: 6204ac9 fails this test on the rows it denied or allowed wrongly."""
+        import collections
+        import re
+        lines = (Path(__file__).parent / "fixtures" / "guard_corpus.jsonl").read_text().splitlines()
+        rows = [json.loads(line) for line in lines]
+        self.assertGreaterEqual(len(rows), 150)
+        self.assertEqual(len(rows), len({(row["cwd"], row["cmd"]) for row in rows}), "duplicate rows")
+        leak = re.compile(r"/Users/|/home/|\b\d{1,3}(?:\.\d{1,3}){3}\b|[\w.+-]+@[\w-]+\.\w+|\b[\w-]+\.(?:com|net|org|io|ai|dev|app)\b", re.I)
+        user, store = self.corpus_home()
+        fill = lambda text: text.replace("@STORE@", str(store)).replace("@HOME@", str(user))
+        wrong, seen = {"allow": [], "deny": []}, collections.Counter()
+        for row in rows:
+            for text in (row["cmd"], row["cwd"]):
+                self.assertFalse(any(shape.search(text) for shape in wa.SECRET_SHAPES), text)
+                self.assertIsNone(leak.search(text), text)
+            reply = self.bash_guard(fill(row["cmd"]), fill(row["cwd"]))
+            seen[row["expect"], row["category"]] += 1
+            if reply.get("hookSpecificOutput", {}).get("permissionDecision", "allow") != row["expect"]:
+                wrong[row["expect"]].append((row["category"], row["cwd"], row["cmd"]))
+        for expect, least in (("allow", 100), ("deny", 100)):
+            self.assertGreaterEqual(sum(n for key, n in seen.items() if key[0] == expect), least)
+        self.assertFalse(wrong["allow"] or wrong["deny"], f"{len(wrong['allow'])} allow rows denied, {len(wrong['deny'])} deny rows allowed, of {len(rows)}: {wrong}")
+        self.assertEqual(wa.pending_failures(), [])  # a crash fails open, so it would otherwise pass every allow row
+
+    def test_guard_deny_text_names_the_root_and_the_way_out(self):
+        """PR review 2a1da45 #2: "Recursive reads of the agent-harness store" misled an agent running `cd ~ && grep -rn x .`."""
+        user, store = self.corpus_home()
+        reason = lambda cmd, cwd: self.bash_guard(cmd, cwd)["hookSpecificOutput"]["permissionDecisionReason"]
+        wide = reason("cd ~ && grep -rn x .", "/tmp")
+        for part in ("`grep`", os.path.realpath(user), "Narrow the path", "names-only listing"):
+            self.assertIn(part, wide)
+        itself = reason(f"rg x {store}", "/tmp")
+        for part in ("`rg`", os.path.realpath(store), "store itself", "subdirectory"):
+            self.assertIn(part, itself)
+        self.assertNotIn("could not be followed", wide)
+        self.assertIn("could not be followed", reason('cd "$NO_SUCH_VAR_X" && rg x', str(user)))
+        removal = reason(f"cd {store} && rm -rf ./*", "/tmp")
+        for part in ("`rm`", os.path.realpath(store), "empty ledger", "named child"):
+            self.assertIn(part, removal)
+
+    def test_guard_reads_a_codex_argv_with_its_quoting(self):
+        """Joined with spaces, `["bash", "-lc", "cd x && ..."]` loses the script's quoting, so the cd would not reach the grep."""
+        user, _ = self.corpus_home()
+        decide = lambda argv, cwd: self.hook("guard", {"tool_name": "shell", "tool_input": {"command": argv}, "cwd": cwd}, runtime="codex")
+        self.assertEqual(decide(["bash", "-lc", "cd /tmp && grep -rn x ."], str(user)), {})
+        self.assertEqual(decide(["bash", "-lc", "cd ~ && grep -rn x ."], "/tmp")["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(decide(["grep", "-rn", "x", str(user)], "/tmp")["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_guard_shell_reader_survives_hostile_syntax(self):
+        """A crash fails open, and nesting is bounded so a deep command cannot raise RecursionError."""
+        user, _ = self.corpus_home()
+        for command in ("(" * 5000, "$(" * 5000, "`" * 5001, "'" * 5001, '"' * 5001, "<<" * 5000, "\\" * 5001, "${" * 5000, "$((" * 5000, "<(" * 5000,
+                        "bash -c '" * 200, "cat <<EOF", "cd", ")", ";;", "|", "&&", "\x00", ""):
+            self.bash_guard(command, str(user))
+        self.assertEqual(wa.pending_failures(), [])
+        self.assertTrue(wa.reads_store_recursively("grep -r x ~/.[z-a]*", str(user)))  # a bad glob range is not judged, and does not raise
+
 
 class AttestGuardTest(Base):
     def guard(self, tool, tool_input):
@@ -1658,12 +1732,12 @@ class AttestGuardTest(Base):
         deny = lambda r: r.get("hookSpecificOutput", {}).get("permissionDecision")
         call = lambda cmd, cwd: deny(self.hook("guard", {"session_id": SID, "tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd}))
         for cmd, cwd in (("grep -rn x .", user_home), ("grep -rn x ~", "/repo"), ("rg x", user_home), ("rg -uu x ..", home + "/work"),
-                         ("find ~ -name '*.json'", "/repo"), ("grep -R secret $HOME", "/repo"), (f"tar czf /tmp/x.tgz {home}", "/repo"),
+                         ("find ~ -name '*.json' -exec cat {} +", "/repo"), ("grep -R secret $HOME", "/repo"), (f"tar czf /tmp/x.tgz {home}", "/repo"),
                          ("cd /repo && grep -rn TODO ~", "/repo"), (f"strings {home}", "/repo")):
             self.assertEqual(call(cmd, cwd), "deny", (cmd, cwd))
         for cmd, cwd in (("python3 ~/.claude/hooks/provenance.py find-user --session x --text 'y'", user_home), ("grep -rn x src", "/repo"),
                          ("rg x", "/repo"), ("ls ~", user_home), ("grep -n x ~/notes.txt", "/repo"), ("cat ~/README.md", "/repo"),
-                         (f"grep -rn x {home}/work", "/repo"), ("echo ~ && git status", user_home)):
+                         (f"grep -rn x {home}/work", "/repo"), ("echo ~ && git status", user_home), ("find ~ -name '*.json'", "/repo")):
             self.assertIsNone(call(cmd, cwd), (cmd, cwd))
 
     def test_guard_allows_ordinary_globs_and_code(self):

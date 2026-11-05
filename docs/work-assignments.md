@@ -150,8 +150,20 @@ paraphrase of that message (and `update --description` can change it). The messa
 in `show` and in the owning session's digest.
 
 Store removal. The guard refuses `rm`, `mv`, `rmdir` and `unlink` of the store directory or any directory that
-contains it, because the next hook would start an empty ledger. A `cd` or `pushd` earlier in the command is followed. Removing a named child (`scratch/`, `work/...`)
+contains it, because the next hook would start an empty ledger. Removing a named child (`scratch/`, `work/...`)
 is allowed. An out-of-store marker that detects a reset is follow-up GoodQA 1ae27b6b#14606.
+
+Bash reads and removals. The guard reads a command the way a shell would, so quoted text, comments, redirection targets and
+here-documents are not commands, while `$(...)`, backticks, subshells, `bash -c` and `eval` are. It follows `cd`, `pushd` and
+`popd` (a subshell's `cd` stays in the subshell); a target only the shell could resolve leaves the last known directory in
+place, and the deny text says so. It refuses a reader that names the store itself, and a recursive content read rooted at an
+ancestor of it: `grep -r`, `rg` without `--files`, `tar`, `zip`, `rsync` and `cp -r` sources, and `find` with `-exec`, `-execdir`,
+`-ok`, `-okdir`, `-fprint*`, `-fls` or `-delete`. Names-only listings of an ancestor are allowed, as with Glob and LS: `find` without
+those actions, `du`, `tree` and `rg --files`, unless their output goes on to a program that reads the files (`| xargs cat`,
+`| tar -T -`, a read loop, `cat $(find ...)`). Unlike the Grep tool, a `--include`, `rg -g` or `rg -t` filter does not exempt a Bash
+content search. `ssh` commands run elsewhere and are not read. The deny text names the directory it judged and how to avoid the
+refusal. `tests/fixtures/guard_corpus.jsonl` holds redacted real false denials and the
+adversarial shapes that must stay denied.
 
 Log size. The digest warns once `work-ledger.events.jsonl` passes half the 128 MiB read bound. Past the bound,
 reads fail loudly and cancel, verify and recover stop; rotation or compaction is follow-up GoodQA 1ae27b6b#14605.
