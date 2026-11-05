@@ -6027,6 +6027,672 @@
    ]
   },
   {
+   "cmd": "time -p pkill foo",
+   "expect": "block",
+   "id": "P-rt2-time-p",
+   "tags": [
+    "verb",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "time -p kill 4004",
+   "expect": "block",
+   "id": "P-rt2-time-p-kill",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "time -f %e pkill foo",
+   "expect": "block",
+   "id": "P-rt2-time-f",
+   "tags": [
+    "verb",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "pgrep foo | time -p xargs kill",
+   "expect": "block",
+   "id": "P-rt2-time-xargs",
+   "tags": [
+    "pidfeed"
+   ]
+  },
+  {
+   "cmd": "gtimeout 5 pkill foo",
+   "expect": "block",
+   "id": "P-rt3-gtimeout",
+   "tags": [
+    "verb",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "pgrep foo | gxargs kill",
+   "expect": "block",
+   "id": "P-rt3-gxargs",
+   "tags": [
+    "pidfeed"
+   ]
+  },
+  {
+   "cmd": "gfind . -exec pkill foo \\;",
+   "expect": "block",
+   "id": "P-rt3-gfind",
+   "tags": [
+    "verb",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "gnohup kill 4004",
+   "expect": "block",
+   "id": "P-rt3-gnohup",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "genv kill 4004",
+   "expect": "block",
+   "id": "P-rt3-genv",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "pgrep foo | xargs -i kill {}",
+   "expect": "block",
+   "id": "P-rt4-xargs-i",
+   "tags": [
+    "pidfeed"
+   ]
+  },
+  {
+   "cmd": "pgrep foo | xargs -l kill",
+   "expect": "block",
+   "id": "P-rt4-xargs-l",
+   "tags": [
+    "pidfeed"
+   ]
+  },
+  {
+   "cmd": "pgrep -f foo | xargs --max-procs 4 kill",
+   "expect": "block",
+   "id": "P-rt4-xargs-maxprocs",
+   "tags": [
+    "pidfeed"
+   ]
+  },
+  {
+   "cmd": "lsof -ti:3000 | xargs --no-run-if-empty --delimiter '\\n' kill -9",
+   "expect": "block",
+   "id": "P-rt4-xargs-delim",
+   "tags": [
+    "pidfeed"
+   ]
+  },
+  {
+   "cmd": "pgrep foo | xargs --max-args 1 kill",
+   "expect": "block",
+   "id": "P-rt4-xargs-maxargs",
+   "tags": [
+    "pidfeed"
+   ]
+  },
+  {
+   "cmd": "sudo VAR=1 pkill foo",
+   "expect": "block",
+   "id": "P-rt5-sudo-assign",
+   "tags": [
+    "verb",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "sudo PATH=$PATH kill 4004",
+   "expect": "block",
+   "id": "P-rt5-sudo-path",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "sudo -i 'pkill foo'",
+   "expect": "block",
+   "id": "P-rt5-sudo-i",
+   "tags": [
+    "verb",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "sudo -s 'kill 4004'",
+   "expect": "block",
+   "id": "P-rt5-sudo-s",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "pgrep foo | sudo VAR=1 xargs kill",
+   "expect": "block",
+   "id": "P-rt5-sudo-xargs",
+   "tags": [
+    "pidfeed"
+   ]
+  },
+  {
+   "cmd": "function stop { pkill -f server; }; stop",
+   "expect": "block",
+   "id": "P-rt6-function-kw",
+   "tags": [
+    "verb"
+   ]
+  },
+  {
+   "cmd": "function f { kill \"$1\"; }; f 4004",
+   "expect": "block",
+   "id": "P-rt6-function-arg",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "coproc FOO { kill 4004; }",
+   "expect": "block",
+   "id": "P-rt6-coproc",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "trap 'pkill foo' EXIT",
+   "expect": "block",
+   "id": "P-rt6-trap",
+   "tags": [
+    "verb"
+   ]
+  },
+  {
+   "cmd": "trap 'kill 4004' EXIT",
+   "expect": "block",
+   "id": "P-rt6-trap-kill",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "trap 'kill $(pgrep foo)' EXIT",
+   "expect": "block",
+   "id": "P-rt6-trap-subst",
+   "tags": [
+    "pidfeed"
+   ]
+  },
+  {
+   "cmd": "trap -- 'kill 4004' EXIT",
+   "expect": "block",
+   "id": "P-rt6-trap-dashdash",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "exec -a foo kill 4004",
+   "expect": "block",
+   "id": "P-rt7-exec-a",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "systemd-run -p Foo=bar kill 4004",
+   "expect": "block",
+   "id": "P-rt7-systemd-run",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "env -a x kill 4004",
+   "expect": "block",
+   "id": "P-rt7-env-a",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "env --split-string='kill 4004'",
+   "expect": "block",
+   "id": "P-rt7-env-split",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "runuser -u eric kill 4004",
+   "expect": "block",
+   "id": "P-rt7-runuser",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "chroot --userspec u / kill 4004",
+   "expect": "block",
+   "id": "P-rt7-chroot",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "nsenter -S 0 kill 4004",
+   "expect": "block",
+   "id": "P-rt7-nsenter",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "sg grp -c 'kill 4004'",
+   "expect": "block",
+   "id": "P-rt7-sg",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "flock -w 5 /tmp/l kill 4004",
+   "expect": "block",
+   "id": "P-rt7-flock",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "kill 1{0,1,2,3,4,5,6,7,8,9}{0,1,2,3,4,5,6,7,8,9}",
+   "expect": "block",
+   "id": "P-rt8-brace-100",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill {-9,4004}",
+   "expect": "block",
+   "id": "P-rt8-brace-neg",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "python3 -c \"import os; os.system('kill 4004')\"",
+   "expect": "block",
+   "id": "P-rt9-py-system",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "python3 -c \"import subprocess; subprocess.run(['kill','4004'])\"",
+   "expect": "block",
+   "id": "P-rt9-py-subprocess",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "python3 -c \"from os import kill; kill(4004,9)\"",
+   "expect": "block",
+   "id": "P-rt9-py-from-os",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "perl -e 'kill 9, 4004'",
+   "expect": "block",
+   "id": "P-rt9-perl-kill",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "php -r 'posix_kill(4004, 9);'",
+   "expect": "block",
+   "id": "P-rt9-php",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "node -e \"require('child_process').execSync('kill 4004')\"",
+   "expect": "block",
+   "id": "P-rt9-node-exec",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "ruby -e 'system(\"kill 4004\")'",
+   "expect": "block",
+   "id": "P-rt9-ruby-system",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "lua -e 'os.execute(\"kill 4004\")'",
+   "expect": "block",
+   "id": "P-rt9-lua",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "npx kill-port 3000",
+   "expect": "block",
+   "id": "P-rt10-npx-killport",
+   "tags": [
+    "verb"
+   ]
+  },
+  {
+   "cmd": "kill-port 3000",
+   "expect": "block",
+   "id": "P-rt10-killport",
+   "tags": [
+    "verb"
+   ]
+  },
+  {
+   "cmd": "fkill :3000",
+   "expect": "block",
+   "id": "P-rt10-fkill",
+   "tags": [
+    "verb"
+   ]
+  },
+  {
+   "cmd": "killport 3000",
+   "expect": "block",
+   "id": "P-rt10-killport-word",
+   "tags": [
+    "verb"
+   ]
+  },
+  {
+   "cmd": "npx fkill -f node",
+   "expect": "block",
+   "id": "P-rt10-npx-fkill",
+   "tags": [
+    "verb"
+   ]
+  },
+  {
+   "cmd": "loginctl terminate-user eric",
+   "expect": "block",
+   "id": "P-rt10-loginctl",
+   "tags": [
+    "verb"
+   ]
+  },
+  {
+   "cmd": "tmux new -d 'kill 4004'",
+   "expect": "block",
+   "id": "P-rt11-tmux-new",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "tmux run-shell 'kill 4004'",
+   "expect": "block",
+   "id": "P-rt11-tmux-run",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "screen -dmS x kill 4004",
+   "expect": "block",
+   "id": "P-rt11-screen",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "at now <<< 'kill 4004'",
+   "expect": "block",
+   "id": "P-rt11-at-herestring",
+   "tags": [
+    "ownership",
+    "delayed"
+   ]
+  },
+  {
+   "cmd": "batch <<< 'pkill x'",
+   "expect": "block",
+   "id": "P-rt11-batch-herestring",
+   "tags": [
+    "verb",
+    "delayed"
+   ]
+  },
+  {
+   "cmd": "uv run kill_guard.py spawn -- pkill foo",
+   "expect": "block",
+   "id": "P-rt11-uv-spawn",
+   "tags": [
+    "spawn",
+    "verb"
+   ]
+  },
+  {
+   "cmd": "k${x}ill 4004",
+   "expect": "block",
+   "id": "P-rt12-split-var",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "k$(true)ill 4004",
+   "expect": "block",
+   "id": "P-rt12-split-subst",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "x='kill 4004'; $x",
+   "expect": "block",
+   "id": "P-rt12-var-string",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "$(printf '\\x6bill') 4004",
+   "expect": "block",
+   "id": "P-rt12-printf-head",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "$(echo a2lsbA== | base64 -d) 4004",
+   "expect": "block",
+   "id": "P-rt12-base64-head",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "echo cGtpbGwgZm9v | base64 -d | sh",
+   "expect": "block",
+   "id": "P-rt12-base64-sh",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "bash -c \"$(echo cGtpbGwgZm9v | base64 -d)\"",
+   "expect": "block",
+   "id": "P-rt12-base64-bash-c",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "eval $(echo cGtpbGwgZm9v | base64 -d)",
+   "expect": "block",
+   "id": "P-rt12-base64-eval",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "kill -0 -s KILL 4004",
+   "expect": "block",
+   "id": "P-rt14-sig-order",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill -n 0 -9 4004",
+   "expect": "block",
+   "id": "P-rt14-sig-order-n",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "ssh -Ap 22 host kill 4004",
+   "expect": "block",
+   "id": "P-rt15-ssh-bundle",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "ssh -B eth0 host kill 4004",
+   "expect": "block",
+   "id": "P-rt15-ssh-B",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "docker-compose exec svc kill 4004",
+   "expect": "block",
+   "id": "P-rt16-compose",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "wsl pkill foo",
+   "expect": "block",
+   "id": "P-rt16-wsl",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "limactl shell default pkill foo",
+   "expect": "block",
+   "id": "P-rt16-limactl",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "multipass exec vm -- pkill foo",
+   "expect": "block",
+   "id": "P-rt16-multipass",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "vagrant ssh -c 'pkill foo'",
+   "expect": "block",
+   "id": "P-rt16-vagrant",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "adb shell pkill foo",
+   "expect": "block",
+   "id": "P-rt16-adb",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "oc rsh pod kill 4004",
+   "expect": "block",
+   "id": "P-rt16-oc",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "netwatch --kill orphans --pid 4242",
+   "expect": "block",
+   "id": "P-rt21-nw-flag-before",
+   "tags": [
+    "netwatch"
+   ]
+  },
+  {
+   "cmd": "netwatch orphans --kill --pid 1",
+   "expect": "block",
+   "id": "P-rt21-nw-pid1",
+   "tags": [
+    "netwatch"
+   ]
+  },
+  {
+   "cmd": "tmux kill-server",
+   "expect": "block",
+   "id": "P-rt26-tmux-server",
+   "tags": [
+    "verb"
+   ]
+  },
+  {
+   "cmd": "pm2 kill",
+   "expect": "block",
+   "id": "P-rt26-pm2",
+   "tags": [
+    "verb"
+   ]
+  },
+  {
    "cmd": "grep -n \"pkill -f pytest\" notes.md",
    "expect": "allow",
    "id": "N-text00-grep",
@@ -7915,6 +8581,254 @@
    ]
   },
   {
+   "cmd": "command -v killall",
+   "expect": "allow",
+   "id": "N-rt22-command-v",
+   "tags": [
+    "text"
+   ]
+  },
+  {
+   "cmd": "type pkill",
+   "expect": "allow",
+   "id": "N-rt22-type",
+   "tags": [
+    "text"
+   ]
+  },
+  {
+   "cmd": "which killall",
+   "expect": "allow",
+   "id": "N-rt22-which",
+   "tags": [
+    "text"
+   ]
+  },
+  {
+   "cmd": "node -e 'process.kill(4242, 0)'",
+   "expect": "allow",
+   "id": "N-rt22-node-liveness",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "python3 -c 'import psutil; print(psutil.cpu_percent())'",
+   "expect": "allow",
+   "id": "N-rt22-psutil-monitor",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "parallel grep pkill ::: a b",
+   "expect": "allow",
+   "id": "N-rt22-parallel-grep",
+   "tags": [
+    "text"
+   ]
+  },
+  {
+   "cmd": "sudo grep -n kill /var/log/syslog",
+   "expect": "allow",
+   "id": "N-rt22-sudo-grep",
+   "tags": [
+    "text"
+   ]
+  },
+  {
+   "cmd": "sudo apt-get install -y foo",
+   "expect": "allow",
+   "id": "N-rt22-sudo-apt",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "ls | xargs grep kill",
+   "expect": "allow",
+   "id": "N-rt22-xargs-grep",
+   "tags": [
+    "text"
+   ]
+  },
+  {
+   "cmd": "ls | xargs -n1 echo",
+   "expect": "allow",
+   "id": "N-rt22-xargs-rm",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "timeout 5 sleep 9",
+   "expect": "allow",
+   "id": "N-rt22-timeout-sleep",
+   "tags": [
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "nohup python3 server.py &",
+   "expect": "allow",
+   "id": "N-rt22-nohup-server",
+   "tags": [
+    "job"
+   ]
+  },
+  {
+   "cmd": "env FOO=1 python3 x.py",
+   "expect": "allow",
+   "id": "N-rt22-env-var",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "time -p ls",
+   "expect": "allow",
+   "id": "N-rt22-time-p-ls",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "gtimeout 5 sleep 9",
+   "expect": "allow",
+   "id": "N-rt22-gtimeout-sleep",
+   "tags": [
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "tmux ls",
+   "expect": "allow",
+   "id": "N-rt22-tmux-ls",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "tmux new -d 'ls'",
+   "expect": "allow",
+   "id": "N-rt22-tmux-new-ls",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "screen -ls",
+   "expect": "allow",
+   "id": "N-rt22-screen-ls",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "trap 'echo done' EXIT",
+   "expect": "allow",
+   "id": "N-rt22-trap-echo",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "function hi { echo hi; }; hi",
+   "expect": "allow",
+   "id": "N-rt22-function-echo",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "uv run pytest",
+   "expect": "allow",
+   "id": "N-rt22-uv-run",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "npx eslint .",
+   "expect": "allow",
+   "id": "N-rt22-npx-eslint",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "at now <<< 'echo hi'",
+   "expect": "allow",
+   "id": "N-rt22-at-echo",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "kill -s 0 -0 4004",
+   "expect": "allow",
+   "id": "N-rt22-kill-0-sigs",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "docker-compose up -d",
+   "expect": "allow",
+   "id": "N-rt22-docker-compose-up",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "wsl ls",
+   "expect": "allow",
+   "id": "N-rt22-wsl-ls",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "ssh -Ap 22 host ls",
+   "expect": "allow",
+   "id": "N-rt22-ssh-bundle-ls",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "netwatch orphans --kill --pid 4242",
+   "expect": "allow",
+   "id": "N-rt22-nw-orphans-kill-pid",
+   "tags": [
+    "netwatch"
+   ]
+  },
+  {
+   "cmd": "echo {a,b}{1,2}",
+   "expect": "allow",
+   "id": "N-rt22-brace-echo",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "echo kill {1,2}",
+   "expect": "allow",
+   "id": "N-rt22-brace-kill-text",
+   "tags": [
+    "text"
+   ]
+  },
+  {
+   "cmd": "python3 -c 'print(sum(range(9)))'",
+   "expect": "allow",
+   "id": "N-rt22-py-killing-ok",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
    "cmd": "kill 5",
    "expect": "block",
    "id": "P-ps-kill-alias",
@@ -7927,6 +8841,42 @@
    "cmd": "Stop-Process -Id 5",
    "expect": "block",
    "id": "P-ps-stop",
+   "ps": true,
+   "tags": [
+    "windows"
+   ]
+  },
+  {
+   "cmd": "(Get-Process foo).Kill()",
+   "expect": "block",
+   "id": "P-ps-dotkill",
+   "ps": true,
+   "tags": [
+    "windows"
+   ]
+  },
+  {
+   "cmd": "Get-Process foo | ForEach-Object { $_.Kill() }",
+   "expect": "block",
+   "id": "P-ps-foreach-kill",
+   "ps": true,
+   "tags": [
+    "windows"
+   ]
+  },
+  {
+   "cmd": "Get-CimInstance Win32_Process | Invoke-CimMethod -MethodName Terminate",
+   "expect": "block",
+   "id": "P-ps-cim-terminate",
+   "ps": true,
+   "tags": [
+    "windows"
+   ]
+  },
+  {
+   "cmd": "[System.Diagnostics.Process]::GetProcessById(5).Kill()",
+   "expect": "block",
+   "id": "P-ps-getprocessbyid",
    "ps": true,
    "tags": [
     "windows"

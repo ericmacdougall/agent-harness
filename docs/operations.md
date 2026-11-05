@@ -398,9 +398,9 @@ Run `replay` over recent transcripts and the red-team hold-out set before the en
 
 | Form | Result |
 |---|---|
-| `pkill`, `killall`, `killall5`, `skill`, `slay`, `fuser -k`, `taskkill`, `Stop-Process`, `systemctl kill`, `launchctl kill`, `loginctl kill-*`, the PowerShell `kill` alias | blocked in any form |
+| `pkill`, `killall`, `killall5`, `skill`, `slay`, `fkill`, `kill-port`, `fuser -k`, `taskkill`, `Stop-Process`, `systemctl kill`, `launchctl kill`, `tmux kill-server`, `pm2 kill`, `loginctl kill-*` and `terminate-*`, the PowerShell `kill` alias | blocked in any form, including after any wrapper (`sudo`, `env`, `time -p`, `gtimeout`, `xargs` with any options, `systemd-run`, `tmux`, `at`, `npx` ...): the first later word that is a kill verb starts the real command |
 | `kill` fed by `xargs`, `$(...)`, backticks, `while read` or a `for` loop variable, or any variable, glob or negative, zero or non-ASCII PID | blocked: the targets cannot be proven yours |
-| interpreter code that signals (`os.kill`, `os.killpg`, `process.kill`, `psutil`, or naming the verbs above) in `-c`, `-e`, here-documents and here-strings | blocked; set `script_kill_pattern` to an empty string in the policy to turn this check off |
+| interpreter code (`-c`, `-e`, here-documents, here-strings) or PowerShell text that mentions `kill`, `terminate(`, `send_signal`, `taskkill`, `Invoke-CimMethod` or `GetProcessById` (a liveness probe `os.kill(pid, 0)` is exempt) | blocked; this is deliberately broad and can block code that merely prints the word. Set `script_kill_pattern` to an empty string in the policy to turn this check off |
 | `find -exec kill`, `parallel kill`, `netwatch orphans --kill` with `--all`, `--force`, `--match` or without `--pid` | blocked |
 | `kill PID...` with literal PIDs | allowed only when every PID is proven yours (below) |
 | `kill -0`, `kill -l`, `kill -L`, `kill %N`, `kill $!` after a background job in the same input, `pgrep`, `ps`, `lsof`, `timeout -s KILL`, text that only contains the word | allowed |
@@ -431,11 +431,11 @@ Every block is one line and names `netwatch orphans --kill --pid <pid>`. It carr
 
 ### Fail closed
 
-The registered command is `kill_guard.py hook`, a launcher that runs the analysis in a child process with a 10 s limit (8 s watchdog inside). If the child crashes, cannot start, times out, prints garbage, or the input exceeds 8 MiB, the launcher blocks when the normalised raw text (quotes, backslashes and `$` removed) contains `kill`, `fuser`, `Stop-Process` or an indirection marker (ANSI-C quote, `eval`, `base64`, `xxd`), and otherwise allows with a note. A harmless `eval` is therefore blocked while the analyser is broken. The Claude Code entry matches `Bash|PowerShell` with `onFailure: block`; the Codex entry has no matcher. The guard never blocks reading or editing its own files. Policy is `kill_guard_policy.json` (`mode`: `enforce`, `warn` or `off`; the file is human-edited, there is no override variable).
+The registered command is `kill_guard.py hook`, a launcher that runs the analysis in a child process with a 10 s limit (8 s watchdog inside). If the child crashes, cannot start, times out, prints garbage, the launcher blocks when the normalised command text (the whole text, with quotes, backslashes and `$` removed) contains `kill`, `fuser`, `Stop-Process` or an indirection marker (ANSI-C quote, `eval`, `base64`, `xxd`), and otherwise allows with a note. Input above 8 MiB is always blocked. A harmless `eval` is therefore blocked while the analyser is broken. The Claude Code entry matches `Bash|PowerShell` with `onFailure: block`; the Codex entry has no matcher. The guard never blocks reading or editing its own files. Policy is `kill_guard_policy.json` (`mode`: `enforce`, `warn` or `off`; the file is human-edited, there is no override variable).
 
 ### Known limits
 
-A verb assembled from several variables at run time, kill calls inside script files the guard cannot read, `make` or `npm` targets and compiled programs, `docker kill`, `pm2`, `tmux kill-server` and `supervisorctl` are not covered. `sleep N; kill PID` is judged when the hook runs, not when the kill runs, so a PID reused in between is a residual risk. On macOS `ps` loses argument boundaries, so only the first two whitespace-separated words are read and a path with spaces is unprovable.
+A verb assembled from several variables at run time, text transformed into a command by `tr`, `rev` or `cut` pipes, `eval "$(cat file)"`, process substitution fed to a shell, kill calls inside script files or interpreter files that were not typed in the same input (`python3 file.py`), `make` or `npm` targets, compiled programs, `docker kill`, `kubectl delete pod`, `supervisorctl`, `launchctl remove` and `scp -S`, `rsync -e` or `git -c core.sshCommand` local command options are not covered. `sleep N; kill PID` is judged when the hook runs, not when the kill runs, so a PID reused in between is a residual risk. On macOS `ps` loses argument boundaries, so only the first two whitespace-separated words are read and a path with spaces is unprovable.
 
 ### Commands and rollout
 

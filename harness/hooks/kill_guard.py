@@ -45,17 +45,36 @@ MAX_PID = 4194304
 GUARDED_TOOLS = {'bash', 'powershell', 'shell', 'local_shell', 'exec_command', 'unified_exec', 'write_stdin',
                  'container.exec'}
 COMMAND_KEYS = ('command', 'cmd', 'script', 'chars', 'input')
-PROTECTED_COMM = {'claude', 'codex', 'sshd', 'launchd', 'systemd', 'init', 'tmux', 'screen', 'netwatch', 'login'}
+PROTECTED_COMM = {'claude', 'codex', 'sshd', 'launchd', 'systemd', 'init', 'tmux', 'screen', 'netwatch', 'login',
+                  'terminal', 'iterm2', 'alacritty', 'kitty', 'wezterm', 'gnome-terminal', 'sudo'}
+SHELL_COMM = {'zsh', 'bash', 'sh', 'fish', 'dash', 'ksh', 'tcsh', 'csh'}  # protected when interactive
+REJECT_ROOTS = {'/', '/tmp', '/private/tmp', '/var', '/private/var', '/var/tmp', '/opt', '/usr', '/private', '/etc',
+                '/home', '/Users', '/mnt', '/srv', '/root'}
 INTERPRETER_COMM = {'python', 'python3', 'node', 'nodejs', 'ruby', 'perl', 'php', 'deno', 'bun', 'bash', 'sh', 'zsh',
                     'dash', 'ksh', 'lua', 'pypy', 'pypy3', 'uv', 'java'}
+# commands that run another command: the rest of their words are scanned for a kill verb
+WRAPPER_NAMES = {'sudo', 'doas', 'env', 'nohup', 'timeout', 'nice', 'ionice', 'time', 'command', 'builtin', 'exec',
+                 'setsid', 'stdbuf', 'chrt', 'taskset', 'unbuffer', 'strace', 'ltrace', 'runuser', 'su', 'sg', 'chroot',
+                 'nsenter', 'flock', 'unshare', 'watch', 'xargs', 'parallel', 'systemd-run', 'caffeinate', 'gosu',
+                 'firejail', 'tmux', 'screen', 'at', 'batch', 'uv', 'uvx', 'pipx', 'npx', 'bunx', 'pnpx', 'dtruss', 'script',
+                 'arch', 'start', 'call', 'busybox', 'toybox'}
+REMOTE_WRAPPERS = {'docker-compose', 'oc', 'wsl', 'limactl', 'multipass', 'vagrant', 'colima', 'orb', 'adb', 'gcloud',
+                   'aws', 'podman-compose', 'lxc', 'incus', 'ctr', 'crictl'}
+GNU_PREFIXED = {'timeout', 'xargs', 'find', 'nohup', 'env', 'nice', 'stdbuf', 'time', 'sudo', 'parallel', 'kill'}
+STOP_COMMANDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'echo', 'printf', 'cat', 'git', 'gh', 'ls', 'sed', 'awk', 'head',
+                 'tail', 'less', 'more', 'man', 'which', 'type', 'whereis', 'apt', 'apt-get', 'brew', 'pip', 'pip3',
+                 'cp', 'mv', 'rm', 'mkdir', 'touch', 'chmod', 'chown', 'make', 'cargo', 'go', 'docker', 'kubectl',
+                 'python', 'python3', 'node', 'ruby', 'perl', 'sleep', 'true', 'false', 'test', 'wc', 'sort', 'uniq',
+                 'tee', 'diff', 'find', 'curl', 'wget', 'pytest', 'ssh', 'scp', 'rsync', 'tar', 'zip', 'unzip', 'date'}
 OVERRIDDEN = ('apply', 'inner_words', 'script', 'ssh', 'container', 'pipeline', 'bind_loop_var')
 
 DEFAULT_POLICY = {
     'mode': 'enforce',
-    'broad_verbs': ['pkill', 'killall', 'killall5', 'skill', 'slay'],
+    'broad_verbs': ['pkill', 'killall', 'killall5', 'skill', 'slay', 'fkill', 'kill-port', 'killport'],
     'windows_verbs': ['taskkill', 'stop-process', 'spps', 'wmic'],
-    'service_kill': {'systemctl': ['kill'], 'launchctl': ['kill'], 'loginctl': ['kill-session', 'kill-user']},
-    'script_kill_pattern': r'os\.kill|os\.killpg|pthread_kill|process\.kill\(|Process\.kill|psutil|\bpkill\b|\bkillall\b|\btaskkill\b',
+    'service_kill': {'systemctl': ['kill'], 'launchctl': ['kill'], 'tmux': ['kill-server'], 'pm2': ['kill'],
+                     'loginctl': ['kill-session', 'kill-user', 'terminate-user', 'terminate-session']},
+    'script_kill_pattern': r'(?i)(?<![a-z])(?:p|f|posix_)?kill|terminate\(|send_signal|taskkill|invoke-cimmethod|getprocessbyid',
     'pid_finders': ['pgrep', 'pidof', 'ps', 'lsof', 'fuser', 'pstree', 'cat', 'awk', 'grep'],
     'ledger_max_lines': 2000,
     'child_timeout_seconds': 10,
@@ -66,6 +85,8 @@ INDIRECT = re.compile(r"\$'|\\x[0-9a-fA-F]{2}|\\[0-7]{3}|\beval\b|base64|\bxxd\b
 JOB_SPEC = re.compile(r'%(?:[0-9]+|[%+\-]|\?\S+|[A-Za-z_]\S*)?')
 LIST_FLAGS = {'-l', '-L', '--list', '-t', '--table', '-Ll', '-lL'}
 SIGNAL_NAME = re.compile(r'-(?:sig)?([A-Za-z0-9+]+)', re.I)
+FUNCTION_KW = re.compile(r'\bfunction\s+([A-Za-z_][\w.:-]*)\s*(?:\(\s*\))?\s*\{')
+COPROC_KW = re.compile(r'\bcoproc\s+(?:[A-Za-z_]\w*\s*)?\{')
 PID_OPT_VALUE = re.compile(r'[0-9]+(?:,[0-9]+)*')
 
 
@@ -87,18 +108,21 @@ def load_policy(path=None):
     return policy
 
 
+DELETE_CHARS = {ord(c): None for c in '\'"\\${}`'}
+DELETE_CHARS.update({c: None for c in list(range(0x200B, 0x2010)) + list(range(0x2060, 0x2065)) +
+                     [0xFEFF, 0x00AD]})
+
+
 def norm_raw(text):
     """Raw text with quoting, backslashes, braces and $ removed, NFKC and case-folded: the loose probe used where
     the parser is unavailable. `pk""ill`, `p\\kill` and `$'\\x70kill'` all still contain `kill`."""
-    text = unicodedata.normalize('NFKC', text)
-    text = ''.join(ch for ch in text if ch not in '\'"\\${}`' and unicodedata.category(ch) != 'Cf')
-    return text.casefold()
+    return unicodedata.normalize('NFKC', text).translate(DELETE_CHARS).casefold()
 
 
 def fallback_blocks(raw):
     """Used when the analyser cannot run: block kill-looking or indirect input, allow the rest. A hook payload is
     reduced to its command text first, so a cwd such as .../kill-notes does not make `ls` look like a kill."""
-    text = raw[:4_000_000]
+    text = raw
     try:
         text = guarded_text(text)[1] or text
     except Exception:  # noqa: BLE001
@@ -132,7 +156,7 @@ def _secure_dir_ok(path):
     return stat_mod.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not (st.st_mode & 0o022)
 
 
-def _read_secure_file(path, limit):
+def _read_secure_file(path, limit, tail=False):
     """Bytes of a regular file owned by us that is not group/world writable; None otherwise. Never follows links."""
     import stat as stat_mod
     flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
@@ -144,6 +168,8 @@ def _read_secure_file(path, limit):
         st = os.fstat(fd)
         if not stat_mod.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
             return None
+        if tail and st.st_size > limit:
+            os.lseek(fd, st.st_size - limit, os.SEEK_SET)
         return os.read(fd, limit)
     except OSError:
         return None
@@ -192,7 +218,7 @@ def read_ledger(root, home=None, max_lines=2000):
     key = read_key(home)
     if not key:
         return []
-    data = _read_secure_file(ledger_path(root, home), 1 << 20)
+    data = _read_secure_file(ledger_path(root, home), 1 << 20, tail=True)
     if not data:
         return []
     out = []
@@ -329,7 +355,7 @@ class Probe:
         return None
 
     def argv(self, pid):
-        """argv[0:2] as a list. On macOS only the whitespace-split `ps` command is available, so paths with spaces
+        """argv[0:4] as a list. On macOS only the whitespace-split `ps` command is available, so paths with spaces
         are not recognised there (unprovable, which is the safe side)."""
         if self.proc:
             try:
@@ -338,10 +364,10 @@ class Probe:
             except OSError:
                 return None
             parts = [p.decode('utf-8', 'replace') for p in raw.split(b'\0') if p]
-            return parts[:2] or None
+            return parts[:4] or None
         out = _run(['ps', '-ww', '-o', 'command=', '-p', str(pid)])
         parts = out.split() if out else []
-        return parts[:2] or None
+        return parts[:4] or None
 
 
 # --------------------------------------------------------------------------- ownership
@@ -368,7 +394,7 @@ def find_worktree(cwd, home=None, runner=None):
         return None, []
     root = os.path.realpath(top.strip().splitlines()[0])
     home_path = os.path.realpath(home or os.path.expanduser('~'))
-    if root == '/' or under(home_path, root) or root.count('/') < 2:
+    if root in REJECT_ROOTS or under(home_path, root) or root.count('/') < 2:
         return None, []
     nested = []
     listing = runner(['git', '-C', root, 'worktree', 'list', '--porcelain'], 3.0, None, env) or ''
@@ -392,6 +418,7 @@ class Ownership:
         self._tree = None
         self._ancestors = None
         self._ledger = None
+        self._memo = {}
 
     def tree(self):
         if self._tree is None:
@@ -416,6 +443,11 @@ class Ownership:
         return under(norm, root) and not any(under(norm, n) for n in nested)
 
     def check(self, pid):
+        if pid not in self._memo:
+            self._memo[pid] = self._check(pid)
+        return self._memo[pid]
+
+    def _check(self, pid):
         if pid <= 1:
             return False, 'protected', 'pid %d is init or invalid' % pid
         if pid in self.ancestors():
@@ -428,8 +460,13 @@ class Ownership:
         comm = self.probe.comm(pid)
         if comm is None:
             return False, 'uninspectable', 'pid %d cannot be inspected' % pid
+        comm = comm.lstrip('-')
         if comm in PROTECTED_COMM:
             return False, 'protected', 'pid %d is a protected process (%s)' % (pid, one_line(comm, 20))
+        if comm in SHELL_COMM:
+            shell_argv = self.probe.argv(pid) or []
+            if len(shell_argv) <= 1 or shell_argv[0].startswith('-'):
+                return False, 'protected', 'pid %d is an interactive shell' % pid
         root, nested = self.tree()
         if not root:
             return False, 'no-worktree', 'pid %d is not provably yours: this call is not in a git worktree' % pid
@@ -444,9 +481,10 @@ class Ownership:
         argv = self.probe.argv(pid) or []
         if argv and '/' in argv[0] and self._inside(argv[0], root, nested):
             return True, 'argv', 'runs a program inside this worktree'
-        if len(argv) > 1 and os.path.basename(argv[0]).casefold().rstrip('0123456789.-') in INTERPRETER_COMM \
-                and '/' in argv[1] and self._inside(argv[1], root, nested):
-            return True, 'argv', 'runs a script inside this worktree'
+        if len(argv) > 1 and os.path.basename(argv[0]).casefold().rstrip('0123456789.-') in INTERPRETER_COMM:
+            script = next((a for a in argv[1:] if not a.startswith('-')), '')
+            if '/' in script and self._inside(script, root, nested):
+                return True, 'argv', 'runs a script inside this worktree'
         return False, 'outside', 'pid %d is not provably yours: its cwd and program are outside worktree %s' % (
             pid, one_line(os.path.basename(root), 40))
 
@@ -471,7 +509,7 @@ def make_analyzer_class(cg):
             self.bg_seen = False
             self.broad = set(policy['broad_verbs'])
             self.windows = set(policy['windows_verbs'])
-            self.script_kill = re.compile(policy['script_kill_pattern'])
+            self.script_kill = re.compile(policy['script_kill_pattern']) if policy['script_kill_pattern'] else None
             self.finders = set(policy['pid_finders'])
 
         # ---- findings
@@ -485,6 +523,8 @@ def make_analyzer_class(cg):
         # ---- overridden traversal hooks (OVERRIDDEN lists them; a test pins the base signatures)
         def script(self, text, depth, tail_visible=None, ps=None):
             saved, self.xargs = self.xargs, 0
+            text = FUNCTION_KW.sub(lambda m: m.group(1) + '() {', text)
+            text = COPROC_KW.sub('{', text)
             try:
                 return super().script(text, depth, tail_visible=tail_visible, ps=ps)
             finally:
@@ -512,12 +552,17 @@ def make_analyzer_class(cg):
                     self.xargs -= 1
 
         def _ssh_host_index(self, texts):
-            value_opts = set('bcDEeFIiJLlmOopQRSWw')
+            value_opts = set('bcDEeFIiJLlmOopQRSWwBP')
             i = 0
             while i < len(texts):
                 t = texts[i]
                 if t.startswith('-') and len(t) > 1:
-                    i += 2 if len(t) == 2 and t[1] in value_opts else 1
+                    consumed = 1
+                    for k, letter in enumerate(t[1:]):
+                        if letter in value_opts:
+                            consumed = 2 if k == len(t) - 2 else 1  # value glued on, or the next word
+                            break
+                    i += consumed
                     continue
                 return i
             return None
@@ -550,8 +595,56 @@ def make_analyzer_class(cg):
                 self.remote -= 1
 
         def apply(self, name, words, cmd, pl, idx, depth):
+            if name.startswith('g') and name[1:] in GNU_PREFIXED:
+                return self.apply(name[1:], words, cmd, pl, idx, depth)  # Homebrew coreutils: gtimeout, gxargs ...
+            args = words[1:]
+            if name in ('command', 'builtin', 'type', 'which', 'whereis', 'hash') and (
+                    name in ('type', 'which', 'whereis', 'hash') or any(a.text in ('-v', '-V') for a in args)):
+                return None  # asks where a program is; runs nothing
+            head_text = words[0].text.strip()
+            if ' ' in head_text and not head_text.startswith('-'):
+                self.script(head_text + ' ' + ' '.join(cg._quote_for_rebuild(a.text) for a in args), depth + 1)
             self.inspect(name, words, cmd, pl, idx, depth)
+            if name in WRAPPER_NAMES or name.startswith('-') or name in REMOTE_WRAPPERS:
+                self.scan_tail(name, args, pl, idx, depth)
             return super().apply(name, words, cmd, pl, idx, depth)
+
+        def scan_tail(self, name, args, pl, idx, depth):
+            """After a wrapper (or the option left over once `time` was stripped): the first later word that is a
+            kill verb starts the real command, whatever options the wrapper takes. Words that are a known ordinary
+            command end the scan, and a word holding a whole command line (`sudo -i 'pkill x'`) is re-parsed."""
+            verbs = self.broad | self.windows | {'kill'}
+            remote = name in REMOTE_WRAPPERS
+            via_xargs = name in ('xargs', 'parallel')
+            for i, w in enumerate(args):
+                if cg.norm_name(w.text).lstrip('g') in ('xargs', 'parallel'):
+                    via_xargs = True
+                if i and args[i - 1].text in ('-s', '--signal', '-k', '--kill-after', '-S'):
+                    continue  # a signal name given to timeout and friends, not a command
+                n = cg.norm_name(w.text)
+                if n.startswith('g') and n[1:] in GNU_PREFIXED:
+                    n = n[1:]
+                if n in verbs:
+                    if remote:
+                        self.remote += 1
+                    try:
+                        self.inner_words(args[i:], depth, pl, idx, via_xargs=via_xargs)
+                    finally:
+                        if remote:
+                            self.remote -= 1
+                    return
+                if not remote and (n in STOP_COMMANDS or n in cg.SHELLS or n in cg.INTERPRETERS):
+                    return
+                if w.text.startswith(('--split-string=', '-S')) and len(w.text) > 2 and name == 'env':
+                    self.script(w.text.split('=', 1)[1] if '=' in w.text else w.text[2:], depth + 1)
+                if (' ' in w.text.strip() or ';' in w.text) and not w.text.startswith('-') and name not in ('xargs', 'parallel'):
+                    if remote:
+                        self.remote += 1
+                    try:
+                        self.script(w.text, depth + 1)
+                    finally:
+                        if remote:
+                            self.remote -= 1
 
         # ---- the checks
         def finder_before(self, pl, idx, subs=()):
@@ -568,7 +661,15 @@ def make_analyzer_class(cg):
             head = words[0]
             if head.dynamic:
                 hints = ' '.join(self.ctx.var_hints.values()) + ' ' + ' '.join(head.subs)
-                if KILLISH.search(norm_raw(head.text + ' ' + hints)):
+                try:
+                    hints += ' ' + cg.decode_ansi(hints)
+                except Exception:  # noqa: BLE001
+                    pass
+                spliced = re.sub('[\ue000-\uf8ff]', '', cg.VAR_MARKER.sub('', head.text))
+                elided = any(cg.norm_name(spliced[:p] + spliced[e:]) in (self.broad | self.windows | {'kill'})
+                             for p in range(len(spliced)) if spliced[p] == '$'
+                             for e in range(p + 2, min(len(spliced), p + 40) + 1))  # k${x}ill, k$@ill
+                if elided or KILLISH.search(norm_raw(spliced + ' ' + hints)) or INDIRECT.search(hints):
                     self.block('dynamic-head', 'the command name is built at run time and the input mentions kill')
             if name in self.broad:
                 self.block('broad-kill', '`%s` signals processes by name or pattern and can hit other owners' % name)
@@ -588,6 +689,13 @@ def make_analyzer_class(cg):
                     self.block('service-kill', '`%s kill` stops processes the guard cannot attribute' % name)
             elif name == 'netwatch':
                 self.check_netwatch(args)
+            elif name in cg.SHELLS or name in ('eval', 'source', '.'):
+                if any(INDIRECT.search(' '.join(a.subs)) for a in args if a.subs):
+                    self.block('obfuscated-input', 'a shell is fed decoded text, so the guard cannot see what runs')
+            elif name == 'trap':
+                rest = [t for t in texts if t not in ('--',)]
+                if rest and rest[0] not in ('-p', '-l', '-', ''):
+                    self.script(rest[0], depth + 1)
             elif name in ('find', 'parallel'):
                 self.check_indirect(name, args, texts)
             elif name in ('busybox', 'toybox', 'systemd-run') and args:
@@ -601,10 +709,12 @@ def make_analyzer_class(cg):
 
         def check_text_runners(self, name, args, texts, cmd, depth):
             """Commands that run a text argument or here-string as shell code, which the base does not follow."""
-            if name in cg.SHELLS:
+            if name in cg.SHELLS or name in ('at', 'batch'):
                 for redir in getattr(cmd, 'redirs', []):
                     if redir.op == '<<<' and redir.target is not None:
                         self.script(redir.target.text, depth + 1)
+                    elif redir.op == '<' and redir.target is not None and name in cg.SHELLS:
+                        self.script_file(redir.target, depth)
             elif name == 'watch':
                 i = 0
                 while i < len(texts) and texts[i].startswith('-'):
@@ -643,11 +753,8 @@ def make_analyzer_class(cg):
                             and cg.norm_name(texts[i + 1]) in verbs:
                         hit = True
             else:
-                for t in texts:
-                    if t == ':::':
-                        break
-                    if cg.norm_name(t) in verbs:
-                        hit = True
+                first = next((t for t in texts if not t.startswith('-') and t != ':::'), '')
+                hit = cg.norm_name(first) in verbs
             if hit:
                 self.block('indirect-kill', '`%s` runs a kill verb on targets the guard cannot list' % name)
 
@@ -658,20 +765,25 @@ def make_analyzer_class(cg):
                     body += '\n' + redir.body
                 elif redir.op == '<<<' and redir.target is not None:
                     body += '\n' + redir.target.text
-            if self.script_kill.search(body):
+            body = body.replace('kill_guard', '')
+            body = re.sub(r'\b(?:os|process)\.kill\(\s*[\w.]+\s*,\s*0\s*\)', '', body)  # liveness probe
+            if self.script_kill is not None and self.script_kill.search(body):
                 self.block('script-kill', 'interpreter code signals processes the guard cannot check')
 
         def check_netwatch(self, args):
             texts = [a.text for a in args]
             if 'orphans' not in texts:
                 return
+            before = texts[:texts.index('orphans')]
             rest = texts[texts.index('orphans') + 1:]
             low = [t.lower() for t in rest]
-            if not any(t in ('-kill', '--kill') or t.startswith(('-kill=', '--kill=')) for t in low):
+            if not any(t in ('-kill', '--kill') or t.startswith(('-kill=', '--kill=')) for t in low + [b.lower() for b in before]):
                 return  # listing only
             bad, has_pid, i = None, False, 0
             if any(a.dynamic or a.subs for a in args):
                 bad = 'a dynamic argument'
+            elif any(t.startswith('-') for t in before):
+                bad = 'a flag before orphans'
             while i < len(rest) and bad is None:
                 t = low[i]
                 if t in ('-kill', '--kill', '-json', '--json'):
@@ -688,16 +800,18 @@ def make_analyzer_class(cg):
                     has_pid = True
                     i += 1
                 else:
-                    bad = '%s is not allowed' % one_line(rest[i], 30)
+                    bad = 'option %s is not allowed' % one_line(rest[i].split('=', 1)[0], 20)
             if bad is None and not has_pid:
                 bad = '--kill without --pid signals every orphan'
+            if bad is None and any(int(p) <= 1 for t in rest for p in re.findall(r'\d+', t if t.replace(',', '').isdigit() else '')):
+                bad = 'pid 0 or 1'
             if bad:
                 self.block('netwatch-broad', 'netwatch orphans --kill is allowed only as --pid N[,N...] (%s); '
                            '--all, --force and --match need the user' % bad)
 
         def check_kill(self, args, pl, idx):
             texts = [a.text for a in args]
-            targets, i, n, signal_seen = [], 0, len(args), False
+            targets, i, n, signal_seen, last_sig = [], 0, len(args), False, None
             while i < n:
                 t, w = texts[i], args[i]
                 if not targets and not w.dynamic:
@@ -710,29 +824,33 @@ def make_analyzer_class(cg):
                     if t in LIST_FLAGS:
                         return
                     if t in ('-s', '-n', '--signal'):
-                        if i + 1 < n and texts[i + 1] == '0':
-                            return
+                        last_sig = texts[i + 1] if i + 1 < n else ''
                         signal_seen = True
                         i += 2
                         continue
                     if t.startswith('--signal='):
-                        if t.split('=', 1)[1] == '0':
-                            return
+                        last_sig = t.split('=', 1)[1]
                         signal_seen = True
                         i += 1
                         continue
                     if t.startswith('--'):
                         i += 1
                         continue
-                    match = SIGNAL_NAME.fullmatch(t) if not signal_seen else None
+                    match = SIGNAL_NAME.fullmatch(t)
                     if match:
-                        if match.group(1) == '0':
-                            return
+                        last_sig = match.group(1)
+                        if signal_seen:  # a second spec: could be a negative PID or the signal that wins; judge as a target too
+                            targets.append(w)
                         signal_seen = True
                         i += 1
                         continue
                 targets.append(w)
                 i += 1
+            if last_sig == '0':
+                return
+            if any(len(a.alts) >= 32 or (len(a.alts) > 1 and any(x.startswith('-') for x in a.alts)) for a in args):
+                self.block('unprovable-target', 'a brace expansion is too large or hides an option')
+                return
             if self.xargs:
                 self.block('pidfeed', 'kill through xargs takes its targets from another command, so none can be '
                            'proven yours')
@@ -757,7 +875,7 @@ def make_analyzer_class(cg):
                     elif re.fullmatch(r'[0-9]{1,10}', alt, re.ASCII) and 0 < int(alt) <= MAX_PID:
                         pids.append(int(alt))
                     else:
-                        problems.append(('unprovable-target', 'kill target %s is not a plain positive PID' % one_line(alt, 20)))
+                        problems.append(('unprovable-target', 'a kill target is not a plain positive PID'))
             for rule, reason in problems[:1]:
                 self.block(rule, reason)
             if self.remote:
@@ -790,6 +908,14 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
         own = ownership or Ownership(effective, home=home, policy=policy)
         analyzer = make_analyzer_class(cg)(compiled, effective, ps, own, policy, raw)
         findings = analyzer.run_kill_scan(command)
+        if not findings:
+            for base in analyzer.ctx.findings:
+                if str(getattr(base, 'rule', '')).startswith('obfuscated'):
+                    findings = [('obfuscated-input', 'the input feeds decoded text to a shell, so the guard cannot see '
+                                 'what runs', ())]
+                    break
+        if not findings and ps and analyzer.script_kill is not None and analyzer.script_kill.search(command):
+            findings = [('script-kill', 'PowerShell code signals processes the guard cannot check', ())]
         if analyzer.ctx.unterminated and not findings and fallback_blocks(raw):
             findings = [('unterminated', 'the command has an unterminated quote or substitution and mentions a kill '
                          'verb or indirection', ())]
@@ -874,7 +1000,10 @@ def analyze_main(data=None):
         cg = _import_base()
         command, ps = cg.extract_command(payload)
         if command is None:
-            return 0
+            guarded, text = guarded_text(raw)
+            if not guarded:
+                return 0
+            command = text  # a tool the launcher treats as a shell tool (a command/cmd/script key): judge its text
         cwd = cg.payload_cwd(payload)
         verdict, _rule, message, _pids = decide(command, cwd=cwd, ps=ps, policy=policy)
         return emit(verdict, message)
@@ -970,7 +1099,14 @@ def spawn_main(argv):
     except OSError as error:
         sys.stderr.write('kill_guard spawn: %s; nothing was started\n' % error)
         return 2
-    out = open(log, 'ab') if log else subprocess.DEVNULL
+    if log:
+        log_real = os.path.realpath(os.path.join(cwd, log))
+        if not under(log_real, root):
+            sys.stderr.write('kill_guard spawn: --log must be a file inside the worktree; nothing was started\n')
+            return 2
+        out = os.fdopen(os.open(log_real, os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0), 0o600), 'ab')
+    else:
+        out = subprocess.DEVNULL
     try:
         child = subprocess.Popen(args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                  start_new_session=True, close_fds=True)
@@ -995,7 +1131,8 @@ def explain_main(argv):
         sys.stderr.write('usage: kill_guard.py explain FILE [--cwd DIR]\n')
         return 2
     cwd = argv[argv.index('--cwd') + 1] if '--cwd' in argv and argv.index('--cwd') + 1 < len(argv) else os.getcwd()
-    text = Path(argv[0]).read_text(encoding='utf-8', errors='replace')
+    with open(argv[0], 'rb') as handle:
+        text = handle.read(MAX_STDIN).decode('utf-8', 'replace')
     verdict, rule, message, pids = decide(text, cwd=cwd)
     print(json.dumps({'verdict': verdict, 'rule': rule, 'message': message, 'pids': list(pids)}))
     return 0

@@ -303,6 +303,18 @@ class RealLedger(unittest.TestCase):
         self.assertIsNone(kg.read_key(self.home), 'world-writable state directory must be ignored')
         os.chmod(str(sdir), 0o700)
 
+    def test_ledger_is_read_from_its_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            root = os.path.join(home, 'wt')
+            os.makedirs(root)
+            kg.append_ledger(root, 1, 'old', home=home)
+            path = kg.ledger_path(root, home)
+            with open(path, 'a') as handle:
+                handle.write('{"junk": 1}\n' * 120000)  # more than 1 MiB of unrelated lines
+            kg.append_ledger(root, 77, 'new', home=home)
+            self.assertIn((77, 'new'), kg.read_ledger(root, home))
+
     def test_state_dir_symlink_refused_for_new_key(self):
         sdir = kg.state_dir(self.home)
         os.makedirs(str(sdir.parent))
@@ -585,6 +597,96 @@ class Spawn(unittest.TestCase):
 
     def test_numeric_command_is_not_a_pid_argument(self):
         self.assertEqual(kg.spawn_main([]), 2)
+
+
+class RedTeamRound(WorldCase):
+    """Regression tests for the red-team findings that the corpus cannot express (work/redteam-report.md)."""
+
+    def world_with(self, extra):
+        world = json.loads(json.dumps(WORLD))
+        world['pids'].update({str(k): v for k, v in extra.items()})
+        return world
+
+    def test_rt1_verb_after_four_mib_is_blocked(self):
+        code, _out, err = run_hook(payload('echo ' + 'a' * 6_000_000 + '; pkill foo'))
+        self.assertEqual(code, 2, err[:200])
+        self.assertIn(LITERAL, err)
+
+    def test_rt1_fallback_scans_the_whole_text(self):
+        self.assertTrue(kg.fallback_blocks('a' * 5_000_000 + ' pkill x'))
+        self.assertFalse(kg.fallback_blocks('a' * 5_000_000))
+
+    def test_rt13_unknown_shell_like_tool_with_command_key_is_judged(self):
+        body = {'tool_name': 'mcp__x__run', 'tool_input': {'command': 'pkill foo'}}
+        self.assertEqual(run_hook(json.dumps(body))[0], 2)
+        body = {'tool_name': 'mcp__x__run', 'tool_input': {'command': 'ls'}}
+        self.assertEqual(run_hook(json.dumps(body))[0], 0)
+
+    def test_rt17_empty_pattern_disables_the_interpreter_check_only(self):
+        off = dict(POLICY, script_kill_pattern='')
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(kg.decide("python3 -c 'print(1)'", cwd=CWD, policy=off, home=tmp)[0], 'allow')
+            self.assertEqual(kg.decide("python3 -c 'import os; os.kill(5, 9)'", cwd=CWD, policy=off, home=tmp)[0], 'allow')
+            self.assertEqual(kg.decide('pkill x', cwd=CWD, policy=off, home=tmp)[0], 'block')
+
+    def test_rt19_values_are_never_echoed(self):
+        for cmd in ('kill sk-live-ABCDEF123456SECRETVALUE', 'netwatch orphans --kill --pid 4242 --token=sk-live-ABCDEF123456SE',
+                    'netwatch orphans --kill --pid sk-live-ABCDEF123456'):
+            verdict, _rule, message, _pids = self.decide(cmd)
+            self.assertEqual(verdict, 'block', cmd)
+            self.assertNotIn('sk-live', message)
+
+    def test_rt20_interactive_shell_is_protected_but_a_script_shell_is_not(self):
+        world = self.world_with({
+            4020: {'uid': 1000, 'comm': 'zsh', 'cwd': '/w/own', 'argv': ['-zsh'], 'start': 'a'},
+            4021: {'uid': 1000, 'comm': 'bash', 'cwd': '/w/own', 'argv': ['bash'], 'start': 'b'},
+            4022: {'uid': 1000, 'comm': 'bash', 'cwd': '/w/own', 'argv': ['bash', '/w/own/run.sh'], 'start': 'c'},
+            4023: {'uid': 1000, 'comm': 'node', 'cwd': '/elsewhere', 'argv': ['node', '--inspect', '/w/own/s.js'], 'start': 'd'},
+            4024: {'uid': 1000, 'comm': 'terminal', 'cwd': '/w/own', 'argv': ['x'], 'start': 'e'}})
+        own = self.ownership(world)
+        self.assertEqual(own.check(4020)[1], 'protected')
+        self.assertEqual(own.check(4021)[1], 'protected')
+        self.assertTrue(own.check(4022)[0])
+        self.assertTrue(own.check(4023)[0], 'a flag before the script must not hide it')
+        self.assertEqual(own.check(4024)[1], 'protected')
+
+    def test_rt20_system_roots_are_rejected(self):
+        for top in ('/private/tmp', '/tmp', '/var', '/opt', '/usr', '/private'):
+            runner = lambda argv, *a, _t=top, **k: _t + '\n' if 'rev-parse' in argv else ''  # noqa: E731
+            own = kg.Ownership('/tmp/x', home=WORLD['home'], probe=FakeProbe(WORLD), runner=runner, policy=POLICY)
+            self.assertEqual(own.check(4001)[1], 'no-worktree', top)
+
+    def test_rt20_probe_results_are_memoised(self):
+        calls = []
+        probe = FakeProbe(WORLD)
+        real_uid = probe.uid
+        probe.uid = lambda pid: calls.append(pid) or real_uid(pid)
+        own = kg.Ownership(CWD, home=WORLD['home'], probe=probe, runner=fake_runner(WORLD), policy=POLICY)
+        for _ in range(20):
+            own.check(4001)
+        self.assertEqual(calls.count(4001), 1)
+
+    def test_rt8_large_brace_expansions_are_blocked(self):
+        self.assertEqual(self.decide('kill 1{0,1,2,3,4,5,6,7,8,9}{0,1,2,3,4,5,6,7,8,9}')[0], 'block')
+        self.assertEqual(self.decide('kill {-9,4001}')[0], 'block')
+
+    def test_rt14_the_last_signal_wins(self):
+        self.assertEqual(self.decide('kill -0 -s KILL 4004')[0], 'block')
+        self.assertEqual(self.decide('kill -s KILL -0 4004')[0], 'allow')
+
+    def test_rt18_spawn_log_outside_the_worktree_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            repo = os.path.join(home, 'wt')
+            os.makedirs(repo)
+            subprocess.run(['git', 'init', '-q', repo], check=True)
+            env = {'HOME': home, 'PATH': '/usr/bin:/bin'}
+            done = subprocess.run([sys.executable, '-I', str(HOOKS / 'kill_guard.py'), 'spawn', '--log',
+                                   os.path.join(home, 'outside.log'), '--', 'true'], cwd=repo, env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            self.assertEqual(done.returncode, 2)
+            self.assertIn(b'inside the worktree', done.stderr)
+            self.assertFalse(os.path.exists(os.path.join(home, 'outside.log')))
 
 
 class Hygiene(unittest.TestCase):
