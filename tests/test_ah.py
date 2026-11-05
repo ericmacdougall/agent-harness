@@ -153,6 +153,25 @@ class OwnersTests(Base):
         self.assertEqual(by["helperfix"]["state"], "returned")  # helper without a WAL file: not a drop
         self.assertEqual(data["counts"]["DROPPED"], 2)
 
+    def test_blocked_paused_and_skipped_owners_are_not_dropped(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        rows = [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": a, "agent_type": "task-owner"}
+                for a in ("blk", "psd", "wtg", "gone", "big")]
+        rows += [{"at": iso(NOW - 100), "event": "subagent_stop", "agent_id": a, "agent_type": "task-owner"}
+                 for a in ("blk", "psd", "wtg", "gone", "big")]
+        rows.append({"at": iso(NOW - 8000), "event": "decision", "note": "owner psd is paused until the pool resets"})
+        jl(w / "main.jsonl", rows)
+        jl(w / "agent-blk.jsonl", [{"at": iso(NOW - 4000), "event": "blocker", "note": "review pool exhausted"}])
+        jl(w / "agent-psd.jsonl", [{"at": iso(NOW - 4000), "event": "intent", "note": "work"}])
+        jl(w / "agent-wtg.jsonl", [{"at": iso(NOW - 4000), "event": "status", "note": "blocked on the dev2 suite"}])
+        jl(w / "agent-gone.jsonl", [{"at": iso(NOW - 4000), "event": "intent", "note": "work"}])
+        jl(w / "agent-big.jsonl", [{"at": iso(NOW - 4000), "event": "result", "note": "done"}])
+        by = {r["agent_id"]: r["state"] for r in ah.owners(self.home, SESSION, now=NOW)["owners"]}
+        self.assertEqual((by["blk"], by["psd"], by["wtg"], by["gone"]), ("blocked", "paused", "waiting-on-the", "DROPPED"))
+        skipped = {r["agent_id"]: r["state"] for r in ah.owners(self.home, SESSION, now=NOW, skip_wal={"big"})["owners"]}
+        self.assertEqual(by["big"], "done")
+        self.assertNotEqual(skipped["big"], "done")  # its WAL was not read
+
     def test_discovers_agents_missing_from_main_wal(self):
         """Owners that never appear as subagent events in main.jsonl (general-purpose) are found from task WALs and meta files."""
         self.make()

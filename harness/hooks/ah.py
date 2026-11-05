@@ -206,8 +206,9 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
                 summary["first"] = note[:160]
         if event in ("handoff", "result"):
             summary["outcome"] = event
-        if event in ("handoff", "result", "status", "blocker", "decision") and note:
+        if event in ("handoff", "result", "status", "blocker", "decision", "intent") and note:
             summary["last_note"] = note[:300]
+            summary["last_kind"] = event
         for match in TICKET_IN_NOTE.findall(note):
             if match not in summary["tickets"] and len(summary["tickets"]) < 8:
                 summary["tickets"].append(match)
@@ -230,6 +231,7 @@ def transcript_mtime(home: Path, session: str, agent: str) -> float:
     return best
 
 
+PAUSE_RE = re.compile(r"\b(paused|pause[sd]?\b|on hold|held|hold off|parked)", re.I)
 RESTRICTED = re.compile(r"\b(solve|interview)", re.I)  # fail-closed: show liveness only, never the task text
 
 
@@ -269,7 +271,7 @@ def discover_agents(home: Path, session: str, wal: Path) -> dict:
     return found
 
 
-def owners(home: Path, session: str, now: float | None = None, comments=None) -> dict:
+def owners(home: Path, session: str, now: float | None = None, comments=None, skip_wal=()) -> dict:
     now = time.time() if now is None else now
     wal = wal_dirs(home) / session
     main = wal / "main.jsonl"
@@ -302,7 +304,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     rows = []
     for agent, info in spawned.items():
         path = wal / f"agent-{agent}.jsonl"
-        summary = summarize_agent_wal(path, index_dir) if path.is_file() else {
+        skipped = agent in skip_wal or path.name in skip_wal
+        summary = summarize_agent_wal(path, index_dir) if path.is_file() and not skipped else {
             "first": None, "last_at": 0.0, "outcome": None, "last_note": "", "tickets": []}
         last_wal = max(summary["last_at"], 0.0) or info["at"]
         tmtime = transcript_mtime(home, session, agent)
@@ -314,7 +317,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         is_owner = agent in registered or info["type"] in liveness.OWNER_TYPES or by_name
         verdict = liveness.classify(now, last_wal, tmtime, is_stopped,
                                     summary["outcome"], summary["last_note"], info["type"],
-                                    agent in registered, owner=is_owner)
+                                    agent in registered, owner=is_owner, last_kind=summary.get("last_kind"),
+                                    paused=bool(PAUSE_RE.search(" ".join(n for n in named if agent in n))))
         idle = verdict["idle_s"]
         text = " ".join(filter(None, [info.get("description"), summary["first"]]))
         restricted = bool(RESTRICTED.search(text))
@@ -1176,6 +1180,8 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
     o = sub.add_parser("owners")
     o.add_argument("--session")
+    o.add_argument("--skip-wal", action="append", default=[], metavar="NAME",
+                   help="ignore one task WAL (agent id or agent-<id>.jsonl), e.g. an oversized one; repeatable")
     o.add_argument("--comments", action="store_true", help="also fetch latest ticket comment age (network)")
     u = sub.add_parser("user-msg")
     u.add_argument("--session")
@@ -1246,7 +1252,7 @@ def run(args, home: Path) -> dict:
         s = args.session or env_session() or newest_session(home)
         if not s or not SESSION_RE.match(s):
             raise AhError("session_unknown", "no session: pass --session")
-        return owners(home, s, comments=comment_age if args.comments else None)
+        return owners(home, s, comments=comment_age if args.comments else None, skip_wal=set(args.skip_wal))
     if cmd == "user-msg":
         s = args.session or env_session()
         if not s:  # never guess "the newest transcript": a running helper session would win

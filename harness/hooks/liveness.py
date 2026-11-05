@@ -17,9 +17,9 @@ LIVE_WAL_S = 20 * 60
 LIVE_TRANSCRIPT_S = 10 * 60
 SILENT_S = 30 * 60
 HIGH_S = 60 * 60
-FINISH_GRACE_S = 10 * 60  # a just-stopped owner may still be writing its handoff: not a drop yet
+FINISH_GRACE_S = 30 * 60  # a just-stopped owner may be waiting on a background job or still writing its handoff
 
-_WAITING = re.compile(r"\bwaiting\s+(?:on|for)\s+([A-Za-z0-9_.:#\-]{1,60})", re.I)
+_WAITING = re.compile(r"\b(?:waiting|waits|blocked|pending)\s+(?:on|for|until)\s+([A-Za-z0-9_.:#\-]{1,60})", re.I)
 
 
 # Types that are owners only when main names them as one (a WAL scope/intent/decision note carrying the id).
@@ -39,7 +39,7 @@ OWNER_TYPES = ("task-owner",)
 
 def classify(now: float, last_wal: float, transcript_mtime: float, stopped: bool, outcome: str | None,
              last_note: str = "", agent_type: str | None = None, registered: bool = False,
-             owner: bool | None = None) -> dict:
+             owner: bool | None = None, last_kind: str | None = None, paused: bool = False) -> dict:
     """Return {"state", "idle_s", "severity"}; `outcome` is the last done/handoff/result kind or None."""
     last = max(last_wal or 0.0, transcript_mtime or 0.0)
     idle = max(0.0, now - last) if last else float("inf")
@@ -52,6 +52,10 @@ def classify(now: float, last_wal: float, transcript_mtime: float, stopped: bool
             wait = waiting_on(last_note)
             if wait:
                 state = f"waiting-on-{wait}"
+            elif paused:
+                state = "paused"  # main's WAL put this owner on hold: expected to be idle
+            elif last_kind == "blocker":
+                state = "blocked"  # its own last word was a blocker (waiting on a pool, a review, a person): not a drop
             else:
                 is_owner = owner if owner is not None else (registered or (agent_type or "task-owner") in OWNER_TYPES)
                 state = "returned"
