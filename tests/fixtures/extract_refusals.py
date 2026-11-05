@@ -3,8 +3,10 @@
 
 For every tool_result that contains "Commit blocked by the Agent Harness commit policy" it records the policy's
 problem lines and, when the triggering tool_use command can be found, a MASKED SHAPE of the message that was refused:
-subject type/scope presence and length, which sections were present, the form of the Testing and Refs lines.
-Output: refusals.jsonl (one shape per refusal) and summary.json (problem categories with counts).
+subject type/scope presence and length, which sections were present, the form of the Testing line and the kind of the
+Refs line (an enum, never its text).
+Output, in the directory given as the first argument and never in this tree: refusals.jsonl (one shape per refusal) and
+summary.json (problem categories with counts, quoted text masked). commit_refusal_shapes.json is the shapes of refusals.jsonl.
 """
 import json
 import os
@@ -14,7 +16,6 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path.home() / ".claude" / "projects"
-OUT = Path(__file__).resolve().parent
 MARK = "Commit blocked by the Agent Harness commit policy"
 SUBJECT = re.compile(r"^(?P<type>[a-z]+)(?:\((?P<scope>[^)]*)\))?(?P<bang>!)?: (?P<summary>.+)$")
 
@@ -22,6 +23,7 @@ SUBJECT = re.compile(r"^(?P<type>[a-z]+)(?:\((?P<scope>[^)]*)\))?(?P<bang>!)?: (
 def category(problem: str) -> str:
     p = re.sub(r"\d+", "N", problem)
     p = re.sub(r"'[^']*'", "'X'", p)
+    p = re.sub(r'"[^"]*"', '"X"', p)
     p = re.sub(r"`[^`]*`", "`X`", p)
     return p[:140]
 
@@ -35,6 +37,14 @@ def extract_message(command: str):
     if pieces:
         return "\n\n".join(a or b for a, b in pieces)
     return None
+
+
+def refs_kind(value: str) -> str:
+    if value.lower().startswith("none"):
+        return "none"
+    if re.search(r"\bPR\s*#\d|/pull/\d", value):
+        return "pr"
+    return "ticket" if re.search(r"GoodQA|#\d", value) else "other"
 
 
 def shape(message: str) -> dict:
@@ -54,7 +64,7 @@ def shape(message: str) -> dict:
         "sections": sections,
         "testing_has_backticks": bool(testing and "`" in testing.group(1)),
         "testing_not_run": bool(testing and testing.group(1).lower().startswith("not run")),
-        "refs_form": (re.sub(r"\d+", "N", re.sub(r"[A-Za-z_-]+#", "P#", refs.group(1)))[:40] if refs else None),
+        "refs_kind": refs_kind(refs.group(1)) if refs else None,
         "has_trailer": bool(re.search(r"(?m)^Co-Authored-By:", body)),
         "blank_after_subject": len(lines) > 1 and lines[1] == "",
         "body_chars": len(body),
@@ -62,6 +72,9 @@ def shape(message: str) -> dict:
 
 
 def main():
+    if len(sys.argv) != 2:
+        sys.exit("usage: extract_refusals.py OUTPUT_DIR (outside the repository)")
+    out_dir = Path(sys.argv[1])
     uses = {}
     found, problems = [], Counter()
     files = [p for p in ROOT.rglob("*.jsonl")]
@@ -93,7 +106,7 @@ def main():
                                 found.append((block.get("tool_use_id"), text))
         except OSError:
             continue
-    out = open(OUT / "refusals.jsonl", "w")
+    out = open(out_dir / "refusals.jsonl", "w")
     n_shape = 0
     for tool_id, text in found:
         plist = re.findall(r"(?m)^\s+- (.+)$", text.split("Problems:", 1)[-1].split("Write the message", 1)[0])
@@ -108,7 +121,7 @@ def main():
     out.close()
     summary = {"transcripts": len(files), "refusals": len(found), "with_message_shape": n_shape,
                "problem_categories": problems.most_common(40)}
-    (OUT / "summary.json").write_text(json.dumps(summary, indent=1))
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=1))
     print(json.dumps({k: summary[k] for k in ("transcripts", "refusals", "with_message_shape")}))
     for c, n in problems.most_common(25):
         print(f"{n:5d}  {c}")

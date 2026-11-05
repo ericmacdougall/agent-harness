@@ -13,10 +13,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA NaeNbNP#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 990
+"body_chars": 990,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 72,
@@ -32,10 +32,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA NaeNbNP#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1011
+"body_chars": 1011,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 67,
@@ -51,10 +51,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA NaeNbNP#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1198
+"body_chars": 1198,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 37,
@@ -70,10 +70,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": true,
-"refs_form": "none (fixture)",
 "has_trailer": false,
 "blank_after_subject": true,
-"body_chars": 84
+"body_chars": 84,
+"refs_kind": "none"
 },
 {
 "subject_len": 70,
@@ -89,10 +89,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "none (disposable fixture, no ticket need",
 "has_trailer": false,
 "blank_after_subject": true,
-"body_chars": 316
+"body_chars": 316,
+"refs_kind": "none"
 },
 {
 "subject_len": 27,
@@ -108,10 +108,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 328
+"body_chars": 328,
+"refs_kind": null
 },
 {
 "subject_len": 78,
@@ -127,10 +127,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N, GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1798
+"body_chars": 1798,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 10,
@@ -146,10 +146,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 1776
+"body_chars": 1776,
+"refs_kind": null
 },
 {
 "subject_len": 10,
@@ -165,10 +165,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 1730
+"body_chars": 1730,
+"refs_kind": null
 },
 {
 "subject_len": 63,
@@ -184,10 +184,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 424
+"body_chars": 424,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 46,
@@ -203,10 +203,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 771
+"body_chars": 771,
+"refs_kind": null
 },
 {
 "subject_len": 65,
@@ -222,10 +222,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 464
+"body_chars": 464,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 152,
@@ -241,10 +241,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 0
+"body_chars": 0,
+"refs_kind": null
 },
 {
 "subject_len": 11,
@@ -260,10 +260,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 1737
+"body_chars": 1737,
+"refs_kind": null
 },
 {
 "subject_len": 11,
@@ -279,10 +279,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 1737
+"body_chars": 1737,
+"refs_kind": null
 },
 {
 "subject_len": 70,
@@ -298,10 +298,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 977
+"body_chars": 977,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 31,
@@ -317,10 +317,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": true,
-"refs_form": "none (disposable fixture)",
 "has_trailer": false,
 "blank_after_subject": true,
-"body_chars": 110
+"body_chars": 110,
+"refs_kind": "none"
 },
 {
 "subject_len": 78,
@@ -336,10 +336,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1219
+"body_chars": 1219,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 11,
@@ -355,10 +355,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 2630
+"body_chars": 2630,
+"refs_kind": null
 },
 {
 "subject_len": 10,
@@ -374,10 +374,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": true,
-"body_chars": 2275
+"body_chars": 2275,
+"refs_kind": null
 },
 {
 "subject_len": 2,
@@ -393,10 +393,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 0
+"body_chars": 0,
+"refs_kind": null
 },
 {
 "subject_len": 61,
@@ -412,10 +412,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1027
+"body_chars": 1027,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 61,
@@ -431,10 +431,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1027
+"body_chars": 1027,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 218,
@@ -450,10 +450,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": true,
-"body_chars": 541
+"body_chars": 541,
+"refs_kind": null
 },
 {
 "subject_len": 352,
@@ -469,10 +469,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": true,
-"body_chars": 200
+"body_chars": 200,
+"refs_kind": null
 },
 {
 "subject_len": 3,
@@ -488,10 +488,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 37
+"body_chars": 37,
+"refs_kind": null
 },
 {
 "subject_len": 3,
@@ -507,10 +507,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 37
+"body_chars": 37,
+"refs_kind": null
 },
 {
 "subject_len": 59,
@@ -526,10 +526,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 952
+"body_chars": 952,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 75,
@@ -545,10 +545,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1270
+"body_chars": 1270,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 69,
@@ -564,10 +564,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 766
+"body_chars": 766,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 69,
@@ -583,10 +583,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 766
+"body_chars": 766,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 64,
@@ -602,10 +602,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 849
+"body_chars": 849,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 159,
@@ -621,10 +621,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 1335
+"body_chars": 1335,
+"refs_kind": null
 },
 {
 "subject_len": 53,
@@ -640,10 +640,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 387
+"body_chars": 387,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 52,
@@ -659,10 +659,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": true,
-"refs_form": "none (merge commit, no behaviour of its ",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 464
+"body_chars": 464,
+"refs_kind": "none"
 },
 {
 "subject_len": 151,
@@ -678,10 +678,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 0
+"body_chars": 0,
+"refs_kind": null
 },
 {
 "subject_len": 77,
@@ -697,10 +697,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 769
+"body_chars": 769,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 57,
@@ -716,10 +716,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1612
+"body_chars": 1612,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 57,
@@ -735,10 +735,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1612
+"body_chars": 1612,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 70,
@@ -754,10 +754,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 626
+"body_chars": 626,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 70,
@@ -773,10 +773,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 626
+"body_chars": 626,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 70,
@@ -792,10 +792,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 626
+"body_chars": 626,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 12,
@@ -811,10 +811,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 328
+"body_chars": 328,
+"refs_kind": null
 },
 {
 "subject_len": 68,
@@ -830,10 +830,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 737
+"body_chars": 737,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 68,
@@ -849,10 +849,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 737
+"body_chars": 737,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 22,
@@ -868,10 +868,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 172
+"body_chars": 172,
+"refs_kind": null
 },
 {
 "subject_len": 64,
@@ -887,10 +887,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": true,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 716
+"body_chars": 716,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 91,
@@ -906,10 +906,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1202
+"body_chars": 1202,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 238,
@@ -925,10 +925,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": true,
-"body_chars": 3434
+"body_chars": 3434,
+"refs_kind": null
 },
 {
 "subject_len": 70,
@@ -944,10 +944,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 639
+"body_chars": 639,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 76,
@@ -963,10 +963,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 649
+"body_chars": 649,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 69,
@@ -982,10 +982,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1061
+"body_chars": 1061,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 76,
@@ -1001,10 +1001,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 121
+"body_chars": 121,
+"refs_kind": null
 },
 {
 "subject_len": 67,
@@ -1020,10 +1020,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1430
+"body_chars": 1430,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 59,
@@ -1039,10 +1039,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 797
+"body_chars": 797,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 84,
@@ -1058,10 +1058,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 665
+"body_chars": 665,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 75,
@@ -1077,10 +1077,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N, GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 647
+"body_chars": 647,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 0,
@@ -1096,10 +1096,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 579
+"body_chars": 579,
+"refs_kind": null
 },
 {
 "subject_len": 190,
@@ -1115,10 +1115,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": true,
-"body_chars": 745
+"body_chars": 745,
+"refs_kind": null
 },
 {
 "subject_len": 35,
@@ -1134,10 +1134,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "none (pin bump of an already-reviewed re",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 518
+"body_chars": 518,
+"refs_kind": "none"
 },
 {
 "subject_len": 61,
@@ -1153,10 +1153,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1748
+"body_chars": 1748,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 62,
@@ -1172,10 +1172,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N, GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1531
+"body_chars": 1531,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 62,
@@ -1191,10 +1191,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N, GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1531
+"body_chars": 1531,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 32,
@@ -1210,10 +1210,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 1838
+"body_chars": 1838,
+"refs_kind": null
 },
 {
 "subject_len": 32,
@@ -1229,10 +1229,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 1838
+"body_chars": 1838,
+"refs_kind": null
 },
 {
 "subject_len": 68,
@@ -1248,10 +1248,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N, GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 808
+"body_chars": 808,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 67,
@@ -1267,10 +1267,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 951
+"body_chars": 951,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 39,
@@ -1286,10 +1286,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 369
+"body_chars": 369,
+"refs_kind": null
 },
 {
 "subject_len": 74,
@@ -1305,10 +1305,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 764
+"body_chars": 764,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 20,
@@ -1324,10 +1324,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 1957
+"body_chars": 1957,
+"refs_kind": null
 },
 {
 "subject_len": 47,
@@ -1343,10 +1343,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 389
+"body_chars": 389,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 47,
@@ -1362,10 +1362,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 389
+"body_chars": 389,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 75,
@@ -1381,10 +1381,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1025
+"body_chars": 1025,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 73,
@@ -1400,10 +1400,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 955
+"body_chars": 955,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 60,
@@ -1419,10 +1419,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N, GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 995
+"body_chars": 995,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 73,
@@ -1438,10 +1438,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 865
+"body_chars": 865,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 76,
@@ -1457,10 +1457,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N, GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1343
+"body_chars": 1343,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 38,
@@ -1476,10 +1476,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 864
+"body_chars": 864,
+"refs_kind": null
 },
 {
 "subject_len": 25,
@@ -1495,10 +1495,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 926
+"body_chars": 926,
+"refs_kind": null
 },
 {
 "subject_len": 79,
@@ -1514,10 +1514,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 668
+"body_chars": 668,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 79,
@@ -1533,10 +1533,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 668
+"body_chars": 668,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 68,
@@ -1552,10 +1552,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N, GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 696
+"body_chars": 696,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 60,
@@ -1571,10 +1571,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N, GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 854
+"body_chars": 854,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 64,
@@ -1590,10 +1590,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 626
+"body_chars": 626,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 64,
@@ -1609,10 +1609,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 626
+"body_chars": 626,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 73,
@@ -1628,10 +1628,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 929
+"body_chars": 929,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 76,
@@ -1647,10 +1647,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 995
+"body_chars": 995,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 73,
@@ -1666,10 +1666,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 929
+"body_chars": 929,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 76,
@@ -1685,10 +1685,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 995
+"body_chars": 995,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 59,
@@ -1704,10 +1704,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 962
+"body_chars": 962,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 59,
@@ -1723,10 +1723,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 962
+"body_chars": 962,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 25,
@@ -1742,10 +1742,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 0
+"body_chars": 0,
+"refs_kind": null
 },
 {
 "subject_len": 68,
@@ -1761,10 +1761,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N, GoodQA #N, GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1386
+"body_chars": 1386,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 62,
@@ -1780,10 +1780,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 777
+"body_chars": 777,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 56,
@@ -1799,10 +1799,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 553
+"body_chars": 553,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 56,
@@ -1818,10 +1818,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 553
+"body_chars": 553,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 64,
@@ -1837,10 +1837,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N, GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1000
+"body_chars": 1000,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 114,
@@ -1856,10 +1856,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 515
+"body_chars": 515,
+"refs_kind": null
 },
 {
 "subject_len": 64,
@@ -1875,10 +1875,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 764
+"body_chars": 764,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 69,
@@ -1894,10 +1894,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 762
+"body_chars": 762,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 15,
@@ -1913,10 +1913,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 242
+"body_chars": 242,
+"refs_kind": null
 },
 {
 "subject_len": 3,
@@ -1932,10 +1932,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 0
+"body_chars": 0,
+"refs_kind": null
 },
 {
 "subject_len": 81,
@@ -1951,10 +1951,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1193
+"body_chars": 1193,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 77,
@@ -1970,10 +1970,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 763
+"body_chars": 763,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 40,
@@ -1989,10 +1989,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 486
+"body_chars": 486,
+"refs_kind": null
 },
 {
 "subject_len": 55,
@@ -2008,10 +2008,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": true,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 351
+"body_chars": 351,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 66,
@@ -2027,10 +2027,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1393
+"body_chars": 1393,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 78,
@@ -2046,10 +2046,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1212
+"body_chars": 1212,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 75,
@@ -2065,10 +2065,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1212
+"body_chars": 1212,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 74,
@@ -2084,10 +2084,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1000
+"body_chars": 1000,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 72,
@@ -2103,10 +2103,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 778
+"body_chars": 778,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 27,
@@ -2122,10 +2122,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 1448
+"body_chars": 1448,
+"refs_kind": null
 },
 {
 "subject_len": 60,
@@ -2141,10 +2141,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N, GoodQA P#N, GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1569
+"body_chars": 1569,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 71,
@@ -2160,10 +2160,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N, GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 750
+"body_chars": 750,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 55,
@@ -2179,10 +2179,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N, GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 759
+"body_chars": 759,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 66,
@@ -2198,10 +2198,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1006
+"body_chars": 1006,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 20,
@@ -2217,10 +2217,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 834
+"body_chars": 834,
+"refs_kind": null
 },
 {
 "subject_len": 80,
@@ -2236,10 +2236,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N, GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1089
+"body_chars": 1089,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 64,
@@ -2255,10 +2255,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 682
+"body_chars": 682,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 68,
@@ -2274,10 +2274,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 893
+"body_chars": 893,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 35,
@@ -2293,10 +2293,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 464
+"body_chars": 464,
+"refs_kind": null
 },
 {
 "subject_len": 51,
@@ -2312,10 +2312,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": true,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 348
+"body_chars": 348,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 309,
@@ -2331,10 +2331,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": true,
-"body_chars": 540
+"body_chars": 540,
+"refs_kind": null
 },
 {
 "subject_len": 69,
@@ -2350,10 +2350,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 471
+"body_chars": 471,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 82,
@@ -2369,10 +2369,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 676
+"body_chars": 676,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 77,
@@ -2388,10 +2388,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 676
+"body_chars": 676,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 65,
@@ -2407,10 +2407,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 686
+"body_chars": 686,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 68,
@@ -2426,10 +2426,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1259
+"body_chars": 1259,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 76,
@@ -2445,10 +2445,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 610
+"body_chars": 610,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 76,
@@ -2464,10 +2464,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 1425
+"body_chars": 1425,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 31,
@@ -2483,10 +2483,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": null,
 "has_trailer": false,
 "blank_after_subject": false,
-"body_chars": 1716
+"body_chars": 1716,
+"refs_kind": null
 },
 {
 "subject_len": 72,
@@ -2502,10 +2502,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA P#N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 469
+"body_chars": 469,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 286,
@@ -2521,10 +2521,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N, GoodQA #N",
 "has_trailer": false,
 "blank_after_subject": true,
-"body_chars": 1612
+"body_chars": 1612,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 286,
@@ -2540,10 +2540,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N, GoodQA #N",
 "has_trailer": false,
 "blank_after_subject": true,
-"body_chars": 1615
+"body_chars": 1615,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 70,
@@ -2559,10 +2559,10 @@
 },
 "testing_has_backticks": false,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 516
+"body_chars": 516,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 73,
@@ -2578,10 +2578,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 865
+"body_chars": 865,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 73,
@@ -2597,10 +2597,10 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 865
+"body_chars": 865,
+"refs_kind": "ticket"
 },
 {
 "subject_len": 66,
@@ -2616,9 +2616,9 @@
 },
 "testing_has_backticks": true,
 "testing_not_run": false,
-"refs_form": "GoodQA #N",
 "has_trailer": true,
 "blank_after_subject": true,
-"body_chars": 919
+"body_chars": 919,
+"refs_kind": "ticket"
 }
 ]
