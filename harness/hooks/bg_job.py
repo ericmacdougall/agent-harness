@@ -291,8 +291,7 @@ def supervise(args, proc, nonce, log, status, argv, before):
         code, _ = read_status(record)
         if code is not None:
             return fail("process exited at once with status %d before proving it runs" % code)
-        alive = pid_is_job(proc.pid, nonce)
-        if not alive:
+        if proc.returncode is not None:  # we are the parent: this is authoritative, unlike a ps read mid-exec
             return fail("process is not alive and wrote no status")
         try:
             size = os.stat(log).st_size
@@ -305,7 +304,10 @@ def supervise(args, proc, nonce, log, status, argv, before):
             # first byte is not reported as a start.
             proc.poll()
             code, _ = read_status(record)
-            if code is None and pid_is_job(proc.pid, nonce):
+            if code is None and proc.returncode is None and not pid_is_job(proc.pid, nonce):
+                time.sleep(0.05)  # between fork and exec ps shows the launcher's command line; ask again
+                continue
+            if code is None and proc.returncode is None:
                 print("STARTED name=%s pid=%d log=%s status=%s argv_sha256=%s" %
                       (args.name, proc.pid, log, status, record["argv_sha256"][:16]))
                 return EXIT_OK
@@ -330,7 +332,9 @@ def cmd_wait(args):
         if why != "missing":
             print("UNPROVEN name=%s reason=status file %s" % (args.name, why))
             return EXIT_UNPROVEN
-        if not pid_is_job(record["pid"], record["nonce"]):
+        if not pid_is_job(record["pid"], record["nonce"]) and not (time.sleep(0.3) or
+                                                                    pid_is_job(record["pid"], record["nonce"])):
+            # (asked twice: one failed `ps` read must not turn a live job into a lost one)
             # Status is written before the wrapper exits; one last look closes the exit/read race.
             code, why = read_status(record)
             if code is not None:

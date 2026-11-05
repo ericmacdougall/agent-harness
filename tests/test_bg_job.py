@@ -235,6 +235,33 @@ class Round2(Base):
         self.assertIn("pid=%d" % rec["pid"], started[0])  # the one recorded job is the one reported
 
 
+class TransientPsRead(Base):
+    """Flake found by the acceptance reviewer: a ps read between fork and exec must not fail a live launch."""
+
+    def test_launch_survives_transient_pid_check_failures(self):
+        import io
+        import contextlib
+        import bg_job
+        real, calls = bg_job.pid_is_job, {"n": 0}
+
+        def flaky(pid, nonce):
+            calls["n"] += 1
+            return False if calls["n"] <= 3 else real(pid, nonce)
+
+        path = self.script("tr.sh", "echo hi\nsleep 30\n")
+        self.started.append("tr")
+        bg_job.pid_is_job = flaky
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = bg_job.main(["launch", "--name", "tr", "--log", str(self.tmp / "tr.log"), "--deadline", "10",
+                                  "--dir", str(self.jobs), "--", "sh", path])
+        finally:
+            bg_job.pid_is_job = real
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertGreater(calls["n"], 3)
+
+
 class WaitFailsClosed(Base):
     def start(self, name, body):
         res = self.launch(name, self.tmp / (name + ".log"), 10, "sh", self.script(name + ".sh", body))
