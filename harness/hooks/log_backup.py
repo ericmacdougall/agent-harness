@@ -140,7 +140,7 @@ def alert_text(result: dict, max_age: int = MAX_AGE_SECONDS) -> str:
 def run_note(home: Path) -> str:
     """Say so when a backup run is in progress: a long run does not hide a stale backup, it explains it."""
     lock = logs_dir(home) / LOCK_DIR
-    if "held by pid" not in lock_holder(home):
+    if not lock_holder(home).startswith("held"):
         return ""
     try:
         since = max(0, int(time.time() - lock.stat().st_mtime))

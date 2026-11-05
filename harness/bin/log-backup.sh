@@ -65,8 +65,10 @@ acquire_lock() {
   age=$(file_age "$LOCKD")
   if [ -n "$holder" ]; then
     holder_alive "$holder" && [ "$age" -lt $STALE_LOCK_SECONDS ] && return 1
-  elif [ "$age" -lt 60 ]; then
-    return 1 # the owner has created the directory but not yet written its pid
+  elif [ "$age" -lt $STALE_LOCK_SECONDS ]; then
+    # No pid file: the owner has not written it yet, or the lock belongs to the older hand-installed script (same
+    # lock.d directory, no pid). Never take that over while it is young; its owner stops it, or it ages out.
+    return 1
   fi
   # Stale. Takeovers are serialized by a second mkdir guard, so two runners cannot both judge the same lock and
   # one of them move the other's fresh lock. A guard left by a crashed takeover expires after 5 minutes.
