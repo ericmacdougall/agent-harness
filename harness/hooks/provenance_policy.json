@@ -5,6 +5,8 @@
   "ask_user_question": "enforce",
   "stop_lint": "warn",
   "ask_presence": "enforce",
+  "quarantine_lint": "enforce",
+  "quarantine_minutes": 10,
   "ask_presence_minutes": 10,
   "ticket_lookup": "enforce",
   "wal": {
