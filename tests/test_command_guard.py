@@ -329,12 +329,15 @@ class FailureModeTests(Fixture):
             cg.Analyzer.run = original
 
     def test_remote_home_is_not_resolved_through_local_links(self):
-        """Fresh red-team #1: on macOS /home is a symlink; ssh targets' Tier B paths must stay protected."""
+        """Fresh red-team #1: on macOS /home is a symlink; ssh targets' Tier B paths must stay protected. The
+        remote user is one that is not local on any test machine (on dev2 /home/eric is the local home, which
+        is rightly resolved as local)."""
         original = cg._resolve_prefix
         cg._resolve_prefix = lambda p: ('/System/Volumes/Data' + p) if p and p.startswith('/home/') else original(p)
         try:
-            for row in ('ssh dev2 "rm -rf /home/eric/.agent-harness/work"', 'ssh dev2 rm /home/eric/.claude/settings.json',
-                        'ssh dev2 rm -rf /home/eric/.agent-harness/scratch'):
+            for row in ('ssh dev2 "rm -rf /home/cgremote/.agent-harness/work"',
+                        'ssh dev2 rm /home/cgremote/.claude/settings.json',
+                        'ssh dev2 rm -rf /home/cgremote/.agent-harness/scratch'):
                 self.assertEqual(self.decide(row)[0], 'block', row)
         finally:
             cg._resolve_prefix = original
