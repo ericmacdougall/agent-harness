@@ -171,6 +171,70 @@ GUARD_OWN_FILES = ('command_guard.py', 'command_guard_hook.py', 'command_guard_c
 ROUTE_HOME = re.compile(r'/[A-Za-z0-9_./-]+')  # HOME goes into a command string, so it must not hold shell syntax
 
 
+SHELL_LONG_OPTS = frozenset(('norc', 'noprofile', 'login', 'posix', 'verbose', 'version', 'help', 'restricted', 'noediting',
+                             'debugger', 'dump-strings', 'dump-po-strings', 'rpm-requires'))
+SHELL_LONG_VALUE_OPTS = frozenset(('rcfile', 'init-file'))
+
+
+def shell_options(texts):
+    """Walk a POSIX shell's options as the shell does: (index of the first non-option word, options left on).
+
+    With `c` on, that word is the command string; otherwise it is the script. bash takes its long names with one dash or
+    two, and each o or O in a cluster takes the next word whichever position it holds.
+    """
+    i, on = 0, set()
+    while i < len(texts):
+        t = texts[i]
+        if t in ('-', '--'):
+            i += 1
+            break
+        if t[:1] not in ('-', '+'):
+            break
+        i += 1
+        word = t.lstrip('-')
+        if t[0] == '-' and word in SHELL_LONG_OPTS:
+            continue
+        if t[0] == '-' and word in SHELL_LONG_VALUE_OPTS:
+            i += 1
+            continue
+        if t.startswith('--'):
+            if word.startswith('command'):
+                on.add('c')
+            continue
+        for ch in t[1:]:
+            if ch in 'oO':
+                i += 1
+            elif t[0] == '-':
+                on.add(ch)
+            else:
+                on.discard(ch)
+    return min(i, len(texts)), on
+
+
+def python_options(texts):
+    """Walk Python's options as Python does: ('script'|'code'|'module'|'stdin'|None, index of that word)."""
+    i = 0
+    while i < len(texts):
+        t = texts[i]
+        if t == '-':
+            return 'stdin', i
+        if t == '--':
+            return ('script', i + 1) if i + 1 < len(texts) else (None, i)
+        if not t.startswith('-'):
+            return 'script', i
+        i += 1
+        if t.startswith('--'):
+            i += 1 if t == '--check-hash-based-pycs' else 0
+            continue
+        for pos, ch in enumerate(t[1:], 1):
+            if ch in 'cm':
+                return ('code' if ch == 'c' else 'module'), i
+            if ch in 'WX':  # takes a value: the rest of this word, or the next word
+                i += 1 if pos == len(t) - 1 else 0
+                break
+    return None, i
+
+
 def _read_prefix(path, limit):
     with open(path, 'rb') as handle:
         return handle.read(limit)
@@ -2377,37 +2441,43 @@ class Analyzer:
     def shell(self, name, args, depth, pl, idx):
         texts = [a.text for a in args]
         ps = name in PS_SHELLS
-        for i, t in enumerate(texts):
-            is_c = (not ps and (t == '-c' or (re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', t) is not None) or t.startswith('--command'))) \
-                or (ps and t.lower() in ('-c', '-command', '-encodedcommand', '-e', '-ec') or ps and t.lower() == '/c')
-            if is_c and i + 1 < len(texts):
-                payload = ' '.join(texts[i + 1:]) if ps else texts[i + 1]
-                if ps and t.lower() in ('-encodedcommand', '-e', '-ec'):
-                    try:
-                        import base64
-                        payload = base64.b64decode(payload + '=' * (-len(payload) % 4)).decode('utf-16-le', 'replace')
-                    except Exception:  # noqa: BLE001
-                        self.ctx.add(SECRET_DUMP, 'obfuscated-shell-input', 'encoded PowerShell cannot be inspected', 'pass the command in plain text')
-                        return
-                if not ps and args[i + 1].subs:
-                    self.program_text(args[i + 1], depth)
-                self.script(payload, depth + 1, tail_visible=True, ps=ps)
-                return
-        if not ps:
-            self.shell_stdin(pl.cmds[idx], depth)
+        if ps:
+            for i, t in enumerate(texts):
+                if t.lower() in ('-c', '-command', '-encodedcommand', '-e', '-ec', '/c') and i + 1 < len(texts):
+                    payload = ' '.join(texts[i + 1:])
+                    if t.lower() in ('-encodedcommand', '-e', '-ec'):
+                        try:
+                            import base64
+                            payload = base64.b64decode(payload + '=' * (-len(payload) % 4)).decode('utf-16-le', 'replace')
+                        except Exception:  # noqa: BLE001
+                            self.ctx.add(SECRET_DUMP, 'obfuscated-shell-input', 'encoded PowerShell cannot be inspected', 'pass the command in plain text')
+                            return
+                    self.script(payload, depth + 1, tail_visible=True, ps=True)
+                    return
+            return
+        stop, on = shell_options(texts)
+        if 'c' in on and stop < len(args):
+            self.shell_payload(args, stop, depth)
+            return
+        self.shell_stdin(pl.cmds[idx], depth)
         # `bash script.sh`: read and analyse the script; `bash -s` + heredoc is handled by heredoc()
-        if not ps:
-            k = 0
-            while k < len(args) and args[k].text.startswith('-'):
-                k += 2 if args[k].text in ('+o', '-O', '+O', '--rcfile', '--init-file') \
-                    or re.fullmatch(r'-[a-zA-Z]*o', args[k].text) else 1
-            if k < len(args):
-                if args[k].subs:
-                    self.program_text(args[k], depth)  # bash <(echo ...)
-                else:
-                    # `bash -n` only parses the file, so it runs nothing that could read a credential
-                    self.script_file(args[k], depth, runs=not any(
-                        re.fullmatch(r'-[a-zA-Z]*n[a-zA-Z]*', a.text) for a in args[:k]))
+        if stop < len(args):
+            if args[stop].subs:
+                self.program_text(args[stop], depth)  # bash <(echo ...)
+            else:
+                # `bash -n` only parses the file, so it runs nothing that could read a credential
+                self.script_file(args[stop], depth, runs='n' not in on)
+        # What follows the first plain word is that script's arguments, or the real options if that word was a variable
+        # or a `busybox sh`, which this cannot tell apart. So a -c there still gets its text judged.
+        for i in range(stop + 1, len(texts) - 1):
+            if re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', texts[i]) or texts[i].startswith('--command'):
+                self.shell_payload(args, i + 1, depth)
+                return
+
+    def shell_payload(self, args, i, depth):
+        if args[i].subs:
+            self.program_text(args[i], depth)
+        self.script(args[i].text, depth + 1, tail_visible=True)
 
     def ssh(self, args, depth):
         texts = [a.text for a in args]
@@ -2959,6 +3029,17 @@ class Analyzer:
                  'php': ('-r',), 'deno': ('eval',), 'bun': ('-e', '--eval'), 'lua': ('-e',), 'osascript': ('-e',),
                  'rscript': ('-e',)}
         key = 'python' if name.startswith('python') or name.startswith('pypy') else name
+        # Python stops reading options at the script, so -c or -m after it belong to the script. Judge the script first.
+        script = None
+        if key == 'python' and args:
+            kind, at = python_options(texts)
+            script = args[at] if kind == 'script' else None
+        if script is not None and not script.dynamic:
+            path = norm_path(script.text, self.ctx)
+            self.credential_script(path)
+            text = self.ctx.written.get(path.casefold())
+            if text:
+                self.code(text, depth)
         for i, t in enumerate(texts):
             if t in flags.get(key, ()) or (key == 'python' and re.fullmatch(r'-[A-Za-z]*c', t)):
                 if i + 1 < len(texts):
@@ -2974,16 +3055,10 @@ class Analyzer:
         # the repository's or harness's own tooling; a raw text scan of their source would block routine runs.
         if key in flags or key == 'python':
             nd = [a for a in args if not a.text.startswith('-')] if args else []
-            if nd and nd[0].text != '-':
+            if nd and nd[0].text != '-' and nd[0] is not script:
                 text = self.ctx.written.get(norm_path(nd[0].text, self.ctx).casefold())
                 if text:
                     self.code(text, depth)
-                if key == 'python' and not nd[0].dynamic and '-m' not in texts:
-                    # The value of -W or -X is not the script; with -m the next word is a module's argument.
-                    skip = {k + 1 for k, t in enumerate(texts) if t in ('-W', '-X', '--check-hash-based-pycs')}
-                    plain = [args[k] for k in range(len(args)) if k not in skip and not args[k].text.startswith('-')]
-                    if plain and plain[0].text != '-' and not plain[0].dynamic:
-                        self.credential_script(norm_path(plain[0].text, self.ctx))
 
     def code(self, code, depth):
         ctx = self.ctx
