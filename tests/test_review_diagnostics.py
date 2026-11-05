@@ -614,16 +614,72 @@ class EndToEndTests(unittest.TestCase):
         result = self.invoke(env={'PROVIDER_LAUNCH_LOG': str(launches)})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(launches.read_text().split(), ['claude'])
-        self.assertIn('Reviewer: Claude', self.output.read_text())
+        self.assert_claude_selected_as_primary()
         self.assertNotIn('codex', self.finals()[-1]['usage']['executables'])
+
+    def outside_cwd(self):
+        # Not under self.root: the fixture's repo and fake CLIs must not be covered by the cwd root.
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        return os.path.realpath(holder.name)
+
+    def assert_claude_selected_as_primary(self):
+        # The source label reads the same for primary and fallback; selection and the fallback note differ.
+        report = self.output.read_text()
+        self.assertIn('Reviewer-Selection: claude', report)
+        self.assertNotIn('Fallback reason:', report)
+
+    def test_review_only_author_rung_refuses_without_blaming_the_clis(self):
+        launches = self.root / 'launches.log'
+        result = self.invoke(extra=('--author-rung', 'R4'), env={'PROVIDER_LAUNCH_LOG': str(launches)})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('review-only', result.stderr)
+        self.assertNotIn('REVIEW_DIAGNOSTIC', result.stderr)
+        self.assertFalse(launches.exists())
+        self.assertFalse(self.output.exists())
+
+    def test_refusal_reports_each_provider_when_causes_differ(self):
+        marker, body = self.poison_codex(None)
+        self.commit_file('bin/codex', body)
+        (self.bin / 'codex').unlink()
+        (self.bin / 'claude').unlink()
+        env = {'PATH': os.pathsep.join([str(self.repo / 'bin'), tpr.system_path()]),
+               **self.policy(claude=['/nonexistent-dir/claude'])}
+        outside = self.outside_cwd()
+        result = self.invoke(env=env, cwd=outside)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('code=EXEC_UNTRUSTED reason=TRANSIENT_INFRA provider=codex', result.stderr)
+        self.assertIn('code=EXEC_NOT_FOUND reason=TRANSIENT_INFRA provider=claude', result.stderr)
+        self.assertIn('/nonexistent-dir/claude', result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_deleted_working_directory_refuses_with_a_diagnostic(self):
+        gone = self.root / 'gone'
+        gone.mkdir()
+        script = (
+            'import os, runpy, sys\n'
+            'os.chdir(sys.argv[1]); os.rmdir(sys.argv[1])\n'
+            'sys.argv = sys.argv[2:]\n'
+            'sys.path.insert(0, os.path.dirname(sys.argv[0]))\n'
+            'runpy.run_path(sys.argv[0], run_name="__main__")\n')
+        with self.packet.open('a') as handle:
+            handle.write(self.evidence(self.head()))
+        result = subprocess.run(
+            [sys.executable, '-c', script, str(gone), str(HOOKS / 'peer_review.py'), 'pr', '--repo', str(self.repo),
+             '--packet', str(self.packet), '--output', str(self.output), '--expected-head', self.head()],
+            capture_output=True, text=True, env={**os.environ, 'PATH': os.pathsep.join([str(self.bin), tpr.system_path()])})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('REVIEW_DIAGNOSTIC', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
 
     def test_both_absent_prints_exec_not_found_with_searched_locations(self):
         (self.bin / 'codex').unlink()
         (self.bin / 'claude').unlink()
-        result = self.invoke(env=self.policy(codex=['/nonexistent-dir/codex']))
+        result = self.invoke(env=self.policy(codex=['/nonexistent-dir/codex'], claude=['/nonexistent-dir/claude']))
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn('code=EXEC_NOT_FOUND', result.stderr)
         self.assertIn('/nonexistent-dir/codex', result.stderr)
+        self.assertIn('/nonexistent-dir/claude', result.stderr)
         self.assertIn('not a helper receipt', result.stderr)
         self.assertIn('wal_note.py', result.stderr)
         self.assertFalse(self.output.exists())
@@ -643,7 +699,19 @@ class EndToEndTests(unittest.TestCase):
         result = self.invoke(env=env, cwd=self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(marker.exists(), 'poisoned binary from the repository was executed')
-        self.assertIn('Reviewer: Claude', self.output.read_text())
+        self.assert_claude_selected_as_primary()
+
+    def test_binary_in_repo_is_unavailable_with_cwd_outside_the_repo(self):
+        # Only the repo root can refuse this binary: the cwd root does not cover it.
+        marker, body = self.poison_codex(None)
+        self.commit_file('bin/codex', body)
+        (self.bin / 'codex').unlink()
+        env = {'PATH': os.pathsep.join([str(self.repo / 'bin'), str(self.bin), tpr.system_path()])}
+        outside = self.outside_cwd()
+        result = self.invoke(env=env, cwd=outside)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists(), 'poisoned binary from the repository was executed')
+        self.assert_claude_selected_as_primary()
 
     def test_policy_pointing_into_repo_is_never_executed(self):
         marker, body = self.poison_codex(None)
@@ -652,6 +720,7 @@ class EndToEndTests(unittest.TestCase):
         result = self.invoke(env=self.policy(codex=[str(self.repo / 'bin/codex')]))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(marker.exists())
+        self.assert_claude_selected_as_primary()
 
     def test_positive_control_same_shim_in_trusted_dir_runs(self):
         marker, body = self.poison_codex(None)
