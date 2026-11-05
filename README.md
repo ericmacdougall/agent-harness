@@ -65,7 +65,7 @@ Claude Code's `--safe-mode` disables `CLAUDE.md` and hooks, including the WAL ga
 To uninstall, follow these steps:
 
 1. Remove the marked block from `CLAUDE.md`.
-2. Remove the harness entries from `settings.json`: the hook entries pointing at `~/.claude/hooks/wal.py`, `~/.claude/hooks/commit_policy.py`, `~/.claude/hooks/spec_flow.py` or `~/.claude/hooks/command_guard_hook.py`, and the harness permission rules.
+2. Remove the harness entries from `settings.json`: the hook entries pointing at `~/.claude/hooks/wal.py`, `~/.claude/hooks/commit_policy.py`, `~/.claude/hooks/spec_flow.py`, `~/.claude/hooks/merge_gate.py` or `~/.claude/hooks/command_guard_hook.py`, and the harness permission rules.
 3. Run `python3 ~/.claude/hooks/commit_policy.py uninstall-git-hook`.
 4. If installed, run `~/.agent-harness/bin/netwatch uninstall`, delete the binary, and pass `--no-netwatch` to any later install.
 5. Remove the copied agents and helper scripts. Restore a backup if you want the exact earlier state.
@@ -90,6 +90,8 @@ Both editions enforce one commit message format for agent commits: `<type>(<scop
 When `peer_review.py` cannot produce a reviewed result it prints a stable reason code, an exact next step and a reminder that native evidence is not a helper receipt; it also finds the reviewer CLIs in documented install locations and lints review packets for run evidence and the exact HEAD. See [review helper reliability](docs/operations.md#review-helper-reliability).
 
 A command guard (`command_guard.py`, behind the fail-closed launcher `command_guard_hook.py`) blocks shell commands that delete, move or empty Claude, Codex and harness logs and state, or that print secrets and configuration (for example `rclone config show`), in both editions; deletes of logs need a verified Dropbox backup and a single-use `approve-delete`. See [command guard](docs/operations.md#command-guard).
+
+Both editions also gate PR merges: a PreToolUse hook (`merge_gate.py`) blocks `gh pr merge`, `gh api` merge calls (REST and GraphQL) and wrapped forms unless every required and reported check on the exact head SHA is green, the merge command carries that head SHA, and the check state could be read; the only override is a recorded single-use waiver. See [merge gate](docs/operations.md#merge-gate).
 
 Work is spec-driven. Each ticket gets a spec with `AC-n` acceptance criteria and negative cases, reviewed adversarially and for acceptance by two different models, agents or people. The spec and its reviews are attached to the ticket. Proof for each criterion (a `REALLY_TESTED` WAL entry, commits and redacted logs) and the click-tester's identity, time window and logs are attached as the work proceeds. `spec_flow.py done` marks a ticket done only when every criterion has evidence, both reviews accepted the current spec, the click-test passed and someone independent signed off. Otherwise it lists what is missing. A Claude Code PreToolUse hook applies the same gate to GoodQA status changes; on Codex and Cursor the check is run by hand. It ships in warn mode. See [spec-driven tickets](docs/operations.md#spec-driven-tickets).
 

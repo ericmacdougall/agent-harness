@@ -3,6 +3,7 @@
  "gates": {
   "command-guard": ["hook"],
   "commit-policy": ["hook"],
+  "merge-gate": ["hook"],
   "spec-flow": ["hook"],
   "tier-gate": ["hook"],
   "wal": ["hook", "prompt", "pretool"]
