@@ -189,82 +189,635 @@ def searches_store(tool: str, tool_input, cwd=None) -> bool:
 GREP_FAMILY = {"grep", "egrep", "fgrep", "rgrep", "rg", "ag", "ack"}
 ALWAYS_RECURSIVE = {"rgrep", "rg", "ag", "ack", "find", "tar", "zip", "rsync", "du", "tree"}
 READERS = GREP_FAMILY | ALWAYS_RECURSIVE | {"cp", "strings", "xxd", "od", "cat", "head", "tail", "less", "more"}
+REMOVERS = {"rm", "mv", "rmdir", "unlink", "trash", "srm"}
+
+# The Bash guard reads a command the way the shell would. Matching over the raw string treated quoted text, here-documents
+# and comments as commands and lost track of `cd`, which denied about 3% of real calls. It deters accidents, not a
+# determined agent (docs, Known limits), so a word whose value only the shell knows is skipped, never guessed.
+SHELL_DEPTH = 8           # substitutions, subshells and `bash -c` nested deeper than this are not read
+DYNAMIC = "\x00"          # stands in for a substitution inside a word: its value is unknown here
+SHELL_WORD = re.compile(r"[^\s\\'\"`$;|&<>()]+")
+SHELL_QUOTED = re.compile(r"[^\"\\$`]+|\$")
+SHELL_ANSI = re.compile(r"'(?:\\.|[^'\\])*'?", re.S)
+SHELL_DELIMITER = re.compile(r"(?:\\.|'[^']*'|\"[^\"]*\"|[^\s;|&<>()])*")
+SHELL_VAR = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})")
+ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\+?=(.*)", re.S)
+SHELL_KEYWORDS = {"if", "then", "elif", "else", "fi", "do", "done", "while", "until", "esac", "{", "}", "!"}
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+DECLARERS = {"export", "local", "declare", "typeset", "readonly"}
+# Commands that run another command, with the flags of theirs that take a value.
+PREFIX_COMMANDS = {"sudo": {"-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "-T"}, "env": {"-u", "-C", "-S"}, "nice": {"-n"},
+                   "nohup": set(), "command": set(), "builtin": set(), "exec": {"-a"}, "time": {"-f", "-o"},
+                   "timeout": {"-k", "-s"}, "stdbuf": {"-i", "-o", "-e"}, "caffeinate": {"-t", "-w"},
+                   "xargs": {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-J", "-R", "-S", "-a"}}
+# A names-only listing stays names-only through text filters and these xargs commands; piped to anything else (xargs cat,
+# tar -T -, a read loop) it becomes the content read it would be with -exec.
+NAME_FILTERS = {"head", "tail", "wc", "sort", "uniq", "grep", "egrep", "fgrep", "rg", "sed", "awk", "cut", "tr", "nl", "column", "tee",
+                "cat", "less", "more", "basename", "dirname"}
+NAME_XARGS = {"ls", "stat", "basename", "dirname", "echo", "printf", "wc", "du"}
+# Flags whose value is the next word, so it is neither a path nor the pattern: (short letters, long names).
+VALUE_FLAGS = {
+    "grep": ("efABCmdD", {"--regexp", "--file", "--include", "--exclude", "--exclude-dir", "--exclude-from", "--context",
+                          "--after-context", "--before-context", "--max-count", "--label", "--binary-files", "--devices",
+                          "--directories"}),
+    "rg": ("efgtTABCmjMErd", {"--regexp", "--file", "--glob", "--iglob", "--type", "--type-not", "--type-add", "--type-clear",
+                              "--context", "--after-context", "--before-context", "--max-count", "--threads", "--max-columns",
+                              "--encoding", "--replace", "--max-depth", "--maxdepth", "--sort", "--sortr", "--colors", "--pre",
+                              "--pre-glob", "--context-separator", "--field-context-separator", "--field-match-separator",
+                              "--engine", "--max-filesize", "--path-separator", "--ignore-file", "--dfa-size-limit",
+                              "--regex-size-limit", "--generate", "--hyperlink-format", "--hostname-bin"}),
+    "ag": ("ABCGgmp", {"--ignore", "--ignore-dir", "--type", "--context", "--after", "--before", "--max-count", "--path-to-ignore",
+                       "--file-search-regex"}),
+    "du": ("dBt", {"--exclude", "--threshold", "--block-size"}),
+    "tree": ("LIPo", {"--filelimit", "--charset", "--sort", "--timefmt"}),
+    "cp": ("tS", {"--target-directory", "--suffix"}),
+    "rsync": ("eTBf", {"--rsh", "--exclude", "--include", "--exclude-from", "--include-from", "--files-from", "--filter",
+                       "--log-file", "--rsync-path", "--link-dest", "--compare-dest", "--copy-dest", "--backup-dir",
+                       "--partial-dir", "--temp-dir", "--password-file", "--bwlimit", "--timeout", "--port", "--chmod"}),
+}
+TAR_VALUE_LETTERS = "fCTXbHgI"
+TAR_VALUE_NAMES = {"--file", "--exclude", "--exclude-from", "--files-from", "--blocking-factor", "--format", "--transform", "--owner",
+                   "--group", "--mode", "--mtime", "--newer", "--use-compress-program"}
+FIND_FLAGS = {"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"}
+FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0", "-fprintf"}
+
+
+class ShellCommand:
+    """One simple command, or with `body` one ( subshell ). `op` joins it to the next command: | or & or ; (also && and ||)."""
+    __slots__ = ("words", "subs", "op", "stdin", "heredoc", "body")
+
+    def __init__(self):
+        self.words, self.subs, self.op, self.stdin, self.heredoc, self.body = [], [], ";", False, None, None
+
+
+def parse_shell(text: str, start: int = 0, closer=None, depth: int = 0) -> tuple:
+    """(commands, end): text as a shell reads it. Quotes, comments, redirection targets and here-documents are not
+    commands or operands; `$(...)`, backticks and subshells are commands. Bad syntax never raises: an unterminated quote
+    or here-document runs to the end."""
+    commands, cmd, word, is_target, reads_target, pending = [], ShellCommand(), None, False, False, []
+    i, n = start, len(text)
+
+    def end_word():
+        nonlocal word, is_target, reads_target
+        if word is not None:
+            if not is_target:
+                cmd.words.append("".join(word))
+            elif reads_target and "".join(word) != "/dev/null":
+                cmd.stdin = True  # rg and friends search stdin only when it could hold data
+            word, is_target, reads_target = None, False, False
+
+    def end_command(op):
+        nonlocal cmd, is_target, reads_target
+        end_word()
+        is_target = reads_target = False
+        if cmd.words or cmd.subs or cmd.body is not None:
+            cmd.op = op
+            commands.append(cmd)
+            cmd = ShellCommand()
+
+    def substitute(begin, close):
+        nonlocal word
+        word = [] if word is None else word
+        if depth >= SHELL_DEPTH:
+            stop = text.find(close, begin)
+            word.append(DYNAMIC)
+            return n if stop < 0 else stop + 1
+        sub, end = parse_shell(text, begin, close, depth + 1)
+        cmd.subs.append(sub)
+        word.append("$PWD" if len(sub) == 1 and sub[0].words == ["pwd"] else DYNAMIC)
+        return end
+
+    while i < n:
+        ch = text[i]
+        if ch == closer:
+            end_command(";")
+            return commands, i + 1
+        if ch == "\n":
+            end_command(";")
+            i += 1
+            for delimiter, strip, owner in pending:
+                lines = []
+                while i < n:
+                    stop = text.find("\n", i)
+                    stop = n if stop < 0 else stop
+                    line, i = text[i:stop], stop + 1
+                    if (line.lstrip("\t") if strip else line) == delimiter:
+                        break
+                    lines.append(line)
+                owner.heredoc = "\n".join(lines)
+            pending.clear()
+            i = min(i, n)
+        elif ch.isspace():
+            end_word()
+            i += 1
+        elif ch == "#" and word is None:
+            stop = text.find("\n", i)
+            i = n if stop < 0 else stop
+        elif ch == "\\":
+            if text[i + 1:i + 2] != "\n":
+                word = [] if word is None else word
+                word.append(text[i + 1:i + 2])
+            i += 2
+        elif ch == "'":
+            stop = text.find("'", i + 1)
+            stop = n if stop < 0 else stop
+            word = [] if word is None else word
+            word.append(text[i + 1:stop])
+            i = stop + 1
+        elif ch == '"':
+            word = [] if word is None else word
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\":
+                    if text[i + 1:i + 2] != "\n":
+                        word.append(text[i + 1:i + 2])
+                    i += 2
+                elif text.startswith("$(", i) and text[i + 2:i + 3] != "(":
+                    i = substitute(i + 2, ")")
+                elif text[i] == "`":
+                    i = substitute(i + 1, "`")
+                else:
+                    match = SHELL_QUOTED.match(text, i)
+                    word.append(match.group())
+                    i = match.end()
+            i += 1
+        elif ch == "`":
+            i = substitute(i + 1, "`")
+        elif ch == "$":
+            word = [] if word is None else word
+            if text.startswith("$((", i):
+                stop = text.find("))", i + 3)
+                word.append(DYNAMIC)
+                i = n if stop < 0 else stop + 2
+            elif text.startswith("$(", i):
+                i = substitute(i + 2, ")")
+            elif text.startswith("${", i):
+                stop = text.find("}", i + 2)
+                stop = n - 1 if stop < 0 else stop
+                word.append(text[i:stop + 1])
+                i = stop + 1
+            elif text.startswith("$'", i):
+                match = SHELL_ANSI.match(text, i + 1)
+                word.append(match.group().strip("'"))
+                i = match.end()
+            else:
+                word.append("$")
+                i += 1
+        elif ch in "<>" or text.startswith("&>", i):
+            if word is not None and "".join(word).isdigit():
+                word = None  # a file descriptor: 2>/dev/null
+            if ch in "<>" and text[i + 1:i + 2] == "(":
+                i = substitute(i + 2, ")")  # process substitution is a word
+                continue
+            end_word()
+            if text.startswith("<<<", i):
+                cmd.stdin, is_target = True, True
+                i += 3
+            elif text.startswith("<<", i):
+                i += 2
+                strip = text[i:i + 1] == "-"
+                i += 1 if strip else 0
+                while i < n and text[i] in " \t":
+                    i += 1
+                match = SHELL_DELIMITER.match(text, i)
+                pending.append((re.sub(r"[\\'\"]", "", match.group()), strip, cmd))
+                cmd.stdin = True
+                i = match.end()
+            else:
+                is_target, reads_target = True, ch == "<"
+                i += 1
+                while i < n and text[i] in "<>&|":
+                    i += 1
+        elif ch in ";|&":
+            two = text[i:i + 2]
+            token = two if two in ("&&", "||", ";;", "|&") else ch
+            end_command("|" if token in ("|", "|&") else "&" if token == "&" else ";")
+            i += len(token)
+        elif ch == "(":
+            if word is not None and "".join(word).endswith("="):  # an array assignment, not a subshell
+                stop = text.find(")", i)
+                word.append(DYNAMIC)
+                i = n if stop < 0 else stop + 1
+                continue
+            end_word()
+            if cmd.words:
+                end_command(";")  # the `f` of `f() { ...; }`
+            if depth >= SHELL_DEPTH:
+                i += 1
+                continue
+            cmd.body, i = parse_shell(text, i + 1, ")", depth + 1)
+        elif ch == ")":
+            end_command(";")  # a `case` pattern
+            i += 1
+        else:
+            match = SHELL_WORD.match(text, i)
+            word = [] if word is None else word
+            word.append(match.group() if match else ch)
+            i = match.end() if match else i + 1
+    end_command(";")
+    return commands, n
+
+
+class ShellState:
+    """Where a command runs: what earlier `cd`s and assignments did, as far as that can be known."""
+
+    def __init__(self, here: str):
+        self.here, self.previous, self.stack, self.variables, self.unknown_cd = here, None, [], {}, False
+
+    def fork(self):
+        copy = ShellState(self.here)
+        copy.previous, copy.stack, copy.variables, copy.unknown_cd = self.previous, list(self.stack), dict(self.variables), self.unknown_cd
+        return copy
+
+    def expand(self, word: str):
+        """The word's value, or None when only the shell could know it."""
+        def value(match):
+            name = match.group(1) or match.group(2)
+            if name == "PWD":
+                return self.here
+            if name == "OLDPWD":
+                return self.previous or DYNAMIC
+            if name in self.variables:
+                return self.variables[name] if self.variables[name] is not None else DYNAMIC
+            return os.environ.get(name, DYNAMIC)
+        text = SHELL_VAR.sub(value, word)
+        return None if DYNAMIC in text or "$" in text else os.path.expanduser(text)
+
+    def assign(self, words: list) -> None:
+        for word in words:
+            match = ASSIGNMENT.fullmatch(word)
+            if match:
+                self.variables[match.group(1)] = self.expand(match.group(2))
+
+    def change_dir(self, prog: str, args: list) -> None:
+        """Follow cd, pushd and popd. A target that cannot be resolved leaves the last known directory in place."""
+        args = [a for a in args if a not in ("-L", "-P", "-e", "-@", "--")]
+        if prog == "popd":
+            if self.stack and not args:
+                self.previous, self.here = self.here, self.stack.pop()
+            else:
+                self.unknown_cd = True
+            return
+        if prog == "pushd" and not args:
+            self.unknown_cd = True
+            return
+        target = args[0] if args else "~"
+        if target == "-":
+            if self.previous is None:
+                self.unknown_cd = True
+            else:
+                self.here, self.previous = self.previous, self.here
+            return
+        path = self.expand(target)
+        if path is None or path.startswith(("~", "+", "-")) or re.search(r"[*?\[]", path):
+            self.unknown_cd = True
+            return
+        if prog == "pushd":
+            self.stack.append(self.here)
+        self.unknown_cd = self.unknown_cd and not path.startswith("/")
+        self.previous, self.here = self.here, os.path.join(self.here, path)
+
+
+def effective_argv(words: list) -> tuple:
+    """(argv, via_xargs) with assignments, keywords and wrappers gone: `sudo nice -n 5 grep ...` is grep.
+    `command -v rg` only asks where rg is, so it runs nothing."""
+    i, via_xargs = 0, False
+    while i < len(words):
+        word = words[i]
+        if ASSIGNMENT.fullmatch(word) or word in SHELL_KEYWORDS or word == "function":
+            i += 2 if word == "function" else 1  # `function f { ...; }`: read the body as if it runs
+            continue
+        name = os.path.basename(word)
+        if name not in PREFIX_COMMANDS:
+            break
+        i += 1
+        via_xargs = via_xargs or name == "xargs"
+        while i < len(words) and words[i].startswith("-"):
+            flag = words[i]
+            if flag == "--":
+                i += 1
+                break
+            if name == "command" and flag in ("-v", "-V"):
+                return [], False
+            i += 2 if flag in PREFIX_COMMANDS[name] else 1
+        if name == "timeout":
+            i += 1  # its duration
+    return words[i:], via_xargs
+
+
+def shell_script(argv: list, heredoc) -> str | None:
+    """The script a shell would run: its `-c` text, or a here-document on stdin. A script file is not read."""
+    for index, word in enumerate(argv[1:], 1):
+        if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", word):
+            return " ".join(argv[index + 1:])
+    return heredoc
+
+
+def outputs_feeding_reads(commands: list) -> list:
+    """For each command, whether what it lists goes on to become file arguments of a later pipeline stage."""
+    feeding = [False] * len(commands)
+    for index in range(len(commands) - 2, -1, -1):
+        if commands[index].op == "|":
+            argv, via_xargs = effective_argv(commands[index + 1].words)
+            prog = os.path.basename(argv[0]) if argv else ""
+            feeding[index] = feeding[index + 1] or prog not in (NAME_XARGS if via_xargs else NAME_FILTERS)
+    return feeding
+
+
+def piped_heredoc_script(commands: list, index: int):
+    """`cat <<EOF | bash`: the here-document is the script of the shell it is piped to."""
+    if commands[index].heredoc is None or commands[index].op != "|" or index + 1 >= len(commands):
+        return None
+    argv = effective_argv(commands[index + 1].words)[0]
+    return commands[index].heredoc if argv and os.path.basename(argv[0]) in SHELLS and shell_script(argv, None) is None else None
+
+
+def walk_shell(commands: list, state: ShellState, fed: bool, depth: int):
+    """Yield (program, args, state, stdin, via_xargs, feeds) for each command that would run, with `state` at that point.
+    `feeds` means its output goes on to become file arguments (xargs, a loop, or a substitution)."""
+    feeding = outputs_feeding_reads(commands)
+    for index, cmd in enumerate(commands):
+        piped_in = index > 0 and commands[index - 1].op == "|"
+        isolated = piped_in or cmd.op in ("|", "&")  # pipeline stages and background jobs are subshells: a cd stays there
+        feeds = fed or feeding[index]
+        argv, via_xargs = effective_argv(cmd.words)
+        prog = os.path.basename(argv[0]) if argv else ""
+        for sub in cmd.subs:  # `x=$(...)`, `echo "$(...)"` and `[ "$(...)" ]` only store, print or test what it lists
+            yield from walk_shell(sub, state.fork(), bool(argv) and prog not in ("echo", "printf", "[", "[[", "test"), depth + 1)
+        script = piped_heredoc_script(commands, index)
+        if script is not None and depth < SHELL_DEPTH:
+            yield from walk_shell(parse_shell(script, depth=depth + 1)[0], state.fork(), feeds, depth + 1)
+        if cmd.body is not None:
+            yield from walk_shell(cmd.body, state.fork(), feeds, depth + 1)
+        if not argv:
+            state.assign(cmd.words)
+        elif prog in ("cd", "pushd", "popd"):
+            if not isolated:
+                state.change_dir(prog, argv[1:])
+        elif prog in DECLARERS:
+            state.assign(argv[1:])
+        elif prog == "eval":
+            if depth < SHELL_DEPTH:
+                yield from walk_shell(parse_shell(" ".join(argv[1:]), depth=depth + 1)[0], state, feeds, depth + 1)
+        elif prog in SHELLS:
+            script = shell_script(argv, cmd.heredoc)
+            if script is not None and depth < SHELL_DEPTH:
+                yield from walk_shell(parse_shell(script, depth=depth + 1)[0], state.fork(), feeds, depth + 1)
+        else:
+            yield prog, argv[1:], state, piped_in or cmd.stdin, via_xargs, feeds
+
+
+def split_flags(args: list, letters: str = "", names=()) -> tuple:
+    """(flags, values, operands). Short flags may cluster, and a value may be attached or the next word: -rnA3, -rne PAT."""
+    flags, values, operands, i = set(), {}, [], 0
+    while i < len(args):
+        word = args[i]
+        i += 1
+        if word == "--":
+            operands.extend(args[i:])
+            break
+        if word.startswith("--"):
+            name, eq, value = word.partition("=")
+            flags.add(name)
+            if eq:
+                values.setdefault(name, []).append(value)
+            elif name in names and i < len(args):
+                values.setdefault(name, []).append(args[i])
+                i += 1
+        elif word.startswith("-") and len(word) > 1:
+            for position, letter in enumerate(word[1:], 1):
+                flags.add("-" + letter)
+                if letter in letters:
+                    value = word[position + 1:]
+                    if not value and i < len(args):
+                        value = args[i]
+                        i += 1
+                    values.setdefault("-" + letter, []).append(value)
+                    break
+        else:
+            operands.append(word)
+    return flags, values, operands
+
+
+def find_paths(args: list) -> tuple:
+    """(starting points, has an action beyond naming files). Everything from the first expression word on is the
+    expression, so predicate values such as `-name '*.py'` are never paths."""
+    paths, i = [], 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] in FIND_FLAGS or re.fullmatch(r"-O\d*", args[i]):
+            i += 1
+        elif args[i] in ("-D", "-f"):  # -f is BSD find's explicit path
+            paths.extend(args[i + 1:i + 2] if args[i] == "-f" else [])
+            i += 2
+        else:
+            break
+    while i < len(args) and not args[i].startswith("-") and args[i] not in ("(", ")", "!", ","):
+        paths.append(args[i])
+        i += 1
+    return paths or ["."], any(word in FIND_ACTIONS for word in args[i:])
+
+
+def tar_paths(args: list) -> tuple:
+    """(deep, shallow) for tar: creating reads its paths, each after any earlier `-C`. Listing and extracting read only
+    the archive, and the archive itself is no path to judge. Old-style `czf x.tgz` letters take their values in order."""
+    base, paths, directories, reading, i = "", [], [], True, 0
+
+    def directory(value):
+        nonlocal base
+        base = os.path.join(base, value)
+        directories.append(base)
+
+    if args and not args[0].startswith("-"):
+        i = 1
+        for letter in args[0]:
+            reading = reading and letter not in "xtd"
+            if letter in TAR_VALUE_LETTERS and i < len(args):
+                if letter == "C":
+                    directory(args[i])
+                i += 1
+    while i < len(args):
+        word = args[i]
+        i += 1
+        if word.startswith("--"):
+            name, eq, value = word.partition("=")
+            reading = reading and name not in ("--extract", "--get", "--list", "--diff", "--compare")
+            if name == "--directory":
+                if not eq and i < len(args):
+                    value = args[i]
+                    i += 1
+                directory(value)
+            elif name in TAR_VALUE_NAMES and not eq:
+                i += 1
+        elif word.startswith("-") and len(word) > 1:
+            for position, letter in enumerate(word[1:], 1):
+                reading = reading and letter not in "xtd"
+                if letter in TAR_VALUE_LETTERS:
+                    value = word[position + 1:]
+                    if not value and i < len(args):
+                        value = args[i]
+                        i += 1
+                    if letter == "C":
+                        directory(value)
+                    break
+        else:
+            paths.append(os.path.join(base, word) if base else word)
+    return (paths, directories) if reading else ([], directories)
+
+
+def reader_paths(prog: str, args: list, stdin: bool, via_xargs: bool, feeds: bool) -> tuple:
+    """(deep, shallow) path words: what a reader opens recursively, and what it only names (a names-only listing, a
+    copy's destination, a plain file). Names-only stays names-only unless its output feeds more reads."""
+    if prog in GREP_FAMILY:
+        flags, values, words = split_flags(args, *VALUE_FLAGS["rg" if prog == "rg" else "ag" if prog in ("ag", "ack") else "grep"])
+        if flags & {"--version", "--help", "--type-list"} or (prog == "rg" and "-V" in flags):
+            return [], []
+        if prog == "rg" and "--files" in flags:
+            words = words or ["."]
+            return (words, []) if feeds else ([], words)
+        if not flags & {"-e", "-f", "--regexp", "--file"}:
+            words = words[1:]
+        recursive = prog in ALWAYS_RECURSIVE or bool(flags & {"-r", "-R", "--recursive", "--dereference-recursive"}) \
+            or "recurse" in values.get("-d", []) + values.get("--directories", [])
+        if not recursive:
+            return [], words
+        reads_stdin = stdin and prog in ("rg", "ag", "ack")  # with no path these search a pipe; grep -r searches `.`
+        return (words or ([] if via_xargs or reads_stdin else ["."])), []
+    if prog == "find":
+        words, acts = find_paths(args)
+        return (words, []) if acts or feeds else ([], words)
+    if prog in ("du", "tree"):
+        words = split_flags(args, *VALUE_FLAGS[prog])[2] or ["."]
+        return (words, []) if feeds else ([], words)
+    if prog == "tar":
+        return tar_paths(args)
+    if prog == "zip":
+        words, skipping = [], False
+        for word in args:
+            if word.startswith("-"):
+                skipping = word in ("-x", "-i")
+            elif not skipping:
+                words.append(word)
+        return words[1:], words[:1]
+    if prog == "rsync":
+        words = split_flags(args, *VALUE_FLAGS["rsync"])[2]
+        sources, target = (words[:-1], words[-1:]) if len(words) > 1 else (words, [])
+        local = lambda part: [word for word in part if not re.match(r"[^/]*:", word)]  # host:path is not on this machine
+        return local(sources), local(target)
+    if prog == "cp":
+        flags, values, words = split_flags(args, *VALUE_FLAGS["cp"])
+        target = []
+        if "-t" not in values and "--target-directory" not in values and len(words) > 1:
+            words, target = words[:-1], words[-1:]
+        return (words, target) if flags & {"-r", "-R", "-a", "--recursive", "--archive"} else ([], words + target)
+    return [], [word for word in args if not word.startswith("-")]
+
+
+def fold_case(path: str) -> str:
+    return path.lower() if sys.platform == "darwin" else path  # APFS/HFS+ default: case-insensitive
+
+
+def path_root(word: str, state: ShellState):
+    """(real path of a word's literal directory, the glob after it), or None when only the shell knows the value."""
+    path = state.expand(word)
+    if path is None or path == "-":
+        return None
+    literal = re.split(r"[*?\[{]", path, 1)[0]
+    head, slash, _ = literal.rpartition("/")
+    directory, rest = (path, "") if literal == path else ((head or "/") if slash else ".", path[len(head) + len(slash):])
+    try:
+        return os.path.realpath(os.path.join(state.here, directory)), rest
+    except ValueError:  # a lone surrogate from JSON: the shell could not name such a path either
+        return None
+
+
+def glob_reaches_store(root: str, rest: str, store: str) -> bool:
+    """Whether a recursive read of `root`, or of what its glob matches below it, includes the store. Without dotglob a
+    shell `*` skips a hidden name, so `grep -r x *` from home does not reach ~/.agent-harness."""
+    import fnmatch
+    if root == store:
+        return True
+    if not store.startswith(root.rstrip("/") + "/"):
+        return False
+    for part, name in zip([p for p in rest.split("/") if p], store[len(root.rstrip("/")) + 1:].split("/")):
+        if "{" in part:
+            return True  # a brace list is not judged here
+        if name.startswith(".") and not part.startswith("."):
+            return False
+        try:
+            if not fnmatch.fnmatchcase(name, fold_case(part)):
+                return False
+        except re.error:  # a bad range such as [z-a]: not judged here
+            return True
+    return True
+
+
+def store_read(command: str, cwd=None):
+    """(program, root) when a command would read the store through `root`, else None: any reader naming the store
+    itself, or a recursive content read rooted at an ancestor of it. Names-only listings of an ancestor are fine, as with
+    Glob and LS, and so are words whose value only the shell knows. Third item: an earlier cd could not be followed."""
+    store = fold_case(os.path.realpath(str(base())))
+    for prog, args, state, stdin, via_xargs, feeds in walk_shell(parse_shell(command)[0], ShellState(cwd or os.getcwd()), False, 0):
+        if prog not in READERS:
+            continue
+        deep, shallow = reader_paths(prog, args, stdin, via_xargs, feeds)
+        for words, recursive in ((deep, True), (shallow, False)):
+            for word in words:
+                found = path_root(word, state)
+                if not found:
+                    continue
+                root = fold_case(found[0])
+                if root == store or (recursive and glob_reaches_store(root, found[1], store)):
+                    return prog, found[0], state.unknown_cd
+    return None
 
 
 def reads_store_recursively(command: str, cwd=None) -> bool:
-    """A reader whose path argument is the store directory, or a recursive reader whose path (or default cwd) is the
-    store or an ancestor of it. Words are parsed per simple command, so `provenance.py find-user` is not `find`."""
-    fold = (lambda x: x.lower()) if sys.platform == "darwin" else (lambda x: x)
-    home = fold(os.path.realpath(str(base())))
-    here = cwd or os.getcwd()
-    for segment in re.split(r"\|\||&&|[;|&\n()`]", command):
-        try:
-            words = shlex.split(segment)
-        except ValueError:
-            words = segment.split()
-        while words and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]) or words[0] in ("sudo", "env", "nice", "command", "exec", "xargs", "time")):
-            words = words[1:]
-        if words and words[0] in ("cd", "pushd"):
-            target = words[1] if len(words) > 1 and words[1] != "-" else "~"
-            here = os.path.join(here, os.path.expanduser(os.path.expandvars(target)))
-            continue
-        if not words:
-            continue
-        prog = os.path.basename(words[0])
-        if prog not in READERS:
-            continue
-        flags = [w for w in words[1:] if w.startswith("-")]
-        args = [w for w in words[1:] if not w.startswith("-")]
-        recursive = prog in ALWAYS_RECURSIVE or (
-            prog in GREP_FAMILY and any(re.fullmatch(r"-[A-Za-z]*[rR][A-Za-z]*|--recursive|--dereference-recursive", f) for f in flags)) or (
-            prog == "cp" and any(re.fullmatch(r"-[A-Za-z]*[rRa][A-Za-z]*|--recursive|--archive", f) for f in flags))
-        if prog in GREP_FAMILY and args and not any(f in ("-e", "-f", "--regexp", "--file") or f.startswith(("--regexp=", "--file=")) for f in flags):
-            args = args[1:]  # the first operand is the pattern
-        if not args and recursive and prog in GREP_FAMILY | {"find", "du", "tree"}:
-            args = ["."]
-        for arg in args:
-            literal = re.split(r"[*?\[{]", arg, 1)[0]
-            if literal != arg:
-                literal = literal if literal.endswith("/") else literal.rpartition("/")[0] or "."
-            root = fold(os.path.realpath(os.path.join(here, os.path.expanduser(os.path.expandvars(literal or ".")))))
-            if root == home or (recursive and home.startswith(root.rstrip("/") + "/")):
-                return True
-    return False
+    return store_read(command, cwd) is not None
 
 
-REMOVERS = {"rm", "mv", "rmdir", "unlink", "trash", "srm"}
+def store_removal(command: str, cwd=None):
+    """(program, root) when a command would remove or move the store or a directory containing it, else None.
+    Children of the store (scratch/, work/) may still be removed. Third item as in store_read."""
+    store = fold_case(os.path.realpath(str(base())))
+    for prog, args, state, _, _, _ in walk_shell(parse_shell(command)[0], ShellState(cwd or os.getcwd()), False, 0):
+        if prog == "find" and "-delete" in args:
+            words = find_paths(args)[0]
+        elif prog in REMOVERS:
+            words = [word for word in args if not word.startswith("-")]
+            if prog == "mv" and len(words) > 1 and not any(word in ("-t", "--target-directory") for word in args):
+                words = words[:-1]  # the destination is not removed; only the sources move away
+        else:
+            continue
+        for word in words:
+            found = path_root(word, state)
+            if found and (fold_case(found[0]) == store or store.startswith(fold_case(found[0]).rstrip("/") + "/")):
+                return prog, found[0], state.unknown_cd
+    return None
 
 
 def removes_store(command: str, cwd=None) -> bool:
-    """rm, mv, rmdir or unlink whose path is the store directory or an ancestor of it: the next hook would silently
-    start an empty ledger. Children of the store (scratch/, work/) may still be removed."""
-    fold = (lambda x: x.lower()) if sys.platform == "darwin" else (lambda x: x)
-    home = fold(os.path.realpath(str(base())))
-    here = cwd or os.getcwd()
-    for segment in re.split(r"\|\||&&|[;|&\n()`]", command):
-        try:
-            words = shlex.split(segment)
-        except ValueError:
-            words = segment.split()
-        while words and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]) or words[0] in ("sudo", "env", "nice", "command", "exec", "xargs", "time")):
-            words = words[1:]
-        if words and words[0] in ("cd", "pushd"):
-            target = words[1] if len(words) > 1 and words[1] != "-" else "~"
-            here = os.path.join(here, os.path.expanduser(os.path.expandvars(target)))
-            continue
-        if not words or os.path.basename(words[0]) not in REMOVERS:
-            continue
-        args = [w for w in words[1:] if not w.startswith("-")]
-        if os.path.basename(words[0]) == "mv" and len(args) > 1 and not any(w in ("-t", "--target-directory") for w in words):
-            args = args[:-1]  # the destination is not removed; only the sources move away
-        for arg in args:
-            literal = re.split(r"[*?\[{]", arg, 1)[0]
-            if literal != arg:
-                literal = literal if literal.endswith("/") else literal.rpartition("/")[0] or "."
-            root = fold(os.path.realpath(os.path.join(here, os.path.expanduser(os.path.expandvars(literal or ".")))))
-            if root == home or home.startswith(root.rstrip("/") + "/"):
-                return True
-    return False
+    return store_removal(command, cwd) is not None
+
+
+CD_NOTE = (" An earlier `cd` in this command could not be followed, so this was judged from the last known directory; "
+           "an absolute path avoids that.")
+
+
+def read_denial(prog: str, root: str, unknown_cd: bool) -> str:
+    if fold_case(root) == fold_case(os.path.realpath(str(base()))):
+        text = (f"`{prog}` would read {root}, the agent-harness store itself, which holds the capture key. "
+                "Read a named file in it, or narrow the path to a subdirectory such as work/.")
+    else:
+        text = (f"`{prog}` would read {root} recursively, and the agent-harness store holding the capture key is inside it. "
+                "Narrow the path to a directory that does not contain the store, or use a names-only listing "
+                "(find without -exec, rg --files, du, tree).")
+    return text + (CD_NOTE if unknown_cd else "")
+
+
+def removal_denial(prog: str, root: str, unknown_cd: bool) -> str:
+    text = (f"`{prog}` would remove or move {root}, which is or contains the agent-harness store. The next hook would start "
+            "an empty ledger and lose every request. Narrow the path to a named child such as scratch/.")
+    return text + (CD_NOTE if unknown_cd else "")
 
 
 WRITEISH = re.compile(r"(?:>|\btee\b|\brm\b|\bmv\b|\bcp\b|sed\s+-i|\btruncate\b|\bpython3?\b|\bperl\b|\bruby\b|\bnode\b|"
@@ -1763,10 +2316,12 @@ def hook_guard(payload: dict, runtime: str) -> dict:
         return {}
     tool, tool_input = str(payload.get("tool_name") or ""), payload.get("tool_input")
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    shell_text = shlex.join(str(part) for part in command) if isinstance(command, list) else command  # argv keeps its quoting
     if isinstance(command, list):
         command = " ".join(str(part) for part in command)
     if tool == "apply_patch" and is_patch(command):
-        command = None  # a patch body is file text, not a shell command: only its headers are checked below
+        command = shell_text = None  # a patch body is file text, not a shell command: only its headers are checked below
+    shell_cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     reason = None
     if names_key(tool_input, tool):
         reason = "The capture key is read and written only by work_assignments.py; tools may not touch it."
@@ -1778,11 +2333,10 @@ def hook_guard(payload: dict, runtime: str) -> dict:
         reason = ("This search would reach the agent-harness store and could expose the capture key (Claude Code searches "
                   "hidden directories). Pass a `path` that does not contain the store, or a `glob`/`type` filter such as "
                   "`*.py`, or read a named file.")
-    elif isinstance(command, str) and reads_store_recursively(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None):
-        reason = "Recursive reads of the agent-harness store would expose the capture key; read a named file instead."
-    elif isinstance(command, str) and removes_store(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None):
-        reason = ("Removing or moving the agent-harness store (or a directory that contains it) would make the next hook "
-                  "start an empty ledger and lose every request; remove a named child such as scratch/ instead.")
+    elif isinstance(shell_text, str) and (removal := store_removal(shell_text, shell_cwd)):
+        reason = removal_denial(*removal)
+    elif isinstance(shell_text, str) and (read := store_read(shell_text, shell_cwd)):
+        reason = read_denial(*read)
     if reason:
         if mode == "enforce":
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
