@@ -3,6 +3,7 @@ import copy
 import importlib.util
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -33,7 +34,7 @@ BASE_IDS = ["test_old.Old.test_one", "test_old.Old.test_two", "test_loss.Loss.te
 def report(head=SHA, ran=100, ids=None, **over):
     r = {"schema": 1, "kind": "suite-report", "runner": "suite_report", "runner_version": 1,
          "command": "python3 -m unittest discover -s tests", "whole_suite": True, "start": "tests", "head": head, "clean": True,
-         "python": "3.12.3", "host": "dev2", "ran": ran, "skipped": 0, "failing_ids": sorted(BASE_IDS if ids is None else ids),
+         "python": "3.12.3", "host": socket.gethostname().split(".")[0], "ran": ran, "skipped": 0, "failing_ids": sorted(BASE_IDS if ids is None else ids),
          "complete": True, "nonce": "n"}
     r.update(over)
     return r
@@ -499,8 +500,9 @@ class Round2(unittest.TestCase):
         log = mock.Mock()
         args = SimpleNamespace(expected_head=SHA, baseline_compare=True)
         for checks in ([], [["python3", "-m", "unittest", "tests.test_a"]]):
-            with mock.patch.object(il, "report") as rep:
-                code = il.baseline_compare_gate(args, Path("."), Path("."), checks, log)
+            import suite_compare as sc
+            with mock.patch.object(il, "report") as rep, mock.patch.object(sc, "run_compare", return_value={}):
+                code = il.baseline_compare_gate(args, Path("."), Path("."), checks, log, {"base": OTHER})
             self.assertEqual(code, 2)
             self.assertEqual(rep.call_args[0][0], "BLOCKED_POLICY")
 
@@ -509,7 +511,7 @@ class Round2(unittest.TestCase):
         args = SimpleNamespace(expected_head=SHA, baseline_compare=True, check_timeout=None, timeout=60)
         with mock.patch.object(sc, "run_compare", side_effect=sc.CompareFailure(["no baseline"])), \
                 mock.patch.object(il, "report") as rep, mock.patch.object(il, "observed_head", return_value=SHA):
-            code = il.baseline_compare_gate(args, Path("."), Path("/x"), [sc.WHOLE_SUITE_ARGV], mock.Mock())
+            code = il.baseline_compare_gate(args, Path("."), Path("/x"), [sc.WHOLE_SUITE_ARGV], mock.Mock(), {"base": OTHER})
         self.assertEqual(code, 3)
         self.assertEqual(rep.call_args[0][0], "RECOVERY_REQUIRED")
 
@@ -517,7 +519,9 @@ class Round2(unittest.TestCase):
         import integrate_local as il, suite_compare as sc
         args = SimpleNamespace(expected_head=SHA, baseline_compare=True, check_timeout=None, timeout=60)
         with tempfile.TemporaryDirectory() as d, mock.patch.object(sc, "run_compare", return_value={"baseline_sha": SHA}):
-            self.assertEqual(il.baseline_compare_gate(args, Path("."), Path(d), [sc.WHOLE_SUITE_ARGV], mock.Mock()), 0)
+            self.assertEqual(il.baseline_compare_gate(args, Path("."), Path(d), [sc.WHOLE_SUITE_ARGV], mock.Mock(), {"base": OTHER}), 0)
+            self.assertFalse((Path(d) / "baseline-compare.json").exists(), "evidence is written only after the journal is archived")
+            il.finish_compare_evidence(args, Path(d))
             saved = json.loads((Path(d) / "baseline-compare.json").read_text())
             self.assertEqual(saved["baseline_sha"], SHA)
             self.assertIn("integrate_local.py", saved["helper"]["files"])
@@ -526,7 +530,7 @@ class Round2(unittest.TestCase):
     def test_accept_recorded_rejects_ids_outside_pinned_baseline(self):
         import suite_compare as sc
         def suite(ids, ran=10):
-            return {"failing_ids": ids, "ran": ran, "skipped": 0}
+            return {"failing_ids": ids, "ran": ran, "skipped": 0, "host": socket.gethostname().split(".")[0]}
         recs = {"A": "ra", "B": "rb"}
         def bs(rec, sha):
             return ({"A": suite(["t.a"]), "B": suite(["t.a", "t.b"])}[sha], [])
@@ -576,7 +580,7 @@ class Round2b(unittest.TestCase):
 
     def test_recorded_run_needs_a_baseline_for_the_pinned_head(self):
         import suite_compare as sc
-        good = {"failing_ids": ["t.a"], "ran": 10, "skipped": 0}
+        good = {"failing_ids": ["t.a"], "ran": 10, "skipped": 0, "host": socket.gethostname().split(".")[0]}
         def bs(rec, sha):
             return (good, []) if sha == "B" else (None, ["no baseline for pinned"])
         with mock.patch.object(sc, "baseline_record_for", return_value="r"), mock.patch.object(ts, "baseline_suite_for", side_effect=bs):
@@ -617,7 +621,8 @@ class Round3(unittest.TestCase):
 
     def test_run_path_refuses_a_failure_outside_the_pinned_baseline(self):
         import suite_compare as sc
-        self.assertEqual(self.pinned_run()["pinned_sha"], OTHER)
+        ran = self.pinned_run()
+        self.assertEqual((ran["pinned_sha"], ran["bounded_by_pinned"]), (OTHER, True))
         with self.assertRaises(sc.CompareFailure) as ctx:
             self.pinned_run(ids=("t.a", "t.new"))  # known in the re-pin's own baseline, but not in the pinned HEAD's
         self.assertIn("t.new", str(ctx.exception))
@@ -633,8 +638,8 @@ class Round3(unittest.TestCase):
         with self.assertRaises(sc.CompareFailure) as ctx:
             self.pinned_run(drop_pinned=True)
         self.assertIn("pinned original HEAD has no complete", str(ctx.exception))
-        suite = {"failing_ids": ["t.a"], "ran": 1, "skipped": 0}
-        pinned = {"failing_ids": ["t.a"], "ran": 4, "skipped": 0}
+        suite = {"failing_ids": ["t.a"], "ran": 1, "skipped": 0, "host": socket.gethostname().split(".")[0]}
+        pinned = {"failing_ids": ["t.a"], "ran": 4, "skipped": 0, "host": socket.gethostname().split(".")[0]}
         with mock.patch.object(sc, "baseline_record_for", return_value="r"), \
                 mock.patch.object(ts, "baseline_suite_for", side_effect=lambda rec, sha: (suite if sha == "X" else pinned, [])):
             with self.assertRaises(sc.CompareFailure):
@@ -724,3 +729,81 @@ class Round3(unittest.TestCase):
         rep = json.loads(out.read_text())
         self.assertLessEqual(rep["skipped"], rep["ran"], rep)
         self.assertEqual(rep["skipped"], 1)
+
+
+class Round4(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name).resolve()
+
+    def gate(self, record, pinned_head=None):
+        import integrate_local as il, suite_compare as sc
+        seen = {}
+        def fake(repo, expected, timeout, d, run_fn, log, pinned_sha=None):
+            seen["pinned"] = pinned_sha
+            return {"baseline_sha": expected}
+        args = SimpleNamespace(expected_head=SHA, baseline_compare=True, check_timeout=None, timeout=60, pinned_head=pinned_head)
+        with mock.patch.object(sc, "run_compare", side_effect=fake), mock.patch.object(il, "report") as rep:
+            code = il.baseline_compare_gate(args, Path("."), self.dir, [sc.WHOLE_SUITE_ARGV], mock.Mock(), record)
+        return code, seen, rep
+
+    def test_the_pin_comes_from_the_journal_and_cannot_be_chosen_by_the_caller(self):
+        self.assertEqual(self.gate({"base": OTHER})[:2], (0, {"pinned": OTHER}))
+        code, seen, rep = self.gate({"base": OTHER}, pinned_head=SHA)  # the weak pin: the very commit being waived
+        self.assertEqual((code, seen), (2, {}))
+        self.assertEqual(rep.call_args[0][0], "BLOCKED_POLICY")
+
+    def test_a_journal_without_a_base_needs_an_explicit_pin(self):
+        code, seen, _ = self.gate({})
+        self.assertEqual((code, seen), (2, {}))
+        self.assertEqual(self.gate({}, pinned_head=OTHER)[:2], (0, {"pinned": OTHER}))
+        self.assertEqual(self.gate(None)[0], 2)
+
+    def test_evidence_does_not_claim_a_pin_that_was_not_applied(self):
+        import suite_compare as sc
+        suite = {"failing_ids": ["t.a"], "ran": 10, "skipped": 0, "host": socket.gethostname().split(".")[0]}
+        with mock.patch.object(sc, "baseline_record_for", return_value="r"), mock.patch.object(ts, "baseline_suite_for", return_value=(suite, [])):
+            unbounded = sc.accept_recorded(".", SHA)
+            bounded = sc.accept_recorded(".", SHA, OTHER)
+        self.assertEqual((unbounded["pinned_sha"], unbounded["bounded_by_pinned"]), (None, False))
+        self.assertEqual((bounded["pinned_sha"], bounded["bounded_by_pinned"]), (OTHER, True))
+
+    def test_run_evidence_is_unbounded_when_no_pin_differs(self):
+        import suite_compare as sc
+        base = record(sha=SHA)
+        def run_fn(repo, argv, **kw):
+            fd = os.open(argv[argv.index("--out") + 1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                json.dump(report(head=SHA, nonce=argv[argv.index("--nonce") + 1]), handle)
+            return subprocess.CompletedProcess(argv, 0)
+        with mock.patch.object(sc, "baseline_record_for", return_value=base), mock.patch.object(sc, "head_of", return_value=SHA):
+            same = sc.run_compare(".", SHA, 60, self.dir, run_fn, mock.Mock(), pinned_sha=SHA)
+            none = sc.run_compare(".", SHA, 60, self.dir, run_fn, mock.Mock())
+        self.assertFalse(same["bounded_by_pinned"])
+        self.assertFalse(none["bounded_by_pinned"])
+        self.assertIsNone(none["pinned_sha"])
+
+    def test_a_baseline_from_another_host_is_refused(self):
+        import suite_compare as sc
+        suite = {"failing_ids": [], "ran": 10, "skipped": 0, "host": "some-other-machine"}
+        with mock.patch.object(sc, "baseline_record_for", return_value="r"), mock.patch.object(ts, "baseline_suite_for", return_value=(suite, [])):
+            for call in (lambda: sc.preflight(".", SHA), lambda: sc.accept_recorded(".", SHA),
+                         lambda: sc.run_compare(".", SHA, 60, self.dir, mock.Mock(), mock.Mock())):
+                with self.assertRaises(sc.CompareFailure) as ctx:
+                    call()
+                self.assertIn("recorded on host", str(ctx.exception))
+
+    def test_ignored_python_files_of_any_name_make_the_run_not_clean(self):
+        for name in ("testé.py", "pad/__init__.py", "helper.py"):
+            with self.subTest(name=name):
+                base = self.dir / name.replace("/", "_")
+                base.mkdir()
+                repo = make_repo(base, {"test_a.py": PASS})
+                (repo / ".git" / "info" / "exclude").write_text("*\n!*/\n!tests/test_a.py\n!.gitkeep\n")
+                target = repo / "tests" / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("x = 1\n")
+                out = base / "r.json"
+                self.assertEqual(run_runner(repo, out).returncode, 0)
+                self.assertFalse(json.loads(out.read_text())["clean"], name)

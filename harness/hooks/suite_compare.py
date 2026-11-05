@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import socket
 import stat
 import subprocess
 from pathlib import Path
@@ -67,6 +68,16 @@ def bound_by_pinned(repo, failing_ids, ran: int, active: int, pinned_sha: str) -
     return problems
 
 
+def host_problem(suite: dict):
+    """A baseline is a failure set of one machine; comparing another machine's run with it would accept or reject by host."""
+    here = socket.gethostname().split(".")[0]
+    recorded = suite.get("host")
+    if recorded != here:
+        return (f"the baseline was recorded on host {recorded!r} but this run is on {here!r}: finish on the host that "
+                "recorded it (the delivery clone), or record a baseline here")
+    return None
+
+
 def baseline_provenance(suite: dict) -> dict:
     """Why/how the baseline was recorded, so a waiver or replacement is visible in every receipt."""
     return {key: suite[key] for key in ("report_sha256", "note", "replaces", "host", "python") if key in suite}
@@ -96,6 +107,8 @@ def preflight(repo, sha: str) -> dict:
     suite, problems = test_scope.baseline_suite_for(baseline_record_for(repo, sha), sha)
     if suite is None:
         raise CompareFailure(problems)
+    if host_problem(suite):
+        raise CompareFailure([host_problem(suite)])
     return suite
 
 
@@ -110,6 +123,8 @@ def run_compare(repo, expected_sha: str, timeout, report_dir, run_fn, log, pinne
     base_suite, base_problems = test_scope.baseline_suite_for(base_record, expected_sha)
     if base_suite is None:
         raise CompareFailure(base_problems)
+    if host_problem(base_suite):
+        raise CompareFailure([host_problem(base_suite)])
     try:
         os.unlink(report_path)
     except FileNotFoundError:
@@ -149,7 +164,8 @@ def run_compare(repo, expected_sha: str, timeout, report_dir, run_fn, log, pinne
                                  baseline_ran=outcome["baseline_ran"], **log.facts())
     summary = {key: outcome[key] for key in ("baseline_sha", "baseline_ran", "checked_ran", "accepted_failing_ids")}
     summary.update(source="run", checked_head=head, baseline_active=outcome["baseline_active"],
-                   checked_active=outcome["checked_active"], pinned_sha=pinned_sha or expected_sha,
+                   checked_active=outcome["checked_active"], pinned_sha=pinned_sha,
+                   bounded_by_pinned=bool(pinned_sha and pinned_sha != expected_sha),
                    baseline_provenance=baseline_provenance(base_suite))
     return summary
 
@@ -162,6 +178,8 @@ def accept_recorded(repo, sha: str, pinned_sha: str | None = None) -> dict:
     suite, problems = test_scope.baseline_suite_for(baseline_record_for(repo, sha), sha)
     if suite is None:
         raise CompareFailure(problems)
+    if host_problem(suite):
+        raise CompareFailure([host_problem(suite)])
     if pinned_sha and pinned_sha != sha:
         problems = bound_by_pinned(repo, suite["failing_ids"], suite["ran"], suite["ran"] - suite.get("skipped", 0), pinned_sha)
         if problems:
@@ -169,4 +187,4 @@ def accept_recorded(repo, sha: str, pinned_sha: str | None = None) -> dict:
     return {"baseline_sha": sha, "baseline_ran": suite["ran"], "checked_ran": suite["ran"],
             "accepted_failing_ids": sorted(suite["failing_ids"]), "source": "recorded", "checked_head": sha,
             "baseline_active": suite["ran"] - suite.get("skipped", 0), "checked_active": suite["ran"] - suite.get("skipped", 0),
-            "pinned_sha": pinned_sha or sha, "baseline_provenance": baseline_provenance(suite)}
+            "pinned_sha": pinned_sha, "bounded_by_pinned": bool(pinned_sha and pinned_sha != sha), "baseline_provenance": baseline_provenance(suite)}

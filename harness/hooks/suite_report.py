@@ -95,13 +95,13 @@ def write_report(path: Path, report: dict) -> None:
 
 def _tree_state(repo: str, start: str = "tests") -> tuple:
     """(HEAD, clean). Clean means no tracked change, no untracked file, no assume-unchanged or skip-worktree entry hiding a
-    change, and no git-ignored test*.py file under the start directory (an ignored file would add tests that are not in the
+    change, and no git-ignored .py file under the start directory (an ignored file would add tests that are not in the
     commit). Other ignored files are excepted."""
     head = _git(repo, "rev-parse", "HEAD").strip()
     dirty = _git(repo, "status", "--porcelain", "--untracked-files=all").strip()
     hidden = [line for line in _git(repo, "ls-files", "-v").splitlines() if line[:1].islower() or line[:1] == "S"]
-    ignored = [line for line in _git(repo, "ls-files", "--others", "--ignored", "--exclude-standard", "--", start).splitlines()
-               if Path(line).name.startswith("test") and line.endswith(".py")]
+    ignored = [name for name in _git(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", start).split("\0")
+               if name.endswith(".py")]
     return head, not dirty and not hidden and not ignored
 
 

@@ -1079,7 +1079,7 @@ def resolve_journal(args, repo, identity, root, common, common_info, root_info, 
     log = CheckLog(directory / 'checks')
     try:
         if getattr(args, 'baseline_compare', False):
-            code = baseline_compare_gate(args, repo, directory, checks, log)
+            code = baseline_compare_gate(args, repo, directory, checks, log, record)
             if code:
                 return code
             checks = []
@@ -1123,6 +1123,7 @@ def resolve_journal(args, repo, identity, root, common, common_info, root_info, 
         pin_details = {'pin_state': pin_state, 'target_pin_verified': verified}
     write_journal(directory, record, first=missing_record)
     directory = archive_journal(directory)
+    finish_compare_evidence(args, directory)
     report('RESOLVED', 'Tested current checkout accepted as recovery baseline; artifacts retained',
            head=args.expected_head, journal=str(directory / 'journal.json'),
            scratch=record.get('scratch'), recovery_ref=record.get('ref'),
@@ -1150,7 +1151,28 @@ def write_compare_result(directory, result):
     os.replace(tmp, path)
 
 
-def baseline_compare_gate(args, repo, directory, checks, log):
+def resolve_pin(args, record):
+    """(pinned HEAD, problem): the journal's own base is the generation's original HEAD, so the caller cannot choose a weaker
+    pin. Only a reservation-only journal (no base) needs --pinned-head."""
+    base = (record or {}).get('base')
+    explicit = getattr(args, 'pinned_head', None)
+    if base:
+        if explicit and explicit != base:
+            return None, '--pinned-head does not match the journal base ' + base
+        return base, None
+    if explicit:
+        return explicit, None
+    return None, 'the journal records no base commit; pass --pinned-head with the generation\'s pinned original HEAD'
+
+
+def finish_compare_evidence(args, directory):
+    """Persist the compare result only once the journal is resolved and archived, never earlier."""
+    result = getattr(args, 'compare_result', None)
+    if result:
+        write_compare_result(directory, result)
+
+
+def baseline_compare_gate(args, repo, directory, checks, log, record=None):
     """--resolve-journal --baseline-compare (GoodQA #14582): the whole suite passes when its failing ids are an exact subset
     of the complete suite baseline recorded for exactly the confirmed HEAD (args.expected_head); the rule deliver.py
     --baseline-compare applies. Returns 0 when it passed, otherwise the exit code after reporting."""
@@ -1161,11 +1183,15 @@ def baseline_compare_gate(args, repo, directory, checks, log):
                "'python3 -m unittest discover -s tests'")
         return 2
     suite_compare.scrub_store_env()  # the store comes from the policy, never from the caller's environment
+    pinned, problem = resolve_pin(args, record)
+    if problem:
+        log.close()
+        report('BLOCKED_POLICY', 'Baseline comparison cannot start: ' + problem, journal=str(directory / 'journal.json'))
+        return 2
     try:
         result = suite_compare.run_compare(repo, args.expected_head, check_timeout(args), directory / 'checks', run, log,
-                                           pinned_sha=getattr(args, 'pinned_head', None))
+                                           pinned_sha=pinned)
         result['helper'] = helper_identity()
-        write_compare_result(directory, result)
         args.compare_result = result
     except suite_compare.CompareFailure as failure:
         log.close()
