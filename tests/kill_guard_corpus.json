@@ -8032,6 +8032,209 @@
    ]
   },
   {
+   "cmd": "kill -0 ${=x}",
+   "expect": "block",
+   "id": "P-rt9-zsh-force-split",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -0 $=x",
+   "expect": "block",
+   "id": "P-rt9-zsh-force-split-short",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -0 \"${=x}\"",
+   "expect": "block",
+   "id": "P-rt9-zsh-quoted-force-split",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -0 ${(z)x}",
+   "expect": "block",
+   "id": "P-rt9-zsh-z-flag",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -0 ${(s: :)x}",
+   "expect": "block",
+   "id": "P-rt9-zsh-s-flag",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -0 ${~x}",
+   "expect": "block",
+   "id": "P-rt9-zsh-glob-subst",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -0 ${~x}${y}",
+   "expect": "block",
+   "id": "P-rt9-zsh-glob-subst-concat",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -0 =(echo 1)",
+   "expect": "block",
+   "id": "P-rt9-zsh-proc-subst-file",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -0 ^x",
+   "expect": "block",
+   "id": "P-rt9-zsh-extended-glob",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -0 4001 $=x",
+   "expect": "block",
+   "id": "P-rt9-zsh-pid-then-split",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -0 *(.)",
+   "expect": "block",
+   "id": "P-rt9-zsh-glob-qualifier",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "zsh -c \"kill -0 \\${=x}\"",
+   "expect": "block",
+   "id": "P-rt9-zsh-sh-c-split",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "kill -9 ${=x}",
+   "expect": "block",
+   "id": "P-rt9-zsh-real-split",
+   "tags": [
+    "ownership",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -9 $=x 4001",
+   "expect": "block",
+   "id": "P-rt9-zsh-real-split-pid",
+   "tags": [
+    "ownership",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -s KILL ${=x}",
+   "expect": "block",
+   "id": "P-rt9-zsh-s-split",
+   "tags": [
+    "ownership",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill ${(z)x}",
+   "expect": "block",
+   "id": "P-rt9-zsh-z-target",
+   "tags": [
+    "ownership",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -9 4001 -s KILL",
+   "expect": "block",
+   "id": "P-rt9-zsh-s-after-targets",
+   "tags": [
+    "ownership",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -9 4001 -n 9",
+   "expect": "block",
+   "id": "P-rt9-zsh-n-after-targets",
+   "tags": [
+    "ownership",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -s 9 4001 -s KILL",
+   "expect": "block",
+   "id": "P-rt9-zsh-s0-then-s",
+   "tags": [
+    "ownership",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill 4001 -s KILL",
+   "expect": "block",
+   "id": "P-rt9-zsh-bare-after-target",
+   "tags": [
+    "ownership",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -0 4001 -n 9",
+   "expect": "block",
+   "id": "P-rt9-zsh-sig0-n-after",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
    "cmd": "grep -n \"pkill -f pytest\" notes.md",
    "expect": "allow",
    "id": "N-text00-grep",

@@ -982,16 +982,19 @@ LONE_VAR = re.compile(r'\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})'
 
 def liveness_only(targets):
     """True when `kill -0 ...` can only probe. Options can sit anywhere: the bash builtin stops at the first PID but
-    procps /usr/bin/kill reorders, and an unquoted or operator variable can split into `-s KILL PID`. So any dash
-    word, expansion, glob or multi-word value among the targets ends the probe; the one exception is a lone quoted
-    simple variable (`"$PID"`), which stays one word."""
+    procps /usr/bin/kill reorders, and an unquoted or operator variable can split into `-s KILL PID`. So every target
+    must be a literal PID or job spec; the one exception is a lone quoted simple variable (`"$PID"`), which stays
+    one word."""
     if len(targets) == 1:
         w = targets[0]
         if w.dynamic and w.quoted and not w.subs and not w.glob and w.alts == [w.text] and LONE_VAR.fullmatch(w.text):
             return True
     for w in targets:
-        if (w.dynamic or w.subs or w.glob or len(w.alts) > 1 or w.text.startswith('-')
-                or any(a.startswith('-') for a in w.alts) or re.search(r'\s', w.text)):
+        # Whitelist, not blacklist: zsh-only forms (${=x}, $=x, ${(z)x}, ${~x}, =(cmd), glob qualifiers) are not parsed
+        # as expansions here, so a plain-looking word must be digits or a job spec to count as a probe target.
+        if w.dynamic or w.subs or w.glob or len(w.alts) > 1:
+            return False
+        if not (re.fullmatch(r'[0-9]{1,10}', w.text, re.ASCII) or JOB_SPEC.fullmatch(w.text)):
             return False
     return True
 
