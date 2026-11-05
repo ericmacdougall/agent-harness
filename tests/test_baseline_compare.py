@@ -529,3 +529,55 @@ class Round2(unittest.TestCase):
             with self.assertRaises(sc.CompareFailure):
                 sc.accept_recorded(".", "B", "A")
             self.assertEqual(sc.accept_recorded(".", "A", "B")["accepted_failing_ids"], ["t.a"])
+
+
+class Round2b(unittest.TestCase):
+    def test_count_floor_applies_even_when_fewer_tests_are_skipped(self):
+        # baseline ran 10 (5 skipped); the checked run ran only 8 but skipped none: active count is higher, total is lower.
+        out = compare(rep=report(ran=8, skipped=0), rec=record(ran=10, skipped=5))
+        self.assertFalse(out["ok"])
+        self.assertTrue(any("fewer than the baseline's 10" in p for p in out["problems"]), out["problems"])
+
+    def test_finish_blocks_on_a_missing_baseline_before_any_effect(self):
+        import suite_compare as sc
+
+        class Flow:
+            original = "/nonexistent"
+            effects = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def load(self):
+                return {"baseline": SHA, "kit_digest": "x"}
+
+            def __getattr__(self, name):
+                Flow.effects.append(name)
+                raise AssertionError(f"effect before preflight: {name}")
+
+        args = SimpleNamespace(baseline_compare=True, use_recorded_baseline=False, resolve_baseline=None, mode="remote",
+                               resume=False, kit_file=None)
+        with mock.patch.object(deliver, "Workflow", lambda a: Flow()), mock.patch.object(deliver, "require_check_interpreters"), \
+                mock.patch.object(sc, "preflight", side_effect=sc.CompareFailure(["no baseline recorded"])):
+            with self.assertRaises(deliver.DeliveryError) as ctx:
+                deliver._finish(args, [], [deliver.WHOLE_SUITE_ARGV], [])
+        self.assertEqual(ctx.exception.status, "BLOCKED_POLICY")
+        self.assertIn("cannot start", ctx.exception.message)
+        self.assertEqual(Flow.effects, [])
+
+    def test_recorded_run_needs_a_baseline_for_the_pinned_head(self):
+        import suite_compare as sc
+        good = {"failing_ids": ["t.a"], "ran": 10, "skipped": 0}
+        def bs(rec, sha):
+            return (good, []) if sha == "B" else (None, ["no baseline for pinned"])
+        with mock.patch.object(sc, "baseline_record_for", return_value="r"), mock.patch.object(ts, "baseline_suite_for", side_effect=bs):
+            with self.assertRaises(sc.CompareFailure):
+                sc.accept_recorded(".", "B", "A")
+
+    def test_skipping_tests_does_not_keep_the_total_up(self):
+        out = compare(rep=report(ran=10, skipped=5), rec=record(ran=10, skipped=0))
+        self.assertFalse(out["ok"])
+        self.assertTrue(any("non-skipped" in p for p in out["problems"]), out["problems"])
