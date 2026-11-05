@@ -1,10 +1,50 @@
 {
  "schema": 1,
  "holds": [
-  {"id": "yates", "patterns": ["yates", "apex_app_pos"], "projects": [], "note": "user hold 2026-11-05: do not touch yates-cloud POS or apex_app_pos"},
-  {"id": "petfiliate", "patterns": ["petfiliate"], "projects": [], "note": "user hold 2026-11-05 until the user lifts it"},
-  {"id": "optinrouter", "patterns": ["optinrouter", "optin-router"], "projects": [], "note": "user hold 2026-11-05 until the user lifts it"}
+  {
+   "id": "yates",
+   "patterns": [
+    "yates",
+    "apex_app_pos"
+   ],
+   "projects": [],
+   "note": "user hold 2026-11-05: do not touch yates-cloud POS or apex_app_pos"
+  },
+  {
+   "id": "petfiliate",
+   "patterns": [
+    "petfiliate"
+   ],
+   "projects": [],
+   "note": "user hold 2026-11-05 until the user lifts it"
+  },
+  {
+   "id": "optinrouter",
+   "patterns": [
+    "optinrouter",
+    "optin-router"
+   ],
+   "projects": [],
+   "note": "user hold 2026-11-05 until the user lifts it"
+  }
  ],
- "protected_paths": ["*/member.key", "member.key", "*.secret", "*/Library/Keychains/*", "*/.ssh/id_*", "*/.aws/credentials", "*/.config/rclone/rclone.conf", "*native-api-key*", "*solve*owner*phrase*", "*/goodqa-hive*/*key*"],
- "policy_files": ["holds.json", "holds.state.json"]
+ "protected_paths": [
+  "*/member.key",
+  "member.key",
+  "*.secret",
+  "*/Library/Keychains/*",
+  "*/.ssh/id_*",
+  "*/.ssh",
+  "*/.aws/credentials",
+  "*/.config/rclone/rclone.conf",
+  "*native-api-key*",
+  "*solve*owner*phrase*",
+  "*/goodqa-hive*/*key*"
+ ],
+ "policy_files": [
+  "holds.json",
+  "holds.state.json",
+  "holds_guard.py",
+  "holds.py"
+ ]
 }

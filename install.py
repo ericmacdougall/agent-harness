@@ -44,7 +44,7 @@ def managed_scripts(claude: Path) -> set[str]:
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "holds_guard.py")}
 
 
-HOLDS_TOOLS = "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Grep|Glob|LS"
+HOLDS_TOOLS = "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Grep|Glob|LS|mcp__.*[Gg][Oo][Oo][Dd][Qq][Aa].*"
 SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
 GOODQA_STATUS_TOOLS = (r"^mcp__.*[Gg][Oo][Oo][Dd][Qq][Aa].*__(close_issue_done|close_issue_wont_fix|update_issue|"
                        r"bulk_update_issues|archive_issue|reassign_issue|call_api)$")
