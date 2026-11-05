@@ -38,7 +38,7 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)
-        p = mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home)})
+        p = mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home), "AH_NOW": str(NOW)})  # server-side stamps on the fixture clock
         p.start()
         self.addCleanup(p.stop)
         self.w = self.home / ".claude" / "wals" / SESSION
@@ -124,6 +124,105 @@ class PruneGuard(unittest.TestCase):
                 self.assertFalse(any("old-task" in str(n) for n in names), names)
                 git("push", "-q", "origin", "HEAD:refs/heads/main")
                 self.assertEqual(workdir._unpushed_repos(task), [])
+
+
+class ReviewRound1(Base):
+    """S3b blind review findings B1, M2 (part), M3, M4 and the deadline.done minor; each fails on 0fd3857."""
+
+    def test_codex_only_session_is_visible_gated_and_writable(self):
+        """B1: a session whose WALs live only under ~/.agent-harness/codex-wals."""
+        real = time.time()
+        cw = self.home / ".agent-harness" / "codex-wals" / "sess-codex-only1"
+        jl(cw / "main.jsonl", [{"at": iso(real - 9000), "event": "subagent", "agent_id": "cxonly000001", "agent_type": "task-owner"},
+                               {"at": iso(real - 100), "event": "subagent_stop", "agent_id": "cxonly000001", "agent_type": "task-owner"}])
+        jl(cw / "agent-cxonly000001.jsonl", [{"at": iso(real - 4000), "event": "intent", "note": "codex work"}])
+        self.assertFalse((self.home / ".claude" / "wals" / "sess-codex-only1").exists())
+        with mock.patch.dict(os.environ, {"AH_NOW": str(real)}):
+            doc = ah.owners(self.home, "sess-codex-only1", now=real)
+            self.assertEqual(doc["undisposed"], ["cxonly000001"])
+            import dropped_gate
+            out = dropped_gate.cmd_stop({"session_id": "sess-codex-only1", "stop_hook_active": False}, now=real)
+            self.assertEqual(out.get("decision"), "block")
+            r = ah.write(self.home, "task.dispose", {"agent": "cxonly000001", "session": "sess-codex-only1", "kind": "closed",
+                                                     "at": iso(real), "reason": "superseded in test", "evidence": "GoodQA goodqa#14791"},
+                         "sess-codex-only1", "disp-codex-0001")
+            self.assertEqual(r["result"], "applied")
+            rows = [json.loads(l) for l in (cw / "main.jsonl").read_text().splitlines()]
+            self.assertEqual(rows[-1]["event"], "disposition")  # written into the Codex root, not ~/.claude/wals
+            self.assertEqual(ah.owners(self.home, "sess-codex-only1", now=real)["undisposed"], [])
+
+    def test_owner_cannot_dispose_itself_and_stamps_are_server_side(self):
+        """M4: the I9 ack is not forgeable by the owner; `at` is the writer's clock, never the caller's."""
+        with mock.patch.dict(os.environ, {"AH_AGENT_ID": "handoffowner"}):
+            with self.assertRaises(ah.AhError) as cm:
+                ah.write(self.home, "task.dispose", {"agent": "handoffowner", "session": SESSION, "kind": "closed", "at": iso(NOW),
+                                                     "reason": "I say I am done", "evidence": "GoodQA goodqa#14791"}, SESSION, "self-ack-01")
+            self.assertEqual(cm.exception.code, "forbidden")
+            ok = ah.write(self.home, "task.dispose", {"agent": "handoffowner", "session": SESSION, "kind": "waiting", "at": iso(NOW - 99999),
+                                                      "ref": "GoodQA goodqa#14791", "until": iso(NOW + 600)}, SESSION, "self-wait-01")
+            self.assertEqual(ok["result"], "applied")  # an owner may name what it waits on
+        rows = [json.loads(l) for l in (self.w / "main.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[-1]["event"], "disposition")
+        disp = ah.dispositions(self.home, SESSION)["handoffowner"]
+        self.assertEqual(int(disp["at"]), int(NOW))  # the caller's backdated `at` was ignored
+
+    def test_unknown_deadline_id_is_refused(self):
+        with self.assertRaises(ah.AhError) as cm:
+            ah.write(self.home, "deadline.done", {"session": SESSION, "id": "dl0123456789", "note": "x"}, SESSION, "dl-done-bad")
+        self.assertEqual(cm.exception.code, "unknown_deadline")
+
+    def test_gate_advice_fits_the_subject(self):
+        """M3: a missed deadline names `ah deadline done`; an unacked handoff names the acknowledging kinds, not waiting."""
+        import dropped_gate
+        text = dropped_gate.message(["dl0123456789", "handoffowner"], {"handoffowner": {"idle_s": 4000, "flags": ["handoff-unacked"]}})
+        self.assertIn("ah deadline done --id dl0123456789", text)
+        ho = text.split("handoffowner", 1)[1]
+        self.assertIn("--kind resumed", ho)
+        self.assertNotIn("--kind waiting", ho.split("\n  - ")[0])
+
+
+class PruneGuardDepth(unittest.TestCase):
+    """M2: the guard examines `.git` before truncating, counts a depth overrun as unpushed, and sees detached and worktree commits."""
+
+    def git(self, *a, cwd, env):
+        return subprocess.run(["git", *a], cwd=cwd, env=env, check=True, capture_output=True, text=True)
+
+    def test_depth_three_clone_detached_head_and_worktree_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x", "HOME": tmp}
+            bare = home / "origin.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(bare)], env=env, check=True)
+            task = home / "task"
+            deep = task / "a" / "b" / "repo"  # exactly three levels under the task dir
+            deep.mkdir(parents=True)
+            self.git("init", "-q", cwd=deep, env=env)
+            self.git("remote", "add", "origin", str(bare), cwd=deep, env=env)
+            (deep / "f").write_text("1")
+            self.git("add", "f", cwd=deep, env=env)
+            self.git("commit", "-q", "-m", "one", cwd=deep, env=env)
+            self.git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=deep, env=env)
+            self.assertEqual(workdir._unpushed_repos(task), [])
+            (deep / "f").write_text("2")
+            self.git("commit", "-q", "-am", "two", cwd=deep, env=env)
+            self.assertEqual([f["reason"] for f in workdir._unpushed_repos(task)], ["unpushed commits"])  # depth 3 is examined
+            self.git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=deep, env=env)
+            self.git("checkout", "-q", "--detach", cwd=deep, env=env)
+            (deep / "f").write_text("3")
+            self.git("commit", "-q", "-am", "detached", cwd=deep, env=env)
+            self.assertEqual([f["reason"] for f in workdir._unpushed_repos(task)], ["unpushed commits"])  # detached HEAD counts
+            self.git("push", "-q", "origin", "HEAD:refs/heads/detached-saved", cwd=deep, env=env)
+            self.assertEqual(workdir._unpushed_repos(task), [])
+            wt = task / "wt"
+            self.git("worktree", "add", "-q", str(wt), "-b", "wtbranch", cwd=deep, env=env)
+            (wt / "g").write_text("w")
+            self.git("add", "g", cwd=wt, env=env)
+            self.git("commit", "-q", "-m", "wt", cwd=wt, env=env)
+            self.assertTrue(any(f["repo"] == str(wt) for f in workdir._unpushed_repos(task)))  # a .git file is a repo too
+            deeper = task / "x" / "y" / "z" / "w"
+            deeper.mkdir(parents=True)
+            found = workdir._unpushed_repos(task / "x", max_depth=2)
+            self.assertTrue(any("depth overrun" in f["reason"] for f in found))  # unexamined subtree is never pruned
 
 
 class CodexStopGate(Base):

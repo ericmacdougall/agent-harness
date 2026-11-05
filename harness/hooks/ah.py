@@ -158,18 +158,33 @@ def read_new_lines(path: Path, meta: dict):
 TICKET_IN_NOTE = re.compile(r"GoodQA\s+(?:[a-z0-9-]+\s*)?#\d{1,10}|\bgoodqa#\d{1,10}", re.I)
 
 
+def wal_roots(home: Path) -> list:
+    """Both WAL roots: Claude Code sessions and Codex sessions (B1, goodqa#14791)."""
+    return [home / ".claude" / "wals", home / ".agent-harness" / "codex-wals"]
+
+
+def session_dir(home: Path, session: str) -> Path:
+    """The directory holding a session's WALs, whichever runtime wrote them; the Claude root when neither has it."""
+    for root in wal_roots(home):
+        if (root / session / "main.jsonl").is_file():
+            return root / session
+    return wal_roots(home)[0] / session
+
+
 def wal_dirs(home: Path):
     return home / ".claude" / "wals"
 
 
 def newest_session(home: Path):
-    root = wal_dirs(home)
     best, stamp = None, -1.0
     try:
-        for entry in os.scandir(root):
-            main = Path(entry.path) / "main.jsonl"
-            if main.is_file() and main.stat().st_mtime > stamp:
-                best, stamp = entry.name, main.stat().st_mtime
+        for root in wal_roots(home):  # Claude and Codex sessions alike (goodqa#14791 B1)
+            if not root.is_dir():
+                continue
+            for entry in os.scandir(root):
+                main = Path(entry.path) / "main.jsonl"
+                if main.is_file() and main.stat().st_mtime > stamp:
+                    best, stamp = entry.name, main.stat().st_mtime
     except OSError:
         pass
     return best
@@ -272,7 +287,7 @@ def discover_agents(home: Path, session: str, wal: Path) -> dict:
 
 def owners(home: Path, session: str, now: float | None = None, comments=None) -> dict:
     now = time.time() if now is None else now
-    wal = wal_dirs(home) / session
+    wal = session_dir(home, session)
     main = wal / "main.jsonl"
     if not main.is_file():
         raise AhError("session_unknown", f"no main WAL for session {session!r}")
@@ -298,8 +313,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         info = spawned.setdefault(agent, {"type": None, "at": 0.0})
         info["type"] = info["type"] or meta.get("type")
         info.update({k: meta[k] for k in ("description", "parent", "finished") if k in meta})
-    registered = {r["args"].get("owner_agent") for r in _ledger(home) if r.get("op") == "task.register"}
-    pending = pending_stops(home, session)
+    led = _ledger(home)  # one read per call
+    registered = {r["args"].get("owner_agent") for r in led if r.get("op") == "task.register"}
+    pending = pending_stops(home, session, led)
     named_text = "\n".join(named)
     rows = []
     for agent, info in spawned.items():
@@ -351,7 +367,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                      "state": verdict["state"], "severity": verdict["severity"],
                      "last_activity": iso(summary["last_at"]), "idle_s": None if idle == float("inf") else int(idle),
                      "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None})
-    disp = dispositions(home, session)
+    disp = dispositions(home, session, led)
     by_id = {r["agent_id"]: r for r in rows}
 
     def covered(agent_id, seen=()):
@@ -407,7 +423,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     counts = {}
     for r in rows:
         counts[r["state"]] = counts.get(r["state"], 0) + 1
-    dls = deadlines(home, session, now)
+    dls = deadlines(home, session, now, led)
     missed = [d for d in dls if d["state"] == "missed" and not liveness.disposition_live(disp.get(d["id"]), now)]
     return {"session": session, "generated": iso(now), "counts": counts, "owners": rows, "source": "direct",
             "deadlines": dls,
@@ -1035,11 +1051,10 @@ def spool_drain(home: Path, only_opid: str | None = None, limit: int | None = No
 
 
 def _wal_path(home: Path, session: str, agent: str) -> Path:
-    return home / ".claude" / "wals" / session / ("main.jsonl" if agent == "main" else f"agent-{agent}.jsonl")
+    return session_dir(home, session) / ("main.jsonl" if agent == "main" else f"agent-{agent}.jsonl")
 
 
 def _wal_append(home: Path, path: Path, record: dict) -> None:
-    import wal
     try:  # a retry after a crash between this append and the ledger row must not duplicate the entry
         with open(path, "rb") as handle:
             handle.seek(0, 2)
@@ -1048,13 +1063,21 @@ def _wal_append(home: Path, path: Path, record: dict) -> None:
                 return
     except OSError:
         pass
-    old = os.environ.get("HOME")
+    # ah is the writer: its own bounded append, valid under either WAL root, independent of which wal.py is installed
+    import fcntl  # noqa: PLC0415
+    real_parent = path.parent.resolve()
+    if path.suffix != ".jsonl" or not any(real_parent.parent == r.resolve() for r in wal_roots(home) if r.exists()) \
+            or not SESSION_RE.match(path.parent.name):
+        raise AhError("bad_request", "WAL path must be a session JSONL under ~/.claude/wals or ~/.agent-harness/codex-wals", 3)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
-        os.environ["HOME"] = str(home)  # wal.append pins ~/.claude/wals under HOME
-        wal.append(path, record)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.write(fd, payload)
+        os.fsync(fd)
     finally:
-        if old is not None:
-            os.environ["HOME"] = old
+        os.close(fd)
 
 
 def _task(ledger: list, name: str):
@@ -1065,7 +1088,8 @@ def _task(ledger: list, name: str):
 def _evidence_ok(home: Path, ev: list, allowed: set, reg: dict) -> None:
     reg_ts = parse_ts(reg.get("received_at"))
     reg_args = reg["args"]
-    root = (home / ".claude" / "wals").resolve()
+    roots = [r.resolve() for r in wal_roots(home) if r.exists()]
+    root = roots[0] if roots else (home / ".claude" / "wals").resolve()
     for e in ev:
         if "really_tested" in e:
             wid = e["really_tested"].strip()
@@ -1160,6 +1184,10 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
                                          "ref": args["ref"], "owner": args["owner"], "note": args["note"][:300]})
             out["deadline"] = did
         else:
+            known = {"dl" + hashlib.sha256(r["key"].encode()).hexdigest()[:10] for r in ledger
+                     if r.get("op") == "deadline.add" and (r.get("args") or {}).get("session") == args["session"]}
+            if args["id"] not in known:
+                raise AhError("unknown_deadline", f"deadline.done: {args['id']} is not a deadline of this session", 3)
             _wal_append(home, main_wal, {"at": now, "event": "deadline_done", "id": wid, "by": actor_id(), "ref": args["id"],
                                          "note": (args.get("note") or "")[:300]})
     elif op == "task.pending":
@@ -1180,6 +1208,8 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             "severity": args.get("severity") or "info", "key": args["alert_key"], "check": args["source"],
             "message": args.get("message") or "cleared", "detail": args.get("detail") or {}}, home=home)
     elif op == "task.dispose":
+        if args["kind"] in ("resumed", "reassigned", "closed") and actor_id() == args["agent"]:
+            raise AhError("forbidden", f"task.dispose {args['kind']}: an owner cannot dispose itself; main or another agent records it", 3)
         main_wal = _wal_path(home, args["session"], "main")
         if not main_wal.is_file():
             raise AhError("session_unknown", f"no main WAL for session {args['session']!r}", 3)
@@ -1221,10 +1251,10 @@ def _wal_has(path: Path, event: str, ident, agent=None) -> bool:
     return False
 
 
-def deadlines(home: Path, session: str, now: float) -> list:
+def deadlines(home: Path, session: str, now: float, ledger=None) -> list:
     """Deadlines of a session from the ah ledger (G3): [{id, due, ref, owner, note, state: open|due|missed|done}]."""
     rows, done = {}, set()
-    for r in _ledger(home):
+    for r in (ledger if ledger is not None else _ledger(home)):
         a = r.get("args") or {}
         if a.get("session") != session:
             continue
@@ -1252,20 +1282,20 @@ def deadlines(home: Path, session: str, now: float) -> list:
 HANDOFF_ACK_S = 3600  # a handoff nobody acknowledged within this window is a drop in disguise (I9)
 
 
-def pending_stops(home: Path, session: str) -> dict:
+def pending_stops(home: Path, session: str, ledger=None) -> dict:
     """agent id -> epoch of the latest task.pending row (a stop with pending work, I7)."""
     out = {}
-    for r in _ledger(home):
+    for r in (ledger if ledger is not None else _ledger(home)):
         a = r.get("args") or {}
         if r.get("op") == "task.pending" and a.get("session") == session:
             out[a["agent"]] = max(out.get(a["agent"], 0.0), parse_ts(a.get("at")) or 0.0)
     return out
 
 
-def dispositions(home: Path, session: str) -> dict:
+def dispositions(home: Path, session: str, ledger=None) -> dict:
     """agent id -> latest applied disposition row for that session (from the ah ledger, the only writer)."""
     out = {}
-    for r in _ledger(home):
+    for r in (ledger if ledger is not None else _ledger(home)):
         a = r.get("args") or {}
         if r.get("op") == "task.dispose" and a.get("session") == session:
             d = {"kind": a.get("kind"), "at": parse_ts(a.get("at")) or 0.0, "ref": a.get("ref"),
@@ -1307,7 +1337,18 @@ def task_list(home: Path, open_only: bool = False) -> dict:
     return {"tasks": rows, "source": "direct"}
 
 
+def server_now() -> str:
+    """The writer's clock for stamped ops; AH_NOW (epoch) pins it for tests."""
+    env = os.environ.get("AH_NOW")
+    return iso(float(env)) if env else iso(time.time())
+
+
 def write(home: Path, op: str, args: dict, session: str, key: str | None = None) -> dict:
+    if op in ("task.dispose", "task.pending", "deadline.add"):
+        stamped = dict(args)
+        if op != "deadline.add":
+            stamped["at"] = server_now()  # never the caller's clock (M4): a backdated disposition cannot be forged
+        args = stamped
     precheck(op, args)
     import redact
     if isinstance(args.get("source"), str):

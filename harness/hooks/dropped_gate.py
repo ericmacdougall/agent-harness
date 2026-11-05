@@ -54,6 +54,16 @@ def message(undisposed: list, rows: dict) -> str:
         r = rows.get(agent) or {}
         idle = r.get("idle_s")
         age = f"{int(idle // 3600)}h{int(idle % 3600 // 60):02d}m" if isinstance(idle, (int, float)) else "?"
+        if agent.startswith("dl") and not r:  # a missed deadline (goodqa#14791 G3)
+            lines.append(f"  - deadline {agent} missed: run `ah deadline done --id {agent} --note <what happened>` when it is met, or\n"
+                         f"      ah task dispose --agent {agent} --kind waiting --ref <ask id or GoodQA ticket> --until <ISO>  (it slipped for a named reason)")
+            continue
+        if "handoff-unacked" in (r.get("flags") or []):  # I9: a handoff nobody took
+            lines.append(f"  - {agent} handed off {age} ago and nobody acknowledged it: main (not the owner) records\n"
+                         f"      ah task dispose --agent {agent} --kind resumed      (someone picked it up)\n"
+                         f"      ah task dispose --agent {agent} --kind reassigned --ref <new agent id>\n"
+                         f"      ah task dispose --agent {agent} --kind closed --reason <why> --evidence <ticket|WAL id|sha>")
+            continue
         lines.append(f"  - {agent} DROPPED {age} ticket {r.get('ticket') or 'none'}: run one of\n"
                      f"      ah task dispose --agent {agent} --kind resumed   (after you resume or re-spawn it)\n"
                      f"      ah task dispose --agent {agent} --kind reassigned --ref <new agent id>\n"

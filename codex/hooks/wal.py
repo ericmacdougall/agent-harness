@@ -332,8 +332,11 @@ def lifecycle_hook(data: dict, session: str) -> None:
         except Exception:  # noqa: BLE001 - never block a Codex turn on a gate error
             gate = {}
         if gate:
-            if result.get("systemMessage") and gate.get("systemMessage"):
-                gate["systemMessage"] = result["systemMessage"] + " " + gate["systemMessage"]
+            if result.get("systemMessage"):
+                if gate.get("decision") == "block":
+                    gate["reason"] = result["systemMessage"] + " " + gate.get("reason", "")
+                elif gate.get("systemMessage"):
+                    gate["systemMessage"] = result["systemMessage"] + " " + gate["systemMessage"]
             result = gate
     print(json.dumps(result))
 
