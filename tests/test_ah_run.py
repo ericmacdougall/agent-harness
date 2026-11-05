@@ -634,22 +634,60 @@ class JobTable(Fixture):
             result, _ = self.run_in(shell, 'jobs')
             self.assertEqual((result.returncode, result.stdout), (0, ''), shell)
 
-    def test_row_names_the_watchdog_pid_and_it_is_gone_after_the_run(self):
+    def test_row_records_the_in_group_watchdog(self):
         self.run_in('/bin/bash', 'true')
-        pid = self.rows()[0]['watchdog']
-        self.assertIsInstance(pid, int); self.assertTrue(self.wait_gone(pid))
+        self.assertEqual(self.rows()[0]['watchdog'], 'in-group')
 
-    def test_watchdog_joins_the_child_group_or_is_recorded_null(self):
-        with mock.patch.object(ah_run.os, 'setpgid', side_effect=OSError('denied')):
-            self.assertIsNone(ah_run.start_watchdog(os.getpgid(0)))
-        child = subprocess.Popen(['sleep', '30'], preexec_fn=os.setpgrp)
-        self.addCleanup(child.wait); self.addCleanup(child.kill)
-        watchdog = ah_run.start_watchdog(child.pid)
-        self.addCleanup(watchdog.wait); self.addCleanup(watchdog.kill)
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and os.getpgid(watchdog.pid) != child.pid:
-            time.sleep(0.05)
-        self.assertEqual(os.getpgid(watchdog.pid), child.pid)
+    def test_normal_end_leaves_no_watchdog_behind(self):
+        marker = Path(self.temp.name) / 'pgid.txt'
+        self.run_in('/bin/bash', 'ps -o pgid= -p $$ > %s' % marker)
+        pgid = marker.read_text().strip()
+        time.sleep(0.5)
+        left = subprocess.run(['ps', '-axo', 'pgid='], capture_output=True, text=True).stdout.split()
+        self.assertNotIn(pgid, left)
+
+    def test_no_job_control_stop_with_a_controlling_terminal(self):
+        """S8: under a pty, stdin reads work and a /dev/tty read ends at once (no SIGTTIN stop)."""
+        import pty, select
+        def run_on_pty(command, typed):
+            pid, master = pty.fork()
+            if pid == 0:
+                os.execve(sys.executable, [sys.executable, AH, 'run', '--task', 't1', '--no-unit', '--', command],
+                          {**self.env, 'CLAUDE_CODE_SHELL': '/bin/bash'})
+            out, deadline, sent = b'', time.monotonic() + 6, False
+            try:
+                while time.monotonic() < deadline:
+                    ready, _, _ = select.select([master], [], [], 0.2)
+                    if not sent:
+                        os.write(master, typed); sent = True
+                    if ready:
+                        try:
+                            chunk = os.read(master, 4096)
+                        except OSError:
+                            break
+                        if not chunk:
+                            break
+                        out += chunk
+                done, _status = os.waitpid(pid, os.WNOHANG)
+                return out.decode('utf-8', 'replace'), done != 0, time.monotonic() - (deadline - 6)
+            finally:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except OSError:
+                    pass
+                os.close(master)
+        out, finished, elapsed = run_on_pty('read x; echo got:$x', b'hi\n')
+        self.assertTrue(finished and 'got:hi' in out, (out, elapsed)); self.assertLess(elapsed, 3)
+        out, finished, elapsed = run_on_pty('read x < /dev/tty; echo end', b'hi\n')
+        self.assertTrue(finished and 'end' in out, (out, elapsed)); self.assertLess(elapsed, 3)
+
+    def test_without_a_tty_behaviour_is_unchanged(self):
+        result, _ = self.run_in('/bin/bash', 'read x; echo got:$x')
+        self.assertEqual(result.stdout, 'got:\n')
 
 
 class Recovery(HookFixture):
@@ -719,6 +757,36 @@ class ParserSync(HookFixture):
         self.settings('user', allow=['Bash(echo:*)'])
         for command in ("echo 'abc", 'echo "abc', "echo $'abc", "echo $'\\'", "echo $'a\\x00b'"):
             self.assertEqual(self.decide(command)['permissionDecision'], 'ask', command)
+
+    FAKE_HEREDOC = "echo $'a\\' <<EOF'\ntouch PWNED\nEOF"
+
+    def test_heredoc_opener_inside_an_ansi_c_string_hides_nothing(self):
+        self.settings('user', allow=['Bash(echo:*)'], deny=['Bash(touch:*)'])
+        self.assertEqual(self.decide(self.FAKE_HEREDOC)['permissionDecision'], 'deny')
+        self.settings('user', allow=['Bash(echo:*)'])
+        self.assertEqual(self.decide(self.FAKE_HEREDOC)['permissionDecision'], 'ask')
+        self.assertTrue(ah_run.classify_escapes("echo $'a\\' <<EOF'\nnohup sleep 9 &\nEOF"))
+
+    def test_heredoc_opener_inside_other_quotes_hides_nothing(self):
+        self.settings('user', allow=['Bash(echo:*)'], deny=['Bash(touch:*)'])
+        for command in ('echo "<<EOF"\ntouch PWNED\nEOF', "echo '<<EOF'\ntouch PWNED\nEOF"):
+            self.assertEqual(self.decide(command)['permissionDecision'], 'deny', command)
+
+    def test_a_benign_heredoc_still_works(self):
+        self.settings('user', allow=['Bash(cat:*)'], deny=['Bash(touch:*)'])
+        out = self.decide("cat <<'EOF'\nit's fine; touch x\nEOF")
+        self.assertEqual(out['permissionDecision'], 'allow')
+        out = self.decide("cat > f.txt <<'EOF'\nprice is $'5'\nEOF")
+        self.assertNotEqual(out['permissionDecision'], 'deny')
+
+    def test_control_the_old_order_lets_the_fake_heredoc_through(self):
+        self.settings('user', allow=['Bash(echo:*)'], deny=['Bash(touch:*)'])
+        def old_order(command):
+            text, bodies = ah_run._strip_heredocs(command.strip())
+            text, ok = ah_run.deansi(text)
+            return text, bodies, not ok
+        with mock.patch.object(ah_run, '_prepare_text', old_order):
+            self.assertEqual(self.decide(self.FAKE_HEREDOC)['permissionDecision'], 'allow')
 
     def test_escape_classifier_sees_through_ansi_c(self):
         self.assertTrue(ah_run.classify_escapes("echo $'\\'' ; nohup x ; echo ''"))
@@ -843,12 +911,44 @@ class TaskSource(HookFixture):
         out = self.with_description('x [task:evil]', agent_id='ag-2')
         self.assertNotIn('evil', out['updatedInput']['command']); self.assertIn('--task auto-', out['updatedInput']['command'])
 
+    def test_a_cwd_named_like_a_task_token_is_never_a_source(self):
+        for extra in ({}, {'agent_id': 'ag-3'}):
+            payload = self.payload('echo hi', **extra); payload['cwd'] = '/tmp/[task:victim]'
+            out = ah_run.decide(payload, home=str(self.home), env={}, ancestors=lambda: [])['hookSpecificOutput']
+            self.assertNotIn('victim', out['updatedInput']['command']); self.assertIn('--task auto-', out['updatedInput']['command'])
+        out = self.decide('echo hi', prompt='x [task:from-spawn]', cwd='/tmp/[task:victim]')
+        self.assertIn('--task from-spawn', out['updatedInput']['command'])
+        out = self.decide('echo hi', other_field='[task:victim]')
+        self.assertNotIn('victim', out['updatedInput']['command'])
+
     def test_main_session_input_token_is_used_and_marked(self):
         out = self.with_description('x [task:from-input]')
         wrapped = out['updatedInput']['command']
         self.assertIn('--task from-input', wrapped); self.assertIn('--task-source input', wrapped)
         subprocess.run(['/bin/sh', '-c', wrapped], env={**self.env, 'AGENT_HARNESS_RESERVE_DIR': str(self.reserve)}, capture_output=True, timeout=30)
         self.assertEqual(self.rows()[0]['task_source'], 'input')
+
+
+class HookSshToken(Fixture):
+    """S10: `via-hook-ssh` is the hook-built remote form (--cmd-b64) only."""
+
+    def go(self, *flags):
+        return subprocess.run([sys.executable, AH, 'run', '--task', 'victim', '--agent', 'x', '--token', 'via-hook-ssh', '--no-unit', *flags],
+                              env=self.env, capture_output=True, text=True, timeout=30)
+
+    def test_local_form_is_refused_for_a_read_only_agent(self):
+        self.assertEqual(self.go('--readonly', '--', 'true').returncode, 126)
+        self.assertEqual(self.go('--readonly', '--cmd-b64', base64.b64encode(b'true').decode(), '--', 'true').returncode, 126)
+        self.assertEqual(self.rows(), [])
+
+    def test_local_form_is_recorded_unverified(self):
+        self.assertEqual(self.go('--', 'true').returncode, 0)
+        row = self.rows()[0]
+        self.assertEqual((row['attribution'], row['attribution_reason']), ('unverified', 'via-hook-ssh-needs-cmd-b64'))
+
+    def test_cmd_b64_form_still_records_hook_ssh_and_passes_read_only(self):
+        result = self.go('--readonly', '--cmd-b64', base64.b64encode(b'echo ok').decode())
+        self.assertEqual((result.returncode, result.stdout), (0, 'ok\n')); self.assertEqual(self.rows()[0]['attribution'], 'hook-ssh')
 
 
 class PayloadFile(Fixture):
@@ -1013,12 +1113,22 @@ class SshRewrite(HookFixture):
     def test_prefix_in_remote_does_not_hide_an_escape(self):
         self.assertEqual(self.ssh("ssh dev2 'ah-run run --task x -- nohup sleep 9'")['permissionDecision'], 'deny')
 
+    def test_config_bearing_options_never_reach_ssh_g_and_leave_the_line_unwrapped(self):
+        for command in ("ssh -F ./x.conf dev2 'git log'", "ssh -o ProxyCommand=true dev2 'git log'", "ssh -oBatchMode=yes dev2 ls",
+                        "ssh -J jump dev2 'git log'", "ssh -p 22 -F./x.conf dev2 ls"):
+            if self.ssh_log.exists():
+                self.ssh_log.unlink()
+            out = self.ssh(command)
+            self.assertFalse(self.contacted(), command)  # ssh -G never ran, so a `Match exec` in -F could not execute
+            self.assertNotIn('via-hook-ssh', out['updatedInput']['command'], command)
+            self.assertIn('ah_run.py', out['updatedInput']['command'])  # still wrapped locally, attributed to the supervisor
+
     def test_options_with_values_are_parsed(self):
-        line = self.inner(self.ssh("ssh -p 2222 -o StrictHostKeyChecking=no -J jump dev2 'git log'"))
-        self.assertTrue(line.startswith('ssh -p 2222 -o StrictHostKeyChecking=no -J jump dev2 python3 %s run' % self.REMOTE_PATH), line)
+        line = self.inner(self.ssh("ssh -p 2222 dev2 'git log'"))
+        self.assertTrue(line.startswith('ssh -p 2222 dev2 python3 %s run' % self.REMOTE_PATH), line)
         self.assertEqual(self.b64_of(line), 'git log')
-        self.assertIn('-G -p 2222 -o StrictHostKeyChecking=no -J jump -- dev2', self.ssh_log.read_text())
-        line = self.inner(self.ssh("ssh -p2222 -oBatchMode=yes -l eric dev2 git -C /x log -1"))
+        self.assertIn('-G -p 2222 -- dev2', self.ssh_log.read_text())
+        line = self.inner(self.ssh("ssh -p2222 -l eric dev2 git -C /x log -1"))
         self.assertEqual(self.b64_of(line), 'git -C /x log -1')
 
     def test_prefix_and_pipeline_stages_are_kept(self):

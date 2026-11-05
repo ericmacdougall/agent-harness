@@ -216,35 +216,41 @@ def shell_quote(value):
     return "'" + str(value).replace("'", "'\\''") + "'"
 
 
-WATCHDOG_CODE = (
-    'import os, signal, sys, time\n'
-    'sup, pgid, grace = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])\n'
-    'while os.getppid() == sup:\n'
-    '    time.sleep(0.5)\n'
-    'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+TRAMPOLINE_CODE = (
+    'import os, sys\n'
+    'rfd, grace, cmd = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3:]\n'
     'try:\n'
-    '    os.killpg(pgid, signal.SIGTERM)\n'
+    '    pid = os.fork()\n'
     'except OSError:\n'
-    '    pass\n'
-    'time.sleep(grace)\n'
+    '    pid = -1\n'
+    'if pid == 0:\n'
+    '    try:\n'
+    '        import signal, time\n'
+    '        null = os.open(os.devnull, os.O_RDWR)\n'
+    '        for fd in (0, 1, 2):\n'
+    '            os.dup2(null, fd)\n'
+    '        os.closerange(3, rfd); os.closerange(rfd + 1, 4096)\n'
+    '        if os.read(rfd, 1) == b"":\n'  # EOF without the clean-end byte: the supervisor died
+    '            signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+    '            group = os.getpgrp()\n'
+    '            os.killpg(group, signal.SIGTERM); time.sleep(grace); os.killpg(group, signal.SIGKILL)\n'
+    '    except BaseException:\n'
+    '        pass\n'
+    '    os._exit(0)\n'
+    'if pid > 0:\n'
+    '    os.close(rfd)\n'
     'try:\n'
-    '    os.killpg(pgid, signal.SIGKILL)\n'
+    '    os.execvp(cmd[0], cmd)\n'
     'except OSError:\n'
-    '    pass\n')
+    '    os._exit(127)\n')
 
 
-def start_watchdog(pgid):
-    """A sibling process in the child's group (not a job of the user's shell, so `wait`, `jobs` and `$!` are untouched):
-    when the supervisor disappears, even by SIGKILL, it ends the group (SIGTERM, then SIGKILL after KILL_GRACE).
-    The supervisor stops it on a normal end. Returns the Popen, or None when the group cannot be joined."""
-    def join_group():
-        os.setpgid(0, pgid)
-    try:
-        return subprocess.Popen([sys.executable, '-S', '-c', WATCHDOG_CODE, str(os.getpid()), str(pgid), str(KILL_GRACE)],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                preexec_fn=join_group)
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
+def trampoline_argv(read_fd, argv):
+    """The child starts as a tiny Python process that is the session and group leader (start_new_session, so no job
+    control stop on a controlling terminal), forks a watchdog that stays in the group and is not a job of the user's
+    shell, then execs the shell. The watchdog reads the pipe the supervisor holds: EOF without the clean-end byte means
+    the supervisor died, and it ends the group (SIGTERM, then SIGKILL after KILL_GRACE)."""
+    return [sys.executable, '-S', '-c', TRAMPOLINE_CODE, str(read_fd), str(KILL_GRACE), *argv]
 
 
 def read_command(args, root=None):
@@ -379,10 +385,18 @@ def launch(args):
     use_unit = user_bus_answers() and not args.no_unit
     unit = 'ah-run-' + run_id if use_unit else None
     argv = [shell, '-c', script]
+    try:
+        read_fd, write_fd = os.pipe()
+    except OSError:
+        read_fd = write_fd = None  # no pipe: run without the in-group watchdog
+    if read_fd is not None:
+        argv = trampoline_argv(read_fd, argv)
     if use_unit:
         argv = ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--unit', unit, *argv]
-    if args.token == 'via-hook-ssh':
-        attribution, why = 'hook-ssh', None
+    if args.token == 'via-hook-ssh' and args.cmd_b64 and not args.cmd_file and not args.command:
+        attribution, why = 'hook-ssh', None  # the hook-built remote form only
+    elif args.token == 'via-hook-ssh':
+        attribution, why = 'unverified', 'via-hook-ssh-needs-cmd-b64'
     elif args.token and ledger is not None:
         attribution, why = consume_pending(ledger.root, args.token, command, task, agent)
     elif args.token:
@@ -396,6 +410,9 @@ def launch(args):
             pass
     if args.readonly and attribution == 'unverified':
         print('ah-run: a read-only agent run needs a hook token; refused', file=sys.stderr)
+        for fd in (read_fd, write_fd):
+            if fd is not None:
+                os.close(fd)
         return 126
     row = {'schema': SCHEMA, 'run_id': run_id, 'task': task, 'agent': agent, 'ticket': ticket, 'session': session,
            'task_source': args.task_source if args.task_source in ('input', 'record') else None,
@@ -405,17 +422,20 @@ def launch(args):
            'cwd_sha256': digest(os.getcwd()), 'started_at': now(), 'supervisor_pid': os.getpid(),
            'supervisor_start': process_start_token(os.getpid()), 'unit': unit, 'end': None}
     try:
-        # own process group, same session, so the watchdog (a sibling) can join it with setpgid
-        child = subprocess.Popen(argv, env=env, preexec_fn=os.setpgrp)
+        child = subprocess.Popen(argv, env=env, start_new_session=True, pass_fds=(read_fd,) if read_fd is not None else ())
     except OSError as error:
+        for fd in (read_fd, write_fd):
+            if fd is not None:
+                os.close(fd)
         row.update(end=now(), exit_code=127, error=type(error).__name__)
         _ledger_write(ledger, run_id, row)
         print('ah-run: cannot start the shell: %s' % type(error).__name__, file=sys.stderr)
         return 127
-    pgid = child.pid  # setpgrp made the child its own group leader
-    watchdog = start_watchdog(pgid)
+    pgid = child.pid  # a new session makes the child its own group leader
+    if read_fd is not None:
+        os.close(read_fd)
     row.update(pid=child.pid, pgid=pgid, start_token=process_start_token(child.pid),
-               watchdog=watchdog.pid if watchdog else None)
+               watchdog='in-group' if write_fd is not None else None)
     written = _ledger_write(ledger, run_id, row)
     state = {'signal': None, 'parent_died': False}
 
@@ -444,12 +464,13 @@ def launch(args):
         kill_group(pgid, signal.SIGTERM); code = child.wait()
     if state['signal'] is not None and child.poll() is None:
         time.sleep(KILL_GRACE); kill_group(pgid, signal.SIGKILL)
-    if watchdog is not None:  # normal end: the watchdog's job is done
+    if write_fd is not None:  # normal end: tell the watchdog its job is done (its pipe would otherwise read as a death)
         try:
-            watchdog.kill(); watchdog.wait(timeout=2)
-        except (OSError, subprocess.SubprocessError):
+            os.write(write_fd, b'x')
+        except OSError:
             pass
-    tree = [entry for entry in pid_tree(pgid) if not (watchdog and entry['pid'] == watchdog.pid)]
+        os.close(write_fd)
+    tree = pid_tree(pgid)
     kill_group(pgid, signal.SIGTERM)  # leftovers of a finished leader are not part of the result
     usage = resource_usage()
     row.update(end=now(), exit_code=code, signal=state['signal'], parent_died=state['parent_died'],
@@ -673,6 +694,20 @@ def inner_commands(text):
     return found
 
 
+def _prepare_text(command):
+    """(text, heredoc bodies, uncertain). $'...' is decoded first so heredoc detection sees the quoting the shell sees
+    (a `<<EOF` inside a $'...' string is not a heredoc); when the whole command cannot be decoded cleanly the result is
+    uncertain and never allowed. The decode runs again on the heredoc-free text."""
+    command = command.strip()
+    uncertain = False
+    if "$'" in command:
+        command, ok = deansi(command)
+        uncertain = not ok
+    text, bodies = _strip_heredocs(command)
+    text, ok = deansi(text)
+    return text, bodies, uncertain or not ok
+
+
 def _strip_heredocs(command):
     """Heredoc bodies removed (markers left behind), plus (body, quoted) pairs. Reuses commit_policy."""
     import commit_policy
@@ -816,8 +851,7 @@ class Parsed:
 def parse_command(command, depth=0):
     """Split into simple-command strings (quote, heredoc and comment aware) and flag substitutions and newlines."""
     parsed = Parsed()
-    text, bodies = _strip_heredocs(command.strip())
-    text, parsed.uncertain = deansi(text)[0], not deansi(text)[1]
+    text, bodies, parsed.uncertain = _prepare_text(command)
     parsed.substitution = any(not quoted and re.search(r'\$\(|`', body) for body, quoted in bodies)
     cur, i, n, quote = [], 0, len(text), None
 
@@ -1268,8 +1302,7 @@ def _classify_text(command, reasons, notes, depth, prefix=''):
 
 def _classify_command(command, reasons, notes, depth):
     try:
-        text, _bodies = _strip_heredocs(command.strip())
-        text = deansi(text)[0]
+        text, _bodies, _uncertain = _prepare_text(command)
         entries = []
         for words, operator in _simple(_tokens(_mask_redirect_amps(text))):
             entries.append(([w[1].replace('\x01', '&') for w in words if w[0] == 'word'], operator))
@@ -1518,7 +1551,11 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
         raws = [w[0] for w in args[1:]]
         count = len(call.opts)
         target_dynamic = args[1 + count][2]
-        if target_dynamic:
+        if call.unsafe:
+            flags = ''.join(sorted(call.unsafe))
+            cls = host_table.HostClass('external', None, None, None, reason='ssh-option-' + flags)
+            _warn_row('ssh -%s not forwarded to ssh -G; host classed external, line left unwrapped' % '/-'.join(sorted(call.unsafe)), call.target)
+        elif target_dynamic:
             cls = host_table.HostClass('external', None, None, None, reason='dynamic-target')
         else:
             cls = host_table.classify(call.target, call.resolve_args, table=table, policy=policy,
@@ -1632,7 +1669,7 @@ def task_key_source(payload, env):
     recorded = subagent_task(agent_id) if agent_id else None
     if recorded:
         return recorded, 'record'
-    for text in _strings({k: v for k, v in payload.items() if k != 'tool_input'}):
+    for text in _strings(payload.get('prompt')):  # the spawn prompt only; never cwd, paths or other model-steerable fields
         found = TASK_TOKEN.search(text)
         if found:
             return found.group(1), 'payload'

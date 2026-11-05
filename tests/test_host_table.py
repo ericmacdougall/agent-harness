@@ -151,11 +151,19 @@ class HostTable(SshStub):
         self.assertEqual(self.classify('dev2').kind, 'external')
         self.assertEqual(self.classify('localhost').kind, 'local')
 
-    def test_ssh_options_reach_ssh_g(self):
+    def test_only_port_and_user_reach_ssh_g(self):
         log = Path(self.temp.name) / 'ssh.log'; os.environ['FAKE_SSH_LOG'] = str(log)
         self.stub('dev2', 'dev2.example.test')
-        self.classify('dev2', ['-p', '2222', '-o', 'StrictHostKeyChecking=no', '-J', 'jump'])
-        self.assertEqual(log.read_text().split(), ['-G', '-p', '2222', '-o', 'StrictHostKeyChecking=no', '-J', 'jump', '--', 'dev2'])
+        self.classify('dev2', ['-p', '2222', '-l', 'eric'])
+        self.assertEqual(log.read_text().split(), ['-G', '-p', '2222', '-l', 'eric', '--', 'dev2'])
+
+    def test_config_bearing_options_are_refused_before_ssh_g_runs(self):
+        log = Path(self.temp.name) / 'ssh.log'; os.environ['FAKE_SSH_LOG'] = str(log)
+        self.stub('dev2', 'dev2.example.test')
+        for args in (['-F', './x.conf'], ['-F./x.conf'], ['-o', 'ProxyCommand=x'], ['-oBatchMode=yes'], ['-J', 'jump'], ['-p', '22', '-F', 'x']):
+            found = self.classify('dev2', args)
+            self.assertEqual(found.kind, 'external', args); self.assertEqual(found.reason, 'resolve-unsafe-option', args)
+        self.assertFalse(log.exists())
 
 
 class ParseSsh(unittest.TestCase):
@@ -163,12 +171,13 @@ class ParseSsh(unittest.TestCase):
         call = host_table.parse_ssh(['-p', '2222', '-o', 'StrictHostKeyChecking=no', '-J', 'jump', '-tt', 'user@dev2', 'git', 'log'])
         self.assertEqual((call.target, call.remote), ('user@dev2', ['git', 'log']))
         self.assertEqual(call.opts, ['-p', '2222', '-o', 'StrictHostKeyChecking=no', '-J', 'jump', '-tt'])
-        self.assertEqual(call.resolve_args, ['-p', '2222', '-o', 'StrictHostKeyChecking=no', '-J', 'jump'])
+        self.assertEqual(call.resolve_args, ['-p', '2222'])
+        self.assertEqual(call.unsafe, {'o', 'J'})
 
     def test_attached_values_and_clusters(self):
         call = host_table.parse_ssh(['-p2222', '-oBatchMode=yes', '-fN', 'h', 'ls'])
         self.assertEqual(call.opts, ['-p2222', '-oBatchMode=yes', '-fN']); self.assertIn('f', call.flags)
-        self.assertEqual(call.resolve_args, ['-p2222', '-oBatchMode=yes'])
+        self.assertEqual(call.resolve_args, ['-p2222'])
 
     def test_every_value_option_takes_its_argument(self):
         for letter in 'pliJLobcDEeFImOQRSWwBP':

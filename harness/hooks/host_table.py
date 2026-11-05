@@ -22,7 +22,10 @@ MAX_POLICY_BYTES = 1 << 20
 ROLES = ('interactive', 'worker', 'external')
 LOOPBACK = frozenset(('127.0.0.1', '::1', 'localhost', '[::1]'))
 SSH_WITH_ARG = frozenset('pliJLobcDEeFImOQRSWwBP')
-RESOLVE_FLAGS = frozenset('pJoFl')  # the options that can change where `ssh -G` says a target goes
+RESOLVE_FLAGS = frozenset('pl')  # the only options forwarded to `ssh -G`: port and user
+# -F names a config file, -o can carry Include, Match or ProxyCommand, -J a jump host: `ssh -G` evaluates `Match exec`
+# (it runs a command), so a model-supplied config never reaches it; such a call is classed external instead.
+UNSAFE_FLAGS = frozenset('FoJ')
 
 
 def policy_path(home=None, env=None):
@@ -62,6 +65,7 @@ class SshCall:
 
     def __init__(self, opts, target, remote, flags, resolve_args):
         self.opts, self.target, self.remote, self.flags, self.resolve_args = opts, target, remote, flags, resolve_args
+        self.unsafe = set(flags) & UNSAFE_FLAGS
 
 
 def parse_ssh(args):
@@ -99,7 +103,11 @@ class Resolved:
 
 
 def resolve(target, ssh_args=(), run=subprocess.run):
-    """`ssh -G` for the target: hostname, port, proxycommand, proxyjump; `error` set on a timeout or failure."""
+    """`ssh -G` for the target: hostname, port, proxycommand, proxyjump; `error` set on a timeout or failure.
+    Never runs with -F, -o or -J (see UNSAFE_FLAGS); the user's default config is the only one evaluated."""
+    for word in ssh_args:
+        if word.startswith('-') and not word.startswith('--') and any(letter in UNSAFE_FLAGS for letter in word[1:2]):
+            return Resolved(None, None, error='unsafe-option')
     try:
         done = run(['ssh', '-G', *ssh_args, '--', target], capture_output=True, text=True, timeout=RESOLVE_TIMEOUT,
                    stdin=subprocess.DEVNULL)
