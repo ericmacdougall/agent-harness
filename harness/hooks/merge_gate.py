@@ -733,38 +733,66 @@ def _pr_required(client, slug, number):
 
 
 INERT_TRIGGERS = {"workflow_dispatch", "schedule", "release", "workflow_call", "repository_dispatch"}
-_ON_KEY = re.compile(r"^(?:on|\"on\"|'on')\s*:\s*(.*)$")
+_ON_KEY = re.compile(r"^(?:on|\"on\"|'on')\s*:(.*)$")
+_TOP_KEY = re.compile(r"^[A-Za-z_][\w-]*\s*:")
+_TRIGGER_LINE = re.compile(r"^([A-Za-z_]+)\s*:\s*$")
+_SUB_KEY = re.compile(r"^([A-Za-z_][\w-]*)\s*:")
 
 
 def _trigger_names(text):
-    """Return {trigger: set(sub-keys)} from a workflow's top-level `on:`; None when it cannot be read with confidence."""
-    lines = [re.sub(r"\s+#.*$", "", ln.rstrip()) for ln in text.splitlines()]
-    for i, line in enumerate(lines):
-        m = _ON_KEY.match(line)
-        if not m:
+    """Return {trigger: set(sub-keys)} from a workflow's top-level `on:`, or None unless every line was understood.
+
+    Deliberately strict: any construct this small reader does not know (documents, anchors, aliases, tabs, quoted or
+    complex keys, multi-line flow values, a second `on:`) yields None, which callers treat as able to run on a PR head.
+    """
+    if "\t" in text or re.search(r"(?m)^(?:---|\.\.\.)", text) or re.search(r"(?m)(?:^|\s)[&*][\w-]+|<<\s*:", text):
+        return None
+    lines = [re.sub(r"\s+#.*$", "", ln.rstrip()) for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    starts = [i for i, ln in enumerate(lines) if _ON_KEY.match(ln)]
+    if len(starts) != 1:
+        return None
+    i = starts[0]
+    rest = _ON_KEY.match(lines[i]).group(1).strip()
+    if rest:  # on: push   |   on: [push, pull_request]   (one line only)
+        if re.fullmatch(r"[A-Za-z_]+", rest):
+            return {rest: set()}
+        if re.fullmatch(r"\[\s*[A-Za-z_]+(?:\s*,\s*[A-Za-z_]+)*\s*\]", rest):
+            return {n: set() for n in re.findall(r"[A-Za-z_]+", rest)}
+        return None
+    found, current, base, sub = {}, None, None, None
+    for ln in lines[i + 1:]:
+        if not ln.strip():
             continue
-        rest = m.group(1).strip()
-        if rest:  # on: push   |   on: [push, pull_request]
-            names = re.findall(r"[A-Za-z_]+", rest)
-            return {n: set() for n in names} if names and "{" not in rest else None
-        found, current, base = {}, None, None
-        for ln in lines[i + 1:]:
-            if not ln.strip():
-                continue
-            indent = len(ln) - len(ln.lstrip())
-            if indent == 0:
-                break
-            base = indent if base is None else base
-            key = re.match(r"^\s*([A-Za-z_]+)\s*:", ln)
-            if indent == base and key:
-                current = key.group(1)
-                found[current] = set()
-            elif indent == base and ln.strip().startswith("- "):
+        indent = len(ln) - len(ln.lstrip())
+        body = ln.strip()
+        if indent == 0:
+            if not _TOP_KEY.match(body):
                 return None
-            elif current and key:
-                found[current].add(key.group(1))
-        return found or None
-    return None
+            break
+        base = indent if base is None else base
+        if indent < base:
+            return None
+        if indent == base:
+            m = _TRIGGER_LINE.match(body)
+            if not m:
+                return None
+            current, sub = m.group(1), None
+            found[current] = set()
+        elif current is None:
+            return None
+        else:
+            sub = indent if sub is None else sub
+            if indent == sub:
+                m = _SUB_KEY.match(body)
+                if m:
+                    found[current].add(m.group(1))
+                elif body.startswith("- "):
+                    found[current].add("-")  # a list directly under the trigger
+                else:
+                    return None
+            elif indent < sub:
+                return None
+    return found or None
 
 
 def _can_run_on_pr_head(triggers):
@@ -774,7 +802,7 @@ def _can_run_on_pr_head(triggers):
     for name, keys in triggers.items():
         if name in INERT_TRIGGERS:
             continue
-        if name == "push" and "tags" in keys and not (keys & {"branches", "branches-ignore", "paths", "paths-ignore"}):
+        if name == "push" and keys == {"tags"}:
             continue  # runs only for tag pushes, never for a pull request head
         return True
     return False

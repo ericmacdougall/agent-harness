@@ -643,6 +643,17 @@ class ActiveWorkflows(Base):
             "workflow-run": "on:\n  workflow_run:\n    workflows: [x]\n", "list-form": "on:\n  - push\n",
             "flow-map": "on: {push: {tags: ['v*']}}\n", "no-on": "name: x\njobs: {}\n", "empty": "",
             "quoted-on": "\"on\":\n  pull_request:\n",
+            "col0-comment": "on:\n  workflow_dispatch:\n# also on PRs\n  pull_request:\n",
+            "branches-ignore": "on:\n  push:\n    tags: [\"v*\"]\n    branches-ignore: [gh-pages]\n",
+            "paths-with-tags": "on:\n  push:\n    tags: [v*]\n    paths: [src/**]\n",
+            "quoted-trigger": "on:\n  workflow_dispatch:\n  \"pull_request\":\n",
+            "quoted-subkey": "on:\n  push:\n    tags: [v*]\n    \"branches\": [main]\n",
+            "explicit-key": "on:\n  workflow_dispatch:\n  ? pull_request\n",
+            "multiline-flow": "on: [workflow_dispatch,\n  pull_request]\n",
+            "two-on": "on: workflow_dispatch\non: pull_request\n",
+            "anchor": "on: &x\n  pull_request:\n", "alias": "on: *x\n", "multi-doc": "on: workflow_dispatch\n---\non: pull_request\n",
+            "tab": "on:\n\tpull_request:\n", "push-list": "on:\n  push:\n    - tags\n",
+            "dedent-garbage": "on:\n    workflow_dispatch:\n  pull_request:\n",
         }
         for name, content in triggers.items():
             with self.subTest(name):
@@ -652,7 +663,9 @@ class ActiveWorkflows(Base):
 
     def test_inert_triggers_alone_are_allowed(self):
         for name, content in {"dispatch": "on: workflow_dispatch\n", "schedule": "on:\n  schedule:\n    - cron: '0 0 * * *'\n",
-                              "release": "on:\n  release:\n    types: [published]\n", "tags-only": self.RELEASE}.items():
+                              "release": "on:\n  release:\n    types: [published]\n", "tags-only": self.RELEASE,
+                              "comments": "# header\non:\n  # note\n  push:  # tags only\n    tags: [\"v*\"]  # releases\n  workflow_dispatch:\n",
+                              "inline-list": "on: [workflow_dispatch, schedule]\n"}.items():
             with self.subTest(name):
                 code, text, _ = self.merge(self.scenario([{"name": "W", "state": "active", "content": content}]))
                 self.assertEqual(code, 0, text)
