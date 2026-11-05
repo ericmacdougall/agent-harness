@@ -19,6 +19,21 @@ Spec: plans/CONSOLE-UI-SPEC.md (reviewed at spec sha b035b064...). Kernel plan: 
 
 Each increment is a commit on `claude/console-k4-process-20261105` with failing-first evidence (a failing control or a broken variant, named in the commit Testing line). Heavy suites (`go test -race ./...` and repeated runs) run on dev2; short process tests may run locally. The three skipped tests are not unskipped by K4; they return with K5b and later as the baseline README says.
 
+## Plan review result for K4 (native red-team a7cb68a15bec81a77, 2026-11-04): BLOCK on wiring
+
+Increment 1 (742ffd6) stays as a committed, unwired primitive. Increment 2 does not start until the primitive is redesigned. Findings that bind the redesign:
+
+- High: the stop-on-exit decision runs at reap, before the reader has consumed a final frame, so a leader that prints its final and exits can have its background work killed. Decide only after the stream is consumed or the drain bound passes, and hold the pgid until then (observe exit without reaping: `waitid` with `WNOWAIT` on Linux, kqueue `NOTE_EXIT` on darwin, then decide, then reap).
+- High: the drain timer closes the read end and drops buffered bytes. Use a pump goroutine that reads continuously into a bounded buffer; apply the drain bound to the pump; make EOF distinguishable from a forced close. Test a 64 KB burst with a slow consumer and a descendant holding the pipe.
+- High: `reaped` is set after `cmd.Wait` returns, up to `WaitDelay` after the real reap, so a stale-pgid signal is possible in that window (A5). The WNOWAIT design closes it. Replace the near-vacuous race assertion with a recorder that checks leader state at signal time.
+- High: Windows cannot meet A5 or A3 with `taskkill` after reap, and runs it under the lock. Use a Job Object with kill-on-close, or mark A5 unmet on Windows; call taskkill by absolute path outside the lock; add a `GOOS=windows go vet` gate.
+- Medium: `stopOnExit` runs under `t.mu` and would take `a.mu`: require a lock-free flag and add the lock-order test before wiring.
+- Medium: no stderr-holder test; `ErrWaitDelay` must be normalised; the login helper merges stdout and stderr and uses `CommandContext`, so it needs a merged-pipe option and `Terminate`-driven cancel.
+- Low: define `Terminate` returning false as "group possibly alive and unsupervised" and test the callers' reaction.
+- Plan gaps: run the full existing console suite on dev2 before and after each wiring commit; split wiring into Claude, Codex, login; lock-order tests (A1, A2, A11) come with or before wiring.
+
+New stop conditions: stop and report if the final-versus-reap ordering needs the WNOWAIT or zombie-hold redesign (this is that redesign, so it is a reported checkpoint, not an auto-repair); stop if the existing console suite regresses at any wiring commit. Revised order: primitive redesign, lock-order tests, Claude wiring, Codex wiring, login, A7 and A8, identity.
+
 ## Residual findings carried from the spec reviews
 
 Both round-3 reviewers returned ACCEPT with these items. They bind the slice that owns them and are folded into the spec, with a fresh re-review, when K12 starts:
