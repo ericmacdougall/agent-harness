@@ -17,7 +17,7 @@ LIVE_WAL_S = 20 * 60
 LIVE_TRANSCRIPT_S = 10 * 60
 SILENT_S = 30 * 60
 HIGH_S = 60 * 60
-FINISH_GRACE_S = 10 * 60  # a just-stopped owner may still be writing its handoff: not a drop yet
+FINISH_GRACE_S = 30 * 60  # a just-stopped owner may be between turns or writing its handoff: not a drop yet
 
 _WAITING = re.compile(r"\bwaiting\s+(?:on|for)\s+([A-Za-z0-9_.:#\-]{1,60})", re.I)
 

@@ -87,6 +87,8 @@ Both editions install `deliver.py`. Its prepare phase verifies reviewed commits 
 
 Both editions enforce one commit message format for agent commits: `<type>(<scope>): <summary>` followed by `Why:`, `What:`, `Testing:` and `Refs:` sections. In ticket-tracked repositories, each commit must name a GoodQA ticket, and that ticket must have been updated about the commit before publication. A PreToolUse hook checks each `git commit` before it runs, including commits made over `ssh` on dev2/T2. It also checks `gh pr create`. A git `commit-msg` config hook (Git 2.54+) runs alongside each repository's own hooks. `deliver.py prepare` and `peer_review.py pr` refuse non-compliant ranges, and `deliver.py finish` comments the delivered SHA on each ticket. Rules live in one file, `commit_policy.json`. The only exception path is a reasoned waiver recorded in the WAL. See [commit message policy](docs/operations.md#commit-message-policy).
 
+Untracked repos may reference local ledger tickets. `harness tickets` keeps tickets in hidden git refs of the repository, offline and on this machine only. In a repository that no ticket system tracks (no remote URL or push URL matches), or a remote-less one listed in `ledger.allowed_repos`, a commit may cite `Refs: Ledger <slug>#<8+ hex>`. The policy resolves the ref with the local `harness` binary and fails closed if it cannot. Tracked repositories still need GoodQA tickets. See [the local ledger](docs/ledger.md).
+
 When `peer_review.py` cannot produce a reviewed result it prints a stable reason code, an exact next step and a reminder that native evidence is not a helper receipt; it also finds the reviewer CLIs in documented install locations and lints review packets for run evidence and the exact HEAD. See [review helper reliability](docs/operations.md#review-helper-reliability).
 
 A command guard (`command_guard.py`, behind the fail-closed launcher `command_guard_hook.py`) blocks shell commands that delete, move or empty Claude, Codex and harness logs and state, or that print secrets and configuration (for example `rclone config show`), in both editions; deletes of logs need a verified Dropbox backup and a single-use `approve-delete`. See [command guard](docs/operations.md#command-guard).
@@ -110,3 +112,13 @@ This repository contains no account credentials, session logs, app fixtures, or 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs should include a reproducible failure, the affected agent edition and version, and evidence that a fix works without breaking the fast path or local delivery.
+
+## Local gates (no CI)
+
+Run before pushing, from a clean tree: `python3 scripts/leak_gate.py --range origin/main..HEAD`.
+It runs `scripts/leak_scan.py` on the tree and the pushed commits, and gitleaks
+if installed and pinned by SHA-256 (`--gitleaks-sha256`). It needs your personal denylist
+(`~/.agent-harness/leak-denylist.txt`, one regex per line, mode 0600, never committed) and
+refuses to pass without one unless you pass `--no-denylist`. Matched values are
+never printed. Personal identifiers live in the untracked
+`commit_policy.local.json`, not in the repo.

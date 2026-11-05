@@ -279,3 +279,21 @@ func (d *Dir) stage(body []byte) (string, fs.FileInfo, error) {
 	}
 	return tmp, fi, nil
 }
+
+// Remove deletes a regular file name inside the pinned directory (never a symlink target or a directory).
+func (d *Dir) Remove(name string) error {
+	if err := validName(name); err != nil {
+		return err
+	}
+	li, err := d.root.Lstat(name)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if li.IsDir() {
+		return fmt.Errorf("%w: %s is a directory", ErrUnsafe, name)
+	}
+	return d.root.Remove(name)
+}
