@@ -880,6 +880,16 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertIsNone(sh.which('ssh', path=path))
         self.assertIsNotNone(sh.which('git', path=path))
         self.assertIsNotNone(sh.which('claude', path=path))  # only the fixture claude resolves
+        # invoke() itself must hand the helper that PATH, not /usr/bin:/bin
+        seen = {}
+
+        def fake_run(command, **kwargs):
+            seen['path'] = kwargs['env']['PATH']
+            return subprocess.CompletedProcess(command, 0, '', '')
+        with patch.object(subprocess, 'run', fake_run):
+            self.invoke()
+        self.assertEqual(seen['path'], path)
+        self.assertNotIn('/usr/bin', seen['path'].split(os.pathsep))
 
     def test_output_symlink_does_not_delete_target(self):
         target = self.root / 'important.txt'

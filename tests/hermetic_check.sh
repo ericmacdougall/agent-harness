@@ -9,7 +9,7 @@
 # state dirs, swallowed or not. Every disposable file lives in a fresh mktemp dir outside ~/.agent-harness; the dir is
 # printed as REPORT_DIR.
 # PASS = suite rc 0 with "Ran N" (N>0) and a final OK line, 0 non-loopback ssh calls, an empty audit log (opendir records count), the hook
-# loaded at least twice, no ~/.codex created in the scratch HOME (a reviewer CLI ran), and two canaries: a write into a temp "protected" dir is recorded,
+# loaded at least twice, no ~/.codex created in the scratch HOME (a reviewer CLI ran, seen only for the gate's scratch HOME), and two canaries: a write into a temp "protected" dir is recorded,
 # and the suite's own configuration loads with protected=9. Every FAIL path exits non-zero.
 # Limits: ssh is recorded only when found through PATH; the plain gate does not cut the network (only HC_BWRAP=1 does, for
 # single modules); the temp dir is left behind for inspection (it is disposable
@@ -83,11 +83,11 @@ ${wrap[@]+"${wrap[@]}"} env -i "${pin[@]}" ${envtmp[@]+"${envtmp[@]}"} \
 rc=$?
 snap > "$LOGS_REAL/after.snap"; diff "$LOGS_REAL/before.snap" "$LOGS_REAL/after.snap" > "$LOGS_REAL/snap.diff"; d=$(wc -l < "$LOGS_REAL/snap.diff" | tr -d ' ')
 # Exempt only the exact form git uses for ssh://127.0.0.1/... remotes (tests/test_delivery_helpers.py fakes an unreachable
-# remote that way): "... 127.0.0.1 git-upload-pack|git-receive-pack|git-upload-archive ...". It never leaves the machine and is
+# remote that way): "[-o SendEnv=GIT_PROTOCOL] 127.0.0.1 git-upload-pack|git-receive-pack|git-upload-archive ...", anchored at the start. It never leaves the machine and is
 # counted separately. Any other ssh call, including other commands run on a loopback name, fails the gate.
 ssh=0; sshlo=0
 if [ -f "$LOGS_REAL/ssh.calls" ]; then
-  gitlo='(^| )(127\.0\.0\.1|localhost) git-(upload-pack|receive-pack|upload-archive)( |$)'
+  gitlo='^(-o SendEnv=GIT_PROTOCOL )?127\.0\.0\.1 git-(upload-pack|receive-pack|upload-archive)( |$)'
   ssh=$(grep -Evc "$gitlo" "$LOGS_REAL/ssh.calls")
   sshlo=$(grep -Ec "$gitlo" "$LOGS_REAL/ssh.calls")
 fi
