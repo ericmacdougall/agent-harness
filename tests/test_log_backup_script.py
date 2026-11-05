@@ -86,6 +86,8 @@ class Case(unittest.TestCase):
         path = self.home / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
+        old = time.time() - 3600  # static sources skip files younger than 2 minutes (--min-age)
+        os.utime(path, (old, old))
 
     def env(self, **extra):
         env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin", "LOG_BACKUP_RCLONE": str(self.fake),
@@ -126,7 +128,7 @@ class Case(unittest.TestCase):
 
 ALLOWED_FLAGS = {"--tpslimit", "--transfers", "--contimeout", "--timeout", "--log-file", "--log-level", "--exclude-from", "--backup-dir", "--ignore-case",
                  "--dropbox-batch-mode", "--dropbox-batch-size", "--checkers", "--retries", "--retries-sleep",
-                 "--low-level-retries"}
+                 "--low-level-retries", "--min-age"}
 
 
 def assert_copy_only(test, calls):
@@ -406,6 +408,18 @@ class Failure(Case):
         done = self.local_run()
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.remote_files(), set(ORDINARY))
+
+    def test_live_sources_upload_from_a_stable_snapshot_and_static_ones_skip_young_files(self):
+        young = self.home / ".agent-harness/work/t1/young.md"
+        young.write_text("just written")  # mtime now: inside the 2 minute window
+        done = self.local_run()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn(".agent-harness/work/t1/young.md", self.remote_files())
+        stage = self.home / ".agent-harness/backup-stage"
+        self.assertEqual((stage / ".claude/projects/p1/a.jsonl").read_bytes(), ORDINARY[".claude/projects/p1/a.jsonl"])
+        for argv in self.copies():
+            live = argv[-2].startswith(str(stage))
+            self.assertEqual("--min-age" in argv, not live, argv)
 
     def test_persistent_failure_exhausts_retries_and_is_not_fresh(self):
         done = self.run_script(FAKE_FAIL_FIRST="1000", LOG_BACKUP_RETRIES="1")
