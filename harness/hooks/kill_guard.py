@@ -87,6 +87,8 @@ DEFAULT_POLICY = {
 
 KILLISH = re.compile(r'kill|fuser|stop-process|spps|slay|wmic')
 INDIRECT = re.compile(r"\$'|\\x[0-9a-fA-F]{2}|\\[0-7]{3}|\beval\b|base64|\bxxd\b", re.I)
+CLOBBER_TEXT = re.compile(r'>&?!')  # >!, >>!, &>!, &>>!, >&!, >>&!: zsh and bash read these apart (GoodQA #14657)
+LINE_JOIN = re.compile(r'\\\r?\n')  # a backslash-newline the shell removes, so `>\` then `!` is still `>!`
 LIST_FLAGS = {'-l', '-L', '--list', '-t', '--table', '-Ll', '-lL'}
 # The closed grammar of a kill command line. Each pattern is matched against text that word_text() has first tied to the
 # word's exact source, so a form the lexer does not understand (zsh ${=x}, $=x, ${(z)x}, =(cmd), a glob qualifier, the
@@ -713,9 +715,10 @@ def make_analyzer_class(cg):
                 remote = name in REMOTE_EXEC or name in REMOTE_WRAPPERS
                 for i, a in enumerate(args):
                     if re.search(r'\s', a.text.strip()) and name not in ('xargs', 'parallel'):  # ssh host 'cd /srv && bash -s'
-                        lexed = cg.Lexer(self.ctx, self.ctx.ps).lex(a.text)
-                        if any(self.reads_program(c.words) for pl in cg.parse(lexed) for c in pl.cmds):
-                            return True
+                        for bang in (True, False):  # the remote shell may be zsh or bash, which read `>! sh` apart
+                            lexed = cg.Lexer(self.ctx, self.ctx.ps, bang_operators=bang).lex(a.text)
+                            if any(self.reads_program(c.words) for pl in cg.parse(lexed) for c in pl.cmds):
+                                return True
                         if remote:
                             continue  # a remote command line; a local wrapper's word is one argv word, a path
                     n = cg.norm_name(a.text)
@@ -1276,6 +1279,7 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
     if policy['mode'] == 'off':
         return 'allow', '', '', ()
     raw = ' '.join(map(str, command)) if isinstance(command, (list, tuple)) else str(command)
+    analyzer = None
     try:
         cg = _import_base()
         compiled = compiled or cg.Compiled(cg.load_policy(), cwd=cwd)
@@ -1298,14 +1302,21 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
         if analyzer.ctx.unterminated and not findings and fallback_blocks(raw):
             findings = [('unterminated', 'the command has an unterminated quote or substitution and mentions a kill '
                          'verb or indirection', ())]
+        if analyzer.ctx.readings_capped and not findings:  # the kill may be in the reading it dropped, spelled any way
+            findings = [('readings-capped', '`>!` could not be judged under both shell readings, so what runs is unknown',
+                         ())]
     except Exception as error:  # noqa: BLE001 - Blocked, RecursionError and bugs alike: fail closed on kill-looking text
-        if fallback_blocks(raw):
+        # With `>!` in the text the stop can come before a reading main would have judged (a script judged on disk
+        # first, GoodQA #14657), so a kill spelled without the word is refused too.
+        findings = list(getattr(analyzer, 'kf', None) or ())  # a kill already found stays found when the analysis stops
+        if not findings:
+            if not (fallback_blocks(raw) or CLOBBER_TEXT.search(LINE_JOIN.sub('', raw))):
+                return 'allow', '', '', ()
             rule = 'unanalysable'
             reason = 'the command could not be analysed safely (%s) and it mentions a kill verb or indirection' % \
                      type(error).__name__
             audit(rule, raw, (), home)
             return ('block' if policy['mode'] == 'enforce' else 'warn'), rule, block_message(rule, reason), ()
-        return 'allow', '', '', ()
     if not findings:
         return 'allow', '', '', ()
     rule, reason, pids = findings[0]
