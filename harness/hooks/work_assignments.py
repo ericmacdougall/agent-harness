@@ -573,8 +573,8 @@ def read_events(limit_tail=None) -> list:
         if not path.exists():
             return []
         raise StoreCorrupt(f"cannot read {path.name} ({error.message}); nothing was folded or overwritten. "
-                           f"The event log is read whole up to {MAX_STORE_BYTES >> 20} MiB: archive it with "
-                           "`work_assignments.py verify` evidence and ask main")
+                           f"The event log is read whole up to {MAX_STORE_BYTES >> 20} MiB and rotation is not built yet "
+                           "(GoodQA 1ae27b6b#14605): keep the file unedited and report this to main")
     lines = raw.split(b"\n")
     if limit_tail:
         lines = lines[1:]  # first line of a tail window may be partial
@@ -1013,9 +1013,19 @@ SECRET_SHAPES = tuple(re.compile(rx) for rx in (
     r"\bgh[pousr]_[A-Za-z0-9]{20,}",                              # GitHub tokens
     r"\bxox[abprs]-[A-Za-z0-9-]{10,}",                            # Slack tokens
     r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)?",  # JWT header.payload[.signature]
-    r"(?<![\d-])(?:\d[ -]?){12,18}\d(?![\d-])",                    # card-like 13-19 digit runs
     r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)",                            # SSN shape
 ))
+
+
+CARD_LIKE = re.compile(r"(?<![\d-])(?:\d[ -]?){12,18}\d(?![\d-])")  # 13-19 digit runs
+
+
+def luhn(digits: str) -> bool:
+    total = 0
+    for place, char in enumerate(reversed(digits)):
+        value = int(char) * (2 if place % 2 else 1)
+        total += value - 9 if value > 9 else value
+    return total % 10 == 0
 
 
 def redact(text: str) -> str:
@@ -1025,6 +1035,7 @@ def redact(text: str) -> str:
         text = re.sub(r"(?i)\b(pass(?:word|wd)?|pwd|secret|token|api[_ -]?key)\s+(?![\[\"'])\S+", r"\1 [redacted]", text)
         for pattern in SECRET_SHAPES:
             text = pattern.sub("[redacted]", text)
+        text = CARD_LIKE.sub(lambda m: "[redacted]" if luhn(re.sub(r"\D", "", m.group())) else m.group(), text)
         return re.sub(r"\b[0-9a-fA-F]{32,}\b", "[redacted]", text)
     except Exception:  # never store an unredacted excerpt when the redactor is unavailable
         return "[excerpt withheld: redactor unavailable]"
@@ -1144,14 +1155,31 @@ def codex_headless(path) -> bool:
     return source == "exec" or meta.get("originator") == "codex_exec" or (isinstance(source, dict) and "subagent" in source)
 
 
+def child_rollout(data, session, runtime, transcript) -> bool:
+    """A Codex subagent hook carries the parent's session id and the child's rollout: it says nothing about the parent."""
+    rec = data["sessions"].get(session)
+    return bool(runtime == "codex" and rec and rec.get("transcript") and not rec.get("headless") and transcript
+                and rec["transcript"] != transcript[:1024] and codex_headless(transcript))
+
+
+def track_transcript(rec, runtime, transcript) -> None:
+    changed = rec.get("transcript") != transcript[:1024]
+    if changed:  # offsets and line counts belong to one file
+        rec.pop("syncOffset", None)
+        rec.pop("syncLine", None)
+    if runtime == "codex" and (changed or "headless" not in rec):
+        rec["headless"] = codex_headless(transcript)  # read once per rollout, not on every hook
+    rec["transcript"] = transcript[:1024]
+
+
 def session_record(data, session, runtime, transcript):
+    if child_rollout(data, session, runtime, transcript):
+        transcript = None
     ident = hive_identity()
     rec = data["sessions"].setdefault(session, {"provider": provider_of(runtime), "hiveId": ident["hiveId"],
                                                  "firstSeenAt": iso(now()), "stopBlocks": {}, "reinject": False})
     if transcript:
-        if runtime == "codex" and (rec.get("transcript") != transcript[:1024] or "headless" not in rec):
-            rec["headless"] = codex_headless(transcript)  # read once per rollout, not on every hook
-        rec["transcript"] = transcript[:1024]
+        track_transcript(rec, runtime, transcript)
     rec["provider"] = provider_of(runtime)
     rec["lastSeenAt"] = iso(now())
     return rec
@@ -1504,7 +1532,7 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
              f"{len(no_asks)} no-ask(s), {sum(1 for r in no_asks if r['cues'])} flagged as a possible request, "
              f"{len(pending_supersessions(data, limit=10 ** 6))} superseded awaiting a user cancel."]
     def mine(rec_session) -> bool:
-        return session is None or rec_session == session  # `status` without --session shows everything
+        return session is None or rec_session == session  # None is `status --all`; "" is no known caller: ids only
 
     def text_of(ask, width) -> str:
         if mine(ask["origin"]["actor"].get("sessionId")):
@@ -1520,6 +1548,8 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
     if log_size > MAX_STORE_BYTES // 2:
         lines.append(f"  WARNING: the event log is {log_size >> 20} MiB, over half its {MAX_STORE_BYTES >> 20} MiB read bound; past "
                      "the bound cancel, verify and recover stop working. Rotation is follow-up GoodQA 1ae27b6b#14605.")
+    if session == "":
+        lines.append("  No caller session is known, so text is withheld: use status --session <id>, or --all for every session.")
     for mid in own[:8]:
         msg = data["messages"][mid]
         tag = "" if msg["humanCheck"].get("verified") else " [unverified: transcript only]"
@@ -1717,7 +1747,9 @@ def hook_stop(payload: dict, runtime: str) -> dict:
     with transaction() as data:
         rec = data["sessions"].get(session)
         if rec is not None and isinstance(payload.get("transcript_path"), str):
-            rec["transcript"] = payload["transcript_path"][:1024]
+            if child_rollout(data, session, runtime, payload["transcript_path"]):
+                return {}
+            track_transcript(rec, runtime, payload["transcript_path"])
         sync_all(data, session)
         found = problems_for(data, session, policy)
         rec = data["sessions"].get(session) or session_record(data, session, runtime, None)
@@ -2102,8 +2134,8 @@ def proof_for(data: dict, ask: dict, file: str, line: int, uuid: str, quote: str
     tracked = data["sessions"].get(msg["sessionId"], {}).get("transcript")
     if not tracked or os.path.realpath(tracked) != os.path.realpath(file):
         raise WAError("proof message is not from a transcript this ledger tracks")
-    if parse_ts(msg["origin"]["at"]) < parse_ts(ask["createdAt"]) - 1:
-        raise WAError("proof message predates the ask")
+    if parse_ts(msg["origin"]["at"]) < evidence_scope(ask)[1] - 1:
+        raise WAError("proof message predates the ask or its last reopen")
     check_binding(data, ask, msg, binding, quote, decision_id, verified.get("text") or "")
     proof = {"messageId": msg["id"], "log": {"file": file[:1024], "lineStart": line, "lineEnd": line, "messageUuid": uuid,
                                               "lineSha256": verified["lineSha256"]},
@@ -2575,7 +2607,7 @@ def cmd_status(args):
         if args.json:
             print(json.dumps({k: data[k] for k in ("messages", "asks", "decisions", "index")}, indent=1, sort_keys=True))
             return
-        session = None if args.all else (args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or None)
+        session = None if args.all else (args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or "")
         print(digest(data, policy, session, limit=args.limit))
     fails = pending_failures()
     if fails:

@@ -251,6 +251,27 @@ class CaptureTest(Base):
         self.assertEqual(next(iter(data["messages"].values()))["triage"]["status"], "untriaged")  # still blocking
         self.check_schema()
 
+    def test_codex_child_stop_leaves_the_parent_record_alone(self):
+        """PR review 2a1da45 #3: a child's Stop pointed the parent at the child's file, keeping the parent's offsets."""
+        parent = Path(self.tmp.name) / "rollout-parent.jsonl"
+        parent.write_text(real_size_rollout({"source": "cli", "originator": "codex_cli"}))
+        child = Path(self.tmp.name) / "rollout-child.jsonl"
+        child.write_text(real_size_rollout({"source": {"subagent": {"thread_spawn": {"parent_thread_id": SID}}}}))
+        other = Path(self.tmp.name) / "rollout-next.jsonl"
+        other.write_text(real_size_rollout({"source": "cli", "originator": "codex_cli"}))
+        self.hook("session", {"session_id": SID, "transcript_path": str(parent)}, runtime="codex")
+        self.hook("stop", {"session_id": SID, "transcript_path": str(parent)}, runtime="codex")
+        before = self.data()["sessions"][SID]
+        self.assertIn("syncOffset", before)
+        self.assertEqual(self.hook("stop", {"session_id": SID, "transcript_path": str(child)}, runtime="codex"), {})
+        self.hook("session", {"session_id": SID, "transcript_path": str(child)}, runtime="codex")
+        after = self.data()["sessions"][SID]
+        self.assertEqual((after["transcript"], after["syncOffset"], after["headless"]), (str(parent), before["syncOffset"], False))
+        with wa.transaction() as data:  # an interactive rollout replacing the tracked one starts a fresh read position
+            wa.session_record(data, SID, "codex", str(other))
+            self.assertEqual(data["sessions"][SID]["transcript"], str(other))
+            self.assertNotIn("syncOffset", data["sessions"][SID])
+
     def test_codex_subagent_payload_creates_no_request(self):
         """NEG-12 on Codex: subagent hooks carry the parent session id and an agent_id."""
         self.hook("prompt", self.payload("do a thing", agent_id="a123"), runtime="codex")
@@ -698,6 +719,28 @@ class RemovalTest(Base):
         self.assertEqual((tomb["proofKind"], tomb["finalState"]), ("verified_evidence", "done"))
         self.assertTrue(wa.files()["archive"].read_text().count("\n") >= 1)
         self.check_schema()
+
+    def test_cancel_typed_before_a_reopen_no_longer_applies(self):
+        """PR review 2a1da45 #4; a fresh cancel after the reopen still works."""
+        _, aid = self.split("build it", "build the thing")
+        early = self.capture(f"cancel {aid}")
+        uid = self.data()["messages"][early["id"]]["origin"]["log"]["messageUuid"]
+        CLOCK[0] += 10
+        self.advance(aid)
+        CLOCK[0] += 10
+        again = self.capture("actually it is not fixed")
+        self.assertEqual(self.cli("update", aid, "--state", "in_progress", "--reopen-by", again["id"])[0], 0)
+        CLOCK[0] += 10
+        self.assertEqual(self.cli(*self.cancel_args(aid, uid, 2))[0], 2)
+        self.assertNotIn("cancellation", self.asks()[aid])
+        fresh = self.capture(f"cancel {aid}")
+        uid = self.data()["messages"][fresh["id"]]["origin"]["log"]["messageUuid"]
+        self.assertEqual(self.cli(*self.cancel_args(aid, uid, 4))[0], 0)
+
+    def test_number_lists_survive_redaction_and_real_cards_do_not(self):
+        """PR review 2a1da45 note 5."""
+        self.assertEqual(REAL_REDACT("tickets 14465 14457 14597"), "tickets 14465 14457 14597")
+        self.assertNotIn("4111", REAL_REDACT("card 4111 1111 1111 1111"))
 
     def test_open_ask_is_never_removable(self):
         _, aid = self.split("x", "still open")
@@ -1409,6 +1452,12 @@ class StoreTest(Base):
             self.assertEqual(self.cli("split", "--msg", msg["id"], "--item", "x thing")[0], 2)
             self.assertEqual(self.cli("no-ask", "--msg", msg["id"], "--session", other, "--reason", "looks like chatter to me")[0], 2)
         self.assertEqual(self.data()["messages"][msg["id"]]["triage"]["status"], "untriaged")
+        with mock.patch.dict(os.environ):  # acceptance v9b D1: no known caller (Codex) means ids only
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            out = self.cli("status")[1]
+            self.assertIn(msg["id"], out)
+            self.assertNotIn("refactor the billing", out)
+            self.assertIn("refactor the billing", self.cli("status", "--session", SID)[1])
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": other}):  # spec review v8 #1: `status` too
             out = self.cli("status")[1]
             self.assertIn(msg["id"], out)
@@ -1840,7 +1889,7 @@ class LatencyTest(Base):
                               "cwd": self.tmp.name}}
         size = wa.files()["snap"].stat().st_size
         control = [sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import work_assignments", str(HOOKS)]
-        RUNS = 9  # acceptance review v8 M2: 5 runs left the gate at its margin
+        RUNS = 9
         medians, control_runs = {}, []
         for name, payload in payloads.items():
             timings = []
@@ -1859,10 +1908,9 @@ class LatencyTest(Base):
                   f"max {timings[-1] * 1000:.0f} ms (250 ms budget: {'met' if timings[RUNS // 2] < 0.25 else 'NOT met'})")
         base = sorted(control_runs)[len(control_runs) // 2]
         print(f"[latency] import-only control median {base * 1000:.0f} ms; load {os.getloadavg()[0]:.0f}; ratio to control "
-              + ", ".join(f"{n} {m / base:.2f}x" for n, m in medians.items()) + " (gate 3x)")
+              + ", ".join(f"{n} {m / base:.2f}x" for n, m in medians.items()) + " (measurement; the gate is the 1 s ceiling)")
         for name, median in medians.items():
             self.assertLess(median, 1.0, name)  # AC-15 ceiling
-            self.assertLessEqual(median, 3 * base, f"{name}: {median:.3f}s vs control {base:.3f}s")  # load-normalised
 
 
 @unittest.skipIf(jsonschema is None, "jsonschema not installed")

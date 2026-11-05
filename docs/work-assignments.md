@@ -141,7 +141,7 @@ rollout (`session_meta` `source.subagent`). Live Codex confirmation is pending (
 
 Sessions. A session's digest shows its own untriaged messages, asks and no-asks in full. Other sessions' items
 appear as ids, states, owners and flags only (no excerpt, ask text or command hint), so text typed in one project
-or provider does not reach another's context; `work_assignments.py status` shows the caller's session (`CLAUDE_CODE_SESSION_ID`) and `status --all` shows everything; no printed triage command carries `--session`. On Codex no caller session is known, so the triage check allows the call (Codex installs with `install_codex.py --ledger-mode warn` until codex-live passes; see docs/codex.md).
+or provider does not reach another's context; `work_assignments.py status` shows the caller's session (`CLAUDE_CODE_SESSION_ID`, or `--session`); with no known caller, as on Codex, it shows ids only; `status --all` shows everything; no printed triage command carries `--session`. On Codex no caller session is known, so the triage check allows the call (Codex installs with `install_codex.py --ledger-mode warn` until codex-live passes; see docs/codex.md).
 `split` and `no-ask` refuse a message from another session (the caller's session is `CLAUDE_CODE_SESSION_ID`)
 unless `--session <its id>` names it; with no session known (Codex) the call is allowed.
 
@@ -180,3 +180,11 @@ counters) are outside the fold by design. The first-touch sync window is the las
 Each hive appends its own events; sync unions event files by `(hiveId, seq)` and re-folds (see the schema DESIGN notes:
 scalar last-writer-wins by `(at, hiveId, seq)`, sets are unions, a transition conflict records `sync_conflict`).
 Never copy `privateRef` or absolute log paths off the capturing machine.
+
+## Known limits
+
+- `claude -p` started from a VS Code, Desktop or local-agent session may keep an inherited non-`sdk-` entrypoint and be captured as human (hypothesis from Claude Code 2.1.318; all user lines seen so far are `cli`).
+- `tested:` evidence must be a `REALLY_TESTED` note in the ask's own session WAL. Notes from other sessions or hosts are refused, and migrated or imported asks have no origin session, so they cannot verify this way (fails safe; GoodQA 1ae27b6b#14597).
+- On Codex with `--ledger-mode warn`, the Codex guard only warns, including over the shared store and policy files. Claude's guard still denies.
+- Past the 128 MiB event-log bound, cancel, remove and recover refuse until rotation exists (GoodQA 1ae27b6b#14605).
+- Hooks cost about 280 ms on a loaded dev2; the hard gate is a 1 s ceiling and the profile target is tracked in its own ticket.
