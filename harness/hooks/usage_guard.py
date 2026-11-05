@@ -185,18 +185,24 @@ def host_identity():
 
 def boot_identity():
     """A boot identifier when the platform offers one cheaply; audit detail only."""
+    # Tokens carry their scheme so an id from another build or platform is never compared.
     try:
-        return Path('/proc/sys/kernel/random/boot_id').read_text().strip()[:64] or None
+        value = Path('/proc/sys/kernel/random/boot_id').read_text().strip()[:64]
+        if value: return 'procboot:' + value
     except OSError:
         pass
     try:
         # kern.boottime moves when the wall clock is stepped; the boot session UUID does not.
         probe = subprocess.run(['sysctl', '-n', 'kern.bootsessionuuid'], capture_output=True, text=True, timeout=5)
         if probe.returncode == 0 and probe.stdout.strip():
-            return probe.stdout.strip()[:64]
+            return 'bootsession:' + probe.stdout.strip()[:64]
     except (OSError, subprocess.SubprocessError, ValueError):
         pass
     return None
+
+
+def same_scheme(recorded, current):
+    return recorded.split(':', 1)[0] == current.split(':', 1)[0]
 
 
 def process_start_token(pid):
@@ -234,8 +240,11 @@ def group_empty(pid):
 
 def incarnation_state(pid, recorded_token, recorded_boot, current_boot, *, whole_group=False):
     """DEAD, ALIVE or UNCERTAIN for one recorded (pid, start token) on this host."""
-    if isinstance(recorded_boot, str) and isinstance(current_boot, str) and recorded_boot != current_boot:
-        return 'DEAD', 'host rebooted since the reservation'
+    if isinstance(recorded_boot, str) and isinstance(current_boot, str):
+        if not same_scheme(recorded_boot, current_boot):
+            return 'UNCERTAIN', 'boot identity scheme differs'
+        if recorded_boot != current_boot:
+            return 'DEAD', 'host rebooted since the reservation'
     if isinstance(recorded_boot, str) and current_boot is None:
         return 'UNCERTAIN', 'boot identity unavailable'
     exists = pid_exists(pid)
@@ -250,7 +259,7 @@ def incarnation_state(pid, recorded_token, recorded_boot, current_boot, *, whole
     current = process_start_token(pid)
     if not isinstance(recorded_token, str) or current is None:
         return 'UNCERTAIN', 'process start time unavailable'
-    if current.split(':', 1)[0] != recorded_token.split(':', 1)[0]:
+    if not same_scheme(recorded_token, current):
         return 'UNCERTAIN', 'process start token scheme differs'
     if current != recorded_token:
         return 'DEAD', 'pid reused: start time differs'
@@ -900,9 +909,18 @@ class UsageStore:
         sha = self._publish(directory / 'events', event + '.json', value)
         self._publish(directory, 'head.json', {'event': event, 'sha256': sha}, replace=True)
 
+    def _require_open(self, run_id):
+        """A run that finished or was reconciled as dead may not launch providers or record children."""
+        directory = self._run_directory(run_id)
+        if os.path.lexists(directory / 'completion.json'):
+            raise GuardError('UNKNOWN', 'Run already finished; it cannot acquire a pool or record a child')
+        if self._reconciliation(directory, run_id):
+            raise GuardError('UNKNOWN', 'Run was reconciled as dead; it cannot acquire a pool or record a child')
+
     def acquire_pool(self, provider, pool, run_id):
         with self._lock():
             self._owned_start(run_id)
+            self._require_open(run_id)
             directory, state = self._pool(provider, pool)
             if state['active'] is not None and self._auto_reconcile_locked(state['active'])['reconciled']:
                 directory, state = self._pool(provider, pool)
@@ -1011,6 +1029,7 @@ class UsageStore:
         with self._lock():
             directory = self._run_directory(run_id)
             self._owned_start(run_id)
+            self._require_open(run_id)
             children = list(self._children(directory))
             if len(children) >= 64: raise GuardError('INVALID_OUTPUT', 'Too many recorded children')
             children.append({'pid': pid, 'process_started': process_start_token(pid)})

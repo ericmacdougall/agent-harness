@@ -544,6 +544,13 @@ class OwnerLiveness(StoreFixture):
         started = datetime.fromisoformat(start['started_at']); deadline = datetime.fromisoformat(owner['deadline'])
         self.assertAlmostEqual((deadline - started).total_seconds(), start['timeout'] + guard.DEADLINE_GRACE, delta=1)
 
+    def test_boot_identity_is_a_tagged_boot_session_id(self):
+        value = guard.boot_identity()
+        if value is None: self.skipTest('no boot identity source on this platform')
+        self.assertTrue(value.startswith(('bootsession:', 'procboot:')))
+        self.assertNotIn('sec =', value)  # never kern.boottime, which moves with clock steps
+        with mock.patch.dict(os.environ, {'TZ': 'America/New_York'}): self.assertEqual(guard.boot_identity(), value)
+
     def test_process_start_token_is_stable_across_time_zones(self):
         alive = self.child()
         with mock.patch.dict(os.environ, {'TZ': 'UTC'}): utc = guard.process_start_token(alive.pid)
@@ -623,11 +630,16 @@ class OwnerLiveness(StoreFixture):
         reused = self.begin_owned(self.facts_for(alive, process_started=real + 'x'), label='reused')
         with self.future(): report = self.store.auto_reconcile(reused.run_id)
         self.assertTrue(report['reconciled']); self.assertIn('pid reused', report['liveness']['why'])
-        rebooted = self.begin_owned(self.facts_for(alive, boot_id='boot-before'), label='rebooted')
-        with self.future(), mock.patch.object(guard, 'boot_identity', return_value='boot-after'):
+        rebooted = self.begin_owned(self.facts_for(alive, boot_id='bootsession:before'), label='rebooted')
+        with self.future(), mock.patch.object(guard, 'boot_identity', return_value='bootsession:after'):
             report = self.store.auto_reconcile(rebooted.run_id)
         self.assertTrue(report['reconciled']); self.assertIn('rebooted', report['liveness']['why'])
-        unknown_boot = self.begin_owned(self.facts_for(alive, boot_id='boot-before'), label='unknown-boot')
+        # F24: an id from another build or scheme (for example the old kern.boottime text) never proves a reboot.
+        old_build = self.begin_owned(self.facts_for(alive, boot_id='{ sec = 1, usec = 2 } Wed Nov 4 2026'), label='old-build')
+        with self.future(), mock.patch.object(guard, 'boot_identity', return_value='bootsession:after'):
+            report = self.store.auto_reconcile(old_build.run_id)
+        self.assertFalse(report['reconciled']); self.assertIn('scheme differs', report['liveness']['why'])
+        unknown_boot = self.begin_owned(self.facts_for(alive, boot_id='bootsession:before'), label='unknown-boot')
         alive.kill(); alive.wait(timeout=5)
         with self.future(), mock.patch.object(guard, 'boot_identity', return_value=None):
             report = self.store.auto_reconcile(unknown_boot.run_id)
@@ -703,6 +715,12 @@ class OwnerLiveness(StoreFixture):
         self.assertEqual(refused.exception.reason, 'UNKNOWN')
         self.assertFalse((self.store.root / 'runs' / run.run_id / 'final.json').exists())
         self.assertFalse((self.store.root / 'runs' / run.run_id / 'completion.json').exists())
+        # R11: a reconciled run can neither take a pool nor record a new child.
+        with self.assertRaises(guard.GuardError): self.store.acquire_pool('codex', 'fixture-pool', run.run_id)
+        with self.assertRaises(guard.GuardError): run.note_child(self.child())
+        done = self.begin_owned(self.facts_for(self.child()), label='done'); self.finish(done)
+        with self.assertRaises(guard.GuardError): self.store.acquire_pool('codex', 'fixture-pool', done.run_id)
+        with self.assertRaises(guard.GuardError): done.note_child(self.child())
 
     def test_completed_run_is_not_auto_reconciled_and_sweep_reports_every_run(self):
         done = self.begin(); self.finish(done)
