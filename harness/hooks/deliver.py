@@ -387,6 +387,7 @@ def helper_source():
     source["files"] = {}
     for name in ("deliver.py", "suite_compare.py", "suite_report.py", "test_scope.py", "integrate_local.py"):
         try:
+            # input-ok: this helper's own sibling source files, identified by digest
             source["files"][name] = hashlib.sha256((here / name).read_bytes()).hexdigest()
         except OSError:
             source["files"][name] = "missing"

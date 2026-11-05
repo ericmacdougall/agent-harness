@@ -368,7 +368,8 @@
   "owner_overlap": "PR #53 / harness-reliability budget",
   "matrix_rows": "Z01,Z02,Z03",
   "mechanisms": [
-   "heavy_job_guard:hook"
+   "heavy_job_guard:hook",
+   "test_scope:hook"
   ]
  },
  {

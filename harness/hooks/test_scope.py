@@ -94,6 +94,7 @@ def full_sha(value: str, what: str) -> str:
 def load_policy(path: Path = POLICY) -> dict:
     policy = dict(DEFAULT_POLICY)
     try:
+        # input-ok: the policy file installed next to this script (a few hundred bytes, root-of-trust like the script itself); malformed content falls back to defaults
         data = json.loads(path.read_text())
         if isinstance(data, dict):
             for key in DEFAULT_POLICY:
@@ -124,6 +125,7 @@ class Store:
         try:
             if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_RECORD:
                 return None
+            # input-ok: size checked against MAX_RECORD on the line above
             data = json.loads(path.read_text())
         except (OSError, ValueError):
             return None
@@ -366,6 +368,7 @@ def validate_report(head: str, report: Path, packet: Path) -> str:
     report = Path(report)
     if report.is_symlink() or not report.is_file() or report.stat().st_size > MAX_REPORT:
         raise Refused("bad-evidence", "the review report is missing, not a regular file or too large")
+    # input-ok: size checked against MAX_REPORT above
     text = report.read_text(errors="replace")
     lines = text.splitlines()
     status_at = next((i for i, line in enumerate(lines[:40]) if line.startswith("Worktree status: ")), -1)
@@ -384,6 +387,7 @@ def validate_report(head: str, report: Path, packet: Path) -> str:
     if fields.get("Worktree status") != "clean":
         problems.append("the reviewed worktree was not clean")
     packet = Path(packet)
+    # input-ok: the review packet is a local file already bounded by the review helper (150000 bytes)
     digest = hashlib.sha256(packet.read_bytes()).hexdigest() if packet.is_file() and not packet.is_symlink() else ""
     if not digest or fields.get("Reviewed packet SHA-256") != digest:
         problems.append("Reviewed packet SHA-256 is absent or does not match the packet")
