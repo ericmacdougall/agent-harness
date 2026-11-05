@@ -328,8 +328,11 @@
   "priority": "P1",
   "owner_overlap": "new; port dev2 hawkeye-worktree-hygiene",
   "matrix_rows": "",
-  "mechanisms": [],
-  "planned_batch": "B4"
+  "mechanisms": [
+   "stop_lints:stop",
+   "stop_lints:subagent-stop"
+  ],
+  "static_mode": "warn"
  },
  {
   "id": "S19",
@@ -489,8 +492,10 @@
   "priority": "P1",
   "owner_overlap": "ad1fe816; PR #53",
   "matrix_rows": "R08",
-  "mechanisms": [],
-  "planned_batch": "B4"
+  "mechanisms": [
+   "stop_lints:subagent-stop"
+  ],
+  "static_mode": "warn"
  },
  {
   "id": "W01",
@@ -562,8 +567,11 @@
   "priority": "P2",
   "owner_overlap": "port hawkeye-wal-cadence",
   "matrix_rows": "",
-  "mechanisms": [],
-  "planned_batch": "B4"
+  "mechanisms": [
+   "stop_lints:stop",
+   "stop_lints:subagent-stop"
+  ],
+  "static_mode": "warn"
  },
  {
   "id": "W05",
@@ -601,8 +609,10 @@
   "priority": "P2",
   "owner_overlap": "new",
   "matrix_rows": "",
-  "mechanisms": [],
-  "planned_batch": "B4"
+  "mechanisms": [
+   "stop_lints:subagent-stop"
+  ],
+  "static_mode": "warn"
  },
  {
   "id": "W07",
@@ -709,8 +719,11 @@
   "priority": "P2",
   "owner_overlap": "new",
   "matrix_rows": "C11",
-  "mechanisms": [],
-  "planned_batch": "B4"
+  "mechanisms": [
+   "stop_lints:stop",
+   "stop_lints:subagent-stop"
+  ],
+  "static_mode": "warn"
  },
  {
   "id": "W13",
@@ -799,8 +812,11 @@
   "priority": "P2",
   "owner_overlap": "new",
   "matrix_rows": "G05",
-  "mechanisms": [],
-  "planned_batch": "B4"
+  "mechanisms": [
+   "stop_lints:stop",
+   "stop_lints:subagent-stop"
+  ],
+  "static_mode": "warn"
  },
  {
   "id": "W18",

@@ -151,7 +151,8 @@ class InstallerTests(unittest.TestCase):
         install(self.home, apply=True)
         self.assertEqual([e for e in self.provenance_entries() if e[0] == "Stop"], [("Stop", None, "stop-lint")])
         stop = json.loads((self.claude / "settings.json").read_text())["hooks"]["Stop"]
-        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10])  # the managed entry replaced the manual one
+        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"] if "provenance_hooks.py" in str(h.get("args"))],
+                         [10])  # the managed entry replaced the manual one
 
     def test_foreign_hook_sharing_a_group_and_users_empty_event_list_survive(self):
         script = str(self.claude / "hooks" / "provenance_hooks.py")
@@ -161,7 +162,8 @@ class InstallerTests(unittest.TestCase):
         (self.claude / "settings.json").write_text(json.dumps(mixed))
         install(self.home, apply=True, provenance=False)
         hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop"])
+        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"] if "stop_lints.py" not in str(h.get("args"))],
+                         ["other-stop"])  # the stop_lints entry is managed separately
         self.assertEqual(hooks["Notification"], [])  # untouched, not ours
 
     def test_no_provenance_hooks_flag_unregisters_and_default_restores(self):
@@ -170,7 +172,7 @@ class InstallerTests(unittest.TestCase):
         install(self.home, apply=True, provenance=False)
         self.assertEqual(self.provenance_entries(), [])
         hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-        self.assertNotIn("Stop", hooks)  # no empty event left behind
+        self.assertFalse(any("provenance_hooks.py" in str(h.get("args")) for g in hooks.get("Stop", []) for h in g["hooks"]))
         self.assertTrue(any("wal.py" in str(h.get("args")) for g in hooks["UserPromptSubmit"] for h in g["hooks"]))
         self.assertTrue((self.claude / "hooks" / "provenance_hooks.py").is_file())  # files stay installed
         install(self.home, apply=True)

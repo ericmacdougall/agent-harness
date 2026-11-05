@@ -1,0 +1,12 @@
+{
+ "schema": 1,
+ "note": "warn or off per lint; Stop and SubagentStop lints are warn-only until their false-positive rate is measured",
+ "modes": {
+  "W04": "warn",
+  "W06": "warn",
+  "W12": "warn",
+  "W17": "warn",
+  "S18": "warn",
+  "S26": "warn"
+ }
+}
