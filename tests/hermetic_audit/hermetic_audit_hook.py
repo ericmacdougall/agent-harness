@@ -16,14 +16,17 @@ import threading
 
 
 def _config():
-    path = os.environ.get('HC_AUDIT_CONFIG') or os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                             'hermetic_audit_config.json')
-    try:
-        import json
-        with open(path) as handle:
-            return json.load(handle)
-    except Exception:
-        return None
+    adjacent = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hermetic_audit_config.json')
+    import json
+    for path in (os.environ.get('HC_AUDIT_CONFIG'), adjacent):  # a missing override falls back, never disables
+        if not path:
+            continue
+        try:
+            with open(path) as handle:
+                return json.load(handle)
+        except Exception:
+            continue
+    return None
 
 
 def _fd_path(fd):
@@ -63,7 +66,11 @@ def install(config):
                 with open(log, 'a') as handle:
                     handle.write('%d %s %s%s argv0=%s\n' % (os.getpid(), event, real, note, sys.argv[0] if sys.argv else ''))
         except Exception:
-            pass
+            try:
+                with open(log + '.error', 'a') as handle:  # a failing log write must be visible, not silent
+                    handle.write('%d log write failed for %s\n' % (os.getpid(), event))
+            except Exception:
+                pass
         finally:
             state.busy = False
 

@@ -5,7 +5,9 @@ usage-touching modules are run on their own. It points HOME and AGENT_HARNESS_US
 the process so every child inherits them. Limits, stated plainly:
 - a child started with an empty environment still falls back to the pwd database (GoodQA #14561); the gate wrapper
   (hermetic_check.sh) therefore also runs the suite under a sandbox that DENIES writes to the real state dirs;
-- modules that froze a real-home path at import time (before install ran) are caught by scan_frozen_paths().
+- modules that froze a real-home path at import time (before install ran) are reported by scan_frozen_paths(), which the
+  suite asserts only when the gate pinned HOME first; under a bare discover those globals are protected by the tests'
+  own patches (see the spec's Scope limits).
 The protected set is the operator's real state directories, not "anything under HOME": a TMPDIR or worktree that
 happens to live under HOME is fine.
 """

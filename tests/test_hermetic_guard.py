@@ -53,7 +53,8 @@ class HermeticSuite(unittest.TestCase):
 
     def test_no_loaded_module_froze_a_real_state_path(self):
         # run_capped, heavy_job_guard and commit_policy compute their paths at import; with HOME pinned first
-        # (gate wrapper) none may point at the real state. Under a bare `discover` they are reported, not hidden.
+        # (gate wrapper) none may point at the real state. Under a bare `discover` this check is skipped (see the
+        # Scope limits in the spec): those globals are frozen before test_hermetic_guard is imported.
         if os.environ.get('HARNESS_SUITE_PINNED') != '1':
             self.skipTest('only meaningful when the gate wrapper pinned HOME before Python started')
         self.assertEqual(hermetic.scan_frozen_paths(), [])
