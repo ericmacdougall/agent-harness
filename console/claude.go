@@ -14,6 +14,7 @@ import (
 
 type claudeRun struct {
 	command     *exec.Cmd
+	tree        *processTree
 	input       io.WriteCloser
 	writeOnce   sync.Once
 	writer      *inputWriter
@@ -34,8 +35,35 @@ func (r *claudeRun) cancel() {
 	r.cancelOnce.Do(func() {
 		r.writeOnce.Do(func() { r.writer = newInputWriter(r.input) })
 		r.writer.close()
-		terminateProcess(r.command)
+		if r.tree != nil {
+			// Callers hold the app lock. The polite signal goes out before cancel
+			// returns; the grace wait and the kill run on their own goroutine, so
+			// a caller that must see the group gone (app.close) uses waitStopped
+			// after releasing the lock. An explicit cancel stops the group even
+			// after a leave verdict while the leader is still alive, and drops
+			// output not yet read.
+			r.tree.Release(true)
+			if r.tree.BeginStop() {
+				go r.tree.FinishStop(100 * time.Millisecond)
+			}
+		} else {
+			terminateProcess(r.command)
+		}
 	})
+}
+
+// waitStopped waits up to grace for a cancelled run's group to end and kills it
+// if it ignores the polite signal. Call it without holding the app lock.
+func (r *claudeRun) waitStopped(grace time.Duration) {
+	if r.tree == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() { r.tree.FinishStop(grace); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(grace + 700*time.Millisecond): // close must not hang on one run
+	}
 }
 func (r *claudeRun) write(value any) error { return r.writeContext(context.Background(), value) }
 func (r *claudeRun) writeContext(ctx context.Context, value any) error {
@@ -213,20 +241,19 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 		if err != nil {
 			return err
 		}
-		output, err := command.StdoutPipe()
-		if err != nil {
-			return err
-		}
 		command.Stderr = &cappedBuffer{limit: 32768}
-		if err = command.Start(); err != nil {
+		tree, err := startProcessTree(command, nil)
+		if err != nil {
 			a.unknownSend(current, requestID, err)
 			return err
 		}
-		run = &claudeRun{command: command, input: input, done: make(chan struct{}), cwd: cwd, runtimeHash: fingerprint, conversationIdentity: identity, policy: policy, authAdmit: a.authAdmission("claude", profile, authGeneration)}
+		output := tree.Stdout()
+		run = &claudeRun{command: command, tree: tree, input: input, done: make(chan struct{}), cwd: cwd, runtimeHash: fingerprint, conversationIdentity: identity, policy: policy, authAdmit: a.authAdmission("claude", profile, authGeneration)}
 		if err = a.attachStartedClaudeRun(current, run, profile, authGeneration, taskID, revision); err != nil {
 			// Start succeeded, so every later failure must reap the child even when
 			// the generation fence refused publication before the session saw it.
-			_ = command.Wait()
+			run.cancel()
+			<-tree.Done()
 			close(run.done)
 			a.unknownSend(current, requestID, err)
 			return err
@@ -240,9 +267,13 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 			final := current.requests[run.requestID] == "final"
 			a.mu.Unlock()
 			if !final {
-				terminateProcess(command)
+				tree.Release(true)
+				tree.Terminate(100 * time.Millisecond)
+			} else {
+				tree.Release(false)
 			}
-			err := command.Wait()
+			<-tree.Done()
+			err := tree.Err()
 			run.writeOnce.Do(func() { run.writer = newInputWriter(run.input) })
 			run.writer.close()
 			close(run.done)
@@ -515,6 +546,11 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 			}
 			a.transitionRequestLocked(current, requestID, "final")
 			current.providerFinal = true
+			if run.tree != nil {
+				// A recorded final: the tool's background work is its own, whatever
+				// the leader and its descendants do with stdout from here on.
+				run.tree.Settle(false)
+			}
 			a.inputOutcomeLocked(current, requestID, "retained", "Main turn final; files retained for possible owner/tool readers until explicit discard")
 			if current.queueUncertain {
 				current.Status = "unknown"
@@ -564,7 +600,10 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 		a.changedLocked()
 		a.mu.Unlock()
 	}
-	if err := scanner.Err(); err != nil {
+	// errStreamDrainBound means the leader is gone and a descendant merely holds
+	// the pipe: the caller's goroutine decides the tree's fate after the final
+	// check, so it is not a stream failure and must not cancel the run here.
+	if err := scanner.Err(); err != nil && !errors.Is(err, errStreamDrainBound) && !errors.Is(err, io.ErrClosedPipe) {
 		a.mu.Lock()
 		a.claudeUnfinishedLocked(current, run, "Claude output stream exceeded its bound or failed before a final result. No request was replayed.")
 		a.changedLocked()

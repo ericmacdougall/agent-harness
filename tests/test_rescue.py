@@ -338,7 +338,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['source'], 'Codex gpt-5.1-terra medium (rung R0)')
         self.assertFalse(capture.exists())
 
     def test_preexisting_ident_variant_cannot_produce_success_exit(self):
@@ -372,7 +372,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['source'], 'Codex gpt-5.1-terra medium (rung R0)')
         self.assertFalse(capture.exists())
 
     def test_info_exclude_cannot_hide_dirty_descendant(self):
@@ -390,7 +390,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['source'], 'Codex gpt-5.1-terra medium (rung R0)')
         self.assertFalse(capture.exists())
 
     def test_optional_git_info_directory_can_be_absent(self):
@@ -423,7 +423,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['source'], 'Codex gpt-5.1-terra medium (rung R0)')
         self.assertFalse(capture.exists())
 
     def two_commit_base(self):
@@ -470,7 +470,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['source'], 'Codex gpt-5.1-terra medium (rung R0)')
         self.assertEqual(report['head'], ancestor)
         self.assertFalse(capture.exists())
 
@@ -502,7 +502,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['source'], 'Codex gpt-5.1-terra medium (rung R0)')
         self.assertFalse(capture.exists())
 
     def test_graft_added_after_presence_check_cannot_spoof_history(self):
@@ -609,7 +609,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['source'], 'Codex gpt-5.1-terra medium (rung R0)')
         self.assertFalse(capture.exists())
 
     def test_worktree_config_redirect_does_not_hide_dirty_original(self):
@@ -630,7 +630,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['source'], 'Codex gpt-5.1-terra medium (rung R0)')
         self.assertFalse(capture.exists())
 
     def test_trailing_space_worktree_redirect_does_not_hide_dirty_original(self):
@@ -656,7 +656,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['source'], 'Codex gpt-5.1-terra medium (rung R0)')
         self.assertFalse(capture.exists())
 
     def test_trailing_carriage_return_worktree_redirect_is_blocked(self):
@@ -690,7 +690,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['source'], 'Codex gpt-5.1-terra medium (rung R0)')
         self.assertFalse(capture.exists())
 
     def test_staged_only_edit_with_clean_worktree_needs_main_commit(self):
@@ -821,7 +821,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['source'], 'Codex gpt-5.1-terra medium (rung R0)')
         self.assertFalse(capture.exists())
 
     def test_fifo_handoff_does_not_block_post_model_inspection(self):
@@ -829,7 +829,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['source'], 'Codex gpt-5.1-terra medium (rung R0)')
 
     def test_fifo_handoff_reader_refuses_pipe_without_waiting_for_writer(self):
         # Bound the actual FIFO reader separately from Git/model preflight.
@@ -855,7 +855,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(report['source'], 'Codex gpt-6-astra')
+        self.assertEqual(report['source'], 'Codex gpt-5.1-terra medium (rung R0)')
 
     def test_fallback_when_astra_executable_unavailable_is_blind_and_handed_off(self):
         (self.bin / 'codex').unlink()
@@ -865,7 +865,8 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
                              watchdog_seconds=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
-        self.assertEqual(report['source'], 'Claude Fable fallback')
+        self.assertEqual(report['source'], 'Claude sonnet medium (rung R0) fallback')
+        self.assertEqual(report['rung'], 'R0')
         self.assertEqual(report['status'], 'needs-main-commit')
         self.assertEqual(report['head'], self.base)
         self.assertTrue(report['dirty'])
@@ -890,6 +891,78 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
             self.invoke()
         self.assertEqual(seen['path'], path)
         self.assertNotIn('/usr/bin', seen['path'].split(os.pathsep))
+
+    def test_top_rung_is_never_launched_without_recorded_permission(self):
+        capture = self.root / 'top-prompt.txt'
+        command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
+                   '--output', str(self.output), '--rung', 'R5']
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin', 'CAPTURE_CODEX_PROMPT': str(capture)}
+        result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=STANDARD_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('needs the user', result.stderr); self.assertIn('never launched automatically', result.stderr)
+        self.assertFalse(capture.exists()); self.assertFalse(self.output.exists())
+        # Review-only rungs cannot write either.
+        command[-1] = 'R4'
+        result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=STANDARD_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual(result.returncode, 2); self.assertIn('review-only', result.stderr)
+
+    def test_top_rung_launches_astra_only_with_approve_top(self):
+        import escalation as ladder, model_tiers as tiers
+        state = self.root / 'ladder'; state.mkdir(mode=0o700)
+        wals = self.root / 'wals'; (wals / 's1').mkdir(parents=True)
+        os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
+        wal = wals / 's1' / 'main.jsonl'
+        wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'permission for [task:rescue-t] top rung',
+                                   'source': 'user:s/u "yes, use fable for rescue-t"'}) + '\n'
+                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'approved by the user'}) + '\n')
+        ladder.Ledger(state, tiers.load_policy()).approve_top('rescue-t', 'w1', wal)
+        capture = self.root / 'astra-prompt.txt'
+        command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
+                   '--output', str(self.output), '--task', 'rescue-t', '--rung', 'R5']
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+                       'CAPTURE_CODEX_PROMPT': str(capture), 'AGENT_HARNESS_ESCALATION_DIR': str(state), 'CODEX_ACTION': 'top'}
+        result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['source'], 'Codex gpt-6-astra medium (rung R5)')
+        self.assertTrue(capture.exists())
+
+    def test_task_only_run_launches_the_ledger_rung(self):
+        import escalation as ladder, model_tiers as tiers
+        state = self.root / 'ladder'; state.mkdir(mode=0o700)
+        ledger = ladder.Ledger(state, tiers.load_policy())
+        block = json.dumps({'schema': 1, 'kind': 'final', 'run_id': 'b' * 32, 'evidence': 'EXECUTED', 'subject': {'head': 'a' * 40},
+                            'invocation': {}, 'execution': 'COMPLETED', 'result': 'NO_RESULT', 'reason': 'CODE_FINDINGS',
+                            'usage': {'provider_launches': 1, 'reported': []},
+                            'review': {'stage': 'CODE_INSPECTION', 'verdict': 'BLOCK', 'findings': ['F1']}}, sort_keys=True)
+        for salt in ('1', '2', '3', '4'):
+            # Each failure at a new HEAD: a repeat at the same HEAD without a claimed fix counts once.
+            receipt = json.loads(block); receipt['salt'] = salt; receipt['subject'] = {'head': salt * 40}
+            ledger.record('rescue-r2', json.dumps(receipt, sort_keys=True).encode(), kind='review', source='test')
+        self.assertEqual(ledger.status('rescue-r2')['rung'], 'R2')
+        capture = self.root / 'r2-prompt.txt'
+        command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
+                   '--output', str(self.output), '--task', 'rescue-r2']
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+                       'CAPTURE_CODEX_PROMPT': str(capture), 'AGENT_HARNESS_ESCALATION_DIR': str(state), 'CODEX_ACTION': 'r2'}
+        result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['source'], 'Codex gpt-6.1-sol high (rung R2)')
+        self.assertEqual(report['rung'], 'R2'); self.assertIn('ledger rung', report['rung_why'])
+
+    def test_claude_written_work_is_rescued_by_codex_and_codex_work_by_claude(self):
+        capture = self.root / 'claude-prompt.txt'
+        command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
+                   '--output', str(self.output), '--author-harness', 'openai']
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+                       'CLAUDE_ACTION': 'other-harness', 'CAPTURE_CLAUDE_PROMPT': str(capture)}
+        result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['source'], 'Claude sonnet medium (rung R0)')
+        self.assertEqual(report['fallback_reason'], '')
+        self.assertTrue(capture.exists())
 
     def test_output_symlink_does_not_delete_target(self):
         target = self.root / 'important.txt'

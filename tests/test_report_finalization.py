@@ -116,7 +116,9 @@ class ReportFinalizationTests(unittest.TestCase):
             git('commit', '-qm', 'baseline')
             base = git('rev-parse', 'HEAD')
             packet = root / 'packet.md'
-            packet.write_text('Fixture scope')
+            packet.write_text('Fixture scope' if helper != 'peer_review' else
+                              # pr packets must carry run evidence and the exact HEAD (review_diagnostics.lint_packet)
+                              f'Fixture scope\nReviewed HEAD {base}\n$ python3 -m unittest\nRan 1 test\nOK\nexit 0\n')
             reports = root / 'reports'
             reports.mkdir(mode=0o700)
             output = reports / 'report.txt'
@@ -172,7 +174,11 @@ class ReportFinalizationTests(unittest.TestCase):
                 stack.enter_context(patch.object(sys, 'argv', argv))
                 # peer_review.main() opens the usage store; keep it out of the real ~/.agent-harness/usage.
                 stack.enter_context(patch.dict(os.environ, {'AGENT_HARNESS_USAGE_DIR': str(root / 'usage-state')}))
-                stack.enter_context(patch.object(module.shutil, 'which', return_value='fixture-model'))
+                if helper == 'peer_review':  # reviewer CLIs are found by review_diagnostics, not shutil.which
+                    stack.enter_context(patch.object(module.diagnostics, 'discover_executable', side_effect=lambda name, **kw: {
+                        'name': name, 'path': 'fixture-model', 'source': 'PATH', 'rejected': [], 'searched': []}))
+                else:
+                    stack.enter_context(patch.object(module.shutil, 'which', return_value='fixture-model'))
                 stack.enter_context(patch.object(module, 'run', side_effect=model))
                 stack.enter_context(contextlib.redirect_stdout(stdout))
                 stack.enter_context(contextlib.redirect_stderr(stderr))
