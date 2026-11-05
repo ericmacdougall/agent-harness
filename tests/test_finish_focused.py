@@ -367,7 +367,8 @@ class DeliverProof(Fixture):
         self.assertEqual(ctx.exception.status, "BLOCKED_POLICY")
 
     def test_facts_and_receipt_carry_the_approval_and_old_receipts_still_load(self):
-        flow = SimpleNamespace(generation="g", directory=Path("/d"), original=Path("/o"), state={"source_head": self.head})
+        flow = SimpleNamespace(generation="g", directory=Path("/d"), original=Path("/o"), state={"source_head": self.head},
+                               target_overrides=lambda: [], policy_waivers=lambda: ([], 0))
         self.assertNotIn("focused_checks", deliver.Workflow.facts(flow))
         flow.focused_checks = [{"approved": True}]
         self.assertEqual(deliver.Workflow.facts(flow)["focused_checks"], [{"approved": True}])

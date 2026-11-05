@@ -27,12 +27,13 @@ from urllib.parse import quote
 from github_identity import github_repository, repository_name
 from git_safety import git_environment, require_safe_source
 from integrate_local import (ALLOWED_GIT_ENV, CheckInterpreterError, CheckLog, ExternalApplyError,
-                             OriginalScope, acquire_scope_lock, approved_check, approved_prepare, focused_unittest,
+                             OriginalScope, acquire_scope_lock, approved_check, approved_prepare, focused_unittest, redact_output,
                              require_check_interpreters,
                              checkout_identity, git_common_directory, journal_key,
                              fsync_directory, private_directory, read_journal, run as run_check,
                              scope_key, valid_identity_text, write_journal)
 from process import cleanup_discarded
+import wal as wal_log
 
 
 OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -52,6 +53,13 @@ SETTLED = {"PR_READY", "REMOTE_BLOCKED", "LOCAL_READY", "RESOLVED_BASELINE",
            "DELIVERED", "LOCAL_DELIVERED", "POLICY_BLOCKED"}
 
 
+# Delivery targets that are far behind origin or carry a huge staged/untracked set are almost
+# always a stale or corrupted checkout (the 77k staged adds / 40k behind case); refuse early with
+# a specific hint instead of a generic "dirty" failure or a status timeout. mode: refuse | warn.
+TARGET_POLICY = {"mode": "refuse", "max_behind": 1000, "max_staged": 5000, "max_untracked": 5000,
+                 "timeout": 30}
+
+
 class DeliveryError(Exception):
     def __init__(self, status, message, *, code=3, **facts):
         super().__init__(message)
@@ -64,23 +72,42 @@ def report(status, message, **facts):
 
 def bounded(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT):
     """Bound a child process group and output without echoing its private output."""
+    code, output, _ = bounded_with_stderr(command, cwd=cwd, env=env, timeout=timeout, limit=limit)
+    return code, output
+
+
+def bounded_with_stderr(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT, stderr_limit=0):
+    """Like bounded, optionally keeping the first stderr_limit bytes.
+
+    stderr is drained through a pipe and the excess discarded, so a child that
+    floods stderr neither blocks, fills the disk, nor grows our memory.
+    """
     process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE if stderr_limit else subprocess.DEVNULL,
                                start_new_session=True)
-    data, deadline = bytearray(), time.monotonic() + timeout
+    data, errors, deadline = bytearray(), bytearray(), time.monotonic() + timeout
     try:
         with selectors.DefaultSelector() as poller:
-            poller.register(process.stdout, selectors.EVENT_READ)
-            while True:
+            poller.register(process.stdout, selectors.EVENT_READ, "out")
+            if stderr_limit:
+                poller.register(process.stderr, selectors.EVENT_READ, "err")
+            while poller.get_map():
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or not poller.select(remaining):
+                ready = poller.select(remaining) if remaining > 0 else []
+                if not ready:
                     raise DeliveryError("BLOCKED_LOCAL", "Delivery command timed out")
-                chunk = os.read(process.stdout.fileno(), 65536)
-                if not chunk:
-                    break
-                data.extend(chunk)
-                if len(data) > limit:
-                    raise DeliveryError("BLOCKED_LOCAL", "Delivery command output exceeded limit", reason="OUTPUT_LIMIT")
+                for key, _ in ready:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                    if not chunk:
+                        poller.unregister(key.fileobj)
+                    elif key.data == "err":
+                        errors.extend(chunk[:max(0, stderr_limit - len(errors))])
+                    else:
+                        data.extend(chunk)
+                        if len(data) > limit:
+                            raise DeliveryError("BLOCKED_LOCAL", "Delivery command output exceeded limit",
+                                                reason="OUTPUT_LIMIT")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise DeliveryError("BLOCKED_LOCAL", "Delivery command timed out")
@@ -88,7 +115,7 @@ def bounded(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT):
             code = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
             raise DeliveryError("BLOCKED_LOCAL", "Delivery command timed out") from None
-        return code, bytes(data).decode("utf-8", "replace")
+        return code, bytes(data).decode("utf-8", "replace"), bytes(errors).decode("utf-8", "replace")
     except BaseException as failure:
         # A reaped leader says nothing about descendants that still hold stdout.
         # Reuse the shared bounded TERM/grace/KILL and discarded-output cleanup.
@@ -99,6 +126,8 @@ def bounded(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT):
         raise
     finally:
         process.stdout.close()
+        if process.stderr:
+            process.stderr.close()
 
 
 def git(repo, *args, timeout=30):
@@ -141,6 +170,73 @@ def snapshot(repo, branch, *, require_clean=True):
         if code or status:
             raise DeliveryError("BLOCKED_LOCAL", "Checkout is dirty or cannot be inspected")
     return valid_oid(git_value(repo, "rev-parse", "HEAD"))
+
+
+def _count_entries(repo, label, *args):
+    """Count NUL-separated entries of a git listing; a truncated or timed-out listing is 'too many'."""
+    try:
+        code, output = bounded(["git", "-C", str(repo), "-c", "core.fsmonitor=false",
+                                "-c", "core.untrackedCache=false", *args, "-z"],
+                               env=git_environment(), timeout=TARGET_POLICY["timeout"], limit=MAX_OUTPUT)
+    except DeliveryError:
+        return None
+    if code:
+        return -1  # git refused the listing (ownership, corrupt index): never read as "zero"
+    return output.count("\0")
+
+
+def target_preflight(original, branch, mode=None):
+    """Refuse (or warn) before anything is published when the original checkout is a bad target.
+
+    Runs before require_safe_source on purpose (a huge index would otherwise time out the strict
+    snapshot first). Only read-only listings run here: no filters, fsmonitor, untracked cache or hooks.
+    """
+    mode = mode or TARGET_POLICY["mode"]
+    original = Path(original)
+    if original.is_symlink() or not original.is_dir():
+        return []  # later source/original checks report the precise refusal; [] keeps warn-mode callers iterable
+    problems = []
+    for label, limit_name, args in (
+            ("staged", "max_staged", ("diff", "--cached", "--name-only")),
+            ("untracked", "max_untracked", ("ls-files", "--others", "--exclude-standard"))):
+        count = _count_entries(original, label, *args)
+        if count == -1:
+            problems.append((f"original checkout {label} paths could not be listed by git",
+                             "TARGET_UNREADABLE",
+                             "run `git status` in the original checkout to see the error (ownership, "
+                             "corrupt index) and fix it before delivering"))
+        elif count is None or count > TARGET_POLICY[limit_name]:
+            shown = "more than the inspectable bound" if count is None else str(count)
+            problems.append((f"original checkout has {shown} {label} paths (limit {TARGET_POLICY[limit_name]})",
+                             f"HUGE_{label.upper()}",
+                             "this looks like a corrupted or abandoned checkout; use a clean checkout of the "
+                             "target branch, or inspect and clear the index before delivering"))
+    code, behind = git(original, "rev-list", "--count", f"HEAD..refs/remotes/origin/{branch}",
+                       timeout=TARGET_POLICY["timeout"]) if _safe_branch(branch) else (1, "")
+    if code:
+        # No usable origin/<branch> tracking ref: the behind check cannot run. Say so rather than
+        # passing silently; the count is only as fresh as the last fetch either way.
+        print("WARNING: behind-origin check skipped (no refs/remotes/origin/<branch> tracking ref; "
+              "fetch first to enable it)", file=sys.stderr)
+    elif behind.strip().isdigit() and int(behind) > TARGET_POLICY["max_behind"]:
+        problems.append((f"original checkout is {int(behind)} commits behind origin/{branch} "
+                         f"(limit {TARGET_POLICY['max_behind']})", "ORIGINAL_BEHIND",
+                         f"for a new generation, update it first (git -C <original> pull --ff-only) and rebase the "
+                         f"feature onto origin/{branch}; to resume an in-flight generation, do not move the original: "
+                         f"use --reconcile-only or --target-policy warn"))
+    if not problems:
+        return []
+    message = "; ".join(item[0] for item in problems)
+    if mode == "warn":
+        print("WARNING: " + message, file=sys.stderr)
+        # The caller records these bypassed checks in the WAL, the generation and the output.
+        return [{"reason": item[1], "message": item[0][:300]} for item in problems]
+    raise DeliveryError("BLOCKED_POLICY", "Original checkout is not a sane delivery target: " + message, code=2,
+                        reason=problems[0][1], hint="; ".join(item[2] for item in problems))
+
+
+def _safe_branch(branch):
+    return valid_identity_text(branch) and not branch.startswith("-")
 
 
 def ancestry(repo, older, newer):
@@ -503,7 +599,53 @@ class Workflow:
                  "checkout": str(self.original), "source_head": self.state["source_head"]}
         if getattr(self, "focused_checks", None):
             facts["focused_checks"] = self.focused_checks
+        overrides = self.target_overrides()
+        if overrides:
+            facts["target_policy_overrides"] = overrides
+        waivers, total = self.policy_waivers()
+        if waivers is None:
+            # A record that exists but cannot be read must not look like "no waivers".
+            facts["commit_policy_waivers_unreadable"] = True
+        elif waivers:
+            facts["commit_policy_waivers"] = waivers
+            if total > len(waivers):
+                facts["commit_policy_waivers_total"] = total
         return facts
+
+    def target_overrides(self):
+        """Every --target-policy warn run recorded for this generation (see record_target_override)."""
+        path = self.directory / TARGET_OVERRIDE_RECORD
+        if not os.path.lexists(path):
+            return []
+        try:
+            items = json.loads(regular_bytes(path, WAIVER_RECORD_LIMIT)).get("overrides", [])
+            return items if isinstance(items, list) else [{"mode": "unreadable"}]
+        except (OSError, ValueError, DeliveryError, AttributeError):
+            return [{"mode": "unreadable"}]
+
+    def policy_waivers(self):
+        """Waivers the checked range used, so a reviewer of the prepare output sees every bypass.
+
+        Returns (items, total): ([], 0) when no record exists (local-only or pre-gate generations),
+        (None, 0) when a record exists but is unreadable or holds a malformed item, and at most 50
+        items with the full count otherwise.
+        """
+        path = self.directory / COMMIT_POLICY_RECORD
+        if not os.path.lexists(path):
+            return [], 0
+        try:
+            # The record also holds exclude/ticket lists; allow far more than the 50 waivers shown.
+            record = json.loads(regular_bytes(path, WAIVER_RECORD_LIMIT))
+            items = record.get("waivers", [])
+            if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+                return None, 0
+            return [{"kind": sanitize_gh_text(str(item.get("kind", "")), 40),
+                     "subject": sanitize_gh_text(str(item.get("subject", "")), 64),
+                     "id": sanitize_gh_text(str(item.get("id", "")), 64),
+                     "wal": os.path.basename(sanitize_gh_text(str(item.get("wal", "")), 200))}
+                    for item in items[:50]], len(items)
+        except (OSError, ValueError, DeliveryError, AttributeError, TypeError):
+            return None, 0
 
     def complete(self, mode, head, digest):
         self.save(target=head, checks_digest=digest)
@@ -550,9 +692,13 @@ class Workflow:
         return {**value, "current_head": current}
 
 
-def gh(*args, timeout=30):
+def gh(*args, timeout=30, stderr_limit=0):
     env = git_environment()
     env.update({"GH_PROMPT_DISABLED": "1", "GH_HOST": "github.com", "GIT_TERMINAL_PROMPT": "0"})
+    if stderr_limit:
+        # Mutating calls (pr create) classify launch, budget and mid-run errors themselves, so
+        # raw exceptions propagate and the result is (code, stdout, bounded stderr).
+        return bounded_with_stderr(["gh", *args], env=env, timeout=min(timeout, 30), stderr_limit=stderr_limit)
     try:
         return bounded(["gh", *args], env=env, timeout=min(timeout, 30))
     except OSError:
@@ -560,6 +706,64 @@ def gh(*args, timeout=30):
     except DeliveryError as error:
         raise DeliveryError("REMOTE_UNCERTAIN", "GitHub command exceeded its output or time budget",
                             code=4, **error.facts) from None
+
+
+GH_STDERR_LIMIT = 4096
+GH_HINT_LIMIT = 300
+ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|.)")
+# Anything ambiguous, transient or from a later step (labels, reviewers) may have happened after
+# GitHub already created the PR, so it can never be a definite verdict.
+GH_TRANSIENT = re.compile(r"(?i)(?:timed? ?out|timeout|deadline exceeded|connection (?:reset|refused|closed)|"
+                          r"broken pipe|\beof\b|temporar|try again|rate limit|too many requests|\b429\b|"
+                          r"something went wrong|internal server error|\b50[0234]\b|bad gateway|"
+                          r"service unavailable|no such host|network is unreachable|\btls\b|"
+                          r"could not add|could not request|after (?:creating|the pull request)|"
+                          # A PR that already exists is positive evidence of a create, never "nothing created",
+                          # even when an eventually consistent `gh pr list` does not show it yet.
+                          r"already exists)")
+# Failures GitHub reports before creating anything. Every pattern is anchored to the start of a line
+# in gh's own message shape (after gh's fixed prefixes), never to free words such as "not found" or
+# to phrases that could appear mid-line next to an echoed branch, label or later-step message.
+_GH_LINE = r"(?im)^\s*(?:(?:pull request create failed|aborted|error|gh|graphql)\s*:\s*)*"
+GH_DEFINITE = (
+    (re.compile(_GH_LINE + r"(?:to get started with github cli, please run:\s+gh auth login|http 401\b|"
+                           r"bad credentials|authentication required)"),
+     "GitHub authentication failed; run `gh auth login` for this host, then re-run prepare with --new-generation"),
+    (re.compile(_GH_LINE + r"(?:http 403\b|resource not accessible)"),
+     "GitHub denied write access to this repository; check the account's write access, then re-run prepare with --new-generation"),
+    (re.compile(_GH_LINE + r"(?:base ref must be a branch|could not resolve to a (?:ref|branch)\b)"),
+     "The base branch does not exist on GitHub; push it or pass the right --original-branch, then re-run with --new-generation"),
+    (re.compile(_GH_LINE + r"(?:http 404\b|could not resolve to a repository\b)"),
+     "GitHub cannot find the repository (or you cannot see it); check origin and access, then re-run with --new-generation"),
+    (re.compile(_GH_LINE + r"(?:validation failed|http 422\b|no commits between|you must first push)"),
+     "GitHub rejected the PR as invalid (for example no commits between base and head); fix it, then re-run with --new-generation"),
+)
+
+
+def sanitize_gh_text(text, limit=GH_HINT_LIMIT):
+    """One bounded printable line of gh stderr: escapes and controls stripped, secrets redacted."""
+    text = ANSI.sub(" ", text[:GH_STDERR_LIMIT])
+    # Controls first: they could otherwise split a token and defeat the redaction patterns.
+    text = "".join(char for char in text if char.isprintable() or char in " \t\r\n")
+    return " ".join(redact_output(text).split())[:limit]
+
+
+def classify_gh_failure(code, error_text):
+    """Return a hint for a failure GitHub reported before acting, or None when completion is unknown."""
+    # gh echoes "Creating draft pull request for <branch> into <base>"; the branch name is not evidence.
+    error_text = ANSI.sub("", error_text[:GH_STDERR_LIMIT])
+    # Any transient phrase anywhere, including the echoed line, keeps the outcome uncertain.
+    if GH_TRANSIENT.search(error_text):
+        return None
+    # Split on "\n" only: str.splitlines() would also break on \r, \v, \f, \x1c-\x1e, \x85 and
+    #   and so promote a mid-line phrase to a line start when the lines are rejoined.
+    error_text = "\n".join(line for line in error_text.split("\n") if not line.lstrip().startswith("Creating "))
+    if code == 4:
+        return GH_DEFINITE[0][1]
+    for pattern, hint in GH_DEFINITE:
+        if pattern.search(error_text):
+            return hint
+    return None
 
 
 def gh_json(*args, timeout=30):
@@ -713,6 +917,32 @@ def published_ref(original, url, state, timeout):
     return state["source_head"]
 
 
+def require_remote_base(flow, url):
+    """The PR base must exist on the remote; fail before any push or PR create when it does not."""
+    ref = "refs/heads/" + flow.branch
+    try:
+        code, output = transport(flow.original, url, flow.state["repository"], ["ls-remote", ref], flow.args.timeout)
+    except DeliveryError as error:
+        if error.status == "BLOCKED_POLICY":
+            raise
+        code, output = 1, ""
+    if code:
+        # ls-remote is read-only and runs before any push or PR create, so nothing was published:
+        # this is the same settled, definite pre-publication block as a failed publisher preflight.
+        flow.save(phase="REMOTE_BLOCKED")
+        raise DeliveryError("REMOTE_BLOCKED", "Remote base branch could not be checked; nothing was published",
+                            code=4, reason="BASE_CHECK_UNAVAILABLE",
+                            hint="Check network and credentials for origin, then re-run prepare with "
+                                 "--new-generation, or finish --mode local", **flow.facts())
+    # ls-remote tail-matches, so demand the exact ref name.
+    found = [row.split("\t")[-1] for row in output.splitlines() if row.strip()]
+    if ref not in found:
+        raise DeliveryError("BLOCKED_POLICY", "The base branch does not exist on the remote; nothing was pushed",
+                            code=2, reason="BASE_BRANCH_MISSING", base_branch=flow.branch[:200],
+                            hint="Push the base branch (git push origin <branch>) or pass the correct "
+                                 "--original-branch, then re-run prepare", **flow.facts())
+
+
 def source_inputs(args):
     require_arguments(args, "source", "original", "original_branch", "expected_source_head",
                       "expected_original_head", "kit_file")
@@ -773,13 +1003,47 @@ def prepare_pr(flow, title, body):
             os.fsync(handle.fileno())
         flow.save(phase="PR_CREATING")
         try:
-            gh("pr", "create", "-R", flow.state["repository"], "--head", flow.state["source_branch"],
-               "--base", flow.branch, "--draft", "--title", title, "--body-file", str(staged),
-               timeout=flow.args.timeout)
-        except DeliveryError:
+            code, _, error_text = gh("pr", "create", "-R", flow.state["repository"],
+                                     "--head", flow.state["source_branch"], "--base", flow.branch, "--draft",
+                                     "--title", title, "--body-file", str(staged),
+                                     timeout=flow.args.timeout, stderr_limit=GH_STDERR_LIMIT)
+        except (FileNotFoundError, PermissionError) as launch:
+            if launch.filename != "gh":
+                flow.save(phase="REMOTE_UNCERTAIN")
+                raise DeliveryError("REMOTE_UNCERTAIN", "PR creation outcome requires later positive reconciliation",
+                                    code=4, **flow.facts()) from None
+            flow.save(phase="REMOTE_BLOCKED")
+            raise DeliveryError("REMOTE_BLOCKED", "GitHub CLI (gh) could not be started",
+                                code=4, hint="Install gh and run `gh auth login`, then re-run prepare with --new-generation",
+                                **flow.facts()) from None
+        except (DeliveryError, OSError):
             flow.save(phase="REMOTE_UNCERTAIN")
             raise DeliveryError("REMOTE_UNCERTAIN", "PR creation outcome requires later positive reconciliation",
                                 code=4, **flow.facts()) from None
+        if code:
+            gh_error = sanitize_gh_text(error_text)
+            hint = classify_gh_failure(code, error_text)
+            # Under REMOTE_UNCERTAIN a new generation is refused, so drop the "re-run" advice.
+            likely = hint.split(", then re-run")[0] if hint else None
+            try:
+                already = matching_pr(flow.state, flow.args.timeout)
+            except DeliveryError:
+                already = None
+                hint = None  # cannot disprove a create that landed; stay uncertain
+            if already:
+                return record_pr(flow, already)
+            if hint is None:
+                flow.save(phase="REMOTE_UNCERTAIN")
+                # Auth or repository errors usually break the follow-up lookup too; keep the likely
+                # cause visible, but absence is unproven, so this stays uncertain.
+                raise DeliveryError("REMOTE_UNCERTAIN", "PR creation failed without a definite GitHub verdict",
+                                    code=4, gh_exit=code, gh_error=gh_error,
+                                    hint=(("Likely cause: " + likely + ". ") if likely else "")
+                                    + "Check `gh pr list`, then run prepare --reconcile-only",
+                                    **flow.facts())
+            flow.save(phase="REMOTE_BLOCKED")
+            raise DeliveryError("REMOTE_BLOCKED", "GitHub refused to create the PR; nothing was created",
+                                code=4, gh_exit=code, gh_error=gh_error, hint=hint, **flow.facts())
     finally:
         staged.unlink(missing_ok=True)
     try:
@@ -796,6 +1060,39 @@ def prepare_pr(flow, title, body):
 
 
 COMMIT_POLICY_RECORD = "commit-policy.json"
+TARGET_OVERRIDE_RECORD = "target-policy-overrides.json"
+TARGET_OVERRIDE_LIMIT = 20
+
+
+def record_target_override_in_wal(args, bypassed):
+    """Append the operator's --target-policy warn and what it bypassed to the WAL, or refuse to run."""
+    override = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "mode": "warn",
+                "task": str(getattr(args, "task", ""))[:120], "bypassed": bypassed}
+    names = ", ".join(item["reason"] for item in bypassed) or "none (no check was exceeded)"
+    record = {"at": override["at"], "event": "risk", "id": "w" + secrets.token_hex(6),
+              "note": f"deliver.py prepare --target-policy warn for task {override['task']}: bypassed {names}",
+              "target_policy_override": override}
+    try:
+        wal_log.append(args.wal.expanduser().absolute(), record)
+    except (OSError, ValueError):
+        raise DeliveryError("BLOCKED_POLICY", "--target-policy warn could not be recorded in the WAL; nothing was done",
+                            code=2, reason="TARGET_OVERRIDE_UNRECORDED",
+                            hint="pass a per-session WAL path under ~/.claude/wals") from None
+    return override
+
+
+def record_target_override(flow, override):
+    """Keep every warn-mode run of this generation beside its journal (the journal schema is fixed)."""
+    path = flow.directory / TARGET_OVERRIDE_RECORD
+    history = []
+    if os.path.lexists(path):
+        try:
+            history = json.loads(regular_bytes(path, WAIVER_RECORD_LIMIT)).get("overrides", [])
+        except (OSError, ValueError, DeliveryError, AttributeError):
+            history = [{"mode": "unreadable-previous-record"}]
+    history = (history if isinstance(history, list) else [])[-(TARGET_OVERRIDE_LIMIT - 1):] + [override]
+    _write_private_json(path, {"schema": 1, "generation": flow.generation, "overrides": history})
+WAIVER_RECORD_LIMIT = 1_048_576
 
 
 def commit_policy_gate(source, original_branch, branch, head, baseline, title, body, local_only):
@@ -925,6 +1222,18 @@ def _ticket_updates(flow, stage, head, pr_url):
 def prepare(args):
     if getattr(args, "reconcile_only", False):
         return reconcile(args)
+    override = None
+    if args.original is not None and isinstance(args.original_branch, str):
+        # Effective mode: the per-run flag, else the source default; either way warn must be recorded.
+        mode = getattr(args, "target_policy", None) or TARGET_POLICY["mode"]
+        if mode == "warn" and getattr(args, "wal", None) is None:
+            raise DeliveryError("BLOCKED_POLICY", "--target-policy warn requires --wal so the override is recorded",
+                                code=2, reason="TARGET_OVERRIDE_UNRECORDED",
+                                hint="pass --wal <your session WAL under ~/.claude/wals>, or drop --target-policy warn")
+        # Before any strict snapshot, so a huge dirty set gets a specific message, not a status timeout.
+        bypassed = target_preflight(args.original.expanduser().absolute(), args.original_branch, mode)
+        if mode == "warn":
+            override = record_target_override_in_wal(args, bypassed)
     source, branch, head, baseline, kit = source_inputs(args)
     local_only = getattr(args, "local_only", False)
     title, body = "", b""
@@ -958,6 +1267,8 @@ def prepare(args):
             flow.create(source, branch, head, baseline, kit, repository, phase)
             write_policy_record(flow, policy_record)
             state = flow.state
+        if override is not None:
+            record_target_override(flow, override)
         if state["phase"] == "LOCAL_READY":
             report("LOCAL_READY", "Explicit local-only generation prepared", **flow.facts())
             return 0
@@ -977,6 +1288,7 @@ def prepare(args):
         if state["phase"] not in {"INITIAL", "PUBLISHING", "PR_LOOKUP", "PR_CREATING", "REMOTE_UNCERTAIN"}:
             raise DeliveryError("RECOVERY_REQUIRED", "Generation has pending checkout recovery", **flow.facts())
         if state["phase"] == "INITIAL":
+            require_remote_base(flow, url)
             flow.save(phase="PUBLISHING")
             try:
                 code, output = bounded([sys.executable, str(Path(__file__).with_name("publish_feature.py")),
@@ -1597,6 +1909,11 @@ def parse_args():
                       help="mode-0600 PR body, e.g. ~/.agent-harness/work/<session-id>/<task>/pr-body.md")
     prep.add_argument("--reconcile-only", action="store_true", help="Query a pending remote outcome without publishing or changing checkout")
     prep.add_argument("--local-only", action="store_true", help="Explicitly choose guarded local delivery")
+    prep.add_argument("--target-policy", choices=("refuse", "warn"), default=None,
+                      help="Original-checkout sanity preflight: refuse (default) or warn and continue; "
+                           "warn is per run, needs --wal, and is recorded in the WAL, the generation and the output")
+    prep.add_argument("--wal", type=Path, default=None,
+                      help="Session WAL (~/.claude/wals/<session>/<name>.jsonl) that records a --target-policy warn run")
     prep.add_argument("--new-generation", action="store_true", help="Supersede only a settled generation")
     end = sub.choices["finish"]
     finish_mode = end.add_mutually_exclusive_group(required=True)

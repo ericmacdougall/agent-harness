@@ -25,7 +25,8 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
          "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py",
          "heavy_job_guard.py", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "resource_limits.json",
-         "domain_gates.py", "domain_checklists.json", "test_scope.py", "test_scope_policy.json")
+         "domain_gates.py", "domain_checklists.json",
+         "command_guard.py", "command_guard_hook.py", "redact.py", "test_scope.py", "test_scope_policy.json")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -42,7 +43,8 @@ class DirectoryPublicationError(OSError):
 
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
-            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py", "test_scope.py")}
+            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
+                         "command_guard_hook.py", "test_scope.py")}
 
 
 SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
@@ -65,7 +67,16 @@ def provenance_hook_groups(claude: Path) -> dict[str, list[dict]]:
     }
 
 
-def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]]:
+def command_guard_group(claude: Path) -> dict:
+    """Destructive and config-dump command guard (GoodQA #14471, docs/operations.md). The launcher blocks on its
+    own when the analyser fails; onFailure covers the launcher itself. The `hook` verb marks it a fail-closed
+    gate for the Go front door (cmd/harness/gates.json); the launcher ignores its arguments."""
+    return {"matcher": "Bash|PowerShell", "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "command_guard_hook.py"), "hook"],
+        "timeout": 30, "onFailure": "block"}]}
+
+
+def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = True) -> dict[str, list[dict]]:
     script = str(claude / "hooks" / "wal.py")
     policy = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "commit_policy.py"), "hook"],
               "timeout": 60, "onFailure": "block"}  # gh pr create checks GitHub and GoodQA
@@ -120,6 +131,8 @@ def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]
             "hooks": [spec_gate],
         }],
     }
+    if command_guard:
+        managed["PreToolUse"].insert(0, command_guard_group(claude))
     if provenance:
         for event, groups in provenance_hook_groups(claude).items():
             managed.setdefault(event, []).extend(groups)
@@ -137,7 +150,8 @@ def durable_scratch(claude: Path) -> Path:
     return claude.parent / ".agent-harness" / "scratch"
 
 
-def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, provenance: bool = True) -> dict:
+def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, provenance: bool = True,
+                    command_guard: bool = True) -> dict:
     settings = json.loads(json.dumps(current))
     env = settings.get("env", {})
     if not isinstance(env, dict):
@@ -152,7 +166,7 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
         settings["env"] = {key: value for key, value in env.items() if key != TMPDIR_KEY}
     hooks = settings.setdefault("hooks", {})
     scripts = managed_scripts(claude)
-    wanted = managed_hooks(claude, provenance)
+    wanted = managed_hooks(claude, provenance, command_guard)
     for event in sorted(set(wanted) | set(managed_hooks(claude, True))):
         managed = wanted.get(event, [])
         entries = hooks.setdefault(event, [])
@@ -547,7 +561,8 @@ def read_regular(path: Path, *, pinned_parent=None, retain_fd=None):
         return None
 
 
-def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool = True) -> list[str]:
+def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool = True,
+            command_guard: bool = True) -> list[str]:
     claude = home.expanduser().resolve() / ".claude"
     files = [
         *((ROOT / "harness" / folder / name, claude / folder / name)
@@ -579,7 +594,7 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
         if not isinstance(current_settings, dict):
             raise ValueError("settings.json must contain an object")
-        settings = merged_settings(current_settings, claude, durable_tmp, provenance)
+        settings = merged_settings(current_settings, claude, durable_tmp, provenance, command_guard)
         # Read every payload before any managed write (also validate it in preview).
         payloads = [(destination, source.read_bytes()) for source, destination in files]
         payloads += [(instructions_path, instructions.encode()),
@@ -765,6 +780,26 @@ def netwatch_status(home: Path, apply: bool, flag) -> str:
         return f"netwatch: skipped ({error.__class__.__name__}: {error})"
 
 
+def command_guard_status(enabled: bool, runner=None) -> str:
+    """Claude Code before 2.1.295 ignores onFailure, so fail-closed then rests on the launcher alone."""
+    if not enabled:
+        return "command guard: not registered (--no-command-guard)"
+    import subprocess
+    try:
+        out = runner() if runner else subprocess.run(["claude", "--version"], capture_output=True, text=True,
+                                                     timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    found = re.search(r"(\d+)\.(\d+)\.(\d+)", out or "")
+    version = tuple(int(x) for x in found.groups()) if found else None
+    if version is None:
+        return "command guard: registered; Claude Code version unknown, fail-closed rests on the launcher"
+    if version < (2, 1, 295):
+        return ("command guard: registered; WARNING Claude Code %s predates onFailure (2.1.295), fail-closed "
+                "rests on the launcher alone" % ".".join(map(str, version)))
+    return "command guard: registered with onFailure block"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
@@ -782,6 +817,9 @@ def main() -> None:
     parser.add_argument("--no-provenance-hooks", dest="provenance", action="store_false",
                         help="do not register the provenance hooks (ask-gate, stop-lint, prompt) and remove any "
                              "registered by an earlier install; the files stay installed; not remembered")
+    parser.add_argument("--no-command-guard", dest="command_guard", action="store_false",
+                        help="do not register the destructive/config-dump command guard and remove an earlier "
+                             "registration (rollback); the files stay installed; not remembered")
     args = parser.parse_args()
     durable_tmp = durable_tmp_choice(args.home, args.durable_tmp)
     if args.apply and args.durable_tmp is not None:
@@ -793,7 +831,8 @@ def main() -> None:
                            f"{args.home / '.agent-harness'} ({error.__class__.__name__}); it must be a "
                            "real directory, not a symlink\n")
     try:
-        changes = install(args.home, args.apply, durable_tmp=durable_tmp, provenance=args.provenance)
+        changes = install(args.home, args.apply, durable_tmp=durable_tmp, provenance=args.provenance,
+                          command_guard=args.command_guard)
     except DirectoryPublicationError as error:
         parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"
@@ -803,6 +842,7 @@ def main() -> None:
     print(f"  {install_git_backstop(args.home, args.apply)}")
     print(f"  {scratch_status(args.home, args.apply, durable_tmp)}")
     print(f"  {netwatch_status(args.home, args.apply, args.netwatch)}")
+    print(f"  {command_guard_status(args.command_guard)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")
 
