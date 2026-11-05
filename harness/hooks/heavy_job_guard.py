@@ -482,11 +482,17 @@ TAR_LONG_VALUES = ("--directory", "--exclude", "--files-from", "--exclude-from",
 def parse_tar(args):
     """(mode 'x'|'c'|None, archive, [source words]) for old-style (`tar xzf a.tgz`) and dashed forms, flags in any order."""
     mode, archive, sources, i = None, None, [], 0
+    to_stdout = False
     while i < len(args):
         a = args[i]
         i += 1
+        if a == "--":
+            sources.extend(args[i:])
+            break
         if a.startswith("--"):
             name, eq, val = a.partition("=")
+            if name == "--to-stdout":
+                to_stdout = True
             if name in ("--extract", "--get"):
                 mode = "x"
             elif name == "--create":
@@ -500,6 +506,8 @@ def parse_tar(args):
         if (a.startswith("-") and len(a) > 1) or (i == 1 and not a.startswith("-") and re.fullmatch(r"[A-Za-z]+", a)):
             wants = []
             for ch in a.lstrip("-"):
+                if ch == "O":
+                    to_stdout = True
                 if ch == "x":
                     mode = "x"
                 elif ch == "c":
@@ -513,7 +521,7 @@ def parse_tar(args):
                     archive = value
             continue
         sources.append(a)
-    return mode, archive, sources
+    return mode, archive, sources, to_stdout
 
 
 def classify_copy(low, args, ctx):
@@ -543,8 +551,8 @@ def classify_copy(low, args, ctx):
         total, unknown = sum_sources(sources, ctx, thr, remote_ok=remote_tool, deref=deref)
         return finish_copy(low, total, unknown, thr)
     if low == "tar" and args:
-        mode, archive, srcs = parse_tar(args)
-        if "--to-stdout" in args or any(re.fullmatch(r"-[A-Za-z]*O[A-Za-z]*", a) for a in args) or re.fullmatch(r"[A-Za-z]*O[A-Za-z]*", args[0]):
+        mode, archive, srcs, to_stdout = parse_tar(args)
+        if to_stdout and mode == "x":
             return None  # extracting to stdout writes nothing to disk
         if mode is None or archive in (None, "-") or REMOTE_SPEC.match(archive) and not archive.startswith(("/", ".", "~")):
             return None  # a pipe or a listing: the other end decides (tar czf - . | ssh dev2 'tar x')
@@ -586,15 +594,17 @@ def classify_copy(low, args, ctx):
 
 def clone_is_shallow(flags):
     """A real --depth N (1..50) given as its own option, not the value of another option (`--template --depth`)."""
-    i = 0
+    i, depth = 0, None
     while i < len(flags):
         f = flags[i]
         if f == "--depth":
-            return i + 1 < len(flags) and flags[i + 1].isdigit() and 0 < int(flags[i + 1]) <= 50
+            depth = flags[i + 1] if i + 1 < len(flags) else ""
+            i += 2
+            continue
         if f.startswith("--depth="):
-            return f[8:].isdigit() and 0 < int(f[8:]) <= 50
+            depth = f[8:]
         i += 2 if f in CLONE_VALUE_FLAGS else 1
-    return False
+    return depth is not None and depth.isdigit() and 0 < int(depth) <= 50  # the last --depth wins, as in git
 
 
 def clone_estimate(url, flags, ctx, thr, label):

@@ -154,6 +154,20 @@ class ReviewFindings(unittest.TestCase):
         for flags in ("--depth 1", "--depth=1", "--depth 50", "-b main --depth 1"):
             self.assertEqual(decide(f"git clone {flags} {url}")["action"], "allow", flags)
 
+    def test_to_stdout_only_counts_as_a_real_extract_option(self):
+        with mock.patch.object(guard, "path_size", fake_size({"/arch": 5 * GIB, "/bigsrc": 5 * GIB})):
+            for command in ("tar -czf /Users/eric/out.tgz /bigsrc -O", "tar -xzf /arch.tgz -C /Users/eric/d --exclude -O",
+                            "tar -xzf /arch.tgz -C /Users/eric/d -- -O"):
+                with self.subTest(command=command):
+                    self.assertEqual(decide(command).get("rule"), "copy", command)
+            self.assertEqual(decide("tar -xzOf /arch.tgz")["action"], "allow")
+
+    def test_the_last_depth_option_wins_as_in_git(self):
+        url = "https://gitlab.com/huge/mono.git"
+        self.assertEqual(decide(f"git clone --depth 1 --depth 2147483647 {url}").get("rule"), "copy")
+        self.assertEqual(decide(f"git clone --depth=1 --depth=1000 {url}").get("rule"), "copy")
+        self.assertEqual(decide(f"git clone --depth 1000 --depth 1 {url}")["action"], "allow")
+
     def test_t2_dev_is_a_fleet_host_and_tar_to_stdout_writes_nothing(self):
         with mock.patch.object(guard, "remote_path_size", lambda spec: 4 * GIB):
             self.assertEqual(decide("scp -r t2-dev:/bigsrc /Users/eric/z")["rule"], "copy")

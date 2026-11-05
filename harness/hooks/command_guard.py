@@ -1107,21 +1107,24 @@ def _config_refusal(listing):
     return None
 
 
-def _nested_repo(directory, limit=20000, deep=False):
-    """A .git in the directory or one level below it (two under @scope folders). Too many entries counts as yes."""
+def _nested_repo(directory, limit=250000, deep=False, seconds=1.5):
+    """True for a repository (.git or a bare repo) in the directory or below it (one level for caches, eight for
+    generic build dirs); 'large' when the scan hit its entry or time bound; False otherwise."""
     seen = 0
+    stop = time.monotonic() + seconds
     stack = [(directory, 0)]
     while stack:
         current, depth = stack.pop()
-        if os.path.lexists(os.path.join(current, '.git')):
-            return True
+        if os.path.lexists(os.path.join(current, '.git')) or (
+                os.path.isfile(os.path.join(current, 'HEAD')) and os.path.isdir(os.path.join(current, 'objects'))):
+            return True  # a checkout, or a bare repository
         if depth >= (8 if deep else 2):
             continue
         with os.scandir(current) as entries:
             for entry in entries:
                 seen += 1
-                if seen > limit:
-                    return True
+                if seen > limit or time.monotonic() > stop:
+                    return 'large'
                 if entry.is_dir(follow_symlinks=False) and (deep or depth == 0 or entry.name.startswith('@')
                                                             or current.rsplit('/', 1)[-1].startswith('@')):
                     stack.append((entry.path, depth + 1))
@@ -1182,7 +1185,10 @@ def reproducible_clone_refusal(path, policy=None, now=None):
                 top = '/' not in name.rstrip('/')
                 if not (name.endswith('/') and (leaf in ignored_ok or (top and leaf in ignored_top_ok))):
                     return 'it holds an ignored file or folder that is not a whole regenerable build directory'
-                if _nested_repo(os.path.join(path, name), deep=leaf not in ignored_ok):
+                found = _nested_repo(os.path.join(path, name), deep=leaf not in ignored_ok)
+                if found == 'large':
+                    return 'an ignored build directory is too large to check for nested repositories in time'
+                if found:
                     return 'an ignored build directory holds a nested repository'
             else:
                 return 'the working tree is not clean (modified, staged or untracked files)'

@@ -341,6 +341,24 @@ class RedTeamRound(CloneCase):
         self.assertAllowed(self.rm())  # control: the same clone is deletable once both are gone
 
 
+class RoundThree(CloneCase):
+    def test_bare_repository_inside_a_build_directory(self):
+        (self.clone / '.git' / 'info' / 'exclude').write_text('build/\n')
+        (self.clone / 'build').mkdir()
+        git(self.clone / 'build', 'init', '-q', '--bare', 'mine.git')
+        self.assertRefused(self.rm(), 'nested')
+
+    def test_a_huge_build_directory_is_refused_with_an_honest_reason_and_a_big_one_passes(self):
+        (self.clone / '.git' / 'info' / 'exclude').write_text('build/\n')
+        deep = self.clone / 'build' / 'debug' / 'deps'
+        deep.mkdir(parents=True)
+        for i in range(30):
+            (deep / ('f%d.o' % i)).write_text('x')
+        self.assertAllowed(self.rm())  # plenty of files, no repository
+        self.assertEqual(cg._nested_repo(str(self.clone / 'build'), limit=10, deep=True), 'large')
+        self.assertFalse(cg._nested_repo(str(self.clone / 'build'), deep=True))
+
+
 class RoundTwo(CloneCase):
     """Second red-team round (head 0c9592c): each row was allowed by that head."""
 
