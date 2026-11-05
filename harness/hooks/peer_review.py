@@ -1112,11 +1112,19 @@ def main() -> int:
             author_rung = ladder.Ledger(policy=policy).status(args.task)['rung']
         except (ladder.LedgerError, tiers.TierError):
             author_rung = None
-    available = {'openai': shutil.which('codex') is not None, 'claude': shutil.which('claude') is not None}
+    # Availability uses the launch's own trust-checked discovery, so a CLI found only at a policy location counts
+    # and a binary inside the reviewed repo does not.
+    found = {name: diagnostics.discover_executable(name, policy=review_policy(),
+                                                   roots=diagnostics.untrusted_roots(repo=repo))
+             for name in diagnostics.PROVIDERS}
+    available = {'openai': bool(found['codex']['path']), 'claude': bool(found['claude']['path'])}
     selection = tiers.reviewer_for(policy, author_rung, args.author_harness, available)
     if selection['harness'] is None:
         print('Review refused: no review harness is available for rung %s (codex and claude both unavailable)'
               % selection['rung'], file=sys.stderr)
+        attempts = [diagnostics.provider_attempt(name, found[name], None, '', '', {}) for name in diagnostics.PROVIDERS]
+        print(diagnostics.render(diagnostics.final_diagnostic(attempts, None), stage=args.stage, head=before[0]),
+              file=sys.stderr)
         return 2
     permission = None
     if policy['rungs'][selection['rung']]['needs_user_permission']:
