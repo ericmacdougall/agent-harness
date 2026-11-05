@@ -410,6 +410,23 @@
    "rules": []
   },
   {
+   "id": "merge_gate:hook",
+   "script": "merge_gate.py",
+   "arg": "hook",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [
+    "S19"
+   ]
+  },
+  {
    "id": "ledger-reminder:SessionStart",
    "script": "ledger_reminder.py",
    "arg": null,

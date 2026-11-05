@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "_comment": "Candidate install locations only. Every candidate still passes the executable trust checks in review_diagnostics.py. Entries must be absolute or start with ~/ .",
+  "known_install_locations": {
+    "codex": [
+      "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+      "/usr/bin/codex",
+      "/usr/local/bin/codex",
+      "/opt/homebrew/bin/codex",
+      "~/.local/bin/codex",
+      "~/.npm-global/bin/codex"
+    ],
+    "claude": [
+      "~/.claude/local/claude",
+      "~/.local/bin/claude",
+      "/usr/local/bin/claude",
+      "/opt/homebrew/bin/claude",
+      "/usr/bin/claude"
+    ]
+  },
+  "snapshot_timeout": {"base_seconds": 1800, "per_gib_seconds": 60, "max_seconds": 7200},
+  "usage_limit_phrases": [
+    "hit your usage limit",
+    "usage limit reached",
+    "reached your usage limit",
+    "exceeded your usage limit",
+    "you've hit your limit"
+  ]
+}
