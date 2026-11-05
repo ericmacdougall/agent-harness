@@ -34,6 +34,17 @@ MAX_REQUEST = 256 * 1024
 SKIP_DARWIN = ("Library", "Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music", "Applications")
 
 
+# One exit-code contract for every ah command: 0 ok (also with warnings[]), 2 refused (nothing written),
+# 3 unavailable or spooled (a lock, GoodQA or a host could not be reached; retry with the same key), 4 internal.
+RETRYABLE = {"lock_timeout", "ticket_unavailable", "host_unreachable"}
+
+
+def exit_for(code: str) -> int:
+    if code in RETRYABLE:
+        return 3
+    return 4 if code in ("internal", "schema_newer") else 2
+
+
 class AhError(Exception):
     def __init__(self, code, message, exit_code=2):
         super().__init__(message)
@@ -1057,6 +1068,9 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
     audit = store_dir(home) / "audit.jsonl"
     with StoreLock(home):
         everything = _ledger(home, include_intents=True)
+        aborted = {r.get("key") for r in everything if r.get("state") == "aborted"}  # refused before any side effect
+        everything = [r for r in everything if r.get("state") != "aborted"
+                      and not (r.get("state") == "intent" and r.get("key") in aborted)]
         ledger = [r for r in everything if r.get("state", "applied") == "applied"]
         intent = None
         for row in everything:
@@ -1077,6 +1091,9 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
         except AhError as e:
             _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who,
                                  "result": "rejected", "code": e.code})
+            if not intent:  # a refusal happens before side effects: free the key for a corrected request
+                _append_line(store_dir(home) / "ledger.jsonl", {"state": "aborted", "key": key, "seq": seq,
+                                                                "at": iso(time.time())})
             raise
         except Exception as e:  # never an unaudited traceback
             _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who,
@@ -1096,8 +1113,10 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
         spool = store_dir(home) / "spool"
         if list(spool.glob(f"*-{tag}.json")):
             reply["comment"] = "pending"
+            reply["warnings"] = ["ticket comment is queued (GoodQA unreachable); `ah spool drain` posts it"]
         elif list((spool / "dead").glob(f"*-{tag}.json")):
             reply["comment"] = "dead"  # the ticket does not exist; nothing was posted
+            reply["warnings"] = ["ticket comment was not posted: the ticket does not exist"]
         else:
             reply["comment"] = "posted"
         spool_drain(home, limit=2, budget_s=10.0)  # a little of the backlog, bounded; ahd drains the rest
@@ -1163,6 +1182,7 @@ def build_parser():
     u.add_argument("--text-match", "--search", dest="search", help="words to find in a real human turn")
     u.add_argument("--recent", type=int)
     u.add_argument("--full", action="store_true")
+    u.add_argument("--queued", action="store_true", help="only queued mid-turn messages and AskUserQuestion answers")
     t = sub.add_parser("ticket")
     ts = t.add_subparsers(dest="sub", required=True)
     g = ts.add_parser("get")
@@ -1231,7 +1251,10 @@ def run(args, home: Path) -> dict:
         s = args.session or env_session()
         if not s:  # never guess "the newest transcript": a running helper session would win
             raise AhError("session_unknown", "no session: pass --session or set CLAUDE_CODE_SESSION_ID")
-        return user_msgs(home, s, text=args.search, recent=args.recent, full=args.full)
+        res = user_msgs(home, s, text=args.search, recent=args.recent, full=args.full, limit=1000 if args.queued else 20)
+        if args.queued:
+            res["matches"] = [m for m in res["matches"] if m["kind"] in ("queued", "answer")][-(args.recent or 20):]
+        return res
     if cmd == "disk":
         return disk(args.host, args.root, args.count, args.budget, not args.no_top)
     if cmd == "ticket":
@@ -1278,7 +1301,7 @@ def main(argv=None) -> int:
     except AhError as e:
         json.dump({"ok": False, "code": e.code, "message": str(e)}, sys.stdout)
         sys.stdout.write("\n")
-        return e.exit_code
+        return exit_for(e.code)
     except BrokenPipeError:
         return 0
     except Exception as e:  # a partial install or a bug: one JSON line, never a traceback
@@ -1290,7 +1313,7 @@ def main(argv=None) -> int:
     else:
         sys.stdout.write(json.dumps(data, indent=None if args.cmd == "write" else 2) + "\n")
     if isinstance(data, dict) and data.get("ok") is False:
-        return 3
+        return 2
     return 0
 
 

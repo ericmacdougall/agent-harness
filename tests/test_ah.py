@@ -260,6 +260,11 @@ class UserMsgTests(Base):
             res = provenance.resolve(source)
             self.assertTrue(res["ok"], (source, res["problems"]))
 
+    def test_queued_flag_lists_only_queued_and_answers(self):
+        self.make()
+        out = ah.run(ah.build_parser().parse_args(["user-msg", "--session", SESSION, "--recent", "10", "--queued"]), self.home)
+        self.assertEqual({m["kind"] for m in out["matches"]}, {"queued", "answer"})
+
     def test_text_search_and_stable_ids(self):
         self.make()
         a = ah.user_msgs(self.home, SESSION, text="USE the CLI for   hooks")["matches"]
@@ -777,6 +782,25 @@ class WriterReview(WriteTests):
         self.assertEqual(c.exception.code, "evidence")
         ok = ah.write(self.home, "task.done", {"task": "t9", "evidence": [{"commit": shas[0], "repo": str(other)}]}, SESSION, "done-wt-0002")
         self.assertEqual(ok["result"], "applied")
+
+    def test_exit_code_contract(self):
+        self.assertEqual([ah.exit_for(c) for c in ("provenance", "evidence", "key_conflict", "bad_request", "unknown_task")], [2] * 5)
+        self.assertEqual([ah.exit_for(c) for c in ("lock_timeout", "ticket_unavailable", "host_unreachable")], [3] * 3)
+        self.assertEqual([ah.exit_for(c) for c in ("internal", "schema_newer")], [4, 4])
+        FakeGoodQA.state["down"] = True
+        r = ah.write(self.home, "ticket.comment", {"ticket": "GoodQA goodqa#77", "body": "x"}, SESSION, "exit-key-0001")
+        self.assertEqual(r["comment"], "pending")
+        self.assertTrue(r["warnings"])  # applied, queued: exit 0 with warnings
+
+    def test_refused_request_does_not_burn_its_key(self):
+        bad = {"task": "t5", "owner_agent": "o", "session": SESSION, "ticket": "GoodQA goodqa#77", "scope": "s",
+               "source": "because I said so"}
+        (self.home / ".claude" / "wals" / SESSION).mkdir(parents=True, exist_ok=True)
+        with self.assertRaises(ah.AhError) as c:
+            ah.write(self.home, "task.register", bad, SESSION, "burn-key-0001")
+        self.assertEqual(c.exception.code, "provenance")
+        good = dict(bad, source="inferred: ok fixture source")
+        self.assertEqual(ah.write(self.home, "task.register", good, SESSION, "burn-key-0001")["result"], "applied")
 
     def test_m2_reregister_does_not_reassign(self):
         self.reg()
