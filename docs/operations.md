@@ -470,7 +470,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
   - A later `BLOCK` for a role replaces an earlier `ACCEPT`.
 - **Review sources:**
   - **Helper report.** A `peer_review.py plan` report. It must have `Stage: plan`, a body verdict `PLAN_RESULT: ...`, and `Reviewed packet SHA-256` equal to the core sha.
-  - **Native agent.** A native agent id recorded by SubagentStart in the main WAL, plus its report file. Only `task-owner`, `click-tester`, `fixer` and `red-team` agents are logged. An adversarial review from a native agent requires `red-team`.
+  - **Native agent.** A native agent id recorded by SubagentStart in the main WAL, plus its report file. Every agent type is logged by SubagentStart; only `task-owner`, `click-tester`, `fixer` and `red-team` agents may record a review (other types are refused). An adversarial review from a native agent requires `red-team`.
   - **Human.** A human name with `--source`. This is self-attested.
 - **What `attach` uploads:** the spec, the reviews JSON and each review report. A report that changed since its review is refused.
 

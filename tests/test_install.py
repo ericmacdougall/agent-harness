@@ -35,9 +35,12 @@ class InstallerTests(unittest.TestCase):
             groups = [g for g in hooks[event]
                       if any(os.path.basename(str((h.get("args") or [""])[0])) == "wal.py" for h in g.get("hooks", []))]
             self.assertEqual(len(groups), 1, event)
-            matcher = groups[0].get("matcher") or ".*"
-            for agent_type in ("general-purpose", "claude", "Explore", "Plan", "task-owner", "red-team", "statusline-setup"):
-                self.assertTrue(re.fullmatch(matcher, agent_type), (event, matcher, agent_type))
+            matcher = groups[0].get("matcher")
+            self.assertIn(matcher, (None, ".*", "*"), (event, matcher))  # every type, not a list of named types
+            matcher = matcher or ".*"
+            for agent_type in ("general-purpose", "claude", "Explore", "Plan", "task-owner", "red-team", "fixer",
+                               "click-tester", "statusline-setup", "any-new-type-123"):
+                self.assertTrue(re.fullmatch(matcher if matcher != "*" else ".*", agent_type), (event, matcher, agent_type))
             hook = [h for h in groups[0]["hooks"] if os.path.basename(str(h["args"][0])) == "wal.py"][0]
             self.assertEqual(hook["args"][1], action)
             result = subprocess.run([sys.executable, *[str(a) for a in hook["args"]]],

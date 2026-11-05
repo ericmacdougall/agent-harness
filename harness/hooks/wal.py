@@ -170,6 +170,10 @@ def tmp_advisory_output(data: dict) -> tuple:
         return 0, None
 
 
+# Types that own or review work and need the full brief; every other type gets a WAL and a short note.
+OWNER_AGENT_TYPES = {"task-owner", "fixer", "red-team", "click-tester", "general-purpose", "claude"}
+
+
 def main() -> None:
     event = sys.argv[1]
     data = json.load(sys.stdin)
@@ -198,7 +202,16 @@ def main() -> None:
         record.update({"agent_id": agent_id, "agent_type": agent_type})
         append(main_wal, record)
         append(agent_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": f"Your private WAL: {agent_wal}. Read the main scope brief and decision log in {main_wal}; challenge omissions and harmful shortcuts. Before editing, record intent, assumptions, domain invariants, a risk table and negative acceptance cases. Then log decisions, tests, commits, blockers and handoff. Do not log secrets or PII." + work_dir_context(session_id, event, data)}}))
+        if agent_type in OWNER_AGENT_TYPES:
+            context = (f"Your private WAL: {agent_wal}. Read the main scope brief and decision log in {main_wal}; challenge "
+                       "omissions and harmful shortcuts. Before editing, record intent, assumptions, domain invariants, a risk "
+                       "table and negative acceptance cases. Then log decisions, tests, commits, blockers and handoff. Do not "
+                       "log secrets or PII.")
+        else:
+            # Short-lived or read-only types (Explore, Plan, statusline-setup, claude-code-guide): a WAL for liveness and
+            # results, no owner brief and no instruction to read the (large) main WAL.
+            context = f"Your private WAL: {agent_wal}. Record results and blockers there; do not log secrets or PII."
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": context + work_dir_context(session_id, event, data)}}))
     elif event == "subagent_stop":
         # SubagentStop: lets spec_flow.py record when a click-test agent finished. Only ids that
         # SubagentStart logged are recorded, so spurious stops (empty agent_type) leave no trace.
