@@ -229,6 +229,20 @@ class PayloadTests(Fixture):
         self.assertEqual(cg.payload_cwd({'cwd': '/elsewhere', 'tool_input': {}}), '/elsewhere')
         self.assertIsNone(cg.payload_cwd({'tool_input': {}}))
 
+    def test_write_stdin_has_no_trusted_cwd(self):
+        """Red-team F5: typed shell input may run after a cd in an earlier call."""
+        self.assertIsNone(cg.payload_cwd({'tool_name': 'write_stdin', 'cwd': '/elsewhere', 'tool_input': {'chars': 'x'}}))
+
+    def test_blank_command_key_does_not_hide_another(self):
+        """Red-team F8: every non-blank command field is judged; a JSON-string tool_input is decoded."""
+        cmd = 'rm -rf ' + str(self.home) + '/.claude/projects'
+        command, _ = cg.extract_command({'tool_name': 'exec_command', 'tool_input': {'command': '   ', 'cmd': cmd}})
+        self.assertEqual(self.decide(command)[0], 'block')
+        command, _ = cg.extract_command({'tool_name': 'exec_command', 'tool_input': {'command': 'ls', 'cmd': cmd}})
+        self.assertEqual(self.decide(command)[0], 'block')
+        command, _ = cg.extract_command({'tool_name': 'Bash', 'tool_input': json.dumps({'command': cmd})})
+        self.assertEqual(command, cmd)
+
 
 class FailureModeTests(Fixture):
     def test_unterminated_quote_with_protected_text_blocks(self):

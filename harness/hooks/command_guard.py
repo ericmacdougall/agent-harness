@@ -73,7 +73,8 @@ DEFAULT_POLICY = {
     'guard_files': ['{home}/.claude/hooks/command_guard*', '{home}/.claude/hooks/redact.py',
                     '{home}/.claude/hooks/safe_input.py', '{home}/.codex/agent-harness/command_guard*',
                     '{home}/.codex/agent-harness/redact.py', '{home}/.codex/agent-harness/safe_input.py'],
-    'protected_work_wal_regex': r'^{home}/\.agent-harness/work/[^/]+/(?:.*/)?(?:wals?|wal[^/]*|[^/]*\.wal\.jsonl)(?:/.*)?$',
+    # wal, wals, wal-*, wal_*, wal.* and *.wal.jsonl; not walker/ or wallet/
+    'protected_work_wal_regex': r'^{home}/\.agent-harness/work/[^/]+/(?:.*/)?(?:wals?|wal[-_.][^/]*|[^/]*\.wal\.jsonl)(?:/.*)?$',
     # Tier A anywhere on disk: a `wals` directory segment, main.jsonl and *.wal.jsonl files.
     'protected_segment_names': ['wals'],
     'protected_file_names': ['main.jsonl'],
@@ -108,7 +109,7 @@ DEFAULT_POLICY = {
         r'(^|/)\.vault-token$',
         r'(^|/)\.config/gcloud/(?:credentials\.db|access_tokens\.db|application_default_credentials\.json|legacy_credentials/.*)$',
         r'(^|/)\.gnupg/(?:private-keys-v1\.d/.*|secring\.gpg)$',
-        r'^/proc/(?:self|[0-9]+|\*)/environ$'],
+        r'^/proc/(?:self|[0-9]+|\*)/environ$', r'^/proc/[^/]+/environ$'],
     'credential_allow_regexes': [r'\.pub$', r'\.env\.(?:example|sample|template|dist|defaults)$', r'-cert\.pub$'],
     'credential_dirs': ['{home}/.ssh', '{home}/.aws', '{home}/.config/rclone', '{home}/.claude/goodqa-hive',
                         '{home}/.gnupg', '{home}/.docker', '{home}/.config/gh', '{home}/.config/gcloud',
@@ -672,6 +673,9 @@ class Lexer:
             self._use_var(m.group(0), w, buf)
             return i + 1 + len(m.group(0))
         if nxt and nxt in '?$!@*#0123456789-':
+            if nxt in '@*0123456789':
+                w.vars.append(nxt)  # positional parameter: a flow variable (see _hint_points_at_protected)
+                w.dynamic = True
             buf.append('$' + nxt)
             return i + 2
         if self.ps and s[i + 1:i + 5].lower() == 'env:':
@@ -905,6 +909,12 @@ def norm_path(text, ctx, cwd=None):
     text = ''.join(ch for ch in text if unicodedata.category(ch) != 'Cf')
     if text == '~' or text.startswith('~/'):
         text = ctx.home + text[1:]
+    elif re.match(r'~[A-Za-z0-9_.][A-Za-z0-9_.-]*(?:/|$)', text):
+        # ~user/...: that user's home; an unknown user still lands under a generic home pattern
+        user, _, rest = text[1:].partition('/')
+        expanded = os.path.expanduser('~' + user)
+        base = expanded if expanded != '~' + user else '/home/' + user
+        text = base + ('/' + rest if rest else '')
     text = re.sub(r'^(?:\$env:USERPROFILE|%USERPROFILE%)', lambda _m: ctx.home, text, flags=re.I)
     if not text.startswith('/') and not re.match(r'^[A-Za-z]:/', text):
         text = posixpath.join(cwd if cwd is not None else ctx.cwd_value(), text)
@@ -1117,6 +1127,9 @@ SECRET_CLIS = [
     ('aws', ('configure', 'get'), r'secret|access_key|session_token', 'aws sts get-caller-identity'),
     ('aws', ('ecr', 'get-login-password'), None, 'pipe it straight into docker login --password-stdin'),
     ('gh', ('auth', 'token'), None, 'gh auth status (shows login, never the token)'),
+    ('gh', ('config', 'get'), r'oauth_token|token', 'gh auth status'),
+    ('kubectl', ('config', 'view'), r'--raw|--flatten', 'kubectl config view (redacted by default)'),
+    ('aws', ('configure', 'export-credentials'), None, 'aws sts get-caller-identity'),
     ('gh', ('auth', 'status'), r'(?:^| )(?:-t|--show-token)(?: |$)', 'gh auth status without --show-token'),
     ('gcloud', ('secrets', 'versions', 'access'), None, 'gcloud secrets versions list / describe (metadata only)'),
     ('gcloud', ('print-access-token',), None, 'let the tool call gcloud itself; never print the token'),
@@ -1183,10 +1196,16 @@ def _build_fallback(c):
                             r'cut|bat|nl|tac|readfile|read_text|read_bytes|file_get_contents|readfilesync|dump|echo)\b')
         add((S, 'credential-file-text', ('and', cred, reader),
              'reads a credential file and prints it', 'check that the file exists with `test -s FILE`; never print it'))
-    protected = re.compile(r'(?:~|\$home|\$\{home\}|\$env:userprofile|%userprofile%|/users/[^/\s]+|/home/[^/\s]+)?/?\.(?:claude/(?:projects|wals|sessions|transcripts|history)|'
-                           r'codex/(?:sessions|archived_sessions|history))|\.agent-harness/work/[^\s/]+/[^\s]*wal', re.I)
+    # path pieces may be joined by /, path.join commas, + or pathlib's / (quotes are spaces by now)
+    sep = r'(?:\s*[/,+\\]\s*|\s+)'
+    protected = re.compile(r'\.(?:claude' + sep + r'(?:projects|wals|sessions|transcripts|history|file-history)|'
+                           r'codex' + sep + r'(?:sessions|archived_sessions|history)|'
+                           r'agent-harness' + sep + r'(?:state|codex-wals)(?![\w-])|'
+                           r'agent-harness' + sep + r'work' + sep + r'[^\s/]+' + sep + r'[^\s]*wal)', re.I)
     destroyer = re.compile(r'\b(?:rm|rmdir|unlink|mv|shred|truncate|rmtree|remove|delete|rimraf|trash|rename|unlinksync|rmsync|'
-                           r'remove-item|rsync|find)\b')
+                           r'remove-item|rsync|find|rm_rf|rm_r|remove_tree|remove_dir|removedirs|rmdirsync|unlink_|'
+                           r'write_text|write_bytes|writefilesync|file_put_contents|sponge)\b|'
+                           r'\bopen\b[^\n]{0,200}?\s(?:w|wb|w\+|a\+)(?:\s|$)|\bfs\.(?:rm|rmdir|unlink)\b')
     add((L, 'log-delete-text', ('and', protected, destroyer),
          'removes or rewrites Claude/Codex logs or WALs', 'back them up to Dropbox, run command_guard.py approve-delete, then delete'))
     # the secret word must be part of the variable's own name: `os.environ['API_TOKEN']`, `getenv("DB_PASSWORD")`,
@@ -1265,6 +1284,7 @@ class Analyzer:
     # ---- entry
     def run(self, text):
         ctx = self.ctx
+        ctx.raw_top = text if isinstance(text, str) else ' '.join(map(str, text))
         self.script(text, depth=0)
         if ctx.kill_seen:
             for finding in ctx.pending_kill:
@@ -1392,6 +1412,29 @@ class Analyzer:
                     if self.refuse('xargs deletion of paths listed by an earlier stage', w,
                                    tiers=('log', 'root', 'ancestor', 'unknown')):
                         break
+        # `find ~/.aws -type f | xargs cat`: a printing reader over paths listed by an earlier stage
+        for idx, cmd in enumerate(pl.cmds):
+            words = self._skip_assigns(strip_reserved(cmd.words))[1]
+            if idx == 0 or not words or norm_name(words[0].text) not in ('xargs', 'parallel'):
+                continue
+            inner = [norm_name(w.text) for w in words[1:] if not w.text.startswith('-')]
+            if not inner or inner[0] not in PRINT_FILE_CMDS | GREP_CMDS | {'base64', 'strings'}:
+                continue
+            if not self.out_visible(pl, idx, True):
+                continue
+            hit = False
+            for prev in pl.cmds[:idx]:
+                for w in self._skip_assigns(strip_reserved(prev.words))[1][1:]:
+                    t = w.text
+                    if t.startswith('-') or not t:
+                        continue
+                    if self._home_cred(t, w) or self.under_cred_dir(norm_path(t, ctx), or_above=False):
+                        hit = True
+                        break
+            if hit:
+                ctx.secret_seen += 1
+                ctx.add(SECRET_DUMP, 'credential-file', 'xargs %s prints credential files listed by an earlier stage'
+                        % inner[0][:20], 'list names only: find DIR -type f, or ls -l')
         # a kill verb anywhere in the pipeline makes the pid-finding stages relevant
         kills = [i for i, cmd in enumerate(pl.cmds) if self._is_kill_stage(cmd)]
         if kills:
@@ -1540,6 +1583,10 @@ class Analyzer:
             if r > rank:
                 chosen, rank = item, r
         if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+            if any(item.dynamic or item.glob or item.subs for item in items):
+                if not hasattr(self.ctx, 'flow_vars'):
+                    self.ctx.flow_vars = set()
+                self.ctx.flow_vars.add(name)
             self.ctx.vars[name] = chosen.text
             self.ctx.tainted.discard(name)
             # `for t in "$GH_TOKEN"`: the loop variable carries whatever secret its items expand to
@@ -1693,6 +1740,16 @@ class Analyzer:
         if depth > ctx.budget.max_depth:
             raise Blocked('command nesting is deeper than %d levels' % ctx.budget.max_depth)
         head = words[0]
+        if head.vars and not head.quoted and re.search(r'\s', head.text) and all(v in ctx.vars for v in head.vars) \
+                and not getattr(self, '_resplit', False):
+            # `R="rm -rf"; $R path`: an unquoted expansion is split into words, so it names a command plus flags
+            rebuilt = head.text + ' ' + ' '.join(_quote_for_rebuild(w.text) for w in words[1:])
+            self._resplit = True
+            try:
+                self.script(rebuilt, depth + 1, tail_visible=ctx.tail_visible)
+            finally:
+                self._resplit = False
+            return
         names = self.names_for(head)
         which = self._which_name(head)
         if which:
@@ -1753,6 +1810,15 @@ class Analyzer:
         if name in ('cd', 'pushd', 'set-location', 'sl', 'chdir'):
             self.chdir(args)
             return
+        if name in ('read', 'mapfile', 'readarray'):
+            # `... | while read f`: the variable holds whatever the upstream stage printed
+            if not hasattr(ctx, 'flow_vars'):
+                ctx.flow_vars = set()
+            for a in args:
+                if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', a.text):
+                    ctx.flow_vars.add(a.text)
+                    ctx.vars.pop(a.text, None)
+            return
         if name in ('popd', 'pop-location'):
             ctx.cwd_unknown = True
             return
@@ -1762,7 +1828,10 @@ class Analyzer:
         if name in ('.', 'source'):
             nd = _nondash(args)
             if nd:
-                self.script_file(nd[0], depth)
+                if nd[0].subs:
+                    self.program_text(nd[0], depth)  # source <(echo ...)
+                else:
+                    self.script_file(nd[0], depth)
             return
         if '/' in name or '/' in words[0].text:
             # ./run.sh or /path/to/script: analyse the script text when it is a shell script
@@ -1770,6 +1839,34 @@ class Analyzer:
         if name in ('flock', 'unshare', 'parallel', 'tmux', 'screen', 'osascript', 'at', 'batch', 'script'):
             if self.launcher(name, args, depth, pl, idx):
                 return
+        if name == 'busybox' and args and not args[0].text.startswith('-') \
+                and norm_name(args[0].text) not in ('sh', 'ash', 'hush'):
+            self.dispatch(args, cmd, pl, idx, depth)  # busybox APPLET ARGS runs the applet
+            return
+        if name == 'gio' and args and args[0].text in ('trash', 'remove', 'rm'):
+            for w in _nondash(args[1:]):
+                self.refuse('gio ' + args[0].text, w)
+            return
+        if name == 'sponge':
+            for w in _nondash(args):
+                if not self.state_dest(w):
+                    self.overwrite_dest('sponge', w)
+        if name == 'sort':
+            for k, a in enumerate(args):
+                val = args[k + 1] if (a.text == '-o' or re.fullmatch(r'-[A-Za-z]*o', a.text)) and k + 1 < len(args) \
+                    else (_literal_word(a.text.split('=', 1)[1]) if a.text.startswith('--output=') else None)
+                if val is not None and not self.state_dest(val):
+                    self.overwrite_dest('sort -o', val)
+        if name in ('fd', 'fdfind'):
+            texts_ = [a.text for a in args]
+            for k, t in enumerate(texts_):
+                if t in ('-x', '-X', '--exec', '--exec-batch') and k + 1 < len(texts_):
+                    inner = norm_name(texts_[k + 1])
+                    if inner in RM_CMDS or inner in MV_CMDS or inner in ('truncate', 'shred'):
+                        pos = [a for a in args[:k] if not a.text.startswith('-')]
+                        for w in pos[1:] or pos:
+                            self.refuse('fd --exec ' + inner, w)
+                    break
         if name in SHELLS or name in PS_SHELLS:
             self.shell(name, args, depth, pl, idx)
             return
@@ -1777,7 +1874,14 @@ class Analyzer:
             self.ssh(args, depth)
             return
         if name in ('docker', 'podman', 'nerdctl', 'kubectl', 'oc'):
+            self.secret_clis(name, [a.text for a in args], visible=self.out_visible(pl, idx, True))
             self.container(name, args, words, depth, pl, idx)
+            return
+        if name.startswith('docker-credential-') and 'get' in [a.text for a in args] \
+                and self.out_visible(pl, idx, True):
+            ctx.secret_seen += 1
+            ctx.add(SECRET_DUMP, 'docker-credential', '%s get prints the stored registry password' % name[:40],
+                    'docker login status: docker info, or test with docker pull')
             return
         if name == 'goodqa':
             self.goodqa(args, depth, pl, idx)
@@ -1799,8 +1903,14 @@ class Analyzer:
         if name in ECHO_CMDS or name in ('cat',):
             self.echo_check(name, args, pl, idx)
         self.secret_clis(name, texts, visible=self.out_visible(pl, idx, True))
-        if name in INTERPRETERS:
+        if name in INTERPRETERS or name in ('awk', 'gawk', 'mawk', 'nawk'):
             self.interpreter(name, args, texts, depth)
+        if (name.startswith('python') or name.startswith('pypy')) and '-m' in texts:
+            # python3 -m json.tool FILE (and other printing modules) prints the file
+            k = texts.index('-m')
+            if k + 1 < len(texts) and texts[k + 1] in ('json.tool', 'base64', 'tokenize', 'pickletools', 'quopri',
+                                                       'uu', 'zipfile', 'tarfile', 'gzip', 'http.server'):
+                self.read_creds('cat', args[k + 2:], pl, idx)
         if name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS or name in ('openssl', 'source'):
             self.read_creds(name, args, pl, idx)
         if name in RM_CMDS or name in MV_CMDS or name in OVERWRITE_CMDS or name in (
@@ -1866,8 +1976,12 @@ class Analyzer:
             return True
         if name in ('unshare', 'script'):
             for k, t in enumerate(texts):
-                if t in ('-c', '--command') and k + 1 < len(texts):
+                if (t in ('-c', '--command') or name == 'script' and re.fullmatch(r'-[A-Za-z]*c', t)) \
+                        and k + 1 < len(texts):
                     self.script(texts[k + 1], depth + 1, tail_visible=True)
+                    return True
+                if t.startswith('--command='):
+                    self.script(t.split('=', 1)[1], depth + 1, tail_visible=True)
                     return True
             k = 0
             while k < len(texts) and texts[k].startswith('-'):
@@ -1919,7 +2033,13 @@ class Analyzer:
                 if t.startswith('-S') and len(t) > 2:
                     self.script(t[2:] + ' ' + ' '.join(_quote_for_rebuild(x) for x in texts[i + 1:]), depth + 1)
                     return
-                if t in ('-u', '-C', '--unset', '--chdir'):
+                if t in ('-C', '--chdir') and i + 1 < len(args):
+                    self.chdir([args[i + 1]])
+                    i += 2
+                elif t.startswith('--chdir='):
+                    self.chdir([_literal_word(t.split('=', 1)[1])])
+                    i += 1
+                elif t in ('-u', '--unset'):
                     i += 2
                 elif t.startswith('-') or re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', t):
                     i += 1
@@ -1991,6 +2111,38 @@ class Analyzer:
     def _decoder_in(self, script):
         return bool(re.search(r'\b(?:base64|base32|xxd|openssl)\b[^|;&]*(?:\s-d\b|\s-D\b|--decode|\s-r\b|-base64)', script))
 
+    def program_text(self, word, depth):
+        """A shell program given as `$(..)` or `<(..)`: judge what the inner command prints. Literal
+        echo/printf text is analysed as a script; anything else is scanned as raw text, and a decoder
+        stage means the program is hidden."""
+        ctx = self.ctx
+        for inner in word.subs:
+            if self._decoder_in(inner):
+                ctx.add(SECRET_DUMP, 'obfuscated-shell-input',
+                        'a shell is fed a decoded (obfuscated) program, so the guard cannot see what runs',
+                        'write the command in plain text')
+                return
+            m = re.match(r'\s*(echo|printf|print)\s+(.*)$', inner, re.S)
+            if m:
+                body = re.sub(r'^(?:-[neE]+\s+)+', '', m.group(2))
+                body = body.strip().strip('\'"')
+                self.script(decode_ansi(body) if m.group(1) == 'printf' else body, depth + 1, tail_visible=True)
+            for f in fallback_scan(inner, ctx.c):
+                ctx.findings.append(f)
+
+    def shell_stdin(self, cmd, depth):
+        """`bash <<< 'text'`, `sh < file`: the shell reads its program from the redirect."""
+        for r in cmd.redirs:
+            if r.op == '<<<' and r.target is not None:
+                if r.target.subs:
+                    self.program_text(r.target, depth)
+                self.script(r.target.text, depth + 1, tail_visible=True)
+            elif r.op == '<' and r.fd in (None, '0') and r.target is not None:
+                if r.target.subs:
+                    self.program_text(r.target, depth)
+                else:
+                    self.script_file(r.target, depth)
+
     def shell(self, name, args, depth, pl, idx):
         texts = [a.text for a in args]
         ps = name in PS_SHELLS
@@ -2006,15 +2158,22 @@ class Analyzer:
                     except Exception:  # noqa: BLE001
                         self.ctx.add(SECRET_DUMP, 'obfuscated-shell-input', 'encoded PowerShell cannot be inspected', 'pass the command in plain text')
                         return
+                if not ps and args[i + 1].subs:
+                    self.program_text(args[i + 1], depth)
                 self.script(payload, depth + 1, tail_visible=True, ps=ps)
                 return
+        if not ps:
+            self.shell_stdin(pl.cmds[idx], depth)
         # `bash script.sh`: read and analyse the script; `bash -s` + heredoc is handled by heredoc()
         if not ps:
             k = 0
             while k < len(args) and args[k].text.startswith('-'):
                 k += 2 if args[k].text in ('-o', '+o', '-O', '+O', '--rcfile', '--init-file') else 1
             if k < len(args):
-                self.script_file(args[k], depth)
+                if args[k].subs:
+                    self.program_text(args[k], depth)  # bash <(echo ...)
+                else:
+                    self.script_file(args[k], depth)
 
     def ssh(self, args, depth):
         texts = [a.text for a in args]
@@ -2035,6 +2194,8 @@ class Analyzer:
                 break
             i += 1
         rest = texts[i:]
+        if rest and rest[0] == '--':
+            rest = rest[1:]
         if rest:
             self.script(' '.join(rest), depth + 1, tail_visible=True)
 
@@ -2197,6 +2358,7 @@ class Analyzer:
         low = [t.casefold() for t in texts]
         if any(t.startswith('--dump') for t in low):
             vals = [t.split('=', 1)[1] for t in low if t.startswith('--dump=')]
+            vals += [t[len('--dump-'):] for t in low if t.startswith('--dump-')]
             for k, t in enumerate(low):
                 if t == '--dump' and k + 1 < len(low):
                     vals.append(low[k + 1])
@@ -2296,7 +2458,8 @@ class Analyzer:
         elif name == 'ps':
             for a in args:
                 t = a.text
-                if t and not t.startswith('-') and 'e' in t and re.fullmatch(r'[a-zA-Z]+', t) and 'w' in t + 'e':
+                if t and (not t.startswith('-') and 'e' in t and re.fullmatch(r'[a-zA-Z]+', t)
+                          or re.fullmatch(r'-[A-Za-z]*E[A-Za-z]*', t)):
                     ctx.secret_seen += 1
                     ctx.add(SECRET_DUMP, 'ps-environment', '`ps e` prints every process environment, including secrets', 'ps -o pid,command -p PID')
                     break
@@ -2514,7 +2677,7 @@ class Analyzer:
                             'check existence with `test -s FILE` or `ls -l FILE`; use the owning tool\'s own config flag; to count entries use `grep -c`')
                     return
 
-    def interpreter(self, name, args, texts, depth):
+    def interpreter(self, name, args, texts, depth, words=None):
         code = None
         flags = {'python': ('-c',), 'node': ('-e', '--eval', '-p', '--print'), 'perl': ('-e', '-E'), 'ruby': ('-e',),
                  'php': ('-r',), 'deno': ('eval',), 'bun': ('-e', '--eval'), 'lua': ('-e',), 'osascript': ('-e',),
@@ -2525,15 +2688,33 @@ class Analyzer:
                 if i + 1 < len(texts):
                     code = texts[i + 1]
                     break
+        if code is None and name in ('awk', 'gawk', 'mawk', 'nawk'):
+            nd = [t for t in texts if not t.startswith('-')]
+            code = nd[0] if nd else None
         if code:
             self.code(code, depth)
+            return
+        # `python3 file.py` for a script written earlier in this same command: judge its text. Existing files are
+        # the repository's or harness's own tooling; a raw text scan of their source would block routine runs.
+        if key in flags or key == 'python':
+            nd = [a for a in args if not a.text.startswith('-')] if args else []
+            if nd and nd[0].text != '-':
+                text = self.ctx.written.get(norm_path(nd[0].text, self.ctx).casefold())
+                if text:
+                    self.code(text, depth)
 
     def code(self, code, depth):
         ctx = self.ctx
         for f in fallback_scan(code, ctx.c):
             ctx.findings.append(f)
         low = code.casefold()
-        if re.search(r'print\s*\(\s*(?:dict\s*\(\s*)?os\.environ\s*\)?|json\.dumps\s*\(\s*(?:dict\s*\(\s*)?os\.environ|console\.log\s*\(\s*process\.env\s*\)|puts\s+env\.to_h|print\s+join\s*\([^)]*%env', low):
+        if re.search(r'print\s*\(\s*(?:dict\s*\(\s*)?os\.environ\s*\)|json\.dumps\s*\(\s*(?:dict\s*\(\s*)?os\.environ(?![.\[\w])|'
+                     r'os\.environ\.(?:items|values)\s*\(|\{\s*\*\*\s*os\.environ\s*\}|'
+                     r'console\.(?:log|dir)\s*\(\s*process\.env\s*\)|json\.stringify\s*\(\s*process\.env\s*[,)]|'
+                     r'object\.(?:entries|values)\s*\(\s*process\.env\s*\)|^\s*process\.env\s*;?\s*$|'
+                     r'puts\s+env\.to_h|env\.(?:to_h|each|inspect|to_a)\b|\bp{1,2}\s+env\b|'
+                     r'print\s+join\s*\([^)]*%env|\bkeys\s*%env\b|print[^;]*%env\b|'
+                     r'for\s*\(\s*\w+\s+in\s+environ\s*\)|getenvironmentvariables\s*\(', low):
             ctx.add(SECRET_DUMP, 'interpreter-env-dump', 'script code prints the whole environment', 'print only specific non-secret names')
         for sample in ctx.c.state_files:
             if sample in low.replace('\\', '/') and re.search(r'open|write|copy|rename|replace|echo|dump', low):
@@ -2683,8 +2864,56 @@ class Analyzer:
                 return None
         return None
 
+    FLOW_POSITIONAL = re.compile(r'[0-9@*#]')
+    RAW_ASSIGN = re.compile(r'(?:^|[\s;&|(])(?:(?:export|declare|typeset|readonly|local)(?:\s+-\w+)*\s+)?'
+                            r'([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|\'[^\']*\'|[^\s;&|)]*)')
+    RAW_PATH = re.compile(r"(?:~[A-Za-z0-9_.-]*|\$HOME|\$\{HOME\}|\$env:USERPROFILE|/)[^\s'\";|&()<>`,]*")
+
+    def _raw_path_class(self, text):
+        text = text.strip('\'"')
+        text = re.sub(r'^(?:\$\{HOME\}|\$HOME|(?i:\$env:USERPROFILE))', '~', text).replace('\\', '/')
+        if text.startswith('~') and not text.startswith('~/') and text != '~':
+            text = '~/' + text.split('/', 1)[1] if '/' in text else '~'  # ~user: some home
+        if len(text) < 2 and text != '~':
+            return None
+        return self._path_class(norm_path(text.rstrip('/') or '/', self.ctx))
+
+    def _raw_protected_paths(self):
+        """Some path written anywhere in this command resolves into a protected tier (cached per command)."""
+        ctx = self.ctx
+        cached = getattr(ctx, 'raw_protected', None)
+        if cached is not None:
+            return cached
+        ctx.raw_protected = False
+        raw = getattr(ctx, 'raw_top', '') or ''
+        if not PROTECTED_TEXT.search(raw):
+            return False
+        for m in self.RAW_PATH.finditer(raw[:200000]):
+            if self._raw_path_class(m.group(0)) in ('log', 'root', 'ancestor', 'unknown'):
+                ctx.raw_protected = True
+                break
+        return ctx.raw_protected
+
     def _hint_points_at_protected(self, word):
         texts = list(word.subs)
+        ctx = self.ctx
+        for inner in word.subs:  # `rm -rf "$(ls -d ~/.c*)"`: the substitution lists protected paths
+            for m in self.RAW_PATH.finditer(inner[:20000]):
+                if self._raw_path_class(m.group(0)) in ('log', 'root', 'ancestor'):
+                    return True
+        raw = getattr(ctx, 'raw_top', '') or ''
+        for v in word.vars:
+            name = v.lstrip('!')
+            # positional parameters and loop/read variables carry paths from elsewhere in the command: that is
+            # undecidable here, so they fail closed when the command names a protected location anywhere
+            if (self.FLOW_POSITIONAL.fullmatch(name) or name in getattr(ctx, 'flow_vars', ())) \
+                    and self._raw_protected_paths():
+                return True
+            # export/declare/readonly/local NAME=value, which the assignment tracker does not bind
+            for m in self.RAW_ASSIGN.finditer(raw[:200000]):
+                if m.group(1) == name and (PROTECTED_TEXT.search(m.group(2))
+                                           or self._raw_path_class(m.group(2)) in ('log', 'root', 'ancestor')):
+                    return True
         for v in word.vars:
             name = v.lstrip('!')
             if name not in self.ctx.vars and PROTECTED_VAR_NAME.search(name):
@@ -2862,7 +3091,8 @@ class Analyzer:
             flags = ('-o', '--output') if name == 'curl' else ('-O', '--output-document')
             for k, a in enumerate(args):
                 val = None
-                if a.text in flags and k + 1 < len(args):
+                short = flags[0][1]
+                if (a.text in flags or re.fullmatch(r'-[A-Za-z]*' + short, a.text)) and k + 1 < len(args):
                     val = args[k + 1]
                 elif a.text.startswith(flags[1] + '='):
                     val = _literal_word(a.text.split('=', 1)[1])
@@ -2912,6 +3142,26 @@ class Analyzer:
                     for w in pos[:-1] if pos and pos[-1] is nd[-1] else pos:
                         self.refuse('rsync --remove-source-files (source)', w)
         elif name == 'rclone':
+            # flags without `=` take the next word as their value unless they are known switches, so
+            # `--exclude '*.tmp' SRC` and `--min-age 30d SRC` still name SRC as the target
+            switches = {'-v', '-vv', '-vvv', '-q', '-p', '-n', '-i', '-l', '-c', '-u', '-l', '--progress', '--dry-run',
+                        '--interactive', '--verbose', '--quiet', '--fast-list', '--checksum', '--update',
+                        '--ignore-existing', '--no-traverse', '--rmdirs', '--leave-root', '--stats-one-line', '--links',
+                        '--copy-links', '--ignore-case', '--ignore-size', '--size-only', '--immutable', '--check-first',
+                        '--no-update-modtime', '--delete-empty-src-dirs', '--create-empty-src-dirs', '--delete-before',
+                        '--delete-during', '--delete-after', '--track-renames', '--metadata', '-m', '--human-readable',
+                        '--use-server-modtime', '--no-check-dest', '--server-side-across-configs', '--resync', '--force'}
+            nd, skip = [], False
+            for a in args:
+                if skip:
+                    skip = False
+                    continue
+                t = a.text.casefold()
+                if t.startswith('-') and len(t) > 1:
+                    if '=' not in t and t not in switches and not re.fullmatch(r'-[a-z]+', t):
+                        skip = True
+                    continue
+                nd.append(a)
             subs = [a.text.casefold() for a in nd]
             for i, s in enumerate(subs):
                 if s in ('move', 'moveto'):
@@ -3695,17 +3945,30 @@ def extract_command(payload):
         return None, False
     tool = str(payload.get('tool_name') or payload.get('toolName') or '')
     tool_input = payload.get('tool_input') or payload.get('toolInput') or {}
+    if isinstance(tool_input, str) and tool_input.lstrip().startswith('{'):
+        try:  # a host that sends tool_input as a JSON-encoded string
+            decoded = json.loads(tool_input)
+            if isinstance(decoded, dict):
+                tool_input = decoded
+        except ValueError:
+            pass
     if isinstance(tool_input, (str, list)) and tool.casefold() in SHELL_TOOLS:
         tool_input = {'command': tool_input}
     if not isinstance(tool_input, dict):
         return None, False
     if tool and tool.casefold() not in SHELL_TOOLS and not tool.casefold().startswith(('bash', 'shell', 'exec')):
         return None, False
-    command = None
+    command, texts = None, []
     for key in COMMAND_KEYS:
-        if tool_input.get(key) not in (None, '', []):
-            command = tool_input.get(key)
-            break
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            if value not in texts:
+                texts.append(value)
+        elif isinstance(value, list) and value and command is None and not texts:
+            command = value
+    if texts:
+        # every non-blank command field is judged: a blank `command` must not hide a real `cmd`
+        command = '\n'.join(texts) if len(texts) > 1 else texts[0]
     if isinstance(command, list):
         command = [str(c) for c in command]
         if len(command) >= 3 and norm_name(command[0]) in SHELLS and command[1] in ('-c', '-lc', '-ic', '-l', '-i'):
@@ -3720,6 +3983,8 @@ def payload_cwd(payload):
     if not isinstance(payload, dict):
         return None
     tool_input = payload.get('tool_input') if isinstance(payload.get('tool_input'), dict) else {}
+    if str(payload.get('tool_name') or '').casefold() == 'write_stdin' and not tool_input.get('workdir'):
+        return None  # text typed into a running shell: its directory may have changed since the session cwd
     for value in (tool_input.get('workdir'), tool_input.get('cwd'), payload.get('cwd')):
         if isinstance(value, str) and value.startswith('/') and len(value) < 4096 and '\x00' not in value:
             return value
