@@ -49,13 +49,19 @@ except ImportError:  # pragma: no cover - non-POSIX
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import safe_input  # noqa: E402
+try:
+    import safe_input  # noqa: E402
+except Exception as _import_error:  # a broken install must block a merge, not crash with exit 1 (= allow)
+    if sys.argv[1:2] == ["hook"]:
+        sys.stderr.write("merge-gate: cannot load its helper module (" + type(_import_error).__name__ + "); blocking.\n")
+        sys.exit(2)
+    raise
 
 CALL_TIMEOUT_MAX = 10.0
 CALL_TIMEOUT_DEFAULT = 8.0
 DEADLINE_SECONDS = 40.0
 MAX_COMMAND_CHARS = 200_000
-MAX_TOKENS = 20_000
+MAX_TOKENS = 5_000
 MAX_DEPTH = 5
 MAX_STDIN_BYTES = 8 * 1024 * 1024
 MAX_GH_OUTPUT = 4 * 1024 * 1024
@@ -80,24 +86,29 @@ SHELL_TOOLS = {"bash", "shell", "local_shell", "exec_command", "unified_exec", "
                "powershell"}
 WRITE_TOOLS = {"write", "edit", "multiedit", "notebookedit", "apply_patch"}
 # Things that run a string as a command; if one is present next to a merge string we cannot see the real command.
-EXEC_MARKER = re.compile(
-    r"\|\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|ksh)\b|<<<|\beval\b|\bsource\b|\bxargs\b|\bparallel\b|\bwatch\b|"
-    r"\btmux\b|\bscreen\b|\bsu\s+-c\b|\benv\s+-S\b|\bgit\s+(?:-c|config)\s+alias\.|\b(?:docker|kubectl|podman)\s+exec\b|"
-    r"-exec\b|\bbase64\b|\bnohup\b|\bat\s+now\b|\bosascript\b", re.I)
 RAW_MERGE = re.compile(
-    r"\bpr\s+merge\b|/pulls/\d+/merge\b|mergePullRequest|enablePullRequestAutoMerge|mergeBranch|"
-    r"/repos/[\w.-]+/[\w.-]+/merges\b", re.I)
+    r"\bpr\s+merge\b|pulls/[^/\s]+/merge\b|mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest|"
+    r"mergeBranch|/repos/[\w.-]+/[\w.-]+/merges\b|\balias\s+(?:set|import)\b[^\n]*--shell", re.I)
+# Commands that only print, search or record text: a merge string that is merely an argument of one of these
+# (a commit message, a grep pattern) is not a merge. Not exempt when piped into a shell or other executor.
+DATA_COMMANDS = {"echo", "printf", "grep", "egrep", "fgrep", "rg", "ag", "ack", "cat", "head", "tail", "wc", "ls",
+                 "less", "more", "diff", "pytest", "py.test", "tee", "file", "stat", "basename", "dirname"}
+EXEC_CONSUMERS = SHELLS | {"eval", "source", ".", "parallel", "env", "sudo", "su", "watch", "ssh"}
+WRAPPER_WORDS = {"env", "command", "sudo", "time", "nohup", "nice", "exec", "builtin", "stdbuf", "timeout", "doas",
+                 "setsid", "ionice"}
 GH_HINT = re.compile(r"\bgh\b|merge|curl|wget|\bhttps?\b|python|node|perl|ruby|ssh|eval|graphql|pulls|api\.github", re.I)
 STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals)", re.I)
+STATE_GLOB = re.compile(r"merge-gate-[wa*?\[]", re.I)  # subagents: globs and split spellings of the state files
 WAIVE_CMD = re.compile(r"merge_gate(?:\.py)?['\"]?\s+(?:--\S+\s+\S+\s+)*waive\b")
-GRAPHQL_MERGE = re.compile(r"mergePullRequest|enablePullRequestAutoMerge", re.I)
+WAIVE_ANY = re.compile(r"waive|add_waiver|consume_waiver|put_stamp|take_stamp", re.I)
+GRAPHQL_MERGE = re.compile(r"mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest", re.I)
 REST_MERGE = re.compile(r"(?:repos/([^/\s'\"]+)/([^/\s'\"]+)/)?pulls/(\d+)/merge\b")
 CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 VALUE_FLAGS = {"-R", "--repo", "--match-head-commit", "-b", "--body", "-F", "--body-file", "-t", "--subject",
                "-A", "--author-email", "-X", "--method", "-H", "--header", "-f", "--raw-field", "--field", "-q",
                "--jq", "--input", "--hostname", "--cache", "-p", "--preview", "--template"}
-SHORT_VALUE = ("-R", "-X", "-f", "-F", "-H", "-b", "-t", "-A", "-q")
+SHORT_VALUE = ("-R", "-X", "-f", "-F", "-H", "-b", "-t", "-A", "-q", "-p")
 
 
 class GateError(Exception):
@@ -148,18 +159,52 @@ def tokenize(text):
         return crude.split(), True
 
 
-def _segment_end(tokens, start):
-    for j in range(start, len(tokens)):
-        if tokens[j] in SEPARATORS:
-            return j
-    return len(tokens)
+def _ends(tokens):
+    """ends[i] = index of the first separator at or after i (len(tokens) when none); one pass."""
+    n = len(tokens)
+    ends, nxt = [n] * (n + 1), n
+    for i in range(n - 1, -1, -1):
+        if tokens[i] in SEPARATORS:
+            nxt = i
+        ends[i] = nxt
+    return ends
 
 
-def _segment_start(tokens, index):
-    for j in range(index - 1, -1, -1):
-        if tokens[j] in SEPARATORS:
-            return j + 1
-    return 0
+def _command_word(seg):
+    """Basename of the command a segment runs: skips assignments, wrappers and their options."""
+    i = 0
+    while i < len(seg):
+        t = seg[i]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t) or t in ("!", "{", "}"):
+            i += 1
+        elif os.path.basename(t) in WRAPPER_WORDS or t.startswith("-") or re.match(r"^\d+[smhd]?$", t):
+            i += 1
+        else:
+            return os.path.basename(t)
+    return ""
+
+
+def _strip_heredocs(tokens):
+    """Drop the body of a heredoc whose consumer only stores or prints text (cat, git commit -F -, tee)."""
+    out, i, n = [], 0, len(tokens)
+    while i < n:
+        t = tokens[i]
+        if t in ("<<", "<<-") and i + 1 < n:
+            seg_start = len(out)
+            while seg_start > 0 and out[seg_start - 1] not in (";", "&&", "||", "|", "&", "(", ")"):
+                seg_start -= 1
+            word = _command_word(out[seg_start:])
+            delim = tokens[i + 1]
+            k = i + 2
+            while k < n and tokens[k] != delim:
+                k += 1
+            if word not in SHELLS and word not in ("eval", "source", ".", "xargs") and not INTERPRETERS.match(word):
+                out.extend((t, delim))
+                i = k + 1
+                continue
+        out.append(t)
+        i += 1
+    return out
 
 
 def _read_small(path, cwd):
@@ -186,8 +231,20 @@ def _parse_gh_args(args):
             if a in VALUE_FLAGS:
                 flags.append((a, args[i + 1] if i + 1 < len(args) else ""))
                 i += 1
-            elif a[:2] in SHORT_VALUE and len(a) > 2 and not a.startswith("--"):
-                flags.append((a[:2], a[2:]))
+            elif not a.startswith("--") and len(a) > 2:
+                # a cluster such as -sR other/repo or -fsha=...: letters up to the first value flag are booleans
+                for pos_in, c in enumerate(a[1:], 1):
+                    if "-" + c in SHORT_VALUE:
+                        rest = a[pos_in + 1:]
+                        if rest:
+                            flags.append(("-" + c, rest))
+                        else:
+                            flags.append(("-" + c, args[i + 1] if i + 1 < len(args) else ""))
+                            i += 1
+                        break
+                    flags.append(("-" + c, None))
+                else:
+                    pass
             else:
                 flags.append((a, None))
         else:
@@ -208,9 +265,12 @@ def _gh_merge(args, in_xargs, ctx, cwd):
         return [Merge("unverifiable", reason="gh subcommand is built at runtime")]
     names = {n for n, _ in flags}
     repo_ok = ctx["implicit_ok"]
+    if "--help" in names or "-h" in names:
+        return []
     if pos[0] == "alias" and len(pos) > 1 and pos[1] in ("set", "import"):
-        if re.search(r"merge", " ".join(pos[2:] + [v for _, v in flags if v]), re.I):
-            return [Merge("unverifiable", reason="gh alias that expands to a merge")]
+        if pos[1] == "import" or "--shell" in names or re.search(
+                r"merge|\$|`", " ".join(pos[2:] + [v for _, v in flags if v]), re.I):
+            return [Merge("unverifiable", reason="gh alias that can expand to a merge")]
         return []
     if pos[0] == "pr" and len(pos) > 1 and pos[1] == "merge":
         if "--disable-auto" in names:
@@ -228,7 +288,7 @@ def _gh_merge(args, in_xargs, ctx, cwd):
             m = re.match(r"^https://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)/?$", target)
             if m:
                 slug, number = m.group(1) + "/" + m.group(2), m.group(3)
-            elif target.isdigit():
+            elif target.isascii() and target.isdigit():
                 number = target
         explicit = slug is not None
         return [Merge("pr_merge", slug=slug, number=number, target=None if number else target,
@@ -236,13 +296,13 @@ def _gh_merge(args, in_xargs, ctx, cwd):
                       auto="--auto" in names, repo_ok=explicit or repo_ok,
                       binding="--match-head-commit <full head sha>")]
     if pos[0] == "api" and len(pos) > 1:
-        endpoint = pos[1].lstrip("/")
+        endpoint = re.sub(r"^https?://[^/]+/", "", pos[1]).lstrip("/")
         method = (_flag_values(flags, "-X", "--method") or [""])[-1].upper()
         fields = _flag_values(flags, "-f", "-F", "--field", "--raw-field")
         has_body = bool(fields) or "--input" in names
         method = method or ("POST" if has_body else "GET")
         if endpoint.startswith("graphql"):
-            return _graphql_merge(flags, pos[2:], fields, cwd)
+            return _graphql_merge(flags, pos[2:], fields, cwd, ctx.get("command"))
         if method == "GET":
             return []
         m = re.match(r"^repos/([^/]+)/([^/]+)/pulls/(\d+)/merge/?(?:\?.*)?$", endpoint)
@@ -256,7 +316,7 @@ def _gh_merge(args, in_xargs, ctx, cwd):
     return []
 
 
-def _graphql_merge(flags, rest, fields, cwd):
+def _graphql_merge(flags, rest, fields, cwd, ctx_command=None):
     text = " ".join(rest + [v for _, v in flags if v])
     values = {}
     for field in fields:
@@ -264,6 +324,8 @@ def _graphql_merge(flags, rest, fields, cwd):
         if re.match(r"^[@]", value) or value.startswith(("$", "`")):
             if key == "query" or key == "":
                 if value.startswith("@") and value != "@-":
+                    if (ctx_command or "").count(value[1:]) > 1:
+                        return [Merge("unverifiable", reason="the GraphQL query file is also written by the same command")]
                     try:
                         text += " " + _read_small(value[1:], cwd)
                     except GateError as error:
@@ -309,12 +371,12 @@ def _http_scan(tokens):
     elif re.search(r"mergeBranch", text, re.I):
         found.append(Merge("unverifiable", reason="the mergeBranch mutation has no pull request to check"))
     m = REST_MERGE.search(text)
-    if m and hint:
+    if m:
         slug = m.group(1) + "/" + m.group(2) if m.group(1) else None
         shas = [s.lower() for s in re.findall(r"\bsha\W{1,4}([0-9a-fA-F]{40,64})", text)]
         found.append(Merge("rest", slug=slug, number=m.group(3), head_vals=shas, repo_ok=slug is not None,
                            binding="\"sha\": \"<full head sha>\""))
-    if re.search(r"/repos/[\w.-]+/[\w.-]+/merges\b", text) and hint:
+    if re.search(r"/repos/[\w.-]+/[\w.-]+/merges\b", text):
         found.append(Merge("unverifiable", reason="the branch merge endpoint has no pull request to check"))
     return found
 
@@ -325,50 +387,87 @@ def _normalize_code(code):
 
 def find_merges(command, cwd=None, _depth=0, _ctx=None):
     ctx = dict(_ctx or {"implicit_ok": True, "http": False})
+    ctx.setdefault("command", command)
     if _depth > MAX_DEPTH:
         return [Merge("unverifiable", reason="commands nested too deeply to inspect")]
     if len(command) > MAX_COMMAND_CHARS:
         return [Merge("unverifiable", reason="command too large to inspect")] if GH_HINT.search(command) else []
-    tokens, _ = tokenize(command)
+    tokens, _ = tokenize(command.replace("\\\n", ""))
     if len(tokens) > MAX_TOKENS:
         return [Merge("unverifiable", reason="command has too many tokens to inspect")] if GH_HINT.search(command) else []
+    tokens = _strip_heredocs(tokens)
+    n = len(tokens)
     base = [os.path.basename(t) for t in tokens]
-    if any(b in ("cd", "pushd", "popd", "chdir", "ssh", "docker", "podman", "kubectl", "su", "tmux") for b in base) or \
-            any(t.startswith(("GH_REPO=", "GH_HOST=")) for t in tokens):
+    if any(b in ("cd", "pushd", "popd", "chdir", "ssh", "docker", "podman", "kubectl", "su", "tmux", "-C", "--chdir")
+           for b in base) or any(t.startswith(("GH_REPO=", "GH_HOST=", "--chdir=")) for t in tokens):
         ctx["implicit_ok"] = False
-    found, covered = [], set()
-    for i, b in enumerate(base):
-        if b in ("gh", "gh.exe"):
-            j = _segment_end(tokens, i + 1)
-            in_xargs = "xargs" in base[_segment_start(tokens, i):i]
-            found.extend(_gh_merge(tokens[i + 1:j], in_xargs, ctx, cwd))
-            covered.update(range(i, j))
-    for i, b in enumerate(base):
-        j = _segment_end(tokens, i + 1)
-        rest = tokens[i + 1:j]
-        scripts = [t for t in rest if re.search(r"\s", t)]
-        if b in SHELLS:
-            for k, t in enumerate(rest[:-1]):
-                if re.match(r"^-[A-Za-z]*c[A-Za-z]*$", t):
-                    found.extend(find_merges(rest[k + 1], cwd, _depth + 1, ctx))
-                    break
-        elif b == "ssh" or b == "eval" or b == "su" or b == "env":
-            sub_ctx = dict(ctx, implicit_ok=ctx["implicit_ok"] and b != "ssh")
-            for t in scripts:
-                found.extend(find_merges(t, cwd, _depth + 1, sub_ctx))
-        elif INTERPRETERS.match(b):
-            for t in rest:
-                if re.search(r"\s", t) or "merge" in t.lower():
-                    found.extend(find_merges(_normalize_code(t), cwd, _depth + 1, dict(ctx, http=True)))
-    if ctx["http"] or any(HTTP_CLIENTS.match(b) or INTERPRETERS.match(b) for b in base):
-        found.extend(_http_scan(tokens))
-    for k in range(len(tokens) - 1):
-        if tokens[k] == "pr" and tokens[k + 1] == "merge" and k not in covered:
-            found.append(Merge("unverifiable", reason="a pr merge outside a recognizable gh command"))
-    if not any(m.kind != "check" for m in found):
-        normalized = _normalize_code(command)
-        if EXEC_MARKER.search(command) and RAW_MERGE.search(normalized):
-            found.append(Merge("unverifiable", reason="a merge string reaches a shell executor the hook cannot read"))
+    ends = _ends(tokens)
+    segments, s_i = [], 0
+    while s_i < n:
+        if tokens[s_i] in SEPARATORS:
+            s_i += 1
+            continue
+        segments.append((s_i, ends[s_i], tokens[ends[s_i]] if ends[s_i] < n else ""))
+        s_i = ends[s_i] + 1
+    words = [_command_word(tokens[a:b]) for a, b, _ in segments]
+    found, http_tokens, raw = [], [], []
+    for index, (a, b, sep) in enumerate(segments):
+        seg = tokens[a:b]
+        handled, seen_xargs = False, False
+        for i in range(a, b):
+            name = base[i]
+            if name == "xargs":
+                seen_xargs = True
+            if name in ("gh", "gh.exe"):
+                found.extend(_gh_merge(tokens[i + 1:b], seen_xargs, ctx, cwd))
+                handled = True
+            elif name in SHELLS:
+                rest = tokens[i + 1:b]
+                for k, t in enumerate(rest[:-1]):
+                    if re.match(r"^-[A-Za-z]*c[A-Za-z]*$", t):
+                        found.extend(find_merges(rest[k + 1], cwd, _depth + 1, ctx))
+                        handled = True
+                        break
+            elif name in ("ssh", "eval", "su", "env"):
+                sub_ctx = dict(ctx, implicit_ok=ctx["implicit_ok"] and name != "ssh")
+                for t in tokens[i + 1:b]:
+                    if re.search(r"\s", t):
+                        found.extend(find_merges(t, cwd, _depth + 1, sub_ctx))
+                        handled = True
+            elif INTERPRETERS.match(name):
+                http_tokens.extend(tokens[a:b])
+                for t in tokens[i + 1:b]:
+                    if re.search(r"\s", t) or "merge" in t.lower():
+                        found.extend(find_merges(_normalize_code(t), cwd, _depth + 1, dict(ctx, http=True)))
+                        handled = True
+            elif HTTP_CLIENTS.match(name):
+                http_tokens.extend(tokens[a:b])
+                handled = True
+        if handled:
+            continue
+        word = words[index]
+        nxt = words[index + 1] if index + 1 < len(segments) else ""
+        next_seg = tokens[segments[index + 1][0]:segments[index + 1][1]] if index + 1 < len(segments) else []
+        consumer = nxt in EXEC_CONSUMERS or bool(INTERPRETERS.match(nxt)) or (
+            nxt == "xargs" and any(os.path.basename(t) in SHELLS or t in ("eval", "gh") for t in next_seg))
+        piped = sep in ("|", "|&") and consumer
+        exempt = word in DATA_COMMANDS or (word == "git" and not any("alias." in t or t.startswith("!") for t in seg))
+        if exempt and not piped:
+            continue
+        text = _normalize_code(" ".join(seg))
+        if RAW_MERGE.search(text):
+            raw.append(Merge("unverifiable", reason="a merge string appears in a command the hook cannot read as a "
+                                                      "plain gh call (variable, wrapper, script or other client)"))
+        elif re.search(r"base64\s+(?:-d|--decode|-D)", text) and nxt in SHELLS:
+            raw.append(Merge("unverifiable", reason="decoded text is piped into a shell"))
+    if ctx["http"]:
+        http_tokens = tokens
+    if http_tokens:
+        scanned = _http_scan(http_tokens)
+        found.extend(scanned)
+        if ctx["http"] and scanned:
+            raw = []  # inside an interpreter string the HTTP scan already classified the merge
+    found.extend(raw)
     seen, unique = set(), []
     for merge in found:
         if merge.key() not in seen:
@@ -508,7 +607,7 @@ def _entries(pr, runs, statuses, head, reasons):
         entries.append(dict(name=status.get("context"), src="status", kind="status", v=v, d=d, ts="", app=None))
     groups = {}
     for e in entries:
-        groups.setdefault((e["src"], e["kind"], e["name"], e.get("wf")), []).append(e)
+        groups.setdefault((e["src"], e["kind"], e["name"], e.get("wf"), e.get("app")), []).append(e)
     kept = []
     for group in groups.values():
         if len(group) > 1 and all(e["ts"] for e in group):
@@ -950,8 +1049,11 @@ def decide(payload, runner, state_dir, now=None):
         return 0, ""
     if not _shell_like(tool) and tool.lower() in WRITE_TOOLS:
         return 0, ""
-    if STATE_NAMES.search(command):
+    plain = re.sub(r"[\"'\\$]", "", command)  # w''aive, $M and escaped spellings
+    if STATE_NAMES.search(command) or STATE_NAMES.search(plain):
         return 2, "merge-gate: the waiver, audit and approval files are written only by merge_gate.py itself."
+    if subagent and (STATE_GLOB.search(plain) or ("merge_gate" in plain.lower() and WAIVE_ANY.search(plain))):
+        return 2, "merge-gate: only the main agent may record a waiver; ask the main agent."
     if WAIVE_CMD.search(command):
         if subagent:
             return 2, "merge-gate: only the main agent may record a waiver; ask the main agent."
@@ -1016,9 +1118,10 @@ def hook_main(state_dir, runner, stdin, stdout, stderr):
         if len(raw) > MAX_STDIN_BYTES:
             stderr.write("merge-gate: hook input is larger than the cap; blocking.\n")
             return 2
-        payload = safe_input.safe_json_loads(raw, max_depth=60, max_bytes=MAX_STDIN_BYTES)
-        if not isinstance(payload, dict):
+        parsed = safe_input.safe_json_loads(raw, max_depth=60, max_bytes=MAX_STDIN_BYTES)
+        if not isinstance(parsed, dict):
             raise ValueError("payload is not an object")
+        payload = parsed
         text = json.dumps(payload.get("tool_input"), ensure_ascii=False)[:MAX_COMMAND_CHARS]
         code, message = decide(payload, runner or SubprocessGh(), state_dir)
     except (ValueError, OSError) as error:

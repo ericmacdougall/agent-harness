@@ -56,6 +56,9 @@
     "older_success_newer_in_progress": {"checks": [
       {"t": "run", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS", "started": "2026-11-01T00:00:00Z"},
       {"t": "run", "name": "test", "status": "IN_PROGRESS", "conclusion": "", "started": "2026-11-02T00:00:00Z"}], "protection": {"contexts": ["test"]}},
+    "app_hidden_failure": {"checks": [
+      {"t": "run", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE", "started": "2026-11-01T00:00:00Z", "app_id": 111},
+      {"t": "run", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS", "started": "2026-11-02T00:00:00Z", "app_id": 222}], "protection": "none"},
     "disagreement": {"checks": [
       {"t": "run", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}], "protection": "none", "api_conclusion": "failure"},
     "truncated_runs": {"checks": [

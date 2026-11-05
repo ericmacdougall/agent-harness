@@ -18,7 +18,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-HOOKS = ROOT / "harness" / "hooks"
+HOOKS = Path(os.environ.get("MERGE_GATE_HOOKS_DIR") or ROOT / "harness" / "hooks")  # override: failing-first run on old code
 sys.path.insert(0, str(HOOKS))
 import merge_gate as mg  # noqa: E402
 
@@ -413,6 +413,56 @@ class Hostile(Base):
             self.assertEqual(code, 2)
         finally:
             mg.find_merges = original
+
+
+class RedTeam(Base):
+    """Findings of the code red-team (review-redteam.md) as failing controls."""
+
+    def test_subagent_cannot_evade_waiver_guard_by_spelling(self):
+        for command in ("python3 /h/merge_gate.py \"waive\" --repo o/r --pr 5 --head " + HEAD,
+                        "python3 /h/merge_gate.py w''aive --repo o/r --approved-by main:x",
+                        "python3 -c \"import merge_gate; merge_gate.add_waiver(1)\"",
+                        "printf x >> ~/.agent-harness/state/merge-gate-w*",
+                        "cp f ~/.agent-harness/state/merge-gate-wai\"\"vers.jsonl",
+                        "M=merge_gate.py; python3 /h/$M waive --repo o/r"):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, agent_id="sub-1"), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 2, text)
+
+    def test_subagent_may_run_the_merge_gate_tests(self):
+        code, _ = mg.decide(bash("python3 -m unittest tests.test_merge_gate -v", agent_id="sub-1"),
+                            FakeGh(SCENARIOS["green"]), self.state)
+        self.assertEqual(code, 0)
+
+    def test_large_command_is_not_quadratic(self):
+        command = "git add " + " ".join("file%d.txt" % i for i in range(4000))
+        start = time.time()
+        self.assertEqual(self.decide(command)[0], 0)
+        self.assertLess(time.time() - start, 3.0)
+
+    def test_non_object_payload_blocks(self):
+        out, err = io.StringIO(), io.StringIO()
+        code = mg.main(["hook", "--state-dir", str(self.state)], runner=FakeGh(SCENARIOS["green"]),
+                       stdin=io.BytesIO(b"[]"), stdout=out, stderr=err)
+        self.assertEqual(code, 2)
+
+    def test_missing_helper_module_blocks_instead_of_exit_one(self):
+        folder = Path(tempfile.mkdtemp(prefix="mg-broken-"))
+        self.addCleanup(__import__("shutil").rmtree, folder, True)
+        (folder / "merge_gate.py").write_bytes((HOOKS / "merge_gate.py").read_bytes())
+        result = subprocess.run([sys.executable, str(folder / "merge_gate.py"), "hook"],
+                                input=b"{}", capture_output=True, env={"PATH": "/usr/bin:/bin", "HOME": str(folder)})
+        self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_graphql_query_file_rewritten_by_same_command_blocks(self):
+        folder = Path(tempfile.mkdtemp(prefix="mg-q-"))
+        self.addCleanup(__import__("shutil").rmtree, folder, True)
+        (folder / "q.graphql").write_text("query { viewer { login } }")
+        kinds = {m.kind for m in mg.find_merges("printf x > q.graphql && gh api graphql -F query=@q.graphql",
+                                                cwd=str(folder))}
+        self.assertEqual(kinds, {"unverifiable"})
+        kinds = {m.kind for m in mg.find_merges("gh api graphql -F query=@q.graphql", cwd=str(folder))}
+        self.assertEqual(kinds, set())
 
 
 class Subprocess(unittest.TestCase):
