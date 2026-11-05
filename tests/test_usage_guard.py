@@ -18,6 +18,7 @@ from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / 'harness/hooks'
 sys.path.insert(0, str(HOOKS))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import hermetic  # noqa: E402
 
 hermetic.install()
@@ -46,9 +47,28 @@ class EvidenceStore(unittest.TestCase):
         # macOS /tmp is a symlink; an ancestor symlink must not break store creation (GoodQA #14553).
         real = self.root / 'real'; real.mkdir()
         link = self.root / 'link'; link.symlink_to(real)
-        store = guard.UsageStore(link / 'state')
+        synced = []
+        original = os.fsync
+
+        def recording_fsync(fd):
+            synced.append(os.fstat(fd).st_ino)
+            return original(fd)
+        with mock.patch.object(guard.os, 'fsync', recording_fsync):
+            store = guard.UsageStore(link / 'state')
         self.assertTrue((real / 'state' / 'store.json').is_file())
         self.assertEqual(store.root, link / 'state')
+        # the durability fsync must reach the directory that really holds the new entry, not be skipped
+        self.assertIn(os.stat(real).st_ino, synced)
+
+    def test_repointed_symlinked_parent_is_detected_as_identity_change(self):
+        real = self.root / 'real2'; real.mkdir()
+        other = self.root / 'other2'; other.mkdir()
+        link = self.root / 'link2'; link.symlink_to(real)
+        store = guard.UsageStore(link / 'state')
+        link.unlink(); link.symlink_to(other)
+        with self.assertRaises(guard.GuardError) as caught:
+            store._current()
+        self.assertEqual(caught.exception.reason, 'UNKNOWN')
 
     def test_symlinked_store_leaf_is_still_refused(self):
         real = self.root / 'real-leaf'; real.mkdir(mode=0o700)
@@ -58,11 +78,13 @@ class EvidenceStore(unittest.TestCase):
         self.assertEqual(caught.exception.reason, 'UNKNOWN')
 
     def test_symlinked_namespace_leaf_is_still_refused(self):
+        state = self.root / 'ns-state'
+        guard.UsageStore(state)  # a real, established store first
         outside = self.root / 'outside'; outside.mkdir(mode=0o700)
-        state = self.root / 'ns-state'; state.mkdir(mode=0o700)
-        (state / 'runs').symlink_to(outside)
-        with self.assertRaises(guard.GuardError):
+        (state / 'runs').rmdir(); (state / 'runs').symlink_to(outside)
+        with self.assertRaises(guard.GuardError) as caught:
             guard.UsageStore(state)
+        self.assertEqual(caught.exception.message, 'Usage directory ownership or permissions are unsafe')
 
     def begin(self, **options):
         return self.store.begin(self.subject, self.identity, owner='fixture', label='focused',

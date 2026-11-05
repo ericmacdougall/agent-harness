@@ -24,9 +24,10 @@ class HermeticSuite(unittest.TestCase):
         self.assertNotIn(hermetic.real_home(), Path(os.path.realpath(store.root)).parents)
 
     def test_guard_detects_a_real_home_resolution(self):
-        with mock.patch.dict(os.environ, {'AGENT_HARNESS_USAGE_DIR': str(hermetic.real_home() / '.agent-harness' / 'usage')}):
+        real = hermetic.real_home()
+        with mock.patch.dict(os.environ, {'AGENT_HARNESS_USAGE_DIR': str(real / '.agent-harness' / 'usage')}):
             self.assertTrue(any('AGENT_HARNESS_USAGE_DIR' in item for item in hermetic.violations()))
-        with mock.patch.dict(os.environ, {'HOME': str(hermetic.real_home())}):
+        with mock.patch.dict(os.environ, {'HOME': str(real)}):
             self.assertTrue(any(item.startswith('HOME=') for item in hermetic.violations()))
 
     def test_install_repairs_a_real_usage_dir(self):
@@ -35,6 +36,26 @@ class HermeticSuite(unittest.TestCase):
             hermetic.install()
             self.assertNotEqual(os.environ['AGENT_HARNESS_USAGE_DIR'], real)
             self.assertEqual(hermetic.violations(), [])
+
+    def test_a_temp_root_under_the_real_home_is_not_a_violation(self):
+        under_home = hermetic.real_home() / '.agent-harness' / 'scratch' / 'x'
+        self.assertFalse(hermetic.hits_protected(under_home))
+        with mock.patch.dict(os.environ, {'AGENT_HARNESS_USAGE_DIR': str(under_home / 'usage')}):
+            self.assertEqual([item for item in hermetic.violations() if 'USAGE' in item], [])
+
+    def test_frozen_real_state_path_in_a_module_is_reported(self):
+        fake = type(sys)('fake_frozen')
+        fake.LOG_PATH = hermetic.real_home() / '.agent-harness' / 'logs' / 'x.jsonl'
+        fake.SAFE = '/tmp/harmless'
+        found = hermetic.scan_frozen_paths({'fake_frozen': fake})
+        self.assertEqual(len(found), 1)
+        self.assertIn('fake_frozen.LOG_PATH', found[0])
+
+    def test_no_loaded_module_froze_a_real_state_path(self):
+        # run_capped, heavy_job_guard and commit_policy compute their paths at import; with HOME pinned first
+        # (gate wrapper) none may point at the real state. Under a bare `discover` they are reported, not hidden.
+        if os.environ.get('HARNESS_SUITE_PINNED') == '1':
+            self.assertEqual(hermetic.scan_frozen_paths(), [])
 
 
 if __name__ == '__main__':
