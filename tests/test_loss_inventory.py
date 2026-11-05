@@ -349,6 +349,26 @@ class CoverageTests(Fixture):
         und = [x["path"] for x in json.loads(self.run_cli("report", "--json", expect=1).stdout)["undecided"]]
         self.assertIn(path, und)
 
+    def test_dirty_decision_stale_for_quoted_filename(self):
+        f = self.noremote / ("caf\u00e9 tab\t.txt")
+        f.write_text("one")
+        self.scan()
+        path = "%s::dirty" % self.noremote
+        self.run_cli("decide", "--row", path, "--decision", "moved", "--ticket", "t#1", expect=0)
+        with open(str(f), "a") as fh:
+            fh.write("more content appended")
+        self.scan()
+        und = [x["path"] for x in json.loads(self.run_cli("report", "--json", expect=1).stdout)["undecided"]]
+        self.assertIn(path, und)
+
+    def test_string_min_db_in_saved_scan_does_not_traceback(self):
+        self.scan()
+        d = json.loads(self.saved().read_text())
+        d["min_db_bytes"] = "1000"
+        self.saved().write_text(json.dumps(d))
+        p = self.run_cli("report", expect=1)
+        self.assertNotIn("Traceback", p.stderr.decode())
+
     def test_crontab_failure_is_an_error_not_empty(self):
         ct = self.fakebin / "crontab"
         ct.write_text('#!/bin/sh\necho "crontab: permission denied" >&2\nexit 1\n')
