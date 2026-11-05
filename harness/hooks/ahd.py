@@ -796,6 +796,11 @@ def install(apply: bool) -> int:
         print(f"{'write' if apply else 'would write'} {p}")
         if apply:
             p.parent.mkdir(parents=True, exist_ok=True)
+            if p.exists():  # never overwrite a unit without a copy to roll back to
+                import shutil  # noqa: PLC0415
+                backup = p.with_name(p.name + ".bak-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+                shutil.copy2(p, backup)  # a unit file is small; copy2 keeps the daemon's read bound rule intact
+                print(f"backup {backup}")
             tmp = p.with_name(p.name + ".tmp")
             tmp.write_text(body)
             os.replace(tmp, p)
@@ -811,6 +816,27 @@ def install(apply: bool) -> int:
     return 0
 
 
+def uninstall(apply: bool) -> int:
+    """Stop the service and remove its unit; backups (.bak-*) stay."""
+    files = unit_files(Path(__file__).resolve())
+    if sys.platform == "darwin":
+        cmds = [["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"]]
+    else:
+        cmds = [["systemctl", "--user", "disable", "--now", "ahd.service"], ["systemctl", "--user", "daemon-reload"]]
+    for c in cmds:
+        print(("run " if apply else "would run ") + " ".join(c))
+        if apply:
+            subprocess.run(c, stdin=subprocess.DEVNULL, check=False)
+    for p in files:
+        print(f"{'remove' if apply else 'would remove'} {p}")
+        if apply:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+    return 0
+
+
 # ---------------------------------------------------------------- CLI
 
 def main(argv=None) -> int:
@@ -821,9 +847,13 @@ def main(argv=None) -> int:
     sp.add_parser("report", help="one tick, then print the unowned / dropped / silent lists")
     i = sp.add_parser("install")
     i.add_argument("--apply", action="store_true")
+    un = sp.add_parser("uninstall", help="stop the service and remove its unit (backups stay)")
+    un.add_argument("--apply", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "install":
         return install(a.apply)
+    if a.cmd == "uninstall":
+        return uninstall(a.apply)
     if a.cmd is None and not a.once:
         ap.print_help()
         return 2

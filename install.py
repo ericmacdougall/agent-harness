@@ -623,14 +623,28 @@ def service_commands(claude: Path) -> list[list[str]]:
     return [[sys.executable, str(claude / "hooks" / "ahd.py"), "install", "--apply"]]
 
 
+class ServiceError(RuntimeError):
+    """A host service failed to register; the files are already installed and stay installed."""
+
+
 def install_services(claude: Path, runner=None) -> list[str]:
     import subprocess  # noqa: PLC0415
 
-    runner = runner or (lambda argv: subprocess.run(argv, stdin=subprocess.DEVNULL, check=False, timeout=120))
+    runner = runner or (lambda argv: subprocess.run(argv, stdin=subprocess.DEVNULL, check=False, timeout=120,
+                                                   capture_output=True, text=True))
     done = []
     for argv in service_commands(claude):
-        runner(argv)
-        done.append(" ".join(argv[1:]))
+        label = " ".join(argv[1:])
+        try:
+            result = runner(argv)
+        except subprocess.TimeoutExpired as error:
+            raise ServiceError(f"service registration timed out after {error.timeout}s: {label}; files are installed, "
+                               "re-run `install.py --apply --services` or that command by hand") from error
+        rc = getattr(result, "returncode", 0)
+        if rc:
+            tail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "")[-300:]
+            raise ServiceError(f"service registration failed (exit {rc}): {label}; files are installed; {tail.strip()}")
+        done.append(label)
     return done
 
 
@@ -676,6 +690,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
                      (settings_path, (json.dumps(settings, indent=2) + "\n").encode())]
         changes = [str(path) for path in managed]
         if not apply:
+            if services:  # preview: name the service commands a real --apply --services run would execute
+                changes.extend("would run service: " + " ".join(argv[1:]) for argv in service_commands(claude))
             return changes
         for note in migrate_local_profiles(claude):
             print(f"  {note}")
@@ -736,6 +752,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
                 raise RuntimeError(f"Installation failed; rollback incomplete for {', '.join(failures)}; "
                                    f"restore from {backups}") from error
             raise
+        if services and not apply:
+            changes.extend("would run service: " + " ".join(argv[1:]) for argv in service_commands(claude))
         if apply and services:  # host services last, after every file is in place (goodqa#14791 S1d)
             changes.extend("service: " + c for c in install_services(claude))
         return changes

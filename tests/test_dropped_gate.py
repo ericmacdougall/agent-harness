@@ -233,6 +233,62 @@ class SubagentStopGate(Base):
             self.assertEqual(self.sstop("jobowner").get("decision"), "block")
 
 
+class RealWalRows(Base):
+    """Blind pr review finding 1: build the fixture from the real wal.py and wal_note.py hooks, not hand-written rows."""
+
+    def hook(self, event, payload):
+        import subprocess
+        env = dict(os.environ, HOME=str(self.home), AH_HOME=str(self.home))
+        p = subprocess.run([sys.executable, str(HOOKS / "wal.py"), event], input=json.dumps(payload), capture_output=True,
+                           text=True, env=env, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr[-400:])
+
+    def note(self, agent, event, text):
+        import subprocess
+        env = dict(os.environ, HOME=str(self.home), AH_HOME=str(self.home))
+        wal = self.home / ".claude" / "wals" / SESSION / f"agent-{agent}.jsonl"
+        p = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(wal), "--event", event, "--note", text],
+                           capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr[-400:])
+
+    def test_real_hook_rows_still_show_pending_work(self):
+        agent = "a0real000000001"
+        self.hook("subagent", {"session_id": SESSION, "agent_id": agent, "agent_type": "task-owner"})
+        self.hook("pretool", {"session_id": SESSION, "agent_id": agent, "tool_name": "Bash", "tool_use_id": "t1",
+                              "tool_input": {"command": "ls"}})
+        self.note(agent, "intent", "running the dev2 suite for goodqa#14791")
+        self.hook("pretool", {"session_id": SESSION, "agent_id": agent, "tool_name": "Edit", "tool_use_id": "t2",
+                              "tool_input": {"file_path": "/tmp/x"}})
+        with mock.patch.object(dropped_gate, "armed_waiter", return_value=False):
+            first = dropped_gate.cmd_subagent_stop({"session_id": SESSION, "agent_id": agent, "stop_hook_active": False})
+            self.assertEqual(first.get("decision"), "block", first)
+            second = dropped_gate.cmd_subagent_stop({"session_id": SESSION, "agent_id": agent, "stop_hook_active": True})
+            self.assertIn("DROPPED", second.get("systemMessage", ""))
+        self.hook("subagent_stop", {"session_id": SESSION, "agent_id": agent, "agent_type": "task-owner"})
+        # finding 2: wal.py stamps microseconds and the stop is seconds later; zero grace must still apply
+        by = {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=time.time() + 5)["owners"]}
+        self.assertEqual(by[agent]["state"], "DROPPED")
+        self.assertTrue(by[agent]["decision_required"])
+
+    def test_real_handoff_row_passes(self):
+        agent = "a0real000000002"
+        self.hook("subagent", {"session_id": SESSION, "agent_id": agent, "agent_type": "task-owner"})
+        self.note(agent, "handoff", "handed to main: PR opened")
+        self.hook("pretool", {"session_id": SESSION, "agent_id": agent, "tool_name": "Bash", "tool_use_id": "t3",
+                              "tool_input": {"command": "git status"}})
+        self.assertEqual(dropped_gate.cmd_subagent_stop({"session_id": SESSION, "agent_id": agent}), {})
+
+    def test_armed_waiter_reads_the_ah_run_ledger_directory(self):
+        """Finding 3: a live ah-run row (agent attributed, no end) is an armed waiter; a finished one is not."""
+        ledger = self.home / ".agent-harness" / "reserve" / "ledger"
+        ledger.mkdir(parents=True)
+        (ledger / "run1.json").write_text(json.dumps({"run_id": "run1", "agent": "jobowner", "task": "t", "start": "x"}))
+        self.assertTrue(dropped_gate.armed_waiter("jobowner", self.home))
+        (ledger / "run1.json").write_text(json.dumps({"run_id": "run1", "agent": "jobowner", "task": "t", "end": "y", "exit_code": 0}))
+        self.assertFalse(dropped_gate.armed_waiter("jobowner", self.home))
+        self.assertFalse(dropped_gate.armed_waiter("nobody", self.home))
+
+
 class TaskWalOwners(Base):
     """I8: task-named WALs are owners in the same view, with the same gate."""
 
@@ -243,7 +299,12 @@ class TaskWalOwners(Base):
                                        {"at": iso(NOW - 7 * 3600), "event": "status", "note": "WORKDIR_DONE: shipped"},
                                        {"at": iso(NOW - 7 * 3600), "event": "result", "note": "done"}])
         jl(w / "quiet-task.jsonl", [{"at": iso(NOW - 90 * 60), "event": "intent", "note": "still mine"}])
+        for name, age in (("fable-review", 7 * 3600), ("finished-task", 7 * 3600), ("quiet-task", 90 * 60)):
+            os.utime(w / f"{name}.jsonl", (NOW - age, NOW - age))  # inside the 48 h task-WAL window on the fixture clock
+        jl(w / "ancient-task.jsonl", [{"at": iso(NOW - 5 * 86400), "event": "intent", "note": "history"}])
+        os.utime(w / "ancient-task.jsonl", (NOW - 5 * 86400, NOW - 5 * 86400))
         data = self.owners()
+        self.assertNotIn("ancient-task", [r["agent_id"] for r in data["owners"]])  # outside the window: history, not an owner
         by = {r["agent_id"]: r for r in data["owners"]}
         self.assertEqual(by["fable-review"]["state"], "DROPPED")
         self.assertEqual(by["fable-review"]["type"], "task-wal")

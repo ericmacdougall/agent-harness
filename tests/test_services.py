@@ -42,6 +42,51 @@ class ServiceRegistration(unittest.TestCase):
         self.assertEqual(done, [" ".join(calls[0][1:])])
 
 
+class ServiceFailures(unittest.TestCase):
+    """Blind pr review finding 4: exit codes and timeouts must surface; --services without --apply previews."""
+
+    def test_nonzero_exit_raises_and_names_the_command(self):
+        import subprocess
+
+        class R:
+            returncode, stderr, stdout = 1, "launchctl: boom", ""
+        with self.assertRaises(installer.ServiceError) as cm:
+            installer.install_services(Path("/x/.claude"), runner=lambda argv: R())
+        self.assertIn("exit 1", str(cm.exception))
+        self.assertIn("ahd.py install --apply", str(cm.exception))
+        self.assertIn("boom", str(cm.exception))
+
+        def slow(argv):
+            raise subprocess.TimeoutExpired(argv, 120)
+        with self.assertRaises(installer.ServiceError) as cm:
+            installer.install_services(Path("/x/.claude"), runner=slow)
+        self.assertIn("timed out", str(cm.exception))
+
+    def test_preview_lists_the_service_commands_without_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with mock.patch.dict(os.environ, {"HOME": tmp}), mock.patch.object(installer, "install_services") as svc:
+                changes = installer.install(home, apply=False, services=True)
+                svc.assert_not_called()
+                self.assertTrue(any(c.startswith("would run service: ") and "ahd.py install --apply" in c for c in changes))
+
+    def test_ahd_install_backs_up_an_existing_unit_and_uninstall_removes_it(self):
+        sys.path.insert(0, str(ROOT / "harness" / "hooks"))
+        import ahd
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"HOME": tmp}), \
+                mock.patch.object(ahd.subprocess, "run") as run:
+            files = ahd.unit_files(Path(ahd.__file__))
+            target = next(iter(files))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("old unit")
+            self.assertEqual(ahd.install(True), 0)
+            self.assertNotEqual(target.read_text(), "old unit")
+            self.assertTrue(any(p.name.startswith(target.name + ".bak-") for p in target.parent.iterdir()))
+            self.assertEqual(ahd.uninstall(True), 0)
+            self.assertFalse(target.exists())
+            self.assertTrue(run.called)
+
+
 class DoctorAhdRunning(unittest.TestCase):
     def test_doctor_fails_until_ahd_holds_its_lock_or_beats(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -122,13 +122,27 @@ def pending_work(home: Path, session: str, agent: str) -> str | None:
     return None
 
 
-def armed_waiter(agent: str) -> bool:
-    """A live ah-run job attributed to the agent counts as an armed waiter (its completion record will notify)."""
+def armed_waiter(agent: str, home: Path | None = None) -> bool:
+    """A live ah-run job attributed to the agent counts as an armed waiter: its completion record will notify.
+    Read from the launcher's ledger directory (~/.agent-harness/reserve/ledger/<run>.json, one row per run, `agent`
+    attribution, `end` set when the run finished; docs/observer.md). No ledger dir, or no live row: not armed."""
+    import safe_input  # noqa: PLC0415
+    home = home or Path(os.environ.get("AH_HOME") or Path.home())
+    ledger = home / ".agent-harness" / "reserve" / "ledger"
     try:
-        import ah_run  # noqa: PLC0415 - G10 launcher, optional
-        return any(True for _ in ah_run.Ledger().live_rows(agent=agent))
-    except Exception:  # noqa: BLE001
+        entries = sorted(os.scandir(ledger), key=lambda e: e.name)[-500:]
+    except OSError:
         return False
+    for entry in entries:
+        if not entry.name.endswith(".json") or not entry.is_file(follow_symlinks=False):
+            continue
+        try:
+            row = safe_input.safe_json_loads(safe_input.read_bounded(Path(entry.path), 65536).decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001 - a torn row is not a waiter
+            continue
+        if isinstance(row, dict) and row.get("agent") == agent and not row.get("end"):
+            return True
+    return False
 
 
 def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
@@ -141,7 +155,7 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
         why = pending_work(home, session, agent)
     except Exception:  # noqa: BLE001
         return {}
-    if not why or armed_waiter(agent):
+    if not why or armed_waiter(agent, home):
         return {}
     state = load_state(session)
     seen = state.setdefault("subagent_blocks", {})
@@ -154,7 +168,8 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
         return {"decision": "block", "reason": text}
     try:  # second stop: let it end, but the owner is DROPPED now, not after the finishing grace
         import ah  # noqa: PLC0415
-        ts = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now or time.time()))
+        import datetime as dt  # noqa: PLC0415
+        ts = dt.datetime.fromtimestamp(now or time.time(), dt.timezone.utc).isoformat()  # microseconds, like wal.py
         ah.write(home, "task.pending", {"agent": agent, "session": session, "at": ts}, session,
                  f"pending:{session[:16]}:{agent}:{int((now or time.time()) // 600)}")
     except Exception:  # noqa: BLE001 - the marker is best effort; the message still says what happened

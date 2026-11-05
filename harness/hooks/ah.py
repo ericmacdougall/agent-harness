@@ -31,6 +31,7 @@ TICKET_RE = re.compile(r"^GoodQA\s+(?:([a-z0-9][a-z0-9-]{0,62})\s*)?#([1-9]\d{0,
 KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 ASK_ID_RE = re.compile(r"^w[0-9a-f]{11}$")
 OWNER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+TASK_WAL_WINDOW_S = 48 * 3600  # a task-named WAL untouched this long is history (ahd owner_window_seconds)
 WRAPPER = re.compile(r"^\s*<[A-Za-z][\w-]*[\s>/]")
 MAX_REQUEST = 256 * 1024
 SKIP_DARWIN = ("Library", "Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music", "Applications")
@@ -306,7 +307,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         is_stopped = agent in stopped and max(last_wal, tmtime) <= stop_at.get(agent, 0.0) + 10
         by_name = info["type"] in liveness.NAMEABLE_TYPES and agent in named_text
         is_owner = agent in registered or info["type"] in liveness.OWNER_TYPES or by_name
-        grace = 0.0 if pending.get(agent, 0.0) >= max(last_wal, tmtime) else None  # I7: no finishing grace
+        grace = 0.0 if pending.get(agent, 0.0) >= max(last_wal, tmtime) - 10 else None  # I7: no finishing grace (10 s, as is_stopped)
         verdict = liveness.classify(now, last_wal, tmtime, is_stopped,
                                     summary["outcome"], summary["last_note"], info["type"],
                                     agent in registered, owner=is_owner, finish_grace=grace)
@@ -327,6 +328,11 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     for f in sorted(wal.glob("*.jsonl")):  # I8: task-named WALs are owners too, with no process behind them
         name = f.name[:-len(".jsonl")]
         if name == "main" or name.startswith("agent-") or not OWNER_ID_RE.match(name):
+            continue
+        try:
+            if now - f.stat().st_mtime > TASK_WAL_WINDOW_S:
+                continue  # history, not an owner (same window ahd uses for sessions)
+        except OSError:
             continue
         summary = summarize_agent_wal(f, index_dir)
         verdict = liveness.classify_task_wal(now, summary["last_at"], summary["outcome"], summary["last_note"])
