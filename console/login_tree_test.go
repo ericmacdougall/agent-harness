@@ -42,11 +42,10 @@ exit 0
 	case <-time.After(15 * time.Second):
 		t.Fatal("login did not finish")
 	}
-	if pid := recordedPID(t, pidFile); pid > 0 {
-		t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
-		if syscall.Kill(pid, 0) != nil {
-			t.Fatal("a finished sign-in must not kill the provider's own helper")
-		}
+	pid := recordedPID(t, pidFile)
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	if syscall.Kill(pid, 0) != nil {
+		t.Fatal("a finished sign-in must not kill the provider's own helper")
 	}
 	settings.mu.Lock()
 	state := task.State

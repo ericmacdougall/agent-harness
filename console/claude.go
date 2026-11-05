@@ -36,7 +36,10 @@ func (r *claudeRun) cancel() {
 		r.writeOnce.Do(func() { r.writer = newInputWriter(r.input) })
 		r.writer.close()
 		if r.tree != nil {
-			r.tree.Terminate(100 * time.Millisecond)
+			// Callers hold the app lock, so the bounded wait for the tree runs on its
+			// own goroutine; stop-work never waits for the process to finish.
+			r.tree.Release(true)
+			go r.tree.Terminate(100 * time.Millisecond)
 		} else {
 			terminateProcess(r.command)
 		}
@@ -572,7 +575,10 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 		a.changedLocked()
 		a.mu.Unlock()
 	}
-	if err := scanner.Err(); err != nil {
+	// errStreamDrainBound means the leader is gone and a descendant merely holds
+	// the pipe: the caller's goroutine decides the tree's fate after the final
+	// check, so it is not a stream failure and must not cancel the run here.
+	if err := scanner.Err(); err != nil && !errors.Is(err, errStreamDrainBound) {
 		a.mu.Lock()
 		a.claudeUnfinishedLocked(current, run, "Claude output stream exceeded its bound or failed before a final result. No request was replayed.")
 		a.changedLocked()

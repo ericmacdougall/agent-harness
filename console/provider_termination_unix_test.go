@@ -222,3 +222,36 @@ exit 0
 		t.Fatalf("descendant %d survived the provider disconnect", childPID)
 	}
 }
+
+// A final followed by the leader's exit, with a descendant keeping stdout open:
+// the stream ends by the drain bound, which is not a failure. The finished turn
+// must stay final and the tool's background work must survive.
+func TestClaudeFinalWithPipeHoldingDescendantKeepsBackgroundWork(t *testing.T) {
+	childFile := filepath.Join(t.TempDir(), "child")
+	a, s := claudeProcessFixture(t, `sh -c 'echo $$ > "`+childFile+`"; exec sleep 60' &
+until [ -s "`+childFile+`" ]; do sleep 0.01; done
+read line
+printf '{"type":"result","result":"done"}\n'
+exit 0
+`)
+	if err := a.sendClaude(s, "A", "bounded", s.CWD, ""); err != nil {
+		t.Fatal(err)
+	}
+	childPID := recordedPID(t, childFile)
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		claude, state := s.claude, s.requests["A"]
+		a.mu.Unlock()
+		if claude == nil && state == "final" {
+			time.Sleep(300 * time.Millisecond)
+			if syscall.Kill(childPID, 0) != nil || processGone(childPID) {
+				t.Fatal("a recorded final lost the tool's background work")
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("final turn did not finish while a descendant held stdout")
+}

@@ -33,6 +33,10 @@ var errStreamDrainBound = errors.New("provider output ended by the drain bound w
 //   - Termination escalates from a polite signal to a kill without sleeping
 //     under a lock.
 //
+// Leaving background work alone is best effort: once the drain bound passes the
+// read end is closed, so a descendant that writes to stdout after that gets
+// SIGPIPE, as it did before the tree existed.
+//
 // Lock rule: stopOnExit must be lock-free (an atomic flag). It is called
 // without t.mu held and must not take any application lock.
 type processTree struct {
@@ -57,6 +61,7 @@ type processTree struct {
 	settled  chan struct{}
 	setOnce  sync.Once
 	verdict  atomic.Int32 // 0 none, 1 stop, 2 leave
+	legacy   bool
 	exitSeen atomic.Bool
 	exited   chan struct{} // leader exit observed
 	done     chan struct{} // leader reaped, Err valid
@@ -69,6 +74,7 @@ type processTreeOptions struct {
 	Drain        time.Duration // idle bound on the pipe after leader exit
 	ConsumeGrace time.Duration // how long the decision waits for the consumer
 	MergeStderr  bool          // send stderr into the same stream as stdout
+	ForceLegacy  bool          // test hook: behave as on a platform without exit observation
 }
 
 const (
@@ -127,7 +133,7 @@ func startProcessTreeWith(cmd *exec.Cmd, stopOnExit func() bool, opt processTree
 	t := &processTree{
 		cmd: cmd, stdout: reader, signal: signal, release: release,
 		drain: opt.Drain, consume: opt.ConsumeGrace, pr: pr, pw: pw,
-		consumed: make(chan struct{}), stopCh: make(chan struct{}), stopOnExit: stopOnExit,
+		legacy: opt.ForceLegacy, consumed: make(chan struct{}), stopCh: make(chan struct{}), stopOnExit: stopOnExit,
 		exited: make(chan struct{}), done: make(chan struct{}), settled: make(chan struct{}),
 	}
 	go t.pump()
@@ -170,7 +176,7 @@ func (t *processTree) pump() {
 
 func (t *processTree) wait() {
 	pid := t.cmd.Process.Pid
-	pinned := observeExit(pid) == nil
+	pinned := !t.legacy && observeExit(pid) == nil
 	var legacyErr error
 	if !pinned {
 		legacyErr = t.cmd.Wait() // old behaviour: Wait is the observation
@@ -178,7 +184,7 @@ func (t *processTree) wait() {
 	t.exitSeen.Store(true)
 	_ = t.stdout.SetReadDeadline(time.Now().Add(t.drain)) // unblock a pending read
 	close(t.exited)
-	if pinned {
+	{
 		// With a stopOnExit policy the stream being consumed triggers the
 		// decision. Without one the caller must say, through Release, what to do
 		// after it has weighed what it read; an explicit stop also triggers it.
@@ -196,6 +202,9 @@ func (t *processTree) wait() {
 			expired = true
 		}
 		timer.Stop()
+		// Expiry with no verdict means nobody decided: the default below stops the
+		// tree. A consumer stalled past ConsumeGrace after the leader's exit can
+		// therefore lose background work; the bound is deliberate and documented.
 		_ = expired
 	}
 	var stop bool
@@ -224,8 +233,12 @@ func (t *processTree) wait() {
 	t.mu.Lock()
 	t.waitErr = err
 	t.mu.Unlock()
-	if t.release != nil && (stop || t.stopped) {
-		t.release()
+	if stop || t.stopped {
+		// Nothing will read the stream any more: unblock a pump stuck on a write.
+		_ = t.pr.CloseWithError(io.ErrClosedPipe)
+	}
+	if t.release != nil {
+		t.release() // the job handle has no kill-on-close flag, so leaving survivors alone is safe
 	}
 	close(t.done)
 }

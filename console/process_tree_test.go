@@ -374,3 +374,42 @@ func TestTreeTerminateEscalatesToKill(t *testing.T) {
 		t.Fatalf("want polite then force, got %v", rec.calls)
 	}
 }
+
+func legacyShellTree(t *testing.T, script string, rec *signalRecorder, legacy bool) *processTree {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", script)
+	configureProcess(cmd)
+	tree, err := startProcessTreeWith(cmd, nil, processTreeOptions{Signal: rec.signal, WaitDelay: 200 * time.Millisecond, Drain: 200 * time.Millisecond, ConsumeGrace: 3 * time.Second, ForceLegacy: legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tree
+}
+
+// Production passes no stopOnExit policy and settles the tree with Release.
+// A leave verdict must keep background work, on the pinned path and on a platform
+// without exit observation; a stop verdict must end it.
+func TestTreeReleaseVerdictDecidesWithoutPolicy(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		for _, stop := range []bool{false, true} {
+			name := map[bool]string{false: "pinned", true: "legacy"}[legacy] + "/" + map[bool]string{false: "leave", true: "stop"}[stop]
+			t.Run(name, func(t *testing.T) {
+				rec := &signalRecorder{}
+				tree := legacyShellTree(t, "sleep 300 & echo $!; exit 0", rec, legacy)
+				pids := readPIDs(t, tree, 1)
+				t.Cleanup(func() { killPID(pids[0]) })
+				<-tree.Exited()
+				time.Sleep(300 * time.Millisecond) // the verdict arrives after the exit
+				tree.Release(stop)
+				<-tree.Done()
+				if stop {
+					if !waitGone(pids[0], 3*time.Second) {
+						t.Fatal("stop verdict left the descendant running")
+					}
+				} else if processGone(pids[0]) {
+					t.Fatal("leave verdict killed background work")
+				}
+			})
+		}
+	}
+}

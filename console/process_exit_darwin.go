@@ -35,6 +35,12 @@ func observeExit(pid int) error {
 			return err
 		}
 		if n > 0 {
+			if events[0].Flags&unix.EV_ERROR != 0 {
+				if unix.Errno(events[0].Data) == unix.ESRCH {
+					return nil
+				}
+				return unix.Errno(events[0].Data)
+			}
 			return nil
 		}
 		change = nil
