@@ -2,6 +2,9 @@
  "schema": 1,
  "note": "status installed = required on every listed flavor; pending = owner PR not merged, reported NOT-ENFORCED. tests/test_doctor.py fails when a pending row's script already ships in harness/hooks (promote it and make the installer wire it). known_gap marks a shipped script that one flavor does not wire yet; it names the batch that fixes it.",
  "integrity_files": [
+  "agent_gate.py",
+  "command_guard.py",
+  "command_guard_hook.py",
   "commit_policy.json",
   "commit_policy.py",
   "deliver.py",
@@ -10,9 +13,11 @@
   "domain_gates.py",
   "git_safety.py",
   "github_identity.py",
+  "heavy_job_guard.py",
   "holds.json",
   "holds.py",
   "holds_guard.py",
+  "holds_guard_policy.json",
   "hooks_manifest.json",
   "integrate_local.py",
   "integrity.py",
@@ -23,10 +28,15 @@
   "provenance_hooks.py",
   "provenance_policy.json",
   "publish_feature.py",
+  "redact.py",
   "report_file.py",
   "rescue.py",
+  "resource_budget.py",
+  "resource_limits.json",
   "review_map.py",
   "rules.json",
+  "run_capped.py",
+  "run_probe.py",
   "safe_input.py",
   "spec_flow.py",
   "spec_policy.json",
@@ -426,7 +436,7 @@
   {
    "id": "command_guard:hook",
    "script": "command_guard_hook.py",
-   "arg": null,
+   "arg": "hook",
    "event": "PreToolUse",
    "tools": [
     "Bash"
@@ -435,8 +445,7 @@
     "claude",
     "codex"
    ],
-   "status": "pending",
-   "owner": "ad1fe816 feat/command-guard (#14471)",
+   "status": "installed",
    "rules": [
     "S01",
     "S02",
@@ -509,11 +518,26 @@
    "flavors": [
     "claude"
    ],
-   "status": "pending",
-   "owner": "PR #53",
+   "status": "installed",
    "rules": [
     "S20"
    ]
+  },
+  {
+   "id": "agent_gate:hook",
+   "script": "agent_gate.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Agent",
+    "Task",
+    "Workflow"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
   }
  ]
 }

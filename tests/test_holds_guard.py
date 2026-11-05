@@ -35,6 +35,18 @@ def tearDownModule():
         patcher.stop()
 
 
+_ENFORCE = []
+
+
+def enforce_dir() -> Path:
+    """A copy of harness/hooks without holds_guard_policy.json: a missing policy file means enforce."""
+    if not _ENFORCE:
+        d = tempfile.mkdtemp(prefix="holds-enforce-")
+        shutil.copytree(ROOT / "harness" / "hooks", Path(d) / "hooks", ignore=shutil.ignore_patterns("__pycache__", "holds_guard_policy.json"))
+        _ENFORCE.append(Path(d) / "hooks")
+    return _ENFORCE[0]
+
+
 def bash(cmd):
     return {"tool_name": "Bash", "tool_input": {"command": cmd}}
 
@@ -129,7 +141,7 @@ class PushSafety(unittest.TestCase):
 
 class Entry(unittest.TestCase):
     def run_hook(self, payload):
-        r = subprocess.run([sys.executable, "-I", str(ROOT / "harness" / "hooks" / "holds_guard.py")],
+        r = subprocess.run([sys.executable, "-I", str(enforce_dir() / "holds_guard.py")],
                            input=json.dumps(payload), capture_output=True, text=True, timeout=20)
         return r
 
@@ -214,7 +226,7 @@ class Lift(unittest.TestCase):
 
 def run_guard(raw, hooks_dir=None):
     """The real hook process; hooks_dir holds a copy of the guard so holds.json can be damaged safely."""
-    script = (Path(hooks_dir) / "holds_guard.py") if hooks_dir else ROOT / "harness" / "hooks" / "holds_guard.py"
+    script = (Path(hooks_dir) / "holds_guard.py") if hooks_dir else enforce_dir() / "holds_guard.py"
     r = subprocess.run([sys.executable, "-I", str(script)], input=raw, capture_output=True, text=True, timeout=30)
     out = json.loads(r.stdout)["hookSpecificOutput"] if r.stdout.strip() else None
     return r.returncode, (out["permissionDecision"] if out else None), (out["permissionDecisionReason"] if out else "")
@@ -964,7 +976,7 @@ class V2Launch(unittest.TestCase):
     def sandbox(self, d):
         home = Path(d).resolve()
         hooks = home / ".claude" / "hooks"
-        shutil.copytree(ROOT / "harness" / "hooks", hooks, ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(ROOT / "harness" / "hooks", hooks, ignore=shutil.ignore_patterns("__pycache__", "holds_guard_policy.json"))
         (home / ".claude" / "settings.json").write_text("{}")
         return home, hooks
 
@@ -1009,6 +1021,54 @@ class V2Launch(unittest.TestCase):
         for cmd in ("bash -c \"rm $(echo x)\"", "sh -c 'echo $(ls)' && eval \"$(echo ls)\"", "bash <<< \"echo $(date)\""):
             self.assertIsNone(verdict({**bash(cmd), "cwd": "/tmp"}), cmd)
         self.assertEqual(verdict({**bash(f"bash -c \"rm $(ls {hg.HERE}/holds.json)\""), "cwd": "/tmp"}), "policy-file")
+
+
+class WarnMode(unittest.TestCase):
+    """The guard ships in warn mode: it reports what it would deny and lets the call proceed."""
+
+    def run_in(self, d, mode_text, payload):
+        hooks = Path(d) / "hooks"
+        shutil.copytree(ROOT / "harness" / "hooks", hooks, ignore=shutil.ignore_patterns("__pycache__", "holds_guard_policy.json"))
+        if mode_text is not None:
+            (hooks / "holds_guard_policy.json").write_text(mode_text)
+        r = subprocess.run([sys.executable, "-I", "-S", str(hooks / "holds_guard.py")], input=json.dumps(payload) if not
+                           isinstance(payload, str) else payload, capture_output=True, text=True, timeout=30,
+                           env={"HOME": d, "PATH": "/usr/bin:/bin"}, cwd=d)
+        return r.returncode, (json.loads(r.stdout) if r.stdout.strip() else None)
+
+    def test_shipped_policy_says_warn_and_warn_reports_instead_of_denying(self):
+        shipped = (ROOT / "harness" / "hooks" / "holds_guard_policy.json").read_text()
+        self.assertEqual(json.loads(shipped)["mode"], "warn")
+        with tempfile.TemporaryDirectory() as d:
+            code, out = self.run_in(d, shipped, bash("ssh yates-cloud uptime"))
+        self.assertEqual(code, 0)
+        self.assertNotIn("hookSpecificOutput", out)
+        self.assertIn("warn mode", out["systemMessage"])
+        self.assertIn("would deny [hold]", out["systemMessage"])
+
+    def test_warn_mode_also_warns_instead_of_failing_closed_on_bad_input(self):
+        with tempfile.TemporaryDirectory() as d:
+            code, out = self.run_in(d, '{"schema": 1, "mode": "warn"}', "not json")
+        self.assertEqual(code, 0)
+        self.assertIn("would deny [input]", out["systemMessage"])
+
+    def test_missing_invalid_or_other_mode_means_enforce(self):
+        for text in (None, "{not json", "[]", '{"mode": "enforce"}', '{"mode": "off"}', '{"mode": "WARN"}', '{"mode": ["warn"]}', ""):
+            with tempfile.TemporaryDirectory() as d:
+                code, out = self.run_in(d, text, bash("ssh yates-cloud uptime"))
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny", repr(text))
+
+    def test_the_mode_file_is_protected_like_the_other_policy_files(self):
+        path = str(hg.HERE / "holds_guard_policy.json")
+        self.assertEqual(verdict(tool("Write", file_path=path)), "policy-file")
+        self.assertEqual(verdict(bash(f"echo '{{\"mode\": \"off\"}}' > {path}")), "policy-file")
+        self.assertIsNone(verdict(tool("Read", file_path=path)))
+
+    def test_install_ships_the_mode_file_and_it_is_integrity_checked(self):
+        import install
+        self.assertIn("holds_guard_policy.json", install.HOOKS)
+        manifest = json.loads((ROOT / "harness" / "hooks" / "hooks_manifest.json").read_text())
+        self.assertIn("holds_guard_policy.json", manifest["integrity_files"])
 
 
 if __name__ == "__main__":

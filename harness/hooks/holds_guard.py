@@ -58,6 +58,7 @@ if str(HERE) not in sys.path:  # -I -S: no script dir, no site; siblings (holds,
     sys.path.insert(0, str(HERE))
 POLICY = HERE / "holds.json"
 STATE = HERE / "holds.state.json"
+MODE_FILE = HERE / "holds_guard_policy.json"
 MAX_INPUT = 4_000_000
 MAX_COMMAND = 64_000
 MAX_GLOB = 200
@@ -74,7 +75,7 @@ BUILTIN = {
     "protected_paths": ["*/member.key", "member.key", "*.secret", "*/Library/Keychains/*", "*/.ssh", "*/.ssh/*",
                         "*/.aws", "*/.aws/*", "*/.config/rclone", "*/.config/rclone/*", "*native-api-key*",
                         "*solve*owner*phrase*", "*/goodqa-hive*/*key*"],
-    "policy_files": ["holds.json", "holds.state.json", "holds_guard.py", "holds.py", "integrity.py"],
+    "policy_files": ["holds.json", "holds.state.json", "holds_guard.py", "holds.py", "integrity.py", "holds_guard_policy.json"],
 }
 SETTINGS_SUFFIXES = ("/.claude/settings.json", "/.claude/settings.local.json")
 # verbs whose bare (non-path) operands name a remote host or resource: every operand is scanned for hold names
@@ -1355,7 +1356,20 @@ def decide_bash(command: str, cwd: str, policy: dict, lifted: set[str], depth: i
     return None
 
 
+def load_mode(path: Path = None) -> str:
+    """"warn" only when the shipped policy file says so; a missing or invalid file means enforce, so removing or
+    damaging it can never switch the guard down."""
+    try:
+        data = json.loads((path or MODE_FILE).read_text())
+    except (OSError, ValueError):
+        return "enforce"
+    return "warn" if isinstance(data, dict) and data.get("mode") == "warn" else "enforce"
+
+
 def emit_deny(kind: str, reason: str) -> None:
+    if load_mode() == "warn":  # rollout mode: say what would be denied, let the call proceed
+        print(json.dumps({"systemMessage": f"holds_guard (warn mode, not blocking) would deny [{kind}]: {reason}"}))
+        return
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                               "permissionDecisionReason": f"holds_guard [{kind}]: {reason}"}}))
 

@@ -326,16 +326,23 @@ class DoctorRow(unittest.TestCase):
 
 class InstallerRecords(unittest.TestCase):
     def test_install_runs_record_and_a_failure_only_warns(self):
+        home = install.real_home()  # injected runner only: nothing real runs
+        seen = []
+        ok = install.integrity_status(home, True, run=lambda argv, **kw: seen.append(argv) or
+                                      subprocess.CompletedProcess(argv, 0, "RECORDED host=x", ""))
+        self.assertIn("RECORDED", ok)
+        self.assertEqual(seen[0][1:3], ["-I", "-S"])
+        self.assertTrue(seen[0][3].endswith(".claude/hooks/integrity.py") and seen[0][4] == "record")
+        bad = install.integrity_status(home, True, run=lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "x", ""))
+        self.assertIn("WARNING", bad)
+        self.assertIn("would record", install.integrity_status(home, False))
+
+    def test_a_trial_home_is_skipped(self):
         with tempfile.TemporaryDirectory() as d:
             seen = []
-            ok = install.integrity_status(Path(d), True, run=lambda argv, **kw: seen.append(argv) or
-                                          subprocess.CompletedProcess(argv, 0, "RECORDED host=x", ""))
-            self.assertIn("RECORDED", ok)
-            self.assertEqual(seen[0][1:3], ["-I", "-S"])
-            self.assertTrue(seen[0][3].endswith(".claude/hooks/integrity.py") and seen[0][4] == "record")
-            bad = install.integrity_status(Path(d), True, run=lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "x", ""))
-            self.assertIn("WARNING", bad)
-            self.assertIn("would record", install.integrity_status(Path(d), False))
+            out = install.integrity_status(Path(d), True, run=lambda argv, **kw: seen.append(argv))
+        self.assertEqual(seen, [])
+        self.assertIn("skipped", out)
 
 
 if __name__ == "__main__":

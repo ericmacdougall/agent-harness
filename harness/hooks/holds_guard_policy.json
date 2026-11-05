@@ -1,0 +1,5 @@
+{
+ "schema": 1,
+ "mode": "warn",
+ "note": "warn: the guard reports what it would deny and lets the call proceed (rollout); enforce: it denies. A missing or invalid file means enforce. Change it in a reviewed branch and install.py, not in the live hooks directory."
+}
