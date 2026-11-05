@@ -172,6 +172,26 @@ class OwnersTests(Base):
         self.assertEqual(by["big"], "done")
         self.assertNotEqual(skipped["big"], "done")  # its WAL was not read
 
+    def test_owner_close_settles_a_finished_owner_without_wal_notes(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [
+            {"at": iso(NOW - 9000), "event": "subagent", "agent_id": "finishedgp", "agent_type": "task-owner"},
+            {"at": iso(NOW - 8000), "event": "subagent_stop", "agent_id": "finishedgp", "agent_type": "task-owner"}])
+        jl(w / "agent-finishedgp.jsonl", [{"at": iso(NOW - 8100), "event": "pretool", "tool": "Bash"}])
+        row = lambda: {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=NOW)["owners"]}["finishedgp"]
+        self.assertEqual(row()["state"], "DROPPED")
+        with mock.patch.object(ah, "time", wraps=time):
+            r = ah.write(self.home, "owner.close", {"agent_id": "finishedgp", "session": SESSION,
+                                                    "evidence": "PR #57 merged at 4d1f3ccf (final report)"}, SESSION, "close-key-0001")
+        self.assertEqual(r["result"], "applied")
+        self.assertEqual((row()["state"], row()["closed_by"][:6]), ("closed", "PR #57"))
+        again = ah.write(self.home, "owner.close", {"agent_id": "finishedgp", "session": SESSION,
+                                                    "evidence": "PR #57 merged at 4d1f3ccf (final report)"}, SESSION, "close-key-0001")
+        self.assertEqual(again["result"], "duplicate")
+        with self.assertRaises(ah.AhError) as c:
+            ah.write(self.home, "owner.close", {"agent_id": "finishedgp", "session": SESSION, "evidence": "done"}, SESSION, "close-key-0002")
+        self.assertEqual(c.exception.code, "evidence")
+
     def test_discovers_agents_missing_from_main_wal(self):
         """Owners that never appear as subagent events in main.jsonl (general-purpose) are found from task WALs and meta files."""
         self.make()

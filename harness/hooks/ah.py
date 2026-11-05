@@ -271,6 +271,11 @@ def discover_agents(home: Path, session: str, wal: Path) -> dict:
     return found
 
 
+def is_stopped_or_idle(verdict: dict) -> bool:
+    """A close settles an owner that is no longer live; a closed owner that works again shows as live."""
+    return verdict["state"] not in ("live", "quiet")
+
+
 def owners(home: Path, session: str, now: float | None = None, comments=None, skip_wal=()) -> dict:
     now = time.time() if now is None else now
     wal = wal_dirs(home) / session
@@ -299,7 +304,10 @@ def owners(home: Path, session: str, now: float | None = None, comments=None, sk
         info = spawned.setdefault(agent, {"type": None, "at": 0.0})
         info["type"] = info["type"] or meta.get("type")
         info.update({k: meta[k] for k in ("description", "parent", "finished") if k in meta})
-    registered = {r["args"].get("owner_agent") for r in _ledger(home) if r.get("op") == "task.register"}
+    ledger_rows = _ledger(home)
+    registered = {r["args"].get("owner_agent") for r in ledger_rows if r.get("op") == "task.register"}
+    closed = {r["args"].get("agent_id"): r["args"].get("evidence") for r in ledger_rows
+              if r.get("op") == "owner.close" and r["args"].get("session") == session}
     named_text = "\n".join(named)
     rows = []
     for agent, info in spawned.items():
@@ -319,11 +327,13 @@ def owners(home: Path, session: str, now: float | None = None, comments=None, sk
                                     summary["outcome"], summary["last_note"], info["type"],
                                     agent in registered, owner=is_owner, last_kind=summary.get("last_kind"),
                                     paused=bool(PAUSE_RE.search(" ".join(n for n in named if agent in n))))
+        if agent in closed and is_stopped_or_idle(verdict):
+            verdict = {"state": "closed", "idle_s": verdict["idle_s"], "severity": "info"}
         idle = verdict["idle_s"]
         text = " ".join(filter(None, [info.get("description"), summary["first"]]))
         restricted = bool(RESTRICTED.search(text))
         row = {"agent_id": agent, "type": info["type"], "task": None if restricted else (summary["first"] or info.get("description")),
-               "restricted": restricted, "parent": info.get("parent"),
+               "restricted": restricted, "parent": info.get("parent"), "closed_by": closed.get(agent),
                "owner": bool(is_owner), "registered": agent in registered,
                "flags": (["unregistered-owner"] if is_owner and agent not in registered else []),
                "state": verdict["state"], "severity": verdict["severity"],
@@ -721,6 +731,10 @@ def canonical(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def who_label() -> str:
+    return os.environ.get("AH_AGENT_ID", "main")
+
+
 def operation_id(key: str) -> str:
     """GoodQA requires a UUID operationId; a UUID derived from the key keeps re-posts idempotent."""
     import uuid
@@ -765,6 +779,14 @@ def precheck(op: str, args: dict) -> None:
                 (re.fullmatch(r"[0-9a-f]{7,40}", str(e.get("commit", ""))) and e.get("repo")))
             if not ok:
                 raise AhError("evidence", "each evidence item is {really_tested, wal} or {commit, repo}")
+    elif op == "owner.close":
+        need("agent_id", "session", "evidence")
+        if not re.fullmatch(r"[A-Za-z0-9]{4,40}", args["agent_id"]):
+            raise AhError("bad_request", "owner.close: agent_id must be the owner's agent id (a prefix of 8+ is not accepted)")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", args["session"]):
+            raise AhError("bad_request", "owner.close: session id is malformed")
+        if len(args["evidence"].strip()) < 10:
+            raise AhError("evidence", "owner.close needs evidence: the PR, commit or report that settles this owner (10+ characters)")
     elif op == "ticket.comment":
         need("body")
         if not TICKET_RE.match(args.get("ticket") or ""):
@@ -1021,6 +1043,12 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         _wal_append(home, _wal_path(home, r["session"], r["owner_agent"]), rec)
         out["wal"] = wid
         comment(r["ticket"], rec["note"])
+    elif op == "owner.close":
+        # Main settles an owner whose result was delivered outside its own WAL (a final message, a merged PR).
+        rec = {"at": now, "event": "status", "id": wid,
+               "note": f"owner {args['agent_id']} closed by {who_label()}: {args['evidence']}"[:3900]}
+        _wal_append(home, _wal_path(home, args["session"], "main"), rec)
+        out["wal"] = wid
     elif op == "ticket.comment":
         comment(args["ticket"], args["body"])
     return out
@@ -1202,6 +1230,13 @@ def build_parser():
     cc.add_argument("--body", required=True)
     for x in (g, c):
         x.add_argument("--project", default="goodqa")
+    oc = sub.add_parser("owner")
+    ocs = oc.add_subparsers(dest="sub", required=True)
+    ocl = ocs.add_parser("close", help="main settles an owner that delivered outside its own WAL")
+    ocl.add_argument("agent_id")
+    ocl.add_argument("--evidence", required=True, help="the PR, commit or report that settles it")
+    ocl.add_argument("--session")
+    ocl.add_argument("--key")
     d = sub.add_parser("disk")
     d.add_argument("--host")
     d.add_argument("--root")
@@ -1269,6 +1304,9 @@ def run(args, home: Path) -> dict:
         if args.sub == "comments":
             return ticket_comments(args.number, args.project, args.since, args.last)
         return write(home, "ticket.comment", {"ticket": args.ticket, "body": args.body}, session_of(args, home), args.key)
+    if cmd == "owner":
+        s = session_of(args, home) or newest_session(home) or ""
+        return write(home, "owner.close", {"agent_id": args.agent_id, "session": s, "evidence": args.evidence}, s, args.key)
     if cmd == "task":
         s = session_of(args, home)
         if args.sub == "list":
