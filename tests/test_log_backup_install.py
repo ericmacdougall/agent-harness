@@ -209,6 +209,25 @@ class Linux(Case):
         self.assertIn("failed", message)
 
 
+class UnitContents(unittest.TestCase):
+    def test_timer_and_service_are_exactly_as_intended(self):
+        timer = (ROOT / "harness/schedulers/log-backup.timer").read_text().splitlines()
+        self.assertEqual(timer, ["[Unit]", "Description=Agent log backup every 15 min", "[Timer]", "OnBootSec=2min",
+                                 "OnUnitActiveSec=15min", "[Install]", "WantedBy=timers.target"])
+        self.assertNotIn("Persistent=true", timer)  # a no-op for OnBootSec/OnUnitActiveSec timers
+        service = (ROOT / "harness/schedulers/log-backup.service").read_text().splitlines()
+        self.assertIn("Type=oneshot", service)
+        self.assertIn("ExecStart=/bin/bash %h/.agent-harness/bin/log-backup.sh", service)
+
+    def test_launchd_template_interval_label_and_program(self):
+        import plistlib
+        text = (ROOT / "harness/schedulers/com.ericmacdougall.log-backup.plist").read_text().replace("@HOME@", "/h")
+        data = plistlib.loads(text.encode())
+        self.assertEqual(data["Label"], "com.ericmacdougall.log-backup")
+        self.assertEqual(data["StartInterval"], 900)
+        self.assertEqual(data["ProgramArguments"], ["/bin/bash", "/h/.agent-harness/bin/log-backup.sh"])
+
+
 class Refusals(Case):
     def test_symlinked_destination_is_refused_and_nothing_is_written(self):
         target = self.tmp / "elsewhere"
