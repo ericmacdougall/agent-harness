@@ -185,8 +185,12 @@ def safe_read(path: Path, limit: int) -> bytes:
 
 def read_text_capped(path, limit: int = 4 * 1024 * 1024) -> str:
     """safe_read as text. Local rather than safe_input.py because the watcher runs alone on hosts without the
-    harness hooks. A file over the cap is cut, so JSON callers see a parse error, as for any malformed file."""
-    return safe_read(Path(path), limit).decode("utf-8", "replace")
+    harness hooks. A file over the cap raises instead of being cut: a cut file can parse clean and clear a real
+    alert, while a raised check reports check-error and keeps its alerts."""
+    data = safe_read(Path(path), limit + 1)
+    if len(data) > limit:
+        raise OSError(f"file over the {limit} byte read cap")
+    return data.decode("utf-8", "replace")
 
 
 def encode_slot(event: dict) -> bytes:
