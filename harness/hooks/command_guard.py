@@ -387,6 +387,7 @@ SUB_MARK, ARITH_MARK = '', ''
 VAR_OPEN, VAR_CLOSE = chr(0xE030), chr(0xE031)
 VAR_MARKER = re.compile(VAR_OPEN + '([A-Za-z_][A-Za-z0-9_]*)' + VAR_CLOSE)
 WS = ' \t\r\f\v'
+_DELIM_TAIL = re.compile(r'[\r\f\v]*')  # blanks to this lexer, word characters to the shell (GoodQA #14782)
 RESERVED = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', '}', '!', 'time', 'fi', 'done', 'esac',
             'function', 'coproc', ';;'}
 NONEXEC_HEADS = {'for', 'case', 'select'}
@@ -486,6 +487,23 @@ def _skip_cont(s, i):
     return i
 
 
+def _bq_join(text):
+    """The text between backticks with every backslash-newline removed. bash, dash, busybox sh and zsh join a
+    continuation anywhere inside backticks, even inside single quotes there, before they parse the command
+    (GoodQA #14771). An escaped backslash still protects the newline after it, and a backslash before CR LF stays."""
+    out, k, n = [], 0, len(text)
+    while k < n:
+        if text[k] == '\\' and text[k + 1:k + 2] == '\n':
+            k += 2
+        elif text[k] == '\\':
+            out.append(text[k:k + 2])
+            k += 2
+        else:
+            out.append(text[k])
+            k += 1
+    return ''.join(out)
+
+
 def brace_expand(text, limit=32):
     """Bash brace expansion on a string whose quoted braces were replaced by sentinels."""
     out = [text]
@@ -559,7 +577,7 @@ class Lexer:
         while i < n:
             self.budget.tick()
             c = s[i]
-            if c in WS or c == '\n' or c in ';&|()' or (c in '<>' and not (c in '<>' and i + 1 < n and s[i + 1] == '(' and i == started)):
+            if c in WS or c == '\n' or c in ';&|()' or (c in '<>' and not (i == started and self._procsub_open(s, i) >= 0)):
                 break
             any_char = True
             if (not self.ps and c == '\\') or (self.ps and c == '`'):
@@ -593,14 +611,15 @@ class Lexer:
             if c == '`' and not self.ps:
                 j = scan_backtick(s, i + 1)
                 inner = s[i + 1:j - 1] if j <= n else s[i + 1:]
-                w.subs.append(inner.replace('\\`', '`').replace('\\\\', '\\'))
+                w.subs.append(_bq_join(inner).replace('\\`', '`').replace('\\\\', '\\'))
                 w.dynamic = True
                 buf.append(SUB_MARK)
                 i = min(j, n)
                 continue
-            if c in '<>' and i + 1 < n and s[i + 1] == '(':
-                j = scan_balanced(s, i + 2)
-                w.subs.append(s[i + 2:j - 1] if j <= n else s[i + 2:])
+            k = self._procsub_open(s, i) if c in '<>' else -1
+            if k >= 0:
+                j = scan_balanced(s, k + 1)
+                w.subs.append(s[k + 1:j - 1] if j <= n else s[k + 1:])
                 w.dynamic = True
                 buf.append(SUB_MARK)
                 i = min(j, n)
@@ -633,6 +652,12 @@ class Lexer:
         w.alts = [_unq(a) for a in alts]
         return w, i
 
+    def _procsub_open(self, s, i):
+        """Index of the `(` opening a process substitution whose `<` or `>` is at s[i], else -1. The shell drops a
+        line continuation between the two, so `<\\` newline `(` is `<(` (GoodQA #14771)."""
+        k = i + 1 if self.ps else _skip_cont(s, i + 1)
+        return k if s[k:k + 1] == '(' else -1
+
     def _double(self, s, i, w, buf):
         n = len(s)
         while i < n and s[i] != '"':
@@ -644,7 +669,7 @@ class Lexer:
                 i += 2
             elif c == '`' and not self.ps:
                 j = scan_backtick(s, i + 1)
-                w.subs.append((s[i + 1:j - 1] if j <= n else s[i + 1:]).replace('\\`', '`'))
+                w.subs.append(_bq_join(s[i + 1:j - 1] if j <= n else s[i + 1:]).replace('\\`', '`'))
                 w.dynamic = True
                 buf.append(SUB_MARK)
                 i = min(j, n)
@@ -783,7 +808,7 @@ class Lexer:
                 j = s.find('\n', i)
                 i = n if j < 0 else j
                 continue
-            if c in ';&|()<>' and not (c in '<>' and s[i + 1:i + 2] == '('):
+            if c in ';&|()<>' and not (c in '<>' and self._procsub_open(s, i) >= 0):
                 op, end = self._operator(s, i)
                 # the whole operator, not its first character: `&>` and `&>>` start with `&` (GoodQA #14471 follow-up)
                 if op in ('<', '>', '&>', '>&', '<&', '<>', '<<', '<<<', '<<-', '&>>', '>>', '>|') or op in ZSH_CLOBBER:
@@ -809,9 +834,10 @@ class Lexer:
             if wait_target is not None:
                 wait_target.target = w
                 if wait_target.op in ('<<', '<<-'):
-                    # a CR right after the word is part of the delimiter: CR is a word character in the shell, though
-                    # this lexer treats it as a blank, so a CRLF line's `E` + CR ends only a `<<E` + CR here-doc (GoodQA #14782)
-                    wait_target.delim = w.text + ('\r' if s[j:j + 1] == '\r' else '')
+                    # the run of CR, FF and VT right after the word is part of the delimiter: they are word characters
+                    # in the shell, though this lexer treats them as blanks, so a CRLF line's `E` + CR ends only a
+                    # `<<E` + CR here-doc, and `<<E` + CR CR ends only at `E` + CR CR (GoodQA #14782)
+                    wait_target.delim = w.text + _DELIM_TAIL.match(s, j).group(0)
                     wait_target.quoted = w.quoted
                 wait_target = None
             else:

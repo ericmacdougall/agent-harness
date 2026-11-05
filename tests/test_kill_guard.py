@@ -192,6 +192,19 @@ class CommentContinuation(WorldCase):
         self.assertEqual(self.decide('ls # list\nkill 4004')[0], 'block')  # CK3 control
         self.assertEqual(self.decide('ls # list \\\necho fine')[0], 'allow')
 
+    def test_a_continuation_the_shell_removes_before_a_kill_is_removed(self):
+        # Review 7 of #14771 (pr-guard-root/review-7/kg9.py Y1-Y3): bash opens `<\` newline `(` as a process
+        # substitution, every shell joins a continuation inside backticks, even in single quotes there, and `<<E` + CR CR
+        # (or + VT) ends only at the line holding the same run. Rows are data handed to decide(); nothing is signalled.
+        for text in ('cat <\\\n(kill -9 4004)', 'cat >\\\n(kill -9 4004)', "x=`kill -9 4'\\\n'004`", "x=`ki'\\\n'll -9 4004`",
+                     'cat <<E\r\r\nbody\nE\r\r\nkill -9 4004', 'cat <<E\v\nbody\nE\v\nkill -9 4004',
+                     'cat <<E\r\r\nbody\nE\r\necho "\nE\r\r\nkill -9 4004\necho "'):
+            with self.subTest(text=text):
+                self.assertEqual(self.decide(text)[0], 'block')
+        for text in ('cat <\\\n(echo fine)', "x=`echo 'fi\\\nne'`", 'cat <<E\r\r\nbody\nE\r\r\necho fine'):
+            with self.subTest(text=text):
+                self.assertEqual(self.decide(text)[0], 'allow')
+
 
 class ClobberReadings(WorldCase):
     """zsh takes `>! w` as one operator and bash as `>` onto a file named `!`, and the shared analyzer judges a script under

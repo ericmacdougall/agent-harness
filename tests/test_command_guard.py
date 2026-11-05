@@ -464,6 +464,58 @@ class LineContinuationTests(Fixture):
                 words = [c.words for pl in cg.parse(cg.Lexer(cg.Ctx(compiled, str(self.home))).lex(text)) for c in pl.cmds]
                 self.assertEqual(tuple(w.text for w in words[0][1:]), want)
 
+    # Review 7 of #14771 (pr-guard-root/review-7/r7a.py, shell_r7_probe.py with harmless stand-ins): the three checks for
+    # a process substitution's `(` did not look past a continuation (bash opens `<\` newline `(`; zsh and dash refuse the
+    # script), backtick text was not joined (every shell removes each backslash-newline there, even inside single
+    # quotes, before it parses the command), and a here-doc delimiter kept one CR of the CR, FF and VT run the shell
+    # keeps in its word, so `<<E` + CR CR never ended (a warning, not a block).
+    REVIEW7 = [
+        'cat <\\\n(rm -rf ~/.claude/projects)',                                           # O1
+        'cat >\\\n(rm -rf ~/.claude/projects)',                                           # O2
+        'cat <\\\n\\\n(rm -rf ~/.claude/projects)',                                       # two continuations
+        'diff <(echo a) <\\\n(rm -rf ~/.claude/projects)',                                # not the first word
+        'x=<\\\n(rm -rf ~/.claude/projects)',                                             # an assignment value
+        "x=`rm -rf ~/'\\\n'.claude/projects`",                                            # B1
+        "x=`rm -rf ~/.claude/pro'\\\n'jects`",                                            # B2
+        "echo \"`rm -rf ~/'\\\n'.claude/projects`\"",                                     # B1 inside double quotes
+        "x=`rm -rf ~/$'\\\n'.claude/projects`",                                           # ... and inside $'..'
+        'cat <<E\r\r\nbody\nE\r\r\nrm -rf ~/.claude/projects',                            # CR1
+        'cat <<E\v\nbody\nE\v\nrm -rf ~/.claude/projects',                                # CR2
+        'cat <<E\f\nbody\nE\f\nrm -rf ~/.claude/projects',                                # FF
+        'cat <<E\r\v\f\r\nbody\nE\r\v\f\r\nrm -rf ~/.claude/projects',                    # a mixed run
+        'cat <<-E\r\r\n\tbody\n\tE\r\r\nrm -rf ~/.claude/projects',                       # `<<-` strips tabs, not CRs
+        'cat <<E\r\r\nbody\nE\r\necho "\nE\r\r\nrm -rf ~/.claude/projects\necho "',      # one CR does not end CR CR
+    ]
+
+    def test_review7_rows_block(self):
+        self.expect(self.REVIEW7, 'block', label='REVIEW7')
+
+    def test_review7_harmless_shapes_allow(self):
+        self.expect(['cat <\\\n(echo a)', 'diff <(echo a) >\\\n(echo b)', "x=`echo 'a\\\nb'`", 'x=`echo a\\\\\nb`',
+                     'cat <<E\r\r\nx\nE\r\r\necho done', 'cat <<E\v\nx\nE\v\necho done',
+                     'cat <<E\r\nx\nE\r\r\nE\r\necho done'], 'allow', label='harmless review 7')
+
+    def test_review7_tokens_are_read_as_the_shell_reads_them(self):
+        compiled = cg.Compiled(self.policy, home=str(self.home), cwd=str(self.home / 'repo'))
+        lex = lambda text: cg.Lexer(cg.Ctx(compiled, str(self.home))).lex(text)  # noqa: E731
+        # a process substitution opened across a continuation is one word holding the substitution
+        words = [c.words for pl in cg.parse(lex('A <\\\n(A p) q')) for c in pl.cmds]
+        self.assertEqual(len(words), 1)
+        self.assertEqual([w.subs for w in words[0]], [[], ['A p'], []])
+        self.assertEqual(words[0][2].text, 'q')
+        # the backtick text reaches the inner lexer joined, with an escaped backslash still protecting its newline
+        for text, want in (("x=`A '\\\n'y`", "A ''y"), ('x=`A a\\\\\nb`', 'A a\\\nb'), ('x=`A a\\\r\nb`', 'A a\\\r\nb'),
+                           ("echo \"`A '\\\n'y`\"", "A ''y")):
+            with self.subTest(text=text):
+                word = [v for k, v in lex(text) if k == 'w'][-1]
+                self.assertEqual(word.subs, [want])
+        # the delimiter holds the whole CR, FF and VT run, and the body ends only at that line
+        for text, delim, body in (('cat <<E\r\r\nx\nE\r\nE\r\r\n', 'E\r\r', 'x\nE\r'), ('cat <<E\v\f\nx\nE\v\f\n', 'E\v\f', 'x'),
+                                  ('cat <<E\r\nx\nE\r\r\nE\r\n', 'E\r', 'x\nE\r\r'), ('cat <<E \r\nx\nE\n', 'E', 'x')):
+            with self.subTest(text=text):
+                rd = [v for k, v in lex(text) if k == 'redir'][0]
+                self.assertEqual((rd.delim, rd.body), (delim, body))
+
 
 class PolicyFileTests(Fixture):
     """Red-team F2: a written or replaced policy file must not weaken the guard."""
