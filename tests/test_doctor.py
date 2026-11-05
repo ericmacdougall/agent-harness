@@ -306,9 +306,10 @@ class RulesRegistry(unittest.TestCase):
 
     def test_known_overclaims_are_flagged_partial(self):
         by_id = {r["id"]: r for r in RULES}
-        for rid in ("W05", "S21", "S23", "S04", "S05", "S24"):
+        for rid in ("W05", "S21", "S23", "S04", "S05", "S24", "S27"):
             self.assertTrue(by_id[rid].get("partial_reason"), rid)
         self.assertEqual(by_id["S21"]["mode"], {"file": "commit_policy.json", "key": "enforcement"})
+        self.assertEqual(by_id["S27"]["mode"], {"file": "kill_guard_policy.json", "key": "mode"})
 
     def test_no_unmapped_rules_and_batches_valid(self):
         rows = doctor.rules_report(RULES, [], ROOT / "harness" / "hooks")
