@@ -862,6 +862,13 @@ def make_analyzer_class(cg):
             while i < n:
                 t, w = texts[i], args[i]
                 if not targets and not w.dynamic:
+                    if signal_seen and t != '--':
+                        # After the first signal option bash and zsh read every later dash word as a target (-0 is
+                        # process group 0, -s / -t an illegal pid), so none of them may be read as a signal or a list
+                        # flag: the judge below finds it is not a plain positive PID and blocks.
+                        targets.append(w)
+                        i += 1
+                        continue
                     if t == '--':
                         i += 1
                         while i < n:
@@ -886,8 +893,6 @@ def make_analyzer_class(cg):
                     match = SIGNAL_NAME.fullmatch(t)
                     if match:
                         last_sig = match.group(1)
-                        if signal_seen:  # a second spec: could be a negative PID or the signal that wins; judge as a target too
-                            targets.append(w)
                         signal_seen = True
                         i += 1
                         continue
@@ -897,8 +902,8 @@ def make_analyzer_class(cg):
                     k and args[k - 1].text in ('-s', '-n', '--signal')))) for k, a in enumerate(args)):
                 self.block('unprovable-target', 'a brace expansion is too large or hides an option')
                 return
-            if last_sig == '0':
-                return
+            if last_sig == '0' and not any(not w.dynamic and w.text.startswith('-') for w in targets):
+                return  # a liveness probe, unless a later dash word hides a real target (kill -0 -s KILL PID)
             if self.xargs:
                 self.block('pidfeed', 'kill through xargs takes its targets from another command, so none can be '
                            'proven yours')
@@ -1086,7 +1091,7 @@ def hook_main():
         return 0
     if oversized:
         return emit('block', block_message('oversized-input', 'the tool input is larger than the guard analyses; '
-                                           'put the commands in a script file')) if fallback_blocks(raw) or True else 0
+                                           'put the commands in a script file'))
     policy = load_policy()
     if policy['mode'] == 'off':
         return 0

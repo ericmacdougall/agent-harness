@@ -7066,6 +7066,258 @@
    ]
   },
   {
+   "cmd": "kill -9 -0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-0",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -KILL -0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-KILL-0",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -s 9 -0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-s9-0",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -9 -s 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-s-pid",
+   "tags": [
+    "ownership",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -9 -s 0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-s0-pid",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -9 -n 0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-n0-pid",
+   "tags": [
+    "ownership",
+    "signal0",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -9 -t 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-t-pid",
+   "tags": [
+    "ownership",
+    "zsh",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -9 --table 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-table-pid",
+   "tags": [
+    "ownership",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -9 -l 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-l-pid",
+   "tags": [
+    "ownership",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -9 -L 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-L-pid",
+   "tags": [
+    "ownership",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -9 --list 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-list-pid",
+   "tags": [
+    "ownership",
+    "zsh"
+   ]
+  },
+  {
+   "cmd": "kill -0 -9 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-0-9",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -s 0 -s 0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-s0-s0",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -s 9 -s 0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-s9-s0",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -n 9 -n 0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-n9-n0",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill --signal=9 --signal=0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-sig-sig",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -9 --signal=0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-sig0",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -9 --signal 0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-signal-0",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -s 0 -0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-s0-0",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -9 -0 4001",
+   "expect": "block",
+   "id": "P-rt4-kill-9-0-own",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -9 4001 -0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-target1-dash",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -9 4001 -s 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-target2-s",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill -9 4001 4001 -t 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-target3-t",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill -9 -- -0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-dashdash-then-dash",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "sudo kill -9 -0 4004",
+   "expect": "block",
+   "id": "P-rt4-sudo-kill-9-0",
+   "tags": [
+    "ownership",
+    "signal0",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "bash -c 'kill -9 -s 4004'",
+   "expect": "block",
+   "id": "P-rt4-bash-c-kill-9-s",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "ssh host kill -9 -0 4004",
+   "expect": "block",
+   "id": "P-rt4-ssh-kill-9-0",
+   "tags": [
+    "ssh",
+    "signal0"
+   ]
+  },
+  {
    "cmd": "grep -n \"pkill -f pytest\" notes.md",
    "expect": "allow",
    "id": "N-text00-grep",
@@ -9138,14 +9390,6 @@
    ]
   },
   {
-   "cmd": "kill -s 0 -0 4004",
-   "expect": "allow",
-   "id": "N-rt22-kill-0-sigs",
-   "tags": [
-    "signal0"
-   ]
-  },
-  {
    "cmd": "docker-compose up -d",
    "expect": "allow",
    "id": "N-rt22-docker-compose-up",
@@ -9367,6 +9611,118 @@
    "id": "N-rt3-uv-heredoc-ok",
    "tags": [
     "plain"
+   ]
+  },
+  {
+   "cmd": "kill -0 4001",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-0-own",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 4004",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-0-foreign",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -s 0 4004",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-s0-foreign",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -n 0 4004",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-n0-foreign",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill --signal=0 4004",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-signal0",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -9 4001",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-9-own",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill -s 9 4001",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-s9-own",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill -KILL 4001 4016",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-KILL-own",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill -9 -- 4001",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-dashdash-own",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill -l",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-l",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -l 9",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-l-9",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -L",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-L",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -t",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-t",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 %1",
+   "expect": "allow",
+   "id": "N-rt4-ok-kill-0-job",
+   "tags": [
+    "signal0"
    ]
   },
   {

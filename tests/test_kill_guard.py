@@ -673,9 +673,12 @@ class RedTeamRound(WorldCase):
         self.assertEqual(self.decide('kill 1{0,1,2,3,4,5,6,7,8,9}{0,1,2,3,4,5,6,7,8,9}')[0], 'block')
         self.assertEqual(self.decide('kill {-9,4001}')[0], 'block')
 
-    def test_rt14_the_last_signal_wins(self):
+    def test_rt14_only_the_first_signal_option_counts(self):
+        # Reviewer F1: after the first signal option bash and zsh read -0 as process group 0, so the PID is a real target.
         self.assertEqual(self.decide('kill -0 -s KILL 4004')[0], 'block')
-        self.assertEqual(self.decide('kill -s KILL -0 4004')[0], 'allow')
+        self.assertEqual(self.decide('kill -s KILL -0 4004')[0], 'block')
+        self.assertEqual(self.decide('kill -9 -s 4004')[0], 'block')
+        self.assertEqual(self.decide('kill -0 4004')[0], 'allow')
 
     def test_rt18_spawn_log_outside_the_worktree_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
