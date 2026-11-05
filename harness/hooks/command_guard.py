@@ -747,7 +747,8 @@ class Lexer:
                 continue
             if c in ';&|()<>' and not (c in '<>' and s[i + 1:i + 2] == '('):
                 op = self._operator(s, i)
-                if op[0] in ('<', '>', '&>', '>&', '<&', '<>', '<<', '<<<', '<<-', '&>>', '>>', '>|'):
+                # the whole operator, not its first character: `&>` and `&>>` start with `&` (GoodQA #14471 follow-up)
+                if op in ('<', '>', '&>', '>&', '<&', '<>', '<<', '<<<', '<<-', '&>>', '>>', '>|'):
                     fd = None
                     if tokens and tokens[-1][0] == 'w' and prev_end == i and re.fullmatch(r'[0-9]', tokens[-1][1].text or 'x'):
                         fd = tokens.pop()[1].text
@@ -3340,8 +3341,13 @@ class Analyzer:
         if self.state_dest(target_word):
             return
         if truncating:
-            tiers = ('log', 'root', 'unknown') if pure else ('log', 'unknown')
-            self.refuse('truncation by redirect', target_word, tiers=tiers, need_existing=True)
+            # `echo x > existing` replaces the file's content just as `: >` empties it, so an existing literal file
+            # under a protected root is refused like `tee` is; new files and `>>` appends stay allowed. A dynamic
+            # target keeps the narrower tiers: its existence cannot be checked, and new-file writes are common.
+            literal = pure or self.target_class(target_word)[2]
+            tiers = ('log', 'root', 'unknown') if literal else ('log', 'unknown')
+            self.refuse('truncation by redirect' if pure else 'overwrite by redirect', target_word, tiers=tiers,
+                        need_existing=True)
         self.note_created(target_word)
 
     def note_created(self, word, text=None):

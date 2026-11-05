@@ -610,6 +610,22 @@ class MktempScratchTests(Fixture):
             self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], want, cmd)
 
 
+class OverwriteExistingTests(Fixture):
+    """`>`, `>|`, `&>` onto an existing protected file replace its content; new files and appends stay allowed."""
+
+    def test_overwrite_rows(self):
+        for rel in ('.claude/wals/s/main.jsonl', '.claude/projects/p/s.jsonl', '.codex/sessions/2026/r.jsonl',
+                    '.claude/settings.json', 'repo/existing.txt'):
+            p = self.home / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('keep\n')
+        (Path(fill('@TASK@', self.home)) / 'existing.log').write_text('keep\n')
+        failures = [(cmd, want, got) for cmd, want in corpus.OVERWRITE_EXISTING
+                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
+        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 15)
+        self.assertEqual(failures, [])
+
+
 class GuardCompositionTests(unittest.TestCase):
     """The command guard and the heavy-job guard (#53) both classify Bash commands. They are separate hook groups
     and decide independently: neither one's allow, hatch or crash policy can override the other's block."""
@@ -724,6 +740,10 @@ class InstallTests(unittest.TestCase):
         self.assertNotIn('matcher', with_guard[-1])
         again = self.install_codex.merge_hooks({'hooks': {'PreToolUse': with_guard}}, codex)['hooks']['PreToolUse']
         self.assertEqual(again, with_guard)  # idempotent: a reinstall keeps every index
+        # upgrade from the 220c37e layout (guard first): one guard group, moved last
+        old = [with_guard[-1]] + with_guard[:-1]
+        upgraded = self.install_codex.merge_hooks({'hooks': {'PreToolUse': old}}, codex)['hooks']['PreToolUse']
+        self.assertEqual(upgraded, with_guard)
 
     def test_old_claude_version_warns(self):
         self.assertIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.200 (Claude Code)'))

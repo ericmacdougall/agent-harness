@@ -854,4 +854,24 @@ MKTEMP_INLINE = [
     ('printf x > new-report.md', 'allow'),
     ('D=$(mktemp -d); rm -rf "$D" ~/.claude/projects', 'block'),
 ]
+# Replacing the content of an EXISTING protected file is as destructive as truncating it. `&>` used to lex as a
+# background `&` plus a separate redirect and was not seen at all. The test creates every @...@ file named here
+# except the ones marked NEW.
+OVERWRITE_EXISTING = [
+    ('ls &> @HOME@/.claude/wals/s/main.jsonl', 'block'),
+    ('echo x &>@HOME@/.claude/projects/p/s.jsonl', 'block'),
+    ('date &> @HOME@/.codex/sessions/2026/r.jsonl', 'block'),
+    ('echo x > @TASK@/existing.log', 'block'),
+    ('printf x >| @TASK@/existing.log', 'block'),
+    ('python3 gen.py 1> @TASK@/existing.log', 'block'),
+    ('make &> @TASK@/existing.log', 'block'),
+    ('echo {} > @HOME@/.claude/settings.json', 'block'),
+    ('echo x > @TASK@/NEW-report.md', 'allow'),
+    ('make &> @TASK@/NEW-build.log', 'allow'),
+    ('echo x >> @TASK@/existing.log', 'allow'),
+    ('ls &>> @HOME@/.claude/wals/s/main.jsonl', 'allow'),
+    ('echo x | tee -a @TASK@/existing.log', 'allow'),
+    ('echo x > @HOME@/repo/existing.txt', 'allow'),
+    ('ls &> /dev/null', 'allow'),
+]
 SEED = 14471

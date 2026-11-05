@@ -331,7 +331,7 @@ Co-Authored-By: ...
 | Tier | Paths | Refused |
 | --- | --- | --- |
 | A (logs and state) | Claude transcripts (`~/.claude/projects`, history), Codex sessions and history, WALs (any `wals` directory, `main.jsonl`, `*.wal.jsonl`), the approval state in `~/.agent-harness/state`, credential files, and the guard's own installed files | every destructive form: delete, move, truncate, overwrite, `find -delete`, `rsync --delete`, `rclone move/sync/delete/purge`, interpreter one-liners, `git clean` |
-| B (harness roots) | everything else under `~/.claude`, `~/.codex` and `~/.agent-harness`, for the local home and for `/home/*`, `/Users/*`, `/root` paths on ssh or container targets | delete, move and pure truncation; ordinary edits and new files are allowed |
+| B (harness roots) | everything else under `~/.claude`, `~/.codex` and `~/.agent-harness`, for the local home and for `/home/*`, `/Users/*`, `/root` paths on ssh or container targets | delete, move, truncation, and replacing an existing file's content through a shell redirect (`>`, `>|`, `&>`, literal path) or `tee`; new files, `>>` appends and editor-tool edits are allowed. `cp` over an existing file here is not refused yet |
 
 A command that names an ancestor of a protected path (`rm -rf ~`), or a path the guard cannot resolve but that points at one (a variable, glob or `cd -` it cannot follow), is refused too.
 
