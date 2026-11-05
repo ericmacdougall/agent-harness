@@ -710,9 +710,10 @@ def make_analyzer_class(cg):
                                        for j in range(i + 1, len(args) - 1))
                         return self.reads_program(args[i:])
                     if re.search(r'\s', a.text.strip()) and name not in ('xargs', 'parallel'):  # ssh host 'cd /srv && bash -s'
-                        lexed = cg.Lexer(self.ctx, self.ctx.ps).lex(a.text)
-                        if any(self.reads_program(c.words) for pl in cg.parse(lexed) for c in pl.cmds):
-                            return True
+                        for bang in (True, False):  # the remote shell may be zsh or bash, which read `>! sh` apart
+                            lexed = cg.Lexer(self.ctx, self.ctx.ps, bang_operators=bang).lex(a.text)
+                            if any(self.reads_program(c.words) for pl in cg.parse(lexed) for c in pl.cmds):
+                                return True
                     if n in STOP_COMMANDS:
                         return False
             return False
@@ -1236,6 +1237,9 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
         if analyzer.ctx.unterminated and not findings and fallback_blocks(raw):
             findings = [('unterminated', 'the command has an unterminated quote or substitution and mentions a kill '
                          'verb or indirection', ())]
+        if analyzer.ctx.readings_capped and not findings and fallback_blocks(raw):  # the kill may be in the reading it dropped
+            findings = [('readings-capped', '`>!` could not be judged under both shell readings and the command mentions a '
+                         'kill verb or indirection', ())]
     except Exception as error:  # noqa: BLE001 - Blocked, RecursionError and bugs alike: fail closed on kill-looking text
         if fallback_blocks(raw):
             rule = 'unanalysable'

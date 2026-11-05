@@ -180,6 +180,64 @@ class Corpus(WorldCase):
             self.assertIn(verb, text_rows)
 
 
+class ClobberReadings(WorldCase):
+    """zsh takes `>! w` as one operator and bash as `>` onto a file named `!`, and the shared analyzer judges a script under
+    both (GoodQA #14657). bash runs `kill` in `>! kill 4004` and zsh writes a file with that name, so losing a reading loses
+    the kill. These rows are strings handed to decide(); nothing is run or signalled."""
+    # Three scripts holding `>!` use up the forks, so a fourth gets only zsh's reading.
+    TOO_DEEP = "bash -c 'echo a >! b; bash -c \"echo c >! d; bash -c \\\"echo e >! f; bash -c \\\\\\\"echo g >! h; %s\\\\\\\"\\\"\"'"
+
+    def test_each_reading_has_its_own_words_tagged(self):
+        # (N) cuts the command at 4001. Only bash's reading has kill as a word, so tagging only the first reading misses 4004.
+        for text in ('>! kill 4001(N) 4004', '>! K=(kill); $K 4004', "bash -c '>! kill 4001(N) 4004'",
+                     'for p in 4004; do echo "kill $p"; done | >! sh'):
+            with self.subTest(text=text):
+                self.assertEqual(self.decide(text)[0], 'block')
+
+    def test_a_reading_with_no_kill_refuses_nothing(self):
+        for text in ('echo x >! y(N)', 'ls >! kill', 'echo x >! kill 4004', '>! y echo 4001(N) 4004', '>! kill',
+                     'echo kill >! y', 'echo ok >! y | cat'):
+            with self.subTest(text=text):
+                self.assertEqual(self.decide(text)[0], 'allow')
+
+    def test_a_kill_under_only_one_reading_is_refused(self):
+        for text in ('>! y kill 4004', '>! echo kill 4004', 'echo kill 4004 | sh >! y'):
+            with self.subTest(text=text):
+                self.assertEqual(self.decide(text)[0], 'block')
+
+    def test_a_reading_dropped_for_depth_blocks_kill_looking_text(self):
+        for inner in ('>! kill 4004', '>! kill 4001(N) 4004'):
+            with self.subTest(inner=inner):
+                verdict = self.decide(self.TOO_DEEP % inner)
+                self.assertEqual(verdict[:2], ('block', 'readings-capped'))
+        self.assertEqual(self.decide('echo x >! y; bash -c "echo x >! y; bash -c \'echo x >! y; bash -c \\">! kill 4004\\"\'"')[0],
+                         'block')
+
+    def test_a_remote_shell_string_is_read_both_ways(self):
+        # bash on the far side writes `!` and runs `bash -s` on the piped text; zsh writes a file named bash.
+        for text in ('echo "kill 4004" | ssh h \'>! bash -s\'', 'echo "kill 4004" | ssh h \'cd /srv; >! sh\'',
+                     'echo "kill 4004" | ssh h \'>! y bash -s\''):
+            with self.subTest(text=text):
+                self.assertEqual(self.decide(text)[0], 'block')
+        self.assertEqual(self.decide('echo ok | ssh h \'>! y\'')[0], 'allow')
+        for inner in ('echo ok', '>! ls', '>! y'):
+            with self.subTest(inner=inner):
+                self.assertEqual(self.decide(self.TOO_DEEP % inner)[0], 'allow')
+
+    def test_readings_that_disagree_inside_eval_block_as_unknown(self):
+        # The cost of the rule above, pinned so it is seen: no kill here, but the readings leave A different and eval is
+        # an indirection, so the guard cannot say what runs. Without the eval the same text is judged.
+        self.assertEqual(self.decide("A=1; eval '>! y A=2'; echo $A")[:2], ('block', 'readings-capped'))
+        self.assertEqual(self.decide("A=1; bash -c '>! y A=2'; echo $A")[0], 'allow')
+
+    def test_a_reading_dropped_for_budget_blocks_kill_looking_text(self):
+        # The real trigger is time and size, so it moves with load; the patch fixes the decision that follows from it.
+        with mock.patch.object(kg._import_base().Budget, 'has_room', return_value=False):
+            verdict = self.decide('>! kill 4004')
+            self.assertEqual(verdict[:2], ('block', 'readings-capped'))
+            self.assertEqual(self.decide('echo ok >! y')[0], 'allow')
+
+
 class Mutants(WorldCase):
     def test_allow_everything_mutant_fails_positives(self):
         bad = judge_rows([r for r in ROWS if r['expect'] == 'block'], lambda r: ('allow', '', '', ()))
