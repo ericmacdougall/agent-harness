@@ -455,8 +455,9 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
 
 def run(cmd: list[str], prompt: str, cwd: Path, timeout=720, on_spawn=None) -> tuple[int, str, str]:
     try:
+        extra = {'on_spawn': on_spawn} if on_spawn is not None else {}
         result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=git_environment(snapshot=True),
-                             timeout=timeout, on_spawn=on_spawn)
+                             timeout=timeout, **extra)
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
         return 124, '', 'HARNESS_PROVIDER_TIMEOUT'
@@ -723,8 +724,9 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                         outcome = {**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}
                     else:
                         options['launches'] += 1
+                        # The child is recorded for the usage guard's liveness rule when a run record exists.
                         code, stdout, stderr = run(cmd, prompt, snapshot, timeout,
-                                                   on_spawn=run_record.note_child if run_record else None)
+                                                   **({'on_spawn': run_record.note_child} if run_record else {}))
                         last_message = last.read_text(errors='replace') if last.exists() else ''
                         outcome = normalize_provider(provider, code, stdout, stderr, last_message, stage)
         except GuardError as error:
