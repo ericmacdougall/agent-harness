@@ -330,7 +330,8 @@ PINNED_ROUTES = (
 # Existing scripts are otherwise judged only for log deletion, so a credential read inside one would pass. This refuses
 # scripts whose own text, outside comment lines, names the rclone config or the token secret or dumps the config. Text only.
 # Python prose does not count as a dump: there the command must open a string or be an argument list. It only ever adds a
-# finding, and it stops after CREDENTIAL_SCRIPT_SECONDS so it cannot use up the guard's own time limit. It does not catch a
+# finding. It starts no new read after CREDENTIAL_SCRIPT_SECONDS, and its time extends the analysis deadline rather than
+# using it, so it cannot turn a refusal into the time-limit warning. It does not catch a
 # script that builds the name at runtime or calls another script, a name past the read limit, a path the guard cannot
 # resolve, a runner it does not unwrap (`uv run`, `tmux`, `python3 -m cProfile`), a test in a folder named tests, or one of
 # the guard's own files.
@@ -413,7 +414,11 @@ def python_script_word(texts):
 
 
 def _read_prefix(path, limit):
-    with open(path, 'rb') as handle:
+    """Read a regular file without blocking: a FIFO swapped in after a check would otherwise hang until the alarm."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))
+    with os.fdopen(fd, 'rb') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError('not a regular file')
         return handle.read(limit)
 
 
@@ -2317,7 +2322,11 @@ class Analyzer:
         except (OSError, ValueError):
             return
         finally:
-            self.credential_seconds = spent + time.monotonic() - started
+            # This time is the check's own, not the analysis's: it moves the deadline, so it can never turn into the
+            # time-limit warning that a command main blocks would otherwise get.
+            elapsed = time.monotonic() - started
+            self.credential_seconds = spent + elapsed
+            self.ctx.budget.deadline += elapsed
 
     def script_file(self, word, depth, require_shell=False):
         """Analyse a shell script named on the command line (or written earlier in this command)."""

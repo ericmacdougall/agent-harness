@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -383,6 +384,48 @@ class CredentialScriptTests(Base):
                         'rsync -a ~/.config/rclone/ t2-dev:.config/rclone/'):
             with self.subTest(command=command):
                 self.assertAllowed(command)
+
+    def test_slow_credential_reads_cannot_turn_a_block_into_a_warning(self):
+        """A command main blocks must stay blocked however long the credential reads take (deterministic, no timing race)."""
+        clean = self.write('x/clean.sh', b'#!/bin/bash\nrm -rf ~/.claude/projects\n')
+        plain = [self.write('x/p%d.sh' % i, b'#!/bin/bash\necho hello\n') for i in range(6)]
+        command = 'bash %s; ' % clean + ''.join('bash %s; ' % p for p in plain) + 'echo a b c; ' * 3000 + 'true'
+        policy = cg.load_policy()
+        policy['limits']['max_seconds'] = 0.5
+        compiled = cg.Compiled(policy, cwd=str(self.home))
+        real = cg._read_prefix
+
+        def slow(path, limit):
+            time.sleep(0.3)
+            return real(path, limit)
+
+        with mock.patch.object(cg, '_read_prefix', side_effect=slow):
+            verdict, message = cg.decide(command, compiled, cwd=str(self.home))[:2]
+        self.assertEqual(verdict, 'block', message)
+        self.assertIn('log_delete', str(message))
+
+    def test_a_fifo_is_never_read(self):
+        """A file swapped for a FIFO after the existence check must not hang the guard until its alarm."""
+        fifo = self.home / 'x/swapped.sh'
+        fifo.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(str(fifo))
+        result = []
+
+        def read():
+            try:
+                result.append(cg._read_prefix(str(fifo), 100))
+            except OSError as error:
+                result.append(error)
+
+        worker = threading.Thread(target=read, daemon=True)
+        worker.start()
+        worker.join(2)
+        hung = worker.is_alive()
+        if hung:  # release the blocked open so the test run can finish
+            os.close(os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK))
+            worker.join(2)
+        self.assertFalse(hung, 'reading a FIFO blocked')
+        self.assertIsInstance(result[0], OSError)
 
     def test_the_credential_file_stays_refused_directly(self):
         conf = self.home / '.config/rclone/rclone.conf'
