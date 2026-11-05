@@ -8,21 +8,26 @@ It never deletes, kills, reclaims or writes Codex trust. It writes only its own 
 
 | Check | Key(s) | Severity | Fires when |
 |---|---|---|---|
-| disk | `disk:volume:<path>` | warning / high / critical | 85 / 92 / 97 % used, or less than `free_floor_gib` (10) free |
+| disk | `disk:volume:<path>` | warning / high / critical | 85 / 92 / 97 % used, or less than `free_floor_gib` (10) free ; on macOS the Data volume `/System/Volumes/Data` is read first, since `/` is the sealed system volume |
 | disk | `disk:growth` | high | a measured dir, or the volume itself, grows by 10 GiB/h or more; names the top three growers |
 | disk | `disk:unmeasured` | warning | a dir keeps timing out under `du` and cannot be split further |
 | units (Linux) | `units:failed` | high | failed user units (transient `run-*.scope` excluded) |
 | units (Linux) | `reclaim:<unit>` | high | a watched reclaim job's last run failed, its timer is inactive, or its last invocation logged `failed` lines |
 | crashes (macOS) | `crashes` | warning; high for python SIGKILL or sandbox SIGKILL | `.ips` reports newer than the last run, kept for 6 h; only process name, pid, parent and time are reported |
 | processes | `procs:orphans`, `procs:runaway`, `procs:chrome-helpers`, `procs:shells` | warning / high | `netwatch orphans --json` (pid/name/age/rss/cpu only, never cmd), and Chrome and shell counts over their limits |
+| processes | `procs:agent-spawned` | warning | shells over 100 or ssh clients over 60 whose ancestry reaches a `claude` or `codex` process (one `ps` snapshot) |
+| processes | `mem:swap`, `mem:pressure` | warning; high at macOS pressure level 4 | swap over 70 % (macOS `vm.swapusage`, Linux `/proc/meminfo`); macOS `kern.memorystatus_vm_pressure_level` 2 or 4 |
+| processes | `procs:heavy-suite` | warning | on a no-heavy-jobs host (the Mac by default): `unittest discover`, `pytest` or `gradle test` processes; only the pid and suite kind are reported |
 | delivery | `delivery:<path>` | high | a configured delivery checkout is missing, not on `main`, or dirty (`GIT_OPTIONAL_LOCKS=0`) |
 | drift | `drift:claude-md`, `drift:hooks` | warning | the CLAUDE.md managed block differs from `HARNESS.md` at `origin/main`, or an installed hook's git blob hash differs from main |
 | codex | `codex:trust` | high | a `~/.codex/hooks.json` handler has no `[hooks.state]` trust entry or a stale `trusted_hash`: "Codex is skipping harness hooks" |
+| liveness | `liveness:<session8>/<task>` | high | "owner silent: <task> <ticket> <minutes>m". An owner WAL (`~/.claude/wals/<session>/<task>.jsonl`, excluding `agent-*` and `main`) whose last event is over 60 min old and is not terminal. Terminal means: `handoff`, `done` or `delivered`; a `status` or `result` note with `WORKDIR_DONE`, `DONE` or `DELIVERED`; or a `blocker` that names what it is waiting on. The same alert fires when the task's open GoodQA ticket has had no comment for 3 h; the Mac looks this up through `gq.py`, at most 15 lookups per run, cached for 30 min. WALs untouched for 24 h are ignored as history. The alert clears on new activity or a terminal event. The work-assignments ledger is added once goodqa#14465 lands |
+| ops-watch | `ops-watch:sink:<name>`, `ops-watch:check-error:<check>`, `ops-watch:internal-error` | warning / high | a sink cannot deliver (cleared when it recovers), a check raised an exception (its existing alerts are kept), or the run crashed |
 | peers | `peer:<host>:unreachable`, `peer:<host>:stale` | warning | a configured peer's `active.json` cannot be read, or that peer's watcher has not run for 30 min |
 
 Disk sizes come from `du -skx`, run round-robin with the least recently tried dir first, inside a 90 s budget per run and with 60 s per dir. A dir that times out is split into its children on later runs, up to depth 2 and at most 200 children. A dir that cannot be split is reported as unmeasured. Growth is computed from two measurements of the same dir taken between 10 min and 6 h apart.
 
-The Codex trust hash is the sha256 of the sorted-key, compact JSON of `{"event_name": <snake_case event>, "hooks": [handler with async defaulting to false], "matcher"?}`. That follows the sidekick crate's mirror of codex-rs hook discovery, and it was checked against a live trusted entry.
+The Codex trust hash is the sha256 of the sorted-key, compact JSON of `{"event_name": <snake_case event>, "hooks": [handler with async defaulting to false, and only type, command, timeout, async and statusMessage kept], "matcher"?}`. That follows the sidekick crate's mirror of codex-rs hook discovery, and it was checked against live trusted entries on the Mac and dev2 (the dev2 entry carries extra, unhashed fields). Groups with a `matcher` have not been checked against a live entry.
 
 ## Alert path (canonical)
 
@@ -31,21 +36,21 @@ The Codex trust hash is the sha256 of the sorted-key, compact JSON of `{"event_n
 - **Writing:** producers call `ops_watch.emit(event)`, or run `ops_watch.py emit --json '<event>'`.
 - **Locking:** under `flock` on `alerts.lock`, `seq` is set to the highest seq in the ring plus 1, and the event goes into slot `seq % 1024`, overwriting the oldest. The write is an in-place `pwrite` followed by `fsync`, so the file never grows and the write works on a full disk.
 - **Fields:** `schema` (1), `seq`, `at` (RFC 3339 UTC), `host`, `source`, `event` (`raise` or `clear`), `severity` (`info`, `warning`, `high` or `critical`), `key`, `message` and `detail`. The required ones are host, source, event, severity, key and message. When an event is too big for a slot, `detail` is dropped, and if it still doesn't fit, `message` is truncated.
-- **Semantics:** the ring holds transitions only. A producer raises once per (host, source, key), raises again only when the severity rises, and clears once.
+- **Semantics:** the ring holds transitions only. A producer raises once per (host, source, key), raises again only when the severity changes, and clears once. A downgrade replaces the stale message. If ops-watch loses its state, it treats its own active raises in the ring as already raised, so they still clear.
 - **Active alerts:** an alert is active when the latest event for its key is a `raise`.
 - **Reassertion:** a producer whose raise has been overwritten by the ring wrapping must re-emit it with `detail.reasserted=true`. ops-watch does this every run.
 
-`wal.py` adds `ops_watch.injection_text()` to the SessionStart, UserPromptSubmit and SubagentStart context. It never raises, and it is empty when nothing is active. On the Mac it also includes the peers' active alerts, read from each peer's `~/.agent-harness/state/ops-watch/active.json` over ssh.
+`wal.py` adds `ops_watch.injection_text()` to the SessionStart, UserPromptSubmit and SubagentStart context. It reads only regular files, without blocking and with a size cap. It never raises, and it is empty when nothing is active. Alert text is reduced to a safe character set and labelled as data, not instructions. On the Mac it also includes the peers' active alerts, read from each peer's `~/.agent-harness/state/ops-watch/active.json` over ssh.
 
 ## Delivery of transitions
 
 1. The ring, as described above.
-2. One GoodQA comment per run on goodqa#14592, "ops-watch alerts".
+2. One GoodQA comment per run on goodqa#14592. `sinks.comment` may be a list that is tried in order, so t2-dev can relay through `ssh <mac> python3 ~/.claude/hooks/ops_watch.py relay-comment` until its own goodqa CLI is installed. That relay only ever posts to #14592.
    - The Mac uses `gq.py comment_on_issue` with an idempotent `operationId`.
    - Linux uses the `goodqa ticket comment` CLI.
 3. The deadman alert script, for critical raises only. Each command in `sinks.deadman` is tried in order until one succeeds.
 
-When a sink fails, its transitions are queued in state and retried on the next run. The run writes the failure to stderr and exits 2. On a fully successful run, ops-watch touches `~/.agent-harness/logs/ops-watch.last-ok`. The deadman config watches that file as the markers `t2-ops-watch` and `mac-ops-watch`, so a dead watcher still sends an email.
+Each run saves its transitions to the ring and to state before calling any slow sink. Comments are posted in chunks of about 7000 characters, and only the chunks that were delivered leave the queue. A run makes at most 3 deadman attempts and sends at most one deadman mail per key every 6 h, and every sink is bounded by a 420 s deadline per run. When a sink fails, its transitions stay queued and are retried on the next run. The run raises `ops-watch:sink:<name>`, writes the failure to stderr and exits 2. On a fully successful run, ops-watch touches `~/.agent-harness/logs/ops-watch.last-ok`. The deadman config watches that file as the markers `t2-ops-watch` and `mac-ops-watch`, so a dead watcher still sends an email.
 
 State lives in `~/.agent-harness/state/ops-watch/state.json`, which has two fixed 512 KiB slots written alternately in place.
 
@@ -58,12 +63,14 @@ Per-host settings go in `~/.agent-harness/ops-watch.json`. Every key is optional
  "drift": {"repo": "~/repos/agent-harness"},
  "peers": ["dev2", "t2-dev"],
  "sinks": {"comment": {"mode": "gq"},
-           "deadman": [["ssh", "-o", "BatchMode=yes", "t2-dev", "~/.agent-harness/bin/deadman-alert.sh '{SUBJECT}'"]]}}
+           "deadman": [["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "t2-dev",
+                        "~/.agent-harness/bin/deadman-alert.sh '{SUBJECT}'"]]}}
 ```
 
 ```
 python3 ~/.claude/hooks/ops_watch.py install           # dry run
 python3 ~/.claude/hooks/ops_watch.py install --apply   # launchd or systemd --user, every 10 min, nice 19, idle IO
+                                                       # (units point at this file: run it from the installed copy)
 python3 ~/.claude/hooks/ops_watch.py run               # one run now
 python3 ~/.claude/hooks/ops_watch.py status            # active alerts, peers, queued deliveries
 tail ~/.agent-harness/logs/ops-watch.err               # macOS; Linux: journalctl --user -u ops-watch
