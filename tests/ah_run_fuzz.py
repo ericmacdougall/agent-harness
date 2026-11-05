@@ -39,7 +39,7 @@ BASE = Path(tempfile.mkdtemp())
 HOOKS = ROOT / 'harness' / 'hooks'
 if CONTROL:
     archive = subprocess.run(['git', '-c', 'safe.directory=*', '-C', str(ROOT), 'archive', CONTROL, 'harness/hooks'], capture_output=True, check=True, timeout=60).stdout
-    tarfile.open(fileobj=io.BytesIO(archive)).extractall(str(BASE / 'control'))
+    tarfile.open(fileobj=io.BytesIO(archive)).extractall(str(BASE / 'control'), **({'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}))
     HOOKS = BASE / 'control' / 'harness' / 'hooks'
 sys.path[:0] = [str(ROOT), str(HOOKS)]
 os.environ['AGENT_HARNESS_RESERVE_DIR'] = str(BASE / 'reserve')

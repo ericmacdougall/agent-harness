@@ -5,7 +5,8 @@
 certain or loses its deny: a row may only move toward uncertain and toward deny. Prints each moved row.
 
 `--pin OUT` (only inside the shell sandbox, tests/shell_sandbox.py): runs every live row in every shell present, writes the
-shell columns (ran, unstable) and `pinned_on` for this host to OUT. Live rows print only the echo marker; a row naming sudo
+shell columns (ran, unstable) and `pinned_on` for this host to OUT; `--pin -` prints the table between PINNED-TABLE-BEGIN and
+PINNED-TABLE-END lines instead, for a sandbox whose files do not outlive the run. Live rows print only the echo marker; a row naming sudo
 or another privilege tool is data only and never reaches a shell.
 
 Run from the repository root: `python3 tests/ah_run_table.py --columns` or `python3 tests/ah_run_table.py --pin /tmp/table.json`.
@@ -269,7 +270,11 @@ def pin(output):
                 unstable.append(name)
         row['ran'], row['unstable'] = sorted(ran), sorted(unstable)
     table['pinned_on'] = {'platform': sys.platform, 'shells': {name: version for name, (_path, version) in sorted(found.items())}}
-    Path(output).write_text(json.dumps(table, indent=0, sort_keys=True) + '\n')
+    text = json.dumps(table, indent=0, sort_keys=True) + '\n'
+    if output == '-':
+        sys.stdout.write('PINNED-TABLE-BEGIN\n' + text + 'PINNED-TABLE-END\n')
+    else:
+        Path(output).write_text(text)
     print('pinned %d rows on %s: %s' % (len(table['rows']), sys.platform, ', '.join('%s %s' % (k, v) for k, (_p, v) in sorted(found.items()))))
     return 0
 
