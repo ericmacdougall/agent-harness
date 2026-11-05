@@ -54,8 +54,10 @@
   "priority": "P0",
   "owner_overlap": "Bash part overlaps ad1fe816; Read/Grep/Write part is new",
   "matrix_rows": "X01,X03",
-  "mechanisms": [],
-  "planned_batch": "B1"
+  "mechanisms": [
+   "holds_guard:hook"
+  ],
+  "partial_reason": "Bash check is token-level; wrapper, eval and encoded evasion are the command guard job; Solve owner phrase location is a path guess"
  },
  {
   "id": "S04",
@@ -148,8 +150,10 @@
   "priority": "P0",
   "owner_overlap": "new (G08 registry family)",
   "matrix_rows": "G08",
-  "mechanisms": [],
-  "planned_batch": "B1"
+  "mechanisms": [
+   "holds_guard:hook"
+  ],
+  "partial_reason": "access verbs and file tools only; GoodQA project ids for yates are not known so ticket calls are not covered"
  },
  {
   "id": "S09",
@@ -166,8 +170,10 @@
   "priority": "P0",
   "owner_overlap": "new; lifts only by user",
   "matrix_rows": "G08",
-  "mechanisms": [],
-  "planned_batch": "B1"
+  "mechanisms": [
+   "holds_guard:hook"
+  ],
+  "partial_reason": "access verbs and file tools only"
  },
  {
   "id": "S10",
@@ -310,8 +316,10 @@
   "priority": "P1",
   "owner_overlap": "new",
   "matrix_rows": "X06",
-  "mechanisms": [],
-  "planned_batch": "B1"
+  "mechanisms": [
+   "holds_guard:hook"
+  ],
+  "partial_reason": "token-level git parsing; wrapped or aliased git is not covered"
  },
  {
   "id": "S18",

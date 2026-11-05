@@ -182,6 +182,75 @@
    ]
   },
   {
+   "id": "holds_guard:hook",
+   "script": "holds_guard.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "Grep",
+    "Glob"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S03",
+    "S08",
+    "S09",
+    "S17"
+   ],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Read",
+      "tool_input": {
+       "file_path": "/Users/x/.claude/goodqa-hive/member.key"
+      }
+     },
+     "expect": "deny"
+    },
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "ls"
+      }
+     },
+     "expect": "allow"
+    }
+   ]
+  },
+  {
+   "id": "codex-holds_guard:hook",
+   "script": "holds_guard.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Bash",
+    "Read",
+    "Write",
+    "Edit"
+   ],
+   "flavors": [
+    "codex"
+   ],
+   "status": "pending",
+   "known_gap": "B5",
+   "owner": "unassigned (B5 Codex parity)",
+   "rules": [
+    "S03",
+    "S08",
+    "S09"
+   ]
+  },
+  {
    "id": "codex-wal:SessionStart",
    "script": "wal.py",
    "arg": "hook",

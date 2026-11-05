@@ -24,7 +24,7 @@ AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py",
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
          "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py",
-         "domain_gates.py", "domain_checklists.json", "doctor.py", "hooks_manifest.json", "rules.json")
+         "domain_gates.py", "domain_checklists.json", "doctor.py", "hooks_manifest.json", "rules.json", "holds_guard.py", "holds.py", "holds.json")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -41,9 +41,10 @@ class DirectoryPublicationError(OSError):
 
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
-            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py")}
+            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "holds_guard.py")}
 
 
+HOLDS_TOOLS = "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Grep|Glob|LS"
 SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
 GOODQA_STATUS_TOOLS = (r"^mcp__.*[Gg][Oo][Oo][Dd][Qq][Aa].*__(close_issue_done|close_issue_wont_fix|update_issue|"
                        r"bulk_update_issues|archive_issue|reassign_issue|call_api)$")
@@ -99,6 +100,11 @@ def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]
         }, {
             "matcher": GOODQA_STATUS_TOOLS,
             "hooks": [spec_gate],
+        }, {
+            # Holds (yates, Petfiliate, OptinRouter), credential paths, force pushes. Fails open on its own crash.
+            "matcher": HOLDS_TOOLS,
+            "hooks": [{"type": "command", "command": "python3", "args": [str(claude / "hooks" / "holds_guard.py")],
+                       "timeout": 10}],
         }],
     }
     if provenance:
