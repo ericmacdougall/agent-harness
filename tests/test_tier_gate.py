@@ -295,7 +295,8 @@ class BashAdvisory(GateFixture):
 
     def test_piped_script_behind_a_wrapper_is_still_checked(self):
         for line in ("echo 'claude -p --model fable x' | sudo bash", "echo 'claude -p --model fable x' | env -i sh",
-                     "echo 'claude -p --model fable x' | nice -n 5 bash", "echo 'claude -p --model fable x' | sudo -u eric /bin/bash"):
+                     "echo 'claude -p --model fable x' | nice -n 5 bash", "echo 'claude -p --model fable x' | sudo -u eric /bin/bash",
+                     "echo 'claude -p --model fable x' | sudo -n bash", "echo 'claude -p --model fable x' | timeout -s KILL 5 bash"):
             self.assertEqual(self.bash(line)[0], 'deny', line)
         self.assertEqual(self.bash("echo 'see claude' | sudo tee /tmp/x")[0], 'allow')
 

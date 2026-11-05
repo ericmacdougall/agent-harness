@@ -152,6 +152,8 @@ SHELL_STRING_HOSTS = ('bash', 'sh', 'zsh', 'dash', 'ksh', 'su', 'sudo')
 ENV_MODEL = re.compile(r'(?:^|\s)(?:export\s+)?(?:ANTHROPIC_MODEL|CLAUDE_MODEL)=([^\s;&|]+)')
 MAX_NESTING = 2
 PURE_SHELLS = ('bash', 'sh', 'zsh', 'dash', 'ksh')
+WRAPPER_VALUE_OPTIONS = {'sudo': ('-u', '-g', '-C', '-h', '-p', '-U', '-r', '-t', '-T'), 'nice': ('-n',), 'timeout': ('-s', '-k'),
+                         'env': ('-u', '-C', '-S'), 'nohup': (), 'time': (), 'command': (), 'exec': ()}
 
 
 def _unquote(value):
@@ -175,10 +177,8 @@ def reads_stdin_as_script(segment):
             index += 1
             while index < len(words) and words[index].startswith('-'):
                 option = words[index]; index += 1  # the wrapper's own options (sudo -u eric, nice -n 5, timeout -s KILL)
-                if option in ('-u', '-g', '-n', '-s', '-k', '-C', '-S', '-i') and base != 'env' and index < len(words):
-                    index += 1  # its value
-                elif option in ('-u', '-C', '-S') and base == 'env' and index < len(words):
-                    index += 1
+                if option in WRAPPER_VALUE_OPTIONS.get(base, ()) and index < len(words):
+                    index += 1  # its value (per wrapper: sudo's -n takes none, nice's -n does)
             if base == 'timeout' and index < len(words) and words[index][:1].isdigit():
                 index += 1
             continue
