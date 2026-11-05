@@ -104,6 +104,19 @@ class Darwin(Case):
         self.assertIn("deferred", message)
         self.assertEqual(runner.calls, [])
 
+    def test_deferred_reload_is_finished_by_the_next_install(self):
+        lock = self.home / ".agent-harness/logs/log-backup.lock.d"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text(str(os.getpid()))
+        self.apply("Darwin")
+        (lock / "pid").unlink()
+        lock.rmdir()
+        message, runner = self.apply("Darwin")
+        self.assertEqual(len(runner.calls), 2)
+        self.assertIn("scheduler loaded", message)
+        message, runner = self.apply("Darwin")
+        self.assertEqual(runner.calls, [])
+
     def test_non_default_home_writes_files_but_leaves_the_scheduler_alone(self):
         message, runner = self.apply("Darwin", activate=False)
         self.assertEqual(runner.calls, [])
