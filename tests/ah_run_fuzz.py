@@ -95,7 +95,17 @@ WORDFORMS = ['a[1 #]=b', 'a[ #]=b', 'a=(b #c)', 'a=(b\n)', 'a+=(b)', '@(a #b)', 
 HOSTS = ['function f { %s; }; f', 'f () { %s; }; f', "alias e='%s'\ne", "shopt -s expand_aliases\nalias e='%s'\ne", 'repeat 1 %s', 'noglob %s', 'nocorrect %s',
          'if [[ 1 = 1 ]] %s', '{ true } always { %s }', 'for i in 1 { %s }', 'for i (1) %s', "trap '%s' EXIT", "eval '%s'", "bash -c '%s'", 'echo "${ %s; }"',
          'find . -maxdepth 0 -exec %s \\;', 'echo | xargs %s', "env -S '%s'", "emulate sh -c '%s'", "x='$(%s)'; echo ${(e)x}", "PS4='$(%s)'; set -x; true",
-         "ssh -o 'ProxyCommand=%s' dev2 ls", 'nice -n 1 %s', 'stdbuf -o0 %s', 'command %s', 'exec %s', 'echo %s | sh', 'sh <<<"%s"']
+         "ssh -o 'ProxyCommand=%s' dev2 ls", 'nice -n 1 %s', 'stdbuf -o0 %s', 'command %s', 'exec %s', 'echo %s | sh', 'sh <<<"%s"',
+         # r7 review: the program behind a wrapper spelling, source and . input, ~ paths, code through a variable (H1, M1, M2, L1)
+         'source <(echo %s)', '. <(echo %s)', "echo '%s' | . /dev/stdin", "echo '%s' | . /proc/self/fd/0", "source /dev/fd/0 <<< '%s'",
+         "source /proc/self/fd/0 <<< '%s'", ". /proc/self/fd/3 3<<'E'\n%s\nE", "bash /proc/self/fd/3 3<<'E'\n%s\nE", '~/../../../../../../../../bin/%s', 'p=\'$(\'; t="a[${p}%s >&3)]"; { echo $((t)); } 3>&1',
+         'p=\'$(\'; v="a[${p}%s >&3)]"; { printf -v "$v" x; } 3>&1']
+# every spelling of the wrappers the hook reads through, known and unknown, chained before the marker (r7 H1)
+WRAPS = ['nice', 'nice -n5', 'nice -n 5', 'nice --adjustment 5', 'nice --adjustment=5', 'nice --10', 'nice -10', 'nice -+3', 'nice 5', 'nice --adj=5',
+         'timeout 5', 'timeout --signal KILL 5', 'timeout -sKILL 5', 'timeout --kill-after 1 5', 'timeout -k1 5', 'timeout -fv 5', 'timeout 5x',
+         'env', 'env -i', 'env -vS', 'env -u X', 'env -uX', 'env -P /bin', 'env -a x', 'env A=1', 'env - A=1', 'env --unset X', 'env --chdir=/',
+         'exec', 'exec -la x', 'exec -a x', 'exec -c', 'exec -x', 'command', 'command -p', 'command -pV', 'command -x', 'builtin', 'builtin -x',
+         'time', 'time -p', 'time -o /dev/null', 'time -v', 'nohup', 'nohup --', 'nohup -x', '--', '-n', '5']
 FIRST = ['', '', 'echo "$(echo \'x\')"\n', 'echo $(true)\n', 'true # x\n', "echo 'a'\n"]
 SEP = ['; ', '\n', ' && ', ' | ', ' || ', ' & ', ';', '&&', '|', '\n\n', ';\n', '&\n']
 TAIL = ['', '', '', ' #', " #'", ' #"', "\n#'", '\n#"', " '", ' "', '\n`', ' `', '\n)', ')', '\n}', '}', '))', ']', "\n$'", ' #`', '\nE', '\nE\n']
@@ -131,8 +141,10 @@ def gen():
         return rng.choice(CMD) + ' ' + atom() + rng.choice(['', '', ' ' + atom()]) + rng.choice(SEP) + H + rng.choice(TAIL)
     if r < .68:
         return atom() + rng.choice(SEP) + H + rng.choice(TAIL)
-    if r < .9:
+    if r < .82:
         return rng.choice(FIRST) + rng.choice(HOSTS) % H + rng.choice(['', '', '\n', '; true', rng.choice(TAIL)])
+    if r < .92:
+        return ' '.join(rng.choice(WRAPS) for _ in range(rng.randint(1, 3))) + ' ' + H + rng.choice(['', '', ' #', '; true'])
     return rng.choice(CMD) + ' ' + atom() + rng.choice(SEP) + atom() + rng.choice(SEP) + H + rng.choice(TAIL)
 
 
@@ -144,6 +156,9 @@ def tags(command):
     found = [name for name, pattern in (('py-blank', PY_BLANK), ('ansi-c', re.compile(r'\\c')), ('funsub', re.compile(r'\$\{[ \t\n|]')),
                                          ('param-hash', re.compile(r'\$\{[^}]*[ \t\n]#')), ('paren-hash', re.compile(r'[@?*+!a-z]\([^)]*[ \t\n]#')),
                                          ('subscript-hash', re.compile(r'\[[^\]]*[ \t\n]#')),
+                                         ('r7-wrapper', re.compile(r'(?:^|[ ;&|])(?:nice|timeout|env|exec|command|builtin|time|nohup) -')),
+                                         ('r7-source', re.compile(r'(?:source|\.) (?:<\(|/dev/|/proc/)')), ('r7-tilde', re.compile(r'~/\.\.')),
+                                         ('r7-variable', re.compile(r'\$\(\(t\)\)|printf -v')),
                                          ('host', re.compile(r'function |\(\) \{|alias |repeat |noglob|nocorrect|always|trap |eval |-c \'|-exec|xargs|env -S|emulate|\(e\)|PS4|ProxyCommand|nice |stdbuf|exec |\| sh|sh <<<|\]\] echo|for i (in 1 \{|\()')))
              if pattern.search(command)]
     return found or ['NEW']

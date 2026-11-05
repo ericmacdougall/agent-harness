@@ -775,6 +775,12 @@ UNPEELED_WRAPPERS = frozenset(('busybox stdbuf flock script arch caffeinate ioni
                                'dtruss').split(' '))
 SHELL_NAMES = frozenset('bash sh zsh dash ksh ash mksh ksh93 rbash fish csh tcsh'.split(' '))
 FIND_RUNNERS = frozenset(('-exec', '-execdir', '-ok', '-okdir'))
+# Builtins that take a variable name (r8 L1): per builtin, the option letters that take an argument, those of them whose
+# argument is a name, and whether plain words are names.
+NAME_TAKERS = {'printf': 'v', 'test': 'v', '[': 'v', 'wait': 'p', 'read': 'adinNptu', 'unset': '', 'getopts': '', 'local': '',
+               'export': ''}
+NAME_OPTIONS = {'printf': 'v', 'test': 'v', '[': 'v', 'wait': 'p', 'read': 'a'}
+NAME_POSITIONAL = frozenset(('read', 'unset', 'local', 'export'))
 # ssh, scp and sftp run these option values as local shell code (r6 N22): a quoted-code host like find -exec. A config file
 # named by -F that sets them is a limit (operations.md).
 SSH_O_CLUSTER = re.compile(r'-[46AaCfGgKkMNnqsTtVvXxYy]*o')
@@ -816,7 +822,7 @@ class _Lexer:
         self.reasons = {}
         self.commands, self.groups, self.group_texts = [], [], []
         self.bodies, self.openers, self.opener_spans, self.spans, self.pending = [], [], [], [], []
-        self.continuations = []
+        self.continuations, self.body_lines = [], 0  # body_lines: lines the body reader read, for the R7-Q bound
         self.newline = self.pipeline = self.substitution = self.saw_nesting = self.stopped = self.ran_off_end = False
         self.first = self.n - len(text.lstrip(' \t\n'))
         self.last = len(text.rstrip(' \t\n'))
@@ -1040,6 +1046,7 @@ class _Lexer:
                 end = n if end < 0 else end
                 line = text[position:end]
                 position = end + 1
+                self.body_lines += 1
                 compared = line.lstrip('\t') if strip_tabs else line
                 if compared == delimiter:
                     break
@@ -1233,6 +1240,8 @@ class _Lexer:
             if text[i + 2:i + 3] == '(':
                 end = self._arithmetic(i)
                 if end is not None:
+                    if re.search(r'[A-Za-z_$]', text[i + 3:end - 2]):
+                        self.reason('arith-variable')  # $((t)) evaluates t's text, so t='a[$(cmd)]' runs cmd (r8 L1)
                     self.substitution = self.saw_nesting = True
                     w.add('X')
                     return end
@@ -1390,14 +1399,23 @@ class _Lexer:
                 self.reason('dynamic-program-word')  # the shell picks the program after expansion; zsh runs =cmd too
                 return
             base = word.value.rsplit('/', 1)[-1]
-            step = _wrapper_step(base, values, raws, k + 1)
+            step, unknown = _wrapper_scan(base, values, raws, k + 1, [w.dynamic for w in words])
             if step is None:
                 self._check_program(base, words[k + 1:], prev_op, here_string)
                 return
             if step < 0:
                 self.reason('quoted-code:env-S')
                 return
-            if base == 'exec' and step >= count:
+            if unknown or step < count and (values[step].startswith('-') or values[step].isdigit()):
+                # which word runs depends on a spelling outside the grammar (r8 H1), or on an expansion: read without the
+                # expansions, an expanded word where the program stands is `exec "$@"`, a dynamic program word
+                plain, plain_unknown = _wrapper_scan(base, values, raws, k + 1)
+                expanded = 0 <= plain < count and words[plain].dynamic
+                if expanded:
+                    self.reason('dynamic-program-word')
+                if plain_unknown or not expanded:
+                    self.reason('wrapper-option')
+            if base == 'exec' and step >= count and not unknown:
                 self.reason('exec-redirect')  # later commands read and write through whatever it opened
             if base in ('env', 'sudo'):
                 for j in range(k + 1, step):
@@ -1414,8 +1432,10 @@ class _Lexer:
             self.reason('quoted-code:' + base)
         elif base in UNPEELED_WRAPPERS:
             self.reason('wrapper:' + base)
-        elif base in SHELL_NAMES:
-            if any(SHELL_C.fullmatch(value) for value in values):
+        elif base in SHELL_NAMES or base in ('source', '.'):
+            # what the shell or source reads as its script: a -c string, stdin, a here-string, a word built at run time
+            # (`<(cmd)`, `$f`), or a descriptor path (/dev/fd/N, /dev/stdin, /proc/self/fd/N) that a redirect or pipe fills
+            if base in SHELL_NAMES and any(SHELL_C.fullmatch(value) for value in values):
                 self.reason('quoted-code:shell-c')
             elif here_string:
                 self.reason('quoted-code:shell-here-string')
@@ -1423,6 +1443,8 @@ class _Lexer:
                 self.reason('shell-dynamic-arg')
             elif prev_op == '|':
                 self.reason('pipe-into-shell')
+            if any(value.startswith(('/dev/', '/proc/')) for value in values):
+                self.reason('source-dev' if base in ('source', '.') else 'shell-dev')  # also a body an earlier `exec 3<<E` saved
         elif base == 'set':
             self._check_set(values)
         elif base == 'find':
@@ -1439,12 +1461,43 @@ class _Lexer:
                     if SSH_OPTION_CODE.match(option):
                         self.reason('quoted-code:ssh-option')
                         return
-        elif base in ('source', '.'):
-            if any(value.startswith('/dev/') for value in values):
-                self.reason('source-dev')  # runs a body an earlier `exec 3<<E` saved
         elif base == 'export':
             if any(value.split('=', 1)[0] in STATE_VARS for value in values):
                 self.reason('state-variable')
+        if base in NAME_TAKERS:
+            self._check_names(base, args)
+
+    def _check_names(self, base, args):
+        """A builtin given a variable name: bash evaluates a subscript in the name, so a name the shell builds at run time can
+        run code (`printf -v "$v" x` with v='a[$(cmd)]', r8 L1). A literal name with code in it is subscript-code."""
+        names, i = [], 0
+        while i < len(args):
+            value = args[i].value
+            if value == '--':
+                names.extend(args[i + 1:] if base in NAME_POSITIONAL else [])
+                break
+            if value.startswith('-') and len(value) > 1 and base not in ('local', 'export'):
+                letters = value[1:]
+                at = next((p for p, letter in enumerate(letters) if letter in NAME_TAKERS[base]), -1)
+                if at >= 0:
+                    named = letters[at] in NAME_OPTIONS.get(base, '')
+                    if at + 1 < len(letters):
+                        names.extend(args[i:i + 1] if named else [])  # an attached name: `-v"$v"`
+                        i += 1
+                        continue
+                    if i + 1 < len(args) and named:
+                        names.append(args[i + 1])
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if base in NAME_POSITIONAL:
+                names.append(args[i])
+            i += 1
+        if base == 'getopts':
+            names = [word for word in args if not word.value.startswith('-')][1:2]
+        if any(re.search(r'[$`]', word.raw.split('=', 1)[0]) for word in names):
+            self.reason('dynamic-name')
 
     def _check_set(self, values):
         """`set` is certain only for -e, -u, -x, -o pipefail, their + forms, -- and positional words."""
@@ -1650,6 +1703,7 @@ LITERAL_START = r'(?:^|(?<=[\s;&|()<>{}`/!=]))=*'  # after = too: option and var
 LITERAL_STOP = r'(?=$|[\s;&|()<>`}$])'
 QUOTE_CHARACTERS = re.compile(r'''['"]''')
 LITERAL_BLANKS = re.compile(r'[ \t]+')
+EQUALS_RUN = re.compile(r'={2,}')  # LITERAL_START's =* would rescan a long run from every start (r8 L2); one = reads the same
 # English words that appear in every prose heredoc; docs/operations.md gives the measured reason they are left out.
 LITERAL_ESCAPE_NAMES = ESCAPE_NAMES - frozenset(('at', 'batch', 'screen'))
 
@@ -1660,7 +1714,7 @@ def literal_views(command):
     text = command.replace('\\\n', '')
     plain = QUOTE_CHARACTERS.sub('', text)
     views = (plain, QUOTE_CHARACTERS.sub(' ', text), plain.replace('\\', ''))
-    return tuple(dict.fromkeys(LITERAL_BLANKS.sub(' ', view) for view in views))
+    return tuple(dict.fromkeys(EQUALS_RUN.sub('=', LITERAL_BLANKS.sub(' ', view)) for view in views))
 
 
 @functools.lru_cache(maxsize=256)
@@ -1700,26 +1754,37 @@ GLOB_CHARS = re.compile(r'[*?\[]')
 def _glob_matches(name, glob):
     """A superset of the shell's reading: `*` is any run, `?` any character, and a bracket expression any one character. The
     set inside the brackets is never read, so an odd range (`[z-a]`) cannot fail, or differ between Python versions as the
-    standard glob matcher does (3.9 raises, 3.12 drops the range); reading more names as matches only widens a refusal."""
-    out, i, n = [], 0, len(glob)
-    while i < n:
+    standard glob matcher does (3.9 raises, 3.12 drops the range); reading more names as matches only widens a refusal.
+    The glob comes from the command and may be 64 KiB, so it is read once, never by a backtracking regex (r8 L2): bit i of
+    `state` says the glob read so far can match name[:i], and each glob character moves every bit at once."""
+    n = len(name)
+    full, masks = (1 << (n + 1)) - 1, {}
+    for i, ch in enumerate(name):
+        masks[ch] = masks.get(ch, 0) | 1 << i
+    closes, after = [-1] * (len(glob) + 1), -1  # closes[j]: the first ] at or after j
+    for j in range(len(glob) - 1, -1, -1):
+        if glob[j] == ']':
+            after = j
+        closes[j] = after
+    state, i, m = 1, 0, len(glob)
+    while i < m and state:
         ch = glob[i]
         if ch == '*':
-            out.append('.*')
+            state = full & ~((state & -state) - 1)  # every length from the shortest one reached so far
         elif ch == '?':
-            out.append('.')
+            state = state << 1 & full
         elif ch == '[':
             j = i + 1 + (glob[i + 1:i + 2] in ('!', '^'))
-            j = glob.find(']', j + (glob[j:j + 1] == ']'))
-            if j < 0:
-                out.append(re.escape(ch))  # no closing bracket: the shell reads a plain [
+            j += glob[j:j + 1] == ']'  # a ] first in the set is a member
+            close = closes[j] if j <= m else -1
+            if close < 0:
+                state = (state & masks.get(ch, 0)) << 1  # no closing bracket: the shell reads a plain [
             else:
-                out.append('.')
-                i = j
+                state, i = state << 1 & full, close
         else:
-            out.append(re.escape(ch))
+            state = (state & masks.get(ch, 0)) << 1
         i += 1
-    return re.match(''.join(out) + r'\Z', name, re.S) is not None
+    return bool(state >> n & 1)
 
 
 def _glob_programs(lexed):
@@ -1875,7 +1940,32 @@ def _spans(text):
     return spans
 
 
-SUDO_ARG_OPTS = frozenset(('-u', '-g', '-h', '-p', '-C', '-D', '-R', '-T', '-U', '-r', '-t'))
+# The option grammar of each wrapper the hook reads through (r8 H1): letters without an argument, letters with one (the rest of
+# the word or the next word), long names without one, long names with one (`--name=v` or `--name v`), and long names whose
+# argument is optional and only ever attached. It holds the GNU, BSD and shell builtin spellings except env's -P, -L, -U (BSD)
+# and -a (GNU), which change how the program is found or named. Anything outside it (one of those, another letter, an
+# abbreviated long name, a value of the wrong kind, an option word the shell expands) leaves the program unknown, which the
+# lexer records as `wrapper-option`.
+WRAPPER_GRAMMAR = {
+    'exec': ('cl', 'a', (), (), ()),
+    'command': ('pvV', '', (), (), ()),
+    'builtin': ('', '', (), (), ()),
+    'nohup': ('', '', (), (), ()),
+    'time': ('ahlpqvV', 'fo', ('append', 'portability', 'quiet', 'verbose'), ('format', 'output'), ()),
+    'nice': ('', 'n', (), ('adjustment',), ()),
+    'timeout': ('fpv', 'ks', ('foreground', 'preserve-status', 'verbose'), ('kill-after', 'signal'), ()),
+    'env': ('0iv', 'uC', ('debug', 'ignore-environment', 'list-signal-handling', 'null'), ('chdir', 'unset'),
+            ('block-signal', 'default-signal', 'ignore-signal')),
+    'sudo': ('ABbEeHiKklNnPSsVv', 'aCcDgpRrTtUu',
+             ('askpass', 'background', 'bell', 'edit', 'list', 'login', 'no-update', 'non-interactive', 'preserve-groups',
+              'remove-timestamp', 'reset-timestamp', 'set-home', 'shell', 'stdin', 'validate'),
+             ('auth-type', 'chdir', 'chroot', 'close-from', 'command-timeout', 'group', 'host', 'other-user', 'prompt', 'role',
+              'type', 'user'),
+             ('preserve-env',)),
+}
+INTEGER = re.compile(r'[-+]?[0-9]+')
+DURATION = re.compile(r'(?:[0-9]+\.?[0-9]*|\.[0-9]+)[smhd]?')
+NICE_LEGACY = re.compile(r'-[-+]?[0-9]+')  # nice -5, --5 (an adjustment of -5) and -+5
 
 
 def _unquote_program(text):
@@ -1893,45 +1983,92 @@ def _unquote_program(text):
     return value + text[spans[0][1]:]
 
 
-def _wrapper_step(base, values, raws, k):
-    """The index of the word a wrapper named `base` would run, where k is the index just past the wrapper: None when `base`
-    is no wrapper, and -(i + 1) when it is `env -S` at index i, whose next word is quoted code. Wrappers read: exec, command,
-    builtin, time, nohup, nice, sudo with options, timeout with options and duration, env with options."""
-    count = len(values)
-    if base in ('exec', 'command', 'builtin', 'time', 'nohup'):
-        while k < count and values[k].startswith('-'):
-            k += 2 if values[k] == '-a' else 1
-    elif base == 'nice':
-        if k < count and values[k] == '-n':
-            k += 2
-        elif k < count and (re.fullmatch(r'-[0-9]+', values[k]) or values[k].startswith('--adjustment')):
+def _wrapper_scan(base, values, raws, k, dynamic=None):
+    """(i, unknown) for a wrapper named `base` whose words start at k: i is the index of the word it runs, None when `base` is
+    no wrapper, and -(j + 1) when word j starts env's split string (`-S`, `--split-string`, a cluster holding S), whose
+    argument is quoted code. unknown is True when a word is outside WRAPPER_GRAMMAR or the shell expands it; the scan then
+    steps over that word and goes on, so the deny forms still see what follows. `dynamic[i]` is True for a word the shell
+    expands (it may become no word, several, or an option)."""
+    grammar = WRAPPER_GRAMMAR.get(base)
+    if grammar is None:
+        return None, False
+    plain, with_arg, long_plain, long_arg, long_optional = grammar
+    count, unknown = len(values), False
+
+    def expands(i):
+        return bool(dynamic is not None and i < len(dynamic) and dynamic[i])
+
+    def fits(name, value):
+        if base == 'nice':
+            return INTEGER.fullmatch(value) is not None
+        if base == 'timeout' and name in ('k', 'kill-after'):
+            return DURATION.fullmatch(value) is not None
+        return value != ''
+
+    def argument(name, attached, has_attached):
+        """The step past an option's argument and whether it fits."""
+        if has_attached:
+            return 1, fits(name, attached)
+        if k + 1 < count and not expands(k + 1):
+            return 2, fits(name, values[k + 1])
+        return 2, False
+
+    while k < count:
+        word = values[k]
+        if expands(k):
+            unknown, k = True, k + 1
+            continue
+        if word == '--':
             k += 1
-    elif base == 'sudo':
-        while k < count and values[k].startswith('-'):
-            option = values[k]
-            k += 2 if option in SUDO_ARG_OPTS else 1
-            if option == '--':
-                break
-    elif base == 'timeout':
-        while k < count and values[k].startswith('-'):
-            k += 2 if values[k] in ('-s', '-k') else 1
-        k += 1
-    elif base == 'env':
-        while k < count:
-            word = values[k]
-            if word.startswith(('-S', '--split-string')):
-                return -(k + 1)
-            if ASSIGNMENT.match(raws[k]):
-                k += 1
-            elif word in ('-u', '-C', '--unset', '--chdir'):
-                k += 2
-            elif word.startswith('-') and len(word) > 1:
-                k += 1
+            break
+        if base == 'env' and word == '-':  # the same as -i
+            k += 1
+            continue
+        if not word.startswith('-'):
+            break
+        if base == 'nice' and NICE_LEGACY.fullmatch(word):
+            k += 1
+            continue
+        if word.startswith('--'):
+            name, eq, attached = word[2:].partition('=')
+            if base == 'env' and name == 'split-string':
+                return -(k + 1), unknown
+            if name in long_plain and not eq or name in long_optional:
+                step, ok = 1, True
+            elif name in long_arg:
+                step, ok = argument(name, attached, bool(eq))
             else:
-                break
-    else:
-        return None
-    return k
+                step, ok = 1, False  # an abbreviation, --help, --version, or a name this wrapper lacks
+            unknown, k = unknown or not ok, k + step
+            continue
+        step, ok, position = 1, True, 1
+        while position < len(word):
+            letter = word[position]
+            if base == 'env' and letter == 'S':
+                return -(k + 1), unknown
+            if letter in plain:
+                position += 1
+                continue
+            if letter in with_arg:
+                step, ok = argument(letter, word[position + 1:], position + 1 < len(word))
+            else:
+                ok = False  # BSD env -P/-L/-U, GNU env -a, a bare sudo -h, or a letter no spelling has
+            break
+        unknown, k = unknown or not ok, k + step
+    if base == 'timeout':
+        if k < count and not expands(k) and DURATION.fullmatch(values[k]):
+            k += 1
+        else:
+            unknown, k = True, k + 1
+    elif base == 'env':
+        while k < count and ASSIGNMENT.match(raws[k]):
+            k += 1
+    return k, unknown
+
+
+def _wrapper_step(base, values, raws, k):
+    """_wrapper_scan's index alone: the word the wrapper runs, read best effort past anything unknown."""
+    return _wrapper_scan(base, values, raws, k)[0]
 
 
 def peel_wrapper(text):
@@ -2012,7 +2149,7 @@ def _bare_forms(form):
         return []
     values = [word[1] for word in words]
     found = [' '.join(values)]
-    if '/' in values[0] and not words[0][2]:
+    if '/' in values[0]:  # an expanded directory too (`~/../../bin/rm`, r8 M2): these forms only widen a deny or an ask
         found.append(' '.join([values[0].rsplit('/', 1)[-1]] + values[1:]))
     return found
 
@@ -2173,26 +2310,16 @@ def _classify_words(words, reasons, notes, depth):
             return
         name = words[index].rsplit('/', 1)[-1]
         rest = words[index + 1:]
-        if name in ('command', 'exec', 'builtin', 'time', 'sudo', 'then', 'do', 'else', 'if', 'while', '!', '{'):
+        if name in ('then', 'do', 'else', 'if', 'while', '!', '{'):
             index += 1
-            while index < len(words) and words[index].startswith('-') and name in ('command', 'exec', 'time', 'sudo'):
-                index += 2 if name == 'sudo' and words[index] in SUDO_ARG_OPTS else 1
             continue
-        if name == 'nice':
-            index += 1
-            if index < len(words) and words[index] == '-n':
-                index += 2
-            elif index < len(words) and re.fullmatch(r'-\d+', words[index]):
-                index += 1
-            continue
-        if name == 'timeout':
-            notes.append('pgid-split')
-            index += 1
-            while index < len(words) and words[index].startswith('-'):
-                index += 2 if words[index] in ('-s', '-k', '--signal', '--kill-after') else 1
-            index += 1  # the duration
+        if name in WRAPPER_GRAMMAR and name not in ('env', 'nohup'):  # nohup is an escape itself; env also names attribution
+            if name == 'timeout':
+                notes.append('pgid-split')
+            index = _wrapper_scan(name, words, words, index + 1)[0]  # the lexer's grammar, so both read the same program
             continue
         if name == 'env':
+            start = index + 1
             index += 1
             while index < len(words):
                 word = words[index]
@@ -2227,6 +2354,8 @@ def _classify_words(words, reasons, notes, depth):
                     index += 2 if takes_next else 1
                 else:
                     break
+            scanned = _wrapper_scan('env', words, words, start)[0]
+            index = scanned if scanned >= 0 else index  # past a split string the loop above already read it
             continue
         break
     else:

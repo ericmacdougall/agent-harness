@@ -2633,7 +2633,7 @@
 "rewritten": "none",
 "shape": "/bin/bash /dev/fd/3 3<<'E'\n%s\nE",
 "unstable": [],
-"verdict": "certain"
+"verdict": "uncertain"
 },
 {
 "deny": true,
@@ -5447,6 +5447,260 @@
 "shape": "ssh -F ./ssh_config dev2 ls",
 "unstable": [],
 "verdict": "certain"
+},
+{
+"deny": true,
+"group": "r7-H1",
+"kind": "hidden",
+"name": "nice-attached",
+"ran": [],
+"rewritten": "none",
+"shape": "nice -n5 %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r7-H1",
+"kind": "hidden",
+"name": "nice-long-space",
+"ran": [],
+"rewritten": "none",
+"shape": "nice --adjustment 5 %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r7-H1",
+"kind": "hidden",
+"name": "nice-long-equals",
+"ran": [],
+"rewritten": "none",
+"shape": "nice --adjustment=5 %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r7-H1",
+"kind": "hidden",
+"name": "nice-double-dash-number",
+"ran": [],
+"rewritten": "none",
+"shape": "nice --10 %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r7-H1",
+"kind": "hidden",
+"name": "timeout-long-signal",
+"ran": [],
+"rewritten": "none",
+"shape": "timeout --signal KILL 5 %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r7-H1",
+"kind": "hidden",
+"name": "timeout-long-kill-after",
+"ran": [],
+"rewritten": "none",
+"shape": "timeout --kill-after 1 5 %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r7-H1",
+"kind": "hidden",
+"name": "env-cluster-split",
+"ran": [],
+"rewritten": "none",
+"shape": "env -vS '%s'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r7-H1",
+"kind": "hidden",
+"name": "env-bsd-path",
+"ran": [],
+"rewritten": "none",
+"shape": "env -P /bin %s",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r7-H1",
+"kind": "hidden",
+"name": "exec-cluster-name",
+"ran": [],
+"rewritten": "none",
+"shape": "exec -la x %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r7-H1",
+"kind": "hidden",
+"name": "time-output",
+"ran": [],
+"rewritten": "none",
+"shape": "time -o /dev/null %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r7-H1",
+"kind": "hidden",
+"name": "nice-attached-nohup",
+"ran": [],
+"rewritten": "none",
+"shape": "nice -n5 nohup %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r7-H1",
+"kind": "hidden",
+"name": "nice-attached-bash-heredoc",
+"ran": [],
+"rewritten": "none",
+"shape": "nice -n5 bash <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r7-H1",
+"kind": "hidden",
+"live": false,
+"name": "sudo-cluster",
+"ran": [],
+"rewritten": "none",
+"shape": "sudo -Eu root %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r7-M1",
+"kind": "hidden",
+"name": "source-procsub",
+"ran": [],
+"rewritten": "none",
+"shape": "source <(echo %s)",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r7-M1",
+"kind": "hidden",
+"name": "dot-procsub",
+"ran": [],
+"rewritten": "none",
+"shape": ". <(echo %s)",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r7-M1",
+"kind": "hidden",
+"name": "source-proc-fd-here-string",
+"ran": [],
+"rewritten": "none",
+"shape": "source /proc/self/fd/0 <<< '%s'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r7-M1",
+"kind": "hidden",
+"name": "dot-proc-fd-pipe",
+"ran": [],
+"rewritten": "none",
+"shape": "echo '%s' | . /proc/self/fd/0",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r7-M1",
+"kind": "hidden",
+"name": "dot-dev-stdin-pipe",
+"ran": [],
+"rewritten": "none",
+"shape": "echo '%s' | . /dev/stdin",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r7-M2",
+"kind": "hidden",
+"name": "tilde-dotdot-program",
+"ran": [],
+"rewritten": "none",
+"shape": "~/../../../../../../../../bin/%s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r7-L1",
+"kind": "hidden",
+"name": "arith-variable",
+"ran": [],
+"rewritten": "none",
+"shape": "p='$('; t=\"a[${p}%s >&3)]\"; { echo $((t)); } 3>&1",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r7-L1",
+"kind": "hidden",
+"name": "printf-dynamic-name",
+"ran": [],
+"rewritten": "none",
+"shape": "p='$('; v=\"a[${p}%s >&3)]\"; { printf -v \"$v\" x; } 3>&1",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r7-M1",
+"kind": "hidden",
+"name": "dot-proc-fd-heredoc",
+"ran": [],
+"rewritten": "none",
+"shape": ". /proc/self/fd/3 3<<'E'\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r7-M1",
+"kind": "hidden",
+"name": "bash-proc-fd-heredoc",
+"ran": [],
+"rewritten": "none",
+"shape": "bash /proc/self/fd/3 3<<'E'\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
 }
 ]
 }

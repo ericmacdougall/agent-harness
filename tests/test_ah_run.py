@@ -1776,7 +1776,7 @@ class DifferentialVerdicts(HookFixture):
     RULE = Differential.RULE
     GROUPS = ('r1-B1', 'r2-B4', 'r3-B6', 'r4-B10', 'r4-B11', 'r4-S15', 'r5-B12', 'r5-B13', 'r5-B14', 'r5-S22', 'r5-S23',
               'r6-B15', 'r6-B16', 'r6-B17', 'r6-B18', 'r6-B19', 'r6-B20', 'r6-B21', 'r6-B22', 'r6-host', 'r6-wrapper', 'r6-path',
-              'r6-state', 'r6-limit', 'r6-N22')
+              'r6-state', 'r6-limit', 'r6-N22', 'r7-H1', 'r7-M1', 'r7-M2', 'r7-L1')
 
     def setUp(self):
         super().setUp()
@@ -1794,7 +1794,7 @@ class DifferentialVerdicts(HookFixture):
 
     def test_the_table_covers_every_round_and_can_fail(self):
         rows = self.TABLE['rows']
-        self.assertGreaterEqual(len(rows), 330)
+        self.assertGreaterEqual(len(rows), 390)
         groups = {row['group'] for row in rows}
         for group in self.GROUPS:
             self.assertIn(group, groups)
@@ -1859,7 +1859,8 @@ class LexerReasons(HookFixture):
         'heredoc-opener': 'cat <<E.F\nE.F', 'heredoc-body': 'cat <<E\n$(date)\nE', 'heredoc-unterminated': 'cat <<E\nb',
         'heredoc-with-group': 'echo $(date); cat <<E\nb\nE', 'nesting': 'echo ' + '$(' * 20 + 'true' + ')' * 20,
         'subscript-code': "x='a[$(true)]'", 'state-variable': 'PS4=x true', 'dynamic-program-word': '$x a', 'set-option': 'set -o vi',
-        'find-exec': 'find . -exec true {} +', 'git-alias': 'git -c alias.x=y x', 'source-dev': '. /dev/stdin', 'exec-redirect': 'exec 3>f',
+        'find-exec': 'find . -exec true {} +', 'git-alias': 'git -c alias.x=y x', 'source-dev': '. /dev/stdin', 'exec-redirect': 'exec 3>f', 'shell-dev': 'bash /dev/fd/3',
+        'wrapper-option': 'nice --adj=5 true', 'dynamic-name': 'printf -v "$v" x', 'arith-variable': 'echo $((t))',
         'amp-redirect-words': 'true &>f x', 'ansi-c': "echo $'\\c'", 'pipe-into-shell': 'echo x | bash', 'shell-dynamic-arg': 'bash $x',
         'quoted-code:shell-c': "bash -c 'true'", 'quoted-code:shell-here-string': 'bash <<<x', 'quoted-code:env-S': "env -S 'true'",
         'wrapper-depth': 'nice ' * 13 + 'true',
@@ -1930,6 +1931,15 @@ class LexerReasons(HookFixture):
         self.assertGreater(len(seen), 1999, 'vacuous: no body line was read')
         self.assertLess(len(seen), 20000)
         self.assertLessEqual({'heredoc-body', 'heredoc-unterminated'}, set(ah_run.parse_command('cat <<A\n$(x)\nA\n<<B\nrm y').reasons))
+
+    def test_quoted_unterminated_bodies_are_read_once(self):
+        """r8 L3: the counter above sees only unquoted bodies. This one counts every line the body reader reads, so quoted
+        openers are bounded too: 3000 of them rescanned would be about 4.5 million lines."""
+        for opener in ("<<'E'\n", '<<"E"\n', '<<\\E\n', "<<-'E'\n", '<<E\n'):
+            lexer = ah_run._Lexer(opener * 3000).run()
+            self.assertIn('heredoc-unterminated', lexer.reasons, opener)
+            self.assertGreater(lexer.body_lines, 2998, 'vacuous: %r read no body' % opener)
+            self.assertLess(lexer.body_lines, 20000, opener)
 
 
 class R6Shapes(HookFixture):
@@ -2152,6 +2162,174 @@ class HookDeadline(HookFixture):
         with mock.patch.object(ah_run._Deadline, 'arm', lambda deadline, seconds: False):
             result, took = self.run_hook('bypassPermissions', 0.5)
         self.assertEqual(result, {'marker': 'decided'}); self.assertGreaterEqual(took, 0.5)
+
+
+    def test_cpu_bound_work_is_cut_off(self):
+        """r8 L3: the limit stops work that spins the CPU through many regex calls, not only a sleep. One C-level regex call
+        cannot be interrupted, which is why decide avoids regexes that backtrack over the text (LinearCost)."""
+        pattern = re.compile(r'(a|b)*c')
+
+        def busy(payload, **kwargs):
+            subject, stop = 'ab' * 2000, time.monotonic() + 5
+            while time.monotonic() < stop:
+                pattern.search(subject)
+            return {'marker': 'decided'}
+        out = io.StringIO()
+        with mock.patch.object(ah_run, 'HOOK_DEADLINE', 0.3), mock.patch.object(ah_run, 'decide', busy):
+            started = time.monotonic()
+            ah_run.hook_main(io.StringIO(json.dumps(self.payload('echo hi', permission_mode='bypassPermissions'))), out)
+        took = time.monotonic() - started
+        self.assertEqual(json.loads(out.getvalue())['hookSpecificOutput']['permissionDecision'], 'deny')
+        self.assertLess(took, 3)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+
+
+class WrapperGrammar(HookFixture):
+    """r8 H1: which word a wrapper runs is read by one strict grammar (WRAPPER_GRAMMAR) in the lexer, the deny forms and the
+    escape classifier. A spelling outside it is uncertain (`wrapper-option`); a spelling inside it is certain and the program
+    behind it is the one checked."""
+    REVIEWED = ('nice -n5 %s', 'nice --adjustment 5 %s', 'nice --adjustment=5 %s', 'nice --10 %s', 'nice -10 %s',
+                'timeout --signal KILL 5 %s', 'timeout --kill-after 1 5 %s', 'timeout -sKILL 5 %s', 'timeout -k1 -s9 5 %s',
+                "env -vS '%s'", 'env -P /bin %s', 'exec -la x %s', 'time -o f %s', 'command -pv %s', 'nice -n 5 nohup %s',
+                'nice 5 %s', 'nice --adj=5 %s', 'timeout 5x %s', 'nice -n $N %s', 'env -i A=1 -u B %s', 'env -a x %s', 'sudo -Eu root %s',
+                'nice -n5 timeout --signal KILL 5 env -u X %s', 'builtin -x %s', 'nohup -x %s', 'exec -x %s')
+    UNCERTAIN = ("env -vS '%s'", 'env -P /bin %s', 'nice 5 %s', 'nice --adj=5 %s', 'timeout 5x %s', 'nice -n $N %s', 'env -i A=1 -u B %s',
+                 'env -a x %s', 'builtin -x %s', 'nohup -x %s', 'exec -x %s')
+    SCAN = (  # (words, index of the program, unknown)
+        ('nice -n5 rm', 2, False), ('nice -n 5 rm', 3, False), ('nice --adjustment=5 rm', 2, False), ('nice --adjustment 5 rm', 3, False),
+        ('nice --10 rm', 2, False), ('nice -+5 rm', 2, False), ('nice -n x rm', 3, True), ('nice -n', 3, True),
+        ('timeout 5 rm', 2, False), ('timeout -s KILL -k 1s 2.5m rm', 6, False), ('timeout --foreground --kill-after=1 5 rm', 4, False),
+        ('timeout -fvsKILL 5 rm', 3, False), ('timeout --sig=KILL 5 rm', 3, True), ('env -iu X -C/tmp A=1 B=2 rm', 6, False),
+        ('env -- A=1 rm', 3, False), ('env - rm', 2, False), ('exec -cl -a n rm', 4, False), ('exec -lan rm', 2, False),
+        ('command -pVv rm', 2, False), ('command -x rm', 2, True), ('time -p rm', 2, False), ('time -f %e -o f rm', 5, False),
+        ('time --format=%e rm', 2, False), ('sudo -Eu root -g wheel rm', 5, False), ('sudo -h rm', 2, True), ('sudo --user=root rm', 2, False),
+        ('sudo --preserve-env=PATH rm', 2, False), ('sudo -- rm', 2, False), ('nohup -- rm', 2, False), ('builtin rm', 1, False),
+    )
+
+    ALLOWS = ['Bash(nice:*)', 'Bash(timeout:*)', 'Bash(env:*)', 'Bash(exec:*)', 'Bash(time:*)', 'Bash(command:*)', 'Bash(sudo:*)', 'Bash(*)']
+
+    def test_each_reviewed_spelling_is_denied_and_never_allowed(self):
+        for shape in self.REVIEWED:
+            command = shape % 'rm -rf /tmp/zz'
+            self.settings('user', deny=['Bash(rm:*)'], allow=self.ALLOWS)  # the review's case: an allow on the wrapper too
+            for mode in ('bypassPermissions', 'default', 'dontAsk', 'acceptEdits'):
+                self.assertEqual(self.decide(command, permission_mode=mode).get('permissionDecision'), 'deny', (shape, mode))
+            self.settings('user', allow=self.ALLOWS)
+            self.assertNotEqual(self.decide(command.replace('rm -rf /tmp/zz', 'true')).get('permissionDecision') if shape in self.UNCERTAIN else None, 'allow', shape)
+
+    def test_outside_the_grammar_is_uncertain_inside_is_certain(self):
+        for shape in self.REVIEWED:
+            command = shape % 'echo hi'
+            reasons = ah_run.parse_command(command).reasons
+            if shape in self.UNCERTAIN:
+                self.assertTrue(set(reasons) & {'wrapper-option', 'quoted-code:env-S'}, (shape, reasons))
+            elif 'sudo' not in shape:
+                self.assertEqual(reasons, [], shape)
+        for command, reasons in (('exec "$@"', ['dynamic-program-word']), ('command "$c" x', ['dynamic-program-word']),
+                                 ('nice -n "$N" make', ['wrapper-option']), ('nice -x "$c"', ['dynamic-program-word', 'wrapper-option'])):
+            self.assertEqual(ah_run.parse_command(command).reasons, reasons, command)  # an expanded program is named as such
+
+    def test_the_scan_table(self):
+        for words, index, unknown in self.SCAN:
+            values = words.split(' ')
+            self.assertEqual(ah_run._wrapper_scan(values[0], values, values, 1), (index, unknown), words)
+        self.assertEqual(ah_run._wrapper_scan('env', ['env', '-vS', 'x'], ['env', '-vS', 'x'], 1)[0], -2)
+        self.assertEqual(ah_run._wrapper_scan('env', ['env', '-uS', 'x'], ['env', '-uS', 'x'], 1), (2, False))  # unsets S
+        self.assertEqual(ah_run._wrapper_scan('ls', ['ls'], ['ls'], 1), (None, False))
+
+    def test_escapes_and_code_hosts_behind_any_spelling(self):
+        for shape in ('nice -n5 %s', 'sudo -Eu root %s', 'timeout --signal KILL 5 %s', 'exec -la x %s', 'command -p %s', 'time -o f %s'):
+            self.assertTrue(any('nohup' in reason for reason in ah_run.classify_escapes(shape % 'nohup sleep 1')), shape)
+            self.assertTrue(any('setsid' in reason for reason in ah_run.classify_escapes(shape % 'setsid sleep 1')), shape)
+        self.settings('user', deny=['Bash(rm:*)'])
+        for command in ("nice -n5 bash <<'E'\nrm x\nE", 'timeout --kill-after 1 5 bash -c "rm x"', "nice --10 sh -c 'rm x'"):
+            self.assertEqual(self.decide(command, permission_mode='bypassPermissions').get('permissionDecision'), 'deny', command)
+
+    def test_control_the_old_peel_reads_the_option_as_the_program(self):
+        """66f21b8's exec reading: every word starting with - is one option, except -a with its name. `-la x` then leaves x as
+        the program, which is certain and matches no rule."""
+        def old_scan(base, values, raws, k, dynamic=None):
+            if base != 'exec':
+                return None, False
+            while k < len(values) and values[k].startswith('-'):
+                k += 2 if values[k] == '-a' else 1
+            return k, False
+        self.settings('user', deny=['Bash(rm:*)'])
+        ah_run.match_candidates.cache_clear(); self.addCleanup(ah_run.match_candidates.cache_clear)  # forms read under the old scan
+        with mock.patch.object(ah_run, '_wrapper_scan', old_scan):
+            self.assertIsNone(self.decide('exec -la x rm -rf /tmp/zz', permission_mode='bypassPermissions').get('permissionDecision'))
+        ah_run.match_candidates.cache_clear()
+        self.assertEqual(self.decide('exec -la x rm -rf /tmp/zz', permission_mode='bypassPermissions').get('permissionDecision'), 'deny')
+
+
+class SourceInput(HookFixture):
+    """r8 M1: source and . read their script the way a shell does, so they get the shell's checks: a here-string, stdin from a
+    pipe, a word built at run time (`<(cmd)`), and descriptor paths (/dev/fd/N, /dev/stdin, /proc/self/fd/N)."""
+    SHAPES = ("source <(echo '%s')", ". <(echo '%s')", "source /proc/self/fd/0 <<< '%s'", "echo '%s' | . /proc/self/fd/0",
+              "echo '%s' | . /dev/stdin", "source /dev/fd/0 <<< '%s'", "echo '%s' | source /dev/stdin", 'source "$f"',
+              ". /proc/self/fd/3 3<<'E'\n%s\nE", "bash /proc/self/fd/3 3<<'E'\n%s\nE", "zsh /dev/fd/3 3<<'E'\n%s\nE",
+              "bash /dev/fd/3 3< <(echo '%s')", "bash /proc/self/fd/0 <<< '%s'")
+
+    def test_each_is_uncertain_and_the_deny_holds(self):
+        self.settings('user', deny=['Bash(rm:*)'])
+        for shape in self.SHAPES:
+            command = shape.replace('%s', 'rm -rf /tmp/zz')
+            self.assertTrue(ah_run.parse_command(command).uncertain, shape)
+            if 'rm' in command:
+                self.assertEqual(self.decide(command, permission_mode='bypassPermissions').get('permissionDecision'), 'deny', shape)
+
+    def test_a_plain_file_stays_certain(self):
+        for command in ('source .venv/bin/activate', 'source ~/.zshrc', '. ./env.sh', 'bash script.sh'):
+            self.assertEqual(ah_run.parse_command(command).reasons, [], command)
+
+
+class TildeProgram(HookFixture):
+    """r8 M2: a program named through ~ is checked by its basename too, as /bin/rm is."""
+
+    def test_tilde_paths_are_denied(self):
+        self.settings('user', deny=['Bash(rm:*)'])
+        for command in ('~/../../../bin/rm -rf /tmp/zz', '~root/../bin/rm x', '~/bin/rm x', '/bin/rm x'):
+            for mode in ('bypassPermissions', 'default'):
+                self.assertEqual(self.decide(command, permission_mode=mode).get('permissionDecision'), 'deny', (command, mode))
+        self.assertIn('rm -rf x', ah_run.match_candidates('~/../bin/rm -rf x'))
+
+
+class VariableCode(HookFixture):
+    """r8 L1: text the shell evaluates as code through a variable is uncertain: arithmetic that names a variable, and a builtin
+    given a variable name built at run time (bash evaluates a subscript in either)."""
+
+    def test_uncertain(self):
+        for command in ('p=\'$(\'; t="a[${p}echo M >&2)]"; echo $((t))', 'echo $((n+1))', 'echo "$(( x * 2 ))"', 'printf -v "$v" x',
+                        'printf -v"$v" x', 'read "$v"', 'read -a "$v"', 'unset -v "$v"', '[ -v "$v" ]', 'test -v "$v"', 'export "$v"=1',
+                        'local "$v"', 'wait -p "$v"', 'getopts ab "$v"'):
+            self.assertTrue(ah_run.parse_command(command).uncertain, command)
+
+    def test_certain(self):
+        for command in ('echo $((1+2))', 'printf "%s\\n" "$x"', 'printf -v name x', 'read -rp "P $x" var', '[ -n "$x" ]', 'export FOO="$x"',
+                        'local -r x="$1"', 'unset FOO', 'getopts "ab:" opt'):
+            self.assertEqual(ah_run.parse_command(command).reasons, [], command)
+
+
+class LinearCost(HookFixture):
+    """r8 L2: the literal rule and the glob reader never backtrack over the text. A regex that backtracks cannot be
+    stopped by the hook's limit in the middle of one call, so these are bounded by construction."""
+    GLOBS = (('touch', 'tou?h', True), ('touch', '*', True), ('touch', 't*h', True), ('touch', '*z*', False), ('touch', '[a-z]ouch', True),
+             ('touch', '[!x]ouch', True), ('touch', '[]ouch', False), ('touch', '[]]ouch', True), ('t]ouch', '[]]]ouch', True), ('t]ouch', 'x[]]]ouch', False),
+             ('touch', 'tou[', False), ('tou[', 'tou[', True), ('touch', '[z-a]ouch', True), ('touch', 'touch?', False), ('', '*', True),
+             ('', '', True), ('a', '', False), ('touch', '**t***o*u*c*h**', True))
+
+    def test_the_glob_reader_agrees_with_its_table(self):
+        for name, glob, matches in self.GLOBS:
+            self.assertEqual(ah_run._glob_matches(name, glob), matches, (name, glob))
+
+    def test_reviewed_inputs_decide_quickly(self):
+        self.settings('user', deny=['Bash(touch:*)'])
+        for command in ('=' * 65000, '*' * 121 + 'Z x', '*a' * 60 + 'b x', '[' * 64000 + ' x', 'x ' + '=' * 64000 + 'touch'):
+            started = time.monotonic()
+            with mock.patch.object(ah_run, 'HOOK_DEADLINE', 60):
+                self.decide(command, permission_mode='bypassPermissions')
+            self.assertLess(time.monotonic() - started, 2.5, command[:12])
+        self.assertTrue(ah_run.literal_match('touch:*', ah_run.literal_views('x ' + '=' * 64000 + 'touch')))
 
 
 class LauncherShell(unittest.TestCase):

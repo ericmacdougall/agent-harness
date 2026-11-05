@@ -150,6 +150,31 @@ NEW_ROWS = [  # (group, name, shape, kind); kind `limit` names what the hook doe
     ('r6-N22', 'session-type-none', 'ssh -o SessionType=none dev2', 'limit'),
     ('r6-N22', 'session-type-subsystem', 'ssh -o SessionType=subsystem dev2 sftp', 'limit'),
     ('r6-N22', 'config-file-proxy', 'ssh -F ./ssh_config dev2 ls', 'limit'),
+    # r7 review (Opus max, round 2): wrapper spellings the old peel misread (H1), source and . reading a descriptor or a
+    # substitution (M1), a program named through ~ (M2), and code a variable carries into arithmetic or a name (L1)
+    ('r7-H1', 'nice-attached', 'nice -n5 %s', 'hidden'),
+    ('r7-H1', 'nice-long-space', 'nice --adjustment 5 %s', 'hidden'),
+    ('r7-H1', 'nice-long-equals', 'nice --adjustment=5 %s', 'hidden'),
+    ('r7-H1', 'nice-double-dash-number', 'nice --10 %s', 'hidden'),
+    ('r7-H1', 'timeout-long-signal', 'timeout --signal KILL 5 %s', 'hidden'),
+    ('r7-H1', 'timeout-long-kill-after', 'timeout --kill-after 1 5 %s', 'hidden'),
+    ('r7-H1', 'env-cluster-split', "env -vS '%s'", 'hidden'),
+    ('r7-H1', 'env-bsd-path', 'env -P /bin %s', 'hidden'),
+    ('r7-H1', 'exec-cluster-name', 'exec -la x %s', 'hidden'),
+    ('r7-H1', 'time-output', 'time -o /dev/null %s', 'hidden'),
+    ('r7-H1', 'nice-attached-nohup', 'nice -n5 nohup %s', 'hidden'),
+    ('r7-H1', 'nice-attached-bash-heredoc', "nice -n5 bash <<'E'\n%s\nE", 'hidden'),
+    ('r7-H1', 'sudo-cluster', 'sudo -Eu root %s', 'hidden'),
+    ('r7-M1', 'source-procsub', 'source <(echo %s)', 'hidden'),
+    ('r7-M1', 'dot-procsub', '. <(echo %s)', 'hidden'),
+    ('r7-M1', 'source-proc-fd-here-string', "source /proc/self/fd/0 <<< '%s'", 'hidden'),
+    ('r7-M1', 'dot-proc-fd-pipe', "echo '%s' | . /proc/self/fd/0", 'hidden'),
+    ('r7-M1', 'dot-dev-stdin-pipe', "echo '%s' | . /dev/stdin", 'hidden'),
+    ('r7-M1', 'dot-proc-fd-heredoc', ". /proc/self/fd/3 3<<'E'\n%s\nE", 'hidden'),
+    ('r7-M1', 'bash-proc-fd-heredoc', "bash /proc/self/fd/3 3<<'E'\n%s\nE", 'hidden'),
+    ('r7-M2', 'tilde-dotdot-program', '~/../../../../../../../../bin/%s', 'hidden'),
+    ('r7-L1', 'arith-variable', 'p=\'$(\'; t="a[${p}%s >&3)]"; { echo $((t)); } 3>&1', 'hidden'),
+    ('r7-L1', 'printf-dynamic-name', 'p=\'$(\'; v="a[${p}%s >&3)]"; { printf -v "$v" x; } 3>&1', 'hidden'),
 ]
 RULE = 'Bash(echo HIDDEN-LINE:*)'
 SSH_STUB = '#!/bin/sh\n[ "$1" = "-G" ] && { for last; do :; done; printf "hostname %s\\nport 22\\n" "$last"; exit 0; }\ncat\n'
