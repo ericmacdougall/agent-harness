@@ -28,7 +28,11 @@ const Usage = `usage: harness tickets <command> [options]
   status [--agent-snippet]
   writers [--show w_...]
   rebuild
-  export [--format md|json] [--out PATH]
+  export [--format md|json|goodqa-import] [--out PATH] [--since-bound] [--redact-secrets]
+  sync-state
+  bind --project UUID --receipt FILE
+  trust-writer w_... --reviewed DIGEST
+  block-writer w_...
 common: --json (reads and writes), --slug S (select a repo-less ledger outside a repository),
         --redact-secrets (mask secret-shaped text instead of refusing), --actor-label L
 exit codes: 0 ok, 2 usage/validation, 3 refused/not found/ambiguous, 6 ledger busy`
@@ -139,7 +143,15 @@ func run(cmd string, args []string, env Env) error {
 		return cmdRebuild(args, env)
 	case "export":
 		return cmdExport(args, env)
-	case "trust-writer", "block-writer", "travel", "fetch", "push", "sync", "bind", "import":
+	case "sync-state":
+		return cmdSyncState(args, env)
+	case "bind":
+		return cmdBind(args, env)
+	case "trust-writer":
+		return cmdTrustWriter(args, env)
+	case "block-writer":
+		return cmdBlockWriter(args, env)
+	case "fetch", "push", "sync", "import":
 		return usagef("%s is not part of Phase 0a (local-only ledger)", cmd)
 	}
 	return usagef("unknown command %q", cmd)
@@ -731,8 +743,23 @@ func cmdWriters(args []string, env Env) error {
 				{K: "claimed_actor", V: term.Line(x.Actor)}, {K: "ticket", V: x.Ticket}, {K: "preview", V: term.Line(x.Title)}})
 			fmt.Fprintf(&b, "  %s %s claimed: %s %s %s\n", when(x.WallMs), x.Kind, term.Line(x.Actor), x.Ticket, term.Line(x.Title))
 		}
-		emit(env, p.has("json"), op.Obj{{K: "writer", V: w}, {K: "class", V: info.Class}, {K: "ops", V: info.Ops},
-			{K: "rejected", V: term.Line(info.Rejected)}, {K: "pending", V: rows}}, b.String())
+		review := op.Obj{}
+		if ops, digest, _, rerr := l.WriterReview(w); rerr == nil {
+			texts := []string{}
+			for _, o := range ops {
+				t := string(o.Raw)
+				if len(t) > 2048 {
+					t = t[:2048] + "..."
+				}
+				texts = append(texts, s(t))
+				fmt.Fprintf(&b, "  op %s\n", s(term.Line(t)))
+			}
+			fmt.Fprintf(&b, "review digest %s (covers all %d ops above; trust-writer %s --reviewed DIGEST)\n", digest, len(ops), w)
+			review = op.Obj{{K: "review_digest", V: digest}, {K: "ops_text", V: texts}}
+		}
+		doc := op.Obj{{K: "writer", V: w}, {K: "class", V: info.Class}, {K: "ops", V: info.Ops},
+			{K: "rejected", V: term.Line(info.Rejected)}, {K: "pending", V: rows}}
+		emit(env, p.has("json"), append(doc, review...), b.String())
 		return nil
 	}
 	ws := []op.Obj{}
@@ -766,26 +793,36 @@ func cmdRebuild(args []string, env Env) error {
 }
 
 func cmdExport(args []string, env Env) error {
-	p, err := parseArgs(args, merge(spec{"format": true, "out": true}))
+	p, err := parseArgs(args, merge(spec{"format": true, "out": true, "since-bound": false}))
 	if err != nil {
 		return err
 	}
 	format := orDefault(p.get("format"), "md")
-	if format != "md" && format != "json" {
-		return usagef("--format must be md or json")
+	if format != "md" && format != "json" && format != "goodqa-import" {
+		return usagef("--format must be md, json or goodqa-import")
+	}
+	if p.has("since-bound") && format != "goodqa-import" {
+		return usagef("--since-bound applies to --format goodqa-import")
 	}
 	l, err := open(p, env)
 	if err != nil {
 		return err
 	}
 	defer l.Close()
-	v, err := nowView(l)
-	if err != nil {
-		return err
-	}
-	body := exportMarkdown(v)
-	if format == "json" {
-		body = exportJSON(v)
+	var body string
+	if format == "goodqa-import" {
+		if body, err = exportImport(p, env, l); err != nil {
+			return err
+		}
+	} else {
+		v, err := nowView(l)
+		if err != nil {
+			return err
+		}
+		body = exportMarkdown(v)
+		if format == "json" {
+			body = exportJSON(v)
+		}
 	}
 	if !p.has("out") {
 		_, err := io.WriteString(env.Stdout, body)
