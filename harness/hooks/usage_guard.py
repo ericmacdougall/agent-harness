@@ -36,11 +36,16 @@ MAX_MANIFEST = 32768
 MAX_FILE = 2 * 1024 * 1024
 LOCK_SECONDS = 2
 # A dead owner is reconciled automatically only after its own timeout plus this grace (seconds).
+# AGENT_HARNESS_DEADLINE_GRACE (0..3600) shortens it for live tests; death is still required.
 DEADLINE_GRACE = 60
 # Attempts that never launched a provider do not spend the two-launch repeat budget, but they are
-# bounded so an infrastructure refusal cannot turn into an unbounded retry loop.
+# bounded (ZERO_LAUNCH_CAP per rolling ZERO_LAUNCH_WINDOW seconds, MAX_ATTEMPTS slots in all) so
+# an infrastructure refusal cannot turn into an unbounded retry loop or lock a fingerprint forever.
 ZERO_LAUNCH_CAP = 6
-MAX_ATTEMPTS = 2 + ZERO_LAUNCH_CAP
+ZERO_LAUNCH_WINDOW = 3600
+ZERO_LAUNCH_REASONS = {'TRANSIENT_INFRA', 'LOW_DISK', 'QUOTA', 'AUTH'}
+MAX_ATTEMPTS = 32
+PID_MAX = 2 ** 31 - 1
 AUTO_ACTOR = 'usage_guard.auto'
 RECONCILIATION_KINDS = {'manual_reconciliation', 'automatic_reconciliation'}
 EXECUTIONS = {'NOT_STARTED', 'RUNNING', 'COMPLETED', 'INTERRUPTED', 'UNKNOWN'}
@@ -146,6 +151,34 @@ def now_utc():
     return datetime.now(timezone.utc)
 
 
+def deadline_grace():
+    raw = os.environ.get('AGENT_HARNESS_DEADLINE_GRACE')
+    if raw is None: return DEADLINE_GRACE
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEADLINE_GRACE
+    return value if 0 <= value <= 3600 else DEADLINE_GRACE
+
+
+def valid_pid(value):
+    return type(value) is int and 1 <= value <= PID_MAX
+
+
+def pid_exists(pid):
+    """True/False when the kernel answers, None when it cannot be asked safely."""
+    if not valid_pid(pid): return None
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def host_identity():
     return socket.gethostname()[:255]
 
@@ -173,12 +206,36 @@ def process_start_token(pid):
     except (OSError, IndexError, ValueError):
         pass
     try:
-        probe = subprocess.run(['ps', '-p', str(pid), '-o', 'lstart='], capture_output=True, text=True, timeout=5)
+        # Pin the zone and locale: ps prints the start time as local text, which must not vary
+        # between the process that recorded the token and the one that checks it.
+        probe = subprocess.run(['ps', '-p', str(pid), '-o', 'lstart='], capture_output=True, text=True, timeout=5,
+                               env={**os.environ, 'TZ': 'UTC', 'LC_ALL': 'C', 'LANG': 'C'})
         if probe.returncode == 0 and probe.stdout.strip():
             return 'ps:' + ' '.join(probe.stdout.split())[:64]
     except (OSError, subprocess.SubprocessError, ValueError):
         pass
     return None
+
+
+def incarnation_state(pid, recorded_token, recorded_boot, current_boot):
+    """DEAD, ALIVE or UNCERTAIN for one recorded (pid, start token) on this host."""
+    if isinstance(recorded_boot, str) and isinstance(current_boot, str) and recorded_boot != current_boot:
+        return 'DEAD', 'host rebooted since the reservation'
+    if isinstance(recorded_boot, str) and current_boot is None:
+        return 'UNCERTAIN', 'boot identity unavailable'
+    exists = pid_exists(pid)
+    if exists is None:
+        return 'UNCERTAIN', 'pid probe failed'
+    if not exists:
+        return 'DEAD', 'pid gone'
+    current = process_start_token(pid)
+    if not isinstance(recorded_token, str) or current is None:
+        return 'UNCERTAIN', 'process start time unavailable'
+    if current.split(':', 1)[0] != recorded_token.split(':', 1)[0]:
+        return 'UNCERTAIN', 'process start token scheme differs'
+    if current != recorded_token:
+        return 'DEAD', 'pid reused: start time differs'
+    return 'ALIVE', 'process alive'
 
 
 def owner_process_facts(pid=None):
@@ -188,12 +245,17 @@ def owner_process_facts(pid=None):
             'process_started': process_start_token(pid)}
 
 
-def owner_liveness(start):
-    """DEAD only when provable on this host; ALIVE when the same incarnation answers; otherwise UNCERTAIN."""
+def owner_liveness(start, children=()):
+    """DEAD only when the owner and every recorded child are provably gone on this host.
+
+    ALIVE when the same incarnation answers; anything else (other host, malformed facts, a probe
+    that cannot answer, a live or unknown child) is UNCERTAIN and leaves state untouched.
+    """
     owner = start.get('owner_process') if isinstance(start, dict) else None
     facts = {'state': 'UNCERTAIN', 'past_deadline': False, 'why': 'owner facts missing or malformed'}
-    if (not isinstance(owner, dict) or type(owner.get('pid')) is not int or owner['pid'] <= 0
-            or not isinstance(owner.get('host'), str) or not isinstance(owner.get('deadline'), str)):
+    if (not isinstance(owner, dict) or not valid_pid(owner.get('pid'))
+            or not isinstance(owner.get('host'), str) or not 1 <= len(owner['host']) <= 255
+            or not isinstance(owner.get('deadline'), str) or len(owner['deadline']) > 64):
         return facts
     try:
         deadline = datetime.fromisoformat(owner['deadline'])
@@ -208,27 +270,20 @@ def owner_liveness(start):
     if owner['host'] != host_identity():
         facts['why'] = 'other host'
         return facts
-    try:
-        os.kill(owner['pid'], 0)
-        exists = True
-    except ProcessLookupError:
-        exists = False
-    except PermissionError:
-        exists = True
-    except OSError:
-        facts['why'] = 'pid probe failed'
+    current_boot = boot_identity()
+    state, why = incarnation_state(owner['pid'], owner.get('process_started'), owner.get('boot_id'), current_boot)
+    facts.update(state=state, why=why)
+    if state != 'DEAD':
         return facts
-    if not exists:
-        facts.update(state='DEAD', why='pid gone')
-        return facts
-    recorded, current = owner.get('process_started'), process_start_token(owner['pid'])
-    if not isinstance(recorded, str) or current is None:
-        facts['why'] = 'process start time unavailable'
-        return facts
-    if current != recorded:
-        facts.update(state='DEAD', why='pid reused: start time differs', live_start=current)
-        return facts
-    facts.update(state='ALIVE', why='owner process alive')
+    for child in children:
+        if not isinstance(child, dict) or not valid_pid(child.get('pid')):
+            facts.update(state='UNCERTAIN', why='child record malformed')
+            return facts
+        child_state, child_why = incarnation_state(child['pid'], child.get('process_started'),
+                                                   owner.get('boot_id'), current_boot)
+        if child_state != 'DEAD':
+            facts.update(state='UNCERTAIN', why='child pid %d %s: %s' % (child['pid'], child_state.lower(), child_why))
+            return facts
     return facts
 
 
@@ -733,12 +788,19 @@ class UsageStore:
                     if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
                         raise GuardError('UNKNOWN', 'Elapsed execution budget is invalid')
                     spent += elapsed
-                    (zero_launch if zero_launch_attempt(record) else counted).append(entry)
+                    if zero_launch_attempt(record):
+                        zero_launch.append((entry, started.get('started_at')))
+                    else:
+                        counted.append(entry)
             if counted and (repeat_reason is None or len(counted) >= 2):
                 raise GuardError('BUDGET_EXHAUSTED', 'Identical invocation already reserved; use evidence or one justified repeat', counted[-1]['start'])
-            if len(zero_launch) >= ZERO_LAUNCH_CAP or len(previous) >= MAX_ATTEMPTS:
-                raise GuardError('BUDGET_EXHAUSTED', 'Repeated infrastructure refusals before any provider launch; '
-                                 'investigate the infrastructure before retrying', previous[-1]['start'])
+            recent = [entry for entry, at in zero_launch if within_window(at, ZERO_LAUNCH_WINDOW)]
+            if len(recent) >= ZERO_LAUNCH_CAP:
+                raise GuardError('BUDGET_EXHAUSTED', 'Repeated infrastructure refusals before any provider launch '
+                                 '(%d in %d s); fix the infrastructure or wait for the window, do not change the packet'
+                                 % (len(recent), ZERO_LAUNCH_WINDOW), recent[-1]['start'])
+            if len(previous) >= MAX_ATTEMPTS:
+                raise GuardError('BUDGET_EXHAUSTED', 'Attempt slots for this invocation are exhausted', previous[-1]['start'])
             remaining = aggregate_timeout - spent
             if remaining <= 0:
                 raise GuardError('BUDGET_EXHAUSTED', 'Declared aggregate execution budget is exhausted')
@@ -748,7 +810,7 @@ class UsageStore:
             owner_process = owner_process_facts()
             if owner_process is not None:
                 owner_process = {**owner_process, 'deadline': (started_at + timedelta(
-                    seconds=min(timeout, remaining) + DEADLINE_GRACE)).isoformat()}
+                    seconds=min(timeout, remaining) + deadline_grace())).isoformat()}
             started = {'schema': SCHEMA, 'kind': 'start', 'run_id': run_id, 'owner': owner, 'label': label,
                        'subject': dict(subject), 'invocation': invocation, 'command_kind': kind,
                        'timeout': min(timeout, remaining), 'aggregate_timeout': aggregate_timeout,
@@ -894,7 +956,7 @@ class UsageStore:
         if self._reconciliation(directory, run_id):
             report['why'] = 'already reconciled'
             return report
-        liveness = owner_liveness(start)
+        liveness = owner_liveness(start, self._children(directory))
         report['liveness'] = liveness
         if liveness['state'] != 'DEAD':
             report['why'] = 'owner ' + liveness['state'].lower() + ': ' + liveness['why']
@@ -914,6 +976,28 @@ class UsageStore:
         with self._lock():
             return self._auto_reconcile_locked(run_id)
 
+    def _children(self, directory):
+        path = directory / 'children.json'
+        if not os.path.lexists(path): return ()
+        value = read_json(path)
+        if (set(value) != {'schema', 'run_id', 'children'} or value.get('schema') != SCHEMA
+                or value.get('run_id') != directory.name or not isinstance(value['children'], list)
+                or len(value['children']) > 64):
+            raise GuardError('UNKNOWN', 'Child process record is malformed')
+        return tuple(value['children'])
+
+    def record_child(self, run_id, pid):
+        """Append the child a live supervisor just spawned, so death means the whole tree is gone."""
+        if not valid_pid(pid): raise GuardError('INVALID_OUTPUT', 'Invalid child pid')
+        with self._lock():
+            directory = self._run_directory(run_id)
+            self._owned_start(run_id)
+            children = list(self._children(directory))
+            if len(children) >= 64: raise GuardError('INVALID_OUTPUT', 'Too many recorded children')
+            children.append({'pid': pid, 'process_started': process_start_token(pid)})
+            self._publish(directory, 'children.json', {'schema': SCHEMA, 'run_id': run_id, 'children': children},
+                          replace=True)
+
     def sweep(self):
         """Apply the automatic rule to every run; the report names each run and why it was or was not reconciled."""
         reports = []
@@ -925,6 +1009,9 @@ class UsageStore:
                 except GuardError as error:
                     reports.append({'run_id': directory.name, 'reconciled': False,
                                     'why': 'error: ' + error.message, 'liveness': None})
+                except (OSError, ValueError, TypeError, UnicodeError) as error:
+                    reports.append({'run_id': directory.name, 'reconciled': False,
+                                    'why': 'error: ' + type(error).__name__, 'liveness': None})
         return reports
 
     def ack_pool(self, provider, pool, *, actor, reason, evidence):
@@ -942,6 +1029,10 @@ class Run:
         self.store, self.subject, self.start, self.start_ref = store, subject, start, reference
         self.run_id, self.timeout = start['run_id'], start['timeout']
         self.began = time.monotonic()
+
+    def note_child(self, process):
+        """process.run on_spawn callback: a recorded child must also be dead before auto-reconciliation."""
+        self.store.record_child(self.run_id, getattr(process, 'pid', process))
 
     def finish(self, *, execution, result, reason, exit_code=None, count=None, review=None,
                usage=None, current_subject=None, cleanup_incomplete=False):
@@ -973,6 +1064,8 @@ class Run:
                  'cleanup_incomplete': bool(cleanup_incomplete), 'review': review, 'usage': usage or {}}
         with self.store._lock():
             self.store.load_ref(self.start_ref)
+            if self.store._reconciliation(self.store._run_directory(self.run_id), self.run_id):
+                raise GuardError('UNKNOWN', 'Run was reconciled as dead while running; the late result is discarded')
             sha = self.store._publish(self.store._run_directory(self.run_id), 'final.json', value)
             reference = {'run_id': self.run_id, 'record': 'final', 'sha256': sha}
             self.store._publish(self.store._run_directory(self.run_id), 'completion.json',
@@ -981,11 +1074,25 @@ class Run:
 
 
 def zero_launch_attempt(final):
-    """True when the attempt provably launched no provider and failed on infrastructure, not on content."""
+    """True only when the attempt provably launched no provider and was refused by infrastructure.
+
+    Content outcomes (CODE_FINDINGS, INPUT_CHANGED, INVALID_OUTPUT) and uncertain ones (TIMEOUT,
+    UNKNOWN) count as attempts even with zero launches.
+    """
     usage = final.get('usage') if isinstance(final.get('usage'), dict) else {}
-    if usage.get('provider_launches') != 0 or type(usage.get('provider_launches')) is not int:
+    launches = usage.get('provider_launches')
+    if type(launches) is not int or launches != 0 or usage.get('reported', []) != []:
         return False
-    return final.get('execution') == 'NOT_STARTED' or final.get('reason') in {'TRANSIENT_INFRA', 'LOW_DISK'}
+    return final.get('execution') == 'NOT_STARTED' and final.get('reason') in ZERO_LAUNCH_REASONS
+
+
+def within_window(started_at, seconds):
+    try:
+        started = datetime.fromisoformat(started_at)
+    except (TypeError, ValueError):
+        return True  # unparseable history stays conservative: it counts toward the cap
+    if started.tzinfo is None: return True
+    return (now_utc() - started).total_seconds() < seconds
 
 
 def command_result(adapter, code, stdout, stderr='', success_exit=None):
@@ -1166,7 +1273,7 @@ def main():
                                       ungated_reason=args.ungated_reason, minimum_bytes=args.minimum_free_bytes)
                     print(json.dumps({'event': 'START', 'reference': run.start_ref}, sort_keys=True), file=sys.stderr, flush=True)
                     try:
-                        completed = run_process(command, cwd=args.repo, timeout=run.timeout)
+                        completed = run_process(command, cwd=args.repo, timeout=run.timeout, on_spawn=run.note_child)
                         result, reason, count = command_result(args.adapter, completed.returncode,
                                                                completed.stdout, completed.stderr, args.success_exit)
                         reference = run.finish(execution='COMPLETED', result=result, reason=reason,

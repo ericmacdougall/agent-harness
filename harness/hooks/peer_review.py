@@ -453,10 +453,10 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
     return base
 
 
-def run(cmd: list[str], prompt: str, cwd: Path, timeout=720) -> tuple[int, str, str]:
+def run(cmd: list[str], prompt: str, cwd: Path, timeout=720, on_spawn=None) -> tuple[int, str, str]:
     try:
         result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=git_environment(snapshot=True),
-                             timeout=timeout)
+                             timeout=timeout, on_spawn=on_spawn)
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
         return 124, '', 'HARNESS_PROVIDER_TIMEOUT'
@@ -723,7 +723,8 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                         outcome = {**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}
                     else:
                         options['launches'] += 1
-                        code, stdout, stderr = run(cmd, prompt, snapshot, timeout)
+                        code, stdout, stderr = run(cmd, prompt, snapshot, timeout,
+                                                   on_spawn=run_record.note_child if run_record else None)
                         last_message = last.read_text(errors='replace') if last.exists() else ''
                         outcome = normalize_provider(provider, code, stdout, stderr, last_message, stage)
         except GuardError as error:

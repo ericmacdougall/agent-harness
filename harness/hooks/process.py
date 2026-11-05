@@ -73,7 +73,7 @@ def cleanup_discarded(process, sink=None):
 
 
 def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True,
-        stream=False, discard_output=False, sink=None):
+        stream=False, discard_output=False, sink=None, on_spawn=None):
     # Git and test runners spawn children that subprocess.run(timeout=...) leaves alive.
     # Malformed output from a child must not bypass a caller's rollback path.
     # Keep binary mode exact for callers that inspect Git object bytes.
@@ -91,6 +91,9 @@ def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True,
                                stdout=output,
                                stderr=subprocess.STDOUT if discard_output else output,
                                start_new_session=True, **decoding)
+    if on_spawn is not None:
+        # Lets a supervisor record the child it is responsible for (usage guard liveness).
+        on_spawn(process)
     if discard_output:
         deadline = None if timeout is None else time.monotonic() + timeout
         try:
