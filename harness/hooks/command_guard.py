@@ -517,6 +517,11 @@ def _find_brace(text):
     return None
 
 
+# zsh clobber forms (the Bash tool may run zsh): judged as the bash operator with the same effect
+ZSH_CLOBBER = {'>!': '>|', '>>!': '>>', '>>|': '>>', '&>!': '&>', '&>|': '&>', '>&!': '&>', '>&|': '&>',
+               '&>>!': '&>>', '&>>|': '&>>'}
+
+
 class Lexer:
     def __init__(self, ctx, ps=False):
         self.ctx = ctx
@@ -747,11 +752,11 @@ class Lexer:
             if c in ';&|()<>' and not (c in '<>' and s[i + 1:i + 2] == '('):
                 op = self._operator(s, i)
                 # the whole operator, not its first character: `&>` and `&>>` start with `&` (GoodQA #14471 follow-up)
-                if op in ('<', '>', '&>', '>&', '<&', '<>', '<<', '<<<', '<<-', '&>>', '>>', '>|'):
+                if op in ('<', '>', '&>', '>&', '<&', '<>', '<<', '<<<', '<<-', '&>>', '>>', '>|') or op in ZSH_CLOBBER:
                     fd = None
                     if tokens and tokens[-1][0] == 'w' and prev_end == i and re.fullmatch(r'[0-9]', tokens[-1][1].text or 'x'):
                         fd = tokens.pop()[1].text
-                    rd = Redir(fd, op)
+                    rd = Redir(fd, ZSH_CLOBBER.get(op, op))
                     tokens.append(('redir', rd))
                     wait_target = rd
                     if op in ('<<', '<<-'):
@@ -780,7 +785,8 @@ class Lexer:
 
     @staticmethod
     def _operator(s, i):
-        for op in ('<<<', '<<-', '&>>', '&&', '||', '|&', '>>', '>&', '<&', '<>', '<<', '&>', '>|', ';', '&', '|', '(', ')', '<', '>'):
+        for op in ('&>>!', '&>>|', '<<<', '<<-', '&>>', '>>!', '>>|', '&>!', '&>|', '>&!', '>&|', '&&', '||', '|&', '>>', '>&',
+                   '<&', '<>', '<<', '&>', '>|', '>!', ';', '&', '|', '(', ')', '<', '>'):
             if s.startswith(op, i):
                 return op
         return s[i]
@@ -1653,6 +1659,11 @@ class Analyzer:
                 if target:
                     self.write_target(r.target, truncating=r.op in ('>', '>|'), via='redirect', pure=pure)
                     is_write = True
+            elif r.op == '<>' and r.fd in ('1', '2') and target:
+                # `1<> f`: stdout opened read-write without truncation; what the command prints overwrites the file
+                # in place, so it is judged like `>` (an fd-0 `<>` only feeds input and stays a read)
+                self.write_target(r.target, truncating=True, via='redirect', pure=False)
+                is_write = True
             if is_write and written is not None and r.target is not None:
                 self.note_created(r.target, written)
             if r.op in ('<', '<>') and target:
@@ -3287,7 +3298,9 @@ class Analyzer:
             tiers = ('log', 'root', 'unknown') if literal else ('log', 'unknown')
             # `link/../x`: the shell resolves `..` after following the link, so check that path as well
             physical = self._physical_dotdot(target_word.text) if not target_word.dynamic else None
-            if not pure and cls == 'root' and self._plain_work_file(path) \
+            # zsh multios: `> {a,b}` writes every expansion, so each one must be a plain work file
+            every = [norm_path(a, self.ctx) for a in (target_word.all_alts() or target_word.alts)]
+            if not pure and cls == 'root' and self._plain_work_file(path) and all(map(self._plain_work_file, every)) \
                     and (physical is None or self._plain_work_file(physical)):
                 # owners routinely rerun `cmd > <task dir>/x.log`; only receipts (*.json) and .keep-marked
                 # directories under the work dir keep the overwrite refusal (replay over real transcripts)

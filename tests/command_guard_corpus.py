@@ -870,5 +870,19 @@ OVERWRITE_EXISTING = [
     ("cat <<'E' > @HOME@/.agent-harness/$X\nE", 'block'),
     ('echo x > @HOME@/.agent-harness/scratch/c/u/s/scratchpad/run.log', 'allow'),
     ('echo x > @HOME@/.agent-harness/scratch/c/u/s/scratchpad/out.jsonl', 'block'),
+    # zsh (the Bash tool may run zsh): clobber forms, read-write stdout, multios
+    ('echo x >! @HOME@/.claude/wals/s/main.jsonl', 'block'),
+    ('echo x >!@HOME@/.claude/projects/p/s.jsonl', 'block'),
+    ('echo x &>! @HOME@/.codex/sessions/2026/r.jsonl', 'block'),
+    ('echo x >&! @HOME@/.claude/wals/s/main.jsonl', 'block'),
+    ('echo x >>! @HOME@/.claude/wals/s/main.jsonl', 'allow'),
+    ('echo x 1<> @HOME@/.claude/projects/p/s.jsonl', 'block'),
+    ('echo x 2<> @HOME@/.claude/wals/s/main.jsonl', 'block'),
+    ('cat <> @HOME@/.claude/wals/s/main.jsonl', 'allow'),
+    ('echo x > @TASK@/existing.log > @HOME@/.claude/wals/s/main.jsonl', 'block'),
+    ('echo x > {@TASK@/NEW-a.txt,@HOME@/.claude/projects/p/s.jsonl}', 'block'),
+    ('echo x > {@TASK@/existing.log,@HOME@/.claude/settings.json}', 'block'),
+    ('echo x >! @TASK@/existing.log', 'allow'),
+    ('echo x >! @TASK@/NEW-c.txt', 'allow'),
 ]
 SEED = 14471
