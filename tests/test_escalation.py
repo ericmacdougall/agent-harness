@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / 'harness/hooks'
 sys.path.insert(0, str(HOOKS))
@@ -285,16 +286,18 @@ class EnvRoots(LedgerFixture):
     def test_installed_home_ignores_a_relabelled_HOME(self):
         import pwd
         real = Path(pwd.getpwuid(os.getuid()).pw_dir)
-        os.environ['HOME'] = self.temp.name; self.addCleanup(lambda: os.environ.__setitem__('HOME', str(real)))
-        self.assertEqual(esc.installed_home(), real)
-        self.assertEqual(esc.DEFAULT_ROOT, real / '.agent-harness' / 'escalation')
-        # A self-written ask pair under the relabelled HOME's wals is refused for the installed ledger.
-        fake = Path(self.temp.name) / '.claude' / 'wals' / 's'; fake.mkdir(parents=True)
-        wal = fake / 'main.jsonl'
-        wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'top for [task:k]', 'source': 'user:s/u "yes"'}) + '\n'
-                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'approved'}) + '\n')
-        with self.assertRaises(esc.LedgerError):
-            esc.verify_ask_pair(wal, 'w1', 'k')
+        # Restore the HOME this test found, never the passwd home: under a scratch HOME that would send every
+        # later test in the process to the real ~/.agent-harness store.
+        with mock.patch.dict(os.environ, {'HOME': self.temp.name}):
+            self.assertEqual(esc.installed_home(), real)
+            self.assertEqual(esc.DEFAULT_ROOT, real / '.agent-harness' / 'escalation')
+            # A self-written ask pair under the relabelled HOME's wals is refused for the installed ledger.
+            fake = Path(self.temp.name) / '.claude' / 'wals' / 's'; fake.mkdir(parents=True)
+            wal = fake / 'main.jsonl'
+            wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'top for [task:k]', 'source': 'user:s/u "yes"'}) + '\n'
+                           + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'approved'}) + '\n')
+            with self.assertRaises(esc.LedgerError):
+                esc.verify_ask_pair(wal, 'w1', 'k')
 
     def test_pending_resets_beyond_one_batch_survive_to_the_next_load(self):
         pending = self.root / 'pb.pending-resets.jsonl'
