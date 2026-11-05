@@ -149,19 +149,26 @@ PINNED_ROUTE_BASE = '.agent-harness/work/dev-decom'
 PINNED_ROUTE_EXPIRES = 1794182400  # 2026-11-09T00:00:00Z, the day the host these routes serve shuts down
 PINNED_ROUTES = (
     ('unit-mig/t2-rclone/user-run-store-dropbox-secret.sh',
-     '32bbbfa1eda1ac160517e492f612b19b6005262726aace3fe20f12bb70f31465',
+     '92438a47d6b8083266e42922a2d151d0d0d65475fcc20744ea54359f2af501f3',
      r'/bin/bash {path}'),
     ('unit-mig/cf-dns/cf_dns_prod_move.py',
-     '95cdc8963a61f5ced79696aab564d37f490ab0973018cfcb460537a64f8391da',
+     '30c688923554c09f93128a7d9b89831557acd06d1f04949c235b09ea05cf89a6',
      r'/usr/bin/python3 -I {path} (?:list'
      r'|set-ttl --name [a-z.]{{1,40}} --ttl [0-9]{{1,5}} --expect-ttl [0-9]{{1,5}}'
      r'|set-content --name [a-z.]{{1,40}} --content [0-9.]{{7,15}} --expect-content [0-9.]{{7,15}})'),
 )
 # Existing scripts are otherwise judged only for log deletion, so a credential read inside one would pass. This refuses
-# scripts whose own text names these credentials. It matches text only: a script that builds the name at runtime, calls
-# another script, or names it past the read limit is not caught.
-CREDENTIAL_SCRIPT_TEXT = re.compile(rb'rclone\.conf|\.config/rclone\b|GOODQA_CLOUDFLARE_API_TOKEN')
+# shell and Python scripts whose own text names the full config path, a config dump, or the token secret. It matches text
+# only, by design narrow enough not to refuse tools that merely mention rclone. It does not catch a script that builds the
+# name at runtime or calls another script, a name past the read limit, a path the guard cannot resolve, a runner it does
+# not unwrap (`uv run`, `tmux`, `python3 -m cProfile`), or a script named like a test or like the guard's own files.
+CREDENTIAL_SCRIPT_TEXT = re.compile(rb'\.config/rclone/rclone\.conf(?![\w.-])|\brclone\s+config\s+(?:show|dump)\b'
+                                    rb'|\bGOODQA_CLOUDFLARE_API_TOKEN\b')
 CREDENTIAL_SCRIPT_READ = 1048576
+CREDENTIAL_SCRIPT_SUFFIXES = ('.sh', '.bash', '.zsh', '.py')
+CREDENTIAL_SCRIPT_SHEBANG = re.compile(rb'#![^\n]*\b(?:ba|z|k|da|)sh\b|#![^\n]*\bpython')
+GUARD_OWN_FILES = ('command_guard.py', 'command_guard_hook.py', 'command_guard_corpus.py', 'live_guard_canary.py')
+ROUTE_HOME = re.compile(r'/[A-Za-z0-9_./-]+')  # HOME goes into a command string, so it must not hold shell syntax
 
 
 def _read_prefix(path, limit):
@@ -174,7 +181,7 @@ def pinned_route(command, now=None):
     if not isinstance(command, str) or (time.time() if now is None else now) >= PINNED_ROUTE_EXPIRES:
         return False
     home = os.environ.get('HOME')
-    if not home or not os.path.isabs(home):
+    if not home or not ROUTE_HOME.fullmatch(home):
         return False
     for rel, digest, shape in PINNED_ROUTES:
         path = os.path.join(home, PINNED_ROUTE_BASE, rel)
@@ -2011,7 +2018,7 @@ class Analyzer:
         if name in ECHO_CMDS or name in ('cat',):
             self.echo_check(name, args, pl, idx)
         self.secret_clis(name, texts, visible=self.out_visible(pl, idx, True))
-        if name in INTERPRETERS or name in ('awk', 'gawk', 'mawk', 'nawk'):
+        if name in INTERPRETERS or name in ('awk', 'gawk', 'mawk', 'nawk') or re.fullmatch(r'(?:python|pypy)[0-9.]+', name):
             self.interpreter(name, args, texts, depth)
         if (name.startswith('python') or name.startswith('pypy')) and '-m' in texts:
             # python3 -m json.tool FILE (and other printing modules) prints the file
@@ -2030,17 +2037,18 @@ class Analyzer:
         if name in KILLERS:
             self.kill_cmd(name, args, texts)
 
-    def script_file(self, word, depth, require_shell=False):
+    def script_file(self, word, depth, require_shell=False, runs=True):
         """Analyse a shell script named on the command line (or written earlier in this command)."""
         ctx = self.ctx
         if word is None or word.dynamic or not word.text:
             return
         path = norm_path(word.text, ctx)
         key = path.casefold()
+        if runs:  # before the written text, which may only be what this command appends to an existing file
+            self.credential_script(path)
         if key in ctx.written:
             self.script(ctx.written[key], depth + 1, tail_visible=True)
             return
-        self.credential_script(path)
         ctx.files_read = getattr(ctx, 'files_read', 0) + 1
         if ctx.files_read > 8:
             return
@@ -2072,20 +2080,25 @@ class Analyzer:
         ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
 
     def credential_script(self, path):
-        """Refuse running an existing text file that names a credential the pinned routes cover (goodqa#14518)."""
+        """Refuse running an existing script that names a credential the pinned routes cover (goodqa#14518)."""
         ctx = self.ctx
+        base = os.path.basename(path)
+        if base in GUARD_OWN_FILES or (base.startswith('test_') and base.endswith('.py')):
+            return  # these hold the names as data
         ctx.credential_reads = getattr(ctx, 'credential_reads', 0) + 1
         if ctx.credential_reads > 32:
             return
         try:
-            if _realpath(path) == _realpath(os.path.abspath(__file__)) or not os.path.isfile(path):
+            if not os.path.isfile(path):
                 return
             data = _read_prefix(path, CREDENTIAL_SCRIPT_READ)
         except (OSError, ValueError):
             return
+        if not path.endswith(CREDENTIAL_SCRIPT_SUFFIXES) and not CREDENTIAL_SCRIPT_SHEBANG.match(data):
+            return  # a data file or a binary, not a script
         if b'\0' not in data and CREDENTIAL_SCRIPT_TEXT.search(data):
             ctx.add(SECRET_DUMP, 'credential-script', 'this script names a credential file or secret, and only a pinned '
-                    'route may run one', 'ask the user to run it in their own terminal')
+                    'route may run one', 'read the task for a pinned route, or take a path that does not need this credential')
 
     def launcher(self, name, args, depth, pl, idx):
         """Commands that run another command given as text or as trailing words. True when handled."""
@@ -2386,12 +2399,15 @@ class Analyzer:
         if not ps:
             k = 0
             while k < len(args) and args[k].text.startswith('-'):
-                k += 2 if args[k].text in ('-o', '+o', '-O', '+O', '--rcfile', '--init-file') else 1
+                k += 2 if args[k].text in ('+o', '-O', '+O', '--rcfile', '--init-file') \
+                    or re.fullmatch(r'-[a-zA-Z]*o', args[k].text) else 1
             if k < len(args):
                 if args[k].subs:
                     self.program_text(args[k], depth)  # bash <(echo ...)
                 else:
-                    self.script_file(args[k], depth)
+                    # `bash -n` only parses the file, so it runs nothing that could read a credential
+                    self.script_file(args[k], depth, runs=not any(
+                        re.fullmatch(r'-[a-zA-Z]*n[a-zA-Z]*', a.text) for a in args[:k]))
 
     def ssh(self, args, depth):
         texts = [a.text for a in args]
@@ -2962,8 +2978,12 @@ class Analyzer:
                 text = self.ctx.written.get(norm_path(nd[0].text, self.ctx).casefold())
                 if text:
                     self.code(text, depth)
-                elif not nd[0].dynamic:
-                    self.credential_script(norm_path(nd[0].text, self.ctx))
+                if key == 'python' and not nd[0].dynamic and '-m' not in texts:
+                    # The value of -W or -X is not the script; with -m the next word is a module's argument.
+                    skip = {k + 1 for k, t in enumerate(texts) if t in ('-W', '-X', '--check-hash-based-pycs')}
+                    plain = [args[k] for k in range(len(args)) if k not in skip and not args[k].text.startswith('-')]
+                    if plain and plain[0].text != '-' and not plain[0].dynamic:
+                        self.credential_script(norm_path(plain[0].text, self.ctx))
 
     def code(self, code, depth):
         ctx = self.ctx
