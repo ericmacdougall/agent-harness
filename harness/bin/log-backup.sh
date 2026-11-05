@@ -59,18 +59,25 @@ acquire_lock() {
   elif [ "$age" -lt 60 ]; then
     return 1 # the owner has created the directory but not yet written its pid
   fi
-  # Stale. Only the process that wins this rename may take over; a loser skips.
-  say "taking over stale lock (holder=${holder:-none} age=${age}s)"
-  local gone="$LOCKD.stale.$$"
-  mv "$LOCKD" "$gone" 2>/dev/null || return 1
-  if [ "$(cat "$gone/pid" 2>/dev/null)" != "$holder" ]; then
-    # We moved a lock that another run took over between our check and our rename: put it back and skip.
-    mv "$gone" "$LOCKD" 2>/dev/null
+  # Stale. Takeovers are serialized by a second mkdir guard, so two runners cannot both judge the same lock and
+  # one of them move the other's fresh lock. A guard left by a crashed takeover expires after 5 minutes.
+  local guard="$LOCKD.takeover"
+  if ! mkdir "$guard" 2>/dev/null; then
+    [ "$(file_age "$guard")" -gt 300 ] || return 1
+    rmdir "$guard" 2>/dev/null; mkdir "$guard" 2>/dev/null || return 1
+  fi
+  if [ -d "$LOCKD" ] && [ "$(cat "$LOCKD/pid" 2>/dev/null)" != "$holder" ]; then
+    rmdir "$guard" 2>/dev/null  # the lock changed hands while we waited for the guard: it is not stale any more
     return 1
   fi
-  rm -f "$gone/pid"; rmdir "$gone" 2>/dev/null
-  mkdir "$LOCKD" 2>/dev/null || return 1
-  echo $$ > "$LOCKD/pid"
+  say "taking over stale lock (holder=${holder:-none} age=${age}s)"
+  local gone="$LOCKD.stale.$$" got=1
+  if mv "$LOCKD" "$gone" 2>/dev/null; then
+    rm -f "$gone/pid"; rmdir "$gone" 2>/dev/null
+  fi
+  if mkdir "$LOCKD" 2>/dev/null; then echo $$ > "$LOCKD/pid"; got=0; fi
+  rmdir "$guard" 2>/dev/null
+  return $got
 }
 
 if ! acquire_lock; then
