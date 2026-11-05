@@ -54,7 +54,7 @@ def make_fixture(home):
     for rel in files:
         p = h / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text('ref: refs/heads/main\n' if rel.endswith('/HEAD') else 'x\n')
+        p.write_text('ref: refs/heads/main\n' if rel.endswith('/HEAD') else '{}\n' if rel.endswith('.json') else 'x\n')
     (h / '.agent-harness/work/S/T/state').mkdir(parents=True, exist_ok=True)
     return h
 
