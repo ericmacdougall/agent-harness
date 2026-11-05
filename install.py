@@ -81,9 +81,12 @@ def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]
 
     # Model ladder (goodqa#14527): rung enforcement on spawns, launch lines and the live-agent cap.
     # Fails open on its own errors (an unreadable tier table denies from inside the hook), so no onFailure.
-    def ladder(action: str) -> dict:
-        return {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "tier_gate.py"), action],
+    def ladder(action: str, fail_closed: bool = False) -> dict:
+        hook = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "tier_gate.py"), action],
                 "timeout": 10}
+        if fail_closed:
+            hook["onFailure"] = "block"
+        return hook
 
     managed = {
         "SessionStart": [{"hooks": [command("session")]}],
@@ -105,7 +108,7 @@ def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]
             "hooks": [command("pretool", True)],
         }, {
             "matcher": "Agent|Task|Workflow|Bash",
-            "hooks": [ladder("hook")],
+            "hooks": [ladder("hook", True)],
         }, {
             # Commit message policy: validates git commit / gh pr merge --squash before they run.
             "matcher": "Bash",

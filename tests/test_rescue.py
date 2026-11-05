@@ -871,6 +871,28 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertEqual(report['source'], 'Codex gpt-6-astra medium (rung R5)')
         self.assertTrue(capture.exists())
 
+    def test_task_only_run_launches_the_ledger_rung(self):
+        import escalation as ladder, model_tiers as tiers
+        state = self.root / 'ladder'; state.mkdir(mode=0o700)
+        ledger = ladder.Ledger(state, tiers.load_policy())
+        block = json.dumps({'schema': 1, 'kind': 'final', 'run_id': 'b' * 32, 'evidence': 'EXECUTED', 'subject': {'head': 'a' * 40},
+                            'invocation': {}, 'execution': 'COMPLETED', 'result': 'NO_RESULT', 'reason': 'CODE_FINDINGS',
+                            'usage': {'provider_launches': 1, 'reported': []},
+                            'review': {'stage': 'CODE_INSPECTION', 'verdict': 'BLOCK', 'findings': ['F1']}}, sort_keys=True)
+        for salt in ('1', '2', '3', '4'):
+            ledger.record('rescue-r2', (block[:-1] + ', "salt": "%s"}' % salt).encode(), kind='review', source='test')
+        self.assertEqual(ledger.status('rescue-r2')['rung'], 'R2')
+        capture = self.root / 'r2-prompt.txt'
+        command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
+                   '--output', str(self.output), '--task', 'rescue-r2']
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+                       'CAPTURE_CODEX_PROMPT': str(capture), 'AGENT_HARNESS_ESCALATION_DIR': str(state), 'CODEX_ACTION': 'r2'}
+        result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        report = json.loads(self.output.read_text())
+        self.assertEqual(report['source'], 'Codex gpt-6.1-sol high (rung R2)')
+        self.assertEqual(report['rung'], 'R2'); self.assertIn('ledger rung', report['rung_why'])
+
     def test_claude_written_work_is_rescued_by_codex_and_codex_work_by_claude(self):
         capture = self.root / 'claude-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),

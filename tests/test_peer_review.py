@@ -1306,3 +1306,78 @@ class ProviderEnvelopeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LadderSelectionTests(unittest.TestCase):
+    """AC-9 of goodqa#14527: the reviewer comes from the tier table and the result feeds the task ledger."""
+    fake = PeerReviewTests.fake
+    invoke = PeerReviewTests.invoke
+
+    def setUp(self):
+        PeerReviewTests.setUp(self)
+        self.ladder = self.root / 'ladder'; self.ladder.mkdir(mode=0o700)
+        self.argv_file = self.root / 'argv.json'
+        body = f'''import json, sys
+from pathlib import Path
+Path({str(self.argv_file)!r}).write_text(json.dumps(sys.argv))
+if '--output-last-message' in sys.argv:
+    Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text(Path({str(self.root / 'verdict.txt')!r}).read_text())
+else:
+    print(Path({str(self.root / 'verdict.txt')!r}).read_text())
+'''
+        self.fake('codex', body)
+        self.fake('claude', body)
+        (self.root / 'verdict.txt').write_text('CODE_INSPECTION_RESULT: BLOCK\nF1: the handler drops the error\n')
+
+    def run_review(self, *extra, stage='code-inspection', remove=()):
+        for name in remove:
+            (self.bin / name).unlink()
+        return self.invoke(stage=stage, env={'AGENT_HARNESS_ESCALATION_DIR': str(self.ladder)}, extra=list(extra))
+
+    def test_codex_primary_carries_the_rung_effort_and_the_headers_name_the_selection(self):
+        result = self.run_review('--task', 'lad-1', '--author-rung', 'R2', '--author-harness', 'claude')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        argv = json.loads(self.argv_file.read_text())
+        self.assertEqual(argv[0].rsplit('/', 1)[-1], 'codex')
+        self.assertIn('gpt-6.1-sol', argv); self.assertIn('model_reasoning_effort=xhigh', argv)
+        report = self.output.read_text()
+        self.assertIn('Author-Rung: R2\n', report); self.assertIn('Reviewer-Rung: R3\n', report)
+        self.assertIn('Reviewer-Selection: openai gpt-6.1-sol xhigh;', report)
+        receipts = list((self.ladder / 'selections').glob('*.json'))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertEqual((receipt['task'], receipt['stage'], receipt['author_rung'], receipt['selection']['rung']),
+                         ('lad-1', 'code-inspection', 'R2', 'R3'))
+        self.assertEqual(receipt['packet_sha256'], hashlib.sha256(self.packet.read_bytes()).hexdigest())
+
+    def test_claude_fallback_carries_effort_and_budget_when_codex_is_absent(self):
+        result = self.run_review('--task', 'lad-2', '--author-rung', 'R1', '--author-harness', 'claude', remove=('codex',))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        argv = json.loads(self.argv_file.read_text())
+        self.assertEqual(argv[0].rsplit('/', 1)[-1], 'claude')
+        self.assertIn('--effort', argv); self.assertEqual(argv[argv.index('--effort') + 1], 'high')
+        self.assertIn('--max-budget-usd', argv); self.assertEqual(argv[argv.index('--max-budget-usd') + 1], '8')
+        self.assertEqual(argv[argv.index('--model') + 1], 'opus')
+        self.assertIn('Reviewer-Rung: R2\n', self.output.read_text())
+
+    def test_block_feeds_one_fail_event_and_a_replay_is_a_noop(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        import escalation as ladder, model_tiers as tiers
+        self.run_review('--task', 'lad-3', '--author-rung', 'R0')
+        state = ladder.Ledger(self.ladder, tiers.load_policy()).load('lad-3')
+        self.assertEqual(len(state['events']), 1)
+        event = state['events'][0]
+        self.assertEqual((event['class'], event['kind'], event['why']), ('FAIL', 'review', 'material review finding'))
+        self.assertEqual(event['source'], 'peer_review:code-inspection')
+        final = next((self.root / 'usage-state' / 'runs').glob('*/final.json'))
+        self.assertEqual(event['receipt_sha256'], hashlib.sha256(final.read_bytes()).hexdigest())
+        status = ladder.Ledger(self.ladder, tiers.load_policy()).record('lad-3', final.read_bytes(), kind='review', source='replay')
+        self.assertTrue(status['replayed']); self.assertEqual(status['failures_at_rung'], 1)
+
+    def test_unknown_author_is_reviewed_at_opus_sol_medium_and_flagged(self):
+        self.run_review()  # no task and no author rung: the author is unknown
+        report = self.output.read_text()
+        self.assertIn('Author-Rung: unknown (author unknown: lowest writer rung reviewer)', report)
+        self.assertIn('Reviewer-Rung: R1\n', report)
+        argv = json.loads(self.argv_file.read_text())
+        self.assertIn('model_reasoning_effort=medium', argv)

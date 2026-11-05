@@ -47,8 +47,19 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def rotate_log(path, limit=4 << 20):
+    """Keep append-only logs bounded: above the limit the file is renamed to .1 (one generation kept)."""
+    try:
+        if path.exists() and path.stat().st_size > limit:
+            os.replace(path, path.with_suffix(path.suffix + '.1'))
+    except OSError:
+        pass
+
+
 def state_root():
     root = Path(os.environ.get('AGENT_HARNESS_ESCALATION_DIR') or Path.home() / '.agent-harness' / 'escalation')
+    if root.is_symlink():
+        raise LedgerError('state_unreadable', 'escalation state directory cannot be a symlink')
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(root, 0o700)
     return root
@@ -69,10 +80,23 @@ def generated_key(*texts):
     return 'auto-' + digest
 
 
+NAMED = re.compile(r'^[A-Za-z][A-Za-z0-9._-]{0,63}$')
+
+
+def named_findings(findings):
+    """Only findings with a real id count: UNSPECIFIED, empty and non-string ids are not named."""
+    kept = []
+    for item in findings or ():
+        ident = item.get('id') if isinstance(item, dict) else str(item).split(':', 1)[0]
+        if isinstance(ident, str) and NAMED.fullmatch(ident.strip()) and ident.strip().upper() != 'UNSPECIFIED':
+            kept.append(item)
+    return kept
+
+
 def fingerprint(findings):
     """A deterministic hash of normalized finding ids, files and categories; None when there are none."""
     rows = []
-    for item in findings or ():
+    for item in named_findings(findings):
         if isinstance(item, dict):
             ident, path, category = item.get('id'), item.get('file'), item.get('category')
         else:
@@ -106,7 +130,7 @@ def classify(receipt, *, kind, claimed_heads=()):
             review = receipt.get('review')
             if not isinstance(review, dict):
                 return 'NOT_COUNTED', 'no review verdict in receipt', None
-            if review.get('verdict') == 'BLOCK' and review.get('findings'):
+            if review.get('verdict') == 'BLOCK' and named_findings(review.get('findings')):
                 return 'FAIL', 'material review finding', fingerprint(review['findings'])
             if review.get('verdict') == 'ACCEPT':
                 return 'PASS', 'review accepted', None
@@ -121,7 +145,7 @@ def classify(receipt, *, kind, claimed_heads=()):
             return 'NOT_COUNTED', 'tests red but no claimed fix at this HEAD', None
         return 'NOT_COUNTED', 'result %s/%s' % (receipt.get('result'), reason), None
     if kind == 'spec_review':
-        if receipt.get('verdict') == 'BLOCK' and receipt.get('findings'):
+        if receipt.get('verdict') == 'BLOCK' and named_findings(receipt.get('findings')):
             return 'FAIL', 'spec review blocked with findings', fingerprint(receipt['findings'])
         if receipt.get('verdict') == 'ACCEPT':
             return 'PASS', 'spec review accepted', None
@@ -133,12 +157,19 @@ def rung_of(events, policy):
     """Pure: replay FAIL events into (rung, failures_at_rung, fingerprint, climbs)."""
     rung = policy['lowest_rung']
     fails, current, climbs = 0, None, 0
+    last_head, fixed_since = None, True
     for event in events:
+        if event.get('class') == 'CLAIM':
+            fixed_since = True
+            continue
         if event.get('class') != 'FAIL':
             continue
         if event.get('fingerprint') != current:
             current, fails = event.get('fingerprint'), 0
+        elif not fixed_since and event.get('head') and event.get('head') == last_head:
+            continue  # the same finding at the same HEAD with no claimed fix between: one failure, not two
         fails += 1
+        last_head, fixed_since = event.get('head'), False
         if fails >= policy['failures_per_rung']:
             above = tiers.next_writing_rung(policy, rung)
             if above is None:
@@ -199,9 +230,10 @@ class Ledger:
             return self.fresh(task), None
         raw = None
         try:
-            raw = path.read_bytes()
-            if len(raw) > MAX_STATE:
-                raise ValueError('oversized')
+            info = os.stat(path, follow_symlinks=False)
+            if not os.path.isfile(path) or os.path.islink(path) or info.st_size > MAX_STATE:
+                raise ValueError('oversized or not a regular file')
+            raw = path.read_bytes()  # input-ok: size checked above
             state = json.loads(raw)
             if (not isinstance(state, dict) or state.get('schema') != SCHEMA or state.get('task') != task
                     or not isinstance(state.get('events'), list)):
@@ -303,10 +335,14 @@ class Ledger:
                 klass, why, fp = 'NOT_COUNTED', 'receipt is not JSON', None
                 state['resets'].append({'at': now(), 'code': 'unclassifiable_evidence', 'receipt_sha256': sha,
                                         'prior_state_sha256': None, 'preserved_copy': None, 'detail': 'not JSON'})
+            if head is None and isinstance(receipt, dict):
+                head = (receipt.get('subject') or {}).get('head')  # the receipt's own HEAD, never a caller claim
             event = {'seq': len(state['events']) + 1, 'at': now(), 'kind': kind, 'class': klass, 'why': why,
                      'fingerprint': fp, 'receipt_sha256': sha, 'source': source, 'head': head,
                      'rung_at': before['rung']}
-            if kind == 'review' and klass != 'NOT_COUNTED':
+            launched = isinstance(receipt, dict) and isinstance(receipt.get('usage'), dict) \
+                and type(receipt['usage'].get('provider_launches')) is int and receipt['usage']['provider_launches'] >= 1
+            if kind == 'review' and launched:
                 state['launches'] = state.get('launches', 0) + 1
                 # Until helpers report real cost, each counted launch spends the rung's review budget
                 # as a conservative upper bound so the ceiling has effect.
@@ -322,14 +358,17 @@ class Ledger:
             self._write(task, state)
             status = ladder_status(state, self.policy)
             status['event'] = event
+            pending = []
             if after['rung'] != before['rung']:
                 status['escalation'] = escalation
-                self._notify(task, 'escalation', escalation, notify)
+                pending.append(('escalation', escalation))
             if reset is not None:
-                self._notify(task, 'reset', reset, notify)
-            return status
+                pending.append(('reset', reset))
         finally:
             os.close(fd)
+        for event_name, record in pending:
+            self._notify(task, event_name, record, notify)
+        return status
 
     def claim_fix(self, task, head):
         """The owner declares a fix at HEAD; a later red test receipt at that HEAD then counts as a failure."""
@@ -340,6 +379,9 @@ class Ledger:
             state, _ = self._read(task)
             if not any(c['head'] == head for c in state['claims']):
                 state['claims'].append({'head': head, 'at': now()})
+                state['events'].append({'seq': len(state['events']) + 1, 'at': now(), 'kind': 'claim', 'class': 'CLAIM',
+                                        'why': 'owner claimed a fix', 'fingerprint': None, 'receipt_sha256': None,
+                                        'source': 'claim-fix', 'head': head, 'rung_at': rung_of(state['events'], self.policy)['rung']})
                 self._write(task, state)
             return ladder_status(state, self.policy)
         finally:
@@ -372,10 +414,10 @@ class Ledger:
             fresh['resets'] = state.get('resets', []) + [record]
             fresh['permission'] = state.get('permission')
             self._write(task, fresh)
-            self._notify(task, 'reset', record, notify)
-            return ladder_status(fresh, self.policy)
         finally:
             os.close(fd)
+        self._notify(task, 'reset', record, notify)
+        return ladder_status(fresh, self.policy)
 
     def approve_top(self, task, ask_id, wal):
         """Record user permission for the top writing rung after verifying the ask pair in the WAL."""
@@ -392,6 +434,25 @@ class Ledger:
     def status(self, task):
         return ladder_status(self.load(task), self.policy)
 
+    def gate_digest(self, limit=200):
+        """What the hook would have refused (warn mode) or refused (enforce): evidence for the flip."""
+        path = self.root / 'gate.jsonl'
+        rows = []
+        try:
+            lines = path.read_text(encoding='utf-8').splitlines()[-limit:]  # input-ok: bounded by limit lines
+        except OSError:
+            return rows
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get('decision') == 'deny' or (record.get('facts') or {}).get('reset'):
+                rows.append({'at': record.get('at'), 'tool': record.get('tool'), 'mode': record.get('mode'),
+                             'decision': record.get('decision'), 'reason': record.get('reason'),
+                             'task': (record.get('facts') or {}).get('task'), 'reset': (record.get('facts') or {}).get('reset')})
+        return rows
+
     def digest(self):
         rows = []
         for path in sorted(self.root.glob('*.json')):
@@ -406,25 +467,44 @@ class Ledger:
     def _notify(self, task, event, record, notify):
         """Durable notification for main plus a WAL decision entry when a WAL path is given."""
         line = {'at': now(), 'task': task, 'event': event, **record}
-        with open(self.root / 'notifications.jsonl', 'a', encoding='utf-8') as handle:
+        target = self.root / 'notifications.jsonl'
+        rotate_log(target)
+        with open(target, 'a', encoding='utf-8') as handle:
             handle.write(json.dumps(line, sort_keys=True) + '\n')
-        os.chmod(self.root / 'notifications.jsonl', 0o600)
+        os.chmod(target, 0o600)
         wal = notify or os.environ.get('AGENT_HARNESS_MAIN_WAL')
         if wal:
             note = ('LADDER %s task %s: %s' % (event.upper(), task, json.dumps(record, sort_keys=True)))[:900]
             try:
+                # No invented source: the entry is unsourced (the hook warns) and cites the state file in its text.
                 subprocess.run([sys.executable, str(Path(__file__).resolve().parent / 'wal_note.py'), '--wal', str(wal),
-                                '--event', 'decision', '--note', note, '--source',
-                                'wal:%s#ladder-%s' % (wal, hashlib.sha256(note.encode()).hexdigest()[:12])],
+                                '--event', 'decision', '--note', note + ' state=' + str(self.path(task))],
                                capture_output=True, text=True, timeout=20)
             except (OSError, subprocess.SubprocessError):
                 pass
 
 
+def verified_final(run_id):
+    """The FINAL receipt bytes of a usage-guard run, verified against the store's completion reference."""
+    import usage_guard
+    store = usage_guard.UsageStore()
+    directory = store._run_directory(run_id)
+    completion = usage_guard.read_json(directory / 'completion.json')
+    reference = completion.get('reference') if isinstance(completion, dict) else None
+    if not isinstance(reference, dict) or reference.get('run_id') != run_id or reference.get('record') != 'final':
+        raise LedgerError('unclassifiable_evidence', 'run has no completion reference')
+    store.load_ref(reference)  # digest and schema check
+    return (directory / 'final.json').read_bytes()  # input-ok: verified by load_ref, bounded by MAX_JSON
+
+
 def verify_ask_pair(wal, ask_id, task):
     """A registered ask with a user: source naming the task, resolved by an ask_resolved that refs it."""
+    wals_root = Path(os.environ.get('AGENT_HARNESS_WALS_DIR') or Path.home() / '.claude' / 'wals').resolve()
+    resolved_wal = Path(wal).resolve()
+    if wals_root not in resolved_wal.parents or resolved_wal.name != 'main.jsonl':
+        raise LedgerError('unclassifiable_evidence', 'permission must come from a session main WAL under ' + str(wals_root))
     try:
-        lines = wal.read_text(encoding='utf-8', errors='replace').splitlines()
+        lines = wal.read_text(encoding='utf-8', errors='replace').splitlines()  # input-ok: session WAL, bounded by the hooks
     except OSError:
         raise LedgerError('unclassifiable_evidence', 'WAL unreadable') from None
     ask = resolved = None
@@ -454,7 +534,9 @@ def main(argv=None):
     parser.add_argument('--root', type=Path)
     parser.add_argument('--policy', type=Path)
     sub = parser.add_subparsers(dest='action', required=True)
-    rec = sub.add_parser('record'); rec.add_argument('--task', required=True); rec.add_argument('--receipt', required=True, type=Path)
+    rec = sub.add_parser('record'); rec.add_argument('--task', required=True)
+    rec.add_argument('--run-id', help='usage-guard run id: the FINAL receipt is read and verified inside the store')
+    rec.add_argument('--receipt', type=Path, help='a spec_flow review record file (kind spec_review only)')
     rec.add_argument('--kind', required=True, choices=('review', 'test', 'spec_review')); rec.add_argument('--source', required=True)
     rec.add_argument('--head'); rec.add_argument('--notify-wal')
     claim = sub.add_parser('claim-fix'); claim.add_argument('--task', required=True); claim.add_argument('--head', required=True)
@@ -464,11 +546,22 @@ def main(argv=None):
     top = sub.add_parser('approve-top'); top.add_argument('--task', required=True); top.add_argument('--ask', required=True); top.add_argument('--wal', required=True)
     status = sub.add_parser('status'); status.add_argument('--task', required=True)
     sub.add_parser('digest')
+    gate = sub.add_parser('gate-digest'); gate.add_argument('--limit', type=int, default=200)
     args = parser.parse_args(argv)
     try:
         ledger = Ledger(args.root, tiers.load_policy(args.policy))
         if args.action == 'record':
-            value = ledger.record(args.task, args.receipt.read_bytes(), kind=args.kind, source=args.source,
+            if args.kind in ('review', 'test'):
+                if not args.run_id:
+                    raise LedgerError('unclassifiable_evidence', 'review and test receipts are read by --run-id from the usage store')
+                receipt_bytes = verified_final(args.run_id)
+            else:
+                if not args.receipt:
+                    raise LedgerError('unclassifiable_evidence', 'spec_review needs --receipt')
+                receipt_bytes = args.receipt.read_bytes()  # input-ok: spec_flow record, bounded by MAX_STATE below
+                if len(receipt_bytes) > MAX_STATE:
+                    raise LedgerError('unclassifiable_evidence', 'receipt oversized')
+            value = ledger.record(args.task, receipt_bytes, kind=args.kind, source=args.source,
                                   head=args.head, notify=args.notify_wal)
         elif args.action == 'claim-fix':
             value = ledger.claim_fix(args.task, args.head)
@@ -480,6 +573,8 @@ def main(argv=None):
             value = ledger.approve_top(args.task, args.ask, args.wal)
         elif args.action == 'status':
             value = ledger.status(args.task)
+        elif args.action == 'gate-digest':
+            value = ledger.gate_digest(args.limit)
         else:
             value = ledger.digest()
     except (LedgerError, tiers.TierError, OSError) as error:

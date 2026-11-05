@@ -32,6 +32,9 @@ LIVE_CAP_DEFAULT = 40
 
 def hook_result(decision, reason=None, updated=None, context=None):
     out = {'hookEventName': 'PreToolUse'}
+    if decision == 'context':
+        out['additionalContext'] = context
+        return {'hookSpecificOutput': out}
     if decision == 'deny':
         out.update(permissionDecision='deny', permissionDecisionReason=reason)
     elif decision == 'allow':
@@ -111,8 +114,11 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
     blocked = status['blocked_by'] if status else []
     # The user's own stop comes first: a computed rung that needs permission is reported as such even
     # when the launch or spend ceilings are reached at the same time.
-    if not is_reviewer and policy['rungs'][target_rung]['needs_user_permission'] and not (status or {}).get('permission'):
+    if policy['rungs'][target_rung]['needs_user_permission'] and not (status or {}).get('permission'):
         return 'deny', 'task %s reached rung %s, which needs the user permission recorded by escalation.py approve-top' % (task, target_rung), None, facts
+    # R12: a fork keeps its parent's model, which the hook cannot see or rewrite; it is never a rung escape.
+    if subagent_type == 'fork' and policy['rungs'][target_rung]['writable'] and target_rung != policy['lowest_rung']:
+        return 'deny', 'fork inherits the parent model, which the ladder cannot verify for task %s at rung %s; spawn a typed agent' % (task, target_rung), None, facts
     if blocked and not is_reviewer:
         return 'deny', 'ladder limit reached for task %s (%s): human sign-off needed' % (task, ', '.join(blocked)), None, facts
     if requested is None:
@@ -156,10 +162,15 @@ def decide_bash(data, policy, ledger):
     model = effort = task = None
     for index, word in enumerate(words):
         if word in ('--model', '-m') and index + 1 < len(words): model = words[index + 1]
+        if word.startswith('--model='): model = word.split('=', 1)[1]
         if word == '--effort' and index + 1 < len(words): effort = words[index + 1]
-        if word == '-c' and index + 1 < len(words) and words[index + 1].startswith('model_reasoning_effort='):
-            effort = words[index + 1].split('=', 1)[1]
+        if word.startswith('--effort='): effort = word.split('=', 1)[1]
+        if word == '-c' and index + 1 < len(words):
+            if words[index + 1].startswith('model_reasoning_effort='): effort = words[index + 1].split('=', 1)[1]
+            if words[index + 1].startswith('model='): model = words[index + 1].split('=', 1)[1]
+        if word.startswith('ANTHROPIC_MODEL=') or word.startswith('CLAUDE_MODEL='): model = word.split('=', 1)[1]
         if word == '--task' and index + 1 < len(words): task = words[index + 1]
+        if word.startswith('--task='): task = word.split('=', 1)[1]
     task = task or esc.task_key_from(command)
     facts = {'model': model, 'effort': effort, 'task': task}
     if model is None:
@@ -177,14 +188,15 @@ def decide_bash(data, policy, ledger):
     # Permission and review-only checks come first: no task means no recorded permission.
     if entry['needs_user_permission'] and not (status or {}).get('permission'):
         return 'deny', 'launch at %s needs recorded user permission for task %s' % (requested['rung'], task or '(none)'), None, facts
-    if not entry['writable'] and 'rescue.py' in command:
+    basenames = [w.rsplit('/', 1)[-1] for w in words]
+    if not entry['writable'] and 'rescue.py' in basenames:
         return 'deny', 'rescue at %s is review-only' % requested['rung'], None, facts
     if task is None:
         return 'allow', 'launch without --task: lowest rung applies', None, facts
     if status is None:
         return 'allow', 'ladder state unreadable (%s): lowest rung applies' % facts.get('ladder_error', 'error'), None, facts
     order = tiers.rung_order(policy)
-    if order.index(requested['rung']) > order.index(status['rung']) and 'rescue.py' not in command:
+    if order.index(requested['rung']) > order.index(status['rung']) and 'rescue.py' not in basenames:
         return 'deny', 'launch at %s is above task %s rung %s' % (requested['rung'], task, status['rung']), None, facts
     return 'allow', None, None, facts
 
@@ -196,21 +208,27 @@ def live_path(session_id):
 
 
 def live_update(session_id, agent_id, *, start):
+    import fcntl
     path = live_path(session_id)
+    lock = os.open(path.with_suffix('.lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        live = json.loads(path.read_text()) if path.exists() else {}
-        if not isinstance(live, dict): live = {}
-    except (OSError, ValueError):
-        live = {}
-    key = str(agent_id or 'unknown')
-    live = _expire_live(live)
-    if start:
-        live[key] = esc.now()
-    else:
-        live.pop(key, None)
-    tmp = path.with_suffix('.tmp')
-    tmp.write_text(json.dumps(live, sort_keys=True)); os.chmod(tmp, 0o600); os.replace(tmp, path)
-    return len(live)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            live = json.loads(path.read_text()) if path.exists() else {}
+            if not isinstance(live, dict): live = {}
+        except (OSError, ValueError):
+            live = {}
+        key = str(agent_id or 'unknown')
+        live = _expire_live(live)
+        if start:
+            live[key] = esc.now()
+        else:
+            live.pop(key, None)
+        tmp = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(live, sort_keys=True)); os.chmod(tmp, 0o600); os.replace(tmp, path)
+        return len(live)
+    finally:
+        os.close(lock)
 
 
 def _expire_live(live, ttl=None):
@@ -246,13 +264,16 @@ def main(argv=None):
     if not isinstance(data, dict):
         data = {}
     session_id = data.get('session_id')
+    tool = str(data.get('tool_name') or '')
+    command = str((data.get('tool_input') or {}).get('command') or '') if isinstance(data.get('tool_input'), dict) else ''
     try:
         policy = tiers.load_policy()
         mode = policy['mode']
         ledger = esc.Ledger(policy=policy)
     except tiers.TierError as error:
-        # Fail closed on an unreadable table: enforce, lowest rung, say why.
-        print(json.dumps(hook_result('deny', 'tier table error: %s' % error)))
+        # Fail closed on an unreadable table, but only where the ladder applies: spawns and launch lines.
+        if tool in SPAWN_TOOLS or (tool == 'Bash' and LAUNCH.search(command)):
+            print(json.dumps(hook_result('deny', 'tier table error: %s' % error)))
         return 0
     if action in ('start', 'stop'):
         count = live_update(session_id, data.get('agent_id'), start=(action == 'start'))
@@ -261,7 +282,6 @@ def main(argv=None):
             print(json.dumps({'hookSpecificOutput': {'hookEventName': 'SubagentStart',
                               'additionalContext': 'live agents %d exceed the cap %d; stop some before spawning more' % (count, cap)}}))
         return 0
-    tool = str(data.get('tool_name') or '')
     if tool in SPAWN_TOOLS:
         cap = int(policy.get('caps', {}).get('session_live_agents', LIVE_CAP_DEFAULT))
         if live_count(session_id) >= cap:
@@ -283,8 +303,9 @@ def main(argv=None):
     if decision == 'allow' and updated is None:
         return 0  # nothing to change; the decision and its reason are in gate.jsonl
     if mode == 'warn':
+        # Warn mode only speaks: no permissionDecision (which would skip the prompt) and no updatedInput.
         text = 'ladder (warn mode): would %s: %s' % (decision, reason or 'apply updatedInput %s' % json.dumps(updated or {}, sort_keys=True)[:200])
-        print(json.dumps(hook_result('allow', context=text)))
+        print(json.dumps(hook_result('context', context=text)))
         return 0
     print(json.dumps(hook_result(decision, reason, updated)))
     return 0

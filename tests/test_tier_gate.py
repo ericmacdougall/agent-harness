@@ -1,5 +1,6 @@
 """The ladder enforcement hook: spawn decisions, resets, TOP permission, Bash advisory, live cap (goodqa#14527)."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -42,7 +43,9 @@ class GateFixture(unittest.TestCase):
         self.salt = getattr(self, 'salt', 0)
         for n in range(times):
             self.salt += 1
-            self.ledger.record(task, final(salt='%s-%d' % (task, self.salt)), kind='review', source='test')
+            receipt = json.loads(final(salt='%s-%d' % (task, self.salt)))
+            receipt['subject'] = {'head': hashlib.sha256(str(self.salt).encode()).hexdigest()[:40]}  # a new HEAD per failure
+            self.ledger.record(task, json.dumps(receipt).encode(), kind='review', source='test')
 
 
 class SpawnDecisions(GateFixture):
@@ -97,7 +100,9 @@ class SpawnDecisions(GateFixture):
         self.assertEqual(decision, 'deny')  # the computed rung needs permission; nothing is minted below it silently
         # The spend ceiling counts each counted launch at the rung's review budget (conservative).
         self.assertGreater(self.ledger.load('k4')['spend_usd'], 0)
-        wal = Path(self.temp.name) / 'main.jsonl'
+        wals = Path(self.temp.name) / 'wals'; (wals / 's1').mkdir(parents=True)
+        os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
+        wal = wals / 's1' / 'main.jsonl'
         wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'fable for [task:k4]', 'source': 'user:s/u "yes use fable for k4"'}) + '\n'
                        + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'approved by the user'}) + '\n')
         self.ledger.approve_top('k4', 'w1', wal)
@@ -105,6 +110,24 @@ class SpawnDecisions(GateFixture):
         self.assertEqual(decision, 'allow')
         decision, reason, updated, facts = self.spawn('do it [task:k4]', model='fable', effort='high')
         self.assertEqual(decision, 'deny'); self.assertIn('review-only', reason)
+
+    def test_no_model_at_a_permission_rung_is_denied_not_filled_in(self):
+        self.policy = {**self.policy, 'ladder_limits': {'max_review_launches': 100, 'max_rung_climbs': 10, 'max_total_review_usd': 1000}}
+        self.ledger = esc.Ledger(self.root, self.policy)
+        for _ in range(4): self.escalate('k13')
+        decision, reason, updated, facts = self.spawn('do it [task:k13]')
+        self.assertEqual((decision, updated), ('deny', None)); self.assertIn('approve-top', reason)
+        decision, reason, updated, facts = self.spawn('review it [task:k13]', subagent_type='red-team')
+        self.assertEqual((decision, updated), ('deny', None))  # a Fable/Astra reviewer needs the task's permission too
+        decision, reason, updated, facts = self.spawn('fork me [task:k13]', subagent_type='fork')
+        self.assertEqual(decision, 'deny')
+
+    def test_fork_cannot_escape_the_rung_but_is_fine_at_the_lowest(self):
+        decision, reason, updated, facts = self.spawn('fork [task:k14]', subagent_type='fork')
+        self.assertEqual(decision, 'allow')
+        self.escalate('k14')
+        decision, reason, updated, facts = self.spawn('fork [task:k14]', subagent_type='fork')
+        self.assertEqual(decision, 'deny'); self.assertIn('fork inherits', reason)
 
     def test_ladder_limits_deny_writers_but_not_reviewers(self):
         self.ledger.add_spend('k5', 100)
@@ -168,6 +191,12 @@ class Resets(GateFixture):
                 capture_output=True, text=True, timeout=20, env={**os.environ, 'AGENT_HARNESS_TIER_POLICY': str(Path(temp) / 'none.json')})
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout)['hookSpecificOutput']['permissionDecision'], 'deny')
+        # Plain shell use is never blocked by a broken table.
+        with tempfile.TemporaryDirectory() as temp:
+            result = subprocess.run([sys.executable, str(HOOKS / 'tier_gate.py'), 'hook'], input=json.dumps(
+                {'tool_name': 'Bash', 'tool_input': {'command': 'ls -la'}, 'session_id': 's'}),
+                capture_output=True, text=True, timeout=20, env={**os.environ, 'AGENT_HARNESS_TIER_POLICY': str(Path(temp) / 'none.json')})
+            self.assertEqual((result.returncode, result.stdout.strip()), (0, ''))
 
 
 class BashAdvisory(GateFixture):
@@ -188,6 +217,9 @@ class BashAdvisory(GateFixture):
         self.assertEqual(self.bash('/opt/homebrew/bin/claude -p --model fable --task k9 x')[0], 'deny')
         self.assertEqual(self.bash('python3 ~/.claude/hooks/rescue.py --repo r --packet p --output o --model fable --rung R5')[0], 'deny')
         self.assertEqual(self.bash('python3 ~/.claude/hooks/rescue.py --repo r --packet p --output o --model opus --effort max')[0], 'deny')
+        self.assertEqual(self.bash('claude -p --model=fable --task=k9 x')[0], 'deny')
+        self.assertEqual(self.bash('codex exec -c model=gpt-6-astra --task k9 -')[0], 'deny')
+        self.assertEqual(self.bash('ANTHROPIC_MODEL=claude-fable-5-1 claude -p --task k9 x')[0], 'deny')
         self.assertEqual(self.bash('python3 rescue.py --repo r --packet p --output o --model opus --effort xhigh --task k9')[0], 'allow')
         self.assertEqual(self.bash('claude -p --model opus "no task"')[0], 'allow')
 
@@ -204,7 +236,8 @@ class ModesAndCap(GateFixture):
     def test_warn_mode_only_adds_context_and_enforce_mode_decides(self):
         data = {'tool_name': 'Agent', 'tool_input': {'prompt': 'x [task:k10]', 'model': 'opus', 'effort': 'max'}, 'session_id': 's'}
         warn = self.run_hook(data, 'warn')
-        self.assertEqual(warn['permissionDecision'], 'allow'); self.assertIn('would deny', warn['additionalContext'])
+        self.assertNotIn('permissionDecision', warn); self.assertNotIn('updatedInput', warn)  # warn only speaks
+        self.assertIn('would deny', warn['additionalContext'])
         enforce = self.run_hook(data, 'enforce')
         self.assertEqual(enforce['permissionDecision'], 'deny')
         log = [json.loads(l) for l in (self.root / 'gate.jsonl').read_text().splitlines()]

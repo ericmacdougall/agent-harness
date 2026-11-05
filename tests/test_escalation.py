@@ -1,5 +1,6 @@
 """Deterministic ladder state: classifier rows, replay, concurrency, resets, TOP permission (goodqa#14527)."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -31,7 +32,9 @@ class LedgerFixture(unittest.TestCase):
         self.ledger = esc.Ledger(self.root, self.policy)
 
     def block(self, task, *findings, salt=''):
-        return self.ledger.record(task, final(verdict='BLOCK', findings=findings, salt=salt), kind='review', source='test')
+        # Distinct heads per call: a repeat of the same finding at the same HEAD is one failure (R9).
+        head = hashlib.sha256(('head' + salt).encode()).hexdigest()[:40]
+        return self.ledger.record(task, final(verdict='BLOCK', findings=findings, salt=salt, head=head), kind='review', source='test')
 
 
 class ClassifierTable(LedgerFixture):
@@ -40,6 +43,9 @@ class ClassifierTable(LedgerFixture):
             ('material review finding', final(verdict='BLOCK', findings=['F1:a.py:logic']), 'review', 'FAIL'),
             ('review accepted', final(verdict='ACCEPT'), 'review', 'PASS'),
             ('block without findings', final(verdict='BLOCK'), 'review', 'NOT_COUNTED'),
+            ('block with unnamed findings', final(verdict='BLOCK', findings=['UNSPECIFIED', '', {}]), 'review', 'NOT_COUNTED'),
+            ('unexecuted final', json.dumps({**json.loads(final(verdict='BLOCK', findings=['F1'])), 'evidence': 'CLAIMED'}).encode(), 'review', 'NOT_COUNTED'),
+            ('float launches', final(verdict='BLOCK', findings=['F1'], launches=1.0), 'review', 'NOT_COUNTED'),
             ('zero launch', final(verdict='BLOCK', findings=['F1'], launches=0, execution='NOT_STARTED', reason='TRANSIENT_INFRA'), 'review', 'NOT_COUNTED'),
             ('launched but infra', final(verdict='BLOCK', findings=['F1'], reason='TRANSIENT_INFRA'), 'review', 'NOT_COUNTED'),
             ('zero launch with a verdict', final(verdict='BLOCK', findings=['F1'], launches=0), 'review', 'NOT_COUNTED'),
@@ -73,7 +79,11 @@ class ClassifierTable(LedgerFixture):
         mutants = {
             'infra counts': ("if reason in NOT_COUNTED_REASONS or", "if False and reason in NOT_COUNTED_REASONS or"),
             'zero launch counts': ("launches == 0):", "launches == -1):"),
-            'block without findings counts': ("verdict') == 'BLOCK' and review.get('findings'):", "verdict') == 'BLOCK':"),
+            'block without findings counts': ("verdict') == 'BLOCK' and named_findings(review.get('findings')):", "verdict') == 'BLOCK':"),
+            'unexecuted counts': ("if receipt.get('kind') != 'final' or receipt.get('evidence') != 'EXECUTED':", "if receipt.get('kind') != 'final':"),
+            'float launches count': ("if kind == 'review' and (type(launches) is not int or launches == 0):", "if kind == 'review' and launches == 0:"),
+            'uncertain execution counts': ("or receipt.get('execution') in ('NOT_STARTED', 'INTERRUPTED', 'UNKNOWN'):", "or False:"),
+            'unspecified finding counts': ("and ident.strip().upper() != 'UNSPECIFIED':", "and True:"),
             'red tests without claim count': ("if reason == 'CODE_FINDINGS' and head and head in set(claimed_heads):", "if reason == 'CODE_FINDINGS':"),
             'accept is a fail': ("return 'PASS', 'review accepted', None", "return 'FAIL', 'review accepted', None"),
         }
@@ -81,8 +91,12 @@ class ClassifierTable(LedgerFixture):
                 (final(verdict='BLOCK', findings=['F1'], launches=0), 'review', 'NOT_COUNTED'),
                 (final(verdict='BLOCK', findings=['F1'], launches=0, execution='NOT_STARTED', reason='TRANSIENT_INFRA'), 'review', 'NOT_COUNTED'),
                 (final(verdict='BLOCK'), 'review', 'NOT_COUNTED'),
+                (final(verdict='BLOCK', findings=['UNSPECIFIED']), 'review', 'NOT_COUNTED'),
                 (final(result='CHECK_FAILED', reason='CODE_FINDINGS', head='c' * 40), 'test', 'NOT_COUNTED'),
-                (final(verdict='ACCEPT'), 'review', 'PASS')]
+                (final(verdict='ACCEPT'), 'review', 'PASS'),
+                (json.dumps({**json.loads(final(verdict='BLOCK', findings=['F1'])), 'evidence': 'CLAIMED'}).encode(), 'review', 'NOT_COUNTED'),
+                (final(verdict='BLOCK', findings=['F1'], launches=1.0), 'review', 'NOT_COUNTED'),
+                (final(verdict='BLOCK', findings=['F1'], execution='INTERRUPTED', reason='NONE'), 'review', 'NOT_COUNTED')]
         for label, (old, new) in mutants.items():
             with self.subTest(label):
                 self.assertEqual(source.count(old), 1, label)
@@ -94,6 +108,17 @@ class ClassifierTable(LedgerFixture):
 
 
 class Transitions(LedgerFixture):
+    def block_at(self, task, head, *findings, salt=''):
+        return self.ledger.record(task, final(verdict='BLOCK', findings=findings, head=head, salt=salt), kind='review', source='test')
+
+    def test_same_finding_at_the_same_head_without_a_claimed_fix_is_one_failure(self):
+        self.block_at('t0', 'a' * 40, 'F1', salt='1')
+        repeat = self.block_at('t0', 'a' * 40, 'F1', salt='2')
+        self.assertEqual((repeat['rung'], repeat['failures_at_rung']), ('R0', 1))
+        self.ledger.claim_fix('t0', 'b' * 40)
+        after_claim = self.block_at('t0', 'a' * 40, 'F1', salt='3')
+        self.assertEqual(after_claim['rung'], 'R1')
+
     def test_two_genuine_failures_on_one_finding_advance_one_rung(self):
         self.assertEqual(self.ledger.status('t1')['rung'], 'R0')
         first = self.block('t1', 'F1:a.py:logic', salt='1')
@@ -120,7 +145,8 @@ class Transitions(LedgerFixture):
             status = self.ledger.record('t3', receipt, kind='review', source='test')
             self.assertEqual((status['rung'], status['failures_at_rung']), ('R0', 0))
         self.assertEqual(self.ledger.status('t3')['rung'], 'R0')
-        self.assertEqual(self.ledger.load('t3')['launches'], 0)
+        # Paid launches (QUOTA after a launch, TIMEOUT, UNKNOWN) still count toward the launch ceiling; the zero-launch one does not.
+        self.assertEqual(self.ledger.load('t3')['launches'], 3)
 
     def test_replay_is_idempotent(self):
         receipt = final(verdict='BLOCK', findings=['F1'], salt='same')
@@ -194,7 +220,7 @@ class Resets(LedgerFixture):
 
 class Concurrency(LedgerFixture):
     def test_concurrent_writers_keep_every_distinct_event_once(self):
-        receipts = [final(verdict='BLOCK', findings=['F1'], salt=str(n)) for n in range(2)] * 3
+        receipts = [final(verdict='BLOCK', findings=['F1'], salt=str(n), head=('%d' % n) * 40) for n in range(2)] * 3
         script = ('import sys\nfrom pathlib import Path\n'
                   f'sys.path.insert(0, {str(HOOKS)!r})\nimport escalation as esc, model_tiers as tiers\n'
                   f'ledger = esc.Ledger({str(self.root)!r}, tiers.load_policy())\n'
@@ -214,7 +240,10 @@ class Concurrency(LedgerFixture):
 class TopPermission(LedgerFixture):
     def wal(self, *, source='user:s/u "please use fable on t13"', note='permission for [task:t13] top rung', resolved=True,
             resolution='approved: user said yes'):
-        path = Path(self.temp.name) / 'main.jsonl'
+        # Permission is read only from a session main WAL under the wals root (never a caller-chosen file).
+        wals = Path(self.temp.name) / 'wals'; (wals / 'session-1').mkdir(parents=True, exist_ok=True)
+        os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
+        path = wals / 'session-1' / 'main.jsonl'
         lines = [json.dumps({'id': 'wask1', 'event': 'ask', 'note': note, 'source': source})]
         if resolved:
             lines.append(json.dumps({'id': 'wres1', 'event': 'ask_resolved', 'ref': 'wask1', 'note': resolution}))
@@ -232,6 +261,9 @@ class TopPermission(LedgerFixture):
         self.assertIsNone(self.ledger.status('t13')['permission'])
         status = self.ledger.approve_top('t13', 'wask1', self.wal())
         self.assertEqual(status['permission']['ask_id'], 'wask1'); self.assertTrue(status['permission']['source'].startswith('user:'))
+        # A caller-chosen file outside the wals root, or not named main.jsonl, is refused even with a valid pair.
+        outside = Path(self.temp.name) / 'main.jsonl'; outside.write_text(self.wal().read_text())
+        with self.assertRaises(esc.LedgerError): self.ledger.approve_top('t13', 'wask1', outside)
 
 
 if __name__ == '__main__':
