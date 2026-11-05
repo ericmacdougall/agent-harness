@@ -453,10 +453,11 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
     return base
 
 
-def run(cmd: list[str], prompt: str, cwd: Path, timeout=720) -> tuple[int, str, str]:
+def run(cmd: list[str], prompt: str, cwd: Path, timeout=720, on_spawn=None) -> tuple[int, str, str]:
     try:
+        extra = {'on_spawn': on_spawn} if on_spawn is not None else {}
         result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=git_environment(snapshot=True),
-                             timeout=timeout)
+                             timeout=timeout, **extra)
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
         return 124, '', 'HARNESS_PROVIDER_TIMEOUT'
@@ -723,7 +724,9 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                         outcome = {**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}
                     else:
                         options['launches'] += 1
-                        code, stdout, stderr = run(cmd, prompt, snapshot, timeout)
+                        # The child is recorded for the usage guard's liveness rule when a run record exists.
+                        code, stdout, stderr = run(cmd, prompt, snapshot, timeout,
+                                                   **({'on_spawn': run_record.note_child} if run_record else {}))
                         last_message = last.read_text(errors='replace') if last.exists() else ''
                         outcome = normalize_provider(provider, code, stdout, stderr, last_message, stage)
         except GuardError as error:
@@ -841,6 +844,21 @@ def plan_ticket_gate(repo, content):
         return 0, f'spec-flow: plan ticket gate could not run ({error}); continuing'
 
 
+def plan_resource_gate(content):
+    """Plan review also needs a `## Resource budget` that fits the target host's live headroom."""
+    try:
+        import resource_budget
+        import spec_flow
+        text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+        try:
+            mode = spec_flow.load_spec_policy().get('resource_budget_gate', 'enforce')
+        except (OSError, ValueError):
+            mode = 'enforce'
+        return resource_budget.plan_gate(text, mode)
+    except ImportError:
+        return 0, ''  # older install without the resource gate
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("plan", "code-inspection", "pr"))
@@ -935,6 +953,15 @@ def main() -> int:
             target.close()
             evidence.close()
             print('Plan review not started: name the ticket this work belongs to first.', file=sys.stderr)
+            return code
+        code, text = plan_resource_gate(evidence.content)
+        if text:
+            print(text, file=sys.stderr)
+        if code:
+            target.close()
+            evidence.close()
+            print('Plan review not started: add a `## Resource budget` that fits the target host (resource_budget.py check).',
+                  file=sys.stderr)
             return code
     if args.stage == 'pr':
         code, text = commit_policy_gate(repo, args.base)
