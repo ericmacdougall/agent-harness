@@ -24,10 +24,12 @@ AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py",
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
          "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py",
+         "review_diagnostics.py", "review_policy.json", "merge_gate.py",
          "heavy_job_guard.py", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "ops_watch.py", "resource_limits.json",
          "domain_gates.py", "domain_checklists.json",
          "command_guard.py", "command_guard_hook.py", "redact.py",
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py",
+         "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
          "ahd.py", "ahd_peek.py", "ahd_policy.json")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
@@ -46,10 +48,12 @@ class DirectoryPublicationError(OSError):
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
-                         "command_guard_hook.py")}
+                         "command_guard_hook.py", "tier_gate.py", "merge_gate.py")}
 
 
-SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
+# Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
+# SubagentStart/Stop WAL record, so no liveness check could see them stop (goodqa#14613, the Solve drop).
+SUBAGENT_MATCHER = ".*"
 GOODQA_STATUS_TOOLS = (r"^mcp__.*[Gg][Oo][Oo][Dd][Qq][Aa].*__(close_issue_done|close_issue_wont_fix|update_issue|"
                        r"bulk_update_issues|archive_issue|reassign_issue|call_api)$")
 
@@ -67,6 +71,14 @@ def provenance_hook_groups(claude: Path) -> dict[str, list[dict]]:
         "Stop": [{"hooks": [hook("stop-lint")]}],
         "UserPromptSubmit": [{"hooks": [hook("prompt")]}],
     }
+
+
+def merge_gate_hook(claude: Path) -> dict:
+    """Merge gate (docs/operations.md#merge-gate): blocks PR merges unless every check on the head is green.
+    It rides in the WAL pretool group, whose matcher already covers Bash and the write tools (the waiver state
+    files must not be edited by hand). Its own deadline is 40 s; onFailure block turns a crash into a block."""
+    return {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "merge_gate.py"), "hook"],
+            "timeout": 60, "onFailure": "block"}
 
 
 def command_guard_group(claude: Path) -> dict:
@@ -97,20 +109,36 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             hook["onFailure"] = "block"
         return hook
 
+    # Model ladder (goodqa#14527): rung enforcement on spawns, launch lines and the live-agent cap.
+    # Fails open on its own errors (an unreadable tier table denies from inside the hook), so no onFailure.
+    def ladder(action: str, fail_closed: bool = False) -> dict:
+        hook = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "tier_gate.py"), action],
+                "timeout": 10}
+        if fail_closed:
+            hook["onFailure"] = "block"
+        return hook
+
     managed = {
         "SessionStart": [{"hooks": [command("session")]}],
         "UserPromptSubmit": [{"hooks": [command("prompt", True)]}],
         "SubagentStart": [{
             "matcher": SUBAGENT_MATCHER,
             "hooks": [command("subagent")],
+        }, {
+            "hooks": [ladder("start")],
         }],
         "SubagentStop": [{
             "matcher": SUBAGENT_MATCHER,
             "hooks": [command("subagent_stop")],
+        }, {
+            "hooks": [ladder("stop")],
         }],
         "PreToolUse": [{
             "matcher": "Agent|Task|Workflow|Bash|PowerShell|Write|Edit|MultiEdit|NotebookEdit",
-            "hooks": [command("pretool", True)],
+            "hooks": [command("pretool", True), merge_gate_hook(claude)],
+        }, {
+            "matcher": "Agent|Task|Workflow|Bash",
+            "hooks": [ladder("hook", True)],
         }, {
             # Commit message policy: validates git commit / gh pr merge --squash before they run.
             "matcher": "Bash",
@@ -185,6 +213,10 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
     # Read-only policy checks are preapproved; `waive` deliberately is not.
     for action in ("check-message", "check-range", "report"):
         rule = f"Bash(python3 ~/.claude/hooks/commit_policy.py {action} *)"
+        if rule not in allowed:
+            allowed.append(rule)
+    for action in ("check", "report"):  # merge gate reads; `waive` is deliberately not preapproved
+        rule = f"Bash(python3 ~/.claude/hooks/merge_gate.py {action} *)"
         if rule not in allowed:
             allowed.append(rule)
     # Read-only spec checks are preapproved; commands that post to tickets are not.
