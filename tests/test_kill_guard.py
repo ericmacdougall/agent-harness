@@ -205,8 +205,10 @@ class ClobberReadings(WorldCase):
             with self.subTest(text=text):
                 self.assertEqual(self.decide(text)[0], 'block')
 
-    def test_a_reading_dropped_for_depth_blocks_kill_looking_text(self):
-        for inner in ('>! kill 4004', '>! kill 4001(N) 4004'):
+    def test_a_reading_dropped_for_depth_blocks(self):
+        # A kill can be spelled without the word (K=ki; K+=ll), so a dropped reading blocks whatever the text says. The
+        # harmless rows are the cost, pinned so it is seen.
+        for inner in ('>! kill 4004', '>! kill 4001(N) 4004', 'K=ki; K+=ll; >! $K 4004', 'echo ok', '>! ls', '>! y'):
             with self.subTest(inner=inner):
                 verdict = self.decide(self.TOO_DEEP % inner)
                 self.assertEqual(verdict[:2], ('block', 'readings-capped'))
@@ -220,22 +222,58 @@ class ClobberReadings(WorldCase):
             with self.subTest(text=text):
                 self.assertEqual(self.decide(text)[0], 'block')
         self.assertEqual(self.decide('echo ok | ssh h \'>! y\'')[0], 'allow')
-        for inner in ('echo ok', '>! ls', '>! y'):
-            with self.subTest(inner=inner):
-                self.assertEqual(self.decide(self.TOO_DEEP % inner)[0], 'allow')
 
-    def test_readings_that_disagree_inside_eval_block_as_unknown(self):
-        # The cost of the rule above, pinned so it is seen: no kill here, but the readings leave A different and eval is
-        # an indirection, so the guard cannot say what runs. Without the eval the same text is judged.
-        self.assertEqual(self.decide("A=1; eval '>! y A=2'; echo $A")[:2], ('block', 'readings-capped'))
-        self.assertEqual(self.decide("A=1; bash -c '>! y A=2'; echo $A")[0], 'allow')
+    def test_readings_that_disagree_block_as_unknown(self):
+        # No kill here, but the nested readings end in different state, so the guard cannot say what a later command
+        # uses: a cost, pinned so it is seen. Readings that agree are judged.
+        for text in ("A=1; eval '>! y A=2'; echo $A", "A=1; bash -c '>! y A=2'; echo $A"):
+            with self.subTest(text=text):
+                self.assertEqual(self.decide(text)[:2], ('block', 'readings-capped'))
+        self.assertEqual(self.decide("A=1; bash -c 'echo ok >! y'; echo $A")[0], 'allow')
 
-    def test_a_reading_dropped_for_budget_blocks_kill_looking_text(self):
+    def test_a_reading_dropped_for_budget_blocks(self):
         # The real trigger is time and size, so it moves with load; the patch fixes the decision that follows from it.
         with mock.patch.object(kg._import_base().Budget, 'has_room', return_value=False):
-            verdict = self.decide('>! kill 4004')
-            self.assertEqual(verdict[:2], ('block', 'readings-capped'))
-            self.assertEqual(self.decide('echo ok >! y')[0], 'allow')
+            for text in ('>! kill 4004', 'K=ki; K+=ll; >! $K 4004', 'echo ok >! y'):
+                with self.subTest(text=text):
+                    self.assertEqual(self.decide(text)[:2], ('block', 'readings-capped'))
+
+    def test_a_stop_with_clobber_text_blocks_a_kill_spelled_without_the_word(self):
+        # The script is judged on disk first; 256 KB of clean lines stop the analysis before the recorded text, which
+        # holds the kill, is read. Main reads the recorded text and blocks. Blocked is raised directly too, as a control
+        # that does not depend on time.
+        big = os.path.join(self.home, 'big.sh')
+        with open(big, 'w') as handle:
+            handle.write(':\n' * 131000)
+        text = "x=$(printf 'K=ki; K+=ll; $K 4004' >! %s); bash %s" % (big, big)
+        self.assertEqual(self.decide(text)[0], 'block')
+        with mock.patch.object(kg._import_base().Budget, 'tick', side_effect=kg._import_base().Blocked('budget')):
+            self.assertEqual(self.decide('K=ki; K+=ll; >! y; $K 4004')[0], 'block')
+            # no clobber text and no kill word: still allows on a stop (Known limits)
+            self.assertEqual(self.decide('K=ki; K+=ll; $K 4004')[0], 'allow')
+
+    def test_a_kill_found_before_the_analysis_stops_stays_found(self):
+        # The kill is judged first; clean lines after it then run the budget out. Main dropped the finding and allowed.
+        # Blocked is raised at the next budget check after the kill is recorded, so this does not depend on time.
+        cg = kg._import_base()
+        real_make, real_tick = kg.make_analyzer_class, cg.Budget.tick
+        found = []
+
+        def make(base):
+            class StopsAfterAKill(real_make(base)):
+                def block(self, rule, reason, pids=()):
+                    found.append(rule)
+                    return super().block(rule, reason, pids)
+            return StopsAfterAKill
+
+        def tick(budget, weight=1):
+            if found:
+                raise cg.Blocked('budget')
+            return real_tick(budget, weight)
+        with mock.patch.object(kg, 'make_analyzer_class', make), mock.patch.object(cg.Budget, 'tick', tick):
+            verdict = self.decide('K=ki; K+=ll; $K 4004; echo after')
+        self.assertEqual(found, ['not-yours'])
+        self.assertEqual(verdict[:2], ('block', 'not-yours'))
 
 
 class Mutants(WorldCase):
