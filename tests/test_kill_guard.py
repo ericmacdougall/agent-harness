@@ -248,11 +248,17 @@ class ClobberReadings(WorldCase):
         text = "x=$(printf 'K=ki; K+=ll; $K 4004' >! %s); bash %s" % (big, big)
         self.assertEqual(self.decide(text)[0], 'block')
         with mock.patch.object(kg._import_base().Budget, 'tick', side_effect=kg._import_base().Blocked('budget')):
-            self.assertEqual(self.decide('K=ki; K+=ll; >! y; $K 4004')[0], 'block')
-            self.assertEqual(self.decide('K=ki; K+=ll; >\\\n! y; $K 4004')[0], 'block')  # a line continuation joins `>!`
-            self.assertEqual(self.decide('K=ki; K+=ll; &>\\\n! y; $K 4004')[0], 'block')
-            # no clobber text and no kill word: still allows on a stop (Known limits)
+            for text in ('K=ki; K+=ll; >! y; $K 4004', 'K=ki; K+=ll; >&! y; $K 4004',
+                         # the guard's lexer joins a backslash-newline, so these are judged as `>!` (real shells split
+                         # them; refusing errs safe and matches what was analysed)
+                         'K=ki; K+=ll; >\\\n! y; $K 4004', 'K=ki; K+=ll; &>\\\n! y; $K 4004',
+                         'K=ki; K+=ll; >\\\r\n! y; $K 4004'):
+                with self.subTest(text=text):
+                    self.assertEqual(self.decide(text)[0], 'block')
+            # no clobber text and no kill word: still allows on a stop (Known limits, goodqa#14764)
             self.assertEqual(self.decide('K=ki; K+=ll; $K 4004')[0], 'allow')
+        # Too large to analyse at all: Blocked comes before the analyzer exists.
+        self.assertEqual(self.decide('K=ki; K+=ll; >! y; $K 4004; : ' + 'x' * 270000)[0], 'block')
 
     def test_a_kill_found_before_the_analysis_stops_stays_found(self):
         # The kill is judged first; clean lines after it then run the budget out. Main dropped the finding and allowed.
