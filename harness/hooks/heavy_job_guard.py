@@ -336,12 +336,25 @@ def path_size(path: str, cap: int = None, seconds: float = COPY_WALK_SECONDS):
     return total, True
 
 
+def measured_hosts():
+    """Hosts the guard may `ssh du` to size a remote source: the fleet (dev2/T2) plus heavy_job_guard.json
+    "measure_hosts". Any other host is not contacted and its source is not counted."""
+    hosts = {"dev2", "t2"}
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
+        if os.path.exists(path):
+            hosts |= {h for h in load_json_file(path).get("measure_hosts", []) if isinstance(h, str)}
+    except Exception:
+        pass
+    return hosts
+
+
 def remote_path_size(spec: str):
     """Bytes of host:path via a read-only `ssh host du -sk`, bounded to 4 s; None when it cannot be measured."""
     import subprocess
     host, _, remote = spec.partition(":")
-    if not remote or remote.startswith("-"):
-        return None
+    if not remote or remote.startswith("-") or host.startswith("-") or host.rpartition("@")[2] not in measured_hosts():
+        return None  # a PreToolUse hook runs before the user approves: only ever connect to the user's own fleet
     try:
         out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2", "--", host, "du", "-sk", "--", remote],
                              capture_output=True, text=True, timeout=4).stdout
@@ -403,12 +416,21 @@ def fmt_gib(n: float) -> str:
     return f"{n / GIB:.1f} GiB"
 
 
-def sum_sources(sources, ctx, thr):
-    """(bytes, unmeasured_detail) over local and host:path sources, stopping once the threshold is reached."""
+def sum_sources(sources, ctx, thr, remote_ok=False, deref=False, budget_s=2.5):
+    """(bytes, unmeasured_detail) over local and (scp/rsync only) host:path sources, stopping at the threshold.
+
+    The whole sizing is bounded by budget_s so a glob of many matches or several slow remotes cannot stall the hook;
+    running out of time counts as unmeasurable (heavy). A remote host outside the fleet is not contacted (the hook
+    runs before the user approves) and its source is not counted."""
     import glob as globmod
+    started = time.monotonic()
     total = 0
     for src in sources:
-        if REMOTE_SPEC.match(src) and not src.startswith(("/", ".", "~")):
+        if time.monotonic() - started > budget_s:
+            return total, f"sizing took longer than {budget_s:g}s"
+        if remote_ok and REMOTE_SPEC.match(src) and not src.startswith(("/", ".", "~")):
+            if src.partition(":")[0].rpartition("@")[2] not in measured_hosts():
+                continue
             size = remote_path_size(src)
             if size is None:
                 return total, f"cannot measure {src.split(':')[0]}:... within the time bound"
@@ -417,7 +439,11 @@ def sum_sources(sources, ctx, thr):
             path = resolve(os.path.expanduser(src), ctx.cwd)
             paths = globmod.glob(path)[:500] if any(c in path for c in "*?[") else [path]
             for one in paths:
-                size, complete = path_size(one, cap=thr - total)
+                if time.monotonic() - started > budget_s:
+                    return total, f"sizing took longer than {budget_s:g}s"
+                if deref and os.path.islink(one):
+                    one = os.path.realpath(one)  # cp -L / rsync -L copy what the link points at
+                size, complete = path_size(one, cap=thr - total, seconds=min(COPY_WALK_SECONDS, max(0.1, budget_s - (time.monotonic() - started))))
                 total += size
                 if total >= thr:
                     return total, None
@@ -442,10 +468,52 @@ RSYNC_VALUE_FLAGS = ("-e", "--rsh", "-f", "--filter", "--exclude", "--include", 
                      "--temp-dir", "--timeout", "--contimeout", "--chmod", "--usermap", "--groupmap", "--iconv",
                      "--rsync-path", "--out-format", "--info", "--debug", "--suffix", "--address", "--sockopts",
                      "--password-file", "--stop-after", "--stop-at", "--compress-level", "--skip-compress")
+SCP_VALUE_FLAGS = ("-P", "-i", "-F", "-l", "-o", "-c", "-J", "-S", "-D")
+CP_VALUE_FLAGS = ("-t", "--target-directory", "-S", "--suffix")
 CLONE_VALUE_FLAGS = ("-b", "--branch", "--depth", "-o", "--origin", "-c", "--config", "--reference",
                      "--reference-if-able", "--separate-git-dir", "--template", "--filter", "-j", "--jobs",
                      "-u", "--upload-pack", "--server-option", "--shallow-since", "--shallow-exclude", "--revision",
                      "--ref-format", "--bundle-uri")
+TAR_ARG_LETTERS = "fCXTIbgL"  # bundled letters that consume the next word, in order of appearance
+TAR_LONG_VALUES = ("--directory", "--exclude", "--files-from", "--exclude-from", "--use-compress-program", "--transform",
+                   "--strip-components", "--newer", "--listed-incremental", "--owner", "--group", "--mode", "--format")
+
+
+def parse_tar(args):
+    """(mode 'x'|'c'|None, archive, [source words]) for old-style (`tar xzf a.tgz`) and dashed forms, flags in any order."""
+    mode, archive, sources, i = None, None, [], 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            if name in ("--extract", "--get"):
+                mode = "x"
+            elif name == "--create":
+                mode = mode or "c"
+            elif name == "--file":
+                archive = val if eq else (args[i] if i < len(args) else None)
+                i += 0 if eq else 1
+            elif name in TAR_LONG_VALUES and not eq:
+                i += 1
+            continue
+        if (a.startswith("-") and len(a) > 1) or (i == 1 and not a.startswith("-") and re.fullmatch(r"[A-Za-z]+", a)):
+            wants = []
+            for ch in a.lstrip("-"):
+                if ch == "x":
+                    mode = "x"
+                elif ch == "c":
+                    mode = mode or "c"
+                if ch in TAR_ARG_LETTERS:
+                    wants.append(ch)
+            for ch in wants:
+                value = args[i] if i < len(args) else None
+                i += 1
+                if ch == "f":
+                    archive = value
+            continue
+        sources.append(a)
+    return mode, archive, sources
 
 
 def classify_copy(low, args, ctx):
@@ -456,58 +524,33 @@ def classify_copy(low, args, ctx):
             return None
         target = None
         flagged = [a for a in args if a in ("-t", "--target-directory")]
-        if flagged and args.index(flagged[0]) + 1 < len(args):
+        if low == "cp" and flagged and args.index(flagged[0]) + 1 < len(args):
             target = args[args.index(flagged[0]) + 1]
-        values = RSYNC_VALUE_FLAGS if low == "rsync" else ("-t", "--target-directory", "-S", "--suffix", "-P", "-i", "-F",
-                                                           "-l", "-o", "-c", "-J", "-S", "-D", "-X")
+        values = {"rsync": RSYNC_VALUE_FLAGS, "scp": SCP_VALUE_FLAGS, "cp": CP_VALUE_FLAGS}.get(low, ())
         pos = positional(args, values)
         if target is None and len(pos) < 2:
             return None
         sources, dest = (pos, target) if target else (pos[:-1], pos[-1])
-        if dest in ("/dev/null",) or (low in ("scp", "rsync") and REMOTE_SPEC.match(dest) and not dest.startswith(("/", ".", "~"))):
-            return None  # the copy lands on another host
-        if dest.startswith("rsync://"):
+        remote_tool = low in ("scp", "rsync")
+        if dest == "/dev/null" or dest.startswith("rsync://"):
             return None
-        total, unknown = sum_sources(sources, ctx, thr)
+        if remote_tool and REMOTE_SPEC.match(dest) and not dest.startswith(("/", ".", "~")):
+            return None  # the copy lands on another host
+        if os.path.abspath(os.path.expanduser(dest)).startswith("/Volumes/"):
+            return None  # an external or network volume, not the Mac's own disk
+        deref = any(a in ("--copy-links", "--dereference") or re.match(r"^-[A-Za-z]*[LH][A-Za-z]*$", a) for a in args
+                    if a.startswith("-") and a not in values)
+        total, unknown = sum_sources(sources, ctx, thr, remote_ok=remote_tool, deref=deref)
         return finish_copy(low, total, unknown, thr)
     if low == "tar" and args:
-        first = args[0]
-        bundle = first.lstrip("-") if (not first.startswith("--")) else ""
-        letters = bundle if (not first.startswith("-") or len(first) > 1) else ""
-        longs = [a for a in args if a.startswith("--")]
-        extract = "x" in letters.split("=")[0] or "--extract" in longs or "--get" in longs or any(
-            re.match(r"^-[A-Za-z]*x[A-Za-z]*$", a) for a in args[:1])
-        create = ("c" in letters and not extract) or "--create" in longs
-        archive = None
-        for i, a in enumerate(args):
-            if a in ("-f", "--file") and i + 1 < len(args):
-                archive = args[i + 1]
-            elif a.startswith("--file="):
-                archive = a.split("=", 1)[1]
-        if archive is None and "f" in letters and len(args) > 1:
-            archive = args[1] if not args[1].startswith("-") else None
-        if archive in (None, "-") or REMOTE_SPEC.match(archive):
-            return None  # a pipe: the other end decides (tar czf - . | ssh dev2 'tar x')
-        if extract:
-            size, complete = path_size(resolve(os.path.expanduser(archive), ctx.cwd))
-            est = size * (4 if COMPRESSED.search(archive) else 1)
-            return finish_copy("tar extract", est, None, thr)
-        if create:
-            skip = {archive}
-            skip_next = False
-            sources = []
-            for a in args[1:] if letters else args:
-                if skip_next:
-                    skip_next = False
-                elif a in ("-f", "--file", "-C", "--directory", "-X", "-T", "--exclude", "--use-compress-program", "-I"):
-                    skip_next = True
-                elif not a.startswith("-") and a not in skip:
-                    sources.append(a)
-            if letters and "C" in letters and sources:
-                sources = sources[1:]
-            total, unknown = sum_sources(sources, ctx, thr)
-            return finish_copy("tar create", total, unknown, thr)
-        return None
+        mode, archive, srcs = parse_tar(args)
+        if mode is None or archive in (None, "-") or REMOTE_SPEC.match(archive) and not archive.startswith(("/", ".", "~")):
+            return None  # a pipe or a listing: the other end decides (tar czf - . | ssh dev2 'tar x')
+        if mode == "x":
+            size, _complete = path_size(resolve(os.path.expanduser(archive), ctx.cwd))
+            return finish_copy("tar extract", size * (4 if COMPRESSED.search(archive) else 1), None, thr)
+        total, unknown = sum_sources(srcs, ctx, thr)
+        return finish_copy("tar create", total, unknown, thr)
     if low == "gh":
         pos = positional(args)
         if pos[:2] == ["repo", "clone"] and len(pos) > 2:
@@ -533,27 +576,29 @@ def classify_copy(low, args, ctx):
             return clone_estimate(pos[0], rest[1:], ctx, thr, "git clone")
         if rest[0] == "worktree" and rest[1:2] == ["add"]:
             size = tracked_tree_bytes(cwd)
-            return finish_copy("git worktree add", size or 0, None, thr, " (tracked tree at HEAD)")
+            if size is None:
+                return finish_copy("git worktree add", 0, "git could not size the tracked tree in time", thr)
+            return finish_copy("git worktree add", size, None, thr, " (tracked tree at HEAD)")
     return None
 
 
 def clone_estimate(url, flags, ctx, thr, label):
     shallow = any(f.startswith(("--depth", "--shallow-since", "--filter", "--shallow-exclude")) for f in flags)
     factor = 0.5 if shallow else 2.0
-    match = GITHUB_URL.search(url) or (GH_SLUG.match(url) if label == "gh repo clone" else None)
-    if match and not os.path.isdir(resolve(os.path.expanduser(url), ctx.cwd)):
-        size = github_repo_bytes(match.group(1), match.group(2))
-        if size is None:
-            return None if shallow else ("copy", f"{label} of {match.group(1)}/{match.group(2)}: size unknown "
-                                                f"(GitHub did not answer; unknown size counts as heavy; limit {fmt_gib(thr)})")
-        return finish_copy(label, int(size * factor), None, thr, f" (repository {fmt_gib(size)} as reported by GitHub)")
     local = resolve(os.path.expanduser(url.replace("file://", "")), ctx.cwd)
     if os.path.isdir(local):
         size, complete = path_size(local, cap=thr)
         return finish_copy(label, int(size * (0.5 if shallow else 1.0)), None if (complete or shallow) else
                            "source is too large to measure", thr)
-    return None if shallow else ("copy", f"{label} of {url[:80]}: size unknown (not a GitHub repo or local path; unknown "
-                                         f"size counts as heavy; limit {fmt_gib(thr)})") if not REMOTE_SPEC.match(url) and "://" not in url else None
+    match = GITHUB_URL.search(url) or (GH_SLUG.match(url) if label == "gh repo clone" else None)
+    if match:
+        size = github_repo_bytes(match.group(1), match.group(2))
+        if size is not None:
+            return finish_copy(label, int(size * factor), None, thr, f" (repository {fmt_gib(size)} as reported by GitHub)")
+    if shallow:
+        return None  # a shallow or filtered clone is bounded by construction, so an unknown size is allowed
+    return ("copy", f"{label} of {url[:80]}: size unknown (no GitHub size available, and any other host is not measured; "
+                    f"unknown size counts as heavy; limit {fmt_gib(thr)})")
 
 
 # ---------------------------------------------------------------- classification
@@ -1449,10 +1494,34 @@ def work_owner_key(path):
     return None
 
 
+def agent_of_key(key: str) -> str:
+    """Same identity ops_watch uses: the sub-agent id of work/<session>/agent-<id>, else '<session8>-<sub>'."""
+    sess, _, sub = key.partition("/")
+    agent = sub[len("agent-"):] if sub.startswith("agent-") and len(sub) > 6 else f"{sess[:8]}-{sub}"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", agent)[:80]
+
+
+def record_epoch(rec) -> float:
+    """When the record was measured: measured_at_epoch, else the ISO measured_at of the agreed contract shape."""
+    try:
+        return float(rec["measured_at_epoch"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    from datetime import datetime, timezone
+    text = str(rec.get("measured_at", "")).replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text if "T" not in text or len(text) > 16 else text + ":00")
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def over_budget(cwd):
     """The over-budget record covering cwd, re-measured live so freeing space unblocks at once.
 
-    Source: state/disk-budget/<owner>.json written by ops_watch (used_bytes, budget_bytes, over_since, path_key)."""
+    Source: state/disk-budget/<agent>.json written by ops_watch (agent, budget_bytes, used_bytes, measured_at,
+    over_since; path_key optional). A live walk that cannot finish in time does NOT clear the block: only a
+    complete measurement under budget does."""
     try:
         directory = os.path.join(state_dir(), "disk-budget")
         records = [load_json_file(os.path.join(directory, n), 64 * 1024) for n in os.listdir(directory) if n.endswith(".json")]
@@ -1463,14 +1532,17 @@ def over_budget(cwd):
         return None
     for rec in records:
         try:
-            if rec.get("over_since") is None or rec.get("path_key") != key:
+            if rec.get("over_since") is None:
                 continue
-            if time.time() - float(rec.get("measured_at_epoch", 0)) > 3 * 3600:
+            if rec.get("path_key") != key and rec.get("agent") != agent_of_key(key):
+                continue
+            if time.time() - record_epoch(rec) > 3 * 3600:
                 continue  # a stale record must never block work for good
             base = os.path.join(os.path.expanduser("~"), ".agent-harness", "work", key)
-            size, _complete = path_size(base, cap=int(rec["budget_bytes"]) + 1, seconds=1.0)
-            if size > int(rec["budget_bytes"]):
-                return dict(rec, used_bytes=size)
+            budget = int(rec["budget_bytes"])
+            size, complete = path_size(base, cap=budget + 1, seconds=1.0)
+            if size > budget or not complete:
+                return dict(rec, path_key=key, used_bytes=max(size, int(rec.get("used_bytes", 0))))
         except Exception:
             continue
     return None
@@ -1554,6 +1626,11 @@ def run(raw: bytes) -> int:
             log_event({"event": "deny-hatch-disk", "rule": "copy"})
             ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a hatch copy: disk above 85%",
                        copy_event_detail(payload, decision))
+            return 2
+        if live_heavy_jobs() >= max_heavy_jobs():  # refuse BEFORE spending this owner's hourly use
+            sys.stderr.write(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
+                             f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n")
+            log_event({"event": "deny-concurrency", "rule": decision["rule"]})
             return 2
         allowed, uses = record_hatch_use(owner, hatch_limit())
         if not allowed:

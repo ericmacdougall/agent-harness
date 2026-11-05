@@ -547,7 +547,9 @@ def owner_budget_bytes(cfg_disk: dict, path: str) -> int:
     try:
         kit = json.loads(safe_read(Path(path) / "kit.json", 64 * 1024))
         declared = float(kit.get("disk_budget_gib"))
-    except (OSError, ValueError, TypeError, AttributeError):
+        if declared != declared or declared in (float("inf"), float("-inf")):
+            declared = None  # NaN or infinity in a kit must never break the disk check
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
         pass
     return int(min(max(declared, default) if declared else default, cap) * GIB)
 

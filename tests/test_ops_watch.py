@@ -138,6 +138,26 @@ class DiskTests(Base):
         self.assertIsNone(json.loads(self.budget_file("AAA.json").read_text())["over_since"])
         self.assertTrue((work / "agent-AAA").is_dir())
 
+    def test_malformed_kit_budget_cannot_break_the_disk_check(self):
+        sizes = {}
+        work, runner = self.owner_fixture(sizes)
+        sizes[str(work / "agent-AAA")] = 9.0
+        for body in ('{"disk_budget_gib": NaN}', '{"disk_budget_gib": Infinity}', '{"disk_budget_gib": "x"}', "[1]", "{"):
+            (work / "agent-AAA" / "kit.json").write_text(body)
+            alerts = keys(ow.check_disk(self.cfg, {}, runner, 2_000_000.0))
+            self.assertIn("disk:owner:AAA", alerts, body)  # default 5 GiB applies
+            self.assertNotIn("ops-watch:check-error:disk", alerts)
+
+    def test_a_measurement_older_than_three_hours_is_not_called_over(self):
+        sizes = {}
+        work, runner = self.owner_fixture(sizes)
+        sizes[str(work / "agent-AAA")] = 9.0
+        state = {}
+        ow.check_disk(self.cfg, state, runner, 2_000_000.0)
+        broken = FakeRunner({("du",): (127, "")})  # the next pass cannot measure: the old number must not be reused
+        alerts = keys(ow.check_disk(self.cfg, state, broken, 2_000_000.0 + 4 * 3600))
+        self.assertNotIn("disk:owner:AAA", alerts)
+
     def test_unmeasured_owner_is_never_called_over(self):
         work, _ = self.owner_fixture({})
         runner = FakeRunner({("du",): (127, "")})
