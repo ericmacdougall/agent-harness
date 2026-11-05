@@ -369,6 +369,16 @@ class Locking(Case):
         self.assertEqual(self.run_script().returncode, 0)
         self.assertTrue(self.last_ok().exists())
 
+    def test_a_live_holder_whose_path_contains_a_space_is_still_a_live_holder(self):
+        # F2: a HOME with a space split the path and made a running backup look like a stranger's pid
+        proc = self.holder("my dir/log-backup.sh")
+        time.sleep(0.3)
+        self.lock(proc.pid)
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(self.recorded(), [])
+        self.assertFalse(self.last_ok().exists())
+
     def make_lock(self, name, age):
         lock = self.logs / name
         lock.mkdir(parents=True)
@@ -611,7 +621,7 @@ class Failure(Case):
         self.put(f"{base}/big.json", b"x" * 5000)
         self.put(f"{base}/odd[1]/.git", b"gitdir: /elsewhere")        # glob characters cannot be excluded safely
         self.put(f"{base}/state.json", b"{}")
-        done = self.local_run(LOG_BACKUP_WORK_MAX_SIZE="1k")
+        done = self.local_run(LOG_BACKUP_WORK_MAX_SIZE="1K")
         self.assertEqual(done.returncode, 0, done.stderr)
         files = {f for f in self.remote_files() if f.startswith(".agent-harness/work/")}
         self.assertEqual(files, {".agent-harness/work/t1/notes.md", f"{base}/state.json", f"{base}/odd[1]/.git"})
@@ -646,6 +656,20 @@ class Failure(Case):
                 self.assertEqual(done.returncode, 2, (name, value))
                 self.assertEqual(self.copies(), [], (name, value))
                 self.assertFalse(self.last_ok().exists() or self.bulk_ok().exists())
+
+    def test_work_size_settings_must_be_plain_non_zero_sizes(self):
+        # F1: a zero transfer cap would stop every run at once; free text would reach rclone
+        for name in ("LOG_BACKUP_WORK_MAX_SIZE", "LOG_BACKUP_WORK_MAX_TRANSFER"):
+            for value in ("0", "0M", "-1", "1.5G", "abc", "12T", "1234567", "5 M", "--delete-after", "$(id)", "1m"):
+                if self.calls.exists():
+                    self.calls.unlink()
+                done = self.run_script(**{name: value})
+                self.assertEqual(done.returncode, 2, (name, value))
+                self.assertEqual(self.copies(), [], (name, value))
+            for value in ("1", "25M", "5G", "100K", "999999G"):
+                if self.calls.exists():
+                    self.calls.unlink()
+                self.assertEqual(self.run_script(**{name: value}).returncode, 0, (name, value))
 
     def test_hostile_work_directory_names_never_cause_a_wrong_exclusion(self):
         base = ".agent-harness/work/t1"

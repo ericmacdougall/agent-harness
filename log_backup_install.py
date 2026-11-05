@@ -106,10 +106,26 @@ def backup_run_active(home: Path) -> bool:
         pid = int(pid_file.read_text().strip())
         if pid <= 1:
             return False
+        if time.time() - lock.stat().st_mtime >= 86400:
+            return False  # as in the script: a lock over a day old may carry a recycled pid
         os.kill(pid, 0)
-        return True
     except (OSError, ValueError):
         return False
+    return is_backup_process(pid)
+
+
+def is_backup_process(pid: int) -> bool:
+    """The pid runs `<shell> <path>/log-backup.sh`, as the script itself requires of a lock holder."""
+    try:
+        done = subprocess.run(["ps", "-p", str(pid), "-o", "args="], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    args = done.stdout.decode("utf-8", "replace").strip()
+    first, _, rest = args.partition(" ")
+    if not rest or os.path.basename(first) not in ("sh", "bash", "dash", "zsh"):
+        return False
+    return not rest.startswith("-") and rest.endswith("log-backup.sh")
 
 
 def default_runner(argv: list[str]) -> int:

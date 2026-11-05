@@ -37,6 +37,13 @@ RUN_START=$(date +%s)
 for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP; do
   case "${!numeric:-0}" in *[!0-9]*|??????*) echo "log-backup: $numeric must be a whole number of at most 5 digits" >&2; exit 2 ;; esac
 done
+# Size limits go to rclone, so they must be plain sizes: digits, an optional K, M or G, and not zero (a zero transfer
+# cap would stop every run immediately and the bulk marker would never be written).
+for sized in LOG_BACKUP_WORK_MAX_SIZE LOG_BACKUP_WORK_MAX_TRANSFER; do
+  if [ -n "${!sized:-}" ] && ! printf '%s' "${!sized}" | grep -Eq '^[1-9][0-9]{0,5}[KMG]?$'; then
+    echo "log-backup: $sized must look like 25M (a non-zero number, optional K, M or G)" >&2; exit 2
+  fi
+done
 
 umask 077
 mkdir -p "$LOGDIR" || { echo "log-backup: cannot create $LOGDIR" >&2; exit 1; }
@@ -80,7 +87,16 @@ legacy_run_active() {
 
 holder_alive() { # pid $1 is running and is a log-backup run (a recycled pid belongs to something else)
   kill -0 "$1" 2>/dev/null || return 1
-  ps -p "$1" -o args= 2>/dev/null | awk '$1 ~ /(^|\/)(ba|da|z)?sh$/ && $2 ~ /log-backup\.sh$/ {f=1} END {exit !f}'
+  # args must read: <shell> <path ending in log-backup.sh>. The path may contain spaces (a HOME with a space), so the
+  # whole remainder is matched, not one word; a remainder that starts with a flag (sh -c ... log-backup.sh) is a spoof.
+  local args first rest
+  args=$(ps -p "$1" -o args= 2>/dev/null) || return 1
+  first=${args%% *}; rest=${args#* }
+  [ "$rest" != "$args" ] || return 1
+  case "$first" in sh|bash|dash|zsh|*/sh|*/bash|*/dash|*/zsh) ;; *) return 1 ;; esac
+  case "$rest" in -*) return 1 ;; esac
+  case "$rest" in *log-backup.sh) return 0 ;; esac
+  return 1
 }
 
 acquire_lock() {
