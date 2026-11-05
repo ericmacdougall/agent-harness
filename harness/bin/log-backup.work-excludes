@@ -1,0 +1,16 @@
+# Extra excludes for ~/.agent-harness/work only (screenshots, recordings and archives are rebuildable evidence).
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.mp4
+*.webm
+*.mov
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.bin
+*.sqlite
+*.db
