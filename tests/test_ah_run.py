@@ -512,9 +512,12 @@ class RewriteHook(HookFixture):
         def fake(argv, **kw):
             calls.append(argv)
             return subprocess.CompletedProcess(argv, 0, stdout='%d sh -c x\n' % (1000 + len(calls)), stderr='')
-        with mock.patch.object(ah_run.subprocess, 'run', fake):
+        # a fixed parent: in a container the test runner's parent can be pid 1, where the walk rightly stops at once
+        with mock.patch.object(ah_run.subprocess, 'run', fake), mock.patch.object(ah_run.os, 'getppid', lambda: 4242):
             chain = ah_run.ancestor_commands()
         self.assertEqual(len(chain), 8); self.assertEqual(len(calls), 8)
+        with mock.patch.object(ah_run.subprocess, 'run', fake), mock.patch.object(ah_run.os, 'getppid', lambda: 1):
+            self.assertEqual(ah_run.ancestor_commands(), [])
 
     def test_project_deny_from_subdirectory(self):
         self.settings('project', deny=['Bash(echo FORBIDDEN*)'])
@@ -2009,7 +2012,13 @@ class LiteralRule(HookFixture):
         for command in ('/bin/tou?h x', '/usr/bin/t*h x', '/bin/tou[c]h x', 'x=1; /usr/bin/to?ch y'):
             self.assertEqual(self.decide(command, permission_mode='bypassPermissions').get('permissionDecision'), 'deny', command)
         self.assertNotEqual(self.decide('/bin/l? x', permission_mode='bypassPermissions').get('permissionDecision'), 'deny')
-        self.assertEqual(self.decide('${<$[echo HIDDEN-LINE)" << E<<-E<&<<<esac]$"<<<((', permission_mode='bypassPermissions').get('permissionDecision'), 'deny')  # fuzz seed 1: a bad range
+        # fuzz seed 1: a glob with the range N-L. fnmatch raised on Python 3.9 and dropped the range on 3.12 (sandbox r7mod), so
+        # the hook reads brackets itself: any one character, the same on every Python, and never an exception.
+        self.assertIsNone(self.decide('${<$[echo HIDDEN-LINE)" << E<<-E<&<<<esac]$"<<<((', permission_mode='bypassPermissions').get('permissionDecision'))
+        for name, glob, matches in (('touch', 'tou?h', True), ('touch', 't*h', True), ('touch', 'tou[c]h', True), ('touch', 'tou[!x]h', True),
+                                    ('touch', 'tou[]]h', True), ('touch', '[z-a]ouch', True), ('touch', 'tou[x-a]h', True), ('touch', 'l?', False),
+                                    ('touch', 'tou[ch', False), ('xtouch', 't*', False), ('axb', 'a.b', False)):
+            self.assertEqual(ah_run._glob_matches(name, glob), matches, (name, glob))
 
     def test_what_it_wrongly_catches(self):
         """Pinned false refusals, the price of the rule: a denied word at a word start in prose inside uncertain text."""

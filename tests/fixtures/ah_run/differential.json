@@ -1,13 +1,13 @@
 {
 "line": "echo HIDDEN-LINE",
 "pinned_on": {
-"platform": "darwin",
+"platform": "linux",
 "shells": {
-"bash3": "3.2.57(1)-release",
-"bash5": "5.3.20(1)-release",
+"bash3": "3.2.57(2)-release",
+"bash5": "5.3.0(1)-release",
 "dash": "",
-"ksh": "Version AJM 93u+ 2012-08-01",
-"sh": "3.2.57(1)-release",
+"ksh": "Version AJM 93u+m/1.0.8 2024-01-01",
+"sh": "3.2.57(2)-release",
 "zsh": "5.9"
 }
 },
@@ -20,9 +20,9 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
+"ksh",
 "sh",
-"ksh"
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo $'\\'' ; %s ; echo ''",
@@ -37,9 +37,9 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
+"ksh",
 "sh",
-"ksh"
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo $'a\\' <<EOF'\n%s\nEOF",
@@ -54,10 +54,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo ${x:-<<EOF}\n%s\nEOF",
@@ -72,9 +72,9 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
+"ksh",
 "sh",
-"ksh"
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo ${x:0:1<<EOF}\n%s\nEOF",
@@ -89,10 +89,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo <<E.F\nE.F\n%s\nE\n",
@@ -107,10 +107,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo <<'E'OF\nEOF\n%s\nE\n",
@@ -125,10 +125,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo <<E\\OF\nEOF\n%s\nE\n",
@@ -143,9 +143,9 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
+"ksh",
 "sh",
-"ksh"
+"zsh"
 ],
 "rewritten": "none",
 "shape": "((x=1<<EOF))\n%s\nEOF",
@@ -160,8 +160,8 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"ksh",
+"sh"
 ],
 "rewritten": "none",
 "shape": "echo $'a\\' <<EOF'\n%s\nEOF\necho $'",
@@ -176,9 +176,9 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
+"ksh",
 "sh",
-"ksh"
+"zsh"
 ],
 "rewritten": "none",
 "shape": "cat <<X\n'\nX\necho $'a\\' <<EOF'\n%s\nEOF\n#'",
@@ -193,8 +193,8 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh"
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo $[1<<EOF]\n%s\nEOF",
@@ -209,10 +209,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo <<E\"O\"F\nEOF\n%s\nE\n",
@@ -227,8 +227,8 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh"
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo <<EOF\nEOF\\\n\n%s\nEOF",
@@ -243,10 +243,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo a\\ #'\ncat <<E\n'; %s\nE\n#'",
@@ -261,10 +261,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "(true)#'\n' cat <<E\n'; %s\nE",
@@ -278,9 +278,9 @@
 "name": "case-in-substitution",
 "ran": [
 "bash5",
-"zsh",
 "dash",
-"ksh"
+"ksh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo \"$(case x in x) echo \" <<EOF\n\"; %s\nEOF\n;; esac)\" #\"",
@@ -309,10 +309,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "cat <<EOF\n$(%s)\nEOF",
@@ -349,10 +349,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo a \\\n# don't do this\n%s\n# won't happen",
@@ -367,10 +367,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo a \\\n#'\n%s\n#'",
@@ -385,10 +385,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo a \\\n#\"\n%s\n#\"",
@@ -403,10 +403,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "\\\n#'\n%s\n#'",
@@ -421,10 +421,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo $(echo # ) '\n); %s; echo \"'\" #\"",
@@ -439,10 +439,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "$(# ) \"\n); %s #\"",
@@ -457,8 +457,7 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"sh"
 ],
 "rewritten": "none",
 "shape": "echo `echo \\` ' `; %s; echo \"'\" #\"",
@@ -473,10 +472,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "bash <<'E'\n%s\nE",
@@ -491,10 +490,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "sh -s <<E\n%s\nE",
@@ -509,10 +508,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "true `true <<'E'`\n%s<<-E\nE",
@@ -538,10 +537,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo a\n%s",
@@ -556,10 +555,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo a; %s",
@@ -574,10 +573,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "# it's\necho $(%s)\n# it's",
@@ -592,10 +591,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo a \\\n  #'\n%s\n#'",
@@ -610,8 +609,8 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"ksh"
+"ksh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "cat <(echo # ) '\n); %s; echo \"'\" #\"",
@@ -626,10 +625,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "x=$(echo # ) '\n); %s; echo \"'\" #\"",
@@ -732,8 +731,8 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"ksh",
+"sh"
 ],
 "rewritten": "none",
 "shape": "x[1 <<E]=1\n%s\nE",
@@ -825,10 +824,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "true <<E\n'\nE\n%s #'",
@@ -942,10 +941,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "true &#<<E\n%s\nE",
@@ -1334,10 +1333,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo \"$(echo ')')\"; %s",
@@ -1351,9 +1350,9 @@
 "name": "none-case-in-subst",
 "ran": [
 "bash5",
-"zsh",
 "dash",
-"ksh"
+"ksh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo $(case x in x) echo y;; esac); %s",
@@ -1368,10 +1367,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "$(true) %s",
@@ -1386,10 +1385,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "`true` %s",
@@ -1404,10 +1403,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "$x %s",
@@ -1422,9 +1421,9 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh"
 ],
 "rewritten": "none",
 "shape": "echo${IFS}HIDDEN-LINE",
@@ -1439,10 +1438,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "ec\\\nho HIDDEN-LINE",
@@ -1457,8 +1456,8 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"ksh",
+"sh"
 ],
 "rewritten": "none",
 "shape": "$\"echo\" HIDDEN-LINE",
@@ -1473,8 +1472,8 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"ksh",
+"sh"
 ],
 "rewritten": "none",
 "shape": "{echo,HIDDEN-LINE}",
@@ -1489,10 +1488,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": ">/dev/null true; 2>&1 %s",
@@ -1507,10 +1506,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "</dev/null %s",
@@ -1525,10 +1524,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "x=1 %s",
@@ -1543,10 +1542,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "{ %s; }",
@@ -1561,10 +1560,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "! %s",
@@ -1579,10 +1578,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "if true; then %s; fi",
@@ -1597,10 +1596,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "case x in x) %s;; esac",
@@ -1615,10 +1614,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "for i in 1; do %s; done",
@@ -1633,10 +1632,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "f() { %s; }; f",
@@ -1651,10 +1650,9 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
+"ksh",
 "sh",
-"dash",
-"ksh"
+"zsh"
 ],
 "rewritten": "none",
 "shape": "time %s",
@@ -1669,10 +1667,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "eval '%s'",
@@ -1687,10 +1685,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "/bin/bash -c '%s'",
@@ -1705,9 +1703,9 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
+"ksh",
 "sh",
-"ksh"
+"zsh"
 ],
 "rewritten": "none",
 "shape": "/bin/bash <<< '%s'",
@@ -1722,10 +1720,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo '%s' | /bin/bash",
@@ -1740,10 +1738,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "/bin/bash <<'E'\n%s\nE",
@@ -1758,10 +1756,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "/bin/sh -s <<E\n%s\nE",
@@ -1787,10 +1785,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": ". /dev/stdin <<'E'\n%s\nE",
@@ -1805,10 +1803,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "read -r x <<'E'\n%s\nE\neval \"$x\"",
@@ -1823,8 +1821,7 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"sh"
 ],
 "rewritten": "none",
 "shape": "echo `echo '`; %s; echo `echo '`",
@@ -1839,8 +1836,7 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"sh"
 ],
 "rewritten": "none",
 "shape": "echo `echo '`\n%s\necho `echo '`",
@@ -1855,8 +1851,7 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"sh"
 ],
 "rewritten": "none",
 "shape": "echo `echo \"`; %s; echo `echo \"`",
@@ -1871,8 +1866,7 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"sh"
 ],
 "rewritten": "none",
 "shape": "echo \"`echo '`\"; %s; echo \"`echo '`\"",
@@ -1902,8 +1896,7 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"sh"
 ],
 "rewritten": "none",
 "shape": "echo `echo '$(`; %s; echo `echo ')'`",
@@ -1918,8 +1911,7 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"sh"
 ],
 "rewritten": "none",
 "shape": "echo `echo a'`\n%s\necho `echo a'`",
@@ -1978,8 +1970,8 @@
 "kind": "hidden",
 "name": "arith-dbl",
 "ran": [
-"zsh",
-"ksh"
+"ksh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "true $(( 1 \" ))\n%s\ntrue $(( 1 \" ))",
@@ -2003,9 +1995,8 @@
 "kind": "hidden",
 "name": "brace-sq-in-dq-group",
 "ran": [
-"zsh",
 "dash",
-"ksh"
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo \"$(echo \"${x-'}\")\"; %s; echo \"$(echo \"${x-'}\")\"",
@@ -2064,10 +2055,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "(true)#'\n%s\n#'",
@@ -2082,10 +2073,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "true &#'\n%s\n#'",
@@ -2100,10 +2091,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "true |#'\ntrue\n%s\n#'",
@@ -2118,10 +2109,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "true ;#'\n%s\n#'",
@@ -2136,10 +2127,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "(#'\n%s\n#'\n)",
@@ -2165,10 +2156,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "{ #'\n%s\n#'\n}",
@@ -2183,10 +2174,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo `#'\n%s\n#'\n`",
@@ -2201,10 +2192,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "(true) \\\n#'\n%s\n#'",
@@ -2219,10 +2210,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo \\\nHIDDEN-LINE",
@@ -2237,8 +2228,8 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"ksh",
+"sh"
 ],
 "rewritten": "none",
 "shape": "echo $'a\\' <<EOF'\nec\\\nho HIDDEN-LINE\nEOF\necho $'",
@@ -2253,10 +2244,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo '<<'\necho \\\nHIDDEN-LINE",
@@ -2271,10 +2262,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "(true)#'\nec\\\nho HIDDEN-LINE\n#'",
@@ -2289,10 +2280,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "# a \\\n%s",
@@ -2307,10 +2298,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo a\\\\\n%s",
@@ -2336,10 +2327,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo \"a\\\nb\"\n%s",
@@ -2354,10 +2345,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo 'a\\\nb'\n%s",
@@ -2372,10 +2363,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo $'a\\\nb'\n%s",
@@ -2390,9 +2381,9 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
+"ksh",
 "sh",
-"ksh"
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo $'a\\'\\\n'\n%s\n#'",
@@ -2407,10 +2398,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "true <<E \\\n; %s\nb\nE",
@@ -2439,10 +2430,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "{ /bin/bash; } <<'E'\n%s\nE",
@@ -2457,10 +2448,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "(/bin/bash) <<'E'\n%s\nE",
@@ -2475,10 +2466,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "if true; then /bin/bash; fi <<'E'\n%s\nE",
@@ -2493,10 +2484,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "while true; do /bin/bash; break; done <<'E'\n%s\nE",
@@ -2511,10 +2502,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "for i in 1; do /bin/bash; done <<'E'\n%s\nE",
@@ -2529,10 +2520,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "f () { /bin/bash; }\nf <<'E'\n%s\nE",
@@ -2547,10 +2538,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "x=/bin/bash; $x <<'E'\n%s\nE",
@@ -2565,10 +2556,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "x=/bin/bash; ${x} <<'E'\n%s\nE",
@@ -2598,10 +2589,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "<<'E' /bin/bash\n%s\nE",
@@ -2616,10 +2607,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "/bin/bash 0<<'E'\n%s\nE",
@@ -2634,10 +2625,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "/bin/bash /dev/fd/3 3<<'E'\n%s\nE",
@@ -2652,10 +2643,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "exec 3<<'E'\n%s\nE\n. /dev/fd/3",
@@ -2670,10 +2661,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "\"/bin/bash\" <<'E'\n%s\nE",
@@ -2688,10 +2679,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "ba\\sh <<'E'\n%s\nE",
@@ -2706,10 +2697,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "env /bin/bash <<'E'\n%s\nE",
@@ -2724,10 +2715,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "exec /bin/bash <<'E'\n%s\nE",
@@ -2742,10 +2733,9 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
+"ksh",
 "sh",
-"dash",
-"ksh"
+"zsh"
 ],
 "rewritten": "none",
 "shape": "time /bin/bash <<'E'\n%s\nE",
@@ -2760,10 +2750,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "A=1 /bin/bash <<'E'\n%s\nE",
@@ -2789,10 +2779,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "/bin/bash <<'E' | cat\n%s\nE",
@@ -2807,10 +2797,9 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "cat <<'E' | /bin/bash /dev/stdin\n%s\nE",
@@ -2839,10 +2828,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "cat <<'E' | xargs -I{} /bin/bash -c '{}'\n%s\nE",
@@ -2857,10 +2846,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "same",
 "shape": "/usr/bin/python3 -I -S -c 'import os,sys;os.system(sys.stdin.read())' <<'E'\n%s\nE",
@@ -2875,21 +2864,13 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "cat <<'E' | /bin/bash -c 'source /dev/stdin'\n%s\nE",
-"unstable": [
-"bash3",
-"bash5",
-"zsh",
-"sh",
-"dash",
-"ksh"
-],
+"unstable": [],
 "verdict": "uncertain"
 },
 {
@@ -2900,10 +2881,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "zsh <<-'E'\n\t%s\n\tE",
@@ -2918,10 +2899,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "cat <<'E' | bash\n%s\nE",
@@ -2936,9 +2917,9 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
+"ksh",
 "sh",
-"ksh"
+"zsh"
 ],
 "rewritten": "none",
 "shape": "source /dev/stdin <<'E'\n%s\nE",
@@ -2962,7 +2943,14 @@
 "group": "r4-S15",
 "kind": "hidden",
 "name": "timeout 5 bash <<'E'",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "timeout 5 bash <<'E'\n%s\nE",
 "unstable": [],
@@ -3009,10 +2997,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "case x in x) /bin/bash;; esac <<'E'\n%s\nE",
@@ -3027,9 +3015,9 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
+"ksh",
 "sh",
-"ksh"
+"zsh"
 ],
 "rewritten": "none",
 "shape": "function f { /bin/bash; }\nf <<'E'\n%s\nE",
@@ -3044,10 +3032,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "exec <<'E'\n%s\nE\n/bin/bash",
@@ -3227,8 +3215,7 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"sh"
 ],
 "rewritten": "none",
 "shape": "echo \"`echo '`\"\n%s\necho \"`echo '`\"",
@@ -3258,10 +3245,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo `echo \\'`\n%s\necho `echo \\'`",
@@ -3276,8 +3263,7 @@
 "ran": [
 "bash3",
 "bash5",
-"sh",
-"ksh"
+"sh"
 ],
 "rewritten": "none",
 "shape": "echo `echo \"'`\n%s\necho `echo \"'`",
@@ -3290,8 +3276,8 @@
 "kind": "hidden",
 "name": "arith-cmd-dq",
 "ran": [
-"zsh",
-"ksh"
+"ksh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "((1 \"))\n%s\n((1 \"))",
@@ -3431,10 +3417,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo 'a' \\\n# it's\n%s\n# it's",
@@ -3460,10 +3446,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo 'a\\\n'\n%s",
@@ -3478,10 +3464,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "none",
 "shape": "echo a\\ #'\n'; %s #'",
@@ -3709,10 +3695,10 @@
 "ran": [
 "bash3",
 "bash5",
-"zsh",
-"sh",
 "dash",
-"ksh"
+"ksh",
+"sh",
+"zsh"
 ],
 "rewritten": "same",
 "shape": "cat > s.sh <<'E'\n%s\nE\n/bin/bash s.sh",
@@ -3724,7 +3710,14 @@
 "group": "r6-B15",
 "kind": "hidden",
 "name": "param-blank-hash",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo ${x:- #}; %s",
 "unstable": [],
@@ -3735,7 +3728,14 @@
 "group": "r6-B15",
 "kind": "hidden",
 "name": "param-tab-hash",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo ${x:-\t#}; %s",
 "unstable": [],
@@ -3746,7 +3746,14 @@
 "group": "r6-B15",
 "kind": "hidden",
 "name": "param-word-hash",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo ${x:-a #b}; %s",
 "unstable": [],
@@ -3757,7 +3764,14 @@
 "group": "r6-B15",
 "kind": "hidden",
 "name": "param-pct-hash",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo ${x% #}; %s",
 "unstable": [],
@@ -3768,7 +3782,9 @@
 "group": "r6-B15",
 "kind": "hidden",
 "name": "subscript-hash",
-"ran": [],
+"ran": [
+"ksh"
+],
 "rewritten": "none",
 "shape": "echo ${x[1 #]}; %s",
 "unstable": [],
@@ -3779,7 +3795,14 @@
 "group": "r6-B15",
 "kind": "hidden",
 "name": "param-and",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "true ${x:- #} && %s",
 "unstable": [],
@@ -3790,7 +3813,14 @@
 "group": "r6-B15",
 "kind": "hidden",
 "name": "param-pipe",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "true ${x:- #} | %s",
 "unstable": [],
@@ -3801,7 +3831,14 @@
 "group": "r6-B15",
 "kind": "hidden",
 "name": "param-newline-hash",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo ${x:-\n#}; %s",
 "unstable": [],
@@ -3812,7 +3849,9 @@
 "group": "r6-B15",
 "kind": "hidden",
 "name": "extglob-at",
-"ran": [],
+"ran": [
+"ksh"
+],
 "rewritten": "none",
 "shape": "echo @(a #b); %s",
 "unstable": [],
@@ -3823,7 +3862,12 @@
 "group": "r6-B15",
 "kind": "hidden",
 "name": "extglob-shopt",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"ksh",
+"sh"
+],
 "rewritten": "none",
 "shape": "shopt -s extglob\necho @(a #b); %s",
 "unstable": [],
@@ -3834,7 +3878,9 @@
 "group": "r6-B15",
 "kind": "hidden",
 "name": "noglob-paren",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "noglob true a(b #c); %s",
 "unstable": [],
@@ -3845,7 +3891,9 @@
 "group": "r6-B15",
 "kind": "hidden",
 "name": "array-assign",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": ": a=(b #c) & %s",
 "unstable": [],
@@ -3856,7 +3904,12 @@
 "group": "r6-B15",
 "kind": "hidden",
 "name": "subscript-assign",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"ksh",
+"sh"
+],
 "rewritten": "none",
 "shape": "a[1 #]=b|%s",
 "unstable": [],
@@ -3867,7 +3920,13 @@
 "group": "r6-B16",
 "kind": "hidden",
 "name": "ansi-c-newline",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo $'\\c'\n%s\n#'",
 "unstable": [],
@@ -3878,7 +3937,13 @@
 "group": "r6-B16",
 "kind": "hidden",
 "name": "ansi-c-semicolon",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo $'\\c' ; %s #'",
 "unstable": [],
@@ -3889,7 +3954,14 @@
 "group": "r6-B16",
 "kind": "hidden",
 "name": "ansi-c-pipe",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "true $'\\c' | %s #'",
 "unstable": [],
@@ -3900,7 +3972,10 @@
 "group": "r6-B17",
 "kind": "hidden",
 "name": "funsub",
-"ran": [],
+"ran": [
+"bash5",
+"ksh"
+],
 "rewritten": "none",
 "shape": "echo ${ %s; }",
 "unstable": [],
@@ -3911,7 +3986,10 @@
 "group": "r6-B17",
 "kind": "hidden",
 "name": "funsub-dq",
-"ran": [],
+"ran": [
+"bash5",
+"ksh"
+],
 "rewritten": "none",
 "shape": "echo \"${ %s; }\"",
 "unstable": [],
@@ -3922,7 +4000,10 @@
 "group": "r6-B17",
 "kind": "hidden",
 "name": "funsub-tab",
-"ran": [],
+"ran": [
+"bash5",
+"ksh"
+],
 "rewritten": "none",
 "shape": "echo ${\t%s; }",
 "unstable": [],
@@ -3933,7 +4014,10 @@
 "group": "r6-B17",
 "kind": "hidden",
 "name": "funsub-heredoc",
-"ran": [],
+"ran": [
+"bash5",
+"ksh"
+],
 "rewritten": "none",
 "shape": "cat <<E\n${ %s; }\nE",
 "unstable": [],
@@ -3944,7 +4028,9 @@
 "group": "r6-B17",
 "kind": "hidden",
 "name": "funsub-valueless",
-"ran": [],
+"ran": [
+"bash5"
+],
 "rewritten": "none",
 "shape": "echo ${| %s; }",
 "unstable": [],
@@ -3955,7 +4041,14 @@
 "group": "r6-B18",
 "kind": "hidden",
 "name": "formfeed-hash",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "\f# ; %s",
 "unstable": [],
@@ -3966,7 +4059,14 @@
 "group": "r6-B18",
 "kind": "hidden",
 "name": "formfeed-line",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "\f#x\n%s",
 "unstable": [],
@@ -3977,7 +4077,14 @@
 "group": "r6-B18",
 "kind": "hidden",
 "name": "vtab-line",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "\u000b#x\n%s",
 "unstable": [],
@@ -3988,7 +4095,14 @@
 "group": "r6-B18",
 "kind": "hidden",
 "name": "nbsp-line",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "\u00a0#x\n%s",
 "unstable": [],
@@ -3999,7 +4113,14 @@
 "group": "r6-B18",
 "kind": "hidden",
 "name": "nel-line",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "\u0085#x\n%s",
 "unstable": [],
@@ -4010,7 +4131,14 @@
 "group": "r6-B18",
 "kind": "hidden",
 "name": "ideographic-line",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "\u3000#x\n%s",
 "unstable": [],
@@ -4021,7 +4149,14 @@
 "group": "r6-B18",
 "kind": "hidden",
 "name": "fs-line",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "\u001c#x\n%s",
 "unstable": [],
@@ -4032,7 +4167,14 @@
 "group": "r6-B18",
 "kind": "hidden",
 "name": "cr-line",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "\r#x\n%s",
 "unstable": [],
@@ -4043,7 +4185,13 @@
 "group": "r6-B19",
 "kind": "hidden",
 "name": "function-brace",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "function f { %s; }; f",
 "unstable": [],
@@ -4054,7 +4202,12 @@
 "group": "r6-B19",
 "kind": "hidden",
 "name": "function-paren",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "function f () { %s; }; f",
 "unstable": [],
@@ -4065,7 +4218,14 @@
 "group": "r6-B19",
 "kind": "hidden",
 "name": "name-paren",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "f () { %s; }; f",
 "unstable": [],
@@ -4076,7 +4236,14 @@
 "group": "r6-B19",
 "kind": "hidden",
 "name": "name-paren-newline",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "f()\n{\n%s\n}\nf",
 "unstable": [],
@@ -4087,7 +4254,11 @@
 "group": "r6-B20",
 "kind": "hidden",
 "name": "alias-heredoc",
-"ran": [],
+"ran": [
+"dash",
+"ksh",
+"sh"
+],
 "rewritten": "none",
 "shape": "alias t=\"echo '\"\nt <<E #'\n%s\nE",
 "unstable": [],
@@ -4098,7 +4269,11 @@
 "group": "r6-B20",
 "kind": "hidden",
 "name": "alias-plain",
-"ran": [],
+"ran": [
+"dash",
+"ksh",
+"sh"
+],
 "rewritten": "none",
 "shape": "alias e='%s'\ne",
 "unstable": [],
@@ -4109,7 +4284,13 @@
 "group": "r6-B20",
 "kind": "hidden",
 "name": "alias-shopt",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh"
+],
 "rewritten": "none",
 "shape": "shopt -s expand_aliases\nalias e='%s'\ne",
 "unstable": [],
@@ -4120,7 +4301,11 @@
 "group": "r6-B20",
 "kind": "hidden",
 "name": "alias-setopt",
-"ran": [],
+"ran": [
+"dash",
+"ksh",
+"sh"
+],
 "rewritten": "none",
 "shape": "setopt aliases\nalias e='%s'\ne",
 "unstable": [],
@@ -4131,7 +4316,14 @@
 "group": "r6-B20",
 "kind": "hidden",
 "name": "histchars",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "histchars='x'\n%s",
 "unstable": [],
@@ -4142,7 +4334,9 @@
 "group": "r6-B20",
 "kind": "hidden",
 "name": "emulate",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "emulate sh -c '%s'",
 "unstable": [],
@@ -4153,7 +4347,9 @@
 "group": "r6-B21",
 "kind": "hidden",
 "name": "repeat",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "repeat 1 %s",
 "unstable": [],
@@ -4164,7 +4360,9 @@
 "group": "r6-B21",
 "kind": "hidden",
 "name": "noglob",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "noglob %s",
 "unstable": [],
@@ -4175,7 +4373,9 @@
 "group": "r6-B21",
 "kind": "hidden",
 "name": "nocorrect",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "nocorrect %s",
 "unstable": [],
@@ -4186,7 +4386,9 @@
 "group": "r6-B21",
 "kind": "hidden",
 "name": "short-if",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "if [[ 1 = 1 ]] %s",
 "unstable": [],
@@ -4197,7 +4399,9 @@
 "group": "r6-B21",
 "kind": "hidden",
 "name": "always",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "{ true } always { %s }",
 "unstable": [],
@@ -4230,7 +4434,9 @@
 "group": "r6-B21",
 "kind": "hidden",
 "name": "paren-for",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "for i (1) %s",
 "unstable": [],
@@ -4252,7 +4458,9 @@
 "group": "r6-B21",
 "kind": "hidden",
 "name": "foreach",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "foreach i (1)\n%s\nend",
 "unstable": [],
@@ -4263,7 +4471,9 @@
 "group": "r6-B21",
 "kind": "hidden",
 "name": "amp-pipe",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "true &| %s",
 "unstable": [],
@@ -4274,7 +4484,10 @@
 "group": "r6-B22",
 "kind": "hidden",
 "name": "funsub",
-"ran": [],
+"ran": [
+"bash5",
+"ksh"
+],
 "rewritten": "none",
 "shape": "echo \"$(echo 'x')\"\necho \"${ %s; }\"",
 "unstable": [],
@@ -4285,7 +4498,13 @@
 "group": "r6-B22",
 "kind": "hidden",
 "name": "function",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo \"$(echo 'x')\"\nfunction f { %s; }; f",
 "unstable": [],
@@ -4296,7 +4515,11 @@
 "group": "r6-B22",
 "kind": "hidden",
 "name": "alias",
-"ran": [],
+"ran": [
+"dash",
+"ksh",
+"sh"
+],
 "rewritten": "none",
 "shape": "echo \"$(echo 'x')\"\nalias e='%s'\ne",
 "unstable": [],
@@ -4307,7 +4530,9 @@
 "group": "r6-B22",
 "kind": "hidden",
 "name": "repeat",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo \"$(echo 'x')\"\nrepeat 1 %s",
 "unstable": [],
@@ -4318,7 +4543,9 @@
 "group": "r6-B22",
 "kind": "hidden",
 "name": "noglob",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo \"$(echo 'x')\"\nnoglob %s",
 "unstable": [],
@@ -4329,7 +4556,9 @@
 "group": "r6-B22",
 "kind": "hidden",
 "name": "short-if",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo \"$(echo 'x')\"\nif [[ 1 = 1 ]] %s",
 "unstable": [],
@@ -4340,7 +4569,9 @@
 "group": "r6-B22",
 "kind": "hidden",
 "name": "always",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo \"$(echo 'x')\"\n{ true } always { %s }",
 "unstable": [],
@@ -4351,7 +4582,14 @@
 "group": "r6-B22",
 "kind": "hidden",
 "name": "trap",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo \"$(echo 'x')\"\ntrap '%s' EXIT",
 "unstable": [],
@@ -4362,7 +4600,14 @@
 "group": "r6-host",
 "kind": "hidden",
 "name": "trap-exit",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "trap '%s' EXIT",
 "unstable": [],
@@ -4373,7 +4618,13 @@
 "group": "r6-host",
 "kind": "hidden",
 "name": "trap-debug",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "trap '%s' DEBUG; true",
 "unstable": [],
@@ -4384,7 +4635,14 @@
 "group": "r6-host",
 "kind": "hidden",
 "name": "bash-c",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "bash -c '%s'",
 "unstable": [],
@@ -4395,7 +4653,14 @@
 "group": "r6-host",
 "kind": "hidden",
 "name": "sh-c",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "sh -c '%s'",
 "unstable": [],
@@ -4406,7 +4671,14 @@
 "group": "r6-host",
 "kind": "hidden",
 "name": "find-exec",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "find . -maxdepth 0 -exec %s \\;",
 "unstable": [],
@@ -4417,7 +4689,14 @@
 "group": "r6-host",
 "kind": "hidden",
 "name": "xargs",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo | xargs %s",
 "unstable": [],
@@ -4428,7 +4707,14 @@
 "group": "r6-host",
 "kind": "hidden",
 "name": "git-alias",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "git -c alias.z='!%s' z",
 "unstable": [],
@@ -4439,7 +4725,14 @@
 "group": "r6-host",
 "kind": "hidden",
 "name": "env-split",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "env -S '%s'",
 "unstable": [],
@@ -4461,7 +4754,9 @@
 "group": "r6-host",
 "kind": "hidden",
 "name": "zsh-e-flag",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "x='$(%s)'; echo ${(e)x}",
 "unstable": [],
@@ -4549,7 +4844,11 @@
 "group": "r6-host",
 "kind": "hidden",
 "name": "compgen-w",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"sh"
+],
 "rewritten": "none",
 "shape": "compgen -W '$(%s)'",
 "unstable": [],
@@ -4560,7 +4859,14 @@
 "group": "r6-wrapper",
 "kind": "hidden",
 "name": "stdbuf",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "stdbuf -o0 %s",
 "unstable": [],
@@ -4571,7 +4877,14 @@
 "group": "r6-wrapper",
 "kind": "hidden",
 "name": "nice",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "nice -n 1 %s",
 "unstable": [],
@@ -4582,7 +4895,14 @@
 "group": "r6-wrapper",
 "kind": "hidden",
 "name": "timeout",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "timeout 5 %s",
 "unstable": [],
@@ -4593,7 +4913,14 @@
 "group": "r6-wrapper",
 "kind": "hidden",
 "name": "command-p",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "command -p %s",
 "unstable": [],
@@ -4604,7 +4931,14 @@
 "group": "r6-wrapper",
 "kind": "hidden",
 "name": "exec",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "exec %s",
 "unstable": [],
@@ -4626,7 +4960,14 @@
 "group": "r6-path",
 "kind": "hidden",
 "name": "absolute",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "/bin/echo HIDDEN-LINE",
 "unstable": [],
@@ -4648,7 +4989,14 @@
 "group": "r6-path",
 "kind": "hidden",
 "name": "glob-question",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "/bin/ec?o HIDDEN-LINE",
 "unstable": [],
@@ -4659,7 +5007,14 @@
 "group": "r6-path",
 "kind": "hidden",
 "name": "glob-bracket",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "/bin/ec[h]o HIDDEN-LINE",
 "unstable": [],
@@ -4670,7 +5025,14 @@
 "group": "r6-path",
 "kind": "hidden",
 "name": "double-quoted-arg",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo \"HIDDEN-LINE\"",
 "unstable": [],
@@ -4681,7 +5043,14 @@
 "group": "r6-path",
 "kind": "hidden",
 "name": "quoted-program",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "'echo' HIDDEN-LINE",
 "unstable": [],
@@ -4692,7 +5061,14 @@
 "group": "r6-path",
 "kind": "limit",
 "name": "built-program-name",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "same",
 "shape": "ec$(true)ho HIDDEN-LINE",
 "unstable": [],
@@ -4703,7 +5079,14 @@
 "group": "r6-path",
 "kind": "limit",
 "name": "substituted-program",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "same",
 "shape": "$(echo echo) HIDDEN-LINE",
 "unstable": [],
@@ -4714,7 +5097,14 @@
 "group": "r6-state",
 "kind": "hidden",
 "name": "shopt",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "shopt -s expand_aliases\n%s",
 "unstable": [],
@@ -4725,7 +5115,14 @@
 "group": "r6-state",
 "kind": "hidden",
 "name": "setopt",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "setopt aliases\n%s",
 "unstable": [],
@@ -4736,7 +5133,12 @@
 "group": "r6-state",
 "kind": "hidden",
 "name": "set-o",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"ksh",
+"sh"
+],
 "rewritten": "none",
 "shape": "set -o posix\n%s",
 "unstable": [],
@@ -4747,7 +5149,14 @@
 "group": "r6-state",
 "kind": "hidden",
 "name": "unalias",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "unalias -a\n%s",
 "unstable": [],
@@ -4780,7 +5189,9 @@
 "group": "r6-state",
 "kind": "hidden",
 "name": "zsh-functions",
-"ran": [],
+"ran": [
+"zsh"
+],
 "rewritten": "none",
 "shape": "functions[f]='%s'\nf",
 "unstable": [],
@@ -4791,7 +5202,14 @@
 "group": "r6-state",
 "kind": "hidden",
 "name": "enable-n",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "enable -n echo\n%s",
 "unstable": [],
@@ -4802,7 +5220,14 @@
 "group": "r6-state",
 "kind": "hidden",
 "name": "path",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "PATH=/nonexistent:$PATH\n%s",
 "unstable": [],
@@ -4813,7 +5238,11 @@
 "group": "r6-state",
 "kind": "limit",
 "name": "hash-renames-a-program",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"sh"
+],
 "rewritten": "same",
 "shape": "hash -p /bin/echo e\ne HIDDEN-LINE",
 "unstable": [],
@@ -4824,7 +5253,14 @@
 "group": "r6-limit",
 "kind": "limit",
 "name": "built-from-data",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "same",
 "shape": "x=ec; y=ho; $x$y HIDDEN-LINE",
 "unstable": [],
@@ -4835,7 +5271,14 @@
 "group": "r6-limit",
 "kind": "hidden",
 "name": "read-from-a-body",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "read -r x y <<'E'\n%s\nE\n$x $y",
 "unstable": [],
@@ -4846,7 +5289,14 @@
 "group": "r6-limit",
 "kind": "limit",
 "name": "python-c",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "same",
 "shape": "python3 -c 'print(\"HIDDEN-LINE\")'",
 "unstable": [],
@@ -4857,7 +5307,14 @@
 "group": "r6-limit",
 "kind": "limit",
 "name": "python-stdin",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "same",
 "shape": "python3 - <<'E'\nprint('HIDDEN-LINE')\nE",
 "unstable": [],
@@ -4868,7 +5325,14 @@
 "group": "r6-limit",
 "kind": "limit",
 "name": "awk",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "same",
 "shape": "awk 'BEGIN { print \"HIDDEN-LINE\" }'",
 "unstable": [],

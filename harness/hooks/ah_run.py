@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
-import fnmatch
 import functools
 import fcntl
 import hashlib
@@ -1696,11 +1695,28 @@ GLOB_CHARS = re.compile(r'[*?\[]')
 
 
 def _glob_matches(name, glob):
-    """fnmatch, failing closed: a glob Python cannot compile (`[z-a]`) counts as a match, since the shell's reading is unknown."""
-    try:
-        return fnmatch.fnmatchcase(name, glob)
-    except re.error:
-        return True
+    """A superset of the shell's reading: `*` is any run, `?` any character, and a bracket expression any one character. The
+    set inside the brackets is never read, so an odd range (`[z-a]`) cannot fail, or differ between Python versions as the
+    standard glob matcher does (3.9 raises, 3.12 drops the range); reading more names as matches only widens a refusal."""
+    out, i, n = [], 0, len(glob)
+    while i < n:
+        ch = glob[i]
+        if ch == '*':
+            out.append('.*')
+        elif ch == '?':
+            out.append('.')
+        elif ch == '[':
+            j = i + 1 + (glob[i + 1:i + 2] in ('!', '^'))
+            j = glob.find(']', j + (glob[j:j + 1] == ']'))
+            if j < 0:
+                out.append(re.escape(ch))  # no closing bracket: the shell reads a plain [
+            else:
+                out.append('.')
+                i = j
+        else:
+            out.append(re.escape(ch))
+        i += 1
+    return re.match(''.join(out) + r'\Z', name, re.S) is not None
 
 
 def _glob_programs(lexed):
