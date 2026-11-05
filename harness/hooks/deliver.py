@@ -194,7 +194,7 @@ def target_preflight(original, branch, mode=None):
     mode = mode or TARGET_POLICY["mode"]
     original = Path(original)
     if original.is_symlink() or not original.is_dir():
-        return  # snapshot() reports the precise policy error
+        return []  # later source/original checks report the precise refusal; [] keeps warn-mode callers iterable
     problems = []
     for label, limit_name, args in (
             ("staged", "max_staged", ("diff", "--cached", "--name-only")),

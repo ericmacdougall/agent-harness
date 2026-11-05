@@ -754,7 +754,7 @@ class PeerReviewTests(unittest.TestCase):
     def test_prompt_carries_section_without_touching_packet(self):
         captured = {}
 
-        def fake_run(cmd, prompt, cwd, timeout):
+        def fake_run(cmd, prompt, cwd, timeout, **kwargs):
             captured["prompt"] = prompt
             return 0, "", ""
         options = {"domain_section": "## Domain checklist\n- reentrancy"}

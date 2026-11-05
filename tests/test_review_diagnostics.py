@@ -917,6 +917,27 @@ class CodeInspectionRound1Tests(unittest.TestCase):
         entries = seen['env']['PATH'].split(os.pathsep)
         self.assertEqual(entries, ['/usr/bin'], entries)
 
+    def test_run_keeps_the_cleaned_path_and_forwards_on_spawn(self):
+        # Merge of main 02fa624 (#68): the usage guard's on_spawn and PR-C's child PATH must both reach run_process.
+        seen = {}
+
+        def fake(cmd, **kw):
+            seen.update(kw)
+            return subprocess.CompletedProcess(cmd, 0, '', '')
+
+        def note_child(_process):
+            return None
+        dirty = os.pathsep.join(['.', str(self.snapshot / 'node_modules/.bin'), str(self.repo / 'bin'), '/usr/bin'])
+        with patch.dict(os.environ, {'PATH': dirty}), patch.object(self.module, 'run_process', side_effect=fake), \
+                patch.object(self.module, '_CHILD_PATH_ROOTS', [str(self.repo)]):
+            self.module.run(['/usr/bin/true'], '', self.snapshot, 5, on_spawn=note_child)
+        self.assertIs(seen.get('on_spawn'), note_child)
+        self.assertEqual(seen['env']['PATH'].split(os.pathsep), ['/usr/bin'])
+        seen.clear()
+        with patch.object(self.module, 'run_process', side_effect=fake):
+            self.module.run(['/usr/bin/true'], '', self.snapshot, 5)
+        self.assertNotIn('on_spawn', seen)
+
     # F3, F6 and AC-10: the docs carry each code's cause and next steps, with table pipes escaped.
     def test_documentation_carries_cause_and_steps(self):
         docs = DOCS.read_text()
