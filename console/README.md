@@ -63,10 +63,9 @@ Implementation plans and scenario registrations live in `../plans/CONSOLE-*.md`.
 
 ### Known defects skipped in this baseline
 
-These three tests fail on this code. The event-log rebuild replaces the code they cover, so they are skipped by name until then (GoodQA #35692). The skips are removed, and the tests must pass, once K4+ lands:
+These two tests fail on this code. The event-log rebuild replaces the code they cover, so they are skipped by name until then (GoodQA #35692). The skips are removed, and the tests must pass, once K5b and later land. A third, `TestClaudeSurvivesRevisionOnlyToolConfigChange`, was un-skipped by K4: its fixture made a tool config appear from nothing, which is a real tool change, so the fixture was corrected and the test passes.
 
 - `TestClaudeResultBeforeWriteAckRemainsFinalAcrossRestart`: a completed Claude request can be replayed after restore.
-- `TestClaudeSurvivesRevisionOnlyToolConfigChange`: an unrelated settings save can refuse a live conversation.
 - `TestRestoreMatchesLiveProjection`: a restored session can show `disconnected` where the live one shows `unknown`.
 
 On Windows the full suite has never passed for this code (discard, torn-record and attachment tests fail, then a test hangs), so Windows CI runs vet, the build and the data-directory guard tests only. K4+ restores the full Windows suite, and it must pass.
