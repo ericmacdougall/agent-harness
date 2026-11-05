@@ -26,6 +26,11 @@ RESOLVE_FLAGS = frozenset('pl')  # the only options forwarded to `ssh -G`: port 
 # -F names a config file, -o can carry Include, Match or ProxyCommand, -J a jump host: `ssh -G` evaluates `Match exec`
 # (it runs a command), so a model-supplied config never reaches it; such a call is classed external instead.
 UNSAFE_FLAGS = frozenset('FoJ')
+# `-o` keys that cannot change the destination or run anything. They are never forwarded to `ssh -G`, so the host is
+# resolved as without them and the line keeps its rewrite. Any other key, or a value outside the plain form, is unsafe.
+SAFE_O_KEYS = frozenset(('connecttimeout', 'batchmode', 'stricthostkeychecking', 'userknownhostsfile', 'serveraliveinterval',
+                         'serveralivecountmax', 'loglevel', 'identitiesonly'))
+SAFE_O_FORM = re.compile(r'([A-Za-z]+)(?:[ \t]*=[ \t]*|[ \t]+)[A-Za-z0-9_./~:@+-]+')
 
 
 def policy_path(home=None, env=None):
@@ -61,40 +66,58 @@ def own_names(path=None):
 
 
 class SshCall:
-    """An ssh argv split into the words before the target, the target and the remote command words."""
+    """An ssh argv split into the words before the target, the target, the option words after it and the remote command."""
 
-    def __init__(self, opts, target, remote, flags, resolve_args):
+    def __init__(self, opts, target, remote, flags, resolve_args, post_opts=(), unsafe_o=True):
         self.opts, self.target, self.remote, self.flags, self.resolve_args = opts, target, remote, flags, resolve_args
+        self.post_opts = list(post_opts)
         self.unsafe = set(flags) & UNSAFE_FLAGS
+        if not unsafe_o:
+            self.unsafe.discard('o')
+
+
+def safe_o_value(value):
+    found = SAFE_O_FORM.fullmatch(value or '')
+    return bool(found) and found.group(1).lower() in SAFE_O_KEYS
 
 
 def parse_ssh(args):
-    """Parse the words after `ssh` (values, quotes already removed). None when there is no target."""
-    index, opts, flags, resolve = 0, [], set(), []
-    while index < len(args):
-        word = args[index]
-        if word == '--':
-            opts.append(word); index += 1
-            break
-        if not (word.startswith('-') and len(word) > 1):
-            break
-        letters, taken = word[1:], 1
-        for position, letter in enumerate(letters):
-            if letter in SSH_WITH_ARG:
-                flags.add(letter)
-                if position == len(letters) - 1:
-                    taken = 2  # the value is the next word
-                    if index + 1 < len(args) and letter in RESOLVE_FLAGS:
-                        resolve += [word, args[index + 1]]
-                elif letter in RESOLVE_FLAGS:
-                    resolve.append(word)
+    """Parse the words after `ssh` (values, quotes already removed). None when there is no target. Like OpenSSH, options
+    are read before the target and again after it, up to the first other word, which starts the remote command."""
+    flags, resolve, state = set(), [], {'unsafe_o': False}
+
+    def options(index):
+        opts = []
+        while index < len(args):
+            word = args[index]
+            if word == '--':
+                opts.append(word); index += 1
                 break
-            flags.add(letter)
-        opts.extend(args[index:index + taken])
-        index += taken
+            if not (word.startswith('-') and len(word) > 1):
+                break
+            letters, taken = word[1:], 1
+            for position, letter in enumerate(letters):
+                if letter in SSH_WITH_ARG:
+                    flags.add(letter)
+                    attached = position < len(letters) - 1
+                    value = letters[position + 1:] if attached else (args[index + 1] if index + 1 < len(args) else '')
+                    taken = 1 if attached else 2
+                    if letter == 'o' and not safe_o_value(value):
+                        state['unsafe_o'] = True
+                    if letter in RESOLVE_FLAGS and (attached or index + 1 < len(args)):
+                        resolve.extend([word] if attached else [word, value])
+                    break
+                flags.add(letter)
+            opts.extend(args[index:index + taken])
+            index += taken
+        return index, opts
+
+    index, opts = options(0)
     if index >= len(args):
         return None
-    return SshCall(opts, args[index], list(args[index + 1:]), flags, resolve)
+    target = args[index]
+    index, post_opts = options(index + 1)
+    return SshCall(opts, target, list(args[index:]), flags, resolve, post_opts, state['unsafe_o'])
 
 
 class Resolved:

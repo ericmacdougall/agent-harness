@@ -172,7 +172,7 @@ class ParseSsh(unittest.TestCase):
         self.assertEqual((call.target, call.remote), ('user@dev2', ['git', 'log']))
         self.assertEqual(call.opts, ['-p', '2222', '-o', 'StrictHostKeyChecking=no', '-J', 'jump', '-tt'])
         self.assertEqual(call.resolve_args, ['-p', '2222'])
-        self.assertEqual(call.unsafe, {'o', 'J'})
+        self.assertEqual(call.unsafe, {'J'})  # StrictHostKeyChecking is on the safe -o list
 
     def test_attached_values_and_clusters(self):
         call = host_table.parse_ssh(['-p2222', '-oBatchMode=yes', '-fN', 'h', 'ls'])
@@ -185,8 +185,29 @@ class ParseSsh(unittest.TestCase):
             self.assertEqual((call.target, call.remote), ('host', ['cmd']), letter)
 
     def test_double_dash_and_no_target(self):
-        self.assertEqual(host_table.parse_ssh(['--', 'h', '-x']).remote, ['-x'])
+        self.assertEqual(host_table.parse_ssh(['--', 'h', '--', '-x']).remote, ['-x'])
         self.assertIsNone(host_table.parse_ssh(['-p', '22'])); self.assertIsNone(host_table.parse_ssh([]))
+
+    def test_safe_and_unsafe_o_keys(self):
+        for value in ('ConnectTimeout=5', 'BatchMode=yes', 'stricthostkeychecking=no', 'UserKnownHostsFile=/dev/null', 'ServerAliveInterval=5',
+                      'ServerAliveCountMax=3', 'LogLevel=ERROR', 'IdentitiesOnly=yes', 'ConnectTimeout 5', 'ConnectTimeout = 5'):
+            self.assertEqual(host_table.parse_ssh(['-o', value, 'h', 'ls']).unsafe, set(), value)
+            self.assertEqual(host_table.parse_ssh(['-o' + value, 'h', 'ls']).unsafe, set(), value)
+        for value in ('ProxyCommand=x', 'ProxyJump=x', 'Match all', 'Include=x', 'LocalCommand=x', 'PermitLocalCommand=yes', 'RemoteCommand=x',
+                      'HostName=x', 'Port=1', 'NoSuchKey=1', 'ConnectTimeout', 'ConnectTimeout=', 'ConnectTimeout=5\nProxyCommand=x',
+                      'ConnectTimeout=$X', 'ConnectTimeout=5 ProxyCommand=x'):
+            self.assertEqual(host_table.parse_ssh(['-o', value, 'h', 'ls']).unsafe, {'o'}, value)
+        self.assertEqual(host_table.parse_ssh(['-o', 'BatchMode=yes', '-o', 'ProxyCommand=x', 'h']).unsafe, {'o'})
+        self.assertEqual(host_table.parse_ssh(['-o', 'BatchMode=yes', 'h']).resolve_args, [])
+
+    def test_options_after_the_target(self):
+        call = host_table.parse_ssh(['h', '-p', '2222', '-t', 'ls', '-p', '1'])
+        self.assertEqual((call.target, call.post_opts, call.remote), ('h', ['-p', '2222', '-t'], ['ls', '-p', '1']))
+        self.assertEqual(call.resolve_args, ['-p', '2222'])
+        self.assertIn('f', host_table.parse_ssh(['h', '-f', 'sleep', '9']).flags)
+        self.assertNotIn('f', host_table.parse_ssh(['h', 'ls', '-f']).flags)
+        self.assertEqual(host_table.parse_ssh(['h', '-F', 'x', 'ls']).unsafe, {'F'})
+        self.assertEqual(host_table.parse_ssh(['h', '-x']).remote, [])
 
     def test_no_command(self):
         self.assertEqual(host_table.parse_ssh(['h']).remote, [])

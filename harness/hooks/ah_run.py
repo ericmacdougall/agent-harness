@@ -217,28 +217,39 @@ def shell_quote(value):
 
 
 TRAMPOLINE_CODE = (
-    'import os, sys\n'
+    'import os, signal, sys, time\n'
     'rfd, grace, cmd = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3:]\n'
+    'forwarded = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}\n'
+    # blocked across the forks: a signal arriving now waits for the watchdog's SIG_IGN and for the unblock before exec
+    'signal.pthread_sigmask(signal.SIG_BLOCK, forwarded)\n'
     'try:\n'
-    '    pid = os.fork()\n'
+    '    first = os.fork()\n'
     'except OSError:\n'
-    '    pid = -1\n'
-    'if pid == 0:\n'
+    '    first = -1\n'
+    'if first == 0:\n'  # double fork: the watchdog is never a child of the shell
     '    try:\n'
-    '        import signal, time\n'
+    '        if os.fork() != 0:\n'
+    '            os._exit(0)\n'
+    '        for signum in forwarded:\n'
+    '            signal.signal(signum, signal.SIG_IGN)\n'
     '        null = os.open(os.devnull, os.O_RDWR)\n'
     '        for fd in (0, 1, 2):\n'
     '            os.dup2(null, fd)\n'
     '        os.closerange(3, rfd); os.closerange(rfd + 1, 4096)\n'
     '        if os.read(rfd, 1) == b"":\n'  # EOF without the clean-end byte: the supervisor died
-    '            signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
     '            group = os.getpgrp()\n'
     '            os.killpg(group, signal.SIGTERM); time.sleep(grace); os.killpg(group, signal.SIGKILL)\n'
     '    except BaseException:\n'
     '        pass\n'
     '    os._exit(0)\n'
-    'if pid > 0:\n'
-    '    os.close(rfd)\n'
+    'if first > 0:\n'
+    '    os.waitpid(first, 0)\n'
+    'os.close(rfd)\n'
+    # Python ignores these at startup and an ignored signal stays ignored across exec
+    'for name in ("SIGPIPE", "SIGXFSZ", "SIGXFZ"):\n'
+    '    if hasattr(signal, name):\n'
+    '        signal.signal(getattr(signal, name), signal.SIG_DFL)\n'
+    'signal.pthread_sigmask(signal.SIG_UNBLOCK, forwarded)\n'
     'try:\n'
     '    os.execvp(cmd[0], cmd)\n'
     'except OSError:\n'
@@ -247,9 +258,11 @@ TRAMPOLINE_CODE = (
 
 def trampoline_argv(read_fd, argv):
     """The child starts as a tiny Python process that is the session and group leader (start_new_session, so no job
-    control stop on a controlling terminal), forks a watchdog that stays in the group and is not a job of the user's
-    shell, then execs the shell. The watchdog reads the pipe the supervisor holds: EOF without the clean-end byte means
-    the supervisor died, and it ends the group (SIGTERM, then SIGKILL after KILL_GRACE)."""
+    control stop on a controlling terminal). It double-forks a watchdog that stays in the group but is a child of
+    neither the trampoline nor the shell, so the command sees no unexpected child, restores the signal dispositions
+    Python changed, and execs the shell in its own pid. The watchdog ignores the forwarded signals and reads the pipe
+    the supervisor holds: EOF without the clean-end byte means the supervisor died, and it ends the group (SIGTERM,
+    then SIGKILL after KILL_GRACE)."""
     return [sys.executable, '-S', '-c', TRAMPOLINE_CODE, str(read_fd), str(KILL_GRACE), *argv]
 
 
@@ -437,11 +450,15 @@ def launch(args):
     row.update(pid=child.pid, pgid=pgid, start_token=process_start_token(child.pid),
                watchdog='in-group' if write_fd is not None else None)
     written = _ledger_write(ledger, run_id, row)
-    state = {'signal': None, 'parent_died': False}
+    state = {'signal': None, 'parent_died': False, 'escalation': None}
 
     def forward(signum, frame):
         state['signal'] = signum
         kill_group(pgid, signum if signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP) else signal.SIGTERM)
+        if state['escalation'] is None:  # a command that ignores the signal still ends KILL_GRACE later
+            state['escalation'] = threading.Timer(KILL_GRACE, kill_group, (pgid, signal.SIGKILL))
+            state['escalation'].daemon = True
+            state['escalation'].start()
 
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(signum, forward)
@@ -462,8 +479,6 @@ def launch(args):
         code = child.wait()
     except KeyboardInterrupt:
         kill_group(pgid, signal.SIGTERM); code = child.wait()
-    if state['signal'] is not None and child.poll() is None:
-        time.sleep(KILL_GRACE); kill_group(pgid, signal.SIGKILL)
     if write_fd is not None:  # normal end: tell the watchdog its job is done (its pipe would otherwise read as a death)
         try:
             os.write(write_fd, b'x')
@@ -471,7 +486,9 @@ def launch(args):
             pass
         os.close(write_fd)
     tree = pid_tree(pgid)
-    kill_group(pgid, signal.SIGTERM)  # leftovers of a finished leader are not part of the result
+    end_group(pgid)  # leftovers of a finished leader are not part of the result
+    if state['escalation'] is not None:
+        state['escalation'].cancel()  # the group is gone; a late SIGKILL could only reach a reused pgid
     usage = resource_usage()
     row.update(end=now(), exit_code=code, signal=state['signal'], parent_died=state['parent_died'],
                rusage=usage, pid_tree=tree)
@@ -496,6 +513,25 @@ def kill_group(pgid, signum):
         os.killpg(pgid, signum)
     except (ProcessLookupError, PermissionError, OSError):
         pass
+
+
+def group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except OSError:  # gone, or (BSD) only zombies are left
+        return False
+
+
+def end_group(pgid):
+    """SIGTERM what is left of a group; SIGKILL whatever still runs after KILL_GRACE. Returns at once when it empties."""
+    kill_group(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + KILL_GRACE
+    while group_alive(pgid):
+        if time.monotonic() >= deadline:
+            kill_group(pgid, signal.SIGKILL)
+            return
+        time.sleep(0.02)
 
 
 def process_table():
@@ -694,24 +730,175 @@ def inner_commands(text):
     return found
 
 
+HEREDOC_NONE, HEREDOC_CERTAIN, HEREDOC_UNCERTAIN = 'none', 'certain', 'uncertain'
+HEREDOC_OPENER = re.compile(r"""<<(-?)[ \t]*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|\\?([A-Za-z_][A-Za-z0-9_]*))(?=[ \t\n;&|)<>]|$)""")
+SIMPLE_BRACE = re.compile(r'\$\{[A-Za-z_][A-Za-z0-9_]*\}')
+HEREDOC_BREAK = ' \t\n;&|'
+
+
+def _double_quote_end(command, i):
+    """Index of the '"' closing the string whose body starts at i, or None when it is unterminated or holds an expansion
+    that can nest other quoting (a plain $NAME or ${NAME} cannot)."""
+    while i < len(command):
+        if command[i] == '\\':
+            i += 2
+        elif command[i] == '"':
+            return i
+        elif command[i] == '`' or command.startswith(('$(', '$['), i):
+            return None
+        elif command.startswith('${', i):
+            found = SIMPLE_BRACE.match(command, i)
+            if not found:
+                return None
+            i = found.end()
+        else:
+            i += 1
+    return None
+
+
+def _heredoc_bodies(command, i, pending, bodies):
+    """Read the bodies of the pending openers from the line starting at i. (next index, True) or (i, False) when a body
+    is unterminated or the shell could read it differently: in an unquoted body a backslash-newline joins lines before
+    the terminator test, and a $(...) or backtick runs a command."""
+    lines = command[i:].split('\n')
+    used, consumed = 0, 0
+    for delimiter, quoted, strip_tabs in pending:
+        body = []
+        while True:
+            if used >= len(lines):
+                return i, False
+            line = lines[used]
+            used += 1
+            consumed += len(line) + 1
+            if (line.lstrip('\t') if strip_tabs else line) == delimiter:
+                break
+            if not quoted and (line.endswith('\\') or '$(' in line or '`' in line):
+                return i, False
+            body.append(line.lstrip('\t') if strip_tabs else line)
+        bodies.append(('\n'.join(body) + '\n', quoted))
+    return i + consumed, True
+
+
+def heredoc_scan(command):
+    """(status, text, bodies): the single rule for what may be hidden from the matcher and the escape classifier.
+
+    Removing a body hides its lines, so a body is removed only when the shell cannot read the command another way.
+    The result is `certain` (markers replace the bodies; bodies are (text, quoted) pairs) only when all of these hold:
+    - every `<<` outside a body is an operator in plain unquoted text, not in quotes, a comment or `<<<`, and is
+      followed by a delimiter that is an identifier, optionally wholly quoted ('EOF', "EOF", \\EOF), and then a word end;
+    - every body ends on a line holding exactly the delimiter (tabs stripped first for `<<-`), and an unquoted body holds
+      no backslash at a line end, `$(` or backtick;
+    - no text outside the bodies holds anything that nests other quoting or changes what `<<` means: $(...), backtick,
+      ${...} other than ${NAME}, $[...], $'...', ((...)), [[...]], or a `(` attached to a word (<(, =(, @(, f().
+    A command with no `<<` is `none`. Anything else is `uncertain`, with the text left whole: callers then check every
+    physical line and never answer allow. A false uncertain costs a prompt; a false certain hides a command."""
+    if '<<' not in command:
+        return HEREDOC_NONE, command, []
+    uncertain = (HEREDOC_UNCERTAIN, command, [])
+    if '\0' in command:
+        return uncertain
+    out, bodies, pending, i, n, after_escape = [], [], [], 0, len(command), -1
+    while i < n:
+        ch = command[i]
+        at_break = i == 0 or (command[i - 1] in HEREDOC_BREAK and i != after_escape)
+        if ch == '\\':
+            if command[i + 1:i + 2] == '<':
+                return uncertain
+            out.append(command[i:i + 2]); i += 2; after_escape = i
+        elif ch == "'":
+            end = command.find("'", i + 1)
+            if end < 0 or '<<' in command[i:end]:
+                return uncertain
+            out.append(command[i:end + 1]); i = end + 1
+        elif ch == '"':
+            end = _double_quote_end(command, i + 1)
+            if end is None or '<<' in command[i:end]:
+                return uncertain
+            out.append(command[i:end + 1]); i = end + 1
+        elif ch == '#' and (at_break or i == after_escape or command[i - 1] in '<>()'):
+            end = command.find('\n', i)
+            end = n if end < 0 else end
+            if not at_break or '<<' in command[i:end]:  # a comment only the shell can place, or an opener in a comment
+                return uncertain
+            out.append(command[i:end]); i = end
+        elif command.startswith('<<<', i):
+            if command[i + 3:i + 4] == '<':
+                return uncertain
+            out.append('<<<'); i += 3
+        elif command.startswith('<<', i):
+            found = HEREDOC_OPENER.match(command, i)
+            if not found:
+                return uncertain
+            delimiter = found.group(2) or found.group(3) or found.group(4)
+            quoted = bool(found.group(2) or found.group(3)) or command[found.end() - len(delimiter) - 1] == '\\'
+            pending.append((delimiter, quoted, bool(found.group(1))))
+            out.append('<<__HD%d__' % (len(bodies) + len(pending) - 1)); i = found.end()
+        elif ch == '\n':
+            out.append(ch); i += 1
+            if pending:
+                i, ok = _heredoc_bodies(command, i, pending, bodies)
+                if not ok:
+                    return uncertain
+                pending = []
+        elif ch == '`' or command.startswith(('$(', '$[', "$'", '[['), i):
+            return uncertain
+        elif command.startswith('${', i):
+            found = SIMPLE_BRACE.match(command, i)
+            if not found:
+                return uncertain
+            out.append(found.group()); i = found.end()
+        elif ch == '(' and (command[i + 1:i + 2] == '(' or not at_break and command[i - 1] != '('):
+            return uncertain
+        else:
+            out.append(ch); i += 1
+    if pending:
+        return uncertain
+    if not bodies:
+        return HEREDOC_NONE, command, []
+    return HEREDOC_CERTAIN, ''.join(out), bodies
+
+
 def _prepare_text(command):
-    """(text, heredoc bodies, uncertain). $'...' is decoded first so heredoc detection sees the quoting the shell sees
-    (a `<<EOF` inside a $'...' string is not a heredoc); when the whole command cannot be decoded cleanly the result is
-    uncertain and never allowed. The decode runs again on the heredoc-free text."""
-    command = command.strip()
-    uncertain = False
-    if "$'" in command:
-        command, ok = deansi(command)
-        uncertain = not ok
-    text, bodies = _strip_heredocs(command)
-    text, ok = deansi(text)
-    return text, bodies, uncertain or not ok
+    """(text, heredoc bodies, uncertain). Bodies are removed only under heredoc_scan's rule; the rest is normalized by
+    deansi. An uncertain result keeps every line in the text and is never allowed."""
+    status, text, bodies = heredoc_scan(command)
+    text, ok = deansi(text.strip())
+    return text, bodies, status == HEREDOC_UNCERTAIN or not ok
 
 
-def _strip_heredocs(command):
-    """Heredoc bodies removed (markers left behind), plus (body, quoted) pairs. Reuses commit_policy."""
-    import commit_policy
-    return commit_policy._heredocs(command)
+PHYSICAL_SPLIT = re.compile(r'[;&|()`\n]|\$\(')
+BACKGROUND_AMP = re.compile(r'(?<![&<>])&(?=\s|$)')
+LATER_WAIT = re.compile(r'(?:^|[\s;&|(])wait(?=[\s;&|)]|$)')
+
+
+def physical_parts(command):
+    """Every fragment of every physical line of a command the hook could not parse with certainty, cut at each operator
+    with quoting ignored, since the quoting is what is in doubt. Used only to widen a deny or an escape check; a fragment
+    that is really string text can give a false deny, never a missed one."""
+    parts = []
+    for fragment in PHYSICAL_SPLIT.split(command):
+        fragment = fragment.strip()
+        bare = fragment.lstrip('\'" \t')
+        for form in (fragment, bare):
+            if form and form not in parts[-2:]:
+                parts.append(form)
+        if "$'" in fragment:
+            decoded, ok = deansi(fragment)
+            if ok:
+                parts.append(decoded)
+    return parts
+
+
+def _classify_physical_lines(command, reasons, depth):
+    """The escape check for an uncertain command: the classifier over every fragment of every line."""
+    found = []
+    for part in physical_parts(command):
+        words = [word.strip('\'"') for word in part.split()]
+        _classify_words(words, found, [], depth)
+    if BACKGROUND_AMP.search(command) and not LATER_WAIT.search(command):
+        found.append('background & without a later wait')
+    reasons.extend('a line of a command the hook cannot parse with certainty (use a file, or a top-level <<\'EOF\'): ' + reason
+                   for reason in found)
 
 
 def _tokens(text):
@@ -846,12 +1033,14 @@ class Parsed:
     def __init__(self):
         self.segments, self.inner, self.substitution, self.newline = [], [], False, False
         self.uncertain, self.pipeline = False, False  # quoting not modelled with certainty; a `|` or `&` joins commands
+        self.heredoc = HEREDOC_NONE
 
 
 def parse_command(command, depth=0):
     """Split into simple-command strings (quote, heredoc and comment aware) and flag substitutions and newlines."""
     parsed = Parsed()
     text, bodies, parsed.uncertain = _prepare_text(command)
+    parsed.heredoc = heredoc_scan(command)[0]
     parsed.substitution = any(not quoted and re.search(r'\$\(|`', body) for body, quoted in bodies)
     cur, i, n, quote = [], 0, len(text), None
 
@@ -1265,30 +1454,14 @@ def _classify_words(words, reasons, notes, depth):
 
 
 def _classify_ssh(args, reasons, notes, depth):
-    with_arg = set('bcDEeFIiJLlmOopQRSWwBP')
-    index, host = 0, None
-    while index < len(args):
-        word = args[index]
-        if word == '--':
-            index += 1
-            break
-        if word.startswith('-') and len(word) > 1:
-            letters = word[1:]
-            for position, letter in enumerate(letters):
-                if letter == 'f':
-                    reasons.append('ssh -f backgrounds the connection')
-                if letter in with_arg:
-                    if position == len(letters) - 1:
-                        index += 1
-                    break
-            index += 1
-            continue
-        break
-    if index < len(args):
-        host, remote = args[index], args[index + 1:]
-        if remote:
-            # a model-supplied `ah-run ... --` prefix in the remote command is replaced by the hook, so look past it
-            _classify_text(strip_ah_run_prefix(' '.join(remote)), reasons, notes, depth + 1, 'ssh remote: ')
+    call = host_table.parse_ssh(args)
+    if call is None:
+        return
+    if 'f' in call.flags:
+        reasons.append('ssh -f backgrounds the connection')
+    if call.remote:
+        # a model-supplied `ah-run ... --` prefix in the remote command is replaced by the hook, so look past it
+        _classify_text(strip_ah_run_prefix(' '.join(call.remote)), reasons, notes, depth + 1, 'ssh remote: ')
 
 
 def _classify_text(command, reasons, notes, depth, prefix=''):
@@ -1301,15 +1474,18 @@ def _classify_text(command, reasons, notes, depth, prefix=''):
 
 
 def _classify_command(command, reasons, notes, depth):
+    uncertain, entries, inner = False, [], []
     try:
-        text, _bodies, _uncertain = _prepare_text(command)
-        entries = []
+        text, _bodies, uncertain = _prepare_text(command)
         for words, operator in _simple(_tokens(_mask_redirect_amps(text))):
             entries.append(([w[1].replace('\x01', '&') for w in words if w[0] == 'word'], operator))
         inner = inner_commands(text)
     except Exception as error:  # noqa: BLE001 - any parse failure is a verdict, never a crash
-        reasons.append('parse failure: %s' % (str(error)[:60] or type(error).__name__))
-        return
+        if not (uncertain and '<<' in command):  # there the physical-line check below is the verdict
+            reasons.append('parse failure: %s' % (str(error)[:60] or type(error).__name__))
+            return
+    if uncertain:
+        _classify_physical_lines(command, reasons, depth)
     for position, (words, operator) in enumerate(entries):
         _classify_words(words, reasons, notes, depth)
         if operator == '&' and words:
@@ -1550,6 +1726,7 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
             continue  # `ssh HOST` with no command, `ssh -N`, `-W`: nothing to wrap
         raws = [w[0] for w in args[1:]]
         count = len(call.opts)
+        before_remote = count + 1 + len(call.post_opts)  # ssh reads options after the host too, up to the first other word
         target_dynamic = args[1 + count][2]
         if call.unsafe:
             flags = ''.join(sorted(call.unsafe))
@@ -1576,8 +1753,8 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
         agent = safe_key(payload.get('agent_id'), 'main')
         session = safe_key(payload.get('session_id'), 'none')
         ticket = env.get('AGENT_HARNESS_TICKET')
-        remote_raw = raws[count + 1:]
-        remote_words = args[2 + count:]
+        remote_raw = raws[before_remote:]
+        remote_words = args[1 + before_remote:]
         if any(w[2] for w in remote_words):
             # the local shell expands this text before ssh sees it: build the base64 from the same words at run time
             b64 = '"$(set -- %s; printf %%s "$*" | base64 | tr -d \'\\n\')"' % ' '.join(remote_raw)
@@ -1602,7 +1779,7 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
         if agent_is_readonly(payload):
             tail.append('--readonly')
         tail += ['--cmd-b64', b64]
-        new_form = ' '.join([args[0][0], *raws[:count + 1], *tail, *redirects])
+        new_form = ' '.join([args[0][0], *raws[:before_remote], *tail, *redirects])
         if command.count(segment) != parsed.segments.count(segment):
             remote = remote or ('remote-unwrapped', digest(who))
             context.append('ah-run: an ssh line could not be rewritten safely (its text repeats inside another command); it runs unwrapped')
@@ -1754,7 +1931,10 @@ def decide(payload, home=None, env=None, ancestors=None):
     parsed = parse_command(command)
     context = []
 
-    for part in parsed.segments + parsed.inner:
+    checked = parsed.segments + parsed.inner
+    if parsed.uncertain and rules['deny']:
+        checked = checked + physical_parts(command)  # what the parse may have swallowed as string or heredoc text
+    for part in checked:
         forms = match_candidates(part)
         for rule in rules['deny']:
             if any(rule.matches(form) for form in forms):
@@ -1773,6 +1953,8 @@ def decide(payload, home=None, env=None, ancestors=None):
             return _out('deny', 'no allow rule matches this recovery command and permission mode dontAsk refuses to ask')
         return _out('ask', 'recovery command: no allow rule matches (run through its installed path or add a narrow rule)')
 
+    if parsed.heredoc == HEREDOC_UNCERTAIN:
+        context.append('heredoc: uncertain (every line was checked against the deny rules; this command is never auto-allowed)')
     reasons, notes = analyze_escapes(command)
     if reasons:
         text = 'command escapes tracking: %s. Run it through `ah-run` or keep it in the foreground (use `wait`).' % '; '.join(reasons)
@@ -1816,6 +1998,8 @@ def decide(payload, home=None, env=None, ancestors=None):
         return _out('allow', 'every command matches an allow rule; wrapped in ah-run', updated, extra)
     if asked:
         why = 'ask rule matched'
+    elif parsed.heredoc == HEREDOC_UNCERTAIN:
+        why = 'heredoc: uncertain (a `<<` the hook cannot read the way the shell does)'
     elif parsed.uncertain:
         why = 'quoting the hook cannot tokenize with certainty'
     elif parsed.substitution or parsed.newline:

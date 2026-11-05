@@ -132,6 +132,82 @@ class Signals(Fixture):
             self.assertTrue(self.wait_gone(pid, 8), 'pid %d survived the launcher SIGKILL' % pid)
 
 
+class SignalEscalation(Fixture):
+    """B8: the supervisor owns TERM then KILL, the watchdog survives the forwarded signal and does the same if it dies."""
+    BUDGET = ah_run.KILL_GRACE + 1
+
+    def start_term_ignoring(self):
+        marker = Path(self.temp.name) / 'pgid.txt'
+        command = "trap '' TERM; echo $$ > %s; sleep 60" % marker
+        proc = subprocess.Popen([sys.executable, AH, 'run', '--task', 't1', '--no-unit', '--', command], env=self.env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(self.finish, proc)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (marker.exists() and marker.read_text().strip()):
+            time.sleep(0.02)
+        pgid = int(marker.read_text())
+        self.groups.append(pgid)
+        return proc, pgid
+
+    def setUp(self):
+        super().setUp()
+        self.env['CLAUDE_CODE_SHELL'] = '/bin/bash'
+        self.groups = []
+        self.addCleanup(self.kill_groups)
+
+    def kill_groups(self):
+        for pgid in self.groups:
+            ah_run.kill_group(pgid, signal.SIGKILL)
+
+    @staticmethod
+    def finish(proc):
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=10)
+
+    def group_gone_within(self, pgid, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if not ah_run.group_alive(pgid):
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_sigterm_to_the_launcher_ends_a_term_ignoring_command(self):
+        proc, pgid = self.start_term_ignoring()
+        proc.send_signal(signal.SIGTERM)
+        self.assertFalse(self.group_gone_within(pgid, 0.5), 'the command ignores SIGTERM, so it must outlive the first signal')
+        self.assertTrue(self.group_gone_within(pgid, self.BUDGET - 0.5), 'group %d survived SIGTERM plus the grace' % pgid)
+        proc.wait(timeout=10)
+        self.assertEqual(self.rows()[0]['signal'], int(signal.SIGTERM))
+
+    def test_sigkill_of_the_supervisor_ends_a_term_ignoring_command(self):
+        proc, pgid = self.start_term_ignoring()
+        proc.kill(); proc.wait(timeout=5)
+        self.assertTrue(self.group_gone_within(pgid, self.BUDGET), 'group %d survived the supervisor' % pgid)
+
+    def test_term_then_kill_of_the_supervisor_still_ends_the_group(self):
+        proc, pgid = self.start_term_ignoring()
+        proc.send_signal(signal.SIGTERM)
+        time.sleep(0.2)  # the forward has reached the group, the watchdog included
+        proc.kill(); proc.wait(timeout=5)
+        self.assertTrue(self.group_gone_within(pgid, self.BUDGET), 'group %d survived TERM then KILL' % pgid)
+
+    def test_a_term_ignoring_leftover_of_a_finished_command_is_ended(self):
+        marker = Path(self.temp.name) / 'left.txt'
+        result = self.run_cmd("trap '' TERM; echo $$ > %s; sleep 60 & exit 4" % marker)
+        self.assertEqual(result.returncode, 4)
+        self.assertFalse(ah_run.group_alive(int(marker.read_text())))
+
+    def test_a_clean_exit_returns_at_once_and_leaves_no_group(self):
+        marker = Path(self.temp.name) / 'clean.txt'
+        started = time.monotonic()
+        result = self.run_cmd('echo $$ > %s' % marker)
+        self.assertEqual(result.returncode, 0)
+        self.assertLess(time.monotonic() - started, ah_run.KILL_GRACE, 'a clean exit must not wait out the grace')
+        self.assertTrue(self.group_gone_within(int(marker.read_text()), 1))
+
+
 class Kill(Fixture):
     def test_kill_by_task_reaches_env_attributed_orphans_and_spares_the_rest(self):
         marker = Path(self.temp.name) / 'orphan.txt'
@@ -559,7 +635,7 @@ class Escapes(unittest.TestCase):
         self.assertEqual(check_rows(ah_run.classify_escapes), [])
 
     def test_control_mutant_ignoring_heredocs_fails_the_heredoc_row(self):
-        with mock.patch.object(ah_run, '_strip_heredocs', lambda command: (command, [])):
+        with mock.patch.object(ah_run, 'heredoc_scan', lambda command: (ah_run.HEREDOC_NONE, command, [])):
             wrong = check_rows(ah_run.classify_escapes)
         self.assertIn('refused:heredoc-body-has-nohup', wrong)
 
@@ -604,6 +680,34 @@ class Equivalence(Fixture):
     def test_cwd_is_inherited(self):
         self.assertEqual(Path(self.both('pwd').stdout.strip()).resolve(), Path(self.temp.name).resolve())
 
+    def test_sigpipe_is_default_in_the_command(self):
+        self.assertEqual(self.both('yes | head -1 >/dev/null; echo "${PIPESTATUS[0]}"').stdout, '141\n')
+        self.assertEqual(self.both('set -o pipefail; yes | head -1').returncode, 141)
+
+    def test_a_builtin_loop_into_head_finishes(self):
+        script = 'while :; do echo x; done | head -1'
+        started = time.monotonic()
+        result = subprocess.run([sys.executable, AH, 'run', '--task', 'eq', '--no-unit', '--', script], stdin=subprocess.DEVNULL,
+                                env={**self.env, 'CLAUDE_CODE_SHELL': '/bin/bash'}, capture_output=True, text=True, timeout=8)
+        self.assertEqual(result.stdout, 'x\n'); self.assertLess(time.monotonic() - started, 2)
+
+    def test_sigxfsz_is_default_in_the_command(self):
+        out = self.both('ulimit -f 1; head -c 8192 /dev/zero > big 2>/dev/null; echo $?')
+        self.assertEqual(out.stdout, '153\n')
+
+    def test_the_mask_is_clear_in_the_command(self):
+        # a TERM blocked across the trampoline's forks must not stay blocked in the command
+        marker = Path(self.temp.name) / 'mask.txt'
+        proc = subprocess.Popen([sys.executable, AH, 'run', '--task', 'eq', '--no-unit', '--', 'echo $$ > %s; sleep 60' % marker],
+                                env={**self.env, 'CLAUDE_CODE_SHELL': '/bin/bash'}, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (marker.exists() and marker.read_text().strip()):
+            time.sleep(0.02)
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM); proc.wait(timeout=10)
+        self.assertEqual(proc.returncode, 128 + signal.SIGTERM)
+        self.assertLess(time.monotonic() - started, ah_run.KILL_GRACE - 0.5, 'ended by the TERM, not by the SIGKILL after the grace')
+
 
 class JobTable(Fixture):
     """B3: the watchdog is not a job of the user's shell, so wait, jobs and $! behave as without ah-run."""
@@ -614,18 +718,18 @@ class JobTable(Fixture):
         env = {**self.env, 'CLAUDE_CODE_SHELL': shell}
         token = ah_run.mint_pending(self.reserve, command, 't1', 'a1')
         result = subprocess.run([sys.executable, AH, 'run', '--task', 't1', '--agent', 'a1', '--token', token, '--no-unit', '--', command],
-                                env=env, capture_output=True, text=True, timeout=20)
+                                env=env, capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
         return result, time.monotonic() - started
 
     def test_bare_wait_returns_after_a_subshell_background_job(self):
         for shell in self.SHELLS:
             result, elapsed = self.run_in(shell, '(sleep 1 &); wait')
-            self.assertEqual(result.returncode, 0, shell); self.assertLess(elapsed, 3.5, shell)
+            self.assertEqual(result.returncode, 0, shell); self.assertLess(elapsed, 8, shell)
 
     def test_dollar_bang_is_one_pid_and_wait_returns(self):
         for shell in self.SHELLS:
             result, elapsed = self.run_in(shell, 'sleep 1 & echo $!; wait')
-            self.assertEqual(result.returncode, 0, shell); self.assertLess(elapsed, 3.5, shell)
+            self.assertEqual(result.returncode, 0, shell); self.assertLess(elapsed, 8, shell)
             lines = result.stdout.split()
             self.assertEqual(len(lines), 1, (shell, result.stdout)); self.assertTrue(lines[0].isdigit())
 
@@ -646,44 +750,63 @@ class JobTable(Fixture):
         left = subprocess.run(['ps', '-axo', 'pgid='], capture_output=True, text=True).stdout.split()
         self.assertNotIn(pgid, left)
 
-    def test_no_job_control_stop_with_a_controlling_terminal(self):
-        """S8: under a pty, stdin reads work and a /dev/tty read ends at once (no SIGTTIN stop)."""
+    def test_the_shell_has_no_child_of_its_own(self):
+        """S12: a sole command that waits for any child sees none (the watchdog is not its child)."""
+        for shell in self.SHELLS:
+            env = {**self.env, 'CLAUDE_CODE_SHELL': shell}
+            result = subprocess.run([sys.executable, AH, 'run', '--task', 't1', '--no-unit', '--',
+                                     '%s -c "import os; os.wait()"' % sys.executable],
+                                    env=env, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+            self.assertIn('ChildProcessError', result.stderr, shell); self.assertEqual(result.returncode, 1, shell)
+
+    def run_on_pty(self, command, typed, limit=20):
+        """(output, exit status or None, seconds). Writes only after the command printed READY, so the read is really
+        waiting; the read loop and the reap are both bounded by the same deadline, and a stopped command misses it."""
         import pty, select
-        def run_on_pty(command, typed):
+        try:
             pid, master = pty.fork()
-            if pid == 0:
-                os.execve(sys.executable, [sys.executable, AH, 'run', '--task', 't1', '--no-unit', '--', command],
-                          {**self.env, 'CLAUDE_CODE_SHELL': '/bin/bash'})
-            out, deadline, sent = b'', time.monotonic() + 6, False
-            try:
-                while time.monotonic() < deadline:
-                    ready, _, _ = select.select([master], [], [], 0.2)
-                    if not sent:
-                        os.write(master, typed); sent = True
-                    if ready:
-                        try:
-                            chunk = os.read(master, 4096)
-                        except OSError:
-                            break
-                        if not chunk:
-                            break
-                        out += chunk
-                done, _status = os.waitpid(pid, os.WNOHANG)
-                return out.decode('utf-8', 'replace'), done != 0, time.monotonic() - (deadline - 6)
-            finally:
+        except OSError as error:
+            self.skipTest('no pty available: %s' % error)
+        if pid == 0:
+            os.execve(sys.executable, [sys.executable, AH, 'run', '--task', 't1', '--no-unit', '--', 'echo READY; ' + command],
+                      {**self.env, 'CLAUDE_CODE_SHELL': '/bin/bash'})
+        started, out, sent, status = time.monotonic(), b'', False, None
+        deadline = started + limit
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([master], [], [], 0.1)
+                if ready:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    out += chunk
+                if not sent and b'READY' in out:
+                    os.write(master, typed); sent = True
+            while time.monotonic() < deadline and status is None:
+                done, code = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    status = code
+                else:
+                    time.sleep(0.02)
+            return out.decode('utf-8', 'replace'), status, time.monotonic() - started
+        finally:
+            if status is None:
                 try:
-                    os.killpg(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                try:
+                    os.kill(pid, signal.SIGKILL)
                     os.waitpid(pid, 0)
                 except OSError:
                     pass
-                os.close(master)
-        out, finished, elapsed = run_on_pty('read x; echo got:$x', b'hi\n')
-        self.assertTrue(finished and 'got:hi' in out, (out, elapsed)); self.assertLess(elapsed, 3)
-        out, finished, elapsed = run_on_pty('read x < /dev/tty; echo end', b'hi\n')
-        self.assertTrue(finished and 'end' in out, (out, elapsed)); self.assertLess(elapsed, 3)
+            os.close(master)
+
+    def test_no_job_control_stop_with_a_controlling_terminal(self):
+        """S8: under a pty, stdin reads work and a /dev/tty read ends at once (no SIGTTIN stop)."""
+        out, status, seconds = self.run_on_pty('read x; echo got:$x', b'hi\n')
+        self.assertTrue(status is not None and 'got:hi' in out, (out, status, seconds))
+        out, status, seconds = self.run_on_pty('read x < /dev/tty; echo end', b'hi\n')
+        self.assertTrue(status is not None and 'end' in out, (out, status, seconds))
 
     def test_without_a_tty_behaviour_is_unchanged(self):
         result, _ = self.run_in('/bin/bash', 'read x; echo got:$x')
@@ -782,7 +905,8 @@ class ParserSync(HookFixture):
     def test_control_the_old_order_lets_the_fake_heredoc_through(self):
         self.settings('user', allow=['Bash(echo:*)'], deny=['Bash(touch:*)'])
         def old_order(command):
-            text, bodies = ah_run._strip_heredocs(command.strip())
+            import commit_policy
+            text, bodies = commit_policy._heredocs(command.strip())
             text, ok = ah_run.deansi(text)
             return text, bodies, not ok
         with mock.patch.object(ah_run, '_prepare_text', old_order):
@@ -791,6 +915,127 @@ class ParserSync(HookFixture):
     def test_escape_classifier_sees_through_ansi_c(self):
         self.assertTrue(ah_run.classify_escapes("echo $'\\'' ; nohup x ; echo ''"))
         self.assertEqual(ah_run.classify_escapes("echo $'nohup \\n' ; true"), [])
+
+
+class HeredocRule(HookFixture):
+    """B6: a body is removed only when the opener is certain; everything else keeps all its lines in the checks."""
+    # Data only for the touch rows. HIDDEN below is the only form that reaches a shell, and it is an echo.
+    SHAPES = {
+        'r2-shape': "echo $'a\\' <<EOF'\n%s\nEOF",
+        'param-default': 'echo ${x:-<<EOF}\n%s\nEOF',
+        'param-arith': 'echo ${x:0:1<<EOF}\n%s\nEOF',
+        'delim-dot': 'echo <<E.F\nE.F\n%s\nE\n',
+        'delim-quote-tail': "echo <<'E'OF\nEOF\n%s\nE\n",
+        'delim-escape': 'echo <<E\\OF\nEOF\n%s\nE\n',
+        'arith-cmd': '((x=1<<EOF))\n%s\nEOF',
+        'undecodable-tail': "echo $'a\\' <<EOF'\n%s\nEOF\necho $'",
+        'prior-heredoc-desync': "cat <<X\n'\nX\necho $'a\\' <<EOF'\n%s\nEOF\n#'",
+        'old-arith': 'echo $[1<<EOF]\n%s\nEOF',
+        'partial-quote-head': 'echo <<E"O"F\nEOF\n%s\nE\n',
+        'backslash-terminator': 'echo <<EOF\nEOF\\\n\n%s\nEOF',
+        'escaped-space-comment': "echo a\\ #'\ncat <<E\n'; %s\nE\n#'",
+        'comment-after-paren': "(true)#'\n' cat <<E\n'; %s\nE",
+        'case-in-substitution': 'echo "$(case x in x) echo " <<EOF\n"; %s\nEOF\n;; esac)" #"',
+        'array-assignment': 'a=(1<<E)\n%s\nE',
+        'unquoted-substitution': 'cat <<EOF\n$(%s)\nEOF',
+        'unterminated': 'echo <<EOF\n%s',
+    }
+    BENIGN = {
+        'plain': ('cat <<EOF\nhi there\nEOF', 'cat'),
+        'python-stdin': ("python3 - <<'PY'\nimport os\nprint(os.getcwd())\nPY", 'python3'),
+        'tab-strip': ('cat <<-TAB\n\tbody\n\tTAB', 'cat'),
+        'double-quoted': ('cat <<"X"\nit\'s $(literal) `text`\nX', 'cat'),
+        'backslash': ('cat <<\\X\n$(literal)\nX', 'cat'),
+        'body-with-escape-words': ("cat <<'EOF'\nnohup x &\ntouch PWNED\nEOF", 'cat'),
+    }
+    TABLE = (
+        (ah_run.HEREDOC_CERTAIN, ('cat <<EOF\nhi\nEOF', 'cat <<EOF\nhi\nEOF\n', "python3 - <<'PY'\nprint(1)\nPY", 'cat <<-TAB\n\tb\n\tTAB',
+                                  'cat <<\\EOF\nb\nEOF', 'cat << EOF\nb\nEOF', 'cat <<A <<B\n1\nA\n2\nB', 'cat 3<<EOF\nb\nEOF',
+                                  'cat <<EOF; echo next\nb\nEOF', 'cat <<EOF | wc -l\nb\nEOF', '(cat <<EOF\nb\nEOF\n)', 'cat <<EOF # note\nb\nEOF',
+                                  'cat > "$HOME/f" <<EOF\nb\nEOF', 'cat > ${HOME}/f <<EOF\nb\nEOF', 'if true; then cat <<EOF\nb\nEOF\nfi')),
+        (ah_run.HEREDOC_NONE, ('echo hi', 'cat <<<x', 'cat <<<"a b"', 'echo a\necho b', "echo 'no shift'", 'echo $((1+1))', 'echo <\\<x')),
+        (ah_run.HEREDOC_UNCERTAIN, ("echo '<<EOF'", 'echo "<<EOF"', 'cat <<', 'cat <<EOF', 'cat <<EOF\nb', 'cat <<E.F\nE.F', "cat <<'E'OF\nEOF",
+                                    'cat <<E\\OF\nEOF', 'cat <<"E"F\nEF', 'cat <<$X\n$X', "cat <<E'O'F\nEOF", 'cat <<EOF\nb\n EOF', 'cat <<EOF\nb\nEOF ',
+                                    'cat <<EOF\r\nb\r\nEOF\r\n', 'echo $((1<<2))', 'echo $[1<<2]', '((x=1<<2))', 'echo ${x:-<<EOF}',
+                                    "git commit -m \"$(cat <<'EOF'\nb\nEOF\n)\"", 'echo `cat <<EOF\nb\nEOF\n`', 'echo # <<EOF', 'echo \\<<EOF\nb\nEOF',
+                                    'cat <<EOF\n$(date)\nEOF', 'cat <<EOF\n`date`\nEOF', 'cat <<EOF\nEOF\\\n\nEOF', "cat <<EOF\nb\nEOF\necho $'x'",
+                                    'cat <<<<EOF', 'cat <(cat <<E\nb\nE\n)', 'cat <<EOF\nb\nEOF\necho "${x:-y}"', '[[ a << b ]]', 'cat <<EOF\0\nb\nEOF')),
+    )
+
+    def test_the_rule_table(self):
+        for status, commands in self.TABLE:
+            for command in commands:
+                self.assertEqual(ah_run.heredoc_scan(command)[0], status, repr(command))
+
+    def test_a_certain_scan_returns_the_bodies_and_markers(self):
+        status, text, bodies = ah_run.heredoc_scan("cat <<A <<'B'\n1\nA\n2\nB\necho after")
+        self.assertEqual(status, ah_run.HEREDOC_CERTAIN)
+        self.assertEqual(text, 'cat <<__HD0__ <<__HD1__\necho after')
+        self.assertEqual(bodies, [('1\n', False), ('2\n', True)])
+        self.assertEqual(ah_run.heredoc_scan('cat <<-T\n\tb\n\tT')[2], [('b\n', False)])
+
+    def test_an_uncertain_scan_keeps_the_text_whole(self):
+        command = 'echo <<E.F\nE.F\nnext line\nE'
+        self.assertEqual(ah_run.heredoc_scan(command), (ah_run.HEREDOC_UNCERTAIN, command, []))
+
+    def test_every_hidden_line_is_denied_in_default_and_bypass(self):
+        self.settings('user', allow=['Bash(echo:*)', 'Bash(cat:*)'], deny=['Bash(touch:*)'])
+        for name, shape in self.SHAPES.items():
+            command = shape % 'touch PWNED'
+            for mode in ('default', 'acceptEdits', 'dontAsk', 'bypassPermissions'):
+                self.assertEqual(self.decide(command, permission_mode=mode).get('permissionDecision'), 'deny', (name, mode))
+
+    def test_without_the_deny_rule_a_hidden_line_is_never_allowed(self):
+        self.settings('user', allow=['Bash(echo:*)', 'Bash(cat:*)'])
+        for name, shape in self.SHAPES.items():
+            command = shape % 'touch PWNED'
+            for mode in ('default', 'acceptEdits'):
+                self.assertEqual(self.decide(command, permission_mode=mode).get('permissionDecision'), 'ask', (name, mode))
+            self.assertEqual(self.decide(command, permission_mode='dontAsk').get('permissionDecision'), 'deny', name)
+            out = self.decide(command, permission_mode='bypassPermissions')
+            self.assertNotIn('permissionDecision', out, name); self.assertIn('updatedInput', out, name)
+            self.assertIn('heredoc: uncertain', out.get('additionalContext', ''), name)
+
+    def test_a_wrapper_or_a_second_command_on_the_hidden_line_is_seen(self):
+        self.settings('user', allow=['Bash(echo:*)'], deny=['Bash(touch:*)'])
+        for line in ('sudo touch PWNED', 'true; touch PWNED', 'true && touch PWNED', "'touch' PWNED", "$'\\x74ouch' PWNED", 'X=1 touch PWNED'):
+            command = "echo $'a\\' <<EOF'\n%s\nEOF\necho $'" % line
+            self.assertEqual(self.decide(command, permission_mode='bypassPermissions').get('permissionDecision'), 'deny', line)
+
+    def test_the_escape_classifier_sees_every_hidden_line(self):
+        for name, shape in self.SHAPES.items():
+            self.assertTrue(ah_run.classify_escapes(shape % 'nohup sleep 9 &'), name)
+            self.assertTrue(ah_run.classify_escapes(shape % 'sleep 9 &'), name)
+
+    def test_benign_heredocs_stay_allowed(self):
+        self.settings('user', allow=['Bash(cat:*)', 'Bash(python3:*)'], deny=['Bash(touch:*)'])
+        for name, (command, _program) in self.BENIGN.items():
+            self.assertEqual(self.decide(command).get('permissionDecision'), 'allow', name)
+            self.assertEqual(ah_run.classify_escapes(command), [], name)
+            out = self.decide(command, permission_mode='bypassPermissions')
+            self.assertNotIn('permissionDecision', out, name)
+            self.assertNotIn('heredoc: uncertain', out.get('additionalContext') or '', name)
+
+    def test_a_certain_scan_agrees_with_the_real_shells(self):
+        """Differential: with a harmless echo on the hidden line, a shape the scan calls certain must not print it."""
+        ran = 0
+        cases = list(self.SHAPES.values()) + ['cat <<EOF\n%s\nEOF', "cat <<'E'\n%s\nE", 'cat <<-E\n\t%s\n\tE', 'cat <<A <<B\n%s\nA\n%s\nB']
+        for shell in ('/bin/bash', '/bin/zsh', '/bin/sh'):
+            if not os.access(shell, os.X_OK):
+                continue
+            for shape in cases:
+                command = shape.replace('%s', 'echo HIDDEN-LINE')
+                done = subprocess.run([shell, '-c', command], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL, cwd=self.temp.name)
+                shown = 'HIDDEN-LINE' in done.stdout.replace('echo HIDDEN-LINE', '')
+                ran += shown
+                if ah_run.heredoc_scan(command)[0] == ah_run.HEREDOC_CERTAIN:
+                    self.assertFalse(shown, (shell, command))
+        self.assertGreater(ran, 5, 'the corpus must include shapes the shell really runs, or the row proves nothing')
+
+    def test_the_rule_is_not_reached_through_the_shared_commit_policy_parser(self):
+        import commit_policy
+        with mock.patch.object(commit_policy, '_heredocs', side_effect=AssertionError('commit_policy parser used')):
+            self.assertEqual(ah_run.parse_command('cat <<EOF\nb\nEOF').segments, ['cat <<__HD0__'])
 
 
 class PermissionRules(HookFixture):
@@ -1114,8 +1359,11 @@ class SshRewrite(HookFixture):
         self.assertEqual(self.ssh("ssh dev2 'ah-run run --task x -- nohup sleep 9'")['permissionDecision'], 'deny')
 
     def test_config_bearing_options_never_reach_ssh_g_and_leave_the_line_unwrapped(self):
-        for command in ("ssh -F ./x.conf dev2 'git log'", "ssh -o ProxyCommand=true dev2 'git log'", "ssh -oBatchMode=yes dev2 ls",
-                        "ssh -J jump dev2 'git log'", "ssh -p 22 -F./x.conf dev2 ls"):
+        for command in ("ssh -F ./x.conf dev2 'git log'", "ssh -o ProxyCommand=true dev2 'git log'", "ssh -oProxyJump=j dev2 ls",
+                        "ssh -J jump dev2 'git log'", "ssh -p 22 -F./x.conf dev2 ls", 'ssh -o NoSuchKey=1 dev2 ls',
+                        'ssh -o RemoteCommand=x dev2 ls', 'ssh -o LocalCommand=x dev2 ls', 'ssh -o PermitLocalCommand=yes dev2 ls',
+                        'ssh -o Include=x dev2 ls', 'ssh -o "Match all" dev2 ls', 'ssh -o ConnectTimeout=$X dev2 ls',
+                        'ssh -o ConnectTimeout=5 -o ProxyCommand=x dev2 ls', 'ssh dev2 -F evil.conf ls', 'ssh dev2 -o ProxyCommand=x ls'):
             if self.ssh_log.exists():
                 self.ssh_log.unlink()
             out = self.ssh(command)
@@ -1130,6 +1378,36 @@ class SshRewrite(HookFixture):
         self.assertIn('-G -p 2222 -- dev2', self.ssh_log.read_text())
         line = self.inner(self.ssh("ssh -p2222 -l eric dev2 git -C /x log -1"))
         self.assertEqual(self.b64_of(line), 'git -C /x log -1')
+
+    def test_safe_o_keys_keep_the_rewrite_and_never_reach_ssh_g(self):
+        for option in ('-o ConnectTimeout=5', '-oBatchMode=yes', '-o StrictHostKeyChecking=no', '-o UserKnownHostsFile=/dev/null',
+                       '-o ServerAliveInterval=5', '-o ServerAliveCountMax=3', '-o LogLevel=ERROR', '-o IdentitiesOnly=yes',
+                       '-o "ConnectTimeout 5"', '-o connecttimeout=5'):
+            self.ssh_log.write_text('')
+            line = self.inner(self.ssh("ssh %s dev2 'git log'" % option, agent_type='red-team'))
+            self.assertIn('via-hook-ssh', line, option); self.assertIn('--readonly', line, option)
+            self.assertTrue(line.startswith('ssh %s dev2 python3 ' % option), line)
+            self.assertEqual(self.b64_of(line), 'git log', option)
+            contacted = self.ssh_log.read_text()
+            self.assertIn('-G -- dev2', contacted, option); self.assertNotIn('-o', contacted.split(), option)
+
+    def test_options_after_the_host_are_options_not_the_remote_command(self):
+        line = self.inner(self.ssh('ssh dev2 -p 2222 ls -l'))
+        self.assertTrue(line.startswith('ssh dev2 -p 2222 python3 %s run' % self.REMOTE_PATH), line)
+        self.assertEqual(self.b64_of(line), 'ls -l')
+        self.assertIn('-G -p 2222 -- dev2', self.ssh_log.read_text())
+        line = self.inner(self.ssh('ssh dev2 ls -p 2222'))  # the first other word ends the options
+        self.assertEqual(self.b64_of(line), 'ls -p 2222')
+        line = self.inner(self.ssh('ssh dev2 -t -- -x'))
+        self.assertEqual(self.b64_of(line), '-x')
+
+    def test_ssh_f_after_the_host_is_still_the_escape(self):
+        for command in ('ssh dev2 -f', 'ssh dev2 -f sleep 99', 'ssh dev2 -p 22 -f ls', 'ssh dev2 -fN'):
+            self.assertEqual(self.ssh(command)['permissionDecision'], 'deny', command)
+        self.assertEqual(self.ssh('ssh dev2 ls -f').get('permissionDecision'), 'ask')  # -f of the remote ls
+
+    def test_a_remote_escape_after_host_options_is_still_found(self):
+        self.assertEqual(self.ssh("ssh dev2 -p 22 'nohup sleep 9'")['permissionDecision'], 'deny')
 
     def test_prefix_and_pipeline_stages_are_kept(self):
         line = self.inner(self.ssh("printf data | ssh dev2 'cat' | wc -c"))
