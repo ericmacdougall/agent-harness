@@ -350,6 +350,23 @@ class Locking(Case):
         self.assertEqual(self.run_script().returncode, 0)
         self.assertTrue(self.last_ok().exists())
 
+    def test_legacy_lock_without_a_pid_is_never_taken_over_while_young(self):
+        # the hand-installed script keeps the same lock.d directory without a pid file
+        lock = self.logs / "log-backup.lock.d"
+        lock.mkdir(parents=True)
+        old = time.time() - 6600  # 110 minutes: an old-script bulk pass that is still running
+        os.utime(lock, (old, old))
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(self.recorded(), [])
+        self.assertTrue((self.logs / "log-backup.last-skip").exists())
+        self.assertFalse(self.last_ok().exists())
+        self.assertTrue(lock.is_dir())
+        old = time.time() - 90000  # over a day: abandoned
+        os.utime(lock, (old, old))
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertTrue(self.last_ok().exists())
+
     def test_lookalike_process_is_not_a_live_holder(self):
         # a command line containing "log-backup" but not the script (tail of the log) must not wedge the backup
         other = subprocess.Popen(["/bin/sh", "-c", "sleep 60", "log-backup.log"])
