@@ -593,7 +593,8 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(capture.exists())
         self.assertEqual(launches.read_text().split(), ['codex', 'claude'])
-        self.assertIn('Blind Claude Opus fallback', self.output.read_text())
+        self.assertIn('Reviewer: Claude opus medium (rung R1)', self.output.read_text())
+        self.assertIn('Fallback reason: Primary reviewer unavailable (AUTH)', self.output.read_text())
 
     def test_structured_failure_overrides_exit_zero_and_last_message_pass(self):
         capture = self.root / 'fallback.capture'

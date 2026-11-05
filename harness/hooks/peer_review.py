@@ -24,6 +24,8 @@ from pathlib import Path
 from process import run as run_process, signal_group
 from git_safety import git_environment as safe_git_environment, require_safe_source
 from report_file import ReportTarget
+import escalation as ladder
+import model_tiers as tiers
 from usage_guard import GuardError, UsageStore, capture_subject, invocation_identity
 
 
@@ -693,11 +695,23 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
     run_record, store = options.get('run_record'), options.get('store')
     deadline = time.monotonic() + min(1440, run_record.timeout if run_record else 1440)
     failure = ''
-    model = options.get('model', os.environ.get('CODEX_REVIEW_MODEL', 'gpt-6.1-sol'))
+    if 'selection' not in options:
+        # Direct callers without a selection get the unknown-author choice from the table.
+        policy = tiers.load_policy()
+        options['selection'] = tiers.reviewer_for(policy, None, 'unknown')
+        options.setdefault('codex_model', policy['rungs'][options['selection']['rung']]['models']['openai'])
+        options.setdefault('claude_model', policy['rungs'][options['selection']['rung']]['models']['claude'])
+    selection = options['selection']
+    effort, rung = selection['effort'], selection['rung']
+    codex_model, claude_model = options['codex_model'], options['claude_model']
     options.setdefault('launches', 0)
     options.setdefault('usage', [])
-    for provider, source, pool in (('codex', 'Codex ' + model, options.get('pool', 'default')),
-                                   ('claude', 'Blind Claude Opus fallback', options.get('fallback_pool', 'default'))):
+    codex_entry = ('codex', 'Codex %s %s (rung %s)' % (codex_model, effort, rung), options.get('pool', 'default'))
+    claude_entry = ('claude', 'Claude %s %s (rung %s)' % (claude_model, effort, rung), options.get('fallback_pool', 'default'))
+    # The tier table picks the primary; the other harness at the same rung is the one authorized fallback.
+    order = (codex_entry, claude_entry) if selection['harness'] == 'openai' else (claude_entry, codex_entry)
+    primary = order[0][0]
+    for provider, source, pool in order:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ReviewFailure({**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}, source)
@@ -713,10 +727,12 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                 with tempfile.TemporaryDirectory() as temp:
                     last = Path(temp) / 'last.txt'
                     if provider == 'codex':
-                        cmd = ['codex', 'exec', '--ephemeral', '--json', '--model', model, '--sandbox', 'read-only',
+                        cmd = ['codex', 'exec', '--ephemeral', '--json', '--model', codex_model,
+                               '-c', 'model_reasoning_effort=' + effort, '--sandbox', 'read-only',
                                '--cd', str(snapshot), '--output-last-message', str(last), '-']
                     else:
-                        cmd = ['claude', '--print', '--safe-mode', '--restricted', '--model', 'opus',
+                        cmd = ['claude', '--print', '--safe-mode', '--restricted', '--model', claude_model,
+                               '--effort', effort, '--max-budget-usd', str(selection.get('review_budget_usd') or 5),
                                '--no-session-persistence', '--output-format', 'json', '--system-prompt', REVIEW_SYSTEM, '-']
                     timeout = min(timeout, deadline - time.monotonic())
                     if timeout <= 0:
@@ -738,7 +754,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         if outcome['result'] != 'NO_RESULT':
             options['outcome'] = outcome
             return source, stage_report(stage, outcome['report']), failure
-        if provider != 'codex' or not outcome['fallback_allowed']:
+        if provider != primary or not outcome['fallback_allowed']:
             raise ReviewFailure(outcome, source)
         failure = 'Primary reviewer unavailable (' + outcome['reason'] + '); used authorized independent fallback.'
     raise OSError('no valid reviewer result')
@@ -841,6 +857,36 @@ def plan_ticket_gate(repo, content):
         return 0, f'spec-flow: plan ticket gate could not run ({error}); continuing'
 
 
+def write_selection_receipt(run_id, args, head, packet_sha256, author_rung, selection):
+    """The selection receipt: what the table chose before launch, bound to task, stage, head and packet."""
+    try:
+        root = ladder.state_root() / 'selections'
+        root.mkdir(mode=0o700, exist_ok=True)
+        path = root / (run_id + '.json')
+        body = json.dumps({'schema': 1, 'run_id': run_id, 'task': args.task, 'stage': args.stage, 'head': head,
+                           'packet_sha256': packet_sha256, 'author_rung': author_rung, 'author_harness': args.author_harness,
+                           'selection': selection, 'at': ladder.now()}, sort_keys=True)
+        path.write_text(body); os.chmod(path, 0o600)
+    except OSError as error:
+        print(f'Selection receipt could not be written: {type(error).__name__}', file=sys.stderr)
+
+
+def record_in_ladder(args, store, reference, head, policy):
+    """Reviews count where they are consumed: the FINAL receipt bytes feed the task ledger."""
+    if not args.task or reference is None:
+        return
+    try:
+        receipt = (store._run_directory(reference['run_id']) / 'final.json').read_bytes()
+        status = ladder.Ledger(policy=policy).record(args.task, receipt, kind='review', source='peer_review:' + args.stage,
+                                                     head=head, notify=os.environ.get('AGENT_HARNESS_MAIN_WAL'))
+        print('Ladder: task %s rung %s, failures at rung %d%s' % (
+            args.task, status['rung'], status['failures_at_rung'],
+            ' (escalated %s -> %s)' % (status['escalation']['from'], status['escalation']['to']) if status.get('escalation') else ''),
+            file=sys.stderr)
+    except (OSError, ladder.LedgerError, tiers.TierError, GuardError) as error:
+        print(f'Ladder record failed: {getattr(error, "message", error)}', file=sys.stderr)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("plan", "code-inspection", "pr"))
@@ -862,6 +908,10 @@ def main() -> int:
     parser.add_argument('--fallback-pool', default='default', help='Opaque independent Claude auth-pool alias')
     parser.add_argument('--owner', default='peer-review', help='Safe owner identifier for execution receipts')
     parser.add_argument('--base', help='PR base for the commit-policy range check (default origin/HEAD or origin/main)')
+    parser.add_argument('--task', help='Ladder task key: the author rung comes from its ledger and the receipt is recorded there')
+    parser.add_argument('--author-rung', help='Author rung override (R0..R6); unknown gets the configured unknown-author reviewer')
+    parser.add_argument('--author-harness', choices=('claude', 'openai', 'unknown'), default='unknown',
+                        help='Harness that wrote the change; the other harness reviews when available')
     args = parser.parse_args()
     if not 1 <= args.packet_budget_bytes <= PACKET_LIMIT:
         parser.error('--packet-budget-bytes must be between 1 and 150000')
@@ -959,8 +1009,27 @@ def main() -> int:
         "material implementation defects, missing tests, insecure behavior, or unverifiable claims."
     )
     store, run_record = None, None
+    try:
+        policy = tiers.load_policy()
+    except tiers.TierError as error:
+        print(f'Review refused: tier table error: {error}', file=sys.stderr)
+        return 2
+    author_rung = args.author_rung
+    if author_rung is None and args.task:
+        try:
+            author_rung = ladder.Ledger(policy=policy).status(args.task)['rung']
+        except (ladder.LedgerError, tiers.TierError):
+            author_rung = None
+    available = {'openai': shutil.which('codex') is not None, 'claude': shutil.which('claude') is not None}
+    selection = tiers.reviewer_for(policy, author_rung, args.author_harness, available)
+    if selection['harness'] is None:
+        print('Review refused: no review harness is available for rung %s (codex and claude both unavailable)'
+              % selection['rung'], file=sys.stderr)
+        return 2
     options = {'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
-               'model': os.environ.get('CODEX_REVIEW_MODEL', 'gpt-6.1-sol')}
+               'selection': selection, 'author_rung': author_rung,
+               'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
+               'claude_model': policy['rungs'][selection['rung']]['models']['claude']}
     try:
         with tempfile.TemporaryDirectory(prefix='peer-review-') as temp:
             snapshot = Path(temp) / 'repo'
@@ -974,16 +1043,20 @@ def main() -> int:
                 raise OSError('source changed while preparing review')
             subject = capture_subject(repo, args.input_manifest)
             invocation = invocation_identity(subject, purpose='peer-review-' + args.stage,
-                argv=['peer_review', args.stage, options['model'], 'opus', args.pool, args.fallback_pool,
+                argv=['peer_review', args.stage, options['codex_model'], options['claude_model'], selection['effort'],
+                      selection['rung'], selection['harness'], args.pool, args.fallback_pool,
                       '--snapshot-base', base or 'none'], cwd=repo,
                 stage=args.stage.upper().replace('-', '_'), packet_digest=evidence.sha256,
-                provider='codex', model=options['model'], pool=args.pool, toolchain=provider_toolchains(),
+                provider='codex' if selection['harness'] == 'openai' else 'claude',
+                model=options['codex_model' if selection['harness'] == 'openai' else 'claude_model'],
+                pool=args.pool, toolchain=provider_toolchains(),
                 environment={name: os.environ[name] for name in ('CI', 'LANG', 'LC_ALL', 'TZ', 'PYTHONHASHSEED', 'NODE_ENV')
                              if name in os.environ})
             store = UsageStore()
             run_record = store.begin(subject, invocation, owner=args.owner, label='peer-review-' + args.stage,
                                      timeout=1440, aggregate_timeout=2880, kind='review', repeat_reason=args.repeat_reason)
             options.update(store=store, run_record=run_record)
+            write_selection_receipt(run_record.run_id, args, before[0], evidence.sha256, author_rung, selection)
             source, report, failure = review_snapshot(snapshot, before[0], args.stage,
                                                        stage_rules, evidence.content, options)
             report = stage_report(args.stage, report)
@@ -996,10 +1069,11 @@ def main() -> int:
             outcome = error.outcome if isinstance(error, ReviewFailure) else {}
             reason = outcome.get('reason', error.reason if isinstance(error, GuardError) else 'UNKNOWN')
             try:
-                run_record.finish(execution='INTERRUPTED' if reason == 'TIMEOUT' else
-                                  'COMPLETED' if options.get('launches') else 'NOT_STARTED',
-                                  result='NO_RESULT', reason=reason,
-                                  usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', [])})
+                failed = run_record.finish(execution='INTERRUPTED' if reason == 'TIMEOUT' else
+                                           'COMPLETED' if options.get('launches') else 'NOT_STARTED',
+                                           result='NO_RESULT', reason=reason,
+                                           usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', [])})
+                record_in_ladder(args, store, failed, before[0], policy)
             except (OSError, GuardError):
                 print('Execution receipt could not be finalized; reconciliation is required.', file=sys.stderr)
         target.close()
@@ -1030,6 +1104,9 @@ def main() -> int:
         evidence.verify()
         target.write_text(f"Reviewer: {source}\nStage: {args.stage}\nReviewed HEAD: {before[0]}\n"
                           f"Reviewed packet SHA-256: {evidence.sha256}\n"
+                          f"Author-Rung: {author_rung or 'unknown'}{' (author unknown: lowest writer rung reviewer)' if selection['author_unknown'] else ''}\n"
+                          f"Reviewer-Rung: {selection['rung']}\nReviewer-Selection: {selection['harness']} {selection['model']} "
+                          f"{selection['effort']}; {selection['why']}\n"
                           f"Review input: isolated committed snapshot (depth 1"
                           f"{', base ' + base if base and base != before[0] else ''})\n"
                           f"Worktree status: {'clean' if not before[1] else 'dirty'}\n{note}\n{report.strip()}\n",
@@ -1053,6 +1130,7 @@ def main() -> int:
         evidence.verify()
         # FINAL preserves execution history; only settled publication is usable.
         store.settle_review(reference)
+        record_in_ladder(args, store, reference, before[0], policy)
         print(f"{source}: {report.splitlines()[0].strip()} | {output}\n"
               'Usage receipt: ' + json.dumps(reference, sort_keys=True), flush=True)
         announced = True
