@@ -17,6 +17,7 @@
 # copied cleanly and at least one primary source (.claude/projects or .codex/sessions) was copied. A run skipped
 # because another run holds the lock writes log-backup.last-skip and leaves last-ok alone.
 set -u
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
 cd / || exit 1
 RCLONE=${LOG_BACKUP_RCLONE:-rclone}
 HOST=${LOG_BACKUP_HOST:-$(hostname -s)}
@@ -25,7 +26,7 @@ STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 LOGDIR="$HOME/.agent-harness/logs"
 LOG="$LOGDIR/log-backup.log"
 LOCKD="$LOGDIR/log-backup.lock.d"
-EXCLUDES=${LOG_BACKUP_EXCLUDES:-$(dirname "$0")/log-backup.excludes}
+EXCLUDES=${LOG_BACKUP_EXCLUDES:-$SELF_DIR/log-backup.excludes}
 STALE_LOCK_SECONDS=86400
 
 mkdir -p "$LOGDIR" || { echo "log-backup: cannot create $LOGDIR" >&2; exit 1; }
