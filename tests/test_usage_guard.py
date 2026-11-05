@@ -18,6 +18,9 @@ from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / 'harness/hooks'
 sys.path.insert(0, str(HOOKS))
+import hermetic  # noqa: E402
+
+hermetic.install()
 import usage_guard as guard
 
 

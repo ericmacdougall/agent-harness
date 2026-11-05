@@ -10,6 +10,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hermetic  # noqa: E402
+
+hermetic.install()
 
 RESCUE = Path(__file__).resolve().parents[1] / 'harness/hooks/rescue.py'
 # Outer test watchdogs, not product deadlines. Validation runs several Git reads.

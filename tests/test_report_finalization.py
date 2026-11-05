@@ -10,6 +10,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hermetic  # noqa: E402
+
+hermetic.install()
+
 HOOKS = Path(__file__).resolve().parents[1] / 'harness/hooks'
 sys.path.insert(0, str(HOOKS))
 
@@ -165,6 +170,8 @@ class ReportFinalizationTests(unittest.TestCase):
             stdout, stderr = io.StringIO(), io.StringIO()
             with contextlib.ExitStack() as stack:
                 stack.enter_context(patch.object(sys, 'argv', argv))
+                # peer_review.main() opens the usage store; keep it out of the real ~/.agent-harness/usage.
+                stack.enter_context(patch.dict(os.environ, {'AGENT_HARNESS_USAGE_DIR': str(root / 'usage-state')}))
                 stack.enter_context(patch.object(module.shutil, 'which', return_value='fixture-model'))
                 stack.enter_context(patch.object(module, 'run', side_effect=model))
                 stack.enter_context(contextlib.redirect_stdout(stdout))
