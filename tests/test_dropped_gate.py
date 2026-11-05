@@ -203,6 +203,18 @@ class SubagentStopGate(Base):
         self.assertEqual(by["pendingowner"]["state"], "DROPPED")
         self.assertTrue(by["pendingowner"]["decision_required"])
 
+    def test_pretool_metadata_rows_do_not_hide_pending_work(self):
+        """Blind review Part 3 #8: wal.py writes a `pretool` row before every write tool, so the last row is rarely
+        the owner's own note; the gate must look past lifecycle rows."""
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "agent-pretoolowner.jsonl", [{"at": iso(NOW - 60), "event": "intent", "note": "running the suite"},
+                                            {"at": iso(NOW - 30), "event": "pretool", "tool": "Bash", "agent_id": "pretoolowner"}])
+        with mock.patch.object(dropped_gate, "armed_waiter", return_value=False):
+            self.assertEqual(self.sstop("pretoolowner").get("decision"), "block")
+        jl(w / "agent-handedowner.jsonl", [{"at": iso(NOW - 60), "event": "handoff", "note": "to main"},
+                                           {"at": iso(NOW - 30), "event": "pretool", "tool": "Bash"}])
+        self.assertEqual(self.sstop("handedowner"), {})
+
     def test_handoff_or_named_wait_does_not_block(self):
         w = self.home / ".claude" / "wals" / SESSION
         jl(w / "main.jsonl", [{"at": iso(NOW - 600), "event": "subagent", "agent_id": "doneowner", "agent_type": "task-owner"},
@@ -240,6 +252,32 @@ class TaskWalOwners(Base):
         self.assertEqual(data["undisposed"], ["dropowner", "fable-review"])
         self.dispose_task("fable-review")
         self.assertEqual(self.owners()["undisposed"], ["dropowner"])
+
+    def test_waiting_on_a_dropped_agent_needs_a_decision(self):
+        """Part 3 #7: `waiting on <agent id>` must not park an owner once that agent is itself DROPPED."""
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": "aabb11223344", "agent_type": "task-owner"},
+                              {"at": iso(NOW - 100), "event": "subagent_stop", "agent_id": "aabb11223344", "agent_type": "task-owner"},
+                              {"at": iso(NOW - 9000), "event": "subagent", "agent_id": "waiter01", "agent_type": "task-owner"},
+                              {"at": iso(NOW - 100), "event": "subagent_stop", "agent_id": "waiter01", "agent_type": "task-owner"}])
+        jl(w / "agent-aabb11223344.jsonl", [{"at": iso(NOW - 4000), "event": "intent", "note": "target work"}])
+        jl(w / "agent-waiter01.jsonl", [{"at": iso(NOW - 4000), "event": "blocker", "note": "waiting on aabb11223344"}])
+        by = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertEqual(by["aabb11223344"]["state"], "DROPPED")
+        self.assertEqual(by["waiter01"]["state"], "waiting-on-aabb11223344")
+        self.assertTrue(by["waiter01"]["decision_required"])  # its target is DROPPED
+        jl(w / "agent-aabb11223344.jsonl", [{"at": iso(NOW - 5), "event": "intent", "note": "back"}])
+        by = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertFalse(by["waiter01"]["decision_required"])  # target live again: the wait holds
+
+    def test_ahd_alerts_cover_task_wal_and_auto_owner_ids(self):
+        """Part 3 #3: ahd.liveness_alerts skipped ids outside ^a[0-9a-f]{6,32}$, so task WALs raised nothing."""
+        import ahd
+        doc = {"owners": [{"agent_id": "fable-review", "state": "DROPPED", "owner": True, "idle_s": 30000, "type": "task-wal"},
+                          {"agent_id": "auto-9f2c1a", "state": "SILENT-HIGH", "owner": True, "idle_s": 4000, "type": "headless-owner"}]}
+        out = ahd.liveness_alerts({SESSION: doc}, ahd.load_policy())
+        self.assertIn(f"liveness:{SESSION[:8]}/agent-fable-review", out)
+        self.assertIn(f"liveness:{SESSION[:8]}/agent-auto-9f2c1a", out)
 
     def dispose_task(self, name):
         return ah.write(self.home, "task.dispose", {"agent": name, "session": SESSION, "kind": "closed", "at": iso(NOW),

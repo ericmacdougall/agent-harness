@@ -353,7 +353,7 @@ def liveness_alerts(owner_docs: dict, policy: dict) -> dict:
                 what = ""
             ticket = r.get("ticket") if isinstance(r.get("ticket"), str) else None
             since = parse_ts(r.get("last_activity")) or 0
-            if not re.match(r"^a[0-9a-f]{6,32}$", r["agent_id"]):
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", r["agent_id"]):  # agents, auto-<hash> owners and task WALs
                 continue
             typ = r.get("type") if isinstance(r.get("type"), str) else "?"
             if peek.value_excluded([typ, ticket], policy):

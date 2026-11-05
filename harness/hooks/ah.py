@@ -347,6 +347,16 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                                           replacement_live=bool(d and d.get("ref") in live_ids))
         r["disposition"] = dict(d, live=alive) if d else None
         r["decision_required"] = bool(r["owner"] and r["state"] == "DROPPED" and not alive)
+    # a wait on another agent holds only while that agent is live; a wait on a DROPPED, done or unknown agent is a drop
+    states = {r["agent_id"]: r["state"] for r in rows}
+    for r in rows:
+        target = r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else ""
+        if r["owner"] and target and OWNER_ID_RE.match(target) and not ASK_ID_RE.match(target) and "#" not in target \
+                and target != "main" and states.get(target, "absent") in ("DROPPED", "done", "handoff", "returned", "absent"):
+            d = disp.get(r["agent_id"])
+            if not liveness.disposition_live(d, now, last_activity=parse_ts(r["last_activity"]) or 0.0):
+                r["decision_required"] = True
+                r["flags"] = list(r.get("flags") or []) + [f"wait-target-{states.get(target, 'absent').lower()}"]
     rows.sort(key=lambda r: (r["state"] in ("done", "handoff"), -(r["idle_s"] or 0)))
     counts = {}
     for r in rows:

@@ -92,6 +92,7 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
 
 
 PENDING_EVENTS = ("intent", "scope", "status", "check", "risk", "decision", "commit", "blocker")
+LIFECYCLE_EVENTS = ("pretool", "subagent", "subagent_stop", "prompt", "session", "pending_stop")  # wal.py metadata (review Part 3 #8)
 
 
 def pending_work(home: Path, session: str, agent: str) -> str | None:
@@ -108,7 +109,8 @@ def pending_work(home: Path, session: str, agent: str) -> str | None:
                 rec = json.loads(raw)
             except ValueError:
                 continue
-            if isinstance(rec, dict) and rec.get("event") and not rec.get("by"):
+            if (isinstance(rec, dict) and rec.get("event") and not rec.get("by")
+                    and rec.get("event") not in LIFECYCLE_EVENTS):  # hook metadata rows are not the owner's own entries
                 last = rec
     if not last:
         return None
