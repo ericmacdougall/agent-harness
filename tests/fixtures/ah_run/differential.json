@@ -5826,7 +5826,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "upper-program",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "ECHO HIDDEN-LINE",
 "unstable": [],
@@ -5837,7 +5844,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "capital-program",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "Echo HIDDEN-LINE",
 "unstable": [],
@@ -5859,7 +5873,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "quoted-upper-program",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "\"ECHO\" HIDDEN-LINE",
 "unstable": [],
@@ -5870,7 +5891,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "upper-assign-program",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "X=1 ECHO HIDDEN-LINE",
 "unstable": [],
@@ -5881,7 +5909,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "upper-after-redirect",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "2>/dev/null ECHO HIDDEN-LINE",
 "unstable": [],
@@ -5892,7 +5927,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "upper-nice",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "NICE -n 5 %s",
 "unstable": [],
@@ -5903,7 +5945,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "upper-env",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "ENV %s",
 "unstable": [],
@@ -5914,7 +5963,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "upper-env-split",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "ENV -S '%s'",
 "unstable": [],
@@ -5925,7 +5981,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "upper-nohup",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "NOHUP %s",
 "unstable": [],
@@ -5936,7 +5999,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "upper-timeout",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "TIMEOUT 5 %s",
 "unstable": [],
@@ -5947,7 +6017,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "upper-bash-c",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "BASH -c '%s'",
 "unstable": [],
@@ -5958,7 +6035,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "upper-bash-heredoc",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "BASH <<'E'\n%s\nE",
 "unstable": [],
@@ -5969,7 +6053,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "long-s-bash-heredoc",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "\"ba\u017fh\" <<'E'\n%s\nE",
 "unstable": [],
@@ -5980,7 +6071,14 @@
 "group": "r8-F1",
 "kind": "hidden",
 "name": "kelvin-ksh-c",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "\"\u212a\u017fh\" -c '%s'",
 "unstable": [],
@@ -5991,7 +6089,11 @@
 "group": "r8-F2",
 "kind": "hidden",
 "name": "read-subscript-name",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"sh"
+],
 "rewritten": "none",
 "shape": "p='$('; t=\"b[${p}%s >&3)]\"; { read 'a[t]' <<< x; } 3>&1",
 "unstable": [],
@@ -6002,7 +6104,9 @@
 "group": "r8-F2",
 "kind": "hidden",
 "name": "printf-subscript-name",
-"ran": [],
+"ran": [
+"bash5"
+],
 "rewritten": "none",
 "shape": "p='$('; t=\"b[${p}%s >&3)]\"; { printf -v 'a[t]' x; } 3>&1",
 "unstable": [],
@@ -6013,7 +6117,9 @@
 "group": "r8-F2",
 "kind": "hidden",
 "name": "printf-attached-subscript-name",
-"ran": [],
+"ran": [
+"bash5"
+],
 "rewritten": "none",
 "shape": "p='$('; t=\"b[${p}%s >&3)]\"; { printf -v'a[t]' x; } 3>&1",
 "unstable": [],
@@ -6024,7 +6130,9 @@
 "group": "r8-F2",
 "kind": "hidden",
 "name": "test-subscript-name",
-"ran": [],
+"ran": [
+"bash5"
+],
 "rewritten": "none",
 "shape": "p='$('; t=\"b[${p}%s >&3)]\"; { test -v 'a[t]'; } 3>&1",
 "unstable": [],
@@ -6035,7 +6143,9 @@
 "group": "r8-F2",
 "kind": "hidden",
 "name": "bracket-subscript-name",
-"ran": [],
+"ran": [
+"bash5"
+],
 "rewritten": "none",
 "shape": "p='$('; t=\"b[${p}%s >&3)]\"; { [ -v 'a[t]' ]; } 3>&1",
 "unstable": [],
@@ -6046,7 +6156,14 @@
 "group": "r8-limit",
 "kind": "limit",
 "name": "unknown-launcher",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "same",
 "shape": "prlimit --nofile=64 %s",
 "unstable": [],
