@@ -102,6 +102,7 @@ class Case(unittest.TestCase):
 
     def run_script(self, script=SCRIPT, **extra):
         extra.setdefault("LOG_BACKUP_RETRY_SLEEP", "0")
+        extra.setdefault("LOG_BACKUP_BULK_EVERY_SECONDS", "0")  # tests run the bulk tier every time unless they test the gap
         done = subprocess.run(["/bin/bash", str(script)], env=self.env(**extra), cwd=str(self.tmp),
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
         self.assertEqual(self.canary.read_text(), "alive")
@@ -110,6 +111,8 @@ class Case(unittest.TestCase):
     def local_run(self, **extra):
         """Real rclone, local directory as the remote."""
         if not REAL_RCLONE:
+            if os.environ.get("LOG_BACKUP_REQUIRE_RCLONE") == "1":  # the gate sets this: fail, never skip
+                self.fail("rclone is required on this host (LOG_BACKUP_REQUIRE_RCLONE=1) but was not found")
             self.skipTest("rclone not installed")
         return self.run_script(FAKE_DELEGATE=REAL_RCLONE, LOG_BACKUP_REMOTE=str(self.remote),
                                LOG_BACKUP_ALLOW_LOCAL="1", **extra)
@@ -198,6 +201,83 @@ class Exclusion(Case):
         self.assertTrue((out / "auth.json").exists())
         self.assertTrue((out / "member.key").exists())
 
+    def test_case_variants_of_credential_names_never_enter_the_stage_or_the_remote(self):
+        # F2: rsync cannot ignore case, so the snapshot patterns are case-folded; no credential copy stays on disk
+        names = ["Auth.JSON", "AUTH.json", ".ENV", ".Env.Local", "Member.KEY", "X.Secret", "Kit.JSON", "RCLONE.CONF",
+                 "Id_Rsa", ".NETRC", "SECRETS.JSON", "Cookies.SQLite"]
+        for source in (".claude/projects", ".codex/sessions"):
+            for name in names:
+                self.put(f"{source}/{name}", b"SECRET-MARKER")
+            self.put(f"{source}/sibling-Auth.JSON.txt", b"harmless")  # a different name: stays
+        self.put(".claude/projects/Goodqa-Hive/inner.txt", b"hive")
+        done = self.local_run()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        stage = self.home / ".agent-harness/backup-stage"
+        staged = {p.name.lower() for p in stage.rglob("*") if p.is_file()}
+        self.assertFalse(staged & {n.lower() for n in names}, staged)
+        self.assertNotIn("inner.txt", staged)
+        self.assertIn("sibling-auth.json.txt", staged)
+        for path in (self.remote / "testhost").rglob("*"):
+            if path.is_file():
+                self.assertNotIn(b"SECRET-MARKER", path.read_bytes(), path)
+
+    def test_a_plain_directory_named_like_a_credential_is_staged_but_the_credential_file_is_not(self):
+        # F3: rsync patterns match directories too; an ordinary file under a directory named token must still be staged
+        for name in ("token", "key", "pem", "credentials-dir"):
+            self.put(f".claude/projects/p1/{name}/ordinary.jsonl", b"ordinary")
+        self.put(".claude/projects/p1/sub/token", b"SECRET-MARKER")  # the credential-named FILE
+        done = self.local_run()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        stage = self.home / ".agent-harness/backup-stage/.claude/projects/p1"
+        for name in ("token", "key", "pem", "credentials-dir"):
+            self.assertTrue((stage / name / "ordinary.jsonl").exists(), name)
+        self.assertFalse((stage / "sub" / "token").exists())
+        remote = self.remote / "testhost/.claude/projects/p1"
+        self.assertTrue((remote / "token/ordinary.jsonl").exists())
+        self.assertFalse((remote / "sub/token").exists())
+
+    def test_log_over_ten_megabytes_is_rotated_once_per_run(self):
+        self.logs.mkdir(parents=True)
+        (self.logs / "log-backup.log").write_bytes(b"x" * (10 * 1024 * 1024 + 10))
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertEqual((self.logs / "log-backup.log.1").stat().st_size, 10 * 1024 * 1024 + 10)
+        self.assertLess((self.logs / "log-backup.log").stat().st_size, 100000)
+
+    def test_write_rate_settings_are_validated_and_reach_rclone(self):
+        self.run_script(LOG_BACKUP_TPSLIMIT="3", LOG_BACKUP_TRANSFERS="5")
+        argv = self.copies()[0]
+        self.assertEqual((argv[argv.index("--tpslimit") + 1], argv[argv.index("--transfers") + 1]), ("3", "5"))
+        for name in ("LOG_BACKUP_TPSLIMIT", "LOG_BACKUP_TRANSFERS"):
+            for value in ("0", "00", "100", "1.5", "-1", "abc", "$(id)", " 2"):
+                if self.calls.exists():
+                    self.calls.unlink()
+                done = self.run_script(**{name: value})
+                self.assertEqual(done.returncode, 2, (name, value))
+                self.assertEqual(self.copies(), [], (name, value))
+
+    def test_bulk_tier_runs_at_most_once_per_gap_while_transcripts_run_every_time(self):
+        first = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue(self.bulk_ok().exists())
+        os.unlink(self.last_ok())
+        os.unlink(self.bulk_ok())
+        self.calls.unlink()
+        second = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertTrue(self.last_ok().exists())            # transcripts ran again
+        self.assertFalse(self.bulk_ok().exists())           # the bulk tier was skipped, no marker claimed
+        self.assertFalse([c for c in self.copies() if "--min-age" in c])
+        self.assertIn("bulk tier skipped", (self.logs / "log-backup.log").read_text())
+        old = time.time() - 7200
+        os.utime(self.logs / "log-backup.bulk-last-try", (old, old))
+        self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")  # the gap has passed: bulk runs again
+        self.assertTrue(self.bulk_ok().exists())
+
+    def test_jitter_is_validated_and_a_run_still_completes_with_it(self):
+        self.assertEqual(self.run_script(LOG_BACKUP_JITTER_SECONDS="1").returncode, 0)
+        for value in ("abc", "1.5", "-3", "007", "123456"):
+            self.assertEqual(self.run_script(LOG_BACKUP_JITTER_SECONDS=value).returncode, 2, value)
+
     def test_vm_dumps_never_appear_in_the_remote(self):
         for name in ("dump.vma", "dump.vma.zst"):
             self.put(f".agent-harness/work/t1/{name}", b"VMA")
@@ -235,7 +315,7 @@ class CopyOnly(Case):
 
     def test_control_variant_with_a_delete_flag_or_moveto_fails_the_checker(self):
         text = SCRIPT.read_text()
-        for needle, repl in (("args=(copy ", "args=(moveto "), ("--tpslimit 2", "--delete-after --tpslimit 2")):
+        for needle, repl in (("args=(copy ", "args=(moveto "), ('--tpslimit "$TPSLIMIT"', '--delete-after --tpslimit "$TPSLIMIT"')):
             variant = self.tmp / "variant.sh"
             variant.write_text(text.replace(needle, repl))
             (self.tmp / "log-backup.excludes").write_text("*.secret\n")
@@ -369,6 +449,56 @@ class Locking(Case):
         self.assertEqual(self.run_script().returncode, 0)
         self.assertTrue(self.last_ok().exists())
 
+    def test_a_live_holder_whose_path_contains_a_space_is_still_a_live_holder(self):
+        # F2: a HOME with a space split the path and made a running backup look like a stranger's pid
+        proc = self.holder("my dir/log-backup.sh")
+        time.sleep(0.3)
+        self.lock(proc.pid)
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(self.recorded(), [])
+        self.assertFalse(self.last_ok().exists())
+
+    def make_lock(self, name, age):
+        lock = self.logs / name
+        lock.mkdir(parents=True)
+        when = time.time() - age
+        os.utime(lock, (when, when))
+        return lock
+
+    def test_young_hand_installed_locks_mean_skip_and_stale_ones_mean_proceed(self):
+        cases = [("log-backup.transcripts.lock.d", 600, True), ("log-backup.transcripts.lock.d", 7200, False),
+                 ("log-backup.bulk.lock.d", 3 * 3600, True), ("log-backup.bulk.lock.d", 7 * 3600, False),
+                 ("log-backup.transcripts.lock.d", -1800, True),      # future, within the limit: assume live
+                 ("log-backup.transcripts.lock.d", -36000, False),    # future beyond the limit: cannot be a real run
+                 ("log-backup.bulk.lock.d", -36000, False)]
+        for name, age, skips in cases:
+            shutil.rmtree(self.logs, ignore_errors=True)
+            if self.calls.exists():
+                self.calls.unlink()
+            self.make_lock(name, age)
+            done = self.run_script()
+            self.assertEqual(done.returncode, 0, (name, age))
+            if skips:
+                self.assertEqual(self.recorded(), [], (name, age))
+                self.assertTrue((self.logs / "log-backup.last-skip").exists(), (name, age))
+                self.assertFalse(self.last_ok().exists(), (name, age))
+            else:
+                self.assertTrue(self.copies(), (name, age))
+                self.assertTrue(self.last_ok().exists(), (name, age))
+
+    def test_a_hand_installed_lock_with_an_unreadable_mtime_means_skip(self):
+        self.make_lock("log-backup.bulk.lock.d", 7 * 3600)  # would be stale, but its time cannot be read
+        fakebin = self.tmp / "statbin"
+        fakebin.mkdir()
+        stat = fakebin / "stat"
+        stat.write_text('#!/bin/sh\ncase "$*" in *bulk.lock.d*) exit 1 ;; esac\nexec /usr/bin/stat "$@"\n')
+        stat.chmod(0o755)
+        done = self.run_script(PATH=f"{fakebin}:/usr/bin:/bin")
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(self.recorded(), [])
+        self.assertFalse(self.last_ok().exists())
+
     def test_lookalike_process_is_not_a_live_holder(self):
         # a command line containing "log-backup" but not the script (tail of the log) must not wedge the backup
         other = subprocess.Popen(["/bin/sh", "-c", "sleep 60", "log-backup.log"])
@@ -421,7 +551,7 @@ class Failure(Case):
     def test_rate_limit_settings_match_the_reviewed_live_script(self):
         self.run_script()
         argv = self.copies()[0]
-        want = {"--transfers": "2", "--tpslimit": "2", "--checkers": "4", "--dropbox-batch-mode": "sync",
+        want = {"--transfers": "2", "--tpslimit": "1", "--checkers": "4", "--dropbox-batch-mode": "sync",
                 "--dropbox-batch-size": "100", "--retries": "10", "--retries-sleep": "30s", "--low-level-retries": "20"}
         for flag, value in want.items():
             self.assertEqual(argv[argv.index(flag) + 1], value, flag)
@@ -463,7 +593,11 @@ class Failure(Case):
         self.run_script(PATH=f"{fakebin}:/usr/bin:/bin")
         args = record.read_text().splitlines()
         self.assertIn(f"--temp-dir={stage}/.rsync-tmp", args)
-        self.assertIn(f"--exclude-from={ROOT}/harness/bin/log-backup.excludes", args)
+        folded = self.home / ".agent-harness/logs/log-backup.rsync-excludes"
+        self.assertIn(f"--exclude-from={folded}", args)  # the case-folded copy, not the case-sensitive original
+        text = folded.read_text()
+        self.assertIn("[aA][uU][tT][hH].[jJ][sS][oO][nN]", text.splitlines())
+        self.assertNotIn("#", text)
 
     def test_failed_snapshot_skips_upload_and_keeps_run_non_fresh(self):
         fakebin = self.tmp / "fakebin"
@@ -571,7 +705,7 @@ class Failure(Case):
         self.put(f"{base}/big.json", b"x" * 5000)
         self.put(f"{base}/odd[1]/.git", b"gitdir: /elsewhere")        # glob characters cannot be excluded safely
         self.put(f"{base}/state.json", b"{}")
-        done = self.local_run(LOG_BACKUP_WORK_MAX_SIZE="1k")
+        done = self.local_run(LOG_BACKUP_WORK_MAX_SIZE="1K")
         self.assertEqual(done.returncode, 0, done.stderr)
         files = {f for f in self.remote_files() if f.startswith(".agent-harness/work/")}
         self.assertEqual(files, {".agent-harness/work/t1/notes.md", f"{base}/state.json", f"{base}/odd[1]/.git"})
@@ -599,13 +733,27 @@ class Failure(Case):
 
     def test_non_numeric_budget_or_retry_settings_are_refused_before_any_copy(self):
         for name in ("LOG_BACKUP_BUDGET_SECONDS", "LOG_BACKUP_RETRIES", "LOG_BACKUP_RETRY_SLEEP"):
-            for value in ("1.5", "abc", "-1", "999999", "x[$(id)]", " 5"):
+            for value in ("1.5", "abc", "-1", "999999", "x[$(id)]", " 5", "08", "09", "007", "00"):
                 if self.calls.exists():
                     self.calls.unlink()
                 done = self.run_script(**{name: value})
                 self.assertEqual(done.returncode, 2, (name, value))
                 self.assertEqual(self.copies(), [], (name, value))
                 self.assertFalse(self.last_ok().exists() or self.bulk_ok().exists())
+
+    def test_work_size_settings_must_be_plain_non_zero_sizes(self):
+        # F1: a zero transfer cap would stop every run at once; free text would reach rclone
+        for name in ("LOG_BACKUP_WORK_MAX_SIZE", "LOG_BACKUP_WORK_MAX_TRANSFER"):
+            for value in ("0", "0M", "-1", "1.5G", "abc", "12T", "1234567", "5 M", "--delete-after", "$(id)", "1m"):
+                if self.calls.exists():
+                    self.calls.unlink()
+                done = self.run_script(**{name: value})
+                self.assertEqual(done.returncode, 2, (name, value))
+                self.assertEqual(self.copies(), [], (name, value))
+            for value in ("1", "25M", "5G", "100K", "999999G"):
+                if self.calls.exists():
+                    self.calls.unlink()
+                self.assertEqual(self.run_script(**{name: value}).returncode, 0, (name, value))
 
     def test_hostile_work_directory_names_never_cause_a_wrong_exclusion(self):
         base = ".agent-harness/work/t1"

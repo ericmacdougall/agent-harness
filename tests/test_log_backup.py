@@ -105,7 +105,7 @@ class Freshness(Base):
         done = self.run_cli("check")
         self.assertEqual(done.returncode, 3)
         self.assertIn(b"bulk tier", done.stdout)
-        self.assertIn(b"never completed", self.run_cli("session-start").stdout)
+        self.assertIn(b"not completed its first full pass yet", self.run_cli("session-start").stdout)
         # stale, invalid, future
         first.write_text(stamp(time.time() - 60) + "\n")
         bulk.write_text("garbage")  # present but unreadable is invalid even right after install
@@ -121,6 +121,25 @@ class Freshness(Base):
         done = self.run_cli("check")
         self.assertEqual(done.returncode, 1)
         self.assertIn(b"LOG BACKUP ALERT", done.stdout)
+
+    def test_alert_says_disabled_by_choice_only_when_the_saved_choice_is_off(self):
+        self.last_ok(stamp(time.time() - 7200) + "\n")
+        choice = self.home / ".agent-harness" / "log-backup-choice.json"
+        for body, expect in (('{"schema": 1, "enabled": false}', True), ('{"schema": 1, "enabled": true}', False),
+                             ("garbage", False), ('{"enabled": "no"}', False), (None, False)):
+            if body is None:
+                if choice.exists():
+                    choice.unlink()
+            else:
+                choice.write_text(body)
+            for argv in (("check",), ("session-start",)):
+                out = self.run_cli(*argv).stdout.decode()
+                self.assertEqual("DISABLED BY CHOICE" in out, expect, (argv, body, out[:80]))
+                self.assertIn("LOG BACKUP ALERT", out)  # the staleness text is still there either way
+        choice.write_text('{"schema": 1, "enabled": false}')
+        out = json.loads(self.run_cli("session-start").stdout)["systemMessage"]
+        self.assertIn("re-enable with install.py --apply --log-backup", out)
+        self.assertEqual(self.run_cli("check").returncode, 1)  # exit codes unchanged: it is still a stale backup
 
     def test_check_exit_codes(self):
         self.assertEqual(self.run_cli("check").returncode, 2)  # missing
@@ -156,7 +175,7 @@ class Freshness(Base):
 
     def test_installed_settings_hook_command_prints_the_alert(self):
         (self.tmp / "inst").mkdir()
-        install.install(self.tmp / "inst", apply=True, durable_tmp=False)
+        install.install(self.tmp / "inst", apply=True, durable_tmp=False, log_backup=True)
         settings = json.loads((self.tmp / "inst" / ".claude" / "settings.json").read_text())
         hooks = [h for group in settings["hooks"]["SessionStart"] for h in group["hooks"]
                  if "log_backup.py" in " ".join(h.get("args", []))]
@@ -200,6 +219,18 @@ class Status(Base):
             code = lb.main(["--home", str(self.home), "status", "--json"])
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(out.getvalue())["transcripts"]["state"], "stale")
+
+    def test_malformed_pid_values_do_not_crash_status_or_check(self):
+        self.last_ok(stamp(time.time()))
+        lock = self.logs / "log-backup.lock.d"
+        lock.mkdir()
+        for value in ("9" * 40, "²³", "-5", "12 34", ""):
+            (lock / "pid").write_text(value)
+            self.assertEqual(lb.lock_holder(self.home), "held (pid unknown)", repr(value))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lb.main(["--home", str(self.home), "status"]), 0)
+                self.assertEqual(lb.main(["--home", str(self.home), "status", "--json"]), 0)
 
     def test_status_reports_success_run_skip_and_lock(self):
         self.last_ok(stamp(time.time() - 60) + " sources=6\n")

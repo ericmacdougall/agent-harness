@@ -73,10 +73,9 @@
   "owner_overlap": "ad1fe816 command guard (X04); backups pr-d feat/log-backup",
   "matrix_rows": "X04,X08",
   "mechanisms": [
-   "command_guard:hook",
-   "log_backup:session-start"
+   "command_guard:hook"
   ],
-  "partial_reason": "a command guard cannot verify the backup itself; the session-start alert (B3) reports staleness but does not block deletes"
+  "partial_reason": "a command guard cannot verify the backup itself; freshness is B3"
  },
  {
   "id": "S05",

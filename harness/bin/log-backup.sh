@@ -13,6 +13,10 @@
 #   LOG_BACKUP_EXCLUDES     exclude file (default: log-backup.excludes next to this script)
 #   LOG_BACKUP_RETRIES      extra attempts per source (default 2) and LOG_BACKUP_RETRY_SLEEP seconds between them (30)
 #   LOG_BACKUP_STAGE        local snapshot directory for live sources (default ~/.agent-harness/backup-stage)
+#   LOG_BACKUP_TPSLIMIT     rclone --tpslimit per host (default 1; the account's write budget is shared by all hosts) and
+#   LOG_BACKUP_TRANSFERS    --transfers (default 2), both whole numbers 1-99
+#   LOG_BACKUP_BULK_EVERY_SECONDS  minimum gap between bulk-tier attempts (default 3600); transcripts run every time
+#   LOG_BACKUP_JITTER_SECONDS      random start delay up to this many seconds (default 0; the launchd plist sets 120)
 #   LOG_BACKUP_VERSIONS     exactly 0 turns off versions/STAMP (loud warning); anything else keeps them
 # Freshness contract, two tiers with their own markers. log-backup.last-ok (transcripts, WALs, ledgers) is written
 # atomically with the run START time only after every tier-1 source copied cleanly and a primary source
@@ -34,8 +38,27 @@ STALE_LOCK_SECONDS=86400
 WORK_EXCLUDES=${LOG_BACKUP_WORK_EXCLUDES:-$SELF_DIR/log-backup.work-excludes}
 BUDGET_SECONDS=${LOG_BACKUP_BUDGET_SECONDS:-780}   # one run must end inside the 15 minute period
 RUN_START=$(date +%s)
-for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP; do
-  case "${!numeric:-0}" in *[!0-9]*|??????*) echo "log-backup: $numeric must be a whole number of at most 5 digits" >&2; exit 2 ;; esac
+TPSLIMIT=${LOG_BACKUP_TPSLIMIT:-1}       # Dropbox write budget is shared by every host that backs up to the account:
+TRANSFERS=${LOG_BACKUP_TRANSFERS:-2}     # keep each host's share small (the Mac, dev2 and T2 together stay near 3/s)
+BULK_EVERY=${LOG_BACKUP_BULK_EVERY_SECONDS:-3600}   # the bulk tier (work tree, archives) runs hourly, transcripts every time
+JITTER=${LOG_BACKUP_JITTER_SECONDS:-0}   # random start delay so hosts on the same schedule do not collide
+for rate in TPSLIMIT TRANSFERS; do
+  if ! printf '%s' "${!rate}" | grep -Eq '^[1-9][0-9]?$'; then
+    echo "log-backup: $rate must be a whole number from 1 to 99" >&2; exit 2
+  fi
+done
+for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER; do
+  # No leading zeros: bash would read 08 as octal and abort the arithmetic.
+  if ! printf '%s' "${!numeric:-0}" | grep -Eq '^(0|[1-9][0-9]{0,4})$'; then
+    echo "log-backup: $numeric must be a whole number of at most 5 digits without leading zeros" >&2; exit 2
+  fi
+done
+# Size limits go to rclone, so they must be plain sizes: digits, an optional K, M or G, and not zero (a zero transfer
+# cap would stop every run immediately and the bulk marker would never be written).
+for sized in LOG_BACKUP_WORK_MAX_SIZE LOG_BACKUP_WORK_MAX_TRANSFER; do
+  if [ -n "${!sized:-}" ] && ! printf '%s' "${!sized}" | grep -Eq '^[1-9][0-9]{0,5}[KMG]?$'; then
+    echo "log-backup: $sized must look like 25M (a non-zero number, optional K, M or G)" >&2; exit 2
+  fi
 done
 
 umask 077
@@ -46,6 +69,13 @@ chmod 700 "$LOGDIR" 2>/dev/null
 for v in $(env | sed -n 's/^\(RCLONE_[A-Za-z0-9_]*\)=.*/\1/p'); do
   [ "$v" = RCLONE_CONFIG ] || unset "$v"
 done
+# Keep the log bounded: past 10 MB it is renamed to log-backup.log.1 (one generation) before this run writes.
+rotate_log() {
+  local size
+  size=$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')
+  if [ -n "$size" ] && [ "$size" -gt 10485760 ]; then mv -f -- "$LOG" "$LOG.1" 2>/dev/null; fi
+}
+[ -f "$LOG" ] && rotate_log
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$LOG"; }
 fail() { say "$1"; echo "log-backup: $1" >&2; echo "$STARTED exit=$2" > "$LOGDIR/log-backup.last-run"; exit "$2"; }
 
@@ -56,9 +86,40 @@ file_age() { # seconds since modification of $1; BSD stat on Darwin, GNU stat el
   echo $(( $(date +%s) - m ))
 }
 
+raw_age() { # like file_age but prints nothing when the modification time cannot be read
+  local m
+  if [ "$(uname)" = Darwin ]; then m=$(stat -f %m "$1" 2>/dev/null); else m=$(stat -c %Y "$1" 2>/dev/null); fi
+  case "$m" in ''|*[!0-9]*) return 0 ;; esac
+  echo $(( $(date +%s) - m ))
+}
+
+# The hand-installed script keeps its own lock directories (transcripts: stale after 1 h, bulk: after 6 h). A young
+# one means its run is still going: skip, never take over. An unreadable modification time counts as a live run; a
+# time in the future counts as live only within the stale limit (beyond it the lock cannot belong to a real run).
+legacy_run_active() {
+  local spec dir limit age
+  for spec in log-backup.transcripts.lock.d:3600 log-backup.bulk.lock.d:21600; do
+    dir="$LOGDIR/${spec%%:*}"; limit=${spec##*:}
+    [ -d "$dir" ] || continue
+    age=$(raw_age "$dir")
+    [ -n "$age" ] || return 0
+    if [ "$age" -lt "$limit" ] && [ "$age" -gt "-$limit" ]; then return 0; fi
+  done
+  return 1
+}
+
 holder_alive() { # pid $1 is running and is a log-backup run (a recycled pid belongs to something else)
   kill -0 "$1" 2>/dev/null || return 1
-  ps -p "$1" -o args= 2>/dev/null | awk '$1 ~ /(^|\/)(ba|da|z)?sh$/ && $2 ~ /log-backup\.sh$/ {f=1} END {exit !f}'
+  # args must read: <shell> <path ending in log-backup.sh>. The path may contain spaces (a HOME with a space), so the
+  # whole remainder is matched, not one word; a remainder that starts with a flag (sh -c ... log-backup.sh) is a spoof.
+  local args first rest
+  args=$(ps -p "$1" -o args= 2>/dev/null) || return 1
+  first=${args%% *}; rest=${args#* }
+  [ "$rest" != "$args" ] || return 1
+  case "$first" in sh|bash|dash|zsh|*/sh|*/bash|*/dash|*/zsh) ;; *) return 1 ;; esac
+  case "$rest" in -*) return 1 ;; esac
+  case "$rest" in *log-backup.sh) return 0 ;; esac
+  return 1
 }
 
 acquire_lock() {
@@ -94,7 +155,8 @@ acquire_lock() {
   return $got
 }
 
-if ! acquire_lock; then
+[ "$JITTER" -gt 0 ] && sleep $((RANDOM % (JITTER + 1)))
+if legacy_run_active || ! acquire_lock; then
   say "skipped: another backup run holds the lock (this is not a successful backup)"
   date -u +%FT%TZ > "$LOGDIR/log-backup.last-skip"
   exit 0
@@ -160,6 +222,12 @@ for guarded in "$HOME" "$HOME/.claude" "$HOME/.codex" "$HOME/.agent-harness/work
 done
 [ ! -L "$STAGE" ] || fail "LOG_BACKUP_STAGE must not be a symlink" 2
 mkdir -p "$STAGE" && chmod 700 "$STAGE" || fail "cannot create the stage directory" 1
+# rclone matches the exclude file case-insensitively (--ignore-case) but rsync cannot, so give rsync a case-folded
+# copy of the same patterns (auth.json becomes [aA][uU][tT][hH].[jJ][sS][oO][nN]): Auth.JSON or .ENV never reach the stage.
+RSYNC_EXCLUDES="$LOGDIR/log-backup.rsync-excludes"
+awk '/^[ \t]*(#|$)/ {next} {out=""; for (i = 1; i <= length($0); i++) {c = substr($0, i, 1); if (c ~ /[A-Za-z]/) out = out "[" tolower(c) toupper(c) "]"; else out = out c} print out}' "$EXCLUDES" > "$RSYNC_EXCLUDES" \
+  || fail "cannot build the snapshot exclude list" 1
+[ -s "$RSYNC_EXCLUDES" ] || fail "the snapshot exclude list is empty (refusing to stage without credential excludes)" 2
 # Leftover partial files of a crashed snapshot are never data: start each run with an empty temp directory.
 rm -rf "$STAGE/.rsync-tmp"
 say "stage size $(du -sk "$STAGE" 2>/dev/null | cut -f1) KiB"
@@ -168,7 +236,7 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   local p="$1" rel="$2" dst
   shift 2
   if [ -d "$p" ]; then dst="$R/$rel"; else dst="$R/$(dirname "$rel")"; fi
-  args=(copy --dropbox-batch-mode sync --dropbox-batch-size 100 --tpslimit 2 --transfers 2 --checkers 4
+  args=(copy --dropbox-batch-mode sync --dropbox-batch-size 100 --tpslimit "$TPSLIMIT" --transfers "$TRANSFERS" --checkers 4
     --checksum --retries 10 --retries-sleep 30s --low-level-retries 20 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE --exclude-from "$EXCLUDES" --ignore-case "$@")
   if [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ]; then args+=(--backup-dir "$R/versions/$STAMP/$rel"); fi
   local remaining
@@ -214,7 +282,7 @@ for src in "${LIVE[@]}"; do
     # that rclone would upload as current. rsync renames within the stage volume, so a full disk fails the copy
     # (exit 11 or 23, source skipped, run non-fresh) instead of leaving a truncated file in place.
     mkdir -p "$STAGE/.rsync-tmp" || { say "cannot create the stage temp directory"; ok=1; continue; }
-    rsync -a --temp-dir="$STAGE/.rsync-tmp" --exclude-from="$EXCLUDES" -- "$HOME/$src/" "$snap/" </dev/null; rc=$?
+    rsync -a --temp-dir="$STAGE/.rsync-tmp" --include='*/' --exclude-from="$RSYNC_EXCLUDES" -- "$HOME/$src/" "$snap/" </dev/null; rc=$?
     if [ $rc -eq 23 ]; then
       # Partial transfer (e.g. one unreadable file): rsync renames files into place, so the stage is consistent.
       # Back up what was staged, but withhold last-ok for this run.
@@ -236,7 +304,18 @@ if [ $ok -eq 0 ]; then
     && mv "$LOGDIR/log-backup.last-ok.tmp.$$" "$LOGDIR/log-backup.last-ok"
 fi
 ok=0
-for src in "${DIRECT[@]}"; do
+# Tier 2 runs at most once per BULK_EVERY seconds: its marker allows 6 hours, and transcripts must not wait behind it.
+bulk_ran=1 sources_bulk=("${DIRECT[@]}")
+bulk_try="$LOGDIR/log-backup.bulk-last-try"
+if [ -e "$bulk_try" ]; then
+  bulk_age=$(raw_age "$bulk_try")
+  if [ -n "$bulk_age" ] && [ "$bulk_age" -ge 0 ] && [ "$bulk_age" -lt "$BULK_EVERY" ]; then
+    bulk_ran=0 sources_bulk=()
+    say "bulk tier skipped: last attempt ${bulk_age}s ago (every ${BULK_EVERY}s)"
+  fi
+fi
+[ $bulk_ran -eq 1 ] && : > "$bulk_try"
+for src in "${sources_bulk[@]+"${sources_bulk[@]}"}"; do
   [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
   if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
   extra=(--min-age 2m)
@@ -262,8 +341,8 @@ for src in "${DIRECT[@]}"; do
 done
 # Tier 2 (bulk: archived sessions and the narrowed work tree) has its own marker.
 bulk_ok=$ok
-say "bulk exit=$bulk_ok"
-if [ $bulk_ok -eq 0 ]; then
+[ $bulk_ran -eq 1 ] && say "bulk exit=$bulk_ok"
+if [ $bulk_ok -eq 0 ] && [ $bulk_ran -eq 1 ]; then
   echo "$STARTED" > "$LOGDIR/log-backup.bulk-last-ok.tmp.$$" \
     && mv "$LOGDIR/log-backup.bulk-last-ok.tmp.$$" "$LOGDIR/log-backup.bulk-last-ok"
 fi

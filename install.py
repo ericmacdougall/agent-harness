@@ -31,8 +31,8 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py",
          "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
-         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py",
-         "log_backup.py", "backup_watch.py")
+         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py",
+         "backup_watch.py")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -99,7 +99,8 @@ def kill_guard_group(claude: Path) -> dict:
         "timeout": 30, "onFailure": "block"}]}
 
 
-def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = True) -> dict[str, list[dict]]:
+def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = True,
+                  log_backup: bool = True) -> dict[str, list[dict]]:
     script = str(claude / "hooks" / "wal.py")
     policy = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "commit_policy.py"), "hook"],
               "timeout": 60, "onFailure": "block"}  # gh pr create checks GitHub and GoodQA
@@ -128,10 +129,7 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
         return hook
 
     managed = {
-        "SessionStart": [{"hooks": [command("session")]}, {"hooks": [{
-            # Visible alert when the scheduled log backup has not succeeded for an hour; fails open.
-            "type": "command", "command": "python3", "args": [str(claude / "hooks" / "log_backup.py"), "session-start"],
-            "timeout": 10}]}],
+        "SessionStart": [{"hooks": [command("session")]}],
         "UserPromptSubmit": [{"hooks": [command("prompt", True)]}],
         "SubagentStart": [{
             "matcher": SUBAGENT_MATCHER,
@@ -170,6 +168,12 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     if command_guard:
         managed["PreToolUse"].insert(0, command_guard_group(claude))
         managed["PreToolUse"].insert(1, kill_guard_group(claude))
+    if log_backup:
+        # Visible alert when the scheduled log backup has not succeeded for an hour; fails open. Only registered
+        # where the backup is opted in (--log-backup, or already installed), so a host without it gets no alert.
+        managed["SessionStart"].append({"hooks": [{
+            "type": "command", "command": "python3", "args": [str(claude / "hooks" / "log_backup.py"), "session-start"],
+            "timeout": 10}]})
     if provenance:
         for event, groups in provenance_hook_groups(claude).items():
             managed.setdefault(event, []).extend(groups)
@@ -186,7 +190,7 @@ def durable_scratch(claude: Path) -> Path:
 
 
 def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, provenance: bool = True,
-                    command_guard: bool = True) -> dict:
+                    command_guard: bool = True, log_backup: bool = True) -> dict:
     settings = json.loads(json.dumps(current))
     env = settings.get("env", {})
     if not isinstance(env, dict):
@@ -201,7 +205,7 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
         settings["env"] = {key: value for key, value in env.items() if key != TMPDIR_KEY}
     hooks = settings.setdefault("hooks", {})
     scripts = managed_scripts(claude)
-    wanted = managed_hooks(claude, provenance, command_guard)
+    wanted = managed_hooks(claude, provenance, command_guard, log_backup)
     for event in sorted(set(wanted) | set(managed_hooks(claude, True))):
         managed = wanted.get(event, [])
         entries = hooks.setdefault(event, [])
@@ -606,8 +610,10 @@ def read_regular(path: Path, *, pinned_parent=None, retain_fd=None):
 
 
 def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool = True,
-            command_guard: bool = True) -> list[str]:
+            command_guard: bool = True, log_backup=None) -> list[str]:
     claude = home.expanduser().resolve() / ".claude"
+    if log_backup is None:
+        log_backup = log_backup_alert(home, None)
     files = [
         *((ROOT / "harness" / folder / name, claude / folder / name)
           for folder, names in (("agents", AGENTS), ("hooks", HOOKS), ("tools", TOOLS))
@@ -638,7 +644,7 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
         if not isinstance(current_settings, dict):
             raise ValueError("settings.json must contain an object")
-        settings = merged_settings(current_settings, claude, durable_tmp, provenance, command_guard)
+        settings = merged_settings(current_settings, claude, durable_tmp, provenance, command_guard, log_backup)
         # Read every payload before any managed write (also validate it in preview).
         payloads = [(destination, source.read_bytes()) for source, destination in files]
         payloads += [(instructions_path, instructions.encode()),
@@ -826,15 +832,6 @@ def netwatch_status(home: Path, apply: bool, flag) -> str:
         return f"netwatch: skipped ({error.__class__.__name__}: {error})"
 
 
-def log_backup_status(home: Path, apply: bool) -> str:
-    """Scheduled log backup (script, excludes, launchd or systemd units); never fails the harness install."""
-    try:
-        import log_backup_install
-        return log_backup_install.status(home, apply)
-    except Exception as error:  # noqa: BLE001
-        return f"log backup: skipped ({error.__class__.__name__}: {error})"
-
-
 def migrate_local_profiles(claude: Path, policy_dir: Path | None = None) -> list[str]:
     """Before the shipped policies are overwritten, copy their personal values into new untracked 0600 profiles.
     Never overwrites an existing profile. Without this an upgrade would silently turn ticket enforcement off."""
@@ -909,6 +906,37 @@ def command_guard_status(enabled: bool, runner=None) -> str:
     return "command guard: registered with onFailure block"
 
 
+def log_backup_enabled(home: Path, flag) -> bool:
+    """--log-backup/--no-log-backup, else the remembered choice, else on only where the component is installed."""
+    try:
+        import log_backup_install
+        return log_backup_install.choice(home, flag)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def log_backup_alert(home: Path, flag) -> bool:
+    """The SessionStart alert stays registered wherever the component is installed, even after --no-log-backup: a
+    backup that was switched off on purpose is still a host whose logs are not being backed up, and the alert says so."""
+    try:
+        import log_backup_install
+        return log_backup_install.choice(home, flag) or log_backup_install.component_installed(home.expanduser().resolve())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def log_backup_status(home: Path, apply: bool, flag=None) -> str:
+    """Scheduled log backup (script, excludes, launchd or systemd units); never fails the harness install."""
+    try:
+        import log_backup_install
+        enabled = log_backup_install.choice(home, flag)
+        if apply and flag is not None:
+            log_backup_install.save_choice(home.expanduser().resolve(), flag)
+        return log_backup_install.status(home, apply, enabled=enabled)
+    except Exception as error:  # noqa: BLE001
+        return f"log backup: skipped ({error.__class__.__name__}: {error})"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
@@ -929,6 +957,13 @@ def main() -> None:
     parser.add_argument("--no-command-guard", dest="command_guard", action="store_false",
                         help="do not register the destructive/config-dump command guard and remove an earlier "
                              "registration (rollback); the files stay installed; not remembered")
+    backup = parser.add_mutually_exclusive_group()
+    backup.add_argument("--log-backup", dest="log_backup", action="store_true", default=None,
+                        help="install the scheduled Dropbox log backup (script, units, SessionStart alert) and "
+                             "remember the choice; plaintext uploads until encryption lands (GoodQA #14522)")
+    backup.add_argument("--no-log-backup", dest="log_backup", action="store_false",
+                        help="remember not to install it; where installed, stop its scheduler job (files and "
+                             "remote copies stay; see docs/operations.md, Agent log backup, for rollback)")
     args = parser.parse_args()
     durable_tmp = durable_tmp_choice(args.home, args.durable_tmp)
     if args.apply and args.durable_tmp is not None:
@@ -941,7 +976,7 @@ def main() -> None:
                            "real directory, not a symlink\n")
     try:
         changes = install(args.home, args.apply, durable_tmp=durable_tmp, provenance=args.provenance,
-                          command_guard=args.command_guard)
+                          command_guard=args.command_guard, log_backup=log_backup_alert(args.home, args.log_backup))
     except DirectoryPublicationError as error:
         parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"
@@ -951,9 +986,9 @@ def main() -> None:
     print(f"  {install_git_backstop(args.home, args.apply)}")
     print(f"  {scratch_status(args.home, args.apply, durable_tmp)}")
     print(f"  {netwatch_status(args.home, args.apply, args.netwatch)}")
-    print(f"  {log_backup_status(args.home, args.apply)}")
     print(f"  {local_profile_status(args.home)}")
     print(f"  {command_guard_status(args.command_guard)}")
+    print(f"  {log_backup_status(args.home, args.apply, args.log_backup)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")
 
