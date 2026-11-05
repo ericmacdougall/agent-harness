@@ -39,6 +39,28 @@ class EvidenceStore(unittest.TestCase):
         self.identity = guard.invocation_identity(self.subject, purpose='focused', argv=['public-command'],
                                                   cwd=self.repo, toolchain=self.toolchain)
 
+    def test_store_under_a_symlinked_parent_is_created(self):
+        # macOS /tmp is a symlink; an ancestor symlink must not break store creation (GoodQA #14553).
+        real = self.root / 'real'; real.mkdir()
+        link = self.root / 'link'; link.symlink_to(real)
+        store = guard.UsageStore(link / 'state')
+        self.assertTrue((real / 'state' / 'store.json').is_file())
+        self.assertEqual(store.root, link / 'state')
+
+    def test_symlinked_store_leaf_is_still_refused(self):
+        real = self.root / 'real-leaf'; real.mkdir(mode=0o700)
+        leaf = self.root / 'leaf'; leaf.symlink_to(real)
+        with self.assertRaises(guard.GuardError) as caught:
+            guard.UsageStore(leaf)
+        self.assertEqual(caught.exception.reason, 'UNKNOWN')
+
+    def test_symlinked_namespace_leaf_is_still_refused(self):
+        outside = self.root / 'outside'; outside.mkdir(mode=0o700)
+        state = self.root / 'ns-state'; state.mkdir(mode=0o700)
+        (state / 'runs').symlink_to(outside)
+        with self.assertRaises(guard.GuardError):
+            guard.UsageStore(state)
+
     def begin(self, **options):
         return self.store.begin(self.subject, self.identity, owner='fixture', label='focused',
                                 timeout=10, kind='focused', minimum_bytes=0, **options)
@@ -251,7 +273,7 @@ class EvidenceStore(unittest.TestCase):
 class SubjectIdentity(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='usage-subject-'); self.addCleanup(self.temp.cleanup)
-        self.repo = Path(self.temp.name)
+        self.repo = Path(os.path.realpath(self.temp.name))  # /tmp is a symlink on macOS
         self.env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
         self.env.update(HOME=str(self.repo), GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
         self.git('init', '-q', '-b', 'main'); self.git('config', 'user.name', 'Fixture')
