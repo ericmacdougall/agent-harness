@@ -64,5 +64,59 @@ class HermeticSuite(unittest.TestCase):
             self.assertTrue(any(item.startswith('HOME=') for item in hermetic.violations()))
 
 
+class PerTestGuard(unittest.TestCase):
+    """A test whose cleanup restores HOME to the passwd home (as tests/test_escalation.py once did) must fail loudly."""
+
+    LEAKY = (
+        "import os, sys, unittest\n"
+        "sys.path.insert(0, %(tests)r)\n"
+        "import hermetic\n"
+        "hermetic.install()\n"
+        "class T(unittest.TestCase):\n"
+        "    def test_a_leaks_home(self):\n"
+        "        os.environ['HOME'] = %(real)r\n"
+        "        self.addCleanup(lambda: os.environ.__setitem__('HOME', %(real)r))\n"
+        "    def test_b_runs_later(self):\n"
+        "        self.assertNotEqual(os.path.realpath(os.environ['HOME']), %(real)r)\n"
+        "if __name__ == '__main__':\n"
+        "    unittest.main()\n")
+    CLEAN = (
+        "import os, sys, unittest\n"
+        "sys.path.insert(0, %(tests)r)\n"
+        "import hermetic\n"
+        "hermetic.install()\n"
+        "class T(unittest.TestCase):\n"
+        "    def test_a_borrows_home(self):\n"
+        "        old = os.environ['HOME']\n"
+        "        os.environ['HOME'] = %(real)r\n"
+        "        self.addCleanup(os.environ.__setitem__, 'HOME', old)\n"
+        "    def test_b_runs_later(self):\n"
+        "        self.assertNotEqual(os.path.realpath(os.environ['HOME']), %(real)r)\n"
+        "if __name__ == '__main__':\n"
+        "    unittest.main()\n")
+
+    def run_child(self, source):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / 'child_tests.py'
+            script.write_text(source % {'tests': str(Path(__file__).resolve().parent), 'real': str(hermetic.real_home())})
+            env = {key: value for key, value in os.environ.items() if key not in ('HOME', 'AGENT_HARNESS_USAGE_DIR')}
+            env['HOME'] = temp
+            return subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env, timeout=60)
+
+    def test_a_leaking_test_fails_and_later_tests_stay_protected(self):
+        done = self.run_child(self.LEAKY)
+        self.assertNotEqual(done.returncode, 0, done.stderr)
+        self.assertIn('test_a_leaks_home', done.stderr)
+        self.assertIn('real home', done.stderr)
+        # the re-pin keeps the later test from running against the real home
+        self.assertNotIn('FAIL: test_b_runs_later', done.stderr)
+
+    def test_a_test_that_restores_the_prior_value_passes(self):
+        done = self.run_child(self.CLEAN)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()

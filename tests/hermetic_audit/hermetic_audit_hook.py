@@ -60,11 +60,11 @@ def install(config):
     def inside(path, bases):
         return any(path == base or path.startswith(base.rstrip('/') + '/') for base in bases)
 
-    def record(event, path, note=''):
+    def record(event, path, note='', force=False):
         state.busy = True
         try:
             real = os.path.realpath(os.fsdecode(path))
-            if inside(real, protect) and not inside(real, allow):
+            if force or (inside(real, protect) and not inside(real, allow)):
                 with open(log, 'a') as handle:
                     handle.write('%d %s %s%s argv0=%s\n' % (os.getpid(), event, real, note, sys.argv[0] if sys.argv else ''))
         except Exception:
@@ -83,8 +83,41 @@ def install(config):
             return os.path.join(base, os.fsdecode(path)) if base else None
         return path
 
+    reviewer_names = ('codex', 'claude')
+    temp_root = os.path.realpath(os.environ.get('TMPDIR') or '/tmp')
+    launch_events = {'subprocess.Popen': (0, 3), 'os.exec': (0, 2), 'os.posix_spawn': (0, 2), 'os.spawn': (1, None)}
+
+    def check_launch(event, args):
+        """Record the start of a real reviewer CLI (codex or claude) that is not a fixture under the temp root."""
+        position, env_position = launch_events[event]
+        if position >= len(args) or not isinstance(args[position], (str, bytes, os.PathLike)):
+            return
+        name = os.fsdecode(args[position])
+        if os.path.basename(name) not in reviewer_names:
+            return
+        resolved = name
+        if os.sep not in name:
+            import shutil
+            environment = args[env_position] if env_position is not None and env_position < len(args) else None
+            search = (environment or os.environ).get('PATH') if hasattr(environment or os.environ, 'get') else None
+            resolved = shutil.which(name, path=search) or name
+        real = os.path.realpath(resolved)
+        import tempfile
+        roots = {temp_root, os.path.realpath(tempfile.gettempdir())}
+        if not any(real == r or real.startswith(r.rstrip('/') + '/') for r in roots) and not inside(real, allow):
+            record('reviewer-launch', real, force=True)
+
     def hook(event, args):
         if getattr(state, "busy", False):
+            return
+        if event in launch_events:
+            state.busy = True
+            try:
+                check_launch(event, args)
+            except Exception:
+                pass
+            finally:
+                state.busy = False
             return
         if event == 'open':
             path, mode, flags = args

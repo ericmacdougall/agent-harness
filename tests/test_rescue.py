@@ -896,7 +896,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         capture = self.root / 'top-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
                    '--output', str(self.output), '--rung', 'R5']
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin', 'CAPTURE_CODEX_PROMPT': str(capture)}
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + scrubbed_system_path(), 'CAPTURE_CODEX_PROMPT': str(capture)}
         result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=STANDARD_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn('needs the user', result.stderr); self.assertIn('never launched automatically', result.stderr)
@@ -919,7 +919,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         capture = self.root / 'astra-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
                    '--output', str(self.output), '--task', 'rescue-t', '--rung', 'R5']
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + scrubbed_system_path(),
                        'CAPTURE_CODEX_PROMPT': str(capture), 'AGENT_HARNESS_ESCALATION_DIR': str(state), 'CODEX_ACTION': 'top'}
         result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 3, result.stderr)
@@ -943,7 +943,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         capture = self.root / 'r2-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
                    '--output', str(self.output), '--task', 'rescue-r2']
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + scrubbed_system_path(),
                        'CAPTURE_CODEX_PROMPT': str(capture), 'AGENT_HARNESS_ESCALATION_DIR': str(state), 'CODEX_ACTION': 'r2'}
         result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 3, result.stderr)
@@ -955,7 +955,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         capture = self.root / 'claude-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
                    '--output', str(self.output), '--author-harness', 'openai']
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + scrubbed_system_path(),
                        'CLAUDE_ACTION': 'other-harness', 'CAPTURE_CLAUDE_PROMPT': str(capture)}
         result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 3, result.stderr)

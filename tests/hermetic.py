@@ -53,7 +53,46 @@ def install():
         os.environ['HOME'] = str(_ROOT)
     if not os.environ.get('AGENT_HARNESS_USAGE_DIR') or hits_protected(os.environ['AGENT_HARNESS_USAGE_DIR']):
         os.environ['AGENT_HARNESS_USAGE_DIR'] = str(_ROOT / 'usage')
+    guard_tests()
     return _ROOT
+
+
+_GUARDED = []
+_LEAKS = []
+
+
+def guard_tests():
+    """After every test, fail that test if HOME or the usage dir no longer resolve to the pinned scratch root.
+
+    A test (or its cleanup) that restores HOME to the passwd home instead of its prior value would otherwise let every
+    later test in the process use the real ~/.agent-harness. The environment is re-pinned so later tests stay protected,
+    and the culprit is recorded in LEAKS for the final check. Idempotent.
+    """
+    import unittest
+    if _GUARDED:
+        return
+    _GUARDED.append(True)
+    original = unittest.TestCase.run
+
+    def run(self, result=None):
+        outcome = original(self, result)
+        found = violations()
+        if found:
+            _LEAKS.append((self.id(), found))
+            install()
+            os.environ['HOME'] = str(_ROOT)
+            os.environ['AGENT_HARNESS_USAGE_DIR'] = str(_ROOT / 'usage')
+            if result is not None:
+                try:
+                    raise AssertionError('test left the process pointing at the real home: ' + '; '.join(found))
+                except AssertionError:
+                    result.addFailure(self, sys.exc_info())
+        return outcome
+    unittest.TestCase.run = run
+
+
+def leaks():
+    return list(_LEAKS)
 
 
 def violations():

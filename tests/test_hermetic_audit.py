@@ -94,6 +94,35 @@ class AuditHookLaunchStyles(unittest.TestCase):
         self.assertIn('os.mkdir', found)
         self.assertIn('(dir_fd)', found)
 
+    def _fake_reviewer(self, directory):
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, 'codex')
+        with open(path, 'w') as handle:
+            handle.write('#!/bin/sh\nexit 0\n')
+        os.chmod(path, 0o755)
+        return path
+
+    def test_reviewer_cli_outside_the_temp_root_is_recorded(self):
+        outside = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.audit-fake-bin-%d' % os.getpid())
+        self.addCleanup(shutil.rmtree, outside, True)
+        fake = self._fake_reviewer(outside)
+        self.run_code("import subprocess\nsubprocess.run([%r])\n" % fake)
+        self.assertIn('reviewer-launch', self.recorded())
+
+    def test_bare_reviewer_name_resolved_through_path_is_recorded(self):
+        outside = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.audit-fake-bin2-%d' % os.getpid())
+        self.addCleanup(shutil.rmtree, outside, True)
+        self._fake_reviewer(outside)
+        env = dict(os.environ, PATH=outside + os.pathsep + os.environ.get('PATH', ''))
+        self.run_code("import subprocess\nsubprocess.run(['codex'])\n", env=env)
+        self.assertIn('reviewer-launch', self.recorded())
+
+    def test_fixture_reviewer_under_the_temp_root_is_not_recorded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fake = self._fake_reviewer(temp)
+            self.run_code("import subprocess\nsubprocess.run([%r])\n" % fake)
+        self.assertEqual(self.recorded(), '')
+
     def test_reads_and_unprotected_writes_are_not_recorded(self):
         self.run_code("import os,tempfile\nos.listdir(PROT)\nt=tempfile.mkdtemp()\nopen(os.path.join(t,'a'),'w').write('1')\n"
                       "import shutil\nshutil.rmtree(t)\n")
