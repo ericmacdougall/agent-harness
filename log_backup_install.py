@@ -6,8 +6,11 @@ NAME.bak-STAMP):
   macOS: ~/Library/LaunchAgents/com.ericmacdougall.log-backup.plist (label unchanged, so no second job appears)
   Linux: ~/.config/systemd/user/log-backup.service and log-backup.timer
 
-The scheduler is (re)loaded only when a unit file changed, never while a backup run holds the lock, and never
-when the installer targets a non-default --home (the job belongs to the real user). A failure here is returned as
+The scheduler is (re)enabled when a unit file changed, a retry marker exists, or the recorded scheduler state is not
+`enabled`, and disabled when the choice is off and the recorded state is not `disabled`; preview and apply share one
+plan() so they cannot disagree. It is never touched while a backup run holds the lock, nor when the installer targets
+a non-default --home (the job belongs to the real user). Limits: a hand-run launchctl/systemctl disable is not noticed
+(the recorded state is what the installer last did), and two concurrent installs are not serialised. A failure here is returned as
 one status line and never fails the harness install. A symlinked destination or parent directory is refused.
 
 Opt-in: encryption at rest is not part of this component (GoodQA #14522), so a host that does not have it yet does
@@ -222,6 +225,10 @@ def disable_scheduler(system: str, home: Path, uid: int, run) -> str:
         if off != 0:
             return f"launchctl disable failed (exit {off}); the job may return at the next login"
         return "stopped" if code in (0, 3, 113) else f"launchctl bootout failed (exit {code})"  # 3/113: not loaded
+    if not (home / ".config" / "systemd" / "user" / "log-backup.timer").exists():
+        # The unit file is gone, so `disable` would fail on every install: stop whatever is still loaded and call it done.
+        safe_run(run, ["systemctl", "--user", "stop", "log-backup.timer"])
+        return "stopped"
     code = safe_run(run, ["systemctl", "--user", "disable", "--now", "log-backup.timer"])
     return "stopped" if code == 0 else f"systemctl disable failed (exit {code})"
 
@@ -242,6 +249,64 @@ def reload_scheduler(system: str, home: Path, uid: int, run) -> str:
     return "enabled" if code == 0 else f"systemctl enable failed (exit {code})"
 
 
+def write_marker(path: Path, text: str) -> None:
+    """The retry marker is written like the state file: atomically, never through a symlink."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(path, (text + "\n").encode(), 0o600)
+
+
+def marker_present(path: Path) -> bool:
+    return path.is_symlink() or path.exists()
+
+
+def plan(home: Path, system: str, enabled: bool, activate: bool) -> dict:
+    """The ONE computation behind both preview and apply (read-only): what would happen, and why.
+    action: none | install-only | enable | disable | skip. reason: files | pending | state | None."""
+    logs = logs_dir(home)
+    pending = marker_present(logs / PENDING_FILE)
+    state = read_scheduler_state(home)
+    if not enabled:
+        if not component_installed(home):
+            return {"action": "skip", "message": "not installed on this host (pass --log-backup to install it); nothing changed"}
+        if not activate:
+            return {"action": "skip", "message": "disabled by choice (non-default --home); scheduler not touched"}
+        if state == "disabled" and not pending:
+            return {"action": "none", "message": "disabled by choice; scheduler already stopped; nothing changed"}
+        return {"action": "disable", "reason": "pending" if pending else "state", "state": state}
+    files = desired_files(home, system)
+    changed, units_changed = [], False
+    for path, data, _mode, is_unit in files:
+        check_path(path, home)
+        if not path.exists() or path.read_bytes() != data:
+            changed.append(path)
+            units_changed = units_changed or is_unit
+    reason = "files" if units_changed else ("pending" if pending else "state" if state != "enabled" else None)
+    out = {"files": files, "changed": changed, "state": state, "reason": reason}
+    if reason and activate:
+        out["action"] = "enable"
+    elif reason:
+        out["action"] = "install-only"      # non-default --home: files only, the scheduler is never touched
+    else:
+        out["action"] = "install-only" if changed else "none"
+    return out
+
+
+def describe_preview(p: dict) -> str:
+    if p["action"] == "skip" or (p["action"] == "none" and "message" in p):
+        return "log backup: " + p["message"]
+    if p["action"] == "disable":
+        why = "a retry is pending" if p["reason"] == "pending" else f"recorded state is {p['state'] or 'unknown'}"
+        return f"log backup: disabled by choice; would stop the scheduler job ({why}; files stay)"
+    names = ", ".join(x.name for x in p["changed"]) or "no file changes"
+    if p["action"] == "enable":
+        why = {"files": "a unit file changed", "pending": "a retry is pending",
+               "state": f"recorded scheduler state is {p['state'] or 'unknown'}"}[p["reason"]]
+        return f"log backup: would install {names}; would (re)load and enable the scheduler ({why})"
+    if p["action"] == "install-only":
+        return f"log backup: would install {names} (scheduler not touched)"
+    return "log backup: up to date (would change nothing)"
+
+
 def status(home: Path, apply: bool, system: str | None = None, run=None, uid: int | None = None,
            activate: bool | None = None, enabled: bool | None = None) -> str:
     try:
@@ -251,71 +316,53 @@ def status(home: Path, apply: bool, system: str | None = None, run=None, uid: in
             return f"log backup: skipped (unsupported platform {system})"
         if enabled is None:
             enabled = choice(home, None)
-        if not enabled:
-            if not component_installed(home):
-                return "log backup: not installed on this host (pass --log-backup to install it); nothing changed"
-            if not apply:
-                return "log backup: disabled by choice; would stop the scheduler job (files stay)"
-            if activate is None:
-                activate = home == real_home()
-            if not activate:
-                return "log backup: disabled by choice (non-default --home); scheduler not touched"
-            if read_scheduler_state(home) == "disabled" and not (logs_dir(home) / PENDING_FILE).exists():
-                return "log backup: disabled by choice; scheduler already stopped; nothing changed"
-            pending = logs_dir(home) / PENDING_FILE
-            pending.parent.mkdir(parents=True, exist_ok=True)
+        if activate is None:
+            activate = home == real_home()
+        p = plan(home, system, enabled, activate)
+        if not apply:
+            return describe_preview(p)
+        pending = logs_dir(home) / PENDING_FILE
+        uid = os.getuid() if uid is None else uid
+        runner = run or default_runner
+        if p["action"] in ("skip", "none") and "message" in p:
+            return "log backup: " + p["message"]
+        if p["action"] == "disable":
             if backup_run_active(home):
-                pending.write_text("disable deferred\n")
+                write_marker(pending, "disable deferred")
                 return "log backup: disabled by choice; scheduler stop deferred while a backup runs; re-run install"
-            pending.write_text("disable started\n")  # stays if the stop fails or raises
-            result = disable_scheduler(system, home, os.getuid() if uid is None else uid, run or default_runner)
+            write_marker(pending, "disable started")  # stays if the stop fails or raises
+            result = disable_scheduler(system, home, uid, runner)
             if result == "stopped":
                 write_scheduler_state(home, "disabled")
-                try:
-                    pending.unlink()
-                except OSError:
-                    pass
+                _drop(pending)
             return f"log backup: disabled by choice, scheduler {result}; files and remote copies stay"
-        files = desired_files(home, system)
-        changed, units_changed = [], False
-        for path, data, _mode, is_unit in files:
-            check_path(path, home)
-            if not path.exists() or path.read_bytes() != data:
-                changed.append(path)
-                units_changed = units_changed or is_unit
-        if not apply:
-            return "log backup: would install " + (", ".join(p.name for p in changed) if changed else "nothing (up to date)")
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{os.getpid()}"
-        for path, data, mode, _unit in files:
-            if path not in changed:
+        for path, data, mode, _unit in p["files"]:
+            if path not in p["changed"]:
                 continue
             if path.exists():
                 write_atomic(path.with_name(f"{path.name}.bak-{stamp}"), path.read_bytes(), 0o600)
             write_atomic(path, data, mode)
-        if activate is None:
-            activate = home == real_home()
-        pending = logs_dir(home) / PENDING_FILE
-        if activate and not units_changed and (pending.exists() or read_scheduler_state(home) != "enabled"):
-            # An earlier enable/disable was deferred or failed, or the job was last switched off (or never known to be
-            # on): the files being unchanged says nothing about the scheduler, so enable it now.
-            units_changed = True
-        if not units_changed:
-            return "log backup: up to date (no scheduler reload)" if not changed else \
+        if p["action"] == "none":
+            return "log backup: up to date (no scheduler reload)"
+        if p["action"] == "install-only":
+            return "log backup: files written; scheduler not loaded (non-default --home)" if p["reason"] else \
                 "log backup: script updated (scheduler untouched)"
-        if not activate:
-            return "log backup: files written; scheduler not loaded (non-default --home)"
-        pending.parent.mkdir(parents=True, exist_ok=True)
         if backup_run_active(home):
-            pending.write_text("reload deferred\n")
+            write_marker(pending, "reload deferred")
             return "log backup: units written; scheduler reload deferred while a backup runs; re-run install to finish it"
-        pending.write_text("reload started\n")  # stays if the reload fails or raises; the next install finishes it
-        result = reload_scheduler(system, home, os.getuid() if uid is None else uid, run or default_runner)
+        write_marker(pending, "reload started")  # stays if the reload fails or raises; the next install finishes it
+        result = reload_scheduler(system, home, uid, runner)
         if result in ("loaded", "enabled"):
             write_scheduler_state(home, "enabled")
-            try:
-                pending.unlink()
-            except OSError:
-                pass
+            _drop(pending)
         return f"log backup: installed, scheduler {result}"
     except (InstallRefused, OSError, subprocess.SubprocessError) as error:
         return f"log backup: skipped ({error.__class__.__name__}: {error})"
+
+
+def _drop(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass

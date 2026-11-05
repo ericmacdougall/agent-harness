@@ -463,13 +463,91 @@ class SchedulerStateMachine(Case):
             self.go(system, sched, False)
             self.assertNotIn("up to date", self.go(system, sched, True), system)
 
-    def test_preview_changes_nothing(self):
+    def preview(self, system, enabled):
+        return lbi.status(self.home, False, system=system, run=FakeScheduler(system), uid=501, activate=True, enabled=enabled)
+
+    def snapshot(self):
+        return sorted((str(p), p.read_bytes()) for p in self.home.rglob("*") if p.is_file())
+
+    def test_preview_never_says_up_to_date_when_apply_would_act_and_changes_nothing(self):
+        marker = ".agent-harness/logs/log-backup.reload-pending"
+        for system, sched in self.each():
+            # 1. up to date: apply and preview agree that nothing happens
+            self.go(system, sched, True)
+            before = self.snapshot()
+            msg = self.preview(system, True)
+            self.assertIn("up to date", msg, system)
+            self.assertNotIn("would (re)load", msg)
+            self.assertEqual(self.snapshot(), before)
+            # 2. disabled: opt-in preview must say it would re-enable, never "up to date"
+            self.go(system, sched, False)
+            before = self.snapshot()
+            msg = self.preview(system, True)
+            self.assertNotIn("up to date", msg, f"{system}: {msg}")
+            self.assertIn("would (re)load and enable", msg)
+            self.assertIn("recorded scheduler state is disabled", msg)
+            self.assertEqual(self.snapshot(), before)
+            # 3. opt-out preview when already disabled: nothing would change (agrees with apply)
+            msg = self.preview(system, False)
+            self.assertIn("nothing changed", msg, system)
+            self.assertNotIn("would stop", msg)
+            # 4. state unknown
+            self.go(system, sched, True)
+            (self.home / ".agent-harness/logs/log-backup.scheduler").unlink()
+            msg = self.preview(system, True)
+            self.assertNotIn("up to date", msg, system)
+            self.assertIn("state is unknown", msg)
+            # 5. retry marker present although the state says enabled
+            self.go(system, sched, True)
+            (self.home / marker).write_text("reload started\n")
+            msg = self.preview(system, True)
+            self.assertNotIn("up to date", msg, system)
+            self.assertIn("a retry is pending", msg)
+            # 6. opt-out preview with the job enabled: would stop; with a marker while disabled: would stop
+            os.unlink(self.home / marker)
+            self.assertIn("would stop the scheduler job", self.preview(system, False), system)
+
+    def test_preview_and_apply_agree_on_every_state(self):
+        """The same plan() drives both: whenever the preview says it would act, apply makes scheduler calls, and the reverse."""
         for system, sched in self.each():
             self.go(system, sched, True)
-            self.go(system, sched, False)
-            state = self.state()
-            self.assertEqual(self.go(system, sched, True, apply=False).count("would"), 1, system)
-            self.assertEqual(self.state(), state)
+            states = []
+            for mutate in (lambda: None, lambda: lbi.write_scheduler_state(self.home, "disabled"),
+                           lambda: (self.home / ".agent-harness/logs/log-backup.scheduler").unlink(),
+                           lambda: (self.home / ".agent-harness/logs/log-backup.reload-pending").write_text("x\n")):
+                mutate()
+                msg = self.preview(system, True)
+                fresh = FakeScheduler(system)
+                self.go(system, fresh, True)
+                states.append(("up to date" in msg, bool(fresh.calls)))
+            for says_up_to_date, called in states:
+                self.assertEqual(says_up_to_date, not called, system)
+
+    def test_the_retry_marker_is_never_written_through_a_symlink(self):
+        for system in self.SYSTEMS:
+            shutil.rmtree(self.home, ignore_errors=True)
+            self.home.mkdir()
+            victim = self.home / "victim.txt"
+            victim.write_text("precious\n")
+            logs = self.home / ".agent-harness/logs"
+            logs.mkdir(parents=True)
+            os.symlink(victim, logs / "log-backup.reload-pending")
+            self.go(system, FakeScheduler(system, fail={"bootstrap" if system == "Darwin" else "enable"}), True)
+            self.assertEqual(victim.read_text(), "precious\n", system)
+            self.assertFalse((logs / "log-backup.reload-pending").is_symlink(), system)
+
+    def test_linux_opt_out_with_a_deleted_timer_unit_succeeds_once_and_stays_quiet(self):
+        sched = FakeScheduler("Linux")
+        self.go("Linux", sched, True)
+        os.unlink(self.home / UNITS[1])
+        sched.fail = {"disable"}  # systemctl disable of a unit whose file is gone fails, as the real one does
+        message = self.go("Linux", sched, False)
+        self.assertNotIn("failed", message)
+        self.assertEqual(self.state(), "disabled")
+        self.assertFalse(self.pending())
+        before = len(sched.calls)
+        self.go("Linux", sched, False)
+        self.assertEqual(len(sched.calls), before)  # not retried on every install
 
 
 class Raising:
