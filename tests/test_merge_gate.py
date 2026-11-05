@@ -664,6 +664,10 @@ class ActiveWorkflows(Base):
             "decoy-flow": "{ env: {\non: workflow_dispatch\n}, on: [pull_request], jobs: {} }\n",
             "explicit-on": "? on\n: [pull_request]\n", "empty-tags": "on:\n  push:\n    tags:\n",
             "empty-tags-list": "on:\n  push:\n    tags: []\n",
+            "indented-root": "  name: \"x\non: workflow_dispatch\n  y\"\n  on:\n    pull_request:\n  jobs: {}\n",
+            "brace-variant": "  name: {a: \"x\non: workflow_dispatch\n  y\"}\n  on:\n    pull_request:\n",
+            "escaped-key": "on:\n  workflow_dispatch:\n  \"pull_\\x72equest\":\n",
+            "multiline-scalar": "name: >\n  text\non: workflow_dispatch\n",
             "tab": "on:\n\tpull_request:\n", "push-list": "on:\n  push:\n    - tags\n",
             "dedent-garbage": "on:\n    workflow_dispatch:\n  pull_request:\n",
         }

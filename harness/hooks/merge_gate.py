@@ -754,6 +754,17 @@ def _trigger_names(text):
     for ln in lines:  # every top-level line must be a plain `key:`; flow maps, `? key`, `}` and quoted keys are unknown
         if ln.strip() and not ln[0].isspace() and not _TOP_KEY.match(ln) and not _ON_KEY.match(ln):
             return None
+    significant = [ln for ln in lines if ln.strip()]
+    if not significant or significant[0][0].isspace():  # an indented root could hide a column-0 decoy inside a scalar
+        return None
+    if any(re.match(r"^\s+(?:on|\"on\"|'on')\s*:", ln) for ln in lines):  # a second, nested or indented `on`
+        return None
+    if re.search(r"(?i)pull_request|merge_group|workflow_run", re.sub(r"(?m)^\s*#.*$", "", text)) and \
+            not re.search(r"(?m)^\s+(?:pull_request|merge_group|workflow_run)\w*\s*:", text):
+        return None  # a PR trigger word that is not a plain key (quoted, escaped, in a flow value): unknown
+    for ln in significant:  # a top-level value that opens a quote or flow collection may span lines: unknown
+        if not ln[0].isspace() and re.search(r"[:]\s*(?:[\"'{\[](?![^\"'}\]]*[\"'}\]]\s*$)|[|>])", ln) and not _ON_KEY.match(ln):
+            return None
     starts = [i for i, ln in enumerate(lines) if _ON_KEY.match(ln)]
     if len(starts) != 1:
         return None
