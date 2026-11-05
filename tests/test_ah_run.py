@@ -1630,16 +1630,26 @@ class Differential(HookFixture):
         self.assertGreater(changed, 5)
 
     def test_control_the_old_model_fails_the_invariant(self):
-        """Without the rule the table must find the hole: a certain verdict, no deny, and a shell printing the marker."""
+        """Without the rule the table must find the hole: a certain verdict, no deny, and a shell printing the marker.
+
+        A hole is observable here only when a row the old model lets through ran the line in a shell this host has
+        (B14's open rows run only in zsh and ksh, which a Linux host may lack); B12 runs in bash, so it is always required.
+        """
         self.settings('user', deny=[self.RULE])
-        found = set()
+        found, observable = set(), set()
+        present = set(self.shells())
         with mock.patch.object(ah_run, '_walk_groups', ah_run_quote_aware_walk):
             for row in self.TABLE['rows']:
                 if row['group'] in ('r5-B12', 'r5-B14'):
                     command = row['shape'].replace('%s', self.TABLE['line'])
-                    if self.hook(command, 'bypassPermissions').get('permissionDecision') != 'deny' and any(self.marker_in(text) for text in self.printed(row).values()):
+                    if self.hook(command, 'bypassPermissions').get('permissionDecision') == 'deny':
+                        continue
+                    if present & set(row['ran']):
+                        observable.add(row['group'])
+                    if any(self.marker_in(text) for text in self.printed(row).values()):
                         found.add(row['group'])
-        self.assertEqual(found, {'r5-B12', 'r5-B14'})
+        self.assertIn('r5-B12', observable)
+        self.assertEqual(found, observable)
 
     def test_control_a_rewrite_that_joins_body_lines_fails_the_end_state(self):
         command = next(row['shape'] for row in self.TABLE['rows'] if row['name'] == 'b13-terminator-appears-table').replace('%s', self.TABLE['line'])
