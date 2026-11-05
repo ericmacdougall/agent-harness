@@ -1,6 +1,8 @@
 """Fail loudly when the suite could touch the real HOME, usage store or state directory (GoodQA #14560)."""
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -61,6 +63,32 @@ class HermeticSuite(unittest.TestCase):
     def test_home_inside_a_protected_dir_is_a_violation(self):
         with mock.patch.dict(os.environ, {'HOME': str(hermetic.real_home() / '.claude')}):
             self.assertTrue(any(item.startswith('HOME=') for item in hermetic.violations()))
+
+
+class AuditHook(unittest.TestCase):
+    """The audit hook records swallowed writes into a protected dir (here a temp dir stands in for the real one)."""
+
+    def run_child(self, code):
+        with tempfile.TemporaryDirectory() as temp:
+            protected, log = os.path.join(temp, 'protected'), os.path.join(temp, 'audit.log')
+            os.mkdir(protected)
+            env = {'PATH': os.environ.get('PATH', ''), 'HC_AUDIT_LOG': log, 'HC_PROTECT': protected,
+                   'PYTHONPATH': str(Path(__file__).resolve().parent / 'hermetic_audit')}
+            subprocess.run([sys.executable, '-c', code.replace('PROT', repr(protected))], env=env, check=True, timeout=30)
+            return Path(log).read_text() if Path(log).exists() else ''
+
+    def test_swallowed_write_into_a_protected_dir_is_recorded(self):
+        found = self.run_child("import os\ntry:\n    open(os.path.join(PROT,'x'),'w').write('1')\nexcept OSError:\n    pass\n")
+        self.assertIn('open', found)
+
+    def test_mkdir_and_rename_into_a_protected_dir_are_recorded(self):
+        found = self.run_child("import os\nos.mkdir(os.path.join(PROT,'d'))\nos.rename(os.path.join(PROT,'d'), os.path.join(PROT,'e'))\n")
+        self.assertIn('os.mkdir', found)
+        self.assertIn('os.rename', found)
+
+    def test_reads_and_unprotected_writes_are_not_recorded(self):
+        found = self.run_child("import os,tempfile\nos.listdir(PROT)\nt=tempfile.mkdtemp()\nopen(os.path.join(t,'a'),'w').write('1')\n")
+        self.assertEqual(found, '')
 
 
 if __name__ == '__main__':
