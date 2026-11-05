@@ -206,7 +206,7 @@ def parse_spec(text: str) -> dict:
 PLACEHOLDER = re.compile(r"<[^<>\n]{2,80}>")
 
 
-def lint(text: str, config: dict | None = None, check_provenance: bool = True) -> list:
+def lint(text: str, config: dict | None = None, check_provenance: bool = True, spec_policy: dict | None = None) -> list:
     spec = parse_spec(text)
     problems = []
     header = spec["header"]
@@ -235,6 +235,9 @@ def lint(text: str, config: dict | None = None, check_provenance: bool = True) -
             problems.append(f"section `## {name}` is empty")
         elif PLACEHOLDER.search(body):
             problems.append(f"section `## {name}` still holds a template placeholder like <...>")
+    if spec_policy and spec_policy.get("resource_budget_gate", "off") == "enforce":
+        import resource_budget  # structure only here; peer_review.py plan also compares the numbers to live capacity
+        problems.extend(resource_budget.lint_budget(text)[0])
     ids = [ident for ident, _ in spec["criteria"]]
     if not ids:
         problems.append("no acceptance criteria: add `- AC-1: <observable result>. Verify by: <check>.`")
@@ -1325,7 +1328,7 @@ def cmd_new(args, spec_policy):
 def cmd_lint(args, spec_policy):
     text = read_spec_text(Path(args.spec))
     _, _, config = ticket_config(spec_policy)
-    problems = lint(text, config)
+    problems = lint(text, config, spec_policy=spec_policy)
     warnings, domain_problems = domain_lint(text, getattr(args, "repo", None) or ".", spec_policy)
     problems = problems + domain_problems
     print(json.dumps({"status": "FAIL" if problems else "PASS", "problems": problems, "warnings": warnings,
@@ -1339,7 +1342,7 @@ def cmd_packet(args, spec_policy):
         _, _, config = ticket_config(spec_policy)
     except (OSError, ValueError, ImportError) as error:
         raise SpecError(f"cannot load the ticket configuration to lint the spec: {error}", EXIT_USAGE)
-    problems = lint(text, config)
+    problems = lint(text, config, spec_policy=spec_policy)
     if problems:  # reviewers should never be handed a spec that cannot be attached
         print(json.dumps({"status": "FAIL", "problems": problems}, indent=1))
         return EXIT_MISSING

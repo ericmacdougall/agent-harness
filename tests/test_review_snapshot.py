@@ -228,7 +228,7 @@ class ReviewSnapshotTests(unittest.TestCase):
     def test_reviewer_prompt_describes_snapshot_history(self):
         prompts = []
 
-        def provider(cmd, prompt, cwd, timeout):
+        def provider(cmd, prompt, cwd, timeout, **kwargs):
             prompts.append(prompt)
             Path(cmd[cmd.index('--output-last-message') + 1]).write_text('PLAN_RESULT: ACCEPT\nok')
             return 0, '', ''
