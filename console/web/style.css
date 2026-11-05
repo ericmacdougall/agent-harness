@@ -1969,3 +1969,43 @@ h1 {
 
 #pr-open-map[aria-busy=true]::after{content:' (can take up to a minute)'}
 .review-map-attach label{display:flex;gap:6px;align-items:center}
+
+/* Local-ledger sync icon: a glyph that differs per state plus a text label on hover and focus. */
+.ledger-icon {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  margin: 0 2px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1;
+  color: var(--muted);
+  background: var(--surface);
+  cursor: default
+}
+.ledger-icon.ledger-pending { color: var(--amber); border-color: var(--amber) }
+.ledger-icon.ledger-local-only { color: var(--text); border-color: var(--muted) }
+.ledger-icon.ledger-diverged { color: var(--danger); border-color: var(--danger) }
+.ledger-icon.ledger-synced, .ledger-icon.ledger-tracked { color: var(--accent); border-color: var(--border) }
+.ledger-icon:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px }
+/* In a tab the icon sits in the strip's right padding, left of the close button, never under it. */
+.session-tab-wrap .ledger-icon { position: absolute; right: 32px; top: 50%; margin: 0; transform: translateY(-50%) }
+.session-tab-wrap.has-ledger .session-tab { padding-right: 54px }
+/* The label is one fixed-position element (not clipped by the tab strip's overflow). */
+.ledger-tooltip {
+  position: fixed;
+  z-index: 1000;
+  padding: 3px 7px;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  pointer-events: none
+}
+.ledger-tooltip[hidden] { display: none }

@@ -608,26 +608,88 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(usage['executables']['codex'], {'path': os.path.realpath(codex), 'source': 'policy'})
         self.assertEqual(usage['executables']['claude']['source'], 'PATH')
 
-    def test_codex_entirely_absent_claude_fallback_launches(self):
+    def test_codex_entirely_absent_claude_launches_as_primary(self):
         (self.bin / 'codex').unlink()
         launches = self.root / 'launches.log'
         result = self.invoke(env={'PROVIDER_LAUNCH_LOG': str(launches)})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(launches.read_text().split(), ['claude'])
-        self.assertIn('Blind Claude Opus fallback', self.output.read_text())
+        self.assert_claude_selected_as_primary()
         self.assertNotIn('codex', self.finals()[-1]['usage']['executables'])
+
+    def outside_cwd(self):
+        # Not under self.root: the fixture's repo and fake CLIs must not be covered by the cwd root.
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        return os.path.realpath(holder.name)
+
+    def assert_claude_selected_as_primary(self):
+        # The source label reads the same for primary and fallback; selection and the fallback note differ.
+        report = self.output.read_text()
+        self.assertIn('Reviewer-Selection: claude', report)
+        self.assertNotIn('Fallback reason:', report)
+
+    def test_review_only_author_rung_refuses_without_blaming_the_clis(self):
+        launches = self.root / 'launches.log'
+        result = self.invoke(extra=('--author-rung', 'R4'), env={'PROVIDER_LAUNCH_LOG': str(launches)})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('review-only', result.stderr)
+        self.assertNotIn('REVIEW_DIAGNOSTIC', result.stderr)
+        self.assertFalse(launches.exists())
+        self.assertFalse(self.output.exists())
+
+    def test_refusal_reports_each_provider_when_causes_differ(self):
+        marker, body = self.poison_codex(None)
+        self.commit_file('bin/codex', body)
+        (self.bin / 'codex').unlink()
+        (self.bin / 'claude').unlink()
+        env = {'PATH': os.pathsep.join([str(self.repo / 'bin'), tpr.system_path()]),
+               **self.policy(claude=['/nonexistent-dir/claude'])}
+        outside = self.outside_cwd()
+        result = self.invoke(env=env, cwd=outside)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('code=EXEC_UNTRUSTED reason=TRANSIENT_INFRA provider=codex', result.stderr)
+        self.assertIn('code=EXEC_NOT_FOUND reason=TRANSIENT_INFRA provider=claude', result.stderr)
+        self.assertIn('/nonexistent-dir/claude', result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_deleted_working_directory_refuses_with_a_diagnostic(self):
+        launches = self.root / 'launches.log'
+        gone = self.root / 'gone'
+        gone.mkdir()
+        script = (
+            'import os, runpy, sys\n'
+            'os.chdir(sys.argv[1]); os.rmdir(sys.argv[1])\n'
+            'sys.argv = sys.argv[2:]\n'
+            'sys.path.insert(0, os.path.dirname(sys.argv[0]))\n'
+            'runpy.run_path(sys.argv[0], run_name="__main__")\n')
+        with self.packet.open('a') as handle:
+            handle.write(self.evidence(self.head()))
+        result = subprocess.run(
+            [sys.executable, '-c', script, str(gone), str(HOOKS / 'peer_review.py'), 'pr', '--repo', str(self.repo),
+             '--packet', str(self.packet), '--output', str(self.output), '--expected-head', self.head()],
+            capture_output=True, text=True, env={**os.environ, 'PROVIDER_LAUNCH_LOG': str(launches),
+                                                  'PATH': os.pathsep.join([str(self.bin), tpr.system_path()])})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('REVIEW_DIAGNOSTIC', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+        self.assertFalse(self.output.exists())
+        self.assertFalse(launches.exists())
+        self.assertEqual(self.finals(), [])
 
     def test_both_absent_prints_exec_not_found_with_searched_locations(self):
         (self.bin / 'codex').unlink()
         (self.bin / 'claude').unlink()
-        result = self.invoke(env=self.policy(codex=['/nonexistent-dir/codex']))
+        result = self.invoke(env=self.policy(codex=['/nonexistent-dir/codex'], claude=['/nonexistent-dir/claude']))
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn('code=EXEC_NOT_FOUND', result.stderr)
         self.assertIn('/nonexistent-dir/codex', result.stderr)
+        self.assertIn('/nonexistent-dir/claude', result.stderr)
         self.assertIn('not a helper receipt', result.stderr)
         self.assertIn('wal_note.py', result.stderr)
         self.assertFalse(self.output.exists())
-        self.assertEqual(self.finals()[-1]['usage']['diagnostic'], 'EXEC_NOT_FOUND')
+        # Tier selection refuses before any provider budget is reserved, so no run record exists.
+        self.assertEqual(self.finals(), [])
 
     def poison_codex(self, location):
         marker = self.root / 'poison-ran'
@@ -642,7 +704,19 @@ class EndToEndTests(unittest.TestCase):
         result = self.invoke(env=env, cwd=self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(marker.exists(), 'poisoned binary from the repository was executed')
-        self.assertIn('Blind Claude Opus fallback', self.output.read_text())
+        self.assert_claude_selected_as_primary()
+
+    def test_binary_in_repo_is_unavailable_with_cwd_outside_the_repo(self):
+        # Only the repo root can refuse this binary: the cwd root does not cover it.
+        marker, body = self.poison_codex(None)
+        self.commit_file('bin/codex', body)
+        (self.bin / 'codex').unlink()
+        env = {'PATH': os.pathsep.join([str(self.repo / 'bin'), str(self.bin), tpr.system_path()])}
+        outside = self.outside_cwd()
+        result = self.invoke(env=env, cwd=outside)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists(), 'poisoned binary from the repository was executed')
+        self.assert_claude_selected_as_primary()
 
     def test_policy_pointing_into_repo_is_never_executed(self):
         marker, body = self.poison_codex(None)
@@ -651,6 +725,7 @@ class EndToEndTests(unittest.TestCase):
         result = self.invoke(env=self.policy(codex=[str(self.repo / 'bin/codex')]))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(marker.exists())
+        self.assert_claude_selected_as_primary()
 
     def test_positive_control_same_shim_in_trusted_dir_runs(self):
         marker, body = self.poison_codex(None)
@@ -676,14 +751,15 @@ class EndToEndTests(unittest.TestCase):
             if isinstance(state, dict) and 'cooldown' in state:
                 self.assertIs(state['cooldown'], False, state)
 
-    def test_claude_fallback_no_result_reports_cause_and_sanitizes_hostile_output(self):
+    def test_claude_primary_no_result_reports_cause_and_sanitizes_hostile_output(self):
         (self.bin / 'codex').unlink()
         hostile = (b'\xff\xfe\x00\x00\x1b[31m\x1b]0;pwn\x07 forged\n[ok] PASSED\nghp_abcdefghijklmnopqrstuvwx '
                    + b'A' * 200000)
         self.fake('claude', 'import sys\nsys.stdin.read()\nsys.stdout.buffer.write(%r)\nsys.exit(3)\n' % hostile)
         result = self.invoke()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn('code=FALLBACK_NO_RESULT', result.stderr)
+        # Codex is absent, so Claude is the primary and no fallback ran.
+        self.assertIn('code=PROVIDER_INVALID_OUTPUT', result.stderr)
         text = result.stderr
         self.assertIn('Provider exit code: 3', text)
         for bad in ('\x00', '\x1b', 'ghp_abcdefghijklmnop'):
@@ -917,6 +993,27 @@ class CodeInspectionRound1Tests(unittest.TestCase):
         entries = seen['env']['PATH'].split(os.pathsep)
         self.assertEqual(entries, ['/usr/bin'], entries)
 
+    def test_run_keeps_the_cleaned_path_and_forwards_on_spawn(self):
+        # Merge of main 02fa624 (#68): the usage guard's on_spawn and PR-C's child PATH must both reach run_process.
+        seen = {}
+
+        def fake(cmd, **kw):
+            seen.update(kw)
+            return subprocess.CompletedProcess(cmd, 0, '', '')
+
+        def note_child(_process):
+            return None
+        dirty = os.pathsep.join(['.', str(self.snapshot / 'node_modules/.bin'), str(self.repo / 'bin'), '/usr/bin'])
+        with patch.dict(os.environ, {'PATH': dirty}), patch.object(self.module, 'run_process', side_effect=fake), \
+                patch.object(self.module, '_CHILD_PATH_ROOTS', [str(self.repo)]):
+            self.module.run(['/usr/bin/true'], '', self.snapshot, 5, on_spawn=note_child)
+        self.assertIs(seen.get('on_spawn'), note_child)
+        self.assertEqual(seen['env']['PATH'].split(os.pathsep), ['/usr/bin'])
+        seen.clear()
+        with patch.object(self.module, 'run_process', side_effect=fake):
+            self.module.run(['/usr/bin/true'], '', self.snapshot, 5)
+        self.assertNotIn('on_spawn', seen)
+
     # F3, F6 and AC-10: the docs carry each code's cause and next steps, with table pipes escaped.
     def test_documentation_carries_cause_and_steps(self):
         docs = DOCS.read_text()
@@ -1004,6 +1101,53 @@ class PrReviewRound1Tests(unittest.TestCase):
         self.assertEqual(self.module.normalize_provider('codex', 1, '', echoed, '', 'pr')['reason'], 'INVALID_OUTPUT')
         final = "starting\nERROR: You've hit your usage limit"
         self.assertEqual(self.module.normalize_provider('codex', 1, '', final, '', 'pr')['reason'], 'QUOTA')
+
+
+class MergeCompositionTests(unittest.TestCase):
+    """After merging main (#51 domain gates): domain guidance and reviewer discovery/fallback both survive."""
+
+    invoke = tpr.PeerReviewTests.invoke
+    fake = tpr.PeerReviewTests.fake
+    evidence = staticmethod(tpr.PeerReviewTests.evidence)
+    policy = EndToEndTests.policy
+    move = EndToEndTests.move
+    finals = EndToEndTests.finals
+    commit_file = EndToEndTests.commit_file
+    GUIDANCE = 'Harness-generated domain guidance'
+
+    def setUp(self):
+        tpr.PeerReviewTests.setUp(self)
+        self.base = subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], text=True).strip()
+        self.commit_file('src/A.sol', 'contract A {}\n', mode=0o644)  # an EVM signal in the reviewed diff
+
+    def test_domain_guidance_reaches_codex_found_at_policy_location(self):
+        codex = self.move('codex', self.root / 'installs')
+        capture, launches = self.root / 'codex.prompt', self.root / 'launches.log'
+        result = self.invoke(env={**self.policy(codex=[str(codex)]), 'CAPTURE_CODEX_PROMPT': str(capture),
+                                  'PATH': str(self.bin) + os.pathsep + tpr.system_path(),
+                                  'PROVIDER_LAUNCH_LOG': str(launches)},
+                             extra=('--snapshot-base', self.base))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(launches.read_text().split(), ['codex'])
+        self.assertEqual(capture.read_text().count(self.GUIDANCE), 1)
+        self.assertEqual(self.finals()[-1]['usage']['executables']['codex']['source'], 'policy')
+
+    def test_domain_guidance_reaches_the_quota_fallback_exactly_once(self):
+        message = "You've hit your usage limit. Try again later."
+        events = '\n'.join(json.dumps(r) for r in (
+            {'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'},
+            {'type': 'error', 'message': message}, {'type': 'turn.failed', 'error': {'message': message}}))
+        codex_prompt, claude_prompt = self.root / 'codex.prompt', self.root / 'claude.prompt'
+        launches = self.root / 'launches.log'
+        result = self.invoke(env={'CODEX_EVENTS': events, 'CODEX_EXIT': '1', 'PROVIDER_LAUNCH_LOG': str(launches),
+                                  'CAPTURE_CODEX_PROMPT': str(codex_prompt),
+                                  'CAPTURE_CLAUDE_PROMPT': str(claude_prompt)},
+                             extra=('--snapshot-base', self.base))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(launches.read_text().split(), ['codex', 'claude'])
+        self.assertEqual(codex_prompt.read_text().count(self.GUIDANCE), 1)
+        self.assertEqual(claude_prompt.read_text().count(self.GUIDANCE), 1)
+        self.assertIn('QUOTA', self.output.read_text())
 
 
 if __name__ == '__main__':
