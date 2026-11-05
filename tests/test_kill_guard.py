@@ -1,0 +1,667 @@
+"""Tests for harness/hooks/kill_guard.py (GoodQA #14506, matrix X05).
+
+Every command string here is DATA handed to kill_guard.decide() or piped as text to the hook launcher, which only
+analyses it; nothing in this file executes a corpus row (safety rules S1/S3). Real signals are sent only by
+tests/live_kill_canary.py, on dev2, in a scratch HOME (rule S2).
+
+KG_HOOKS_DIR points the suite at another directory (for example one without kill_guard.py) to show it failing first.
+"""
+
+import ast
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+HOOKS = Path(os.environ.get('KG_HOOKS_DIR') or ROOT / 'harness/hooks')
+sys.path.insert(0, str(HOOKS))
+
+import kill_guard as kg  # noqa: E402
+
+CORPUS = json.loads((Path(__file__).resolve().parent / 'kill_guard_corpus.json').read_text(encoding='utf-8'))
+ROWS, WORLD = CORPUS['rows'], CORPUS['world']
+POSITIVE_FLOOR, NEGATIVE_FLOOR = 120, 80
+TAG_FLOORS = {'verb': 40, 'wrapper': 20, 'pidfeed': 10, 'ssh': 10, 'netwatch': 6, 'interpreter': 6, 'obfuscation': 6,
+              'listing': 8, 'ownership': 20, 'text': 20, 'signal0': 4, 'job': 4, 'windows': 3, 'delayed': 3, 'spawn': 2}
+LITERAL = 'netwatch orphans --kill --pid'
+CWD = WORLD['worktree'] + '/sub'
+POLICY = kg.load_policy()
+
+
+class FakeProbe:
+    """Process facts from the corpus world. Never touches a real process."""
+
+    def __init__(self, world):
+        self.pids = {int(k): v for k, v in world['pids'].items()}
+        self.chain = {os.getpid(): world['ancestors'][1], world['ancestors'][1]: world['ancestors'][0],
+                      world['ancestors'][0]: 1}
+
+    def _get(self, pid, key):
+        entry = self.pids.get(pid)
+        return None if entry is None else entry[key]
+
+    def uid(self, pid):
+        return self._get(pid, 'uid')
+
+    def comm(self, pid):
+        return self._get(pid, 'comm')
+
+    def cwd(self, pid):
+        return self._get(pid, 'cwd')
+
+    def argv(self, pid):
+        return self._get(pid, 'argv')
+
+    def start(self, pid):
+        return self._get(pid, 'start')
+
+    def ppid(self, pid):
+        return self.chain.get(pid)
+
+
+def fake_runner(world):
+    def run(argv, timeout=2.0, cwd=None, env=None):
+        if 'rev-parse' in argv:
+            return world['worktree'] + '\n'
+        if 'worktree' in argv:
+            return 'worktree %s\n\nworktree %s\n\nworktree %s\n' % (world['worktree'], world['nested'], world['sibling'])
+        return None
+    return run
+
+
+class WorldCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = self.tmp.name
+        env = mock.patch.dict(os.environ, {'HOME': self.home})
+        env.start()
+        self.addCleanup(env.stop)
+        patch = mock.patch.object(kg, 'read_ledger', lambda root, home=None, max_lines=2000: [tuple(x) for x in WORLD['ledger']])
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def ownership(self, world=WORLD):
+        return kg.Ownership(world['worktree'] + '/sub', home=world['home'], probe=FakeProbe(world),
+                            runner=fake_runner(world), policy=POLICY)
+
+    def decide(self, cmd, ps=False, world=WORLD, cwd=CWD):
+        return kg.decide(cmd, cwd=cwd, ps=ps, ownership=self.ownership(world), policy=POLICY, home=self.home)
+
+
+def judge_rows(rows, decide_fn):
+    """Names of rows whose verdict differs from the expectation. Shared by the corpus tests and the mutant tests."""
+    bad = []
+    for row in rows:
+        verdict = decide_fn(row)[0]
+        if (row['expect'] == 'block') != (verdict == 'block'):
+            bad.append('%s expected %s got %s' % (row['id'], row['expect'], verdict))
+    return bad
+
+
+class Corpus(WorldCase):
+    def rows(self, expect):
+        return [r for r in ROWS if r['expect'] == expect]
+
+    def test_corpus_is_not_vacuous(self):
+        pos, neg = self.rows('block'), self.rows('allow')
+        self.assertGreaterEqual(len(pos), POSITIVE_FLOOR)
+        self.assertGreaterEqual(len(neg), NEGATIVE_FLOOR)
+        ids = [r['id'] for r in ROWS]
+        self.assertEqual(len(ids), len(set(ids)))
+        for row in ROWS:
+            self.assertIn(row['expect'], ('block', 'allow'), row['id'])
+            self.assertTrue(row['cmd'].strip(), row['id'])
+        for tag, floor in TAG_FLOORS.items():
+            self.assertGreaterEqual(sum(1 for r in ROWS if tag in r['tags']), floor, 'tag %s' % tag)
+
+    def test_positive_rows_blocked(self):
+        bad = judge_rows(self.rows('block'), lambda r: self.decide(r['cmd'], ps=r.get('ps', False)))
+        self.assertEqual(bad, [], '\n'.join(bad[:40]))
+
+    def test_negative_rows_allowed(self):
+        bad = judge_rows(self.rows('allow'), lambda r: self.decide(r['cmd'], ps=r.get('ps', False)))
+        self.assertEqual(bad, [], '\n'.join(bad[:40]))
+
+    def test_every_verb_in_the_table_has_a_row(self):
+        text = ' '.join(r['cmd'] for r in self.rows('block'))
+        for verb in POLICY['broad_verbs'] + ['fuser', 'taskkill', 'Stop-Process', 'systemctl kill', 'launchctl kill',
+                                              'os.kill', 'process.kill', 'psutil', 'xargs', 'netwatch']:
+            self.assertIn(verb.lower(), text.lower(), verb)
+
+    def test_twins_differ_only_in_the_risky_token(self):
+        """Every positive verb row has a negative twin quoting the same text, so block-everything fails one of them."""
+        verbs = {r['cmd'] for r in ROWS if r['id'].startswith('P-verb') and r['id'].endswith('-plain')}
+        text_rows = ' '.join(r['cmd'] for r in ROWS if r['id'].startswith('N-text'))
+        for verb in verbs:
+            self.assertIn(verb, text_rows)
+
+
+class Mutants(WorldCase):
+    def test_allow_everything_mutant_fails_positives(self):
+        bad = judge_rows([r for r in ROWS if r['expect'] == 'block'], lambda r: ('allow', '', '', ()))
+        self.assertGreaterEqual(len(bad), POSITIVE_FLOOR)
+
+    def test_block_everything_mutant_fails_negatives(self):
+        bad = judge_rows([r for r in ROWS if r['expect'] == 'allow'], lambda r: ('block', 'x', 'x', ()))
+        self.assertGreaterEqual(len(bad), NEGATIVE_FLOOR)
+
+    def test_empty_corpus_would_be_caught(self):
+        with self.assertRaises(AssertionError):
+            self.assertGreaterEqual(len([]), POSITIVE_FLOOR)
+
+
+class Ownership(WorldCase):
+    def check(self, pid):
+        return self.ownership().check(pid)
+
+    def test_cwd_proof(self):
+        self.assertEqual(self.check(4001)[:2], (True, 'cwd'))
+
+    def test_argv_proof(self):
+        self.assertEqual(self.check(4002)[:2], (True, 'argv'))
+        self.assertEqual(self.check(4003)[:2], (True, 'argv'))
+
+    def test_argv_arbitrary_arg_not_proof(self):
+        self.assertFalse(self.check(4005)[0])
+        self.assertFalse(self.check(4014)[0])
+
+    def test_sibling_worktree(self):
+        self.assertFalse(self.check(4004)[0])
+
+    def test_prefix_sharing_path(self):
+        self.assertFalse(self.check(4006)[0])
+
+    def test_nested_worktree(self):
+        self.assertFalse(self.check(4007)[0])
+
+    def test_uid_mismatch(self):
+        self.assertEqual(self.check(4008)[1], 'other-user')
+
+    def test_deny_list_ancestors_and_protected(self):
+        self.assertEqual(self.check(1)[1], 'protected')
+        self.assertEqual(self.check(WORLD['ancestors'][1])[1], 'ancestor')
+        self.assertEqual(self.check(os.getpid())[1], 'ancestor')
+        self.assertEqual(self.check(4009)[1], 'protected')
+
+    def test_ledger_proof(self):
+        self.assertEqual(self.check(4010)[:2], (True, 'ledger'))
+
+    def test_ledger_start_time_mismatch(self):
+        self.assertFalse(self.check(4011)[0])
+
+    def test_probe_failure_blocks(self):
+        self.assertEqual(self.check(4015)[1], 'uninspectable')
+        self.assertEqual(self.check(9999)[1], 'uninspectable')
+
+    def test_cwd_outside_everything(self):
+        self.assertFalse(self.check(4012)[0])
+
+    def test_no_worktree_means_unprovable(self):
+        own = kg.Ownership('/tmp/not-a-repo', home=WORLD['home'], probe=FakeProbe(WORLD),
+                           runner=lambda *a, **k: None, policy=POLICY)
+        self.assertEqual(own.check(4001)[1], 'no-worktree')
+
+    def test_malformed_pids(self):
+        for cmd in ('kill 001', 'kill １２３', 'kill 4194305', 'kill +4001', 'kill 0x4001', 'kill 4001abc', 'kill -- -4001'):
+            self.assertEqual(self.decide(cmd)[0], 'block', cmd)
+
+    def test_mixed_list(self):
+        self.assertEqual(self.decide('kill 4001 4004')[0], 'block')
+        self.assertEqual(self.decide('kill 4001 4016')[0], 'allow')
+
+    def test_cd_into_other_worktree(self):
+        verdict = self.decide('cd /w/other && kill 4004')
+        self.assertEqual(verdict[0], 'block')
+        # the proof comes from the tool call's cwd: a cd cannot make another owner's processes yours
+        self.assertEqual(self.decide('cd /w/other && kill 4001')[0], 'allow')
+
+    def test_root_rejected(self):
+        for top in ('/', WORLD['home'], '/home', '/x'):
+            runner = lambda argv, *a, _t=top, **k: _t + '\n' if 'rev-parse' in argv else ''  # noqa: E731
+            own = kg.Ownership('/w/own', home=WORLD['home'], probe=FakeProbe(WORLD), runner=runner, policy=POLICY)
+            self.assertEqual(own.check(4001)[1], 'no-worktree', top)
+
+    def test_spawn_command_is_analysed_as_typed(self):
+        self.assertEqual(self.decide('kill_guard.py spawn -- sleep 60')[0], 'allow')
+        self.assertEqual(self.decide('kill_guard.py spawn -- pkill x')[0], 'block')
+        self.assertEqual(self.decide('python3 harness/hooks/kill_guard.py spawn --log o.txt -- killall node')[0], 'block')
+
+
+class RealLedger(unittest.TestCase):
+    """The ledger with real files in a scratch HOME and a real temporary git worktree. No process is signalled."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = os.path.realpath(self.tmp.name)
+        self.root = os.path.join(self.home, 'wt')
+        os.makedirs(self.root)
+
+    def probe(self, start='st1'):
+        world = json.loads(json.dumps(WORLD))
+        world['pids']['5001'] = {'uid': os.getuid(), 'comm': 'sleep', 'cwd': '/tmp/q', 'argv': ['sleep'], 'start': start}
+        world['pids']['5002'] = {'uid': os.getuid(), 'comm': 'sleep', 'cwd': '/tmp/q', 'argv': ['sleep'], 'start': 'x'}
+        return FakeProbe(world)
+
+    def own(self, root=None, start='st1', home=None):
+        root = root or self.root
+        runner = lambda argv, *a, **k: root + '\n' if 'rev-parse' in argv else ''  # noqa: E731
+        return kg.Ownership(root, home=home or self.home, probe=self.probe(start), runner=runner, policy=POLICY)
+
+    def test_ledger_roundtrip_and_proof(self):
+        kg.append_ledger(self.root, 5001, 'st1', home=self.home)
+        self.assertEqual(self.own().check(5001)[:2], (True, 'ledger'))
+        self.assertFalse(self.own().check(5002)[0])
+
+    def test_ledger_start_time_mismatch(self):
+        kg.append_ledger(self.root, 5001, 'st1', home=self.home)
+        self.assertFalse(self.own(start='REUSED').check(5001)[0])
+
+    def test_ledger_other_worktree(self):
+        other = os.path.join(self.home, 'wt2')
+        os.makedirs(other)
+        kg.append_ledger(other, 5001, 'st1', home=self.home)
+        self.assertFalse(self.own().check(5001)[0])
+
+    def test_ledger_bad_mac(self):
+        kg.append_ledger(self.root, 5001, 'st1', home=self.home)
+        path = kg.ledger_path(self.root, self.home)
+        text = Path(path).read_text()
+        Path(path).write_text(text.replace('"pid": 5001', '"pid": 5002'))
+        self.assertFalse(self.own().check(5002)[0])
+        Path(path).write_text('{"pid": 5002, "start": "x", "ts": 1, "root": "%s", "mac": "00"}\n' % self.root)
+        self.assertFalse(self.own().check(5002)[0])
+
+    def test_ledger_without_key_is_empty(self):
+        kg.append_ledger(self.root, 5001, 'st1', home=self.home)
+        os.unlink(str(kg.state_dir(self.home) / 'ledger.key'))
+        self.assertFalse(self.own().check(5001)[0])
+
+    def test_ledger_symlink_and_world_writable(self):
+        kg.append_ledger(self.root, 5001, 'st1', home=self.home)
+        path = Path(kg.ledger_path(self.root, self.home))
+        os.chmod(str(path), 0o666)
+        self.assertFalse(self.own().check(5001)[0], 'world-writable ledger must be ignored')
+        os.chmod(str(path), 0o600)
+        self.assertTrue(self.own().check(5001)[0])
+        real = path.with_name('real.jsonl')
+        path.rename(real)
+        os.symlink(str(real), str(path))
+        self.assertFalse(self.own().check(5001)[0], 'symlinked ledger must be ignored')
+        path.unlink()
+        sdir = kg.state_dir(self.home)
+        os.chmod(str(sdir), 0o777)
+        self.assertIsNone(kg.read_key(self.home), 'world-writable state directory must be ignored')
+        os.chmod(str(sdir), 0o700)
+
+    def test_state_dir_symlink_refused_for_new_key(self):
+        sdir = kg.state_dir(self.home)
+        os.makedirs(str(sdir.parent))
+        os.symlink(self.home, str(sdir))
+        with self.assertRaises(OSError):
+            kg.ensure_key(self.home)
+
+    def test_real_git_worktree_discovery(self):
+        subprocess.run(['git', 'init', '-q', self.root], check=True)
+        sub = os.path.join(self.root, 'a', 'b')
+        os.makedirs(sub)
+        root, nested = kg.find_worktree(sub, home='/home/nobody')
+        self.assertEqual(root, os.path.realpath(self.root))
+        self.assertEqual(nested, [])
+        # a HOME that is inside the repo makes the repo unusable as a proof boundary
+        self.assertEqual(kg.find_worktree(sub, home=os.path.join(self.root, 'a'))[0], None)
+
+    def test_real_probe_reads_this_process(self):
+        probe = kg.Probe()
+        me = os.getpid()
+        self.assertEqual(probe.uid(me), os.getuid())
+        self.assertTrue(probe.start(me))
+        self.assertEqual(os.path.realpath(probe.cwd(me)), os.path.realpath(os.getcwd()))
+        self.assertTrue(probe.argv(me))
+        self.assertTrue(probe.comm(me))
+        self.assertIsNotNone(probe.ppid(me))
+        self.assertIsNone(probe.uid(4194303))
+
+
+class Messages(WorldCase):
+    def test_every_positive_row_one_line(self):
+        for row in (r for r in ROWS if r['expect'] == 'block'):
+            verdict, rule, message, _pids = self.decide(row['cmd'], ps=row.get('ps', False))
+            self.assertEqual(verdict, 'block', row['id'])
+            self.assertNotIn('\n', message, row['id'])
+            self.assertIn(LITERAL, message, row['id'])
+            self.assertTrue(rule, row['id'])
+            self.assertLess(len(message), 600, row['id'])
+
+    def test_no_command_echo(self):
+        secret = 'ghp_' + 'A1b2C3d4' * 5
+        for cmd in ('pkill -f "%s"' % secret, 'kill $(echo %s)' % secret, 'ssh host.example "pkill -f %s"' % secret,
+                    'pkill -f x\n# %s' % secret):
+            verdict, _rule, message, _pids = self.decide(cmd)
+            self.assertEqual(verdict, 'block')
+            self.assertNotIn(secret[:8], message)
+            self.assertNotIn('host.example', message)
+            self.assertNotIn('\n', message)
+
+    def test_message_names_pid_not_other_processes_command_line(self):
+        message = self.decide('kill 4004')[2]
+        self.assertIn('4004', message)
+        self.assertNotIn('t.py', message)
+        self.assertNotIn('/w/other', message)
+
+    def test_unprovable_message_mentions_spawn(self):
+        self.assertIn('spawn', self.decide('kill 4004')[2])
+
+
+class Audit(WorldCase):
+    def test_block_logged_without_command_text(self):
+        self.decide('pkill -f very-secret-pattern')
+        log = Path(kg.state_dir(self.home)) / 'audit.jsonl'
+        text = log.read_text()
+        entry = json.loads(text.splitlines()[-1])
+        self.assertEqual(entry['rule'], 'broad-kill')
+        self.assertEqual(len(entry['sha256']), 16)
+        self.assertNotIn('very-secret', text)
+        self.assertNotIn('pkill', text)
+
+    def test_allow_writes_nothing(self):
+        self.decide('ls -la')
+        self.assertFalse((Path(kg.state_dir(self.home)) / 'audit.jsonl').exists())
+
+
+class Perf(WorldCase):
+    def test_no_probe_for_non_kill_commands(self):
+        def boom(*a, **k):
+            raise AssertionError('probe or ledger touched for a command without a kill verb')
+        with mock.patch.object(kg.Probe, 'uid', boom), mock.patch.object(kg.Probe, 'cwd', boom), \
+                mock.patch.object(kg.Probe, 'argv', boom), mock.patch.object(kg.Probe, 'start', boom), \
+                mock.patch.object(kg, 'read_ledger', boom), mock.patch.object(kg, 'append_ledger', boom), \
+                mock.patch.object(kg, 'audit', boom), mock.patch.object(kg, 'find_worktree', boom):
+            for cmd in ('ls', 'git status', 'grep -n pkill f', 'pgrep -f x | wc -l', 'kill -0 5', 'kill -l', 'echo kill'):
+                own = kg.Ownership(CWD, home=self.home, policy=POLICY)
+                self.assertEqual(kg.decide(cmd, cwd=CWD, ownership=own, policy=POLICY, home=self.home)[0], 'allow', cmd)
+
+    def test_decision_time_is_bounded(self):
+        start = time.monotonic()
+        for _ in range(5):
+            self.decide('pkill -f x')
+        self.assertLess((time.monotonic() - start) / 5, 0.5)
+
+
+class Policy(unittest.TestCase):
+    def test_shipped_mode_is_enforce(self):
+        data = json.loads((HOOKS / 'kill_guard_policy.json').read_text())
+        self.assertEqual(data['mode'], 'enforce')
+        self.assertEqual(kg.load_policy()['mode'], 'enforce')
+
+    def test_bad_policy_falls_back_to_enforce(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'p.json'
+            path.write_text('{"mode": "banana", "broad_verbs": "x"}')
+            policy = kg.load_policy(path)
+            self.assertEqual(policy['mode'], 'enforce')
+            self.assertIsInstance(policy['broad_verbs'], list)
+            path.write_text('not json')
+            self.assertEqual(kg.load_policy(path)['mode'], 'enforce')
+
+    def test_mode_off_allows_everything_and_warn_does_not_block(self):
+        off = dict(POLICY, mode='off')
+        self.assertEqual(kg.decide('pkill -f x', cwd=CWD, policy=off)[0], 'allow')
+        warn = dict(POLICY, mode='warn')
+        with tempfile.TemporaryDirectory() as tmp:
+            verdict, _rule, message, _p = kg.decide('pkill -f x', cwd=CWD, policy=warn, home=tmp)
+        self.assertEqual(verdict, 'warn')
+        self.assertIn('WARNING', message)
+
+    def test_interpreter_switch_disables_only_the_interpreter_check(self):
+        cmd_py = "python3 -c 'import os; os.kill(5, 9)'"
+        off = dict(POLICY, script_kill_pattern='(?!x)x')
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(kg.decide(cmd_py, cwd=CWD, policy=off, home=tmp)[0], 'allow')
+            self.assertEqual(kg.decide('pkill x', cwd=CWD, policy=off, home=tmp)[0], 'block')
+
+    def test_interpreter_code_without_signals_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(kg.decide("python3 -c 'print(sum(range(9)))'", cwd=CWD, policy=POLICY, home=tmp)[0], 'allow')
+
+    def test_overridden_base_methods_exist_with_expected_signatures(self):
+        import inspect
+        import command_guard as cg
+        expected = {'apply': ['self', 'name', 'words', 'cmd', 'pl', 'idx', 'depth'],
+                    'inner_words': ['self', 'words', 'depth', 'pl', 'idx', 'via_xargs'],
+                    'script': ['self', 'text', 'depth', 'tail_visible', 'ps'],
+                    'ssh': ['self', 'args', 'depth'],
+                    'container': ['self', 'name', 'args', 'words', 'depth', 'pl', 'idx'],
+                    'pipeline': ['self', 'pl', 'depth'],
+                    'bind_loop_var': ['self', 'words']}
+        self.assertEqual(sorted(expected), sorted(kg.OVERRIDDEN))
+        for name, params in expected.items():
+            self.assertEqual(list(inspect.signature(getattr(cg.Analyzer, name)).parameters), params, name)
+
+
+def run_hook(payload_text, hooks_dir=None, mode='hook', timeout=60, env_extra=None):
+    """Pipe text to the launcher. The text is only ever analysed, never executed."""
+    hooks_dir = hooks_dir or HOOKS
+    home = tempfile.mkdtemp()
+    env = {'HOME': home, 'PATH': '/usr/bin:/bin'}
+    env.update(env_extra or {})
+    done = subprocess.run([sys.executable, '-I', str(Path(hooks_dir) / 'kill_guard.py'), mode],
+                          input=payload_text.encode('utf-8', 'replace'), stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=timeout, env=env, check=False)
+    return done.returncode, done.stdout.decode('utf-8', 'replace'), done.stderr.decode('utf-8', 'replace')
+
+
+def payload(command, tool='Bash', cwd=None):
+    return json.dumps({'tool_name': tool, 'tool_input': {'command': command}, 'cwd': cwd or str(ROOT)})
+
+
+class Hook(unittest.TestCase):
+    def test_blocks_with_exit_2_and_message(self):
+        code, _out, err = run_hook(payload('pkill -f pytest'))
+        self.assertEqual(code, 2, err)
+        self.assertIn(LITERAL, err)
+        self.assertEqual(len(err.strip().splitlines()), 1)
+
+    def test_allows_plain_commands(self):
+        for cmd in ('ls -la', 'git status', 'kill -0 1', 'pgrep -f x'):
+            code, _out, err = run_hook(payload(cmd))
+            self.assertEqual(code, 0, (cmd, err))
+
+    def test_non_shell_tools_pass_untouched(self):
+        payload_text = json.dumps({'tool_name': 'Write', 'tool_input': {'file_path': 'x', 'content': 'pkill -f x'}})
+        self.assertEqual(run_hook(payload_text)[0], 0)
+
+    def test_codex_shell_shapes(self):
+        for body in ({'tool_name': 'Bash', 'tool_input': {'command': ['bash', '-lc', 'pkill -f x']}},
+                     {'tool_name': 'exec_command', 'tool_input': {'cmd': 'killall node', 'workdir': str(ROOT)}},
+                     {'tool_name': 'write_stdin', 'tool_input': {'chars': 'pkill x\n'}}):
+            self.assertEqual(run_hook(json.dumps(body))[0], 2, body)
+
+    def test_powershell_kill_alias_blocked(self):
+        self.assertEqual(run_hook(payload('kill 5', tool='PowerShell'))[0], 2)
+        self.assertEqual(run_hook(payload('Get-Process', tool='PowerShell'))[0], 0)
+
+    def test_unowned_numeric_kill_blocked_end_to_end(self):
+        code, _out, err = run_hook(payload('kill 1'))
+        self.assertEqual(code, 2, err)
+        self.assertIn(LITERAL, err)
+
+
+class Failure(unittest.TestCase):
+    """The launcher must turn analyser trouble into a block for kill-looking input and an allow for the rest."""
+
+    def staged(self, command_guard_source=None, policy=None):
+        tmp = tempfile.mkdtemp()
+        for name in ('kill_guard.py', 'kill_guard_policy.json', 'command_guard_policy.json', 'redact.py', 'safe_input.py'):
+            src = HOOKS / name
+            if src.exists():
+                Path(tmp, name).write_bytes(src.read_bytes())
+        if command_guard_source is not None:
+            Path(tmp, 'command_guard.py').write_text(command_guard_source)
+        else:
+            Path(tmp, 'command_guard.py').write_bytes((HOOKS / 'command_guard.py').read_bytes())
+        if policy is not None:
+            Path(tmp, 'kill_guard_policy.json').write_text(json.dumps(policy))
+        return tmp
+
+    def assert_fail_closed(self, tmp):
+        code, _out, err = run_hook(payload('pkill -f x'), hooks_dir=tmp)
+        self.assertEqual(code, 2, err)
+        self.assertIn(LITERAL, err)
+        for obf in ('"pk""ill" -f x', "$'\\x70kill' -f x", 'eval "$X"'):
+            self.assertEqual(run_hook(payload(obf), hooks_dir=tmp)[0], 2, obf)
+        code, _out, err = run_hook(payload('ls -la'), hooks_dir=tmp)
+        self.assertEqual(code, 0, err)
+
+    def test_module_missing(self):
+        tmp = self.staged()
+        os.unlink(os.path.join(tmp, 'command_guard.py'))
+        self.assert_fail_closed(tmp)
+
+    def test_import_raises(self):
+        self.assert_fail_closed(self.staged('raise RuntimeError("boom")\n'))
+
+    def test_child_exits_nonzero(self):
+        self.assert_fail_closed(self.staged('import os\nos._exit(3)\n'))
+
+    def test_child_prints_invalid_output(self):
+        self.assert_fail_closed(self.staged('import sys\nsys.stdout.write("garbage")\nsys.exit(0)\n'))
+
+    def test_child_hangs(self):
+        policy = json.loads((HOOKS / 'kill_guard_policy.json').read_text())
+        policy['child_timeout_seconds'] = 3
+        self.assert_fail_closed(self.staged('import time\ntime.sleep(60)\n', policy=policy))
+
+    def test_oversized_input_blocked(self):
+        code, _out, err = run_hook(payload('pkill x ' + 'a' * (9 * 1024 * 1024)))
+        self.assertEqual(code, 2, err[:300])
+        self.assertIn(LITERAL, err)
+
+    def test_nul_bytes_and_unterminated_quote(self):
+        self.assertEqual(run_hook(payload('pkill\x00 -f x'))[0], 2)
+        self.assertEqual(run_hook(payload('echo "pkill -f x'))[0], 2)
+        self.assertEqual(run_hook(payload('echo "unterminated'))[0], 0)
+
+    def test_deep_nesting(self):
+        deep = 'echo ' + '$(' * 200 + 'pkill x' + ')' * 200
+        self.assertEqual(run_hook(payload(deep))[0], 2)
+        self.assertEqual(run_hook(payload('echo ' + '$(' * 200 + 'date' + ')' * 200))[0], 0)
+
+    def test_garbage_payload(self):
+        self.assertEqual(run_hook('{not json pkill')[0], 2)
+        self.assertEqual(run_hook('{not json at all')[0], 0)
+
+    def test_policy_off_allows(self):
+        policy = json.loads((HOOKS / 'kill_guard_policy.json').read_text())
+        policy['mode'] = 'off'
+        tmp = self.staged(policy=policy)
+        self.assertEqual(run_hook(payload('pkill -f x'), hooks_dir=tmp)[0], 0)
+
+
+class Spawn(unittest.TestCase):
+    """spawn starts a harmless sleeper that this test owns and stops it by its own PID through safe_signal."""
+
+    def test_refuses_outside_a_worktree_and_without_a_command(self):
+        home = tempfile.mkdtemp()
+        env = {'HOME': home, 'PATH': '/usr/bin:/bin'}
+        done = subprocess.run([sys.executable, '-I', str(HOOKS / 'kill_guard.py'), 'spawn'], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, cwd=home)
+        self.assertEqual(done.returncode, 2)
+        done = subprocess.run([sys.executable, '-I', str(HOOKS / 'kill_guard.py'), 'spawn', '--', 'sleep', '1'], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, cwd=home)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn(b'git worktree', done.stderr)
+        self.assertFalse((Path(home) / '.agent-harness').exists())
+
+    def test_numeric_command_is_not_a_pid_argument(self):
+        self.assertEqual(kg.spawn_main([]), 2)
+
+
+class Hygiene(unittest.TestCase):
+    FILES = ('test_kill_guard.py', 'live_kill_canary.py')
+
+    def trees(self):
+        base = Path(__file__).resolve().parent
+        for name in self.FILES:
+            path = base / name
+            if path.exists():
+                yield name, ast.parse(path.read_text(encoding='utf-8'))
+
+    def test_no_shell_or_eval_anywhere_in_kill_guard_tests(self):
+        seen = 0
+        for name, tree in self.trees():
+            seen += 1
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    func = node.func
+                    dotted = (func.value.id + '.' + func.attr) if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) else getattr(func, 'id', '')
+                    self.assertNotIn(dotted, ('os.system', 'os.popen', 'eval', 'exec', 'subprocess.getoutput'), name)
+                    for kw in node.keywords:
+                        self.assertFalse(kw.arg == 'shell' and not (isinstance(kw.value, ast.Constant) and kw.value.value is False),
+                                         '%s uses shell=' % name)
+        self.assertGreaterEqual(seen, 1)
+
+    def test_signals_only_through_safe_signal(self):
+        for name, tree in self.trees():
+            for fn in ast.walk(tree):
+                if isinstance(fn, ast.FunctionDef) and fn.name != 'safe_signal':
+                    for node in ast.walk(fn):
+                        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
+                                node.func.attr in ('kill', 'killpg') and isinstance(node.func.value, ast.Name) and node.func.value.id == 'os':
+                            self.fail('%s: os.%s outside safe_signal in %s' % (name, node.func.attr, fn.name))
+
+    def test_subprocess_in_unit_tests_only_pipes_text_on_stdin(self):
+        """The only subprocess call that takes corpus-shaped text is run_hook, which passes it via stdin=input."""
+        tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
+        for fn in ast.walk(tree):
+            if isinstance(fn, ast.FunctionDef):
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'run' \
+                            and isinstance(node.func.value, ast.Name) and node.func.value.id == 'subprocess' and node.args:
+                        argv = node.args[0]
+                        self.assertIsInstance(argv, ast.List, fn.name)
+                        for item in argv.elts:
+                            self.assertNotIn(type(item).__name__, ('BinOp', 'JoinedStr'), fn.name)
+
+    def test_corpus_loaded_only_as_json_data(self):
+        text = Path(__file__).read_text(encoding='utf-8')
+        self.assertIn('json.loads', text)
+        self.assertNotRegex(text, r'(?m)^\s*(?:import|from)\s+kill_guard_corpus')
+
+
+class Wiring(unittest.TestCase):
+    def test_rules_registry_entry(self):
+        path = ROOT / 'docs' / 'rules' / 'kill-guard.json'
+        data = json.loads(path.read_text(encoding='utf-8'))
+        entries = [e for e in data['rules'] if e.get('id') == 'kill-guard']
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        for key in ('rule', 'mechanism', 'enforcement', 'test', 'test_file', 'source'):
+            self.assertTrue(entry.get(key), key)
+        self.assertEqual(entry['enforcement'], 'ENFORCED')
+        self.assertIn('14506', entry['source'])
+        test_file = ROOT / entry['test_file']
+        self.assertTrue(test_file.exists())
+        klass, _, method = entry['test'].partition('.')
+        tree = ast.parse(test_file.read_text(encoding='utf-8'))
+        found = any(isinstance(c, ast.ClassDef) and c.name == klass and any(
+            isinstance(m, ast.FunctionDef) and m.name == method for m in c.body) for c in ast.walk(tree))
+        self.assertTrue(found, 'registry names a test that does not exist: %s' % entry['test'])
+
+    def test_registry_with_a_missing_test_would_fail(self):
+        tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
+        names = {m.name for c in ast.walk(tree) if isinstance(c, ast.ClassDef) and c.name == 'Corpus'
+                 for m in c.body if isinstance(m, ast.FunctionDef)}
+        self.assertNotIn('test_no_such_test', names)
+
+
+if __name__ == '__main__':
+    unittest.main()
