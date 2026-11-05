@@ -66,8 +66,9 @@ def policy_command(codex_home: Path) -> str:
     return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'commit_policy.py')) + ' hook'
 
 
-def guard_command(codex_home: Path) -> str:
-    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'command_guard_hook.py'))
+def guard_command(codex_home: Path, verb: str = ' hook') -> str:
+    # The hook verb marks a fail-closed gate for the Go front door (cmd/harness/gates.json); the launcher ignores it.
+    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'command_guard_hook.py')) + verb
 
 
 def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) -> dict:
@@ -93,7 +94,8 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
                 raise ValueError(f'hooks.json {event} has an invalid hook group')
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
-                                and handler.get('command') in (command, policy, guard))]
+                                and handler.get('command') in (command, policy, guard,
+                                                               guard_command(codex_home, '')))]
             if lifecycle and len(handlers) != len(group['hooks']) and group != managed:
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')

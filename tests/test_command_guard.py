@@ -633,6 +633,19 @@ class InstallTests(unittest.TestCase):
         for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py'):
             self.assertIn(name, self.install_codex.DELIVERY_HELPERS)
 
+    def test_guard_carries_the_gate_verb_and_replaces_a_verbless_entry(self):
+        # cmd/harness/gates.json lists command-guard as a fail-closed gate only when the hook verb is present.
+        claude, codex = self.home / '.claude', self.home / '.codex'
+        hook = self.guard_groups(self.install.merged_settings({}, claude))[0]['hooks'][0]
+        self.assertEqual(hook['args'][1:], ['hook'])
+        guard = self.install_codex.guard_command(codex)
+        self.assertTrue(guard.endswith(' hook'))
+        legacy = {'hooks': {'PreToolUse': [{'hooks': [{'type': 'command', 'timeout': 30,
+                                                       'command': self.install_codex.guard_command(codex, '')}]}]}}
+        merged = self.install_codex.merge_hooks(legacy, codex)
+        commands = [h['command'] for g in merged['hooks']['PreToolUse'] for h in g['hooks']]
+        self.assertEqual([c for c in commands if 'command_guard_hook.py' in c], [guard])
+
     def test_old_claude_version_warns(self):
         self.assertIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.200 (Claude Code)'))
         self.assertNotIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.295 (Claude Code)'))

@@ -69,9 +69,10 @@ def provenance_hook_groups(claude: Path) -> dict[str, list[dict]]:
 
 def command_guard_group(claude: Path) -> dict:
     """Destructive and config-dump command guard (GoodQA #14471, docs/operations.md). The launcher blocks on its
-    own when the analyser fails; onFailure covers the launcher itself."""
+    own when the analyser fails; onFailure covers the launcher itself. The `hook` verb marks it a fail-closed
+    gate for the Go front door (cmd/harness/gates.json); the launcher ignores its arguments."""
     return {"matcher": "Bash|PowerShell", "hooks": [{
-        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "command_guard_hook.py")],
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "command_guard_hook.py"), "hook"],
         "timeout": 30, "onFailure": "block"}]}
 
 
