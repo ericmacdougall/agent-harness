@@ -368,25 +368,22 @@ def report(status, message, **extra):
     print(json.dumps({"status": status, "message": message, **extra}))
 
 
-FOCUSED_MODULE_RE = re.compile(r"tests\.test_[A-Za-z0-9_]+")  # used with fullmatch
+FOCUSED_TEST_FILE = re.compile(r"test_[A-Za-z0-9_]{1,100}\.py")
 
 
-def focused_unittest(argv):
-    """The modules of `python3 -m unittest [-v] tests.test_x ...` (test modules only, no other argument), else None.
-    This shape is only a syntax check: deliver.py accepts it after test_scope.py proves the scope and a full run."""
-    if len(argv) >= 4 and argv[0] in {"python", "python3"} and argv[1:3] == ["-m", "unittest"]:
-        modules = [item for item in argv[3:] if item != "-v"]
-        if modules and len(modules) <= 60 and len(set(modules)) == len(modules) \
-                and all(FOCUSED_MODULE_RE.fullmatch(item) for item in modules):
-            return modules
-    return None
+def focused_unittest(options):
+    """`-m unittest discover -s tests -p <one literal test_*.py name>`: one file name, no glob, path or extra argv
+    (discovery matches that name in tests/ and its subpackages).
+
+    A name that matches no file is still safe: run() wraps every `-m unittest discover` check so that an empty or
+    all-skipped discovery fails (Python before 3.12 would otherwise exit zero)."""
+    return (len(options) == 7 and options[:6] == ["-m", "unittest", "discover", "-s", "tests", "-p"]
+            and FOCUSED_TEST_FILE.fullmatch(options[6]) is not None)
 
 
-def approved_check(argv, allow_focused=False):
+def approved_check(argv):
     if not argv:
         return False
-    if allow_focused and focused_unittest(argv) is not None:
-        return True
     if argv[0] == "go" and len(argv) >= 2:
         if argv[1:] == ["vet", "./..."]:
             return True
@@ -403,7 +400,7 @@ def approved_check(argv, allow_focused=False):
             ["-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"],
             ["-m", "pytest"],
             ["-m", "pytest", "-q"],
-        )
+        ) or focused_unittest(argv[1:])
     if argv in (["pytest"], ["pytest", "-q"]):
         return True
     return False
@@ -433,8 +430,6 @@ def main():
     parser.add_argument("--prepare", action="append", default=[], help="Lockfile install after merge, before checks")
     parser.add_argument("--check", action="append", required=True, help="One argv command, quoted as a single argument; no shell")
     parser.add_argument("--timeout", type=int, default=600, help="Seconds allowed for each Git command and abort")
-    parser.add_argument("--allow-focused-checks", action="store_true",
-                        help="deliver.py only: accept focused unittest checks it has already proven with test_scope.py")
     parser.add_argument("--check-timeout", type=int,
                         help="Seconds allowed for each preparation and check (default: --timeout)")
     args = parser.parse_args()
@@ -452,7 +447,7 @@ def main():
     except ValueError as error:
         report("BLOCKED_POLICY", f"Verification command is not a parseable argv: {error}")
         return 2
-    if not all(approved_prepare(argv) for argv in preparations) or not all(approved_check(argv, args.allow_focused_checks) for argv in checks):
+    if not all(approved_prepare(argv) for argv in preparations) or not all(approved_check(argv) for argv in checks):
         report("BLOCKED_POLICY", "Verification command is outside the approved test/build set")
         return 2
     try:

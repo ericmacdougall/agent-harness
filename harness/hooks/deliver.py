@@ -27,7 +27,7 @@ from urllib.parse import quote
 from github_identity import github_repository, repository_name
 from git_safety import git_environment, require_safe_source
 from integrate_local import (ALLOWED_GIT_ENV, CheckInterpreterError, CheckLog, ExternalApplyError,
-                             OriginalScope, acquire_scope_lock, approved_check, approved_prepare, focused_unittest, redact_output,
+                             OriginalScope, acquire_scope_lock, approved_check, approved_prepare, redact_output,
                              require_check_interpreters,
                              checkout_identity, git_common_directory, journal_key,
                              fsync_directory, private_directory, read_journal, run as run_check,
@@ -266,7 +266,7 @@ def regular_bytes(path, limit=MAX_PRIVATE):
 
 
 IGNORED_GIT_ENV = ("GIT_EDITOR", "GIT_SEQUENCE_EDITOR")
-SCRUBBED_ENV = ("HARNESS_TEST_SCOPE_ROOT", "HARNESS_TEST_SCOPE_HOST")  # would redirect the focused-check gate
+SCRUBBED_ENV = ("HARNESS_TEST_SCOPE_ROOT", "HARNESS_TEST_SCOPE_HOST")  # would redirect the baseline store
 
 
 def private_json(path):
@@ -299,7 +299,7 @@ def kit_digest(path):
     return hashlib.sha256(data).hexdigest()
 
 
-def approved_commands(values, *, prepare=False, allow_focused=False):
+def approved_commands(values, *, prepare=False):
     if not values and not prepare:
         raise DeliveryError("BLOCKED_POLICY", "At least one focused check is required", code=2)
     commands = []
@@ -308,53 +308,10 @@ def approved_commands(values, *, prepare=False, allow_focused=False):
             argv = shlex.split(value)
         except ValueError:
             raise DeliveryError("BLOCKED_POLICY", "Check command could not be parsed", code=2) from None
-        if not (approved_prepare(argv) if prepare else approved_check(argv, allow_focused)):
+        if not (approved_prepare(argv) if prepare else approved_check(argv)):
             raise DeliveryError("BLOCKED_POLICY", "Check command is not approved", code=2)
         commands.append(argv)
     return commands
-
-
-def focused_proof(flow, focused):
-    """test_scope.py's approval of each focused check: it names every test mapped to the changed files and their
-    dependents, and a finished passing full run is on record for the frozen source head. Nothing is accepted without it."""
-    try:
-        import test_scope
-    except ImportError:
-        raise DeliveryError("BLOCKED_POLICY", "Focused checks need test_scope.py, which is not installed", code=2) from None
-    approvals = []
-    for argv in focused:
-        failure = None
-        for repo in (flow.state.get("source"), str(flow.original)):
-            if not repo:
-                continue
-            try:
-                approvals.append(test_scope.approve_focused(str(repo), flow.state["baseline"], flow.state["source_head"], argv))
-                break
-            except test_scope.Refused as refused:
-                raise DeliveryError("BLOCKED_POLICY", "Focused check is not approved: " + refused.message, code=2) from None
-            except (OSError, ValueError, subprocess.SubprocessError):
-                failure = True  # this checkout lacks the commits; try the next one
-        else:
-            raise DeliveryError("BLOCKED_POLICY", "Focused check proof could not be verified" if failure else
-                                "Focused check proof needs a source or original checkout", code=2)
-    return approvals
-
-
-def focused_recheck(flow, target):
-    """Remote delivery checks out the merge TARGET, which can carry other people's commits on top of the delta: the
-    focused tests must still cover everything mapped for baseline..target."""
-    if not getattr(flow, "focused_checks", None):
-        return
-    import test_scope
-    try:
-        required = {"tests." + t for t in test_scope.focused_scope(str(flow.original), flow.state["baseline"], target)["tests"]}
-    except (OSError, ValueError, subprocess.SubprocessError):
-        raise DeliveryError("BLOCKED_POLICY", "Focused check coverage of the merge target could not be verified", code=2) from None
-    for approval in flow.focused_checks:
-        missing = sorted(required - set(approval.get("tests", [])))
-        if missing:
-            raise DeliveryError("BLOCKED_POLICY", "Focused check does not cover tests mapped to the merge target: "
-                                + " ".join(missing[:8]) + "; run a whole-suite check", code=2)
 
 
 # --baseline-compare (GoodQA #14582): the whole-suite check passes when its failing test ids are an exact-id subset of the
@@ -671,8 +628,6 @@ class Workflow:
     def facts(self):
         facts = {"generation": self.generation, "state": str(self.directory / "journal.json"),
                  "checkout": str(self.original), "source_head": self.state["source_head"]}
-        if getattr(self, "focused_checks", None):
-            facts["focused_checks"] = self.focused_checks
         if ACTIVE_COMPARE.get("result"):
             facts["baseline_compare"] = ACTIVE_COMPARE["result"]
         overrides = self.target_overrides()
@@ -730,8 +685,6 @@ class Workflow:
                 "generation": self.generation, "source_head": self.state["source_head"], "head": head,
                 "mode": mode, "repository": self.state["repository"], "pr_number": self.state["pr_number"],
                 "checks_digest": digest, "guard_key": self.state["guard_key"]}
-        if getattr(self, "focused_checks", None):
-            data["focused_checks"] = self.focused_checks  # the test_scope approval of each focused check
         if ACTIVE_COMPARE.get("result"):
             data["baseline_compare"] = ACTIVE_COMPARE["result"]  # baseline sha, both test counts, the accepted failing ids
             write_compare_evidence(self)
@@ -748,10 +701,8 @@ class Workflow:
         value = private_json(self.receipt)
         expected = {"schema", "kind", "scope", "task", "generation", "source_head", "head", "mode",
                     "repository", "pr_number", "checks_digest", "guard_key"}
-        extra = value.get("focused_checks", [])
         compare = value.get("baseline_compare", {})
-        if (not isinstance(extra, list) or len(extra) > 20 or any(not isinstance(item, dict) for item in extra)
-                or not isinstance(compare, dict) or set(value) - {"focused_checks", "baseline_compare"} != expected or type(value.get("schema")) is not int or value["schema"] != 1
+        if (not isinstance(compare, dict) or set(value) - {"baseline_compare"} != expected or type(value.get("schema")) is not int or value["schema"] != 1
                 or value.get("kind") != "delivery_receipt" or value.get("scope") != self.scope
                 or value.get("task") != self.task or value.get("generation") != self.generation
                 or value.get("source_head") != self.state["source_head"]
@@ -1608,7 +1559,6 @@ def resume_remote_finish(flow, preparations, checks):
         write_journal(attempt / "start", start, first=True)
         try:
             revalidate()
-            focused_recheck(flow, guard.target)
             run_checks(flow.original, preparations, checks, args.check_timeout, flow.directory / "checks")
             revalidate()
             if origin_destination(flow.original)[0] != state["repository"]:
@@ -1705,7 +1655,6 @@ def remote_finish(flow, preparations, checks):
                         raise DeliveryError("BLOCKED_LOCAL", "Protected fast-forward was refused")
             if snapshot(flow.original, flow.branch) != target:
                 raise DeliveryError("DELIVERED_CHECK_FAILED", "Original changed during sync")
-            focused_recheck(flow, target)
             run_checks(flow.original, preparations, checks, args.check_timeout, flow.directory / "checks")
             if snapshot(flow.original, flow.branch) != target:
                 raise DeliveryError("DELIVERED_CHECK_FAILED", "Checks changed the delivered checkout")
@@ -1812,8 +1761,6 @@ def local_finish(flow, preparations, checks):
     for name in ("prepare", "check"):
         for value in getattr(flow.args, name):
             command.extend(("--" + name, value))
-    if getattr(flow, "focused_checks", None):
-        command.append("--allow-focused-checks")  # only after focused_proof approved every focused check
     try:
         # Each preparation/check gets its check deadline; Git steps keep --timeout.
         code, output = bounded(command, timeout=2 * (len(checks) + len(preparations)) * flow.args.check_timeout
@@ -1869,15 +1816,14 @@ def preflight_compare(flow):
 
 
 def finish(args):
-    preparations, checks = approved_commands(args.prepare, prepare=True), approved_commands(args.check, allow_focused=True)
-    focused = [argv for argv in checks if not approved_check(argv)]  # accepted syntactically; proven below
+    preparations, checks = approved_commands(args.prepare, prepare=True), approved_commands(args.check)
     try:
-        return _finish(args, preparations, checks, focused)
+        return _finish(args, preparations, checks)
     finally:
         ACTIVE_COMPARE.clear()
 
 
-def _finish(args, preparations, checks, focused):
+def _finish(args, preparations, checks):
     try:
         # Before any checkout effect: a bare python3 that resolves to an
         # unsupported interpreter would only fail after the fast-forward.
@@ -1892,9 +1838,6 @@ def _finish(args, preparations, checks, focused):
             raise DeliveryError("BLOCKED_POLICY", "Run kit changed since prepare", code=2)
         configure_compare(args, checks, state)
         preflight_compare(flow)
-        if focused and args.resolve_baseline is not None:
-            raise DeliveryError("BLOCKED_POLICY", "A recovery baseline needs a whole-suite check, not a focused one", code=2)
-        flow.focused_checks = focused_proof(flow, focused) if focused else []
         if args.resolve_baseline is not None:
             return resolve_baseline(flow, preparations, checks)
         if args.resume:

@@ -13,6 +13,7 @@ import json
 import os
 import random
 import re
+import shlex
 import sys
 import tempfile
 import threading
@@ -609,6 +610,415 @@ class OverwriteExistingTests(Fixture):
         self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 122)
         self.assertEqual(failures, [])
 
+    def _seed_bang_rows(self):
+        for rel in ('.claude/wals/s/main.jsonl', '.claude/projects/p/s.jsonl', '.claude/hooks/hook.py',
+                    '.agent-harness/work/S/T/existing.log', '.agent-harness/work/S/T/kept/.keep'):
+            p = self.home / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('keep\n')
+        (self.home / 'proj').mkdir(exist_ok=True)
+
+    def test_bang_clobber_is_judged_under_both_readings(self):
+        self._seed_bang_rows()
+        self.assertGreaterEqual(len(corpus.BANG_READINGS), 120)
+        failures = [(cmd, want, got) for cmd, want in corpus.BANG_READINGS
+                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
+        self.assertEqual(failures, [])
+        self.assertGreaterEqual(len(corpus.BANG_READINGS_CWD), 9)
+        failures = [(cmd, want, got) for cmd, want, where in corpus.BANG_READINGS_CWD
+                    for got in [self.decide(cmd, cwd=where)[0]] if got != want]
+        self.assertEqual(failures, [])
+
+    def test_bash_reading_stops_the_operator_before_the_bang(self):
+        # the spellings and results observed from bash 5.2 and dash on dev2 (shell_probe rows C1-C8, N1, S1)
+        def lexed(text, bang):
+            lexer = cg.Lexer(cg.Ctx(cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))),
+                             bang_operators=bang)
+            tokens = lexer.lex(text)
+            words = [v.text for k, v in tokens if k == 'w']
+            redirs = [(v.fd, v.op, v.target.text if v.target else None) for k, v in tokens if k == 'redir']
+            return words, redirs, lexer.saw_bang
+        self.assertEqual(lexed('echo hi >! f1', False), (['echo', 'hi', 'f1'], [(None, '>', '!')], True))
+        self.assertEqual(lexed('echo hi >>! f1', False), (['echo', 'hi', 'f1'], [(None, '>>', '!')], True))
+        self.assertEqual(lexed('echo hi &>! f1', False), (['echo', 'hi', 'f1'], [(None, '&>', '!')], True))
+        self.assertEqual(lexed('echo hi >&! f1', False), (['echo', 'hi', 'f1'], [(None, '>&', '!')], True))
+        self.assertEqual(lexed('echo hi 2>! f1', False), (['echo', 'hi', 'f1'], [('2', '>', '!')], True))
+        self.assertEqual(lexed('echo hi >!f1', False), (['echo', 'hi'], [(None, '>', '!f1')], True))
+        self.assertEqual(lexed('echo hi >! ; true', False)[:2], (['echo', 'hi', 'true'], [(None, '>', '!')]))
+        self.assertEqual(lexed('echo hi >! f1', True), (['echo', 'hi'], [(None, '>|', 'f1')], True))
+        self.assertEqual(lexed('echo hi >>&! f1', True), (['echo', 'hi'], [(None, '&>>', 'f1')], True))
+        # only an unquoted operator is one, so nothing else starts a second reading
+        for text in ("echo '>!' f1", 'echo x \\>! f1', "echo x >'!' f1", 'echo x >\\! f1', 'echo x > ! f1', 'echo x >| f1',
+                     'echo x >> f1', 'echo x &> f1', 'echo "a >! b"', "cat <<'E'\n>! f1\nE"):
+            self.assertFalse(lexed(text, True)[2], text)
+
+    def test_a_finding_in_both_readings_is_reported_once(self):
+        self._seed_bang_rows()
+        plain = self.decide('rm -rf @HOME@/.claude/hooks', cwd='@TASK@')[1]
+        both = self.decide('rm -rf @HOME@/.claude/hooks >! /dev/null', cwd='@TASK@')[1]
+        self.assertEqual(both, plain)
+
+    def test_many_bang_operators_stay_two_parses(self):
+        # one shell reads every `>!` in a script alike: the count of parses must not grow with the operators
+        count = []
+        real = cg.Lexer.lex
+
+        def counted(lexer, text):
+            count.append(1)
+            return real(lexer, text)
+        cg.Lexer.lex = counted
+        try:
+            self.decide('; '.join('echo x >! @TASK@/f%d' % i for i in range(40)), cwd='@TASK@')
+        finally:
+            cg.Lexer.lex = real
+        self.assertEqual(len(count), 2)
+
+    def test_bang_forms_stay_fast_on_long_commands(self):
+        self._seed_bang_rows()
+        token = 'a' * 65536
+        forms = ('>! ' + token, 'echo x >! ' + token, token + ' >! x', '>! x ' + token, 'cat >! @TASK@/' + token,
+                 'echo ' + token + ' >! x; >! y', "bash -c '>! x " + token + "'", '>!' + token)
+        for text in forms:
+            started = time.monotonic()
+            self.decide(text, cwd='@TASK@')
+            self.assertLess(time.monotonic() - started, 3.0, text[:12])
+
+    def _nested(self, levels, leaf):
+        for _ in range(levels):
+            leaf = 'echo $(>! a %s)' % leaf
+        return leaf
+
+    def test_nested_bang_forks_are_capped_and_stay_cheap(self):
+        # 8 levels is the depth limit, and the worst case: every level would double the parses
+        count = []
+        real = cg.Lexer.lex
+
+        def counted(lexer, text):
+            count.append(1)
+            return real(lexer, text)
+        cg.Lexer.lex = counted
+        try:
+            verdict = self.decide(self._nested(8, 'word'), cwd='@HOME@/proj')[0]
+        finally:
+            cg.Lexer.lex = real
+        self.assertEqual(verdict, 'warn')  # past the cap the command is unanalysable, not clean
+        self.assertLessEqual(len(count), 60)
+        self.assertGreater(len(count), 8)  # it did fork: the row is not stopped at the first descent
+        self.assertEqual(self.decide(self._nested(8, 'word @HOME@/.claude'), cwd='@HOME@/proj')[0], 'block')
+
+    def test_a_budget_stop_keeps_what_was_already_refused(self):
+        self._seed_bang_rows()
+        hide = 'rm -rf ~/.c*/projects'  # a glob the parse resolves and the raw-text check does not see
+        self.assertFalse(cg.raw_sensitive(hide))
+        big = 'word ' * 50000
+        for name, text in (('before a large >!', hide + "; ssh host 'echo x >! y; " + big + "'"),
+                           ('after a large >!', "ssh host 'echo x >! y; " + big + "'; " + hide),
+                           ('before nested >!', hide + '; ' + self._nested(8, 'word ' * 500)),
+                           ('after nested >!', self._nested(8, 'word ' * 500) + '; ' + hide),
+                           ('control with >', hide + "; ssh host 'echo x > y; " + big + "'")):
+            self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'block', name)
+        # a stop with nothing refused yet is still not a pass
+        big = 'word ' * 150000
+        self.assertEqual(self.decide('echo ' + big, cwd='@HOME@/proj')[0], 'warn')
+
+    def test_budget_stop_keeps_an_enforced_finding(self):
+        # the stop itself, with nothing to avoid it: a finding raised before the budget runs out still blocks
+        hide = 'rm -rf ~/.c*/projects'
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home), cwd=str(self.home / 'proj'))
+        # the outer lex skips over $(..) cheaply and the nested script's does not fit, so the stop comes after the first
+        # command was judged. The second assertion proves the stop happens
+        comp.limits = dict(comp.limits, max_nodes=5000)
+        nested = 'echo $(echo ' + 'word ' * 2000 + ')'
+        self.assertEqual(cg.decide(hide + '; ' + nested, comp, cwd=str(self.home / 'proj'))[0], 'block')
+        self.assertEqual(cg.decide(nested, comp, cwd=str(self.home / 'proj'))[0], 'warn')
+
+    def test_second_reading_is_skipped_rather_than_run_out_of_budget(self):
+        self._seed_bang_rows()
+        text = "ssh host 'echo x >! /tmp/y; " + 'word ' * 50000 + "'"
+        self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'warn')
+        # the skip is what lets the command after it be read: a stop here would never reach it
+        hide = 'rm -rf ~/.c*/projects'
+        self.assertFalse(cg.raw_sensitive(hide))
+        self.assertEqual(self.decide(text + '; ' + hide, cwd='@HOME@/proj')[0], 'block')
+        # text that names a protected location fails closed when both readings cannot be judged
+        self.assertEqual(self.decide(text + '; ls @HOME@/.claude', cwd='@HOME@/proj')[0], 'block')
+
+    def test_nesting_too_deep_for_python_keeps_what_was_already_refused(self):
+        self._seed_bang_rows()
+        hide = 'rm -rf ~/.c*/projects'
+        # just past the interpreter's limit: a recursion error's frames stay in this process's peak memory, and the
+        # hostile input tests later in a full run measure their children against 100 MiB, which starts from that peak
+        deep = 'sudo ' * (sys.getrecursionlimit() + 100) + 'ls'
+        self.assertEqual(self.decide(deep, cwd='@HOME@/proj')[0], 'warn')  # it does stop
+        self.assertEqual(self.decide(hide + '; ' + deep, cwd='@HOME@/proj')[0], 'block')
+
+    def test_any_exception_keeps_what_was_already_refused(self):
+        # the hook's alarm raises TimeoutError part way through, and raw text cannot see every finding
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))
+
+        def run(analyzer, command):
+            analyzer.ctx.add(cg.LOG_DELETE, 'r', 'seen before the alarm', 'a')
+            raise TimeoutError('alarm')
+        real = cg.Analyzer.run
+        cg.Analyzer.run = run
+        try:
+            verdict = cg.decide('echo plain', comp)
+        finally:
+            cg.Analyzer.run = real
+        self.assertEqual(verdict[0], 'block')
+        self.assertIn('seen before the alarm', verdict[1])
+        self.assertEqual(cg.decide('echo plain', comp)[0], 'allow')
+
+    def _existing_script(self, name, *lines):
+        self._seed_bang_rows()
+        (self.home / 'proj' / name).write_text('#!/bin/bash\n' + '\n'.join(lines) + '\n')
+        return self.decide('bash ' + name, cwd='@HOME@/proj')[0]
+
+    def test_an_existing_script_past_the_cap_is_not_clean(self):
+        nest = 'plain'
+        for name in 'dcba':
+            nest = 'echo $(>! %s %s)' % (name, nest)
+        self.assertEqual(self._existing_script('deep.sh', nest), 'warn')
+
+    def test_a_stop_in_an_existing_script_keeps_only_what_its_filter_keeps(self):
+        nest = 'plain'
+        for _ in range(10):
+            nest = 'echo $(%s)' % nest
+        # a secret lookup is routine in a repository's own script, so it does not turn the stop into a refusal
+        self.assertEqual(self._existing_script('nest.sh', nest), 'warn')
+        self.assertEqual(self._existing_script('lookup.sh', 'printenv', nest), 'warn')
+        self.assertEqual(self._existing_script('ok.sh', 'printenv', 'echo plain'), 'allow')
+
+    def test_disputes_lists_only_what_a_merge_cannot_keep(self):
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))
+        ctx = cg.Ctx(comp, '/tmp/start')
+        ctx.written['/same'] = 'text'
+        self.assertFalse(ctx.disputes(ctx.state()))
+        changes = (('vars', {'A': '1'}), ('var_hints', {'A': '1'}), ('aliases', {'a': 'b'}), ('links', {'/l': '/t'}),
+                   ('cwd', '/tmp/other'), ('cwd_unknown', True), ('written', {'/same': 'other text'}))
+        for name, value in changes:
+            other = ctx.state()
+            other[name] = value
+            self.assertTrue(ctx.disputes(other), name)
+        # one reading alone wrote a file, or added to a set: a merge keeps both
+        other = ctx.state()
+        other['written'] = {'/same': 'text', '/new': 'x'}
+        other['created'] = {'/new'}
+        other['secret_seen'] = 3
+        self.assertFalse(ctx.disputes(other))
+        # bash's file named `!` is rewritten by every nested `>!`, and a file only needs the name to end that way to count
+        ctx.written['/p/!'] = 'one'
+        other = ctx.state()
+        other['written']['/p/!'] = 'two'
+        self.assertFalse(ctx.disputes(other))
+        ctx.written['/p/x!'] = 'one'
+        other = ctx.state()
+        other['written']['/p/x!'] = 'two'
+        self.assertTrue(ctx.disputes(other))
+
+    def test_a_file_one_reading_wrote_is_also_judged_on_disk(self):
+        # bash leaves the file as it was, or zsh appends to it, so what is on disk can still be what runs
+        self._seed_bang_rows()
+        proj = self.home / 'proj'
+        (proj / 'ondisk.sh').write_text('rm -rf ' + str(self.home / '.claude/projects') + '\n')
+        (proj / 'plain.sh').write_text('echo plain\n')
+        for form in ("eval '%s echo hi'; bash %s", "bash -c '%s echo hi'; bash %s", 'x=$(%s echo hi); bash %s',
+                     "ssh h '%s echo hi'; bash %s"):
+            for op in ('>!', '>>!'):
+                text = form % (op + ' ondisk.sh', 'ondisk.sh')
+                self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'block', text)
+                text = form % (op + ' plain.sh', 'plain.sh')
+                self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'allow', text)
+                text = form % (op + ' absent.sh', 'absent.sh')
+                self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'allow', text)
+        # the other direction: only bash's reading wrote this one, and zsh would leave what is on disk
+        (proj / '!').write_text('rm -rf ' + str(self.home / '.claude/projects') + '\n')
+        self.assertEqual(self.decide("eval 'echo hi >! x'; bash '!'", cwd='@HOME@/proj')[0], 'block')
+        # both readings replaced the file, so what was on disk is gone and is not what runs
+        for text in ('echo hi > ondisk.sh; bash ondisk.sh', "eval 'echo hi > ondisk.sh'; bash ondisk.sh"):
+            self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'allow', text)
+
+    def test_the_disk_is_judged_before_the_recorded_text(self):
+        # in the reading where the disk is what runs, the recorded text never ran: its cd or alias must not colour the disk
+        self._seed_bang_rows()
+        proj, other = self.home / 'proj', self.home / 'other'
+        other.mkdir()
+        (other / 'rel.sh').write_text('rm -rf .claude/projects\n')
+        (other / 'cdonly.sh').write_text('cd /tmp\n')
+        (proj / 'ondisk.sh').write_text('rm -rf ' + str(self.home / '.claude/projects') + '\n')
+        rel = "cd @HOME@/other; %s; cd @HOME@; bash @HOME@/other/rel.sh"
+        for nested in ("eval '>! rel.sh echo cd /tmp'", "eval '>! rel.sh echo cd /tmp; true'", "eval '>>! rel.sh echo cd /tmp'",
+                       "bash -c '>! rel.sh echo cd /tmp'", 'x=$(>! rel.sh echo cd /tmp)'):
+            self.assertEqual(self.decide(rel % nested, cwd='@HOME@/proj')[0], 'block', nested)
+        self.assertEqual(self.decide("eval '>! ondisk.sh echo alias rm=true'; bash ondisk.sh", cwd='@HOME@/proj')[0], 'block')
+        # the disk text's own cd stays inside its own process
+        text = "cd @HOME@/other; eval '>! cdonly.sh echo hi'; cd @HOME@; bash @HOME@/other/cdonly.sh; rm -rf .claude/projects"
+        self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'block')
+        # and the recorded text is still read after a disk read that finishes: the rule label shows a reading refused it
+        (proj / 'plain.sh').write_text('echo plain\n')
+        for name in ('plain.sh', 'absent.sh'):
+            text = "eval '>! %s echo rm -rf ~/.c*/projects'; bash %s" % (name, name)
+            verdict, message = self.decide(text, cwd='@HOME@/proj')
+            self.assertEqual(verdict, 'block', text)
+            self.assertIn('[log_delete/log-delete]', message, text)
+        self.assertEqual(self.decide("eval '>! plain.sh echo hi'; bash plain.sh", cwd='@HOME@/proj')[0], 'allow')
+        # Known limit: a disk read that stops the analysis costs the recorded text its reading, so that text goes only to
+        # the raw-text check, which sees no protected location in this glob inside $(..). This warns; 60cf346 blocked it.
+        # In a child: parsing this file adds about 70 MiB, and tests that bound their own children's peak inherit this
+        # process's high-water mark on Linux.
+        import subprocess
+        (proj / 'big.sh').write_text(':\n' * 128000)
+        text = 'x=$(>! big.sh echo rm -rf ~/.c*/projects); bash big.sh'
+        code = ('import sys\nsys.path.insert(0, sys.argv[1])\nimport command_guard as cg\n'
+                "comp = cg.Compiled(cg.load_policy(sys.argv[2] + '/none.json'), home=sys.argv[2], cwd=sys.argv[3])\n"
+                'print(cg.decide(sys.argv[4], comp, cwd=sys.argv[3])[0])\n')
+        child = subprocess.run([sys.executable, '-c', code, os.path.dirname(cg.__file__), str(self.home), str(proj), text],
+                               env=dict(os.environ, HOME=str(self.home)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=60, check=False)
+        self.assertEqual(child.returncode, 0, child.stderr.decode('utf-8', 'replace')[-400:])
+        self.assertEqual(child.stdout.decode().strip(), 'warn', text)
+        # a small file does it too: this one stops on the nesting limit, with budget left to read the recorded text
+        (proj / 'self.sh').write_text('bash self.sh\n')
+        text = 'x=$(>! self.sh echo rm -rf ~/.c*/projects); bash self.sh'
+        self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'warn', text)
+
+    def test_known_limits_worse_than_the_base_are_pinned(self):
+        # Each of these blocks at cbfc4da and runs with no refusal here, so each is a regression accepted for now, listed in
+        # the PR: goodqa#14722 (the disk read) and goodqa#14723 (a script's state carrying past its process). The allows reach
+        # a deletion with no warning. These rows are not wanted behaviour: a repair should change them on purpose.
+        self._seed_bang_rows()
+        fx = self.home / 'fx'
+        fx.mkdir()
+        (fx / 'del.sh').write_text('rm -rf ' + str(self.home / '.claude/projects') + '\n')
+        (fx / 'a1.sh').write_text('echo plain\n')
+        (fx / 'a8.sh').write_text(''.join('bash %s/c%d.sh\n' % (fx, n) for n in range(1, 9)))
+        (fx / 'self.sh').write_text('bash %s/self.sh\n' % fx)
+        for n in range(1, 9):
+            (fx / ('c%d.sh' % n)).write_text('echo plain\n')
+        allows = (
+            ('P1', 'x=$(echo bash del.sh >! a8.sh); bash a8.sh', str(fx)),
+            ('P2', "eval 'echo bash del.sh >! a8.sh'; bash a8.sh", str(fx)),
+            ('P3', "bash -c 'echo bash del.sh >! a8.sh'; bash a8.sh", str(fx)),
+            ('R3', 'x=$(echo hi >! a8.sh); echo bash del.sh > a8.sh; bash a8.sh', str(fx)),
+            ('T1', 'T=@HOME@/.claude/projects; x=$(echo T=/tmp/plain >! a1.sh); bash a1.sh; rm -rf $T', str(fx)),
+            ('D5', "eval '>! a1.sh echo cd /tmp'; bash a1.sh; rm -rf .claude/projects", '@HOME@'),
+        )
+        warns = (
+            ('U1', 'x=$(echo hi >! self.sh); bash self.sh; rm -rf ~/.c*/projects', str(fx)),
+            ('R1', 'x=$(echo hi >! self.sh); echo rm -rf ~/.c*/projects > self.sh; bash self.sh', str(fx)),
+        )
+        for want, rows in (('allow', allows), ('warn', warns)):
+            for name, text, cwd in rows:
+                with self.subTest(name):
+                    self.assertEqual(self.decide(text, cwd=cwd)[0], want)
+
+    def test_only_enforced_findings_survive_a_stop(self):
+        # broad_kill warns by default, so a warning raised before the stop must not turn into a refusal
+        self._seed_bang_rows()
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home), cwd=str(self.home / 'proj'))
+        self.assertNotEqual(comp.policy['modes'].get(cg.PARSE), 'enforce')
+
+        def run(analyzer, command):
+            analyzer.ctx.add(cg.PARSE, 'r', 'only a warning', 'a')
+            raise self.stop
+        real = cg.Analyzer.run
+        cg.Analyzer.run = run
+        try:
+            for self.stop in (TimeoutError('alarm'), cg.Blocked('budget')):
+                self.assertNotEqual(cg.decide('echo plain', comp)[0], 'block', repr(self.stop))
+        finally:
+            cg.Analyzer.run = real
+
+    def test_the_fork_cap_is_three(self):
+        self._seed_bang_rows()
+        self.assertEqual(self.decide(self._nested(3, 'word'), cwd='@HOME@/proj')[0], 'allow')
+        self.assertEqual(self.decide(self._nested(4, 'word'), cwd='@HOME@/proj')[0], 'warn')
+
+    def test_written_rule_reads_the_real_home_not_a_variable_named_home(self):
+        code = "%s\nshutil.rmtree(%s)\n"
+        for target in ("home / '.claude'", "os.path.join(home, '.claude')"):
+            self.assertFalse(cg.written_code_destroys_root(code % ('home = tmp', target), str(self.home)), target)
+        for target in ("Path.home() / '.claude'", "os.environ['HOME'] + '/.claude'", "os.environ.get('HOME') + '/.claude'",
+                       "os.getenv('HOME') + '/.claude'", "'$HOME/.claude'", "'${HOME}/.claude'", "'~/.claude'",
+                       "'/users/x/.claude'", "'/home/x/.claude'", "'/root/.claude'"):
+            self.assertTrue(cg.written_code_destroys_root(code % ('', target), str(self.home)), target)
+
+    def test_readings_merge_keeps_what_either_one_knows(self):
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))
+        ctx = cg.Ctx(comp, '/tmp/start')
+        start = ctx.state()
+        # one reading
+        ctx.vars.update({'SAME': 'a', 'DIFF': '/x/one', 'ONLY_A': '/x/a'})
+        ctx.var_hints.update({'HINT': 'first'})
+        ctx.written.update({'/f': 'text one', '/g': 'kept'})
+        ctx.created.add('/c1')
+        ctx.tainted.add('T1')
+        ctx.aliases['a1'] = 'x'
+        ctx.links['/l1'] = '/t1'
+        ctx.secret_seen = 1
+        ctx.kill_seen = True
+        ctx.cwd = '/tmp/one'
+        ctx.pending_kill.append('k1')
+        ctx.flow_vars = {'F1'}
+        one = ctx.state()
+        ctx.restore(start)
+        self.assertEqual((ctx.vars, ctx.cwd, ctx.secret_seen, ctx.kill_seen), ({}, '/tmp/start', 0, False))
+        self.assertFalse(hasattr(ctx, 'flow_vars'))  # an attribute added by one reading does not reach the other
+        # the other
+        ctx.vars.update({'SAME': 'a', 'DIFF': '/x/two', 'ONLY_B': '/x/b'})
+        ctx.var_hints.update({'HINT': 'second'})
+        ctx.written.update({'/f': 'text two', '/h': 'also kept'})
+        ctx.created.add('/c2')
+        ctx.tainted.add('T2')
+        ctx.aliases['a2'] = 'y'
+        ctx.links['/l2'] = '/t2'
+        ctx.secret_seen = 2
+        ctx.unterminated = True
+        ctx.cwd = '/home/x/.claude'
+        ctx.pending_kill.append('k2')
+        ctx.merge(one)
+        self.assertEqual(ctx.vars, {'SAME': 'a'})
+        for name, value in (('DIFF', '/x/one'), ('DIFF', '/x/two'), ('ONLY_A', '/x/a'), ('ONLY_B', '/x/b'),
+                            ('HINT', 'first'), ('HINT', 'second')):
+            self.assertIn(value, ctx.var_hints[name])
+        self.assertIn('text one', ctx.written['/f'])
+        self.assertIn('text two', ctx.written['/f'])
+        self.assertEqual((ctx.written['/g'], ctx.written['/h']), ('kept', 'also kept'))
+        self.assertEqual(ctx.created, {'/c1', '/c2'})
+        self.assertEqual(ctx.tainted, {'T1', 'T2'})
+        self.assertEqual((ctx.aliases, ctx.links), ({'a1': 'x', 'a2': 'y'}, {'/l1': '/t1', '/l2': '/t2'}))
+        self.assertEqual(ctx.secret_seen, 2)
+        self.assertTrue(ctx.kill_seen)  # set by the other reading
+        self.assertTrue(ctx.unterminated)  # set by this one
+        self.assertEqual(sorted(ctx.pending_kill), ['k1', 'k2'])
+        self.assertEqual(ctx.flow_vars, {'F1'})
+        self.assertTrue(ctx.cwd_unknown)
+        self.assertTrue(ctx.cwd_protected_unknown)
+
+    def test_merge_keeps_a_protected_cwd_flag_set_by_either_reading(self):
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))
+        ctx = cg.Ctx(comp, '/tmp/start')
+        ctx.cwd = '/tmp/one'
+        one = ctx.state()
+        ctx.cwd, ctx.cwd_unknown, ctx.cwd_protected_unknown = '/tmp/two', True, True
+        ctx.merge(one)
+        self.assertTrue(ctx.cwd_protected_unknown)
+
+    def test_root_text_stays_linear(self):
+        # _scan_text collapses runs of spaces and commas, so these tails are the ones that reach the regex as written.
+        # The short run comes first: a backtracking regex then fails here instead of hanging on the long one
+        for size in (16, 50000):
+            for tail in ('/ ', ' + ', '\\\\ ', ' / '):
+                text = 'x = ~' + tail * size + 'y'
+                started = time.monotonic()
+                self.assertFalse(cg.written_code_destroys_root(text, str(self.home)))
+                self.assertLess(time.monotonic() - started, 1.0, repr((tail, size)))
+        # a run the name class of /users/ and /home/ could also match, which made this quadratic: 3.5 s at 64 KB
+        for text in ('/users/x' + '+' * 50000 + 'y', '/home/x' + '+' * 50000 + 'y', '/users/x' + '\\' * 50000 + 'y'):
+            started = time.monotonic()
+            self.assertFalse(cg.written_code_destroys_root(text, str(self.home)))
+            self.assertLess(time.monotonic() - started, 1.0, text[:9])
+
     def test_other_user_home_link_out_of_the_tree_is_refused(self):
         # a real /home/<user> on this machine cannot be made in a test, so its realpath is what is simulated
         target = '/home/alice/.agent-harness/work/a/b/lnk'
@@ -757,13 +1167,15 @@ class InstallTests(unittest.TestCase):
         without = self.install_codex.merge_hooks(user, codex, command_guard=False)['hooks']['PreToolUse']
         with_guard = self.install_codex.merge_hooks(user, codex)['hooks']['PreToolUse']
         self.assertEqual(with_guard[:len(without)], without)
-        self.assertEqual(len(with_guard), len(without) + 1)
-        self.assertEqual(with_guard[-1]['hooks'][0]['command'], self.install_codex.guard_command(codex))
+        self.assertEqual(len(with_guard), len(without) + 2)  # the command guard, then the kill guard (GoodQA #14506)
+        self.assertEqual(with_guard[-2]['hooks'][0]['command'], self.install_codex.guard_command(codex))
+        self.assertEqual(with_guard[-1]['hooks'][0]['command'], self.install_codex.kill_guard_command(codex))
+        self.assertNotIn('matcher', with_guard[-2])
         self.assertNotIn('matcher', with_guard[-1])
         again = self.install_codex.merge_hooks({'hooks': {'PreToolUse': with_guard}}, codex)['hooks']['PreToolUse']
         self.assertEqual(again, with_guard)  # idempotent: a reinstall keeps every index
-        # upgrade from the 220c37e layout (guard first): one guard group, moved last
-        old = [with_guard[-1]] + with_guard[:-1]
+        # upgrade from the 220c37e layout (guard first): one guard group, moved back to its place
+        old = [with_guard[-2]] + with_guard[:-2] + with_guard[-1:]
         upgraded = self.install_codex.merge_hooks({'hooks': {'PreToolUse': old}}, codex)['hooks']['PreToolUse']
         self.assertEqual(upgraded, with_guard)
 
