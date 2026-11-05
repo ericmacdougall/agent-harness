@@ -23,6 +23,14 @@ import ah_run
 import host_table
 
 AH = str(HOOKS / 'ah_run.py')
+REAL_SUDO = re.compile(r'''(?:^|[^A-Za-z0-9_.-])s['"\\]*u['"\\]*d['"\\]*o(?:$|[^A-Za-z0-9_.-])''')
+
+
+def assert_no_real_sudo(command):
+    """r6 S30: a shell string that names sudo, however it is quoted, never reaches a shell from a test, generator or fuzz.
+    A verdict row may hold it as data; `Differential.printed` skips any row marked `live: false`."""
+    if REAL_SUDO.search(command.replace('\\\n', '')):
+        raise AssertionError('refusing to run a string that names sudo: %r' % command[:120])
 
 
 class Fixture(unittest.TestCase):
@@ -1512,11 +1520,14 @@ class Differential(HookFixture):
     everywhere: certain and no deny means no shell printed the marker, uncertain is never allowed, a printed marker was denied and
     seen by the escape classifier, and a rewritten command ends as the typed one does. `limit` rows are programs handed the text
     at run time (eval, sh -c, <<<, a pipe into a shell, python, a file written then run); no text model sees those, and the table
-    says so instead of hiding them. Only echo, true, read, cat and a stub ssh that copies stdin ever run."""
+    says so instead of hiding them. Live rows print only the echo marker; besides echo, true, read and cat they use shell builtins
+    (alias, shopt, setopt, trap, ...), a shell or python3 handed that echo, and a stub ssh that copies stdin. A stub sudo sits first
+    on PATH and fails, and a row that names sudo is data only (`live: false`, r6 S30): `stdout` refuses to run it."""
     TABLE = json.loads((Path(__file__).resolve().parent / 'fixtures' / 'ah_run' / 'differential.json').read_text())
     RULE = 'Bash(echo HIDDEN-LINE:*)'
     MARKER = 'HIDDEN-LINE'
     STUB = '#!/bin/sh\ncat\n'
+    SUDO_STUB = '#!/bin/sh\nexit 126\n'
     observed = {}
 
     @classmethod
@@ -1536,6 +1547,7 @@ class Differential(HookFixture):
         super().setUp()
         self.bin = Path(self.temp.name) / 'bin'; self.bin.mkdir()
         (self.bin / 'ssh').write_text(self.STUB); (self.bin / 'ssh').chmod(0o755)
+        (self.bin / 'sudo').write_text(self.SUDO_STUB); (self.bin / 'sudo').chmod(0o755)
         self.policy = Path(self.temp.name) / 'policy.json'
         self.policy.write_text(json.dumps({'hosts': {'dev2.example.test': {'role': 'worker', 'ah_run': '/opt/ah/ah_run.py'}}, 'self': []}))
         patcher = mock.patch.object(host_table, 'resolve', lambda target, ssh_args=(), run=None: host_table.Resolved({'dev2': 'dev2.example.test'}.get(target, 'elsewhere.example.test'), 22))
@@ -1545,6 +1557,7 @@ class Differential(HookFixture):
         return self.decide(command, env={'AGENT_HARNESS_RESOURCE_POLICY': str(self.policy)}, permission_mode=mode)
 
     def stdout(self, shell, command):
+        assert_no_real_sudo(command)
         with tempfile.TemporaryDirectory(dir=self.temp.name) as cwd:
             try:
                 return subprocess.run([shell, '-c', command], env={**self.env, 'PATH': '%s:%s' % (self.bin, os.environ['PATH'])}, capture_output=True, timeout=5,
@@ -1555,6 +1568,8 @@ class Differential(HookFixture):
     def printed(self, row):
         """{shell key: stdout} for the typed text, kept across rows of the class: the runs are the slow part."""
         key = row['group'] + ':' + row['name']
+        if not row.get('live', True):
+            return {}  # data only: its verdict and deny columns are checked, and no shell is given it
         if key not in self.observed:
             command = row['shape'].replace('%s', self.TABLE['line'])
             self.observed[key] = {name: self.stdout(path, command) for name, (path, _version) in self.shells().items()}
@@ -1562,6 +1577,23 @@ class Differential(HookFixture):
 
     def marker_in(self, text):
         return text is not None and self.MARKER in text.split('\n')
+
+    def test_no_live_row_reaches_a_real_sudo(self):
+        """r6 S30. Runs no row: every row naming sudo is data only, and the guard in `stdout` refuses the string if one is not."""
+        named = [row for row in self.TABLE['rows'] if REAL_SUDO.search(row['shape'].replace('\\\n', ''))]
+        self.assertGreaterEqual(len(named), 1, 'the verdict row stays in the table as data')
+        for row in named:
+            self.assertIs(row.get('live'), False, row['name'])
+            self.assertEqual(self.printed(row), {}, row['name'])
+            with self.assertRaises(AssertionError):
+                self.stdout('/bin/sh', row['shape'].replace('%s', self.TABLE['line']))
+        for command in ('sudo bash', 'true; sudo -n true', '"sudo" x', "s'u'do x", 's\\udo x', '/usr/bin/sudo x', 'su\\\ndo x', 'env sudo x'):
+            with self.assertRaises(AssertionError, msg=command):
+                assert_no_real_sudo(command)
+        for command in ('echo pseudo', 'echo sudoku', 'cat sudo.txt', 'echo HIDDEN-LINE'):
+            assert_no_real_sudo(command)
+        self.assertEqual(os.stat(self.bin / 'sudo').st_mode & 0o111, 0o111)
+        self.assertEqual(subprocess.run(['/bin/sh', '-c', 'command -v sudo'], env={**self.env, 'PATH': '%s:%s' % (self.bin, os.environ['PATH'])}, capture_output=True, text=True, timeout=5).stdout.strip(), str(self.bin / 'sudo'))
 
     def test_the_table_covers_every_round_and_can_fail(self):
         rows = self.TABLE['rows']

@@ -2949,6 +2949,7 @@
 "deny": true,
 "group": "r4-S15",
 "kind": "hidden",
+"live": false,
 "name": "sudo bash <<'E'",
 "ran": [],
 "rewritten": "none",
