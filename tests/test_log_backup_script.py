@@ -182,6 +182,19 @@ class Exclusion(Case):
         self.assertTrue((out / "auth.json").exists())
         self.assertTrue((out / "member.key").exists())
 
+    def test_vm_dumps_never_appear_in_the_remote(self):
+        for name in ("dump.vma", "dump.vma.zst"):
+            self.put(f".agent-harness/work/t1/{name}", b"VMA")
+            self.put(f".claude/projects/p1/{name}", b"VMA")
+        done = self.local_run()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        files = self.remote_files()
+        self.assertEqual(files, set(ORDINARY))
+        self.assertFalse([f for f in files if ".vma" in f])
+        text = (ROOT / "harness" / "bin" / "log-backup.excludes").read_text().split()
+        self.assertIn("*.vma", text)
+        self.assertIn("*.vma.zst", text)
+
     def test_no_glob_expansion_and_no_symlink_following_flags(self):
         for name in ("a.secret", "b.secret"):
             (self.tmp / name).write_text("x")  # the cwd of the run holds files an unquoted glob would expand to
