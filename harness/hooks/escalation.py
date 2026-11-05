@@ -408,6 +408,25 @@ class Ledger:
         finally:
             os.close(fd)
 
+    def record_failover(self, task, info, *, source, head=None):
+        """Audit a same-harness review failover (GoodQA #14833). The event is class FAILOVER, which rung_of ignores, so an
+        infrastructure failover can never count as a genuine failure; it only makes failovers listable per task."""
+        if not isinstance(info, dict) or info.get('mode') != 'same-harness' or not isinstance(info.get('run_ids'), list):
+            raise LedgerError('unclassifiable_evidence', 'a failover record needs mode same-harness and its prior run ids')
+        facts = {'mode': 'same-harness', 'need': info.get('need'), 'run_ids': [str(r)[:64] for r in info['run_ids']][:20],
+                 'reason': str(info.get('reason', ''))[:300]}
+        fd = self._lock(task)
+        try:
+            state, _ = self._read(task)
+            state['events'].append({'seq': len(state['events']) + 1, 'at': now(), 'kind': 'failover', 'class': 'FAILOVER',
+                                    'why': 'review failed over to the author harness: ' + facts['reason'],
+                                    'fingerprint': None, 'receipt_sha256': None, 'source': source, 'head': head,
+                                    'failover': facts, 'rung_at': rung_of(state['events'], self.policy)['rung']})
+            self._write(task, state)
+            return ladder_status(state, self.policy)
+        finally:
+            os.close(fd)
+
     def add_spend(self, task, usd):
         fd = self._lock(task)
         try:

@@ -32,6 +32,7 @@ from git_safety import git_environment as safe_git_environment, require_safe_sou
 from report_file import ReportTarget
 import escalation as ladder
 import model_tiers as tiers
+import review_failover as failover
 from usage_guard import GuardError, UsageStore, capture_subject, invocation_identity
 
 
@@ -751,8 +752,9 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
     options.setdefault('usage', [])
     codex_entry = ('codex', 'Codex %s %s (rung %s)' % (codex_model, effort, rung), options.get('pool', 'default'))
     claude_entry = ('claude', 'Claude %s %s (rung %s)' % (claude_model, effort, rung), options.get('fallback_pool', 'default'))
-    # The tier table picks the primary; the other harness at the same rung is the one authorized fallback.
-    order = (codex_entry, claude_entry) if selection['harness'] == 'openai' else (claude_entry, codex_entry)
+    # The tier table picks the primary; the other harness at the same rung is the one authorized fallback, except on a
+    # failover run, where the failed provider is never launched again.
+    order = reviewer_order(selection, codex_entry, claude_entry, no_fallback=bool(options.get('no_fallback')))
     primary = order[0][0]
     for provider, source, pool in order:
         remaining = deadline - time.monotonic()
@@ -811,6 +813,12 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             raise ReviewFailure(outcome, source)
         failure = 'Primary reviewer unavailable (' + outcome['reason'] + '); used authorized independent fallback.'
     raise OSError('no valid reviewer result')
+
+
+def reviewer_order(selection, codex_entry, claude_entry, no_fallback=False):
+    """Primary first, then the one authorized fallback; a failover run has no fallback."""
+    order = (codex_entry, claude_entry) if selection['harness'] == 'openai' else (claude_entry, codex_entry)
+    return order[:1] if no_fallback else order
 
 
 def provider_toolchains(resolutions):
@@ -910,7 +918,7 @@ def plan_ticket_gate(repo, content):
         return 0, f'spec-flow: plan ticket gate could not run ({error}); continuing'
 
 
-def write_selection_receipt(run_id, args, head, packet_sha256, author_rung, selection):
+def write_selection_receipt(run_id, args, head, packet_sha256, author_rung, selection, failover_info=None):
     """The selection receipt: what the table chose before launch, bound to task, stage, head and packet."""
     try:
         root = ladder.state_root() / 'selections'
@@ -918,10 +926,40 @@ def write_selection_receipt(run_id, args, head, packet_sha256, author_rung, sele
         path = root / (run_id + '.json')
         body = json.dumps({'schema': 1, 'run_id': run_id, 'task': args.task, 'stage': args.stage, 'head': head,
                            'packet_sha256': packet_sha256, 'author_rung': author_rung, 'author_harness': args.author_harness,
-                           'selection': selection, 'at': ladder.now()}, sort_keys=True)
+                           'selection': selection, 'at': ladder.now(),
+                           **({'failover': failover_info} if failover_info else {})}, sort_keys=True)
         path.write_text(body); os.chmod(path, 0o600)
     except OSError as error:
         print(f'Selection receipt could not be written: {type(error).__name__}', file=sys.stderr)
+
+
+def plan_failover(args, repo, head, packet_sha256, policy, author_rung, available, selection):
+    """(facts, selection, refusal) for --failover. Reads the usage store only; nothing is launched or written here."""
+    chosen, refusal = failover.failover_selection(policy, author_rung, args.author_harness, available, selection)
+    if refusal:
+        return None, selection, refusal
+    try:
+        subject = capture_subject(repo, args.input_manifest)
+        found = failover.evaluate(UsageStore(), repository=subject['repository'], head=head, stage=args.stage,
+                                  packet_sha256=packet_sha256, need=args.failover_after,
+                                  primary_provider='codex' if selection['harness'] == 'openai' else 'claude')
+    except (GuardError, OSError, ValueError) as error:
+        return None, selection, 'failover refused: the review history could not be read (%s)' % getattr(error, 'message', error)
+    if not found['ok']:
+        return None, selection, found['refusal']
+    return ({'mode': 'same-harness', 'need': found['need'], 'run_ids': found['run_ids'], 'runs': found['runs'],
+             'reason': found['reason'], 'normal_reviewer': selection['harness']}, chosen, None)
+
+
+def record_failover_in_ladder(args, head, failover_info):
+    """The distinct, never-counted ladder event for a failover (class FAILOVER); best effort like record_in_ladder."""
+    if not args.task or not failover_info:
+        return
+    try:
+        ladder.Ledger(policy=tiers.load_policy()).record_failover(args.task, failover_info, source='peer_review:' + args.stage,
+                                                                  head=head)
+    except (OSError, ladder.LedgerError, tiers.TierError) as error:
+        print(f'Ladder failover record failed: {getattr(error, "message", error)}', file=sys.stderr)
 
 
 def record_in_ladder(args, store, reference, head, policy):
@@ -981,7 +1019,15 @@ def main() -> int:
     parser.add_argument('--author-rung', help='Author rung override (R0..R6); unknown gets the configured unknown-author reviewer')
     parser.add_argument('--author-harness', choices=('claude', 'openai', 'unknown'), default='unknown',
                         help='Harness that wrote the change; the other harness reviews when available')
+    parser.add_argument('--failover', choices=failover.MODES,
+                        help='After repeated reconciled provider timeouts or unavailable results on this exact subject, run the '
+                             'same-rung reviewer on the author harness instead (receipted; refused after material findings)')
+    parser.add_argument('--failover-after', type=int, default=failover.DEFAULT_AFTER,
+                        help='Prior timeouts or unavailable results required before --failover (1 to %d, default %d)'
+                             % (failover.MAX_AFTER, failover.DEFAULT_AFTER))
     args = parser.parse_args()
+    if not 1 <= args.failover_after <= failover.MAX_AFTER:
+        parser.error('--failover-after must be between 1 and %d' % failover.MAX_AFTER)
     if not 1 <= args.packet_budget_bytes <= PACKET_LIMIT:
         parser.error('--packet-budget-bytes must be between 1 and 150000')
     if not 1 <= args.timeout <= 720:
@@ -1141,6 +1187,15 @@ def main() -> int:
             print(diagnostics.render(diagnostics.provider_attempt(name, found[name], None, '', '', {}),
                                      stage=args.stage, head=before[0]), file=sys.stderr)
         return 2
+    failover_info = None
+    if args.failover:
+        failover_info, selection, refusal = plan_failover(args, repo, before[0], evidence.sha256, policy, author_rung,
+                                                          available, selection)
+        if refusal:
+            target.close()
+            evidence.close()
+            print('Review refused: ' + refusal, file=sys.stderr)
+            return 2
     permission = None
     if policy['rungs'][selection['rung']]['needs_user_permission']:
         # --author-rung is a claim; the ledger permission is the only record of Fable-approved work.
@@ -1157,6 +1212,7 @@ def main() -> int:
             return 2
     options = {'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
                'selection': selection, 'author_rung': author_rung, 'permission': permission,
+               'no_fallback': bool(failover_info), 'failover': failover_info,
                'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
                'claude_model': policy['rungs'][selection['rung']]['models']['claude']}
     try:
@@ -1181,6 +1237,7 @@ def main() -> int:
                 argv=['peer_review', args.stage, options['codex_model'], options['claude_model'], selection['effort'],
                       selection['rung'], selection['harness'], args.pool, args.fallback_pool,
                       '--snapshot-base', base or 'none',
+                      *(['--failover', failover_info['mode'], str(failover_info['need'])] if failover_info else []),
                       # The effective review policy (shipped or override) changes discovery and quota classification.
                       '--review-policy', hashlib.sha256(json.dumps(review_policy(), sort_keys=True).encode()).hexdigest()],
                 cwd=repo,
@@ -1194,7 +1251,7 @@ def main() -> int:
             run_record = store.begin(subject, invocation, owner=args.owner, label='peer-review-' + args.stage,
                                      timeout=1440, aggregate_timeout=2880, kind='review', repeat_reason=args.repeat_reason)
             options.update(store=store, run_record=run_record)
-            write_selection_receipt(run_record.run_id, args, before[0], evidence.sha256, author_rung, selection)
+            write_selection_receipt(run_record.run_id, args, before[0], evidence.sha256, author_rung, selection, failover_info)
             source, report, failure = review_snapshot(snapshot, before[0], args.stage,
                                                        stage_rules, evidence.content, options)
             report = stage_report(args.stage, report)
@@ -1216,6 +1273,7 @@ def main() -> int:
                                                   'executables': diagnostics.executable_record(options.get('resolutions', {})),
                                                   'diagnostic': diagnosis['code']})
                 record_in_ladder(args, store, failed, before[0], policy)
+                record_failover_in_ladder(args, before[0], failover_info)
             except (OSError, GuardError):
                 print('Execution receipt could not be finalized; reconciliation is required.', file=sys.stderr)
         target.close()
@@ -1249,6 +1307,7 @@ def main() -> int:
                           f"Author-Rung: {author_rung or 'unknown'}{' (author unknown: lowest writer rung reviewer)' if selection['author_unknown'] else ''}\n"
                           f"Reviewer-Rung: {selection['rung']}\nReviewer-Selection: {selection['harness']} {selection['model']} "
                           f"{selection['effort']}; {selection['why']}\n"
+                          f"{failover.receipt_lines(failover_info)}"
                           f"{'Permission: ' + str(permission['ask_id']) + chr(10) if permission else ''}"
                           f"Review input: isolated committed snapshot (depth 1"
                           f"{', base ' + base if base and base != before[0] else ''})\n"
@@ -1262,7 +1321,8 @@ def main() -> int:
             review={'stage': args.stage.upper().replace('-', '_'), 'verdict': 'ACCEPT' if passed else 'BLOCK',
                     'findings': [] if passed else finding_ids(report)},
             usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
-                   'executables': diagnostics.executable_record(options.get('resolutions', {}))})
+                   'executables': diagnostics.executable_record(options.get('resolutions', {})),
+                   **({'failover': failover_info} if failover_info else {})})
         finalized = True
         final = store.load_ref(reference)
         if final['result'] != ('CHECK_OK' if passed else 'CHECK_FAILED') or final['reason'] != ('NONE' if passed else 'CODE_FINDINGS'):
@@ -1275,6 +1335,7 @@ def main() -> int:
         # FINAL preserves execution history; only settled publication is usable.
         store.settle_review(reference)
         record_in_ladder(args, store, reference, before[0], policy)
+        record_failover_in_ladder(args, before[0], failover_info)
         print(f"{source}: {report.splitlines()[0].strip()} | {output}\n"
               'Usage receipt: ' + json.dumps(reference, sort_keys=True), flush=True)
         announced = True
