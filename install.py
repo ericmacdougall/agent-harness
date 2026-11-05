@@ -29,7 +29,8 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "domain_gates.py", "domain_checklists.json",
          "command_guard.py", "command_guard_hook.py", "redact.py",
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py",
-         "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py")
+         "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
+         "ahd.py", "ahd_peek.py", "ahd_policy.json")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
