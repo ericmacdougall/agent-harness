@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Lift or inspect holds (rules S08/S09). A hold is lifted only by the user.
+"""Lift or inspect holds (rules S08/S09). A hold is lifted only on a real user instruction.
 
   holds.py status
   holds.py lift <hold-id> --source 'user:<session>/<message-uuid> "lift hold <hold-id>"'
 
-To lift a hold the user (1) sends Claude the message `lift hold <hold-id>` (that exact text as the whole message;
-"please" in front and a final "." or "!" are tolerated) and (2) runs `holds.py lift` in their own interactive
-terminal, citing that message. `lift` refuses without a terminal on stdin and stdout (an agent's Bash tool has
-none), then parses the source with provenance.py and looks the message up in that session's transcript
-(provenance.find_user): the same uuid must be a human-typed message, and the whole message must be the lift
-phrase, so a quote cut out of "do not lift hold yates" or "until I lift hold yates" lifts nothing. Anything else
-(ticket, wal, inferred, agent text, a uuid that is not found) is refused. holds_guard.py re-verifies every state
-entry with the same rule on every call, refuses any agent call of `holds.py` other than `status`, protects the
-policy files and refuses agent writes to session transcripts.
+Any agent (main included) may run `lift`; the authority is the user's message, checked twice:
+  1. the LOCAL transcript (provenance.find_user): the uuid must be a human-typed message in that session and the whole
+     message must be the lift phrase `lift hold <id>` ("please" in front and a final "." or "!" tolerated), so a quote
+     cut out of "do not lift hold yates" or "until I lift hold yates" lifts nothing;
+  2. the OFF-HOST TRANSCRIPT BACKUP (rclone, the log backup's Dropbox remote): the same uuid and words must be in the
+     backed-up copy of that session's transcript. A message that is not backed up yet is refused with the next step
+     (run the backup, then retry); an unreachable backup is refused (fail closed). Nothing is cached.
+After writing holds.state.json, lift runs `integrity.py record` so the new state is part of the mirrored record.
+holds_guard.py re-verifies every state entry against the local transcript on every call.
 """
 from __future__ import annotations
 
@@ -20,14 +20,21 @@ import argparse
 import json
 import os
 import re
+import socket
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
 POLICY = HERE / "holds.json"
 STATE = HERE / "holds.state.json"
+BACKUP_RUN = "~/.agent-harness/bin/log-backup.sh"
+BACKUP_BASE = "lessons-dropbox:Backups/agent-logs"
+RCLONE_NOT_FOUND = (3, 4)  # rclone exit codes: directory not found, file not found
 
 
 def load_state(path: Path = STATE) -> dict:
@@ -59,14 +66,9 @@ def lift_phrase_ok(text: str, hold_id: str) -> bool:
         and not NEGATION.search(t)
 
 
-def _interactive() -> bool:
-    return os.isatty(0) and os.isatty(1)
-
-
 def verify_user_source(source: str, finder=None, hold_id: str = None) -> dict:
     """Parsed user source whose uuid really is a human message with that excerpt, else ValueError. With a hold id the
-    quoted words AND the whole human message (the finder's preview) must be exactly `lift hold <id>`, so an unrelated
-    message, or the phrase cut out of a negated or conditional sentence, can not lift anything."""
+    quoted words AND the whole human message (the finder's preview) must be exactly `lift hold <id>`."""
     import provenance
     try:
         parsed = provenance.parse_source(source)
@@ -90,19 +92,102 @@ def verify_user_source(source: str, finder=None, hold_id: str = None) -> dict:
     return parsed
 
 
-def lift(hold_id: str, source: str, policy: Path = POLICY, state_path: Path = STATE, finder=None, now=None) -> str:
+class BackupUnreachable(Exception):
+    """The off-host transcript backup could not be asked (rclone missing, network, auth, timeout)."""
+
+
+def _rclone_env() -> dict:
+    """Inherited RCLONE_* options (other than the config path) must not redirect the lookup."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("RCLONE_") or k == "RCLONE_CONFIG"}
+
+
+def backup_location(session: str) -> str:
+    """rclone path of the backed-up transcript, the layout harness/bin/log-backup.sh writes:
+    <LOG_BACKUP_REMOTE or lessons-dropbox:Backups/agent-logs>/<LOG_BACKUP_HOST or hostname -s>/.claude/projects/
+    <project dir>/<session>.jsonl."""
+    import provenance
+    try:
+        local = provenance.find_transcript(session)
+    except provenance.Problem as exc:
+        raise ValueError(f"cannot locate the local transcript: {exc}") from None
+    base = os.environ.get("LOG_BACKUP_REMOTE") or BACKUP_BASE
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*:[A-Za-z0-9_./-]*", base) or ".." in base:
+        raise ValueError("LOG_BACKUP_REMOTE is not a plain NAME:path")
+    host = os.environ.get("LOG_BACKUP_HOST") or socket.gethostname().split(".")[0]
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", host):
+        raise ValueError("backup host label is not plain")
+    return f"{base.rstrip('/')}/{host}/.claude/projects/{local.parent.name}/{session}.jsonl"
+
+
+def backup_has_message(session: str, uuid: str, hold_id: str, run=subprocess.run, rclone: str = "rclone",
+                       remote: str | None = None) -> bool:
+    """True when the backed-up transcript holds the human message `uuid` and it is the lift phrase for hold_id.
+    False when the transcript or the message is not in the backup yet. BackupUnreachable when rclone can not answer.
+    The copy goes to a private temporary directory removed afterwards; no secret is passed in argv."""
+    import provenance
+    remote = remote or backup_location(session)
+    try:
+        st = run([rclone, "lsjson", "--stat", "--ask-password=false", "--", remote], stdin=subprocess.DEVNULL,
+                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, env=_rclone_env(), check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BackupUnreachable(f"rclone could not run ({type(exc).__name__})") from None
+    if st.returncode in RCLONE_NOT_FOUND:
+        return False
+    if st.returncode != 0:
+        raise BackupUnreachable(f"rclone lsjson exit {st.returncode}")
+    with tempfile.TemporaryDirectory(prefix="holds-backup-") as tmp:
+        project = Path(tmp) / "projects" / remote.rsplit("/", 2)[-2]
+        project.mkdir(parents=True, mode=0o700)
+        target = project / f"{session}.jsonl"
+        try:
+            cp = run([rclone, "copyto", "--ask-password=false", "--", remote, str(target)], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300, env=_rclone_env(), check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BackupUnreachable(f"rclone could not copy ({type(exc).__name__})") from None
+        if cp.returncode in RCLONE_NOT_FOUND:
+            return False
+        if cp.returncode != 0 or not target.is_file():
+            raise BackupUnreachable(f"rclone copyto exit {cp.returncode}")
+        try:
+            found = provenance.find_user(session, f"lift hold {hold_id}", home=tmp, limit=50)
+        except provenance.Problem as exc:
+            raise BackupUnreachable(f"backed-up transcript unreadable: {exc}") from None
+    return any(str(f.get("uuid", "")).lower() == uuid.lower() and lift_phrase_ok(f.get("preview", ""), hold_id)
+               for f in found)
+
+
+def record_integrity() -> str:
+    """Run integrity.py record next to this file; a one-line status (never raises: the lift already happened)."""
+    try:
+        r = subprocess.run([sys.executable, "-I", "-S", str(HERE / "integrity.py"), "record"],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"integrity record could not run ({type(exc).__name__}); run integrity.py record"
+    last = (r.stdout.strip().splitlines() or [""])[-1][:200]
+    return last if r.returncode == 0 else f"integrity record failed (exit {r.returncode}): {last}; run integrity.py record"
+
+
+def lift(hold_id: str, source: str, policy: Path = POLICY, state_path: Path = STATE, finder=None, now=None,
+         backup=None, record=None) -> str:
     ids = {h["id"] for h in json.loads(policy.read_text())["holds"]}
     if hold_id not in ids:
         raise ValueError(f"unknown hold {hold_id!r}; known: {', '.join(sorted(ids))}")
-    if not _interactive():
-        raise ValueError("a hold is lifted only by the user in an interactive terminal (stdin and stdout must be a "
-                         "TTY); an agent can not run this")
     parsed = verify_user_source(source, finder, hold_id)
+    check = backup or backup_has_message
+    try:
+        in_backup = check(parsed["session"], parsed["uuid"], hold_id)
+    except BackupUnreachable as exc:
+        raise ValueError(f"the off-host transcript backup is unreachable ({exc}); refusing to lift (fail closed); "
+                         "check `rclone lsd lessons-dropbox:` and retry") from None
+    if not in_backup:
+        raise ValueError(f"message {parsed['uuid']} is not in the off-host transcript backup yet; run the backup now: "
+                         f"{BACKUP_RUN}, then retry")
     state = load_state(state_path)
     state["lifted"][hold_id] = {"source_uuid": parsed["uuid"], "session": parsed["session"],
                                 "excerpt": parsed["excerpt"][:200], "at": int(time.time() if now is None else now)}
     write_state(state, state_path)
-    return f"hold {hold_id} lifted by user message {parsed['uuid']}"
+    status = (record or record_integrity)()
+    return f"hold {hold_id} lifted by user message {parsed['uuid']} (verified locally and in the backup); {status}"
 
 
 def main(argv=None) -> int:

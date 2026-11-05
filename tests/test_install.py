@@ -185,6 +185,17 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(len(settings["hooks"]["PreToolUse"]), 6)  # + spec gate + ask gate + holds guard
         self.assertEqual(settings["hooks"]["PreToolUse"][0]["hooks"][0]["args"], [])
 
+    def test_holds_guard_runs_isolated_and_blocks_on_failure_without_duplicates(self):
+        for _ in range(2):  # a reinstall recognises the -I -S handler as managed and replaces it
+            install(self.home, apply=True)
+        groups = json.loads((self.claude / "settings.json").read_text())["hooks"]["PreToolUse"]
+        guards = [h for g in groups for h in g["hooks"] if any(str(a).endswith("holds_guard.py") for a in h.get("args", []))]
+        self.assertEqual(len(guards), 1)
+        self.assertEqual(guards[0]["args"], ["-I", "-S", str(self.claude / "hooks" / "holds_guard.py")])
+        self.assertEqual((guards[0]["onFailure"], guards[0]["timeout"]), ("block", 10))
+        for name in ("integrity.py", "integrity_policy.json", "holds_guard.py", "holds.py"):
+            self.assertTrue((self.claude / "hooks" / name).is_file(), name)
+
     def test_backups_are_private(self):
         (self.claude / "settings.json").write_text(json.dumps({"env": {"EXAMPLE": "value"}}))
         install(self.home, apply=True)

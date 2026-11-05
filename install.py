@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import stat
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +25,8 @@ AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py",
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
          "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py",
-         "domain_gates.py", "domain_checklists.json", "doctor.py", "hooks_manifest.json", "rules.json", "holds_guard.py", "holds.py", "holds.json")
+         "domain_gates.py", "domain_checklists.json", "doctor.py", "hooks_manifest.json", "rules.json", "holds_guard.py", "holds.py", "holds.json",
+         "integrity.py", "integrity_policy.json")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -37,6 +39,11 @@ NO_CONTENT_CHECK = object()
 
 class DirectoryPublicationError(OSError):
     """An exclusive directory publish could not be completed safely."""
+
+
+def hook_script(hook: dict):
+    """The script a python3 hook runs: its first argument that is not an interpreter flag (-I, -S ...)."""
+    return next((a for a in (hook.get("args") or []) if not str(a).startswith("-")), None)
 
 
 def managed_scripts(claude: Path) -> set[str]:
@@ -101,10 +108,12 @@ def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]
             "matcher": GOODQA_STATUS_TOOLS,
             "hooks": [spec_gate],
         }, {
-            # Holds (yates, Petfiliate, OptinRouter), credential paths, force pushes. Fails CLOSED (denies) on its own crash or input it can not parse.
+            # Holds, credential paths, protected harness files, force pushes. Fails CLOSED: a deny on its own crash,
+            # bad input or 4 s internal deadline; -I -S keeps PYTHONPATH/site out; onFailure blocks on a timeout.
             "matcher": HOLDS_TOOLS,
-            "hooks": [{"type": "command", "command": "python3", "args": [str(claude / "hooks" / "holds_guard.py")],
-                       "timeout": 10}],
+            "hooks": [{"type": "command", "command": "python3",
+                       "args": ["-I", "-S", str(claude / "hooks" / "holds_guard.py")],
+                       "timeout": 10, "onFailure": "block"}],
         }],
     }
     if provenance:
@@ -144,7 +153,7 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
                 hook for hook in item.get("hooks", [])
                 if not (hook.get("type") == "command"
                         and hook.get("command") == "python3"
-                        and (hook.get("args") or [None])[0] in scripts)
+                        and hook_script(hook) in scripts)
             ]
             if remaining == item.get("hooks", []):
                 preserved.append(item)
@@ -742,6 +751,23 @@ def netwatch_status(home: Path, apply: bool, flag) -> str:
         return f"netwatch: skipped ({error.__class__.__name__}: {error})"
 
 
+def integrity_status(home: Path, apply: bool, run=subprocess.run) -> str:
+    """After a successful install, record the new hashes off-host (integrity.py record), so a legitimate change is
+    never reported as tampering. A mirror failure does not fail the install; verify then reports UNVERIFIABLE."""
+    script = home.expanduser() / ".claude" / "hooks" / "integrity.py"
+    if not apply:
+        return f"would record integrity hashes ({script} record)"
+    try:
+        r = run([sys.executable, "-I", "-S", str(script), "record"], stdin=subprocess.DEVNULL, capture_output=True,
+                text=True, timeout=180, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"WARNING: integrity record could not run ({error.__class__.__name__}); run {script} record"
+    last = (r.stdout.strip().splitlines() or [""])[-1][:200]
+    if r.returncode != 0:
+        return f"WARNING: integrity record failed (exit {r.returncode}): {last}; run {script} record"
+    return f"integrity: {last}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
@@ -778,6 +804,7 @@ def main() -> None:
     for path in changes:
         print(f"  {path}")
     print(f"  {install_git_backstop(args.home, args.apply)}")
+    print(f"  {integrity_status(args.home, args.apply)}")
     print(f"  {scratch_status(args.home, args.apply, durable_tmp)}")
     print(f"  {netwatch_status(args.home, args.apply, args.netwatch)}")
     if not args.apply:

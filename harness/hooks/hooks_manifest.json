@@ -1,6 +1,57 @@
 {
  "schema": 1,
  "note": "status installed = required on every listed flavor; pending = owner PR not merged, reported NOT-ENFORCED. tests/test_doctor.py fails when a pending row's script already ships in harness/hooks (promote it and make the installer wire it). known_gap marks a shipped script that one flavor does not wire yet; it names the batch that fixes it.",
+ "integrity_files": [
+  "commit_policy.json",
+  "commit_policy.py",
+  "deliver.py",
+  "doctor.py",
+  "domain_checklists.json",
+  "domain_gates.py",
+  "git_safety.py",
+  "github_identity.py",
+  "holds.json",
+  "holds.py",
+  "holds_guard.py",
+  "hooks_manifest.json",
+  "integrate_local.py",
+  "integrity.py",
+  "integrity_policy.json",
+  "peer_review.py",
+  "process.py",
+  "provenance.py",
+  "provenance_hooks.py",
+  "provenance_policy.json",
+  "publish_feature.py",
+  "report_file.py",
+  "rescue.py",
+  "review_map.py",
+  "rules.json",
+  "safe_input.py",
+  "spec_flow.py",
+  "spec_policy.json",
+  "spec_template.md",
+  "ticket_adapters.py",
+  "usage_guard.py",
+  "wal.py",
+  "wal_note.py",
+  "workdir.py"
+ ],
+ "checks": [
+  {
+   "id": "integrity:verify",
+   "script": "integrity.py",
+   "args": [
+    "verify",
+    "--json"
+   ],
+   "rules": [
+    "S08",
+    "S09"
+   ],
+   "note": "tamper evidence (B1): CHANGED fails the check (exit 1), UNVERIFIABLE (mirror unreachable or no record) only warns"
+  }
+ ],
  "hooks": [
   {
    "id": "wal:session",

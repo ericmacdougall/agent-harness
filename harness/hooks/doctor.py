@@ -7,6 +7,8 @@ nothing stopped a recursive delete. Nothing noticed. This tool makes that visibl
   check         expected hooks (what install.py would write, plus hooks_manifest.json extras) against a live
                 settings.json or Codex hooks.json (local file, or read-only `ssh HOST cat PATH`).
                 exit 0 all required hooks wired, 1 something required is missing, 2 settings unreadable.
+                Also runs the manifest "checks" rows locally: `integrity.py verify` (tamper evidence) fails the check
+                on CHANGED and only warns on UNVERIFIABLE; --no-integrity skips it.
   rules-report  rules.json (docs/rules/rules.json) joined with `check`: ENFORCED / ALERT-ONLY / NOT-ENFORCED /
                 ADVISORY per rule. exit 1 if a rule has no mechanism mapping and is not marked advisory.
 
@@ -190,6 +192,36 @@ def remote_names(ssh: str, path: str) -> set[str]:
     return set(r.stdout.split())
 
 
+def check_integrity(manifest: dict, hooks_dir: Path, settings: str, run=subprocess.run) -> list[dict]:
+    """Manifest "checks" rows (integrity.py verify): CHANGED is a required failure (exit 1), UNVERIFIABLE a warning,
+    MATCH is WIRED. A missing script fails only where the holds guard is installed (B1 ships both)."""
+    out = []
+    for row in manifest.get("checks", []):
+        script = hooks_dir / row["script"]
+        base = {"id": row["id"], "owner": row.get("owner", ""), "rules": row.get("rules", [])}
+        if not script.is_file():
+            needed = (hooks_dir / "holds_guard.py").is_file()
+            out.append({**base, "state": SCRIPT_MISSING, "required": needed, "detail": f"{script} does not exist"})
+            continue
+        argv = ["python3", "-I", "-S", str(script), "--hooks-dir", str(hooks_dir), "--settings", settings, *row["args"]]
+        try:
+            r = run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            result = json.loads(r.stdout)
+            status = result["status"]
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as exc:
+            out.append({**base, "state": "UNVERIFIABLE", "required": False, "detail": f"verify did not answer ({type(exc).__name__})"})
+            continue
+        if status == "MATCH":
+            out.append({**base, "state": WIRED, "required": True, "detail": f"integrity MATCH ({result.get('mirror', '')})"})
+        elif status == "CHANGED":
+            keys = ", ".join(c.get("key", "?") for c in result.get("changed", []))[:300]
+            out.append({**base, "state": "CHANGED", "required": True, "detail": f"differs from the off-host record: {keys}"})
+        else:
+            out.append({**base, "state": "UNVERIFIABLE", "required": False,
+                        "detail": f"warning: {str(result.get('reason', ''))[:200]}"})
+    return out
+
+
 def verdict(findings: list[dict]) -> int:
     return 0 if all(f["state"] == WIRED or not f["required"] for f in findings) else 1
 
@@ -240,6 +272,7 @@ def main(argv=None) -> int:
     c.add_argument("--hooks-dir", default="~/.claude/hooks")
     c.add_argument("--ssh")
     c.add_argument("--no-canary", action="store_true")
+    c.add_argument("--no-integrity", action="store_true", help="skip the integrity.py verify row (it uses ssh)")
     c.add_argument("--json", action="store_true")
     r = sub.add_parser("rules-report")
     r.add_argument("--settings", default="~/.claude/settings.json")
@@ -267,6 +300,8 @@ def main(argv=None) -> int:
                 return 2
             exists = names.__contains__
         findings = check_hooks(manifest, a.flavor, live, hooks_dir, canary=not (a.no_canary or a.ssh), exists=exists)
+        if not a.ssh and not a.no_integrity and a.flavor == "claude":
+            findings += check_integrity(manifest, hooks_dir, str(Path(a.settings).expanduser()))
         if a.json:
             print(json.dumps(findings, indent=1))
         else:
