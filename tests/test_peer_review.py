@@ -15,9 +15,42 @@ from unittest.mock import patch
 
 
 REVIEW = Path(__file__).resolve().parents[1] / 'harness/hooks/peer_review.py'
+sys.path.insert(0, str(REVIEW.parent))
+import review_diagnostics  # noqa: E402
 
 
 _OFFLINE = None
+_SYSTEM_BIN = []
+REVIEWER_NAMES = frozenset({'codex', 'claude', 'codex.js'})
+
+
+def system_path():
+    """A PATH entry with the machine's tools but never a real reviewer CLI.
+
+    A real codex or claude in /usr/bin (dev2 has one) must not be discovered and
+    executed by a test that removes the fake reviewer to simulate absence.
+    """
+    if not _SYSTEM_BIN:
+        holder = tempfile.TemporaryDirectory(prefix='review-sysbin-')
+        target = Path(holder.name)
+        for source in ('/usr/bin', '/bin'):
+            try:
+                names = sorted(os.listdir(source))
+            except OSError:
+                continue
+            for name in names:
+                full = os.path.join(source, name)
+                if name in REVIEWER_NAMES or os.path.lexists(target / name) or os.path.isdir(full):
+                    continue
+                if os.access(full, os.X_OK):
+                    os.symlink(full, target / name)
+        empty = {'known_install_locations': {'codex': [], 'claude': []}}
+        for reviewer in ('codex', 'claude'):
+            found = review_diagnostics.discover_executable(reviewer, policy=empty, roots=[], path_env=holder.name)
+            if found['path'] is not None:
+                raise RuntimeError('test system PATH still reaches a real reviewer: %s' % found['path'])
+        _SYSTEM_BIN.append(holder)
+    return _SYSTEM_BIN[0].name
 
 
 def setUpModule():  # tests never call the ticket tracker; restored in tearDownModule so it cannot leak into other modules
@@ -39,6 +72,13 @@ class PeerReviewTests(unittest.TestCase):
             'AGENT_HARNESS_USAGE_DIR': str(self.root / 'usage-state')})
         self.guard_environment.start()
         self.addCleanup(self.guard_environment.stop)
+        # Never discover a real reviewer CLI from the machine's install locations.
+        policy = self.root / 'review-policy.json'
+        policy.write_text(json.dumps({'schema': 1, 'known_install_locations': {'codex': [], 'claude': []}}))
+        policy.chmod(0o600)
+        self.policy_environment = patch.dict(os.environ, {'AGENT_HARNESS_REVIEW_POLICY': str(policy)})
+        self.policy_environment.start()
+        self.addCleanup(self.policy_environment.stop)
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         subprocess.run(['git', 'init', '-q', '-b', 'main', str(self.repo)], check=True)
@@ -123,21 +163,34 @@ print(os.environ.get('CLAUDE_VERDICT', default + '\\nFallback reviewed.'))
 sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
 ''')
 
+    @staticmethod
+    def evidence(head):
+        return (f'\nReviewed HEAD {head}\n$ python3 -m unittest discover tests\nRan 12 tests in 0.5s\nOK\nexit 0\n')
+
     def fake(self, name, body):
         path = self.bin / name
         path.write_text(f'#!{sys.executable}\n{body}')
         path.chmod(0o700)
 
-    def invoke(self, *, packet=None, output=None, env=None, expected_head=None, stage='pr', extra=()):
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin', **(env or {})}
+    def invoke(self, *, packet=None, output=None, env=None, expected_head=None, stage='pr', extra=(), cwd=None):
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + system_path(), **(env or {})}
         if expected_head is None:
             expected_head = subprocess.run(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'],
                                            check=True, capture_output=True, text=True).stdout.strip()
+        if stage in {'pr', 'code-inspection'} and packet in (None, self.packet) and self.packet.exists():
+            # Packets must carry run evidence and the exact HEAD (review_diagnostics.lint_packet).
+            if review_diagnostics.lint_packet(stage, self.packet.read_text(errors='replace'), expected_head):
+                with self.packet.open('a') as handle:
+                    handle.write(self.evidence(expected_head))
+        if stage == 'plan':  # plan packets now need a resource budget; the fixture host is a vm so no live capacity is read
+            target = Path(packet or self.packet)
+            if target.exists() and '## Resource budget' not in target.read_text():
+                target.write_text(target.read_text() + '\n## Resource budget\nHost: vm:fixture\nCapacity: fixture VM, 8 GB memory, 4 cores, 50 GB disk\nFan-out: agents=1 jobs=1 processes=2 browser_pages=0 test_workers=1\nPeak memory: 1 GB (method: fixture)\nCPU: 1 cores (method: fixture)\nDisk: 1 GB (method: fixture)\nNetwork: 1 MB (method: fixture)\nWall time: 1 min\nCap and kill: none needed for a fixture; run_capped.py would pause on breach\nCheckpoint: none\n')
         command = [sys.executable, str(REVIEW), stage, '--repo', str(self.repo),
                                '--packet', str(packet or self.packet), '--output', str(output or self.output),
                                *(['--expected-head', expected_head] if stage in {'pr', 'code-inspection'} else []), *extra]
         return subprocess.run(command,
-                              text=True, capture_output=True, env=environment, timeout=45)
+                              text=True, capture_output=True, env=environment, timeout=45, cwd=cwd)
 
     def test_source_local_clean_filter_is_refused_before_execution(self):
         (self.repo / '.gitattributes').write_text('app.txt filter=fixture\n')
@@ -410,6 +463,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                     stack.enter_context(patch.dict(os.environ, {'AGENT_HARNESS_USAGE_DIR': str(self.root / ('usage-' + failure))}))
                     stack.enter_context(patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(output)]))
+                    stack.enter_context(patch.object(module, 'plan_resource_gate', return_value=(0, '')))
                     stack.enter_context(patch.object(module, 'make_snapshot', side_effect=snapshot))
                     model = stack.enter_context(patch.object(module, 'review_snapshot', side_effect=review))
                     stack.enter_context(patch.object(module.tempfile.TemporaryDirectory, 'cleanup', cleanup))
@@ -661,11 +715,14 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                 raise OSError('synthetic stdout failure')
             print(*arguments, **keywords)
 
+        if review_diagnostics.lint_packet('code-inspection', self.packet.read_text(errors='replace'), head):
+            with self.packet.open('a') as handle:
+                handle.write(self.evidence(head))
         output, errors = io.StringIO(), io.StringIO()
         with patch.object(sys, 'argv', ['review', 'code-inspection', '--repo', str(self.repo),
                 '--packet', str(self.packet), '--output', str(self.output),
                 '--expected-head', head, '--input-manifest', str(manifest)]), \
-             patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin'}), \
+             patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'CODE_INSPECTION_RESULT: ACCEPT', '')), \
              patch.object(usage_guard.Run, 'finish', finish_with_hook), \
              patch.object(module, 'print', side_effect=announce, create=True), \
@@ -848,7 +905,8 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                 self.assertFalse(output.exists())
 
     def test_report_names_raw_packet_bytes_digest(self):
-        raw = b'Scope with non-UTF8 byte: \xff'
+        head = subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], text=True).strip()
+        raw = b'Scope with non-UTF8 byte: \xff' + self.evidence(head).encode()
         self.packet.write_bytes(raw)
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -878,6 +936,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         errors = io.StringIO()
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
+             patch.object(module, 'plan_resource_gate', return_value=(0, '')), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'fsync', side_effect=fsync_then_mutate), \
              contextlib.redirect_stderr(errors):
@@ -909,6 +968,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         errors = io.StringIO()
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
+             patch.object(module, 'plan_resource_gate', return_value=(0, '')), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'link', side_effect=link_then_mutate), \
              contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
@@ -993,7 +1053,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         subdir = self.repo / 'subdir'
         subdir.mkdir()
         capture = self.root / 'model.capture'
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + system_path(),
                        'CAPTURE_CODEX_PROMPT': str(capture)}
         result = subprocess.run([sys.executable, str(REVIEW), 'pr', '--repo', str(subdir),
                                  '--packet', str(self.packet), '--output', str(self.output)],
@@ -1017,7 +1077,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         alias.symlink_to(self.root, target_is_directory=True)
         result = self.invoke(packet=alias / 'packet.md', output=self.packet)
         self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(self.packet.read_text(), 'Scope and evidence for a disposable review.')
+        self.assertTrue(self.packet.read_text().startswith('Scope and evidence for a disposable review.'))
 
     def test_case_aliases_cannot_delete_repo_file_or_packet(self):
         alias_repo = self.repo.parent / self.repo.name.upper()
@@ -1031,7 +1091,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertEqual(tracked.read_text(), 'preserve\n')
         second = self.invoke(output=alias_packet)
         self.assertEqual(second.returncode, 2, second.stdout)
-        self.assertEqual(self.packet.read_text(), 'Scope and evidence for a disposable review.')
+        self.assertTrue(self.packet.read_text().startswith('Scope and evidence for a disposable review.'))
 
     def test_hardlinked_packet_cannot_be_unlinked_as_output(self):
         alias = self.root / 'packet-hardlink.md'
@@ -1296,11 +1356,12 @@ class ProviderEnvelopeTests(unittest.TestCase):
             calls.append((command[0], timeout))
             return (1, quota, '') if len(calls) == 1 else (0, valid, '')
         with tempfile.TemporaryDirectory() as temporary, \
-             patch.object(self.module.shutil, 'which', return_value='fixture'), \
+             patch.object(self.module.diagnostics, 'discover_executable',
+                          side_effect=lambda name, **_: {'name': name, 'path': '/fixture/' + name, 'source': 'PATH', 'rejected': []}), \
              patch.object(self.module, 'run', side_effect=run), \
              patch.object(self.module.time, 'monotonic', side_effect=[0, 0, 0, 721, 721]):
             source, report, reason = self.module.review_snapshot(Path(temporary), 'a' * 40, 'pr', 'Review', 'Evidence')
-        self.assertEqual(calls, [('codex', 720), ('claude', 719)])
+        self.assertEqual(calls, [('/fixture/codex', 720), ('/fixture/claude', 719)])
         self.assertEqual(report, 'VERDICT: PASS')
         self.assertIn('fallback', reason)
 
@@ -1313,6 +1374,7 @@ class LadderSelectionTests(unittest.TestCase):
     """AC-9 of goodqa#14527: the reviewer comes from the tier table and the result feeds the task ledger."""
     fake = PeerReviewTests.fake
     invoke = PeerReviewTests.invoke
+    evidence = staticmethod(PeerReviewTests.evidence)
 
     def setUp(self):
         PeerReviewTests.setUp(self)

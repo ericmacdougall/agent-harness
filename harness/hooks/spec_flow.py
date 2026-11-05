@@ -38,7 +38,8 @@ RECORD_BLOCK = re.compile(r"```" + RECORD_FENCE + r"\n(.*?)\n```", re.S)
 NAMESPACE = uuid.UUID("8f2a4f2e-3c1b-4b7e-9d55-6a1f0c2b7e10")
 KINDS = ("spec", "evidence", "click_test", "signoff")
 ROLES = ("adversarial", "acceptance")
-LOGGED_AGENT_TYPES = ("task-owner", "click-tester", "fixer", "red-team")
+# Every agent type is logged by SubagentStart (goodqa#14613); only these may record a spec review.
+REVIEWER_AGENT_TYPES = ("task-owner", "click-tester", "fixer", "red-team")
 OPEN_STATUSES = {"triage", "backlog", "todo", "in_progress", "in_review", "on_dev", "verified_on_dev",
                  "on_staging", "verified_on_staging", "on_production"}
 REASON_STATUSES = {"wont_fix", "duplicate"}
@@ -206,7 +207,7 @@ def parse_spec(text: str) -> dict:
 PLACEHOLDER = re.compile(r"<[^<>\n]{2,80}>")
 
 
-def lint(text: str, config: dict | None = None, check_provenance: bool = True) -> list:
+def lint(text: str, config: dict | None = None, check_provenance: bool = True, spec_policy: dict | None = None) -> list:
     spec = parse_spec(text)
     problems = []
     header = spec["header"]
@@ -235,6 +236,9 @@ def lint(text: str, config: dict | None = None, check_provenance: bool = True) -
             problems.append(f"section `## {name}` is empty")
         elif PLACEHOLDER.search(body):
             problems.append(f"section `## {name}` still holds a template placeholder like <...>")
+    if spec_policy and spec_policy.get("resource_budget_gate", "off") == "enforce":
+        import resource_budget  # structure only here; peer_review.py plan also compares the numbers to live capacity
+        problems.extend(resource_budget.lint_budget(text)[0])
     ids = [ident for ident, _ in spec["criteria"]]
     if not ids:
         problems.append("no acceptance criteria: add `- AC-1: <observable result>. Verify by: <check>.`")
@@ -1325,7 +1329,7 @@ def cmd_new(args, spec_policy):
 def cmd_lint(args, spec_policy):
     text = read_spec_text(Path(args.spec))
     _, _, config = ticket_config(spec_policy)
-    problems = lint(text, config)
+    problems = lint(text, config, spec_policy=spec_policy)
     warnings, domain_problems = domain_lint(text, getattr(args, "repo", None) or ".", spec_policy)
     problems = problems + domain_problems
     print(json.dumps({"status": "FAIL" if problems else "PASS", "problems": problems, "warnings": warnings,
@@ -1339,7 +1343,7 @@ def cmd_packet(args, spec_policy):
         _, _, config = ticket_config(spec_policy)
     except (OSError, ValueError, ImportError) as error:
         raise SpecError(f"cannot load the ticket configuration to lint the spec: {error}", EXIT_USAGE)
-    problems = lint(text, config)
+    problems = lint(text, config, spec_policy=spec_policy)
     if problems:  # reviewers should never be handed a spec that cannot be attached
         print(json.dumps({"status": "FAIL", "problems": problems}, indent=1))
         return EXIT_MISSING
@@ -1377,8 +1381,10 @@ def cmd_review(args, spec_policy):
         types = [e.get("agent_type") for e in wal_entries(checked_wal(Path(args.wal)))
                  if e.get("event") == "subagent" and e.get("agent_id") == agent]
         if not types:
-            raise SpecError(f"agent {args.agent} has no subagent record in {args.wal}; only "
-                            f"{', '.join(LOGGED_AGENT_TYPES)} agents are logged")
+            raise SpecError(f"agent {args.agent} has no subagent record in {args.wal}")
+        if types[0] not in REVIEWER_AGENT_TYPES:
+            raise SpecError(f"agent {args.agent} is a {types[0] or 'typeless'} agent; only "
+                            f"{', '.join(REVIEWER_AGENT_TYPES)} agents may record a review")
         if args.role == "adversarial" and types[0] != "red-team":
             raise SpecError("the adversarial review must come from a red-team agent, a helper receipt or a human")
         data = read_regular(Path(args.report_file), 1_000_000)

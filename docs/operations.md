@@ -92,6 +92,17 @@ python3 ~/.codex/agent-harness/usage_guard.py reconcile --run RUN_ID --actor own
 python3 ~/.codex/agent-harness/usage_guard.py ack-pool --provider codex --pool default --actor owner-a --reason 'Availability change verified' --evidence 'private-evidence-reference'
 ```
 
+Every START also records who holds the reservation (`owner_process`: pid, host, boot id, a process start-time token taken with TZ=UTC, and a deadline of the run's recorded timeout plus 60 s of grace; `AGENT_HARNESS_DEADLINE_GRACE` 0..3600 shortens the grace for live tests). A supervisor records each child it spawns through `process.run(on_spawn=run.note_child)` in `children.json`; peer_review records its reviewer process. A reservation without a FINAL is reconciled automatically, on the next `begin`, `acquire_pool`, `reconcile --auto` or `sweep`, only when all of these are proven on the same host: the owner is dead (pid gone, or alive with a different start token of the same scheme, or the boot id changed), every recorded child is dead by the same rule, and the deadline has passed. The record is a `reconciled.json` of kind `automatic_reconciliation` with the liveness facts as evidence; it keeps the run UNKNOWN / NO_RESULT, releases the pools the run held with a `RECONCILED` event, and never writes a FINAL; a late `finish` on a reconciled run is refused and its result discarded. A dead owner before its deadline, an owner on another host, a live owner or child, a START without owner facts, a boot id that cannot be read, and any pool held by a FINAL that itself says TIMEOUT or UNKNOWN stay uncertain and still need the manual command above.
+
+```sh
+python3 ~/.codex/agent-harness/usage_guard.py reconcile --run RUN_ID --auto
+python3 ~/.codex/agent-harness/usage_guard.py sweep
+```
+
+`sweep` prints one report per run (`reconciled`, `why`, `liveness`), probes only runs without a completion, and is safe to run on a schedule; the dead-man check uses it.
+
+Attempt budget: an attempt is zero-launch only when its FINAL shows `provider_launches` 0 (an int), no reported usage, execution `NOT_STARTED` and reason TRANSIENT_INFRA, LOW_DISK, QUOTA or AUTH: the provider was never launched and the refusal was infrastructure. Such attempts do not spend the two-launch repeat budget and the next attempt needs no `--repeat-reason`. Launched attempts, content outcomes (CODE_FINDINGS, INPUT_CHANGED, INVALID_OUTPUT), uncertain results and reconciled runs without a FINAL still count. Zero-launch attempts are bounded to 6 per rolling hour per invocation (`ZERO_LAUNCH_CAP`, `ZERO_LAUNCH_WINDOW`) and 32 attempt slots in all (`MAX_ATTEMPTS`); the refusal is `BUDGET_EXHAUSTED` and names the infrastructure, not the packet. Every attempt's elapsed time still counts against the declared aggregate budget.
+
 These actions retain history and record actor/reason/evidence; they never manufacture successful execution. Acknowledging availability is separate from reconciling an active owner. Quota/auth cooldowns apply only to cooperating callers sharing this state directory and the configured opaque provider/auth-pool alias. Aliases do not derive from credentials. Trusted account errors can set a cooldown; vague credit messages, model-specific availability and tool content cannot disable the whole pool. A reliable reset hint can permit a later call after its reset; otherwise availability needs recorded evidence, with no polling, purchase or automatic model-switch loop.
 
 Before expensive commands, disk probes cover work/build, temp and receipt filesystems. Default floors are 2 GiB for compile/test work and 256 MiB otherwise, with `--minimum-free-bytes` for a declared override or known higher peak. Missing data or low space prevents launch. Floors are not predictions and are subject to concurrent consumption. No automatic cache deletion or broad process killing occurs. Process-group cleanup retains its existing detached-descendant limitations. Hashes/permissions catch accidental staleness or mutation; same-user receipts are cooperative evidence, not signed attestations.
@@ -148,6 +159,43 @@ The main agent can invoke `rescue.py` after repeated material findings, only in 
 
 The rescue wrapper does not stage or commit leftover model edits. It always exits 3 after a valid model attempt, including a clean committed descendant reported as `needs-main-verification`; exit 0 is never a rescue success signal. The isolated worktree and its existing Git index remain in place. Main must independently inspect the preserved worktree, branch, commit ancestry, file types and contents, and test evidence, then obtain final review before integration. If the model leaves a dirty worktree, the report says `needs-main-commit`; main must test and commit the preserved work. Any failed Astra invocation preserves the worktree for main inspection instead of triggering Fable. Fable is used only when the Astra executable is unavailable and the worktree remains unchanged under Git inspection; the main agent must give this worktree exclusive ownership. The wrapper compares `.git/info/attributes`, `.git/info/exclude`, and repository-local configuration values for their alternate paths while selecting fallback and reporting status. It does not pin the alternate files' contents or worktree-scoped configuration, nor attest to raw file bytes under every pre-existing attribute or stat-cache combination; a `needs-main-verification` report is only a handoff. Keep the report's `exit` field distinct from the helper exit: it records the model's exit code.
 
+## Review helper reliability
+
+`peer_review.py` never fails silently. Every failed review prints a `REVIEW_DIAGNOSTIC code=<CODE> reason=<usage-guard reason>` block with the cause, numbered next steps, a `wal_note.py --event blocker` command to record the blocker, and a fixed disclosure: a native review you run instead is **native evidence only, it is disclosed, it is not a helper receipt**, and it never carries the PR pass marker. The helper never suggests skipping review. The budget is unchanged: one primary and at most one authorized independent fallback, 720 seconds per provider and 1,440 in total, and no same-provider retry after any diagnostic.
+
+**Executable discovery.** Codex and Claude are looked up on `PATH` (absolute entries only; relative and empty entries are ignored) and then in `known_install_locations` of `harness/hooks/review_policy.json` (the ChatGPT app bundle, `/usr/bin/codex`, Homebrew and `~/.local/bin` by default). Set `AGENT_HARNESS_REVIEW_POLICY` to a private copy to change locations (a provider's list in the copy replaces the default list, so copy the defaults you still want); it is ignored with a warning unless you or root own it and it is not group/world-writable. Policy entries are candidates only: every candidate must resolve outside the repository, snapshot and working directory (compared case-insensitively and after Unicode normalization, and by device and inode of each ancestor, so a differently spelled path to the same folder is still refused), be a regular executable owned by you or root, not be group/world-writable, and have no world-writable ancestor (a root-owned sticky directory such as `/tmp` is accepted). The helper runs the resolved absolute path, once per provider, and records `usage.executables[provider] = {path, source}` (`PATH` or `policy`) in the run record's `final.json`; the invocation identity also holds the path digest and a digest of the effective policy. The reviewer process gets a PATH without empty, relative, repository, snapshot or working-directory entries, so a `#!/usr/bin/env node` reviewer script cannot pick up an interpreter committed in the reviewed repository. An override policy is ignored unless its directories, too, are owned by you or root and writable by no other user. Limits: the executable is checked once, after the snapshot is built and before the provider runs, so it could be swapped in between (its sha256 is recorded in the invocation identity); group-writable ancestor directories (for example a root:admin 775 `/Applications`) are accepted; system temp directories are not refused as reviewer locations.
+
+**Snapshot deadline.** Without `--snapshot-timeout`, the deadline is `base_seconds + per_gib_seconds x pack GiB` from `git count-objects -v` (30 second probe cap), clamped to 7,200 seconds. A failed, hanging or zero probe uses the base. An explicit `--snapshot-timeout` (1 to 7,200) wins. The deadline is separate from the 720/1,440 provider budget.
+
+**Usage-limit prose.** In a terminal Codex or Claude error record, or in the stderr of a Codex run that exits non-zero with no stdout, text such as "You've hit your usage limit" is classified `QUOTA` and unlocks the one independent fallback. Because it is unstructured text it writes no account-pool cooldown and sets no reset time; only structured provider codes do that.
+
+**Packet lint.** For `code-inspection` and `pr` stages the packet must contain the full `--expected-head` SHA and at least one command line (`$ ...`, `Command:`, `Testing:` or a backtick span) with, in the same fenced block within 12 lines, an exit status of 0 and a positive count (`Ran N tests`, `N passed`, `N tests`, `N checks`). A command written just above a fence may have its output in that fence. A non-zero exit is not passing evidence. Each line is inspected up to 2,048 characters and the lint stops and rejects the packet after 5 seconds, so a hostile packet cannot hang the helper. This is a format guard: a count and an exit status in the same block are not proven to come from the same command, and reviewers still verify. The packet is never rewritten and the 150,000-byte ceiling still applies. Plan packets are not linted.
+
+| Code | Reason | Cause | Next step |
+| --- | --- | --- | --- |
+| `EXEC_NOT_FOUND` | `TRANSIENT_INFRA` | The reviewer CLI was not found on PATH or in the policy install locations. | Run `command -v codex claude` in a normal shell and note the absolute path. Add that absolute path to known_install_locations in review_policy.json, or set AGENT_HARNESS_REVIEW_POLICY to a private copy you own (its list for a provider replaces the default list, so copy the defaults you still want), then rerun the same command once. |
+| `EXEC_UNTRUSTED` | `TRANSIENT_INFRA` | A reviewer CLI was found but refused: it sits inside the repo or cwd, is writable by others, or has an unsafe parent directory. | Install the CLI in a directory only you or root can write (for example ~/.local/bin). Do not point the policy at a binary inside the reviewed repository. |
+| `PROVIDER_USAGE_LIMIT` | `QUOTA` | The provider reported a usage limit in free text (no structured code). | Wait for the limit to reset or use the other authorized provider; the helper already tries one independent fallback and will not retry this provider. No account-pool cooldown is written because the text is unstructured. |
+| `PROVIDER_AUTH` | `AUTH` | The provider rejected authentication. | Sign in again with the provider CLI, then rerun once. |
+| `PROVIDER_UNAVAILABLE` | `TRANSIENT_INFRA` | The provider was overloaded, rate limited or its model was unavailable. | Rerun once later; the helper already tried the independent fallback if one was allowed. |
+| `BUDGET_EXHAUSTED` | `BUDGET_EXHAUSTED` | The 1440 second review budget (720 per provider) was used up. | Do not loop. Reconcile the usage store, then decide with the main agent whether one repeat with --repeat-reason is justified. |
+| `PROVIDER_TIMEOUT` | `TIMEOUT` | The provider exceeded its 720 second deadline. | Reconcile the run in the usage store before any retry; do not loop. |
+| `PROVIDER_IO_UNKNOWN` | `UNKNOWN` | The provider process could not be supervised to a known end. | Reconcile the unknown run in the usage store before any retry. |
+| `PROVIDER_INVALID_OUTPUT` | `INVALID_OUTPUT` | The provider produced no valid stage verdict. | Inspect the excerpt below; a rerun needs a changed packet or a declared repeat reason. |
+| `FALLBACK_NO_RESULT` | `INVALID_OUTPUT` | The independent fallback produced no valid result and no more providers remain. | Check the exit code and excerpt below, fix the cause, and rerun once with --repeat-reason. |
+| `SNAPSHOT_TIMEOUT` | `TRANSIENT_INFRA` | Preparing the review snapshot exceeded its deadline. | Rerun with a larger --snapshot-timeout (maximum 7200) or tune snapshot_timeout in review_policy.json. The snapshot deadline is separate from the 720 second per-provider budget. |
+| `SNAPSHOT_GIT_FAILED` | `TRANSIENT_INFRA` | An isolated Git step failed. | Run `git -C <repo> fsck --connectivity-only` and `git -C <repo> status` to see why. |
+| `SNAPSHOT_PARTIAL_CLONE` | `TRANSIENT_INFRA` | The repository is a partial clone (promisor remote). | Review from a full clone: `git clone --no-local <repo> <fresh-dir>`, check out the commit, rerun with --repo <fresh-dir>. |
+| `SNAPSHOT_SPARSE_INDEX` | `TRANSIENT_INFRA` | The index has skip-worktree (sparse checkout) entries. | Review from a fresh full clone, or in this clone run `git sparse-checkout disable`. |
+| `SNAPSHOT_HIDDEN_INDEX_FLAG` | `TRANSIENT_INFRA` | The index has assume-unchanged or other hidden entry flags. | List them with `git ls-files -v \| grep "^[a-z]"` and clear with `git update-index --no-assume-unchanged <path>`. |
+| `SNAPSHOT_SHALLOW` | `TRANSIENT_INFRA` | The repository is shallow. | Review from a full clone, or run `git fetch --unshallow` in a disposable clone. |
+| `SNAPSHOT_GRAFTS_ALTERNATES` | `TRANSIENT_INFRA` | The repository uses grafts or alternate object stores. | Review from a fresh clone made with `git clone --no-local` (no alternates). |
+| `SNAPSHOT_CASE_COLLISION` | `TRANSIENT_INFRA` | Reviewed paths differ only by case or Unicode form and this filesystem is case-insensitive. | Run the review on a case-sensitive filesystem (for example dev2) or a case-sensitive APFS volume. |
+| `SNAPSHOT_GITLINK` | `TRANSIENT_INFRA` | The reviewed tree contains submodule gitlinks or unsupported entries. | Review the submodule repositories separately; the packet must list their commits. |
+| `SNAPSHOT_SOURCE_CHANGED` | `TRANSIENT_INFRA` | The source checkout changed during the review. | Commit or stash changes, keep the worktree untouched while reviewing, rerun. |
+| `PYTHON_UNSUPPORTED` | `TRANSIENT_INFRA` | The Python interpreter is older than 3.9. | Run with python3.9 or newer, for example `python3.12 ~/.claude/hooks/peer_review.py ...`. |
+| `ISOLATION_FAILED` | `UNKNOWN` | Review isolation failed for a reason without a specific code. | Read the Detail line, fix the cause, rerun once; reconcile if a provider was launched. |
+
 ## Delivery workflow
 
 Both editions install the same delivery implementation and dependencies. Claude uses `~/.claude/hooks/deliver.py`; Codex uses `~/.codex/agent-harness/deliver.py` and needs no Claude installation. Remote delivery also needs an authenticated Git transport and GitHub CLI (`gh`). The helper never merges a remote PR. Repository review, authorization and scope checks remain the main agent's responsibility.
@@ -201,6 +249,15 @@ python3 ~/.codex/agent-harness/deliver.py finish --task OWNER_TASK --original /a
 Only known interrupted apply phases can make this transition. Exact clean HEAD, passing nonvacuous checks, unchanged generation/state and no shared unresolved barriers are required. `RESOLVED_BASELINE` preserves every record/ref and writes no delivery receipt; start a new reviewed generation and finish with fresh proof. It cannot settle unknown push/PR outcomes.
 
 No global Stop hook claims these steps occurred or blocks ordinary questions/background work. The main agent must call the helper and inspect the actual result. The run kit also needs useful user-facing instructions: verify a repository-native watcher or the installed dependency-free watcher (`~/.codex/agent-harness/watch-tests.py` or `~/.claude/tools/watch-tests.py`). Use `--once` to verify setup, omit it for continuous testing and Ctrl-C to stop. The helper cannot judge whether those commands are useful. Local scratch and remote checks execute repository code and are not an OS sandbox; same-user external mutations and changes reverted entirely between guards remain outside the guarantee.
+
+### Prepare preflights and failure verdicts
+
+`deliver.py prepare` refuses early, with a `reason` and a `hint` in its JSON, instead of failing late or generically:
+
+- **Target sanity (`TARGET_POLICY` in deliver.py):** the original checkout is refused (`BLOCKED_POLICY`, reasons `HUGE_STAGED`, `HUGE_UNTRACKED`, `ORIGINAL_BEHIND`, `TARGET_UNREADABLE`) when it has more than 5000 staged or 5000 untracked paths, or is more than 1000 commits behind its local `origin/<branch>` tracking ref. Counts are bounded reads; a listing that exceeds the output or time bound counts as too many, and a git error in the listing is refused as `TARGET_UNREADABLE`. Limits are inclusive. Pass `prepare --target-policy warn --wal <session WAL>` to print a warning and continue to the strict clean check instead. Warn applies to that run only (it cannot come from the run kit or the environment) and is never silent: it is refused without a usable `--wal`, and each warn run, with the checks it bypassed, is appended to the WAL (a `risk` event), kept beside the generation journal in `target-policy-overrides.json`, and shown as `target_policy_overrides` in every later output of that generation. Behind-counts use the last fetched tracking ref, so fetch first for an accurate answer; when that ref is missing, prepare prints a warning that the behind check was skipped. To resume an in-flight generation while behind, do not move the original checkout (its HEAD is pinned); use `--reconcile-only` or `--target-policy warn`.
+- **Remote base branch:** before any push, `--original-branch` must exist on the remote (exact `refs/heads/<name>`); otherwise `BASE_BRANCH_MISSING` and nothing is pushed. `BASE_BRANCH_MISSING` is not settled: push the base and re-run the same prepare. A remote that cannot be queried gives `REMOTE_BLOCKED` with reason `BASE_CHECK_UNAVAILABLE`; nothing was pushed, so, like any `REMOTE_BLOCKED`, it is settled and `finish --mode local` is available (or retry with `--new-generation`).
+- **`gh pr create` failures:** a non-zero exit is classified from bounded, redacted stderr. Authentication, access, missing base, missing repository and validation errors, recognised only at the start of a gh message line and only when the follow-up lookup succeeds and shows no PR, become `REMOTE_BLOCKED` with a hint (re-run with `--new-generation` once fixed). If a PR exists anyway, it is adopted. gh's authentication exit code 4 counts as definite even without stderr. When the follow-up lookup fails too (usual for authentication or repository errors), the result stays `REMOTE_UNCERTAIN` and the hint names the likely cause. Any transient phrase anywhere in stderr, including gh's echoed `Creating ... for <branch>` line, keeps the outcome uncertain, so a branch name containing words such as `timeout` or `eof` always gives `REMOTE_UNCERTAIN` (the safe direction). Timeouts, killed processes, gateway or network errors, "already exists", a failed lookup, and unrecognised failures stay `REMOTE_UNCERTAIN` and are never a local-fallback licence. Output carries `gh_exit` and a sanitised one-line `gh_error` (escapes and control characters stripped, secrets redacted, at most 300 characters).
+- **Waivers:** `commit_policy_waivers` in the prepare output lists every commit-policy waiver (kind, subject, id, WAL) the checked range used (at most 50, with `commit_policy_waivers_total` when there are more; fields sanitised, WAL as a basename). A waiver record that exists but cannot be read, or holds a malformed item, sets `commit_policy_waivers_unreadable` instead of looking like no waivers. Finish output does not repeat the list.
 
 ## Commit message policy
 
@@ -339,6 +396,101 @@ Co-Authored-By: ...
   - Claude Code: delete the `commit_policy.py hook` handler from `~/.claude/settings.json`.
   - Codex: delete it from `~/.codex/hooks.json`.
 
+## Command guard
+
+`command_guard.py` (GoodQA #14471) is a PreToolUse guard for shell commands. It blocks two kinds of command before they run: commands that delete, move or empty the harness's own logs and state, and commands that print secrets or configuration into a transcript. It exists because an agent once fed test strings through a heredoc, and the real shell then deleted `~/.claude/projects` and `~/.claude/wals` and printed rclone OAuth tokens. The guard is stdlib-only and runs on Python 3.9 to 3.13.
+
+### What it protects
+
+| Tier | Paths | Refused |
+| --- | --- | --- |
+| A (logs and state) | Claude transcripts (`~/.claude/projects`, history), Codex sessions and history, WALs (any `wals` directory, `main.jsonl`, `*.wal.jsonl`), the approval state in `~/.agent-harness/state`, credential files, and the guard's own installed files | every destructive form: delete, move, truncate, overwrite, `find -delete`, `rsync --delete`, `rclone move/sync/delete/purge`, interpreter one-liners, `git clean` |
+| B (harness roots) | everything else under `~/.claude`, `~/.codex` and `~/.agent-harness`, for the local home and for `/home/*`, `/Users/*`, `/root` paths on ssh or container targets | delete, move and pure truncation; ordinary edits and new files are allowed |
+
+A command that names an ancestor of a protected path (`rm -rf ~`), or a path the guard cannot resolve but that points at one (a variable, glob or `cd -` it cannot follow), is refused too.
+
+Exceptions, none of which applies to Tier A:
+
+- Under `~/.agent-harness/work`, deletes are allowed only inside the git repository the agent is working in. That is the working tree whose top level holds the effective working directory: the payload `cwd`, or Codex `tool_input.workdir`, updated by a `cd` or `pushd` earlier in the same command. The tree must have a real `.git` (a directory holding `HEAD`, or a `gitdir:` file) that existed before the command, and it must lie strictly below a task folder. The top level itself, its `.git` and `git worktree remove` stay refused. A wildcard that could reach `.git`, `.` or `..` (one starting with `.`, `?` or `[`) voids the exception. A `tmp/` folder directly in a task folder is also deletable, by literal path only, so `rm -rf tmp/*` is refused and the message suggests per-item deletes. `kit.json`, `*.jsonl` and `state` directories are never deletable by name anywhere under `~/.agent-harness`. Session folders, task folders and sibling task folders are cleaned up with `workdir.py prune --apply`. When the guard cannot tell where the agent is working, the delete is refused.
+- Literal paths in `~/.agent-harness/scratch/<a>/<b>/<c>/...` are deletable, except WAL-shaped files, `kit.json`, anything in a `tasks` folder, and `*.output` and `*.log` files. Agent task output falls under the log-retention rule and is never deleted without a verified backup.
+- Under `~/.claude` and `~/.codex`, literal paths are deletable inside a git working tree whose top level sits two or more levels below the root and whose `.git` existed before the command.
+- In temp directories and inside git working trees outside the harness roots, WAL-shaped names (`wals/`, `main.jsonl`) are test data, not WALs.
+
+**Residual risks.** These are recorded, not hidden:
+
+- "Own worktree" means only "the repository the agent is working in". Any agent can `cd` into another agent's worktree, so the rule guards against mistakes; it is not an ownership boundary.
+- `git clean` is allowed inside the worktree and can remove untracked `*.jsonl` or WAL-shaped files there.
+- A `git init` run in an earlier command makes a folder count as a repository. That is outside the threat model, which covers careless or hurried agents, not an adversary.
+- Name-based refusals have false positives: `*.jsonl` results and `state` directories under `~/.agent-harness` cannot be deleted by name.
+- A script or program file that already exists when the command runs (`bin/dev2`, `./run.sh`, `python3 tool.py`) is the repository's own tooling. Only its deletions of protected logs count, and a Python file's source is not scanned. A script written earlier in the same command is judged in full.
+- Inside the own worktree, a wildcard below the top level (`rm -rf build/*`) is judged by what it matches on disk when the guard runs. Hidden entries count, as if `dotglob` were set. A wildcard directly in the top level, one that can match a dot-name, or one behind a symlinked directory is judged by the pattern rule instead: it is refused when it could match a protected name. Above 2,000 matches in one command, the pattern rule also applies. A path whose `..` follows a symlink is judged where the shell really resolves it.
+- `find` with `-delete`, `-exec rm` or `-exec mv` is judged by its start directories, whatever `-name` filters it has. The guard skips leading options such as `-P`, `-D`, `-O3` and `--`. Start directories read with `-files0-from` are unknown and refused. The operands of the `-exec` command other than `{}` are judged too. So `find build -name '*.o' -delete` is allowed. `find . -name '*.pyc' -delete` from the worktree top is refused, because the walk reaches `.git`. This is a known false positive: run it from a subdirectory instead. Two attempts to relax it by its filters both opened bypasses.
+- `find -L` or `-follow` combined with a deleting action is refused.
+- Known gaps, unchanged since earlier rounds:
+  - an xargs here-string or heredoc line holding several paths is judged as one path;
+  - a pnpm or yarn global flag before the bin (`pnpm --silent rimraf`) hides the bin;
+  - a `-exec` operand that embeds `{}` (`{}/../x`) is not judged;
+  - the POSIX classes `[^x]` and `[[:lower:]]` in a worktree glob are matched literally;
+  - `cd -P` through a symlink is tracked logically.
+- A nested repository below the worktree (`src/vendor/.git`) is not the worktree's own `.git` and is not protected. A script written with `tee` and then run in the same command gets only the heredoc advisory, not the written-then-run analysis.
+- Not detected (tracked for a later round): `rsync` or `scp` of a whole credential directory such as `~/.ssh/` (single key files are caught); a PowerShell `Get-ChildItem ... | Remove-Item` pipeline whose `Remove-Item` has no path; macOS `ditto` over a protected directory; and a protected directory mounted into a container (`docker run -v ~/.claude:/c ... rm -rf /c/...`). The in-process `approve_delete` verifier can be replaced by code running in the same process. That is outside the threat model.
+- Variables the guard cannot resolve fail closed. A positional parameter (`$1`, `$@`, `$0`), a loop variable over a glob or a substitution, a `read` variable, or an `export`/`declare`/`local` value that names a protected path refuses a destructive command whenever the same command names a protected location anywhere. That includes, for example, `ls ~/.claude/projects; for f in $(...); do rm "$f"; done`.
+
+**Policy file.** `command_guard_policy.json` is optional and can only add protection. Its protective lists are merged into the built-in ones, and `broad_kill` may be set to `enforce`. Every other key is ignored, including allow-lists, regexes, temp roots and limits. The guard's own files (`command_guard*`, `redact.py`, `safe_input.py` in both hook directories) are refused for writes even when they do not exist yet, so an agent cannot create a policy file or a replacement module beside the hook. Block messages do not name the file.
+
+### Secret and configuration dumps
+
+Blocked: `rclone config show|dump|file|redacted|reconnect|paste`, a bare `rclone config`, `rclone config create|update|password` with values, `rclone authorize|reveal`, `--dump auth|headers|bodies`; `gh auth status --show-token`; and `gh auth token` in every shape except `VAR=$(gh auth token) gh <subcommand>`, where the subcommand is not `auth`, `config`, `extension`, `alias` or `secret`, with no other assignment, wrapper, redirect, pipe or further command. Also blocked: environment dumps (`env`, `printenv`, `set`, `export -p`, `declare -p|-x`, `compgen -v` with values, `${!name}`, and interpreter dumps such as `os.environ.items()`, `process.env`, `%ENV`, awk `ENVIRON` loops) and printing secret-named variables. `env | grep '^NAME='` or `grep -w NAME` with exact non-secret names is allowed. A prefix or substring filter (`env | grep -i GITHUB`) is still blocked, because it also matches `GITHUB_TOKEN`. Also blocked: `kubectl config view --raw`, `gh config get oauth_token`, `aws configure export-credentials`, `docker-credential-* get`, and `xargs cat` over paths listed from a credential directory. Reading credential files (ssh private keys, AWS, Codex `auth.json`, Claude `.credentials.json`, `rclone.conf`, `gh` `hosts.yml`, `.netrc`, `.npmrc`, `~/.env`, the approval key) with a printing reader or a network sender is blocked, and so is the same read through a copy made earlier in the command. So are recursive greps for secret words above a credential directory, Keychain password reads, `/proc/*/environ` and `ps e`. A project `.env` can still be sourced or added to git.
+
+`rclone config file` is blocked too. It prints only a path, but it is the first step of the incident, and `doctor` reports where the config lives.
+
+### How it decides
+
+The command is lexed like a shell before any rule runs. The lexer handles quotes, `$'..'`, escapes, line continuations, heredocs (the body ends at its delimiter and the rest of the text is commands again), `$(..)`, backticks, pipes, redirects, brace expansion, prefix assignments, wrappers (`sudo`, `env`, `nice -n`, `timeout`, `xargs` including its here-string, heredoc, `< <(..)` and `-a` input, package runners `npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `npm exec`, `uvx`, `pipx run`, `yarn`/`pnpm` (and `yarn run`) with a deleter bin, `shx`, `cross-env` and `cross-env-shell`, `eval "$(..)"`, `flock`, `script -c`, `tmux send-keys`, `osascript`, `at`), `sh -c` strings, `ssh` and `docker exec` commands, scripts written and then run in the same command, `$(which rm)`, absolute binary paths, and case and Unicode lookalikes. An unterminated quote or substitution, nesting that is too deep, or input over the analysis budget is blocked when the raw text names a protected location, a secret source, or a code-execution step (a pipe into a shell, `eval`, `-c` or `-e` code, a decoder) together with a destructive verb. Otherwise it is a warning. Block messages are passed through `redact.py` and never echo a secret.
+
+A heredoc whose body contains a deletion of a protected location gets an advisory warning even when the heredoc only prints the text or writes it to a file, such as test data or a commit message. Heredoc text passes through the shell, which is how the incident happened. The warning points to the editor's file-writing tool and does not block. Interpreter heredocs are scanned as code and still block.
+
+The guard never emits an explicit allow, so the host's own permission flow still applies.
+
+### Fail closed
+
+The registered command is the launcher `command_guard_hook.py`, not the analyser. Claude Code allows a command when a hook crashes or times out unless the entry sets `onFailure: block` (Claude Code 2.1.295 and later), and Codex always allows. The launcher therefore runs the analyser in a child process with a 10 s watchdog. If the child crashes, cannot start, prints invalid output or runs out of time, the launcher decides from the raw text with the same probe and exits 2 for sensitive input. Non-shell tools return at once. The Claude Code entry matches `Bash|PowerShell` with a 30 s timeout and `onFailure: block`. Both entries pass the verb `hook`, which the launcher ignores; `cmd/harness/gates.json` lists `command-guard hook` as a fail-closed gate, so the Go front door blocks rather than allows when it cannot run the guard. The Codex entry has no matcher, because the host does not re-check `write_stdin` text typed into a running shell, and the guard analyses that text as shell input. A command split across several `write_stdin` calls is a residual risk.
+
+### Deleting logs on purpose
+
+The agent may approve a delete itself, but only after a backup that the approval command verifies in the same run:
+
+```bash
+python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal path> --remote dropbox:<mirror dir> --wal <WAL path>
+```
+
+`approve-delete` refuses in these cases:
+
+- a glob or variable path;
+- a whole root, or a whole `projects`, `wals`, `sessions` or other top-level log directory, or one of their parents;
+- more than 20,000 files;
+- anything changed in the last 10 minutes;
+- a remote that is not a named remote of type `dropbox` (checked with `rclone listremotes --long`);
+- a remote copy that is missing a file, differs in size or hash, or offers sizes only.
+
+The approval is single use, signed with a local key and bound to the exact realpath, device, inode and a stat manifest. The hook consumes it under a lock, so of two commands racing for one approval exactly one runs. Every approval, refusal and use goes to `~/.agent-harness/state/log-delete-audit.jsonl` and to the WAL; report it in the ticket status. `revoke-delete` removes every approval.
+
+### Commands
+
+| Command | Purpose |
+| --- | --- |
+| `command_guard.py doctor` | Checks the installed files, the registration (`onFailure`, matcher, Codex no-matcher), the Claude Code version, and runs built-in self-test probes. Exit 0 when healthy. |
+| `command_guard.py explain --file F [--cwd D]` | Shows the decision and every finding for a command stored in a file. Never put a command you are unsure about into a shell argument. |
+| `command_guard.py check 'CMD'` | Shows the decision for one command. Runs nothing. |
+| `command_guard.py replay T.jsonl...` | Counts decisions over real transcripts for false-positive measurement. Prints rule counts and digests, never commands. Failure-path blocks are counted separately. |
+| `command_guard.py scan-wal PATH...` | Reports secret shapes in WAL or transcript files without printing the values. |
+
+### Rollout and rollback
+
+Run `replay` over recent transcripts and the red-team hold-out set before the enforcing install on a machine. Then install with `install.py --apply` and `install_codex.py --apply`, and run `doctor`. Rollback is `install.py --apply --no-command-guard` (and the same flag for `install_codex.py`). That removes the registration and leaves the files in place. Removing the hook entry that points at `command_guard_hook.py` by hand works too.
+
+**Known gap.** Claude Code `Write`, `Edit`, `MultiEdit`, `NotebookEdit` and Codex `apply_patch` are not shell tools. The guard does not see them, so they can still overwrite or empty a transcript or WAL. Follow-up: GoodQA #14500.
+
 ## Spec-driven tickets
 
 Every want, need, finding or bug is a GoodQA ticket. When an agent picks one up, it writes a spec, gets the spec reviewed and attaches it to the ticket. As it works, it attaches proof for each acceptance criterion. After deploy, it attaches the click-test record. Once signed off, the ticket can be marked done.
@@ -381,7 +533,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
   - A later `BLOCK` for a role replaces an earlier `ACCEPT`.
 - **Review sources:**
   - **Helper report.** A `peer_review.py plan` report. It must have `Stage: plan`, a body verdict `PLAN_RESULT: ...`, and `Reviewed packet SHA-256` equal to the core sha.
-  - **Native agent.** A native agent id recorded by SubagentStart in the main WAL, plus its report file. Only `task-owner`, `click-tester`, `fixer` and `red-team` agents are logged. An adversarial review from a native agent requires `red-team`.
+  - **Native agent.** A native agent id recorded by SubagentStart in the main WAL, plus its report file. Every agent type is logged by SubagentStart; only `task-owner`, `click-tester`, `fixer` and `red-team` agents may record a review (other types are refused). An adversarial review from a native agent requires `red-team`.
   - **Human.** A human name with `--source`. This is self-attested.
 - **What `attach` uploads:** the spec, the reviews JSON and each review report. A report that changed since its review is refused.
 
