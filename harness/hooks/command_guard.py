@@ -3379,7 +3379,7 @@ class Analyzer:
 
     def _work_base(self, segs):
         """Segment count of the ~/.agent-harness/work or /scratch prefix of `segs`, for this machine's homes and for
-        /home/<user> on another host (`ssh dev2 'cmd > /home/eric/...'`), else None."""
+        /home/<user> on another host (`ssh dev2 'cmd > /home/someone/...'`), else None."""
         other = ['/'.join(segs[:2])] if len(segs) > 2 and segs[0] == 'home' else []
         for h in list(self.c.homes) + other:
             for top in ('work', 'scratch'):
