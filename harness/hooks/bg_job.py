@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -103,7 +104,9 @@ def read_json(path):
 
 def pid_is_job(pid, nonce):
     """True only when PID is alive AND its command line is our wrapper carrying this job's nonce."""
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+    if not isinstance(pid, int) or isinstance(pid, bool) or not 1 < pid < 2 ** 31:
+        return False
+    if not isinstance(nonce, str) or not re.match(r"^[0-9a-f]{32}$", nonce):
         return False
     try:
         os.kill(pid, 0)
@@ -119,9 +122,24 @@ def pid_is_job(pid, nonce):
     return ("_run" in out) and (nonce in out)
 
 
-def stop_group(pid, nonce):
-    """Stop the process group this launcher created, after proving PID identity. Never signals anything else."""
-    if not pid_is_job(pid, nonce):
+def group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stop_group(pid, nonce, own=False):
+    """Stop a job's process group. `own` is True only for the launcher, which created the group and is still the
+    wrapper's parent, so the group id cannot belong to anyone else. Otherwise the wrapper's identity is proven first.
+    SIGKILL follows the grace period whenever the group still has members, even after the wrapper itself died
+    (a SIGTERM-ignoring job outlives its wrapper)."""
+    if not own and not pid_is_job(pid, nonce):
+        return
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
         return
     for sig, wait in ((signal.SIGTERM, 2.0), (signal.SIGKILL, 2.0)):
         try:
@@ -129,10 +147,10 @@ def stop_group(pid, nonce):
         except (ProcessLookupError, PermissionError):
             return
         end = time.time() + wait
-        while time.time() < end:
-            if not pid_is_job(pid, nonce):
-                return
+        while time.time() < end and group_alive(pid):
             time.sleep(0.05)
+        if not group_alive(pid):
+            return
 
 
 def read_status(record):
@@ -157,6 +175,11 @@ def load_record(directory, name):
     for key in ("pid", "nonce", "status", "log", "argv_sha256"):
         if key not in obj:
             return None, "job record incomplete"
+    pid = obj["pid"]
+    if (isinstance(pid, bool) or not isinstance(pid, int) or not 1 < pid < 2 ** 31
+            or not isinstance(obj["nonce"], str) or not re.match(r"^[0-9a-f]{32}$", obj["nonce"])
+            or not isinstance(obj["status"], str) or not isinstance(obj["log"], str)):
+        return None, "job record invalid"
     return obj, None
 
 
@@ -195,7 +218,7 @@ def cmd_launch(args):
     if not argv:
         print("FAILED_TO_START reason=no command given after --")
         return EXIT_USAGE
-    if args.deadline <= 0 or args.deadline > 3600:
+    if not math.isfinite(args.deadline) or args.deadline <= 0 or args.deadline > 3600:
         print("FAILED_TO_START reason=deadline must be 1..3600 seconds")
         return EXIT_USAGE
     directory = job_dir(args.dir)
@@ -220,12 +243,25 @@ def cmd_launch(args):
                "--nonce", nonce, "--"] + argv
     proc = subprocess.Popen(wrapper, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True, close_fds=True)
-    record = {"name": args.name, "pid": proc.pid, "nonce": nonce, "start": time.time(), "log": log,
-              "status": status, "argv_sha256": argv_hash(argv), "argv": argv, "deadline": args.deadline}
-    atomic_write_json(os.path.join(directory, args.name + ".json"), record)
+    try:
+        atomic_write_json(os.path.join(directory, args.name + ".json"),
+                          {"name": args.name, "pid": proc.pid, "nonce": nonce, "start": time.time(), "log": log,
+                           "status": status, "argv_sha256": argv_hash(argv), "argv": argv, "deadline": args.deadline})
+        return supervise(args, proc, nonce, log, status, argv, before)
+    except BaseException as exc:  # never leave a started job without a record or an owner
+        proc.poll()
+        stop_group(proc.pid, nonce, own=True)
+        print("FAILED_TO_START name=%s reason=internal error after start (%s: %s); job stopped" %
+              (args.name, type(exc).__name__, exc))
+        return EXIT_FAILED_TO_START
+
+
+def supervise(args, proc, nonce, log, status, argv, before):
+    record = {"pid": proc.pid, "nonce": nonce, "status": status, "argv_sha256": argv_hash(argv)}
 
     def fail(reason):
-        stop_group(proc.pid, nonce)
+        proc.poll()
+        stop_group(proc.pid, nonce, own=True)
         print("FAILED_TO_START name=%s reason=%s log=%s" % (args.name, reason, log))
         return EXIT_FAILED_TO_START
 
@@ -332,7 +368,18 @@ def main(argv=None):
     if args.cmd == "_run":
         args.argv = [a for i, a in enumerate(args.argv) if not (i == 0 and a == "--")]
         return cmd_run(args)
-    return {"launch": cmd_launch, "wait": cmd_wait, "status": cmd_status}[args.cmd](args)
+    for opt in ("timeout",):
+        value = getattr(args, opt, None)
+        if value is not None and (not math.isfinite(value) or value < 0):
+            print("UNPROVEN reason=--%s must be a finite number >= 0" % opt)
+            return EXIT_USAGE
+    try:
+        return {"launch": cmd_launch, "wait": cmd_wait, "status": cmd_status}[args.cmd](args)
+    except Exception as exc:
+        if args.cmd == "launch":
+            raise
+        print("UNPROVEN name=%s reason=internal error (%s)" % (args.name, type(exc).__name__))
+        return EXIT_UNPROVEN
 
 
 if __name__ == "__main__":

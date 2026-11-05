@@ -32,7 +32,8 @@ class Base(unittest.TestCase):
         self.started = []
 
     def tearDown(self):
-        import bg_job
+        if self.started:
+            import bg_job
         for name in self.started:  # stop only jobs this test launched, via the identity-checked helper
             rec, _ = bg_job.load_record(str(self.jobs), name)
             if rec:
@@ -130,6 +131,54 @@ class LaunchEvidence(Base):
         res = self.launch("twice", self.tmp / "t2.log", 3, "sh", path)
         self.assertEqual(res.returncode, 3)
         self.assertIn("already running", res.stdout)
+
+
+class RedTeamRegressions(Base):
+    """Findings B1, B2, N3, N4 from the independent red-team pass."""
+
+    def _alive_pid(self, name):
+        import bg_job
+        rec = json.loads((self.jobs / (name + ".json")).read_text())
+        return bg_job.group_alive(rec["pid"])
+
+    def test_term_ignoring_silent_job_is_killed_on_failed_to_start(self):
+        path = self.script("deaf.sh", "trap '' TERM\nsleep 300\n")
+        res = self.launch("deaf", self.tmp / "deaf.log", 1, "sh", path)
+        self.assertEqual(res.returncode, 3, res.stdout)
+        self.assertFalse(self._alive_pid("deaf"), "SIGTERM-ignoring job outlived FAILED_TO_START")
+
+    def test_record_write_failure_does_not_orphan_job(self):
+        self.jobs.mkdir()
+        (self.jobs / "orph.json").mkdir()  # the record cannot be written
+        path = self.script("orph.sh", "echo hi\nsleep 300\n")
+        res = self.launch("orph", self.tmp / "orph.log", 5, "sh", path)
+        self.assertEqual(res.returncode, 3, res.stdout)
+        self.assertIn("FAILED_TO_START", res.stdout)
+        time.sleep(0.5)
+        import bg_job
+        out = subprocess.run(["ps", "-ww", "-o", "command="], stdout=subprocess.PIPE, universal_newlines=True).stdout
+        self.assertNotIn(str(self.tmp / "orph.sh"), out)
+
+    def test_empty_or_bad_nonce_never_matches_a_stranger(self):
+        import bg_job
+        self.assertFalse(bg_job.pid_is_job(os.getpid(), ""))
+        self.assertFalse(bg_job.pid_is_job(os.getpid(), 5))
+        self.assertFalse(bg_job.pid_is_job(2 ** 40, "0" * 32))
+
+    def test_tampered_record_is_unproven_not_job_failure(self):
+        self.jobs.mkdir()
+        for rec in ({"pid": 10 ** 12, "nonce": "0" * 32, "status": "s", "log": "l", "argv_sha256": "x"},
+                    {"pid": 123, "nonce": 7, "status": "s", "log": "l", "argv_sha256": "x"},
+                    {"pid": True, "nonce": "0" * 32, "status": "s", "log": "l", "argv_sha256": "x"}):
+            (self.jobs / "t.json").write_text(json.dumps(rec))
+            for cmd in ("wait", "status"):
+                res = run_bg(cmd, "--name", "t", "--dir", str(self.jobs))
+                self.assertEqual(res.returncode, 2, res.stdout)
+
+    def test_non_finite_numbers_refused(self):
+        self.assertEqual(self.launch("nan", self.tmp / "n.log", "nan", "true").returncode, 64)
+        self.assertEqual(self.launch("inf", self.tmp / "i.log", "inf", "true").returncode, 64)
+        self.assertEqual(run_bg("wait", "--name", "x", "--timeout", "nan", "--dir", str(self.jobs)).returncode, 64)
 
 
 class WaitFailsClosed(Base):
@@ -253,6 +302,15 @@ class LintCorpora(unittest.TestCase):
         for case in json.loads((DATA / "bg_lint_positive.json").read_text()):
             for code, message in bg_lint.lint(case["command"]):
                 self.assertIn("bg_job", message + (" bg_job" if code == "pipestatus" else ""), case["id"])
+
+
+class LintBounded(unittest.TestCase):
+    def test_unclosed_substitutions_are_linear(self):
+        import bg_lint
+        for text in ("x=$(" * 40000, "x=$(a|" * 30000, "x=`" * 60000, ("a=$(b|" * 100) + "PIPESTATUS" + "x=$(" * 30000):
+            start = time.time()
+            bg_lint.lint(text + " echo ${PIPESTATUS[@]}")
+            self.assertLess(time.time() - start, 2.0, text[:12])
 
 
 class LintHook(unittest.TestCase):

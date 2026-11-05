@@ -17,5 +17,9 @@
   {"id": "subst-no-pipe-no-status", "command": "H=$(a | b); echo \"$H\""},
   {"id": "or-chain", "command": "cmd1 || echo failed"},
   {"id": "newline-echo-ordinary", "command": "cmd1\necho started"},
+  {"id": "if-then-echo-done", "command": "if make build; then echo done; fi"},
+  {"id": "for-do-echo-done", "command": "for f in a b; do echo done $f; done"},
+  {"id": "ssh-clean-chain", "command": "ssh dev2 'cmd1 && nohup ./suite > r.log 2>&1 & echo pid'"},
+  {"id": "comment-only-chain-text", "command": "# cmd1; echo started\ncmd1 && cmd2"},
   {"id": "empty", "command": ""}
 ]

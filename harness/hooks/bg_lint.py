@@ -26,10 +26,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 MAX_COMMAND_CHARS = 200_000
-SUCCESS_WORD = re.compile(r"\b(started|launched|running|done|ok)\b", re.IGNORECASE)
+SUCCESS_WORD = re.compile(r"\b(started|launched|running|done|ok|submitted|queued|spawned|in background)\b", re.IGNORECASE)
 POLL_HINT = re.compile(r"\b(sleep|pgrep|is-active|is-system-running|inotifywait)\b|\bkill\s+-0\b")
 LOOP_START = re.compile(r"^(while|until|for)\b")
-TAIL_CMDS = {"ls", "cat", "tail"}
+TAIL_CMDS = {"ls", "cat", "tail", "grep", "head", "wc", "stat"}
 SAFE = "Use `python3 ~/.claude/hooks/bg_job.py launch|wait` (reports STARTED only on proof, wait returns the real exit status)."
 
 
@@ -54,6 +54,17 @@ def split_top_level(command):
         if c == "\\" and i + 1 < n:
             buf.append(c + command[i + 1])
             i += 2
+            continue
+        if c == "#" and (i == 0 or command[i - 1] in " \t\n;&|(") and depth == 0 and not tick:
+            while i < n and command[i] != "\n":  # comment: its apostrophes must not open a quote
+                i += 1
+            continue
+        if c == "'" and command[i - 1:i] == "$":
+            j = i + 1  # $'...' ANSI-C quoting honours backslash escapes
+            while j < n and command[j] != "'":
+                j += 2 if command[j] == "\\" else 1
+            buf.append(command[i:j + 1])
+            i = j + 1
             continue
         if c in "'\"":
             quote = c
@@ -88,8 +99,10 @@ def split_top_level(command):
     return [(o, t.strip()) for o, t in segments if t.strip()]
 
 
-def first_word(text):
-    text = re.sub(r"^(do|then|else|time|nohup)\s+", "", text.strip())
+def first_word(text, keep_keywords=False):
+    text = text.strip()
+    if not keep_keywords:
+        text = re.sub(r"^(do|then|else|time|nohup)\s+", "", text)
     m = re.match(r"[A-Za-z0-9_./-]+", text)
     return os.path.basename(m.group(0)) if m else ""
 
@@ -99,7 +112,7 @@ def find_success_echo(segments):
     for idx, (op, text) in enumerate(segments):
         if idx == 0 or op not in (";", "&"):
             continue
-        if first_word(text) in ("echo", "printf") and SUCCESS_WORD.search(text):
+        if first_word(text, True) in ("echo", "printf") and SUCCESS_WORD.search(text):
             hits.append(text[:60])
     return hits
 
@@ -122,30 +135,60 @@ def find_wait_loop_tail(command, segments):
     return body_last[:60] if first_word(body_last) in TAIL_CMDS else None
 
 
+MAX_SUBST_SCAN = 4096
+MAX_SUBST_MATCHES = 200
+
+
 def find_pipestatus_after_substitution(command):
-    for m in re.finditer(r"(?:^|[\s;&|(])(?:(?:local|export|declare|readonly)\s+)?[A-Za-z_][A-Za-z0-9_]*=(\$\(|`)", command):
+    if "PIPESTATUS" not in command:
+        return None  # cheap exit; also bounds the work on huge commands
+    for count, m in enumerate(re.finditer(r"(?:^|[\s;&|(])(?:(?:local|export|declare|readonly)\s+)?[A-Za-z_][A-Za-z0-9_]*=(\$\(|`)", command)):
+        if count >= MAX_SUBST_MATCHES:
+            return None
         start = m.end()
+        limit = min(len(command), start + MAX_SUBST_SCAN)
         if m.group(1) == "`":
-            end = command.find("`", start)
-            end = len(command) if end < 0 else end
+            end = command.find("`", start, limit)
+            end = limit if end < 0 else end
         else:
             depth, end = 1, start
-            while end < len(command) and depth:
+            while end < limit and depth:
                 depth += {"(": 1, ")": -1}.get(command[end], 0)
                 end += 1
         inner = command[start:end]
-        if re.search(r"(?<!\|)\|(?!\|)", inner) and "PIPESTATUS" in command[end:]:
+        if re.search(r"(?<!\|)\|(?!\|)", inner) and command.find("PIPESTATUS", end) >= 0:
             return command[m.start():end].strip()[:60]
     return None
 
 
-def lint(command):
+WRAPPERS = {"ssh", "bash", "sh", "zsh", "dash"}
+MAX_NESTED = 8
+
+
+def nested_commands(segments):
+    """Quoted script arguments of ssh/bash -c/sh -c: the incident chain ran on a remote host."""
+    import shlex
+    found = []
+    for _, text in segments:
+        if first_word(text) in WRAPPERS and len(found) < MAX_NESTED:
+            try:
+                words = shlex.split(text)
+            except ValueError:
+                continue
+            found += [w for w in words[1:] if (";" in w or "&" in w or "|" in w) and not w.startswith("-")][:MAX_NESTED]
+    return found[:MAX_NESTED]
+
+
+def lint(command, _depth=0):
     """List of (code, message) warnings. Pure; the corpus tests call this directly."""
     if not isinstance(command, str) or not command.strip():
         return []
     command = command[:MAX_COMMAND_CHARS]
     segments = split_top_level(command)
     out = []
+    if _depth < 2:
+        for inner in nested_commands(segments):
+            out += [w for w in lint(inner, _depth + 1) if w[0] not in [o[0] for o in out]]
     for text in find_success_echo(segments)[:1]:
         out.append(("success-echo", "A success message (`%s`) follows `;` or `&`, so it prints even if the earlier "
                                     "command failed. Chain with `&&`, and report a launch only after bg_job.py "
