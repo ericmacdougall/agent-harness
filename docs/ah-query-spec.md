@@ -35,3 +35,16 @@ Source: user "how we dont have proper tools/a cli in our harness that handles al
 ## Ledger and spool
 
 `~/.agent-harness/state/ah/store/`: `ledger.jsonl` (seq, key, body sha, op, args, actor), `audit.jsonl` (applied, rejected, key_conflict), `spool/` (pending GoodQA comments, keyed by operationId), `store.lock` (flock). Index files live in `~/.agent-harness/state/ah-index/`.
+
+## Dropped-owner dispositions and the Stop gate (goodqa#14791)
+
+A DROPPED owner (the shared `liveness.py` rule) must carry a live **disposition** or it is a defect that needs a decision now. `ah owners` rows carry `disposition` and `decision_required`; the document carries `undisposed`. `ah owners --gate` exits 1 while any owner is undisposed, so a "0 dropped" summary cannot be printed over a dropped owner. Dispositions go only through the `ah` writer (`task.dispose`: idempotent key, audit row, and a `disposition` entry in the session main WAL):
+
+    ah task dispose --agent <id> --kind resumed                      live while activity follows within 30 min, or any later activity
+    ah task dispose --agent <id> --kind reassigned --ref <agent id>  live while the replacement is live
+    ah task dispose --agent <id> --kind waiting --ref <ask id | GoodQA proj#N> --until <ISO>   expires at --until
+    ah task dispose --agent <id> --kind closed --reason <why> --evidence <ticket | WAL id | sha>  permanent
+
+A `waiting` disposition must name an ask id that exists in the session WAL or a ticket (a wait cannot park work); the same rule applies to `waiting on <x>` notes in an owner WAL. A `status` or `result` row that `ah` writes on an owner's behalf carries `by: <actor>` and never counts as that owner's own activity.
+
+`harness/hooks/dropped_gate.py` is a Claude Code Stop hook (registered by `install.py`): it blocks the main agent's turn from ending while the session has undisposed DROPPED owners, names them with the exact `ah task dispose` lines, and is bounded to 3 blocks per problem signature (state under `~/.agent-harness/state/dropped-gate/`). Headless (`sdk-*`) and sub-agent sessions are not gated; any `ah` failure fails open with a message.

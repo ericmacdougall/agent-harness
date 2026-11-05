@@ -109,7 +109,8 @@ class LivenessTests(unittest.TestCase):
         self.assertEqual(self.c(9999, stopped=True), "DROPPED")
         self.assertEqual(self.c(53, stopped=True), "finishing")  # just stopped, handoff may still be coming
         self.assertEqual(self.c(25 * 60, stopped=True), "finishing")  # between turns is not a drop
-        self.assertEqual(self.c(9999, stopped=True, note="waiting on dev2 suite"), "waiting-on-dev2")
+        self.assertEqual(self.c(9999, stopped=True, note="waiting on dev2 suite"), "DROPPED")  # goodqa#14791 H3: a wait must name an ask, ticket or agent
+        self.assertEqual(self.c(9999, stopped=True, note="waiting on GoodQA goodqa#14791"), "waiting-on-GoodQA goodqa#14791")
         for helper in ("red-team", "fixer", "click-tester", "Explore"):
             self.assertEqual(self.c(9999, stopped=True, typ=helper), "returned", helper)
         self.assertEqual(liveness.classify(NOW, NOW - 9999, 0.0, True, None, "", "fixer", registered=True)["state"], "DROPPED")

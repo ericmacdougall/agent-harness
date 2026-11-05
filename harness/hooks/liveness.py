@@ -19,22 +19,53 @@ SILENT_S = 30 * 60
 HIGH_S = 60 * 60
 FINISH_GRACE_S = 30 * 60  # a just-stopped owner may be between turns or writing its handoff: not a drop yet
 
-_WAITING = re.compile(r"\bwaiting\s+(?:on|for)\s+([A-Za-z0-9_.:#\-]{1,60})", re.I)
+_WAITING = re.compile(r"\bwaiting\s+(?:on|for)\s+((?:GoodQA\s+)?[A-Za-z0-9_.:#\-]{1,60})", re.I)
 
 
 # Types that are owners only when main names them as one (a WAL scope/intent/decision note carrying the id).
 NAMEABLE_TYPES = ("general-purpose", "claude")
 
 
+_WAIT_TARGET = re.compile(r"^(w[0-9a-f]{11}|(GoodQA\s+)?([a-z0-9][a-z0-9-]*)?#\d{1,10}|a[0-9a-f]{6,32}|main)$", re.I)
+
+
 def waiting_on(note: str):
+    """The named thing an owner waits on: an ask id, a ticket or an agent. Anything else is not a wait
+    (goodqa#14791 review H3: "waiting on <anything>" used to park an owner forever)."""
     match = _WAITING.search(note or "")
-    return match.group(1) if match else None
+    target = match.group(1) if match else None
+    return target if target and _WAIT_TARGET.match(target) else None
 
 
 # Only owner tasks must leave a handoff/result in their WAL. Helpers (fixer, click-tester, red-team, reviewer,
 # Explore, Plan) return their result to the parent as the final message, so stopping without a WAL outcome
 # is "returned", not DROPPED. A helper explicitly registered as a task owner (ah task register) is an owner.
 OWNER_TYPES = ("task-owner",)
+
+
+DISPOSITIONS = ("resumed", "reassigned", "waiting", "closed")
+RESUMED_GRACE_S = 30 * 60  # a "resumed" disposition must be followed by activity within this window
+
+
+def disposition_live(disp: dict | None, now: float, last_activity: float = 0.0, replacement_live: bool = False) -> bool:
+    """Whether a recorded disposition still excuses a DROPPED owner (goodqa#14791, invariant I1).
+
+    resumed     live only while activity follows it: within RESUMED_GRACE_S of its time, or any activity after it
+    reassigned  live while the replacement agent is live (the caller resolves that)
+    waiting     live until its `until` time (epoch seconds); it must cite an ask id or a ticket (checked at write)
+    closed      permanent
+    """
+    if not isinstance(disp, dict) or disp.get("kind") not in DISPOSITIONS:
+        return False
+    at = float(disp.get("at") or 0.0)
+    kind = disp["kind"]
+    if kind == "closed":
+        return True
+    if kind == "waiting":
+        return now < float(disp.get("until") or 0.0)
+    if kind == "reassigned":
+        return bool(replacement_live)
+    return (last_activity > at) or (now - at < RESUMED_GRACE_S)
 
 
 def classify(now: float, last_wal: float, transcript_mtime: float, stopped: bool, outcome: str | None,
