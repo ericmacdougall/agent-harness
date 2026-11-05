@@ -265,6 +265,7 @@ class TargetSanity(workflow.DeliveryWorkflow):
         data = json.loads(out.getvalue())
         self.assertEqual(data['status'], 'BLOCKED_POLICY', data)
         self.assertNotEqual(code, 0)
+        self.assertIn('distinct worktrees', data['message'], data)
         self.assertEqual(module.target_preflight(link, 'main', 'warn'), [])
 
     def test_huge_staged_set_gets_a_specific_refusal(self):
