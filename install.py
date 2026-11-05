@@ -27,7 +27,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "review_diagnostics.py", "review_policy.json", "merge_gate.py",
          "heavy_job_guard.py", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "ops_watch.py", "resource_limits.json",
          "domain_gates.py", "domain_checklists.json",
-         "command_guard.py", "command_guard_hook.py", "redact.py",
+         "command_guard.py", "command_guard_hook.py", "redact.py", "kill_guard.py", "kill_guard_policy.json",
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py",
          "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
@@ -49,7 +49,7 @@ class DirectoryPublicationError(OSError):
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
-                         "command_guard_hook.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py")}
+                         "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -88,6 +88,13 @@ def command_guard_group(claude: Path) -> dict:
     gate for the Go front door (cmd/harness/gates.json); the launcher ignores its arguments."""
     return {"matcher": "Bash|PowerShell", "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "command_guard_hook.py"), "hook"],
+        "timeout": 30, "onFailure": "block"}]}
+
+
+def kill_guard_group(claude: Path) -> dict:
+    """Broad-kill and unowned-PID kill guard (GoodQA #14506). Its launcher fails closed on its own."""
+    return {"matcher": "Bash|PowerShell", "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "kill_guard.py"), "hook"],
         "timeout": 30, "onFailure": "block"}]}
 
 
@@ -158,6 +165,7 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     }
     if command_guard:
         managed["PreToolUse"].insert(0, command_guard_group(claude))
+        managed["PreToolUse"].insert(1, kill_guard_group(claude))
     if provenance:
         for event, groups in provenance_hook_groups(claude).items():
             managed.setdefault(event, []).extend(groups)

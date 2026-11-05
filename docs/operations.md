@@ -505,6 +505,106 @@ Run `replay` over recent transcripts and the red-team hold-out set before the en
 
 **Known gap.** Claude Code `Write`, `Edit`, `MultiEdit`, `NotebookEdit` and Codex `apply_patch` are not shell tools. The guard does not see them, so they can still overwrite or empty a transcript or WAL. Follow-up: GoodQA #14500.
 
+## Kill guard
+
+`kill_guard.py` (GoodQA #14506, matrix X05) is a PreToolUse guard that stops an agent from killing processes it does not own. It exists because an owner piped `pgrep -f` into `xargs kill`, and another ran `pkill -f`, and both stopped other owners' test runs on a shared host. It is separate from the command guard and reuses its parser, so wrappers (`sudo`, `env`, `nohup`, `timeout`, `sh -c`, `eval`, here-documents, aliases, script files) are followed. Threat model: careless agents and common obfuscation, not an agent that edits its own hooks.
+
+### What is blocked
+
+| Form | Result |
+|---|---|
+| `pkill`, `killall`, `killall5`, `skill`, `slay`, `fkill`, `kill-port`, `fuser -k`, `taskkill`, `Stop-Process`, `systemctl kill`, `launchctl kill`, `tmux kill-server`, `pm2 kill`, `loginctl kill-*` and `terminate-*`, the PowerShell `kill` alias | blocked in any form, including after any wrapper (`sudo`, `env`, `time -p`, `gtimeout`, `xargs` with any options, `systemd-run`, `tmux`, `at`, `npx` ...): the first later word that is a kill verb starts the real command |
+| `kill` fed by `xargs`, `$(...)`, backticks, `while read` or a `for` loop variable, or any variable, glob or negative, zero or non-ASCII PID | blocked: the targets cannot be proven yours |
+| interpreter code (`-c`, `-e`, here-documents, here-strings) or PowerShell text that mentions `kill`, `terminate(`, `send_signal`, `taskkill`, `Invoke-CimMethod` or `GetProcessById` (a liveness probe `os.kill(pid, 0)` is exempt) | blocked; this is deliberately broad and can block code that merely prints the word. Set `script_kill_pattern` to an empty string in the policy to turn this check off |
+| `find -exec kill`, `parallel kill`, `netwatch orphans --kill` with `--all`, `--force`, `--match` or without `--pid` | blocked |
+| text that names a kill and is run as shell code: anything on the left of a pipe into a shell (`sh`, `zsh`, `bash -s`, `sudo sh`, `ssh host bash`, `xargs -I{} sh -c {}`), including a `for`, `while`, `if`, `{ }` or `( )` body and a here-document, or a substitution given to `eval`, `sh -c` or a shell as a file operand (`bash <(...)`) | blocked as `text-to-shell`, even when the PIDs are yours; the guard does not compute what the left side prints. Text that is only printed, searched or piped to something else stays allowed. `skill`, `slay`, `spps` and `wmic` do not count as kill words in text, so `echo 'skill -9 foo' \| ssh dev2 bash` is allowed. Other routes into a shell are in Known limits, rows 19, 21, 22 and 25 |
+| `kill PID...` with literal PIDs | allowed only when every PID is proven yours (below) |
+| `kill -0` with literal PIDs or one quoted simple variable (`"$PID"`), `kill -l`, `kill -L`, job specs (`kill %N`, `%%`, `%+`, `%-`, `%name`), `pgrep`, `ps`, `lsof`, `timeout -s KILL`, text that only contains the word | allowed |
+| `kill -0` with a dash word anywhere among its targets (procps `/usr/bin/kill` reads options after the PID), an unquoted or operator variable (`$PID`, `${x:-..}`), `"$@"`, an array, a substitution or glob, or fed by `xargs` | blocked: the probe shortcut ends, and the targets are judged like any kill |
+| a `kill` whose option words (the words before the PID list) are not single literal tokens: `-SIG`, `-NUM`, `-s SIG`, `-n SIG`, `--signal SIG`, `--signal=SIG`, `--`; or that has a quoted, expanded, braced or globbed option word, an unknown long option, or any dash word after the first signal option; `kill -l` with an expanded or quoted word | blocked as `unprovable-target`; bash and zsh read these words differently from each other and from a text scan, so no PID after them can be proven yours |
+
+### How ownership is proven
+
+A PID is yours when it is not PID 1, not the hook process or any ancestor of it (the agent CLI and its shell), not a protected program (`claude`, `codex`, `sshd`, `launchd`, `systemd`, `init`, `tmux`, `screen`, `netwatch`), has your uid, and one of these holds:
+
+1. its cwd (Linux `/proc/PID/cwd`, macOS `lsof -a -d cwd -p PID`) is inside your git worktree;
+2. its program (`argv[0]`) is a path inside your worktree, or `argv[0]` is an interpreter or shell and `argv[1]` is a path inside your worktree (a `tail` or editor that merely names a file there does not count);
+3. it is in this worktree's spawn ledger with the same start time.
+
+Your worktree is the git toplevel of the tool call's working directory, not of a `cd` inside the command, so a `cd` into another owner's worktree proves nothing. Worktrees nested inside yours are excluded, and `/`, HOME and its ancestors are never used. Anything that cannot be read, times out (2 s per probe) or does not parse is unprovable and blocked. The probes run only after a kill verb is found, so ordinary commands cost nothing extra.
+
+Process ancestry is deliberately not a proof: subagents share the CLI process, so another owner's processes are descendants of it too.
+
+### Kill grammar
+
+Once the shared command parser has handed the guard a `kill` command, the guard accepts it only if every word fits a closed grammar, checked against the word's exact source text so a form the lexer does not understand cannot pass as a literal (`kill_guard.py`, `parse_kill_words`). This covers the kill words only. A kill the parser never presents to the guard is not judged at all; those gaps are listed under Known limits below and tracked in goodqa#14654 (items 1-14) and goodqa#14677 (item 16):
+
+- option, first word only and unquoted: `-SIG`, `-s SIG`, `-n SIG`, `--signal SIG`, `--signal=SIG`, then an optional `--`; or `-l`, `-L`, `--list`, `-t`, `--table` with plain signal values;
+- target: a literal integer, a job spec `%N`, `%%`, `%+`, `%-` or `%name` matching `[A-Za-z_][A-Za-z0-9_.-]*`, unquoted or wholly inside one pair of quotes;
+- `kill -0` only: one target that is exactly `"$NAME"` or `"${NAME}"`.
+
+Everything else fails closed, whatever it would expand to: `$!`, `PID=4001; kill $PID`, `{4001,4016}`, `\\4001`, `$'4001'`, `$x""`, `%a$=x`, `%?str`, and a parenthesis in a command that holds a kill (`kill 4001(N) 4004`, where zsh drops the first word). The shell may read such words again as code, so the parenthesis rule judges the command up to the parenthesis with its variables resolved, whatever the command is called: `gkill`, `K=kil; ${K}l`, `$(...)`, `K=kill; eval $K 4001(N) 4004` and `eval "kill 4001" 4001(N) 4004` all count, as do `env -S` with a separate value, `watch`, `sh -c`, and a wrapper with the parenthesis word directly before the kill (`timeout 5 x(N) kill 4004`). A parenthesis word among a wrapper's own options is not seen (Known limits, row 26). When a value is unknown, a shell, `eval`, `source`, `trap`, a listed wrapper or remote tool, or a command whose name holds an expansion is refused if the input names a kill anywhere. Other commands that run text are not, such as `cmd /c` and `pnpm exec` (row 26). A command that only prints or searches its words (`echo`, `print`, `printf`, `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `ag`, `ack`) leaves them as data unless it is piped into a shell. A parenthesis in another command does not count (`[[ "$s" =~ ^(a|b)$ ]] && kill 4001`, `case "$x" in (a) kill 4001;; esac`), and neither does the definition `kill() { ...; }` or the parenthesis of an array literal. An array assigns its variable like any other, so `K=(kill); $K 4004` and `a=(kill 4001); $a 4004` are judged as the kills they run; in bash `$a` is only the first element, and the guard judges all of them. The words of a literal are also still read as a command, so `K=(kill stop)` is refused on its own and `K=(kill)` is not (Known limits, row 24). After a background job use `kill %1`, or start it with `kill_guard.py spawn` and use the printed PID.
+
+### Starting processes you will need to stop
+
+`python3 ~/.claude/hooks/kill_guard.py spawn [--log FILE] -- CMD ARGS...` starts the command detached from inside a git worktree, records its PID and start time in `~/.agent-harness/state/kill-guard/ledger-<hash>.jsonl` with an HMAC under a 0600 key in a 0700 directory, and prints the PID. `spawn` takes a command, never a PID, and the guard judges the spawned command as if you had typed it. The ledger protects against accident: anyone who can read the key can forge a line. A later call's `kill "$SERVER_PID"` is blocked by design; use the printed PID literally, or `netwatch orphans --kill --pid N`.
+
+### Remote kills
+
+Ownership cannot be checked on another machine, so every kill verb and every kill with a numeric PID inside `ssh`, `mosh`, `docker exec` or `kubectl exec` is blocked, as is the code of `ssh -o ProxyCommand=` and `-o LocalCommand=`. Remote listing and `kill -0` are allowed. The only remote kill is `ssh HOST netwatch orphans --kill --pid N[,N...]` (digits only; flags `--json` allowed). netwatch signals only processes it lists as orphans, and the guard recognises it by name. A local `netwatch orphans --kill --pid N` is allowed without the ownership proof, so an orphan of another owner can still be named by PID; that trust is accepted.
+
+### Block messages and audit
+
+Every block is one line and names `netwatch orphans --kill --pid <pid>`. It carries a rule code and PIDs, never the command, a secret or another process's command line. Each block appends a redacted line (time, rule, PIDs, a 16-character hash of the command) to `~/.agent-harness/state/kill-guard/audit.jsonl`.
+
+### Fail closed
+
+The registered command is `kill_guard.py hook`, a launcher that runs the analysis in a child process with a 10 s limit (8 s watchdog inside). If the child crashes, cannot start, times out, prints garbage, the launcher blocks when the normalised command text (the whole text, with quotes, backslashes and `$` removed) contains `kill`, `fuser`, `Stop-Process` or an indirection marker (ANSI-C quote, `eval`, `base64`, `xxd`), and otherwise allows with a note. Input above 8 MiB is always blocked. A harmless `eval` is therefore blocked while the analyser is broken. The Claude Code entry matches `Bash|PowerShell` with `onFailure: block`; the Codex entry has no matcher. The guard never blocks reading or editing its own files. Policy is `kill_guard_policy.json` (`mode`: `enforce`, `warn` or `off`; the file is human-edited, there is no override variable).
+
+### Known limits
+
+**Not covered: kills the shared parser never hands to the guard (goodqa#14654; the protected-log variant is goodqa#14655).** Found by the red-team of `4922c22`; the lexer in `command_guard.py` predates the kill guard and is being changed by another owner. Payload shapes (real-shell results are macOS bash 3.2 and zsh 5.9 on sleepers only):
+
+| # | Shape | Example |
+|---|---|---|
+| 1 | text piped into a remote login shell with no command named (`| ssh dev2 bash` is now blocked, the goodqa#14617 incident shape) | `printf 'pkill -f x\n' \| ssh dev2` |
+| 3 | backslash-newline continuation inside a comment, after a heredoc last line, or after an escaped backslash | `# note \` then a `kill` on the next line |
+| 4 | substitutions inside `${...}`, `$((...))` and case patterns are not read | `echo ${x:-$(kill -9 4004)}` |
+| 5 | case state entered from an argument | `echo then case x in; kill -9 4004` |
+| 6 | heredoc delimiter taken from expanded text | `cat <<$x` then a `kill` after the body |
+| 9 | a variable head whose value is never visible | `read x <<< kill; $x -9 4004` |
+| 10 | zsh command forms | `=kill`, `nocorrect kill`, `repeat 1 kill`, `zargs`, `zpty`, `hash k=/bin/kill` |
+| 12 | local stdin shells | `source /dev/stdin <<< 'kill ...'` |
+| 13 | a literal PID rewritten at parse time | `alias -g 4001=4004; eval "kill -9 4001"` |
+| 14 | wrappers and remote tools the guard does not list | `xcrun kill`, `tailscale ssh`, `pdsh`, `ansible -a`, `fd -x` |
+| 15 | an alias of the kill verb, because `_alias()` in `command_guard.py` does nothing | `alias K=kill` then `K -9 4004` on the next line |
+| 16 | interpreter code in a heredoc given to a remote command; the body is read as shell, not as interpreter code, so this is the goodqa#14617 route (goodqa#14677; a local `python3 - <<PY` is blocked) | `ssh dev2 python3 - <<'PY'` with `os.kill(4004, 9)` in the body |
+| 17 | a command name from a zsh expansion flag, split or joined from variables (goodqa#14684, medium) | `A=ki; B=ll; R="$A$B -15"; ${=R} 4004`, `K=(kill); ${(@)K} 4004` |
+| 18 | `find -exec` with the Homebrew-prefixed verb (goodqa#14685, low; `find -exec kill` is blocked) | `find . -exec gkill 4004 \;` |
+| 19 | kill text that reaches a shell by a route other than a pipe into it (goodqa#14691) | `echo "kill 4004" \| while read l; do eval "$l"; done`, `echo "kill 4004" \| tee >(sh)`, `echo "kill 4001" x(N) 4004 > x.sh; sh x.sh`, a shell in a variable with no visible value (`read S; ... \| $S`) |
+| 20 | kill text that only exists once a command has run, so no word names it (goodqa#14691) | `python3 gen.py \| sh`, `cat gen.txt \| sh` when the file cannot be read, `echo ki ll \| tr -d ' ' \| sh`, `for a in ki; do for b in ll; do echo "$a$b 4004"; done; done \| sh` |
+| 21 | a substitution or function that reaches a shell by a route other than a pipe stage or a file operand (goodqa#14697, low) | `bash < <(for p in 4001 4004; do echo "kill $p"; done)`, `sh <<< "$(for p in 4001 4004; do echo "kill $p"; done)"` (`sh <<< "$(echo kill 4004)"` is blocked), `ssh dev2 "$(echo kill 4004)"`, `cat <<< "$(echo kill 4004)" \| sh`, `f() { echo "kill 4004"; }; f \| sh` |
+| 22 | a pipe into a shell the guard does not recognise as reading its input (goodqa#14697, low) | `\| sudo -s`, `\| sudo su`, `\| su -`, `\| (sh)`, `\| (cd /tmp && sh)`, `\| { cd /tmp; sh; }`, `\| parallel -j 4`, `\| $(which bash)`, `S=sh; ... \| sudo $S` |
+| 23 | a command name whose value reaches its variable by a copy, a loop or a builtin, or a glued `env -S` (goodqa#14697, low) | `K=(kill); c="${K[0]}"; $c 4004`, `for c in kill; do $c 4004; done`, `set -A K kill; $K 4004`, `printf -v K kill; $K 4004`, `K=kill; env -S"$K" 4001(N) 4004`, `env -S"kill 4001" 4001(N) 4004` |
+| 24 | a false refusal, not a gap: the words of an array literal are read as a command, as they were before this rule (goodqa#14697, low) | `K=(kill stop); echo "${K[@]}"` is refused |
+| 25 | a pipe into a wrapped ssh or a variable holding ssh: the shell at the far end is not seen, which is the goodqa#14617 harm (goodqa#14712, medium); `\| ssh dev2 bash` is blocked | `printf 'pkill -f x\n' \| timeout 30 ssh dev2 bash`, `\| sudo ssh dev2 bash`, `\| ssh jump ssh dev2 bash`, `\| timeout 5 docker exec -i c sh`, `SSH="ssh -T dev2"; ... \| $SSH bash`, `S=(ssh dev2 bash); ... \| "${S[@]}"`, `SSH=(ssh -T dev2); "${SSH[@]}" 'pkill -f x'` |
+| 26 | a regression from dropping the whole-command check of `d6ae1ff`: a parenthesis word among a wrapper's own options, or an unknown value given to an unlisted command that runs text (goodqa#14713, low) | `timeout x(N) 5 kill 4004`, `flock x(N) /tmp/l kill 4004`, `nice -n x(N) 5 kill 4004`, `sudo -u x(N) root kill 4004`, `read x; cmd /c $x 4001(N) 4004; kill 4001`. The same with `pnpm exec` is allowed too, but `2f3bf1b` allowed it as well |
+
+Verdicts in rows 17 to 26 come from `decide()`, the guard's classifier. Real-shell results come from dev2 with stand-in sleepers. There, every form of rows 21, 22 and 23 that ran killed while the guard allowed it, and so did `timeout`, `flock` and `nice` in row 26. The `sudo`, `su`, `ssh` and `parallel` forms were not run in a real shell, and neither were `docker`, `cmd /c` or `pnpm exec`, so the outcome of those forms is inferred. Further low gaps are listed in goodqa#14713.
+
+The guard therefore does not close the incident class. It closes the kill words it is shown.
+
+**Other limits.** A verb assembled from several variables at run time, `eval "$(cat file)"`, kill calls inside script files or interpreter files that were not typed in the same input (`python3 file.py`), `make` or `npm` targets, compiled programs, `docker kill`, `kubectl delete pod`, `supervisorctl`, `launchctl remove` and `scp -S`, `rsync -e` or `git -c core.sshCommand` local command options, code run by `awk`, `sed 1e`, `tar --to-command`, `vim -c` or `emacs --eval`, `tmux send-keys`, and a wrapper option whose value is itself the name of an ordinary command (`exec -a echo pkill x`; the scan ends at the first ordinary command so `sudo grep kill file` stays allowed) are not covered. Between 1 and 8 MiB the crash fallback is weaker than the analyser (it does not rebuild a verb split by variables). Not verified: busybox and util-linux `kill` option parsing, live `docker exec` and `kubectl exec` kills, and interactive zsh with Claude Code's shell snapshot (the zsh-only forms are refused by the closed grammar; only `kill A(N) B` and the `#` comment form were run, on macOS zsh 5.9 against sleepers). `sleep N; kill PID` is judged when the hook runs, not when the kill runs, so a PID reused in between is a residual risk. On macOS `ps` loses argument boundaries, so only the first two whitespace-separated words are read and a path with spaces is unprovable.
+
+### Commands and rollout
+
+| Command | Purpose |
+|---|---|
+| `kill_guard.py spawn [--log F] -- CMD...` | Start a process you can later kill. |
+| `kill_guard.py explain FILE [--cwd D]` | Show the decision for a command stored in a file. Runs nothing. |
+
+Install with `install.py --apply` and `install_codex.py --apply`; both register the kill guard together with the command guard, and `--no-command-guard` removes both registrations. Tests: `python3 -m unittest tests.test_kill_guard` (decides text only, signals nothing, safe anywhere). The live canary test, `tests/live_kill_canary.py`, starts its own sleepers and a canary, and runs only on dev2: `env -i HOME=$(mktemp -d) PATH=/usr/bin:/bin KILL_GUARD_LIVE=1 python3 tests/live_kill_canary.py`. Rules registry entry: `docs/rules/kill-guard.json`.
+
 ## Spec-driven tickets
 
 Every want, need, finding or bug is a GoodQA ticket. When an agent picks one up, it writes a spec, gets the spec reviewed and attaches it to the ticket. As it works, it attaches proof for each acceptance criterion. After deploy, it attaches the click-test record. Once signed off, the ticket can be marked done.

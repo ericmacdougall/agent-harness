@@ -65,7 +65,7 @@ Claude Code's `--safe-mode` disables `CLAUDE.md` and hooks, including the WAL ga
 To uninstall, follow these steps:
 
 1. Remove the marked block from `CLAUDE.md`.
-2. Remove the harness entries from `settings.json`: the hook entries pointing at `~/.claude/hooks/wal.py`, `~/.claude/hooks/commit_policy.py`, `~/.claude/hooks/spec_flow.py`, `~/.claude/hooks/merge_gate.py` or `~/.claude/hooks/command_guard_hook.py`, and the harness permission rules.
+2. Remove the harness entries from `settings.json`: the hook entries pointing at `~/.claude/hooks/wal.py`, `~/.claude/hooks/commit_policy.py`, `~/.claude/hooks/spec_flow.py`, `~/.claude/hooks/merge_gate.py`, `~/.claude/hooks/command_guard_hook.py` or `~/.claude/hooks/kill_guard.py`, and the harness permission rules.
 3. Run `python3 ~/.claude/hooks/commit_policy.py uninstall-git-hook`.
 4. If installed, run `~/.agent-harness/bin/netwatch uninstall`, delete the binary, and pass `--no-netwatch` to any later install.
 5. Remove the copied agents and helper scripts. Restore a backup if you want the exact earlier state.
@@ -92,6 +92,8 @@ Untracked repos may reference local ledger tickets. `harness tickets` keeps tick
 When `peer_review.py` cannot produce a reviewed result it prints a stable reason code, an exact next step and a reminder that native evidence is not a helper receipt; it also finds the reviewer CLIs in documented install locations and lints review packets for run evidence and the exact HEAD. See [review helper reliability](docs/operations.md#review-helper-reliability).
 
 A command guard (`command_guard.py`, behind the fail-closed launcher `command_guard_hook.py`) blocks shell commands that delete, move or empty Claude, Codex and harness logs and state, or that print secrets and configuration (for example `rclone config show`), in both editions; deletes of logs need a verified Dropbox backup and a single-use `approve-delete`. See [command guard](docs/operations.md#command-guard).
+
+A kill guard (`kill_guard.py`, GoodQA #14506) blocks `pkill`, `killall`, `pgrep`-fed kills and kills of processes the caller cannot prove it owns (cwd or program inside its own worktree, or a `kill_guard.py spawn` ledger entry), including inside `ssh`, except `netwatch orphans --kill --pid N`; see [kill guard](docs/operations.md#kill-guard).
 
 Both editions also gate PR merges: a PreToolUse hook (`merge_gate.py`) blocks `gh pr merge`, `gh api` merge calls (REST and GraphQL) and wrapped forms unless every required and reported check on the exact head SHA is green, the merge command carries that head SHA, and the check state could be read; the only override is a recorded single-use waiver. See [merge gate](docs/operations.md#merge-gate).
 

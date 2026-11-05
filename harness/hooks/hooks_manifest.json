@@ -398,17 +398,19 @@
   {
    "id": "kill_guard:hook",
    "script": "kill_guard.py",
-   "arg": null,
+   "arg": "hook",
    "event": "PreToolUse",
    "tools": [
     "Bash"
    ],
    "flavors": [
-    "claude"
+    "claude",
+    "codex"
    ],
-   "status": "pending",
-   "owner": "feat/kill-guard-14506",
-   "rules": []
+   "status": "installed",
+   "rules": [
+    "S27"
+   ]
   },
   {
    "id": "heavy_job_guard:hook",
