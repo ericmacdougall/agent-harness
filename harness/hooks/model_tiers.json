@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "mode": "warn",
+  "lowest_rung": "R0",
+  "top_writing_rung": "R5",
+  "failures_per_rung": 2,
+  "unknown_author_reviewer_rung": "R1",
+  "ladder_limits": {"max_review_launches": 8, "max_rung_climbs": 3, "max_total_review_usd": 60},
+  "preferred_review_harness": {"claude": "openai", "openai": "claude", "unknown": "openai"},
+  "rungs": {
+    "R0": {"effort": "medium", "effort_any": true, "writable": true, "reviewer_rung": "R1", "needs_user_permission": false, "ultracode": false, "review_budget_usd": 5, "timeout_minutes": 15,
+           "models": {"claude": "sonnet", "openai": "gpt-5.1-terra"}},
+    "R1": {"effort": "medium", "effort_any": false, "writable": true, "reviewer_rung": "R2", "needs_user_permission": false, "ultracode": false, "review_budget_usd": 5, "timeout_minutes": 15,
+           "models": {"claude": "opus", "openai": "gpt-6.1-sol"}},
+    "R2": {"effort": "high", "effort_any": false, "writable": true, "reviewer_rung": "R3", "needs_user_permission": false, "ultracode": false, "review_budget_usd": 8, "timeout_minutes": 20,
+           "models": {"claude": "opus", "openai": "gpt-6.1-sol"}},
+    "R3": {"effort": "xhigh", "effort_any": false, "writable": true, "reviewer_rung": "R4", "needs_user_permission": false, "ultracode": false, "review_budget_usd": 12, "timeout_minutes": 25,
+           "models": {"claude": "opus", "openai": "gpt-6.1-sol"}},
+    "R4": {"effort": "max", "effort_any": false, "writable": false, "reviewer_rung": null, "needs_user_permission": false, "ultracode": false, "review_budget_usd": 20, "timeout_minutes": 30,
+           "models": {"claude": "opus", "openai": "gpt-6.1-sol"}},
+    "R5": {"effort": "medium", "effort_any": false, "writable": true, "reviewer_rung": "R6", "needs_user_permission": true, "ultracode": false, "review_budget_usd": 30, "timeout_minutes": 40,
+           "models": {"claude": "fable", "openai": "gpt-6-astra"}},
+    "R6": {"effort": "high", "effort_any": false, "writable": false, "reviewer_rung": null, "needs_user_permission": true, "ultracode": false, "review_budget_usd": 30, "timeout_minutes": 40,
+           "models": {"claude": "fable", "openai": "gpt-6-astra"}}
+  },
+  "families": {
+    "claude": {
+      "sonnet": {"aliases": ["sonnet"], "id_pattern": "^claude-sonnet-", "rung_by_effort": {"*": "R0"}},
+      "opus": {"aliases": ["opus"], "id_pattern": "^claude-opus-", "rung_by_effort": {"low": "R1", "medium": "R1", "high": "R2", "xhigh": "R3", "max": "R4"}},
+      "fable": {"aliases": ["fable"], "id_pattern": "^claude-fable-", "rung_by_effort": {"low": "R5", "medium": "R5", "high": "R6", "xhigh": "R6", "max": "R6"}}
+    },
+    "openai": {
+      "terra": {"aliases": [], "id_pattern": "^gpt-[0-9.]+-terra$", "rung_by_effort": {"*": "R0"}},
+      "sol": {"aliases": [], "id_pattern": "^gpt-[0-9.]+-sol$", "rung_by_effort": {"low": "R1", "medium": "R1", "high": "R2", "xhigh": "R3", "max": "R4"}},
+      "astra": {"aliases": [], "id_pattern": "^gpt-[0-9.]+-astra$", "rung_by_effort": {"low": "R5", "medium": "R5", "high": "R6", "xhigh": "R6", "max": "R6"}}
+    }
+  },
+  "caps": {"session_live_agents": 40, "live_ttl_seconds": 1800},
+  "default_effort": "medium",
+  "efforts": ["low", "medium", "high", "xhigh", "max"]
+}

@@ -410,7 +410,7 @@ def capture_subject(repo, manifest=None):
                 known[label] = hashlib.sha256(body).hexdigest()
         except (OSError, TypeError, ValueError):
             unknown.append(label)
-    for name in ('usage_guard.py', 'peer_review.py', 'process.py', 'git_safety.py', 'report_file.py'):
+    for name in ('usage_guard.py', 'peer_review.py', 'review_diagnostics.py', 'review_policy.json', 'process.py', 'git_safety.py', 'report_file.py'):
         path = Path(__file__).resolve().with_name(name)
         if path.is_file():
             known['runtime/' + name] = hashlib.sha256(file_bytes(path, MAX_FILE, private=False)).hexdigest()

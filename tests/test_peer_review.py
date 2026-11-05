@@ -4,6 +4,7 @@ import json
 import os
 import resource
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,9 +15,42 @@ from unittest.mock import patch
 
 
 REVIEW = Path(__file__).resolve().parents[1] / 'harness/hooks/peer_review.py'
+sys.path.insert(0, str(REVIEW.parent))
+import review_diagnostics  # noqa: E402
 
 
 _OFFLINE = None
+_SYSTEM_BIN = []
+REVIEWER_NAMES = frozenset({'codex', 'claude', 'codex.js'})
+
+
+def system_path():
+    """A PATH entry with the machine's tools but never a real reviewer CLI.
+
+    A real codex or claude in /usr/bin (dev2 has one) must not be discovered and
+    executed by a test that removes the fake reviewer to simulate absence.
+    """
+    if not _SYSTEM_BIN:
+        holder = tempfile.TemporaryDirectory(prefix='review-sysbin-')
+        target = Path(holder.name)
+        for source in ('/usr/bin', '/bin'):
+            try:
+                names = sorted(os.listdir(source))
+            except OSError:
+                continue
+            for name in names:
+                full = os.path.join(source, name)
+                if name in REVIEWER_NAMES or os.path.lexists(target / name) or os.path.isdir(full):
+                    continue
+                if os.access(full, os.X_OK):
+                    os.symlink(full, target / name)
+        empty = {'known_install_locations': {'codex': [], 'claude': []}}
+        for reviewer in ('codex', 'claude'):
+            found = review_diagnostics.discover_executable(reviewer, policy=empty, roots=[], path_env=holder.name)
+            if found['path'] is not None:
+                raise RuntimeError('test system PATH still reaches a real reviewer: %s' % found['path'])
+        _SYSTEM_BIN.append(holder)
+    return _SYSTEM_BIN[0].name
 
 
 def setUpModule():  # tests never call the ticket tracker; restored in tearDownModule so it cannot leak into other modules
@@ -38,6 +72,13 @@ class PeerReviewTests(unittest.TestCase):
             'AGENT_HARNESS_USAGE_DIR': str(self.root / 'usage-state')})
         self.guard_environment.start()
         self.addCleanup(self.guard_environment.stop)
+        # Never discover a real reviewer CLI from the machine's install locations.
+        policy = self.root / 'review-policy.json'
+        policy.write_text(json.dumps({'schema': 1, 'known_install_locations': {'codex': [], 'claude': []}}))
+        policy.chmod(0o600)
+        self.policy_environment = patch.dict(os.environ, {'AGENT_HARNESS_REVIEW_POLICY': str(policy)})
+        self.policy_environment.start()
+        self.addCleanup(self.policy_environment.stop)
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         subprocess.run(['git', 'init', '-q', '-b', 'main', str(self.repo)], check=True)
@@ -122,16 +163,25 @@ print(os.environ.get('CLAUDE_VERDICT', default + '\\nFallback reviewed.'))
 sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
 ''')
 
+    @staticmethod
+    def evidence(head):
+        return (f'\nReviewed HEAD {head}\n$ python3 -m unittest discover tests\nRan 12 tests in 0.5s\nOK\nexit 0\n')
+
     def fake(self, name, body):
         path = self.bin / name
         path.write_text(f'#!{sys.executable}\n{body}')
         path.chmod(0o700)
 
-    def invoke(self, *, packet=None, output=None, env=None, expected_head=None, stage='pr', extra=()):
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin', **(env or {})}
+    def invoke(self, *, packet=None, output=None, env=None, expected_head=None, stage='pr', extra=(), cwd=None):
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + system_path(), **(env or {})}
         if expected_head is None:
             expected_head = subprocess.run(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'],
                                            check=True, capture_output=True, text=True).stdout.strip()
+        if stage in {'pr', 'code-inspection'} and packet in (None, self.packet) and self.packet.exists():
+            # Packets must carry run evidence and the exact HEAD (review_diagnostics.lint_packet).
+            if review_diagnostics.lint_packet(stage, self.packet.read_text(errors='replace'), expected_head):
+                with self.packet.open('a') as handle:
+                    handle.write(self.evidence(expected_head))
         if stage == 'plan':  # plan packets now need a resource budget; the fixture host is a vm so no live capacity is read
             target = Path(packet or self.packet)
             if target.exists() and '## Resource budget' not in target.read_text():
@@ -140,7 +190,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
                                '--packet', str(packet or self.packet), '--output', str(output or self.output),
                                *(['--expected-head', expected_head] if stage in {'pr', 'code-inspection'} else []), *extra]
         return subprocess.run(command,
-                              text=True, capture_output=True, env=environment, timeout=45)
+                              text=True, capture_output=True, env=environment, timeout=45, cwd=cwd)
 
     def test_source_local_clean_filter_is_refused_before_execution(self):
         (self.repo / '.gitattributes').write_text('app.txt filter=fixture\n')
@@ -598,7 +648,8 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(capture.exists())
         self.assertEqual(launches.read_text().split(), ['codex', 'claude'])
-        self.assertIn('Blind Claude Opus fallback', self.output.read_text())
+        self.assertIn('Reviewer: Claude opus medium (rung R1)', self.output.read_text())
+        self.assertIn('Fallback reason: Primary reviewer unavailable (AUTH)', self.output.read_text())
 
     def test_structured_failure_overrides_exit_zero_and_last_message_pass(self):
         capture = self.root / 'fallback.capture'
@@ -664,11 +715,14 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                 raise OSError('synthetic stdout failure')
             print(*arguments, **keywords)
 
+        if review_diagnostics.lint_packet('code-inspection', self.packet.read_text(errors='replace'), head):
+            with self.packet.open('a') as handle:
+                handle.write(self.evidence(head))
         output, errors = io.StringIO(), io.StringIO()
         with patch.object(sys, 'argv', ['review', 'code-inspection', '--repo', str(self.repo),
                 '--packet', str(self.packet), '--output', str(self.output),
                 '--expected-head', head, '--input-manifest', str(manifest)]), \
-             patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin'}), \
+             patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'CODE_INSPECTION_RESULT: ACCEPT', '')), \
              patch.object(usage_guard.Run, 'finish', finish_with_hook), \
              patch.object(module, 'print', side_effect=announce, create=True), \
@@ -851,7 +905,8 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                 self.assertFalse(output.exists())
 
     def test_report_names_raw_packet_bytes_digest(self):
-        raw = b'Scope with non-UTF8 byte: \xff'
+        head = subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], text=True).strip()
+        raw = b'Scope with non-UTF8 byte: \xff' + self.evidence(head).encode()
         self.packet.write_bytes(raw)
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -998,7 +1053,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         subdir = self.repo / 'subdir'
         subdir.mkdir()
         capture = self.root / 'model.capture'
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + system_path(),
                        'CAPTURE_CODEX_PROMPT': str(capture)}
         result = subprocess.run([sys.executable, str(REVIEW), 'pr', '--repo', str(subdir),
                                  '--packet', str(self.packet), '--output', str(self.output)],
@@ -1022,7 +1077,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         alias.symlink_to(self.root, target_is_directory=True)
         result = self.invoke(packet=alias / 'packet.md', output=self.packet)
         self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(self.packet.read_text(), 'Scope and evidence for a disposable review.')
+        self.assertTrue(self.packet.read_text().startswith('Scope and evidence for a disposable review.'))
 
     def test_case_aliases_cannot_delete_repo_file_or_packet(self):
         alias_repo = self.repo.parent / self.repo.name.upper()
@@ -1036,7 +1091,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertEqual(tracked.read_text(), 'preserve\n')
         second = self.invoke(output=alias_packet)
         self.assertEqual(second.returncode, 2, second.stdout)
-        self.assertEqual(self.packet.read_text(), 'Scope and evidence for a disposable review.')
+        self.assertTrue(self.packet.read_text().startswith('Scope and evidence for a disposable review.'))
 
     def test_hardlinked_packet_cannot_be_unlinked_as_output(self):
         alias = self.root / 'packet-hardlink.md'
@@ -1301,14 +1356,121 @@ class ProviderEnvelopeTests(unittest.TestCase):
             calls.append((command[0], timeout))
             return (1, quota, '') if len(calls) == 1 else (0, valid, '')
         with tempfile.TemporaryDirectory() as temporary, \
-             patch.object(self.module.shutil, 'which', return_value='fixture'), \
+             patch.object(self.module.diagnostics, 'discover_executable',
+                          side_effect=lambda name, **_: {'name': name, 'path': '/fixture/' + name, 'source': 'PATH', 'rejected': []}), \
              patch.object(self.module, 'run', side_effect=run), \
              patch.object(self.module.time, 'monotonic', side_effect=[0, 0, 0, 721, 721]):
             source, report, reason = self.module.review_snapshot(Path(temporary), 'a' * 40, 'pr', 'Review', 'Evidence')
-        self.assertEqual(calls, [('codex', 720), ('claude', 719)])
+        self.assertEqual(calls, [('/fixture/codex', 720), ('/fixture/claude', 719)])
         self.assertEqual(report, 'VERDICT: PASS')
         self.assertIn('fallback', reason)
 
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LadderSelectionTests(unittest.TestCase):
+    """AC-9 of goodqa#14527: the reviewer comes from the tier table and the result feeds the task ledger."""
+    fake = PeerReviewTests.fake
+    invoke = PeerReviewTests.invoke
+    evidence = staticmethod(PeerReviewTests.evidence)
+
+    def setUp(self):
+        PeerReviewTests.setUp(self)
+        self.ladder = self.root / 'ladder'; self.ladder.mkdir(mode=0o700)
+        self.argv_file = self.root / 'argv.json'
+        body = f'''import json, sys
+from pathlib import Path
+Path({str(self.argv_file)!r}).write_text(json.dumps(sys.argv))
+if '--output-last-message' in sys.argv:
+    Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text(Path({str(self.root / 'verdict.txt')!r}).read_text())
+else:
+    print(Path({str(self.root / 'verdict.txt')!r}).read_text())
+'''
+        self.fake('codex', body)
+        self.fake('claude', body)
+        # Hermetic PATH: only the fake bin dir plus symlinks to the tools a review run needs, so removing the
+        # fake codex means codex is absent even where a real /usr/bin/codex exists (dev2).
+        self.tools = self.root / 'tools'; self.tools.mkdir(mode=0o700)
+        for name in ('git', 'python3', 'sh', 'env', 'cat', 'mkdir', 'rm', 'cp', 'mv', 'ln', 'ls', 'chmod', 'sed', 'grep',
+                     'awk', 'tr', 'sort', 'head', 'tail', 'wc', 'date', 'sleep', 'dirname', 'basename', 'uname', 'mktemp',
+                     'readlink', 'true', 'false', 'find', 'xargs', 'diff', 'tar'):
+            found = shutil.which(name, path='/usr/bin:/bin:/usr/local/bin')
+            if found:
+                (self.tools / name).symlink_to(found)
+        self.assertFalse((self.tools / 'codex').exists() or (self.tools / 'claude').exists())
+        (self.root / 'verdict.txt').write_text('CODE_INSPECTION_RESULT: BLOCK\nF1: the handler drops the error\n')
+
+    def run_review(self, *extra, stage='code-inspection', remove=()):
+        for name in remove:
+            (self.bin / name).unlink()
+        return self.invoke(stage=stage, extra=list(extra), env={
+            'AGENT_HARNESS_ESCALATION_DIR': str(self.ladder), 'PATH': str(self.bin) + os.pathsep + str(self.tools)})
+
+    def test_codex_primary_carries_the_rung_effort_and_the_headers_name_the_selection(self):
+        result = self.run_review('--task', 'lad-1', '--author-rung', 'R2', '--author-harness', 'claude')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        argv = json.loads(self.argv_file.read_text())
+        self.assertEqual(argv[0].rsplit('/', 1)[-1], 'codex')
+        self.assertIn('gpt-6.1-sol', argv); self.assertIn('model_reasoning_effort=xhigh', argv)
+        report = self.output.read_text()
+        self.assertIn('Author-Rung: R2\n', report); self.assertIn('Reviewer-Rung: R3\n', report)
+        self.assertIn('Reviewer-Selection: openai gpt-6.1-sol xhigh;', report)
+        receipts = list((self.ladder / 'selections').glob('*.json'))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertEqual((receipt['task'], receipt['stage'], receipt['author_rung'], receipt['selection']['rung']),
+                         ('lad-1', 'code-inspection', 'R2', 'R3'))
+        self.assertEqual(receipt['packet_sha256'], hashlib.sha256(self.packet.read_bytes()).hexdigest())
+
+    def test_permission_rung_reviewer_needs_a_recorded_permission(self):
+        import escalation as ladder
+        import model_tiers as tiers
+        refused = self.run_review('--author-rung', 'R5', '--author-harness', 'claude')
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn('needs user permission', refused.stderr)
+        self.assertFalse(self.argv_file.exists()); self.assertFalse((self.ladder / 'selections').exists())
+        wals = self.root / 'wals'; (wals / 's').mkdir(parents=True)
+        wal = wals / 's' / 'main.jsonl'
+        wal.write_text(json.dumps({'id': 'w9', 'event': 'ask', 'note': 'fable review for [task:lad-5]', 'source': 'user:s/u "yes"'}) + '\n'
+                       + json.dumps({'id': 'w10', 'event': 'ask_resolved', 'ref': 'w9', 'note': 'approved'}) + '\n')
+        os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
+        ladder.Ledger(self.ladder, tiers.load_policy()).approve_top('lad-5', 'w9', wal)
+        allowed = self.run_review('--task', 'lad-5', '--author-rung', 'R5', '--author-harness', 'claude')
+        self.assertEqual(allowed.returncode, 3, allowed.stderr)
+        argv = json.loads(self.argv_file.read_text())
+        # Claude author, Codex present: the cross-harness reviewer is Astra high, launched only with the record.
+        self.assertIn('gpt-6-astra', argv); self.assertIn('Permission: w9\n', self.output.read_text())
+
+    def test_claude_fallback_carries_effort_and_budget_when_codex_is_absent(self):
+        result = self.run_review('--task', 'lad-2', '--author-rung', 'R1', '--author-harness', 'claude', remove=('codex',))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        argv = json.loads(self.argv_file.read_text())
+        self.assertEqual(argv[0].rsplit('/', 1)[-1], 'claude')
+        self.assertIn('--effort', argv); self.assertEqual(argv[argv.index('--effort') + 1], 'high')
+        self.assertIn('--max-budget-usd', argv); self.assertEqual(argv[argv.index('--max-budget-usd') + 1], '8')
+        self.assertEqual(argv[argv.index('--model') + 1], 'opus')
+        self.assertIn('Reviewer-Rung: R2\n', self.output.read_text())
+
+    def test_block_feeds_one_fail_event_and_a_replay_is_a_noop(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        import escalation as ladder, model_tiers as tiers
+        self.run_review('--task', 'lad-3', '--author-rung', 'R0')
+        state = ladder.Ledger(self.ladder, tiers.load_policy()).load('lad-3')
+        self.assertEqual(len(state['events']), 1)
+        event = state['events'][0]
+        self.assertEqual((event['class'], event['kind'], event['why']), ('FAIL', 'review', 'material review finding'))
+        self.assertEqual(event['source'], 'peer_review:code-inspection')
+        final = next((self.root / 'usage-state' / 'runs').glob('*/final.json'))
+        self.assertEqual(event['receipt_sha256'], hashlib.sha256(final.read_bytes()).hexdigest())
+        status = ladder.Ledger(self.ladder, tiers.load_policy()).record('lad-3', final.read_bytes(), kind='review', source='replay')
+        self.assertTrue(status['replayed']); self.assertEqual(status['failures_at_rung'], 1)
+
+    def test_unknown_author_is_reviewed_at_opus_sol_medium_and_flagged(self):
+        self.run_review()  # no task and no author rung: the author is unknown
+        report = self.output.read_text()
+        self.assertIn('Author-Rung: unknown (author unknown: lowest writer rung reviewer)', report)
+        self.assertIn('Reviewer-Rung: R1\n', report)
+        argv = json.loads(self.argv_file.read_text())
+        self.assertIn('model_reasoning_effort=medium', argv)

@@ -21,15 +21,37 @@ import time
 import unicodedata
 from pathlib import Path
 
+if sys.version_info < (3, 9):
+    sys.exit('REVIEW_DIAGNOSTIC code=PYTHON_UNSUPPORTED reason=TRANSIENT_INFRA: peer_review needs Python 3.9 or newer; '
+             'run it with python3.9+ (for example python3.12). Record the blocker in the WAL; any native review is '
+             'native evidence only, not a helper receipt.')
+
+import review_diagnostics as diagnostics
 from process import run as run_process, signal_group
 from git_safety import git_environment as safe_git_environment, require_safe_source
 from report_file import ReportTarget
+import escalation as ladder
+import model_tiers as tiers
 from usage_guard import GuardError, UsageStore, capture_subject, invocation_identity
 
 
 PACKET_LIMIT = 150_000
 PACKET_WARNING = 32 * 1024
 PROVIDER_LIMIT = 1_000_000
+_POLICY = []
+
+
+def review_policy():
+    if not _POLICY:
+        _POLICY.append(diagnostics.load_policy(warn=lambda message: print('Warning: ' + message, file=sys.stderr)))
+    return _POLICY[0]
+
+
+def prose_quota_failure(message):
+    """Free-text usage limit: unlock the one independent fallback, but never an account-pool cooldown."""
+    if diagnostics.usage_limit_prose(message, review_policy()):
+        return {**provider_failure({'code': 'quota_exceeded'}, trusted=False), 'reset_at': None}
+    return None
 DOMAIN_SECTION_LIMIT = 9000  # generated reviewer checklist, kept outside the signed packet bytes
 
 
@@ -87,6 +109,8 @@ def codex_failure(record, *, terminal):
         # Prose-derived, so it may unlock the independent fallback but never
         # places an account-pool cooldown.
         return provider_failure({'code': 'unauthorized'}, trusted=False)
+    if terminal and result['reason'] == 'INVALID_OUTPUT' and unstructured:
+        return prose_quota_failure(message) or result
     return result
 
 
@@ -177,13 +201,19 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
         elif provider == 'claude':
             for record in records:
                 if record.get('type') == 'error' or record.get('is_error') is True or record.get('error') is not None:
-                    return provider_failure(record)
+                    failure = provider_failure(record)
+                    if failure['reason'] == 'INVALID_OUTPUT' and record.get('is_error') is True:
+                        failure = prose_quota_failure(record.get('result')) or failure
+                    return failure
             terminal = [record for record in records if record.get('type') == 'result']
             if len(terminal) != 1 or records[-1] is not terminal[0]:
                 return invalid
             record = terminal[0]
             if record.get('is_error') is not False or record.get('subtype') != 'success':
-                return provider_failure(record)
+                failure = provider_failure(record)
+                if failure['reason'] == 'INVALID_OUTPUT' and record.get('is_error') is True:
+                    failure = prose_quota_failure(record.get('result')) or failure
+                return failure
             if (record.get('stop_reason') is not None and not isinstance(record['stop_reason'], str)
                     or record.get('terminal_reason') is not None and not isinstance(record['terminal_reason'], str)
                     or record.get('stop_reason') not in (None, 'end_turn', 'stop_sequence', 'completed', 'success', 'complete', 'normal', 'done')
@@ -202,7 +232,10 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                                   stderr.strip() or stripped)
             if marker:
                 return provider_failure({'code': marker[1].lower()})
-            return invalid
+            # Free-text stderr counts only for codex with no stdout, and only its last line (the CLI's own
+            # final error): earlier lines may echo packet or model text.
+            last_line = (stderr.strip().splitlines() or [''])[-1].strip()
+            return (prose_quota_failure(last_line) if provider == 'codex' and not stripped else None) or invalid
     if code != 0:
         return invalid
     try:
@@ -346,7 +379,8 @@ def git(repo: Path, *args: str, timeout: float = 120, snapshot: bool = False) ->
     result = run_process(['git', '-C', str(repo), *args], env=git_environment(snapshot=snapshot),
                          timeout=timeout)
     if result.returncode:
-        raise OSError('isolated Git operation failed')
+        step = next((a for a in args if not a.startswith('-') and '=' not in a), 'git')
+        raise OSError('isolated Git operation failed (%s)' % step)
     return result.stdout
 
 
@@ -447,16 +481,26 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
         # Symlinks (120000) are checked out as inert text files; gitlinks stay refused.
         if entry and entry.split(' ', 1)[0] not in ('100644', '100755', '120000'):
             raise OSError('reviewed tree contains gitlinks or unsupported entries')
+    clashes = diagnostics.path_collisions([e.split('\t', 1)[-1] for e in tree.split('\0') if e])
+    if clashes and diagnostics.fs_is_case_insensitive(snapshot.parent):
+        raise OSError('reviewed paths differ only by case or Unicode form on a case-insensitive filesystem')
     slow_git(snapshot, 'checkout', '--quiet', '--detach', head)
     if repo_state(snapshot, snapshot=True) != (head, ''):
         raise OSError('snapshot does not match reviewed commit')
     return base
 
 
+_CHILD_PATH_ROOTS: list[str] = []  # reviewed repo roots, set where discovery computes them
+
+
 def run(cmd: list[str], prompt: str, cwd: Path, timeout=720, on_spawn=None) -> tuple[int, str, str]:
+    environment = git_environment(snapshot=True)
+    # The reviewer's own interpreter lookup (`#!/usr/bin/env node`) must not reach reviewed files.
+    environment['PATH'] = diagnostics.child_path(
+        environment.get('PATH', ''), [*_CHILD_PATH_ROOTS, *diagnostics.untrusted_roots(snapshot=cwd)])
     try:
         extra = {'on_spawn': on_spawn} if on_spawn is not None else {}
-        result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=git_environment(snapshot=True),
+        result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=environment,
                              timeout=timeout, **extra)
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
@@ -650,7 +694,7 @@ def require_unflagged_index(repo: Path) -> None:
         if count > 250_000 or time.monotonic() > deadline:
             raise OSError('Git index listing exceeded limits')
         if len(record) < 3 or record[:2] != b'H ':
-            raise OSError('Git index contains a hidden or unsupported entry flag')
+            raise OSError('Git index contains a hidden or unsupported entry flag (%r)' % record[:1].decode('ascii', 'replace'))
 
 
 def ignored_directory_prefixes(repo: Path, deadline: float) -> set[tuple[str, ...]]:
@@ -694,30 +738,50 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
     run_record, store = options.get('run_record'), options.get('store')
     deadline = time.monotonic() + min(1440, run_record.timeout if run_record else 1440)
     failure = ''
-    model = options.get('model', os.environ.get('CODEX_REVIEW_MODEL', 'gpt-6.1-sol'))
+    if 'selection' not in options:
+        # Direct callers without a selection get the unknown-author choice from the table.
+        policy = tiers.load_policy()
+        options['selection'] = tiers.reviewer_for(policy, None, 'unknown')
+        options.setdefault('codex_model', policy['rungs'][options['selection']['rung']]['models']['openai'])
+        options.setdefault('claude_model', policy['rungs'][options['selection']['rung']]['models']['claude'])
+    selection = options['selection']
+    effort, rung = selection['effort'], selection['rung']
+    codex_model, claude_model = options['codex_model'], options['claude_model']
     options.setdefault('launches', 0)
     options.setdefault('usage', [])
-    for provider, source, pool in (('codex', 'Codex ' + model, options.get('pool', 'default')),
-                                   ('claude', 'Blind Claude Opus fallback', options.get('fallback_pool', 'default'))):
+    codex_entry = ('codex', 'Codex %s %s (rung %s)' % (codex_model, effort, rung), options.get('pool', 'default'))
+    claude_entry = ('claude', 'Claude %s %s (rung %s)' % (claude_model, effort, rung), options.get('fallback_pool', 'default'))
+    # The tier table picks the primary; the other harness at the same rung is the one authorized fallback.
+    order = (codex_entry, claude_entry) if selection['harness'] == 'openai' else (claude_entry, codex_entry)
+    primary = order[0][0]
+    for provider, source, pool in order:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ReviewFailure({**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}, source)
         timeout = min(720, options.get('timeout', 720), remaining)
         leased = False
+        resolution, code, stdout, stderr = None, None, '', ''
         try:
+            # Resolve before the lease, so a lease refusal is reported with its own reason, not as a missing CLI.
+            roots = diagnostics.untrusted_roots(repo=options.get('repo'), snapshot=snapshot)
+            _CHILD_PATH_ROOTS[:] = sorted(set(_CHILD_PATH_ROOTS) | set(roots))
+            resolution = (options.get('resolutions') or {}).get(provider) or diagnostics.discover_executable(
+                provider, policy=review_policy(), roots=roots)
             if store is not None:
                 store.acquire_pool(provider, pool, run_record.run_id)
                 leased = True
-            if not shutil.which(provider):
+            if not resolution['path']:
                 outcome = normalize_provider(provider, 127, '', 'HARNESS_PROVIDER_UNAVAILABLE')
             else:
                 with tempfile.TemporaryDirectory() as temp:
                     last = Path(temp) / 'last.txt'
                     if provider == 'codex':
-                        cmd = ['codex', 'exec', '--ephemeral', '--json', '--model', model, '--sandbox', 'read-only',
+                        cmd = [resolution['path'], 'exec', '--ephemeral', '--json', '--model', codex_model,
+                               '-c', 'model_reasoning_effort=' + effort, '--sandbox', 'read-only',
                                '--cd', str(snapshot), '--output-last-message', str(last), '-']
                     else:
-                        cmd = ['claude', '--print', '--safe-mode', '--restricted', '--model', 'opus',
+                        cmd = [resolution['path'], '--print', '--safe-mode', '--restricted', '--model', claude_model,
+                               '--effort', effort, '--max-budget-usd', str(selection.get('review_budget_usd') or 5),
                                '--no-session-persistence', '--output-format', 'json', '--system-prompt', REVIEW_SYSTEM, '-']
                     timeout = min(timeout, deadline - time.monotonic())
                     if timeout <= 0:
@@ -732,6 +796,8 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         except GuardError as error:
             outcome = {**provider_failure({}), 'reason': error.reason,
                        'fallback_allowed': error.reason in {'QUOTA', 'AUTH'}}
+        options.setdefault('attempts', []).append(
+            diagnostics.provider_attempt(provider, resolution, code, stdout, stderr, outcome))
         if outcome.get('usage') is not None:
             options['usage'].append({'provider': provider, 'reported': outcome['usage']})
         if leased and outcome['reason'] not in {'TIMEOUT', 'UNKNOWN'}:
@@ -741,20 +807,20 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         if outcome['result'] != 'NO_RESULT':
             options['outcome'] = outcome
             return source, stage_report(stage, outcome['report']), failure
-        if provider != 'codex' or not outcome['fallback_allowed']:
+        if provider != primary or not outcome['fallback_allowed']:
             raise ReviewFailure(outcome, source)
         failure = 'Primary reviewer unavailable (' + outcome['reason'] + '); used authorized independent fallback.'
     raise OSError('no valid reviewer result')
 
 
-def provider_toolchains():
+def provider_toolchains(resolutions):
     specifications = {}
     for provider in ('codex', 'claude'):
-        executable = shutil.which(provider)
-        if executable is None:
-            specifications[provider] = {'executable': provider, 'public': True, 'sha256': None}
-            continue
+        executable = resolutions[provider]['path']
         specifications[provider] = {'executable': provider, 'public': True, 'sha256': None}
+        if executable is None:
+            continue
+        specifications[provider]['path'] = executable
         try:
             path = Path(executable).resolve()
             if not stat.S_ISREG(path.stat().st_mode) or path.stat().st_size > 256 * 1024**2:
@@ -844,6 +910,36 @@ def plan_ticket_gate(repo, content):
         return 0, f'spec-flow: plan ticket gate could not run ({error}); continuing'
 
 
+def write_selection_receipt(run_id, args, head, packet_sha256, author_rung, selection):
+    """The selection receipt: what the table chose before launch, bound to task, stage, head and packet."""
+    try:
+        root = ladder.state_root() / 'selections'
+        root.mkdir(mode=0o700, exist_ok=True)
+        path = root / (run_id + '.json')
+        body = json.dumps({'schema': 1, 'run_id': run_id, 'task': args.task, 'stage': args.stage, 'head': head,
+                           'packet_sha256': packet_sha256, 'author_rung': author_rung, 'author_harness': args.author_harness,
+                           'selection': selection, 'at': ladder.now()}, sort_keys=True)
+        path.write_text(body); os.chmod(path, 0o600)
+    except OSError as error:
+        print(f'Selection receipt could not be written: {type(error).__name__}', file=sys.stderr)
+
+
+def record_in_ladder(args, store, reference, head, policy):
+    """Reviews count where they are consumed: the FINAL receipt bytes feed the task ledger."""
+    if not args.task or reference is None:
+        return
+    try:
+        receipt = (store._run_directory(reference['run_id']) / 'final.json').read_bytes()  # input-ok: final receipt just written by usage_guard, capped at write; the ledger bounds it again
+        status = ladder.Ledger(policy=policy).record(args.task, receipt, kind='review', source='peer_review:' + args.stage,
+                                                     head=head, notify=os.environ.get('AGENT_HARNESS_MAIN_WAL'))
+        print('Ladder: task %s rung %s, failures at rung %d%s' % (
+            args.task, status['rung'], status['failures_at_rung'],
+            ' (escalated %s -> %s)' % (status['escalation']['from'], status['escalation']['to']) if status.get('escalation') else ''),
+            file=sys.stderr)
+    except (OSError, ladder.LedgerError, tiers.TierError, GuardError) as error:
+        print(f'Ladder record failed: {getattr(error, "message", error)}', file=sys.stderr)
+
+
 def plan_resource_gate(content):
     """Plan review also needs a `## Resource budget` that fits the target host's live headroom."""
     try:
@@ -872,20 +968,25 @@ def main() -> int:
                         help='Optional tighter packet ceiling; maximum 150000 bytes')
     parser.add_argument('--timeout', type=int, default=720, help='Per-provider deadline, at most 720 seconds')
     parser.add_argument('--snapshot-base', help='Optional full ancestor commit SHA to include in the review snapshot for diffs')
-    parser.add_argument('--snapshot-timeout', type=int, default=DEFAULT_SNAPSHOT_TIMEOUT,
-                        help=f'Deadline for preparing the review snapshot, at most {MAX_SNAPSHOT_TIMEOUT} seconds')
+    parser.add_argument('--snapshot-timeout', type=int, default=None,
+                        help=f'Deadline for preparing the review snapshot, at most {MAX_SNAPSHOT_TIMEOUT} seconds '
+                             '(default: review_policy.json base plus a per-GiB allowance for the repository pack size)')
     parser.add_argument('--input-manifest', type=Path, help='Private declared runtime/configuration input manifest')
     parser.add_argument('--repeat-reason', help='Spend at most one additional declared attempt with a reason')
     parser.add_argument('--pool', default='default', help='Opaque Codex auth-pool alias; never a credential')
     parser.add_argument('--fallback-pool', default='default', help='Opaque independent Claude auth-pool alias')
     parser.add_argument('--owner', default='peer-review', help='Safe owner identifier for execution receipts')
     parser.add_argument('--base', help='PR base for the commit-policy range check (default origin/HEAD or origin/main)')
+    parser.add_argument('--task', help='Ladder task key: the author rung comes from its ledger and the receipt is recorded there')
+    parser.add_argument('--author-rung', help='Author rung override (R0..R6); unknown gets the configured unknown-author reviewer')
+    parser.add_argument('--author-harness', choices=('claude', 'openai', 'unknown'), default='unknown',
+                        help='Harness that wrote the change; the other harness reviews when available')
     args = parser.parse_args()
     if not 1 <= args.packet_budget_bytes <= PACKET_LIMIT:
         parser.error('--packet-budget-bytes must be between 1 and 150000')
     if not 1 <= args.timeout <= 720:
         parser.error('--timeout must be between 1 and 720')
-    if not 1 <= args.snapshot_timeout <= MAX_SNAPSHOT_TIMEOUT:
+    if args.snapshot_timeout is not None and not 1 <= args.snapshot_timeout <= MAX_SNAPSHOT_TIMEOUT:
         parser.error(f'--snapshot-timeout must be between 1 and {MAX_SNAPSHOT_TIMEOUT}')
     if args.snapshot_base is not None and not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', args.snapshot_base.lower()):
         parser.error('--snapshot-base must be a full commit SHA')
@@ -927,7 +1028,15 @@ def main() -> int:
     except (OSError, subprocess.TimeoutExpired) as error:
         target.close()
         evidence.close()
-        parser.error(f'repo state inspection failed: {error}')
+        print(diagnostics.render(diagnostics.classify_isolation_error(error), stage=args.stage), file=sys.stderr)
+        parser.error(f'repo state inspection failed: {diagnostics.sanitize(error)}')
+    if args.snapshot_timeout is None:
+        try:
+            counted = run_process(['git', '-C', str(repo), 'count-objects', '-v'], env=git_environment(), timeout=30)
+            size = diagnostics.parse_pack_bytes(counted.stdout) if counted.returncode == 0 else 0
+        except (OSError, subprocess.TimeoutExpired):
+            size = 0  # a failed or capped probe keeps the policy base deadline
+        args.snapshot_timeout = diagnostics.scaled_snapshot_timeout(size, review_policy())
     if args.expected_head and (not re.fullmatch(r'[0-9a-fA-F]{40,64}', args.expected_head)
                                or before[0] != args.expected_head.lower()):
         target.close()
@@ -937,6 +1046,12 @@ def main() -> int:
         target.close()
         evidence.close()
         parser.error('review requires a clean worktree')
+    problems = diagnostics.lint_packet(args.stage, evidence.content, args.expected_head)
+    if problems:
+        print(diagnostics.render_lint(problems, args.stage), file=sys.stderr)
+        target.close()
+        evidence.close()
+        return 2
     if args.stage == 'plan':
         prov_code, prov_text = packet_provenance_gate(evidence.content)
         if prov_text:
@@ -986,8 +1101,39 @@ def main() -> int:
         "material implementation defects, missing tests, insecure behavior, or unverifiable claims."
     )
     store, run_record = None, None
+    try:
+        policy = tiers.load_policy()
+    except tiers.TierError as error:
+        print(f'Review refused: tier table error: {error}', file=sys.stderr)
+        return 2
+    author_rung = args.author_rung
+    if author_rung is None and args.task:
+        try:
+            author_rung = ladder.Ledger(policy=policy).status(args.task)['rung']
+        except (ladder.LedgerError, tiers.TierError):
+            author_rung = None
+    available = {'openai': shutil.which('codex') is not None, 'claude': shutil.which('claude') is not None}
+    selection = tiers.reviewer_for(policy, author_rung, args.author_harness, available)
+    if selection['harness'] is None:
+        print('Review refused: no review harness is available for rung %s (codex and claude both unavailable)'
+              % selection['rung'], file=sys.stderr)
+        return 2
+    permission = None
+    if policy['rungs'][selection['rung']]['needs_user_permission']:
+        # --author-rung is a claim; the ledger permission is the only record of Fable-approved work.
+        if args.task:
+            try:
+                permission = ladder.Ledger(policy=policy).status(args.task).get('permission')
+            except (ladder.LedgerError, tiers.TierError):
+                permission = None
+        if not isinstance(permission, dict) or not permission.get('ask_id'):
+            print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
+                  '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
+            return 2
     options = {'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
-               'model': os.environ.get('CODEX_REVIEW_MODEL', 'gpt-6.1-sol')}
+               'selection': selection, 'author_rung': author_rung, 'permission': permission,
+               'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
+               'claude_model': policy['rungs'][selection['rung']]['models']['claude']}
     try:
         with tempfile.TemporaryDirectory(prefix='peer-review-') as temp:
             snapshot = Path(temp) / 'repo'
@@ -996,21 +1142,34 @@ def main() -> int:
             # that needs reconciliation or consume the review time budget.
             base = make_snapshot(repo, snapshot, before[0], base=base, timeout=args.snapshot_timeout)
             options['base'] = base
+            options['repo'] = repo
+            _CHILD_PATH_ROOTS[:] = diagnostics.untrusted_roots(repo=repo, snapshot=snapshot)
+            resolutions = {name: diagnostics.discover_executable(
+                name, policy=review_policy(), roots=list(_CHILD_PATH_ROOTS))
+                for name in diagnostics.PROVIDERS}
+            options['resolutions'] = resolutions
             options['domain_section'], options['domain_disabled'] = domain_section(snapshot, base)
             if repo_state(repo) != before:
                 raise OSError('source changed while preparing review')
             subject = capture_subject(repo, args.input_manifest)
             invocation = invocation_identity(subject, purpose='peer-review-' + args.stage,
-                argv=['peer_review', args.stage, options['model'], 'opus', args.pool, args.fallback_pool,
-                      '--snapshot-base', base or 'none'], cwd=repo,
+                argv=['peer_review', args.stage, options['codex_model'], options['claude_model'], selection['effort'],
+                      selection['rung'], selection['harness'], args.pool, args.fallback_pool,
+                      '--snapshot-base', base or 'none',
+                      # The effective review policy (shipped or override) changes discovery and quota classification.
+                      '--review-policy', hashlib.sha256(json.dumps(review_policy(), sort_keys=True).encode()).hexdigest()],
+                cwd=repo,
                 stage=args.stage.upper().replace('-', '_'), packet_digest=evidence.sha256,
-                provider='codex', model=options['model'], pool=args.pool, toolchain=provider_toolchains(),
+                provider='codex' if selection['harness'] == 'openai' else 'claude',
+                model=options['codex_model' if selection['harness'] == 'openai' else 'claude_model'],
+                pool=args.pool, toolchain=provider_toolchains(resolutions),
                 environment={name: os.environ[name] for name in ('CI', 'LANG', 'LC_ALL', 'TZ', 'PYTHONHASHSEED', 'NODE_ENV')
                              if name in os.environ})
             store = UsageStore()
             run_record = store.begin(subject, invocation, owner=args.owner, label='peer-review-' + args.stage,
                                      timeout=1440, aggregate_timeout=2880, kind='review', repeat_reason=args.repeat_reason)
             options.update(store=store, run_record=run_record)
+            write_selection_receipt(run_record.run_id, args, before[0], evidence.sha256, author_rung, selection)
             source, report, failure = review_snapshot(snapshot, before[0], args.stage,
                                                        stage_rules, evidence.content, options)
             report = stage_report(args.stage, report)
@@ -1018,15 +1177,20 @@ def main() -> int:
                 raise OSError('snapshot changed during review')
         # Cleanup must succeed before any report is published.
     except (OSError, subprocess.TimeoutExpired, GuardError) as error:
-        print(f'Review isolation failed: {error}; no signoff published.', file=sys.stderr)
+        print(f'Review isolation failed: {diagnostics.sanitize(error)}; no signoff published.', file=sys.stderr)
+        diagnosis = diagnostics.final_diagnostic(options.get('attempts', []), error)
+        print(diagnostics.render(diagnosis, stage=args.stage, head=before[0]), file=sys.stderr)
         if run_record is not None:
             outcome = error.outcome if isinstance(error, ReviewFailure) else {}
             reason = outcome.get('reason', error.reason if isinstance(error, GuardError) else 'UNKNOWN')
             try:
-                run_record.finish(execution='INTERRUPTED' if reason == 'TIMEOUT' else
-                                  'COMPLETED' if options.get('launches') else 'NOT_STARTED',
-                                  result='NO_RESULT', reason=reason,
-                                  usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', [])})
+                failed = run_record.finish(execution='INTERRUPTED' if reason == 'TIMEOUT' else
+                                           'COMPLETED' if options.get('launches') else 'NOT_STARTED',
+                                           result='NO_RESULT', reason=reason,
+                                           usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
+                                                  'executables': diagnostics.executable_record(options.get('resolutions', {})),
+                                                  'diagnostic': diagnosis['code']})
+                record_in_ladder(args, store, failed, before[0], policy)
             except (OSError, GuardError):
                 print('Execution receipt could not be finalized; reconciliation is required.', file=sys.stderr)
         target.close()
@@ -1057,6 +1221,10 @@ def main() -> int:
         evidence.verify()
         target.write_text(f"Reviewer: {source}\nStage: {args.stage}\nReviewed HEAD: {before[0]}\n"
                           f"Reviewed packet SHA-256: {evidence.sha256}\n"
+                          f"Author-Rung: {author_rung or 'unknown'}{' (author unknown: lowest writer rung reviewer)' if selection['author_unknown'] else ''}\n"
+                          f"Reviewer-Rung: {selection['rung']}\nReviewer-Selection: {selection['harness']} {selection['model']} "
+                          f"{selection['effort']}; {selection['why']}\n"
+                          f"{'Permission: ' + str(permission['ask_id']) + chr(10) if permission else ''}"
                           f"Review input: isolated committed snapshot (depth 1"
                           f"{', base ' + base if base and base != before[0] else ''})\n"
                           f"Worktree status: {'clean' if not before[1] else 'dirty'}\n{note}\n{report.strip()}\n",
@@ -1068,7 +1236,8 @@ def main() -> int:
             reason='NONE' if passed else 'CODE_FINDINGS', exit_code=0,
             review={'stage': args.stage.upper().replace('-', '_'), 'verdict': 'ACCEPT' if passed else 'BLOCK',
                     'findings': [] if passed else finding_ids(report)},
-            usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', [])})
+            usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
+                   'executables': diagnostics.executable_record(options.get('resolutions', {}))})
         finalized = True
         final = store.load_ref(reference)
         if final['result'] != ('CHECK_OK' if passed else 'CHECK_FAILED') or final['reason'] != ('NONE' if passed else 'CODE_FINDINGS'):
@@ -1080,6 +1249,7 @@ def main() -> int:
         evidence.verify()
         # FINAL preserves execution history; only settled publication is usable.
         store.settle_review(reference)
+        record_in_ladder(args, store, reference, before[0], policy)
         print(f"{source}: {report.splitlines()[0].strip()} | {output}\n"
               'Usage receipt: ' + json.dumps(reference, sort_keys=True), flush=True)
         announced = True
