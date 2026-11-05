@@ -251,6 +251,44 @@ class BashAdvisory(GateFixture):
         self.assertEqual(self.bash('sleep 1 2>&1; claude -p --model sonnet --task k9 y &> /dev/null')[0], 'allow')
         self.assertEqual(gate.split_segments('a "b; c" d\\; e; f && g || h | i & j 2>&1 &> k'),
                          ['a "b; c" d\\; e', 'f', 'g', 'h', 'i', 'j 2>&1 &> k'])
+        # A backtick substitution is a launch too (the $(...) form already was).
+        self.assertEqual(self.bash('ls; `claude -p --model fable x`')[0], 'deny')
+        self.assertEqual(self.bash('echo `claude -p --model sonnet --task k9 x`')[0], 'allow')
+
+    def test_launches_hidden_in_shell_strings_and_substitutions_are_checked(self):
+        self.escalate('k9'); self.escalate('k9')
+        for line in ('out=`claude -p --model fable x`',
+                     "bash -c 'claude -p --model fable x'",
+                     'sh -c "claude -p --model fable x"',
+                     "/bin/zsh -lc 'cd /tmp; claude -p --model fable x'",
+                     "sudo -u eric -c 'claude -p --model fable x'",
+                     "eval 'claude -p --model fable x'",
+                     "ssh dev2 'claude -p --model fable x'",
+                     "ssh -p 2222 -o StrictHostKeyChecking=no dev2 claude -p --model fable x",
+                     'claude -p --model sonnet --task k9 "$(claude -p --model fable x)"',
+                     "export ANTHROPIC_MODEL=claude-fable-5-1; claude -p x",
+                     "export ANTHROPIC_MODEL=claude-fable-5-1\nclaude -p x",
+                     "ANTHROPIC_MODEL=claude-fable-5-1; claude -p x",
+                     'Claude -p --model fable x',
+                     '/opt/homebrew/bin/CLAUDE -p --model fable x',
+                     'claude -p --model fable "x'):
+            self.assertEqual(self.bash(line)[0], 'deny', line)
+        for line in ("echo 'claude --model fable'",
+                     "bash -c 'claude -p --model sonnet --task k9 x'",
+                     "ssh dev2 'git log'",
+                     "export ANTHROPIC_MODEL=claude-sonnet-4-5; claude -p --task k9 x",
+                     'claude -p --model opus --effort high --task k9 "$(date)"'):
+            self.assertEqual(self.bash(line)[0], 'allow', line)
+
+    def test_a_task_at_a_permission_rung_launches_nothing_below_it_either(self):
+        self.policy = {**self.policy, 'ladder_limits': {'max_review_launches': 100, 'max_rung_climbs': 10, 'max_total_review_usd': 1000}}
+        self.ledger = esc.Ledger(self.root, self.policy)
+        for _ in range(4): self.escalate('k5')
+        self.assertEqual(self.ledger.status('k5')['rung'], 'R5')
+        decision, reason, _, _ = self.bash('claude -p --model opus --task k5 x')
+        self.assertEqual(decision, 'deny'); self.assertIn('approve-top', reason)
+        self.assertEqual(self.bash('claude -p --model sonnet --task k5 x')[0], 'deny')
+        self.assertEqual(self.bash('python3 rescue.py --repo r --packet p --output o --model opus --effort high --task k5')[0], 'allow')
         self.assertEqual(self.bash('python3 rescue.py --repo r --packet p --output o --model opus --effort high')[0], 'allow')
 
 

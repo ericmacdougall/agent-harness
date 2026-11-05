@@ -146,7 +146,10 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
     return 'allow', 'requested %s %s is above rung %s; downgraded' % (requested['model'], requested['effort'], target_rung), updated, facts
 
 
-LAUNCH = re.compile(r'(^|[\s;&|(/])(claude|codex|rescue\.py|peer_review\.py)(\s|$)')
+LAUNCH = re.compile(r'(^|[\s;&|(/`\'"=])(claude|codex|rescue\.py|peer_review\.py)(\s|$)', re.IGNORECASE)
+SHELL_STRING_HOSTS = ('bash', 'sh', 'zsh', 'dash', 'ksh', 'su', 'sudo')
+ENV_MODEL = re.compile(r'(?:^|\s)(?:export\s+)?(?:ANTHROPIC_MODEL|CLAUDE_MODEL)=([^\s;&|]+)')
+MAX_NESTING = 2
 
 
 def split_segments(command):
@@ -180,14 +183,61 @@ def split_segments(command):
     return [segment.strip() for segment in segments if segment.strip()]
 
 
-def decide_bash(data, policy, ledger):
-    """Advisory check of launch lines: every launch segment of a compound line is checked on its own and
-    any denied segment denies the line, so a later harmless launch cannot mask an earlier one."""
+def nested_strings(segment):
+    """Strings inside a segment that the shell would run as commands: substitutions ($(...), backticks) and
+    the string argument of bash/sh/zsh -c, su/sudo -c, eval and ssh HOST. Quoted prose elsewhere is not one."""
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        return []
+    found = []
+    for index, word in enumerate(words):
+        if '`' in word or '$(' in word:
+            found.append(word)
+        base = word.rsplit('/', 1)[-1].lower()
+        if base in SHELL_STRING_HOSTS:
+            for later in range(index + 1, min(index + 6, len(words))):
+                flag = words[later]
+                if flag.startswith('-') and not flag.startswith('--') and 'c' in flag[1:] and later + 1 < len(words):
+                    found.append(words[later + 1]); break  # -c, -lc, -ic: the next word is the shell string
+        elif base == 'eval':
+            found.append(' '.join(words[index + 1:]))
+        elif base == 'ssh':
+            rest = words[index + 1:]
+            host_seen = False
+            skip = False
+            for item in rest:
+                if skip:
+                    skip = False; continue
+                if not host_seen and item.startswith('-'):
+                    skip = len(item) == 2 and item[1] in 'bcDEeFIiJLlmOopQRSWw'
+                    continue
+                if not host_seen:
+                    host_seen = True; continue
+                found.append(' '.join(rest[rest.index(item):])); break
+    return [text for text in found if LAUNCH.search(text)]
+
+
+def decide_bash(data, policy, ledger, depth=0):
+    """Advisory check of launch lines: every launch segment of a compound line is checked on its own, as are
+    the shell strings and substitutions inside it (one level down, bounded), and any denied part denies the
+    line, so a later harmless launch cannot mask an earlier one. A model set by an earlier
+    `export ANTHROPIC_MODEL=` applies to later claude segments that name none."""
     tool_input = data.get('tool_input') if isinstance(data.get('tool_input'), dict) else {}
     command = str(tool_input.get('command') or '')
     if not LAUNCH.search(command):
         return 'allow', None, None, {}
-    results = [_decide_launch(segment, policy, ledger) for segment in split_segments(command) if LAUNCH.search(segment)]
+    results = []
+    env_model = None
+    for segment in split_segments(command):
+        assignment = ENV_MODEL.search(segment)
+        if assignment:
+            env_model = assignment.group(1)
+        if LAUNCH.search(segment):
+            results.append(_decide_launch(segment, policy, ledger, env_model=env_model))
+        if depth < MAX_NESTING:
+            for inner in nested_strings(segment):
+                results.append(decide_bash({'tool_input': {'command': inner}}, policy, ledger, depth + 1))
     if not results:
         return 'allow', None, None, {'segments': 0}
     for decision, reason, updated, facts in results:
@@ -197,12 +247,13 @@ def decide_bash(data, policy, ledger):
     return 'allow', ('; '.join(reasons) or None), None, dict(results[0][3], segments=len(results))
 
 
-def _decide_launch(command, policy, ledger):
+def _decide_launch(command, policy, ledger, env_model=None):
     """One launch segment: same rule as a spawn, reported as context or deny."""
     try:
         words = shlex.split(command)
     except ValueError:
-        return 'allow', None, None, {'unparsed': True}
+        # The shell would refuse it too; an unparsable launch line is never a silent allow.
+        return 'deny', 'launch line cannot be parsed (unterminated quote)', None, {'unparsed': True}
     model = effort = task = author_rung = None
     author_harness = 'unknown'
     for index, word in enumerate(words):
@@ -214,14 +265,18 @@ def _decide_launch(command, policy, ledger):
             if words[index + 1].startswith('model_reasoning_effort='): effort = words[index + 1].split('=', 1)[1]
             if words[index + 1].startswith('model='): model = words[index + 1].split('=', 1)[1]
         if word.startswith('ANTHROPIC_MODEL=') or word.startswith('CLAUDE_MODEL='): model = word.split('=', 1)[1]
+        if word.lower() in ('export',) and index + 1 < len(words) and words[index + 1].split('=', 1)[0] in ('ANTHROPIC_MODEL', 'CLAUDE_MODEL') and '=' in words[index + 1]:
+            model = words[index + 1].split('=', 1)[1]
         if word == '--task' and index + 1 < len(words): task = words[index + 1]
         if word.startswith('--task='): task = word.split('=', 1)[1]
         if word == '--author-rung' and index + 1 < len(words): author_rung = words[index + 1]
         if word.startswith('--author-rung='): author_rung = word.split('=', 1)[1]
         if word == '--author-harness' and index + 1 < len(words): author_harness = words[index + 1]
     task = task or esc.task_key_from(command)
+    basenames = [w.rsplit('/', 1)[-1].lower() for w in words]
+    if model is None and env_model and 'claude' in basenames:
+        model = env_model  # set by an earlier segment's export
     facts = {'model': model, 'effort': effort, 'task': task}
-    basenames = [w.rsplit('/', 1)[-1] for w in words]
     if 'peer_review.py' in basenames:
         # A review launch: the reviewer rung follows from the author rung (the installed ledger's rung for a
         # --task-only line); a permission rung needs the installed ledger's record, checked here so a forged
@@ -269,6 +324,10 @@ def _decide_launch(command, policy, ledger):
         return 'allow', 'launch without --task: lowest rung applies', None, facts
     if status is None:
         return 'allow', 'ladder state unreadable (%s): lowest rung applies' % facts.get('ladder_error', 'error'), None, facts
+    if status.get('needs_user_permission') and not status.get('permission') and 'rescue.py' not in basenames:
+        # The task has climbed to a permission rung: like the spawn path, nothing launches for it below
+        # that rung either until approve-top records the user's answer.
+        return 'deny', 'task %s is computed at %s: approve-top permission is needed before any launch' % (task, status['rung']), None, facts
     order = tiers.rung_order(policy)
     if order.index(requested['rung']) > order.index(status['rung']) and 'rescue.py' not in basenames:
         return 'deny', 'launch at %s is above task %s rung %s' % (requested['rung'], task, status['rung']), None, facts

@@ -213,6 +213,25 @@ def next_rung_above(policy, rung):
     return order[position + 1] if position + 1 < len(order) else None
 
 
+def set_mode(path, new_mode=None):
+    """Read the installed table's mode, and with new_mode rewrite it atomically (validated before and after)."""
+    path = Path(path or os.environ.get('AGENT_HARNESS_TIER_POLICY') or DEFAULT_PATH)
+    previous = load_policy(path)['mode']
+    if new_mode is None or new_mode == previous:
+        return {'path': str(path), 'mode': previous, 'previous': previous, 'changed': False}
+    raw = json.loads(path.read_text(encoding='utf-8'))
+    raw['mode'] = new_mode
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(raw, indent=1, sort_keys=True) + '\n', encoding='utf-8')
+    try:
+        os.chmod(tmp, path.stat().st_mode & 0o777)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    load_policy(path)  # fail loudly if the rewrite produced an invalid table
+    return {'path': str(path), 'mode': new_mode, 'previous': previous, 'changed': True}
+
+
 def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
@@ -223,7 +242,12 @@ def main(argv=None):
     review = sub.add_parser('reviewer'); review.add_argument('--author-rung'); review.add_argument('--author-harness', default='unknown')
     review.add_argument('--unavailable', action='append', default=[], choices=('claude', 'openai'))
     sub.add_parser('table')
+    mode = sub.add_parser('mode', help='show or set the table mode (the one-command rollback is `mode --set warn`)')
+    mode.add_argument('--set', choices=('warn', 'enforce'))
     args = parser.parse_args(argv)
+    if args.action == 'mode':
+        print(json.dumps(set_mode(args.policy, args.set), sort_keys=True, indent=1))
+        return 0
     policy = load_policy(args.policy)
     if args.action == 'classify':
         value = classify(args.model, args.effort, policy)

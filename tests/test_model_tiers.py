@@ -161,5 +161,24 @@ class Selection(unittest.TestCase):
         self.assertEqual(set(json.loads(table.stdout)), {'R0', 'R1', 'R2', 'R3', 'R4', 'R5', 'R6'})
 
 
+class ModeSwitch(unittest.TestCase):
+    def test_mode_set_rewrites_the_table_atomically_and_reports_the_rollback(self):
+        import os, shutil, subprocess, sys, tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            table = Path(temp) / 'model_tiers.json'
+            shutil.copy(tiers.DEFAULT_PATH, table); os.chmod(table, 0o600)
+            cli = [sys.executable, str(tiers.DEFAULT_PATH.parent / 'model_tiers.py'), '--policy', str(table), 'mode']
+            shown = json.loads(subprocess.run(cli, capture_output=True, text=True, timeout=30).stdout)
+            self.assertEqual((shown['mode'], shown['changed']), ('warn', False))
+            flipped = json.loads(subprocess.run(cli + ['--set', 'enforce'], capture_output=True, text=True, timeout=30).stdout)
+            self.assertEqual((flipped['previous'], flipped['mode'], flipped['changed']), ('warn', 'enforce', True))
+            self.assertEqual(tiers.load_policy(table)['mode'], 'enforce')
+            self.assertEqual(oct(table.stat().st_mode & 0o777), '0o600'); self.assertFalse(list(Path(temp).glob('*.tmp')))
+            back = json.loads(subprocess.run(cli + ['--set', 'warn'], capture_output=True, text=True, timeout=30).stdout)
+            self.assertEqual(back['mode'], 'warn'); self.assertEqual(tiers.load_policy(table)['mode'], 'warn')
+            bogus = subprocess.run(cli + ['--set', 'loud'], capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(bogus.returncode, 0); self.assertEqual(tiers.load_policy(table)['mode'], 'warn')
+
+
 if __name__ == '__main__':
     unittest.main()
