@@ -51,7 +51,7 @@ DONE_RE = re.compile(
     r"[ \t]+(?:done|complete|completed|finished|delivered|merged|shipped|deployed)\b"
     r"|\b(?:i|we)(?:'ve| have)?[ \t]+(?:finished|completed|shipped|merged|deployed|delivered)\b|^[ \t]*done[.!:]")
 CITE_RE = re.compile(r"\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b|REALLY_TESTED[ \t]+(?=[A-Za-z0-9_.\-]*[0-9_\-])[A-Za-z0-9_][A-Za-z0-9_.\-]*"
-                     r"|/pull/\d+|\bPR[ \t]*#\d+", re.I)
+                     r"|/pull/\d+|\bPR[ \t]*#?[ \t]*\d+|\b(?:commit|sha)[ \t]+[0-9a-f]{7,40}\b", re.I)
 VERBS = r"(?:run|install|copy|paste|edit|restart|click|open|sign in|log ?in|download|approve|create|set up|configure|add)"
 CHORE_RES = [re.compile(p, re.I) for p in (
     r"\byou(?:'ll| will)? (?:(?:need|have) to|must|should) " + VERBS + r"\b",
@@ -60,7 +60,8 @@ CHORE_RES = [re.compile(p, re.I) for p in (
     r"\bcan you " + VERBS + r"\b")]
 NO_AGENT_PATH_RE = re.compile(r"no agent[- ]doable path|agent cannot|can(?:'|no)t be done by an agent|only you can", re.I)
 WORST_RE = re.compile(r"worst[- ]case", re.I)
-BOUND_RE = re.compile(r"\bbounds?\b[ \t]*[:=\-\u2013\u2014]|\bbounded (?:by|to)\b", re.I)
+BOUND_RE = re.compile(r"(?<!upper )(?<!lower )(?<!out of )\bbounds?\b[*_`|)\]\t ]*(?:\([^)\n]{0,40}\)[*_`|\t ]*)?[:=\-\u2013\u2014|]"
+                      r"|\bbounded (?:by|to)\b", re.I)
 
 
 def load_modes(path: Path = POLICY) -> dict[str, str]:
@@ -150,9 +151,11 @@ def lint_pending_tests(rows: list[dict], other_rows: list[dict] | None = None) -
         done.update(m.group(1) for m in REALLY_RE.finditer(str(r.get("note") or "")))
     for r in rows:
         note = str(r.get("note") or "")
-        for m in PENDING_RE.finditer(note):
+        opened = list(PENDING_RE.finditer(note))
+        for m in opened:
             pending.setdefault(m.group(1), r.get("id") or "")
-        done.update(m.group(1) for m in REALLY_RE.finditer(note))
+        if not opened:  # a note that opens a pending test and mentions its future REALLY_TESTED does not close it
+            done.update(m.group(1) for m in REALLY_RE.finditer(note))
     dangling = [i for i in pending if i not in done]
     if not dangling:
         return []
@@ -214,7 +217,10 @@ def lint_unpushed(cwd: str) -> list[str]:
         return []
     # git status runs clean filters, fsmonitor and similar commands named in the repo's own config; do not run it
     # in a repo whose local config names any (a repo an agent or an archive wrote)
-    if RISKY_CONFIG.search(git(cwd, "config", "--local", "--name-only", "--list") or ""):
+    scoped = git(cwd, "config", "--show-scope", "--list", "--name-only")
+    if scoped is None or any(  # repo-controlled scopes only: local and worktree (config.worktree); our own -c is the command scope
+            RISKY_CONFIG.search(line.split(None, 1)[1]) for line in scoped.splitlines()
+            if line.split(None, 1)[0] in ("local", "worktree") and len(line.split(None, 1)) == 2):
         return []
     if not (git(cwd, "remote") or "").strip():
         return []  # nowhere to push: every commit would be "unpushed" on every turn

@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "harness" / "hooks"))
@@ -344,6 +345,67 @@ class UnpushedNoise(Unpushed):
         marker.unlink(missing_ok=True)  # setup commands above may have run the filter themselves
         self.assertEqual(sl.lint_unpushed(str(self.repo)), [])
         self.assertFalse(marker.exists())
+
+
+class SecondRound(WalFixture):
+    """Findings of the delta review of cc3cff2."""
+
+    def test_filter_in_worktree_config_is_never_run(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        remote, repo = root / "r.git", root / "repo"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        (repo / "f").write_text("1")
+        run_git(repo, "add", "f")
+        run_git(repo, "commit", "-q", "-m", "one")
+        run_git(repo, "remote", "add", "origin", str(remote))
+        run_git(repo, "push", "-q", "origin", "main")
+        marker = root / "PWNED"
+        run_git(repo, "config", "extensions.worktreeConfig", "true")
+        (repo / ".git" / "config.worktree").write_text(f'[filter "ev"]\n\tclean = touch {marker}; cat\n')
+        (repo / ".gitattributes").write_text("f filter=ev\n")
+        run_git(repo, "add", ".gitattributes")
+        run_git(repo, "commit", "-q", "-m", "attrs")
+        run_git(repo, "push", "-q", "origin", "main")
+        marker.unlink(missing_ok=True)
+        (repo / "f").write_text("changed")
+        self.assertEqual(sl.lint_unpushed(str(repo)), [])
+        self.assertFalse(marker.exists())
+
+    def test_user_level_git_config_does_not_switch_s18_off(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        repo = root / "repo"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        remote = root / "r.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+        (repo / "f").write_text("1")
+        run_git(repo, "add", "f")
+        run_git(repo, "commit", "-q", "-m", "one")
+        run_git(repo, "remote", "add", "origin", str(remote))
+        (root / "gitconfig").write_text("[core]\n\tpager = less\n")
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(root / "gitconfig")}):
+            self.assertIn("1 commit(s)", (sl.lint_unpushed(str(repo)) or [""])[0])
+
+    def test_markdown_bound_declarations_count_but_upper_bound_does_not(self):
+        rt = dict(subagent=True, agent_type="red-team")
+        for good in ("Worst-case: x.\n**Bound**: 1 GB", "worst case x\n| Bound | 1GB |", "Worst-case: x. Bound (enforced): 1GB",
+                     "Worst-case: x. Bound: 1GB", "Worst-case: x. Bound -- 5 s"):
+            self.assertEqual(self.lint(message=good, **rt), [], good)
+        self.assertIn("Bound", self.lint(message="Worst-case: x. Upper bound: 3", **rt)[0])
+
+    def test_a_note_that_opens_a_pending_test_does_not_close_it(self):
+        self.wal([row("check", 1, note="PENDING_REAL_TEST a1: will append REALLY_TESTED a1: after the run")])
+        self.assertEqual(len(self.lint()), 1)
+        self.wal([row("check", 1, note="PENDING_REAL_TEST a1: x"), row("check", 2, note="REALLY_TESTED a1: ran")])
+        self.assertEqual(self.lint(), [])
+
+    def test_more_real_cites_count(self):
+        for msg in ("All done: PR 12 is open.", "It is all done at commit 1234567.", "all done, sha abcdef1"):
+            self.assertEqual(self.lint(message=msg), [], msg)
 
 
 if __name__ == "__main__":
