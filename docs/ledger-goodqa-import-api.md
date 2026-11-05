@@ -160,6 +160,42 @@ The document is user content from a machine GoodQA cannot verify: titles, bodies
 sanitisation and secret scan as ordinary issue text, and a finding refuses the plan rather than storing the secret.
 `claimed_actor` and `writer` are metadata. The import never grants anyone access to a project.
 
+## As implemented by GoodQA (#35824, bugtracker draft PR #1215)
+
+The server was built from this contract by a separate owner (branch `claude/ledger-import-35824-20261105-r2`). Where it
+differs from or adds to the text above, the implementation is what runs:
+
+- **Endpoints (all under `/v1`):** `POST /projects/:projectId/ledger-imports` (plan), `GET /projects/:projectId/ledger-imports[/:id]`,
+  `POST .../:id/commit`, `POST .../:id/cancel`, and `GET /ledger-imports/signing-key` (authenticated; returns
+  `{alg: "ed25519", key_id, public_key_hex}`, 404 when the server has no key). The new-project variant is
+  `POST /orgs/:orgId/ledger-imports?create_project={"name":..,"slug"?:..,"description"?:..}` with GET, commit and cancel under
+  `/orgs/:orgId/ledger-imports/:id`; a delta is refused there (`409 base_mismatch`). Options travel in the query (`status_map`
+  and `create_project`, both JSON); the `Idempotency-Key` header is required on plan. Response bodies carry `project_id`, `plan`,
+  `progress`, `results`, `receipt` and `signed_receipt` (the signed envelope, null when the server has no key). Commit returns
+  202 while batches remain: post the same request again.
+- **Idempotency** is stored per project in `ledger_import_ops`, not in `issue_operations` (whose `kind` check admits only
+  `issue_create`, `issue_update` and `comment_create`).
+- **Access:** the API-key family is `ledger_import` and is explicit-only (a key naming no family, or only `issues`, is refused;
+  over MCP the key must name both `mcp` and `ledger_import`). Permission is project role pm or better; the org variant also needs
+  `project:create`.
+- **Attribution:** imported issues list the importing user as reporter; events and comments have no actor and carry
+  `data.ledger {op, writer, claimed_actor, ctr}`.
+- **Re-committing** an older full export makes it the last committed export again, so a later delta must use that receipt's
+  `export_digest`. The harness rebinds to the receipt it is given, so this stays consistent.
+- **Limits:** one plan per project (per org for the new-project variant) per minute, 8 MiB, 5,000 tickets, 50,000 events, 64 KiB per
+  op. The 8 MiB cap binds first (roughly 10 to 20 thousand events fit).
+- **Validation beyond the digest:** members in canonical order; op lines canonical and agreeing with the history events that cite
+  them; history in fold order with exactly one `ticket.create` (an op ordered before the create is allowed); field limits equal to
+  the snapshot's (title 1 to 1024 characters on one line, label 1 to 128, priority and type 1 to 32); `ctr` at most 2^31-1; times at
+  most 8.64e15 ms; and, for a full unredacted export, the frontier must equal its own op lines per writer (count and last op). A
+  secret-shaped string anywhere, ids and writers included, is refused `422 secret_detected`. A redacted export carries no ops, so
+  its frontier is echoed unchecked.
+- **Status mapping:** a `status_map` entry, else the identical GoodQA status key, else the category default with a plan warning;
+  an unmapped target with no stage is `422 unmapped_status`.
+- **Error codes added:** `idempotency_conflict`, `invalid_resolution`, `invalid_status_map`, `secret_detected` (422),
+  `import_failed` (422, a batch failed: the job is failed and a re-plan of the same document resumes), `already_committed`,
+  `plan_stale`.
+
 ## What GoodQA has to build
 
 A `ledger_imports` table (id, project, ledger project, export digest, base digest, plan, state, results, receipt), the
