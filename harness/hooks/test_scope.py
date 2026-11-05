@@ -18,6 +18,10 @@ This is a cooperative control: `accept` records evidence an owner presents (it c
 digest, not that a reviewer really ran), and the HARNESS_SCOPE_OK hatch is logged, not authorized. It stops accidental
 duplicate and premature full suites, not a determined bypass.
 
+ssh launches are judged against the LOCAL checkout (the remote head is not consulted), so for them the guard is advisory.
+A confirmed reservation is never completed automatically: it holds its head for 12 hours (a control for 6) unless
+`finish` or `release` ends it, and a suite whose command is never seen (a script, a Makefile, ssh on stdin) is not guarded.
+
 Store: <root>/<repo-id>/{baseline-<sha>,control-<sha>,full-<head>,accepted-<head>}.json, every mutation under one
 flock per repo directory. On the Mac the CLI runs the same command on the store host over ssh (BatchMode, short
 timeout); an unreachable store warns and allows (a guard must not stop work because dev2 is down). Records are
@@ -189,7 +193,10 @@ def reserve_control(store: Store, repo_id: str, main_sha: str, token: str) -> di
         name = f"control-{main_sha}.json"
         held = store.read(repo_id, name, {"repo_id": repo_id, "main_sha": main_sha, "kind": "control"})
         if held and held.get("state") == "reserved" and live(held, CONTROL_TTL):
-            if held.get("token") == token and now() - held.get("at", 0) < IDEMPOTENT_S:
+            if held.get("token") == token and (not held.get("confirmed") or now() - held.get("at", 0) < IDEMPOTENT_S):
+                if not held.get("confirmed"):
+                    held["at"] = now()  # a retry of an unconfirmed launch keeps its ten minutes
+                    store.write(repo_id, name, held)
                 return {"allowed": True, "idempotent": True, "reservation": held}
             raise Refused("control-in-flight", "another owner is already running the main control for this SHA: wait "
                           "for its baseline instead of starting a second one (if that run never started: "
@@ -281,7 +288,10 @@ def reserve_full(store: Store, repo_id: str, head: str, token: str, focused: lis
                 fresh = live(other, FULL_TTL)
                 if other.get("state") == "finished" or fresh:
                     if (other is held and other.get("token") == token and other.get("state") == "reserved"
-                            and now() - other.get("at", 0) < IDEMPOTENT_S):
+                            and (not other.get("confirmed") or now() - other.get("at", 0) < IDEMPOTENT_S)):
+                        if not other.get("confirmed"):
+                            other["at"] = now()
+                            store.write(repo_id, name, other)
                         return {"allowed": True, "idempotent": True, "reservation": other}
                     raise Refused("duplicate-full", "a full run for this head was already started or finished (one full "
                                   f"run per head); read its result, or release it if it never ran or was an infrastructure failure: test_scope.py "
@@ -357,6 +367,11 @@ def guarded_full_start(head: str, token: str, root=None, confirm: bool = False) 
                 raise Refused("duplicate-full", "a full run for this head already finished (one full run per head); "
                               f"test_scope.py release --kind full --key {head} --reason <10+ characters> if it was an "
                               "infrastructure failure", record=held)
+            if token in (held.get("token"), held.get("guarded_token")):  # this owner's own reservation (the confirm call)
+                if confirm and not held.get("confirmed"):
+                    held.update(confirmed=True, confirmed_at=now())
+                    store.write(repo_id, f"full-{head}.json", held)
+                return
             if held.get("source") == "hook" and now() - held.get("at", 0) < ADOPT_S:
                 held.update(source="both", guarded_token=token, **({"confirmed": True} if confirm else {}))
                 store.write(repo_id, f"full-{head}.json", held)  # the hook reserved this very launch moments ago
@@ -570,36 +585,75 @@ def deny(text: str) -> int:
 
 
 SSH_ARG_OPTS = set("iplFJLRDbcemowOSEBIQW")
+WRAPPERS = {"time", "nohup", "env", "nice", "command", "exec", "builtin", "sudo", "stdbuf", "caffeinate"}
+SUITE_HINT = re.compile(r"test|check|verify|spec|jest|mvn|gradle|bazel|xcodebuild|make|tox|nox|cargo|ctest|playwright|cypress|"
+                        r"vitest|mocha|npm|pnpm|yarn|bun|\bgo\b|dotnet|rspec|phpunit|unittest|ssh|bash|sh\b|zsh", re.I)
+
+
+def _unwrap(words: list) -> list:
+    """Drop leading assignments and wrapper commands (time, nohup, env, timeout N ...)."""
+    while words:
+        w = words[0]
+        if re.match(r"^[A-Za-z_]\w*=", w) or os.path.basename(w) in WRAPPERS:
+            words = words[1:]
+        elif os.path.basename(w) == "timeout":
+            words = words[2:] if len(words) > 1 and not words[1].startswith("-") else words[1:]
+        else:
+            break
+    return words
+
+
+def ssh_inners(command: str, depth: int = 0) -> list:
+    """Remote commands of every `ssh [options] host <command>` in the command line (per segment, through wrappers and
+    `bash -c '...'`). The usual way to run a suite is from the Mac on dev2. A suite fed to ssh on stdin is not seen."""
+    import heavy_job_guard as hjg
+    found = []
+    for segment in hjg.split_segments(command):
+        try:
+            words = _unwrap(shlex.split(segment))
+        except ValueError:
+            continue
+        if not words:
+            continue
+        verb = os.path.basename(words[0])
+        if verb in ("bash", "sh", "zsh", "dash") and depth < 2:
+            for i, w in enumerate(words[1:-1], 1):
+                if re.match(r"^-[a-z]*c[a-z]*$", w):
+                    found += ssh_inners(words[i + 1], depth + 1)
+            continue
+        if verb != "ssh":
+            continue
+        i, host_seen = 1, False
+        while i < len(words):
+            w = words[i]
+            if not host_seen and w.startswith("-") and len(w) >= 2 and w != "--":
+                i += 2 if (w[-1] in SSH_ARG_OPTS and not w.startswith("--")) else 1  # `-tp 22`: the last letter takes the arg
+                continue
+            if not host_seen:
+                host_seen = True
+                i += 1
+                continue
+            rest = words[i:]
+            if rest and rest[0] == "--":
+                rest = rest[1:]
+            if rest:
+                found.append(" ".join(rest))
+            break
+    return found
 
 
 def ssh_inner(command: str) -> str:
-    """The remote command of `ssh [options] host <command>`, or ''. The usual way to run a suite is from the Mac on dev2."""
-    try:
-        words = shlex.split(command)
-    except ValueError:
-        return ""
-    while words and re.match(r"^[A-Za-z_]\w*=", words[0]):
-        words.pop(0)
-    if not words or os.path.basename(words[0]) != "ssh":
-        return ""
-    i, host_seen = 1, False
-    while i < len(words):
-        w = words[i]
-        if not host_seen and w.startswith("-") and len(w) >= 2:
-            i += 2 if (w[1] in SSH_ARG_OPTS and len(w) == 2) else 1
-            continue
-        if not host_seen:
-            host_seen = True
-            i += 1
-            continue
-        return " ".join(words[i:])
-    return ""
+    inners = ssh_inners(command)
+    return inners[0] if inners else ""
 
 
 def suite_launch(command: str, cwd: str) -> bool:
-    """True when the command (or the command it runs over ssh) is a full-suite launch, by heavy_job_guard's rules."""
+    """True when the command (or a command it runs over ssh) is a full-suite launch, by heavy_job_guard's rules.
+    Judged against the LOCAL checkout: the remote head is not consulted (advisory for ssh launches)."""
+    if not SUITE_HINT.search(command or ""):
+        return False  # cheap prefilter: most Bash calls are not suites, and importing the classifier costs ~50 ms
     import heavy_job_guard as hjg
-    for text in (command, ssh_inner(command)):
+    for text in [command] + ssh_inners(command):
         if text and any(f[0] == "full-suite" for f in hjg.scan_state(text, cwd)[1]):
             return True
     return False

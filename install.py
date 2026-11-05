@@ -123,11 +123,12 @@ def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]
     if provenance:
         for event, groups in provenance_hook_groups(claude).items():
             managed.setdefault(event, []).extend(groups)
-    # Confirms a full-suite reservation once its command really ran (rule B6); fails open.
-    managed.setdefault("PostToolUse", []).append({
-        "matcher": "Bash",
-        "hooks": [{"type": "command", "command": "python3", "args": [str(claude / "hooks" / "test_scope.py"), "post"],
-                   "timeout": 20}]})
+    # Confirms a full-suite reservation once its command really ran, passing or failing (rule B6); fails open.
+    for event in ("PostToolUse", "PostToolUseFailure"):
+        managed.setdefault(event, []).append({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "python3", "args": [str(claude / "hooks" / "test_scope.py"), "post"],
+                       "timeout": 20}]})
     return managed
 
 

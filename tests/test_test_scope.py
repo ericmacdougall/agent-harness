@@ -265,11 +265,13 @@ class OneFullPerHead(Tmp):
         with self.assertRaises(ts.Refused):
             ts.guarded_full_start(SHA_B, "usage_guard:o1", root=self.store.root)
 
-    def test_same_owner_inside_the_retry_window_only(self):
+    def test_same_owner_retry_rules(self):
         ts.reserve_full(self.store, "r", SHA_A, "t1")
-        self.assertTrue(ts.reserve_full(self.store, "r", SHA_A, "t1")["idempotent"])
-        with mock.patch.object(ts, "IDEMPOTENT_S", -1):  # the window has passed: a second launch is a duplicate
-            with self.assertRaises(ts.Refused):
+        with mock.patch.object(ts, "IDEMPOTENT_S", -1):
+            # unconfirmed: the owner's launch was denied or never started, so a retry is always fine (and keeps its TTL)
+            self.assertTrue(ts.reserve_full(self.store, "r", SHA_A, "t1")["idempotent"])
+            ts.confirm_reservation(self.store, "r", "full", SHA_A, "t1")
+            with self.assertRaises(ts.Refused):  # confirmed and outside the retry window: a second launch is a duplicate
                 ts.reserve_full(self.store, "r", SHA_A, "t1")
 
 
@@ -731,6 +733,72 @@ class ThirdReview(Tmp):
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0]["matcher"], "Bash")
         self.assertIn('"post"', json.dumps(groups[0]))
+
+
+class FourthReview(Tmp):
+    """Findings of the delta review of d5cc7bf."""
+
+    def test_usage_guard_start_adopt_then_confirm_does_not_strand_the_run(self):  # F1
+        give_evidence(self.store, "r", SHA_A, self.dir)
+        ts.reserve_full(self.store, "r", SHA_A, "sid:agent")  # the PreToolUse hook
+        ts.guarded_full_start(SHA_A, "usage_guard:own", root=self.store.root)  # begin(): reserve (adopts)
+        ts.guarded_full_start(SHA_A, "usage_guard:own", root=self.store.root, confirm=True)  # begin(): confirm
+        ts.guarded_full_confirm(SHA_A, "usage_guard:own", root=self.store.root)
+        rec = self.store.read("r", f"full-{SHA_A}.json", {"repo_id": "r", "head": SHA_A, "kind": "full"})
+        self.assertTrue(rec["confirmed"])
+        with self.assertRaises(ts.Refused):  # still a duplicate for anyone else
+            ts.guarded_full_start(SHA_A, "usage_guard:other", root=self.store.root)
+
+    def test_guarded_only_start_then_confirm_by_the_same_owner(self):  # F1
+        ts.guarded_full_start(SHA_B, "usage_guard:o1", root=self.store.root)
+        ts.guarded_full_start(SHA_B, "usage_guard:o1", root=self.store.root, confirm=True)
+        rec = self.store.read("_guarded", f"full-{SHA_B}.json", {"repo_id": "_guarded", "head": SHA_B, "kind": "full"})
+        self.assertTrue(rec["confirmed"])
+
+    def test_denied_launch_does_not_block_its_own_owner_for_ten_minutes(self):  # F2
+        give_evidence(self.store, "r", SHA_A, self.dir)
+        ts.reserve_full(self.store, "r", SHA_A, "owner")
+        path = self.store.dir("r") / f"full-{SHA_A}.json"
+        rec = json.loads(path.read_text())
+        rec["at"] = time.time() - 300
+        path.write_text(json.dumps(rec))
+        self.assertTrue(ts.reserve_full(self.store, "r", SHA_A, "owner")["allowed"])  # 5 minutes later, same owner
+        ts.reserve_control(self.store, "r", SHA_B, "owner")
+        path = self.store.dir("r") / f"control-{SHA_B}.json"
+        rec = json.loads(path.read_text())
+        rec["at"] = time.time() - 300
+        path.write_text(json.dumps(rec))
+        self.assertTrue(ts.reserve_control(self.store, "r", SHA_B, "owner")["allowed"])
+        with self.assertRaises(ts.Refused):  # another owner still waits
+            ts.reserve_control(self.store, "r", SHA_B, "someone-else")
+
+    def test_failed_suites_are_confirmed_too(self):  # F3
+        import install
+        hooks = install.managed_hooks(Path("/h/.claude"), True)
+        for event in ("PostToolUse", "PostToolUseFailure"):
+            groups = [g for g in hooks.get(event, []) if "test_scope.py" in json.dumps(g)]
+            self.assertEqual(len(groups), 1, event)
+            self.assertIn('"post"', json.dumps(groups[0]))
+
+    def test_ssh_forms_through_wrappers_segments_clusters_and_double_dash(self):  # F4
+        for cmd, expect in (("cd /tmp && ssh dev2 'pytest'", ["pytest"]), ("time ssh dev2 pytest", ["pytest"]),
+                            ("nohup ssh dev2 pytest &", ["pytest"]), ("timeout 900 ssh dev2 pytest", ["pytest"]),
+                            ("ssh dev2 'echo a' && ssh dev2 pytest", ["echo a", "pytest"]), ("bash -c 'ssh dev2 pytest'", ["pytest"]),
+                            ("ssh dev2 -- pytest", ["pytest"]), ("ssh -tp 22 dev2 pytest", ["pytest"]),
+                            ("FOO=1 ssh -o BatchMode=yes dev2 make test", ["make test"]), ("ls", []), ("ssh dev2", [])):
+            self.assertEqual(ts.ssh_inners(cmd), expect, cmd)
+        for cmd in ("cd /tmp && ssh dev2 'python3 -m unittest discover -s tests'", "time ssh dev2 pytest",
+                    "ssh -tp 22 dev2 make test", "bash -c 'ssh dev2 pytest'"):
+            self.assertTrue(ts.suite_launch(cmd, "/tmp"), cmd)
+        self.assertFalse(ts.suite_launch("ssh dev2 uptime", "/tmp"))
+
+    def test_prefilter_skips_the_classifier_for_ordinary_commands(self):  # F7
+        for cmd in ("ls -la", "git status", "cat README.md", "echo hi", "rg foo src"):
+            self.assertFalse(ts.SUITE_HINT.search(cmd), cmd)
+        for cmd in ("python3 -m unittest discover", "pytest", "make test", "ssh dev2 uptime", "npm run build"):
+            self.assertTrue(ts.SUITE_HINT.search(cmd), cmd)
+        with mock.patch.dict(sys.modules, {"heavy_job_guard": None}):  # import would fail: the prefilter must come first
+            self.assertFalse(ts.suite_launch("ls -la", "/tmp"))
 
 
 class Cli(Tmp):
