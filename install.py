@@ -30,8 +30,9 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "command_guard.py", "command_guard_hook.py", "redact.py", "kill_guard.py", "kill_guard_policy.json",
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py",
          "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
-         "ahd.py", "ahd_peek.py", "ahd_policy.json", "dropped_gate.py", "ask_reminders.py",
-         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py")
+         "ahd.py", "ahd_peek.py", "ahd_policy.json",
+         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "bg_lint.py",
+         "dropped_gate.py", "ask_reminders.py")  # dropped-owner gate and ask reminders (goodqa#14791)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -50,7 +51,7 @@ class DirectoryPublicationError(OSError):
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
-                         "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py",
+                         "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py")}
 
 
@@ -153,7 +154,8 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
         }, {
             # Commit message policy: validates git commit / gh pr merge --squash before they run.
             "matcher": "Bash",
-            "hooks": [policy],
+            "hooks": [policy, {"type": "command", "command": "python3",  # advisory bg_lint: warns, never blocks
+                               "args": [str(claude / "hooks" / "bg_lint.py")], "timeout": 5}],
         }, {
             # Route heavy Mac work (browsers, full suites, builds) to dev2; advisory for hostile probes.
             "matcher": "Bash",

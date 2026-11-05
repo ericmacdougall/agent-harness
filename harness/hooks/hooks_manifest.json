@@ -500,6 +500,20 @@
    "rules": []
   },
   {
+   "id": "bg_lint:pretool",
+   "script": "bg_lint.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
    "id": "dropped-gate:stop",
    "script": "dropped_gate.py",
    "arg": null,
