@@ -972,5 +972,39 @@ class CodeInspectionRound1Tests(unittest.TestCase):
         self.assertIn("'review_policy.json'", (HOOKS / 'usage_guard.py').read_text())
 
 
+class PrReviewRound1Tests(unittest.TestCase):
+    """Regressions for the pr review findings on 117e8af (F3 policy directory trust, F4 stderr last line)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_peer_review()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(os.path.realpath(self.temp.name))
+
+    def test_override_in_a_world_writable_directory_is_ignored(self):
+        body = json.dumps({'known_install_locations': {'codex': ['/evil/codex']}})
+        shared = self.root / 'shared'
+        shared.mkdir()
+        path = private_file(shared / 'p.json', body, 0o600)
+        shared.chmod(0o777)
+        self.addCleanup(shared.chmod, 0o700)
+        warnings = []
+        policy = rd.load_policy(path, warn=warnings.append)
+        self.assertNotIn('/evil/codex', policy['known_install_locations']['codex'])
+        self.assertTrue(warnings)
+        # control: the same private file in a private directory applies
+        shared.chmod(0o700)
+        self.assertIn('/evil/codex', rd.load_policy(path)['known_install_locations']['codex'])
+
+    def test_only_the_last_stderr_line_can_be_usage_limit_prose(self):
+        echoed = "reading prompt: the packet says You've hit your usage limit\nError: unexpected failure"
+        self.assertEqual(self.module.normalize_provider('codex', 1, '', echoed, '', 'pr')['reason'], 'INVALID_OUTPUT')
+        final = "starting\nERROR: You've hit your usage limit"
+        self.assertEqual(self.module.normalize_provider('codex', 1, '', final, '', 'pr')['reason'], 'QUOTA')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -227,8 +227,10 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                                   stderr.strip() or stripped)
             if marker:
                 return provider_failure({'code': marker[1].lower()})
-            # Free-text stderr counts only for codex with no stdout: other output may echo packet or model text.
-            return (prose_quota_failure(stderr.strip()) if provider == 'codex' and not stripped else None) or invalid
+            # Free-text stderr counts only for codex with no stdout, and only its last line (the CLI's own
+            # final error): earlier lines may echo packet or model text.
+            last_line = (stderr.strip().splitlines() or [''])[-1].strip()
+            return (prose_quota_failure(last_line) if provider == 'codex' and not stripped else None) or invalid
     if code != 0:
         return invalid
     try:

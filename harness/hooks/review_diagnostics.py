@@ -146,9 +146,30 @@ def _clamp_number(value, low, high, default):
     return min(max(value, low), high)
 
 
+def _ancestor_problem(real):
+    """Why a directory above real lets another user swap it, or None.
+
+    Every ancestor must be owned by the current uid or root, and must not be world-writable unless it is
+    sticky and root-owned (such as /tmp). Raises OSError when an ancestor cannot be inspected.
+    """
+    parent = os.path.dirname(real)
+    while True:
+        pinfo = os.stat(parent)
+        if pinfo.st_uid not in (os.geteuid(), 0):
+            return 'parent directory owned by another user'
+        if pinfo.st_mode & 0o002 and not (pinfo.st_mode & stat.S_ISVTX and pinfo.st_uid == 0):
+            return 'parent directory is world-writable'
+        if parent == os.sep:
+            return None
+        parent = os.path.dirname(parent)
+
+
 def _policy_trusted(path):
-    info = os.stat(path)
-    return (stat.S_ISREG(info.st_mode) and info.st_uid in (os.geteuid(), 0) and not info.st_mode & 0o022)
+    """The override must be a private regular file in directories no other user can rewrite."""
+    real = os.path.realpath(path)
+    info = os.stat(real)
+    return (stat.S_ISREG(info.st_mode) and info.st_uid in (os.geteuid(), 0) and not info.st_mode & 0o022
+            and _ancestor_problem(real) is None)
 
 
 def load_policy(path=None, warn=None):
@@ -159,7 +180,8 @@ def load_policy(path=None, warn=None):
     result = json.loads(json.dumps(DEFAULT_POLICY))
     try:
         if override and not _policy_trusted(chosen):
-            warn('review policy ignored: it must be a regular file owned by you or root and not group/world-writable')
+            warn('review policy ignored: it must be a regular file owned by you or root, not group/world-writable, '
+                 'in directories owned by you or root that no other user can write')
             return result
         if read_bounded is None:
             return result
@@ -295,17 +317,9 @@ def check_executable(path, roots):
             return None, 'owned by another user'
         if info.st_mode & 0o022:
             return None, 'writable by group or others'
-        parent = os.path.dirname(real)
-        while True:
-            pinfo = os.stat(parent)
-            owner_ok = pinfo.st_uid in (os.geteuid(), 0)
-            if not owner_ok:
-                return None, 'parent directory owned by another user'
-            if pinfo.st_mode & 0o002 and not (pinfo.st_mode & stat.S_ISVTX and pinfo.st_uid == 0):
-                return None, 'parent directory is world-writable'
-            if parent == os.sep:
-                break
-            parent = os.path.dirname(parent)
+        problem = _ancestor_problem(real)
+        if problem:
+            return None, problem
     except (OSError, ValueError):
         return None, 'not accessible'
     return real, None
