@@ -158,22 +158,36 @@ PINNED_ROUTES = (
      r'|set-content --name [a-z.]{{1,40}} --content [0-9.]{{7,15}} --expect-content [0-9.]{{7,15}})'),
 )
 # Existing scripts are otherwise judged only for log deletion, so a credential read inside one would pass. This refuses
-# shell and Python scripts whose own text names the full config path, a config dump, or the token secret. It matches text
-# only, by design narrow enough not to refuse tools that merely mention rclone. It does not catch a script that builds the
-# name at runtime or calls another script, a name past the read limit, a path the guard cannot resolve, a runner it does
-# not unwrap (`uv run`, `tmux`, `python3 -m cProfile`), or a script named like a test or like the guard's own files.
-CREDENTIAL_SCRIPT_TEXT = re.compile(rb'\.config/rclone/rclone\.conf(?![\w.-])|\brclone\s+config\s+(?:show|dump)\b'
-                                    rb'|\bGOODQA_CLOUDFLARE_API_TOKEN\b')
+# scripts whose own text, outside comment lines, names the rclone config or the token secret or dumps the config. Text only.
+# Python prose does not count as a dump: there the command must open a string or be an argument list. It does not catch a
+# script that builds the name at runtime or calls another script, a name past the read limit, a path the guard cannot
+# resolve, a runner it does not unwrap (`uv run`, `tmux`, `python3 -m cProfile`), a test in a folder named tests, or one of
+# the guard's own files.
+_CREDENTIAL_NAMES = (rb'\.config/rclone/?(?=["\'\s;|&)*$]|\Z)'  # the config directory as a whole word, or a glob or variable
+                     rb'|/rclone/rclone\.conf(?![\w.-])'  # the file under any base, such as $XDG_CONFIG_HOME
+                     rb'|["\']rclone\.conf["\']'  # the quoted file name: os.path.join, pathlib, read("...")
+                     rb'|\bGOODQA_CLOUDFLARE_API_TOKEN\b')
+_RCLONE_DUMP = rb'rclone(?:\s|\\)+(?:-\S+(?:\s+"?\$?\{?\w+\}?"?)?\s+)*config(?:\s|\\)+"?(?:show|dump)\b'
+CREDENTIAL_SHELL_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|\b' + _RCLONE_DUMP)
+CREDENTIAL_PYTHON_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|[f]?["\'](?:[^"\'\s]*/)?' + _RCLONE_DUMP
+                                    + rb'|["\']rclone["\']\s*,\s*["\']config["\']\s*,\s*["\'](?:show|dump)["\']')
 CREDENTIAL_SCRIPT_READ = 1048576
 CREDENTIAL_SCRIPT_SUFFIXES = ('.sh', '.bash', '.zsh', '.py')
+CREDENTIAL_DATA_SUFFIXES = ('.json', '.jsonl', '.md')
 CREDENTIAL_SCRIPT_SHEBANG = re.compile(rb'#![^\n]*\b(?:ba|z|k|da|)sh\b|#![^\n]*\bpython')
-GUARD_OWN_FILES = ('command_guard.py', 'command_guard_hook.py', 'command_guard_corpus.py', 'live_guard_canary.py')
+GUARD_OWN_FILES = ('command_guard.py', 'command_guard_hook.py', 'command_guard_corpus.py', 'live_guard_canary.py',
+                   'holds_guard.py')
 ROUTE_HOME = re.compile(r'/[A-Za-z0-9_./-]+')  # HOME goes into a command string, so it must not hold shell syntax
 
 
+VERSIONED_PYTHON = re.compile(r'(?:python|pypy)(?:[0-9.]+t?(?:-intel64)?|w)')
 SHELL_LONG_OPTS = frozenset(('norc', 'noprofile', 'login', 'posix', 'verbose', 'version', 'help', 'restricted', 'noediting',
                              'debugger', 'dump-strings', 'dump-po-strings', 'rpm-requires'))
 SHELL_LONG_VALUE_OPTS = frozenset(('rcfile', 'init-file'))
+
+
+def is_interpreter(name):
+    return name in INTERPRETERS or VERSIONED_PYTHON.fullmatch(name) is not None
 
 
 def shell_options(texts):
@@ -1850,10 +1864,10 @@ class Analyzer:
             if any(n in SHELLS or n in ('ssh',) for n in inner):
                 self.script(body, depth + 1, tail_visible=True)
                 return
-            if any(n in INTERPRETERS for n in inner):
+            if any(is_interpreter(n) for n in inner):
                 self.code(body, depth)
                 return
-        if name in INTERPRETERS:
+        if is_interpreter(name):
             self.code(body, depth)
             return
         if name == 'ssh':
@@ -2082,7 +2096,7 @@ class Analyzer:
         if name in ECHO_CMDS or name in ('cat',):
             self.echo_check(name, args, pl, idx)
         self.secret_clis(name, texts, visible=self.out_visible(pl, idx, True))
-        if name in INTERPRETERS or name in ('awk', 'gawk', 'mawk', 'nawk') or re.fullmatch(r'(?:python|pypy)[0-9.]+', name):
+        if is_interpreter(name) or name in ('awk', 'gawk', 'mawk', 'nawk'):
             self.interpreter(name, args, texts, depth)
         if (name.startswith('python') or name.startswith('pypy')) and '-m' in texts:
             # python3 -m json.tool FILE (and other printing modules) prints the file
@@ -2092,6 +2106,8 @@ class Analyzer:
                 self.read_creds('cat', args[k + 2:], pl, idx)
         if name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS or name in ('openssl', 'source'):
             self.read_creds(name, args, pl, idx)
+        if name in ('cp', 'rsync', 'scp', 'tar', 'gtar', 'bsdtar', 'zip', 'ditto'):
+            self.rclone_dir_copy(name, args)
         if name in RM_CMDS or name in MV_CMDS or name in OVERWRITE_CMDS or name in (
                 'sed', 'perl', 'ruby', 'awk', 'gawk', 'rsync', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content',
                 'out-file', 'curl', 'wget', 'touch', 'mkdir', 'unzip', 'bsdtar', 'gtar'):
@@ -2109,7 +2125,7 @@ class Analyzer:
         path = norm_path(word.text, ctx)
         key = path.casefold()
         if runs:  # before the written text, which may only be what this command appends to an existing file
-            self.credential_script(path)
+            self.credential_script(path, runner=None if require_shell else 'shell')
         if key in ctx.written:
             self.script(ctx.written[key], depth + 1, tail_visible=True)
             return
@@ -2143,11 +2159,15 @@ class Analyzer:
                 setattr(ctx, k, v)
         ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
 
-    def credential_script(self, path):
-        """Refuse running an existing script that names a credential the pinned routes cover (goodqa#14518)."""
+    def credential_script(self, path, runner=None):
+        """Refuse running an existing script that names a credential the pinned routes cover (goodqa#14518).
+
+        `runner` is 'shell' or 'python' when one was named to run this file, so the file's own name says nothing about it.
+        """
         ctx = self.ctx
         base = os.path.basename(path)
-        if base in GUARD_OWN_FILES or (base.startswith('test_') and base.endswith('.py')):
+        in_tests = os.path.basename(os.path.dirname(path)) == 'tests' and base.startswith('test_') and base.endswith('.py')
+        if base in GUARD_OWN_FILES or in_tests or path.lower().endswith(CREDENTIAL_DATA_SUFFIXES):
             return  # these hold the names as data
         ctx.credential_reads = getattr(ctx, 'credential_reads', 0) + 1
         if ctx.credential_reads > 32:
@@ -2158,11 +2178,38 @@ class Analyzer:
             data = _read_prefix(path, CREDENTIAL_SCRIPT_READ)
         except (OSError, ValueError):
             return
-        if not path.endswith(CREDENTIAL_SCRIPT_SUFFIXES) and not CREDENTIAL_SCRIPT_SHEBANG.match(data):
+        lower = path.lower()
+        shebang = CREDENTIAL_SCRIPT_SHEBANG.match(data)
+        if runner is None and not lower.endswith(CREDENTIAL_SCRIPT_SUFFIXES) and not shebang:
             return  # a data file or a binary, not a script
-        if b'\0' not in data and CREDENTIAL_SCRIPT_TEXT.search(data):
+        python = runner == 'python' or (runner is None and (lower.endswith('.py') or (shebang and b'python' in shebang.group())))
+        code = b'\n'.join(line for line in data.split(b'\n') if not line.lstrip().startswith(b'#'))
+        if b'\0' not in data and (CREDENTIAL_PYTHON_TEXT if python else CREDENTIAL_SHELL_TEXT).search(code):
             ctx.add(SECRET_DUMP, 'credential-script', 'this script names a credential file or secret, and only a pinned '
                     'route may run one', 'read the task for a pinned route, or take a path that does not need this credential')
+
+    def rclone_dir_copy(self, name, args):
+        """Refuse copying the whole rclone config directory: the likely way to move a config (goodqa#14518)."""
+        ctx = self.ctx
+        config = norm_path('~/.config/rclone', ctx).rstrip('/').casefold()
+        tar = name in ('tar', 'gtar', 'bsdtar')
+        words, base, k = [], ctx.cwd, 0
+        while k < len(args):
+            t = args[k].text
+            if tar and t == '-C' and k + 1 < len(args):
+                base = norm_path(args[k + 1].text, ctx)
+                k += 2
+                continue
+            if not t.startswith('-') and not args[k].dynamic:
+                words.append((t, base))
+            k += 1
+        if not tar and name != 'zip':
+            words = words[:-1]  # the last word is the destination: restoring into the directory is not a copy out
+        for t, at in words:
+            if norm_path(t, ctx, at).rstrip('/').casefold() == config:
+                ctx.add(SECRET_DUMP, 'credential-dir-copy', '`%s` of the whole rclone config directory copies its tokens' % name[:40],
+                        'read the task for a pinned route, or take a path that does not need this credential')
+                return
 
     def launcher(self, name, args, depth, pl, idx):
         """Commands that run another command given as text or as trailing words. True when handled."""
@@ -2884,7 +2931,7 @@ class Analyzer:
         """Fallback for readers missing from the printing-reader list: a home credential file in a positional
         slot of a verb outside the non-revealing allowlist, with stdout reaching the transcript."""
         ctx = self.ctx
-        if name in self.NON_REVEALING or name in SHELLS or name in INTERPRETERS or name in WRAPPERS_SIMPLE \
+        if name in self.NON_REVEALING or name in SHELLS or is_interpreter(name) or name in WRAPPERS_SIMPLE \
                 or name in KILLERS or self.stdout_redirected(cmd):
             return
         prev = ''
@@ -3036,7 +3083,7 @@ class Analyzer:
             script = args[at] if kind == 'script' else None
         if script is not None and not script.dynamic:
             path = norm_path(script.text, self.ctx)
-            self.credential_script(path)
+            self.credential_script(path, runner='python')
             text = self.ctx.written.get(path.casefold())
             if text:
                 self.code(text, depth)
