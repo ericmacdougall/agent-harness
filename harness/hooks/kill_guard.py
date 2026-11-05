@@ -918,7 +918,7 @@ def make_analyzer_class(cg):
                     k and args[k - 1].text in ('-s', '-n', '--signal')))) for k, a in enumerate(args)):
                 self.block('unprovable-target', 'a brace expansion is too large or hides an option')
                 return
-            if last_sig == '0' and liveness_only(targets):
+            if last_sig == '0' and not self.xargs and liveness_only(targets):
                 return  # a liveness probe, unless a later dash word hides a real target (kill -0 -s KILL PID)
             if self.xargs:
                 self.block('pidfeed', 'kill through xargs takes its targets from another command, so none can be '
@@ -977,17 +977,22 @@ def bad_signal_value(word, remote=False):
     return unsafe_word(word, remote) or not SIGNAL_VALUE.fullmatch(word.text)
 
 
+LONE_VAR = re.compile(r'\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})')
+
+
 def liveness_only(targets):
-    """True when `kill -0 ...` can only probe. bash reads -s/-n/-l after the first signal option, so a word that expands
-    to one (a substitution, a glob, a variable that splits) placed before a real PID turns the probe into a kill."""
+    """True when `kill -0 ...` can only probe. Options can sit anywhere: the bash builtin stops at the first PID but
+    procps /usr/bin/kill reorders, and an unquoted or operator variable can split into `-s KILL PID`. So any dash
+    word, expansion, glob or multi-word value among the targets ends the probe; the one exception is a lone quoted
+    simple variable (`"$PID"`), which stays one word."""
+    if len(targets) == 1:
+        w = targets[0]
+        if w.dynamic and w.quoted and not w.subs and not w.glob and w.alts == [w.text] and LONE_VAR.fullmatch(w.text):
+            return True
     for w in targets:
-        plain = not (w.dynamic or w.subs or w.glob)
-        if plain and re.fullmatch(r'[0-9]{1,10}', w.text, re.ASCII):
-            return True  # bash stops reading options at the first PID
-        if plain and not w.text.startswith('-') and not any(a.startswith('-') for a in w.alts):
-            continue
-        # A lone plain variable (kill -0 $PID) stays a probe; its value is not visible here (see Known limits).
-        return len(targets) == 1 and w.dynamic and not w.subs and not w.glob
+        if (w.dynamic or w.subs or w.glob or len(w.alts) > 1 or w.text.startswith('-')
+                or any(a.startswith('-') for a in w.alts) or re.search(r'\s', w.text)):
+            return False
     return True
 
 

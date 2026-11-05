@@ -7736,6 +7736,302 @@
    ]
   },
   {
+   "cmd": "/bin/kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-bin-kill-after-pid",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "/usr/bin/kill -0 4004 -s 9",
+   "expect": "block",
+   "id": "P-rt8-usrbin-kill-after-pid",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "/bin/kill -0 4004 --signal=KILL",
+   "expect": "block",
+   "id": "P-rt8-bin-kill-signal-eq",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "/bin/kill -s 0 4004 -s 9",
+   "expect": "block",
+   "id": "P-rt8-bin-kill-s0-s9",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "env kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-env-after-pid",
+   "tags": [
+    "ownership",
+    "signal0",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "exec kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-exec-after-pid",
+   "tags": [
+    "ownership",
+    "signal0",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "nice kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-nice-after-pid",
+   "tags": [
+    "ownership",
+    "signal0",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "nohup kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-nohup-after-pid",
+   "tags": [
+    "ownership",
+    "signal0",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "timeout 5 kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-timeout-after-pid",
+   "tags": [
+    "ownership",
+    "signal0",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-builtin-after-pid",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 4004 -- -s KILL",
+   "expect": "block",
+   "id": "P-rt8-dash-dash-then-dash",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "docker exec c kill -0 1 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-docker-after-pid",
+   "tags": [
+    "ssh",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "ssh dev2 /bin/kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-ssh-bin-after-pid",
+   "tags": [
+    "ssh",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 ${x:--s KILL 4004}",
+   "expect": "block",
+   "id": "P-rt8-default-op",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -0 ${x=-s KILL 4004}",
+   "expect": "block",
+   "id": "P-rt8-assign-op",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -0 ${@:--s KILL 4004}",
+   "expect": "block",
+   "id": "P-rt8-at-default",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "set -- -s KILL 4004; kill -0 \"$@\"",
+   "expect": "block",
+   "id": "P-rt8-set-dashdash-at",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "for x in '-s KILL 4004'; do kill -0 $x; done",
+   "expect": "block",
+   "id": "P-rt8-for-loop-var",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "printf -v x %s '-s KILL 4004'; kill -0 $x",
+   "expect": "block",
+   "id": "P-rt8-printf-v",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "read x <<< '-s KILL 4004'; kill -0 $x",
+   "expect": "block",
+   "id": "P-rt8-read-herestring",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "read -a x <<< '-s KILL 4004'; kill -0 \"${x[@]}\"",
+   "expect": "block",
+   "id": "P-rt8-read-array",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "x=$(printf -- '-s KILL 4004'); kill -0 $x",
+   "expect": "block",
+   "id": "P-rt8-assign-subst-var",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "f() { kill -0 \"$@\"; }; f -s KILL 4004",
+   "expect": "block",
+   "id": "P-rt8-function-at",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -0 $1",
+   "expect": "block",
+   "id": "P-rt8-positional",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 $PID",
+   "expect": "block",
+   "id": "P-rt8-unquoted-var",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 4004 $x",
+   "expect": "block",
+   "id": "P-rt8-pid-then-var",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 $a $b",
+   "expect": "block",
+   "id": "P-rt8-two-vars",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 \"$a\" \"$b\"",
+   "expect": "block",
+   "id": "P-rt8-quoted-two-vars",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 \"${a[@]}\"",
+   "expect": "block",
+   "id": "P-rt8-array-expansion",
+   "tags": [
+    "ownership",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "echo 4004 -s KILL | xargs kill -0",
+   "expect": "block",
+   "id": "P-rt8-xargs-literal-opts",
+   "tags": [
+    "ownership",
+    "pidfeed",
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "pgrep x | xargs kill -0",
+   "expect": "block",
+   "id": "P-rt8-xargs-pgrep",
+   "tags": [
+    "ownership",
+    "pidfeed",
+    "signal0"
+   ]
+  },
+  {
    "cmd": "grep -n \"pkill -f pytest\" notes.md",
    "expect": "allow",
    "id": "N-text00-grep",
@@ -8752,14 +9048,6 @@
    ]
   },
   {
-   "cmd": "kill -0 $PID",
-   "expect": "allow",
-   "id": "N-kill-0-var",
-   "tags": [
-    "signal0"
-   ]
-  },
-  {
    "cmd": "ssh host kill -0 12",
    "expect": "allow",
    "id": "N-ssh-kill-0",
@@ -8775,14 +9063,6 @@
    "tags": [
     "signal0",
     "ssh"
-   ]
-  },
-  {
-   "cmd": "pgrep x | xargs kill -0",
-   "expect": "allow",
-   "id": "N-xargs-kill-0",
-   "tags": [
-    "signal0"
    ]
   },
   {
@@ -10144,25 +10424,9 @@
    ]
   },
   {
-   "cmd": "kill -0 $PID",
-   "expect": "allow",
-   "id": "N-rt5-ok-lone-var",
-   "tags": [
-    "signal0"
-   ]
-  },
-  {
    "cmd": "kill -0 \"$PID\"",
    "expect": "allow",
    "id": "N-rt5-ok-lone-quoted-var",
-   "tags": [
-    "signal0"
-   ]
-  },
-  {
-   "cmd": "kill -0 4004 $x",
-   "expect": "allow",
-   "id": "N-rt5-ok-pid-then-var",
    "tags": [
     "signal0"
    ]
@@ -10293,6 +10557,72 @@
    "tags": [
     "ownership",
     "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -0 \"$PID\"",
+   "expect": "allow",
+   "id": "N-rt8-ok-quoted-var",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 \"${PID}\"",
+   "expect": "allow",
+   "id": "N-rt8-ok-quoted-braced",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 4004 4001",
+   "expect": "allow",
+   "id": "N-rt8-ok-two-literals",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 \"4004\"",
+   "expect": "allow",
+   "id": "N-rt8-ok-quoted-literal",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 -- 4004",
+   "expect": "allow",
+   "id": "N-rt8-ok-dashdash-pid",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "/bin/kill -0 4004",
+   "expect": "allow",
+   "id": "N-rt8-ok-bin-kill-0",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "env kill -0 4004",
+   "expect": "allow",
+   "id": "N-rt8-ok-env-kill-0",
+   "tags": [
+    "signal0",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "ssh host kill -0 12",
+   "expect": "allow",
+   "id": "N-rt8-ok-ssh-kill-0",
+   "tags": [
+    "signal0",
+    "ssh"
    ]
   },
   {
