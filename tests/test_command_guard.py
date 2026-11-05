@@ -290,6 +290,20 @@ class FailureModeTests(Fixture):
         self.assertEqual(self.decide('rm -f lnk_task/notes.md', cwd='@WT@')[0], 'block')
         self.assertEqual(self.decide('rm -f lnk_build/a.o', cwd='@WT@')[0], 'allow')
 
+    def test_globs_and_dotdot_follow_links_like_the_shell(self):
+        """Native code-inspection of b5daca9 (findings 3 and 4): `..` after a symlink and a hidden symlink under a
+        wildcard are judged where the shell really goes."""
+        wt = self.home / '.agent-harness/work/S/T/wt'
+        (wt / 'linkfx/b').mkdir(parents=True, exist_ok=True)
+        (wt / 'linkfx/d/e').mkdir(parents=True, exist_ok=True)
+        (self.home / '.claude/projects/p').mkdir(parents=True, exist_ok=True)
+        for link, target in ((wt / 'linkfx/b/c', self.home / '.claude/projects/p'),
+                             (wt / 'linkfx/d/.hid', self.home / '.claude')):
+            if not os.path.lexists(link):
+                os.symlink(str(target), str(link))
+        for cmd, want in corpus.LINK_GLOB_ROWS:
+            self.assertEqual(self.decide(cmd, cwd='@WT@')[0], want, cmd)
+
     def test_brace_overflow_is_not_dropped(self):
         """Red-team F4: alternatives past the expansion cap are unknown, not absent."""
         alts = ','.join('d%d' % k for k in range(40)) + ',.claude'

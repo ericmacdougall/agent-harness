@@ -2118,6 +2118,14 @@ class Analyzer:
         for i, a in enumerate(args[:-1]):
             if a.text in ('-a', '--arg-file') and args[i + 1].subs:
                 sources.append(args[i + 1])
+        heredocs = [r.body for r in (cmd.redirs if cmd is not None else []) if r.op in ('<<', '<<-') and r.body]
+        for body in heredocs:
+            if any(self._raw_path_class(m.group(0)) in ('log', 'root', 'ancestor', 'unknown')
+                   for m in self.RAW_PATH.finditer(body[:200000])):
+                self.ctx.add(LOG_DELETE, 'log-delete',
+                             'xargs deletes paths given in its heredoc, and that heredoc names a protected harness '
+                             'location', 'delete only paths inside your own task worktree, named directly')
+                return
         for src in sources:
             if self.refuse('xargs deletion of paths given on its input', src):
                 return
@@ -2142,17 +2150,31 @@ class Analyzer:
     PKG_RUNNERS = {'npx': 0, 'bunx': 0, 'pnpx': 0, 'uvx': 0, 'pnpm': ('dlx', 'exec'), 'yarn': ('dlx', 'exec'),
                    'bun': ('x',), 'npm': ('exec', 'x'), 'pipx': ('run',)}
     PKG_DELETERS = {'del-cli': 'rm', 'trash-cli': 'trash', 'rimraf': 'rimraf', 'del': 'rm', 'trash': 'trash'}
+    PKG_PASSTHROUGH = set(PKG_DELETERS) | {'shx', 'cross-env', 'trash-put'}
 
     def package_runner(self, name, args, depth, pl, idx):
         """`npx rimraf PATH`, `pnpm dlx del-cli PATH`, `uvx trash-cli PATH`: the package runs as a command."""
+        if name == 'shx' and args:
+            self.inner_words(list(args), depth, pl, idx)  # shx rm -rf PATH: the first word is the command
+            return True
+        if name == 'cross-env':
+            rest = list(args)
+            while rest and (rest[0].text.startswith('-') or re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', rest[0].text)):
+                rest = rest[1:]
+            if rest:
+                self.inner_words(rest, depth, pl, idx)
+            return True
         sub = self.PKG_RUNNERS.get(name)
         if sub is None:
             return False
         i = 0
         if sub:
-            if not args or args[0].text not in sub:
+            if args and name in ('yarn', 'pnpm') and norm_name(args[0].text) in self.PKG_PASSTHROUGH:
+                i = 0  # `yarn rimraf PATH`: a package bin run directly
+            elif not args or args[0].text not in sub:
                 return False
-            i = 1
+            else:
+                i = 1
         while i < len(args):
             t = args[i].text
             if t == '--':
@@ -2356,14 +2378,9 @@ class Analyzer:
                     j += 1
                 exec_cmds.append(body)
         if '-delete' in texts or any(norm_name(b[0].text) in RM_CMDS | MV_CMDS | {'unlink', 'shred', 'truncate'} for b in exec_cmds if b):
-            safe_filter = self._find_filter_safe(texts)
             for r in roots:
-                if safe_filter and not r.dynamic and not any(ch in r.text for ch in GLOB_CHARS):
-                    # `find . -name '*.pyc' -delete` from the worktree top: find removes matching entries below
-                    # the start directory, never the directory itself, so judge a child of it
-                    child = norm_path(r.text, ctx).rstrip('/') + '/__command_guard_probe__'
-                    if self._path_class(child) is None:
-                        continue
+                if self._find_root_relaxed(r, texts):
+                    continue
                 self.protected_target('find -delete/-exec', r)
         for body in exec_cmds:
             if not body:
@@ -2860,6 +2877,41 @@ class Analyzer:
         return best
 
     NO_EXPANSION = object()
+    GLOB_MATCH_CAP = 2000  # across the whole command; beyond it the pattern rule applies (fail closed)
+
+    def _glob_with_hidden(self, pattern, limit):
+        """Expand `pattern` like a shell with dotglob set (a wildcard also matches names starting with a dot,
+        never `.` or `..`), so a hidden symlink cannot hide behind `*`. None when over `limit` or unreadable."""
+        out = ['/']
+        segs = [x for x in pattern.split('/') if x]
+        for k, seg in enumerate(segs):
+            last = k == len(segs) - 1
+            nxt = []
+            for base in out:
+                if not _has_glob(seg):
+                    cand = os.path.join(base, seg)
+                    if os.path.lexists(cand) if last else os.path.isdir(cand):
+                        nxt.append(cand)
+                    continue
+                if not os.path.isdir(base):
+                    continue
+                try:
+                    names = sorted(e.name for e in os.scandir(base))
+                except OSError:
+                    return None
+                for name in names:
+                    if not fnmatch.fnmatchcase(name, seg):
+                        continue
+                    cand = os.path.join(base, name)
+                    if last or os.path.isdir(cand):
+                        self.ctx.budget.tick()
+                        nxt.append(cand)
+                        if len(nxt) > limit:
+                            return None
+            out = nxt
+            if not out:
+                return []
+        return out
 
     def _expand_work_glob(self, path):
         """`rm -rf build/*` under ~/.agent-harness/work: judge what the glob actually matches on disk (as the
@@ -2875,14 +2927,17 @@ class Analyzer:
         top = self._git_top(prefix, self._under_work(path) + 3)
         if not top or len(Compiled._segs(top)) >= first:
             return self.NO_EXPANSION  # a wildcard directly in the worktree top level (or above it) empties the tree
-        import glob as _glob
-        import itertools
         try:
-            matches = list(itertools.islice(_glob.iglob(path), 2001))
-        except (OSError, ValueError, re.error):
+            if os.path.realpath(prefix) != os.path.abspath(prefix):
+                return self.NO_EXPANSION  # the shell walks the link (and resolves `..` physically after it)
+        except (OSError, ValueError):
             return self.NO_EXPANSION
-        if len(matches) > 2000:
+        ctx = self.ctx
+        remaining = self.GLOB_MATCH_CAP - getattr(ctx, 'glob_matches', 0)
+        matches = self._glob_with_hidden('/' + '/'.join(segs), remaining)
+        if matches is None:
             return self.NO_EXPANSION
+        ctx.glob_matches = getattr(ctx, 'glob_matches', 0) + len(matches)
         if not matches:
             # nothing matches yet: the shell passes the pattern through literally, so judge one ordinary name in
             # place of each wildcard segment (a later match is judged when that command runs)
@@ -2894,9 +2949,39 @@ class Analyzer:
             self._in_glob = False
         return max(classes, key=lambda k: self.RANK[k])
 
+    GIT_INTERNAL_NAMES = {'.git', 'head', 'orig_head', 'fetch_head', 'merge_head', 'config', 'index', 'objects',
+                          'refs', 'logs', 'hooks', 'info', 'packed-refs', 'description', 'worktrees', 'modules',
+                          'commondir', 'gitdir', 'shallow', 'exclude', 'commit-graph', 'x.pack', 'x.idx', 'x.rev',
+                          'x.lock', 'x.sample', 'x.keep', 'x.bitmap', 'x.promisor', 'x.midx'}
+
+    def _find_root_relaxed(self, root, texts):
+        """A find deletion is judged by its -name filters only when the start directory resolves (with no
+        symlink) strictly inside the agent's own worktree and is not .git. From the worktree top itself, where
+        the walk reaches .git, only extension patterns (`-name '*.pyc'`) qualify. Every other start directory
+        (home, /, a parent of a protected root, anything unresolvable) gets the normal target rule."""
+        if root.dynamic or any(ch in root.text for ch in GLOB_CHARS) or not self._find_filter_safe(texts):
+            return False
+        path = norm_path(root.text, self.ctx).rstrip('/') or '/'
+        work = self._under_work(path)
+        inner = path + '/x'  # _git_top and _own_worktree look at ancestors; this locates the top that holds `path`
+        if work is None or '.git' in Compiled._segs(path) or not self._own_worktree(inner, work):
+            return False
+        try:
+            if os.path.realpath(path) != os.path.abspath(path) or not os.path.isdir(path):
+                return False  # a symlinked start directory (or one that does not exist yet)
+        except (OSError, ValueError):
+            return False
+        top = self._git_top(inner, work + 3)
+        if not top:
+            return False
+        if len(Compiled._segs(path)) <= len(Compiled._segs(top)):
+            pats = [texts[i + 1] for i, t in enumerate(texts) if t in ('-name', '-iname') and i + 1 < len(texts)]
+            return all(re.fullmatch(r'\*\.[A-Za-z0-9_]+', p) for p in pats)
+        return True
+
     def _find_filter_safe(self, texts):
-        """find's -name/-iname filters can only match names that are never protected (no -o, -path, -regex,
-        negation or symlink following that could widen them)."""
+        """find's -name/-iname filters can only match names that are never protected or git-internal (no -o,
+        -path, -regex, negation or symlink following that could widen them)."""
         if any(t in ('-o', '-or', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex', '!', '-not',
                      '-L', '-H', '-follow') for t in texts):
             return False
@@ -2904,7 +2989,8 @@ class Analyzer:
         if not pats:
             return False
         c = self.c
-        samples = set(c.seg_names) | set(c.file_names) | {'x' + s for s in c.file_suffixes} | {'.git', 'state'}
+        samples = set(c.seg_names) | set(c.file_names) | {'x' + s for s in c.file_suffixes} | {'state'} \
+            | self.GIT_INTERNAL_NAMES
         for p in pats:
             for sample in samples:
                 if fnmatch.fnmatchcase(sample, p.casefold()) or fnmatch.fnmatchcase(sample.upper(), p):
@@ -3078,6 +3164,11 @@ class Analyzer:
             path = norm_path(alt, ctx)
             dynamic = is_dynamic_path(alt) or word.dynamic
             cls = self._path_class(path)
+            physical = None if dynamic else self._physical_dotdot(alt)
+            if physical and physical != path:
+                other = self._path_class(physical)
+                if self.RANK[other] > self.RANK[cls]:
+                    cls, path = other, physical
             if dynamic:
                 literal = False
                 if cls is None and self._dynamic_suffix_protected(path):
@@ -3093,6 +3184,30 @@ class Analyzer:
             if self.RANK[cls] > self.RANK[best]:
                 best, shown = cls, path
         return best, shown, literal
+
+    def _physical_dotdot(self, alt):
+        """`sub/link/../../x`: the shell (and the kernel) resolve `..` after following `link`, so the real target
+        can differ from the lexically normalised path. Resolve the part up to the last `..` physically."""
+        text = alt.replace('\\', '/')
+        parts = text.split('/')
+        if '..' not in parts:
+            return None
+        last = len(parts) - 1 - parts[::-1].index('..')
+        head, rest = '/'.join(parts[:last + 1]), '/'.join(parts[last + 1:])
+        ctx = self.ctx
+        if head.startswith('~/') or head == '~':
+            head = (ctx.home or '') + head[1:]
+        elif not head.startswith('/'):
+            if not ctx.cwd or ctx.cwd_unknown:
+                return None
+            head = ctx.cwd.rstrip('/') + '/' + head
+        if head.startswith('~'):
+            return None
+        try:
+            real = os.path.realpath(head)
+        except (OSError, ValueError):
+            return None
+        return norm_path(real.rstrip('/') + ('/' + rest if rest else ''), ctx)
 
     def _dynamic_suffix_protected(self, path):
         """`$X/projects`, `$DIR/.claude`, `$(..)/wals`: an unresolved prefix followed by a protected tail."""
