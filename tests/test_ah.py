@@ -107,6 +107,7 @@ class LivenessTests(unittest.TestCase):
         self.assertEqual(self.c(9999, stopped=True, outcome="handoff"), "handoff")
         self.assertEqual(self.c(9999, stopped=True), "DROPPED")
         self.assertEqual(self.c(53, stopped=True), "finishing")  # just stopped, handoff may still be coming
+        self.assertEqual(self.c(25 * 60, stopped=True), "finishing")  # between turns is not a drop
         self.assertEqual(self.c(9999, stopped=True, note="waiting on dev2 suite"), "waiting-on-dev2")
         for helper in ("red-team", "fixer", "click-tester", "Explore"):
             self.assertEqual(self.c(9999, stopped=True, typ=helper), "returned", helper)
