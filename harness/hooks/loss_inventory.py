@@ -32,6 +32,7 @@ timeout and a failing repo becomes an entry in "errors", not a crash.
 """
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import socket
@@ -145,9 +146,10 @@ class Scan:
                         mtime = os.lstat(common).st_mtime
                     except OSError:
                         mtime = None
-                    rc, head, _ = self.git(repo, "rev-parse", "--verify", "-q", "HEAD")
-                    self.row("no_remote_repo", repo, mtime, self.pack_bytes(common),
-                             head.strip() if rc == 0 else None)
+                    # fingerprint = all local branch tips, so a commit on any branch voids a decision
+                    rc, refs, _ = self.git(repo, "for-each-ref", "--format=%(refname)%(objectname)", "refs/heads")
+                    fp = hashlib.sha256(refs.encode("utf-8", "replace")).hexdigest()[:16] if rc == 0 else None
+                    self.row("no_remote_repo", repo, mtime, self.pack_bytes(common), fp)
                 else:
                     rc, out, er = self.git(repo, "for-each-ref", "--format=%(refname:short)\t%(objectname)\t%(committerdate:unix)",
                                            "refs/heads")
@@ -303,7 +305,8 @@ def merge_decisions(rows):
     dec = load_decisions()
     for r in rows:
         d = dec.get(r["path"])
-        stale = d is not None and d.get("fp") is not None and r.get("fp") is not None and d["fp"] != r["fp"]
+        # only "moved" depends on content; accepted-loss/rebuildable on a live DB must not churn
+        stale = d is not None and d.get("decision") == "moved" and d.get("fp") is not None and r.get("fp") is not None and d["fp"] != r["fp"]
         r["decision"] = d["decision"] if d and not stale else None
         r["decision_stale"] = True if stale else None
     return rows
@@ -335,7 +338,7 @@ def cmd_scan(args):
     for r in s.rows:
         classes[r["class"]] += 1
     result = {
-        "host": socket.gethostname(), "scanned_at": now_iso(), "roots": roots,
+        "host": socket.gethostname(), "scanned_at": now_iso(), "roots": roots, "excludes": sorted(s.prune - PRUNE),
         "classes": classes, "rows": s.rows,
         "partial": s.budget.exceeded,
         "partial_reason": "max-seconds budget exceeded" if s.budget.exceeded else None,
@@ -409,7 +412,7 @@ def cmd_report(args):
     nmounts = last.get("skipped_mounts_total", 0)
     incomplete = partial or nerr > 0 or nmounts > 0
     if args.json:
-        print(json.dumps({"scanned_at": last.get("scanned_at"), "partial": partial, "errors_total": nerr,
+        print(json.dumps({"scanned_at": last.get("scanned_at"), "partial": partial, "errors_total": nerr, "excludes": last.get("excludes", []),
                           "errors": errors, "skipped_mounts": last.get("skipped_mounts", []),
                           "undecided": undecided}, indent=1))
     else:
@@ -417,6 +420,8 @@ def cmd_report(args):
         for r in undecided:
             print("%s\t%s\tage_days=%s\tbytes=%s%s" % (r["class"], r["path"], r["age_days"], r["bytes"],
                                                        "\t(decision stale: changed since decided)" if r.get("decision_stale") else ""))
+        if last.get("excludes"):
+            print("EXCLUDED_DIR_NAMES\t%s (anything under these names anywhere was not inventoried)" % ",".join(last["excludes"]))
         for e in errors:
             print("ERROR\t%s\t%s" % (e["path"], e["error"]))
         for m in last.get("skipped_mounts", []):
