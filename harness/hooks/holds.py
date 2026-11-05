@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Lift or inspect holds (rules S08/S09). A hold is lifted only with a verified user source.
+"""Lift or inspect holds (rules S08/S09). A hold is lifted only by the user.
 
   holds.py status
-  holds.py lift <hold-id> --source 'user:<session>/<message-uuid> "verbatim words"'
+  holds.py lift <hold-id> --source 'user:<session>/<message-uuid> "lift hold <hold-id>"'
 
-`lift` parses the source with provenance.py, then looks the message up in that session's transcript
-(provenance.find_user) and requires the same uuid to be a human-typed message containing the excerpt. Anything
-else (ticket, wal, inferred, agent text, a uuid that is not found) is refused, so an agent cannot lift a hold on
-its own say-so. The quoted words must name the hold and say lift. holds_guard.py refuses `holds.py lift` when an
-agent runs it and protects the policy files, so the user running it in their own terminal is the only path.
+To lift a hold the user (1) sends Claude the message `lift hold <hold-id>` (that exact text as the whole message;
+"please" in front and a final "." or "!" are tolerated) and (2) runs `holds.py lift` in their own interactive
+terminal, citing that message. `lift` refuses without a terminal on stdin and stdout (an agent's Bash tool has
+none), then parses the source with provenance.py and looks the message up in that session's transcript
+(provenance.find_user): the same uuid must be a human-typed message, and the whole message must be the lift
+phrase, so a quote cut out of "do not lift hold yates" or "until I lift hold yates" lifts nothing. Anything else
+(ticket, wal, inferred, agent text, a uuid that is not found) is refused. holds_guard.py re-verifies every state
+entry with the same rule on every call, refuses any agent call of `holds.py` other than `status`, protects the
+policy files and refuses agent writes to session transcripts.
 """
 from __future__ import annotations
 
@@ -44,12 +48,25 @@ def write_state(state: dict, path: Path = STATE) -> None:
     os.replace(tmp, path)
 
 
-LIFT_WORDS = re.compile(r"\b(lift|lifted|release|unhold|un-hold|remove|drop)\b", re.I)
+NEGATION = re.compile(r"\b(not|no|never|don'?t|doesn'?t|won'?t|until|unless|keep|stay|stays|without|before|after"
+                      r"|if|when|wait)\b|n't\b", re.I)
+
+
+def lift_phrase_ok(text: str, hold_id: str) -> bool:
+    """True only for the exact lift phrase `lift hold <id>` (optional leading "please", final "." or "!")."""
+    t = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    return bool(re.fullmatch(r"(please )?lift hold " + re.escape(hold_id.lower()) + r" ?[.!]?", t)) \
+        and not NEGATION.search(t)
+
+
+def _interactive() -> bool:
+    return os.isatty(0) and os.isatty(1)
 
 
 def verify_user_source(source: str, finder=None, hold_id: str = None) -> dict:
-    """Parsed user source whose uuid really is a human message with that excerpt, else ValueError. With a hold id
-    the words must also name that hold and say lift, so an unrelated human message can not lift anything."""
+    """Parsed user source whose uuid really is a human message with that excerpt, else ValueError. With a hold id the
+    quoted words AND the whole human message (the finder's preview) must be exactly `lift hold <id>`, so an unrelated
+    message, or the phrase cut out of a negated or conditional sentence, can not lift anything."""
     import provenance
     try:
         parsed = provenance.parse_source(source)
@@ -62,10 +79,14 @@ def verify_user_source(source: str, finder=None, hold_id: str = None) -> dict:
         found = find(parsed["session"], parsed["excerpt"])
     except provenance.Problem as exc:
         raise ValueError(f"cannot verify: {exc}") from None
-    if parsed["uuid"] not in {str(f.get("uuid", "")).lower() for f in found}:
+    matches = [f for f in found if str(f.get("uuid", "")).lower() == parsed["uuid"]]
+    if not matches:
         raise ValueError("that message uuid is not a human message containing the excerpt in that session")
-    if hold_id is not None and (hold_id.lower() not in parsed["excerpt"].lower() or not LIFT_WORDS.search(parsed["excerpt"])):
-        raise ValueError(f"the quoted words must name the hold {hold_id!r} and say to lift it")
+    if hold_id is not None:
+        if not lift_phrase_ok(parsed["excerpt"], hold_id) or not any(
+                lift_phrase_ok(m.get("preview", ""), hold_id) for m in matches):
+            raise ValueError(f"the user's whole message must be exactly `lift hold {hold_id}` "
+                             "(no negation, condition or other words)")
     return parsed
 
 
@@ -73,6 +94,9 @@ def lift(hold_id: str, source: str, policy: Path = POLICY, state_path: Path = ST
     ids = {h["id"] for h in json.loads(policy.read_text())["holds"]}
     if hold_id not in ids:
         raise ValueError(f"unknown hold {hold_id!r}; known: {', '.join(sorted(ids))}")
+    if not _interactive():
+        raise ValueError("a hold is lifted only by the user in an interactive terminal (stdin and stdout must be a "
+                         "TTY); an agent can not run this")
     parsed = verify_user_source(source, finder, hold_id)
     state = load_state(state_path)
     state["lifted"][hold_id] = {"source_uuid": parsed["uuid"], "session": parsed["session"],

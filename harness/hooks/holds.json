@@ -1,5 +1,6 @@
 {
  "schema": 1,
+ "projects_note": "Each hold's 'projects' lists GoodQA project ids to deny. Only the user supplies them; nobody lists or opens a held project to find them. Until then GoodQA calls are matched by project name, slug and ref (for example 'Petfiliate#5').",
  "holds": [
   {
    "id": "yates",
