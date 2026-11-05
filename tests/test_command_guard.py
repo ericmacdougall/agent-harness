@@ -838,6 +838,30 @@ class OverwriteExistingTests(Fixture):
         for text in ('echo hi > ondisk.sh; bash ondisk.sh', "eval 'echo hi > ondisk.sh'; bash ondisk.sh"):
             self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'allow', text)
 
+    def test_the_disk_is_judged_before_the_recorded_text(self):
+        # in the reading where the disk is what runs, the recorded text never ran: its cd or alias must not colour the disk
+        self._seed_bang_rows()
+        proj, other = self.home / 'proj', self.home / 'other'
+        other.mkdir()
+        (other / 'rel.sh').write_text('rm -rf .claude/projects\n')
+        (other / 'cdonly.sh').write_text('cd /tmp\n')
+        (proj / 'ondisk.sh').write_text('rm -rf ' + str(self.home / '.claude/projects') + '\n')
+        rel = "cd @HOME@/other; %s; cd @HOME@; bash @HOME@/other/rel.sh"
+        for nested in ("eval '>! rel.sh echo cd /tmp'", "eval '>! rel.sh echo cd /tmp; true'", "eval '>>! rel.sh echo cd /tmp'",
+                       "bash -c '>! rel.sh echo cd /tmp'", 'x=$(>! rel.sh echo cd /tmp)'):
+            self.assertEqual(self.decide(rel % nested, cwd='@HOME@/proj')[0], 'block', nested)
+        self.assertEqual(self.decide("eval '>! ondisk.sh echo alias rm=true'; bash ondisk.sh", cwd='@HOME@/proj')[0], 'block')
+        # the disk text's own cd stays inside its own process
+        text = "cd @HOME@/other; eval '>! cdonly.sh echo hi'; cd @HOME@; bash @HOME@/other/cdonly.sh; rm -rf .claude/projects"
+        self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'block')
+        # and the recorded text is still read, even when a large clean file on disk is read first
+        (proj / 'big.sh').write_text(':\n' * 128000)
+        (proj / 'plain.sh').write_text('echo plain\n')
+        for name in ('plain.sh', 'absent.sh', 'big.sh'):
+            text = "eval '>! %s echo rm -rf ~/.c*/projects'; bash %s" % (name, name)
+            self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'block', text)
+        self.assertEqual(self.decide("eval '>! plain.sh echo hi'; bash plain.sh", cwd='@HOME@/proj')[0], 'allow')
+
     def test_only_enforced_findings_survive_a_stop(self):
         # broad_kill warns by default, so a warning raised before the stop must not turn into a refusal
         self._seed_bang_rows()

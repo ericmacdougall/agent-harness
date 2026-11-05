@@ -2131,9 +2131,16 @@ class Analyzer:
         path = norm_path(word.text, ctx)
         key = path.casefold()
         if key in ctx.written:
+            # the disk first: in the reading where the disk is what runs, the recorded text never ran, so its cd or
+            # alias must not colour this read
+            if key in ctx.one_sided:
+                self._script_on_disk(path, depth, require_shell)
             self.script(ctx.written[key], depth + 1, tail_visible=True)
-            if key not in ctx.one_sided:
-                return
+            return
+        self._script_on_disk(path, depth, require_shell)
+
+    def _script_on_disk(self, path, depth, require_shell):
+        ctx = self.ctx
         ctx.files_read = getattr(ctx, 'files_read', 0) + 1
         if ctx.files_read > 8:
             return
