@@ -463,3 +463,6 @@
 {"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "cd /opt/elsewhere && rm work-assignments"}
 {"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "cd ~/.agent-harness/work && rm -rf work-assignments/old"}
 {"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "python3 x.py > docs/work-assignments.md"}
+{"category": "key-glob-word", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -n \"a\\.\\w* =\" f.py"}
+{"category": "key-glob-word", "expect": "allow", "cwd": "@HOME@", "cmd": "sed -n \"/x\\|y\\.\\w*/p\" f.py"}
+{"category": "key-glob-word", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -E \"(a|\\\\w*|b)\" f.py"}

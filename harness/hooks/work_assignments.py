@@ -73,7 +73,7 @@ PROTECTED = re.compile(r"work-(?:assign|ledger)[A-Za-z0-9._*?-]*|work_assignment
 SAFE_CLI = re.compile(r"^\s*python3\s+(?:~|\$HOME|/[^\s;&|<>`$]*)?[^\s;&|<>`$]*/work_assignments\.py\s+[A-Za-z-]+(?:\s+[^;&|<>`$\n]*)?$")
 KEY_FILE = re.compile(r"(?i)work-ledger\.key")
 GLOB_TOKEN = re.compile(r"[^\s'\"=;&|<>()`]*[*?\[][^\s'\"=;&|<>()`]*")
-SHELL_WORD = re.compile(r"[^\s'\"=;&|<>()`]+")  # findall with GLOB_TOKEN was quadratic on one long token: 64 KB took 28 s
+GLOB_WORD = re.compile(r"[^\s'\"=;&|<>()`]+")  # findall with GLOB_TOKEN was quadratic on one long token: 64 KB took 28 s
 HOOK_CALL = re.compile(r"\bhook\s+(?:prompt|stop|session|compact|ask-answer|guard|subagent-start)\b")
 INPROCESS = re.compile(r"\b(?:import|from)\s+work_assignments\b|__import__\(\s*['\"]work_assignments|\bcapture_key\b|"
                        r"\bhook_prompt\s*\(|\bhook_ask_answer\s*\(|\bbuild_capture\s*\(|\battest\s*\(")
@@ -202,7 +202,7 @@ def names_key(tool_input, tool: str = "") -> bool:
     paths, command = guard_targets(tool_input, tool)
     if any(KEY_FILE.search(v) or (GLOB_TOKEN.fullmatch(v) and glob_could_name_key(v)) for v in paths):
         return True
-    return bool(KEY_FILE.search(command)) or any(glob_could_name_key(t) for t in SHELL_WORD.findall(command) if "*" in t or "?" in t or "[" in t)
+    return bool(KEY_FILE.search(command)) or any(glob_could_name_key(t) for t in GLOB_WORD.findall(command) if "*" in t or "?" in t or "[" in t)
 
 
 def searches_store(tool: str, tool_input, cwd=None) -> bool:
