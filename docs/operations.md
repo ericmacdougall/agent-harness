@@ -322,6 +322,101 @@ Co-Authored-By: ...
   - Claude Code: delete the `commit_policy.py hook` handler from `~/.claude/settings.json`.
   - Codex: delete it from `~/.codex/hooks.json`.
 
+## Command guard
+
+`command_guard.py` (GoodQA #14471) is a PreToolUse guard for shell commands. It blocks two kinds of command before they run: commands that delete, move or empty the harness's own logs and state, and commands that print secrets or configuration into a transcript. It exists because an agent once fed test strings through a heredoc, and the real shell then deleted `~/.claude/projects` and `~/.claude/wals` and printed rclone OAuth tokens. The guard is stdlib-only and runs on Python 3.9 to 3.13.
+
+### What it protects
+
+| Tier | Paths | Refused |
+| --- | --- | --- |
+| A (logs and state) | Claude transcripts (`~/.claude/projects`, history), Codex sessions and history, WALs (any `wals` directory, `main.jsonl`, `*.wal.jsonl`), the approval state in `~/.agent-harness/state`, credential files, and the guard's own installed files | every destructive form: delete, move, truncate, overwrite, `find -delete`, `rsync --delete`, `rclone move/sync/delete/purge`, interpreter one-liners, `git clean` |
+| B (harness roots) | everything else under `~/.claude`, `~/.codex` and `~/.agent-harness`, for the local home and for `/home/*`, `/Users/*`, `/root` paths on ssh or container targets | delete, move and pure truncation; ordinary edits and new files are allowed |
+
+A command that names an ancestor of a protected path (`rm -rf ~`), or a path the guard cannot resolve but that points at one (a variable, glob or `cd -` it cannot follow), is refused too.
+
+Exceptions, none of which applies to Tier A:
+
+- Under `~/.agent-harness/work`, deletes are allowed only inside the git repository the agent is working in. That is the working tree whose top level holds the effective working directory: the payload `cwd`, or Codex `tool_input.workdir`, updated by a `cd` or `pushd` earlier in the same command. The tree must have a real `.git` (a directory holding `HEAD`, or a `gitdir:` file) that existed before the command, and it must lie strictly below a task folder. The top level itself, its `.git` and `git worktree remove` stay refused. A wildcard that could reach `.git`, `.` or `..` (one starting with `.`, `?` or `[`) voids the exception. A `tmp/` folder directly in a task folder is also deletable, by literal path only, so `rm -rf tmp/*` is refused and the message suggests per-item deletes. `kit.json`, `*.jsonl` and `state` directories are never deletable by name anywhere under `~/.agent-harness`. Session folders, task folders and sibling task folders are cleaned up with `workdir.py prune --apply`. When the guard cannot tell where the agent is working, the delete is refused.
+- Literal paths in `~/.agent-harness/scratch/<a>/<b>/<c>/...` are deletable, except WAL-shaped files, `kit.json`, anything in a `tasks` folder, and `*.output` and `*.log` files. Agent task output falls under the log-retention rule and is never deleted without a verified backup.
+- Under `~/.claude` and `~/.codex`, literal paths are deletable inside a git working tree whose top level sits two or more levels below the root and whose `.git` existed before the command.
+- In temp directories and inside git working trees outside the harness roots, WAL-shaped names (`wals/`, `main.jsonl`) are test data, not WALs.
+
+**Residual risks.** These are recorded, not hidden:
+
+- "Own worktree" means only "the repository the agent is working in". Any agent can `cd` into another agent's worktree, so the rule guards against mistakes; it is not an ownership boundary.
+- `git clean` is allowed inside the worktree and can remove untracked `*.jsonl` or WAL-shaped files there.
+- A `git init` run in an earlier command makes a folder count as a repository. That is outside the threat model, which covers careless or hurried agents, not an adversary.
+- Name-based refusals have false positives: `*.jsonl` results and `state` directories under `~/.agent-harness` cannot be deleted by name.
+- A script or program file that already exists when the command runs (`bin/dev2`, `./run.sh`, `python3 tool.py`) is the repository's own tooling. Only its deletions of protected logs count, and a Python file's source is not scanned. A script written earlier in the same command is judged in full.
+- Inside the own worktree, a wildcard below the top level (`rm -rf build/*`) is judged by what it matches on disk when the guard runs. Hidden entries count, as if `dotglob` were set. A wildcard directly in the top level, one that can match a dot-name, or one behind a symlinked directory is judged by the pattern rule instead: it is refused when it could match a protected name. Above 2,000 matches in one command, the pattern rule also applies. A path whose `..` follows a symlink is judged where the shell really resolves it.
+- `find` with `-delete`, `-exec rm` or `-exec mv` is judged by its start directories, whatever `-name` filters it has. The guard skips leading options such as `-P`, `-D`, `-O3` and `--`. Start directories read with `-files0-from` are unknown and refused. The operands of the `-exec` command other than `{}` are judged too. So `find build -name '*.o' -delete` is allowed. `find . -name '*.pyc' -delete` from the worktree top is refused, because the walk reaches `.git`. This is a known false positive: run it from a subdirectory instead. Two attempts to relax it by its filters both opened bypasses.
+- `find -L` or `-follow` combined with a deleting action is refused.
+- Known gaps, unchanged since earlier rounds:
+  - an xargs here-string or heredoc line holding several paths is judged as one path;
+  - a pnpm or yarn global flag before the bin (`pnpm --silent rimraf`) hides the bin;
+  - a `-exec` operand that embeds `{}` (`{}/../x`) is not judged;
+  - the POSIX classes `[^x]` and `[[:lower:]]` in a worktree glob are matched literally;
+  - `cd -P` through a symlink is tracked logically.
+- A nested repository below the worktree (`src/vendor/.git`) is not the worktree's own `.git` and is not protected. A script written with `tee` and then run in the same command gets only the heredoc advisory, not the written-then-run analysis.
+- Not detected (tracked for a later round): `rsync` or `scp` of a whole credential directory such as `~/.ssh/` (single key files are caught); a PowerShell `Get-ChildItem ... | Remove-Item` pipeline whose `Remove-Item` has no path; macOS `ditto` over a protected directory; and a protected directory mounted into a container (`docker run -v ~/.claude:/c ... rm -rf /c/...`). The in-process `approve_delete` verifier can be replaced by code running in the same process. That is outside the threat model.
+- Variables the guard cannot resolve fail closed. A positional parameter (`$1`, `$@`, `$0`), a loop variable over a glob or a substitution, a `read` variable, or an `export`/`declare`/`local` value that names a protected path refuses a destructive command whenever the same command names a protected location anywhere. That includes, for example, `ls ~/.claude/projects; for f in $(...); do rm "$f"; done`.
+
+**Policy file.** `command_guard_policy.json` is optional and can only add protection. Its protective lists are merged into the built-in ones, and `broad_kill` may be set to `enforce`. Every other key is ignored, including allow-lists, regexes, temp roots and limits. The guard's own files (`command_guard*`, `redact.py`, `safe_input.py` in both hook directories) are refused for writes even when they do not exist yet, so an agent cannot create a policy file or a replacement module beside the hook. Block messages do not name the file.
+
+### Secret and configuration dumps
+
+Blocked: `rclone config show|dump|file|redacted|reconnect|paste`, a bare `rclone config`, `rclone config create|update|password` with values, `rclone authorize|reveal`, `--dump auth|headers|bodies`; `gh auth status --show-token`; and `gh auth token` in every shape except `VAR=$(gh auth token) gh <subcommand>`, where the subcommand is not `auth`, `config`, `extension`, `alias` or `secret`, with no other assignment, wrapper, redirect, pipe or further command. Also blocked: environment dumps (`env`, `printenv`, `set`, `export -p`, `declare -p|-x`, `compgen -v` with values, `${!name}`, and interpreter dumps such as `os.environ.items()`, `process.env`, `%ENV`, awk `ENVIRON` loops) and printing secret-named variables. `env | grep '^NAME='` or `grep -w NAME` with exact non-secret names is allowed. A prefix or substring filter (`env | grep -i GITHUB`) is still blocked, because it also matches `GITHUB_TOKEN`. Also blocked: `kubectl config view --raw`, `gh config get oauth_token`, `aws configure export-credentials`, `docker-credential-* get`, and `xargs cat` over paths listed from a credential directory. Reading credential files (ssh private keys, AWS, Codex `auth.json`, Claude `.credentials.json`, `rclone.conf`, `gh` `hosts.yml`, `.netrc`, `.npmrc`, `~/.env`, the approval key) with a printing reader or a network sender is blocked, and so is the same read through a copy made earlier in the command. So are recursive greps for secret words above a credential directory, Keychain password reads, `/proc/*/environ` and `ps e`. A project `.env` can still be sourced or added to git.
+
+`rclone config file` is blocked too. It prints only a path, but it is the first step of the incident, and `doctor` reports where the config lives.
+
+### How it decides
+
+The command is lexed like a shell before any rule runs. The lexer handles quotes, `$'..'`, escapes, line continuations, heredocs (the body ends at its delimiter and the rest of the text is commands again), `$(..)`, backticks, pipes, redirects, brace expansion, prefix assignments, wrappers (`sudo`, `env`, `nice -n`, `timeout`, `xargs` including its here-string, heredoc, `< <(..)` and `-a` input, package runners `npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `npm exec`, `uvx`, `pipx run`, `yarn`/`pnpm` (and `yarn run`) with a deleter bin, `shx`, `cross-env` and `cross-env-shell`, `eval "$(..)"`, `flock`, `script -c`, `tmux send-keys`, `osascript`, `at`), `sh -c` strings, `ssh` and `docker exec` commands, scripts written and then run in the same command, `$(which rm)`, absolute binary paths, and case and Unicode lookalikes. An unterminated quote or substitution, nesting that is too deep, or input over the analysis budget is blocked when the raw text names a protected location, a secret source, or a code-execution step (a pipe into a shell, `eval`, `-c` or `-e` code, a decoder) together with a destructive verb. Otherwise it is a warning. Block messages are passed through `redact.py` and never echo a secret.
+
+A heredoc whose body contains a deletion of a protected location gets an advisory warning even when the heredoc only prints the text or writes it to a file, such as test data or a commit message. Heredoc text passes through the shell, which is how the incident happened. The warning points to the editor's file-writing tool and does not block. Interpreter heredocs are scanned as code and still block.
+
+The guard never emits an explicit allow, so the host's own permission flow still applies.
+
+### Fail closed
+
+The registered command is the launcher `command_guard_hook.py`, not the analyser. Claude Code allows a command when a hook crashes or times out unless the entry sets `onFailure: block` (Claude Code 2.1.295 and later), and Codex always allows. The launcher therefore runs the analyser in a child process with a 10 s watchdog. If the child crashes, cannot start, prints invalid output or runs out of time, the launcher decides from the raw text with the same probe and exits 2 for sensitive input. Non-shell tools return at once. The Claude Code entry matches `Bash|PowerShell` with a 30 s timeout and `onFailure: block`. Both entries pass the verb `hook`, which the launcher ignores; `cmd/harness/gates.json` lists `command-guard hook` as a fail-closed gate, so the Go front door blocks rather than allows when it cannot run the guard. The Codex entry has no matcher, because the host does not re-check `write_stdin` text typed into a running shell, and the guard analyses that text as shell input. A command split across several `write_stdin` calls is a residual risk.
+
+### Deleting logs on purpose
+
+The agent may approve a delete itself, but only after a backup that the approval command verifies in the same run:
+
+```bash
+python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal path> --remote dropbox:<mirror dir> --wal <WAL path>
+```
+
+`approve-delete` refuses in these cases:
+
+- a glob or variable path;
+- a whole root, or a whole `projects`, `wals`, `sessions` or other top-level log directory, or one of their parents;
+- more than 20,000 files;
+- anything changed in the last 10 minutes;
+- a remote that is not a named remote of type `dropbox` (checked with `rclone listremotes --long`);
+- a remote copy that is missing a file, differs in size or hash, or offers sizes only.
+
+The approval is single use, signed with a local key and bound to the exact realpath, device, inode and a stat manifest. The hook consumes it under a lock, so of two commands racing for one approval exactly one runs. Every approval, refusal and use goes to `~/.agent-harness/state/log-delete-audit.jsonl` and to the WAL; report it in the ticket status. `revoke-delete` removes every approval.
+
+### Commands
+
+| Command | Purpose |
+| --- | --- |
+| `command_guard.py doctor` | Checks the installed files, the registration (`onFailure`, matcher, Codex no-matcher), the Claude Code version, and runs built-in self-test probes. Exit 0 when healthy. |
+| `command_guard.py explain --file F [--cwd D]` | Shows the decision and every finding for a command stored in a file. Never put a command you are unsure about into a shell argument. |
+| `command_guard.py check 'CMD'` | Shows the decision for one command. Runs nothing. |
+| `command_guard.py replay T.jsonl...` | Counts decisions over real transcripts for false-positive measurement. Prints rule counts and digests, never commands. Failure-path blocks are counted separately. |
+| `command_guard.py scan-wal PATH...` | Reports secret shapes in WAL or transcript files without printing the values. |
+
+### Rollout and rollback
+
+Run `replay` over recent transcripts and the red-team hold-out set before the enforcing install on a machine. Then install with `install.py --apply` and `install_codex.py --apply`, and run `doctor`. Rollback is `install.py --apply --no-command-guard` (and the same flag for `install_codex.py`). That removes the registration and leaves the files in place. Removing the hook entry that points at `command_guard_hook.py` by hand works too.
+
+**Known gap.** Claude Code `Write`, `Edit`, `MultiEdit`, `NotebookEdit` and Codex `apply_patch` are not shell tools. The guard does not see them, so they can still overwrite or empty a transcript or WAL. Follow-up: GoodQA #14500.
+
 ## Spec-driven tickets
 
 Every want, need, finding or bug is a GoodQA ticket. When an agent picks one up, it writes a spec, gets the spec reviewed and attaches it to the ticket. As it works, it attaches proof for each acceptance criterion. After deploy, it attaches the click-test record. Once signed off, the ticket can be marked done.
