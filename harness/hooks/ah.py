@@ -529,7 +529,8 @@ def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limi
 
 def load_adapter(home: Path | None = None):
     import ticket_adapters
-    cfg = json.loads(_bounded(Path(__file__).with_name("commit_policy.json")))["ticket_systems"]["goodqa"]
+    import commit_policy  # overlay-aware: the shipped policy no longer carries the org id (GoodQA #14538)
+    cfg = commit_policy.load_policy(Path(__file__).with_name("commit_policy.json"))["ticket_systems"]["goodqa"]
     if os.environ.get("AH_GOODQA_ENDPOINT"):  # loopback endpoints only (tests); the adapter enforces the scheme
         cfg = dict(cfg, endpoint=os.environ["AH_GOODQA_ENDPOINT"])
     if os.environ.get("AH_GOODQA_KEY_FILE"):

@@ -1063,10 +1063,12 @@ def commit_policy_gate(source, original_branch, branch, head, baseline, title, b
                                            verify_tickets=True, exclude=exclude)
     except (OSError, subprocess.TimeoutExpired):
         raise DeliveryError("BLOCKED_COMMIT_POLICY", "Commit range could not be inspected", code=2) from None
-    origin = commit_policy.git(source, "remote", "get-url", "origin", check=False).strip() or None
+    # N11: tracked if any remote url/pushurl matches, not only origin's fetch URL.
+    ticket_context = commit_policy.repo_ticket_context(str(source), policy)
     pr_problems = [] if local_only or policy.get("enforcement") == "off" else commit_policy.validate_pr(
         title, body.decode("utf-8", "replace"), policy,
-        tickets_required=commit_policy.tickets_required_for(origin, policy))
+        tickets_required=True if ticket_context is None else ticket_context["tracked"],
+        ledger=commit_policy.ledger_checker(policy, ticket_context, int(time.time() * 1000)))
     text = commit_policy.format_report(result)
     if pr_problems and policy.get("enforcement") != "warn":
         text += "\n  PR title/body (GitHub squash uses them as the final commit message):\n" + "\n".join(

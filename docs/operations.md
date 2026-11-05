@@ -285,8 +285,10 @@ Co-Authored-By: ...
 - **Testing.** Name the exact command and its result. Bare text like "tests pass" is rejected. If you didn't test, write `not run: <reason>`.
 - **Refs.** Reference a GoodQA ticket as `GoodQA #N` (project `goodqa`) or `GoodQA <project-slug>#N`.
   - PR references and `R-NNNNNN` coordinator records are recognized. They do not count as a ticket, because they cannot be verified.
-  - In tracked repositories (origin matches `ticket_systems.*.repos`), only `chore` and `docs` may write `Refs: none (<reason>)`. Every other type needs a GoodQA ticket.
+  - A repository is tracked when the `url` or `pushurl` of any remote, raw or rewritten by `insteadOf`, matches `ticket_systems.*.repos` (each URL is also matched in a normalized form: lowercase host without a trailing dot or port, scp-style or URL syntax, percent-decoding, `.`/`..` and doubled slashes resolved, `.git` dropped; SSH host aliases from `~/.ssh/config` are not visible). This applies to the GoodQA rule too. Renaming `origin`, pointing it at a fork with a tracked `pushurl`, or tracking only a second remote does not shed the rule. `check-range --push-url <url>` also counts the push destination.
+  - In tracked repositories only `chore` and `docs` may write `Refs: none (<reason>)`. Every other type needs a GoodQA ticket.
   - Other repositories accept `none (<reason>)` for any type.
+  - **Local ledger refs** (`Refs: Ledger <slug>#<8+ hex>`, the `ledger` system) count only in untracked repositories that have a remote, or in remote-less repositories whose absolute top-level path fully matches a regex in `ticket_systems.ledger.allowed_repos` (empty by default). They never satisfy a tracked repository's rule. Each one is resolved through `harness tickets show --json --min-version --as-of --slug`, with a 5-second deadline; a missing, old, hanging or malformed binary rejects the commit as "could not verify". GoodQA verification and delivery comments ignore them. See [the local ledger](ledger.md#commit-policy).
 - **Reverts.** A revert uses type `revert` and includes `Reason:` and `Authorized-by:` lines. In tracked repositories, `Authorized-by:` must cite the GoodQA ticket that records the authorization.
   - A commit is treated as a revert if its body says "This reverts commit", even when its subject uses another type.
   - The policy enforces a recorded and verifiable citation. It cannot prove that a human approved the revert.
@@ -329,7 +331,7 @@ Co-Authored-By: ...
    - It runs alongside each repository's own hooks and never changes `core.hooksPath`.
    - It enforces only when both of these hold:
      - an agent marker is present (`CLAUDECODE`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_SANDBOX` or `AI_AGENT`);
-     - the repository's origin matches `backstop_repos`.
+     - any remote URL of the repository matches `backstop_repos`.
    - Everywhere else it stays silent: human commits, test fixtures, and other repositories that agents run.
    - The installer reports "backstop inactive" when Git is older than 2.54.
    - If the script is removed, the hook command exits 0.
@@ -344,13 +346,13 @@ Co-Authored-By: ...
    - **Results.** Neither failure creates delivery state.
      - `BLOCKED_COMMIT_POLICY` (exit 2) lists each failing commit and stale ticket, with the fix.
      - `TICKETS_UNVERIFIED` (exit 6) means GoodQA was unreachable or answered unexpectedly. The check fails closed.
-   - **Projects the credential cannot see.** The member key reaches the FrameBright org only (`org_id` is pinned to it), so GoodQA answers `project_not_found` for Eric-org refs such as `GoodQA solve#7`.
+   - **Projects the credential cannot see.** The key reaches one GoodQA org only (`org_id` is pinned to it), so GoodQA answers `project_not_found` for refs in other orgs such as `GoodQA solve#7`.
      - Only projects listed in `ticket_systems.goodqa.unreachable_projects` (shipped: `solve`, `ai-course`, `harness`) are reported as `OUT_OF_SCOPE`. The ref still has to be well formed. The range passes with a warning naming `unreachable_reason`. `deliver.py prepare` and the PR-review gate print it; the `gh pr create` hook passes silently. Each warning is recorded once per ticket and head in `~/.agent-harness/commit-policy/warnings.jsonl`. finish skips the ticket's comment and lists it as not verified on the other tickets' comments.
-     - Any other `project_not_found` fails closed as `TICKETS_UNVERIFIED`. That covers a typo, an invented slug, an Eric-org project not yet listed, and the default project `goodqa`, which is never treated as out of scope. A missing ticket in a project the key can see is still `MISSING` and blocks.
+     - Any other `project_not_found` fails closed as `TICKETS_UNVERIFIED`. That covers a typo, an invented slug, another org's project not yet listed, and the default project `goodqa`, which is never treated as out of scope. A missing ticket in a project the key can see is still `MISSING` and blocks.
      - Adding a confirmed slug is a config change. Empty the list once durable cross-org access lands.
    - Local-only delivery verifies tickets too.
    - **Credentials.** The member key file `~/.claude/goodqa-hive/member.key` (mode 600) is used first and keeps full access: verification, plus the finish and `notify` comments. Never copy it to another host.
-     - A host without that file (dev2) reads `key_secret` (Secret Manager `goodqa-api-key-framebright` in project `goodqa-28dd3`) in-process through `gcloud secrets versions access`. The value is never passed in argv or the environment, and never written to disk.
+     - A host without that file (dev2) reads `key_secret` (a Secret Manager secret named in your local profile) in-process through `gcloud secrets versions access`. The value is never passed in argv or the environment, and never written to disk.
      - That credential is **read-only** in code: only `list_orgs`, `list_projects`, `get_issue_by_number` and `get_issue_comments` are allowed. Any write (a comment, a status change) is refused before a request is sent. On dev2, `prepare` and PR review therefore verify tickets, but finish's ticket comment stays pending (exit 5). Post it from the Mac with the printed `notify` command.
      - If gcloud cannot read the secret, verification fails closed (`TICKETS_UNVERIFIED`).
    - **Project-qualified refs.** `GoodQA #N` means the default project `goodqa`. Tickets in another project need its slug, for example `GoodQA work-tracker-automatic#35633`. A `MISSING` result says so.
@@ -370,7 +372,7 @@ Co-Authored-By: ...
 
 ### Checks, waivers and audit
 
-- **Check a draft:** `python3 ~/.claude/hooks/commit_policy.py check-message --file msg.txt`
+- **Check a draft:** `python3 ~/.claude/hooks/commit_policy.py check-message --file msg.txt` (add `--repo <checkout>` to apply that repository's tracked-repo rule and resolve `Ledger` refs)
 - **Check a range:** `python3 ~/.claude/hooks/commit_policy.py check-range --repo . --base origin/main --head HEAD --branch <branch> --verify-tickets` (exit 0 pass, 2 blocked, 4 tickets unverified; `deliver.py prepare` reports the last case as exit 6 `TICKETS_UNVERIFIED`)
 - **Waivers.** A waiver is the only exception path. There is no environment-variable bypass.
 
@@ -404,8 +406,8 @@ Co-Authored-By: ...
 
 | Tier | Paths | Refused |
 | --- | --- | --- |
-| A (logs and state) | Claude transcripts (`~/.claude/projects`, history), Codex sessions and history, WALs (any `wals` directory, `main.jsonl`, `*.wal.jsonl`), the approval state in `~/.agent-harness/state`, credential files, and the guard's own installed files | every destructive form: delete, move, truncate, overwrite, `find -delete`, `rsync --delete`, `rclone move/sync/delete/purge`, interpreter one-liners, `git clean` |
-| B (harness roots) | everything else under `~/.claude`, `~/.codex` and `~/.agent-harness`, for the local home and for `/home/*`, `/Users/*`, `/root` paths on ssh or container targets | delete, move and pure truncation; ordinary edits and new files are allowed |
+| A (logs and state) | Claude transcripts (`~/.claude/projects`, history), Codex sessions and history, WALs (any `wals` directory, `main.jsonl`, `*.wal.jsonl`, and under a work dir on any home `wal`, `wal-*`, `wal_*` and `wal.*`), the approval state in `~/.agent-harness/state`, credential files, and the guard's own installed files | every destructive form: delete, move, truncate, overwrite, `find -delete`, `rsync --delete`, `rclone move/sync/delete/purge`, interpreter one-liners, `git clean` |
+| B (harness roots) | everything else under `~/.claude`, `~/.codex` and `~/.agent-harness`, for the local home and for `/home/*`, `/Users/*`, `/root` paths on ssh or container targets | delete, move, truncation, and replacing an existing file's content through a shell redirect (`>`, `>|`, `&>`, zsh `>!`, `1<>`, a `N<>` that a `>&N` dup or `exec` writes, every target of a zsh multios brace, and the existing files a redirect glob matches) or `tee`. bash reads `>! word` as a write to a file named `!` with `word` as an argument, so the guard judges that word both ways. As a result, `cat >! f`, `echo >! f` and a bare `>! f` count as overwrites, not truncations, and are allowed on a plain work file (GoodQA #14634). Under `~/.agent-harness/work/<session>/...` a redirect may still replace a plain file (owners rerun `cmd > <task>/x.log`), except `*.json` receipts, `*.jsonl`, files in a folder named `state`, files directly in the work or scratch dir, and files in a directory marked with `.keep`. The same exception applies to a fully literal `/home/<user>/.agent-harness/{work,scratch}/...` path on another host, where the `.keep` and symlink checks cannot run; a `..`, variable or glob in such a path is refused. New files, `>>` appends and editor-tool edits are allowed; `cp` over an existing file here is not refused yet (GoodQA #14594) |
 
 A command that names an ancestor of a protected path (`rm -rf ~`), or a path the guard cannot resolve but that points at one (a variable, glob or `cd -` it cannot follow), is refused too.
 
@@ -454,7 +456,7 @@ The guard never emits an explicit allow, so the host's own permission flow still
 
 ### Fail closed
 
-The registered command is the launcher `command_guard_hook.py`, not the analyser. Claude Code allows a command when a hook crashes or times out unless the entry sets `onFailure: block` (Claude Code 2.1.295 and later), and Codex always allows. The launcher therefore runs the analyser in a child process with a 10 s watchdog. If the child crashes, cannot start, prints invalid output or runs out of time, the launcher decides from the raw text with the same probe and exits 2 for sensitive input. Non-shell tools return at once. The Claude Code entry matches `Bash|PowerShell` with a 30 s timeout and `onFailure: block`. Both entries pass the verb `hook`, which the launcher ignores; `cmd/harness/gates.json` lists `command-guard hook` as a fail-closed gate, so the Go front door blocks rather than allows when it cannot run the guard. The Codex entry has no matcher, because the host does not re-check `write_stdin` text typed into a running shell, and the guard analyses that text as shell input. A command split across several `write_stdin` calls is a residual risk.
+The registered command is the launcher `command_guard_hook.py`, not the analyser. Claude Code allows a command when a hook crashes or times out unless the entry sets `onFailure: block` (Claude Code 2.1.295 and later), and Codex always allows. The launcher therefore runs the analyser in a child process with a 10 s watchdog. If the child crashes, cannot start, prints invalid output or runs out of time, the launcher decides from the raw text with the same probe and exits 2 for sensitive input. Non-shell tools return at once. The Claude Code entry matches `Bash|PowerShell` with a 30 s timeout and `onFailure: block`. Both entries pass the verb `hook`, which the launcher ignores; `cmd/harness/gates.json` lists `command-guard hook` as a fail-closed gate, so the Go front door blocks rather than allows when it cannot run the guard. The Codex entry has no matcher, because the host does not re-check `write_stdin` text typed into a running shell, and the guard analyses that text as shell input. It is the last `PreToolUse` group: Codex keys hook trust by position (`[hooks.state."<hooks.json>:pre_tool_use:<group>:<handler>"]` in `config.toml`), so appending it keeps the existing hooks' trusted hashes valid, and only the new guard entry needs trusting with `/hooks` in a new Codex session (GoodQA #14590). Upgrading from an install that placed the guard first moves every later group back one position, so hooks trusted under that layout need one re-trust. A command split across several `write_stdin` calls is a residual risk.
 
 ### Deleting logs on purpose
 
@@ -627,8 +629,8 @@ When a repo shows blockchain work, the spec flow and the reviewers get a data-dr
 ### Credentials and rollout
 
 - **Keys and routing.** A GoodQA key is bound to one organization. `spec_policy.json` `projects` maps a project slug to its `project_id` and `org_id`, and to `key_file` when it needs a different key. `doctor --project <slug>` checks that the routed key can create attachments, comment and transition in that project.
-  - `member.key` reaches FrameBright, including the `work-tracker-automatic` tracker.
-  - The Harness project lives in org Eric, and no key file reaches it yet.
+  - `member.key` reaches one org, including the `work-tracker-automatic` tracker.
+  - The Harness project lives in the maintainer's own org, and no key file reaches it yet.
 - **Shipped mode:** `mode: warn`, `plan_ticket_gate: warn`, `enforced_projects: []`. No project is enforced in this release.
 - **Before enforcing any project:** resolve the remaining items in GoodQA work-tracker-automatic#35672 (per-project plan ticket gate, a policy for tickets opened before enforcement, bulk timing with several routed keys). `doctor` reports the permissions GoodQA lists for the key; it does not try a write. Re-run it after any key or membership change.
 - **Enforcing on `harness`:** once #35672 is resolved, add `{"key_file": ...}` to its route, run `doctor --project harness`, then set `"enforced_projects": ["harness"]` and `"mode": "enforce"`.

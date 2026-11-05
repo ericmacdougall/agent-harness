@@ -27,10 +27,12 @@ type UsageError struct{ Msg string }
 func (e *UsageError) Error() string { return e.Msg }
 
 const Usage = "usage: harness --host {claude,codex,cursor} --config-dir DIR [--entry {launcher,py:PATH}] SUBCOMMAND ...\n" +
-	"       harness version [--json]\n       harness install --host HOST ..."
+	"       harness version [--json]\n       harness install --host HOST ...\n       harness tickets COMMAND ...\n       harness ledger-mcp [--slug S]"
 
 // exempt subcommands may run without the global prefix.
-var exempt = map[string]bool{"version": true, "install": true}
+// tickets and ledger-mcp are user/agent tools with their own flags; they are never hook entries or
+// allow-rule prefixes for gates.
+var exempt = map[string]bool{"version": true, "install": true, "tickets": true, "ledger-mcp": true}
 
 func usage(format string, a ...any) error { return &UsageError{Msg: fmt.Sprintf(format, a...)} }
 

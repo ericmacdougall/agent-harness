@@ -41,7 +41,7 @@ NORMAL = [
     "python3 -m unittest tests.test_wal -v", "python3 -m pytest tests/test_wal.py -x -q",
     "pytest tests/test_wal.py::TestWal::test_append", "python3 tests/test_wal.py", "npm test -- src/foo.test.ts",
     "npx vitest run src/foo.test.ts", "go test ./pkg/foo -run TestBar", "echo 'next build' > note.txt",
-    "ssh dev2 'cd repo && pytest'", "ssh eric@100.86.166.93 'npm run build'", "rsync -a src/ dev2:src/",
+    "ssh dev2 'cd repo && pytest'", "ssh eric@192.0.2.7 'npm run build'", "rsync -a src/ dev2:src/",
     "sed -n 1,40p heavy.py", "python3 -m json.tool < x.json", "node --version", "npm install --no-audit",
     "docker ps", "docker logs web | tail", "cargo --version", "ffmpeg -version", "ffprobe -v error clip.mp4",
     "xargs -n1 echo < list.txt", "git ls-files -z | xargs -0 -P 6 grep -l foo", "ls | xargs -P2 echo", "playwright install chromium", "open -a 'Google Chrome' http://x",
@@ -92,7 +92,7 @@ class Classification(unittest.TestCase):
     def test_ac2_ssh_prefix_allows(self):
         d = self.sweep_dir()
         self.assertEqual(decide(f"ssh dev2 'cd {d} && ./venv/bin/python site_sweep.py https://x'"), {"action": "allow"})
-        self.assertEqual(decide("ssh eric@100.86.166.93 pytest"), {"action": "allow"})
+        self.assertEqual(decide("ssh eric@192.0.2.7 pytest"), {"action": "allow"})
 
     def test_hatch_needs_reason_and_cap_for_browser(self):
         d = self.sweep_dir()
@@ -285,7 +285,7 @@ class BuildTools(unittest.TestCase):
         "mvn --version", "mvn -v", "mvn clean", "mvn help:effective-pom", "mvn dependency:tree", "./mvnw -v",
         "bazel version", "bazel info", "bazel query //...", "bazel clean", "xcodebuild -version", "xcodebuild -list",
         "xcodebuild -showBuildSettings", "xcodebuild -showsdks", "xcodebuild -scheme test -list",
-        "ssh dev2 'make test'", "ssh dev2 'cd repo && ./gradlew build'", "ssh eric@100.86.166.93 'mvn verify'",
+        "ssh dev2 'make test'", "ssh dev2 'cd repo && ./gradlew build'", "ssh eric@192.0.2.7 'mvn verify'",
         "rsync -a Makefile dev2:repo/", "cd /nonexistent && ls Makefile", "which make gradle mvn",
     ]
 
