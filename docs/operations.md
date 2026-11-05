@@ -431,6 +431,7 @@ Run `replay` over recent transcripts and the red-team hold-out set before the en
 | `find -exec kill`, `parallel kill`, `netwatch orphans --kill` with `--all`, `--force`, `--match` or without `--pid` | blocked |
 | `kill PID...` with literal PIDs | allowed only when every PID is proven yours (below) |
 | `kill -0`, `kill -l`, `kill -L`, `kill %N`, `kill $!` after a background job in the same input, `pgrep`, `ps`, `lsof`, `timeout -s KILL`, text that only contains the word | allowed |
+| a `kill` whose option words (the words before the PID list) are not single literal tokens: `-SIG`, `-NUM`, `-s SIG`, `-n SIG`, `--signal SIG`, `--signal=SIG`, `--`; or that has a quoted, expanded, braced or globbed option word, an unknown long option, or any dash word after the first signal option; `kill -l` with an expanded or quoted word | blocked as `unprovable-target`; bash and zsh read these words differently from each other and from a text scan, so no PID after them can be proven yours |
 
 ### How ownership is proven
 

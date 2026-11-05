@@ -876,11 +876,17 @@ def make_analyzer_class(cg):
                             targets.append(args[i])
                             i += 1
                         break
+                    if t.startswith('-') and unsafe_word(w, self.remote):
+                        self.block('unprovable-target', 'a kill option is quoted, expanded, braced or a glob, so the '
+                                   'shell may read it as something else')
+                        return
                     if t in LIST_FLAGS:
+                        if any(unsafe_word(a, self.remote) for a in args[i + 1:]):
+                            self.block('unprovable-target', 'kill -l with an expanded or quoted word is not provable')
                         return
                     if t in ('-s', '-n', '--signal'):
                         value = args[i + 1] if i + 1 < n else None
-                        if value is not None and bad_signal_value(value):
+                        if value is not None and bad_signal_value(value, self.remote):
                             self.block('unprovable-target', 'the signal value is an expansion, a glob or several '
                                        'words, and the shell may split it into more kill options or targets')
                             return
@@ -897,8 +903,9 @@ def make_analyzer_class(cg):
                         i += 1
                         continue
                     if t.startswith('--'):
-                        i += 1
-                        continue
+                        self.block('unprovable-target', 'kill option %s is outside the literal grammar the guard '
+                                   'proves (-SIG, -s SIG, -n SIG, --signal SIG, --)' % one_line(t.split('=', 1)[0], 20))
+                        return
                     match = SIGNAL_NAME.fullmatch(t)
                     if match:
                         last_sig = match.group(1)
@@ -954,10 +961,20 @@ def make_analyzer_class(cg):
 
 
 
-def bad_signal_value(word):
+UNSAFE_CHARS = re.compile(r'[$`*?\[\]{}"\'\\\s;&|<>()]')
+
+
+def unsafe_word(word, remote=False):
+    """A word the shell may expand, split, glob, brace-expand or re-quote into something other than its text.
+    Words of an ssh/docker command line are re-parsed from a string, so the quoted mark says nothing there."""
+    return bool(word.dynamic or word.subs or word.glob or (word.quoted and not remote) or len(word.alts) > 1
+                or UNSAFE_CHARS.search(word.text))
+
+
+def bad_signal_value(word, remote=False):
     """The word after -s/-n/--signal must be one plain name or number: bash splits an expanded value, so `-s $S`
     with S='KILL -1' becomes `kill -s KILL -1` (every process)."""
-    return bool(word.dynamic or word.subs or word.glob or len(word.alts) > 1 or not SIGNAL_VALUE.fullmatch(word.text))
+    return unsafe_word(word, remote) or not SIGNAL_VALUE.fullmatch(word.text)
 
 
 def liveness_only(targets):

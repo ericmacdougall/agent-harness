@@ -7522,6 +7522,220 @@
    ]
   },
   {
+   "cmd": "kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-quoted-sig",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -'9' 4001",
+   "expect": "block",
+   "id": "P-rt7-squoted-sig",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -$'9' 4001",
+   "expect": "block",
+   "id": "P-rt7-ansic-sig",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -9\"\" 4001",
+   "expect": "block",
+   "id": "P-rt7-empty-concat-sig",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill \"-s\" KILL 4001",
+   "expect": "block",
+   "id": "P-rt7-quoted-s-opt",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -s \"KILL\" 4001",
+   "expect": "block",
+   "id": "P-rt7-quoted-s-value",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -s K\"IL\"L 4001",
+   "expect": "block",
+   "id": "P-rt7-concat-s-value",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -\\9 4001",
+   "expect": "block",
+   "id": "P-rt7-backslash-sig",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill --foo 4001",
+   "expect": "block",
+   "id": "P-rt7-unknown-long",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill --list=9 4001",
+   "expect": "block",
+   "id": "P-rt7-unknown-list-eq",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill --help 4001",
+   "expect": "block",
+   "id": "P-rt7-help",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -l $x",
+   "expect": "block",
+   "id": "P-rt7-l-with-var",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -l $(echo 9)",
+   "expect": "block",
+   "id": "P-rt7-l-with-subst",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -l '9'",
+   "expect": "block",
+   "id": "P-rt7-l-quoted",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "sudo kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-sudo-quoted-sig",
+   "tags": [
+    "ownership",
+    "grammar",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "env kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-env-quoted-sig",
+   "tags": [
+    "ownership",
+    "grammar",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "command kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-command-quoted-sig",
+   "tags": [
+    "ownership",
+    "grammar",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "builtin kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-builtin-quoted-sig",
+   "tags": [
+    "ownership",
+    "grammar",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "exec kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-exec-quoted-sig",
+   "tags": [
+    "ownership",
+    "grammar",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "/bin/kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-bin-kill-quoted-sig",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "/usr/bin/kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-usr-bin-kill-quoted-sig",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "eval 'kill -\"9\" 4001'",
+   "expect": "block",
+   "id": "P-rt7-eval-quoted-sig",
+   "tags": [
+    "ownership",
+    "grammar",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "echo 4001 | xargs kill -\"9\"",
+   "expect": "block",
+   "id": "P-rt7-xargs-quoted-sig",
+   "tags": [
+    "ownership",
+    "grammar",
+    "pidfeed"
+   ]
+  },
+  {
    "cmd": "grep -n \"pkill -f pytest\" notes.md",
    "expect": "allow",
    "id": "N-text00-grep",
@@ -10007,6 +10221,78 @@
    "id": "N-rt6-ok-s0",
    "tags": [
     "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -9 4001",
+   "expect": "allow",
+   "id": "N-rt7-ok-literal-sig",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -9 \"4001\"",
+   "expect": "allow",
+   "id": "N-rt7-ok-quoted-pid",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -- 4001",
+   "expect": "allow",
+   "id": "N-rt7-ok-dashdash",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -l 9",
+   "expect": "allow",
+   "id": "N-rt7-ok-l-literal",
+   "tags": [
+    "signal0",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -L",
+   "expect": "allow",
+   "id": "N-rt7-ok-L",
+   "tags": [
+    "signal0",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill --signal KILL 4001",
+   "expect": "allow",
+   "id": "N-rt7-ok-s-sep-signal",
+   "tags": [
+    "ownership",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "kill -0 \"$PID\"",
+   "expect": "allow",
+   "id": "N-rt7-ok-probe-quoted-var",
+   "tags": [
+    "signal0",
+    "grammar"
+   ]
+  },
+  {
+   "cmd": "sudo kill -9 4001",
+   "expect": "allow",
+   "id": "N-rt7-ok-sudo-literal",
+   "tags": [
+    "ownership",
+    "grammar"
    ]
   },
   {
