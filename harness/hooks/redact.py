@@ -31,7 +31,11 @@ PATTERNS = [
     ('anthropic', re.compile(r'\bsk-ant-[A-Za-z0-9_-]{8,}')),
     ('openai', re.compile(r'\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}')),
     ('github', re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})')),
+    # an access key id followed by its 40-character secret (CSV exports, `aws configure` echoes)
+    ('aws-key-pair', re.compile(r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b[\s,:;=\x22\x27]{1,20}[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])')),
     ('aws-key', re.compile(r'\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[A-Z0-9]{16}\b')),
+    ('aws-secret', re.compile(r'(?i)\baws[_-]?secret[_-]?(?:access[_-]?)?key[\x22\x27]?\s*[:=]\s*[\x22\x27]?'
+                              r'[A-Za-z0-9/+]{40}')),
     ('google-oauth', re.compile(r'\bya29\.[A-Za-z0-9_-]{20,}')),
     ('google-api', re.compile(r'\bAIza[A-Za-z0-9_-]{30,}')),
     ('google-refresh', re.compile(r'\b1//[A-Za-z0-9_-]{30,}')),
