@@ -87,6 +87,7 @@ DEFAULT_POLICY = {
 KILLISH = re.compile(r'kill|fuser|stop-process|spps|slay|wmic')
 INDIRECT = re.compile(r"\$'|\\x[0-9a-fA-F]{2}|\\[0-7]{3}|\beval\b|base64|\bxxd\b", re.I)
 CLOBBER_TEXT = re.compile(r'>&?!')  # >!, >>!, &>!, &>>!, >&!, >>&!: zsh and bash read these apart (GoodQA #14657)
+LINE_JOIN = re.compile(r'\\\r?\n')  # a backslash-newline the shell removes, so `>\` then `!` is still `>!`
 LIST_FLAGS = {'-l', '-L', '--list', '-t', '--table', '-Ll', '-lL'}
 # The closed grammar of a kill command line. Each pattern is matched against text that word_text() has first tied to the
 # word's exact source, so a form the lexer does not understand (zsh ${=x}, $=x, ${(z)x}, =(cmd), a glob qualifier, the
@@ -1247,7 +1248,7 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
         # first, GoodQA #14657), so a kill spelled without the word is refused too.
         findings = list(getattr(analyzer, 'kf', None) or ())  # a kill already found stays found when the analysis stops
         if not findings:
-            if not (fallback_blocks(raw) or CLOBBER_TEXT.search(raw)):
+            if not (fallback_blocks(raw) or CLOBBER_TEXT.search(LINE_JOIN.sub('', raw))):
                 return 'allow', '', '', ()
             rule = 'unanalysable'
             reason = 'the command could not be analysed safely (%s) and it mentions a kill verb or indirection' % \

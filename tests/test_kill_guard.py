@@ -249,6 +249,8 @@ class ClobberReadings(WorldCase):
         self.assertEqual(self.decide(text)[0], 'block')
         with mock.patch.object(kg._import_base().Budget, 'tick', side_effect=kg._import_base().Blocked('budget')):
             self.assertEqual(self.decide('K=ki; K+=ll; >! y; $K 4004')[0], 'block')
+            self.assertEqual(self.decide('K=ki; K+=ll; >\\\n! y; $K 4004')[0], 'block')  # a line continuation joins `>!`
+            self.assertEqual(self.decide('K=ki; K+=ll; &>\\\n! y; $K 4004')[0], 'block')
             # no clobber text and no kill word: still allows on a stop (Known limits)
             self.assertEqual(self.decide('K=ki; K+=ll; $K 4004')[0], 'allow')
 
