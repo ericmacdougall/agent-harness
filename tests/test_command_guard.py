@@ -242,6 +242,10 @@ class PayloadTests(Fixture):
         self.assertEqual(self.decide(command)[0], 'block')
         command, _ = cg.extract_command({'tool_name': 'Bash', 'tool_input': json.dumps({'command': cmd})})
         self.assertEqual(command, cmd)
+        # fresh red-team #11: a list command next to a string field
+        command, _ = cg.extract_command({'tool_name': 'shell', 'tool_input': {
+            'command': ['rm', '-rf', str(self.home) + '/.claude/projects'], 'cmd': 'ls'}})
+        self.assertEqual(self.decide(command)[0], 'block')
 
 
 class FailureModeTests(Fixture):
@@ -301,6 +305,38 @@ class FailureModeTests(Fixture):
             self.assertEqual(self.decide('ls -la')[0], 'allow')
         finally:
             cg.Analyzer.run = original
+
+    def test_remote_home_is_not_resolved_through_local_links(self):
+        """Fresh red-team #1: on macOS /home is a symlink; ssh targets' Tier B paths must stay protected."""
+        original = cg._resolve_prefix
+        cg._resolve_prefix = lambda p: ('/System/Volumes/Data' + p) if p and p.startswith('/home/') else original(p)
+        try:
+            for row in ('ssh dev2 "rm -rf /home/eric/.agent-harness/work"', 'ssh dev2 rm /home/eric/.claude/settings.json',
+                        'ssh dev2 rm -rf /home/eric/.agent-harness/scratch'):
+                self.assertEqual(self.decide(row)[0], 'block', row)
+        finally:
+            cg._resolve_prefix = original
+
+    def test_over_budget_from_protected_cwd_blocks(self):
+        """Fresh red-team #2: the unanalysable fallback must consider a protected working directory."""
+        padding = "cat <<'EOF'\n" + ('x' * 280000) + "\nEOF\n"
+        self.assertEqual(self.decide(padding + 'rm -rf projects', cwd='@HOME@/.claude')[0], 'block')
+        nested = '$(' * 12 + 'true' + ')' * 12
+        self.assertEqual(self.decide('echo ' + nested + '; rm -rf sessions', cwd='@HOME@/.codex')[0], 'block')
+        self.assertIn(self.decide(padding + 'ls', cwd='@HOME@/repo')[0], ('warn', 'allow'))
+
+    def test_powershell_overwrite_is_not_an_append(self):
+        """Fresh red-team #3: -Value/-FilePath are not short-flag bundles containing a."""
+        for row in ('Set-Content -Path ~/.claude/wals/s/main.jsonl -Value ""',
+                    'Out-File -FilePath ~/.claude/history.jsonl'):
+            self.assertEqual(self.decide(row, ps=True)[0], 'block', row)
+        self.assertEqual(self.decide('Add-Content -Path ~/.claude/history.jsonl -Value x', ps=True)[0], 'allow')
+
+    def test_dotnet_environment_dump_blocks(self):
+        """Fresh red-team #9."""
+        self.assertEqual(self.decide('[Environment]::GetEnvironmentVariables()', ps=True)[0], 'block')
+        self.assertEqual(self.decide('[System.Environment]::GetEnvironmentVariable("GITHUB_TOKEN")', ps=True)[0], 'block')
+        self.assertEqual(self.decide('[Environment]::GetEnvironmentVariable("PATH")', ps=True)[0], 'allow')
 
     def test_over_budget_plain_text_does_not_block(self):
         padding = 'true; ' * 120000

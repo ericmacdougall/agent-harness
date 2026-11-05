@@ -1740,6 +1740,15 @@ class Analyzer:
         if depth > ctx.budget.max_depth:
             raise Blocked('command nesting is deeper than %d levels' % ctx.budget.max_depth)
         head = words[0]
+        if ctx.ps:
+            # the lexer splits at the parentheses, so read the call (and its argument) from the raw command
+            joined_ps = (getattr(ctx, 'raw_top', '') or '')[:20000] + ' ' + ' '.join(w.text for w in words)
+            m = re.search(r'(?i)\[(?:system\.)?environment\]::getenvironmentvariable(s?)\b\s*\(?\s*[\'"]?([A-Za-z0-9_]*)', joined_ps)
+            if m and (m.group(1) or ctx.c.secret_name(m.group(2) or 'X_TOKEN') or not m.group(2)) \
+                    and self.out_visible(pl, idx, True):
+                ctx.secret_seen += 1
+                ctx.add(SECRET_DUMP, 'env-dump', '[Environment]::GetEnvironmentVariable(s) prints environment values',
+                        'test presence with [string]::IsNullOrEmpty($env:NAME)')
         if head.vars and not head.quoted and re.search(r'\s', head.text) and all(v in ctx.vars for v in head.vars) \
                 and not getattr(self, '_resplit', False):
             # `R="rm -rf"; $R path`: an unquoted expansion is split into words, so it names a command plus flags
@@ -2751,7 +2760,7 @@ class Analyzer:
                 if self.RANK[other] > self.RANK[best]:
                     best = other
         if best == 'root' and not is_dynamic_path(path) and not self._kept(path):
-            real = _resolve_prefix(self._through_links(path))
+            real = None if self._foreign_home(path) else _resolve_prefix(self._through_links(path))
             if real and real.casefold() != folded and not any(ch in path for ch in GLOB_CHARS) \
                     and not getattr(self, '_in_real', False):
                 # an exception must hold where the path really leads: a symlink inside the agent's own worktree
@@ -3070,7 +3079,10 @@ class Analyzer:
                     continue
                 self.refuse('truncate', w, tiers=('log', 'root', 'unknown'), need_existing=True)
         elif name in ('tee', 'out-file', 'set-content'):
-            appending = _flag_letters(args) & {'a'} or '--append' in texts or any(t.lower() == '-append' for t in texts)
+            if ctx.ps:  # -Value/-FilePath/-LiteralPath are not bundles of short flags in PowerShell
+                appending = any(len(t) >= 3 and '-append'.startswith(t.lower()) for t in texts)
+            else:
+                appending = _flag_letters(args) & {'a'} or '--append' in texts or any(t.lower() == '-append' for t in texts)
             for w in nd:
                 if self.state_dest(w):
                     continue
@@ -3353,7 +3365,7 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
     analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=marker)
     findings = analyzer.run(command)
     if analyzer.ctx.unterminated and not any(f.category in ALWAYS_ENFORCED for f in findings):
-        if raw_sensitive(command, compiled):
+        if raw_sensitive(command, compiled, cwd=cwd):
             findings.append(Finding(LOG_DELETE if PROTECTED_TEXT.search(command) else SECRET_DUMP, 'unanalysable',
                                     'the command has an unterminated quote or substitution and names a protected '
                                     'location or secret', 'close the quote, or split the command'))
@@ -3369,13 +3381,18 @@ SECRET_TEXT = re.compile(r'(?i)\brclone\b|\bauth\s+token\b|--show-token|\bprinte
                          r'internet)-password|dump-keychain|/environ\b|(?:TOKEN|SECRET|PASSWORD|API_?KEY)\b')
 
 
-def raw_sensitive(text, compiled=None):
-    """Cheap raw-text probe: does this text name a protected location or a secret source?"""
+def raw_sensitive(text, compiled=None, cwd=None):
+    """Cheap raw-text probe: does this text name a protected location or a secret source? A destructive verb run
+    from a working directory inside a harness root counts too (`cd ~/.claude` then `rm -rf projects`)."""
     if not isinstance(text, str):
         text = ' '.join(map(str, text))
     t = text[:4_000_000]
     if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t):
         return True
+    if cwd and DESTROY_TEXT.search(t):
+        for place in (cwd, _realpath(cwd) or cwd):
+            if PROTECTED_TEXT.search(place.replace('\\', '/') + '/'):
+                return True
     # code execution the guard could not follow, combined with a destructive verb
     return bool(EXEC_TEXT.search(t) and DESTROY_TEXT.search(t))
 
@@ -3393,7 +3410,7 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
         findings = analyze(command, compiled, cwd=cwd, ps=ps, marker=marker)
     except (Blocked, RecursionError) as stop:
         reason = str(stop) if isinstance(stop, Blocked) else 'command nesting is too deep'
-        if raw_sensitive(command, compiled):
+        if raw_sensitive(command, compiled, cwd=cwd):
             category = LOG_DELETE if PROTECTED_TEXT.search(command if isinstance(command, str) else ' '.join(command)) \
                 else SECRET_DUMP
             return 'block', format_block(Finding(category, 'unanalysable', reason + ' and it names a protected location '
@@ -3403,7 +3420,7 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
         try:
             text = command if isinstance(command, str) else ' '.join(map(str, command))
             raw = [f for f in fallback_scan(text, compiled) if modes.get(f.category) == 'enforce']
-            if not raw and raw_sensitive(command, compiled):
+            if not raw and raw_sensitive(command, compiled, cwd=cwd):
                 raw = [Finding(LOG_DELETE if PROTECTED_TEXT.search(text) else SECRET_DUMP, 'guard-error',
                                'it names a protected location or secret', 'retry with a simpler command')]
         except Exception:  # noqa: BLE001
@@ -3964,8 +3981,12 @@ def extract_command(payload):
         if isinstance(value, str) and value.strip():
             if value not in texts:
                 texts.append(value)
-        elif isinstance(value, list) and value and command is None and not texts:
+        elif isinstance(value, list) and value and command is None:
             command = value
+    if command is not None and texts:
+        # a list command and a string field together: judge both
+        texts.insert(0, ' '.join(_quote_for_rebuild(str(c)) for c in command))
+        command = None
     if texts:
         # every non-blank command field is judged: a blank `command` must not hide a real `cmd`
         command = '\n'.join(texts) if len(texts) > 1 else texts[0]

@@ -61,14 +61,37 @@ def guarded_text(raw):
     return True, raw if not isinstance(tool_input, str) else tool_input
 
 
-def sensitive(text):
+def payload_cwd(raw):
+    """The working directory the command runs in (Codex workdir, else the payload cwd), or None."""
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    tool_input = payload.get('tool_input') if isinstance(payload.get('tool_input'), dict) else {}
+    for value in (tool_input.get('workdir'), payload.get('cwd')):
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def sensitive(text, cwd=None):
     t = text[:4_000_000]
-    return bool(PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t) or (EXEC_TEXT.search(t) and DESTROY_TEXT.search(t)))
+    if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t) or (EXEC_TEXT.search(t) and DESTROY_TEXT.search(t)):
+        return True
+    if cwd and DESTROY_TEXT.search(t):
+        try:
+            real = os.path.realpath(cwd)
+        except (OSError, ValueError):
+            real = cwd
+        return any(PROTECTED_TEXT.search(place.replace('\\', '/') + '/') for place in (cwd, real))
+    return False
 
 
 def fallback(raw, why):
     guarded, text = guarded_text(raw)
-    if guarded and sensitive(text):
+    if guarded and sensitive(text, payload_cwd(raw)):
         sys.stderr.write('command_guard BLOCKED [guard_failure]: the analyser %s and the command names a protected '
                          'harness location, a secret source or a code-execution step with a destructive verb. Safe '
                          'alternative: split the command into simple steps; run `python3 %s doctor` to check the '
