@@ -196,7 +196,7 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
         if rule not in allowed:
             allowed.append(rule)
     # ah reads are local or GoodQA reads; ah writes (task, ticket comment, spool) stay prompted.
-    for action in ("owners", "user-msg", "disk", "ticket get", "ticket comments", "write result"):
+    for action in ("owners", "user-msg", "disk", "ticket get", "ticket comments", "write result", "task list"):
         rule = f"Bash(python3 ~/.claude/hooks/ah.py {action}*)"
         if rule not in allowed:
             allowed.append(rule)
