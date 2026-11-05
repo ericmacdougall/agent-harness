@@ -6,7 +6,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import tracemalloc
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -63,10 +65,10 @@ sys.stderr.write("ah: error: argument cmd: invalid choice\n"); sys.exit(2)
 '''
 
 
-def owner(agent, state, idle=1900, typ="task-owner", task="build the thing", ticket=None):
-    return {"agent_id": agent, "type": typ, "task": task, "state": state,
+def owner(agent, state, idle=1900, typ="task-owner", task="build the thing", ticket=None, last="2027-01-15T07:28:00Z"):
+    return {"agent_id": agent, "type": typ, "task": task, "state": state, "owner": True,
             "severity": {"SILENT": "warning", "SILENT-HIGH": "high", "DROPPED": "high"}.get(state, "info"),
-            "idle_s": idle, "ticket": ticket}
+            "idle_s": idle, "ticket": ticket, "last_activity": last}
 
 
 class Scratch(unittest.TestCase):
@@ -205,11 +207,34 @@ class RestartAndKeys(Scratch):
         d.tick()
         self.owners([])
         d.tick()
-        self.owners([owner("a1111111111111111", "SILENT")])
+        self.owners([owner("a1111111111111111", "SILENT", last="2027-01-15T07:40:00Z")])  # went quiet again later
         d.tick()
         keys = [a[a.index("--key") + 1] for a in self.alert_calls("raise")]
         self.assertEqual(len(keys), 2)
         self.assertNotEqual(keys[0], keys[1])
+
+    def test_key_shape(self):
+        self.owners([owner("a1111111111111111", "SILENT")])
+        self.daemon().tick()
+        k = [a[a.index("--key") + 1] for a in self.alert_calls("raise")][0]
+        self.assertRegex(k, r"^ahd:[A-Za-z0-9._-]+:liveness:11111111\.agent-a1111111111111111:raise-warning:\d+$")
+        self.assertLessEqual(len(k), 128)
+        self.assertEqual(k.rsplit(":", 1)[1], str(int(ahd.parse_ts("2027-01-15T07:28:00Z"))))
+
+    def test_ring_wrap_reasserts_with_a_new_key(self):
+        self.owners([owner("a1111111111111111", "SILENT")])
+        d = self.daemon()
+        d.tick()
+        ring = self.home / ".agent-harness" / "state" / "alerts.jsonl"
+        other = {"schema": 1, "seq": 99, "host": "elsewhere", "source": "x", "event": "raise", "severity": "info",
+                 "key": "k", "message": "m"}
+        ring.write_text(json.dumps(other).ljust(1023) + "\n")  # our raise was overwritten by the wrap
+        d.tick()
+        raises = self.alert_calls("raise")
+        self.assertEqual(len(raises), 3)  # original, duplicate (ah already had it), reassert
+        self.assertIn('"reasserted": true', raises[2][raises[2].index("--detail") + 1])
+        self.assertNotEqual(raises[2][raises[2].index("--key") + 1], raises[0][raises[0].index("--key") + 1])
+        self.assertEqual([e["event"] for e in self.ring().values()], ["raise"])
 
 
 class SingleInstance(Scratch):
@@ -291,19 +316,19 @@ class BadInputs(Scratch):
 
 
 class ClockAndDisk(Scratch):
-    def test_clock_jump_holds_liveness_raises_for_two_ticks(self):
-        self.owners([])
+    def test_clock_jump_holds_liveness_transitions_for_one_tick(self):
+        self.owners([owner("a2222222222222222", "SILENT")])
         d = self.daemon()
         d.tick()
         self.t -= 3600  # wall clock jumps back an hour; monotonic does not
-        self.owners([owner("a1111111111111111", "SILENT")])
+        self.owners([owner("a1111111111111111", "SILENT")])  # a new raise and a clear are both due
         s = d.tick()
         self.assertIn("clock_jump", s)
-        self.assertEqual(self.alert_calls("raise"), [])
+        self.assertEqual(len(self.alert_calls("raise")), 1)  # only the first tick's raise
+        self.assertEqual(self.alert_calls("clear"), [])
         d.tick()
-        self.assertEqual(self.alert_calls("raise"), [])
-        d.tick()
-        self.assertEqual(len(self.alert_calls("raise")), 1)
+        self.assertEqual(len(self.alert_calls("raise")), 2)
+        self.assertEqual(len(self.alert_calls("clear")), 1)
 
     def test_full_disk_degrades_without_crashing(self):
         self.owners([owner("a1111111111111111", "SILENT")])
@@ -359,6 +384,90 @@ class Batching(Scratch):
         self.assertEqual(len([c for c in self.calls() if c["argv"][:1] == ["apply"]]), 1)  # remembered unsupported
 
 
+class EscalationAndTickets(Scratch):
+    def test_critical_after_90_min_and_stop_block_detail(self):
+        self.owners([owner("a1111111111111111", "DROPPED", idle=5500, typ="general-purpose"),
+                     owner("a2222222222222222", "SILENT", idle=6000)])
+        self.daemon().tick()
+        by = {a[a.index("--alert-key") + 1]: a for a in self.alert_calls("raise")}
+        k1 = f"liveness:{SESSION[:8]}/agent-a1111111111111111"
+        k2 = f"liveness:{SESSION[:8]}/agent-a2222222222222222"
+        self.assertEqual(by[k1][by[k1].index("--severity") + 1], "critical")
+        self.assertEqual(by[k2][by[k2].index("--severity") + 1], "warning")  # SILENT never escalates by itself
+        detail = json.loads(by[k1][by[k1].index("--detail") + 1])
+        self.assertTrue(detail["stop_block"])
+        self.assertEqual(detail["main_session"], SESSION)
+
+    def test_ticket_comment_only_from_the_goodqa_poster_host(self):
+        self.owners([owner("a1111111111111111", "DROPPED", ticket="goodqa#14506")])
+        self.policy["goodqa_poster"] = False
+        d = self.daemon()
+        d.tick()
+        self.assertEqual([c for c in self.calls() if c["argv"][:2] == ["ticket", "comment"]], [])
+        d.release()
+        self.policy["goodqa_poster"] = True
+        (self.fake / "keys.txt").unlink()
+        ring = self.home / ".agent-harness" / "state" / "alerts.jsonl"
+        ring.unlink()
+        self.daemon().tick()
+        comments = [c["argv"] for c in self.calls() if c["argv"][:2] == ["ticket", "comment"]]
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0][2], "GoodQA goodqa#14506")
+        self.assertIn("--key", comments[0])
+
+    def test_silent_warning_does_not_comment(self):
+        self.policy["goodqa_poster"] = True
+        self.owners([owner("a1111111111111111", "SILENT", ticket="goodqa#1")])
+        self.daemon().tick()
+        self.assertEqual([c for c in self.calls() if c["argv"][:2] == ["ticket", "comment"]], [])
+
+
+AH_PY = HOOKS / "ah.py"
+
+
+@unittest.skipUnless(AH_PY.is_file(), "needs ah.py from feat/ah-query (feat/ahd is stacked on it)")
+class SolveDropFixture(Scratch):
+    """The incident: a general-purpose owner, never in main.jsonl spawn events, stopped 2 h ago with no handoff,
+    while its ask stays open. Asserted end to end through the real `ah owners`."""
+
+    def test_solve_style_drop_is_flagged_critical(self):
+        import time as _t
+        real_now = _t.time()
+        aid = "a5017e0000000000d"
+        wal_dir = self.main_wal.parent
+        two_h = real_now - 7200
+        self.main_wal.write_text(json.dumps({"at": ahd.iso(two_h - 600), "event": "scope",
+                                             "note": f"Owner for the capture app fix: agent {aid}, branch fix/x"}) + "\n")
+        task_wal = wal_dir / f"agent-{aid}.jsonl"
+        task_wal.write_text(json.dumps({"at": ahd.iso(two_h - 300), "event": "intent", "note": "start the fix"}) + "\n"
+                            + json.dumps({"at": ahd.iso(two_h), "event": "pretool", "agent_id": aid, "tool": "Bash"}) + "\n")
+        os.utime(task_wal, (two_h, two_h))
+        sub = self.home / ".claude" / "projects" / "-Users-x-repo" / SESSION / "subagents"
+        sub.mkdir(parents=True)
+        tr = sub / f"agent-{aid}.jsonl"
+        tr.write_text("{}\n")
+        os.utime(tr, (two_h, two_h))
+        (sub / f"agent-{aid}.meta.json").write_text(json.dumps({"agentType": "general-purpose", "finished": True,
+                                                                "description": "capture app fix owner"}))
+        os.utime(self.main_wal, (real_now - 60, real_now - 60))
+        self.t = real_now
+        self.policy["ah"] = [sys.executable, "-I", str(AH_PY)]
+        d = self.daemon()
+        d.tick()
+        flag = d.last["desired"].get(f"liveness:{SESSION[:8]}/agent-{aid}")
+        self.assertIsNotNone(flag, d.last["desired"])
+        self.assertEqual(flag["detail"]["state"], "DROPPED")
+        self.assertEqual(flag["severity"], "critical")
+        # control: the same owner active 5 minutes ago is not flagged
+        for p in (task_wal, tr):
+            os.utime(p, (real_now - 300, real_now - 300))
+        task_wal.write_text(task_wal.read_text() + json.dumps({"at": ahd.iso(real_now - 300), "event": "status",
+                                                               "note": "still working"}) + "\n")
+        (sub / f"agent-{aid}.meta.json").write_text(json.dumps({"agentType": "general-purpose"}))
+        d.tick()
+        self.assertNotIn(f"liveness:{SESSION[:8]}/agent-{aid}", d.last["desired"])
+
+
 class Messages(Scratch):
     def test_interview_task_text_and_secrets_never_reach_the_writer(self):
         self.owners([owner("a1111111111111111", "SILENT", task="prep Solve interview answers"),
@@ -372,3 +481,225 @@ class Messages(Scratch):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRound1(Scratch):
+    """Regressions for red-team round 1 (B1-B4, F1, F4, F6) at 37fb2f8."""
+
+    def second_session(self, name="22222222-3333-4444-8555-666666666666"):
+        d = self.home / ".claude" / "wals" / name
+        d.mkdir(parents=True)
+        (d / "main.jsonl").write_text("{}\n")
+        os.utime(d / "main.jsonl", (NOW - 60, NOW - 60))
+        return name
+
+    def test_b1_partial_owner_failure_keeps_that_sessions_alerts(self):
+        other = self.second_session()
+        self.owners([owner("a1111111111111111", "SILENT")])
+        self.owners([owner("a2222222222222222", "SILENT")], session=other)
+        d = self.daemon()
+        d.tick()
+        (self.fake / f"owners-{other}.json").unlink()
+        d.tick()
+        self.assertEqual(self.alert_calls("clear"), [])
+
+    def test_b1_unreadable_wal_root_clears_nothing(self):
+        self.owners([owner("a1111111111111111", "SILENT")])
+        d = self.daemon()
+        d.tick()
+        root = self.home / ".claude" / "wals"
+        root.chmod(0)
+        try:
+            d.tick()
+        finally:
+            root.chmod(0o700)
+        self.assertEqual(self.alert_calls("clear"), [])
+
+    def ledger(self, text):
+        led = self.home / ".agent-harness" / "work-assignments.json"
+        led.parent.mkdir(parents=True, exist_ok=True)
+        led.write_text(text)
+        return led
+
+    def test_b1_torn_ledger_or_failing_step_clears_no_ask(self):
+        self.owners([])
+        self.t = ahd.parse_ts("2027-01-15T10:00:00Z")
+        self.ledger(json.dumps({"items": {"q1": {"id": "q1", "state": "open", "owner": "unassigned",
+                                                 "description": "x", "created": "2027-01-15T07:00:00Z"}}}))
+        d = self.daemon()
+        d.tick()
+        self.assertEqual(len(self.alert_calls("raise")), 1)
+        self.ledger("{torn")
+        d.tick()
+        with mock.patch.object(ahd, "v1_asks", side_effect=RuntimeError("boom")):
+            d.tick()
+        self.assertEqual([a for a in self.alert_calls("clear") if "ask:q1" in " ".join(a)], [])
+
+    def test_b2_type_and_ticket_naming_interview_never_reach_ah(self):
+        self.owners([dict(owner("a1111111111111111", "DROPPED", typ="interview-coach", ticket="solvecapture#3"))])
+        self.policy["goodqa_poster"] = True
+        self.daemon().tick()
+        blob = json.dumps(self.calls()).lower()
+        self.assertNotIn("interview", blob)
+        self.assertNotIn("solve", blob)
+        self.assertEqual(len(self.alert_calls("raise")), 1)
+
+    def test_b3_row_without_owner_field_never_raises(self):
+        row = owner("a1111111111111111", "DROPPED")
+        del row["owner"]
+        self.owners([row])
+        self.daemon().tick()
+        self.assertEqual(self.alert_calls("raise"), [])
+
+    def test_b4_cut_never_leaves_a_secret_fragment(self):
+        for pad in range(180, 240, 3):
+            jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0." + "s" * pad
+            text = jwt + " sk-ant-api03-" + "F" * 40 + " tail"
+            for limit in (60, 80):
+                out = ahd_peek.scrub(text, limit)
+                self.assertNotIn("sk-ant", out, (pad, limit))
+                self.assertNotIn("FFFF", out, (pad, limit))
+
+    def test_f1_fifo_and_dev_zero_never_hang_or_flood(self):
+        self.main_wal.unlink()
+        os.mkfifo(self.main_wal)
+        os.utime(self.main_wal, (NOW - 60, NOW - 60))
+        led = self.home / ".agent-harness" / "work-assignments.json"
+        led.parent.mkdir(parents=True, exist_ok=True)
+        big = self.home / "sparse.bin"  # never a real /dev/zero here: a regression must not be able to eat the host
+        with open(big, "wb") as fh:
+            fh.truncate(1 << 20)
+        os.symlink(big, led)
+        t0 = time.monotonic()
+        s = self.daemon().tick()
+        self.assertLess(time.monotonic() - t0, 10)
+        self.assertEqual(s["sessions"], 0)
+        self.assertIn("ask:ledger:error", self.daemon_last_desired(s))
+
+    def daemon_last_desired(self, s):
+        return ahd.ask_alerts(ahd.v1_asks(self.policy), self.policy, self.t)
+
+    def test_f4_timeout_kills_the_whole_process_group(self):
+        marker = self.home / "grandchild.pid"
+        rc, _, _ = ahd.run_cmd(["/bin/sh", "-c", f"sleep 30 & echo $! > {marker}; wait"], 1.0)
+        self.assertEqual(rc, 124)
+        pid = int(marker.read_text())
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("grandchild survived the timeout")
+
+    def test_f6_report_runs_beside_the_service_and_writes_nothing(self):
+        self.daemon()  # the service holds the lock
+        self.owners([owner("a1111111111111111", "SILENT")])
+        (self.home / ".claude" / "hooks").mkdir(parents=True)
+        (self.home / ".claude" / "hooks" / "ah.py").write_text(FAKE_AH)
+        p = subprocess.run([sys.executable, "-I", str(HOOKS / "ahd.py"), "report"], env=dict(os.environ),
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        out = json.loads(p.stdout)
+        self.assertEqual(len(out["silent"]), 1)
+        self.assertEqual(self.alert_calls(), [])
+        self.assertTrue(any(w.startswith("alert raise") or "alert raise" in w for w in out["would_write"]))
+
+
+class MemoryBounds(Scratch):
+    """The 76 GB incident: at 37fb2f8 v1_asks did p.read_bytes() on a ledger symlinked to /dev/zero. Worst case of a
+    regression in these tests is the sparse file's 256 MiB, except the Linux-only child, which has an RLIMIT_AS."""
+
+    def ledger_path(self):
+        led = self.home / ".agent-harness" / "work-assignments.json"
+        led.parent.mkdir(parents=True, exist_ok=True)
+        return led
+
+    def sparse(self, path, size=256 << 20):
+        with open(path, "wb") as fh:
+            fh.truncate(size)
+
+    def test_oversized_ledger_allocates_under_the_bound(self):
+        self.sparse(self.ledger_path())
+        self.policy["ledger_max_bytes"] = 1 << 20
+        tracemalloc.start()
+        try:
+            got = ahd.v1_asks(self.policy)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertIn("error", got[0])
+        self.assertLess(peak, 8 << 20)
+
+    def test_ledger_symlink_is_refused_without_reading_it(self):
+        small = self.home / "sparse.bin"
+        self.sparse(small, 4 << 20)
+        os.symlink(small, self.ledger_path())
+        tracemalloc.start()
+        try:
+            got = ahd.v1_asks(self.policy)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertIn("error", got[0])
+        self.assertLess(peak, 1 << 20)
+
+    def test_devices_are_rejected_at_open(self):
+        with self.assertRaises(OSError):  # open + fstat only: nothing is read, so this is safe on any host
+            ahd_peek.open_regular("/dev/zero")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "RLIMIT_AS is not enforced on macOS; proven on Linux")
+    def test_real_dev_zero_ledger_under_rlimit(self):
+        os.symlink("/dev/zero", self.ledger_path())
+        code = ("import resource,sys,json;resource.setrlimit(resource.RLIMIT_AS,(1<<30,1<<30));"
+                f"sys.path.insert(0,{str(HOOKS)!r});import ahd;print(json.dumps(ahd.v1_asks(ahd.load_policy())))")
+        p = subprocess.run([sys.executable, "-I", "-c", code], env=dict(os.environ), capture_output=True,
+                           text=True, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stderr[-300:])
+        self.assertIn("error", json.loads(p.stdout)[0])
+
+    def test_no_unbounded_read_calls_in_the_daemon(self):
+        for name in ("ahd.py", "ahd_peek.py"):
+            src = (HOOKS / name).read_text()
+            for bad in (".read_bytes(", ".read_text(", ".read()", ".readlines(", "communicate("):
+                self.assertNotIn(bad, src, f"{name}: {bad}")
+
+    def test_child_output_flood_is_cut_at_the_cap(self):
+        flood = [sys.executable, "-I", "-c", "import os\nwhile True: os.write(1, b'x'*65536)"]
+        t0 = time.monotonic()
+        tracemalloc.start()
+        try:
+            rc, out, err = ahd.run_cmd(flood, 20, cap=1 << 20)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual((rc, out), (125, ""))
+        self.assertLess(peak, 8 << 20)
+        self.assertLess(time.monotonic() - t0, 15)
+
+    def test_run_cmd_keeps_normal_output_stdin_and_rc(self):
+        code = "import sys;d=sys.stdin.read();print(d.upper());sys.stderr.write('e');sys.exit(3)"
+        self.assertEqual(ahd.run_cmd([sys.executable, "-I", "-c", code], 20, stdin="abc"), (3, "ABC\n", "e"))
+
+    def test_memory_guard_exits_past_the_cap_and_stays_quiet_below(self):
+        died = []
+        stop = threading.Event()
+        ahd.memory_guard(100, stop, period=0, die=died.append, peak=lambda: 101)
+        self.assertEqual(died, [70])
+        calls = []
+
+        def low():
+            calls.append(1)
+            if len(calls) >= 3:
+                stop.set()
+            return 99
+
+        ahd.memory_guard(100, stop, period=0, die=died.append, peak=low)
+        self.assertEqual(died, [70])
+
+    def test_oversized_main_wal_is_not_handed_to_ah(self):
+        self.sparse(self.main_wal, 2 << 20)
+        os.utime(self.main_wal, (NOW - 60, NOW - 60))
+        self.policy["owners_wal_max_bytes"] = 1 << 20
+        self.assertEqual(ahd.active_sessions(self.policy, NOW), [])
