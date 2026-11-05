@@ -24,6 +24,8 @@ AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py",
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
          "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py",
+         "heavy_job_guard.py", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "resource_limits.json",
+         "domain_gates.py", "domain_checklists.json",
          "command_guard.py", "command_guard_hook.py", "redact.py", "kill_guard.py", "kill_guard_policy.json")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
@@ -41,7 +43,8 @@ class DirectoryPublicationError(OSError):
 
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
-            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "command_guard_hook.py", "kill_guard.py")}
+            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
+                         "command_guard_hook.py", "kill_guard.py")}
 
 
 SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
@@ -66,9 +69,10 @@ def provenance_hook_groups(claude: Path) -> dict[str, list[dict]]:
 
 def command_guard_group(claude: Path) -> dict:
     """Destructive and config-dump command guard (GoodQA #14471, docs/operations.md). The launcher blocks on its
-    own when the analyser fails; onFailure covers the launcher itself."""
+    own when the analyser fails; onFailure covers the launcher itself. The `hook` verb marks it a fail-closed
+    gate for the Go front door (cmd/harness/gates.json); the launcher ignores its arguments."""
     return {"matcher": "Bash|PowerShell", "hooks": [{
-        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "command_guard_hook.py")],
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "command_guard_hook.py"), "hook"],
         "timeout": 30, "onFailure": "block"}]}
 
 
@@ -86,6 +90,11 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     # Spec gate: GoodQA status changes; internal budget 40 s, so the explanation arrives before 60 s.
     spec_gate = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "spec_flow.py"), "hook"],
                  "timeout": 60, "onFailure": "block"}
+
+    # Resource guards fail OPEN (no onFailure=block): a guard bug must never stop all Bash or Agent calls.
+    heavy_guard = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "heavy_job_guard.py")],
+                   "timeout": 10}
+    agent_gate = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "agent_gate.py")], "timeout": 10}
 
     def command(event: str, fail_closed: bool = False) -> dict:
         hook = {"type": "command", "command": "python3", "args": [script, event], "timeout": 10}
@@ -111,6 +120,13 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             # Commit message policy: validates git commit / gh pr merge --squash before they run.
             "matcher": "Bash",
             "hooks": [policy],
+        }, {
+            # Route heavy Mac work (browsers, full suites, builds) to dev2; advisory for hostile probes.
+            "matcher": "Bash",
+            "hooks": [heavy_guard],
+        }, {
+            "matcher": "Agent|Task|Workflow",
+            "hooks": [agent_gate],
         }, {
             "matcher": GOODQA_STATUS_TOOLS,
             "hooks": [spec_gate],
@@ -180,6 +196,10 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
     # Read-only spec checks are preapproved; commands that post to tickets are not.
     for action in ("lint", "status"):
         rule = f"Bash(python3 ~/.claude/hooks/spec_flow.py {action} *)"
+        if rule not in allowed:
+            allowed.append(rule)
+    for action in ("check", "capacity"):  # read-only; run_capped.py/run_probe.py run arbitrary commands, so stay prompted
+        rule = f"Bash(python3 ~/.claude/hooks/resource_budget.py {action} *)"
         if rule not in allowed:
             allowed.append(rule)
     rule = "Bash(python3 ~/.claude/hooks/workdir.py prune)"  # dry run only; --apply still asks

@@ -54,7 +54,7 @@ def make_fixture(home):
     for rel in files:
         p = h / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text('ref: refs/heads/main\n' if rel.endswith('/HEAD') else 'x\n')
+        p.write_text('ref: refs/heads/main\n' if rel.endswith('/HEAD') else '{}\n' if rel.endswith('.json') else 'x\n')
     (h / '.agent-harness/work/S/T/state').mkdir(parents=True, exist_ok=True)
     return h
 
@@ -123,6 +123,14 @@ class CorpusTests(Fixture):
 
     def test_work_tree_allows(self):
         self.expect(corpus.NEG15_WORK_ALLOW, 'allow', label='NEG15_WORK_ALLOW')
+
+    def test_heredoc_with_destructive_text_is_never_silent(self):
+        # warn, never block: writing or printing the text is not a deletion, but it must not pass silently
+        self.expect(corpus.HEREDOC_DESTRUCTIVE_WARN, 'warn', label='HEREDOC_DESTRUCTIVE_WARN')
+        for cmd in corpus.HEREDOC_DESTRUCTIVE_WARN:
+            self.assertIn('heredoc-destructive-text', self.decide(cmd)[1], cmd)
+        self.expect(corpus.HEREDOC_DESTRUCTIVE_BLOCK, 'block', label='HEREDOC_DESTRUCTIVE_BLOCK')
+        self.expect(corpus.HEREDOC_PLAIN_ALLOW, 'allow', label='HEREDOC_PLAIN_ALLOW')
 
     def test_kill_positive_warns_or_blocks(self):
         self.expect(corpus.KILL_POSITIVE, ('warn', 'block'), label='KILL_POSITIVE')
@@ -229,6 +237,24 @@ class PayloadTests(Fixture):
         self.assertEqual(cg.payload_cwd({'cwd': '/elsewhere', 'tool_input': {}}), '/elsewhere')
         self.assertIsNone(cg.payload_cwd({'tool_input': {}}))
 
+    def test_write_stdin_has_no_trusted_cwd(self):
+        """Red-team F5: typed shell input may run after a cd in an earlier call."""
+        self.assertIsNone(cg.payload_cwd({'tool_name': 'write_stdin', 'cwd': '/elsewhere', 'tool_input': {'chars': 'x'}}))
+
+    def test_blank_command_key_does_not_hide_another(self):
+        """Red-team F8: every non-blank command field is judged; a JSON-string tool_input is decoded."""
+        cmd = 'rm -rf ' + str(self.home) + '/.claude/projects'
+        command, _ = cg.extract_command({'tool_name': 'exec_command', 'tool_input': {'command': '   ', 'cmd': cmd}})
+        self.assertEqual(self.decide(command)[0], 'block')
+        command, _ = cg.extract_command({'tool_name': 'exec_command', 'tool_input': {'command': 'ls', 'cmd': cmd}})
+        self.assertEqual(self.decide(command)[0], 'block')
+        command, _ = cg.extract_command({'tool_name': 'Bash', 'tool_input': json.dumps({'command': cmd})})
+        self.assertEqual(command, cmd)
+        # fresh red-team #11: a list command next to a string field
+        command, _ = cg.extract_command({'tool_name': 'shell', 'tool_input': {
+            'command': ['rm', '-rf', str(self.home) + '/.claude/projects'], 'cmd': 'ls'}})
+        self.assertEqual(self.decide(command)[0], 'block')
+
 
 class FailureModeTests(Fixture):
     def test_unterminated_quote_with_protected_text_blocks(self):
@@ -242,9 +268,144 @@ class FailureModeTests(Fixture):
         padding = 'true; ' * 120000
         self.assertEqual(self.decide(padding + 'echo eA== | base64 -d | sh; rm x')[0], 'block')
 
+    def test_existing_script_counts_only_log_deletion(self):
+        """Replay false positives: repo tooling that handles env is allowed; its log deletion still blocks."""
+        tools = self.home / 'repo/tools'
+        tools.mkdir(exist_ok=True)
+        (tools / 'envcheck.sh').write_text('#!/bin/sh\nenv | sort\n')
+        (tools / 'wipe.sh').write_text('#!/bin/sh\nrm -rf "$HOME/.claude/projects"\n')
+        self.assertEqual(self.decide('bash @HOME@/repo/tools/envcheck.sh')[0], 'allow')
+        self.assertEqual(self.decide('bash @HOME@/repo/tools/wipe.sh')[0], 'block')
+        written = "printf 'env\\n' > @HOME@/repo/tools/new.sh && bash @HOME@/repo/tools/new.sh"
+        self.assertEqual(self.decide(written)[0], 'block')
+
+    def test_symlink_in_own_worktree_does_not_reach_protected(self):
+        """Red-team F3: the own-worktree exception must hold for the path a symlink really leads to."""
+        wt = self.home / '.agent-harness/work/S/T/wt'
+        for name, target in (('lnk_claude', self.home / '.claude'), ('lnk_task', self.home / '.agent-harness/work/S/T'),
+                             ('lnk_build', wt / 'build')):
+            if not os.path.lexists(wt / name):
+                os.symlink(str(target), str(wt / name))
+        self.assertEqual(self.decide('rm -f lnk_claude/settings.json', cwd='@WT@')[0], 'block')
+        self.assertEqual(self.decide('rm -f lnk_task/notes.md', cwd='@WT@')[0], 'block')
+        self.assertEqual(self.decide('rm -f lnk_build/a.o', cwd='@WT@')[0], 'allow')
+
+    def test_globs_and_dotdot_follow_links_like_the_shell(self):
+        """Native code-inspection of b5daca9 (findings 3 and 4): `..` after a symlink and a hidden symlink under a
+        wildcard are judged where the shell really goes."""
+        wt = self.home / '.agent-harness/work/S/T/wt'
+        (wt / 'linkfx/b').mkdir(parents=True, exist_ok=True)
+        (wt / 'linkfx/d/e').mkdir(parents=True, exist_ok=True)
+        (self.home / '.claude/projects/p').mkdir(parents=True, exist_ok=True)
+        for link, target in ((wt / 'linkfx/b/c', self.home / '.claude/projects/p'),
+                             (wt / 'linkfx/d/.hid', self.home / '.claude')):
+            if not os.path.lexists(link):
+                os.symlink(str(target), str(link))
+        for cmd, want in corpus.LINK_GLOB_ROWS:
+            self.assertEqual(self.decide(cmd, cwd='@WT@')[0], want, cmd)
+
+    def test_brace_overflow_is_not_dropped(self):
+        """Red-team F4: alternatives past the expansion cap are unknown, not absent."""
+        alts = ','.join('d%d' % k for k in range(40)) + ',.claude'
+        verdict, message = self.decide('rm -rf ~/{' + alts + '}/projects')
+        self.assertEqual(verdict, 'block')
+        self.assertIn('[log_delete/log-delete]', message)  # judged by the analyser, not its error fallback
+        self.assertEqual(self.decide('rm -rf ~/{d1,.claude}/projects')[0], 'block')
+        creds = ','.join('c%d' % k for k in range(40)) + ',.aws'
+        self.assertEqual(self.decide('cat ~/{' + creds + '}/credentials')[0], 'block')
+        self.assertEqual(self.decide('touch {' + ','.join('f%d' % k for k in range(40)) + '}')[0], 'allow')
+
+    def test_internal_error_uses_raw_sensitive(self):
+        """Red-team F6: an analyser bug must fail closed for commands that name protected locations."""
+        original = cg.Analyzer.run
+        def boom(self, *a, **k):
+            raise ValueError('seeded analyser bug')
+        cg.Analyzer.run = boom
+        try:
+            self.assertEqual(self.decide('rm -rf ~/.agent-harness/state')[0], 'block')
+            self.assertEqual(self.decide('rm -rf ~/.claude')[0], 'block')
+            self.assertEqual(self.decide('ls -la')[0], 'allow')
+        finally:
+            cg.Analyzer.run = original
+
+    def test_remote_home_is_not_resolved_through_local_links(self):
+        """Fresh red-team #1: on macOS /home is a symlink; ssh targets' Tier B paths must stay protected. The
+        remote user is one that is not local on any test machine (on dev2 /home/eric is the local home, which
+        is rightly resolved as local)."""
+        original = cg._resolve_prefix
+        cg._resolve_prefix = lambda p: ('/System/Volumes/Data' + p) if p and p.startswith('/home/') else original(p)
+        try:
+            for row in ('ssh dev2 "rm -rf /home/cgremote/.agent-harness/work"',
+                        'ssh dev2 rm /home/cgremote/.claude/settings.json',
+                        'ssh dev2 rm -rf /home/cgremote/.agent-harness/scratch'):
+                self.assertEqual(self.decide(row)[0], 'block', row)
+        finally:
+            cg._resolve_prefix = original
+
+    def test_over_budget_from_protected_cwd_blocks(self):
+        """Fresh red-team #2: the unanalysable fallback must consider a protected working directory."""
+        padding = "cat <<'EOF'\n" + ('x' * 280000) + "\nEOF\n"
+        self.assertEqual(self.decide(padding + 'rm -rf projects', cwd='@HOME@/.claude')[0], 'block')
+        nested = '$(' * 12 + 'true' + ')' * 12
+        self.assertEqual(self.decide('echo ' + nested + '; rm -rf sessions', cwd='@HOME@/.codex')[0], 'block')
+        self.assertIn(self.decide(padding + 'ls', cwd='@HOME@/repo')[0], ('warn', 'allow'))
+
+    def test_powershell_overwrite_is_not_an_append(self):
+        """Fresh red-team #3: -Value/-FilePath are not short-flag bundles containing a."""
+        for row in ('Set-Content -Path ~/.claude/wals/s/main.jsonl -Value ""',
+                    'Out-File -FilePath ~/.claude/history.jsonl'):
+            self.assertEqual(self.decide(row, ps=True)[0], 'block', row)
+        self.assertEqual(self.decide('Add-Content -Path ~/.claude/history.jsonl -Value x', ps=True)[0], 'allow')
+
+    def test_dotnet_environment_dump_blocks(self):
+        """Fresh red-team #9."""
+        self.assertEqual(self.decide('[Environment]::GetEnvironmentVariables()', ps=True)[0], 'block')
+        self.assertEqual(self.decide('[System.Environment]::GetEnvironmentVariable("GITHUB_TOKEN")', ps=True)[0], 'block')
+        self.assertEqual(self.decide('[Environment]::GetEnvironmentVariable("PATH")', ps=True)[0], 'allow')
+
     def test_over_budget_plain_text_does_not_block(self):
         padding = 'true; ' * 120000
         self.assertIn(self.decide(padding + 'echo ok')[0], ('warn', 'allow'))
+
+
+class PolicyFileTests(Fixture):
+    """Red-team F2: a written or replaced policy file must not weaken the guard."""
+
+    def test_hostile_policy_cannot_weaken(self):
+        hostile = {
+            'modes': {'secret_dump': 'warn', 'log_delete': 'warn', 'broad_kill': 'warn'},
+            'protected_log_roots': [], 'protected_roots': [], 'protected_segment_names': [],
+            'ancestor_roots': [], 'credential_path_regexes': [], 'guard_files': [],
+            'allow_subtrees': ['{home}/.claude', '{home}/.claude/*'], 'temp_roots': ['{home}'],
+            'credential_allow_regexes': ['.*'], 'secret_env_regex': 'NEVERMATCH',
+            'limits': {'max_command_bytes': 1}, 'keep_suffixes': [],
+        }
+        path = self.home / 'hostile-policy.json'
+        path.write_text(json.dumps(hostile))
+        policy = cg.load_policy(path=str(path))
+        compiled = cg.Compiled(policy, home=str(self.home), cwd=str(self.home / 'repo'))
+        for row in ('rm -rf ~/.claude/projects', 'cat ~/.aws/credentials', 'env', 'rm -rf ~/.claude'):
+            self.assertEqual(cg.decide(fill(row, self.home), compiled, cwd=str(self.home / 'repo'))[0], 'block', row)
+        self.assertEqual(policy['allow_subtrees'], cg.DEFAULT_POLICY['allow_subtrees'])
+
+    def test_policy_may_add_protection(self):
+        path = self.home / 'extra-policy.json'
+        path.write_text(json.dumps({'protected_log_roots': ['{home}/repo/precious'], 'modes': {'broad_kill': 'enforce'}}))
+        policy = cg.load_policy(path=str(path))
+        self.assertEqual(policy['modes']['broad_kill'], 'enforce')
+        compiled = cg.Compiled(policy, home=str(self.home), cwd=str(self.home / 'repo'))
+        self.assertEqual(cg.decide(fill('rm -rf @HOME@/repo/precious', self.home), compiled,
+                                   cwd=str(self.home / 'repo'))[0], 'block')
+
+    def test_creating_guard_files_blocks(self):
+        for row in ("printf '{}' > ~/.claude/hooks/command_guard_policy.json",
+                    'cp /dev/null ~/.codex/agent-harness/command_guard_policy.json',
+                    "printf 'x' > ~/.claude/hooks/safe_input.py",
+                    'tee ~/.claude/hooks/command_guard_extra.py < /dev/null'):
+            self.assertEqual(self.decide(row)[0], 'block', row)
+
+    def test_block_message_does_not_point_at_policy_file(self):
+        self.assertNotIn('command_guard_policy', self.decide('rm -rf ~/.claude/projects')[1])
 
 
 class ApprovalTests(Fixture):
@@ -427,6 +588,50 @@ class LauncherTests(unittest.TestCase):
         self.assertLessEqual(mods, {'json', 'os', 're', 'subprocess', 'sys'})
 
 
+class GuardCompositionTests(unittest.TestCase):
+    """The command guard and the heavy-job guard (#53) both classify Bash commands. They are separate hook groups
+    and decide independently: neither one's allow, hatch or crash policy can override the other's block."""
+
+    def run_both(self, command):
+        import subprocess
+        home = tempfile.TemporaryDirectory(prefix='cg-compose-')
+        self.addCleanup(home.cleanup)
+        data = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'session_id': 's'}).encode()
+        env = {'PATH': '/usr/bin:/bin', 'HOME': home.name, 'HARNESS_HEAVY_GUARD_FORCE': '1'}
+        codes = {}
+        for name, argv in (('command', [str(HOOKS / 'command_guard_hook.py'), 'hook']),
+                           ('heavy', [str(HOOKS / 'heavy_job_guard.py')])):
+            done = subprocess.run([sys.executable] + argv, input=data, env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=60, check=False)
+            codes[name] = done.returncode
+        return codes
+
+    def test_each_guard_blocks_its_own_class_and_allows_the_other(self):
+        protected = PROTECTED_PAYLOAD['tool_input']['command']
+        self.assertEqual(self.run_both('ls -la'), {'command': 0, 'heavy': 0})
+        self.assertEqual(self.run_both('pytest'), {'command': 0, 'heavy': 2})
+        self.assertEqual(self.run_both(protected), {'command': 2, 'heavy': 0})
+        self.assertEqual(self.run_both('pytest; ' + protected), {'command': 2, 'heavy': 2})
+
+    def test_heavy_job_hatch_does_not_bypass_the_command_guard(self):
+        protected = PROTECTED_PAYLOAD['tool_input']['command']
+        hatch = 'HARNESS_LOCAL_OK=needs-the-local-mac-gpu '
+        self.assertEqual(self.run_both(hatch + 'pytest')['heavy'], 0)
+        self.assertEqual(self.run_both(hatch + protected)['command'], 2)
+
+    def test_install_keeps_the_guards_in_separate_groups(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        groups = install.managed_hooks(Path('/home/u/.claude'))['PreToolUse']
+        scripts = [[Path((h.get('args') or [''])[0]).name for h in g['hooks']] for g in groups]
+        self.assertEqual(scripts[0], ['command_guard_hook.py'])
+        self.assertEqual(groups[0]['hooks'][0]['onFailure'], 'block')
+        heavy = [g for g, s in zip(groups, scripts) if 'heavy_job_guard.py' in s]
+        self.assertEqual(len(heavy), 1)
+        self.assertEqual([Path(h['args'][0]).name for h in heavy[0]['hooks']], ['heavy_job_guard.py'])
+        self.assertNotIn('onFailure', heavy[0]['hooks'][0])  # fail-open by design (#53); the guard stays fail-closed
+
+
 class InstallTests(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, str(ROOT))
@@ -471,6 +676,19 @@ class InstallTests(unittest.TestCase):
         self.assertFalse([g for g in off['hooks']['PreToolUse'] if g['hooks'][0]['command'] == guard])
         for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py'):
             self.assertIn(name, self.install_codex.DELIVERY_HELPERS)
+
+    def test_guard_carries_the_gate_verb_and_replaces_a_verbless_entry(self):
+        # cmd/harness/gates.json lists command-guard as a fail-closed gate only when the hook verb is present.
+        claude, codex = self.home / '.claude', self.home / '.codex'
+        hook = self.guard_groups(self.install.merged_settings({}, claude))[0]['hooks'][0]
+        self.assertEqual(hook['args'][1:], ['hook'])
+        guard = self.install_codex.guard_command(codex)
+        self.assertTrue(guard.endswith(' hook'))
+        legacy = {'hooks': {'PreToolUse': [{'hooks': [{'type': 'command', 'timeout': 30,
+                                                       'command': self.install_codex.guard_command(codex, '')}]}]}}
+        merged = self.install_codex.merge_hooks(legacy, codex)
+        commands = [h['command'] for g in merged['hooks']['PreToolUse'] for h in g['hooks']]
+        self.assertEqual([c for c in commands if 'command_guard_hook.py' in c], [guard])
 
     def test_old_claude_version_warns(self):
         self.assertIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.200 (Claude Code)'))

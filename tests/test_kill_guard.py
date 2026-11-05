@@ -822,5 +822,55 @@ class Wiring(unittest.TestCase):
         self.assertNotIn('test_no_such_test', names)
 
 
+class GuardCompositionTests(unittest.TestCase):
+    """The kill guard and the command guard (#66) are separate hook groups and decide independently."""
+    REAL = ROOT / 'harness/hooks'
+    PROTECTED = 'rm -rf /home/x/' + '.cla' + 'ude/proj' + 'ects'  # a command the command guard blocks; never executed
+
+    def run_both(self, command):
+        home = tempfile.TemporaryDirectory(prefix='kg-compose-')
+        self.addCleanup(home.cleanup)
+        data = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'session_id': 's',
+                           'cwd': str(ROOT)}).encode()
+        env = {'PATH': '/usr/bin:/bin', 'HOME': home.name}
+        codes = {}
+        for name, script in (('command', 'command_guard_hook.py'), ('kill', 'kill_guard.py')):
+            done = subprocess.run([sys.executable, '-I', str(self.REAL / script), 'hook'], input=data, env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
+            codes[name] = done.returncode
+        return codes
+
+    def test_each_guard_blocks_its_own_class_and_allows_the_other(self):
+        self.assertEqual(self.run_both('ls -la'), {'command': 0, 'kill': 0})
+        self.assertEqual(self.run_both('pkill -f pytest'), {'command': 0, 'kill': 2})
+        self.assertEqual(self.run_both(self.PROTECTED), {'command': 2, 'kill': 0})
+        self.assertEqual(self.run_both('pkill -f pytest; ' + self.PROTECTED), {'command': 2, 'kill': 2})
+
+    def test_claude_install_keeps_both_guards_in_separate_blocking_groups(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        groups = install.managed_hooks(Path('/home/u/.claude'))['PreToolUse']
+        names = [[Path((h.get('args') or [''])[0]).name for h in g['hooks']] for g in groups]
+        self.assertEqual(names[0], ['command_guard_hook.py'])
+        kill = [g for g, n in zip(groups, names) if 'kill_guard.py' in n]
+        self.assertEqual(len(kill), 1)
+        self.assertEqual([Path(h['args'][0]).name for h in kill[0]['hooks']], ['kill_guard.py'])
+        self.assertEqual(kill[0]['hooks'][0]['args'][1], 'hook')
+        self.assertEqual(kill[0]['hooks'][0]['onFailure'], 'block')
+
+    def test_codex_install_appends_the_kill_guard_so_existing_indexes_do_not_shift(self):
+        sys.path.insert(0, str(ROOT))
+        try:
+            import install_codex
+        except (ImportError, SyntaxError, TypeError) as error:  # needs Python 3.11 (tomllib)
+            self.skipTest('install_codex not importable here: %s' % error)
+        groups = install_codex.merge_hooks({}, Path('/home/u/.codex'))['hooks']['PreToolUse']
+        commands = [h['command'] for g in groups for h in g['hooks']]
+        self.assertIn('command_guard_hook.py', commands[0])
+        self.assertIn('commit_policy.py', commands[-2])
+        self.assertIn('kill_guard.py', commands[-1])
+        self.assertEqual(sum('kill_guard.py' in c for c in commands), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -36,7 +36,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'ticket_adapters.py', 'commit_policy.py', 'commit_policy.json',
                     # Spec flow commands work by hand in Codex; its done hook is Claude Code only.
                     'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
-                    'provenance_hooks.py', 'safe_input.py',
+                    'provenance_hooks.py', 'safe_input.py', 'domain_gates.py', 'domain_checklists.json',
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
                     'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
@@ -66,8 +66,9 @@ def policy_command(codex_home: Path) -> str:
     return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'commit_policy.py')) + ' hook'
 
 
-def guard_command(codex_home: Path) -> str:
-    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'command_guard_hook.py'))
+def guard_command(codex_home: Path, verb: str = ' hook') -> str:
+    # The hook verb marks a fail-closed gate for the Go front door (cmd/harness/gates.json); the launcher ignores it.
+    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'command_guard_hook.py')) + verb
 
 
 def kill_guard_command(codex_home: Path) -> str:
@@ -98,7 +99,8 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
                 raise ValueError(f'hooks.json {event} has an invalid hook group')
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
-                                and handler.get('command') in (command, policy, guard, kill_guard))]
+                                and handler.get('command') in (command, policy, guard,
+                                                               guard_command(codex_home, ''), kill_guard))]
             if lifecycle and len(handlers) != len(group['hooks']) and group != managed:
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')
@@ -109,10 +111,12 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             # Command guard for every tool (no matcher): Codex fails open, so the launcher blocks by itself, and
             # write_stdin text typed into a running shell is never checked again by the host.
             preserved.insert(0, {'hooks': [{'type': 'command', 'command': guard, 'timeout': 30}]})
-            preserved.insert(1, {'hooks': [{'type': 'command', 'command': kill_guard, 'timeout': 30}]})  # GoodQA #14506
         if event == 'PreToolUse':
             # Commit message policy for every tool (no matcher): shell argv, strings, stdin writes.
             preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 60}]})
+            if command_guard:
+                # Kill guard last so no existing hook index shifts (trusted hook indexes, GoodQA #14590); GoodQA #14506.
+                preserved.append({'hooks': [{'type': 'command', 'command': kill_guard, 'timeout': 30}]})
         hooks[event] = preserved
     return result
 
