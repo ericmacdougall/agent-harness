@@ -96,6 +96,8 @@ DATA_COMMANDS = {"echo", "printf", "grep", "egrep", "fgrep", "rg", "ag", "ack", 
 EXEC_CONSUMERS = SHELLS | {"eval", "source", ".", "parallel", "env", "sudo", "su", "watch", "ssh"}
 WRAPPER_WORDS = {"env", "command", "sudo", "time", "nohup", "nice", "exec", "builtin", "stdbuf", "timeout", "doas",
                  "setsid", "ionice"}
+MERGE_HINT = re.compile(r"\bgh\b|merge|pulls|graphql|api\.github", re.I)
+DYNAMIC_WORD = re.compile(r"^(?:\$|\$\w+|\$\{[^}]*\}\w*)$")  # a command word that is only a variable or substitution
 GH_HINT = re.compile(r"\bgh\b|merge|curl|wget|\bhttps?\b|python|node|perl|ruby|ssh|eval|graphql|pulls|api\.github", re.I)
 STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals)", re.I)
 STATE_GLOB = re.compile(r"merge-gate-[wa*?\[]", re.I)  # subagents: globs and split spellings of the state files
@@ -312,7 +314,7 @@ def _gh_merge(args, in_xargs, ctx, cwd):
     if not pos:
         return []
     words = pos[:2] if pos[0] == "pr" else pos[:1]
-    if any(not re.match(r"^[a-z][a-z-]*$", p) for p in words):
+    if any(not re.match(r"^[a-z][a-z0-9_-]*$", p) for p in words):
         return [Merge("unverifiable", reason="gh subcommand is built at runtime")]
     names = {n for n, _ in flags}
     repo_ok = ctx["implicit_ok"]
@@ -356,6 +358,9 @@ def _gh_merge(args, in_xargs, ctx, cwd):
             return _graphql_merge(flags, pos[2:], fields, cwd, ctx.get("command"))
         if method == "GET":
             return []
+        last = endpoint.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+        if re.search(r"[$`]", last) or (re.search(r"[$`]", endpoint) and last == "merge"):
+            return [Merge("unverifiable", reason="the gh api endpoint is built at run time and the method writes")]
         m = re.match(r"^repos/([^/]+)/([^/]+)/pulls/(\d+)/merge/?(?:\?.*)?$", endpoint)
         if m:
             slug = None if "{" in m.group(1) or "{" in m.group(2) else m.group(1) + "/" + m.group(2)
@@ -468,8 +473,8 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
             name = base[i]
             if name == "xargs":
                 seen_xargs = True
-            if name.startswith("gh") and name not in ("gh", "gh.exe") and re.search(r"[${}*?]", name) and \
-                    re.search(r"gh[${}*?\w]*(?:IFS|\$|\{)", name):
+            if re.match(r"^gh(?:\$|\{)[^\s]*$", name) and name not in ("gh", "gh.exe") and \
+                    not re.search(r"\s", tokens[i]):
                 found.append(Merge("unverifiable", reason="a gh command glued together at run time"))
                 handled = True
             if name in ("gh", "gh.exe"):
@@ -502,6 +507,14 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
         if handled:
             continue
         word = words[index]
+        first = next((t for t in seg if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)
+                      and os.path.basename(t) not in WRAPPER_WORDS and not t.startswith("-")), "")
+        full_command = " ".join(tokens)
+        if MERGE_HINT.search(full_command) and (DYNAMIC_WORD.match(first) or (
+                word == "eval" and any("$" in t for t in seg[1:]))):
+            raw.append(Merge("unverifiable", reason="the command word is built at run time and the command mentions "
+                                                    "gh or a merge"))
+            continue
         nxt = words[index + 1] if index + 1 < len(segments) else ""
         next_seg = tokens[segments[index + 1][0]:segments[index + 1][1]] if index + 1 < len(segments) else []
         consumer = nxt in EXEC_CONSUMERS or bool(INTERPRETERS.match(nxt)) or (
