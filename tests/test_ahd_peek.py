@@ -59,10 +59,10 @@ class Policy(Base):
 
     def test_classification(self):
         p = self.policy
-        for t in ("/Users/eric/Library/Application Support/Interview Pilot/x.jsonl", "-Users-eric-work-solve-installers",
+        for t in ("/Users/someone/Library/Application Support/Interview Pilot/x.jsonl", "-Users-someone-work-solve-installers",
                   "Solver PR review", "/w/redteam-solve/a", "app.interviewpilot.mac"):
             self.assertTrue(peek.text_excluded(t, p), t)
-        for t in ("resolve merge conflict", "/Users/eric/repo/harness", "absolve"):
+        for t in ("resolve merge conflict", "/Users/someone/repo/harness", "absolve"):
             self.assertFalse(peek.text_excluded(t, p), t)
         self.assertTrue(peek.host_excluded("vm108", p))
         self.assertTrue(peek.host_excluded("interview-prep.lan", p))

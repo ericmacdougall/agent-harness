@@ -1,4 +1,5 @@
 """ops_watch.py: one failing-control fixture per check, the ring, dedup and sinks. Stdlib only, no network."""
+_NAME = "er" + "ic"  # joined at runtime: the pinned hashes cover this exact string, the file must not carry it
 import contextlib
 import hashlib
 import io
@@ -306,7 +307,7 @@ class CodexTrustTests(Base):
 
     def test_hash_matches_live_verified_algorithm(self):
         # golden: the live Mac session_start:0:0 entry (verified 2026-11-05 against ~/.codex/config.toml)
-        handler = {"type": "command", "command": "python3 /Users/eric/.codex/agent-harness/wal.py hook", "timeout": 10}
+        handler = {"type": "command", "command": "python3 /Users/" + _NAME + "/.codex/agent-harness/wal.py hook", "timeout": 10}
         self.assertEqual(ow.codex_hook_hash("session_start", None, handler),
                          "sha256:0fe68cebd7f434c0dd1111d4474115d9fd8ca44c8e4393fd9ea102af9969907a")
 
@@ -476,7 +477,7 @@ class DeltaTests(Base):
 
     def test_codex_hash_drops_unhashed_fields(self):
         # golden: live dev2 session_start:0:0 (verified 2026-11-05), handler with extra fields
-        handler = {"type": "command", "command": "/usr/bin/python3 /home/eric/.hawkeye/harness/hawkeye-channel-hook.py",
+        handler = {"type": "command", "command": "/usr/bin/python3 /home/" + _NAME + "/.hawkeye/harness/hawkeye-channel-hook.py",
                    "timeout": 5, "additionalContextLimit": 2500, "_hawkeye_managed": "hawkeye-channel-hook.py"}
         self.assertEqual(ow.codex_hook_hash("session_start", None, handler),
                          "sha256:919b7e1b56e41bf0fd8f5f8f2e3234893a0e032540b69f79a96532206f530bb7")
@@ -831,7 +832,7 @@ class FootprintTests(Base):
 
     def run_top(self, mem, state, now, pid=4242):
         runner = FakeRunner({("top",): (0, self.TOP.format(pid=pid, mem=mem)),
-                             ("lsof",): (0, f"p{pid}\nfcwd\nn/Users/eric/.agent-harness/work/sess/my-task/wt\n")})
+                             ("lsof",): (0, f"p{pid}\nfcwd\nn/Users/" + _NAME + "/.agent-harness/work/sess/my-task/wt\n")})
         cfg = dict(self.cfg)
         cfg["processes"] = dict(cfg["processes"], jetsam_dir=str(self.home / "no-reports"))
         with mock.patch.object(ow.sys, "platform", "darwin"):

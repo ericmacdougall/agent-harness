@@ -1,0 +1,12 @@
+# Path globs of fixtures that deliberately contain FAKE secrets, so redaction tests have input.
+# Only the built-in token rules are skipped for these paths; the local denylist and the
+# home-directory rule still apply. Never add a real credential here.
+internal/redact/testdata/corpus.json
+tests/test_delivery_checks.py
+tests/test_review_map.py
+tests/test_spec_flow.py
+tests/test_wal.py
+internal/redact/testdata/gen_corpus.py
+tests/test_ah.py
+tests/data/review_diagnostics_hostile.json
+tests/test_ahd.py
