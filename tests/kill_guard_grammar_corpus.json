@@ -4193,6 +4193,20 @@
    "id": "RROK-087",
    "shape": "RROK",
    "why": "a definition, pattern, array, or text that is only printed or searched must stay allowed"
+  },
+  {
+   "cmd": "kill -9 4001 &>/dev/null 4004",
+   "expect": "block",
+   "id": "R5-amp-redirect",
+   "shape": "R5",
+   "why": "the word after a &> redirect is still a kill target, not a new command"
+  },
+  {
+   "cmd": "kill -9 4001 &>/dev/null",
+   "expect": "allow",
+   "id": "OK-amp-redirect",
+   "shape": "OK",
+   "why": "a &> redirect on a kill of an owned PID must keep working"
   }
  ]
 }

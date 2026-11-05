@@ -902,9 +902,10 @@ class GuardCompositionTests(unittest.TestCase):
             self.skipTest('install_codex not importable here: %s' % error)
         groups = install_codex.merge_hooks({}, Path('/home/u/.codex'))['hooks']['PreToolUse']
         commands = [h['command'] for g in groups for h in g['hooks']]
-        self.assertIn('command_guard_hook.py', commands[0])
-        self.assertIn('commit_policy.py', commands[-2])
-        self.assertIn('kill_guard.py', commands[-1])
+        order = ('wal.py', 'commit_policy.py', 'merge_gate.py', 'command_guard_hook.py', 'kill_guard.py')
+        self.assertEqual(len(commands), len(order))
+        for command, name in zip(commands, order):
+            self.assertIn(name, command)
         self.assertEqual(sum('kill_guard.py' in c for c in commands), 1)
 
 
