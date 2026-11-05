@@ -512,6 +512,12 @@ NEG15_WORK_BLOCK = [
     {'cmd': 'find -sE ~/.claude -delete', 'cwd': '@WT@/build'},
     {'cmd': 'find -Hd ~/.claude -exec rm -rf {} +', 'cwd': '@WT@/build'},
     {'cmd': 'find -f@HOME@/.claude/projects -delete', 'cwd': '@WT@/build'},
+    # delta review of 146f7f7: GNU -f* expressions are not start directories (no root means `.`)
+    {'cmd': 'find -fprint /var/tmp/l -delete', 'cwd': '@WT@'},
+    {'cmd': 'find -fprint /var/tmp/l -delete', 'cwd': '@HOME@'},
+    {'cmd': 'find -fls /var/tmp/l -delete', 'cwd': '@HOME@'},
+    {'cmd': "find -fprintf /var/tmp/l '%p' -delete", 'cwd': '@HOME@'},
+    {'cmd': 'find -false -o -delete', 'cwd': '@HOME@'},
     {'cmd': 'find . -name "*.pyc" , -delete', 'cwd': '@WT@'},
     {'cmd': 'find .. -delete -name "*.pyc"', 'cwd': '@WT@/build'},
     # -exec operands other than {} (pre-existing gap, same review)

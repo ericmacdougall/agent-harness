@@ -2380,9 +2380,14 @@ class Analyzer:
             if t in ('-P', '-H', '-L', '-E', '-X', '-d', '-s', '-x', '--') or re.fullmatch(r'-O\d*', t) \
                     or re.fullmatch(r'-[EHLPXdsx]+', t):
                 k += 1  # BSD getopt also accepts clusters such as -xd or -sE
-            elif t.startswith('-f') and len(t) > 2 and not t.startswith('-fo') and not t.startswith('-fs'):
-                roots.append(_literal_word(t[2:]))  # BSD -fPATH (but not -follow, -fstype)
-                k += 1
+            elif t.startswith('-f') and len(t) > 2:
+                # BSD -fPATH, or a GNU expression such as -fprint, -fls, -false: judge both readings (the attached
+                # path and the default `.`) and stop scanning options, since what follows is an expression
+                roots.append(_literal_word(t[2:]))
+                default_root = Word()
+                default_root.alts = ['.']
+                roots.append(default_root)
+                break
             elif t == '-D' and k + 1 < len(args):
                 k += 2
             elif t == '-f' and k + 1 < len(args):
