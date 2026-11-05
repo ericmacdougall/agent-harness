@@ -239,8 +239,10 @@ class Compiled:
         self.ancestors = [self._segs(fmt(t, h)) for t in policy['ancestor_roots'] for h in homes]
         self.guard_globs = [fmt(t, h).casefold() for t in policy.get('guard_files', []) for h in homes]
         self.state_files = [fmt(t, h).casefold() for t in policy['state_files'] for h in homes]
-        self.wal_regexes = [re.compile(policy['protected_work_wal_regex'].replace('{home}', re.escape(h)), re.I)
-                            for h in homes]
+        # every home form, not only this machine's: a WAL under another host's work dir is still a WAL
+        self.wal_regexes = [re.compile(policy['protected_work_wal_regex'].replace(
+            '{home}', re.escape(h).replace(r'\*', '[^/]+')), re.I)
+            for h in homes + [g for g in policy.get('generic_homes', []) if isinstance(g, str)]]
         self.cred = [re.compile(r, re.I) for r in policy['credential_path_regexes']]
         self.cred_allow = [re.compile(r, re.I) for r in policy['credential_allow_regexes']]
         self.cred_dirs = [self._segs(fmt(t, h)) for t in policy['credential_dirs'] for h in homes]
@@ -272,7 +274,7 @@ class Compiled:
     def is_guard_file(self, path):
         folded = path.casefold()
         real = (_realpath(path) or path).casefold()
-        return any(fnmatch.fnmatchcase(p, g) for g in self.guard_globs for p in (folded, real))
+        return any(_fnmatchcase(p, g) for g in self.guard_globs for p in (folded, real))
 
     def secret_name(self, name):
         upper = name.upper()
@@ -518,6 +520,11 @@ def _find_brace(text):
     return None
 
 
+# zsh clobber forms (the Bash tool may run zsh): judged as the bash operator with the same effect
+ZSH_CLOBBER = {'>!': '>|', '>>!': '>>', '>>|': '>>', '&>!': '&>', '&>|': '&>', '>&!': '&>', '>&|': '&>',
+               '&>>!': '&>>', '&>>|': '&>>'}
+
+
 class Lexer:
     def __init__(self, ctx, ps=False):
         self.ctx = ctx
@@ -728,6 +735,7 @@ class Lexer:
         tokens, pending = [], []
         prev_end = -1
         wait_target = None
+        also_arg = False
         while i < n:
             self.budget.tick()
             c = s[i]
@@ -747,13 +755,17 @@ class Lexer:
                 continue
             if c in ';&|()<>' and not (c in '<>' and s[i + 1:i + 2] == '('):
                 op = self._operator(s, i)
-                if op[0] in ('<', '>', '&>', '>&', '<&', '<>', '<<', '<<<', '<<-', '&>>', '>>', '>|'):
+                # the whole operator, not its first character: `&>` and `&>>` start with `&` (GoodQA #14471 follow-up)
+                if op in ('<', '>', '&>', '>&', '<&', '<>', '<<', '<<<', '<<-', '&>>', '>>', '>|') or op in ZSH_CLOBBER:
                     fd = None
                     if tokens and tokens[-1][0] == 'w' and prev_end == i and re.fullmatch(r'[0-9]', tokens[-1][1].text or 'x'):
                         fd = tokens.pop()[1].text
-                    rd = Redir(fd, op)
+                    rd = Redir(fd, ZSH_CLOBBER.get(op, op))
                     tokens.append(('redir', rd))
                     wait_target = rd
+                    # bash has no `>!`: it reads `>` onto a file named `!`, so the next word is an argument of the
+                    # command. Judge both shells: zsh's redirect target and bash's argument (delta review F1)
+                    also_arg = op.endswith('!') and s[i + len(op):i + len(op) + 1] in WS
                     if op in ('<<', '<<-'):
                         rd.strip = op == '<<-'
                         pending.append(rd)
@@ -773,6 +785,9 @@ class Lexer:
                     wait_target.delim = w.text
                     wait_target.quoted = w.quoted
                 wait_target = None
+                if also_arg:
+                    tokens.append(('w', w))
+                    also_arg = False
             else:
                 tokens.append(('w', w))
             prev_end = j
@@ -781,7 +796,8 @@ class Lexer:
 
     @staticmethod
     def _operator(s, i):
-        for op in ('<<<', '<<-', '&>>', '&&', '||', '|&', '>>', '>&', '<&', '<>', '<<', '&>', '>|', ';', '&', '|', '(', ')', '<', '>'):
+        for op in ('&>>!', '&>>|', '<<<', '<<-', '&>>', '>>!', '>>|', '&>!', '&>|', '>&!', '>&|', '&&', '||', '|&', '>>', '>&',
+                   '<&', '<>', '<<', '&>', '>|', '>!', ';', '&', '|', '(', ')', '<', '>'):
             if s.startswith(op, i):
                 return op
         return s[i]
@@ -930,6 +946,16 @@ def _has_glob(seg):
     return any(ch in seg for ch in GLOB_CHARS)
 
 
+def _fnmatchcase(name, pattern):
+    """fnmatch that cannot raise: Python 3.9 raises re.error on a reversed range such as [z-a], and an exception here
+    would cost the whole command its findings. It may still match in a shell ([z-ae] matches e), so an unreadable
+    pattern counts as a match: every caller only gets stricter."""
+    try:
+        return fnmatch.fnmatchcase(name, pattern)
+    except re.error:
+        return True
+
+
 def _seg_eq(p, r):
     """One path segment against one pattern segment; either side may be a glob."""
     if p == r:
@@ -938,9 +964,9 @@ def _seg_eq(p, r):
     if gp and gr:
         return True  # two patterns may overlap: assume they do
     if gp:
-        return fnmatch.fnmatchcase(r, p)
+        return _fnmatchcase(r, p)
     if gr:
-        return fnmatch.fnmatchcase(p, r)
+        return _fnmatchcase(p, r)
     return False
 
 
@@ -1005,9 +1031,9 @@ def classify_segs(c, segs):
     if in_root == 'root':
         # inside a harness tree a glob that can reach a WAL name counts as a WAL path
         for s in segs:
-            if _has_glob(s) and any(fnmatch.fnmatchcase(n, s) for n in c.seg_names | c.file_names):
+            if _has_glob(s) and any(_fnmatchcase(n, s) for n in c.seg_names | c.file_names):
                 return 'log'
-        if _has_glob(leaf) and any(fnmatch.fnmatchcase('x' + suf, leaf) for suf in c.file_suffixes):
+        if _has_glob(leaf) and any(_fnmatchcase('x' + suf, leaf) for suf in c.file_suffixes):
             return 'log'
         if leaf in c.keep_names or leaf.endswith(c.keep_suffixes) or any(x in c.keep_segments for x in segs):
             return 'root'
@@ -1037,7 +1063,7 @@ def seg_match(pattern_segs, concrete_segs):
     """Pattern (may have globs) vs concrete path segments, over the shorter length: True if one reaches the other."""
     n = min(len(pattern_segs), len(concrete_segs))
     for k in range(n):
-        if not fnmatch.fnmatchcase(concrete_segs[k], pattern_segs[k]):
+        if not _fnmatchcase(concrete_segs[k], pattern_segs[k]):
             return False
     return True
 
@@ -1628,11 +1654,15 @@ class Analyzer:
     def redirects(self, cmd, pl, idx, has_command, depth):
         ctx = self.ctx
         words = self._skip_assigns(strip_reserved(cmd.words))[1]
+        # a `>! word` target is also in `words` for bash's reading, and heredoc and exec checks below must see it. So
+        # `cat >! f` and a bare `>! f` count as content writes here: on a plain work file they are allowed
         name = norm_name(words[0].text) if words else ''
         arg_texts = [w.text for w in words[1:]]
         # pure truncation: nothing (or nothing meaningful) is written, so the redirect only empties the file
+        # `cat > f <<EOF` writes content; an empty heredoc writes nothing, so that stays a pure truncation
+        has_body = any(r.op == '<<<' or r.op in ('<<', '<<-') and r.body.strip('\n') for r in cmd.redirs)
         pure = (not words or name in (':', 'true', 'false')
-                or (name == 'cat' and all(t == '/dev/null' for t in arg_texts))
+                or (name == 'cat' and not has_body and all(t == '/dev/null' for t in arg_texts))
                 or (name in ('echo', 'printf') and all(t in ('', '-n', '-e', '-ne', '-en') for t in arg_texts)))
         written = None
         if name in ('echo', 'printf'):
@@ -1648,7 +1678,8 @@ class Analyzer:
             if r.target is not None:
                 self.subs(r.target, depth, visible=False)
             is_write = False
-            if r.op in ('>', '>|', '&>', '>&') and r.fd in (None, '1', '2') or r.op in ('>>', '&>>'):
+            # `3&> f`: bash and zsh read the digit as an argument, so `&>` always writes the file
+            if r.op in ('>', '>|', '>&') and r.fd in (None, '1', '2') or r.op in ('>>', '&>>', '&>'):
                 if target and r.op != '>&' or (r.op == '>&' and target and not re.fullmatch(r'[0-9-]+', target)):
                     self.write_target(r.target, truncating=r.op not in ('>>', '&>>'), via='redirect', pure=pure)
                     is_write = True
@@ -1656,6 +1687,13 @@ class Analyzer:
                 if target:
                     self.write_target(r.target, truncating=r.op in ('>', '>|'), via='redirect', pure=pure)
                     is_write = True
+            elif r.op == '<>' and target and (r.fd in ('1', '2') or name == 'exec' or any(
+                    x.op == '>&' and x.target is not None and x.target.text == (r.fd or '0') for x in cmd.redirs)):
+                # `1<> f`: stdout opened read-write without truncation; what the command prints overwrites the file
+                # in place, so it is judged like `>`. So is any `N<> f` that a `>&N` dup writes to, and an `exec N<>`
+                # whose descriptor later commands can write; a plain fd-0 `<>` only feeds input and stays a read
+                self.write_target(r.target, truncating=True, via='redirect', pure=False)
+                is_write = True
             if is_write and written is not None and r.target is not None:
                 self.note_created(r.target, written)
             if r.op in ('<', '<>') and target:
@@ -1799,7 +1837,7 @@ class Analyzer:
             name = norm_name(alt)
             if head.glob or any(ch in name for ch in '*?['):
                 for known in KNOWN_NAMES:
-                    if fnmatch.fnmatchcase(known, name):
+                    if _fnmatchcase(known, name):
                         out.append(known)
             if name:
                 out.append(name)
@@ -2758,7 +2796,7 @@ class Analyzer:
                 return True
         if any(ch in text for ch in '*?['):
             for sample in c.cred_samples:
-                if fnmatch.fnmatchcase(norm_path(sample, ctx, ctx.cwd).casefold(), path.casefold()):
+                if _fnmatchcase(norm_path(sample, ctx, ctx.cwd).casefold(), path.casefold()):
                     return True
         if is_dynamic_path(text):
             tail = path.split('$')[-1] if '$' in path else ''
@@ -2958,7 +2996,7 @@ class Analyzer:
                 except OSError:
                     return None
                 for name in names:
-                    if not fnmatch.fnmatchcase(name, seg):
+                    if not _fnmatchcase(name, seg):
                         continue
                     cand = os.path.join(base, name)
                     if last or os.path.isdir(cand):
@@ -3239,7 +3277,7 @@ class Analyzer:
                     return True
         return False
 
-    def refuse(self, what, word, tiers=('log', 'root', 'ancestor', 'unknown'), need_existing=False):
+    def refuse(self, what, word, tiers=('log', 'root', 'ancestor', 'unknown'), need_existing=False, instead=None):
         """Add a log_delete finding when `word` resolves into one of `tiers`. Returns True when it did."""
         ctx = self.ctx
         cls, path, literal = self.target_class(word)
@@ -3258,9 +3296,9 @@ class Analyzer:
         ctx.add(LOG_DELETE, 'log-delete',
                 ('%s targets %s (%s). Claude/Codex/harness logs and state are never deleted, moved or truncated '
                  'without a verified backup' % (what, label, name[:60]))[:300],
-                'back up to Dropbox (rclone copy), then `command_guard.py approve-delete --path P --remote REMOTE`, '
-                'then delete the literal path' + ('' if literal else '; spell out the literal path, globs and '
-                                                  'variables cannot be approved'))
+                instead or 'back up to Dropbox (rclone copy), then `command_guard.py approve-delete --path P --remote '
+                'REMOTE`, then delete the literal path' + ('' if literal else '; spell out the literal path, globs and '
+                                                           'variables cannot be approved'))
         return True
 
     def _foreign_home(self, path):
@@ -3282,9 +3320,115 @@ class Analyzer:
         if self.state_dest(target_word):
             return
         if truncating:
-            tiers = ('log', 'root', 'unknown') if pure else ('log', 'unknown')
-            self.refuse('truncation by redirect', target_word, tiers=tiers, need_existing=True)
+            # `echo x > existing` replaces the file's content just as `: >` empties it, so an existing literal file
+            # under a protected root is refused like `tee` is; new files and `>>` appends stay allowed. A dynamic
+            # target keeps the narrower tiers: its existence cannot be checked, and new-file writes are common.
+            cls, path, exact = self.target_class(target_word)
+            literal = pure or exact
+            tiers = ('log', 'root', 'unknown') if literal else ('log', 'unknown')
+            # another host's home: nothing can be checked from here, so only a fully literal path may be narrowed
+            foreign = cls == 'root' and self._foreign_home(path)
+            if foreign and not exact:
+                tiers = ('log', 'root', 'unknown')
+            # `link/../x`: the shell resolves `..` after following the link, so check that path as well
+            physical = self._physical_dotdot(target_word.text) if not target_word.dynamic else None
+            # zsh multios: `> {a,b}` writes every expansion, so each one must be a plain work file
+            every = [norm_path(a, self.ctx) for a in (target_word.all_alts() or target_word.alts)]
+            dotted = any('..' in a.replace('\\', '/').split('/') for a in (target_word.all_alts() or target_word.alts))
+            if not pure and cls == 'root' and self._plain_work_file(path) and all(map(self._plain_work_file, every)) \
+                    and (physical is None or self._plain_work_file(physical)) and not (foreign and (dotted or not exact)):
+                # owners routinely rerun `cmd > <task dir>/x.log`; only receipts (*.json) and .keep-marked
+                # directories under the work dir keep the overwrite refusal (replay over real transcripts)
+                tiers = ('log', 'unknown')
+            what = 'truncation by redirect' if pure else 'overwrite by redirect'
+            done = self.refuse(what, target_word, tiers=tiers, need_existing=True, instead=self._overwrite_hint(path))
+            raw_alts = target_word.all_alts() or target_word.alts
+            if not done and len(raw_alts) > 1:
+                # refuse() checks existence only for the strongest alt it shows; multios writes all of them,
+                # so an existing protected file behind a new first alt must still count (delta review F2)
+                if len(raw_alts) > 256:  # too many to stat one by one: judge them as if they all existed
+                    done = self.refuse(what, target_word, tiers=tiers)
+                for alt in ([] if len(raw_alts) > 256 else raw_alts):
+                    one = Word()
+                    one.alts, one.dynamic = [alt], target_word.dynamic
+                    if self.refuse(what, one, tiers=tiers, need_existing=True):
+                        done = True
+                        break
+            if not done and cls is not None and target_word.glob and not target_word.dynamic:
+                # `> ~/.claude/settings.jso?`: bash and zsh expand a redirect glob that matches one file, so judge
+                # the files it matches now as literal targets (delta review F4). Only below a protected root, and
+                # through the budgeted walker: an exception or a stall here would lose every other finding in the
+                # command, because the launcher then falls back to its raw-text check (re-review N1)
+                pattern = norm_path(target_word.text, self.ctx)
+                hits = self._glob_with_hidden(pattern, 256) if pattern.startswith('/') and '\x00' not in pattern else None
+                if hits is None:  # too many matches, unreadable or not expandable: its targets are not known
+                    done = self.refuse(what, target_word, tiers=('log', 'root', 'unknown'))
+                for hit in hits or []:
+                    one = Word()
+                    one.alts = [hit]
+                    hit_tiers = ('log', 'unknown') if not pure and self._plain_work_file(hit) \
+                        else ('log', 'root', 'unknown')
+                    if self.refuse(what, one, tiers=hit_tiers, need_existing=True):
+                        done = True
+                        break
+            if not done and physical and physical.casefold() != norm_path(target_word.text, self.ctx).casefold():
+                real = Word()
+                real.alts = [physical]
+                self.refuse(what, real, tiers=tiers, need_existing=True)  # the file the shell really opens
         self.note_created(target_word)
+
+    def _work_base(self, segs):
+        """Segment count of the ~/.agent-harness/work or /scratch prefix of `segs`, for this machine's homes and for
+        /home/<user> on another host (`ssh dev2 'cmd > /home/eric/...'`), else None."""
+        other = ['/'.join(segs[:2])] if len(segs) > 2 and segs[0] == 'home' else []
+        for h in list(self.c.homes) + other:
+            for top in ('work', 'scratch'):
+                base = Compiled._segs(h) + ['.agent-harness', top]
+                if len(segs) > len(base) and segs[:len(base)] == base:
+                    return len(base)
+        return None
+
+    def _overwrite_hint(self, path):
+        """What to do instead when a redirect is refused for a layout reason under work or scratch, else None."""
+        segs = Compiled._segs(path)
+        base_len = self._work_base(segs)
+        if base_len is None:
+            return None
+        rest = segs[base_len:]
+        if len(rest) == 1:
+            return 'write to a subfolder of it instead; files directly in the work or scratch dir are not replaced'
+        if any(s in self.c.keep_segments for s in rest[:-1]):
+            return 'write to a differently named folder instead; files under a folder named state are kept'
+        return None
+
+    def _plain_work_file(self, path):
+        """A plain file at least two levels below ~/.agent-harness/work or ~/.agent-harness/scratch, both as typed
+        and where it really leads (symlinks): not a JSON receipt, not a kept name (kit.json, *.jsonl, state), and no
+        `.keep` in any directory between it and the work or scratch dir. Also true for another host's
+        /home/<user>/.agent-harness tree, where the `.keep` and symlink checks can only see this machine's disk."""
+        try:
+            real = os.path.realpath(path)
+        except (OSError, ValueError):
+            return False
+        # macOS makes /home itself a symlink, so that prefix alone must not fail the check. A /home/<user> path that
+        # does exist here (another user on this machine) is still followed, so a link out of the tree is refused
+        if real.startswith('/System/Volumes/Data/home/') and self._foreign_home(path):
+            real = real[len('/System/Volumes/Data'):]
+        for cand in (path, real):
+            if self._kept(cand) or any(rx.search(cand.casefold()) for rx in self.c.wal_regexes):
+                return False
+            segs = Compiled._segs(cand)
+            raw = [s for s in cand.replace('\\', '/').split('/') if s]
+            base_len = self._work_base(segs)
+            if base_len is None or len(raw) != len(segs):
+                return False
+            rest = segs[base_len:]
+            if len(rest) < 2 or '..' in rest or rest[-1].casefold().endswith('.json'):
+                return False
+            for k in range(1, len(rest)):
+                if _lexists('/' + '/'.join(raw[:base_len + k]) + '/.keep'):
+                    return False
+        return True
 
     def note_created(self, word, text=None):
         for alt in word.alts[:32]:

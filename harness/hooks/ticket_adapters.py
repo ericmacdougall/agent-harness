@@ -14,6 +14,7 @@ import os
 import re
 import socket
 import stat
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -30,7 +31,7 @@ class TicketOutOfScope(Exception):
     """The ticket system answered, but this credential cannot see the ticket's project.
 
     Distinct from "ticket missing": a project in another organisation (for example the
-    Eric org while the member key reaches FrameBright only) cannot be verified at all.
+    another org while the member key reaches ExampleOrg only) cannot be verified at all.
     """
 
 
@@ -372,7 +373,103 @@ class GoodQAAdapter:
                 f"comment_on_issue (issueId {ticket.id}) or the GoodQA UI.")
 
 
-ADAPTERS = {"goodqa": GoodQAAdapter}
+LEDGER_TICKET_ID = re.compile(r"tk_[0-9A-HJKMNP-TV-Z]{26}")
+LEDGER_VERSION = re.compile(r"(\d{1,6})\.(\d{1,6})\.(\d{1,6})")
+
+
+class LedgerAdapter:
+    """Resolve `Ledger <slug>#<hex>` handles through the local `harness tickets` binary.
+
+    A temporary Python <-> Go seam until commit-policy is ported (P4): one call with a hard
+    deadline whose process group is killed on timeout. Anything other than a well-formed
+    answer from a new-enough binary raises TicketSystemUnavailable ("could not verify");
+    "not found" and "ambiguous" are reported only when the binary says so in JSON.
+    Only tickets from this machine's own (self) and explicitly trusted writers are visible,
+    because the binary folds nothing else. The ledger has no comments API for delivery.
+    """
+
+    def __init__(self, config: dict, runner=None, which=None):
+        self.config = config
+        self.binary = str(config.get("binary") or "harness")
+        self.min_version = str(config.get("min_version") or "0.1.0")
+        if not LEDGER_VERSION.fullmatch(self.min_version):
+            raise TicketSystemUnavailable("ledger min_version must be MAJOR.MINOR.PATCH")
+        self.timeout = min(float(config.get("timeout_seconds", 5)), 5.0)
+        if runner is None:
+            from process import run as runner
+        self.runner = runner
+        if which is None:
+            import shutil
+            which = shutil.which
+        self.which = which
+
+    def _executable(self) -> str:
+        path = self.binary if os.path.isabs(self.binary) else self.which(self.binary)
+        if not path or not os.path.isabs(path) or not os.access(path, os.X_OK):
+            raise TicketSystemUnavailable(f"ledger binary {self.binary!r} not found on PATH")
+        return path
+
+    def resolve(self, slug: str, handle: str, *, cwd: str, as_of_ms: int):
+        """Return ("ok", Ticket), ("not_found", None) or ("ambiguous", None)."""
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", slug) or not re.fullmatch(r"[0-9a-f]{8,64}", handle):
+            return "not_found", None
+        command = [self._executable(), "tickets", "show", handle, "--json", "--min-version", self.min_version,
+                   "--as-of", str(int(as_of_ms)), "--slug", slug]
+        # No GIT_* (the repository is chosen by cwd) and no HARNESS_LEDGER_* test variables, which a
+        # test build would honour (fake clock or machine id could defeat the --as-of bound).
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "HARNESS_LEDGER_"))}
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        try:
+            result = self.runner(command, cwd=cwd, env=env, timeout=self.timeout, input="")
+        except subprocess.TimeoutExpired as error:
+            raise TicketSystemUnavailable(f"ledger binary did not answer within {self.timeout:g}s") from error
+        except OSError as error:
+            raise TicketSystemUnavailable(f"ledger binary could not run ({type(error).__name__})") from error
+        try:
+            data = json.loads(result.stdout or "")
+        except ValueError:
+            raise TicketSystemUnavailable("ledger binary printed non-JSON output") from None
+        if not isinstance(data, dict):
+            raise TicketSystemUnavailable("ledger binary printed an unexpected JSON shape")
+        if result.returncode == 3 and data.get("error") in ("not_found", "ambiguous"):
+            return data["error"], None
+        if result.returncode != 0:
+            # Exit 2 covers "older than --min-version" and an unknown --as-of flag; both fail closed.
+            raise TicketSystemUnavailable(f"ledger binary failed (exit {result.returncode}, "
+                                          f"{str(data.get('error') or 'unknown')[:40]})")
+        version = LEDGER_VERSION.fullmatch(str(data.get("ledger_version") or ""))
+        if not version or tuple(map(int, version.groups())) < tuple(
+                map(int, LEDGER_VERSION.fullmatch(self.min_version).groups())):
+            raise TicketSystemUnavailable("ledger binary is older than the required version")
+        ticket = data.get("ticket")
+        if (data.get("slug") != slug or not isinstance(ticket, dict)
+                or not LEDGER_TICKET_ID.fullmatch(str(ticket.get("id") or ""))
+                or not isinstance(ticket.get("title"), str) or not isinstance(ticket.get("status"), str)):
+            raise TicketSystemUnavailable("ledger binary answered for a different ledger or ticket shape")
+        shown = str(ticket.get("handle") or "")
+        if not re.fullmatch(r"[0-9a-f]{8,64}", shown) or not (shown.startswith(handle) or handle.startswith(shown)):
+            raise TicketSystemUnavailable("ledger binary answered for a different handle")
+        created = ticket.get("created_ms")
+        if not isinstance(created, int) or created >= int(as_of_ms):
+            raise TicketSystemUnavailable("ledger binary ignored --as-of")
+        return "ok", Ticket("ledger", slug, handle, ticket["id"], ticket["title"], ticket["status"])
+
+    # The generic verification/notification paths never route ledger refs here (ticket_refs
+    # excludes them by default); if one ever does, it fails closed instead of guessing.
+    def lookup(self, project, number):
+        raise TicketSystemUnavailable("ledger tickets are verified only through resolve()")
+
+    def comments_since(self, ticket, since):
+        raise TicketSystemUnavailable("the local ledger has no comment feed for delivery checks")
+
+    def comment(self, ticket, body, op):
+        raise TicketSystemUnavailable("the local ledger does not accept delivery comments")
+
+    def update_instructions(self, ticket, names: str) -> str:
+        return f"Ledger {ticket.project}#{ticket.number} is local; reference a GoodQA ticket for delivery."
+
+
+ADAPTERS = {"goodqa": GoodQAAdapter, "ledger": LedgerAdapter}
 
 
 def project_config(config: dict, project: str | None, routes: dict | None = None) -> dict:

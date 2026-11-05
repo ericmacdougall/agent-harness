@@ -151,9 +151,7 @@ func (s *settingsStore) runLogin(ctx context.Context, task *settingsLogin, p set
 		args = []string{"auth", "login", "--claudeai"}
 		key = "CLAUDE_CONFIG_DIR"
 	}
-	cmd := exec.CommandContext(ctx, binary, args...)
-	cmd.Cancel = func() error { terminateProcess(cmd); return nil }
-	cmd.WaitDelay = time.Second
+	cmd := exec.Command(binary, args...)
 	env := []string{}
 	for _, entry := range os.Environ() {
 		k, _, _ := strings.Cut(entry, "=")
@@ -164,38 +162,40 @@ func (s *settingsStore) runLogin(ctx context.Context, task *settingsLogin, p set
 	}
 	cmd.Env = append(env, key+"="+home)
 	configureProcess(cmd)
-	reader, writer := io.Pipe()
-	cmd.Stdout = writer
-	cmd.Stderr = writer
 	s.mu.Lock()
 	current, ok := s.profileLocked(p.ID)
 	valid := ok && current.Generation == task.Generation && task.State != "cancelled"
 	s.mu.Unlock()
 	if !valid {
 		task.cancel()
-		_ = reader.Close()
-		_ = writer.Close()
 		return
 	}
-	err := cmd.Start()
+	tree, err := startProcessTreeWith(cmd, nil, processTreeOptions{MergeStderr: true})
 	if err == nil {
-		done := make(chan struct{})
+		// Cancellation and the five minute limit end the whole group through the tree.
+		stopWatch := make(chan struct{})
 		go func() {
-			defer close(done)
-			scanner := bufio.NewScanner(io.LimitReader(reader, 65536))
-			scanner.Buffer(make([]byte, 4096), 8192)
-			for scanner.Scan() {
-				s.parseLoginLine(task, scanner.Text())
+			select {
+			case <-ctx.Done():
+				tree.Release(true)
+				tree.Terminate(100 * time.Millisecond)
+			case <-stopWatch:
 			}
-			_ = reader.Close()
 		}()
-		err = cmd.Wait()
-		_ = writer.Close()
-		<-done
-	} else {
-		_ = writer.Close()
+		scanner := bufio.NewScanner(io.LimitReader(tree.Stdout(), 65536))
+		scanner.Buffer(make([]byte, 4096), 8192)
+		for scanner.Scan() {
+			s.parseLoginLine(task, scanner.Text())
+		}
+		// A finished sign-in leaves anything the provider deliberately started alone.
+		tree.Release(ctx.Err() != nil)
+		<-tree.Done()
+		close(stopWatch)
+		err = tree.Err()
+		if err == nil && ctx.Err() != nil {
+			err = ctx.Err()
+		}
 	}
-	_ = reader.Close()
 	if err == nil {
 		checkArgs := []string{"-c", "cli_auth_credentials_store=\"keyring\"", "login", "status"}
 		if p.Provider == "claude" {

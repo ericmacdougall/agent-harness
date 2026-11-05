@@ -28,6 +28,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import safe_input
 import ticket_adapters as ta
 
 HERE = Path(__file__).resolve().parent
@@ -38,7 +39,8 @@ RECORD_BLOCK = re.compile(r"```" + RECORD_FENCE + r"\n(.*?)\n```", re.S)
 NAMESPACE = uuid.UUID("8f2a4f2e-3c1b-4b7e-9d55-6a1f0c2b7e10")
 KINDS = ("spec", "evidence", "click_test", "signoff")
 ROLES = ("adversarial", "acceptance")
-LOGGED_AGENT_TYPES = ("task-owner", "click-tester", "fixer", "red-team")
+# Every agent type is logged by SubagentStart (goodqa#14613); only these may record a spec review.
+REVIEWER_AGENT_TYPES = ("task-owner", "click-tester", "fixer", "red-team")
 OPEN_STATUSES = {"triage", "backlog", "todo", "in_progress", "in_review", "on_dev", "verified_on_dev",
                  "on_staging", "verified_on_staging", "on_production"}
 REASON_STATUSES = {"wont_fix", "duplicate"}
@@ -66,9 +68,35 @@ class SpecError(Exception):
 
 # --------------------------------------------------------------------------- configuration
 
+SPEC_LOCAL_KEYS = ("projects", "enforced_projects")
+
+
 def load_spec_policy(path: Path = POLICY_FILE) -> dict:
+    """The shipped policy is generic. Personal values (your GoodQA projects, which projects are enforced)
+    live in the untracked spec_policy.local.json beside it, which may set only SPEC_LOCAL_KEYS. A profile
+    that exists but cannot be read fails closed (ValueError)."""
     with open(path, encoding="utf-8") as handle:
         policy = json.load(handle)
+    local = Path(path).with_name("spec_policy.local.json")
+    if os.path.lexists(local) and not local.is_file():
+        raise ValueError(f"{local} exists but is not a readable regular file")
+    if local.is_file():
+        try:
+            overlay = safe_input.safe_json_loads(safe_input.read_bounded(local, 1 << 20))
+        except (OSError, ValueError, safe_input.InputRejected) as error:
+            raise ValueError(f"{local} is not a readable JSON object: {error}") from error
+        if not isinstance(overlay, dict):
+            raise ValueError(f"{local} is not a JSON object")
+        forbidden = sorted(k for k in overlay if k not in SPEC_LOCAL_KEYS and not k.startswith("_"))
+        if forbidden:
+            raise ValueError(f"{local} may only set {list(SPEC_LOCAL_KEYS)}, not {forbidden}")
+        routes = overlay.get("projects") or {}
+        if not isinstance(routes, dict) or not isinstance(overlay.get("enforced_projects", []), list):
+            raise ValueError(f"{local}: projects must be an object and enforced_projects a list")
+        for slug, route in routes.items():
+            if not isinstance(route, dict) or set(route) - {"project_id", "org_id", "key_file"}:
+                raise ValueError(f"{local}: project route {slug!r} may only set project_id, org_id, key_file")
+        policy = {**policy, **{k: v for k, v in overlay.items() if k in SPEC_LOCAL_KEYS}}
     if not isinstance(policy, dict) or policy.get("schema") != 1:
         raise ValueError(f"{path} is not a schema 1 spec policy")
     for key in ("mode", "plan_ticket_gate"):
@@ -1380,8 +1408,10 @@ def cmd_review(args, spec_policy):
         types = [e.get("agent_type") for e in wal_entries(checked_wal(Path(args.wal)))
                  if e.get("event") == "subagent" and e.get("agent_id") == agent]
         if not types:
-            raise SpecError(f"agent {args.agent} has no subagent record in {args.wal}; only "
-                            f"{', '.join(LOGGED_AGENT_TYPES)} agents are logged")
+            raise SpecError(f"agent {args.agent} has no subagent record in {args.wal}")
+        if types[0] not in REVIEWER_AGENT_TYPES:
+            raise SpecError(f"agent {args.agent} is a {types[0] or 'typeless'} agent; only "
+                            f"{', '.join(REVIEWER_AGENT_TYPES)} agents may record a review")
         if args.role == "adversarial" and types[0] != "red-team":
             raise SpecError("the adversarial review must come from a red-team agent, a helper receipt or a human")
         data = read_regular(Path(args.report_file), 1_000_000)
