@@ -235,14 +235,19 @@ class CredentialScriptTests(Base):
                 self.assertRefused(command)
 
     def test_harness_tools_are_not_refused(self):
-        """Every hook and helper the harness ships, run by path. A mention of rclone must not stop them."""
+        """Every hook and helper the harness ships, run by path. A mention of rclone must not stop them: the verdict is the
+        one main's rules give (some tools, such as log-backup.sh, are refused by main's log rule, which this leaves alone)."""
         files = sorted(p for d in ('harness/hooks', 'harness/bin', 'scripts', 'tools') for p in (ROOT / d).glob('*')
                        if p.is_file() and p.suffix in ('.py', '.sh'))
         self.assertGreater(len(files), 20)
+        compiled = cg.Compiled(cg.load_policy(), cwd=str(self.home))
         for path in files:
             run = 'bash' if path.suffix == '.sh' else 'python3'
+            command = '%s %s' % (run, path)
             with self.subTest(path=path.name):
-                self.assertNotEqual(self.verdict('%s %s' % (run, path)), 'block')
+                verdict, message = cg.decide(command, compiled, cwd=str(self.home))[:2]
+                self.assertNotIn('credential-script', message)
+                self.assertEqual(verdict, self.main_verdict(command, compiled))
 
     def test_data_and_lookalikes_are_not_refused(self):
         marker = b'.config/rclone/rclone.conf GOODQA_CLOUDFLARE_API_TOKEN\n'
