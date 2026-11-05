@@ -1,47 +1,67 @@
 #!/usr/bin/env python3
 """Loss-class inventory for a host that is about to be decommissioned (goodqa#14565, PL-03).
 
-Single-file, stdlib-only. Counts and paths only: it never reads file contents
-(the one exception is the 16-byte SQLite magic header of a ``.db`` file, used
-to avoid listing non-database files) and never prints secrets.
+Single-file, stdlib-only. Counts and paths only: it never reads file contents or prints secrets
+(the one read is the 16-byte SQLite magic header of a ``.db`` file; git status/crontab output is
+reduced to a count and a hash).
 
 Subcommands
-  scan   --root DIR [--root DIR ...] [--json] [--max-seconds N] [--min-db-bytes N]
-         Walk the roots and classify what would be lost with the host:
-           unpushed_branch      local branch (or detached HEAD) whose tip is in no
-                                remote-tracking ref (LOCAL refs only; never fetches,
-                                so it can be stale versus the real remote)
-           no_remote_repo       git work tree with no remote at all
-           systemd_user_unit    *.service in $HOME/.config/systemd/user
-           timer                *.timer in $HOME/.config/systemd/user
-           state_db_outside_git sqlite/db file >= --min-db-bytes outside any git work tree
+  scan   --root DIR [--root DIR ...] [--json] [--max-seconds N] [--min-db-bytes N] [--exclude NAME]
+         [--cross-devices] [--allow-symlink-target PATH] [--no-save]
+         Classes (rows keyed by path; branch rows are REPO::branch):
+           unpushed_branch      local branch/detached HEAD whose tip is in no OFF-HOST remote-tracking ref
+           no_remote_repo       git repo (incl. bare) with no remote, or only same-host remotes
+                                (local path, file://, localhost, this hostname)
+           local_tag            tag whose commit is in no off-host remote-tracking ref
+           git_stash            repo has stash entries
+           dirty_worktree       work tree with uncommitted/untracked entries (count only)
+           systemd_user_unit    .service/.socket/.path/.mount/.automount in ~/.config/systemd/user
+                                and ~/.local/share/systemd/user
+           timer                .timer in the same directories
+           crontab              user crontab has active lines (count only)
+           state_db_outside_git sqlite/db >= --min-db-bytes not tracked by git
+         Git state comes from LOCAL refs only and never fetches, so it can be stale.
          The result is saved to $HOME/.agent-harness/state/loss-inventory/last-scan.json.
   decide --row PATH --decision moved|rebuildable|accepted-loss --ticket REF
-         Append a decision to $HOME/.agent-harness/state/loss-inventory/decisions.jsonl.
-         PATH must be a row of the last saved scan.
-  report [--json]
-         Print rows of the last saved scan that have no decision. Exit 1 if any remain
-         or the saved scan was partial, had errors, or skipped other filesystems
-         (such a scan cannot prove nothing is left),
-         exit 2 if there is no saved scan, otherwise 0.
+         Append to $HOME/.agent-harness/state/loss-inventory/decisions.jsonl. PATH must be a row of
+         the last scan. A decision on a git/crontab row is voided by any change of its fingerprint
+         (tips, stash, status hash, crontab hash); on a DB or unit only a "moved" decision is voided.
+  report [--json] [--max-age HOURS] [--allow-partial-roots]
+         Print undecided rows and problems. Exit 1 if any row is undecided OR the saved scan cannot
+         prove nothing is left: wrong schema/missing keys, older than --max-age (default 24 h), roots
+         do not include $HOME, partial (--max-seconds), scan errors, skipped other-filesystem dirs,
+         or symlinks not followed whose target is outside the scanned roots. Exit 2 if no saved
+         scan, else 0. Excluded and built-in pruned directory names are listed in the output.
 
-Safety: symlinks are never followed (a symlinked directory is not entered, a symlinked
-file is not sized through); the walk does not cross filesystems unless --cross-devices;
-node_modules, .git internals, virtualenvs and caches are skipped; every git call has a
-timeout and a failing repo becomes an entry in "errors", not a crash.
+NOT covered (known limits): system units (/etc/systemd/system), other users' crontabs and homes,
+anything outside the --root dirs, git objects outside refs (reflog-only commits), rewritten
+remotes (url.insteadOf), and remote-side state (we never contact a remote).
+
+Safety: symlinks are never followed; the walk does not cross filesystems unless --cross-devices;
+node_modules, .git internals, virtualenvs and caches are skipped; every git call has a timeout,
+runs with optional locks off and fsmonitor disabled, and a failing repo becomes an entry in
+"errors", not a crash.
 """
 import argparse
 import getpass
 import hashlib
 import json
 import os
+import re
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 
-CLASSES = ("unpushed_branch", "no_remote_repo", "systemd_user_unit", "timer", "state_db_outside_git")
+SCHEMA = 2
+CLASSES = ("unpushed_branch", "no_remote_repo", "systemd_user_unit", "timer", "state_db_outside_git",
+           "git_stash", "local_tag", "dirty_worktree", "crontab")
+UNIT_EXTS = (".service", ".socket", ".path", ".mount", ".automount")
+REQUIRED_KEYS = ("schema", "host", "scanned_at", "roots", "classes", "rows", "partial", "errors_total",
+                 "skipped_mounts_total", "skipped_symlinks_total", "excludes", "prune")
 DECISIONS = ("moved", "rebuildable", "accepted-loss")
 DB_EXTS = (".sqlite", ".sqlite3", ".db")
 SQLITE_MAGIC = b"SQLite format 3\x00"
@@ -80,8 +100,11 @@ class Scan:
     def __init__(self, args):
         self.min_db = args.min_db_bytes
         self.budget = Budget(args.max_seconds)
-        self.prune = PRUNE | set(args.exclude or [])
+        self.extra_prune = set(args.exclude or [])
+        self.prune = PRUNE | self.extra_prune
         self.cross = args.cross_devices
+        self.symlink_allow = [os.path.abspath(os.path.expanduser(x)) for x in (args.allow_symlink_target or [])]
+        self.roots_real = []
         self.rows = []
         self.errors = []
         self.errors_total = 0
@@ -90,16 +113,22 @@ class Scan:
         self.now = time.time()
         self.seen_common = set()
         self.skipped_mounts = []
+        self.skipped_symlinks = []
+        self.skipped_symlinks_total = 0
+        self.local_names = local_host_names()
 
     def err(self, path, what):
         self.errors_total += 1
         if len(self.errors) < MAX_ERRORS:
             self.errors.append({"path": path, "error": str(what)[:200]})
 
-    def row(self, cls, path, mtime, size, fp=None):
+    def row(self, cls, path, mtime, size, fp=None, count=None):
         age = None if mtime is None else round(max(0.0, self.now - mtime) / 86400.0, 1)
-        self.rows.append({"class": cls, "path": path, "age_days": age, "bytes": size, "decision": None,
-                          "fp": fp})  # fp: tip sha or size:mtime; a decision is void when it changes
+        r = {"class": cls, "path": path, "age_days": age, "bytes": size, "decision": None,
+             "fp": fp}  # fp: tip sha / hash / size:mtime; a decision is void when it changes
+        if count is not None:
+            r["count"] = count  # number of entries (stash entries, dirty paths, cron lines); never contents
+        self.rows.append(r)
 
     # ---- git (local refs only, never fetch) ----
     def git(self, repo, *argv):
@@ -108,10 +137,12 @@ class Scan:
         env = os.environ.copy()
         for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
             env.pop(k, None)
-        env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
+        env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")  # optional locks off: status never writes the index
+        # fsmonitor=false: a scanned repo's config must not be able to run a command
+        cmd = ["git", "-C", repo, "-c", "core.fsmonitor=false"] + list(argv)
         try:
-            p = subprocess.run(["git", "-C", repo] + list(argv), stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+                               env=env, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             raise RuntimeError("git %s timed out" % argv[0])
         except OSError as e:
@@ -126,55 +157,116 @@ class Scan:
             raise RuntimeError("for-each-ref --contains failed: %s" % er.strip()[:120])
         return bool(out.strip())
 
-    def analyze_repo(self, repo, gitpath):
-        """Branch/remote checks run once per common git dir (linked worktrees, submodules and
-        bare repos with worktrees share refs); the detached-HEAD check runs per work tree."""
+    def offhost_remotes(self, repo):
+        """Names of remotes whose URL is not this host (URLs are never stored or printed)."""
+        rc, out, er = self.git(repo, "remote")
+        if rc != 0:
+            raise RuntimeError("git remote failed: %s" % er.strip()[:120])
+        names = [n for n in out.split("\n") if n.strip()]
+        good = []
+        for n in names:
+            urls = []
+            for key in ("url", "pushurl"):
+                rc, o, _ = self.git(repo, "config", "--get-all", "remote.%s.%s" % (n, key))
+                if rc == 0:
+                    urls += [u for u in o.split("\n") if u.strip()]
+            if urls and not any(url_is_local(u, self.local_names) for u in urls):
+                good.append(n)
+        return names, good
+
+    def any_not_in_remotes(self, repo, kind, offhost):
+        """Fast path: one rev-list says whether any local branch/tag has a commit no off-host remote has."""
+        if any(c in n for n in offhost for c in "*?["):
+            return True
+        rc, out, _ = self.git(repo, "rev-list", "--max-count=1", kind, "--not",
+                              *["--remotes=%s" % n for n in offhost])
+        return rc != 0 or bool(out.strip())
+
+    def analyze_repo(self, repo):
+        """Branch/remote/stash checks run once per common git dir (linked worktrees, submodules and
+        bare repos with worktrees share refs); detached-HEAD and dirty checks run per work tree."""
         self.repos += 1
         try:
-            rc, out, er = self.git(repo, "rev-parse", "--git-common-dir")
-            if rc != 0:
+            rc, out, er = self.git(repo, "rev-parse", "--git-common-dir", "--is-bare-repository")
+            lines = out.split("\n")
+            if rc != 0 or len(lines) < 2:
                 raise RuntimeError("git rev-parse failed: %s" % er.strip()[:120])
-            common = os.path.realpath(os.path.join(repo, out.strip()))
-            rc, out, er = self.git(repo, "remote")
-            if rc != 0:
-                raise RuntimeError("git remote failed: %s" % er.strip()[:120])
-            has_remote = bool(out.strip())
+            common = os.path.realpath(os.path.join(repo, lines[0].strip()))
+            bare = lines[1].strip() == "true"
+            names, offhost = self.offhost_remotes(repo)
+            ns = ["refs/remotes/%s" % n for n in offhost]
             if common not in self.seen_common:
                 self.seen_common.add(common)
-                if not has_remote:
-                    try:
-                        mtime = os.lstat(common).st_mtime
-                    except OSError:
-                        mtime = None
-                    # fingerprint = all local branch tips, so a commit on any branch voids a decision
-                    rc, refs, _ = self.git(repo, "for-each-ref", "--format=%(refname)%(objectname)", "refs/heads")
-                    fp = hashlib.sha256(refs.encode("utf-8", "replace")).hexdigest()[:16] if rc == 0 else None
-                    self.row("no_remote_repo", repo, mtime, self.pack_bytes(common), fp)
-                else:
-                    rc, out, er = self.git(repo, "for-each-ref", "--format=%(refname:short)\t%(objectname)\t%(committerdate:unix)",
-                                           "refs/heads")
-                    if rc != 0:
-                        raise RuntimeError("for-each-ref failed: %s" % er.strip()[:120])
-                    for line in out.splitlines():
-                        parts = line.split("\t")
-                        if len(parts) != 3 or self.budget.over():
-                            continue
-                        name, sha, ct = parts
-                        if not self.contained_in(repo, sha, "refs/remotes"):
-                            self.row("unpushed_branch", "%s::%s" % (repo, name), float(ct) if ct.isdigit() else None, None, sha)
-            if not has_remote or self.budget.over():
-                return
-            rc, _, _ = self.git(repo, "symbolic-ref", "-q", "HEAD")
-            if rc == 1:  # detached HEAD
-                rc, sha, _ = self.git(repo, "rev-parse", "--verify", "-q", "HEAD")
-                sha = sha.strip()
-                if rc == 0 and sha and not self.contained_in(repo, sha, "refs/remotes", "refs/heads", "refs/tags"):
-                    rc, ct, _ = self.git(repo, "log", "-1", "--format=%ct", sha)
-                    ct = ct.strip()
-                    self.row("unpushed_branch", "%s::(detached HEAD)" % repo,
-                             float(ct) if ct.isdigit() else None, None, sha)
+                self.first_visit(repo, common, offhost, ns)
+            if offhost and not self.budget.over():
+                self.check_detached(repo, ns)
+            if not bare and not self.budget.over():
+                self.check_dirty(repo)
         except RuntimeError as e:
             self.err(repo, e)
+
+    def first_visit(self, repo, common, offhost, ns):
+        rc, refs, er = self.git(repo, "for-each-ref", "--format=%(refname:short)\t%(objectname)\t%(committerdate:unix)",
+                                "refs/heads")
+        if rc != 0:
+            raise RuntimeError("for-each-ref failed: %s" % er.strip()[:120])
+        if not offhost:
+            try:
+                mtime = os.lstat(common).st_mtime
+            except OSError:
+                mtime = None
+            # fingerprint = every local branch tip + HEAD, so a commit anywhere voids a decision
+            rc2, head, _ = self.git(repo, "rev-parse", "--verify", "-q", "HEAD")
+            tips = "\n".join(l.split("\t")[0] + l.split("\t")[1] for l in refs.splitlines() if l.count("\t") == 2)
+            fp = hashlib.sha256((tips + "\nHEAD:" + (head.strip() if rc2 == 0 else "")).encode("utf-8", "replace")).hexdigest()[:16]
+            self.row("no_remote_repo", repo, mtime, self.pack_bytes(common), fp)
+        else:
+            if self.any_not_in_remotes(repo, "--branches", offhost):
+                for line in refs.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) != 3 or self.budget.over():
+                        continue
+                    name, sha, ct = parts
+                    if not self.contained_in(repo, sha, *ns):
+                        self.row("unpushed_branch", "%s::%s" % (repo, name), float(ct) if ct.isdigit() else None, None, sha)
+            if self.any_not_in_remotes(repo, "--tags", offhost):
+                rc, tags, er = self.git(repo, "for-each-ref", "--format=%(refname:short)\t%(objectname)", "refs/tags")
+                if rc != 0:
+                    raise RuntimeError("for-each-ref tags failed: %s" % er.strip()[:120])
+                for line in tags.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) != 2 or self.budget.over():
+                        continue
+                    tname, tsha = parts
+                    if not self.contained_in(repo, tsha, *ns):
+                        self.row("local_tag", "%s::tag:%s" % (repo, tname), None, None, tsha)
+        rc, sha, _ = self.git(repo, "rev-parse", "--verify", "-q", "refs/stash")
+        if rc == 0 and sha.strip():
+            rc, cnt, _ = self.git(repo, "rev-list", "-g", "--count", "refs/stash")
+            rc2, ct, _ = self.git(repo, "log", "-1", "--format=%ct", "refs/stash")
+            self.row("git_stash", "%s::stash" % repo, float(ct.strip()) if ct.strip().isdigit() else None, None,
+                     sha.strip(), int(cnt.strip()) if cnt.strip().isdigit() else None)
+
+    def check_detached(self, repo, ns):
+        rc, _, _ = self.git(repo, "symbolic-ref", "-q", "HEAD")
+        if rc != 1:
+            return
+        rc, sha, _ = self.git(repo, "rev-parse", "--verify", "-q", "HEAD")
+        sha = sha.strip()
+        if rc == 0 and sha and not self.contained_in(repo, sha, *(ns + ["refs/heads", "refs/tags"])):
+            rc, ct, _ = self.git(repo, "log", "-1", "--format=%ct", sha)
+            ct = ct.strip()
+            self.row("unpushed_branch", "%s::(detached HEAD)" % repo, float(ct) if ct.isdigit() else None, None, sha)
+
+    def check_dirty(self, repo):
+        """Count of changed/untracked entries only (git status --porcelain, no index write)."""
+        rc, out, er = self.git(repo, "status", "--porcelain")
+        if rc != 0:
+            raise RuntimeError("git status failed: %s" % er.strip()[:120])
+        n = len([l for l in out.split("\n") if l.strip()])
+        if n:
+            self.row("dirty_worktree", "%s::dirty" % repo, self.now, None,
+                     hashlib.sha256(out.encode("utf-8", "replace")).hexdigest()[:16], n)
 
     def tracked(self, repo_root, path):
         """True if path is tracked by git (so it lives in the repo, not only on this disk)."""
@@ -197,39 +289,79 @@ class Scan:
             return None
         return total
 
-    # ---- systemd user units ----
+    # ---- systemd user units and crontab ----
     def scan_units(self):
-        d = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+        home = os.path.expanduser("~")
+        for d in (os.path.join(home, ".config", "systemd", "user"),
+                  os.path.join(home, ".local", "share", "systemd", "user")):
+            try:
+                with os.scandir(d) as it:
+                    entries = sorted(it, key=lambda e: e.name)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                self.err(d, e)
+                continue
+            for e in entries:
+                cls = "timer" if e.name.endswith(".timer") else "systemd_user_unit" if e.name.endswith(UNIT_EXTS) else None
+                if not cls:
+                    continue
+                try:
+                    st = e.stat(follow_symlinks=False)
+                except OSError as ex:
+                    self.err(e.path, ex)
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    continue
+                self.row(cls, e.path, st.st_mtime, st.st_size, "%d:%d" % (st.st_size, st.st_mtime))
+
+    def scan_crontab(self):
+        """User crontab: count of active lines only; contents are hashed and discarded."""
         try:
-            with os.scandir(d) as it:
-                entries = sorted(it, key=lambda e: e.name)
+            p = subprocess.run(["crontab", "-l"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               timeout=10, stdin=subprocess.DEVNULL)
         except FileNotFoundError:
             return
-        except OSError as e:
-            self.err(d, e)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self.err("crontab", e)
             return
-        for e in entries:
-            cls = "systemd_user_unit" if e.name.endswith(".service") else "timer" if e.name.endswith(".timer") else None
-            if not cls:
-                continue
-            try:
-                st = e.stat(follow_symlinks=False)
-            except OSError as ex:
-                self.err(e.path, ex)
-                continue
-            if e.is_dir(follow_symlinks=False):
-                continue
-            self.row(cls, e.path, st.st_mtime, st.st_size, "%d:%d" % (st.st_size, st.st_mtime))
+        if p.returncode != 0:
+            return  # "no crontab for user"
+        text = p.stdout.decode("utf-8", "replace")
+        n = len([l for l in text.split("\n") if l.strip() and not l.strip().startswith("#")])
+        if n:
+            self.row("crontab", "crontab:%s" % getpass.getuser(), self.now, None,
+                     hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16], n)
 
     # ---- tree walk ----
     def is_sqlite(self, path, name):
         if name.endswith((".sqlite", ".sqlite3")):
             return True
-        try:  # .db: header magic only, no other content
-            with open(path, "rb") as f:
-                return f.read(16) == SQLITE_MAGIC
+        try:  # .db: header magic only, no other content; O_NONBLOCK so a FIFO cannot hang us
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
         except OSError:
             return False
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return False
+            return os.read(fd, 16) == SQLITE_MAGIC
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
+    def inside(self, target, prefixes):
+        return any(target == r or target.startswith(r.rstrip("/") + "/") for r in prefixes)
+
+    def note_symlink(self, path, force=False):
+        """A symlink we did not follow. Blocks report unless its target is inside a scanned root
+        (it is then inventoried through the real path) or under --allow-symlink-target."""
+        target = os.path.realpath(path)
+        if not force and (self.inside(target, self.roots_real) or self.inside(target, self.symlink_allow)):
+            return
+        self.skipped_symlinks_total += 1
+        if len(self.skipped_symlinks) < MAX_ERRORS:
+            self.skipped_symlinks.append({"path": path, "target": target})
 
     def walk(self, root):
         try:
@@ -250,21 +382,29 @@ class Scan:
                 continue
             self.dirs += 1
             names = {e.name: e for e in entries}
-            # bare repository: HEAD + objects + refs; nothing to inventory, do not descend
+            # bare repository: HEAD + objects + refs; inventory it, do not descend
             if all(n in names for n in ("HEAD", "objects", "refs")) and ".git" not in names:
-                self.analyze_repo(cur, cur)  # bare repository: inventory it, do not descend
+                self.analyze_repo(cur)
                 continue
             g = names.get(".git")
             if g is not None:
                 try:
-                    if g.is_dir(follow_symlinks=False) or g.is_file(follow_symlinks=False):
-                        self.analyze_repo(cur, g.path)
+                    if g.is_symlink():
+                        self.note_symlink(g.path, force=True)  # repo not analysed: always blocks
+                    elif g.is_dir(follow_symlinks=False) or g.is_file(follow_symlinks=False):
+                        self.analyze_repo(cur)
                         repo_root = cur
                 except OSError as e:
                     self.err(cur, e)
             for e in entries:
                 try:
                     if e.is_symlink():
+                        if e.name in self.prune or e.name == ".git":
+                            continue
+                        if e.is_dir():  # follows the link only to learn it is a directory
+                            self.note_symlink(e.path)
+                        elif e.name.endswith(DB_EXTS) and os.path.exists(e.path):
+                            self.note_symlink(e.path)
                         continue
                     if e.is_dir(follow_symlinks=False):
                         if e.name in self.prune:
@@ -281,6 +421,34 @@ class Scan:
                                      "%d:%d" % (st.st_size, st.st_mtime))
                 except OSError as ex:
                     self.err(e.path, ex)
+
+
+def local_host_names():
+    names = {"localhost", "127.0.0.1", "::1"}
+    for n in (socket.gethostname(), socket.getfqdn()):
+        if n:
+            names.add(n.lower())
+            names.add(n.lower().split(".")[0])
+    return names
+
+
+def url_is_local(url, local_names):
+    """True if a remote URL points at this machine (a path, file://, localhost or our own hostname)."""
+    u = url.strip()
+    if not u or u == "." or u.startswith(("/", "./", "../", "~", "file:")):
+        return True
+    m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]*@)?(\[[^\]]+\]|[^:/]+)", u)
+    if not m:
+        m = re.match(r"^(?:[^@/:]+@)?(\[[^\]]+\]|[^:/]+):", u)  # scp-like host:path
+    if not m:
+        return True  # plain relative path
+    host = m.group(1).strip("[]").lower()
+    return host in local_names or host.split(".")[0] in local_names
+
+
+# decisions on these classes are voided by ANY change of the row fingerprint: the content behind a
+# branch/tree/stash/crontab can change under the same path
+GUARDED = {"unpushed_branch", "no_remote_repo", "git_stash", "local_tag", "dirty_worktree", "crontab"}
 
 
 def load_decisions():
@@ -301,32 +469,51 @@ def load_decisions():
 
 
 def merge_decisions(rows):
-    """A decision applies only while the row's fingerprint (branch tip / size:mtime) is unchanged."""
+    """Apply recorded decisions unless the row changed since it was decided (fingerprint)."""
     dec = load_decisions()
     for r in rows:
         d = dec.get(r["path"])
-        # only "moved" depends on content; accepted-loss/rebuildable on a live DB must not churn
-        stale = d is not None and d.get("decision") == "moved" and d.get("fp") is not None and r.get("fp") is not None and d["fp"] != r["fp"]
-        r["decision"] = d["decision"] if d and not stale else None
+        stale = False
+        if d is not None:
+            if r["class"] in GUARDED:
+                stale = r.get("fp") is None or d.get("fp") != r.get("fp")  # unknown fingerprint: fail closed
+            else:  # live DBs/units: only a "moved" claim depends on content
+                stale = d["decision"] == "moved" and d.get("fp") is not None and r.get("fp") is not None and d["fp"] != r["fp"]
+        r["decision"] = d["decision"] if d is not None and not stale else None
         r["decision_stale"] = True if stale else None
     return rows
 
 
+def ensure_state_dir():
+    d = state_dir()
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    return d
+
+
 def write_private(path, text):
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    tmp = "%s.%d.tmp" % (path, os.getpid())
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    ensure_state_dir()
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(path))  # O_EXCL, mode 0600
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def cmd_scan(args):
     roots = [os.path.abspath(os.path.expanduser(r)) for r in args.root]
     s = Scan(args)
+    s.roots_real = [os.path.realpath(r) for r in roots]
     s.scan_units()
+    s.scan_crontab()
     for r in roots:
         s.walk(r)
     uniq = {}
@@ -338,13 +525,16 @@ def cmd_scan(args):
     for r in s.rows:
         classes[r["class"]] += 1
     result = {
-        "host": socket.gethostname(), "scanned_at": now_iso(), "roots": roots, "excludes": sorted(s.prune - PRUNE),
+        "schema": SCHEMA, "host": socket.gethostname(), "scanned_at": now_iso(), "roots": roots,
         "classes": classes, "rows": s.rows,
         "partial": s.budget.exceeded,
         "partial_reason": "max-seconds budget exceeded" if s.budget.exceeded else None,
         "dirs_scanned": s.dirs, "repos_scanned": s.repos,
-        "errors": s.errors, "errors_total": s.errors_total, "skipped_mounts": s.skipped_mounts[:MAX_ERRORS],
-        "skipped_mounts_total": len(s.skipped_mounts),
+        "errors": s.errors, "errors_total": s.errors_total,
+        "skipped_mounts": s.skipped_mounts[:MAX_ERRORS], "skipped_mounts_total": len(s.skipped_mounts),
+        "skipped_symlinks": s.skipped_symlinks, "skipped_symlinks_total": s.skipped_symlinks_total,
+        "symlink_allow": s.symlink_allow,
+        "excludes": sorted(s.extra_prune), "prune": sorted(PRUNE),
         "note": "git state comes from local refs only (never fetched); remote-tracking refs may be stale",
     }
     if not args.no_save:
@@ -365,8 +555,9 @@ def load_last():
             d = json.load(f)
     except (OSError, ValueError):
         return None
-    if not isinstance(d, dict) or not isinstance(d.get("rows"), list) or not d.get("scanned_at"):
+    if not isinstance(d, dict) or not isinstance(d.get("rows"), list):
         return None
+    d["rows"] = [r for r in d["rows"] if isinstance(r, dict) and isinstance(r.get("path"), str) and r.get("class")]
     return d
 
 
@@ -389,7 +580,7 @@ def cmd_decide(args):
         return 2
     entry = {"ts": now_iso(), "path": path, "class": match[0]["class"], "decision": args.decision,
              "ticket": ticket, "by": args.by or getpass.getuser(), "fp": match[0].get("fp")}
-    os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+    ensure_state_dir()
     fd = os.open(os.path.join(state_dir(), "decisions.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         os.write(fd, (json.dumps(entry) + "\n").encode("utf-8"))  # one write: atomic append
@@ -400,35 +591,72 @@ def cmd_decide(args):
     return 0
 
 
+def roots_cover_home(roots):
+    home = os.path.realpath(os.path.expanduser("~"))
+    for r in roots:
+        r = os.path.realpath(r).rstrip("/")
+        if home == r or home.startswith(r + "/") or r == "":
+            return True
+    return False
+
+
 def cmd_report(args):
     last = load_last()
     if last is None:
         print("error: no saved scan; run scan first", file=sys.stderr)
         return 2
-    undecided = [r for r in merge_decisions(last["rows"]) if r["decision"] is None]
-    partial = bool(last.get("partial"))
+    problems = []  # each one means "this scan cannot prove nothing is left"
+    missing = [k for k in REQUIRED_KEYS if k not in last]
+    if missing:
+        problems.append("INCOMPLETE\tsaved scan is incomplete or not written by this tool (missing: %s)" % ",".join(missing))
+    elif last.get("schema") != SCHEMA:
+        problems.append("INCOMPLETE\tsaved scan has schema %r, expected %d; rescan" % (last.get("schema"), SCHEMA))
+    try:
+        age_h = (datetime.now(timezone.utc) - datetime.strptime(last.get("scanned_at", ""), "%Y-%m-%dT%H:%M:%SZ")
+                 .replace(tzinfo=timezone.utc)).total_seconds() / 3600.0
+    except (ValueError, TypeError):
+        age_h = None
+        problems.append("INCOMPLETE\tscanned_at missing or unparseable")
+    if age_h is not None and age_h > args.max_age:
+        problems.append("STALE\tscan is %.1f h old, older than --max-age %g h; rescan" % (age_h, args.max_age))
+    roots = last.get("roots") or []
+    if not args.allow_partial_roots and not roots_cover_home(roots):
+        problems.append("ROOTS\tscanned roots do not include $HOME; rescan with --root ~ (or --allow-partial-roots)")
+    undecided = [r for r in merge_decisions(last["rows"]) if r.get("decision") is None]
+    if last.get("partial"):
+        problems.append("PARTIAL\tscan hit its --max-seconds budget; some of the tree was not scanned")
     errors = last.get("errors") or []
-    nerr = last.get("errors_total", len(errors))
-    nmounts = last.get("skipped_mounts_total", 0)
-    incomplete = partial or nerr > 0 or nmounts > 0
+    if last.get("errors_total", len(errors)) > 0:
+        problems.append("ERRORS\t%d scan errors" % last.get("errors_total", len(errors)))
+    if last.get("skipped_mounts_total", 0) > 0:
+        problems.append("SKIPPED_MOUNTS\t%d other-filesystem dirs not scanned; rescan with --cross-devices" % last["skipped_mounts_total"])
+    if last.get("skipped_symlinks_total", 0) > 0:
+        problems.append("SKIPPED_SYMLINKS\t%d symlinks not followed whose target is outside the scanned roots; scan the target as a --root or use --allow-symlink-target" % last["skipped_symlinks_total"])
     if args.json:
-        print(json.dumps({"scanned_at": last.get("scanned_at"), "partial": partial, "errors_total": nerr, "excludes": last.get("excludes", []),
+        print(json.dumps({"scanned_at": last.get("scanned_at"), "roots": roots, "problems": problems,
+                          "partial": bool(last.get("partial")), "errors_total": last.get("errors_total"),
                           "errors": errors, "skipped_mounts": last.get("skipped_mounts", []),
-                          "undecided": undecided}, indent=1))
+                          "skipped_symlinks": last.get("skipped_symlinks", []), "excludes": last.get("excludes", []),
+                          "prune": last.get("prune", []), "undecided": undecided}, indent=1))
     else:
-        print("last scan %s%s" % (last.get("scanned_at"), " (PARTIAL: some of the tree was not scanned)" if partial else ""))
+        print("last scan %s (incomplete)" % last.get("scanned_at") if problems else "last scan %s" % last.get("scanned_at"))
+        print("ROOTS\t%s" % ",".join(roots))
         for r in undecided:
-            print("%s\t%s\tage_days=%s\tbytes=%s%s" % (r["class"], r["path"], r["age_days"], r["bytes"],
+            print("%s\t%s\tage_days=%s\tbytes=%s%s" % (r["class"], r["path"], r.get("age_days"), r.get("bytes"),
                                                        "\t(decision stale: changed since decided)" if r.get("decision_stale") else ""))
-        if last.get("excludes"):
-            print("EXCLUDED_DIR_NAMES\t%s (anything under these names anywhere was not inventoried)" % ",".join(last["excludes"]))
+        for pr in problems:
+            print(pr)
         for e in errors:
             print("ERROR\t%s\t%s" % (e["path"], e["error"]))
         for m in last.get("skipped_mounts", []):
-            print("SKIPPED_MOUNT\t%s (other filesystem; rescan with --cross-devices)" % m)
-        print("%d undecided, %d scan errors, %d skipped mounts" % (len(undecided), nerr, nmounts))
-    # a scan that could not see everything cannot prove nothing is left
-    return 1 if (undecided or incomplete) else 0
+            print("SKIPPED_MOUNT\t%s" % m)
+        for sl in last.get("skipped_symlinks", []):
+            print("SKIPPED_SYMLINK\t%s -> %s" % (sl["path"], sl["target"]))
+        if last.get("excludes"):
+            print("EXCLUDED_DIR_NAMES\t%s (anything under these names anywhere was not inventoried)" % ",".join(last["excludes"]))
+        print("PRUNED_DIR_NAMES\t%s (never inventoried)" % ",".join(last.get("prune", [])))
+        print("%d undecided, %d problems" % (len(undecided), len(problems)))
+    return 1 if (undecided or problems) else 0
 
 
 def main(argv=None):
@@ -439,8 +667,9 @@ def main(argv=None):
     s.add_argument("--json", action="store_true")
     s.add_argument("--max-seconds", type=float, default=900, help="time budget, 0 = unlimited (default 900)")
     s.add_argument("--min-db-bytes", type=int, default=1000000)
-    s.add_argument("--exclude", action="append", help="extra directory name to skip")
+    s.add_argument("--exclude", action="append", help="extra directory name to skip (reported)")
     s.add_argument("--cross-devices", action="store_true")
+    s.add_argument("--allow-symlink-target", action="append", help="acknowledge symlinks whose target is under this path (reported)")
     s.add_argument("--no-save", action="store_true")
     d = sub.add_parser("decide")
     d.add_argument("--row", required=True)
@@ -449,6 +678,8 @@ def main(argv=None):
     d.add_argument("--by")
     r = sub.add_parser("report")
     r.add_argument("--json", action="store_true")
+    r.add_argument("--max-age", type=float, default=24, help="max scan age in hours (default 24)")
+    r.add_argument("--allow-partial-roots", action="store_true", help="do not require $HOME under the scanned roots")
     args = p.parse_args(argv)
     return {"scan": cmd_scan, "decide": cmd_decide, "report": cmd_report}[args.cmd](args)
 
