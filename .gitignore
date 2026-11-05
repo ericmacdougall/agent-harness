@@ -12,3 +12,8 @@ build/
 *.zip
 !testdata/mutants/LEDGER.jsonl
 console/console
+
+# Personal values: local profile, never committed (see harness/hooks/commit_policy.local.json.example)
+commit_policy.local.json
+spec_policy.local.json
+leak-denylist.txt

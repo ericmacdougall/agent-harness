@@ -9,8 +9,11 @@ Subcommands:
   waive           record a reasoned exception in the WAL and the waiver ledger
   notify          comment delivery evidence on referenced tickets
 
-Rules live in commit_policy.json beside this file. There is no environment
-bypass: the only exception path is `waive`, which records a reason in the WAL.
+Rules live in commit_policy.json beside this file; personal values (your org, repos) live in the
+untracked commit_policy.local.json, which may set only backstop_repos and ticket_systems. There is no
+environment bypass: the only exception path is `waive`, which records a reason in the WAL. (The
+AGENT_HARNESS_POLICY_LOCAL test variable is honoured only for files under the repository's tests/data,
+so on an installed copy it does nothing.)
 Runs on Python 3.9 with the standard library only.
 """
 
@@ -33,6 +36,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 POLICY_FILE = HERE / "commit_policy.json"
+LOCAL_PROFILE_NAME = "commit_policy.local.json"
 LEDGER = Path.home() / ".agent-harness" / "commit-policy" / "waivers.jsonl"
 SECTION_NAMES = ("Why", "What", "Testing", "Refs", "Risk", "Reason", "Authorized-by")
 SECTION_LINE = re.compile(r"^(Why|What|Testing|Refs|Risk|Reason|Authorized-by)\s*:\s?(.*)$", re.I)
@@ -56,9 +60,79 @@ class Unresolvable(Exception):
 
 # --------------------------------------------------------------------------- policy
 
+def _deep_merge(base: dict, extra: dict) -> dict:
+    """Objects merge key by key; every other value (lists included) is replaced by the profile."""
+    merged = dict(base)
+    for key, value in extra.items():
+        merged[key] = _deep_merge(merged[key], value) if isinstance(value, dict) and isinstance(merged.get(key), dict) else value
+    return merged
+
+
+LOCAL_PROFILE_KEYS = ("backstop_repos", "ticket_systems")
+LOCAL_TICKET_KEYS = ("repos", "org_id", "key_file", "key_secret", "default_project", "projects",
+                     "unreachable_projects", "unreachable_reason")
+
+
+def _override_allowed(candidate: Path) -> bool:
+    """Test fixtures only: the override must resolve inside <repo>/tests/data. An installed copy of the
+    hooks has no such directory, so there the override is inert."""
+    try:
+        here = Path(__file__).resolve()
+        root = here.parents[2]
+        # Only inside a source checkout (<root>/harness/hooks/ with install.py at <root>). An installed copy lives at
+        # ~/.claude/hooks, where parents[1] is ".claude", so a ~/tests/data directory someone creates does not count.
+        if not (here.parent.name == "hooks" and here.parents[1].name == "harness" and (root / "install.py").is_file()):
+            return False
+        data_dir = (root / "tests" / "data").resolve()
+        return data_dir.is_dir() and candidate.resolve().is_relative_to(data_dir)
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def load_policy(path: Path = POLICY_FILE) -> dict:
+    """Read the shipped (generic) policy, then overlay commit_policy.local.json beside it if present.
+
+    The local profile holds personal values (your org, repos, key location) and is never tracked or
+    overwritten by the installer. A profile that exists but cannot be parsed fails closed (ValueError)."""
     with open(path, encoding="utf-8") as handle:
         policy = json.load(handle)
+    override = os.environ.get("AGENT_HARNESS_POLICY_LOCAL")
+    if override and not _override_allowed(Path(override)):
+        # A variable set on one command line must never be able to swap the enforcement profile.
+        print("commit_policy: AGENT_HARNESS_POLICY_LOCAL ignored (only files under the repository's tests/data "
+              "are accepted)", file=sys.stderr)
+        override = None
+    local = Path(override) if override else Path(path).with_name(LOCAL_PROFILE_NAME)
+    if override and not local.is_file():
+        raise ValueError(f"AGENT_HARNESS_POLICY_LOCAL={local} does not exist")
+    if os.path.lexists(local) and not local.is_file():
+        # a dangling symlink, directory or FIFO must not read as "no profile" (that would silently drop enforcement)
+        raise ValueError(f"{local} exists but is not a readable regular file")
+    if local.is_file():
+        import safe_input  # same directory as this script; bounds size and nesting
+        try:
+            overlay = safe_input.safe_json_loads(safe_input.read_bounded(local, 1 << 20))
+        except (OSError, ValueError, safe_input.InputRejected) as error:
+            raise ValueError(f"{local} is not a readable JSON object: {error}") from error
+        if not isinstance(overlay, dict):
+            raise ValueError(f"{local} is not a JSON object")
+        forbidden = sorted(k for k in overlay if k not in LOCAL_PROFILE_KEYS and not k.startswith("_"))
+        if forbidden:  # a profile holds personal values only; it cannot switch off enforcement rules
+            raise ValueError(f"{local} may only set {sorted(LOCAL_PROFILE_KEYS)}, not {forbidden}")
+        systems = overlay.get("ticket_systems", {})
+        if not isinstance(systems, dict) or any(not isinstance(v, dict) for v in systems.values()):
+            raise ValueError(f"{local}: ticket_systems must map names to objects")
+        for name, entry in systems.items():  # endpoint, ref_pattern and the like change verification, not who you are
+            bad = sorted(k for k in entry if k not in LOCAL_TICKET_KEYS and not k.startswith("_"))
+            if bad:
+                raise ValueError(f"{local}: ticket_systems.{name} may only set {sorted(LOCAL_TICKET_KEYS)}, not {bad}")
+            routes = entry.get("projects") or {}
+            if not isinstance(routes, dict):
+                raise ValueError(f"{local}: ticket_systems.{name}.projects must be an object")
+            for slug, route in routes.items():  # a route must not redirect the endpoint
+                if not isinstance(route, dict) or set(route) - {"project_id", "org_id", "key_file"}:
+                    raise ValueError(f"{local}: project route {slug!r} may only set project_id, org_id, key_file")
+        policy = _deep_merge(policy, overlay)
     if not isinstance(policy, dict) or policy.get("schema") != 1:
         raise ValueError(f"{path} is not a schema 1 commit policy")
     for key in ("subject", "body", "refs", "exempt", "ticket_systems", "waivers"):

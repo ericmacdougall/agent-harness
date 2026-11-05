@@ -474,7 +474,9 @@
   "owner_overlap": "OWNED a0e07708 (#14525-#14533)",
   "matrix_rows": "Z06",
   "mechanisms": [
-   "escalation:hook"
+   "tier_gate:hook",
+   "tier_gate:start",
+   "tier_gate:stop"
   ]
  },
  {

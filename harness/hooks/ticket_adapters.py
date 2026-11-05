@@ -31,7 +31,7 @@ class TicketOutOfScope(Exception):
     """The ticket system answered, but this credential cannot see the ticket's project.
 
     Distinct from "ticket missing": a project in another organisation (for example the
-    Eric org while the member key reaches FrameBright only) cannot be verified at all.
+    another org while the member key reaches ExampleOrg only) cannot be verified at all.
     """
 
 

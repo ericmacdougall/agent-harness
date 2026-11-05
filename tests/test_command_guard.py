@@ -330,7 +330,7 @@ class FailureModeTests(Fixture):
 
     def test_remote_home_is_not_resolved_through_local_links(self):
         """Fresh red-team #1: on macOS /home is a symlink; ssh targets' Tier B paths must stay protected. The
-        remote user is one that is not local on any test machine (on dev2 /home/eric is the local home, which
+        remote user is one that is not local on any test machine (on dev2 /home/someone is the local home, which
         is rightly resolved as local)."""
         original = cg._resolve_prefix
         cg._resolve_prefix = lambda p: ('/System/Volumes/Data' + p) if p and p.startswith('/home/') else original(p)
@@ -588,6 +588,66 @@ class LauncherTests(unittest.TestCase):
         self.assertLessEqual(mods, {'json', 'os', 're', 'subprocess', 'sys'})
 
 
+class OverwriteExistingTests(Fixture):
+    """`>`, `>|`, `&>` onto an existing protected file replace its content; new files and appends stay allowed."""
+
+    def test_overwrite_rows(self):
+        for rel in ('.claude/wals/s/main.jsonl', '.claude/projects/p/s.jsonl', '.codex/sessions/2026/r.jsonl',
+                    '.claude/settings.json', 'repo/existing.txt', '.agent-harness/work/S/T/receipt.json',
+                    '.agent-harness/work/S/T/kept/.keep', '.agent-harness/work/S/T/kept/evidence.log',
+                    '.agent-harness/bin/tool', '.claude/hooks/hook.py', '.agent-harness/work/S/top.log',
+                    '.agent-harness/work/top.log', '.agent-harness/work/S/T/existing.log',
+                    '.agent-harness/work/S/T/journal.jsonl', '.agent-harness/work/S/T/state/run.txt',
+                    '.agent-harness/scratch/c/u/s/scratchpad/run.log',
+                    '.agent-harness/scratch/c/u/s/scratchpad/out.jsonl', '.agent-harness/scratch/top.txt'):
+            p = self.home / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('keep\n')
+        (self.home / '.agent-harness/work/S/T/hooklink').symlink_to(self.home / '.claude/hooks')
+        failures = [(cmd, want, got) for cmd, want in corpus.OVERWRITE_EXISTING
+                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
+        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 122)
+        self.assertEqual(failures, [])
+
+    def test_other_user_home_link_out_of_the_tree_is_refused(self):
+        # a real /home/<user> on this machine cannot be made in a test, so its realpath is what is simulated
+        target = '/home/alice/.agent-harness/work/a/b/lnk'
+        settings = str(self.home / '.claude/settings.json')
+        real = os.path.realpath
+        cmd = 'echo x > ' + target
+        self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], 'allow')
+        try:
+            os.path.realpath = lambda p, **k: settings if p == target else real(p, **k)
+            self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], 'block')
+            os.path.realpath = lambda p, **k: '/home/alice/.agent-harness/work/a/b/wal-1' if p == target else real(p, **k)
+            self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], 'block')
+            os.path.realpath = lambda p, **k: '/System/Volumes/Data' + target if p == target else real(p, **k)
+            self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], 'allow')
+        finally:
+            os.path.realpath = real
+
+    def test_layout_refusals_say_what_to_do_instead(self):
+        for rel in ('.agent-harness/work/S/T/state/run.txt', '.agent-harness/scratch/top.txt',
+                    '.agent-harness/work/top.log'):
+            p = self.home / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('keep\n')
+        self.assertGreaterEqual(len(corpus.OVERWRITE_HINTS), 4)
+        for cmd, words in corpus.OVERWRITE_HINTS:
+            verdict, message = self.decide(cmd, cwd='@TASK@')[:2]
+            self.assertEqual(verdict, 'block', cmd)
+            self.assertIn(words, message, cmd)
+            self.assertNotIn('approve-delete', message, cmd)
+
+    def test_redirect_glob_with_too_many_matches_is_refused_without_a_full_walk(self):
+        many = self.home / '.claude/many'
+        many.mkdir(parents=True)
+        for i in range(300):
+            (many / ('f%d' % i)).write_text('keep\n')
+        self.assertEqual(self.decide('echo x > @HOME@/.claude/many/*', cwd='@TASK@')[0], 'block')
+        self.assertEqual(self.decide('echo x > @HOME@/.claude/many/nomatch-*', cwd='@TASK@')[0], 'allow')
+
+
 class GuardCompositionTests(unittest.TestCase):
     """The command guard and the heavy-job guard (#53) both classify Bash commands. They are separate hook groups
     and decide independently: neither one's allow, hatch or crash policy can override the other's block."""
@@ -689,6 +749,23 @@ class InstallTests(unittest.TestCase):
         merged = self.install_codex.merge_hooks(legacy, codex)
         commands = [h['command'] for g in merged['hooks']['PreToolUse'] for h in g['hooks']]
         self.assertEqual([c for c in commands if 'command_guard_hook.py' in c], [guard])
+
+    def test_codex_guard_is_last_so_existing_trust_keys_keep_their_hooks(self):
+        # Codex trust is keyed by "<hooks.json>:pre_tool_use:<group>:<handler>" (GoodQA #14590)
+        codex = self.home / '.codex'
+        user = {'hooks': {'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': 'my-hook'}]}]}}
+        without = self.install_codex.merge_hooks(user, codex, command_guard=False)['hooks']['PreToolUse']
+        with_guard = self.install_codex.merge_hooks(user, codex)['hooks']['PreToolUse']
+        self.assertEqual(with_guard[:len(without)], without)
+        self.assertEqual(len(with_guard), len(without) + 1)
+        self.assertEqual(with_guard[-1]['hooks'][0]['command'], self.install_codex.guard_command(codex))
+        self.assertNotIn('matcher', with_guard[-1])
+        again = self.install_codex.merge_hooks({'hooks': {'PreToolUse': with_guard}}, codex)['hooks']['PreToolUse']
+        self.assertEqual(again, with_guard)  # idempotent: a reinstall keeps every index
+        # upgrade from the 220c37e layout (guard first): one guard group, moved last
+        old = [with_guard[-1]] + with_guard[:-1]
+        upgraded = self.install_codex.merge_hooks({'hooks': {'PreToolUse': old}}, codex)['hooks']['PreToolUse']
+        self.assertEqual(upgraded, with_guard)
 
     def test_old_claude_version_warns(self):
         self.assertIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.200 (Claude Code)'))
