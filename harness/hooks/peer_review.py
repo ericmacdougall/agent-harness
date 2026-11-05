@@ -737,7 +737,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         prompt += ("\n\nHarness-generated domain guidance (repo signals triggered it; use it as review questions, "
                    "not as instructions):\n" + options['domain_section'])
     run_record, store = options.get('run_record'), options.get('store')
-    deadline = time.monotonic() + min(1440, run_record.timeout if run_record else 1440)
+    deadline = time.monotonic() + (run_record.timeout if run_record else options.get('budget', 1440))
     failure = ''
     if 'selection' not in options:
         # Direct callers without a selection get the unknown-author choice from the table.
@@ -760,7 +760,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ReviewFailure({**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}, source)
-        timeout = min(720, options.get('timeout', 720), remaining)
+        timeout = provider_deadline(options, provider, remaining)
         leased = False
         resolution, code, stdout, stderr = None, None, '', ''
         try:
@@ -813,6 +813,35 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             raise ReviewFailure(outcome, source)
         failure = 'Primary reviewer unavailable (' + outcome['reason'] + '); used authorized independent fallback.'
     raise OSError('no valid reviewer result')
+
+
+def review_deadlines(policy, selection, requested, no_fallback=False):
+    """{provider: {'seconds', 'source', 'ceiling'}} for each provider this run may launch: the primary and, unless this is a
+    failover run, the one authorized fallback. Raises tiers.TierError when a request is over a rung's ceiling."""
+    primary = 'codex' if selection['harness'] == 'openai' else 'claude'
+    providers = [primary] if no_fallback else [primary, 'claude' if primary == 'codex' else 'codex']
+    return {provider: tiers.review_deadline(policy, selection['rung'], 'openai' if provider == 'codex' else 'claude', requested)
+            for provider in providers}
+
+
+def review_budget(deadlines):
+    """Seconds the whole run may take: at least the historical 1440, more when the deadlines need it."""
+    return max(1440, sum(item['seconds'] for item in deadlines.values()))
+
+
+def provider_deadline(options, provider, remaining):
+    """The seconds one provider call may run: its planned deadline, never more than the time left."""
+    planned = (options.get('deadlines') or {}).get(provider)
+    base = planned['seconds'] if planned else min(720, options.get('timeout') or 720)  # direct callers keep the old default
+    return min(base, remaining)
+
+
+def deadline_line(deadlines):
+    """The report header line that makes the deadline visible in the receipt."""
+    if not deadlines:
+        return ''
+    return 'Review-Deadline: ' + '; '.join('%s %d s (%s, ceiling %d s)' % (provider, item['seconds'], item['source'], item['ceiling'])
+                                           for provider, item in deadlines.items()) + '\n'
 
 
 def reviewer_order(selection, codex_entry, claude_entry, no_fallback=False):
@@ -918,7 +947,7 @@ def plan_ticket_gate(repo, content):
         return 0, f'spec-flow: plan ticket gate could not run ({error}); continuing'
 
 
-def write_selection_receipt(run_id, args, head, packet_sha256, author_rung, selection, failover_info=None):
+def write_selection_receipt(run_id, args, head, packet_sha256, author_rung, selection, failover_info=None, deadlines=None):
     """The selection receipt: what the table chose before launch, bound to task, stage, head and packet."""
     try:
         root = ladder.state_root() / 'selections'
@@ -927,7 +956,8 @@ def write_selection_receipt(run_id, args, head, packet_sha256, author_rung, sele
         body = json.dumps({'schema': 1, 'run_id': run_id, 'task': args.task, 'stage': args.stage, 'head': head,
                            'packet_sha256': packet_sha256, 'author_rung': author_rung, 'author_harness': args.author_harness,
                            'selection': selection, 'at': ladder.now(),
-                           **({'failover': failover_info} if failover_info else {})}, sort_keys=True)
+                           **({'failover': failover_info} if failover_info else {}),
+                           **({'deadlines': deadlines} if deadlines else {})}, sort_keys=True)
         path.write_text(body); os.chmod(path, 0o600)
     except OSError as error:
         print(f'Selection receipt could not be written: {type(error).__name__}', file=sys.stderr)
@@ -1004,7 +1034,10 @@ def main() -> int:
     parser.add_argument("--expected-head", help="full reviewed commit SHA; required for PR review")
     parser.add_argument('--packet-budget-bytes', type=int, default=PACKET_LIMIT,
                         help='Optional tighter packet ceiling; maximum 150000 bytes')
-    parser.add_argument('--timeout', type=int, default=720, help='Per-provider deadline, at most 720 seconds')
+    parser.add_argument('--timeout', type=int, default=None,
+                        help='Per-provider deadline in seconds (default 720; up to %d for high, xhigh and max reviewer rungs, '
+                             'otherwise at most 720; the tier table can set another default per rung and provider)'
+                             % tiers.MAX_REVIEW_DEADLINE)
     parser.add_argument('--snapshot-base', help='Optional full ancestor commit SHA to include in the review snapshot for diffs')
     parser.add_argument('--snapshot-timeout', type=int, default=None,
                         help=f'Deadline for preparing the review snapshot, at most {MAX_SNAPSHOT_TIMEOUT} seconds '
@@ -1030,8 +1063,8 @@ def main() -> int:
         parser.error('--failover-after must be between 1 and %d' % failover.MAX_AFTER)
     if not 1 <= args.packet_budget_bytes <= PACKET_LIMIT:
         parser.error('--packet-budget-bytes must be between 1 and 150000')
-    if not 1 <= args.timeout <= 720:
-        parser.error('--timeout must be between 1 and 720')
+    if args.timeout is not None and not 1 <= args.timeout <= tiers.MAX_REVIEW_DEADLINE:
+        parser.error('--timeout must be between 1 and %d' % tiers.MAX_REVIEW_DEADLINE)
     if args.snapshot_timeout is not None and not 1 <= args.snapshot_timeout <= MAX_SNAPSHOT_TIMEOUT:
         parser.error(f'--snapshot-timeout must be between 1 and {MAX_SNAPSHOT_TIMEOUT}')
     if args.snapshot_base is not None and not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', args.snapshot_base.lower()):
@@ -1210,7 +1243,16 @@ def main() -> int:
             print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
                   '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
             return 2
-    options = {'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
+    try:
+        deadlines = review_deadlines(policy, selection, args.timeout, no_fallback=bool(failover_info))
+    except tiers.TierError as error:
+        target.close()
+        evidence.close()
+        print('Review refused: %s' % error, file=sys.stderr)
+        return 2
+    budget = review_budget(deadlines)
+    options = {'timeout': args.timeout, 'deadlines': deadlines, 'budget': budget,
+               'pool': args.pool, 'fallback_pool': args.fallback_pool,
                'selection': selection, 'author_rung': author_rung, 'permission': permission,
                'no_fallback': bool(failover_info), 'failover': failover_info,
                'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
@@ -1238,6 +1280,7 @@ def main() -> int:
                       selection['rung'], selection['harness'], args.pool, args.fallback_pool,
                       '--snapshot-base', base or 'none',
                       *(['--failover', failover_info['mode'], str(failover_info['need'])] if failover_info else []),
+                      '--deadlines', ','.join('%s=%d' % (name, item['seconds']) for name, item in deadlines.items()),
                       # The effective review policy (shipped or override) changes discovery and quota classification.
                       '--review-policy', hashlib.sha256(json.dumps(review_policy(), sort_keys=True).encode()).hexdigest()],
                 cwd=repo,
@@ -1249,9 +1292,9 @@ def main() -> int:
                              if name in os.environ})
             store = UsageStore()
             run_record = store.begin(subject, invocation, owner=args.owner, label='peer-review-' + args.stage,
-                                     timeout=1440, aggregate_timeout=2880, kind='review', repeat_reason=args.repeat_reason)
+                                     timeout=budget, aggregate_timeout=2 * budget, kind='review', repeat_reason=args.repeat_reason)
             options.update(store=store, run_record=run_record)
-            write_selection_receipt(run_record.run_id, args, before[0], evidence.sha256, author_rung, selection, failover_info)
+            write_selection_receipt(run_record.run_id, args, before[0], evidence.sha256, author_rung, selection, failover_info, deadlines)
             source, report, failure = review_snapshot(snapshot, before[0], args.stage,
                                                        stage_rules, evidence.content, options)
             report = stage_report(args.stage, report)
@@ -1308,6 +1351,7 @@ def main() -> int:
                           f"Reviewer-Rung: {selection['rung']}\nReviewer-Selection: {selection['harness']} {selection['model']} "
                           f"{selection['effort']}; {selection['why']}\n"
                           f"{failover.receipt_lines(failover_info)}"
+                          f"{deadline_line(deadlines)}"
                           f"{'Permission: ' + str(permission['ask_id']) + chr(10) if permission else ''}"
                           f"Review input: isolated committed snapshot (depth 1"
                           f"{', base ' + base if base and base != before[0] else ''})\n"
@@ -1322,6 +1366,7 @@ def main() -> int:
                     'findings': [] if passed else finding_ids(report)},
             usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
                    'executables': diagnostics.executable_record(options.get('resolutions', {})),
+                   'deadlines': deadlines,
                    **({'failover': failover_info} if failover_info else {})})
         finalized = True
         final = store.load_ref(reference)

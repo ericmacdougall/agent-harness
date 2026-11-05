@@ -98,6 +98,81 @@ def validate(policy):
                 raise TierError('family %s/%s has a bad id pattern' % (harness, family)) from None
     if not policy['rungs'][policy['lowest_rung']]['writable']:
         raise TierError('the lowest rung must be writable')
+    _validate_review_deadlines(policy)
+
+
+# ---- review deadlines (GoodQA #14833, P19) -------------------------------------------------------------------------
+DEFAULT_REVIEW_DEADLINE = 720   # seconds one provider call may run; the historical fixed helper deadline
+MAX_REVIEW_DEADLINE = 1800      # the most any rung may be given
+LONG_REVIEW_EFFORTS = ('high', 'xhigh', 'max')  # these rungs may be given up to MAX_REVIEW_DEADLINE
+_DEADLINE_KEYS = {'default_seconds', 'seconds', 'ceiling_seconds_by_effort'}
+
+
+def _deadline_value(value, what):
+    if type(value) is not int or not 1 <= value <= MAX_REVIEW_DEADLINE:
+        raise TierError('%s must be a whole number of seconds from 1 to %d' % (what, MAX_REVIEW_DEADLINE))
+    return value
+
+
+def _validate_review_deadlines(policy):
+    section = policy.get('review_deadlines')
+    if section is None:
+        return
+    if not isinstance(section, dict) or set(section) - _DEADLINE_KEYS:
+        raise TierError('review_deadlines must be an object with only %s' % ', '.join(sorted(_DEADLINE_KEYS)))
+    if 'default_seconds' in section:
+        _deadline_value(section['default_seconds'], 'review_deadlines.default_seconds')
+    ceilings = section.get('ceiling_seconds_by_effort', {})
+    if not isinstance(ceilings, dict):
+        raise TierError('review_deadlines.ceiling_seconds_by_effort must be an object')
+    for effort, value in ceilings.items():
+        if effort not in _EFFORTS:
+            raise TierError('review_deadlines names an unknown effort %r' % (effort,))
+        _deadline_value(value, 'review_deadlines ceiling for %s' % effort)
+    table = section.get('seconds', {})
+    if not isinstance(table, dict):
+        raise TierError('review_deadlines.seconds must be an object')
+    for rung, harnesses in table.items():
+        if rung not in policy['rungs'] or not isinstance(harnesses, dict):
+            raise TierError('review_deadlines.seconds names an undefined rung %r' % (rung,))
+        for harness, value in harnesses.items():
+            if harness not in ('claude', 'openai'):
+                raise TierError('review_deadlines.seconds names an unknown harness %r' % (harness,))
+            if _deadline_value(value, 'review_deadlines.seconds %s/%s' % (rung, harness)) > _deadline_ceiling(policy, rung):
+                raise TierError('review_deadlines.seconds %s/%s is above the rung\'s %d s ceiling'
+                                % (rung, harness, _deadline_ceiling(policy, rung)))
+
+
+def _deadline_ceiling(policy, rung):
+    effort = policy['rungs'][rung]['effort']
+    ceilings = (policy.get('review_deadlines') or {}).get('ceiling_seconds_by_effort') or {}
+    if effort in ceilings:
+        return ceilings[effort]
+    return MAX_REVIEW_DEADLINE if effort in LONG_REVIEW_EFFORTS else DEFAULT_REVIEW_DEADLINE
+
+
+def review_deadline(policy, rung, harness, requested=None):
+    """{'seconds', 'source', 'ceiling'}: how long one provider call for this rung and harness may run.
+
+    The default is 720 s. A tier-table value sets another default for a rung and provider; a request (--timeout) wins over
+    both. Nothing may exceed the rung's ceiling: 1800 s for high, xhigh and max efforts, 720 s otherwise."""
+    if rung not in policy['rungs']:
+        raise TierError('undefined rung %r' % (rung,))
+    if harness not in ('claude', 'openai'):
+        raise TierError('unknown harness %r' % (harness,))
+    ceiling = _deadline_ceiling(policy, rung)
+    section = policy.get('review_deadlines') or {}
+    configured = (section.get('seconds') or {}).get(rung, {}).get(harness, section.get('default_seconds'))
+    if requested is not None:
+        if type(requested) is not int or requested < 1:
+            raise TierError('the deadline must be a whole number of seconds, at least 1')
+        if requested > ceiling:
+            raise TierError('deadline %d s exceeds the %d s allowed for rung %s (effort %s)'
+                            % (requested, ceiling, rung, policy['rungs'][rung]['effort']))
+        return {'seconds': requested, 'source': '--timeout', 'ceiling': ceiling}
+    if configured is not None:
+        return {'seconds': min(configured, ceiling), 'source': 'tier table', 'ceiling': ceiling}
+    return {'seconds': DEFAULT_REVIEW_DEADLINE, 'source': 'default', 'ceiling': ceiling}
 
 
 def rung_order(policy):
