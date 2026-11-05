@@ -200,6 +200,10 @@ class ParseSsh(unittest.TestCase):
         self.assertEqual(host_table.parse_ssh(['-o', 'BatchMode=yes', '-o', 'ProxyCommand=x', 'h']).unsafe, {'o'})
         self.assertEqual(host_table.parse_ssh(['-o', 'BatchMode=yes', 'h']).resolve_args, [])
 
+    def test_o_values_are_kept_for_the_escape_check(self):
+        call = host_table.parse_ssh(['-o', 'ForkAfterAuthentication=yes', '-oBatchMode=yes', 'h', '-o', 'LogLevel=ERROR', 'ls'])
+        self.assertEqual(call.o_values, ['ForkAfterAuthentication=yes', 'BatchMode=yes', 'LogLevel=ERROR'])
+
     def test_options_after_the_target(self):
         call = host_table.parse_ssh(['h', '-p', '2222', '-t', 'ls', '-p', '1'])
         self.assertEqual((call.target, call.post_opts, call.remote), ('h', ['-p', '2222', '-t'], ['ls', '-p', '1']))

@@ -68,9 +68,9 @@ def own_names(path=None):
 class SshCall:
     """An ssh argv split into the words before the target, the target, the option words after it and the remote command."""
 
-    def __init__(self, opts, target, remote, flags, resolve_args, post_opts=(), unsafe_o=True):
+    def __init__(self, opts, target, remote, flags, resolve_args, post_opts=(), unsafe_o=True, o_values=()):
         self.opts, self.target, self.remote, self.flags, self.resolve_args = opts, target, remote, flags, resolve_args
-        self.post_opts = list(post_opts)
+        self.post_opts, self.o_values = list(post_opts), list(o_values)
         self.unsafe = set(flags) & UNSAFE_FLAGS
         if not unsafe_o:
             self.unsafe.discard('o')
@@ -84,7 +84,7 @@ def safe_o_value(value):
 def parse_ssh(args):
     """Parse the words after `ssh` (values, quotes already removed). None when there is no target. Like OpenSSH, options
     are read before the target and again after it, up to the first other word, which starts the remote command."""
-    flags, resolve, state = set(), [], {'unsafe_o': False}
+    flags, resolve, state, o_values = set(), [], {'unsafe_o': False}, []
 
     def options(index):
         opts = []
@@ -102,8 +102,9 @@ def parse_ssh(args):
                     attached = position < len(letters) - 1
                     value = letters[position + 1:] if attached else (args[index + 1] if index + 1 < len(args) else '')
                     taken = 1 if attached else 2
-                    if letter == 'o' and not safe_o_value(value):
-                        state['unsafe_o'] = True
+                    if letter == 'o':
+                        o_values.append(value)
+                        state['unsafe_o'] = state['unsafe_o'] or not safe_o_value(value)
                     if letter in RESOLVE_FLAGS and (attached or index + 1 < len(args)):
                         resolve.extend([word] if attached else [word, value])
                     break
@@ -117,7 +118,7 @@ def parse_ssh(args):
         return None
     target = args[index]
     index, post_opts = options(index + 1)
-    return SshCall(opts, target, list(args[index:]), flags, resolve, post_opts, state['unsafe_o'])
+    return SshCall(opts, target, list(args[index:]), flags, resolve, post_opts, state['unsafe_o'], o_values)
 
 
 class Resolved:

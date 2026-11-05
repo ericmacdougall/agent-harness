@@ -229,7 +229,7 @@ Co-Authored-By: ...
      - `-m` (repeated) and `-am`;
      - `--message=`;
      - `-F <file>` and `-F -` with a quoted heredoc;
-     - `-m "$(cat <<'EOF' ... EOF)"`;
+     - `-m "$(cat <<'EOF' ... EOF)"` (accepted here, but prefer `-F - <<'EOF'`: the ah-run hook cannot read a heredoc inside `$(...)` with certainty, so it checks that message line by line as commands and can refuse it);
      - `--amend --no-edit`, which checks HEAD's message;
      - `-C <commit>`;
      - `--fixup` and `--squash`;

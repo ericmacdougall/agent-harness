@@ -208,6 +208,49 @@ class SignalEscalation(Fixture):
         self.assertTrue(self.group_gone_within(int(marker.read_text()), 1))
 
 
+class PausedGroup(SignalEscalation):
+    """S19: a pause through `ah-run kill --pause` leaves the watchdog running, and it resumes the group before ending it."""
+    test_sigterm_to_the_launcher_ends_a_term_ignoring_command = None
+    test_sigkill_of_the_supervisor_ends_a_term_ignoring_command = None
+    test_term_then_kill_of_the_supervisor_still_ends_the_group = None
+    test_a_term_ignoring_leftover_of_a_finished_command_is_ended = None
+    test_a_clean_exit_returns_at_once_and_leaves_no_group = None
+
+    def pause(self, task):
+        result = subprocess.run([sys.executable, AH, 'kill', '--task', task, '--pause'], env=self.env, capture_output=True, text=True, timeout=30)
+        return json.loads(result.stdout)
+
+    def start(self, task):
+        marker = Path(self.temp.name) / ('%s.txt' % task)
+        proc = subprocess.Popen([sys.executable, AH, 'run', '--task', task, '--token', 'tok', '--no-unit', '--', 'echo $$ > %s; sleep 60 & echo $! >> %s; wait' % (marker, marker)],
+                                env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(self.finish, proc)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (marker.exists() and len(marker.read_text().split()) == 2):
+            time.sleep(0.02)
+        pids = [int(pid) for pid in marker.read_text().split()]
+        self.groups.append(pids[0])
+        return proc, pids
+
+    def test_a_paused_group_ends_when_the_supervisor_dies(self):
+        proc, pids = self.start('ps1')
+        report = self.pause('ps1')
+        self.assertTrue(report['signalled'], report)
+        self.assertTrue(any('watchdog' in entry['why'] for entry in report['skipped']), report)
+        proc.kill(); proc.wait(timeout=5)
+        # under the grace: the watchdog's SIGCONT let the TERM act at once, it did not wait for the SIGKILL. The watchdog
+        # itself stays in the group until its SIGKILL, so the row checks the command's processes.
+        for pid in pids:
+            self.assertTrue(self.wait_gone(pid, ah_run.KILL_GRACE - 0.5), 'paused pid %d outlived the supervisor' % pid)
+
+    def test_a_signal_to_the_launcher_reaches_a_paused_command_at_once(self):
+        proc, pids = self.start('ps2')
+        self.pause('ps2')
+        proc.send_signal(signal.SIGTERM)
+        self.assertTrue(self.group_gone_within(pids[0], ah_run.KILL_GRACE - 0.5), 'paused group %d waited for the SIGKILL' % pids[0])
+        proc.wait(timeout=10)
+
+
 class Kill(Fixture):
     def test_kill_by_task_reaches_env_attributed_orphans_and_spares_the_rest(self):
         marker = Path(self.temp.name) / 'orphan.txt'
@@ -337,7 +380,7 @@ class RewriteHook(HookFixture):
         out = self.decide('echo OK-2')
         self.assertEqual(out['permissionDecision'], 'allow')
         wrapped = out['updatedInput']['command']
-        self.assertTrue(wrapped.startswith('python3 %s run --task auto-' % ah_run.Path(ah_run.__file__).resolve()), wrapped)
+        self.assertTrue(wrapped.startswith('python3 -I %s run --task auto-' % ah_run.Path(ah_run.__file__).resolve()), wrapped)
         self.assertIn('--agent main --session s-1 --token ', wrapped); self.assertTrue(wrapped.endswith("-- 'echo OK-2'"))
         result = self.run_wrapped(wrapped)
         self.assertEqual((result.returncode, result.stdout), (0, 'OK-2\n'))
@@ -695,6 +738,45 @@ class Equivalence(Fixture):
         out = self.both('ulimit -f 1; head -c 8192 /dev/zero > big 2>/dev/null; echo $?')
         self.assertEqual(out.stdout, '153\n')
 
+    def decoy_dir(self, name):
+        decoy = Path(tempfile.mkdtemp(dir=self.temp.name))
+        marker = decoy / 'MARKER'
+        (decoy / (name + '.py')).write_text('open(%r, "w").write("ran")\n' % str(marker))
+        return decoy, marker
+
+    def test_a_module_in_the_cwd_is_not_imported_by_the_launcher(self):
+        for name in ('signal', 'os', 'time', 'sys'):
+            decoy, marker = self.decoy_dir(name)
+            result = subprocess.run([sys.executable, AH, 'run', '--task', 'eq', '--no-unit', '--', 'echo hi'], cwd=str(decoy), env=self.env,
+                                    capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            self.assertEqual((result.returncode, result.stdout), (0, 'hi\n'), (name, result.stderr))
+            self.assertFalse(marker.exists(), name)
+
+    def test_pythonpath_is_ignored_by_the_launcher_and_kept_for_the_command(self):
+        for name in ('signal', 'os'):
+            decoy, marker = self.decoy_dir(name)
+            env = {**self.env, 'PYTHONPATH': str(decoy), 'PYTHONSTARTUP': str(decoy / (name + '.py'))}
+            # the form the hook and the ssh rewrite build
+            result = subprocess.run([sys.executable, '-I', AH, 'run', '--task', 'eq', '--no-unit', '--', 'echo "$PYTHONPATH|$PYTHONSTARTUP"'],
+                                    env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            self.assertEqual(result.returncode, 0, (name, result.stderr))
+            self.assertEqual(result.stdout, '%s|%s\n' % (env['PYTHONPATH'], env['PYTHONSTARTUP']), name)
+            self.assertFalse(marker.exists(), name)
+
+    def test_closed_stdio_does_not_kill_the_command(self):
+        for closed in ('<&-', '>&-', '2>&-', '<&- 2>&-', '>&- 2>&-', '<&- >&- 2>&-'):
+            done = Path(tempfile.mkdtemp(dir=self.temp.name)) / 'done'
+            command = 'sleep 0.3; echo end > %s' % done
+            outer = '%s %s run --task eq --no-unit -- %s %s' % (sys.executable, AH, shlex.quote(command), closed)
+            result = subprocess.run(['/bin/bash', '-c', outer], env=self.env, capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+            self.assertEqual(result.returncode, 0, closed); self.assertTrue(done.exists(), closed)
+
+    def test_the_pipe_is_above_stdio_even_when_stdio_is_closed(self):
+        code = ('import os, sys; sys.path.insert(0, %r); import ah_run; os.close(0); os.close(2); r, w = ah_run.pipe_above_stdio(); '
+                'os.write(1, b"%%d %%d" %% (r, w))' % str(HOOKS))
+        out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=20, env=self.env, stdin=subprocess.DEVNULL).stdout
+        self.assertTrue(out and min(int(fd) for fd in out.split()) >= 3, out)
+
     def test_the_mask_is_clear_in_the_command(self):
         # a TERM blocked across the trampoline's forks must not stay blocked in the command
         marker = Path(self.temp.name) / 'mask.txt'
@@ -746,6 +828,7 @@ class JobTable(Fixture):
         marker = Path(self.temp.name) / 'pgid.txt'
         self.run_in('/bin/bash', 'ps -o pgid= -p $$ > %s' % marker)
         pgid = marker.read_text().strip()
+        self.assertTrue(pgid, 'ps gave no group, so this row would prove nothing')
         time.sleep(0.5)
         left = subprocess.run(['ps', '-axo', 'pgid='], capture_output=True, text=True).stdout.split()
         self.assertNotIn(pgid, left)
@@ -1036,6 +1119,293 @@ class HeredocRule(HookFixture):
         import commit_policy
         with mock.patch.object(commit_policy, '_heredocs', side_effect=AssertionError('commit_policy parser used')):
             self.assertEqual(ah_run.parse_command('cat <<EOF\nb\nEOF').segments, ['cat <<__HD0__'])
+
+
+class Continuations(HookFixture):
+    """B10 and S16: a continuation and a run of blanks read as the shell reads them."""
+    COMMENT_SHAPES = {
+        'natural': "echo a \\\n# don't do this\n%s\n# won't happen",
+        'single': "echo a \\\n#'\n%s\n#'",
+        'double': 'echo a \\\n#"\n%s\n#"',
+        'first-word': "\\\n#'\n%s\n#'",
+        'indented': "echo a \\\n  #'\n%s\n#'",
+    }
+
+    def test_join_table(self):
+        for text, joined in (('a \\\nb', 'a b'), ('a\\\nb', 'ab'), ('"a\\\nb"', '"ab"'), ("'a\\\nb'", "'a\\\nb'"), ("$'a\\\nb' c\\\nd", "$'a\\\nb' cd"),
+                             ('# c \\\nb', '# c \\\nb'), ('a # c \\\nb', 'a # c \\\nb'), ('a#c\\\nb', 'a#cb'), ('a\\\\\nb', 'a\\\\\nb'), ('plain', 'plain')):
+            self.assertEqual(ah_run.join_continuations(text), joined, repr(text))
+
+    def test_a_comment_after_a_continuation_hides_nothing(self):
+        self.settings('user', allow=['Bash(echo:*)'], deny=['Bash(touch:*)'])
+        for name, shape in self.COMMENT_SHAPES.items():
+            command = shape % 'touch PWNED'
+            for mode in ('default', 'acceptEdits', 'dontAsk', 'bypassPermissions'):
+                self.assertEqual(self.decide(command, permission_mode=mode).get('permissionDecision'), 'deny', (name, mode))
+        self.settings('user', allow=['Bash(echo:*)'])
+        for name, shape in self.COMMENT_SHAPES.items():
+            self.assertEqual(self.decide(shape % 'touch PWNED').get('permissionDecision'), 'ask', name)
+
+    def test_blanks_and_continuations_do_not_defeat_a_deny_rule(self):
+        self.settings('user', allow=['Bash(git:*)', 'Bash(touch:*)'], deny=['Bash(git push --force:*)'])
+        for command in ('git push  --force origin m', 'git push \\\n  --force origin m', 'git \\\n push --force', 'git\tpush --force',
+                        'git\t\tpush\t--force', 'gi\\\nt push --force', '  git   push   --force  ', 'sudo  git  push  --force'):
+            for mode in ('default', 'bypassPermissions'):
+                self.assertEqual(self.decide(command, permission_mode=mode).get('permissionDecision'), 'deny', (command, mode))
+
+    def test_collapsing_never_widens_an_allow_rule(self):
+        self.settings('user', allow=['Bash(echo a b)'])
+        self.assertEqual(self.decide('echo a b')['permissionDecision'], 'allow')
+        self.assertEqual(self.decide("echo a  b")['permissionDecision'], 'ask')
+
+    def test_a_continued_ordinary_command_still_works(self):
+        self.settings('user', allow=['Bash(git:*)'])
+        self.assertEqual(self.decide('git log \\\n  -1')['permissionDecision'], 'allow')
+
+
+class GroupWalk(HookFixture):
+    """B11: a group ends where a shell ends it, or the parse is uncertain."""
+    SHAPES = {
+        'comment-paren': "echo $(echo # ) '\n); %s; echo \"'\" #\"",
+        'comment-paren-dq': '$(# ) "\n); %s #"',
+        'backtick-escape': "echo `echo \\` ' `; %s; echo \"'\" #\"",
+        'procsub-comment': "cat <(echo # ) '\n); %s; echo \"'\" #\"",
+        'assign-comment': "x=$(echo # ) '\n); %s; echo \"'\" #\"",
+    }
+
+    def test_the_walk_table(self):
+        for text, certain in (('echo hi', True), ('echo $(date)', True), ('echo "$(echo ")")"', True), ('$(echo a#b)', True), ("$(echo '#')", True),
+                              ('echo ${#x} $#', True), ('echo # $(', True), ("# it's\necho", True), ('`echo a`', True), ('$(echo $(date))', True),
+                              ('$(echo # c\n)', False), ('`echo \\``', False), ('`# c`', False), ('$(case x in x) echo;; esac)', False),
+                              ('"${x:-\'}"', False), ('$(echo', False), ('`echo', False), ("echo 'a", False)):
+            self.assertEqual(ah_run._walk_groups(text)[1], certain, repr(text))
+
+    def test_a_group_end_respects_quotes(self):
+        text = 'a $(echo ")") b'
+        self.assertEqual(text[ah_run._skip_group(text, 3):], ' b')
+        text = "a `echo ')'` b"
+        self.assertEqual(text[ah_run._backtick_end(text, 2):], ' b')
+        self.assertEqual(ah_run.inner_commands('a $(echo ")"; touch x) b'), ['echo ")"; touch x'])
+
+    def test_every_line_after_an_uncertain_group_is_denied(self):
+        self.settings('user', allow=['Bash(echo:*)'], deny=['Bash(touch:*)'])
+        for name, shape in self.SHAPES.items():
+            for mode in ('default', 'acceptEdits', 'dontAsk', 'bypassPermissions'):
+                self.assertEqual(self.decide(shape % 'touch PWNED', permission_mode=mode).get('permissionDecision'), 'deny', (name, mode))
+            self.assertTrue(ah_run.classify_escapes(shape % 'nohup sleep 9'), name)
+
+    def test_a_quoted_close_does_not_end_a_group_early(self):
+        self.settings('user', deny=['Bash(touch:*)'])
+        command = 'echo $(echo ")"; touch PWNED; echo ")") #"'
+        self.assertEqual(self.decide(command, permission_mode='bypassPermissions').get('permissionDecision'), 'deny')
+        self.assertEqual(self.decide('echo $(case x in x) echo ")";; esac; touch PWNED)', permission_mode='bypassPermissions').get('permissionDecision'), 'deny')
+
+    def test_a_comment_apostrophe_does_not_hide_a_later_substitution(self):
+        self.settings('user', deny=['Bash(touch:*)'])
+        command = "# it's\necho $(touch PWNED)\n# it's"
+        self.assertEqual(self.decide(command, permission_mode='bypassPermissions').get('permissionDecision'), 'deny')
+
+    def test_an_ordinary_substitution_is_not_uncertain(self):
+        for command in ('echo $(date)', 'x=$(git rev-parse HEAD); echo "$x"', 'echo "$(echo "a b")"', "echo `date`", "cat <(echo 'a # b')"):
+            self.assertFalse(ah_run.parse_command(command).uncertain, command)
+
+
+class HeredocScripts(HookFixture):
+    """S15: a heredoc a shell reads is a script, so its lines reach both checks; any other reader keeps it as data."""
+    SCRIPT_SHAPES = ("bash <<'E'\n%s\nE", 'sh -s <<E\n%s\nE', "zsh <<-'E'\n\t%s\n\tE", "cat <<'E' | bash\n%s\nE", ". /dev/stdin <<'E'\n%s\nE", "source /dev/stdin <<'E'\n%s\nE",
+                     "sudo bash <<'E'\n%s\nE", "timeout 5 bash <<'E'\n%s\nE", "/bin/bash <<'E'\n%s\nE", "ssh dev2 bash <<'E'\n%s\nE", "ssh dev2 <<'E'\n%s\nE", "ssh dev2 'cd /x && sh' <<'E'\n%s\nE")
+    DATA_SHAPES = ("cat <<'E'\n%s\nE", "python3 - <<'E'\n%s\nE", "cat > f.sh <<'E'\n%s\nE", "ssh dev2 'cat > f' <<'E'\n%s\nE", "ssh dev2 python3 - <<'E'\n%s\nE")
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(host_table, 'resolve', lambda target, ssh_args=(), run=None: host_table.Resolved('elsewhere.example.test', 22))
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def test_script_lines_reach_deny_and_the_classifier(self):
+        self.settings('user', deny=['Bash(touch:*)'])
+        for shape in self.SCRIPT_SHAPES:
+            for mode in ('default', 'bypassPermissions'):
+                self.assertEqual(self.decide(shape % 'touch PWNED', permission_mode=mode).get('permissionDecision'), 'deny', (shape, mode))
+            self.assertTrue(ah_run.classify_escapes(shape % 'nohup sleep 9 &'), shape)
+            self.assertTrue(ah_run.classify_escapes(shape % 'setsid sleep 9'), shape)
+
+    def test_a_script_is_never_auto_allowed(self):
+        self.settings('user', allow=['Bash(bash:*)', 'Bash(cat:*)'])
+        self.assertEqual(self.decide("bash <<'E'\necho hi\nE")['permissionDecision'], 'ask')
+        self.assertEqual(self.decide("cat <<'E'\necho hi\nE")['permissionDecision'], 'allow')
+
+    def test_any_other_reader_keeps_the_body_as_data(self):
+        self.settings('user', deny=['Bash(touch:*)'])
+        for shape in self.DATA_SHAPES:
+            self.assertNotEqual(self.decide(shape % 'touch PWNED', permission_mode='bypassPermissions').get('permissionDecision'), 'deny', shape)
+            self.assertEqual(ah_run.classify_escapes(shape % 'nohup sleep 9 &'), [], shape)
+
+    def test_the_script_table(self):
+        bodies = [('one\n', True), ('two\n', True)]
+        self.assertEqual(ah_run.script_bodies('bash <<__HD0__\ncat <<__HD1__', bodies), ['one\n'])
+        self.assertEqual(ah_run.script_bodies('cat <<__HD0__ <<__HD1__', bodies), [])
+        self.assertEqual(ah_run.script_bodies('cat <<__HD0__ | sh', bodies[:1]), ['one\n'])
+        self.assertEqual(ah_run.script_bodies('bash', []), [])
+
+
+class EndState(HookFixture):
+    """The property behind rounds 1-4: if a real shell runs the hidden line, the hook's bypass decision is deny, for every
+    scan status; and a certain scan means no shell ran it. The hidden line is an echo, the only command any row runs."""
+    LINE = 'echo HIDDEN-LINE'
+    SHELLS = [s for s in ('/bin/bash', '/bin/zsh', '/bin/sh') if os.access(s, os.X_OK)]
+    # name: (shape, scan status, whether /bin/bash runs the line)
+    TABLE = {
+        'r1-ansi-quote': ("echo $'\\'' ; %s ; echo ''", 'none', True),
+        'r2-ansi-opener': ("echo $'a\\' <<EOF'\n%s\nEOF", 'uncertain', True),
+        'r3-param-default': ('echo ${x:-<<EOF}\n%s\nEOF', 'uncertain', True),
+        'r3-param-arith': ('echo ${x:0:1<<EOF}\n%s\nEOF', 'uncertain', True),
+        'r3-delim-dot': ('echo <<E.F\nE.F\n%s\nE\n', 'uncertain', True),
+        'r3-delim-quote-tail': ("echo <<'E'OF\nEOF\n%s\nE\n", 'uncertain', True),
+        'r3-delim-escape': ('echo <<E\\OF\nEOF\n%s\nE\n', 'uncertain', True),
+        'r3-arith': ('((x=1<<EOF))\n%s\nEOF', 'uncertain', True),
+        'r3-undecodable': ("echo $'a\\' <<EOF'\n%s\nEOF\necho $'", 'uncertain', True),
+        'r3-prior-desync': ("cat <<X\n'\nX\necho $'a\\' <<EOF'\n%s\nEOF\n#'", 'uncertain', True),
+        'r3-backslash-terminator': ('echo <<EOF\nEOF\\\n\n%s\nEOF', 'uncertain', True),
+        'r3-escaped-space-comment': ("echo a\\ #'\ncat <<E\n'; %s\nE\n#'", 'uncertain', True),
+        'r3-comment-after-paren': ("(true)#'\n' cat <<E\n'; %s\nE", 'uncertain', True),
+        'r4-dbracket': ('[[ a << b ]]\n%s\nb', 'uncertain', False),
+        'r4-cont-natural': ("echo a \\\n# don't do this\n%s\n# won't happen", 'none', True),
+        'r4-cont-single': ("echo a \\\n#'\n%s\n#'", 'none', True),
+        'r4-cont-double': ('echo a \\\n#"\n%s\n#"', 'none', True),
+        'r4-cont-first-word': ("\\\n#'\n%s\n#'", 'none', True),
+        'r4-comment-paren': ("echo $(echo # ) '\n); %s; echo \"'\" #\"", 'none', True),
+        'r4-comment-paren-dq': ('$(# ) "\n); %s #"', 'none', True),
+        'r4-backtick-escape': ("echo `echo \\` ' `; %s; echo \"'\" #\"", 'none', True),
+        'r4-shell-heredoc': ("bash <<'E'\n%s\nE", 'certain', True),
+        'r4-sh-heredoc': ("sh -s <<E\n%s\nE", 'certain', True),
+        'r4-attached-opener': ("true `true <<'E'`\n%s<<-E\nE", 'uncertain', True),
+        'r4-attached-redirect': ("echo $'a\\' <<EOF'\n%s>/dev/null\nEOF", 'uncertain', False),
+        'plain-line': ('echo a\n%s', 'none', True),
+        'second-command': ('echo a; %s', 'none', True),
+        'comment-apostrophe-substitution': ("# it's\necho $(%s)\n# it's", 'none', True),
+    }
+    QUIET = {  # the line is text here: the hook must neither run it nor refuse it, or the table would pass by denying everything
+        'none-single-quoted': ("echo 'a\n%s\nb'", 'none'),
+        'none-double-quoted': ('echo "a\n%s\nb"', 'none'),
+        'none-comment': ('echo a # %s', 'none'),
+        'certain-cat': ("cat <<'E'\n%s\nE", 'certain'),
+        'certain-unquoted': ('cat <<E\n%s\nE', 'certain'),
+        'certain-tab': ('cat <<-E\n\t%s\n\tE', 'certain'),
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.settings('user', deny=['Bash(echo HIDDEN-LINE:*)'])
+
+    def runs(self, shell, command):
+        done = subprocess.run([shell, '-c', command], capture_output=True, text=True, errors='replace', timeout=5, stdin=subprocess.DEVNULL, cwd=self.temp.name)
+        return 'HIDDEN-LINE' in done.stdout.splitlines()
+
+    def bypass(self, command):
+        return self.decide(command, permission_mode='bypassPermissions').get('permissionDecision')
+
+    def test_the_table_agrees_with_the_shells(self):
+        for name, (shape, status, bash_runs) in self.TABLE.items():
+            command = shape % self.LINE
+            self.assertEqual(ah_run.heredoc_scan(command)[0], status, name)
+            self.assertEqual(self.runs('/bin/bash', command), bash_runs, name)
+            self.assertEqual(self.bypass(command), 'deny', name)
+            for shell in self.SHELLS:
+                if self.runs(shell, command):
+                    self.assertNotEqual(self.bypass(command), None, (name, shell))
+
+    def test_the_quiet_rows_are_neither_run_nor_refused(self):
+        for name, (shape, status) in self.QUIET.items():
+            command = shape % self.LINE
+            self.assertEqual(ah_run.heredoc_scan(command)[0], status, name)
+            for shell in self.SHELLS:
+                self.assertFalse(self.runs(shell, command), (name, shell))
+            self.assertIsNone(self.bypass(command), name)
+
+    def test_seeded_soup_holds_the_end_state(self):
+        import random
+        seed = 14548
+        rng = random.Random(seed)
+        tokens = ['echo', 'cat', 'true', ' ', ' ', '\n', '\n', '<<E', "<<'E'", '<<-E', '<<<x', 'E', "'", "'", '"', '"', '#', ' #', '\\', '\\\n', '$x', '${x}', '${',
+                  '}', "$'", '`', '$(', '(', ')', '((', '))', ';', ';;', '&&', '|', 'case x in x)', 'esac', '[[', ']]', '$[', ']',
+                  "echo $(echo # ) '", '\\\n#\'', '<<E.F', "<<'E'F", '${x:-<<E}', '`echo \\` \' `']
+        checked = ran = 0
+        for _ in range(250):
+            head = ''.join(rng.choice(tokens) for _ in range(rng.randint(1, 8)))
+            tail = ''.join(rng.choice(tokens) for _ in range(rng.randint(0, 4)))
+            command = '%s\n%s\nE\n%s' % (head, self.LINE, tail)
+            decision, status = self.bypass(command), ah_run.heredoc_scan(command)[0]
+            checked += 1
+            for shell in self.SHELLS:
+                if self.runs(shell, command):
+                    ran += 1
+                    self.assertEqual(decision, 'deny', (seed, shell, status, command))
+                    self.assertNotEqual(status, ah_run.HEREDOC_CERTAIN, (seed, shell, command))
+        self.assertEqual(checked, 250); self.assertGreater(ran, 50, 'seed %d: too few shell runs to prove anything' % seed)
+
+    def test_control_the_old_parse_fails_the_table(self):
+        with mock.patch.object(ah_run, '_walk_groups', lambda text, i=0, stack=None: (len(text), True) if not stack else ah_run_old_walk(text, i, stack)):
+            command = self.TABLE['r4-comment-paren'][0] % self.LINE
+            self.assertIsNone(self.bypass(command), 'without the group check this shape must slip through')
+
+
+def ah_run_old_walk(text, i, stack):
+    """The pre-r4 group end: parentheses counted with no regard for quotes or comments."""
+    depth = 1
+    while i < len(text):
+        if stack[0] == '`' and text[i] == '`':
+            return i + 1, True
+        depth += stack[0] == '(' and text[i] == '('
+        depth -= stack[0] == '(' and text[i] == ')'
+        i += 1
+        if stack[0] == '(' and depth == 0:
+            return i, True
+    return len(text), True
+
+
+class HookCost(HookFixture):
+    """S21: the refused case costs nothing and the two scans are linear."""
+
+    def test_the_payload_cap_runs_before_any_analysis(self):
+        with mock.patch.object(ah_run, 'parse_command', side_effect=AssertionError('analysis ran')):
+            out = self.decide('echo ' + 'x' * ah_run.PAYLOAD_CAP)
+        self.assertEqual(out['permissionDecision'], 'deny'); self.assertIn('1 MiB', out['permissionDecisionReason'])
+
+    def test_deep_nesting_is_uncertain_not_an_internal_error(self):
+        self.settings('user', deny=['Bash(touch:*)'])
+        command = 'echo ' + '$(' * 6000 + 'true' + ')' * 6000 + '\ntouch PWNED'
+        started = time.monotonic()
+        self.assertTrue(ah_run.parse_command(command).uncertain)
+        self.assertEqual(self.decide(command, permission_mode='bypassPermissions').get('permissionDecision'), 'deny')
+        self.assertLess(time.monotonic() - started, 8)
+
+    def test_many_heredocs_and_backgrounds_stay_fast(self):
+        many = ''.join('cat <<E\nb\nE\n' for _ in range(3000))
+        started = time.monotonic()
+        self.assertEqual(len(ah_run.heredoc_scan(many)[2]), 3000)
+        backgrounds = 'a & ' * 3000 + 'wait'
+        self.assertEqual(ah_run.classify_escapes(backgrounds), [])
+        self.assertLess(time.monotonic() - started, 5)
+
+
+class RefusalText(HookFixture):
+    """S18: the refusal for an uncertain heredoc names the forms the hook reads with certainty."""
+    FORM = "cat <<'EOF'"
+
+    def test_the_refusal_names_the_certain_commit_form(self):
+        self.settings('user', deny=['Bash(touch:*)'])
+        command = "git commit -m \"$(cat <<'EOF'\ntouch up the docs\nEOF\n)\""
+        reason = self.decide(command, permission_mode='bypassPermissions')['permissionDecisionReason']
+        self.assertIn("git commit -F - <<'EOF'", reason); self.assertIn("--body-file - <<'EOF'", reason)
+        self.settings_policy('enforce')
+        reason = self.decide("git commit -m \"$(cat <<'EOF'\nat least one row\nEOF\n)\"", permission_mode='bypassPermissions')['permissionDecisionReason']
+        self.assertIn("git commit -F - <<'EOF'", reason)
+
+    def test_the_named_form_is_not_refused(self):
+        self.settings('user', allow=['Bash(git commit:*)'], deny=['Bash(touch:*)'])
+        self.settings_policy('enforce')
+        out = self.decide("git commit -F - <<'EOF'\ntouch up the docs\nat least one row & more\nEOF")
+        self.assertEqual(out['permissionDecision'], 'allow')
 
 
 class PermissionRules(HookFixture):
@@ -1329,7 +1699,7 @@ class SshRewrite(HookFixture):
 
     def test_plain_rewrite(self):
         line = self.inner(self.ssh("ssh dev2 'git log'"))
-        self.assertTrue(line.startswith('ssh dev2 python3 %s run --task auto-' % self.REMOTE_PATH), line)
+        self.assertTrue(line.startswith('ssh dev2 python3 -I %s run --task auto-' % self.REMOTE_PATH), line)
         self.assertIn('--agent main --session s-1 --token via-hook-ssh --cmd-b64 ', line)
         self.assertNotIn('--readonly', line)
         self.assertEqual(self.b64_of(line), 'git log')
@@ -1373,7 +1743,7 @@ class SshRewrite(HookFixture):
 
     def test_options_with_values_are_parsed(self):
         line = self.inner(self.ssh("ssh -p 2222 dev2 'git log'"))
-        self.assertTrue(line.startswith('ssh -p 2222 dev2 python3 %s run' % self.REMOTE_PATH), line)
+        self.assertTrue(line.startswith('ssh -p 2222 dev2 python3 -I %s run' % self.REMOTE_PATH), line)
         self.assertEqual(self.b64_of(line), 'git log')
         self.assertIn('-G -p 2222 -- dev2', self.ssh_log.read_text())
         line = self.inner(self.ssh("ssh -p2222 -l eric dev2 git -C /x log -1"))
@@ -1393,7 +1763,7 @@ class SshRewrite(HookFixture):
 
     def test_options_after_the_host_are_options_not_the_remote_command(self):
         line = self.inner(self.ssh('ssh dev2 -p 2222 ls -l'))
-        self.assertTrue(line.startswith('ssh dev2 -p 2222 python3 %s run' % self.REMOTE_PATH), line)
+        self.assertTrue(line.startswith('ssh dev2 -p 2222 python3 -I %s run' % self.REMOTE_PATH), line)
         self.assertEqual(self.b64_of(line), 'ls -l')
         self.assertIn('-G -p 2222 -- dev2', self.ssh_log.read_text())
         line = self.inner(self.ssh('ssh dev2 ls -p 2222'))  # the first other word ends the options
@@ -1408,6 +1778,39 @@ class SshRewrite(HookFixture):
 
     def test_a_remote_escape_after_host_options_is_still_found(self):
         self.assertEqual(self.ssh("ssh dev2 -p 22 'nohup sleep 9'")['permissionDecision'], 'deny')
+
+    def test_a_heredoc_script_keeps_the_rewrite_and_readonly(self):
+        line = self.inner(self.ssh("ssh dev2 bash <<'E'\necho hi\nE", agent_type='red-team', agent_id='rt1'))
+        self.assertIn('--token via-hook-ssh --readonly --cmd-b64 ', line)
+        self.assertEqual(self.b64_of(line.split('\n')[0]), 'bash')
+        self.assertTrue(line.endswith("<<'E'\necho hi\nE"), line)
+
+    def test_a_heredoc_script_reaches_the_remote_shell(self):
+        out = self.ssh("ssh rig bash <<'E'\necho from-the-body\nE")
+        result = self.exec_wrapped(out)
+        self.assertEqual((result.returncode, result.stdout), (0, 'from-the-body\n'), result.stderr)
+
+    def test_a_continued_ssh_line_is_still_wrapped(self):
+        line = self.inner(self.ssh("ssh dev2 \\\n  'git log'", agent_type='red-team', agent_id='rt1'))
+        self.assertIn('via-hook-ssh --readonly', line); self.assertEqual(self.b64_of(line), 'git log')
+
+    def test_ssh_fork_and_persist_options_are_escapes(self):
+        for command in ('ssh -o ForkAfterAuthentication=yes dev2 sleep 99', 'ssh -oForkAfterAuthentication=yes dev2 sleep 99',
+                        'ssh dev2 -o ForkAfterAuthentication=yes sleep 99', 'ssh -o "ForkAfterAuthentication yes" dev2 ls',
+                        'ssh -o forkafterauthentication=YES dev2 ls', 'ssh -o ControlPersist=yes dev2 ls', 'ssh -o ControlPersist=10m dev2 ls',
+                        'ssh -o RemoteCommand="nohup x" dev2', 'ssh -o LocalCommand="nohup x" dev2 ls'):
+            self.assertEqual(self.ssh(command)['permissionDecision'], 'deny', command)
+        for command in ('ssh -o ForkAfterAuthentication=no dev2 ls', 'ssh -o ControlPersist=no dev2 ls', 'ssh -o ConnectTimeout=5 dev2 ls'):
+            self.assertNotEqual(self.ssh(command).get('permissionDecision'), 'deny', command)
+
+    def test_an_unwrapped_line_of_a_readonly_agent_records_readonly(self):
+        for command in ('ssh -o IdentityFile=x dev2 ls', 'ssh -J jump dev2 ls', 'ssh -F x dev2 ls', "ssh dev2 <<'E'\necho hi\nE"):
+            out = self.ssh(command, agent_type='red-team', agent_id='rt1')
+            wrapped = out['updatedInput']['command']
+            head = wrapped.split(' -- ', 1)[0]
+            self.assertIn('--readonly', head, command); self.assertIn('--command-class remote-', head, command)
+            self.assertIn('read-only agent', out.get('additionalContext', ''), command)
+            self.assertNotIn('--readonly', self.ssh(command)['updatedInput']['command'].split(' -- ', 1)[0], command)
 
     def test_prefix_and_pipeline_stages_are_kept(self):
         line = self.inner(self.ssh("printf data | ssh dev2 'cat' | wc -c"))
@@ -1557,7 +1960,7 @@ class SshRewrite(HookFixture):
     # -- failing-first controls ---------------------------------------------------------------------------
 
     def alias_row_rewrites(self):
-        return 'python3 %s run' % self.REMOTE_PATH in self.inner(self.ssh("ssh dev2 'git log'"))
+        return 'python3 -I %s run' % self.REMOTE_PATH in self.inner(self.ssh("ssh dev2 'git log'"))
 
     def nohup_row_refused(self):
         return self.ssh("ssh dev2 'nohup sleep 30'").get('permissionDecision') == 'deny'

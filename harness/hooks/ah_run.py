@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -238,7 +239,8 @@ TRAMPOLINE_CODE = (
     '        os.closerange(3, rfd); os.closerange(rfd + 1, 4096)\n'
     '        if os.read(rfd, 1) == b"":\n'  # EOF without the clean-end byte: the supervisor died
     '            group = os.getpgrp()\n'
-    '            os.killpg(group, signal.SIGTERM); time.sleep(grace); os.killpg(group, signal.SIGKILL)\n'
+    '            os.killpg(group, signal.SIGCONT); os.killpg(group, signal.SIGTERM)\n'
+    '            time.sleep(grace); os.killpg(group, signal.SIGKILL)\n'
     '    except BaseException:\n'
     '        pass\n'
     '    os._exit(0)\n'
@@ -256,14 +258,18 @@ TRAMPOLINE_CODE = (
     '    os._exit(127)\n')
 
 
+WATCHDOG_ARGV = '-I -S -c ' + TRAMPOLINE_CODE.split('\n', 1)[0]  # how the watchdog reads in `ps`; it keeps this argv
+
+
 def trampoline_argv(read_fd, argv):
     """The child starts as a tiny Python process that is the session and group leader (start_new_session, so no job
     control stop on a controlling terminal). It double-forks a watchdog that stays in the group but is a child of
     neither the trampoline nor the shell, so the command sees no unexpected child, restores the signal dispositions
     Python changed, and execs the shell in its own pid. The watchdog ignores the forwarded signals and reads the pipe
-    the supervisor holds: EOF without the clean-end byte means the supervisor died, and it ends the group (SIGTERM,
-    then SIGKILL after KILL_GRACE)."""
-    return [sys.executable, '-S', '-c', TRAMPOLINE_CODE, str(read_fd), str(KILL_GRACE), *argv]
+    the supervisor holds: EOF without the clean-end byte means the supervisor died, and it ends the group (SIGCONT,
+    SIGTERM, then SIGKILL after KILL_GRACE). -I keeps a signal.py or os.py in the cwd or on PYTHONPATH from running
+    here; it reads no PYTHON* variable and changes no environment, so the command still sees the user's values."""
+    return [sys.executable, '-I', '-S', '-c', TRAMPOLINE_CODE, str(read_fd), str(KILL_GRACE), *argv]
 
 
 def read_command(args, root=None):
@@ -371,6 +377,22 @@ def _ledger_write(ledger, run_id, row):
         return False
 
 
+def pipe_above_stdio():
+    """A pipe with both ends at 3 or above. With stdio closed, os.pipe() can return 0-2; the watchdog would overwrite that
+    end with /dev/null, read EOF and end the group. Closed stdio itself is left closed, as it is without ah-run."""
+    ends = []
+    for fd in os.pipe():
+        if fd < 3:
+            moved = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 3)
+            ends.append((moved, fd))
+        else:
+            ends.append((fd, None))
+    for _moved, old in ends:
+        if old is not None:
+            os.close(old)
+    return ends[0][0], ends[1][0]
+
+
 def launch(args):
     try:
         ledger = Ledger()
@@ -399,7 +421,7 @@ def launch(args):
     unit = 'ah-run-' + run_id if use_unit else None
     argv = [shell, '-c', script]
     try:
-        read_fd, write_fd = os.pipe()
+        read_fd, write_fd = pipe_above_stdio()
     except OSError:
         read_fd = write_fd = None  # no pipe: run without the in-group watchdog
     if read_fd is not None:
@@ -454,6 +476,7 @@ def launch(args):
 
     def forward(signum, frame):
         state['signal'] = signum
+        kill_group(pgid, signal.SIGCONT)  # a paused command must see the signal now, not when someone resumes it
         kill_group(pgid, signum if signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP) else signal.SIGTERM)
         if state['escalation'] is None:  # a command that ignores the signal still ends KILL_GRACE later
             state['escalation'] = threading.Timer(KILL_GRACE, kill_group, (pgid, signal.SIGKILL))
@@ -525,6 +548,7 @@ def group_alive(pgid):
 
 def end_group(pgid):
     """SIGTERM what is left of a group; SIGKILL whatever still runs after KILL_GRACE. Returns at once when it empties."""
+    kill_group(pgid, signal.SIGCONT)
     kill_group(pgid, signal.SIGTERM)
     deadline = time.monotonic() + KILL_GRACE
     while group_alive(pgid):
@@ -637,6 +661,9 @@ def kill(args):
         if args.pause and (entry['comm'].endswith('wal.py') or 'wal_note.py' in table[entry['pid']]['args'] or 'wal.py' in table[entry['pid']]['args']):
             skipped.append({'pid': entry['pid'], 'why': 'never paused: WAL writer'})
             continue
+        if args.pause and WATCHDOG_ARGV in table[entry['pid']]['args']:
+            skipped.append({'pid': entry['pid'], 'why': 'never paused: a stopped watchdog cannot end the group'})
+            continue
         try:
             os.kill(entry['pid'], signum)
             signalled.append({**entry, 'signal': int(signum)})
@@ -685,23 +712,134 @@ KEYWORD_PREFIX = re.compile(r'^(?:then|do|else|elif|if|while|until|!|\{)\s+')
 ESCAPE_NAMES = frozenset(('nohup', 'setsid', 'disown', 'screen', 'tmux', 'at', 'batch', 'crontab', 'osascript', 'coproc'))
 LAUNCHCTL_ESCAPES = frozenset(('submit', 'bootstrap', 'load', 'kickstart'))
 TASK_TOKEN = re.compile(r'\[task:([A-Za-z0-9][A-Za-z0-9._:/#-]{0,127})\]')
-AH_PREFIX = re.compile(r'^\s*(?:(?:\S*/)?python3?(?:\.\d+)?\s+)?\S*(?:ah_run\.py|ah-run)(?=\s)')
+AH_PREFIX = re.compile(r'^\s*(?:(?:\S*/)?python3?(?:\.\d+)?(?:\s+-[A-Za-z]+)*\s+)?\S*(?:ah_run\.py|ah-run)(?=\s)')
 RECOVERY_SCRIPTS = frozenset(('reserve.py', 'reclaim.py'))
 POLICY_SELFCHECK_FIX = 'python3 harness/install.py --apply --role ROLE'
 
 
-def _skip_group(text, i):
-    """Index just past the ')' that closes the '(' at text[i-1]... called with i at the opening paren."""
-    depth, n = 0, len(text)
+WORD_BREAK = ' \t\n;&|(`'
+CASE_WORD = re.compile(r'case(?=[ \t\n])')
+
+
+def _walk_groups(text, i=0, stack=None):
+    """(index, certain). Walks shell text from i with the open contexts in stack: '(' for $(, <(, >( and a parenthesis
+    inside one, '`', '"' and '{' for ${. With a starting stack it stops just past the close of that group; from the top
+    level it reads to the end. `certain` is False when a shell may close the group elsewhere than this walk does: a
+    word-start # in a group (shells disagree on whether a comment there can hide the close), a \\` inside backticks, a
+    `case` in a group (its patterns hold unbalanced parentheses), a quote inside a double-quoted ${...}, or an
+    unterminated quote or group."""
+    stack = list(stack or [])
+    grouped, certain, n = bool(stack), True, len(text)
     while i < n:
-        if text[i] == '(':
-            depth += 1
-        elif text[i] == ')':
-            depth -= 1
-            if depth == 0:
-                return i + 1
-        i += 1
-    return n
+        top, ch = (stack[-1] if stack else None), text[i]
+        at_word = i == 0 or text[i - 1] in WORD_BREAK
+        if top == '"':
+            if ch == '\\':
+                i += 2
+            elif ch == '"':
+                stack.pop(); i += 1
+            elif ch == '`':
+                stack.append('`'); i += 1
+            elif text.startswith('$(', i):
+                stack.append('('); i += 2
+            elif text.startswith('${', i):
+                stack.append('{'); i += 2
+            else:
+                i += 1
+        elif ch == '\\':
+            certain = certain and not (text[i + 1:i + 2] == '`' and '`' in stack)
+            i += 2
+        elif text.startswith("$'", i):
+            try:
+                i = _decode_ansi_c(text, i + 2)[1]
+            except ValueError:
+                return n, False
+        elif ch == "'" or ch == '"':
+            in_quoted_brace = top == '{' and len(stack) > 1 and stack[-2] == '"'
+            certain = certain and not in_quoted_brace
+            if in_quoted_brace:
+                i += 1
+            elif ch == '"':
+                stack.append('"'); i += 1
+            else:
+                end = text.find("'", i + 1)
+                if end < 0:
+                    return n, False
+                i = end + 1
+        elif ch == '`':
+            if top == '`':
+                stack.pop()
+            else:
+                stack.append('`')
+            i += 1
+        elif text.startswith(('$(', '<(', '>('), i):
+            stack.append('('); i += 2
+        elif text.startswith('${', i):
+            stack.append('{'); i += 2
+        elif ch == '(' and stack and top != '{':
+            stack.append('('); i += 1
+        elif ch == ')' and top == '(':
+            stack.pop(); i += 1
+        elif ch == '}' and top == '{':
+            stack.pop(); i += 1
+        elif ch == '#' and at_word and top != '{':
+            if stack:
+                certain = False; i += 1
+            else:
+                end = text.find('\n', i)
+                i = n if end < 0 else end
+        elif stack and top != '{' and at_word and CASE_WORD.match(text, i):
+            certain = False; i += 4
+        else:
+            i += 1
+        if grouped and not stack:
+            return i, certain
+    return n, certain and not stack
+
+
+def _skip_group(text, i):
+    """Index just past the ')' that closes the group whose '(' is at text[i]; len(text) when it never closes."""
+    return _walk_groups(text, i + 1, ['('])[0]
+
+
+def _backtick_end(text, i):
+    """Index just past the '`' that closes the one at text[i]; len(text) when it never closes."""
+    return _walk_groups(text, i + 1, ['`'])[0]
+
+
+def join_continuations(text):
+    """Backslash-newline removed where the shell removes it (not in single quotes, $'...' or a comment), so a word split
+    or a comment after a continuation reads as the shell reads it."""
+    if '\\\n' not in text:
+        return text
+    out, i, n, quote = [], 0, len(text), None
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            out.append(ch); i += 1
+            quote = None if ch == "'" else quote
+        elif ch == '\\':
+            if text[i + 1:i + 2] != '\n':
+                out.append(text[i:i + 2])
+            i += 2
+        elif quote == '"':
+            out.append(ch); i += 1
+            quote = None if ch == '"' else quote
+        elif text.startswith("$'", i):
+            try:
+                end = _decode_ansi_c(text, i + 2)[1]
+            except ValueError:
+                return text
+            out.append(text[i:end]); i = end
+        elif ch in '\'"':
+            quote = ch; out.append(ch); i += 1
+        elif ch == '#' and (not out or out[-1][-1] in ' \t\n;&|('):
+            end = text.find('\n', i)
+            end = n if end < 0 else end
+            out.append(text[i:end]); i = end
+        else:
+            out.append(ch); i += 1
+    return ''.join(out)
 
 
 def inner_commands(text):
@@ -718,10 +856,12 @@ def inner_commands(text):
             quote = "'"; i += 1
         elif ch == '"':
             quote = None if quote == '"' else '"'; i += 1
+        elif quote is None and ch == '#' and (i == 0 or text[i - 1] in WORD_BREAK):
+            end = text.find('\n', i)  # a comment's apostrophe opens nothing
+            i = n if end < 0 else end
         elif ch == '`':
-            end = text.find('`', i + 1)
-            end = n if end < 0 else end
-            found.append(text[i + 1:end]); i = end + 1
+            end = _backtick_end(text, i)
+            found.append(text[i + 1:end - 1]); i = end
         elif text.startswith('$(', i) or (quote is None and text[i:i + 2] in ('<(', '>(')):
             end = _skip_group(text, i + 1)
             found.append(text[i + 2:end - 1]); i = end
@@ -760,26 +900,26 @@ def _heredoc_bodies(command, i, pending, bodies):
     """Read the bodies of the pending openers from the line starting at i. (next index, True) or (i, False) when a body
     is unterminated or the shell could read it differently: in an unquoted body a backslash-newline joins lines before
     the terminator test, and a $(...) or backtick runs a command."""
-    lines = command[i:].split('\n')
-    used, consumed = 0, 0
+    position, n = i, len(command)
     for delimiter, quoted, strip_tabs in pending:
         body = []
         while True:
-            if used >= len(lines):
+            if position > n:
                 return i, False
-            line = lines[used]
-            used += 1
-            consumed += len(line) + 1
+            end = command.find('\n', position)
+            end = n if end < 0 else end
+            line = command[position:end]
+            position = end + 1
             if (line.lstrip('\t') if strip_tabs else line) == delimiter:
                 break
             if not quoted and (line.endswith('\\') or '$(' in line or '`' in line):
                 return i, False
             body.append(line.lstrip('\t') if strip_tabs else line)
         bodies.append(('\n'.join(body) + '\n', quoted))
-    return i + consumed, True
+    return position, True
 
 
-def heredoc_scan(command):
+def heredoc_scan(command, openers=None):
     """(status, text, bodies): the single rule for what may be hidden from the matcher and the escape classifier.
 
     Removing a body hides its lines, so a body is removed only when the shell cannot read the command another way.
@@ -791,7 +931,8 @@ def heredoc_scan(command):
     - no text outside the bodies holds anything that nests other quoting or changes what `<<` means: $(...), backtick,
       ${...} other than ${NAME}, $[...], $'...', ((...)), [[...]], or a `(` attached to a word (<(, =(, @(, f().
     A command with no `<<` is `none`. Anything else is `uncertain`, with the text left whole: callers then check every
-    physical line and never answer allow. A false uncertain costs a prompt; a false certain hides a command."""
+    physical line and never answer allow. A false uncertain costs a prompt; a false certain hides a command.
+    `openers`, when given, receives each opener's text in marker order."""
     if '<<' not in command:
         return HEREDOC_NONE, command, []
     uncertain = (HEREDOC_UNCERTAIN, command, [])
@@ -832,6 +973,8 @@ def heredoc_scan(command):
             delimiter = found.group(2) or found.group(3) or found.group(4)
             quoted = bool(found.group(2) or found.group(3)) or command[found.end() - len(delimiter) - 1] == '\\'
             pending.append((delimiter, quoted, bool(found.group(1))))
+            if openers is not None:
+                openers.append(found.group())
             out.append('<<__HD%d__' % (len(bodies) + len(pending) - 1)); i = found.end()
         elif ch == '\n':
             out.append(ch); i += 1
@@ -859,16 +1002,61 @@ def heredoc_scan(command):
 
 
 def _prepare_text(command):
-    """(text, heredoc bodies, uncertain). Bodies are removed only under heredoc_scan's rule; the rest is normalized by
-    deansi. An uncertain result keeps every line in the text and is never allowed."""
+    """(text, heredoc bodies, uncertain). Bodies are removed only under heredoc_scan's rule; continuations are joined and
+    the rest normalized by deansi; _walk_groups then says whether every group ends where a shell ends it. An uncertain
+    result keeps every line in the text and is never allowed."""
     status, text, bodies = heredoc_scan(command)
-    text, ok = deansi(text.strip())
-    return text, bodies, status == HEREDOC_UNCERTAIN or not ok
+    text, ok = deansi(join_continuations(text.strip()))
+    return text, bodies, status == HEREDOC_UNCERTAIN or not ok or not _walk_groups(text)[1]
 
 
-PHYSICAL_SPLIT = re.compile(r'[;&|()`\n]|\$\(')
+HEREDOC_HINT = ("Text in a heredoc inside $(...) is checked line by line as commands. Use a top-level quoted heredoc: "
+                "`git commit -F - <<'EOF'` for a commit message, `gh pr create --body-file - <<'EOF'` for a PR body.")
+SCRIPT_SPLIT = re.compile(r'[;&|()`\n]|\$\(')
+PHYSICAL_SPLIT = re.compile(r'[;&|()`\n\r<>]|\$\(')  # a redirect can touch the word before it (`touch<<E`)
 BACKGROUND_AMP = re.compile(r'(?<![&<>])&(?=\s|$)')
 LATER_WAIT = re.compile(r'(?:^|[\s;&|(])wait(?=[\s;&|)]|$)')
+
+
+SCRIPT_HOSTS = frozenset(('bash', 'sh', 'zsh', 'dash', 'ksh', 'source', '.', 'eval'))
+HEREDOC_MARKER = re.compile(r'<<__HD(\d+)__')
+SSH_ON_LINE = re.compile(r'(?:^|[\s;&|(/])ssh\s')
+
+
+def _reads_script(fragment):
+    """True when this simple command runs its stdin or a heredoc as shell text: a shell, source, `.` or eval (through any
+    wrapper), or ssh with no remote command or a shell in it."""
+    for form in match_candidates(fragment):
+        try:
+            words = [word[1] for word in raw_words(HEREDOC_MARKER.sub('', form))]
+        except ValueError:
+            words = form.split()
+        name = words[0].rsplit('/', 1)[-1] if words else ''
+        if name in SCRIPT_HOSTS:
+            return True
+        if name == 'ssh':
+            call = host_table.parse_ssh(words[1:])
+            if call and (not call.remote or any(word.rsplit('/', 1)[-1] in SCRIPT_HOSTS for word in ' '.join(call.remote).split())):
+                return True
+    return False
+
+
+def script_bodies(text, bodies):
+    """The heredoc bodies a shell will run: read by a shell directly, or from a pipeline that holds a shell. Any other
+    reader (cat, python3 -) keeps its body as data."""
+    if not bodies:
+        return []
+    fragments = SCRIPT_SPLIT.split(text)
+    piped = '|' in text and any(_reads_script(fragment) for fragment in fragments)
+    found = []
+    for line in text.split('\n'):
+        # the split ignores quotes, so a quoted remote command (`ssh h 'cd x && sh' <<E`) is judged on its whole line
+        remote_shell = SSH_ON_LINE.search(line) and any(word.strip('\'"').rsplit('/', 1)[-1] in SCRIPT_HOSTS for word in line.split())
+        for fragment in SCRIPT_SPLIT.split(line):
+            numbers = [int(number) for number in HEREDOC_MARKER.findall(fragment)]
+            if numbers and (piped or remote_shell or _reads_script(fragment)):
+                found.extend(bodies[number][0] for number in numbers if number < len(bodies))
+    return found
 
 
 def physical_parts(command):
@@ -878,7 +1066,7 @@ def physical_parts(command):
     parts = []
     for fragment in PHYSICAL_SPLIT.split(command):
         fragment = fragment.strip()
-        bare = fragment.lstrip('\'" \t')
+        bare = fragment.strip('\'" \t')
         for form in (fragment, bare):
             if form and form not in parts[-2:]:
                 parts.append(form)
@@ -897,8 +1085,7 @@ def _classify_physical_lines(command, reasons, depth):
         _classify_words(words, found, [], depth)
     if BACKGROUND_AMP.search(command) and not LATER_WAIT.search(command):
         found.append('background & without a later wait')
-    reasons.extend('a line of a command the hook cannot parse with certainty (use a file, or a top-level <<\'EOF\'): ' + reason
-                   for reason in found)
+    reasons.extend('a line of a command the hook cannot parse with certainty: ' + reason for reason in found)
 
 
 def _tokens(text):
@@ -970,31 +1157,37 @@ def _decode_ansi_c(text, i):
     raise ValueError('unterminated $\'')
 
 
-def _deansi_group(text, i, out):
+MAX_GROUP_DEPTH = 16
+
+
+def _deansi_group(text, i, out, depth):
     """Copy the substitution or process substitution at text[i] into out, normalizing its body; return the next index."""
     if text[i] == '`':
-        end = text.find('`', i + 1)
-        if end < 0:
+        end = _backtick_end(text, i)
+        if end <= i + 1 or text[end - 1] != '`':
             raise ValueError('unterminated backtick')
-        body, ok = deansi(text[i + 1:end])
+        body, ok = deansi(text[i + 1:end - 1], depth + 1)
         if not ok:
             raise ValueError('inner quoting')
         out.append('`' + body + '`')
-        return end + 1
+        return end
     end = _skip_group(text, i + 1)
     if end > len(text) or text[end - 1] != ')':
         raise ValueError('unterminated substitution')
-    body, ok = deansi(text[i + 2:end - 1])
+    body, ok = deansi(text[i + 2:end - 1], depth + 1)
     if not ok:
         raise ValueError('inner quoting')
     out.append(text[i:i + 2] + body + ')')
     return end
 
 
-def deansi(text):
+def deansi(text, depth=0):
     """(text, ok): every $'...' word rewritten as an equivalent single-quoted word, so the splitter, the matcher and
     the classifier all read what the shell reads. ok is False for any quoting that cannot be tokenized with certainty
-    (unterminated quotes, substitutions or ANSI-C strings, NUL escapes); callers then never answer allow."""
+    (unterminated quotes, substitutions or ANSI-C strings, NUL escapes, groups nested past MAX_GROUP_DEPTH); callers then
+    never answer allow."""
+    if depth > MAX_GROUP_DEPTH:
+        return text, False
     out, i, n, quote = [], 0, len(text), None
     try:
         while i < n:
@@ -1008,7 +1201,7 @@ def deansi(text):
                 if ch == '"':
                     quote = None; out.append(ch); i += 1
                 elif ch == '`' or text.startswith('$(', i):
-                    i = _deansi_group(text, i, out)
+                    i = _deansi_group(text, i, out, depth)
                 else:
                     out.append(ch); i += 1
             elif ch in '\'"':
@@ -1021,7 +1214,7 @@ def deansi(text):
                 end = n if end < 0 else end
                 out.append(text[i:end]); i = end
             elif ch == '`' or text.startswith('$(', i) or text[i:i + 2] in ('<(', '>('):
-                i = _deansi_group(text, i, out)
+                i = _deansi_group(text, i, out, depth)
             else:
                 out.append(ch); i += 1
     except ValueError:
@@ -1059,11 +1252,8 @@ def parse_command(command, depth=0):
                 cur.append(text[i:i + 2]); i += 2; continue
             if ch == '`' or text.startswith('$(', i):
                 parsed.substitution = True
-                if ch == '`':
-                    end = text.find('`', i + 1); end = n - 1 if end < 0 else end
-                    cur.append('X'); i = end + 1
-                else:
-                    cur.append('X'); i = _skip_group(text, i + 1)
+                cur.append('X')
+                i = _backtick_end(text, i) if ch == '`' else _skip_group(text, i + 1)
                 continue
             cur.append(ch); quote = None if ch == '"' else quote; i += 1
         elif ch == '\\':
@@ -1075,11 +1265,8 @@ def parse_command(command, depth=0):
                 i += 1
         elif ch == '`' or text.startswith('$(', i) or text[i:i + 2] in ('<(', '>('):
             parsed.substitution = True
-            if ch == '`':
-                end = text.find('`', i + 1); end = n - 1 if end < 0 else end
-                cur.append('X'); i = end + 1
-            else:
-                cur.append('X'); i = _skip_group(text, i + 1)
+            cur.append('X')
+            i = _backtick_end(text, i) if ch == '`' else _skip_group(text, i + 1)
         elif ch == '\n':
             parsed.newline = True; cut(); i += 1
         elif ch in ';()':
@@ -1095,6 +1282,14 @@ def parse_command(command, depth=0):
     cut()
     if quote:
         parsed.uncertain = True
+    for body in script_bodies(text, bodies):
+        parsed.substitution = True  # never allow-eligible; its lines reach the deny check through inner
+        if depth < 4:
+            sub = parse_command(body, depth + 1)
+            parsed.inner.extend(sub.segments + sub.inner)
+            parsed.uncertain = parsed.uncertain or sub.uncertain
+        else:
+            parsed.uncertain = True
     if depth < 4:
         for body in inner_commands(text):
             sub = parse_command(body, depth + 1)
@@ -1209,6 +1404,9 @@ def peel_wrapper(text):
         return None
 
 
+BLANKS = re.compile(r'[ \t]+')
+
+
 def match_candidates(segment):
     """The segment as typed plus every form with env assignments, wrappers (exec, command, time, nohup, nice, sudo,
     timeout, env) and the quoting of the program word removed. A deny or ask rule matching any form applies."""
@@ -1227,6 +1425,8 @@ def match_candidates(segment):
             if nxt == base:
                 nxt = WRAPPER_PREFIX.sub('', base, count=1)
         current = normalize_segment(nxt)
+    # a run of blanks is one separator to the shell. Only these forms get it, not allow, so it can only widen a deny or ask.
+    forms.extend(collapsed for collapsed in dict.fromkeys(BLANKS.sub(' ', form) for form in forms) if collapsed not in seen)
     return forms
 
 
@@ -1459,6 +1659,15 @@ def _classify_ssh(args, reasons, notes, depth):
         return
     if 'f' in call.flags:
         reasons.append('ssh -f backgrounds the connection')
+    for value in call.o_values:
+        key, _sep, setting = value.strip().partition('=') if '=' in value else value.strip().partition(' ')
+        key, setting = key.strip().lower(), setting.strip()
+        if key == 'forkafterauthentication' and setting.lower() != 'no':
+            reasons.append('ssh -o ForkAfterAuthentication backgrounds the connection')
+        elif key == 'controlpersist' and setting.lower() != 'no':
+            reasons.append('ssh -o ControlPersist leaves a master connection running')
+        elif key in ('remotecommand', 'localcommand') and setting:
+            _classify_text(setting, reasons, notes, depth + 1, 'ssh -o %s: ' % key)
     if call.remote:
         # a model-supplied `ah-run ... --` prefix in the remote command is replaced by the hook, so look past it
         _classify_text(strip_ah_run_prefix(' '.join(call.remote)), reasons, notes, depth + 1, 'ssh remote: ')
@@ -1474,9 +1683,10 @@ def _classify_text(command, reasons, notes, depth, prefix=''):
 
 
 def _classify_command(command, reasons, notes, depth):
-    uncertain, entries, inner = False, [], []
+    uncertain, entries, inner, scripts = False, [], [], []
     try:
-        text, _bodies, uncertain = _prepare_text(command)
+        text, bodies, uncertain = _prepare_text(command)
+        scripts = script_bodies(text, bodies)
         for words, operator in _simple(_tokens(_mask_redirect_amps(text))):
             entries.append(([w[1].replace('\x01', '&') for w in words if w[0] == 'word'], operator))
         inner = inner_commands(text)
@@ -1486,14 +1696,15 @@ def _classify_command(command, reasons, notes, depth):
             return
     if uncertain:
         _classify_physical_lines(command, reasons, depth)
+    last_wait = max((position for position, (words, _op) in enumerate(entries) if _command_word(words) == 'wait'), default=-1)
     for position, (words, operator) in enumerate(entries):
         _classify_words(words, reasons, notes, depth)
-        if operator == '&' and words:
-            later = any(_command_word(later_words) == 'wait' for later_words, _op in entries[position + 1:])
-            if not later:
-                reasons.append('background & without a later wait')
+        if operator == '&' and words and position >= last_wait:
+            reasons.append('background & without a later wait')
     for body in inner:
         _classify_text(body, reasons, notes, depth + 1, 'substitution: ')
+    for body in scripts:
+        _classify_text(body, reasons, notes, depth + 1, 'heredoc script: ')
 
 
 def _simple(tokens):
@@ -1702,6 +1913,13 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
     candidates = [(s, _ssh_form(s)) for s in segments]
     if not any(form for _s, form in candidates):
         return command, None
+    if not parsed.uncertain:
+        command = join_continuations(command)  # the segments were cut from the joined text
+    openers = []
+    heredoc_scan(command, openers)
+
+    def with_openers(text):
+        return HEREDOC_MARKER.sub(lambda m: openers[int(m.group(1))] if int(m.group(1)) < len(openers) else m.group(), text)
     policy = host_table.policy_path(home, env)
     table = host_table.load(policy)
     remote = None
@@ -1722,6 +1940,8 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
             else:
                 args.append(word)
         call = host_table.parse_ssh([w[1] for w in args[1:]])
+        if call is not None and not call.remote and HEREDOC_MARKER.search(form):
+            remote = remote or ('remote-unwrapped', digest(call.target))  # its login shell reads the body
         if call is None or not call.remote:
             continue  # `ssh HOST` with no command, `ssh -N`, `-W`: nothing to wrap
         raws = [w[0] for w in args[1:]]
@@ -1765,7 +1985,7 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
                                  'to the host, then run a short remote command (for example `ssh HOST bash /path/script.sh`)'
                                  % (len(text.encode('utf-8')), INLINE_LIMIT))
             b64 = base64.b64encode(text.encode('utf-8')).decode('ascii')
-        tail = ['python3', path] if path.endswith('.py') else [path]
+        tail = ['python3', '-I', path] if path.endswith('.py') else [path]
         entry_env = cls.entry.get('remote_env')  # AGENT_HARNESS_* only: the rig points the remote reserve at a private dir
         pairs = []
         if isinstance(entry_env, dict):
@@ -1779,12 +1999,13 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
         if agent_is_readonly(payload):
             tail.append('--readonly')
         tail += ['--cmd-b64', b64]
-        new_form = ' '.join([args[0][0], *raws[:before_remote], *tail, *redirects])
-        if command.count(segment) != parsed.segments.count(segment):
+        new_form = with_openers(' '.join([args[0][0], *raws[:before_remote], *tail, *redirects]))
+        typed = with_openers(segment)
+        if command.count(typed) != parsed.segments.count(segment):
             remote = remote or ('remote-unwrapped', digest(who))
             context.append('ah-run: an ssh line could not be rewritten safely (its text repeats inside another command); it runs unwrapped')
             continue
-        command = command.replace(segment, prefix + new_form)
+        command = command.replace(typed, prefix + new_form)
     return command, remote
 
 
@@ -1885,7 +2106,7 @@ def build_rewrite(command, payload, env, notes, context, remote=None):
         token = mint_pending(root, command, task, agent, session)
     except (OSError, RuntimeError):
         context.append('ah-run: the pending token row could not be written; attribution will be unverified')
-    parts = ['python3', str(Path(__file__).resolve()), 'run', '--task', task, '--agent', agent]
+    parts = ['python3', '-I', str(Path(__file__).resolve()), 'run', '--task', task, '--agent', agent]
     if ticket and SAFE_KEY.fullmatch(ticket):
         parts += ['--ticket', ticket]
     parts += ['--session', session]
@@ -1895,6 +2116,9 @@ def build_rewrite(command, payload, env, notes, context, remote=None):
         parts += ['--task-source', task_source]
     if remote:
         parts += ['--command-class', remote[0], '--remote-host-sha256', remote[1]]
+        if agent_is_readonly(payload):  # no remote line carries it, so the local row records it
+            parts.append('--readonly')
+            context.append('ah-run: a read-only agent ran an ssh line that could not be wrapped; the local row records readonly')
     elif 'pgid-split' in notes:
         parts += ['--command-class', 'pgid-split']
     if len(raw) > INLINE_LIMIT:
@@ -1925,6 +2149,10 @@ def decide(payload, home=None, env=None, ancestors=None):
     if not isinstance(original, str) or not original.strip() or mode == 'plan':
         return {}
     command = strip_ah_run_prefix(original)
+    try:
+        check_payload_cap(command)  # first: a command that will be refused should not cost a full analysis
+    except ValueError as error:
+        return _out('deny', 'ah-run: %s' % error)
     cwd = payload.get('cwd') or os.getcwd()
     cli = settings_from_ancestors(ancestors() if ancestors else ancestor_commands())
     rules = load_rules(cwd, home, cli)
@@ -1938,7 +2166,8 @@ def decide(payload, home=None, env=None, ancestors=None):
         forms = match_candidates(part)
         for rule in rules['deny']:
             if any(rule.matches(form) for form in forms):
-                return _out('deny', 'denied by permission rule %s' % rule.label())
+                hint = ' %s' % HEREDOC_HINT if parsed.heredoc == HEREDOC_UNCERTAIN else ''
+                return _out('deny', 'denied by permission rule %s%s' % (rule.label(), hint))
 
     asked = any(rule.matches(form) for part in parsed.segments + parsed.inner for rule in rules['ask'] for form in match_candidates(part))
     if (parsed.segments and not parsed.substitution and not parsed.newline and not parsed.uncertain and not parsed.pipeline
@@ -1958,6 +2187,8 @@ def decide(payload, home=None, env=None, ancestors=None):
     reasons, notes = analyze_escapes(command)
     if reasons:
         text = 'command escapes tracking: %s. Run it through `ah-run` or keep it in the foreground (use `wait`).' % '; '.join(reasons)
+        if parsed.heredoc == HEREDOC_UNCERTAIN:
+            text += ' ' + HEREDOC_HINT
         if escape_mode(home, env) == 'enforce':
             return _out('deny', text)
         context.append('WARNING (escapes in warn mode, will be refused in enforce): ' + text)
