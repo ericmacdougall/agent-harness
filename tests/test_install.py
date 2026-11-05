@@ -1,4 +1,5 @@
 import json
+import re
 import os
 import stat
 import subprocess
@@ -24,6 +25,29 @@ class InstallerTests(unittest.TestCase):
         self.home = Path(self.temp.name).resolve()
         self.claude = self.home / ".claude"
         self.claude.mkdir()
+
+    def test_subagent_hooks_fire_for_every_agent_type(self):
+        # goodqa#14613: the matcher covered four agent types, so a general-purpose owner never got a
+        # SubagentStart/Stop WAL record and no liveness check could see it stop.
+        install(self.home, apply=True)
+        hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+        for event, action in (("SubagentStart", "subagent"), ("SubagentStop", "subagent_stop")):
+            groups = [g for g in hooks[event]
+                      if any(os.path.basename(str((h.get("args") or [""])[0])) == "wal.py" for h in g.get("hooks", []))]
+            self.assertEqual(len(groups), 1, event)
+            matcher = groups[0].get("matcher") or ".*"
+            for agent_type in ("general-purpose", "claude", "Explore", "Plan", "task-owner", "red-team", "statusline-setup"):
+                self.assertTrue(re.fullmatch(matcher, agent_type), (event, matcher, agent_type))
+            hook = [h for h in groups[0]["hooks"] if os.path.basename(str(h["args"][0])) == "wal.py"][0]
+            self.assertEqual(hook["args"][1], action)
+            result = subprocess.run([sys.executable, *[str(a) for a in hook["args"]]],
+                                    input=json.dumps({"session_id": "s-gp", "agent_id": "owner-gp", "agent_type": "general-purpose"}),
+                                    text=True, capture_output=True, timeout=30, env={**os.environ, "HOME": str(self.home)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+        wal = self.claude / "wals" / "s-gp" / "main.jsonl"
+        self.assertTrue(wal.exists(), list((self.claude / "wals").rglob("*")))
+        events = [json.loads(line).get("event") for line in wal.read_text().splitlines() if line.strip()]
+        self.assertIn("subagent", events); self.assertIn("subagent_stop", events)
 
     def test_preview_does_not_write(self):
         paths = install(self.home, apply=False)

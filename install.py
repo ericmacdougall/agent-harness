@@ -47,7 +47,9 @@ def managed_scripts(claude: Path) -> set[str]:
                          "command_guard_hook.py")}
 
 
-SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
+# Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
+# SubagentStart/Stop WAL record, so no liveness check could see them stop (goodqa#14613, the Solve drop).
+SUBAGENT_MATCHER = ".*"
 GOODQA_STATUS_TOOLS = (r"^mcp__.*[Gg][Oo][Oo][Dd][Qq][Aa].*__(close_issue_done|close_issue_wont_fix|update_issue|"
                        r"bulk_update_issues|archive_issue|reassign_issue|call_api)$")
 
