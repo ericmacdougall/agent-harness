@@ -441,7 +441,12 @@ func (l *Ledger) snapshot() (*snapshot, error) {
 	for i, b := range bad {
 		badAny[i] = b
 	}
-	k, err := pycompat.Canonical(map[string]any{"v": Version, "project": l.Project, "tips": tips, "classes": cl, "bad": badAny, "sources": src})
+	// The reviewed prefix of each trusted writer decides which of its ops fold, so it is part of the key.
+	trust := map[string]any{}
+	for w, e := range l.ReadTrust().Trusted {
+		trust[w] = strconv.Itoa(e.Ops) + ":" + e.Digest
+	}
+	k, err := pycompat.Canonical(map[string]any{"v": Version, "project": l.Project, "tips": tips, "classes": cl, "bad": badAny, "sources": src, "trust": trust})
 	if err != nil {
 		return nil, err
 	}

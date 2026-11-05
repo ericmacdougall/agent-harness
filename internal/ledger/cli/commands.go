@@ -33,6 +33,7 @@ const Usage = `usage: harness tickets <command> [options]
   bind --project UUID --receipt FILE
   trust-writer w_... --reviewed DIGEST
   block-writer w_...
+  travel enable --remote NAME [--yes-share TOKEN] | status | push | fetch [--adopt --remote NAME --yes-share TOKEN]
 common: --json (reads and writes), --slug S (select a repo-less ledger outside a repository),
         --redact-secrets (mask secret-shaped text instead of refusing), --actor-label L
 exit codes: 0 ok, 2 usage/validation, 3 refused/not found/ambiguous, 6 ledger busy`
@@ -151,6 +152,8 @@ func run(cmd string, args []string, env Env) error {
 		return cmdTrustWriter(args, env)
 	case "block-writer":
 		return cmdBlockWriter(args, env)
+	case "travel":
+		return cmdTravel(args, env)
 	case "fetch", "push", "sync", "import":
 		return usagef("%s is not part of Phase 0a (local-only ledger)", cmd)
 	}
@@ -724,6 +727,9 @@ func cmdWriters(args []string, env Env) error {
 	defer l.Close()
 	v, err := nowView(l)
 	if err != nil {
+		if errors.Is(err, ledger.ErrRefused) {
+			return writersWithoutRoot(p, l, env, err) // an adopted ledger whose writers are not trusted yet
+		}
 		return err
 	}
 	if p.has("show") {

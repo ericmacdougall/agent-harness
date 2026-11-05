@@ -6,9 +6,13 @@ package store
 // no prompt, and a URL that is validated before git ever sees it.
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -91,8 +95,8 @@ func ValidateURL(u string) error {
 					return errors.New("remote URLs with embedded credentials are refused")
 				}
 			}
-			if strings.HasPrefix(pu.Host, "-") {
-				return errors.New("remote host may not start with a dash")
+			if strings.HasPrefix(pu.Host, "-") || (pu.User != nil && strings.HasPrefix(pu.User.Username(), "-")) {
+				return errors.New("remote user and host may not start with a dash")
 			}
 			return nil
 		case "file":
@@ -176,4 +180,81 @@ func (g *Git) PushForeign(repo, ref string) error {
 			" -c core.alternateRefsCommand=true receive-pack",
 		repo, ref+":"+ref)
 	return err
+}
+
+// DirSize sums the sizes of regular files under dir (best effort).
+func DirSize(dir string) int64 {
+	var n int64
+	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			if fi, e := d.Info(); e == nil {
+				n += fi.Size()
+			}
+		}
+		return nil
+	})
+	return n
+}
+
+// ErrFetchTooBig means the fetch grew past its size cap and was stopped.
+var ErrFetchTooBig = errors.New("the fetch exceeded its size cap and was stopped")
+
+// FetchCapped is FetchRefspec with a watchdog: git offers no portable pack-size cap, so this stops the
+// fetch once the (disposable) git directory holds more than maxBytes.
+func (g *Git) FetchCapped(remote, refspec string, maxBytes int64) error {
+	if err := ValidateURL(remote); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), FetchTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "--git-dir="+g.GitDir, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+		"--no-recurse-submodules", "--", remote, refspec)
+	cmd.Env = TransportEnv()
+	cmd.WaitDelay = 2 * time.Second
+	var stderr bytes.Buffer
+	cmd.Stderr = &limitedWriter{b: &stderr, max: 32 << 10}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("git fetch could not run: %w", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	tick := time.NewTicker(150 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				if ctx.Err() != nil {
+					return fmt.Errorf("git fetch timed out after %s", FetchTimeout)
+				}
+				return &GitError{Sub: "fetch", Code: 1, Stderr: stderr.String()}
+			}
+			if DirSize(g.GitDir) > maxBytes {
+				return ErrFetchTooBig
+			}
+			return nil
+		case <-tick.C:
+			if DirSize(g.GitDir) > maxBytes {
+				cancel()
+				<-done
+				return ErrFetchTooBig
+			}
+		}
+	}
+}
+
+type limitedWriter struct {
+	b   *bytes.Buffer
+	max int
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	if room := w.max - w.b.Len(); room > 0 {
+		if len(p) > room {
+			w.b.Write(p[:room])
+		} else {
+			w.b.Write(p)
+		}
+	}
+	return len(p), nil
 }

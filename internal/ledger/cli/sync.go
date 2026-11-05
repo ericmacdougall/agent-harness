@@ -355,3 +355,46 @@ func cmdBlockWriter(args []string, env Env) error {
 	emit(env, p.has("json"), op.Obj{{K: "writer", V: w}, {K: "blocked", V: true}}, fmt.Sprintf("blocked %s\n", w))
 	return nil
 }
+
+// writersWithoutRoot lists writers when no folded writer holds the project root yet (a freshly adopted
+// ledger): the view cannot be built, but the writers can be reviewed and trusted.
+func writersWithoutRoot(p parsed, l *ledger.Ledger, env Env, viewErr error) error {
+	if p.has("show") {
+		w := p.get("show")
+		ops, digest, class, err := l.WriterReview(w)
+		if err != nil {
+			return err
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "writer %s class %s, %d ops (untrusted data below; not folded unless self or trusted)\n", w, class, len(ops))
+		texts := []string{}
+		for i, o := range ops {
+			if i == 200 {
+				break
+			}
+			t := string(o.Raw)
+			if len(t) > 2048 {
+				t = t[:2048] + "..."
+			}
+			texts = append(texts, s(t))
+			fmt.Fprintf(&b, "  op %s\n", s(term.Line(t)))
+		}
+		fmt.Fprintf(&b, "review digest %s (covers all %d ops; trust-writer %s --reviewed DIGEST)\n", digest, len(ops), w)
+		emit(env, p.has("json"), op.Obj{{K: "writer", V: w}, {K: "class", V: class}, {K: "ops", V: len(ops)},
+			{K: "review_digest", V: digest}, {K: "ops_text", V: texts}}, b.String())
+		return nil
+	}
+	in, err := l.Snapshot()
+	if err != nil {
+		return err
+	}
+	rows := []op.Obj{}
+	var b strings.Builder
+	fmt.Fprintf(&b, "no trusted or own writer holds the project root yet (%s)\n", term.Line(viewErr.Error()))
+	for _, r := range in.Refs {
+		rows = append(rows, op.Obj{{K: "id", V: r.Writer}, {K: "class", V: in.Class(r.Writer)}, {K: "ops", V: len(r.Ops)}, {K: "rejected", V: term.Line(r.Rejected)}})
+		fmt.Fprintf(&b, "%s %-10s %4d ops %s\n", r.Writer, in.Class(r.Writer), len(r.Ops), term.Line(r.Rejected))
+	}
+	emit(env, p.has("json"), op.Obj{{K: "project", V: l.Project}, {K: "writers", V: rows}}, b.String())
+	return nil
+}
