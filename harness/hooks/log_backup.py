@@ -98,10 +98,13 @@ def bulk_classify(home: Path, now: float | None = None, max_age: int = BULK_MAX_
     """State of the bulk tier (archived sessions, narrowed work tree). A bulk marker that never appeared is only a
     problem once the backup has been installed for longer than max_age ('pending' before that)."""
     now = time.time() if now is None else now
-    stamp = parse_stamp(read_small(logs_dir(home) / BULK_OK))
+    text = read_small(logs_dir(home) / BULK_OK)
+    stamp = parse_stamp(text)
+    if stamp is None and text is not None:
+        return {"state": "invalid", "age": None}  # present but unreadable is never "pending"
     if stamp is None:
         first = parse_stamp(read_small(logs_dir(home) / FIRST_RUN))
-        if first is not None and now - first <= max_age:
+        if first is not None and -FUTURE_TOLERANCE_SECONDS <= now - first <= max_age:
             return {"state": "pending", "age": None}
         return {"state": "missing", "age": None}
     age = now - stamp
