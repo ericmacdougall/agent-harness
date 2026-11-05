@@ -239,7 +239,7 @@ class Restore(Base):
     def test_unsafe_src_and_host_are_refused(self):
         for src in (".", "", "../x", "/abs", "-x", ".claude/../../etc"):
             self.assertEqual(self.restore(src, self.tmp / "s")[0], 2, src)
-        for host in ("../x", "a b", "-x", "a/b", ""):
+        for host in ("../x", "a b", "-x", "a/b", "", "..", ".x"):
             self.assertEqual(self.restore(".claude/projects", self.tmp / "s", host=host)[0], 2, host)
 
     def test_hostile_remote_override_is_refused(self):

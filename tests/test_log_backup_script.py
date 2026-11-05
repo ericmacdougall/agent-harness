@@ -47,7 +47,10 @@ sys.exit(0)
 
 # Credential-named files planted in every source; none may reach the remote.
 SECRET_NAMES = ["auth.json", "rclone.conf", "member.key", "x.key", "cert.pem", "a.p12", "a.token", "id_rsa", ".netrc",
-                ".npmrc", "kit.json", ".env", ".env.local", "x.secret", ".credentials.json"]
+                ".npmrc", "kit.json", ".env", ".env.local", "x.secret", ".credentials.json",
+                "key", "token", "pem", "p12", "netrc", "_netrc", "Auth.json", "AUTH.JSON", ".ENV", "Member.Key",
+                ".pgpass", ".pypirc", "a.jks", "a.gpg", "a.tfvars", "secrets.json", "service-account-1.json", "id_dsa",
+                ".git/config", ".docker/config.json", "cookies.sqlite"]
 SOURCES = [".claude/projects", ".claude/wals", ".codex/sessions", ".codex/archived_sessions", ".agent-harness/work"]
 ORDINARY = {
     ".claude/projects/p1/a.jsonl": b"claude transcript A\n",
@@ -120,7 +123,7 @@ class Case(unittest.TestCase):
         return self.logs / "log-backup.last-ok"
 
 
-ALLOWED_FLAGS = {"--tpslimit", "--transfers", "--contimeout", "--timeout", "--log-file", "--log-level", "--exclude-from", "--backup-dir"}
+ALLOWED_FLAGS = {"--tpslimit", "--transfers", "--contimeout", "--timeout", "--log-file", "--log-level", "--exclude-from", "--backup-dir", "--ignore-case"}
 
 
 def assert_copy_only(test, calls):
@@ -327,6 +330,14 @@ class Locking(Case):
         self.assertEqual(self.run_script().returncode, 0)
         self.assertTrue(self.last_ok().exists())
 
+    def test_spoofed_command_line_with_script_name_as_later_argument_is_not_a_holder(self):
+        other = subprocess.Popen(["/bin/sh", "-c", "sleep 60", "log-backup.sh"])  # script name only as argv[2]
+        self.addCleanup(lambda: (other.terminate(), other.wait()))
+        time.sleep(0.3)
+        self.lock(other.pid)
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertTrue(self.last_ok().exists())
+
     def test_lookalike_process_is_not_a_live_holder(self):
         # a command line containing "log-backup" but not the script (tail of the log) must not wedge the backup
         other = subprocess.Popen(["/bin/sh", "-c", "sleep 60", "log-backup.log"])
@@ -435,8 +446,21 @@ class Failure(Case):
             self.assertEqual(done.returncode, 2, text)
         self.assertEqual(self.copies(), [])
 
+    def test_symlinked_source_root_and_empty_primary_do_not_make_a_fresh_backup(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "stolen.txt").write_text("x")
+        shutil.rmtree(self.home / ".claude/projects")
+        os.symlink(outside, self.home / ".claude/projects")
+        shutil.rmtree(self.home / ".codex/sessions")
+        (self.home / ".codex/sessions").mkdir()  # an empty primary tree
+        done = self.local_run()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.last_ok().exists())
+        self.assertNotIn("stolen.txt", {Path(f).name for f in self.remote_files()})
+
     def test_invalid_host_label_is_refused(self):
-        for host in ("a b", "-x", "../x", "a/b"):
+        for host in ("a b", "-x", "../x", "a/b", "..", ".", ".hidden"):
             done = self.run_script(LOG_BACKUP_HOST=host)
             self.assertEqual(done.returncode, 2, host)
 

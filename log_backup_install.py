@@ -83,6 +83,8 @@ def backup_run_active(home: Path) -> bool:
     pid_file = home / ".agent-harness" / "logs" / "log-backup.lock.d" / "pid"
     try:
         pid = int(pid_file.read_text().strip())
+        if pid <= 1:
+            return False
         os.kill(pid, 0)
         return True
     except (OSError, ValueError):
