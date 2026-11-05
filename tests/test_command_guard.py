@@ -804,6 +804,15 @@ class OverwriteExistingTests(Fixture):
         other['created'] = {'/new'}
         other['secret_seen'] = 3
         self.assertFalse(ctx.disputes(other))
+        # bash's file named `!` is rewritten by every nested `>!`, and a file only needs the name to end that way to count
+        ctx.written['/p/!'] = 'one'
+        other = ctx.state()
+        other['written']['/p/!'] = 'two'
+        self.assertFalse(ctx.disputes(other))
+        ctx.written['/p/x!'] = 'one'
+        other = ctx.state()
+        other['written']['/p/x!'] = 'two'
+        self.assertTrue(ctx.disputes(other))
 
     def test_written_rule_reads_the_real_home_not_a_variable_named_home(self):
         code = "%s\nshutil.rmtree(%s)\n"

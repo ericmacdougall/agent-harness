@@ -1142,6 +1142,14 @@ BANG_READINGS_CWD = [
     # no protected text and no code execution next to a delete: the same dispute warns, it does not pass as clean
     ("cd @HOME@; ssh h '>! x cd /tmp'; rm -rf .c*/projects", 'warn', '@HOME@/proj'),
     ("cd @HOME@; x=$(>! y cd /tmp); rm -rf .c*/projects", 'warn', '@HOME@/proj'),
+    # one reading really leaves a different script behind, or the same file ends with either text
+    ("echo 'rm -rf @HOME@/.claude/projects' > run.sh; eval '>! run.sh echo hi'; bash run.sh", 'block', '@HOME@/proj'),
+    ("ssh h 'echo a >! f1'; ssh h 'echo b >! f1'", 'warn', '@HOME@/proj'),
+    # bash's reading writes a file named `!` at each of these, which is no dispute: found by a perf row, not by review
+    ("ssh h 'echo a >! f1'; ssh h 'echo b >! f2'", 'allow', '@HOME@/proj'),
+    ("bash -c 'echo a >! f1'; bash -c 'echo b >! f2'", 'allow', '@HOME@/proj'),
+    ('echo $(echo a >! f1) $(echo b >! f2)', 'allow', '@HOME@/proj'),
+    ("eval 'echo a >! f1'; eval 'echo b >! f2'", 'allow', '@HOME@/proj'),
     # both readings agree, or it is the top level where each saw its own later commands: not a dispute
     ("T=/tmp/a; eval 'echo hi >! out.txt'; echo $T", 'allow', '@HOME@/proj'),
     ("ssh h 'echo hi >! out.txt'; ls", 'allow', '@HOME@/proj'),

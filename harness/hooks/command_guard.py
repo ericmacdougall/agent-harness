@@ -1356,7 +1356,9 @@ class Ctx:
         """Can a later command depend on which reading was right? Sets and flags combine without loss. These values do
         not: a merged variable is only a hint on a path operand, and is lost as a command name, an option or a script."""
         return (any(getattr(self, k) != other[k] for k in ('vars', 'var_hints', 'aliases', 'links', 'cwd', 'cwd_unknown'))
-                or any(other['written'].get(path, text) != text for path, text in self.written.items()))
+                # not bash's file named `!`: every nested `>!` writes it, and no later command depends on it
+                or any(other['written'].get(path, text) != text for path, text in self.written.items()
+                       if os.path.basename(path) != '!'))
 
     def merge(self, other):
         """Combine another reading's end state into this one for the commands that follow. Either reading may be the
