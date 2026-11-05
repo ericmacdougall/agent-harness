@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -113,6 +114,20 @@ class Darwin(Case):
         self.assertIn("deferred", message)
         self.assertEqual(runner.calls, [])
         self.assertEqual((self.home / SCRIPT).read_bytes(), (ROOT / "harness/bin/log-backup.sh").read_bytes())
+
+    def test_young_hand_installed_transcripts_or_bulk_lock_defers_the_reload(self):
+        for name, age, deferred in (("log-backup.transcripts.lock.d", 600, True), ("log-backup.transcripts.lock.d", 7200, False),
+                                    ("log-backup.bulk.lock.d", 3 * 3600, True), ("log-backup.bulk.lock.d", 7 * 3600, False),
+                                    ("log-backup.bulk.lock.d", -1800, True), ("log-backup.bulk.lock.d", -40 * 3600, False)):
+            shutil.rmtree(self.home, ignore_errors=True)
+            self.home.mkdir()
+            lock = self.home / ".agent-harness/logs" / name
+            lock.mkdir(parents=True)
+            when = time.time() - age
+            os.utime(lock, (when, when))
+            message, runner = self.apply("Darwin")
+            self.assertEqual("deferred" in message, deferred, (name, age, message))
+            self.assertEqual(runner.calls == [], deferred, (name, age))
 
     def test_deferred_reload_is_finished_by_the_next_install(self):
         lock = self.home / ".agent-harness/logs/log-backup.lock.d"

@@ -82,7 +82,18 @@ def write_atomic(path: Path, data: bytes, mode: int) -> None:
 
 
 def backup_run_active(home: Path) -> bool:
-    lock = home / ".agent-harness" / "logs" / "log-backup.lock.d"
+    logs = home / ".agent-harness" / "logs"
+    for name, limit in (("log-backup.transcripts.lock.d", 3600), ("log-backup.bulk.lock.d", 21600)):
+        # The hand-installed script's locks: young means its run is going (an unreadable time counts as live).
+        legacy = logs / name
+        if legacy.is_dir():
+            try:
+                age = time.time() - legacy.stat().st_mtime
+            except OSError:
+                return True
+            if -limit < age < limit:
+                return True
+    lock = logs / "log-backup.lock.d"
     pid_file = lock / "pid"
     if lock.is_dir() and not pid_file.exists():
         # The older hand-installed script uses the same lock directory without a pid: treat a young one as a run in

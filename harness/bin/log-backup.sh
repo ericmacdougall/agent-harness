@@ -56,6 +56,28 @@ file_age() { # seconds since modification of $1; BSD stat on Darwin, GNU stat el
   echo $(( $(date +%s) - m ))
 }
 
+raw_age() { # like file_age but prints nothing when the modification time cannot be read
+  local m
+  if [ "$(uname)" = Darwin ]; then m=$(stat -f %m "$1" 2>/dev/null); else m=$(stat -c %Y "$1" 2>/dev/null); fi
+  case "$m" in ''|*[!0-9]*) return 0 ;; esac
+  echo $(( $(date +%s) - m ))
+}
+
+# The hand-installed script keeps its own lock directories (transcripts: stale after 1 h, bulk: after 6 h). A young
+# one means its run is still going: skip, never take over. An unreadable modification time counts as a live run; a
+# time in the future counts as live only within the stale limit (beyond it the lock cannot belong to a real run).
+legacy_run_active() {
+  local spec dir limit age
+  for spec in log-backup.transcripts.lock.d:3600 log-backup.bulk.lock.d:21600; do
+    dir="$LOGDIR/${spec%%:*}"; limit=${spec##*:}
+    [ -d "$dir" ] || continue
+    age=$(raw_age "$dir")
+    [ -n "$age" ] || return 0
+    if [ "$age" -lt "$limit" ] && [ "$age" -gt "-$limit" ]; then return 0; fi
+  done
+  return 1
+}
+
 holder_alive() { # pid $1 is running and is a log-backup run (a recycled pid belongs to something else)
   kill -0 "$1" 2>/dev/null || return 1
   ps -p "$1" -o args= 2>/dev/null | awk '$1 ~ /(^|\/)(ba|da|z)?sh$/ && $2 ~ /log-backup\.sh$/ {f=1} END {exit !f}'
@@ -94,7 +116,7 @@ acquire_lock() {
   return $got
 }
 
-if ! acquire_lock; then
+if legacy_run_active || ! acquire_lock; then
   say "skipped: another backup run holds the lock (this is not a successful backup)"
   date -u +%FT%TZ > "$LOGDIR/log-backup.last-skip"
   exit 0
