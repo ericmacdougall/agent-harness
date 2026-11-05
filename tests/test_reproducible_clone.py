@@ -336,7 +336,57 @@ class RedTeamRound(CloneCase):
         hook.write_text('#!/bin/sh\nexit 0\n')
         self.assertRefused(self.rm(), 'hooks')
         hook.unlink()
+        self.assertRefused(self.rm(), 'not on the remote')  # ORIG_HEAD still names the orphaned commit
+        (self.clone / '.git' / 'ORIG_HEAD').unlink()
         self.assertAllowed(self.rm())  # control: the same clone is deletable once both are gone
+
+
+class RoundTwo(CloneCase):
+    """Second red-team round (head 0c9592c): each row was allowed by that head."""
+
+    def test_embedded_repository_added_without_gitmodules(self):
+        sub = self.clone / 'sub'
+        sub.mkdir()
+        git(sub, 'init', '-q', '-b', 'main')
+        (sub / 'f.txt').write_text('only here\n')
+        git(sub, 'add', '.')
+        git(sub, 'commit', '-q', '-m', 'inner')
+        git(self.clone, 'add', 'sub')
+        git(self.clone, 'commit', '-q', '-m', 'embed')
+        git(self.clone, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+        self.live['refs/heads/main'] = git(self.clone, 'rev-parse', 'HEAD')
+        self.assertRefused(self.rm(), 'embedded')
+
+    def test_control_characters_are_not_word_separators(self):
+        for ch in ('\x0b', '\x0c', '\r'):
+            self.assertRefused(self.verdict('rm -rf %s%s' % (self.clone, ch)))
+            self.assertRefused(self.verdict('rm -rf %s %s' % (self.clone, ch)))
+        self.assertAllowed(self.verdict('rm\t-rf  %s' % self.clone))  # ordinary blanks still work
+        self.assertAllowed(self.verdict('rm -rf -- %s/' % self.clone))
+
+    def test_stat_trust_settings_that_hide_same_size_edits(self):
+        for key, value in (('core.trustctime', 'false'), ('core.checkStat', 'minimal'), ('core.ignoreStat', 'true')):
+            git(self.clone, 'config', key, value)
+            self.assertRefused(self.rm(), key.split('.')[1].lower())
+            git(self.clone, 'config', '--unset', key)
+        git(self.clone, 'config', 'core.logAllRefUpdates', 'false')
+        self.assertRefused(self.rm(), 'reflog')
+
+    def test_a_relative_path_entry_cannot_supply_the_program_git_runs(self):
+        env = cg._clone_env()
+        self.assertTrue(all(p.startswith('/') for p in env['PATH'].split(os.pathsep)))
+        with mock.patch.dict(os.environ, {'PATH': 'node_modules/.bin:.::/usr/bin'}):
+            self.assertEqual(cg._clone_env()['PATH'], '/usr/bin')
+
+    def test_nested_repository_deep_inside_a_top_level_build_dir(self):
+        (self.clone / '.git' / 'info' / 'exclude').write_text('build/\n')
+        deep = self.clone / 'build' / 'a' / 'b'
+        deep.mkdir(parents=True)
+        git(deep, 'init', '-q')
+        self.assertRefused(self.rm(), 'nested')
+
+
+
 
 
 if __name__ == '__main__':

@@ -1019,7 +1019,7 @@ class ScriptArgumentTextIsData(WorldCase):
     """goodqa#14817: words in a script's ARGUMENTS (a note, a JSON body) are data, not interpreter code."""
     DATA = [
         "python3 ~/.claude/hooks/wal_note.py --wal ~/w.jsonl --event status --note 'owner will kill nothing; delete later'",
-        "python3 tool.py --note 'os.kill is not called here'",
+        "python3 spec_flow.py --note 'os.kill is not called here'",
         "python3 ./gq.py comment 14817 --json '{\"body\": \"a kill-guard false positive\"}'",
     ]
     CODE = [  # inline code and heredoc bodies are still scanned
@@ -1035,6 +1035,12 @@ class ScriptArgumentTextIsData(WorldCase):
         # a script that runs its own arguments as a command
         "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 -- kill -9 4242",
         "python3 ./runner.py pkill -f node",
+        # delta review: runners that take a command without `--`, absolute-path verbs, shell and -c strings
+        "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 /bin/kill -9 4242",
+        "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 /usr/bin/pkill -f node",
+        "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 sh -c 'kill -9 4242'",
+        "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 python3 -c 'import os; os.kill(4242, 9)'",
+        "python3 ~/.claude/tools/watch-tests.py --root . -- killall node",
     ]
 
     def test_script_arguments_are_not_code(self):

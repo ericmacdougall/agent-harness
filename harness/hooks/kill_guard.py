@@ -1052,14 +1052,19 @@ def make_analyzer_class(cg):
             if self.script_kill is not None and self.script_kill.search(body):
                 self.block('script-kill', 'interpreter code signals processes the guard cannot check')
 
+        DATA_ARG_SCRIPTS = frozenset(('wal_note.py', 'gq.py', 'ah.py', 'spec_flow.py', 'provenance.py', 'commit_policy.py',
+                                      'peer_review.py', 'deliver.py', 'workdir.py', 'escalation.py', 'ops_watch.py',
+                                      'rescue.py', 'ticket_adapters.py', 'report_file.py'))
+
         def drop_script_arguments(self, texts):
-            """`interp script.py ARGS`: ARGS are data for the script, not code the interpreter runs (goodqa#14817).
-            Narrow on purpose: the script must be the FIRST word (any flag before it may carry inline code or a value
-            we cannot place), and the arguments stay scanned when they could be a command the script itself runs: a
-            `--` separator, or a word that is by itself a signal verb (a wrapper script given a verb to run).
-            Free text such as a --note value is one word with spaces, never a bare verb."""
-            if not texts or texts[0].startswith('-') or not (
-                    re.search(r'\.(?:py|rb|pl|js|mjs|cjs|ts|php|sh|lua|r)$', texts[0], re.I) or '/' in texts[0]):
+            """`python3 wal_note.py --note 'will kill nothing'`: the arguments of a NAMED harness tool that records
+            text are data, not code (goodqa#14817). Deliberately an allowlist: any other script (run_capped.py,
+            watch-tests.py, a runner) may run its arguments as a command, and a flag before the script may carry
+            inline code, so everything else keeps being scanned in full. The script must be the first word and the
+            arguments must not carry a `--` separator or a bare signal verb."""
+            if not texts or texts[0].startswith('-'):
+                return texts
+            if os.path.basename(texts[0]) not in self.DATA_ARG_SCRIPTS:
                 return texts
             rest = texts[1:]
             if '--' in rest or any(self.script_kill is not None and self.script_kill.fullmatch(w.strip().lower())

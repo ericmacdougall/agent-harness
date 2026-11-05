@@ -339,7 +339,7 @@ def path_size(path: str, cap: int = None, seconds: float = COPY_WALK_SECONDS):
 def measured_hosts():
     """Hosts the guard may `ssh du` to size a remote source: the fleet (dev2/T2) plus heavy_job_guard.json
     "measure_hosts". Any other host is not contacted and its source is not counted."""
-    hosts = {"dev2", "t2"}
+    hosts = {"dev2", "t2", "t2-dev"}
     try:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
         if os.path.exists(path):
@@ -536,7 +536,7 @@ def classify_copy(low, args, ctx):
             return None
         if remote_tool and REMOTE_SPEC.match(dest) and not dest.startswith(("/", ".", "~")):
             return None  # the copy lands on another host
-        if os.path.abspath(os.path.expanduser(dest)).startswith("/Volumes/"):
+        if os.path.realpath(os.path.expanduser(dest)).startswith("/Volumes/"):
             return None  # an external or network volume, not the Mac's own disk
         deref = any(a in ("--copy-links", "--dereference") or re.match(r"^-[A-Za-z]*[LH][A-Za-z]*$", a) for a in args
                     if a.startswith("-") and a not in values)
@@ -544,6 +544,8 @@ def classify_copy(low, args, ctx):
         return finish_copy(low, total, unknown, thr)
     if low == "tar" and args:
         mode, archive, srcs = parse_tar(args)
+        if "--to-stdout" in args or any(re.fullmatch(r"-[A-Za-z]*O[A-Za-z]*", a) for a in args) or re.fullmatch(r"[A-Za-z]*O[A-Za-z]*", args[0]):
+            return None  # extracting to stdout writes nothing to disk
         if mode is None or archive in (None, "-") or REMOTE_SPEC.match(archive) and not archive.startswith(("/", ".", "~")):
             return None  # a pipe or a listing: the other end decides (tar czf - . | ssh dev2 'tar x')
         if mode == "x":
@@ -554,7 +556,7 @@ def classify_copy(low, args, ctx):
     if low == "gh":
         pos = positional(args)
         if pos[:2] == ["repo", "clone"] and len(pos) > 2:
-            return clone_estimate(pos[2], [a for a in args if a.startswith("-")], ctx, thr, "gh repo clone")
+            return clone_estimate(pos[2], list(args), ctx, thr, "gh repo clone")
         return None
     if low == "git":
         cwd, i, rest = ctx.cwd, 0, list(args)
@@ -582,8 +584,21 @@ def classify_copy(low, args, ctx):
     return None
 
 
+def clone_is_shallow(flags):
+    """A real --depth N (1..50) given as its own option, not the value of another option (`--template --depth`)."""
+    i = 0
+    while i < len(flags):
+        f = flags[i]
+        if f == "--depth":
+            return i + 1 < len(flags) and flags[i + 1].isdigit() and 0 < int(flags[i + 1]) <= 50
+        if f.startswith("--depth="):
+            return f[8:].isdigit() and 0 < int(f[8:]) <= 50
+        i += 2 if f in CLONE_VALUE_FLAGS else 1
+    return False
+
+
 def clone_estimate(url, flags, ctx, thr, label):
-    shallow = any(f.startswith(("--depth", "--shallow-since", "--filter", "--shallow-exclude")) for f in flags)
+    shallow = clone_is_shallow(flags)
     factor = 0.5 if shallow else 2.0
     local = resolve(os.path.expanduser(url.replace("file://", "")), ctx.cwd)
     if os.path.isdir(local):

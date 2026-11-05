@@ -145,6 +145,29 @@ class ReviewFindings(unittest.TestCase):
         with mock.patch.object(guard, "remote_path_size", lambda spec: None):
             self.assertEqual(decide("rsync -a dev2:repo /Users/eric/r")["rule"], "copy")  # unknown fleet size is heavy
 
+    def test_depth_must_be_a_real_small_depth_option(self):
+        url = "https://gitlab.com/huge/mono.git"
+        for flags in ("--depth 2147483647", "--shallow-since=1970-01-01", "--filter=blob:none", "--template --depth",
+                      "--separate-git-dir --depth", "--server-option --depth", "--depth 0", "--depth x"):
+            with self.subTest(flags=flags):
+                self.assertEqual(decide(f"git clone {flags} {url} m").get("rule"), "copy", flags)
+        for flags in ("--depth 1", "--depth=1", "--depth 50", "-b main --depth 1"):
+            self.assertEqual(decide(f"git clone {flags} {url}")["action"], "allow", flags)
+
+    def test_t2_dev_is_a_fleet_host_and_tar_to_stdout_writes_nothing(self):
+        with mock.patch.object(guard, "remote_path_size", lambda spec: 4 * GIB):
+            self.assertEqual(decide("scp -r t2-dev:/bigsrc /Users/eric/z")["rule"], "copy")
+        with mock.patch.object(guard, "path_size", fake_size({"/arch": 5 * GIB})):
+            self.assertEqual(decide("tar xzf /arch.tgz --to-stdout")["action"], "allow")
+            self.assertEqual(decide("tar -xOf /arch.tar")["action"], "allow")
+
+    def test_a_volumes_path_that_leads_back_to_the_boot_disk_is_still_the_macs_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            link = os.path.join(tmp, "Boot")
+            os.symlink("/Users/eric", link)
+            with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB})):
+                self.assertEqual(decide(f"cp -R /bigsrc {link}/x").get("rule"), "copy")
+
     def test_external_volumes_are_not_the_macs_disk(self):
         with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB})):
             self.assertEqual(decide("cp -R /bigsrc /Volumes/Backup/x")["action"], "allow")
