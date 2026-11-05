@@ -75,3 +75,5 @@ On Windows the full suite has never passed for this code (discard, torn-record a
 
 - Codex conversation identity (separating the client cache key from conversation identity) and Codex A8 belong to K6.
 - `cancel()` and a stop verdict discard output the console has not read yet; an explicit stop is not a drain.
+- `app.close` waits for the process groups of runs still attached to a session (300 ms grace each, about one second at most per run). A run already detached before close (a closed tab, a discard, a replaced Codex client) is signalled when it is detached but not waited on; the console may exit before such a group has fully ended.
+- A tree with no caller verdict stops its group after a 7 second grace once the leader exits; production callers settle it, so this only bounds a caller that forgets.

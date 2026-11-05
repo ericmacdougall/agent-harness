@@ -55,8 +55,14 @@ func (r *claudeRun) cancel() {
 // waitStopped waits up to grace for a cancelled run's group to end and kills it
 // if it ignores the polite signal. Call it without holding the app lock.
 func (r *claudeRun) waitStopped(grace time.Duration) {
-	if r.tree != nil {
-		r.tree.FinishStop(grace)
+	if r.tree == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() { r.tree.FinishStop(grace); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(grace + 700*time.Millisecond): // close must not hang on one run
 	}
 }
 func (r *claudeRun) write(value any) error { return r.writeContext(context.Background(), value) }

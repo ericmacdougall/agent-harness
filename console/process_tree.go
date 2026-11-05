@@ -35,9 +35,10 @@ var errStreamDrainBound = errors.New("provider output ended by the drain bound w
 //   - Termination escalates from a polite signal to a kill without sleeping
 //     under a lock.
 //
-// Leaving background work alone is best effort: once the drain bound passes the
-// read end is closed, so a descendant that writes to stdout after that gets
-// SIGPIPE, as it did before the tree existed.
+// Leaving background work alone (a leave verdict) keeps draining the pipe with no
+// idle bound, so a slow writer never gets SIGPIPE. Without a verdict, once the
+// drain bound passes the read end is closed and a later write gets SIGPIPE, as it
+// did before the tree existed.
 //
 // Lock rule: stopOnExit must be lock-free (an atomic flag). It is called
 // without t.mu held and must not take any application lock.
@@ -158,7 +159,7 @@ func (t *processTree) pump() {
 			// Idle bound, re-armed before every read so a slow consumer never
 			// spends it. Where the pipe is not pollable (Windows) the bound is a
 			// timer that closes the read end once, dropping unread bytes.
-			if err := t.stdout.SetReadDeadline(time.Now().Add(t.drain)); err != nil {
+			if err := t.stdout.SetReadDeadline(time.Now().Add(t.drain)); errors.Is(err, os.ErrNoDeadline) {
 				t.noDeadline.Do(func() { time.AfterFunc(t.drain, func() { t.boundHit.Store(true); _ = t.stdout.Close() }) })
 			}
 		}
@@ -172,7 +173,11 @@ func (t *processTree) pump() {
 			}
 		}
 		if err != nil {
-			if discard && errors.Is(err, os.ErrDeadlineExceeded) {
+			if errors.Is(err, os.ErrDeadlineExceeded) && (discard || t.verdict.Load() == 2) {
+				// Decided to leave background work alone: the idle bound no longer
+				// applies. Keep emptying the pipe so a slow writer is never sent
+				// SIGPIPE; the cost is a goroutine and an fd until the pipe closes.
+				discard = true
 				_ = t.stdout.SetReadDeadline(time.Time{})
 				continue
 			}
@@ -200,7 +205,7 @@ func (t *processTree) wait() {
 		legacyErr = t.cmd.Wait() // old behaviour: Wait is the observation
 	}
 	t.exitSeen.Store(true)
-	if err := t.stdout.SetReadDeadline(time.Now().Add(t.drain)); err != nil { // unblock a pending read
+	if err := t.stdout.SetReadDeadline(time.Now().Add(t.drain)); errors.Is(err, os.ErrNoDeadline) { // unblock a pending read
 		t.noDeadline.Do(func() { time.AfterFunc(t.drain, func() { t.boundHit.Store(true); _ = t.stdout.Close() }) })
 	}
 	close(t.exited)
