@@ -96,7 +96,7 @@ def notify(text: str) -> None:
     if platform.system() != "Darwin":
         return
     try:
-        subprocess.run(["osascript", "-e", f'display notification "{text}" with title "Log backup alert"'],
+        subprocess.run(["osascript", "-e", f'display notification "{text.replace(chr(92), "").replace(chr(34), "")}" with title "Log backup alert"'],
                        capture_output=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         pass
@@ -149,7 +149,7 @@ def unit_files(home: Path, system: str) -> list[tuple[Path, str]]:
 def default_runner(argv: list[str], capture: str | None = None):
     """Exit code, or with capture=<anything> the stripped stdout (used only for loginctl --value)."""
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return "" if capture else 127
     return r.stdout.strip() if capture else r.returncode
@@ -204,7 +204,11 @@ def install(home: Path, apply: bool, system: str | None = None, run=default_runn
         if system == "Darwin":
             domain = f"gui/{os.getuid()}"
             run(["launchctl", "bootout", f"{domain}/{LABEL}"])  # not loaded is fine; loaded-with-old-plist must go
-            code = run(["launchctl", "bootstrap", domain, str(unit_files(home, system)[0][0])])
+            plist = str(unit_files(home, system)[0][0])
+            code = run(["launchctl", "bootstrap", domain, plist])
+            if code:  # bootout can still be unloading; one short retry
+                time.sleep(2)
+                code = run(["launchctl", "bootstrap", domain, plist])
             out.append(f"launchctl bootstrap rc={code}")
             rc = 4 if code else 0
         else:
@@ -227,12 +231,18 @@ def main(argv=None) -> int:
         try:
             return run(a.home)
         except Exception as exc:  # noqa: BLE001 - an internal failure must not look like "transcripts stale"
-            print(f"backup-watch internal error: {type(exc).__name__}", file=sys.stderr)
+            msg = f"backup-watch internal error: {type(exc).__name__}"
+            print(msg, file=sys.stderr)
+            notify(msg)
             return 5
     if a.cmd == "status":
         print(status(a.home))
         return 0
-    lines, code = install(a.home, a.apply)
+    try:
+        lines, code = install(a.home, a.apply)
+    except OSError as exc:
+        print(f"install failed: {type(exc).__name__}", file=sys.stderr)
+        return 5
     print("\n".join(lines))
     return code
 

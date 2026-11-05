@@ -21,7 +21,7 @@ def stamp(epoch):
 class Base(unittest.TestCase):
     def setUp(self):
         self.notices = []
-        self._notify = bw.notify
+        self._notify = self._real_notify = bw.notify
         bw.notify = self.notices.append
         self.addCleanup(setattr, bw, "notify", self._notify)
         self.tmp = tempfile.TemporaryDirectory()
@@ -288,6 +288,28 @@ class Reader(Base):
             self.assertEqual(bw.main(["run", "--home", str(self.home)]), 5)
         finally:
             bw._write_private = orig
+        self.assertEqual(len(self.notices), 2)  # the internal error is also announced
+
+    def test_install_oserror_is_exit_five_not_traceback(self):
+        orig = bw.install
+        bw.install = lambda *a, **k: (_ for _ in ()).throw(OSError("x"))
+        try:
+            self.assertEqual(bw.main(["install", "--home", str(self.home), "--apply"]), 5)
+        finally:
+            bw.install = orig
+
+    def test_notification_text_cannot_break_the_applescript_string(self):
+        calls = []
+        orig = bw.subprocess.run
+        bw.subprocess.run = lambda argv, **k: calls.append(argv)
+        pf = bw.platform.system
+        bw.platform.system = lambda: "Darwin"
+        try:
+            self._real_notify('a"b\\c')
+        finally:
+            bw.subprocess.run, bw.platform.system = orig, pf
+        script = calls[0][2]
+        self.assertEqual(script.count('"'), 4)
 
 
 class ShippedHooksAreInstalled(unittest.TestCase):
