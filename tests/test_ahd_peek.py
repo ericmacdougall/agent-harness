@@ -246,3 +246,47 @@ class Follow(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRound1Peek(Base):
+    def test_b2_codex_cwd_only_in_the_first_record_still_excludes(self):
+        d = self.home / ".codex" / "sessions" / "2027" / "01" / "15"
+        d.mkdir(parents=True)
+        rid = "01a1aa40-7b53-7c63-a19f-b5c63e28b7f7"
+        p = d / f"rollout-2027-01-15T08-00-00-{rid}.jsonl"
+        filler = json.dumps({"type": "response_item", "payload": {"type": "function_call_output", "output": "y" * 60000}})
+        with open(p, "w") as fh:
+            fh.write(json.dumps({"type": "session_meta", "payload": {"cwd": "/Users/u/Solve"}}) + "\n")
+            for _ in range(80):
+                fh.write(filler + "\n")
+            fh.write(json.dumps({"type": "response_item", "payload": {"type": "message", "role": "assistant",
+                                                                      "content": [{"type": "output_text", "text": "leak"}]}}) + "\n")
+        res = peek.tail(peek.find(f"x:{rid}", self.policy), 5, self.policy)
+        self.assertFalse(res["ok"])
+        self.assertNotIn("leak", json.dumps(res))
+
+    def test_b2_screening_sees_text_beyond_the_cut(self):
+        self.agent("a1111111111111111", [text("assistant", "a" * 900 + " then the Solve interview notes")])
+        res = peek.tail(peek.find("c:a1111111111111111", self.policy), 5, self.policy)
+        self.assertEqual(res["items"][0]["text"], peek.EXCLUDED_TEXT)
+
+    def test_no_cwd_anywhere_is_refused(self):
+        rec = {"type": "assistant", "timestamp": "t", "message": {"content": [{"type": "text", "text": "hi"}]}}
+        self.agent("a1111111111111111", [rec])
+        res = peek.tail(peek.find("c:a1111111111111111", self.policy), 5, self.policy)
+        self.assertFalse(res["ok"])
+
+    def test_tool_result_bodies_are_never_shown(self):
+        self.agent("a1111111111111111", [{"type": "user", "timestamp": "t", "cwd": "/Users/x/repo",
+                                          "message": {"content": [{"type": "tool_result", "content": "PLAINBODYWORD"}]}}])
+        res = peek.tail(peek.find("c:a1111111111111111", self.policy), 5, self.policy)
+        self.assertNotIn("PLAINBODYWORD", json.dumps(res))
+        self.assertEqual(res["items"][0]["chars"], len("PLAINBODYWORD"))
+
+    def test_fifo_meta_never_hangs_list(self):
+        p = self.agent("a1111111111111111", [text("user", "x")])
+        meta = p.with_name(p.stem + ".meta.json")
+        meta.unlink()
+        os.mkfifo(meta)
+        rows = peek.discover(self.policy, include_all=True)
+        self.assertEqual(len(rows), 1)

@@ -3,9 +3,12 @@
 
 Read-only toward transcripts. Interview material (any path, project dir, agent description, cwd or host whose token
 starts with a configured prefix, see ahd_policy.json "exclude") is never read, shown or stored: such an instance is
-listed only as `excluded`, by stat. Classification fails closed: a path that cannot be classified is excluded.
+listed only as `excluded`, by stat. Classification fails closed: a path, record or text that cannot be classified is
+excluded, and a tail whose working directory cannot be established is refused.
 
-Secrets are removed with redact.py; if redact.py cannot be imported, no free text is printed at all.
+Secrets are removed with redact.py before any cut; if redact.py cannot be imported, no free text is printed at all.
+Tool results are never shown (only their size). Every file is opened O_NOFOLLOW | O_NONBLOCK, must be a regular
+file, and is read only up to a cap, so a FIFO, device or symlink cannot hang or flood a reader.
 """
 
 from __future__ import annotations
@@ -30,12 +33,14 @@ except Exception:  # pragma: no cover - exercised by a test that hides the modul
 
 ID_RE = re.compile(r"^(?:(?P<host>[A-Za-z0-9._-]{1,64})/)?(?P<kind>[csx]):(?P<id>[A-Za-z0-9._-]{1,128})$")
 TOKEN_SPLIT = re.compile(r"[^a-z0-9]+")
+REDACT_MAX = 256 * 1024
+EXCLUDED_TEXT = "[excluded: interview material]"
 
 
 def load_policy(path=None) -> dict:
     p = Path(path) if path else POLICY_FILE
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(safe_read(p, 1 << 20).decode("utf-8"))
         if not isinstance(data, dict) or not isinstance(data.get("exclude"), dict):
             raise ValueError("policy has no exclude table")
         return data
@@ -46,6 +51,46 @@ def load_policy(path=None) -> dict:
 
 def home() -> Path:
     return Path(os.environ.get("HOME") or os.path.expanduser("~"))
+
+
+# ---------------------------------------------------------------- safe file access
+
+class NotRegular(OSError):
+    pass
+
+
+def open_regular(path) -> int:
+    """fd for a regular file, never following a final symlink and never blocking on a FIFO."""
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise NotRegular(f"not a regular file: {path}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def safe_read(path, cap: int, offset: int | None = None) -> bytes:
+    """At most `cap` bytes (from `offset`, or the whole file when it fits). Raises if the file is larger than cap
+    and no offset was given, so callers can tell "too big" from "empty"."""
+    fd = open_regular(path)
+    try:
+        size = os.fstat(fd).st_size
+        if offset is None:
+            if size > cap:
+                raise NotRegular(f"over cap: {size} > {cap}")
+            offset = 0
+        out, pos = [], offset
+        while pos < offset + cap:
+            chunk = os.pread(fd, min(1 << 20, offset + cap - pos), pos)
+            if not chunk:
+                break
+            out.append(chunk)
+            pos += len(chunk)
+        return b"".join(out)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------- classification
@@ -71,7 +116,23 @@ def text_excluded(text, policy: dict) -> bool:
     return any(tok.startswith(prefixes) for tok in _tokens(low)) if prefixes else False
 
 
+def value_excluded(value, policy: dict, depth: int = 0) -> bool:
+    """text_excluded over every string inside a JSON value (keys too), bounded in depth."""
+    if depth > 8:
+        return True
+    if isinstance(value, str) or value is None:
+        return text_excluded(value, policy)
+    if isinstance(value, (int, float, bool)):
+        return False
+    if isinstance(value, dict):
+        return any(text_excluded(str(k), policy) or value_excluded(v, policy, depth + 1) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(value_excluded(v, policy, depth + 1) for v in value)
+    return True
+
+
 def host_excluded(host: str, policy: dict) -> bool:
+    """For peer peeks (slice 2): a host on the exclusion list is never contacted."""
     ex = policy.get("exclude")
     if not isinstance(ex, dict):
         return True
@@ -121,7 +182,7 @@ def roots() -> list:
 
 def _stat(p: Path):
     try:
-        st = p.stat()
+        st = os.lstat(p)
         return st if stat.S_ISREG(st.st_mode) else None
     except OSError:
         return None
@@ -129,11 +190,7 @@ def _stat(p: Path):
 
 def _read_small_json(p: Path, limit: int = 16384):
     try:
-        with open(p, "rb") as fh:
-            raw = fh.read(limit + 1)
-        if len(raw) > limit:
-            return None
-        return json.loads(raw.decode("utf-8"))
+        return json.loads(safe_read(p, limit).decode("utf-8"))
     except Exception:
         return None
 
@@ -152,18 +209,18 @@ def discover(policy: dict, now=None, window=None, include_all=False) -> list:
         projects = []
     for proj in projects:
         try:
-            if not proj.is_dir():
+            if proj.is_symlink() or not proj.is_dir():
                 continue
             entries = list(proj.iterdir())
         except OSError:
             continue
         proj_excl = text_excluded(proj.name, policy)
         for ent in entries:
-            if ent.suffix == ".jsonl" and ent.is_file():
+            if ent.suffix == ".jsonl":
                 st = _stat(ent)
                 if st:
                     out.append(_row("s", ent.stem, ent, st, proj.name, None, proj_excl, policy, rts, now, active_s))
-            elif ent.is_dir():
+            elif ent.is_dir() and not ent.is_symlink():
                 sub = ent / "subagents"
                 try:
                     files = list(sub.glob("agent-*.jsonl")) if sub.is_dir() else []
@@ -174,7 +231,7 @@ def discover(policy: dict, now=None, window=None, include_all=False) -> list:
                     if not st:
                         continue
                     aid = f.stem[len("agent-"):]
-                    meta = _read_small_json(f.with_name(f.stem + ".meta.json")) or {}
+                    meta = {} if proj_excl else (_read_small_json(f.with_name(f.stem + ".meta.json")) or {})
                     out.append(_row("c", aid, f, st, proj.name, meta, proj_excl, policy, rts, now, active_s,
                                     session=ent.name))
     try:
@@ -196,7 +253,8 @@ def discover(policy: dict, now=None, window=None, include_all=False) -> list:
 def _row(kind, rid, path, st, project, meta, proj_excl, policy, rts, now, active_s, session=None) -> dict:
     meta = meta if isinstance(meta, dict) else {}
     desc = meta.get("description") if isinstance(meta.get("description"), str) else ""
-    excluded = proj_excl or path_excluded(path, policy, rts) or text_excluded(desc, policy)
+    excluded = proj_excl or path_excluded(path, policy, rts) or value_excluded(
+        {k: meta.get(k) for k in ("description", "agentType", "cwd", "name") if k in meta}, policy)
     age = max(0.0, now - st.st_mtime)
     row = {"id": f"{kind}:{rid}", "kind": {"c": "claude-subagent", "s": "claude-session", "x": "codex"}[kind],
            "mtime": st.st_mtime, "age_s": int(age), "active": age <= active_s, "size": st.st_size,
@@ -227,23 +285,39 @@ def find(ident: str, policy: dict):
 
 # ---------------------------------------------------------------- redaction and rendering
 
+PARTIAL_TAIL = re.compile(r"[A-Za-z0-9_+/=.-]{1,63}$")
+
+
 def scrub(text, limit: int = 300) -> str:
+    """Redact the whole (bounded) text first, then cut, then drop a partial token left at the cut, so a secret
+    split by the cut can never leave a recognisable fragment."""
     if not isinstance(text, str):
         return ""
     if _redact is None:
         return f"[{len(text)} chars, redactor unavailable]"
-    one = " ".join(text.split())
-    out = _redact.redact(one[: limit * 4])
-    return out if len(out) <= limit else out[: limit - 1] + "…"
+    if len(text) > REDACT_MAX:
+        text = text[:REDACT_MAX]
+        cut_input = True
+    else:
+        cut_input = False
+    one = " ".join(_redact.redact(text).split())
+    if len(one) <= limit and not cut_input:
+        return one
+    out = one[: max(0, limit - 1)]
+    if limit < len(one) and not one[limit - 1:limit + 1].startswith(" "):
+        out = PARTIAL_TAIL.sub("", out)
+    return out.rstrip() + "…"
 
 
 INPUT_KEYS = ("command", "description", "file_path", "path", "pattern", "url", "query", "prompt", "subagent_type",
               "to", "skill")
 
 
-def summarize_input(inp) -> str:
+def summarize_input(inp, policy: dict) -> str:
+    if value_excluded(inp, policy):
+        return EXCLUDED_TEXT
     if not isinstance(inp, dict):
-        return scrub(json.dumps(inp)[:400] if inp is not None else "", 200)
+        return scrub(json.dumps(inp)[:REDACT_MAX] if inp is not None else "", 200)
     parts = []
     for k in INPUT_KEYS:
         v = inp.get(k)
@@ -260,7 +334,12 @@ def _content_text(content) -> str:
     return ""
 
 
-def render_claude(rec: dict) -> list:
+def safe_text(raw: str, limit: int, policy: dict) -> str:
+    """Screen the raw, uncut text for interview material, then redact and cut."""
+    return EXCLUDED_TEXT if text_excluded(raw, policy) else scrub(raw, limit)
+
+
+def render_claude(rec: dict, policy: dict) -> list:
     out = []
     ts = rec.get("timestamp") if isinstance(rec.get("timestamp"), str) else ""
     typ = rec.get("type")
@@ -271,25 +350,26 @@ def render_claude(rec: dict) -> list:
             if not isinstance(c, dict):
                 continue
             if c.get("type") == "text":
-                out.append({"at": ts, "kind": "assistant", "text": scrub(c.get("text"), 400)})
+                out.append({"at": ts, "kind": "assistant", "text": safe_text(c.get("text") or "", 400, policy)})
             elif c.get("type") == "tool_use":
-                out.append({"at": ts, "kind": "tool_use", "tool": scrub(str(c.get("name", "?")), 64),
-                            "text": summarize_input(c.get("input"))})
+                name = str(c.get("name", "?"))
+                out.append({"at": ts, "kind": "tool_use", "tool": EXCLUDED_TEXT if text_excluded(name, policy) else scrub(name, 64),
+                            "text": summarize_input(c.get("input"), policy)})
     elif typ == "user":
         if isinstance(content, list) and any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
             for c in content:
                 if isinstance(c, dict) and c.get("type") == "tool_result":
-                    body = _content_text(c.get("content"))
+                    # never a tool_result body (review D4): results carry file contents and command output
                     out.append({"at": ts, "kind": "tool_result", "error": bool(c.get("is_error")),
-                                "text": scrub(body, 200), "chars": len(body)})
+                                "text": "", "chars": len(_content_text(c.get("content")))})
         else:
             text = _content_text(content)
             if text:
-                out.append({"at": ts, "kind": "user", "text": scrub(text, 300)})
+                out.append({"at": ts, "kind": "user", "text": safe_text(text, 300, policy)})
     return out
 
 
-def render_codex(rec: dict) -> list:
+def render_codex(rec: dict, policy: dict) -> list:
     ts = rec.get("timestamp") if isinstance(rec.get("timestamp"), str) else ""
     p = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
     pt = p.get("type")
@@ -299,7 +379,8 @@ def render_codex(rec: dict) -> list:
         role = p.get("role") if p.get("role") in ("user", "assistant", "developer", "system") else "?"
         if role in ("developer", "system"):
             return []
-        return [{"at": ts, "kind": "assistant" if role == "assistant" else "user", "text": scrub(_content_text(p.get("content")), 400)}]
+        return [{"at": ts, "kind": "assistant" if role == "assistant" else "user",
+                 "text": safe_text(_content_text(p.get("content")), 400, policy)}]
     if pt in ("function_call", "custom_tool_call", "local_shell_call"):
         args = p.get("arguments") if isinstance(p.get("arguments"), str) else p.get("input")
         try:
@@ -310,33 +391,42 @@ def render_codex(rec: dict) -> list:
             parsed = dict(parsed, command=parsed["cmd"] if isinstance(parsed["cmd"], str) else " ".join(map(str, parsed["cmd"])))
         if isinstance(parsed, dict) and isinstance(parsed.get("command"), list):
             parsed = dict(parsed, command=" ".join(map(str, parsed["command"])))
-        return [{"at": ts, "kind": "tool_use", "tool": scrub(str(p.get("name", pt)), 64), "text": summarize_input(parsed)}]
+        name = str(p.get("name", pt))
+        return [{"at": ts, "kind": "tool_use", "tool": EXCLUDED_TEXT if text_excluded(name, policy) else scrub(name, 64),
+                 "text": summarize_input(parsed, policy)}]
     if pt in ("function_call_output", "custom_tool_call_output"):
         o = p.get("output")
-        body = o if isinstance(o, str) else json.dumps(o)[:2000] if o is not None else ""
-        return [{"at": ts, "kind": "tool_result", "text": scrub(body, 200), "chars": len(body)}]
+        return [{"at": ts, "kind": "tool_result", "text": "", "chars": len(o) if isinstance(o, str) else 0}]
     return []
 
 
-def screen(items: list, policy: dict) -> list:
-    """Blank any rendered item whose text or tool name names interview material (fail closed)."""
-    out = []
-    for it in items:
-        if text_excluded(it.get("text", ""), policy) or text_excluded(it.get("tool", ""), policy):
-            it = {"at": it.get("at", ""), "kind": it.get("kind"), "text": "[excluded: interview material]"}
-        out.append(it)
-    return out
+def record_cwd(rec: dict):
+    if isinstance(rec.get("cwd"), str):
+        return rec["cwd"]
+    p = rec.get("payload")
+    if isinstance(p, dict) and isinstance(p.get("cwd"), str):
+        return p["cwd"]
+    return None
 
 
 def record_excluded(rec: dict, policy: dict) -> bool:
     """A record whose working directory is interview material taints the whole instance."""
-    for key in ("cwd",):
-        if isinstance(rec.get(key), str) and text_excluded(rec[key], policy):
-            return True
-    p = rec.get("payload")
-    if isinstance(p, dict) and isinstance(p.get("cwd"), str) and text_excluded(p["cwd"], policy):
-        return True
-    return False
+    cwd = record_cwd(rec)
+    return cwd is not None and text_excluded(cwd, policy)
+
+
+def head_record(path: str, line_max: int):
+    """The first record of a transcript (Codex session_meta carries the cwd), read within line_max."""
+    try:
+        raw = safe_read(path, line_max, offset=0)
+    except OSError:
+        return None
+    line = raw.split(b"\n", 1)[0]
+    try:
+        obj = json.loads(line.decode("utf-8"))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------- bounded reading
@@ -345,11 +435,13 @@ def read_tail_lines(path: str, max_bytes: int, line_max: int):
     """Returns (lines, stats). Reads at most max_bytes from the end. A first partial line is dropped; an
     over-long or undecodable line is skipped and counted. Never raises for content problems."""
     stats = {"malformed": 0, "oversized": 0, "partial_head": False}
-    with open(path, "rb") as fh:
-        size = os.fstat(fh.fileno()).st_size
+    fd = open_regular(path)
+    try:
+        size = os.fstat(fd).st_size
         start = max(0, size - max_bytes)
-        fh.seek(start)
-        raw = fh.read(max_bytes)
+        raw = os.pread(fd, max_bytes, start)
+    finally:
+        os.close(fd)
     chunks = raw.split(b"\n")
     if start > 0 and chunks:
         chunks = chunks[1:]
@@ -383,20 +475,32 @@ def parse_lines(lines, stats) -> list:
     return recs
 
 
+def refuse(message="interview material is never peeked") -> dict:
+    return {"ok": False, "code": "excluded", "message": message}
+
+
 def tail(row: dict, n: int, policy: dict) -> dict:
     if row.get("excluded"):
-        return {"ok": False, "code": "excluded", "message": "interview material is never peeked"}
+        return refuse()
     path = row["path"]
     if path_excluded(path, policy, roots()):
-        return {"ok": False, "code": "excluded", "message": "path could not be classified"}
-    lines, stats = read_tail_lines(path, policy.get("peek_tail_max_bytes", 4 << 20), policy.get("peek_line_max_bytes", 1 << 20))
+        return refuse("path could not be classified")
+    line_max = policy.get("peek_line_max_bytes", 1 << 20)
+    try:
+        lines, stats = read_tail_lines(path, policy.get("peek_tail_max_bytes", 4 << 20), line_max)
+    except OSError:
+        return refuse("transcript is not a readable regular file")
     recs = parse_lines(lines, stats)
-    if any(record_excluded(r, policy) for r in recs):
-        return {"ok": False, "code": "excluded", "message": "interview material is never peeked"}
+    head = head_record(path, line_max)
+    cwds = [c for c in (record_cwd(r) for r in ([head] if head else []) + recs) if c is not None]
+    if not cwds:
+        return refuse("working directory unknown; cannot classify")
+    if any(text_excluded(c, policy) for c in cwds):
+        return refuse()
     render = render_codex if row["kind"] == "codex" else render_claude
     items = []
     for r in recs:
-        items.extend(screen(render(r), policy))
+        items.extend(render(r, policy))
     return {"ok": True, "id": row["id"], "items": items[-n:] if n > 0 else [], "stats": stats}
 
 
@@ -406,7 +510,7 @@ class Follower:
     def __init__(self, path: str, offset: int | None = None, line_max: int = 1 << 20):
         self.path = path
         self.line_max = line_max
-        st = os.stat(path)
+        st = os.lstat(path)
         self.key = (st.st_dev, st.st_ino)
         self.offset = st.st_size if offset is None else offset
         self.buf = b""
@@ -414,17 +518,20 @@ class Follower:
 
     def poll(self, max_bytes: int = 1 << 20) -> list:
         try:
-            st = os.stat(self.path)
+            st = os.lstat(self.path)
         except OSError:
+            return []
+        if not stat.S_ISREG(st.st_mode):
             return []
         if (st.st_dev, st.st_ino) != self.key or st.st_size < self.offset:
             self.key, self.offset, self.buf = (st.st_dev, st.st_ino), 0, b""
             self.stats["resets"] += 1
         if st.st_size == self.offset:
             return []
-        with open(self.path, "rb") as fh:
-            fh.seek(self.offset)
-            raw = fh.read(max_bytes)
+        try:
+            raw = safe_read(self.path, max_bytes, offset=self.offset)
+        except OSError:
+            return []
         self.offset += len(raw)
         data = self.buf + raw
         parts = data.split(b"\n")
@@ -442,6 +549,7 @@ class Follower:
 
 
 def follow(row: dict, policy: dict, out=sys.stdout, interval: float = 1.0, max_polls=None) -> int:
+    """Local follow only (no -f over ssh, review M13)."""
     if row.get("excluded"):
         return 3
     fol = Follower(row["path"], line_max=policy.get("peek_line_max_bytes", 1 << 20))
@@ -453,7 +561,7 @@ def follow(row: dict, policy: dict, out=sys.stdout, interval: float = 1.0, max_p
             if record_excluded(rec, policy):
                 out.write("[excluded: interview material; stopping]\n")
                 return 3
-            for it in screen(render(rec), policy):
+            for it in render(rec, policy):
                 out.write(fmt(it) + "\n")
         out.flush()
         if max_polls is None or polls < max_polls:
@@ -467,7 +575,7 @@ def fmt(it: dict) -> str:
     if k == "tool_use":
         return f"{at} tool_use {it.get('tool')}: {it.get('text')}"
     if k == "tool_result":
-        return f"{at} result{' ERROR' if it.get('error') else ''} ({it.get('chars', 0)} chars): {it.get('text')}"
+        return f"{at} result{' ERROR' if it.get('error') else ''} ({it.get('chars', 0)} chars)"
     return f"{at} {k}: {it.get('text')}"
 
 
