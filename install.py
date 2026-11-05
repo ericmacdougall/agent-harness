@@ -25,7 +25,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
          "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py",
          "heavy_job_guard.py", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "resource_limits.json",
-         "domain_gates.py", "domain_checklists.json")
+         "domain_gates.py", "domain_checklists.json", "test_scope.py", "test_scope_policy.json")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -42,7 +42,7 @@ class DirectoryPublicationError(OSError):
 
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
-            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py")}
+            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py", "test_scope.py")}
 
 
 SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
@@ -77,6 +77,9 @@ def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]
     heavy_guard = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "heavy_job_guard.py")],
                    "timeout": 10}
     agent_gate = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "agent_gate.py")], "timeout": 10}
+    # Test-scope guard (rule B6): fails open, runs on every host (the heavy guard above acts on the Mac only).
+    test_scope = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "test_scope.py"), "hook"],
+                  "timeout": 20}
 
     def command(event: str, fail_closed: bool = False) -> dict:
         hook = {"type": "command", "command": "python3", "args": [script, event], "timeout": 10}
@@ -106,6 +109,9 @@ def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]
             # Route heavy Mac work (browsers, full suites, builds) to dev2; advisory for hostile probes.
             "matcher": "Bash",
             "hooks": [heavy_guard],
+        }, {
+            "matcher": "Bash",
+            "hooks": [test_scope],
         }, {
             "matcher": "Agent|Task|Workflow",
             "hooks": [agent_gate],

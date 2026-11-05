@@ -64,7 +64,7 @@ LOG_PATH = os.path.join(os.path.expanduser("~"), ".agent-harness", "logs", "heav
 RULE_HELP = {
     "browser": "browser automation (Playwright/Puppeteer/headless Chrome) can spawn dozens of renderers",
     "adversarial": "hostile-input, fuzz or unbounded-read test code can grow without limit",
-    "full-suite": "a full test suite is long and CPU/memory heavy",
+    "full-suite": "a full test suite is long and CPU/memory heavy (run focused tests first: test_scope.py scope --base <main> --head <head>)",
     "build": "a production build is CPU/memory heavy",
     "media": "large media work (ffmpeg/whisper) is CPU/memory heavy",
     "fan-out": "parallel fan-out multiplies memory use",

@@ -1,0 +1,6 @@
+{
+ "schema": 1,
+ "host": "dev2",
+ "root": "~/.agent-harness/test-scope",
+ "ssh_timeout_s": 8
+}

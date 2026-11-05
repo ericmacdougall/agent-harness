@@ -565,6 +565,17 @@ class UsageStore:
         for field in ('actor', 'reason', 'evidence', 'at'): safe_text(value[field])
         return True
 
+    @staticmethod
+    def _one_full_per_head(head, owner):
+        """Rule B6 (test_scope.py): one full run per head. Fails open when no store is reachable."""
+        try:
+            import test_scope
+            test_scope.guarded_full_start(head, 'usage_guard:' + str(owner))
+        except test_scope.Refused as refused:
+            raise GuardError('INPUT_CHANGED', refused.message)
+        except Exception:  # noqa: BLE001 - no store, bad head: not this guard's job
+            return
+
     def begin(self, subject, invocation, *, owner, label, timeout, kind='review', repeat_reason=None,
               gate=None, ungated_reason=None, minimum_bytes=None, aggregate_timeout=None):
         safe_label(owner); safe_label(label); finite_seconds(timeout)
@@ -593,6 +604,8 @@ class UsageStore:
             except OSError:
                 resource_reason = 'UNKNOWN'
         with self._lock():
+            if kind == 'full' and isinstance(subject.get('head'), str):
+                self._one_full_per_head(subject['head'], owner)
             purpose = self._directory(self.root / 'purposes' / invocation['fingerprint'])
             previous, spent = [], 0
             for number in (1, 2):
