@@ -101,6 +101,22 @@ class States(unittest.TestCase):
         env = Env(self, {"state": "none", "ledger": "unusable", "tracked": False}, commits=5)
         self.assertEqual(env.hook(), "")
 
+    def test_a_silent_outcome_is_not_rechecked_on_every_prompt(self):
+        env = Env(self, {"state": "tracked"})
+        self.assertEqual(env.hook(session="a"), "")
+        self.assertEqual(env.runs(), 1)
+        self.assertEqual(env.hook(session="b", now=1_000_000_000_000 + 1000), "")
+        self.assertEqual(env.runs(), 1)
+        env.set_fake({"state": "local-only", "slug": "demo"})
+        self.assertTrue(env.hook(session="c", now=1_000_000_000_000 + 11 * 60 * 1000))
+
+    def test_corrupt_numbers_in_state_drop_the_entry_not_the_file(self):
+        env = Env(self)
+        env.state_file().parent.mkdir(parents=True)
+        env.state_file().write_text('{"v":1,"repos":{"/x":{"last_ms":NaN,"dismissed_until_ms":Infinity}}}')
+        self.assertTrue(env.hook())
+        self.assertEqual(lr.main(["dismiss", "--repo", str(env.repo)], env.env, b"", lambda: 1), 0)
+
     def test_none_needs_three_commits_and_an_untracked_repository(self):
         self.assertEqual(Env(self, {"state": "none", "tracked": False}, commits=2).hook(), "")
         env = Env(self, {"state": "none", "tracked": False}, commits=3)

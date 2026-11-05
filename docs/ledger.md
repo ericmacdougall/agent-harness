@@ -237,8 +237,11 @@ advisory: its digest is public.
   reviewed ops (`~/.agent-harness/ledgers/<proj>/trust.json`, never read from the git dir). Ops the writer appends later
   are held back (counted as `held_ops` in the export) until you review again. `block-writer` excludes a writer; neither
   command accepts your own writer.
-- **Git behaviours.** Squash, rebase and branch deletion do not touch the refs; `git gc --prune=now` and
-  `git push --mirror` keep them; a remote that refuses the push gives an error and records nothing. A HOME copied
+- **Leaks that skip consent.** The repository holds a copy of the ledger refs, so commands that send every ref carry the
+  whole ledger without the consent token, size check or secret re-scan: `git push --mirror`, a `refs/*` refspec,
+  `git clone --mirror` from this repository and `git bundle create --all`. Do not use them on a repository whose ledger
+  must stay private.
+- **Git behaviours.** Squash, rebase and branch deletion do not touch the refs; `git gc --prune=now` keeps them; a remote that refuses the push gives an error and records nothing. A HOME copied
   together with its repository defeats the HOME trust anchor.
 
 ### Reminder hook and console icon

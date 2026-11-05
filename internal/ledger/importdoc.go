@@ -143,6 +143,11 @@ func BuildImport(in fold.Input, from, to []Frontier, baseDigest string, redact b
 	var fields []textField
 	name := v.Name
 	fields = append(fields, textField{"project name", &name})
+	statusNames := make([]fold.Status, len(v.Statuses))
+	copy(statusNames, v.Statuses)
+	for i := range statusNames {
+		fields = append(fields, textField{fmt.Sprintf("status %d name", i), &statusNames[i].Name})
+	}
 	copies := make([]fold.Ticket, len(picked))
 	for i, t := range picked {
 		c := *t
@@ -151,15 +156,18 @@ func BuildImport(in fold.Input, from, to []Frontier, baseDigest string, redact b
 		c.History = append([]fold.Event(nil), t.History...)
 		copies[i] = c
 		h := c.Handle
+		fields = append(fields, textField{"ticket " + h + " created_by", &copies[i].CreatedBy})
 		fields = append(fields, textField{"ticket " + h + " title", &copies[i].Title}, textField{"ticket " + h + " body", &copies[i].Body})
 		for j := range copies[i].Labels {
 			fields = append(fields, textField{fmt.Sprintf("ticket %s label %d", h, j), &copies[i].Labels[j]})
 		}
 		for j := range copies[i].Comments {
+			fields = append(fields, textField{fmt.Sprintf("ticket %s comment %d actor", h, j), &copies[i].Comments[j].Actor})
 			fields = append(fields, textField{fmt.Sprintf("ticket %s comment %d", h, j), &copies[i].Comments[j].Body})
 		}
 		for j := range copies[i].History {
-			fields = append(fields, textField{fmt.Sprintf("ticket %s event %d from", h, j), &copies[i].History[j].From},
+			fields = append(fields, textField{fmt.Sprintf("ticket %s event %d actor", h, j), &copies[i].History[j].Actor},
+				textField{fmt.Sprintf("ticket %s event %d from", h, j), &copies[i].History[j].From},
 				textField{fmt.Sprintf("ticket %s event %d to", h, j), &copies[i].History[j].To})
 		}
 	}
@@ -187,8 +195,8 @@ func BuildImport(in fold.Input, from, to []Frontier, baseDigest string, redact b
 	}
 
 	statuses := []op.Obj{}
-	for _, s := range v.Statuses {
-		statuses = append(statuses, op.Obj{{K: "key", V: s.Key}, {K: "name", V: s.Name}, {K: "category", V: s.Category}})
+	for i, s := range v.Statuses {
+		statuses = append(statuses, op.Obj{{K: "key", V: s.Key}, {K: "name", V: statusNames[i].Name}, {K: "category", V: s.Category}})
 	}
 	tickets := []op.Obj{}
 	for i := range copies {

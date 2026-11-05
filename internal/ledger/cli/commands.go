@@ -753,12 +753,9 @@ func cmdWriters(args []string, env Env) error {
 		if ops, digest, _, rerr := l.WriterReview(w); rerr == nil {
 			texts := []string{}
 			for _, o := range ops {
-				t := string(o.Raw)
-				if len(t) > 2048 {
-					t = t[:2048] + "..."
-				}
-				texts = append(texts, s(t))
-				fmt.Fprintf(&b, "  op %s\n", s(term.Line(t)))
+				t := string(o.Raw) // the whole op: the review digest covers exactly what is shown
+				texts = append(texts, wholeText(t))
+				fmt.Fprintf(&b, "  op %s\n", wholeText(t))
 			}
 			fmt.Fprintf(&b, "review digest %s (covers all %d ops above; trust-writer %s --reviewed DIGEST)\n", digest, len(ops), w)
 			review = op.Obj{{K: "review_digest", V: digest}, {K: "ops_text", V: texts}}

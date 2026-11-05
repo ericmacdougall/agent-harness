@@ -144,7 +144,7 @@ func TestCompareClassifiesFrontiers(t *testing.T) {
 func TestURLValidation(t *testing.T) {
 	good := []string{"https://example.org/x.git", "ssh://git@example.org/x.git", "git@example.org:x/y.git", "/abs/path/x.git", "file:///abs/x.git"}
 	bad := []string{"", "-oProxyCommand=x", "ext::sh -c id", "fd::3", "transport::x", "ssh://-oProxy@host/x", "ssh://-host/x", "-o@host:x",
-		"https://user:pw@host/x", "http://host/x", "git://host/x", "rel/path", "https://host/a b", "file://rel/path", "host:path\nx"}
+		"https://user:pw@host/x", "http://host/x", "git://host/x", "rel/path", "https://host/a b", "file://rel/path", "host:path\nx", "git@example.invalid:--upload-pack=x"}
 	for _, u := range good {
 		if err := store.ValidateURL(u); err != nil {
 			t.Errorf("%q refused: %v", u, err)

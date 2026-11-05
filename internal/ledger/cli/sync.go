@@ -67,7 +67,7 @@ func cmdSyncState(args []string, env Env) error {
 	default:
 		presence = "unusable"
 	}
-	if presence != "present" && report.State == ledger.StateNone && tracked && presence == "absent" {
+	if report.State == ledger.StateNone && tracked {
 		report.State = ledger.StateTracked
 	}
 	doc := op.Obj{{K: "state", V: report.State}, {K: "ledger", V: presence}, {K: "slug", V: slug}, {K: "project", V: project},
@@ -143,7 +143,12 @@ func readReceipt(path string, env Env) (*receipt, error) {
 	case len(r.Frontier) == 0 || len(r.Frontier) > 4096:
 		return nil, refusedf("receipt frontier is empty or too large")
 	}
+	seenW := map[string]bool{}
 	for _, f := range r.Frontier {
+		if seenW[f.Writer] {
+			return nil, refusedf("receipt frontier lists a writer twice")
+		}
+		seenW[f.Writer] = true
 		if !op.ValidID(f.Writer, op.PrefixWriter) || !op.ValidID(f.LastOp, op.PrefixOp) || f.Ops < 1 || f.Ops > 1<<30 {
 			return nil, refusedf("receipt frontier entry is malformed")
 		}
@@ -353,6 +358,19 @@ func cmdBlockWriter(args []string, env Env) error {
 	return nil
 }
 
+// wholeText renders an op for review without losing a byte to the 2,000-character line cap: it is cut into
+// chunks, each sanitized on its own, and rejoined. The review digest covers exactly this text.
+func wholeText(raw string) string {
+	rs := []rune(raw)
+	var b strings.Builder
+	for len(rs) > 0 {
+		n := min(1500, len(rs))
+		b.WriteString(s(string(rs[:n])))
+		rs = rs[n:]
+	}
+	return b.String()
+}
+
 // writersWithoutRoot lists writers when no folded writer holds the project root yet (a freshly adopted
 // ledger): the view cannot be built, but the writers can be reviewed and trusted.
 func writersWithoutRoot(p parsed, l *ledger.Ledger, env Env, viewErr error) error {
@@ -365,16 +383,10 @@ func writersWithoutRoot(p parsed, l *ledger.Ledger, env Env, viewErr error) erro
 		var b strings.Builder
 		fmt.Fprintf(&b, "writer %s class %s, %d ops (untrusted data below; not folded unless self or trusted)\n", w, class, len(ops))
 		texts := []string{}
-		for i, o := range ops {
-			if i == 200 {
-				break
-			}
-			t := string(o.Raw)
-			if len(t) > 2048 {
-				t = t[:2048] + "..."
-			}
-			texts = append(texts, s(t))
-			fmt.Fprintf(&b, "  op %s\n", s(term.Line(t)))
+		for _, o := range ops {
+			t := string(o.Raw) // the whole op: the review digest covers exactly what is shown
+			texts = append(texts, wholeText(t))
+			fmt.Fprintf(&b, "  op %s\n", wholeText(t))
 		}
 		fmt.Fprintf(&b, "review digest %s (covers all %d ops; trust-writer %s --reviewed DIGEST)\n", digest, len(ops), w)
 		emit(env, p.has("json"), op.Obj{{K: "writer", V: w}, {K: "class", V: class}, {K: "ops", V: len(ops)},

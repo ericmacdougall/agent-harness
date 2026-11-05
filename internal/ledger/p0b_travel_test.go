@@ -433,3 +433,36 @@ func TestTravelGitBehaviours(t *testing.T) {
 }
 
 var execCommand = exec.Command
+
+// The review digest covers exactly what `writers --show` prints: a long op is shown whole.
+func TestWritersShowPrintsWholeOpsSoTheDigestIsReviewable(t *testing.T) {
+	p := newPair(t)
+	a, b := p.a, p.b
+	a.ok(a.repo, nil, "init", "--slug", "rv")
+	a.newTicket(a.repo, nil, "hello", "--body", strings.Repeat("A", 3000)+" HIDDEN-TAIL")
+	a.enable(a.repo)
+	a.ok(a.repo, nil, "travel", "push")
+	b.ok(b.repo, nil, "travel", "fetch", "--adopt", "--remote", "origin", "--yes-share", b.adoptToken(b.repo))
+	wid := b.jsonOK(b.repo, nil, "writers")["writers"].([]any)[0].(map[string]any)["id"].(string)
+	if out := b.ok(b.repo, nil, "writers", "--show", wid); !strings.Contains(out, "HIDDEN-TAIL") {
+		t.Fatalf("the tail of a long op is not shown, yet the digest would cover it")
+	}
+}
+
+func TestTrackedWinsEvenWhenTheLedgerIsUnusable(t *testing.T) {
+	w := newWorld(t)
+	policy := filepath.Join(w.home, "policy.json")
+	os.WriteFile(policy, []byte(`{"ticket_systems":{"goodqa":{"adapter":"goodqa","repos":["github\\.com[:/]acme-corp/"]}}}`), 0o600)
+	w.git(w.repo, "remote", "add", "origin", "git@github.com:acme-corp/x.git")
+	w.ok(w.repo, nil, "init", "--slug", "tu")
+	w.newTicket(w.repo, nil, "a")
+	home2 := filepath.Join(filepath.Dir(w.home), "home2")
+	os.MkdirAll(home2, 0o700)
+	repo2 := filepath.Join(filepath.Dir(w.home), "repo2")
+	execCopy(w.repo, repo2)
+	w.env = gitEnv(home2)
+	st := w.syncState(repo2, []string{"HARNESS_COMMIT_POLICY_FILE=" + policy})
+	if st["state"] != "tracked" || st["ledger"] != "unusable" {
+		t.Fatalf("%v", st)
+	}
+}

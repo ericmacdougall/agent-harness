@@ -26,7 +26,7 @@ export function ledgerLabel(info) {
 
 export function ledgerState(info) {
   const state = info && typeof info.state === 'string' ? info.state : 'unknown';
-  return GLYPH[state] || state === 'none' ? state : 'unknown';
+  return Object.hasOwn(GLYPH, state) || state === 'none' ? state : 'unknown';
 }
 
 // One shared, fixed-position label element: the tab strip clips overflow, so a label drawn inside it would be cut off.

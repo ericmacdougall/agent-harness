@@ -486,6 +486,9 @@ func (l *Ledger) readAll(s *snapshot) (fold.Input, error) {
 		if proj != l.Project {
 			continue
 		}
+		if in.Class(w) == fold.ClassBlocked {
+			continue // a blocked writer is never read and never uses the unverified budget
+		}
 		ref := fold.Ref{Writer: w}
 		budget, chain := store.FoldedBudget, store.MaxChain
 		if !folded(r) {

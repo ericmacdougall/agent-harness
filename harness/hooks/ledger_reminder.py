@@ -36,6 +36,7 @@ except Exception:  # pragma: no cover - a missing helper must not break the agen
 BUDGET_SECONDS = 2.5
 GIT_SECONDS = 0.5
 DAY_MS = 24 * 3600 * 1000
+SILENT_RECHECK_MS = 10 * 60 * 1000
 MAX_REPOS = 500
 STATE_MAX_BYTES = 512 * 1024
 STDIN_MAX_BYTES = 64 * 1024
@@ -118,12 +119,17 @@ def read_state(directory: Path) -> dict:
         return empty
     repos = {}
     for key, entry in data["repos"].items():
-        if isinstance(key, str) and isinstance(entry, dict):
+        if not (isinstance(key, str) and isinstance(entry, dict)):
+            continue
+        try:  # one bad entry (NaN, Infinity, huge numbers) is dropped, never the whole file
+            until = entry.get("dismissed_until_ms")
             repos[key] = {"last_ms": int(entry.get("last_ms") or 0) if isinstance(entry.get("last_ms"), (int, float)) else 0,
                           "state": entry.get("state") if entry.get("state") in STATES else "",
                           "session": str(entry.get("session") or "")[:128],
-                          "dismissed_until_ms": entry.get("dismissed_until_ms")
-                          if isinstance(entry.get("dismissed_until_ms"), (int, float)) else None}
+                          "dismissed_until_ms": int(until) if isinstance(until, (int, float)) else None,
+                          "checked_ms": int(entry.get("checked_ms") or 0) if isinstance(entry.get("checked_ms"), (int, float)) else 0}
+        except (ValueError, OverflowError):
+            continue
     return {"v": 1, "repos": repos}
 
 
@@ -180,7 +186,7 @@ class StateLock:
 # ---------------------------------------------------------------------------------------------- hook
 
 def reminder_text(state: str, slug: str) -> str:
-    return TEXT[state].format(slug=f" ({slug})" if SLUG.match(slug or "") else "")
+    return TEXT[state].format(slug=f" ({slug})" if SLUG.fullmatch(slug or "") else "")
 
 
 def decide(report: dict, top: str, env, remaining: float, runner=subprocess.run):
@@ -235,6 +241,8 @@ def hook(env, stdin_bytes: bytes, now_ms, runner=subprocess.run, clock=time.mono
             return ""
         if entry.get("session") == session:
             return ""
+        if entry.get("checked_ms", 0) and now - entry["checked_ms"] < SILENT_RECHECK_MS:
+            return ""  # the last look found nothing to say: do not start harness on every prompt
         harness = find_harness(env)
         if not harness:
             return ""
@@ -252,10 +260,17 @@ def hook(env, stdin_bytes: bytes, now_ms, runner=subprocess.run, clock=time.mono
             return ""
         chosen = decide(report, top, env, BUDGET_SECONDS - (clock() - started), runner)
         if chosen is None:
+            quiet = {**entry, "checked_ms": now}
+            quiet.setdefault("last_ms", 0)
+            quiet.setdefault("state", "")
+            quiet.setdefault("session", "")
+            quiet.setdefault("dismissed_until_ms", None)
+            state["repos"][top] = quiet
+            write_state(directory, state)
             return ""
         slug = report.get("slug") if isinstance(report.get("slug"), str) else ""
         text = reminder_text(chosen, slug)
-        state["repos"][top] = {"last_ms": now, "state": chosen, "session": session,
+        state["repos"][top] = {"last_ms": now, "state": chosen, "session": session, "checked_ms": 0,
                                "dismissed_until_ms": entry.get("dismissed_until_ms")}
         if not write_state(directory, state):
             return ""  # without a recorded reminder it would repeat on every prompt
@@ -268,7 +283,7 @@ def dismiss(argv, env, now_ms) -> int:
     while i < len(argv):
         if argv[i] == "--repo" and i + 1 < len(argv):
             repo, i = argv[i + 1], i + 2
-        elif argv[i] == "--days" and i + 1 < len(argv) and argv[i + 1].isdigit():
+        elif argv[i] == "--days" and i + 1 < len(argv) and argv[i + 1].isascii() and argv[i + 1].isdigit():
             days, i = int(argv[i + 1]), i + 2
         elif argv[i] == "--forever":
             forever, i = True, i + 1

@@ -60,13 +60,13 @@ type travelJSON struct {
 }
 
 // ConsentError is returned by TravelEnable when the token is missing or wrong; its text is the warning.
-type ConsentError struct{ Token, Remote string }
+type ConsentError struct{ Token, Remote, Fetch, Push string }
 
 func (e *ConsentError) Error() string {
 	return fmt.Sprintf("travel would publish this ledger, including every ticket, comment and its full history, "+
 		"to everyone who can read remote %q, and publishing cannot be undone; ops carry writer ids, claimed actor labels "+
 		"and wall times. The harness cannot tell whether the remote is public. To proceed run: "+
-		"harness tickets travel enable --remote %s --yes-share %s", e.Remote, e.Remote, e.Token)
+		"harness tickets travel enable --remote %s --yes-share %s. URLs: fetch %s, push %s", e.Remote, e.Remote, e.Token, shownURL(e.Fetch), shownURL(e.Push))
 }
 
 func endpointSum(fetch, push string) string {
@@ -149,7 +149,7 @@ func (l *Ledger) TravelEnable(remote, token string) error {
 	}
 	want := URLToken(fetch, push)
 	if token != want {
-		return &ConsentError{Token: want, Remote: remote}
+		return &ConsentError{Token: want, Remote: remote, Fetch: fetch, Push: push}
 	}
 	return l.writeTravel(&TravelConfig{Remote: remote, Endpoint: endpointSum(fetch, push),
 		PushedOps: map[string]int{}, FetchedOps: map[string]int{}})
@@ -460,7 +460,7 @@ func TravelAdopt(loc Location, remote, token string) (*Ledger, *FetchResult, err
 		return nil, nil, err
 	}
 	if want := URLToken(fetch, push); token != want {
-		return nil, nil, &ConsentError{Token: want, Remote: remote}
+		return nil, nil, &ConsentError{Token: want, Remote: remote, Fetch: fetch, Push: push}
 	}
 	home, err := LedgersHome()
 	if err != nil {
@@ -554,4 +554,23 @@ func TravelAdopt(loc Location, remote, token string) (*Ledger, *FetchResult, err
 		l.warn = append(l.warn, "travel consent could not be recorded: "+err.Error())
 	}
 	return l, res, nil
+}
+
+// shownURL renders a URL for a consent prompt: credentials removed, control characters escaped, bounded.
+func shownURL(u string) string {
+	if i := strings.Index(u, "://"); i >= 0 {
+		rest := u[i+3:]
+		if at := strings.Index(strings.SplitN(rest, "/", 2)[0], "@"); at >= 0 {
+			u = u[:i+3] + rest[at+1:]
+		}
+	}
+	if len(u) > 200 {
+		u = u[:200] + "..."
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return '?'
+		}
+		return r
+	}, u)
 }

@@ -65,7 +65,7 @@ func (g *Git) runT(timeout time.Duration, args ...string) ([]byte, error) {
 }
 
 var (
-	scpURL   = regexp.MustCompile(`^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9.-]*:[^/:\\\s][^\s]*$`)
+	scpURL   = regexp.MustCompile(`^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9.-]*:[^/:\\\s-][^\s]*$`)
 	unsafeCh = regexp.MustCompile(`[\x00-\x20\x7f\\]`)
 )
 
