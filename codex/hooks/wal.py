@@ -94,6 +94,34 @@ def session_directory(session: str):
         yield directory, current_directory
 
 
+def ops_alert_context(event: str) -> str:
+    """Active ops-watch alerts for the Codex side (parity with harness/hooks/wal.py, goodqa#14613 M9). ops_watch is
+    looked up next to this hook, then in the Claude hooks dir, then in a repo checkout. Never raises."""
+    try:
+        import importlib.util
+        here = Path(__file__).resolve().parent
+        candidates = [here / "ops_watch.py", Path.home() / ".claude" / "hooks" / "ops_watch.py",
+                      here.parent.parent / "harness" / "hooks" / "ops_watch.py"]
+        for candidate in candidates:
+            if candidate.is_file():
+                spec = importlib.util.spec_from_file_location("ops_watch_codex", candidate)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                return module.injection_text(Path.home(), max_chars=400 if event == "UserPromptSubmit" else 700)
+    except Exception:  # an alert line must never block a prompt or a session start
+        pass
+    return ""
+
+
+def degraded_note(error: OSError) -> str:
+    """The note a hook answers with when its WAL append fails (ENOSPC, EACCES, EROFS): the turn proceeds, the
+    operator is told, and recovery commands stay possible. Codex blocks the turn on a non-zero hook exit."""
+    import errno
+    name = errno.errorcode.get(getattr(error, "errno", 0) or 0, type(error).__name__)
+    return (f" WAL append failed ({name}): this turn is not journaled; free space or fix permissions on the WAL "
+            "directory (recovery commands only until it works).")
+
+
 def append(path: Path, record: dict) -> None:
     root = wal_root()
     if (path.parent.parent != root or path.suffix != ".jsonl"
@@ -326,21 +354,35 @@ def hook() -> None:
     }
     if event == "SessionStart":
         record["source"] = data.get("source", "")
-        append(main_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Add redacted intent before edits, then decisions, checks, commits and handoffs. Hook metadata is not a semantic work log.")}}))
+        note = ""
+        try:
+            append(main_wal, record)
+        except OSError as error:
+            note = degraded_note(error)
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Add redacted intent before edits, then decisions, checks, commits and handoffs. Hook metadata is not a semantic work log.") + note + ops_alert_context(event)}}))
     elif event == "UserPromptSubmit":
         prompt = str(data.get("prompt", ""))
         record["prompt_chars"] = len(prompt)
-        append(main_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Use the fast path for small changes. For substantive work, scope and coordinate an owner. Record redacted intent before editing.")}}))
+        note = ""
+        try:
+            append(main_wal, record)
+        except OSError as error:
+            # A full or read-only disk must not block the prompt (the turn would otherwise be refused): degrade
+            # to a note so the operator can run the recovery commands.
+            note = degraded_note(error)
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Use the fast path for small changes. For substantive work, scope and coordinate an owner. Record redacted intent before editing.") + note + ops_alert_context(event)}}))
     elif event == "SubagentStart":
         agent_id = safe_id(data.get("agent_id"))
         agent_type = safe_id(data.get("agent_type"))
         agent_wal = root / f"agent-{agent_id}.jsonl"
         record.update({"agent_id": agent_id, "agent_type": agent_type})
-        append(main_wal, record)
-        append(agent_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": f"Your private WAL: {agent_wal}. Read the main scope brief and decisions in {main_wal}; record redacted intent, tests, commits and handoff."}}))
+        note = ""
+        try:
+            append(main_wal, record)
+            append(agent_wal, record)
+        except OSError as error:
+            note = degraded_note(error)
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": f"Your private WAL: {agent_wal}. Read the main scope brief and decisions in {main_wal}; record redacted intent, tests, commits and handoff." + note + ops_alert_context(event)}}))
     elif event == "PreToolUse":
         agent_id = data.get("agent_id")
         wal = root / f"agent-{safe_id(agent_id)}.jsonl" if agent_id else main_wal
