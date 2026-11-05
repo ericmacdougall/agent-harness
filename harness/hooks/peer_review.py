@@ -11,7 +11,6 @@ import math
 import os
 import re
 import selectors
-import shutil
 import signal
 import stat
 import subprocess
@@ -21,6 +20,12 @@ import time
 import unicodedata
 from pathlib import Path
 
+if sys.version_info < (3, 9):
+    sys.exit('REVIEW_DIAGNOSTIC code=PYTHON_UNSUPPORTED reason=TRANSIENT_INFRA: peer_review needs Python 3.9 or newer; '
+             'run it with python3.9+ (for example python3.12). Record the blocker in the WAL; any native review is '
+             'native evidence only, not a helper receipt.')
+
+import review_diagnostics as diagnostics
 from process import run as run_process, signal_group
 from git_safety import git_environment as safe_git_environment, require_safe_source
 from report_file import ReportTarget
@@ -30,6 +35,20 @@ from usage_guard import GuardError, UsageStore, capture_subject, invocation_iden
 PACKET_LIMIT = 150_000
 PACKET_WARNING = 32 * 1024
 PROVIDER_LIMIT = 1_000_000
+_POLICY = []
+
+
+def review_policy():
+    if not _POLICY:
+        _POLICY.append(diagnostics.load_policy(warn=lambda message: print('Warning: ' + message, file=sys.stderr)))
+    return _POLICY[0]
+
+
+def prose_quota_failure(message):
+    """Free-text usage limit: unlock the one independent fallback, but never an account-pool cooldown."""
+    if diagnostics.usage_limit_prose(message, review_policy()):
+        return {**provider_failure({'code': 'quota_exceeded'}, trusted=False), 'reset_at': None}
+    return None
 DOMAIN_SECTION_LIMIT = 9000  # generated reviewer checklist, kept outside the signed packet bytes
 
 
@@ -87,6 +106,8 @@ def codex_failure(record, *, terminal):
         # Prose-derived, so it may unlock the independent fallback but never
         # places an account-pool cooldown.
         return provider_failure({'code': 'unauthorized'}, trusted=False)
+    if terminal and result['reason'] == 'INVALID_OUTPUT' and unstructured:
+        return prose_quota_failure(message) or result
     return result
 
 
@@ -177,13 +198,19 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
         elif provider == 'claude':
             for record in records:
                 if record.get('type') == 'error' or record.get('is_error') is True or record.get('error') is not None:
-                    return provider_failure(record)
+                    failure = provider_failure(record)
+                    if failure['reason'] == 'INVALID_OUTPUT' and record.get('is_error') is True:
+                        failure = prose_quota_failure(record.get('result')) or failure
+                    return failure
             terminal = [record for record in records if record.get('type') == 'result']
             if len(terminal) != 1 or records[-1] is not terminal[0]:
                 return invalid
             record = terminal[0]
             if record.get('is_error') is not False or record.get('subtype') != 'success':
-                return provider_failure(record)
+                failure = provider_failure(record)
+                if failure['reason'] == 'INVALID_OUTPUT' and record.get('is_error') is True:
+                    failure = prose_quota_failure(record.get('result')) or failure
+                return failure
             if (record.get('stop_reason') is not None and not isinstance(record['stop_reason'], str)
                     or record.get('terminal_reason') is not None and not isinstance(record['terminal_reason'], str)
                     or record.get('stop_reason') not in (None, 'end_turn', 'stop_sequence', 'completed', 'success', 'complete', 'normal', 'done')
@@ -202,7 +229,10 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                                   stderr.strip() or stripped)
             if marker:
                 return provider_failure({'code': marker[1].lower()})
-            return invalid
+            # Free-text stderr counts only for codex with no stdout, and only its last line (the CLI's own
+            # final error): earlier lines may echo packet or model text.
+            last_line = (stderr.strip().splitlines() or [''])[-1].strip()
+            return (prose_quota_failure(last_line) if provider == 'codex' and not stripped else None) or invalid
     if code != 0:
         return invalid
     try:
@@ -346,7 +376,8 @@ def git(repo: Path, *args: str, timeout: float = 120, snapshot: bool = False) ->
     result = run_process(['git', '-C', str(repo), *args], env=git_environment(snapshot=snapshot),
                          timeout=timeout)
     if result.returncode:
-        raise OSError('isolated Git operation failed')
+        step = next((a for a in args if not a.startswith('-') and '=' not in a), 'git')
+        raise OSError('isolated Git operation failed (%s)' % step)
     return result.stdout
 
 
@@ -447,16 +478,26 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
         # Symlinks (120000) are checked out as inert text files; gitlinks stay refused.
         if entry and entry.split(' ', 1)[0] not in ('100644', '100755', '120000'):
             raise OSError('reviewed tree contains gitlinks or unsupported entries')
+    clashes = diagnostics.path_collisions([e.split('\t', 1)[-1] for e in tree.split('\0') if e])
+    if clashes and diagnostics.fs_is_case_insensitive(snapshot.parent):
+        raise OSError('reviewed paths differ only by case or Unicode form on a case-insensitive filesystem')
     slow_git(snapshot, 'checkout', '--quiet', '--detach', head)
     if repo_state(snapshot, snapshot=True) != (head, ''):
         raise OSError('snapshot does not match reviewed commit')
     return base
 
 
+_CHILD_PATH_ROOTS: list[str] = []  # reviewed repo roots, set where discovery computes them
+
+
 def run(cmd: list[str], prompt: str, cwd: Path, timeout=720, on_spawn=None) -> tuple[int, str, str]:
+    environment = git_environment(snapshot=True)
+    # The reviewer's own interpreter lookup (`#!/usr/bin/env node`) must not reach reviewed files.
+    environment['PATH'] = diagnostics.child_path(
+        environment.get('PATH', ''), [*_CHILD_PATH_ROOTS, *diagnostics.untrusted_roots(snapshot=cwd)])
     try:
         extra = {'on_spawn': on_spawn} if on_spawn is not None else {}
-        result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=git_environment(snapshot=True),
+        result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=environment,
                              timeout=timeout, **extra)
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
@@ -650,7 +691,7 @@ def require_unflagged_index(repo: Path) -> None:
         if count > 250_000 or time.monotonic() > deadline:
             raise OSError('Git index listing exceeded limits')
         if len(record) < 3 or record[:2] != b'H ':
-            raise OSError('Git index contains a hidden or unsupported entry flag')
+            raise OSError('Git index contains a hidden or unsupported entry flag (%r)' % record[:1].decode('ascii', 'replace'))
 
 
 def ignored_directory_prefixes(repo: Path, deadline: float) -> set[tuple[str, ...]]:
@@ -704,20 +745,26 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             raise ReviewFailure({**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}, source)
         timeout = min(720, options.get('timeout', 720), remaining)
         leased = False
+        resolution, code, stdout, stderr = None, None, '', ''
         try:
+            # Resolve before the lease, so a lease refusal is reported with its own reason, not as a missing CLI.
+            roots = diagnostics.untrusted_roots(repo=options.get('repo'), snapshot=snapshot)
+            _CHILD_PATH_ROOTS[:] = sorted(set(_CHILD_PATH_ROOTS) | set(roots))
+            resolution = (options.get('resolutions') or {}).get(provider) or diagnostics.discover_executable(
+                provider, policy=review_policy(), roots=roots)
             if store is not None:
                 store.acquire_pool(provider, pool, run_record.run_id)
                 leased = True
-            if not shutil.which(provider):
+            if not resolution['path']:
                 outcome = normalize_provider(provider, 127, '', 'HARNESS_PROVIDER_UNAVAILABLE')
             else:
                 with tempfile.TemporaryDirectory() as temp:
                     last = Path(temp) / 'last.txt'
                     if provider == 'codex':
-                        cmd = ['codex', 'exec', '--ephemeral', '--json', '--model', model, '--sandbox', 'read-only',
+                        cmd = [resolution['path'], 'exec', '--ephemeral', '--json', '--model', model, '--sandbox', 'read-only',
                                '--cd', str(snapshot), '--output-last-message', str(last), '-']
                     else:
-                        cmd = ['claude', '--print', '--safe-mode', '--restricted', '--model', 'opus',
+                        cmd = [resolution['path'], '--print', '--safe-mode', '--restricted', '--model', 'opus',
                                '--no-session-persistence', '--output-format', 'json', '--system-prompt', REVIEW_SYSTEM, '-']
                     timeout = min(timeout, deadline - time.monotonic())
                     if timeout <= 0:
@@ -732,6 +779,8 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         except GuardError as error:
             outcome = {**provider_failure({}), 'reason': error.reason,
                        'fallback_allowed': error.reason in {'QUOTA', 'AUTH'}}
+        options.setdefault('attempts', []).append(
+            diagnostics.provider_attempt(provider, resolution, code, stdout, stderr, outcome))
         if outcome.get('usage') is not None:
             options['usage'].append({'provider': provider, 'reported': outcome['usage']})
         if leased and outcome['reason'] not in {'TIMEOUT', 'UNKNOWN'}:
@@ -747,14 +796,14 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
     raise OSError('no valid reviewer result')
 
 
-def provider_toolchains():
+def provider_toolchains(resolutions):
     specifications = {}
     for provider in ('codex', 'claude'):
-        executable = shutil.which(provider)
-        if executable is None:
-            specifications[provider] = {'executable': provider, 'public': True, 'sha256': None}
-            continue
+        executable = resolutions[provider]['path']
         specifications[provider] = {'executable': provider, 'public': True, 'sha256': None}
+        if executable is None:
+            continue
+        specifications[provider]['path'] = executable
         try:
             path = Path(executable).resolve()
             if not stat.S_ISREG(path.stat().st_mode) or path.stat().st_size > 256 * 1024**2:
@@ -872,8 +921,9 @@ def main() -> int:
                         help='Optional tighter packet ceiling; maximum 150000 bytes')
     parser.add_argument('--timeout', type=int, default=720, help='Per-provider deadline, at most 720 seconds')
     parser.add_argument('--snapshot-base', help='Optional full ancestor commit SHA to include in the review snapshot for diffs')
-    parser.add_argument('--snapshot-timeout', type=int, default=DEFAULT_SNAPSHOT_TIMEOUT,
-                        help=f'Deadline for preparing the review snapshot, at most {MAX_SNAPSHOT_TIMEOUT} seconds')
+    parser.add_argument('--snapshot-timeout', type=int, default=None,
+                        help=f'Deadline for preparing the review snapshot, at most {MAX_SNAPSHOT_TIMEOUT} seconds '
+                             '(default: review_policy.json base plus a per-GiB allowance for the repository pack size)')
     parser.add_argument('--input-manifest', type=Path, help='Private declared runtime/configuration input manifest')
     parser.add_argument('--repeat-reason', help='Spend at most one additional declared attempt with a reason')
     parser.add_argument('--pool', default='default', help='Opaque Codex auth-pool alias; never a credential')
@@ -885,7 +935,7 @@ def main() -> int:
         parser.error('--packet-budget-bytes must be between 1 and 150000')
     if not 1 <= args.timeout <= 720:
         parser.error('--timeout must be between 1 and 720')
-    if not 1 <= args.snapshot_timeout <= MAX_SNAPSHOT_TIMEOUT:
+    if args.snapshot_timeout is not None and not 1 <= args.snapshot_timeout <= MAX_SNAPSHOT_TIMEOUT:
         parser.error(f'--snapshot-timeout must be between 1 and {MAX_SNAPSHOT_TIMEOUT}')
     if args.snapshot_base is not None and not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', args.snapshot_base.lower()):
         parser.error('--snapshot-base must be a full commit SHA')
@@ -927,7 +977,15 @@ def main() -> int:
     except (OSError, subprocess.TimeoutExpired) as error:
         target.close()
         evidence.close()
-        parser.error(f'repo state inspection failed: {error}')
+        print(diagnostics.render(diagnostics.classify_isolation_error(error), stage=args.stage), file=sys.stderr)
+        parser.error(f'repo state inspection failed: {diagnostics.sanitize(error)}')
+    if args.snapshot_timeout is None:
+        try:
+            counted = run_process(['git', '-C', str(repo), 'count-objects', '-v'], env=git_environment(), timeout=30)
+            size = diagnostics.parse_pack_bytes(counted.stdout) if counted.returncode == 0 else 0
+        except (OSError, subprocess.TimeoutExpired):
+            size = 0  # a failed or capped probe keeps the policy base deadline
+        args.snapshot_timeout = diagnostics.scaled_snapshot_timeout(size, review_policy())
     if args.expected_head and (not re.fullmatch(r'[0-9a-fA-F]{40,64}', args.expected_head)
                                or before[0] != args.expected_head.lower()):
         target.close()
@@ -937,6 +995,12 @@ def main() -> int:
         target.close()
         evidence.close()
         parser.error('review requires a clean worktree')
+    problems = diagnostics.lint_packet(args.stage, evidence.content, args.expected_head)
+    if problems:
+        print(diagnostics.render_lint(problems, args.stage), file=sys.stderr)
+        target.close()
+        evidence.close()
+        return 2
     if args.stage == 'plan':
         prov_code, prov_text = packet_provenance_gate(evidence.content)
         if prov_text:
@@ -996,15 +1060,24 @@ def main() -> int:
             # that needs reconciliation or consume the review time budget.
             base = make_snapshot(repo, snapshot, before[0], base=base, timeout=args.snapshot_timeout)
             options['base'] = base
+            options['repo'] = repo
+            _CHILD_PATH_ROOTS[:] = diagnostics.untrusted_roots(repo=repo, snapshot=snapshot)
+            resolutions = {name: diagnostics.discover_executable(
+                name, policy=review_policy(), roots=list(_CHILD_PATH_ROOTS))
+                for name in diagnostics.PROVIDERS}
+            options['resolutions'] = resolutions
             options['domain_section'], options['domain_disabled'] = domain_section(snapshot, base)
             if repo_state(repo) != before:
                 raise OSError('source changed while preparing review')
             subject = capture_subject(repo, args.input_manifest)
             invocation = invocation_identity(subject, purpose='peer-review-' + args.stage,
                 argv=['peer_review', args.stage, options['model'], 'opus', args.pool, args.fallback_pool,
-                      '--snapshot-base', base or 'none'], cwd=repo,
+                      '--snapshot-base', base or 'none',
+                      # The effective review policy (shipped or override) changes discovery and quota classification.
+                      '--review-policy', hashlib.sha256(json.dumps(review_policy(), sort_keys=True).encode()).hexdigest()],
+                cwd=repo,
                 stage=args.stage.upper().replace('-', '_'), packet_digest=evidence.sha256,
-                provider='codex', model=options['model'], pool=args.pool, toolchain=provider_toolchains(),
+                provider='codex', model=options['model'], pool=args.pool, toolchain=provider_toolchains(resolutions),
                 environment={name: os.environ[name] for name in ('CI', 'LANG', 'LC_ALL', 'TZ', 'PYTHONHASHSEED', 'NODE_ENV')
                              if name in os.environ})
             store = UsageStore()
@@ -1018,7 +1091,9 @@ def main() -> int:
                 raise OSError('snapshot changed during review')
         # Cleanup must succeed before any report is published.
     except (OSError, subprocess.TimeoutExpired, GuardError) as error:
-        print(f'Review isolation failed: {error}; no signoff published.', file=sys.stderr)
+        print(f'Review isolation failed: {diagnostics.sanitize(error)}; no signoff published.', file=sys.stderr)
+        diagnosis = diagnostics.final_diagnostic(options.get('attempts', []), error)
+        print(diagnostics.render(diagnosis, stage=args.stage, head=before[0]), file=sys.stderr)
         if run_record is not None:
             outcome = error.outcome if isinstance(error, ReviewFailure) else {}
             reason = outcome.get('reason', error.reason if isinstance(error, GuardError) else 'UNKNOWN')
@@ -1026,7 +1101,9 @@ def main() -> int:
                 run_record.finish(execution='INTERRUPTED' if reason == 'TIMEOUT' else
                                   'COMPLETED' if options.get('launches') else 'NOT_STARTED',
                                   result='NO_RESULT', reason=reason,
-                                  usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', [])})
+                                  usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
+                                         'executables': diagnostics.executable_record(options.get('resolutions', {})),
+                                         'diagnostic': diagnosis['code']})
             except (OSError, GuardError):
                 print('Execution receipt could not be finalized; reconciliation is required.', file=sys.stderr)
         target.close()
@@ -1068,7 +1145,8 @@ def main() -> int:
             reason='NONE' if passed else 'CODE_FINDINGS', exit_code=0,
             review={'stage': args.stage.upper().replace('-', '_'), 'verdict': 'ACCEPT' if passed else 'BLOCK',
                     'findings': [] if passed else finding_ids(report)},
-            usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', [])})
+            usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
+                   'executables': diagnostics.executable_record(options.get('resolutions', {}))})
         finalized = True
         final = store.load_ref(reference)
         if final['result'] != ('CHECK_OK' if passed else 'CHECK_FAILED') or final['reason'] != ('NONE' if passed else 'CODE_FINDINGS'):

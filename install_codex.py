@@ -256,7 +256,8 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
     backup_root = harness_dir / 'backups'
     files = [(SOURCE / 'agents' / name, codex_home / 'agents' / name) for name in AGENTS]
     files += [(SOURCE / 'skills' / 'agent-harness' / name, skill_dir / name) for name in SKILL_FILES]
-    files += [(SOURCE / 'hooks' / 'wal.py', harness_dir / 'wal.py')]
+    files += [(SOURCE / 'hooks' / 'wal.py', harness_dir / 'wal.py'),
+              (SOURCE.parent / 'harness' / 'hooks' / 'ops_watch.py', harness_dir / 'ops_watch.py')]  # alert parity (goodqa#14613 M9)
     files += [(ROOT / 'harness' / 'hooks' / name, harness_dir / name)
               for name in DELIVERY_HELPERS]
     files += [(ROOT / 'harness' / 'tools' / 'watch-tests.py', harness_dir / 'watch-tests.py')]

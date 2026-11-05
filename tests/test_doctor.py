@@ -192,6 +192,78 @@ class Remote(unittest.TestCase):
                                            Path("/Users/local/.claude/hooks")))
 
 
+class BoundedReads(unittest.TestCase):
+    """PR #75 bounded input: settings reads refuse oversize, FIFO and missing files cleanly (rc=2, no traceback)."""
+
+    def run_main(self, settings):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = doctor.main(["check", "--settings", str(settings), "--no-canary", "--hooks-dir", str(settings.parent)])
+        return code, err.getvalue()
+
+    def test_oversize_settings_is_refused_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            big = Path(tmp, "settings.json")
+            big.write_text('{"x": "' + "a" * (doctor.MAX_JSON_BYTES + 10) + '"}')
+            code, err = self.run_main(big)
+        self.assertEqual(code, 2, err)
+        self.assertIn("cannot read", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_exact_cap_is_accepted_and_one_byte_more_is_not(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "s.json")
+            body = '{"x": ""}'
+            path.write_text(body[:-2] + "a" * (doctor.MAX_JSON_BYTES - len(body) + 0) + body[-2:])
+            self.assertEqual(os.path.getsize(path), doctor.MAX_JSON_BYTES)
+            self.assertIsInstance(doctor.load_json(path), dict)
+            path.write_text(path.read_text()[:-2] + "a" + '"}')
+            with self.assertRaises(ValueError):
+                doctor.load_json(path)
+
+    def test_fifo_and_missing_settings_fail_without_hanging_or_traceback(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = Path(tmp, "settings.json")
+            os.mkfifo(fifo)
+            code, err = self.run_main(fifo)
+            self.assertEqual(code, 2, err)
+            self.assertNotIn("Traceback", err)
+            code, err = self.run_main(Path(tmp, "absent.json"))
+            self.assertEqual(code, 2, err)
+            self.assertNotIn("Traceback", err)
+
+    def test_remote_read_is_bounded_and_oversize_refused(self):
+        class R:
+            returncode = 0
+            stdout = b"{" + b" " * (doctor.MAX_JSON_BYTES + 5) + b"}"
+        calls = []
+        orig = doctor.subprocess.run
+        doctor.subprocess.run = lambda argv, **k: (calls.append(argv), R())[1]
+        try:
+            with self.assertRaises(ValueError):
+                doctor.read_live("/home/u/.claude/settings.json", "dev2")
+        finally:
+            doctor.subprocess.run = orig
+        argv = calls[0]
+        self.assertEqual(argv[argv.index("head") + 1:argv.index("head") + 3], ["-c", str(doctor.MAX_JSON_BYTES + 1)])
+        self.assertNotIn("cat", argv)
+
+    def test_unreadable_manifest_is_rc2(self):
+        orig = doctor.MANIFEST
+        with tempfile.TemporaryDirectory() as tmp:
+            doctor.MANIFEST = Path(tmp, "missing.json")
+            try:
+                code, err = self.run_main(Path(tmp, "settings.json"))
+            finally:
+                doctor.MANIFEST = orig
+        self.assertEqual(code, 2, err)
+        self.assertNotIn("Traceback", err)
+
+
 class Canary(unittest.TestCase):
     def script(self, body):
         d = tempfile.TemporaryDirectory()
