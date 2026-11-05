@@ -32,6 +32,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import usage_guard  # noqa: E402  (SECRET detector; liveness helpers when the guard has them)
@@ -774,6 +775,31 @@ UNPEELED_WRAPPERS = frozenset(('busybox stdbuf flock script arch caffeinate ioni
                                'unshare setpriv taskset numactl unbuffer rlwrap su doas pkexec runuser fakeroot strace ltrace '
                                'dtruss').split(' '))
 SHELL_NAMES = frozenset('bash sh zsh dash ksh ash mksh ksh93 rbash fish csh tcsh'.split(' '))
+
+
+def fold_name(text):
+    """A name as a case-insensitive, Unicode-folding file system compares it, widened (r9 F1). macOS's APFS finds a program
+    whatever its case or Unicode spelling: `RM`, `/BIN/RM`, `ba\u017fename` (long s) and `aw\u212a` (Kelvin sign) run rm,
+    basename and awk. So each lookup that adds a refusal, a question or a reason compares folded names: NFKC, casefold, NFKC.
+    It folds more than APFS does (full-width letters too), which only widens those. A lookup whose match removes a reason
+    or allows stays exact: allow rules, `wait`, shell keywords, the recovery commands, the `ah-run` prefix and the ssh
+    rewrite."""
+    if text.isascii():
+        return text.lower()
+    return unicodedata.normalize('NFKC', unicodedata.normalize('NFKC', text).casefold())
+
+
+PROGRAM_WORD = re.compile(r'[ \t\n]*([^ \t\n]+)')
+
+
+def _fold_program(text):
+    """text with its first word folded (fold_name), unless that word is an assignment: a deny or ask form, or a rule's spec."""
+    found = PROGRAM_WORD.match(text)
+    if not found or ASSIGNMENT.match(found.group(1)):
+        return text
+    return text[:found.start(1)] + fold_name(found.group(1)) + text[found.end(1):]
+
+
 FIND_RUNNERS = frozenset(('-exec', '-execdir', '-ok', '-okdir'))
 # Builtins that take a variable name (r8 L1): per builtin, the option letters that take an argument, those of them whose
 # argument is a name, and whether plain words are names.
@@ -1398,7 +1424,7 @@ class _Lexer:
             if word.dynamic or word.value.startswith('='):
                 self.reason('dynamic-program-word')  # the shell picks the program after expansion; zsh runs =cmd too
                 return
-            base = word.value.rsplit('/', 1)[-1]
+            base = fold_name(word.value.rsplit('/', 1)[-1])  # the program the file system finds (r9 F1)
             step, unknown = _wrapper_scan(base, values, raws, k + 1, [w.dynamic for w in words])
             if step is None:
                 self._check_program(base, words[k + 1:], prev_op, here_string)
@@ -1469,7 +1495,8 @@ class _Lexer:
 
     def _check_names(self, base, args):
         """A builtin given a variable name: bash evaluates a subscript in the name, so a name the shell builds at run time can
-        run code (`printf -v "$v" x` with v='a[$(cmd)]', r8 L1). A literal name with code in it is subscript-code."""
+        run code (`printf -v "$v" x` with v='a[$(cmd)]', r8 L1). A literal name with code in it is subscript-code. A name with
+        a subscript is dynamic-name too (r9 F2): the subscript is arithmetic, so `read 'a[t]'` evaluates t's text as code."""
         names, i = [], 0
         while i < len(args):
             value = args[i].value
@@ -1496,7 +1523,7 @@ class _Lexer:
             i += 1
         if base == 'getopts':
             names = [word for word in args if not word.value.startswith('-')][1:2]
-        if any(re.search(r'[$`]', word.raw.split('=', 1)[0]) for word in names):
+        if any(re.search(r'[$`\[]', word.raw.split('=', 1)[0]) for word in names):
             self.reason('dynamic-name')
 
     def _check_set(self, values):
@@ -1634,12 +1661,12 @@ def _reads_script(fragment):
             words = [word[1] for word in raw_words(HEREDOC_MARKER.sub('', form))]
         except ValueError:
             words = _blank_split(form)
-        name = words[0].rsplit('/', 1)[-1] if words else ''
+        name = words[0].rsplit('/', 1)[-1] if words else ''  # match_candidates gives the folded forms too (r9 F1)
         if name in SCRIPT_HOSTS:
             return True
         if name == 'ssh':
             call = host_table.parse_ssh(words[1:])
-            if call and (not call.remote or any(word.rsplit('/', 1)[-1] in SCRIPT_HOSTS for word in _blank_split(' '.join(call.remote)))):
+            if call and (not call.remote or any(fold_name(word.rsplit('/', 1)[-1]) in SCRIPT_HOSTS for word in _blank_split(' '.join(call.remote)))):
                 return True
     return False
 
@@ -1710,10 +1737,13 @@ LITERAL_ESCAPE_NAMES = ESCAPE_NAMES - frozenset(('at', 'batch', 'screen'))
 
 def literal_views(command):
     """The text as a shell might read it once its quoting is in doubt: continuations gone, then quotes removed, quotes as
-    blanks (`alias e='cmd'`, `trap 'cmd'`), and quotes and backslashes removed (`to\\uch` reads as `touch`)."""
+    blanks (`alias e='cmd'`, `trap 'cmd'`), and quotes and backslashes removed (`to\\uch` reads as `touch`); each of the
+    text as typed and folded (fold_name, r9 F1), since a file system may find `RM` or `NOHUP` as rm or nohup."""
     text = command.replace('\\\n', '')
-    plain = QUOTE_CHARACTERS.sub('', text)
-    views = (plain, QUOTE_CHARACTERS.sub(' ', text), plain.replace('\\', ''))
+    views = []
+    for source in dict.fromkeys((text, fold_name(text).replace('\\\n', ''))):
+        plain = QUOTE_CHARACTERS.sub('', source)
+        views.extend((plain, QUOTE_CHARACTERS.sub(' ', source), plain.replace('\\', '')))
     return tuple(dict.fromkeys(EQUALS_RUN.sub('=', LITERAL_BLANKS.sub(' ', view)) for view in views))
 
 
@@ -1806,8 +1836,11 @@ def denied_as_literal(command, rules, lexed=None):
     for rule in rules:
         if rule.spec is None or rule.spec == '*' or literal_match(rule.spec, views):
             return rule
+        folded = fold_name(rule.spec)  # the views hold the folded text too, and a rule may spell its program in any case (r9 F1)
+        if folded != rule.spec and literal_match(folded, views):
+            return rule
         program = LITERAL_BLANKS.split(rule.spec.strip(' \t'), 1)[0].split('*', 1)[0].rsplit(':', 1)[0]
-        if program and any(_glob_matches(program, glob) for glob in globs):
+        if program and any(_glob_matches(program, glob) or _glob_matches(fold_name(program), fold_name(glob)) for glob in globs):
             return rule
     return None
 
@@ -2071,9 +2104,10 @@ def _wrapper_step(base, values, raws, k):
     return _wrapper_scan(base, values, raws, k)[0]
 
 
-def peel_wrapper(text):
+def peel_wrapper(text, fold=True):
     """The command with its first wrapper removed (an env assignment or anything _wrapper_step reads), or None when it starts
-    with no wrapper. `env -S` gives back its split string as the command."""
+    with no wrapper. `env -S` gives back its split string as the command. The wrapper's name is read folded unless fold is
+    False."""
     try:
         spans = _spans(text)
         if not spans:
@@ -2084,7 +2118,8 @@ def peel_wrapper(text):
         if ASSIGNMENT.match(raws[0]):
             k = 1
         else:
-            k = _wrapper_step(values[0].rsplit('/', 1)[-1], values, raws, 1)
+            name = values[0].rsplit('/', 1)[-1]
+            k = _wrapper_step(fold_name(name) if fold else name, values, raws, 1)
             if k is None:
                 return None
             if k < 0:
@@ -2120,7 +2155,7 @@ def _read_through(form):
     return EMPTY_HEAD.sub('', text).replace('$"', '"', 1).strip(' \t\n') if text.startswith(('$', '=', 'X', '"', '`')) else text
 
 
-def _peeled_forms(segment):
+def _peeled_forms(segment, fold=True):
     forms, seen, current = [], set(), normalize_segment(segment)
     for _ in range(12):
         if current in seen:
@@ -2130,11 +2165,14 @@ def _peeled_forms(segment):
         if bare and bare not in seen:
             seen.add(bare); forms.append(bare)
         base = bare or current
-        nxt = peel_wrapper(base)
+        folded = _fold_program(base) if fold else base
+        if folded not in seen:  # `RM -rf`, `/BIN/RM -rf`: the program as the file system finds it (r9 F1)
+            seen.add(folded); forms.append(folded)
+        nxt = peel_wrapper(base, fold)
         if nxt is None:
             nxt = ENV_PREFIX.sub('', base, count=1)
             if nxt == base:
-                nxt = WRAPPER_PREFIX.sub('', base, count=1)
+                nxt = WRAPPER_PREFIX.sub('', folded, count=1)
         current = normalize_segment(nxt)
     return forms
 
@@ -2155,16 +2193,17 @@ def _bare_forms(form):
 
 
 @functools.lru_cache(maxsize=4096)
-def match_candidates(segment):
+def match_candidates(segment, fold=True):
     """The segment as typed plus every form with env assignments, wrappers (exec, command, time, nohup, nice, sudo,
     timeout, env) and the quoting of the program word removed, those with _read_through's words gone, and each with all
-    its quoting or the program's directory removed, as a tuple. A deny or ask rule matching any form applies. Cached because
-    one command asks for the same segment up to four times."""
-    forms = _peeled_forms(segment)
+    its quoting or the program's directory removed, as a tuple. With fold (r9 F1), each program word is also folded
+    (fold_name) and wrapper names are read folded; the ssh rewrite asks without it. A deny or ask rule matching any form
+    applies. Cached because one command asks for the same segment up to four times."""
+    forms = _peeled_forms(segment, fold)
     for form in list(forms):
         through = _read_through(form)
         if through != form and through:
-            forms.extend(extra for extra in _peeled_forms(through) if extra not in forms)
+            forms.extend(extra for extra in _peeled_forms(through, fold) if extra not in forms)
     for form in list(forms):
         forms.extend(extra for extra in _bare_forms(form) if extra not in forms)
     # a run of blanks is one separator to the shell. Only these forms get it, not allow, so it can only widen a deny or ask.
@@ -2202,6 +2241,18 @@ def _parse_rule(text, source, path):
         return None
     match = re.fullmatch(r'Bash(?:\((.*)\))?', text.strip(), re.S)
     return Rule(text.strip(), match.group(1), source, path) if match else None
+
+
+def folded_rules(rules):
+    """r9 F1: each deny or ask rule, and the same rule with its program word folded when that changes it, so `Bash(RM:*)`
+    refuses `rm -rf` as well. Never given allow rules: folding only widens a refusal or a question."""
+    found = list(rules)
+    for rule in rules:
+        if rule.spec and rule.spec != '*':
+            spec = _fold_program(rule.spec)
+            if spec != rule.spec:
+                found.append(Rule(rule.text, spec, rule.source, rule.path))
+    return found
 
 
 def _read_settings(source, path, rules):
@@ -2308,9 +2359,9 @@ def _classify_words(words, reasons, notes, depth):
     for _ in range(8):
         if index >= len(words):
             return
-        name = words[index].rsplit('/', 1)[-1]
-        rest = words[index + 1:]
-        if name in ('then', 'do', 'else', 'if', 'while', '!', '{'):
+        typed = words[index].rsplit('/', 1)[-1]
+        name, rest = fold_name(typed), words[index + 1:]  # the program the file system finds (r9 F1)
+        if typed in ('then', 'do', 'else', 'if', 'while', '!', '{'):  # a keyword only as the shell spells it
             index += 1
             continue
         if name in WRAPPER_GRAMMAR and name not in ('env', 'nohup'):  # nohup is an escape itself; env also names attribution
@@ -2419,6 +2470,7 @@ def _classify_text(command, reasons, notes, depth, prefix=''):
 def _classify_list(commands, reasons, notes, depth, uncertain):
     """The classifier over one command list. On uncertain text it also reads through what may be empty or a redirect."""
     entries = [[word.value for word in item.words] for item in commands]
+    # exact (r9 F1): on macOS `WAIT` finds /usr/bin/wait, a script whose own shell has no jobs to wait for
     last_wait = max((position for position, words in enumerate(entries) if _command_word(words) == 'wait'), default=-1)
     for position, (item, words) in enumerate(zip(commands, entries)):
         _classify_words(words, reasons, notes, depth)
@@ -2638,7 +2690,7 @@ def _warn_row(reason, target, guard='ssh-resolve'):
 
 
 def _ssh_form(segment):
-    for form in match_candidates(segment):
+    for form in match_candidates(segment, False):  # the rewrite reads the program as typed (r9 F1)
         if SSH_WORD.match(form) and segment.endswith(form):
             return segment[:len(segment) - len(form)], form
     return None
@@ -2961,12 +3013,13 @@ def decide(payload, home=None, env=None, ancestors=None):
     parsed = parse_command(command)
     context = []
 
+    deny_rules, ask_rules = folded_rules(rules['deny']), folded_rules(rules['ask'])  # r9 F1; allow rules stay as written
     checked = parsed.segments + parsed.inner
     if parsed.uncertain and rules['deny']:
         checked = checked + physical_parts(command)  # what the parse may have swallowed as string or heredoc text
     for part in checked:
         forms = match_candidates(part)
-        for rule in rules['deny']:
+        for rule in deny_rules:
             if any(rule.matches(form) for form in forms):
                 hint = ' %s' % HEREDOC_HINT if parsed.heredoc == HEREDOC_UNCERTAIN else ''
                 return _out('deny', 'denied by permission rule %s%s' % (rule.label(), hint))
@@ -2977,7 +3030,7 @@ def decide(payload, home=None, env=None, ancestors=None):
             return _out('deny', 'denied by permission rule %s: the hook cannot parse this command with certainty (%s) and the '
                                 "rule's text appears in it at a word start%s" % (rule.label(), ', '.join(parsed.reasons), hint))
 
-    asked = any(rule.matches(form) for part in parsed.segments + parsed.inner for rule in rules['ask'] for form in match_candidates(part))
+    asked = any(rule.matches(form) for part in parsed.segments + parsed.inner for rule in ask_rules for form in match_candidates(part))
     if (parsed.segments and not parsed.substitution and not parsed.newline and not parsed.uncertain and not parsed.pipeline
             and all(plain_recovery(segment, home) for segment in parsed.segments)):
         # exempt from the rewrite (and from the floor and heavy-command guards elsewhere), never from the allow rules

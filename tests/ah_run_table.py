@@ -7,7 +7,8 @@ certain or loses its deny: a row may only move toward uncertain and toward deny.
 `--pin OUT` (only inside the shell sandbox, tests/shell_sandbox.py): runs every live row in every shell present, writes the
 shell columns (ran, unstable) and `pinned_on` for this host to OUT; `--pin -` prints the table between PINNED-TABLE-BEGIN and
 PINNED-TABLE-END lines instead, for a sandbox whose files do not outlive the run. Live rows print only the echo marker; a row naming sudo
-or another privilege tool is data only and never reaches a shell.
+or another privilege tool is data only and never reaches a shell. PATH holds shell_sandbox.fold_links, the sandbox's stand-in for
+macOS finding `ECHO` or `ba\u017fh` as echo or bash (r9 F1).
 
 Run from the repository root: `python3 tests/ah_run_table.py --columns` or `python3 tests/ah_run_table.py --pin /tmp/table.json`.
 """
@@ -175,6 +176,29 @@ NEW_ROWS = [  # (group, name, shape, kind); kind `limit` names what the hook doe
     ('r7-M2', 'tilde-dotdot-program', '~/../../../../../../../../bin/%s', 'hidden'),
     ('r7-L1', 'arith-variable', 'p=\'$(\'; t="a[${p}%s >&3)]"; { echo $((t)); } 3>&1', 'hidden'),
     ('r7-L1', 'printf-dynamic-name', 'p=\'$(\'; v="a[${p}%s >&3)]"; { printf -v "$v" x; } 3>&1', 'hidden'),
+    # r8 review (Opus max, round 3): a program spelled in another case or Unicode form, which macOS's file system finds (F1;
+    # the sandbox stands in with shell_sandbox.fold_links), and a subscript in a builtin's variable name (F2)
+    ('r8-F1', 'upper-program', 'ECHO HIDDEN-LINE', 'hidden'),
+    ('r8-F1', 'capital-program', 'Echo HIDDEN-LINE', 'hidden'),
+    ('r8-F1', 'upper-path-program', '/BIN/ECHO HIDDEN-LINE', 'hidden'),
+    ('r8-F1', 'quoted-upper-program', '"ECHO" HIDDEN-LINE', 'hidden'),
+    ('r8-F1', 'upper-assign-program', 'X=1 ECHO HIDDEN-LINE', 'hidden'),
+    ('r8-F1', 'upper-after-redirect', '2>/dev/null ECHO HIDDEN-LINE', 'hidden'),
+    ('r8-F1', 'upper-nice', 'NICE -n 5 %s', 'hidden'),
+    ('r8-F1', 'upper-env', 'ENV %s', 'hidden'),
+    ('r8-F1', 'upper-env-split', "ENV -S '%s'", 'hidden'),
+    ('r8-F1', 'upper-nohup', 'NOHUP %s', 'hidden'),
+    ('r8-F1', 'upper-timeout', 'TIMEOUT 5 %s', 'hidden'),
+    ('r8-F1', 'upper-bash-c', "BASH -c '%s'", 'hidden'),
+    ('r8-F1', 'upper-bash-heredoc', "BASH <<'E'\n%s\nE", 'hidden'),
+    ('r8-F1', 'long-s-bash-heredoc', '"ba\u017fh" <<\'E\'\n%s\nE', 'hidden'),
+    ('r8-F1', 'kelvin-ksh-c', '"\u212a\u017fh" -c \'%s\'', 'hidden'),
+    ('r8-F2', 'read-subscript-name', 'p=\'$(\'; t="b[${p}%s >&3)]"; { read \'a[t]\' <<< x; } 3>&1', 'hidden'),
+    ('r8-F2', 'printf-subscript-name', 'p=\'$(\'; t="b[${p}%s >&3)]"; { printf -v \'a[t]\' x; } 3>&1', 'hidden'),
+    ('r8-F2', 'printf-attached-subscript-name', 'p=\'$(\'; t="b[${p}%s >&3)]"; { printf -v\'a[t]\' x; } 3>&1', 'hidden'),
+    ('r8-F2', 'test-subscript-name', 'p=\'$(\'; t="b[${p}%s >&3)]"; { test -v \'a[t]\'; } 3>&1', 'hidden'),
+    ('r8-F2', 'bracket-subscript-name', 'p=\'$(\'; t="b[${p}%s >&3)]"; { [ -v \'a[t]\' ]; } 3>&1', 'hidden'),
+    ('r8-limit', 'unknown-launcher', 'prlimit --nofile=64 %s', 'limit'),  # GoodQA goodqa#14793: a launcher outside the grammar
 ]
 RULE = 'Bash(echo HIDDEN-LINE:*)'
 SSH_STUB = '#!/bin/sh\n[ "$1" = "-G" ] && { for last; do :; done; printf "hostname %s\\nport 22\\n" "$last"; exit 0; }\ncat\n'
@@ -270,6 +294,7 @@ def pin(output):
     binary.mkdir()
     for name, text in (('ssh', SSH_STUB), ('sudo', SUDO_STUB)):
         (binary / name).write_text(text); (binary / name).chmod(0o755)
+    shell_sandbox.fold_links(str(binary))  # r9 F1: folded spellings resolve, as on a case-insensitive Mac
     (BASE / 'home').mkdir(exist_ok=True)  # an existing HOME, as the fuzz has: `~/../bin/x` resolves only through one (r7 M2)
     env = {**os.environ, 'PATH': '%s:%s' % (binary, os.environ['PATH']), 'HOME': str(BASE / 'home')}
 

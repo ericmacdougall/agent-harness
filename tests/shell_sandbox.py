@@ -60,6 +60,31 @@ def reasons(env=None, geteuid=os.geteuid, which=shutil.which, exists=os.path.exi
     return out
 
 
+# r9 F1: the spellings macOS's case-insensitive, Unicode-folding file system resolves to these programs (`ECHO` runs echo, `ba\u017fh`
+# with a long s runs bash, `\u212a\u017fh` with a Kelvin sign runs ksh). Linux does not, so fold_links puts them in a PATH directory as
+# symlinks: a stand-in for the Mac's lookup, so table and fuzz rows spelled this way run in the sandbox as they would on a Mac.
+# Never a privilege tool: those never reach a shell in any spelling.
+FOLDED_SPELLINGS = {'echo': ('ECHO', 'Echo'), 'nice': ('NICE',), 'env': ('ENV',), 'nohup': ('NOHUP',), 'timeout': ('TIMEOUT',),
+                    'bash': ('BASH', 'ba\u017fh'), 'sh': ('SH', '\u017fh'), 'ksh': ('KSH', '\u212a\u017fh')}
+
+
+def fold_links(directory, which=shutil.which):
+    """Symlinks in directory for FOLDED_SPELLINGS whose program is on PATH; the spellings made. A spelling the directory's own
+    file system already folds onto another (a case-insensitive host) is skipped."""
+    made = []
+    for program, spellings in FOLDED_SPELLINGS.items():
+        target = which(program)
+        if not target:
+            continue
+        for spelling in spellings:
+            try:
+                os.symlink(target, os.path.join(directory, spelling))
+            except FileExistsError:
+                continue
+            made.append(spelling)
+    return made
+
+
 def require():
     """Raise SkipTest naming every missing condition; call it from setUpClass or a script entry point."""
     missing = reasons()

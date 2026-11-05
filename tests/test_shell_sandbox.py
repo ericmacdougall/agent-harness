@@ -90,3 +90,22 @@ class Wiring(unittest.TestCase):
         with mock.patch.object(shell_sandbox, 'reasons', return_value=['closed for the control']):
             for name in ('Launcher', 'RewriteHook', 'SshRewrite', 'PausedGroup', 'Equivalence'):
                 getattr(test_ah_run, name).setUpClass()
+
+
+class FoldLinks(unittest.TestCase):
+    """r9 F1: the sandbox's stand-in for macOS finding `ECHO` or `baſh` as echo or bash. It links only the listed spellings,
+    never a privilege tool, and a spelling its own file system already folds onto another is skipped, not an error."""
+
+    def test_links_the_spellings_of_programs_on_path(self):
+        import tempfile
+        from tests.test_ah_run import names_a_privilege_tool
+        with tempfile.TemporaryDirectory() as directory:
+            made = shell_sandbox.fold_links(directory, which=lambda name: '/bin/echo' if name in ('echo', 'bash') else None)
+            self.assertIn('ECHO', made)
+            self.assertIn('BASH', made)
+            self.assertNotIn('NICE', made)
+            for spelling in made:
+                self.assertEqual(os.readlink(os.path.join(directory, spelling)), '/bin/echo')
+        for program, spellings in shell_sandbox.FOLDED_SPELLINGS.items():
+            for spelling in (program,) + spellings:
+                self.assertFalse(names_a_privilege_tool(spelling + ' x'), spelling)

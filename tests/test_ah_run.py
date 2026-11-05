@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -27,10 +28,15 @@ AH = str(HOOKS / 'ah_run.py')
 REAL_SUDO = re.compile(r'''(?:^|[^A-Za-z0-9_.-])s['"\\]*u['"\\]*d['"\\]*o(?:$|[^A-Za-z0-9_.-])''')
 
 
+def _folded(text):
+    """The test's own fold (r9 F1), not the hook's: a privilege tool spelled `SUDO` or `ſudo` is still one on macOS."""
+    return unicodedata.normalize('NFKC', unicodedata.normalize('NFKC', text).casefold())
+
+
 def assert_no_real_sudo(command):
-    """r6 S30: a shell string that names sudo, however it is quoted, never reaches a shell from a test, generator or fuzz.
-    A verdict row may hold it as data; `Differential.printed` skips any row marked `live: false`."""
-    if REAL_SUDO.search(command.replace('\\\n', '')):
+    """r6 S30: a shell string that names sudo, however it is quoted or cased, never reaches a shell from a test, generator or
+    fuzz. A verdict row may hold it as data; `Differential.printed` skips any row marked `live: false`."""
+    if REAL_SUDO.search(_folded(command.replace('\\\n', ''))):
         raise AssertionError('refusing to run a string that names sudo: %r' % command[:120])
 
 
@@ -1594,6 +1600,7 @@ class Differential(HookFixture):
         self.bin = Path(self.temp.name) / 'bin'; self.bin.mkdir()
         (self.bin / 'ssh').write_text(self.STUB); (self.bin / 'ssh').chmod(0o755)
         (self.bin / 'sudo').write_text(self.SUDO_STUB); (self.bin / 'sudo').chmod(0o755)
+        shell_sandbox.fold_links(str(self.bin))  # r9 F1: folded spellings resolve, as on a case-insensitive Mac
         self.policy = Path(self.temp.name) / 'policy.json'
         self.policy.write_text(json.dumps({'hosts': {'dev2.example.test': {'role': 'worker', 'ah_run': '/opt/ah/ah_run.py'}}, 'self': []}))
         patcher = mock.patch.object(host_table, 'resolve', lambda target, ssh_args=(), run=None: host_table.Resolved({'dev2': 'dev2.example.test'}.get(target, 'elsewhere.example.test'), 22))
@@ -1635,7 +1642,8 @@ class Differential(HookFixture):
             self.assertEqual(self.printed(row), {}, row['name'])
             with self.assertRaises(AssertionError):
                 self.stdout('/bin/sh', row['shape'].replace('%s', self.TABLE['line']))
-        for command in ('sudo bash', 'true; sudo -n true', '"sudo" x', "s'u'do x", 's\\udo x', '/usr/bin/sudo x', 'su\\\ndo x', 'env sudo x'):
+        for command in ('sudo bash', 'true; sudo -n true', '"sudo" x', "s'u'do x", 's\\udo x', '/usr/bin/sudo x', 'su\\\ndo x', 'env sudo x',
+                        'SUDO x', '\u017fudo x'):
             with self.assertRaises(AssertionError, msg=command):
                 assert_no_real_sudo(command)
         for command in ('echo pseudo', 'echo sudoku', 'cat sudo.txt', 'echo HIDDEN-LINE'):
@@ -1768,6 +1776,7 @@ PRIVILEGE_TOOLS = re.compile(r'(?:^|[^A-Za-z0-9_.-])(sudo|doas|su|pkexec|runuser
 
 
 def names_a_privilege_tool(command):
+    command = _folded(command)  # r9: `SUDO` and `\u017fudo` name sudo on a case-insensitive Mac
     return bool(PRIVILEGE_TOOLS.search(re.sub(r'''['"\\]''', '', command.replace('\\\n', ''))))
 
 
@@ -1778,7 +1787,7 @@ class DifferentialVerdicts(HookFixture):
     RULE = Differential.RULE
     GROUPS = ('r1-B1', 'r2-B4', 'r3-B6', 'r4-B10', 'r4-B11', 'r4-S15', 'r5-B12', 'r5-B13', 'r5-B14', 'r5-S22', 'r5-S23',
               'r6-B15', 'r6-B16', 'r6-B17', 'r6-B18', 'r6-B19', 'r6-B20', 'r6-B21', 'r6-B22', 'r6-host', 'r6-wrapper', 'r6-path',
-              'r6-state', 'r6-limit', 'r6-N22', 'r7-H1', 'r7-M1', 'r7-M2', 'r7-L1')
+              'r6-state', 'r6-limit', 'r6-N22', 'r7-H1', 'r7-M1', 'r7-M2', 'r7-L1', 'r8-F1', 'r8-F2')
 
     def setUp(self):
         super().setUp()
@@ -1796,7 +1805,7 @@ class DifferentialVerdicts(HookFixture):
 
     def test_the_table_covers_every_round_and_can_fail(self):
         rows = self.TABLE['rows']
-        self.assertGreaterEqual(len(rows), 390)
+        self.assertGreaterEqual(len(rows), 415)
         groups = {row['group'] for row in rows}
         for group in self.GROUPS:
             self.assertIn(group, groups)
@@ -1834,6 +1843,8 @@ class DifferentialVerdicts(HookFixture):
             self.assertTrue(names_a_privilege_tool(command), command)
         for command in ('echo pseudo', 'echo HIDDEN-LINE', 'cat sudo.txt', 'git log --summary', 'echo result'):
             self.assertFalse(names_a_privilege_tool(command), command)
+        for command in ('SUDO x', 'Doas x', '\u017fudo x', 'SG g -c x'):  # r9: a case-insensitive file system finds these too
+            self.assertTrue(names_a_privilege_tool(command), command)
 
     def test_limit_rows_name_what_the_hook_does_not_claim(self):
         limits = [row for row in self.TABLE['rows'] if row['kind'] == 'limit']
@@ -2167,8 +2178,7 @@ class HookDeadline(HookFixture):
 
 
     def test_cpu_bound_work_is_cut_off(self):
-        """r8 L3: the limit stops work that spins the CPU through many regex calls, not only a sleep. One C-level regex call
-        cannot be interrupted, which is why decide avoids regexes that backtrack over the text (LinearCost)."""
+        """r8 L3: the limit stops work that spins the CPU through many regex calls, not only a sleep."""
         pattern = re.compile(r'(a|b)*c')
 
         def busy(payload, **kwargs):
@@ -2178,6 +2188,23 @@ class HookDeadline(HookFixture):
             return {'marker': 'decided'}
         out = io.StringIO()
         with mock.patch.object(ah_run, 'HOOK_DEADLINE', 0.3), mock.patch.object(ah_run, 'decide', busy):
+            started = time.monotonic()
+            ah_run.hook_main(io.StringIO(json.dumps(self.payload('echo hi', permission_mode='bypassPermissions'))), out)
+        took = time.monotonic() - started
+        self.assertEqual(json.loads(out.getvalue())['hookSpecificOutput']['permissionDecision'], 'deny')
+        self.assertLess(took, 3)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+
+    def test_one_long_regex_call_is_cut_off(self):
+        """r9 (review r8 F3): Python's regex engine checks for signals while it matches, so the limit stops one long call too.
+        decide still avoids regexes that backtrack over the text (LinearCost): a call the limit stops is a refusal."""
+        pattern = re.compile(r'(a*)*b')
+
+        def one_call(payload, **kwargs):
+            pattern.match('a' * 30)  # one call of about 25 s uninterrupted (0.1 s at 22 a's, twice as long per a)
+            return {'marker': 'decided'}
+        out = io.StringIO()
+        with mock.patch.object(ah_run, 'HOOK_DEADLINE', 0.3), mock.patch.object(ah_run, 'decide', one_call):
             started = time.monotonic()
             ah_run.hook_main(io.StringIO(json.dumps(self.payload('echo hi', permission_mode='bypassPermissions'))), out)
         took = time.monotonic() - started
@@ -2308,13 +2335,25 @@ class VariableCode(HookFixture):
 
     def test_certain(self):
         for command in ('echo $((1+2))', 'printf "%s\\n" "$x"', 'printf -v name x', 'read -rp "P $x" var', '[ -n "$x" ]', 'export FOO="$x"',
-                        'local -r x="$1"', 'unset FOO', 'getopts "ab:" opt'):
+                        'local -r x="$1"', 'unset FOO', 'getopts "ab:" opt', "read -p 'go [y/n]? ' ans", "read -d '[' x", 'test -v x',
+                        '[ -v x ]', 'read -r line', "printf -v x '%s' y", 'local x=y'):
             self.assertEqual(ah_run.parse_command(command).reasons, [], command)
+
+    def test_a_subscript_in_a_name_is_dynamic_name(self):
+        """r9 F2: bash evaluates a name's subscript as arithmetic, and arithmetic reads a variable's text as code, so
+        `read 'a[t]'` with t='b[$(cmd)]' runs cmd. Any [ in a name the builtin assigns or tests is dynamic-name."""
+        lead = 'p=\'$(\'; t="b[${p}rm -rf /tmp/zz >&2)]"; '
+        self.settings('user', deny=['Bash(rm:*)'])
+        for name in ("read 'a[t]' <<< x", "read -a 'a[t]' <<< x", "printf -v 'a[t]' x", "printf -v'a[t]' x", "test -v 'a[t]'",
+                     "[ -v 'a[t]' ]", "unset 'a[t]'", "wait -p 'a[t]'", "getopts ab 'a[t]'", "READ 'a[t]' <<< x", 'read a[t] <<< x'):
+            self.assertIn('dynamic-name', ah_run.parse_command(lead + name).reasons, name)
+            self.assertEqual(self.decide(lead + name, permission_mode='bypassPermissions').get('permissionDecision'), 'deny', name)
 
 
 class LinearCost(HookFixture):
-    """r8 L2: the literal rule and the glob reader never backtrack over the text. A regex that backtracks cannot be
-    stopped by the hook's limit in the middle of one call, so these are bounded by construction."""
+    """r8 L2: the literal rule and the glob reader never backtrack over the text. The hook's limit stops a long regex call
+    too (HookDeadline), but a stopped call is a refusal, so these are bounded by construction. r9: the folded views and
+    forms (fold_name) keep the cost linear."""
     GLOBS = (('touch', 'tou?h', True), ('touch', '*', True), ('touch', 't*h', True), ('touch', '*z*', False), ('touch', '[a-z]ouch', True),
              ('touch', '[!x]ouch', True), ('touch', '[]ouch', False), ('touch', '[]]ouch', True), ('t]ouch', '[]]]ouch', True), ('t]ouch', 'x[]]]ouch', False),
              ('touch', 'tou[', False), ('tou[', 'tou[', True), ('touch', '[z-a]ouch', True), ('touch', 'touch?', False), ('', '*', True),
@@ -2326,12 +2365,81 @@ class LinearCost(HookFixture):
 
     def test_reviewed_inputs_decide_quickly(self):
         self.settings('user', deny=['Bash(touch:*)'])
-        for command in ('=' * 65000, '*' * 121 + 'Z x', '*a' * 60 + 'b x', '[' * 64000 + ' x', 'x ' + '=' * 64000 + 'touch'):
+        for command in ('=' * 65000, '*' * 121 + 'Z x', '*a' * 60 + 'b x', '[' * 64000 + ' x', 'x ' + '=' * 64000 + 'touch',
+                        'TOUCH ' * 10000 + 'x', '\u017f' * 30000 + ' x', '\uff1d' * 20000 + ' touch', 'Echo "$(true)" ' + 'A=1 ' * 15000):
             started = time.monotonic()
             with mock.patch.object(ah_run, 'HOOK_DEADLINE', 60):
                 self.decide(command, permission_mode='bypassPermissions')
             self.assertLess(time.monotonic() - started, 2.5, command[:12])
         self.assertTrue(ah_run.literal_match('touch:*', ah_run.literal_views('x ' + '=' * 64000 + 'touch')))
+
+
+class ProgramNames(HookFixture):
+    """r9 F1: macOS's file system finds a program whatever its case or Unicode spelling (`RM`, `/BIN/RM`, `ba\u017fename`,
+    `aw\u212a`), so every lookup that adds a refusal, a question or a reason compares folded names (fold_name). A lookup whose
+    match removes a reason or allows stays exact."""
+    DENIED = (('rm', 'RM -rf /tmp/zz'), ('rm', '/BIN/RM -rf /tmp/zz'), ('rm', 'Rm -rf /tmp/zz'), ('rm', '"RM" -rf /tmp/zz'),
+              ('rm', '\\RM -rf /tmp/zz'), ('rm', "BASH -c 'rm -rf /tmp/zz'"), ('rm', 'NICE -n 5 rm -rf /tmp/zz'), ('rm', 'ENV rm -rf /tmp/zz'),
+              ('rm', 'ENV NICE RM -rf /tmp/zz'), ('rm', 'COMMAND rm -rf /tmp/zz'), ('rm', 'TIME rm -rf /tmp/zz'), ('rm', 'NOHUP rm -rf /tmp/zz'),
+              ('rm', 'SUDO -u root rm -rf /tmp/zz'), ('rm', 'X=1 RM -rf /tmp/zz'), ('rm', '>f RM -rf /tmp/zz'), ('rm', "ENV -S 'rm -rf /tmp/zz'"),
+              ('rm', "EVAL 'rm -rf /tmp/zz'"), ('rm', "BASH <<'E'\nrm -rf /tmp/zz\nE"), ('rm', '"BA\u017fH" <<\'E\'\nrm -rf /tmp/zz\nE'),
+              ('rm', 'echo "$(true)"; /BIN/R? -rf /tmp/zz'), ('rm', '\uff32\uff2d -rf /tmp/zz'), ('git push --force', 'GIT push --force'),
+              ('basename', 'ba\u017fename x'), ('basename', '"ba\u017fename" x'), ('awk', 'aw\u212a x'), ('awk', '"aw\u212a" x'),
+              ('RM', 'rm -rf /tmp/zz'), ('Rm -rf', 'rm -rf /tmp/zz'), ('RM', "alias e='rm -rf /tmp/zz'\ne"), ('rm', "alias e='RM -rf /tmp/zz'\ne"),
+              ('rm', "ssh dev2 BASH <<'E'\nrm -rf /tmp/zz\nE"))
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(host_table, 'resolve', lambda target, ssh_args=(), run=None: host_table.Resolved('elsewhere.example.test', 22))
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        ah_run.match_candidates.cache_clear()
+        super().tearDown()
+
+    def denied(self, program, command, mode='bypassPermissions'):
+        self.settings('user', deny=['Bash(%s:*)' % program])
+        return self.decide(command, permission_mode=mode).get('permissionDecision') == 'deny'
+
+    def test_each_spelling_is_denied(self):
+        for program, command in self.DENIED:
+            for mode in ('bypassPermissions', 'default'):
+                self.assertTrue(self.denied(program, command, mode), (command, mode))
+
+    def test_control_without_the_fold_none_is_denied(self):
+        ah_run.match_candidates.cache_clear()
+        with mock.patch.object(ah_run, 'fold_name', lambda text: text):
+            missed = [command for program, command in self.DENIED if not self.denied(program, command)]
+        ah_run.match_candidates.cache_clear()
+        self.assertEqual(len(missed), len(self.DENIED), [c for _p, c in self.DENIED if c not in missed])
+
+    def test_wrappers_shells_and_names_are_read_folded(self):
+        for command in ("BASH -c 'true'", "EVAL 'true'", 'SOURCE <(true)', 'ALIAS e=true', "TRAP 'true' EXIT", 'NICE --adj=5 true',
+                        'READ "$v"', 'EXEC 3>f', 'GIT -c alias.x=y x', 'XARGS true', '"\u212a\u017fH" -c true', 'FIND . -exec true {} +'):
+            self.assertTrue(ah_run.parse_command(command).uncertain, command)
+        for command in ('NOHUP sleep 1', 'SETSID sleep 1', 'ENV -i true', "BASH -c 'nohup sleep 1'", 'echo "$(true)"\nNOHUP sleep 1',
+                        'TIMEOUT 5 nohup sleep 1', 'true; DISOWN', 'OPEN -a X', "trap 'NOHUP sleep 1' EXIT"):
+            self.assertTrue(ah_run.classify_escapes(command), command)
+        self.assertEqual(ah_run.peel_wrapper('ENV rm x'), 'rm x')
+        self.assertIsNone(ah_run.peel_wrapper('ENV rm x', fold=False))
+        self.assertIn('rm -rf x', ah_run.match_candidates('ENV NICE /BIN/RM -rf x'))
+        self.assertNotIn('rm -rf x', ah_run.match_candidates('ENV NICE /BIN/RM -rf x', False))
+
+    def test_allow_rules_and_exact_lookups_are_not_widened(self):
+        """NEG: an allow rule matches the program as typed, and a lookup whose match removes a reason stays exact."""
+        self.settings('user', allow=['Bash(rm:*)', 'Bash(echo:*)'])
+        for command in ('RM -rf x', 'ECHO x', '/BIN/ECHO x', 'Echo x', '\uff45\uff43\uff48\uff4f x'):
+            self.assertEqual(self.decide(command, permission_mode='default').get('permissionDecision'), 'ask', command)
+            self.assertEqual(self.decide(command, permission_mode='dontAsk').get('permissionDecision'), 'deny', command)
+        self.assertEqual(self.decide('echo x', permission_mode='default').get('permissionDecision'), 'allow')
+        self.assertIn('background & without a later wait', ah_run.classify_escapes('sleep 1 & WAIT'))  # /usr/bin/wait waits for nothing
+        self.assertEqual(ah_run.classify_escapes('sleep 1 & wait'), [])
+        self.assertEqual(ah_run.classify_escapes('IF nohup'), ah_run.classify_escapes('IF x'))  # IF is a program, not a keyword
+        for ask, command in (('rm', 'RM -rf x'), ('RM', 'rm -rf x'), ('git push --force', 'GIT push --force')):  # ask widens
+            self.settings('user', allow=['Bash(*)'], ask=['Bash(%s:*)' % ask])
+            self.assertEqual(self.decide(command, permission_mode='default').get('permissionDecision'), 'ask', command)
+        rules = [ah_run.Rule('Bash(RM:*)', 'RM:*', 'user', 'p'), ah_run.Rule('Bash(rm:*)', 'rm:*', 'user', 'p')]
+        self.assertEqual([rule.spec for rule in ah_run.folded_rules(rules)], ['RM:*', 'rm:*', 'rm:*'])
 
 
 class LauncherShell(unittest.TestCase):
@@ -3037,6 +3145,15 @@ class SshRewrite(HookFixture):
             self.assertEqual(self.inner(out), command, command)
             plain = self.ssh(command)['updatedInput']['command']
             self.assertIn('--command-class remote-unattributed', plain, command); self.assertNotIn('--readonly', plain, command)
+        self.assertFalse(self.contacted())
+
+    def test_a_folded_ssh_word_is_recorded_not_rewritten(self):
+        """r9 F1: on macOS `SSH` and `ENV ssh` run ssh. The rewrite reads the program as typed, so the line runs unwrapped and is
+        recorded remote-unattributed, as a quoted ssh word is."""
+        for command in ('SSH dev2 ls', 'ENV ssh dev2 ls', '/USR/BIN/SSH dev2 ls'):
+            out = self.ssh(command)
+            self.assertEqual(self.inner(out), command, command)
+            self.assertIn('--command-class remote-unattributed', out['updatedInput']['command'], command)
         self.assertFalse(self.contacted())
 
     def test_control_without_the_s28_check_a_quoted_ssh_word_is_not_recorded(self):

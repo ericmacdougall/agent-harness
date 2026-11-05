@@ -5820,6 +5820,237 @@
 "shape": "bash /proc/self/fd/3 3<<'E'\n%s\nE",
 "unstable": [],
 "verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "upper-program",
+"ran": [],
+"rewritten": "none",
+"shape": "ECHO HIDDEN-LINE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "capital-program",
+"ran": [],
+"rewritten": "none",
+"shape": "Echo HIDDEN-LINE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "upper-path-program",
+"ran": [],
+"rewritten": "none",
+"shape": "/BIN/ECHO HIDDEN-LINE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "quoted-upper-program",
+"ran": [],
+"rewritten": "none",
+"shape": "\"ECHO\" HIDDEN-LINE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "upper-assign-program",
+"ran": [],
+"rewritten": "none",
+"shape": "X=1 ECHO HIDDEN-LINE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "upper-after-redirect",
+"ran": [],
+"rewritten": "none",
+"shape": "2>/dev/null ECHO HIDDEN-LINE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "upper-nice",
+"ran": [],
+"rewritten": "none",
+"shape": "NICE -n 5 %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "upper-env",
+"ran": [],
+"rewritten": "none",
+"shape": "ENV %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "upper-env-split",
+"ran": [],
+"rewritten": "none",
+"shape": "ENV -S '%s'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "upper-nohup",
+"ran": [],
+"rewritten": "none",
+"shape": "NOHUP %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "upper-timeout",
+"ran": [],
+"rewritten": "none",
+"shape": "TIMEOUT 5 %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "upper-bash-c",
+"ran": [],
+"rewritten": "none",
+"shape": "BASH -c '%s'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "upper-bash-heredoc",
+"ran": [],
+"rewritten": "none",
+"shape": "BASH <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "long-s-bash-heredoc",
+"ran": [],
+"rewritten": "none",
+"shape": "\"ba\u017fh\" <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r8-F1",
+"kind": "hidden",
+"name": "kelvin-ksh-c",
+"ran": [],
+"rewritten": "none",
+"shape": "\"\u212a\u017fh\" -c '%s'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r8-F2",
+"kind": "hidden",
+"name": "read-subscript-name",
+"ran": [],
+"rewritten": "none",
+"shape": "p='$('; t=\"b[${p}%s >&3)]\"; { read 'a[t]' <<< x; } 3>&1",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r8-F2",
+"kind": "hidden",
+"name": "printf-subscript-name",
+"ran": [],
+"rewritten": "none",
+"shape": "p='$('; t=\"b[${p}%s >&3)]\"; { printf -v 'a[t]' x; } 3>&1",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r8-F2",
+"kind": "hidden",
+"name": "printf-attached-subscript-name",
+"ran": [],
+"rewritten": "none",
+"shape": "p='$('; t=\"b[${p}%s >&3)]\"; { printf -v'a[t]' x; } 3>&1",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r8-F2",
+"kind": "hidden",
+"name": "test-subscript-name",
+"ran": [],
+"rewritten": "none",
+"shape": "p='$('; t=\"b[${p}%s >&3)]\"; { test -v 'a[t]'; } 3>&1",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r8-F2",
+"kind": "hidden",
+"name": "bracket-subscript-name",
+"ran": [],
+"rewritten": "none",
+"shape": "p='$('; t=\"b[${p}%s >&3)]\"; { [ -v 'a[t]' ]; } 3>&1",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "r8-limit",
+"kind": "limit",
+"name": "unknown-launcher",
+"ran": [],
+"rewritten": "same",
+"shape": "prlimit --nofile=64 %s",
+"unstable": [],
+"verdict": "certain"
 }
 ]
 }

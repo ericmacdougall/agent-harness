@@ -3,7 +3,8 @@
 usage: python3 tests/ah_run_fuzz.py SEED CASES SECONDS [--hook-only] [--control REV] [--show K]
 
 Generates CASES distinct commands from SEED (atoms from the round 5 and round 6 fuzzers plus the r6 classes), each holding the
-marker line `echo HIDDEN-LINE`, and checks every case:
+marker line `echo HIDDEN-LINE`; one in seven has a program word respelled as macOS's file system still finds it (r9 F1, with
+shell_sandbox.fold_links on PATH in the sandbox). Checks every case:
   B  uncertain is never allowed (allow-all rule, default mode)                       -> must be 0
   A  certain, not denied in bypass, and a shell prints the marker (typed text)        -> must be 0 outside `limit` tags
   A2 the same for the hook's rewritten text                                           -> must be 0
@@ -60,6 +61,8 @@ BIN = BASE / 'bin'
 BIN.mkdir()
 (BIN / 'ssh').write_text('#!/bin/sh\n[ "$1" = "-G" ] && exit 0\ncat\n')
 (BIN / 'ssh').chmod(0o755)
+if not HOOK_ONLY:
+    shell_sandbox.fold_links(str(BIN))  # r9 F1: folded spellings resolve, as on a case-insensitive Mac
 ENV = {**os.environ, 'PATH': '%s:%s' % (BIN, os.environ['PATH']), 'HOME': str(HOME)}
 SHELLS = {}
 for name, path in (('bash5', '/opt/homebrew/bin/bash'), ('bash5', '/usr/bin/bash'), ('bash3', '/usr/local/bin/bash'), ('bash3', '/bin/bash'), ('zsh', '/bin/zsh'),
@@ -99,7 +102,10 @@ HOSTS = ['function f { %s; }; f', 'f () { %s; }; f', "alias e='%s'\ne", "shopt -
          # r7 review: the program behind a wrapper spelling, source and . input, ~ paths, code through a variable (H1, M1, M2, L1)
          'source <(echo %s)', '. <(echo %s)', "echo '%s' | . /dev/stdin", "echo '%s' | . /proc/self/fd/0", "source /dev/fd/0 <<< '%s'",
          "source /proc/self/fd/0 <<< '%s'", ". /proc/self/fd/3 3<<'E'\n%s\nE", "bash /proc/self/fd/3 3<<'E'\n%s\nE", '~/../../../../../../../../bin/%s', 'p=\'$(\'; t="a[${p}%s >&3)]"; { echo $((t)); } 3>&1',
-         'p=\'$(\'; v="a[${p}%s >&3)]"; { printf -v "$v" x; } 3>&1']
+         'p=\'$(\'; v="a[${p}%s >&3)]"; { printf -v "$v" x; } 3>&1',
+         # r8 review (round 3): a subscript in a builtin's variable name (F2)
+         'p=\'$(\'; t="b[${p}%s >&3)]"; { read \'a[t]\' <<< x; } 3>&1', 'p=\'$(\'; t="b[${p}%s >&3)]"; { printf -v \'a[t]\' x; } 3>&1',
+         'p=\'$(\'; t="b[${p}%s >&3)]"; { [ -v \'a[t]\' ]; } 3>&1']
 # every spelling of the wrappers the hook reads through, known and unknown, chained before the marker (r7 H1)
 WRAPS = ['nice', 'nice -n5', 'nice -n 5', 'nice --adjustment 5', 'nice --adjustment=5', 'nice --10', 'nice -10', 'nice -+3', 'nice 5', 'nice --adj=5',
          'timeout 5', 'timeout --signal KILL 5', 'timeout -sKILL 5', 'timeout --kill-after 1 5', 'timeout -k1 5', 'timeout -fv 5', 'timeout 5x',
@@ -148,6 +154,18 @@ def gen():
     return rng.choice(CMD) + ' ' + atom() + rng.choice(SEP) + atom() + rng.choice(SEP) + H + rng.choice(TAIL)
 
 
+FOLD_WORD = re.compile(r'(?:^|(?<=[ \t\n;&|(\'"]))(%s)(?=[ \t\n;&|)\'"]|$)' % '|'.join(shell_sandbox.FOLDED_SPELLINGS))
+
+
+def fold_mutation(command):
+    """r8 review F1: one program word spelled as macOS's file system still finds it (`ECHO`, `NICE`, `ba\u017fh`)."""
+    found = list(FOLD_WORD.finditer(command))
+    if not found:
+        return command
+    hit = rng.choice(found)
+    return command[:hit.start(1)] + rng.choice(shell_sandbox.FOLDED_SPELLINGS[hit.group(1)]) + command[hit.end(1):]
+
+
 PY_BLANK = re.compile('[\\f\\v\\x1c-\\x1f\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]')
 
 
@@ -159,6 +177,8 @@ def tags(command):
                                          ('r7-wrapper', re.compile(r'(?:^|[ ;&|])(?:nice|timeout|env|exec|command|builtin|time|nohup) -')),
                                          ('r7-source', re.compile(r'(?:source|\.) (?:<\(|/dev/|/proc/)')), ('r7-tilde', re.compile(r'~/\.\.')),
                                          ('r7-variable', re.compile(r'\$\(\(t\)\)|printf -v')),
+                                         ('r9-fold', re.compile('|'.join(s for spellings in shell_sandbox.FOLDED_SPELLINGS.values() for s in spellings))),
+                                         ('r9-name', re.compile(r"'a\[t\]'")),
                                          ('host', re.compile(r'function |\(\) \{|alias |repeat |noglob|nocorrect|always|trap |eval |-c \'|-exec|xargs|env -S|emulate|\(e\)|PS4|ProxyCommand|nice |stdbuf|exec |\| sh|sh <<<|\]\] echo|for i (in 1 \{|\()')))
              if pattern.search(command)]
     return found or ['NEW']
@@ -202,6 +222,8 @@ def main():
     with mock.patch.object(host_table, 'resolve', resolve):
         while counts['seen'] < CASES and time.monotonic() - started < LIMIT:
             command = gen()
+            if rng.random() < .15:
+                command = fold_mutation(command)
             if command in done or '\0' in command or not command.strip(' \t\n'):
                 continue
             if RECURSIVE.search(command) or names_a_privilege_tool(command):  # a function named like the command it calls recurses; the table has those rows
