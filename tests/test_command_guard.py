@@ -683,14 +683,129 @@ class OverwriteExistingTests(Fixture):
             self.decide(text, cwd='@TASK@')
             self.assertLess(time.monotonic() - started, 3.0, text[:12])
 
-    def test_nested_bang_forks_are_bounded_by_the_budget(self):
-        # each nesting level with `>!` parses twice; the shared budget must stop this rather than the hook timeout
-        text = 'echo x >! y'
-        for _ in range(9):
-            text = 'eval %s >! z' % shlex.quote(text)
-        started = time.monotonic()
-        self.assertIn(self.decide(text, cwd='@TASK@')[0], ('allow', 'warn', 'block'))
-        self.assertLess(time.monotonic() - started, 5.0)
+    def _nested(self, levels, leaf):
+        for _ in range(levels):
+            leaf = 'echo $(>! a %s)' % leaf
+        return leaf
+
+    def test_nested_bang_forks_are_capped_and_stay_cheap(self):
+        # 8 levels is the depth limit, and the worst case: every level would double the parses
+        count = []
+        real = cg.Lexer.lex
+
+        def counted(lexer, text):
+            count.append(1)
+            return real(lexer, text)
+        cg.Lexer.lex = counted
+        try:
+            verdict = self.decide(self._nested(8, 'word'), cwd='@HOME@/proj')[0]
+        finally:
+            cg.Lexer.lex = real
+        self.assertEqual(verdict, 'warn')  # past the cap the command is unanalysable, not clean
+        self.assertLessEqual(len(count), 60)
+        self.assertGreater(len(count), 8)  # it did fork: the row is not stopped at the first descent
+        self.assertEqual(self.decide(self._nested(8, 'word @HOME@/.claude'), cwd='@HOME@/proj')[0], 'block')
+
+    def test_a_budget_stop_keeps_what_was_already_refused(self):
+        self._seed_bang_rows()
+        hide = 'rm -rf ~/.c*/projects'  # a glob the parse resolves and the raw-text check does not see
+        self.assertFalse(cg.raw_sensitive(hide))
+        big = 'word ' * 50000
+        for name, text in (('before a large >!', hide + "; ssh host 'echo x >! y; " + big + "'"),
+                           ('after a large >!', "ssh host 'echo x >! y; " + big + "'; " + hide),
+                           ('before nested >!', hide + '; ' + self._nested(8, 'word ' * 500)),
+                           ('after nested >!', self._nested(8, 'word ' * 500) + '; ' + hide),
+                           ('control with >', hide + "; ssh host 'echo x > y; " + big + "'")):
+            self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'block', name)
+        # a stop with nothing refused yet is still not a pass
+        big = 'word ' * 150000
+        self.assertEqual(self.decide('echo ' + big, cwd='@HOME@/proj')[0], 'warn')
+
+    def test_budget_stop_keeps_an_enforced_finding(self):
+        # the stop itself, with nothing to avoid it: a finding raised before the budget runs out still blocks
+        hide = 'rm -rf ~/.c*/projects'
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home), cwd=str(self.home / 'proj'))
+        # the outer lex skips over $(..) cheaply and the nested script's does not fit, so the stop comes after the first
+        # command was judged. The second assertion proves the stop happens
+        comp.limits = dict(comp.limits, max_nodes=5000)
+        nested = 'echo $(echo ' + 'word ' * 2000 + ')'
+        self.assertEqual(cg.decide(hide + '; ' + nested, comp, cwd=str(self.home / 'proj'))[0], 'block')
+        self.assertEqual(cg.decide(nested, comp, cwd=str(self.home / 'proj'))[0], 'warn')
+
+    def test_second_reading_is_skipped_rather_than_run_out_of_budget(self):
+        self._seed_bang_rows()
+        text = "ssh host 'echo x >! /tmp/y; " + 'word ' * 50000 + "'"
+        self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'warn')
+        # text that names a protected location fails closed when both readings cannot be judged
+        self.assertEqual(self.decide(text + '; ls @HOME@/.claude', cwd='@HOME@/proj')[0], 'block')
+
+    def test_readings_merge_keeps_what_either_one_knows(self):
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))
+        ctx = cg.Ctx(comp, '/tmp/start')
+        start = ctx.state()
+        # one reading
+        ctx.vars.update({'SAME': 'a', 'DIFF': '/x/one', 'ONLY_A': '/x/a'})
+        ctx.var_hints.update({'HINT': 'first'})
+        ctx.written.update({'/f': 'text one', '/g': 'kept'})
+        ctx.created.add('/c1')
+        ctx.tainted.add('T1')
+        ctx.aliases['a1'] = 'x'
+        ctx.links['/l1'] = '/t1'
+        ctx.secret_seen = 1
+        ctx.kill_seen = True
+        ctx.cwd = '/tmp/one'
+        ctx.pending_kill.append('k1')
+        ctx.flow_vars = {'F1'}
+        one = ctx.state()
+        ctx.restore(start)
+        self.assertEqual((ctx.vars, ctx.cwd, ctx.secret_seen, ctx.kill_seen), ({}, '/tmp/start', 0, False))
+        self.assertFalse(hasattr(ctx, 'flow_vars'))  # an attribute added by one reading does not reach the other
+        # the other
+        ctx.vars.update({'SAME': 'a', 'DIFF': '/x/two', 'ONLY_B': '/x/b'})
+        ctx.var_hints.update({'HINT': 'second'})
+        ctx.written.update({'/f': 'text two', '/h': 'also kept'})
+        ctx.created.add('/c2')
+        ctx.tainted.add('T2')
+        ctx.aliases['a2'] = 'y'
+        ctx.links['/l2'] = '/t2'
+        ctx.secret_seen = 2
+        ctx.unterminated = True
+        ctx.cwd = '/home/x/.claude'
+        ctx.pending_kill.append('k2')
+        ctx.merge(one)
+        self.assertEqual(ctx.vars, {'SAME': 'a'})
+        for name, value in (('DIFF', '/x/one'), ('DIFF', '/x/two'), ('ONLY_A', '/x/a'), ('ONLY_B', '/x/b'),
+                            ('HINT', 'first'), ('HINT', 'second')):
+            self.assertIn(value, ctx.var_hints[name])
+        self.assertIn('text one', ctx.written['/f'])
+        self.assertIn('text two', ctx.written['/f'])
+        self.assertEqual((ctx.written['/g'], ctx.written['/h']), ('kept', 'also kept'))
+        self.assertEqual(ctx.created, {'/c1', '/c2'})
+        self.assertEqual(ctx.tainted, {'T1', 'T2'})
+        self.assertEqual((ctx.aliases, ctx.links), ({'a1': 'x', 'a2': 'y'}, {'/l1': '/t1', '/l2': '/t2'}))
+        self.assertEqual(ctx.secret_seen, 2)
+        self.assertTrue(ctx.kill_seen)  # set by the other reading
+        self.assertTrue(ctx.unterminated)  # set by this one
+        self.assertEqual(sorted(ctx.pending_kill), ['k1', 'k2'])
+        self.assertEqual(ctx.flow_vars, {'F1'})
+        self.assertTrue(ctx.cwd_unknown)
+        self.assertTrue(ctx.cwd_protected_unknown)
+
+    def test_merge_keeps_a_protected_cwd_flag_set_by_either_reading(self):
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))
+        ctx = cg.Ctx(comp, '/tmp/start')
+        ctx.cwd = '/tmp/one'
+        one = ctx.state()
+        ctx.cwd, ctx.cwd_unknown, ctx.cwd_protected_unknown = '/tmp/two', True, True
+        ctx.merge(one)
+        self.assertTrue(ctx.cwd_protected_unknown)
+
+    def test_root_text_stays_linear(self):
+        for tail in (' ', '/ ', ' ,', ' + '):
+            text = 'x = home' + tail * 50000 + 'y'
+            started = time.monotonic()
+            self.assertFalse(cg.written_code_destroys_root(text, str(self.home)))
+            self.assertLess(time.monotonic() - started, 1.0, repr(tail))
 
     def test_other_user_home_link_out_of_the_tree_is_refused(self):
         # a real /home/<user> on this machine cannot be made in a test, so its realpath is what is simulated

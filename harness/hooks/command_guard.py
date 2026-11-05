@@ -320,6 +320,10 @@ class Budget:
         self.max_depth = int(limits['max_depth'])
         self.count = 0
 
+    def has_room(self, ticks, seconds):
+        """Could about this much more work finish inside the budget?"""
+        return self.count + ticks <= self.nodes and time.monotonic() + seconds <= self.deadline
+
     def tick(self, weight=1):
         self.count += weight
         if self.count > self.nodes:
@@ -1253,17 +1257,30 @@ def _scan_text(text):
     return re.sub(r'\s+', ' ', t).casefold()
 
 
-# a script's code naming a home-anchored harness root, outside the work and scratch dirs owners clean up routinely, and
-# calling something that destroys or replaces a file (quotes are spaces by now, see _scan_text)
-_ROOT_SEP = r'(?:\s*[/,+\\]\s*|\s+)+'
+# a line of a script that names a harness root under a home, outside the work and scratch dirs owners clean up routinely,
+# and calls something that destroys or replaces a file (quotes are spaces by now, see _scan_text). One character class
+# for the separator, so a long run of spaces cannot make the regex backtrack
+_ROOT_SEP = r'[\s/,+\\]+'
 ROOT_DELETE_VERB = re.compile(r'\b(?:rm|rmdir|unlink|shred|truncate|rmtree|remove|rimraf|trash|rm_rf|rm_r|remove_tree|removedirs|'
                               r'rmdirsync|unlinksync|rmsync|write_text|write_bytes|writefilesync|sponge)\b|'
-                              r'\bopen\b[^\n]{0,200}?\s(?:w|wb|w\+)(?:\s|$)|\bfs\.(?:rm|rmdir|unlink)\b')
+                              r'\bopen\b[^\n]{0,200}?\s(?:w|wb|wt|w\+)(?:\s|$)|\bfs\.(?:rm|rmdir|unlink)\b')
 
 
 def _root_text(home):
-    anchor = r'(?:~|\bhome\b|/users/[^/\s]+|/home/[^/\s]+|/root|' + re.escape(home.casefold().rstrip('/')) + ')'
-    return re.compile(anchor + _ROOT_SEP + r'\.(?:claude|codex|agent-harness' + _ROOT_SEP + r'(?!work\b|scratch\b)[\w.-])')
+    start = r'(?<![\w./-])'  # the start of a path or a name: /tmp/fake/home/.claude and /tmp/root/.claude are not homes
+    anchor = (r'(?:' + start + r'(?:~|home\b|/users/[^/\s]+|/home/[^/\s]+|/root\b|' + re.escape(home.casefold().rstrip('/'))
+              + r')|\.home\b)')
+    return re.compile(anchor + _ROOT_SEP + r'\.(?:(?:claude|codex)(?![\w-])|agent-harness(?![\w-])(?!' + _ROOT_SEP
+                      + r'(?:work|scratch)(?![\w.-])))')
+
+
+def written_code_destroys_root(code, home):
+    """A path and the call that destroys it on one line. Anywhere in the script would refuse every script that reads a
+    harness file and writes its own output (replay: 13 of 13 false). A path held in a variable is not followed."""
+    root = _root_text(home)
+    if not root.search(_scan_text(code)):
+        return False
+    return any(root.search(line) and ROOT_DELETE_VERB.search(line) for line in map(_scan_text, code.splitlines()))
 
 
 def fallback_scan(text, ctx):
@@ -1315,12 +1332,14 @@ class Ctx:
         self.pending_kill = []
         self.marker = marker  # callable(path) -> bool, injectable for tests
         self.fixed_cwd = None
+        self.fork_depth = 0  # readings of `>!` being analysed around the current script (Analyzer._both_readings)
+        self.readings_capped = False  # a script got one reading of `>!`: too deeply nested, or no budget left for two
 
     def cwd_value(self):
         return self.cwd
 
     # what one reading of a script can change; findings accumulate across readings and the rest is not analysis state
-    NOT_STATE = ('findings', 'budget', 'c', 'marker', 'raw_top', 'ps', 'tail_visible')
+    NOT_STATE = ('findings', 'budget', 'c', 'marker', 'raw_top', 'ps', 'tail_visible', 'fork_depth', 'readings_capped')
 
     def state(self):
         return {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(self).items()
@@ -1333,25 +1352,38 @@ class Ctx:
             setattr(self, k, v.copy() if isinstance(v, (set, dict, list)) else v)
 
     def merge(self, other):
-        """Combine another reading's end state into this one for the commands that follow: what either reading knows
-        stays known. If they end in different directories, the current one is unknown, and if either names a protected
-        location relative paths are judged as if they lead there."""
+        """Combine another reading's end state into this one for the commands that follow. Either reading may be the
+        real one, so nothing it knows can be lost: a variable they disagree on is no longer known and both values
+        become hints, a file keeps both texts, and if they end in different directories the current one is unknown,
+        judged as protected if either names a protected location."""
+        hints = dict(self.var_hints)
+        for name, value in other['var_hints'].items():
+            hints[name] = value if hints.get(name) in (None, value) else hints[name] + ' ' + value
+        known = {name: value for name, value in self.vars.items() if name in other['vars'] and other['vars'][name] == value}
+        for name in (set(self.vars) | set(other['vars'])) - set(known):
+            values = [hints.get(name), self.vars.get(name), other['vars'].get(name)]
+            hints[name] = ' '.join(v for v in values if isinstance(v, str))[:4096]
+        self.vars, self.var_hints = known, hints
         for k, theirs in other.items():
-            if k in self.NOT_STATE:
+            if k in self.NOT_STATE or k in ('vars', 'var_hints'):
                 continue
             mine = getattr(self, k, None)
-            if isinstance(theirs, set):
+            if k == 'written':
+                both = dict(theirs)
+                for path, text in (mine or {}).items():
+                    both[path] = text if both.get(path) in (None, text) else (both[path] + '\n' + text)[:524288]
+                self.written = both
+            elif isinstance(theirs, set):
                 setattr(self, k, (mine or set()) | theirs)
             elif isinstance(theirs, dict):
                 setattr(self, k, {**(mine or {}), **theirs})
             elif isinstance(theirs, list):
                 setattr(self, k, (mine or []) + [x for x in theirs if x not in (mine or [])])
-            elif isinstance(theirs, bool):
-                setattr(self, k, bool(mine) or theirs)
-            elif isinstance(theirs, int):
+            elif isinstance(theirs, int):  # counters only rise, and a flag set by either reading stays set
                 setattr(self, k, max(mine or 0, theirs))
             elif k == 'cwd' and mine != theirs:
-                self.cwd_protected_unknown = bool(PROTECTED_TEXT.search((mine or '') + ' ' + (theirs or '') + '/'))
+                self.cwd_protected_unknown = self.cwd_protected_unknown or bool(
+                    PROTECTED_TEXT.search((mine or '') + ' ' + (theirs or '') + '/'))
                 self.cwd = theirs
                 self.cwd_unknown = True
             else:
@@ -1359,6 +1391,12 @@ class Ctx:
 
     def add(self, category, rule, reason, alternative):
         self.findings.append(Finding(category, rule, reason, alternative))
+
+
+# Each nesting level with a `>!` doubles the parses. This keeps a small command inside the budget, which matters because
+# a budget stop loses whatever the guard has not reached yet. Past it a script gets one reading, and analyze() treats
+# the command as unanalysable.
+MAX_READING_FORKS = 3
 
 
 class Analyzer:
@@ -1391,9 +1429,14 @@ class Analyzer:
         try:
             lexer = Lexer(ctx, ctx.ps)
             tokens = lexer.lex(text)
-            if lexer.saw_bang:
-                self._both_readings(tokens, text, depth)
+            if lexer.saw_bang and ctx.fork_depth < MAX_READING_FORKS:
+                ctx.fork_depth += 1
+                try:
+                    self._both_readings(tokens, text, depth)
+                finally:
+                    ctx.fork_depth -= 1
             else:
+                ctx.readings_capped = ctx.readings_capped or lexer.saw_bang
                 self._run_tokens(tokens, depth)
         finally:
             ctx.ps, ctx.tail_visible = saved_ps, saved_tail
@@ -1411,7 +1454,13 @@ class Analyzer:
         ctx = self.ctx
         start = ctx.state()
         mark = len(ctx.findings)
+        count, began = ctx.budget.count, time.monotonic()
         self._run_tokens(zsh_tokens, depth)
+        # a second reading that cannot finish would stop the analysis and lose every later command, so skip it instead;
+        # analyze() then treats the command as unanalysable
+        if not ctx.budget.has_room(2 * (ctx.budget.count - count) + len(text), 2 * (time.monotonic() - began)):
+            ctx.readings_capped = True
+            return
         after_zsh = ctx.state()
         ctx.restore(start)
         mid = len(ctx.findings)
@@ -2481,7 +2530,9 @@ class Analyzer:
             ctx.cwd_protected_unknown = bool(PROTECTED_TEXT.search(target) or self._hint_points_at_protected(word))
             return
         if ctx.cwd_unknown and not target.startswith(('/', '~')):
-            return  # relative to a directory the guard could not resolve: still unknown
+            # relative to a directory the guard could not resolve: still unknown, and a protected name stays visible
+            ctx.cwd_protected_unknown = ctx.cwd_protected_unknown or bool(PROTECTED_TEXT.search(target))
+            return
         if target.startswith(('/', '~')):
             ctx.cwd_known = True
         ctx.cwd = norm_path(target, ctx, ctx.cwd)
@@ -2974,13 +3025,13 @@ class Analyzer:
                 text = self.ctx.written.get(norm_path(nd[0].text, self.ctx).casefold())
                 if text:
                     self.code(text, depth)
-                    # a script this same command wrote and now runs is the incident's shape, so a deletion anywhere
-                    # under a harness root counts here, not only logs (GoodQA #14657). Existing scripts and one-liners
-                    # keep the log-only rule: harness tooling reads and edits these files routinely
-                    scan = _scan_text(text)
-                    if _root_text(self.ctx.home).search(scan) and ROOT_DELETE_VERB.search(scan):
+                    # a script this same command wrote and now runs is the incident's shape, so a deletion under a
+                    # harness root counts here, not only logs (GoodQA #14657). Existing scripts and one-liners keep
+                    # the log-only rule: harness tooling reads and edits these files routinely
+                    if written_code_destroys_root(text, self.ctx.home):
                         self.ctx.add(LOG_DELETE, 'written-script-root',
-                                     'a script written in this command destroys or replaces a file under a harness root',
+                                     'a line of a script written in this command names a harness root and a call that '
+                                     'can destroy or replace a file',
                                      'edit the file with the editor tool, or keep the change out of the harness roots')
 
     def code(self, code, depth):
@@ -3846,7 +3897,11 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
     if len(command.encode('utf-8', 'replace')) > int(compiled.limits['max_command_bytes']):
         raise Blocked('command is larger than %d bytes' % int(compiled.limits['max_command_bytes']))
     analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=marker)
-    findings = analyzer.run(command)
+    try:
+        findings = analyzer.run(command)
+    except (Blocked, RecursionError) as stop:
+        stop.findings = list(analyzer.ctx.findings)  # what the guard already refused still counts (decide)
+        raise
     if analyzer.ctx.unterminated and not any(f.category in ALWAYS_ENFORCED for f in findings):
         if raw_sensitive(command, compiled, cwd=cwd):
             findings.append(Finding(LOG_DELETE if PROTECTED_TEXT.search(command) else SECRET_DUMP, 'unanalysable',
@@ -3855,6 +3910,14 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
         else:
             findings.append(Finding(PARSE, 'unterminated', 'the command has an unterminated quote or substitution',
                                     'check the quoting'))
+    if analyzer.ctx.readings_capped and not any(f.category in ALWAYS_ENFORCED for f in findings):
+        if raw_sensitive(command, compiled, cwd=cwd):
+            findings.append(Finding(LOG_DELETE if PROTECTED_TEXT.search(command) else SECRET_DUMP, 'unanalysable',
+                                    '`>!` is too large or too deeply nested to judge under both shell readings and the '
+                                    'command names a protected location or secret', 'split the command, or use `>|`'))
+        else:
+            findings.append(Finding(PARSE, 'readings-capped', '`>!` is too large or too deeply nested to judge under both shell readings',
+                                    'split the command, or use `>|`'))
     return findings
 
 
@@ -3893,6 +3956,9 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
         findings = analyze(command, compiled, cwd=cwd, ps=ps, marker=marker)
     except (Blocked, RecursionError) as stop:
         reason = str(stop) if isinstance(stop, Blocked) else 'command nesting is too deep'
+        already = [f for f in getattr(stop, 'findings', []) if modes.get(f.category) == 'enforce']
+        if already:
+            return 'block', format_block(already[0], more=len(already) - 1)
         if raw_sensitive(command, compiled, cwd=cwd):
             category = LOG_DELETE if PROTECTED_TEXT.search(command if isinstance(command, str) else ' '.join(command)) \
                 else SECRET_DUMP

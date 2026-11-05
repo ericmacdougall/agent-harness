@@ -1095,7 +1095,7 @@ BANG_READINGS = [
     ("cat >! run.py <<'E'\nimport os\nos.remove(os.path.expanduser('~/.agent-harness/bin/tool'))\nE\npython3 run.py", 'block'),  # D3
     ("cat > run.py <<'E'\nprint(open('@HOME@/.claude/hooks/hook.py').read())\nE\npython3 run.py", 'allow'),  # D4
     ("cat > run.py <<'E'\nimport shutil\nshutil.rmtree('@TASK@/old')\nE\npython3 run.py", 'allow'),  # D5
-    ("cat > run.py <<'E'\nimport shutil\nshutil.rmtree('/tmp/x')\nprint('@HOME@/.claude/hooks')\nE\npython3 run.py", 'block'),  # D7
+    ("cat > run.py <<'E'\nimport shutil\nshutil.rmtree('/tmp/x')\nprint('@HOME@/.claude/hooks')\nE\npython3 run.py", 'allow'),  # D7, the path and the call are on different lines
     ('echo x >! @TASK@/existing.log', 'allow'),  # K1
     ("cat >! @TASK@/NEW-k2.txt <<'E'\nplain words\nE", 'allow'),  # K2
     ("cat >! @TASK@/existing.log <<'E'\nplain words\nE", 'allow'),  # K3
@@ -1107,6 +1107,21 @@ BANG_READINGS = [
     ('git log -1 >! @TASK@/NEW-k9.txt', 'allow'),  # K9
     ('echo x > @TASK@/existing.log', 'allow'),  # K10
     ('ls -la > @TASK@/existing.log', 'allow'),  # K11
+    ("cat > run.py <<'E'\nopen('@HOME@/.claude/hooks/hook.py', 'wt').write('x')\nE\npython3 run.py", 'block'),  # review R13
+    ("cat > run.py <<'E'\nimport shutil\nshutil.rmtree('@HOME@/.agent-harness')\nE\npython3 run.py", 'block'),  # review R15
+    ("cat > run.py <<'E'\nimport shutil\nshutil.rmtree('@HOME@/.agent-harness/work-old')\nE\npython3 run.py", 'block'),  # review R18
+    ("cat > /tmp/a.py <<'E'\nimport os\ndata = open(os.path.expanduser('~/.claude/settings.json')).read()\nfor w in data.split():\n    print(w)\nE\npython3 /tmp/a.py", 'allow'),  # review F4
+    ("cat > /tmp/t.py <<'E'\nimport os, shutil, tempfile\nhome = tempfile.mkdtemp()\nos.makedirs(os.path.join(home, '.claude', 'hooks'))\nshutil.rmtree(home)\nE\npython3 /tmp/t.py", 'allow'),  # review F5
+    ("cat > /tmp/t.py <<'E'\nimport shutil, tempfile\nfrom pathlib import Path\nhome = Path(tempfile.mkdtemp())\n(home / '.codex').mkdir()\nshutil.rmtree(home)\nE\npython3 /tmp/t.py", 'allow'),  # review F6
+    ("cat > /tmp/a.py <<'E'\nimport shutil, os\nshutil.rmtree(os.path.expanduser('~/.claude-backup-old'))\nE\npython3 /tmp/a.py", 'allow'),  # review F7
+    ("cat > /tmp/a.py <<'E'\nimport shutil, os\nshutil.rmtree(os.path.expanduser('~/.codexfoo'))\nE\npython3 /tmp/a.py", 'allow'),  # review F8
+    ("cat > /tmp/a.py <<'E'\nimport subprocess\nprint(subprocess.run(['git', 'rm', '--cached', 'x'], cwd='/tmp/repo'))\nprint('see ~/.claude/settings.json')\nE\npython3 /tmp/a.py", 'allow'),  # review F9
+    ("cat > /tmp/a.py <<'E'\nimport os\ndata = open(os.path.expanduser('~/.claude/settings.json')).read()\nopen('/tmp/out.txt', 'w').write(data)\nE\npython3 /tmp/a.py", 'allow'),  # review F10
+    ("cat > /tmp/a.py <<'E'\nimport shutil\nshutil.rmtree('/tmp/fake/home/.claude/hooks')\nE\npython3 /tmp/a.py", 'allow'),  # review F11
+    ("cat > /tmp/a.py <<'E'\nimport shutil\nshutil.rmtree('/tmp/root/.claude/hooks')\nE\npython3 /tmp/a.py", 'allow'),  # review F12
+    ("cat > /tmp/a.py <<'E'\nprint('home', '.codex')\nkeep = ['a', 'b']\nkeep.remove('a')\nE\npython3 /tmp/a.py", 'allow'),  # review F13
+    ("cat > /tmp/a.py <<'E'\nimport os, tempfile\nprint(os.listdir(os.path.expanduser('~/.claude/hooks')))\nd = tempfile.mkdtemp()\nos.remove(os.path.join(d, 'x'))\nE\npython3 /tmp/a.py", 'allow'),  # review F15
+    ("cat > /tmp/a.py <<'E'\nimport os\nprint(os.path.expanduser('~/.agent-harness/bin/tool'))\nopen('/tmp/x', 'w').close()\nE\npython3 /tmp/a.py", 'allow'),  # review F17
 ]
 # (row, verdict, working directory): one reading's `cd` must not move the other, and a directory they disagree on counts
 BANG_READINGS_CWD = [
@@ -1121,6 +1136,15 @@ BANG_READINGS_CWD = [
     ('>! x cd /var/empty; rm -rf plain', 'allow', '@HOME@/proj'),
     ('cd @HOME@/proj >! out.log; rm -rf plain', 'allow', '@HOME@/proj'),
     ("cat > run.py <<'E'\nimport shutil\nshutil.rmtree('.claude/tmp')\nE\npython3 run.py", 'allow', '@HOME@/proj'),
+    ("T=@HOME@/.claude/projects; eval '>! x T=/tmp/plain'; rm -rf $T", 'block', '@HOME@/proj'),  # review A1p
+    ("T=@HOME@/.claude/hooks; eval '>! x T=/tmp/plain'; rm -rf $T", 'block', '@HOME@/proj'),  # review A1
+    ("T=/tmp/plain; eval '>! x T=$(echo @HOME@/.claude/hooks)'; rm -rf $T", 'block', '@HOME@/proj'),  # review A2
+    ('T=@HOME@/.claude/hooks; x=$(>! y T=/tmp/plain); rm -rf $T', 'block', '@HOME@/proj'),  # review A4
+    ('eval \'>! x cd /tmp; >! cd "$X/.claude"\'; rm -rf hooks', 'block', '@HOME@/proj'),  # review A5
+    ("cd @HOME@; eval '>! x cd /tmp'; cd .claude; rm -rf hooks", 'block', '@HOME@/proj'),  # review A8
+    ('cd $X; cd .claude; rm -rf hooks', 'block', '@HOME@/proj'),  # review A8c
+    ("T=$(echo @HOME@/.claude/hooks); eval '>! x T=$(echo /tmp/plain)'; rm -rf $T", 'block', '@HOME@/proj'),  # review A9
+    ("echo 'rm -rf @HOME@/.claude/hooks' > run.sh; eval '>! x echo harmless >! run.sh'; bash run.sh", 'block', '@HOME@/proj'),  # review A10
 ]
 # (target row, words the refusal must carry so the owner knows what to do instead)
 OVERWRITE_HINTS = [
