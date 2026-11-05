@@ -746,7 +746,9 @@ class OverwriteExistingTests(Fixture):
     def test_nesting_too_deep_for_python_keeps_what_was_already_refused(self):
         self._seed_bang_rows()
         hide = 'rm -rf ~/.c*/projects'
-        deep = 'sudo ' * 5000 + 'ls'
+        # just past the interpreter's limit: a recursion error's frames stay in this process's peak memory, and the
+        # hostile input tests later in a full run measure their children against 100 MiB, which starts from that peak
+        deep = 'sudo ' * (sys.getrecursionlimit() + 100) + 'ls'
         self.assertEqual(self.decide(deep, cwd='@HOME@/proj')[0], 'warn')  # it does stop
         self.assertEqual(self.decide(hide + '; ' + deep, cwd='@HOME@/proj')[0], 'block')
 
