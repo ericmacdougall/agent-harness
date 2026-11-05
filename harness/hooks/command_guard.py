@@ -809,7 +809,9 @@ class Lexer:
             if wait_target is not None:
                 wait_target.target = w
                 if wait_target.op in ('<<', '<<-'):
-                    wait_target.delim = w.text
+                    # a CR right after the word is part of the delimiter: CR is a word character in the shell, though
+                    # this lexer treats it as a blank, so a CRLF line's `E` + CR ends only a `<<E` + CR here-doc (GoodQA #14782)
+                    wait_target.delim = w.text + ('\r' if s[j:j + 1] == '\r' else '')
                     wait_target.quoted = w.quoted
                 wait_target = None
             else:
@@ -858,7 +860,7 @@ class Lexer:
                 break
             line = ''.join(parts)
             check = line.lstrip('\t') if rd.strip else line
-            if check.rstrip('\r') == delim:
+            if check == delim:  # exactly, as the shell compares it (GoodQA #14782)
                 break
             size += len(line) + 1
             if size > 1 << 20:

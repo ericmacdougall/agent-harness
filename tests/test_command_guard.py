@@ -440,6 +440,19 @@ class LineContinuationTests(Fixture):
     def test_review6_rows_block(self):
         self.expect(self.REVIEW6, 'block', label='REVIEW6')
 
+    def test_a_heredoc_ends_only_at_its_exact_delimiter(self):
+        # GoodQA #14782: no shell ends `<<E` at a line `E` + CR, and a CRLF `<<E` + CR ends at `E` + CR, not `E`
+        # (pr-guard-root/cr_probe.py: bash 3.2, bash 5 and dash run the deletion line's stand-in; zsh from a file).
+        self.expect(['cat <<E\nE\r\necho "\nE\nrm -rf ~/.claude/projects\necho "',
+                     "cat <<E\nE\r\necho '\nE\nrm -rf ~/.claude/projects\necho '",
+                     'cat <<-E\n\tE\r\necho "\n\tE\nrm -rf ~/.claude/projects\necho "',
+                     "cat <<'E'\nE\r\necho \"\nE\nrm -rf ~/.claude/projects\necho \"",
+                     'cat <<E\r\nE\necho "\nE\r\nrm -rf ~/.claude/projects\necho "'], 'block', label='CR delimiter')
+        # CRLF scripts still end their here-docs where the shell does
+        self.expect(['cat <<E\r\nx\r\nE\r\nrm -rf ~/.claude/projects\r\n', "cat <<'E'\r\nx\r\nE\r\nrm -rf ~/.claude/projects\r\n",
+                     'cat <<-E\r\n\tx\r\n\tE\r\nrm -rf ~/.claude/projects\r\n'], 'block', label='CRLF here-doc')
+        self.expect(['cat <<E\r\nx\r\nE\r\necho done\r\n', 'cat <<E\nx\nE\necho done'], 'allow', label='harmless here-docs')
+
     def test_words_are_read_as_the_shell_passes_them(self):
         # argv as bash 3.2, bash 5, dash and zsh pass it (review-6/shell_ctx_probe.py, pr-guard-root/cont_argv.py)
         compiled = cg.Compiled(self.policy, home=str(self.home), cwd=str(self.home / 'repo'))
