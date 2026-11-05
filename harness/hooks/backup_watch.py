@@ -7,7 +7,8 @@ starts; nobody is told when a running host's backup silently goes stale.
 
   run      classify both tiers; write one JSON line to ~/.agent-harness/logs/backup-alert.jsonl when the verdict
            changes or the same bad verdict is 60 min old; exit 0 fresh, 1 transcripts stale, 2 transcripts
-           missing/invalid, 3 bulk tier bad (same codes as `log_backup.py check`), 4 log_backup.py unavailable.
+           missing/invalid, 3 bulk tier bad (same codes as `log_backup.py check`), 4 log_backup.py unavailable,
+           5 internal error (state write failed, symlink refused).
   status   one line: last verdict, when it was written, whether the scheduler unit is installed.
   install  write the launchd or systemd unit targeting ~/.claude/hooks/backup_watch.py and activate it (dry run unless
            --apply). Alerts go to stderr (launchd: backup-watch.err), to backup-alert.jsonl, and a non-zero exit shows
@@ -90,6 +91,17 @@ def _write_private(path: Path, text: str, append: bool = False) -> None:
     os.replace(tmp, path)
 
 
+def notify(text: str) -> None:
+    """Visible desktop notice on macOS (the second reader besides the session-start check). Never raises."""
+    if platform.system() != "Darwin":
+        return
+    try:
+        subprocess.run(["osascript", "-e", f'display notification "{text}" with title "Log backup alert"'],
+                       capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def run(home: Path, now: float | None = None) -> int:
     now = time.time() if now is None else now
     v = verdict(home, now)
@@ -103,7 +115,9 @@ def run(home: Path, now: float | None = None) -> int:
         _write_private(logs / ALERT_LOG, json.dumps(line) + "\n", append=True)
         _write_private(logs / STATE, json.dumps({"code": v["code"], "at": now}))
         if v["code"] != 0:
-            print(f"BACKUP ALERT code={v['code']} transcripts={v['transcripts']} bulk={v['bulk']}", file=sys.stderr)
+            msg = f"BACKUP ALERT code={v['code']} transcripts={v['transcripts']} bulk={v['bulk']}"
+            print(msg, file=sys.stderr)
+            notify(msg)
     return v["code"]
 
 
@@ -124,7 +138,7 @@ def unit_files(home: Path, system: str) -> list[tuple[Path, str]]:
                  f"<key>StandardErrorPath</key><string>{escape(str(err))}</string>\n</dict></plist>\n")
         return [(home / "Library" / "LaunchAgents" / f"{LABEL}.plist", plist)]
     d = home / ".config" / "systemd" / "user"
-    q = '"' + str(script).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    q = '"' + str(script).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
     service = (f"[Unit]\nDescription=Agent log backup freshness alert\n[Service]\nType=oneshot\n"
                f"ExecStart=/usr/bin/python3 {q} run\n")
     timer = ("[Unit]\nDescription=Backup freshness alert every 10 min\n[Timer]\nOnBootSec=3min\n"
@@ -132,24 +146,27 @@ def unit_files(home: Path, system: str) -> list[tuple[Path, str]]:
     return [(d / f"{UNIT}.service", service), (d / f"{UNIT}.timer", timer)]
 
 
-def default_runner(argv: list[str]) -> int:
+def default_runner(argv: list[str], capture: str | None = None):
+    """Exit code, or with capture=<anything> the stripped stdout (used only for loginctl --value)."""
     try:
-        return subprocess.run(argv, capture_output=True, timeout=30).returncode
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
-        return 127
+        return "" if capture else 127
+    return r.stdout.strip() if capture else r.returncode
 
 
 def active(home: Path, system: str, run=default_runner, uid: int | None = None) -> bool:
     """True only when the scheduler itself reports the job loaded/enabled, not merely when files exist."""
     if system == "Darwin":
         return run(["launchctl", "print", f"gui/{os.getuid() if uid is None else uid}/{LABEL}"]) == 0
-    return run(["systemctl", "--user", "is-enabled", f"{UNIT}.timer"]) == 0
+    return (run(["systemctl", "--user", "is-enabled", f"{UNIT}.timer"]) == 0
+            and run(["systemctl", "--user", "is-active", f"{UNIT}.timer"]) == 0)
 
 
 def linger(run=default_runner) -> bool:
     """Linux user timers stop at logout unless lingering is on (dev2 is headless)."""
     user = os.environ.get("USER", "")
-    return bool(user) and run(["loginctl", "show-user", user, "--property=Linger=yes"]) == 0
+    return bool(user) and run(["loginctl", "show-user", user, "-p", "Linger", "--value"], capture="yes") == "yes"
 
 
 def status(home: Path, system: str | None = None, run=default_runner) -> str:
@@ -166,30 +183,38 @@ def status(home: Path, system: str | None = None, run=default_runner) -> str:
     return f"backup-watch: {last}; scheduler {sched}"
 
 
-def install(home: Path, apply: bool, system: str | None = None, run=default_runner) -> list[str]:
+def install(home: Path, apply: bool, system: str | None = None, run=default_runner) -> tuple[list[str], int]:
+    """Lines to print and an exit code: 0 ok, 3 script not installed, 4 a scheduler command failed, 5 refused."""
     system = system or platform.system()
-    out, changed = [], False
+    out, changed, rc = [], False, 0
+    if apply and not installed_script(home).is_file():
+        return [f"refused: {installed_script(home)} is not installed (run the harness installer first)"], 3
     for path, text in unit_files(home, system):
         if path.is_symlink() or path.parent.is_symlink():
-            out.append(f"refused symlink {path}")
-            return out
+            return out + [f"refused symlink {path}"], 5
         same = path.exists() and path.read_text() == text
         out.append(f"{'unchanged' if same else ('wrote' if apply else 'would write')} {path}")
         if apply and not same:
             path.parent.mkdir(parents=True, exist_ok=True)
             _write_private(path, text)
             changed = True
+    if apply:
+        (home / ".agent-harness" / "logs").mkdir(parents=True, exist_ok=True)
     if apply and (changed or not active(home, system, run)):
         if system == "Darwin":
-            code = run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(unit_files(home, system)[0][0])])
+            domain = f"gui/{os.getuid()}"
+            run(["launchctl", "bootout", f"{domain}/{LABEL}"])  # not loaded is fine; loaded-with-old-plist must go
+            code = run(["launchctl", "bootstrap", domain, str(unit_files(home, system)[0][0])])
             out.append(f"launchctl bootstrap rc={code}")
+            rc = 4 if code else 0
         else:
             run(["systemctl", "--user", "daemon-reload"])
             code = run(["systemctl", "--user", "enable", "--now", f"{UNIT}.timer"])
             out.append(f"systemctl enable --now rc={code}")
+            rc = 4 if code else 0
             if not linger(run):
                 out.append("WARNING: lingering is off; user timers stop at logout (run loginctl enable-linger)")
-    return out
+    return out, rc
 
 
 def main(argv=None) -> int:
@@ -199,12 +224,17 @@ def main(argv=None) -> int:
     ap.add_argument("--apply", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "run":
-        return run(a.home)
+        try:
+            return run(a.home)
+        except Exception as exc:  # noqa: BLE001 - an internal failure must not look like "transcripts stale"
+            print(f"backup-watch internal error: {type(exc).__name__}", file=sys.stderr)
+            return 5
     if a.cmd == "status":
         print(status(a.home))
         return 0
-    print("\n".join(install(a.home, a.apply)))
-    return 0
+    lines, code = install(a.home, a.apply)
+    print("\n".join(lines))
+    return code
 
 
 if __name__ == "__main__":

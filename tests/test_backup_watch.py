@@ -20,6 +20,10 @@ def stamp(epoch):
 
 class Base(unittest.TestCase):
     def setUp(self):
+        self.notices = []
+        self._notify = bw.notify
+        bw.notify = self.notices.append
+        self.addCleanup(setattr, bw, "notify", self._notify)
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.logs = self.home / ".agent-harness" / "logs"
@@ -136,64 +140,118 @@ class StateFile(Base):
 
 
 class Runner:
-    def __init__(self, loaded=False):
-        self.calls, self.loaded = [], loaded
+    """Test double that behaves like the real tools where it matters: bootstrap fails on a loaded label, a
+    bootout of an unloaded label fails, enable --now makes the timer enabled and active, linger is configurable."""
 
-    def __call__(self, argv):
+    def __init__(self, loaded=False, linger="yes", fail_enable=False):
+        self.calls, self.loaded, self.linger, self.fail_enable = [], loaded, linger, fail_enable
+
+    def __call__(self, argv, capture=None):
         self.calls.append(argv)
-        if argv[:2] in (["systemctl", "--user"],) and "is-enabled" in argv:
+        if argv[0] == "loginctl":
+            return self.linger if capture else 0
+        if argv[0] == "systemctl" and ("is-enabled" in argv or "is-active" in argv):
             return 0 if self.loaded else 1
         if argv[0] == "launchctl" and argv[1] == "print":
             return 0 if self.loaded else 113
-        if argv[0] == "systemctl" and "enable" in argv or argv[0] == "launchctl" and argv[1] == "bootstrap":
+        if argv[0] == "launchctl" and argv[1] == "bootout":
+            was, self.loaded = self.loaded, False
+            return 0 if was else 3
+        if argv[0] == "launchctl" and argv[1] == "bootstrap":
+            if self.loaded:
+                return 5
+            self.loaded = True
+            return 0
+        if argv[0] == "systemctl" and "enable" in argv:
+            if self.fail_enable:
+                return 1
             self.loaded = True
         return 0
 
 
 class InstallCoverage(Base):
+    def setUp(self):
+        super().setUp()
+        script = bw.installed_script(self.home)
+        script.parent.mkdir(parents=True)
+        script.write_text("# installed copy\n")
+
     def test_files_without_active_job_are_not_reported_installed(self):
-        r = Runner(loaded=False)
-        bw.install(self.home, False, "Linux", r)
-        self.assertIn("NOT INSTALLED", bw.status(self.home, "Linux", r))
-        bw.install(self.home, True, "Linux", Runner(loaded=False))
-        self.assertIn("NOT ACTIVE", bw.status(self.home, "Linux", Runner(loaded=False)))
+        self.assertIn("NOT INSTALLED", bw.status(self.home, "Linux", Runner()))
+        bw.install(self.home, True, "Linux", Runner(fail_enable=True))
+        self.assertIn("NOT ACTIVE", bw.status(self.home, "Linux", Runner()))
         self.assertIn("installed and active", bw.status(self.home, "Linux", Runner(loaded=True)))
 
     def test_dry_run_writes_and_activates_nothing(self):
         r = Runner()
-        out = bw.install(self.home, False, "Linux", r)
+        out, rc = bw.install(self.home, False, "Linux", r)
         self.assertTrue(all(o.startswith("would write") for o in out))
-        self.assertEqual(r.calls, [])
+        self.assertEqual((r.calls, rc), ([], 0))
 
-    def test_apply_writes_then_activates_linux_and_darwin(self):
+    def test_apply_activates_linux(self):
         r = Runner()
-        bw.install(self.home, True, "Linux", r)
+        out, rc = bw.install(self.home, True, "Linux", r)
+        self.assertEqual(rc, 0)
         self.assertTrue(any("enable" in c and "backup-watch.timer" in c for c in r.calls))
-        r2 = Runner()
-        bw.install(self.home, True, "Darwin", r2)
-        self.assertTrue(any(c[:2] == ["launchctl", "bootstrap"] for c in r2.calls))
-        self.assertIn("installed and active", bw.status(self.home, "Darwin", r2))
+        self.assertIn("installed and active", bw.status(self.home, "Linux", r))
+
+    def test_apply_activates_darwin_and_replaces_a_loaded_job(self):
+        r = Runner(loaded=True)  # an older plist is already loaded: bootstrap alone would fail with rc 5
+        out, rc = bw.install(self.home, True, "Darwin", r)
+        self.assertEqual(rc, 0, out)
+        kinds = [c[1] for c in r.calls if c[0] == "launchctl"]
+        self.assertLess(kinds.index("bootout"), kinds.index("bootstrap"))
+        self.assertIn("installed and active", bw.status(self.home, "Darwin", r))
+
+    def test_failed_scheduler_command_is_a_nonzero_exit(self):
+        out, rc = bw.install(self.home, True, "Linux", Runner(fail_enable=True))
+        self.assertEqual(rc, 4)
+
+    def test_linger_off_warns_and_value_is_compared(self):
+        import os
+        os.environ.setdefault("USER", "tester")
+        out, _ = bw.install(self.home, True, "Linux", Runner(linger="no"))
+        self.assertTrue(any("lingering is off" in o for o in out))
+        out, _ = bw.install(self.home, True, "Linux", Runner(loaded=False, linger="yes"))
+        self.assertFalse(any("lingering is off" in o for o in out))
+
+    def test_stopped_but_enabled_timer_is_not_active(self):
+        class Stopped(Runner):
+            def __call__(self, argv, capture=None):
+                if argv[0] == "systemctl" and "is-active" in argv:
+                    return 3
+                return super().__call__(argv, capture) if "is-enabled" not in argv else 0
+        bw.install(self.home, True, "Linux", Runner())
+        self.assertIn("NOT ACTIVE", bw.status(self.home, "Linux", Stopped()))
 
     def test_second_apply_is_idempotent_when_active(self):
         r = Runner()
         bw.install(self.home, True, "Linux", r)
         r.calls.clear()
-        out = bw.install(self.home, True, "Linux", r)
-        self.assertTrue(all(o.startswith("unchanged") for o in out))
+        out, rc = bw.install(self.home, True, "Linux", r)
+        self.assertTrue(all(o.startswith("unchanged") for o in out[:2]))
         self.assertFalse(any("enable" in c for c in r.calls))
+
+    def test_refuses_when_installed_script_is_missing(self):
+        bw.installed_script(self.home).unlink()
+        r = Runner()
+        out, rc = bw.install(self.home, True, "Linux", r)
+        self.assertEqual((rc, r.calls), (3, []))
 
     def test_plist_parses_and_targets_installed_script_not_checkout(self):
         import plistlib
         (path, text), = bw.unit_files(self.home, "Darwin")
         d = plistlib.loads(text.encode())
-        self.assertEqual(d["ProgramArguments"][1], str(self.home / ".claude" / "hooks" / "backup_watch.py"))
+        self.assertEqual(d["ProgramArguments"][1], str(bw.installed_script(self.home)))
         self.assertEqual(d["ProgramArguments"][2], "run")
         self.assertIn("StandardErrorPath", d)
         self.assertNotIn(str(ROOT), text)
 
-    def test_systemd_unit_targets_installed_script_quoted(self):
+    def test_systemd_unit_quotes_and_escapes(self):
         text = "".join(t for _, t in bw.unit_files(self.home, "Linux"))
-        self.assertIn(f'ExecStart=/usr/bin/python3 "{self.home}/.claude/hooks/backup_watch.py" run', text)
+        self.assertIn(f'ExecStart=/usr/bin/python3 "{bw.installed_script(self.home)}" run', text)
+        odd = bw.unit_files(Path("/tmp/a%b$c"), "Linux")[0][1]
+        self.assertIn("a%%b$$c", odd)
         self.assertNotIn(str(ROOT), text)
 
     def test_symlinked_destination_refused_and_nothing_activated(self):
@@ -201,19 +259,35 @@ class InstallCoverage(Base):
         d.mkdir(parents=True)
         (d / "user").symlink_to(self.home)
         r = Runner()
-        self.assertTrue(any("refused" in o for o in bw.install(self.home, True, "Linux", r)))
-        self.assertEqual(r.calls, [])
+        out, rc = bw.install(self.home, True, "Linux", r)
+        self.assertTrue(any("refused" in o for o in out))
+        self.assertEqual((rc, r.calls), (5, []))
 
     def test_preexisting_tmp_symlink_not_followed(self):
+        import os
         d = self.home / ".config" / "systemd" / "user"
         d.mkdir(parents=True)
         victim = self.home / "victim"
         victim.write_text("keep")
         for name in ("backup-watch.service", "backup-watch.timer"):
-            (d / f"{name}.tmp.{__import__('os').getpid()}").symlink_to(victim)
+            (d / f"{name}.tmp.{os.getpid()}").symlink_to(victim)
         with self.assertRaises(OSError):
             bw.install(self.home, True, "Linux", Runner())
         self.assertEqual(victim.read_text(), "keep")
+
+
+class Reader(Base):
+    def test_alert_notifies_once_per_change_and_internal_error_is_five(self):
+        self.mark(lb.LAST_OK, 99999)
+        bw.run(self.home, NOW)
+        bw.run(self.home, NOW + 60)
+        self.assertEqual(len(self.notices), 1)
+        orig = bw._write_private
+        bw._write_private = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+        try:
+            self.assertEqual(bw.main(["run", "--home", str(self.home)]), 5)
+        finally:
+            bw._write_private = orig
 
 
 class ShippedHooksAreInstalled(unittest.TestCase):
