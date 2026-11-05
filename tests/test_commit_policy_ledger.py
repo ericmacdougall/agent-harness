@@ -20,6 +20,17 @@ ROOT = Path(__file__).resolve().parents[1]
 HOOKS = ROOT / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import commit_policy as cp  # noqa: E402
+
+
+PROFILE = Path(__file__).resolve().parent / "data" / "ledger_local_profile.json"
+
+
+def load_policy_with_repos():
+    """The shipped policy tracks no repository (the list lives in each user's local profile), so these tests
+    give it the pattern they exercise."""
+    policy = cp.load_policy()
+    policy["ticket_systems"]["goodqa"]["repos"] = [r"github\.com[:/]ericmacdougall/"]
+    return policy
 import ticket_adapters  # noqa: E402
 
 FEAT = """feat(ledger): reference a local ledger ticket from a commit
@@ -74,7 +85,8 @@ class LedgerWorld(unittest.TestCase):
                     if not k.startswith(("GIT_", "CLAUDE", "CODEX", "AI_AGENT", "HARNESS_"))}
         self.env.update(HOME=str(home), GIT_CONFIG_GLOBAL=str(gitconfig), GIT_CONFIG_NOSYSTEM="1",
                         PATH=f"{self.bin_dir}{os.pathsep}{os.environ.get('PATH', '')}", TZ="UTC",
-                        HARNESS_LEDGER_FAKE_MACHINE_ID="machine-A", PYTHONDONTWRITEBYTECODE="1")
+                        HARNESS_LEDGER_FAKE_MACHINE_ID="machine-A", PYTHONDONTWRITEBYTECODE="1",
+                        AGENT_HARNESS_POLICY_LOCAL=str(PROFILE))
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.git("init", "-q")
@@ -104,7 +116,7 @@ class LedgerWorld(unittest.TestCase):
 
     def in_process(self, message, policy=None):
         """validate() exactly as check-message --repo runs it, with an editable policy."""
-        policy = policy or cp.load_policy()
+        policy = policy or load_policy_with_repos()
         policy["ticket_systems"]["ledger"]["binary"] = str(self.bin_dir / "harness")
         with mock.patch.dict(os.environ, {"HOME": self.env["HOME"], "HARNESS_LEDGER_FAKE_MACHINE_ID": "machine-A",
                                           "GIT_CONFIG_GLOBAL": self.env["GIT_CONFIG_GLOBAL"],
@@ -159,7 +171,7 @@ class TrackedRepoRule(LedgerWorld):
     def test_remote_removed_needs_allowed_repos(self):
         self.git("remote", "remove", "origin")
         self.assert_rejected("Ledger refs count only in untracked repos or repos listed in ledger.allowed_repos")
-        policy = cp.load_policy()
+        policy = load_policy_with_repos()
         policy["ticket_systems"]["ledger"]["allowed_repos"] = [re_escape(str(self.repo))]
         self.assertEqual(self.in_process(FEAT.format(ref=self.ref), policy), [])
         # A prefix-only match is not enough: allowed_repos patterns must match the whole path.
@@ -184,7 +196,7 @@ class TrackedRepoRule(LedgerWorld):
         path.write_text(FEAT.format(ref=f"Ledger demo#{later}"))
         run(["git", "commit", "-q", "--allow-empty", "-F", str(path)], cwd=self.repo,
             env={**self.env, "GIT_AUTHOR_DATE": past})
-        policy = cp.load_policy()
+        policy = load_policy_with_repos()
         policy["enforce_after"] = None
         with mock.patch.dict(os.environ, {"PATH": self.env["PATH"], "HOME": self.env["HOME"],
                                           "HARNESS_LEDGER_FAKE_MACHINE_ID": "machine-A"}):
@@ -211,7 +223,7 @@ class TrackedRepoRule(LedgerWorld):
                 self.assert_rejected()
 
     def test_push_url_counts_toward_tracking(self):
-        policy = cp.load_policy()
+        policy = load_policy_with_repos()
         self.assertFalse(cp.repo_ticket_context(str(self.repo), policy)["tracked"])
         self.assertTrue(cp.repo_ticket_context(str(self.repo), policy, push_url=TRACKED)["tracked"])
 
@@ -256,7 +268,7 @@ class ShimFailsClosed(unittest.TestCase):
         return str(path)
 
     def problems(self, binary):
-        policy = cp.load_policy()
+        policy = load_policy_with_repos()
         policy["ticket_systems"]["ledger"]["binary"] = binary
         context = cp.repo_ticket_context(str(self.repo), policy)
         self.assertTrue(context["ledger_allowed"])
