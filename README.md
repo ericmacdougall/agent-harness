@@ -22,7 +22,7 @@ python3 install.py --apply
 
 ```sh
 python3.11 install_codex.py
-python3.11 install_codex.py --apply
+python3.11 install_codex.py --apply  # sets the work-assignments ledger to enforce; add --ledger-mode warn to hold it in warn mode
 ```
 
 Replace `python3.11` with your available Python 3.11+ executable if needed. The Codex installer adds a narrow permission profile for private WAL writes and local Git commits. To explicitly select built-in Full Access for new chats, preview and apply with `--default-full-access`; [Codex setup and limits](docs/codex.md) explains the effect, legacy sandbox conflicts, and separate Browser site permissions. Windows behavior has not been tested.

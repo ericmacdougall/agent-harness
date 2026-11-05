@@ -435,8 +435,9 @@ def main() -> None:
     except (ValueError, RuntimeError) as error:
         parser.exit(2, f'error: {error}\n')
     print(('Installed' if args.apply else 'Would install') + f' Codex Agent Harness in {args.home / ".codex"}')
-    if args.ledger_mode != 'enforce':
-        print(f'Work-assignments ledger on Codex: {args.ledger_mode} (re-run without --ledger-mode to enforce).')
+    # Always said: a plain reinstall moves warn to enforce, and that must not pass unnoticed.
+    print(f'Work-assignments ledger on Codex: {args.ledger_mode}' + ('' if args.ledger_mode == 'enforce'
+                                                                     else ' (re-run without --ledger-mode to enforce)') + '.')
     if args.default_full_access:
         print('Full Access default requested: unrestricted local filesystem and network; approval prompts disabled.')
     for path in changes:

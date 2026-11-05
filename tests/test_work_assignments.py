@@ -40,6 +40,15 @@ def human(text, uid=None, **extra):
     return record
 
 
+def queued(text, uid=None, **item):
+    """A message typed mid-turn, in the shape of real transcripts (keys checked on a real session; text synthetic)."""
+    attachment = {"type": "queued_command", "prompt": text, "commandMode": "prompt", "humanTurn": True, "origin": {"kind": "human"},
+                  "source_uuid": str(uuidlib.uuid4()), "timestamp": wa.iso(CLOCK[0])}
+    attachment.update(item)
+    return {"type": "attachment", "uuid": uid or str(uuidlib.uuid4()), "isSidechain": False, "timestamp": wa.iso(CLOCK[0]),
+            "entrypoint": "cli", "attachment": attachment}
+
+
 def validator(ref=None):
     schema = SCHEMA if ref is None else {"$schema": SCHEMA["$schema"], "$ref": f"#/$defs/{ref}", "$defs": SCHEMA["$defs"]}
     return jsonschema.Draft202012Validator(schema)
@@ -159,6 +168,48 @@ class CaptureTest(Base):
         self.assertEqual((msg["humanCheck"]["isHuman"], msg["origin"]["actor"]["kind"]), (True, "human"))
         self.assertNotIn("model", msg["origin"]["actor"])
         self.check_schema()
+
+    def test_a_message_typed_mid_turn_binds_like_any_other(self):
+        """Acceptance v13-b F1: 38 of 88 human messages in one real session were queued, and none could bind."""
+        uid = str(uuidlib.uuid4())
+        self.hook("prompt", self.payload("please also check the invoices"))
+        self.assertEqual(self.last_message()["origin"]["binding"]["status"], "pending")
+        self.append(queued("please also check the invoices", uid))
+        self.assertEqual(self.cli("sync")[0], 0)
+        msg = self.last_message()
+        self.assertEqual((msg["origin"]["binding"]["status"], msg["origin"]["log"]["messageUuid"]), ("bound", uid))
+        self.assertEqual(len(self.data()["messages"]), 1)
+        self.check_schema()
+
+    def test_queued_prompts_that_are_not_human_stay_out(self):
+        for record in (queued("from an agent please do it", origin={"kind": "task-notification"}),
+                       queued("marked not a turn please do it", humanTurn=False),
+                       queued("marked sidechain please do it") | {"isSidechain": True},
+                       queued("shell mode please do it", commandMode="bash"),
+                       queued("no origin please do it", origin=None)):
+            self.append(record)
+        self.append({"type": "attachment", "uuid": str(uuidlib.uuid4()), "attachment": {"type": "other", "origin": {"kind": "human"}, "humanTurn": True, "prompt": "x y z"}})
+        self.assertEqual(self.cli("sync")[0], 0)
+        self.assertEqual(self.data()["messages"], {})
+
+    def test_a_queued_prompt_given_as_blocks_binds(self):
+        self.hook("prompt", self.payload("please read this one too"))
+        self.append(queued([{"type": "text", "text": "please read this one too"}, {"type": "image", "source": {}}]))
+        self.cli("sync")
+        self.assertEqual(self.last_message()["origin"]["binding"]["status"], "bound")
+
+    def test_an_answer_stores_the_humans_words_not_the_agents_question(self):
+        """Acceptance v13-b F2: `questions` comes first in the reply, so the agent's words were the human's excerpt."""
+        for key, response in (("toolu_a", {"questions": [{"question": "Which synthetic color please", "header": "Color"}],
+                                           "answers": {"Which synthetic color please": "plain teal"},
+                                           "annotations": {"Which synthetic color please": {"notes": "matte finish"}}}),
+                              ("toolu_b", {"answers": {"id1": {"answers": ["pale amber"]}}}),
+                              ("toolu_c", 'User has answered your questions: "Which synthetic color please"="deep violet". Continue.')):
+            self.hook("ask-answer", {"session_id": SID, "tool_use_id": key, "tool_name": "AskUserQuestion", "tool_response": response})
+        excerpts = [m["text"]["excerpt"] for m in self.data()["messages"].values()]
+        self.assertEqual(len(excerpts), 3)
+        self.assertEqual(sorted(excerpts), sorted(["plain teal matte finish", "pale amber", "deep violet"]))
+        self.assertFalse(any("please" in text or "synthetic" in text for text in excerpts))
 
     def test_raw_human_text_is_never_stored(self):
         self.capture("filler " * 20 + "zebra-quartz-marmalade-unique-token and more words after it")
@@ -638,6 +689,24 @@ class StopTest(Base):
         with mock.patch.object(wa, "agent_stopped", lambda s, a: True):
             self.assertEqual(self.stop()["decision"], "block")
 
+    def test_the_real_stop_reader_follows_the_wal_and_a_resume_clears_it(self):
+        """Acceptance v13-b F3: NEG-13 mocked this reader. The line is written by the real wal.py."""
+        wal_dir = Path.home() / ".claude" / "wals" / SID
+        wal_dir.mkdir(parents=True)
+        agent_wal = wal_dir / "agent-zz.jsonl"
+        self.assertFalse(wa.agent_stopped(SID, "zz"))
+        agent_wal.write_text('{"at":"2027-01-15T08:00:00+00:00","event":"subagent_start","agent_id":"zz"}\n')
+        self.assertFalse(wa.agent_stopped(SID, "zz"))
+        payload = {"session_id": SID, "agent_id": "zz", "agent_type": "task-owner", "cwd": self.tmp.name, "hook_event_name": "SubagentStop"}
+        run = subprocess.run([sys.executable, str(HOOKS / "wal.py"), "subagent_stop"], input=json.dumps(payload).encode(), capture_output=True,
+                             env={**os.environ, "HOME": str(Path.home()), "CLAUDE_CONFIG_DIR": str(Path.home() / ".claude")}, timeout=20)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn(b"subagent_stop", agent_wal.read_bytes(), "the real wal.py must write the line this reader looks for")
+        self.assertTrue(wa.agent_stopped(SID, "zz"))
+        with agent_wal.open("a") as handle:
+            handle.write('{"at":"2027-01-15T09:00:00+00:00","event":"subagent_start","agent_id":"zz"}\n')
+        self.assertFalse(wa.agent_stopped(SID, "zz"))
+
     def test_codex_stop_payload_blocks_with_decision_block(self):
         self.hook("prompt", self.payload("codex needs triage", turn_id="t1"), runtime="codex")
         reply = self.hook("stop", {"session_id": SID, "transcript_path": str(self.transcript), "turn_id": "t1",
@@ -886,6 +955,26 @@ class RemovalTest(Base):
         self.cli("prune", "--apply")
         self.assertIn(thanks["id"], self.data()["messages"])
 
+    def test_a_cancel_typed_mid_turn_is_proof(self):
+        """Acceptance v13-b F1: a cancel is usually typed while the agent is busy."""
+        _, aid = self.split("start something", "finish the whole thing please")
+        uid = str(uuidlib.uuid4())
+        self.hook("prompt", self.payload(f"cancel {aid}"))
+        self.append(queued(f"cancel {aid}", uid))
+        self.assertEqual(self.cli("sync")[0], 0)
+        line = self.transcript.read_text().count("\n")
+        self.assertEqual(self.cli(*self.cancel_args(aid, uid, line))[0], 0)
+        self.assertEqual(self.asks()[aid]["cancellation"]["proof"]["binding"], "explicit_reference")
+        CLOCK[0] += 25 * 3600
+        self.assertEqual(self.cli("remove", aid)[0], 0)  # the proof is read again at removal
+
+    def test_a_queued_prompt_without_the_human_marks_is_not_proof(self):
+        _, aid = self.split("start something", "finish the whole thing please")
+        uid = str(uuidlib.uuid4())
+        self.append(queued(f"cancel {aid}", uid, origin={"kind": "task-notification"}))
+        line = self.transcript.read_text().count("\n")
+        self.assertEqual(self.cli(*self.cancel_args(aid, uid, line))[0], 2)
+
     def test_cancel_with_genuine_proof_then_removal_after_24h(self):
         aid, uid, line = self.setup_cancel()
         self.assertEqual(self.cli(*self.cancel_args(aid, uid, line))[0], 0)
@@ -1058,6 +1147,51 @@ class RemovalTest(Base):
         args = self.cancel_args(aid, uid, 2, None, "answer_to_decision", "--decision", did)
         self.assertEqual(self.cli(*args)[0], 0)
         self.check_schema()
+
+    def ask_answer(self, key, reply):
+        self.hook("ask-answer", {"session_id": SID, "tool_use_id": key, "tool_name": "AskUserQuestion", "tool_response": {"answers": {"q": reply}}})
+        return self.last_message()
+
+    def test_an_askuserquestion_answer_records_as_the_answer(self):
+        """PR review b1ac561 F3: it could not bind, so the decision could only be `assumed`, which recorded a real answer wrongly."""
+        _, aid = self.split("start something", "refactor the billing exporter module")
+        did = self.ask_decision(aid, "Which billing exporter format should it use?")
+        msg = self.ask_answer("toolu_d1", "the csv format")
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", msg["id"])[0], 0)
+        self.assertEqual(self.data()["decisions"][did]["state"], "answered")
+        self.check_schema()
+
+    def test_a_reply_typed_mid_turn_records_as_the_answer(self):
+        _, aid = self.split("start something", "refactor the billing exporter module")
+        did = self.ask_decision(aid, "Which billing exporter format should it use?")
+        self.hook("prompt", self.payload("the parquet format please"))
+        self.append(queued("the parquet format please"))
+        self.cli("sync")
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", self.last_message()["id"])[0], 0)
+        self.assertEqual(self.data()["decisions"][did]["state"], "answered")
+
+    def test_only_the_first_reply_answers_and_an_askuserquestion_answer_is_never_cancel_proof(self):
+        _, aid = self.split("start something", "refactor the billing exporter module")
+        did = self.ask_decision(aid, f"Cancel it? Reply `cancel {aid}` to cancel it.")
+        first = self.ask_answer("toolu_d2", f"cancel {aid}")
+        later = self.capture("a later typed reply about the exporter")
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", later["id"])[0], 2)
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", first["id"])[0], 0)
+        for binding in ("answer_to_decision", "answer_to_cancel_question", "explicit_reference"):
+            args = self.cancel_args(aid, first["humanCheck"].get("providerItemId") or "toolu_d2", 1, None, binding, "--decision", did)
+            self.assertEqual(self.cli(*args)[0], 2, binding)
+        self.assertEqual(self.asks()[aid]["state"], "open")
+
+    def test_an_askuserquestion_answer_is_prunable_and_never_reported_as_unbindable(self):
+        """PR review b1ac561 F4: it stays pending for good, so it was kept forever and an untriaged one raised cannot-bind."""
+        msg = self.ask_answer("toolu_d3", "the csv format")
+        CLOCK[0] += 3 * 3600
+        self.hook("session", {"session_id": SID, "transcript_path": str(self.transcript), "source": "startup"})
+        self.assertFalse([v for v in self.data()["violations"] if v.get("kind") == "cannot_bind"])
+        self.assertEqual(self.cli("no-ask", "--msg", msg["id"], "--reason", "answers a question already closed")[0], 0)
+        CLOCK[0] += (wa.PRUNE_NO_ASK_DAYS + 1) * 86400
+        self.assertEqual(self.cli("prune", "--apply")[0], 0)
+        self.assertNotIn(msg["id"], self.data()["messages"])
 
     def test_refusal_is_not_cancel_proof(self):
         """PR review 62e5e5f #1 and 39c949d #1/#2: refusals, a "reinstate" reply, curly quotes, and a retraction of a
@@ -2025,7 +2159,9 @@ class LatencyTest(Base):
         env = {**os.environ, "PYTHONPATH": str(HOOKS)}
         removal = f"; {'r' + 'm'} {wa.base()}/work-ledger.json"
         for text in (f"python3 /{'A' * 512 * 1024} {removal}", f"python3 x/work_assignments.py status{' ' * 512 * 1024}{removal}",
-                     f"python3 /{'A' * 512 * 1024} -c 'import work_assignments'"):
+                     f"python3 /{'A' * 512 * 1024} -c 'import work_assignments'",
+                     # PR review b1ac561: a run of c in a shell's flag took 12.7 s at 32 KiB, past the hook timeout
+                     f"bash -{'c' * 512 * 1024}! {removal}"):
             payload = {"session_id": SID, "tool_name": "Bash", "tool_input": {"command": text}, "cwd": self.tmp.name}
             started = time.monotonic()
             run = subprocess.run([sys.executable, str(HOOKS / "work_assignments.py"), "hook", "guard"],
@@ -2040,7 +2176,8 @@ class LatencyTest(Base):
                      "  python3  /a/b/work_assignments.py  show  x  y ", "python3 ./work_assignments.py decision ask --text 'a b'",
                      "python3 x/work_assignments.py status\n"):
             self.assertTrue(wa.SAFE_CLI.match(good), good)
-        for bad in ("python3 x/work_assignments.py status; ls", "python3 x/work_assignments.py status a\n ls", "python3 $(x)/work_assignments.py status",
+        for bad in ("python3 x/work_assignments.py status\n ls", "python3 x/work_assignments.py status\nls", "python3 x/work_assignments.py\nstatus",
+                    "python3 x/work_assignments.py status; ls", "python3 x/work_assignments.py status a\n ls", "python3 $(x)/work_assignments.py status",
                     "python3 x/work_assignments.py status > y", "python3 $HOME$HOME/work_assignments.py status", "python3 work_assignments.py status"):
             self.assertFalse(wa.SAFE_CLI.match(bad), bad)
 
@@ -2056,6 +2193,17 @@ class LatencyTest(Base):
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(run.returncode, 0, run.stderr)
         return run.stdout
+
+    def test_a_second_line_after_a_cli_call_is_judged(self):
+        """PR review b1ac561 F2, NEG-23: a newline after a bare CLI call passed SAFE_CLI, so the next line went unjudged."""
+        cli = "python3 ~/.claude/hooks/work_assignments.py status"
+        ledger, policy = f"{wa.base()}/work-ledger.json", "~/.claude/hooks/work_assignments_policy.json"
+        env = {**os.environ, "PYTHONPATH": str(HOOKS)}
+        for second in (f"{'r' + 'm'} {ledger}", f"mv {ledger} /tmp/x", f"cp /tmp/x {policy}", f"sed -i s/a/b/ {policy}", f"\n  {'r' + 'm'} {ledger}"):
+            payload = {"session_id": SID, "tool_name": "Bash", "tool_input": {"command": f"{cli}\n{second}"}, "cwd": self.tmp.name}
+            run = subprocess.run([sys.executable, str(HOOKS / "work_assignments.py"), "hook", "guard"], input=json.dumps(payload).encode(),
+                                 capture_output=True, env=env, timeout=20)
+            self.assertIn(b'"deny"', run.stdout, second)
 
     def test_guard_timeout_denies_in_enforce_and_other_hooks_stay_open(self):
         """Owner decision from the live check: the guard's own abort denies; a ledger hook's abort must not block the turn."""

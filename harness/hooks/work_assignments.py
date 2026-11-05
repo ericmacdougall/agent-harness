@@ -71,8 +71,9 @@ DEFAULT_POLICY = {"schema": 1, "capture": "enforce", "stop": "enforce", "guard":
 PROTECTED = re.compile(r"work-(?:assign|ledger)[A-Za-z0-9._*?-]*|work_assignments_policy[A-Za-z0-9._*?-]*|"
                        r"work_assign[a-z]*[*?]|work-[a-z]+[*?]|\bhive\.json\b")
 # Linear on purpose, with the same language as its older form: past the 10 s hook timeout the tool runs, and a regex holds
-# the GIL so the 6 s abort cannot fire. No two adjacent parts here may match the same character.
-SAFE_CLI = re.compile(r"^\s*python3\s+(?:\$HOME)?[^\s;&|<>`$]*/work_assignments\.py\s+[A-Za-z-]+(?:\s+(?:[^\s;&|<>`$][^;&|<>`$\n]*)?)?$")
+# the GIL so the 6 s abort cannot fire. No two adjacent parts here may match the same character. Blanks are spaces and tabs:
+# a newline ends the command, and what follows it is another command.
+SAFE_CLI = re.compile(r"^\s*python3[ \t]+(?:\$HOME)?[^\s;&|<>`$]*/work_assignments\.py[ \t]+[A-Za-z-]+(?:[ \t]+(?:[^\s;&|<>`$][^;&|<>`$\n]*)?)?$")
 KEY_FILE = re.compile(r"(?i)work-ledger\.key")
 GLOB_WORD = re.compile(r"[^\s'\"=;&|<>()`]+")  # an older two-star glob pattern was quadratic on one long token: 64 KB took 28 s
 HOOK_CALL = re.compile(r"\bhook\s+(?:prompt|stop|session|compact|ask-answer|guard|subagent-start)\b")
@@ -586,7 +587,7 @@ def effective_argv(words: list) -> tuple:
 def shell_script(argv: list, heredoc) -> str | None:
     """The script a shell would run: its `-c` text, or a here-document on stdin. A script file is not read."""
     for index, word in enumerate(argv[1:], 1):
-        if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", word):
+        if "c" in word and re.fullmatch(r"-[A-Za-z]+", word):  # one class, so linear: this runs on every word of a shell call
             return " ".join(argv[index + 1:])
     return heredoc
 
@@ -1896,6 +1897,22 @@ def spoolable(fields: dict) -> dict:
 CODEX_INJECTED = re.compile(r"\s*(?:<(?:environment_context|user_instructions|turn_aborted|INSTRUCTIONS)\b|# AGENTS\.md instructions)")
 
 
+def queued_text(record: dict):
+    """The text of a message the human typed while the agent was working, else None. Claude Code records it as an
+    `attachment` of type `queued_command`, never as a user turn; agent and task-notification prompts lack the human marks."""
+    item = record.get("attachment")
+    if record.get("type") != "attachment" or record.get("isSidechain") or not isinstance(item, dict):
+        return None
+    origin = item.get("origin")
+    if (item.get("type") != "queued_command" or item.get("humanTurn") is not True or item.get("commandMode", "prompt") != "prompt"
+            or not isinstance(origin, dict) or origin.get("kind") != "human"):
+        return None
+    prompt = item.get("prompt")
+    if isinstance(prompt, list):
+        prompt = "\n".join(b["text"] for b in prompt if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
+    return prov.strip_blocks(prompt) if isinstance(prompt, str) else None
+
+
 def human_records(raw: bytes, runtime: str, first_line: int):
     """Yield (line_number, id, ts, text, pasted, line_sha) for genuine human turns in complete transcript lines."""
     marker = b'"origin"' if runtime == "claude" else b'"UserMessage"'
@@ -1912,6 +1929,8 @@ def human_records(raw: bytes, runtime: str, first_line: int):
             if str(record.get("entrypoint") or "").startswith("sdk"):
                 continue  # a headless turn, written by a program
             text, _ = prov.user_authorship(record)
+            if text is None:
+                text = queued_text(record)
             if text is None:
                 continue
             uid, ts = record.get("uuid"), record.get("timestamp")
@@ -2059,7 +2078,9 @@ def sync_all(data: dict, session=None) -> int:
 def agent_stopped(session: str, agent: str) -> bool:
     try:
         wal = Path.home() / ".claude" / "wals" / prov.safe_name(session) / f"agent-{prov.safe_name(agent)}.jsonl"
-        return b'"event":"subagent_stop"' in prov.read_tail(wal, 65536)
+        tail = prov.read_tail(wal, 65536)
+        at = tail.rfind(b'"event":"subagent_stop"')
+        return at >= 0 and not tail[at:].partition(b"\n")[2].strip()  # anything after the stop means it was resumed
     except prov.Problem:
         return False
 
@@ -2266,7 +2287,7 @@ def surface_warnings(data: dict, session: str) -> list:
             emit(data, "acknowledged", "ledger", "ledger", {"violationId": v["id"]}, actor("harness", "harness", session))
     for mid, m in list(data["messages"].items()):
         if m["sessionId"] == session and m["triage"]["status"] == "untriaged" and m["origin"]["binding"]["status"] == "pending" \
-                and now() - parse_ts(m["capturedAt"]) > PENDING_BIND_SECONDS:
+                and not never_binds(m) and now() - parse_ts(m["capturedAt"]) > PENDING_BIND_SECONDS:
             emit(data, "unbindable", "message", mid, {"reason": "no transcript line after 2h", "attempts": m["origin"]["binding"].get("attempts", 0)},
                  actor("harness", "harness", session))
             add_violation(data, "cannot_bind", session, f"{mid} could not be bound to a transcript line after 2h (cannot-bind)", targets=())
@@ -2345,6 +2366,32 @@ def hook_compact(payload: dict, runtime: str) -> dict:
     return {}
 
 
+ANSWER_PAIR = re.compile(r'"[^"]*"="([^"]*)"')
+
+
+def answer_text(response) -> str:
+    """Only what the human chose or wrote. The tool's reply also carries the agent's `questions`, and they come first, so
+    dumping it stored the agent's words as the human's excerpt and request cues. Keys of `answers` are question text."""
+    def leaves(value):
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, dict):
+            return [leaf for item in value.values() for leaf in leaves(item)]
+        if isinstance(value, list):
+            return [leaf for item in value for leaf in leaves(item)]
+        return []
+
+    if isinstance(response, str):
+        return "\n".join(ANSWER_PAIR.findall(response)) or response
+    if isinstance(response, dict) and "answers" in response:
+        notes = [note.get("notes") for note in (response.get("annotations") or {}).values() if isinstance(note, dict)] \
+            if isinstance(response.get("annotations"), dict) else []
+        return "\n".join(leaves(response["answers"]) + [n for n in notes if isinstance(n, str)])
+    if isinstance(response, dict):
+        response = {k: v for k, v in response.items() if k != "questions"}
+    return json.dumps(response, ensure_ascii=False)
+
+
 def hook_ask_answer(payload: dict, runtime: str) -> dict:
     session = str(payload.get("session_id") or "")
     if load_policy()["capture"] == "off" or not valid_session(session) or payload.get("agent_id"):
@@ -2352,7 +2399,7 @@ def hook_ask_answer(payload: dict, runtime: str) -> dict:
     if headless_run(runtime, payload.get("transcript_path") if isinstance(payload.get("transcript_path"), str) else None):
         return {}
     response = payload.get("tool_response", payload.get("tool_result"))
-    text = json.dumps(response, ensure_ascii=False)[:20000] if response is not None else ""
+    text = answer_text(response)[:20000] if response is not None else ""
     if not text.strip() or text in ("null", "{}", '""'):
         return {}
     transcript = payload.get("transcript_path") if isinstance(payload.get("transcript_path"), str) else None
@@ -2685,6 +2732,11 @@ def captured_after(mid: str, did: str, asked_at: float) -> bool:
     if m_hive == d_hive:
         return int(m_seq) > int(d_seq)
     return False  # another hive's message cannot answer this hive's question
+
+
+def never_binds(msg: dict) -> bool:
+    """An AskUserQuestion answer is a tool result, so it has no transcript line of its own to bind to."""
+    return msg["humanCheck"]["method"] == "claude_ask_answer"
 
 
 def answer_problem(data: dict, dec: dict, msg: dict):
@@ -3110,7 +3162,7 @@ def message_prunable(data: dict, msg: dict, ts: float) -> bool:
     and not referenced by a live cancel proof or decision answer."""
     age = ts - parse_ts(msg["capturedAt"])
     triage = msg["triage"]
-    if triage["status"] == "untriaged" or msg["origin"].get("binding", {}).get("status") == "pending":
+    if triage["status"] == "untriaged" or (msg["origin"].get("binding", {}).get("status") == "pending" and not never_binds(msg)):
         return False  # a pending binding means sync may still read its line; a tombstone without the uuid cannot stop re-capture
     if triage["status"] == "no_ask":
         if age < PRUNE_NO_ASK_DAYS * 86400:
@@ -3227,7 +3279,7 @@ def cmd_decision(args):
             msg = find_message(data, args.msg)
             if not dec or dec["state"] not in ("asked", "assumed"):
                 raise WAError("decision not found or already closed")
-            if not verified_human(msg) or msg["origin"]["binding"]["status"] != "bound":
+            if not verified_human(msg) or (msg["origin"]["binding"]["status"] != "bound" and not never_binds(msg)):
                 raise WAError("an answer needs a hook-captured human message bound to a transcript line (run `sync`)")
             why = answer_problem(data, dec, msg)
             if why:

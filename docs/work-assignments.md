@@ -178,6 +178,8 @@ A bare name after an unresolved `$VAR` is not judged; the real files are still c
 
 ## Known limits
 
+- A message typed while the agent is working is recorded by Claude Code as a `queued_command` attachment, not a user turn. It binds to that attachment and counts as a typed message, including for a cancel. An AskUserQuestion answer has no transcript line of its own: it stays pending, can answer a decision and be pruned, and is never cancel proof.
+
 A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt and no request cues, and an excerpt whose first 15 words look secret-adjacent
 (pass..., pw, key, token, secret, credential, login, ssh, auth..., PIN, OTP, common key prefixes) is withheld entirely.
 That check is a keyword heuristic too: a secret with none of those words nearby can still reach the excerpt, the
