@@ -369,6 +369,89 @@ class CoverageTests(Fixture):
         p = self.run_cli("report", expect=1)
         self.assertNotIn("Traceback", p.stderr.decode())
 
+    def undecided(self):
+        return [x["path"] for x in json.loads(self.run_cli("report", "--json").stdout)["undecided"]]
+
+    def test_r4_f1_fingerprint_covers_all_refs_not_just_heads(self):
+        path = str(self.noremote)
+        self.scan()
+        self.run_cli("decide", "--row", path, "--decision", "moved", "--ticket", "t#1", expect=0)
+        git(self.noremote, "checkout", "-q", "--detach")
+        commit(self.noremote, "kept-by-tag")
+        git(self.noremote, "tag", "keep")
+        git(self.noremote, "checkout", "-q", "main")  # HEAD and every branch tip are back where they were
+        self.scan()
+        self.assertIn(path, self.undecided())
+
+    def test_r4_f2_allow_symlink_target_root_rejected_and_acks_shown(self):
+        out = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, str(out))
+        os.symlink(str(out), str(self.home / "linkdir"))
+        self.assertEqual(self.run_cli("scan", "--root", str(self.home), "--allow-symlink-target", "/").returncode, 2)
+        self.run_cli("scan", "--root", str(self.home), "--allow-symlink-target", str(out), "--json", expect=0)
+        rj = json.loads(self.run_cli("report", "--json").stdout)
+        self.assertEqual(rj["symlink_allow"], [str(out)])
+        self.assertEqual([a["path"] for a in rj["acked_symlinks"]], [str(self.home / "linkdir")])
+        txt = self.run_cli("report").stdout.decode()
+        self.assertIn("SYMLINK_ALLOW", txt)
+        self.assertIn("ACKED_SYMLINK", txt)
+
+    def test_r4_f3_excludes_block_report_unless_acknowledged(self):
+        self.run_cli("scan", "--root", str(self.home), "--exclude", "code", "--json", expect=0)
+        self.decide_all()
+        p = self.run_cli("report", expect=1)
+        self.assertIn("EXCLUDES", p.stdout.decode())
+        q = self.run_cli("report", "--ack-excludes", expect=0)
+        self.assertIn("EXCLUDED_DIR_NAMES", q.stdout.decode())
+
+    def test_r4_f4_nested_remote_name_does_not_inherit_prefix_remote(self):
+        git(self.work, "remote", "remove", "origin")
+        git(self.work, "remote", "add", "a", "https://remote.example.invalid/a.git")
+        git(self.work, "config", "remote.a/b.url", str(self.bare))  # same-host, nested name
+        git(self.work, "config", "remote.a/b.fetch", "+refs/heads/*:refs/remotes/a/b/*")
+        for br in ("main", "work"):
+            git(self.work, "update-ref", "refs/remotes/a/b/%s" % br, br)
+        r = self.scan()
+        self.assertEqual(r["classes"]["no_remote_repo"], 2, r["rows"])  # nothing proven off-host
+        self.assertTrue(any(e["path"] == str(self.work) and "remote name" in e["error"] for e in r["errors"]), r["errors"])
+        self.run_cli("report", expect=1)
+
+    def test_r4_f5_lookalike_bare_dir_inside_repo_is_walked(self):
+        look = self.work / "lookalike"
+        (look / "objects").mkdir(parents=True)
+        (look / "refs").mkdir()
+        (look / "HEAD").write_text("ref: refs/heads/x\n")
+        shutil.copy(str(self.db), str(look / "hidden.sqlite"))  # untracked, inside the enclosing repo
+        r = self.scan()
+        self.assertIn(str(look / "hidden.sqlite"), [x["path"] for x in r["rows"] if x["class"] == "state_db_outside_git"])
+        self.assertFalse(any(e["path"] == str(look) for e in r["errors"]), r["errors"])
+
+    def test_r4_f7_clean_filter_repo_is_skipped_with_blocking_error(self):
+        marker = self.home.parent / ("filter-ran-%d" % os.getpid())
+        self.addCleanup(lambda: marker.exists() and marker.unlink())
+        git(self.noremote, "config", "filter.x.clean", "touch %s; cat" % marker)
+        (self.noremote / ".gitattributes").write_text("* filter=x\n")
+        (self.noremote / "n1").write_text("modified so status must re-read it")
+        r = self.scan()
+        self.assertFalse(marker.exists(), "repo filter command was executed")
+        self.assertTrue(any(e["path"] == str(self.noremote) and "filter" in e["error"] for e in r["errors"]), r["errors"])
+        self.assertFalse(any(x["class"] == "dirty_worktree" and str(self.noremote) in x["path"] for x in r["rows"]))
+        self.decide_all()
+        self.run_cli("report", expect=1)
+
+    def test_r4_f7_every_git_call_disables_fsmonitor_and_signature_display(self):
+        real = shutil.which("git")
+        log = self.fakebin / "git.log"
+        g = self.fakebin / "git"
+        g.write_text('#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexec "%s" "$@"\n' % (log, real))
+        g.chmod(0o755)
+        self.scan()
+        calls = [l for l in log.read_text().splitlines() if " -C " in l or l.startswith("-C ")]
+        self.assertGreater(len(calls), 5)
+        for l in calls:
+            self.assertIn("core.fsmonitor=false", l)
+            self.assertIn("log.showSignature=false", l)
+
     def test_crontab_failure_is_an_error_not_empty(self):
         ct = self.fakebin / "crontab"
         ct.write_text('#!/bin/sh\necho "crontab: permission denied" >&2\nexit 1\n')

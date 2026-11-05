@@ -31,7 +31,7 @@ Subcommands
          prove nothing is left: wrong schema/missing keys, older than --max-age (default 24 h), roots
          do not include $HOME, partial (--max-seconds), scan errors, skipped other-filesystem dirs,
          or symlinks not followed whose target is outside the scanned roots. Exit 2 if no saved
-         scan, else 0. Excluded and built-in pruned directory names are listed in the output.
+         scan, else 0. Excluded names block until --ack-excludes; built-in pruned names are listed in the output.
 
 NOT covered (known limits): system units (/etc/systemd/system), other users' crontabs and homes,
 anything outside the --root dirs, remotes addressed by this host's LAN IP (only loopback, hostname and
@@ -41,7 +41,9 @@ remotes (url.insteadOf), and remote-side state (we never contact a remote).
 
 Safety: symlinks are never followed; the walk does not cross filesystems unless --cross-devices;
 node_modules, .git internals, virtualenvs and caches are skipped; every git call has a timeout,
-runs with optional locks off and fsmonitor disabled, and a failing repo becomes an entry in
+runs with optional locks off, fsmonitor disabled and signature display off. git status is skipped
+(with a blocking error) for a repo whose config defines a clean/process filter, because that would
+run a command from the repo. A failing repo becomes an entry in
 "errors", not a crash.
 """
 import argparse
@@ -121,6 +123,7 @@ class Scan:
         self.skipped_mounts = []
         self.skipped_symlinks = []
         self.skipped_symlinks_total = 0
+        self.acked_symlinks = []
         self.local_names = local_host_names()
 
     def err(self, path, what):
@@ -145,7 +148,7 @@ class Scan:
             env.pop(k, None)
         env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_LITERAL_PATHSPECS="1")  # optional locks off: status never writes the index
         # fsmonitor=false: a scanned repo's config must not be able to run a command
-        cmd = ["git", "-C", repo, "-c", "core.fsmonitor=false"] + list(argv)
+        cmd = ["git", "-C", repo, "-c", "core.fsmonitor=false", "-c", "log.showSignature=false"] + list(argv)
         try:
             p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
                                env=env, stdin=subprocess.DEVNULL)
@@ -178,6 +181,10 @@ class Scan:
                     urls += [u for u in o.split("\n") if u.strip()]
             if urls and not any(url_is_local(u, self.local_names) for u in urls):
                 good.append(n)
+        if any("/" in n for n in names):
+            # tracking refs of "a/b" live under refs/remotes/a/: they cannot be told apart from remote "a"
+            self.err(repo, "remote name contains '/'; cannot attribute tracking refs, repo treated as having no off-host remote")
+            good = []
         return names, good
 
     def any_not_in_remotes(self, repo, kind, offhost):
@@ -223,7 +230,8 @@ class Scan:
                 mtime = None
             # fingerprint = every local branch tip + HEAD, so a commit anywhere voids a decision
             rc2, head, _ = self.git(repo, "rev-parse", "--verify", "-q", "HEAD")
-            tips = "\n".join(l.split("\t")[0] + l.split("\t")[1] for l in refs.splitlines() if l.count("\t") == 2)
+            rc3, allrefs, _ = self.git(repo, "for-each-ref", "--format=%(refname)%(objectname)")  # every ref: tags, stash, notes
+            tips = allrefs if rc3 == 0 else "?"
             fp = hashlib.sha256((tips + "\nHEAD:" + (head.strip() if rc2 == 0 else "")).encode("utf-8", "replace")).hexdigest()[:16]
             self.row("no_remote_repo", repo, mtime, self.pack_bytes(common), fp)
         else:
@@ -266,6 +274,11 @@ class Scan:
 
     def check_dirty(self, repo):
         """Count of changed/untracked entries only (git status --porcelain, no index write)."""
+        # a clean/process filter would make status run a command from the repo's config: skip, fail closed
+        rc, flt, _ = self.git(repo, "config", "--get-regexp", r"^filter\..*\.(clean|process)$")
+        if rc == 0 and flt.strip():
+            raise RuntimeError("repo config defines a clean/process filter; git status skipped "
+                               "(it would run a repo-defined command); dirty state not inventoried")
         # explicit flags: user/repo config (status.showUntrackedFiles=no) must not hide files
         rc, out, er = self.git(repo, "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none")
         if rc != 0:
@@ -393,11 +406,23 @@ class Scan:
         """A symlink we did not follow. Blocks report unless its target is inside a scanned root
         (it is then inventoried through the real path) or under --allow-symlink-target."""
         target = os.path.realpath(path)
-        if not force and (self.walked(target) or self.inside(target, self.symlink_allow)):
+        if not force and self.walked(target):
+            return
+        if not force and self.inside(target, self.symlink_allow):
+            if len(self.acked_symlinks) < MAX_ERRORS:
+                self.acked_symlinks.append({"path": path, "target": target})
             return
         self.skipped_symlinks_total += 1
         if len(self.skipped_symlinks) < MAX_ERRORS:
             self.skipped_symlinks.append({"path": path, "target": target})
+
+    def is_own_git_dir(self, d):
+        """A HEAD/objects/refs look-alike inside an enclosing repo is not a bare repo."""
+        try:
+            rc, out, _ = self.git(d, "rev-parse", "--git-dir")
+        except RuntimeError:
+            return False
+        return rc == 0 and os.path.realpath(os.path.join(d, out.strip())) == os.path.realpath(d)
 
     def walk(self, root):
         try:
@@ -419,9 +444,12 @@ class Scan:
             self.dirs += 1
             names = {e.name: e for e in entries}
             # bare repository: HEAD + objects + refs; inventory it, do not descend
-            if all(n in names for n in ("HEAD", "objects", "refs")) and ".git" not in names:
-                self.analyze_repo(cur)
-                continue
+            if (all(n in names for n in ("HEAD", "objects", "refs")) and ".git" not in names
+                    and self.is_own_git_dir(cur)):
+                self.analyze_repo(cur)  # bare repository: inventory it
+                if repo_root is None:
+                    continue  # standalone bare repo: nothing else to find inside
+                # inside an enclosing work tree (git accepts any HEAD/objects/refs dir as bare): keep walking
             g = names.get(".git")
             if g is not None:
                 try:
@@ -559,6 +587,10 @@ def write_private(path, text):
 
 def cmd_scan(args):
     roots = [os.path.abspath(os.path.expanduser(r)) for r in args.root]
+    for a in args.allow_symlink_target or []:
+        if os.path.realpath(os.path.expanduser(a)) == "/":
+            print("error: --allow-symlink-target / would silence every symlink", file=sys.stderr)
+            return 2
     s = Scan(args)
     s.roots_real = [os.path.realpath(r) for r in roots]
     s.scan_units()
@@ -582,7 +614,7 @@ def cmd_scan(args):
         "errors": s.errors, "errors_total": s.errors_total,
         "skipped_mounts": s.skipped_mounts[:MAX_ERRORS], "skipped_mounts_total": len(s.skipped_mounts),
         "skipped_symlinks": s.skipped_symlinks, "skipped_symlinks_total": s.skipped_symlinks_total,
-        "symlink_allow": s.symlink_allow,
+        "symlink_allow": s.symlink_allow, "acked_symlinks": s.acked_symlinks,
         "excludes": sorted(s.extra_prune), "prune": sorted(PRUNE),
         "min_db_bytes": s.min_db, "no_crontab": bool(s.no_crontab),
         "note": "git state comes from local refs only (never fetched); remote-tracking refs may be stale",
@@ -677,6 +709,8 @@ def cmd_report(args):
     mdb = last.get("min_db_bytes")
     if not isinstance(mdb, int) or isinstance(mdb, bool) or mdb > DEFAULT_MIN_DB:
         problems.append("DB_THRESHOLD\tscan skipped databases below %s bytes (default %d); rescan with the default" % (last.get("min_db_bytes"), DEFAULT_MIN_DB))
+    if last.get("excludes") and not args.ack_excludes:
+        problems.append("EXCLUDES\tdirectory names excluded from the scan (%s): anything under them was not inventoried; review and pass --ack-excludes" % ",".join(last["excludes"]))
     if last.get("no_crontab"):
         problems.append("NO_CRONTAB\tcrontab was not checked (--no-crontab)")
     undecided = [r for r in merge_decisions(last["rows"]) if r.get("decision") is None]
@@ -693,7 +727,9 @@ def cmd_report(args):
         print(json.dumps({"scanned_at": last.get("scanned_at"), "roots": roots, "problems": problems,
                           "partial": bool(last.get("partial")), "errors_total": last.get("errors_total"),
                           "errors": errors, "skipped_mounts": last.get("skipped_mounts", []),
-                          "skipped_symlinks": last.get("skipped_symlinks", []), "excludes": last.get("excludes", []),
+                          "skipped_symlinks": last.get("skipped_symlinks", []),
+                          "symlink_allow": last.get("symlink_allow", []), "acked_symlinks": last.get("acked_symlinks", []),
+                          "excludes": last.get("excludes", []),
                           "prune": last.get("prune", []), "undecided": undecided}, indent=1))
     else:
         print("last scan %s (incomplete)" % last.get("scanned_at") if problems else "last scan %s" % last.get("scanned_at"))
@@ -708,6 +744,10 @@ def cmd_report(args):
             print("ERROR\t%s\t%s" % (e["path"], e["error"]))
         for m in last.get("skipped_mounts", []):
             print("SKIPPED_MOUNT\t%s" % m)
+        if last.get("symlink_allow"):
+            print("SYMLINK_ALLOW\t%s" % ",".join(last["symlink_allow"]))
+        for sl in last.get("acked_symlinks", []):
+            print("ACKED_SYMLINK\t%s -> %s" % (sl["path"], sl["target"]))
         for sl in last.get("skipped_symlinks", []):
             print("SKIPPED_SYMLINK\t%s -> %s" % (sl["path"], sl["target"]))
         if last.get("excludes"):
@@ -742,6 +782,7 @@ def main(argv=None):
     r = sub.add_parser("report")
     r.add_argument("--json", action="store_true")
     r.add_argument("--max-age", type=float, default=24, help="max scan age in hours (default 24)")
+    r.add_argument("--ack-excludes", action="store_true", help="acknowledge the scan's --exclude names (they are printed)")
     r.add_argument("--expect-host", help="fail unless the saved scan was taken on this host")
     r.add_argument("--allow-partial-roots", action="store_true", help="do not require $HOME under the scanned roots")
     args = p.parse_args(argv)
