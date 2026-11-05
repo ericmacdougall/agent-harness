@@ -198,6 +198,26 @@ class Exclusion(Case):
         self.assertTrue((out / "auth.json").exists())
         self.assertTrue((out / "member.key").exists())
 
+    def test_case_variants_of_credential_names_never_enter_the_stage_or_the_remote(self):
+        # F2: rsync cannot ignore case, so the snapshot patterns are case-folded; no credential copy stays on disk
+        names = ["Auth.JSON", "AUTH.json", ".ENV", ".Env.Local", "Member.KEY", "X.Secret", "Kit.JSON", "RCLONE.CONF",
+                 "Id_Rsa", ".NETRC", "SECRETS.JSON", "Cookies.SQLite"]
+        for source in (".claude/projects", ".codex/sessions"):
+            for name in names:
+                self.put(f"{source}/{name}", b"SECRET-MARKER")
+            self.put(f"{source}/sibling-Auth.JSON.txt", b"harmless")  # a different name: stays
+        self.put(".claude/projects/Goodqa-Hive/inner.txt", b"hive")
+        done = self.local_run()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        stage = self.home / ".agent-harness/backup-stage"
+        staged = {p.name.lower() for p in stage.rglob("*") if p.is_file()}
+        self.assertFalse(staged & {n.lower() for n in names}, staged)
+        self.assertNotIn("inner.txt", staged)
+        self.assertIn("sibling-auth.json.txt", staged)
+        for path in (self.remote / "testhost").rglob("*"):
+            if path.is_file():
+                self.assertNotIn(b"SECRET-MARKER", path.read_bytes(), path)
+
     def test_vm_dumps_never_appear_in_the_remote(self):
         for name in ("dump.vma", "dump.vma.zst"):
             self.put(f".agent-harness/work/t1/{name}", b"VMA")
@@ -513,7 +533,11 @@ class Failure(Case):
         self.run_script(PATH=f"{fakebin}:/usr/bin:/bin")
         args = record.read_text().splitlines()
         self.assertIn(f"--temp-dir={stage}/.rsync-tmp", args)
-        self.assertIn(f"--exclude-from={ROOT}/harness/bin/log-backup.excludes", args)
+        folded = self.home / ".agent-harness/logs/log-backup.rsync-excludes"
+        self.assertIn(f"--exclude-from={folded}", args)  # the case-folded copy, not the case-sensitive original
+        text = folded.read_text()
+        self.assertIn("[aA][uU][tT][hH].[jJ][sS][oO][nN]", text.splitlines())
+        self.assertNotIn("#", text)
 
     def test_failed_snapshot_skips_upload_and_keeps_run_non_fresh(self):
         fakebin = self.tmp / "fakebin"
@@ -649,7 +673,7 @@ class Failure(Case):
 
     def test_non_numeric_budget_or_retry_settings_are_refused_before_any_copy(self):
         for name in ("LOG_BACKUP_BUDGET_SECONDS", "LOG_BACKUP_RETRIES", "LOG_BACKUP_RETRY_SLEEP"):
-            for value in ("1.5", "abc", "-1", "999999", "x[$(id)]", " 5"):
+            for value in ("1.5", "abc", "-1", "999999", "x[$(id)]", " 5", "08", "09", "007", "00"):
                 if self.calls.exists():
                     self.calls.unlink()
                 done = self.run_script(**{name: value})

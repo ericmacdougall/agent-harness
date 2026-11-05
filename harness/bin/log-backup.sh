@@ -35,7 +35,10 @@ WORK_EXCLUDES=${LOG_BACKUP_WORK_EXCLUDES:-$SELF_DIR/log-backup.work-excludes}
 BUDGET_SECONDS=${LOG_BACKUP_BUDGET_SECONDS:-780}   # one run must end inside the 15 minute period
 RUN_START=$(date +%s)
 for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP; do
-  case "${!numeric:-0}" in *[!0-9]*|??????*) echo "log-backup: $numeric must be a whole number of at most 5 digits" >&2; exit 2 ;; esac
+  # No leading zeros: bash would read 08 as octal and abort the arithmetic.
+  if ! printf '%s' "${!numeric:-0}" | grep -Eq '^(0|[1-9][0-9]{0,4})$'; then
+    echo "log-backup: $numeric must be a whole number of at most 5 digits without leading zeros" >&2; exit 2
+  fi
 done
 # Size limits go to rclone, so they must be plain sizes: digits, an optional K, M or G, and not zero (a zero transfer
 # cap would stop every run immediately and the bulk marker would never be written).
@@ -198,6 +201,12 @@ for guarded in "$HOME" "$HOME/.claude" "$HOME/.codex" "$HOME/.agent-harness/work
 done
 [ ! -L "$STAGE" ] || fail "LOG_BACKUP_STAGE must not be a symlink" 2
 mkdir -p "$STAGE" && chmod 700 "$STAGE" || fail "cannot create the stage directory" 1
+# rclone matches the exclude file case-insensitively (--ignore-case) but rsync cannot, so give rsync a case-folded
+# copy of the same patterns (auth.json becomes [aA][uU][tT][hH].[jJ][sS][oO][nN]): Auth.JSON or .ENV never reach the stage.
+RSYNC_EXCLUDES="$LOGDIR/log-backup.rsync-excludes"
+awk '/^[ \t]*(#|$)/ {next} {out=""; for (i = 1; i <= length($0); i++) {c = substr($0, i, 1); if (c ~ /[A-Za-z]/) out = out "[" tolower(c) toupper(c) "]"; else out = out c} print out}' "$EXCLUDES" > "$RSYNC_EXCLUDES" \
+  || fail "cannot build the snapshot exclude list" 1
+[ -s "$RSYNC_EXCLUDES" ] || fail "the snapshot exclude list is empty (refusing to stage without credential excludes)" 2
 # Leftover partial files of a crashed snapshot are never data: start each run with an empty temp directory.
 rm -rf "$STAGE/.rsync-tmp"
 say "stage size $(du -sk "$STAGE" 2>/dev/null | cut -f1) KiB"
@@ -252,7 +261,7 @@ for src in "${LIVE[@]}"; do
     # that rclone would upload as current. rsync renames within the stage volume, so a full disk fails the copy
     # (exit 11 or 23, source skipped, run non-fresh) instead of leaving a truncated file in place.
     mkdir -p "$STAGE/.rsync-tmp" || { say "cannot create the stage temp directory"; ok=1; continue; }
-    rsync -a --temp-dir="$STAGE/.rsync-tmp" --exclude-from="$EXCLUDES" -- "$HOME/$src/" "$snap/" </dev/null; rc=$?
+    rsync -a --temp-dir="$STAGE/.rsync-tmp" --exclude-from="$RSYNC_EXCLUDES" -- "$HOME/$src/" "$snap/" </dev/null; rc=$?
     if [ $rc -eq 23 ]; then
       # Partial transfer (e.g. one unreadable file): rsync renames files into place, so the stage is consistent.
       # Back up what was staged, but withhold last-ok for this run.
