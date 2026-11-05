@@ -2377,7 +2377,11 @@ class Analyzer:
         # -f ROOT, and `--`; skipping them keeps `find -P ~/.claude ...` from defaulting to `.`
         while k < len(args):
             t = texts[k]
-            if t in ('-P', '-H', '-L', '-E', '-X', '-d', '-s', '-x', '--') or re.fullmatch(r'-O\d*', t):
+            if t in ('-P', '-H', '-L', '-E', '-X', '-d', '-s', '-x', '--') or re.fullmatch(r'-O\d*', t) \
+                    or re.fullmatch(r'-[EHLPXdsx]+', t):
+                k += 1  # BSD getopt also accepts clusters such as -xd or -sE
+            elif t.startswith('-f') and len(t) > 2 and not t.startswith('-fo') and not t.startswith('-fs'):
+                roots.append(_literal_word(t[2:]))  # BSD -fPATH (but not -follow, -fstype)
                 k += 1
             elif t == '-D' and k + 1 < len(args):
                 k += 2
@@ -2409,6 +2413,13 @@ class Analyzer:
                 exec_cmds.append(body)
         destroyers = RM_CMDS | MV_CMDS | {'unlink', 'shred', 'truncate'}
         if '-delete' in texts or any(norm_name(b[0].text) in destroyers for b in exec_cmds if b):
+            leading = texts[:k]
+            if '-follow' in texts or any(re.fullmatch(r'-[EHLPXdsx]*L[EHLPXdsx]*', t) for t in leading):
+                # following symlinks while deleting walks into whatever a link inside the tree points at
+                ctx.add(LOG_DELETE, 'log-delete',
+                        'find follows symlinks (-L or -follow) while deleting, so a link inside the tree can lead '
+                        'into a protected harness location',
+                        'drop -L/-follow; find does not need to follow links to clean a build tree')
             for r in roots:
                 self.protected_target('find -delete/-exec', r)
         for body in exec_cmds:

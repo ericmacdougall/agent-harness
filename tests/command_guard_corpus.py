@@ -505,6 +505,13 @@ NEG15_WORK_BLOCK = [
     {'cmd': 'find -H -L ~/.codex -name "*.jsonl" -delete', 'cwd': '@WT@/build'},
     {'cmd': 'find -files0-from list.txt -name "*.json" -delete', 'cwd': '@WT@/build'},
     {'cmd': 'find . -delete -name "*.pyc"', 'cwd': '@WT@'},
+    # final delta inspection of 07ddce7: symlink following while deleting, BSD option clusters
+    {'cmd': 'find -L build -delete', 'cwd': '@WT@'},
+    {'cmd': 'find build -follow -name "*.o" -delete', 'cwd': '@WT@'},
+    {'cmd': 'find -xd ~/.claude/projects -delete', 'cwd': '@WT@/build'},
+    {'cmd': 'find -sE ~/.claude -delete', 'cwd': '@WT@/build'},
+    {'cmd': 'find -Hd ~/.claude -exec rm -rf {} +', 'cwd': '@WT@/build'},
+    {'cmd': 'find -f@HOME@/.claude/projects -delete', 'cwd': '@WT@/build'},
     {'cmd': 'find . -name "*.pyc" , -delete', 'cwd': '@WT@'},
     {'cmd': 'find .. -delete -name "*.pyc"', 'cwd': '@WT@/build'},
     # -exec operands other than {} (pre-existing gap, same review)
