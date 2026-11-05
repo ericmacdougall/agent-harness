@@ -49,8 +49,9 @@ hook loses nothing, but with `verified: false`. They show in the digest as `[unv
 split from one has source kind `inferred`, not `user`. A cancel proof, a decision answer and `--reopen-by` all need a
 verified message. A cancel proof also records the captured event id and its MAC, and both are re-checked against the
 event log at removal. A transcript line alone never proves anything. A decision answer must be the first
-hook-captured message (typed or an AskUserQuestion answer) in that session after the question was recorded, never an
-agent's pick. A cancel through an answer needs the answer itself to be `cancel <ask-id>`; the question text does not count,
+reply in that session after the question was recorded, never an agent's pick: a bound typed message or an AskUserQuestion
+answer. A message that can never bind (a raw slash prompt, a message taken back from the queue) does not count, and for a
+decision recorded with `--tool AskUserQuestion` the dialog's answer outranks anything typed while it was open. A cancel through an answer needs the answer itself to be `cancel <ask-id>`; the question text does not count,
 because the agent wrote it. An ask has at most one `superseded_by`
 relation, to an ask split from the same human message. Superseding only marks the link for the digest: it never
 makes an ask removable, because which asks a message holds is the agent's own split. The older ask leaves only

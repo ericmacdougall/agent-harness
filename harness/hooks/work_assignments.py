@@ -2740,8 +2740,9 @@ def never_binds(msg: dict) -> bool:
 
 
 def answer_problem(data: dict, dec: dict, msg: dict):
-    """The answer to a decision is not the agent's pick of any human message: it is the first verified human
-    message (typed, or an AskUserQuestion answer) in that session after the question was recorded."""
+    """The answer to a decision is not the agent's pick of any human message: it is the first reply in that session
+    after the question was recorded, a bound typed message or an AskUserQuestion answer. A message that can never bind
+    cannot answer, so it does not hold up the real reply. A dialog's answer outranks what was typed while it was open."""
     if not verified_human(msg):
         return "the answer must be a hook-captured human message"
     asked_at = parse_ts(dec.get("createdAt") or dec["stateSince"])
@@ -2749,12 +2750,15 @@ def answer_problem(data: dict, dec: dict, msg: dict):
         return "the answer was captured before the question was asked"
     session = (dec.get("question", {}).get("actor") or {}).get("sessionId") or dec.get("origin", {}).get("actor", {}).get("sessionId")
     later = sorted((m for m in data["messages"].values()
-                    if m["sessionId"] == msg["sessionId"] and verified_human(m) and captured_after(m["id"], dec["id"], asked_at)),
+                    if m["sessionId"] == msg["sessionId"] and verified_human(m) and captured_after(m["id"], dec["id"], asked_at)
+                    and (m["origin"]["binding"]["status"] == "bound" or never_binds(m))),
                    key=lambda m: (m["origin"]["at"], m["id"]))
+    if dec.get("question", {}).get("tool") == "AskUserQuestion":
+        later = [m for m in later if never_binds(m)] or later
     if session and msg["sessionId"] != session:
         return "the answer must come from the session that asked the question"
     if not later or later[0]["id"] != msg["id"]:
-        return "the answer must be the first human message after the question was asked"
+        return "the answer must be the first reply after the question was asked"
     return None
 
 

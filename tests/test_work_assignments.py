@@ -132,6 +132,15 @@ class Base(unittest.TestCase):
     def asks(self):
         return self.data()["asks"]
 
+    def ask_decision(self, aid, text, tool="AskUserQuestion"):
+        self.assertEqual(self.cli("decision", "ask", "--text", text, "--tool", tool, "--ask", aid)[0], 0)
+        CLOCK[0] += 5
+        return sorted(self.data()["decisions"])[-1]
+
+    def ask_answer(self, key, reply):
+        self.hook("ask-answer", {"session_id": SID, "tool_use_id": key, "tool_name": "AskUserQuestion", "tool_response": {"answers": {"q": reply}}})
+        return self.last_message()
+
     def split(self, text, ask_text, **kw):
         msg = self.capture(text)
         extra = [x for pair in kw.items() for x in ("--" + pair[0], pair[1])]
@@ -182,15 +191,108 @@ class CaptureTest(Base):
         self.check_schema()
 
     def test_queued_prompts_that_are_not_human_stay_out(self):
+        """PR review f2e496c D1: sync reads only a tracked session, so with none this test could not fail. The last record shows the reader ran."""
+        self.hook("session", {"session_id": SID, "transcript_path": str(self.transcript), "source": "startup"})
         for record in (queued("from an agent please do it", origin={"kind": "task-notification"}),
                        queued("marked not a turn please do it", humanTurn=False),
                        queued("marked sidechain please do it") | {"isSidechain": True},
                        queued("shell mode please do it", commandMode="bash"),
-                       queued("no origin please do it", origin=None)):
+                       queued("no origin please do it", origin=None),
+                       queued("<system-reminder>a wrapped reminder please do it</system-reminder>"),
+                       queued("another attachment type please do it", type="other")):
             self.append(record)
-        self.append({"type": "attachment", "uuid": str(uuidlib.uuid4()), "attachment": {"type": "other", "origin": {"kind": "human"}, "humanTurn": True, "prompt": "x y z"}})
         self.assertEqual(self.cli("sync")[0], 0)
         self.assertEqual(self.data()["messages"], {})
+        self.append(queued("a genuine one please do it"))
+        self.assertEqual(self.cli("sync")[0], 0)
+        self.assertEqual(len(self.data()["messages"]), 1)
+
+    def test_an_askuserquestion_answer_records_as_the_answer(self):
+        """PR review b1ac561 F3: it could not bind, so the decision could only be `assumed`, which recorded a real answer wrongly."""
+        _, aid = self.split("start something", "refactor the billing exporter module")
+        did = self.ask_decision(aid, "Which billing exporter format should it use?")
+        msg = self.ask_answer("toolu_d1", "the csv format")
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", msg["id"])[0], 0)
+        self.assertEqual(self.data()["decisions"][did]["state"], "answered")
+        self.check_schema()
+
+    def test_a_reply_typed_mid_turn_records_as_the_answer(self):
+        _, aid = self.split("start something", "refactor the billing exporter module")
+        did = self.ask_decision(aid, "Which billing exporter format should it use?")
+        self.hook("prompt", self.payload("the parquet format please"))
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", self.last_message()["id"])[0], 2)  # still pending
+        self.assertEqual(self.data()["decisions"][did]["state"], "asked")
+        self.append(queued("the parquet format please"))
+        self.cli("sync")
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", self.last_message()["id"])[0], 0)
+        self.assertEqual(self.data()["decisions"][did]["state"], "answered")
+
+    def test_an_askuserquestion_answer_is_prunable_and_never_reported_as_unbindable(self):
+        """PR review b1ac561 F4: it stays pending for good, so it was kept forever and an untriaged one raised cannot-bind."""
+        msg = self.ask_answer("toolu_d3", "the csv format")
+        CLOCK[0] += 3 * 3600
+        self.hook("session", {"session_id": SID, "transcript_path": str(self.transcript), "source": "startup"})
+        self.assertFalse([v for v in self.data()["violations"] if v.get("kind") == "cannot_bind"])
+        self.assertEqual(self.cli("no-ask", "--msg", msg["id"], "--reason", "answers a question already closed")[0], 0)
+        CLOCK[0] += (wa.PRUNE_NO_ASK_DAYS + 1) * 86400
+        self.assertEqual(self.cli("prune", "--apply")[0], 0)
+        self.assertNotIn(msg["id"], self.data()["messages"])
+
+    def test_a_message_that_can_never_bind_does_not_hold_up_the_real_reply(self):
+        """PR review f2e496c D2: a raw slash prompt is verified but can never bind. It counted as the first reply, so the
+        typed reply was refused for not being first, the slash message for not being bound, and only `assume` remained."""
+        _, aid = self.split("start something", "refactor the billing exporter module")
+        did = self.ask_decision(aid, "Which billing exporter format should it use?", tool="plain_text")
+        self.hook("prompt", self.payload("/synthetic-skill with its arguments"))
+        slash = self.last_message()
+        CLOCK[0] += 5
+        typed = self.capture("the parquet format please")
+        self.assertEqual(self.cli("sync")[0], 0)
+        self.assertEqual(self.data()["messages"][slash["id"]]["origin"]["binding"]["status"], "pending")
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", slash["id"])[0], 2)
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", typed["id"])[0], 0)
+        self.assertEqual(self.data()["decisions"][did]["answer"]["messageId"], typed["id"])
+        self.check_schema()
+
+    def typed_then_answer(self, tool):
+        """A decision, an unrelated message typed mid-turn, then a dialog's answer."""
+        _, aid = self.split("start something", "refactor the billing exporter module")
+        did = self.ask_decision(aid, "Which billing exporter format should it use?", tool=tool)
+        self.hook("prompt", self.payload("also tidy the readme please"))
+        self.append(queued("also tidy the readme please"))
+        self.assertEqual(self.cli("sync")[0], 0)
+        typed = self.last_message()
+        self.assertEqual(typed["origin"]["binding"]["status"], "bound")
+        CLOCK[0] += 5
+        return did, typed, self.ask_answer("toolu_d4", "the csv format")
+
+    def test_a_message_typed_while_a_dialog_is_open_does_not_take_its_answer(self):
+        """Adversarial v14 F1: it blocked the dialog's answer, and was itself accepted as the answer."""
+        did, typed, answer = self.typed_then_answer("AskUserQuestion")
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", typed["id"])[0], 2)
+        self.assertEqual(self.data()["decisions"][did]["state"], "asked")
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", answer["id"])[0], 0)
+        self.assertEqual(self.data()["decisions"][did]["answer"]["messageId"], answer["id"])
+        self.check_schema()
+
+    def test_a_dialogs_answer_still_records_after_an_assumption(self):
+        did, _, answer = self.typed_then_answer("AskUserQuestion")
+        self.assertEqual(self.cli("decision", "assume", "--id", did, "--text", "assume the csv format for now")[0], 0)
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", answer["id"])[0], 0)
+        self.assertEqual(self.data()["decisions"][did]["state"], "answered")
+
+    def test_a_dialogs_answer_only_outranks_a_typed_reply_on_a_dialog_question(self):
+        did, typed, answer = self.typed_then_answer("plain_text")
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", answer["id"])[0], 2)
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", typed["id"])[0], 0)
+        self.assertEqual(self.data()["decisions"][did]["answer"]["messageId"], typed["id"])
+
+    def test_a_reply_typed_instead_of_using_the_dialog_still_answers(self):
+        _, aid = self.split("start something", "refactor the billing exporter module")
+        did = self.ask_decision(aid, "Which billing exporter format should it use?")
+        typed = self.capture("the parquet format please")
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", typed["id"])[0], 0)
+        self.assertEqual(self.data()["decisions"][did]["answer"]["messageId"], typed["id"])
 
     def test_a_queued_prompt_given_as_blocks_binds(self):
         self.hook("prompt", self.payload("please read this one too"))
@@ -1133,11 +1235,6 @@ class RemovalTest(Base):
         args = self.cancel_args(aid, uid, 1, "add a dark mode toggle to the settings page", "same_message_retraction")
         self.assertEqual(self.cli(*args)[0], 2)
 
-    def ask_decision(self, aid, text):
-        self.assertEqual(self.cli("decision", "ask", "--text", text, "--tool", "AskUserQuestion", "--ask", aid)[0], 0)
-        CLOCK[0] += 5
-        return sorted(self.data()["decisions"])[-1]
-
     def test_decision_answer_binding(self):
         _, aid = self.split("start something", "refactor the billing exporter module")
         did = self.ask_decision(aid, f"Cancel the billing exporter refactor? Reply `cancel {aid}` to cancel it.")
@@ -1147,28 +1244,6 @@ class RemovalTest(Base):
         args = self.cancel_args(aid, uid, 2, None, "answer_to_decision", "--decision", did)
         self.assertEqual(self.cli(*args)[0], 0)
         self.check_schema()
-
-    def ask_answer(self, key, reply):
-        self.hook("ask-answer", {"session_id": SID, "tool_use_id": key, "tool_name": "AskUserQuestion", "tool_response": {"answers": {"q": reply}}})
-        return self.last_message()
-
-    def test_an_askuserquestion_answer_records_as_the_answer(self):
-        """PR review b1ac561 F3: it could not bind, so the decision could only be `assumed`, which recorded a real answer wrongly."""
-        _, aid = self.split("start something", "refactor the billing exporter module")
-        did = self.ask_decision(aid, "Which billing exporter format should it use?")
-        msg = self.ask_answer("toolu_d1", "the csv format")
-        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", msg["id"])[0], 0)
-        self.assertEqual(self.data()["decisions"][did]["state"], "answered")
-        self.check_schema()
-
-    def test_a_reply_typed_mid_turn_records_as_the_answer(self):
-        _, aid = self.split("start something", "refactor the billing exporter module")
-        did = self.ask_decision(aid, "Which billing exporter format should it use?")
-        self.hook("prompt", self.payload("the parquet format please"))
-        self.append(queued("the parquet format please"))
-        self.cli("sync")
-        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", self.last_message()["id"])[0], 0)
-        self.assertEqual(self.data()["decisions"][did]["state"], "answered")
 
     def test_only_the_first_reply_answers_and_an_askuserquestion_answer_is_never_cancel_proof(self):
         _, aid = self.split("start something", "refactor the billing exporter module")
@@ -1181,17 +1256,6 @@ class RemovalTest(Base):
             args = self.cancel_args(aid, first["humanCheck"].get("providerItemId") or "toolu_d2", 1, None, binding, "--decision", did)
             self.assertEqual(self.cli(*args)[0], 2, binding)
         self.assertEqual(self.asks()[aid]["state"], "open")
-
-    def test_an_askuserquestion_answer_is_prunable_and_never_reported_as_unbindable(self):
-        """PR review b1ac561 F4: it stays pending for good, so it was kept forever and an untriaged one raised cannot-bind."""
-        msg = self.ask_answer("toolu_d3", "the csv format")
-        CLOCK[0] += 3 * 3600
-        self.hook("session", {"session_id": SID, "transcript_path": str(self.transcript), "source": "startup"})
-        self.assertFalse([v for v in self.data()["violations"] if v.get("kind") == "cannot_bind"])
-        self.assertEqual(self.cli("no-ask", "--msg", msg["id"], "--reason", "answers a question already closed")[0], 0)
-        CLOCK[0] += (wa.PRUNE_NO_ASK_DAYS + 1) * 86400
-        self.assertEqual(self.cli("prune", "--apply")[0], 0)
-        self.assertNotIn(msg["id"], self.data()["messages"])
 
     def test_refusal_is_not_cancel_proof(self):
         """PR review 62e5e5f #1 and 39c949d #1/#2: refusals, a "reinstate" reply, curly quotes, and a retraction of a
@@ -1657,6 +1721,27 @@ class StoreTest(Base):
 
 
 class GuardTest(Base):
+    def test_a_second_line_after_a_cli_call_is_judged(self):
+        """PR review b1ac561 F2, NEG-23: a newline after a bare CLI call passed SAFE_CLI, so the next line went unjudged."""
+        cli = "python3 ~/.claude/hooks/work_assignments.py status"
+        ledger, policy = f"{wa.base()}/work-ledger.json", "~/.claude/hooks/work_assignments_policy.json"
+        env = {**os.environ, "PYTHONPATH": str(HOOKS)}
+        for second in (f"{'r' + 'm'} {ledger}", f"mv {ledger} /tmp/x", f"cp /tmp/x {policy}", f"sed -i s/a/b/ {policy}", f"\n  {'r' + 'm'} {ledger}"):
+            payload = {"session_id": SID, "tool_name": "Bash", "tool_input": {"command": f"{cli}\n{second}"}, "cwd": self.tmp.name}
+            run = subprocess.run([sys.executable, str(HOOKS / "work_assignments.py"), "hook", "guard"], input=json.dumps(payload).encode(),
+                                 capture_output=True, env=env, timeout=20)
+            self.assertIn(b'"deny"', run.stdout, second)
+
+    def test_only_one_bare_cli_call_on_one_line_is_exempt(self):
+        for good in ("python3 ~/.claude/hooks/work_assignments.py status", "python3 $HOME/.claude/hooks/work_assignments.py status --all",
+                     "  python3  /a/b/work_assignments.py  show  x  y ", "python3 ./work_assignments.py decision ask --text 'a b'",
+                     "python3 x/work_assignments.py status\n"):
+            self.assertTrue(wa.SAFE_CLI.match(good), good)
+        for bad in ("python3 x/work_assignments.py status\n ls", "python3 x/work_assignments.py status\nls", "python3 x/work_assignments.py\nstatus",
+                    "python3 x/work_assignments.py status; ls", "python3 x/work_assignments.py status a\n ls", "python3 $(x)/work_assignments.py status",
+                    "python3 x/work_assignments.py status > y", "python3 $HOME$HOME/work_assignments.py status", "python3 work_assignments.py status"):
+            self.assertFalse(wa.SAFE_CLI.match(bad), bad)
+
     def test_a_bad_bracket_range_does_not_crash_the_guard(self):
         """Fixer finding: fnmatch raised re.error on Python 3.9, so the guard failed open for the whole command."""
         for token in ("s[i-30:i+30]", "x[z-a]"):
@@ -2154,7 +2239,7 @@ class LatencyTest(Base):
                 self.assertLess(took, 3.0, size)
                 self.assertEqual(b'"deny"' in run.stdout, text.startswith("rm"), size)
 
-    def test_safe_cli_is_linear_and_keeps_its_language(self):
+    def test_safe_cli_is_linear(self):
         """Acceptance v12 W2: a long path after python3 took over 14 s at 64 KiB in SAFE_CLI, inside re, where the 6 s abort cannot fire."""
         env = {**os.environ, "PYTHONPATH": str(HOOKS)}
         removal = f"; {'r' + 'm'} {wa.base()}/work-ledger.json"
@@ -2172,14 +2257,6 @@ class LatencyTest(Base):
         started = time.monotonic()  # adversarial v12: a 32 KB run of * in a Write path took 12.5 s in GLOB_TOKEN.fullmatch
         subprocess.run([sys.executable, str(HOOKS / "work_assignments.py"), "hook", "guard"], input=json.dumps(payload).encode(), capture_output=True, env=env, timeout=20)
         self.assertLess(time.monotonic() - started, 3.0)
-        for good in ("python3 ~/.claude/hooks/work_assignments.py status", "python3 $HOME/.claude/hooks/work_assignments.py status --all",
-                     "  python3  /a/b/work_assignments.py  show  x  y ", "python3 ./work_assignments.py decision ask --text 'a b'",
-                     "python3 x/work_assignments.py status\n"):
-            self.assertTrue(wa.SAFE_CLI.match(good), good)
-        for bad in ("python3 x/work_assignments.py status\n ls", "python3 x/work_assignments.py status\nls", "python3 x/work_assignments.py\nstatus",
-                    "python3 x/work_assignments.py status; ls", "python3 x/work_assignments.py status a\n ls", "python3 $(x)/work_assignments.py status",
-                    "python3 x/work_assignments.py status > y", "python3 $HOME$HOME/work_assignments.py status", "python3 work_assignments.py status"):
-            self.assertFalse(wa.SAFE_CLI.match(bad), bad)
 
     def run_with_stuck_hook(self, name, policy):
         """The real run_hook with its timer shortened and the hook stuck: the timer's own exit path, in a real process."""
@@ -2193,17 +2270,6 @@ class LatencyTest(Base):
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(run.returncode, 0, run.stderr)
         return run.stdout
-
-    def test_a_second_line_after_a_cli_call_is_judged(self):
-        """PR review b1ac561 F2, NEG-23: a newline after a bare CLI call passed SAFE_CLI, so the next line went unjudged."""
-        cli = "python3 ~/.claude/hooks/work_assignments.py status"
-        ledger, policy = f"{wa.base()}/work-ledger.json", "~/.claude/hooks/work_assignments_policy.json"
-        env = {**os.environ, "PYTHONPATH": str(HOOKS)}
-        for second in (f"{'r' + 'm'} {ledger}", f"mv {ledger} /tmp/x", f"cp /tmp/x {policy}", f"sed -i s/a/b/ {policy}", f"\n  {'r' + 'm'} {ledger}"):
-            payload = {"session_id": SID, "tool_name": "Bash", "tool_input": {"command": f"{cli}\n{second}"}, "cwd": self.tmp.name}
-            run = subprocess.run([sys.executable, str(HOOKS / "work_assignments.py"), "hook", "guard"], input=json.dumps(payload).encode(),
-                                 capture_output=True, env=env, timeout=20)
-            self.assertIn(b'"deny"', run.stdout, second)
 
     def test_guard_timeout_denies_in_enforce_and_other_hooks_stay_open(self):
         """Owner decision from the live check: the guard's own abort denies; a ledger hook's abort must not block the turn."""
