@@ -30,6 +30,14 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # python -I and -P drop the script directory
+try:  # installed beside this file; the lints fail open (warn only) when it is missing
+    import safe_input
+    READ_ERRORS = (OSError, ValueError, AttributeError, safe_input.InputRejected)
+except ImportError:  # pragma: no cover - exercised by test_missing_safe_input_fails_open
+    safe_input = None
+    READ_ERRORS = (OSError, ValueError, AttributeError)
+
 HERE = Path(__file__).resolve().parent
 POLICY = HERE / "stop_lints_policy.json"
 RULES = ("W04", "W06", "W12", "W17", "S18", "S26")
@@ -38,6 +46,7 @@ INTENT_EVENTS = {"intent", "scope"}
 RESULT_EVENTS = {"result", "check", "handoff", "commit"}
 MAX_INPUT = 2_000_000
 MAX_WAL = 4_000_000
+MAX_POLICY = 65_536
 MAX_MESSAGE = 60_000
 TAIL_WINDOW = 400_000
 SESSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{7,63}$")
@@ -67,11 +76,11 @@ BOUND_RE = re.compile(r"(?<!upper )(?<!lower )(?<!out of )\bbounds?\b[*_`|)\]\t 
 def load_modes(path: Path = POLICY) -> dict[str, str]:
     modes = {rule: "warn" for rule in RULES}
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(safe_input.read_bounded(path, MAX_POLICY))
         for rule, mode in (data.get("modes") or {}).items():
             if rule in modes and mode in ("warn", "off"):
                 modes[rule] = mode
-    except (OSError, ValueError, AttributeError):
+    except READ_ERRORS:
         pass
     return modes
 
@@ -103,12 +112,10 @@ def read_wal(path: Path | None) -> list[dict]:
         return []
     try:
         size = path.stat().st_size
-        with open(path, "rb") as fh:
-            if size > MAX_WAL:
-                fh.seek(size - MAX_WAL)
-                fh.readline()
-            data = fh.read().decode("utf-8", "replace")
-    except OSError:
+        data = safe_input.read_tail(path, MAX_WAL).decode("utf-8", "replace")
+        if size > MAX_WAL:
+            data = data.split("\n", 1)[1] if "\n" in data else ""  # the first line is cut mid-way
+    except READ_ERRORS:
         return []
     rows = []
     for line in data.splitlines():
@@ -246,12 +253,10 @@ def tail_message(path: str) -> str:
         if not real.is_file() or root not in real.parents:
             return ""
         size = real.stat().st_size
-        with open(real, "rb") as fh:
-            if size > TAIL_WINDOW:
-                fh.seek(size - TAIL_WINDOW)
-                fh.readline()
-            data = fh.read().decode("utf-8", "replace")
-    except OSError:
+        data = safe_input.read_tail(real, TAIL_WINDOW).decode("utf-8", "replace")
+        if size > TAIL_WINDOW:
+            data = data.split("\n", 1)[1] if "\n" in data else ""  # the first line is cut mid-way
+    except READ_ERRORS:
         return ""
     for line in reversed(data.splitlines()):
         try:

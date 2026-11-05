@@ -1,0 +1,14 @@
+{
+  "_doc": "Entry for the future rules registry (matrix G08). Keys: id, rule, mechanism, test (Class.method inside tests/test_merge_gate.py, resolved by Wiring.test_rules_registry_entry), source, enforcement.",
+  "rules": [
+    {
+      "id": "merge-gate",
+      "rule": "No agent merges a pull request (gh pr merge, gh api pulls/N/merge, GraphQL mergePullRequest or enablePullRequestAutoMerge, wrapped or not) unless every required and reported check run and commit status on the exact head SHA concluded success, the merge command carries that head SHA, and the check state could be read. Override only with a recorded single-use waiver bound to repo, PR and head, approved by the main agent.",
+      "mechanism": "PreToolUse hook harness/hooks/merge_gate.py (Claude Code: Bash and write tools, onFailure block; Codex: PreToolUse with exit 2 mapping). Fails closed. Audit and waiver log under ~/.agent-harness/state/, listed by merge_gate.py report.",
+      "enforcement": "ENFORCED",
+      "test": "Decisions.test_decision_corpus",
+      "test_file": "tests/test_merge_gate.py",
+      "source": "ticket:GoodQA goodqa#14502 (matrix D11); incident: netwatch PR #1 merged with red CI, coordinator relay 2026-11-04"
+    }
+  ]
+}

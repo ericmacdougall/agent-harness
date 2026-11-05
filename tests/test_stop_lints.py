@@ -487,5 +487,45 @@ class FourthRound(WalFixture):
         self.assertIn("uncommitted", s18.get("partial_reason", ""))
 
 
+class BoundedReads(unittest.TestCase):
+    """The lints read the WAL, a transcript and the policy through safe_input: a window at most, never a FIFO."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def test_a_wal_over_the_cap_yields_only_whole_rows_from_the_tail(self):
+        path = self.dir / "main.jsonl"
+        pad = json.dumps({"event": "pad", "x": "y" * 900}) + "\n"
+        last = json.dumps({"event": "last", "at": "2026-11-05T03:00:00+00:00"}) + "\n"
+        with mock.patch.object(sl, "MAX_WAL", 5000):
+            path.write_text(pad * 20 + last)
+            rows = sl.read_wal(path)
+        self.assertTrue(rows and rows[-1]["event"] == "last", rows[-1:] )
+        self.assertLess(len(rows), 8)  # the head of the file was not read
+        self.assertTrue(all(r["event"] in ("pad", "last") for r in rows))  # no half-cut first row survived as junk
+
+    def test_a_fifo_wal_is_not_read(self):
+        path = self.dir / "fifo.jsonl"
+        os.mkfifo(path)
+        self.assertEqual(sl.read_wal(path), [])
+
+    def test_an_oversized_policy_file_falls_back_to_warn(self):
+        path = self.dir / "policy.json"
+        path.write_text(json.dumps({"modes": {"W04": "off"}, "pad": "x" * (sl.MAX_POLICY + 10)}))
+        self.assertEqual(sl.load_modes(path)["W04"], "warn")
+        small = self.dir / "small.json"
+        small.write_text(json.dumps({"modes": {"W04": "off"}}))
+        self.assertEqual(sl.load_modes(small)["W04"], "off")
+
+    def test_missing_safe_input_fails_open(self):
+        path = self.dir / "main.jsonl"
+        path.write_text(json.dumps({"event": "x"}) + "\n")
+        with mock.patch.object(sl, "safe_input", None):
+            self.assertEqual(sl.read_wal(path), [])
+            self.assertEqual(sl.load_modes(path)["W04"], "warn")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,15 @@ func TestParseExempt(t *testing.T) {
 	}
 }
 
+func TestParseLedgerSubcommandsExempt(t *testing.T) {
+	for _, argv := range [][]string{{"tickets", "new", "--title", "x"}, {"ledger-mcp"}} {
+		g, err := Parse(argv)
+		if err != nil || g.Sub != argv[0] || g.Host != "" || len(g.Args) != len(argv)-1 {
+			t.Errorf("%v: got %+v err %v", argv, g, err)
+		}
+	}
+}
+
 func TestParseUsageErrors(t *testing.T) {
 	cases := [][]string{
 		{},

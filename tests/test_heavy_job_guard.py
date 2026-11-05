@@ -39,7 +39,7 @@ NORMAL = [
     "python3 -m unittest tests.test_wal -v", "python3 -m pytest tests/test_wal.py -x -q",
     "pytest tests/test_wal.py::TestWal::test_append", "python3 tests/test_wal.py", "npm test -- src/foo.test.ts",
     "npx vitest run src/foo.test.ts", "go test ./pkg/foo -run TestBar", "echo 'next build' > note.txt",
-    "ssh dev2 'cd repo && pytest'", "ssh eric@100.86.166.93 'npm run build'", "rsync -a src/ dev2:src/",
+    "ssh dev2 'cd repo && pytest'", "ssh eric@192.0.2.7 'npm run build'", "rsync -a src/ dev2:src/",
     "sed -n 1,40p heavy.py", "python3 -m json.tool < x.json", "node --version", "npm install --no-audit",
     "docker ps", "docker logs web | tail", "cargo --version", "ffmpeg -version", "ffprobe -v error clip.mp4",
     "xargs -n1 echo < list.txt", "git ls-files -z | xargs -0 -P 6 grep -l foo", "ls | xargs -P2 echo", "playwright install chromium", "open -a 'Google Chrome' http://x",
@@ -90,7 +90,7 @@ class Classification(unittest.TestCase):
     def test_ac2_ssh_prefix_allows(self):
         d = self.sweep_dir()
         self.assertEqual(decide(f"ssh dev2 'cd {d} && ./venv/bin/python site_sweep.py https://x'"), {"action": "allow"})
-        self.assertEqual(decide("ssh eric@100.86.166.93 pytest"), {"action": "allow"})
+        self.assertEqual(decide("ssh eric@192.0.2.7 pytest"), {"action": "allow"})
 
     def test_hatch_needs_reason_and_cap_for_browser(self):
         d = self.sweep_dir()
@@ -283,7 +283,7 @@ class BuildTools(unittest.TestCase):
         "mvn --version", "mvn -v", "mvn clean", "mvn help:effective-pom", "mvn dependency:tree", "./mvnw -v",
         "bazel version", "bazel info", "bazel query //...", "bazel clean", "xcodebuild -version", "xcodebuild -list",
         "xcodebuild -showBuildSettings", "xcodebuild -showsdks", "xcodebuild -scheme test -list",
-        "ssh dev2 'make test'", "ssh dev2 'cd repo && ./gradlew build'", "ssh eric@100.86.166.93 'mvn verify'",
+        "ssh dev2 'make test'", "ssh dev2 'cd repo && ./gradlew build'", "ssh eric@192.0.2.7 'mvn verify'",
         "rsync -a Makefile dev2:repo/", "cd /nonexistent && ls Makefile", "which make gradle mvn",
     ]
 
@@ -513,6 +513,177 @@ def wait_dead(pid, seconds=8):
 def state(pid):
     out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return out
+
+
+class PathologicalInput(unittest.TestCase):
+    """GoodQA #14505: shlex is quadratic in CPython 3.9, so a 1 MB token hung every hook for 100 s+, and review
+    found more superlinear paths (heredoc terminators, per-invocation rescans, wrapper argv slicing).
+
+    Each case builds its string inside a child process with a hard timeout, so a regression fails the test
+    instead of hanging the suite. The strings are only ever passed to decide(); nothing executes them. The
+    child uses DEFAULT_MODES and a throwaway HOME, so the developer's guard mode and log are never involved."""
+
+    def timed(self, expression, limit=5, cwd="/tmp"):
+        code = ("import sys,time; sys.path.insert(0, %r); import heavy_job_guard as g\n"
+                "cmd = %s\nt = time.time(); r = g.decide(cmd, %r, g.DEFAULT_MODES); "
+                "print(round(time.time() - t, 3), r['action'], r.get('rule'))" % (str(HOOKS), expression, cwd))
+        with tempfile.TemporaryDirectory() as home:
+            env = {k: v for k, v in os.environ.items() if not k.startswith("HARNESS_")}
+            env["HOME"] = home
+            try:
+                done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=limit,
+                                      env=env)
+            except subprocess.TimeoutExpired:
+                self.fail("no decision within %ss for %s" % (limit, expression))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        elapsed, action, rule = done.stdout.split()
+        return float(elapsed), action, rule
+
+    def fast(self, expression, action, rule="oversize", **kwargs):
+        elapsed, got_action, got_rule = self.timed(expression, **kwargs)
+        self.assertLess(elapsed, 1.0, expression)
+        if action is not None:  # None: only the bounded time matters, allow or deny are both safe answers
+            self.assertEqual(got_action, action, expression)
+        if action == "deny" and rule:
+            self.assertEqual(got_rule, rule, expression)
+
+    def test_ac1_one_megabyte_token_decides_in_under_a_second(self):
+        for expression in ("'echo ' + 'a' * 1000000", "'echo \"' + 'a' * 1000000 + '\"'",
+                           "\"echo $'\" + 'a' * 1000000 + \"'\"", "'echo ' + 'a\\\\' * 500000"):
+            self.fast(expression, "deny")
+
+    def test_ac1_million_character_command_of_many_segments_decides_in_under_a_second(self):
+        self.fast("'ls; ' * 250000", "deny")
+
+    def test_ac1_large_token_under_the_cap_is_scanned_linearly_and_allowed(self):
+        self.fast("'echo ' + 'a' * 250000", "allow")
+
+    def test_scan_cap_boundary_is_exact(self):
+        self.fast("'ls; ' * 65536", "allow")  # exactly 262144 characters
+        self.fast("'ls; ' * 65536 + 'x'", "deny")  # one more
+
+    def test_word_cap_boundary_is_exact(self):
+        self.fast("'echo ' + 'a ' * 8191", "allow")  # 8192 words
+        self.fast("'echo ' + 'a ' * 8192", "deny")
+        self.fast("'rm ' + 'file.txt ' * 3000", "allow")  # an ordinary long argument list is not an attack
+
+    def test_neg1_heavy_invocation_past_the_cap_is_not_silently_allowed_even_with_the_hatch(self):
+        self.fast("'echo ' + 'a' * 300000 + '; pytest'", "deny")
+        # The tail may hold a browser/media/fan-out job that needs the resource cap, so the hatch cannot waive it.
+        self.fast("'HARNESS_LOCAL_OK=needs-the-mac echo ' + 'a' * 300000 + '; chromium --headless'", "deny")
+        self.fast("'HARNESS_LOCAL_OK=needs-the-mac echo ' + 'a ' * 9000", "deny")
+
+    def test_neg1_long_heredoc_body_does_not_count_toward_the_cap(self):
+        self.fast("'cat > big.txt <<EOF\\n' + 'x' * 400000 + '\\nEOF\\nls'", "allow")
+
+    def test_neg2_nested_wrappers_with_long_tokens_stay_bounded(self):
+        self.fast("'bash -c ' + repr('sudo ' * 50 + 'x' * 1000000)", "deny")
+        self.fast("'bash -c ' + repr('env ' * 200 + 'x' * 200000)", "deny", rule=None)  # depth limit, not size
+
+    def test_many_distinct_unterminated_heredoc_markers_stay_linear(self):
+        self.fast("' '.join('<<T%d' % i for i in range(1000)) + '\\n' * 50000", "allow")
+
+    def test_repeated_python_invocations_do_not_rescan_a_large_heredoc_body(self):
+        self.fast("'cat <<EOF\\n' + 'x' * 700000 + '\\nEOF\\n' + 'python3 y\\n' * 2000", "allow")
+
+    def test_repeated_script_invocations_do_not_reread_a_large_file(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            Path(cwd, "big.py").write_text("x = 1\n" * 300000)
+            self.fast("'python3 big.py\\n' * 3000", "allow", cwd=cwd)
+
+    def test_wrapper_argv_slicing_paths_are_bounded(self):
+        for expression in ("'env -Z ' + 'a ' * 80000", "'do ' * 80000 + 'ls'", "'xcrun ' + '-v ' * 80000 + 'ls'",
+                           "'timeout ' + '-x ' * 80000 + '1 ls'"):
+            self.fast(expression, "deny")
+
+    def test_g1_deep_eval_chain_is_denied_not_failed_open(self):
+        # At base this raised RecursionError inside the hook, which failed open and allowed the heavy command.
+        self.fast("'eval ' * 2000 + 'pytest'", "deny", rule=None)
+        self.fast("'bash -c \\'' * 1 + 'eval ' * 2000 + 'pytest' + \"'\"", "deny", rule=None)
+
+    def test_g2_nested_uncertain_wrappers_are_not_exponential(self):
+        self.fast("'env -Z ' + ('eval env -Z ' + 'a ' * 20) * 12", "deny", rule=None)
+        self.fast("'env -Z ' + ('eval env -Z ' + 'a ' * 20) * 16", "deny", rule=None)
+
+    def test_h1_work_is_budgeted_by_size_not_by_probe_count(self):
+        for expression in ("'env -Z ' + 'gradle ' * 8000", "'nice -19 ' + 'gradle ' * 8000",
+                           "'env -Z ' + 'make ' * 8000", "'env -Z ' + 'xcodebuild ' * 8000",
+                           "'env -Z ' + ('eval ' + 'a' * 120 + ' ') * 500",
+                           "'env -Z ' + ('eval ' + 'a' * 120 + ' ') * 2000"):
+            self.fast(expression, "deny")  # past the budget the guard fails closed; it never allows an unscanned job
+
+    def test_h2_ordinary_long_scripts_are_not_denied_by_the_budget(self):
+        self.fast("'\\n'.join('nice -5 cp f%d /tmp/x' % i for i in range(1000))", "allow")
+        self.fast("'\\n'.join('bash -c \"echo %d\"' % i for i in range(2500))", "allow")
+
+    def test_i1_wrappers_with_unknown_flags_and_long_ordinary_argument_lists_are_allowed(self):
+        self.fast("'nice -19 git add ' + ' '.join('src/f%d.py' % i for i in range(2000))", "allow")
+        self.fast("'sudo -iu bob rm ' + ' '.join('f%d' % i for i in range(3000))", "allow")
+        self.fast("'caffeinate -dims ' + ' '.join('a%d' % i for i in range(2000))", "allow")
+
+    def test_n1_many_spellings_of_one_script_are_read_once(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            Path(cwd, "big.py").write_text("x = 1\n" * 300000)
+            self.fast("''.join('python3 ' + ''.join('.//' if (i >> k) & 1 else './' for k in range(12)) + 'big.py\\n' "
+                      "for i in range(4096))", None, cwd=cwd)
+
+    def test_g3_nested_commands_share_the_script_cache(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            Path(cwd, "big.py").write_text("x = 1\n" * 300000)
+            self.fast("'bash -c \"python3 big.py\"\\n' * 300", "allow", cwd=cwd)
+
+    def test_ac2_linear_split_matches_shlex_on_seeded_random_input(self):
+        import random
+        import shlex
+        rng, alphabet, cases = random.Random(14505), "ab '\"\\\t\n\r$#;\x0b\x0c\0\u00a0\u2028\u00e9", 0
+        for _ in range(20000):
+            text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 12)))
+            try:
+                want = shlex.split(text)
+            except ValueError:
+                want = "ValueError"
+            try:
+                got = guard.posix_split(text)
+            except ValueError:
+                got = "ValueError"
+            self.assertEqual(got, want, "seed 14505, input %r" % text)
+            cases += 1
+        self.assertEqual(cases, 20000)
+
+    def test_ac2_heredoc_extraction_matches_the_reference_scan(self):
+        import random
+        rng = random.Random(14505)
+        parts = ["cat <<EOF", "cat <<-EOF", "x <<A <<B", "EOF", "\tEOF", "A", "B", "echo hi", "<<<EOF",
+                 "cat <<'EOF'", "  EOF", "ls", "<<EOF <<EOF2", "EOF2"]
+
+        def reference(text):  # the pre-#14505 implementation: rescan the remaining lines for each new terminator
+            lines, out, bodies, i, missing = text.split("\n"), [], [], 0, set()
+            while i < len(lines):
+                line = lines[i]
+                out.append(line)
+                i += 1
+                for match in guard.HEREDOC.finditer(line):
+                    if line[max(0, match.start() - 1):match.start()] == "<":
+                        continue
+                    strip_tabs, term = match.group(1) == "-", match.group(3)
+                    if term in missing:
+                        continue
+                    j = i
+                    while j < len(lines) and (lines[j].strip() if strip_tabs else lines[j]) != term:
+                        j += 1
+                    if j < len(lines):
+                        bodies.append("\n".join(lines[i:j]))
+                        i = j + 1
+                    else:
+                        missing.add(term)
+            return "\n".join(out), bodies
+
+        cases = 0
+        for _ in range(20000):
+            text = "\n".join(rng.choice(parts) for _ in range(rng.randint(0, 9)))
+            self.assertEqual(guard.extract_heredocs(text), reference(text), "seed 14505, input %r" % text)
+            cases += 1
+        self.assertEqual(cases, 20000)
 
 
 class BoundValidation(unittest.TestCase):

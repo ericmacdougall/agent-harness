@@ -17,7 +17,7 @@ try:
 except ModuleNotFoundError:  # Codex installer requires Python 3.11+.
     tomllib = None
 
-from install import (DirectoryPins, netwatch_status, atomic_write, git_hook_status, markdown_marker_lines, read_regular,
+from install import (DirectoryPins, local_profile_status, migrate_local_profiles, netwatch_status, atomic_write, git_hook_status, markdown_marker_lines, read_regular,
                      safe_unlink)
 
 
@@ -37,8 +37,10 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     # Spec flow commands work by hand in Codex; its done hook is Claude Code only.
                     'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
                     'provenance_hooks.py', 'safe_input.py', 'domain_gates.py', 'domain_checklists.json',
+                    'commit_policy.local.json.example', 'spec_policy.local.json.example',
+                    'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
-                    'command_guard.py', 'command_guard_hook.py', 'redact.py')
+                    'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json', 'merge_gate.py')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
@@ -66,9 +68,18 @@ def policy_command(codex_home: Path) -> str:
     return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'commit_policy.py')) + ' hook'
 
 
+def gate_command(codex_home: Path) -> str:
+    """Merge gate; `|| exit 2` because a crash (exit 1) would otherwise count as allow."""
+    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'merge_gate.py')) + ' hook || exit 2'
+
+
 def guard_command(codex_home: Path, verb: str = ' hook') -> str:
     # The hook verb marks a fail-closed gate for the Go front door (cmd/harness/gates.json); the launcher ignores it.
     return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'command_guard_hook.py')) + verb
+
+
+def kill_guard_command(codex_home: Path) -> str:
+    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'kill_guard.py')) + ' hook'
 
 
 def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) -> dict:
@@ -81,6 +92,8 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
     command = managed_command(codex_home)
     policy = policy_command(codex_home)
     guard = guard_command(codex_home)
+    kill_guard = kill_guard_command(codex_home)
+    gate = gate_command(codex_home)
     for event in HOOK_EVENTS:
         lifecycle = event in {'Stop', 'Interrupt'}
         managed = {'hooks': [{'type': 'command', 'command': command,
@@ -95,20 +108,27 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
                                 and handler.get('command') in (command, policy, guard,
-                                                               guard_command(codex_home, '')))]
+                                                               guard_command(codex_home, ''), gate, kill_guard))]
             if lifecycle and len(handlers) != len(group['hooks']) and group != managed:
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')
             if handlers:
                 preserved.append({**group, 'hooks': handlers})
         preserved.append(managed)
-        if event == 'PreToolUse' and command_guard:
-            # Command guard for every tool (no matcher): Codex fails open, so the launcher blocks by itself, and
-            # write_stdin text typed into a running shell is never checked again by the host.
-            preserved.insert(0, {'hooks': [{'type': 'command', 'command': guard, 'timeout': 30}]})
         if event == 'PreToolUse':
             # Commit message policy for every tool (no matcher): shell argv, strings, stdin writes.
             preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 60}]})
+            preserved.append({'hooks': [{'type': 'command', 'command': gate, 'timeout': 60}]})
+        if event == 'PreToolUse' and command_guard:
+            # Command guard for every tool (no matcher): Codex fails open, so the launcher blocks by itself, and
+            # write_stdin text typed into a running shell is never checked again by the host. Appended last:
+            # Codex keys hook trust by position (hooks.state "<file>:pre_tool_use:<group>:<handler>"), so adding
+            # it after the existing groups keeps their trusted hashes valid (GoodQA #14590). Codex runs every
+            # matching hook, so position does not change whether the guard can block.
+            preserved.append({'hooks': [{'type': 'command', 'command': guard, 'timeout': 30}]})
+            # Kill guard after the command guard, so main's trusted positions above it do not move (GoodQA #14590,
+            # GoodQA #14506). --no-command-guard leaves out both.
+            preserved.append({'hooks': [{'type': 'command', 'command': kill_guard, 'timeout': 30}]})
         hooks[event] = preserved
     return result
 
@@ -249,7 +269,8 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
     backup_root = harness_dir / 'backups'
     files = [(SOURCE / 'agents' / name, codex_home / 'agents' / name) for name in AGENTS]
     files += [(SOURCE / 'skills' / 'agent-harness' / name, skill_dir / name) for name in SKILL_FILES]
-    files += [(SOURCE / 'hooks' / 'wal.py', harness_dir / 'wal.py')]
+    files += [(SOURCE / 'hooks' / 'wal.py', harness_dir / 'wal.py'),
+              (SOURCE.parent / 'harness' / 'hooks' / 'ops_watch.py', harness_dir / 'ops_watch.py')]  # alert parity (goodqa#14613 M9)
     files += [(ROOT / 'harness' / 'hooks' / name, harness_dir / name)
               for name in DELIVERY_HELPERS]
     files += [(ROOT / 'harness' / 'tools' / 'watch-tests.py', harness_dir / 'watch-tests.py')]
@@ -284,6 +305,7 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
         changes = [str(path) for path in managed]
         if not apply:
             return changes
+        migrate_local_profiles(codex_home, harness_dir)  # before the generic policies overwrite personal values
         for directory in directories[1:]:
             pins.create(directory)
         for directory in (codex_home, harness_dir, backup_root, wal_parent, wal_dir):
@@ -373,6 +395,7 @@ def main() -> None:
         print(f'  {path}')
     print(f'  {install_git_backstop(args.home, args.apply)}')
     print(f'  {netwatch_status(args.home, args.apply, args.netwatch)}')
+    print(f'  {local_profile_status(args.home, args.home / ".codex" / "agent-harness")}')
     if args.apply:
         print('Review and trust the new user hooks with /hooks in a new Codex session.')
 

@@ -340,7 +340,7 @@
   "source": "~/.claude/CLAUDE.md; OWNER-BRIEF-COMMON.md; matrix D11",
   "rule": "Do not merge to a protected main/deploy/spend/irreversible without main's go; PRs must not merge on red CI.",
   "enforcement": "ADVISORY",
-  "live_evidence": "commit_policy only validates gh pr merge message text. pr-e feat/merge-gate-14502 in flight.",
+  "live_evidence": "commit_policy only validates gh pr merge message text. merge_gate.py (GoodQA #14502) blocks gh pr merge, merge REST and GraphQL calls unless every check on the exact head is success; install.py and install_codex.py register it.",
   "checkable": "YES",
   "checkable_reason": "Required check status on exact head SHA is queryable.",
   "proposed_event": "PreToolUse Bash",
@@ -350,7 +350,10 @@
   "priority": "P1",
   "owner_overlap": "pr-e merge-gate #14502",
   "matrix_rows": "D11,D08",
-  "mechanisms": [],
+  "mechanisms": [
+   "merge_gate:hook"
+  ],
+  "partial_reason": "same-user honesty control: wrapper and runtime-built command shapes are disclosed residuals, and the waiver is not authentication of main",
   "planned_batch": "owner:pr-e"
  },
  {
@@ -475,7 +478,9 @@
   "owner_overlap": "OWNED a0e07708 (#14525-#14533)",
   "matrix_rows": "Z06",
   "mechanisms": [
-   "escalation:hook"
+   "tier_gate:hook",
+   "tier_gate:start",
+   "tier_gate:stop"
   ]
  },
  {
@@ -497,6 +502,30 @@
    "stop_lints:subagent-stop"
   ],
   "static_mode": "warn"
+ },
+ {
+  "id": "S27",
+  "source": "ticket:GoodQA goodqa#14506 (matrix X05, G08); docs/rules/kill-guard.json",
+  "rule": "No agent kills a process it cannot prove it owns: no pkill, killall, fuser -k, taskkill, Stop-Process or pgrep-fed kill, and no plain kill of another owner's PID.",
+  "enforcement": "HOOK-ENFORCED",
+  "live_evidence": "kill_guard.py (GoodQA #14506) blocks these on Claude Code and Codex; install.py and install_codex.py register it. On Codex it runs only once its hook is trusted.",
+  "checkable": "YES",
+  "checkable_reason": "Kill verbs and targets are parseable, and ownership is checked from process cwd, argv and a spawn ledger.",
+  "proposed_event": "PreToolUse Bash (+Codex PreToolUse)",
+  "proposed_check": "Parse the command, judge kill words with a closed grammar, and block any target not proven to be the caller's.",
+  "on_failure": "block",
+  "failing_first_test": "tests/kill_guard_grammar_corpus.json judged by decide(): R4, R5, RR, TC and AH hold rows that fail at d1a0fd5, while OK, R3OK, R4OK, RROK and PKILL pin what must keep working; tests/live_kill_canary.py on dev2 with its own sleepers.",
+  "priority": "P0",
+  "owner_overlap": "feat/kill-guard-14506; open routes are in docs/operations.md Kill guard Known limits, starting from goodqa#14654 and goodqa#14712",
+  "matrix_rows": "X05,G08",
+  "mechanisms": [
+   "kill_guard:hook"
+  ],
+  "mode": {
+   "file": "kill_guard_policy.json",
+   "key": "mode"
+  },
+  "partial_reason": "text and value routes in docs/operations.md Kill guard Known limits are not closed, and the threat model is careless agents, not one that edits its hooks"
  },
  {
   "id": "W01",

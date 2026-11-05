@@ -148,9 +148,14 @@ func TestRestoreRebuildsLastRequestForUnresolvedTab(t *testing.T) {
 // A settings save bumps the GoodQA snapshot revision on purpose, which revokes the
 // old proxy. That alone must not refuse the Claude conversation.
 func TestClaudeSurvivesRevisionOnlyToolConfigChange(t *testing.T) {
-	t.Skip("known defect in the unreleased baseline; replaced by the event-log rebuild (K4+), GoodQA #35692, see console/README.md")
-	a, s, _ := claudeConversationFixture(t, false)
+	a, s, env := claudeConversationFixture(t, false)
+	// A conversation that already has GoodQA tools: the endpoint and allowlist
+	// identity stays, only the settings revision embedded in the config hash moves.
 	policy := s.policy
+	policy.MCPConfigSHA256 = "revision-one"
+	policy.MCPIdentity = "stable-endpoint-and-allowlist"
+	s.policy = policy
+	s.conversationRuntimeHash = conversationIdentity("/fixture/claude-absent", *env, policy)
 	policy.MCPConfigSHA256 = "revision-two"
 	a.resolvePolicy = func(string, string, string) (resolvedPolicy, error) { return policy, nil }
 	err := a.send(s.ID, "B", "continue", nil, false)
@@ -174,5 +179,42 @@ func TestClaudeRefusesRealToolIdentityChange(t *testing.T) {
 	err := a.send(s.ID, "B", "continue", nil, false)
 	if err == nil || !strings.Contains(err.Error(), "credentials or tools changed") {
 		t.Fatalf("tool identity change was not refused: %v", err)
+	}
+}
+
+// A7 for Codex: a stored credential change refuses further sends on a live
+// client, manual or automatic, and records nothing for the refused request.
+func TestCodexRefusesSendAcrossCredentialChange(t *testing.T) {
+	for _, automatic := range []bool{false, true} {
+		name := map[bool]string{false: "manual", true: "automatic"}[automatic]
+		t.Run(name, func(t *testing.T) {
+			a, s, c := identityCodexFixture(t)
+			s.requests["A"] = "final"
+			s.lastRequest = "A"
+			s.providerFinal = true
+			sink := &repairSink{}
+			c.input = sink
+			bindings := []sendBinding{}
+			if automatic {
+				s.task = &trackedTask{ID: "task", State: "active", Generation: 1, passes: map[string]string{}, attempts: map[string]int{}}
+				s.Supervision.State = "active"
+				bindings = append(bindings, sendBinding{taskID: "task", epoch: s.controlEpoch})
+			}
+			a.runtime = func(string, string) (string, []string, error) {
+				return "/fixture/codex", []string{"OPENAI_API_KEY=replacement-credential-value"}, nil
+			}
+			err := a.send(s.ID, "B", "continue", nil, automatic, bindings...)
+			if !errors.Is(err, errRuntimeChanged) {
+				t.Fatalf("Codex conversation crossed a credential change: %v", err)
+			}
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			if _, sent := s.requests["B"]; sent || s.lastRequest != "A" {
+				t.Fatalf("refused send recorded request state: %v", s.requests)
+			}
+			if sink.Len() != 0 {
+				t.Fatalf("refused send wrote %d bytes to the provider", sink.Len())
+			}
+		})
 	}
 }
