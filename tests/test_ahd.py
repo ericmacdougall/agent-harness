@@ -71,6 +71,10 @@ def owner(agent, state, idle=1900, typ="task-owner", task="build the thing", tic
             "idle_s": idle, "ticket": ticket, "last_activity": last}
 
 
+def mono_deadline():
+    return time.monotonic() + 30
+
+
 class Scratch(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -267,7 +271,10 @@ class BadInputs(Scratch):
         self.assertEqual(list(self.ring()), [good["key"]])
         self.owners([owner("a1111111111111111", "SILENT")])
         self.daemon().tick()
-        self.assertEqual(self.alert_calls("raise"), [])  # already active: the torn tail did not hide it
+        # already active, so the torn tail did not hide it: the only raise is a refresh of the fixture's short text
+        calls = self.alert_calls("raise")
+        self.assertEqual(len(calls), 1)
+        self.assertIn('"updated": true', " ".join(calls[0]))
 
     def test_wal_asks_survive_malformed_lines_and_truncation(self):
         lines = [json.dumps({"at": "2027-01-15T07:00:00+00:00", "event": "ask", "id": "w1", "note": "need key"}),
@@ -426,6 +433,53 @@ AH_PY = HOOKS / "ah.py"
 
 
 @unittest.skipUnless(AH_PY.is_file(), "needs ah.py from feat/ah-query (feat/ahd is stacked on it)")
+class AlertTextRefresh(unittest.TestCase):
+    """ahd must not inherit the frozen text or the false-drop bug from ops-watch (GoodQA goodqa#14740)."""
+
+    def flag(self, message, severity="high"):
+        return {"severity": severity, "class": "liveness", "kind": "liveness", "subject": "s.t", "since": 100,
+                "message": message, "detail": {"ticket": "goodqa#1"}}
+
+    def ring(self, message, at="2027-01-15T07:00:00+00:00", severity="high"):
+        return {"k": {"event": "raise", "severity": severity, "message": message, "at": at}}
+
+    def test_state_change_at_the_same_severity_refreshes(self):
+        plan = ahd.plan_transitions({"k": self.flag("owner DROPPED: a1")}, self.ring("owner SILENT-HIGH: a1"), now=NOW)
+        self.assertEqual([(op, k) for op, k, _, _ in plan], [("raise", "k")])
+        self.assertTrue(plan[0][2]["detail"]["updated"])
+
+    def test_same_text_plans_nothing(self):
+        self.assertEqual(ahd.plan_transitions({"k": self.flag("same")}, self.ring("same"), now=NOW), [])
+
+    def test_lower_severity_replaces_the_stale_one(self):
+        plan = ahd.plan_transitions({"k": self.flag("x", "warning")}, self.ring("x"), now=NOW)
+        self.assertEqual(plan[0][2]["severity"], "warning")
+
+    def test_refresh_key_differs_by_text_and_repeats_for_the_same_text(self):
+        d = ahd.Daemon.__new__(ahd.Daemon)
+        d.host = "h"
+        plan = lambda m: ahd.plan_transitions({"k": self.flag(m)}, self.ring("old"), now=NOW)[0][2]
+        self.assertNotEqual(d.key_for("raise", "k", plan("one"), None), d.key_for("raise", "k", plan("two"), None))
+        self.assertEqual(d.key_for("raise", "k", plan("one"), None), d.key_for("raise", "k", plan("one"), None))
+
+    def test_refresh_posts_no_ticket_comment(self):
+        d = ahd.Daemon.__new__(ahd.Daemon)
+        d.host, d.policy, d.call = "h", {"goodqa_poster": ["darwin", "linux"]}, mock.Mock(return_value=(0, {}))
+        d.posts_goodqa = lambda: True
+        f = ahd.plan_transitions({"k": self.flag("new")}, self.ring("old"), now=NOW)[0][2]
+        d.ticket_comment("k", f, mono_deadline())
+        d.call.assert_not_called()
+
+    def test_only_real_owner_rows_alert(self):
+        rows = [dict(owner("a1111111", "returned", typ="general-purpose"), owner=False),
+                dict(owner("a2222222", "idle-helper", typ=None), owner=False),
+                owner("a3333333", "finishing", typ="general-purpose"),
+                owner("a4444444", "DROPPED", typ="general-purpose"),
+                dict(owner("a5555555", "DROPPED", typ="general-purpose"), owner=False)]  # only the owner check stops it
+        got = ahd.liveness_alerts({SESSION: {"owners": rows}}, ahd.load_policy())
+        self.assertEqual([f["detail"]["agent"] for f in got.values()], ["a4444444"])
+
+
 class SolveDropFixture(Scratch):
     """The incident: a general-purpose owner, never in main.jsonl spawn events, stopped 2 h ago with no handoff,
     while its ask stays open. Asserted end to end through the real `ah owners`."""

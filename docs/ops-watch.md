@@ -39,6 +39,8 @@ The Codex trust hash is the sha256 of the sorted-key, compact JSON of `{"event_n
 
 Each host posts at most one digest comment per 30 minutes (`sinks.comment_min_interval_s`). A digest holds the latest transition per key. Stop and remove the timer with `ops_watch.py uninstall --apply`; unit files move to `~/.agent-harness/state/ops-watch/uninstalled/`, and the ring and state stay.
 
+An active alert's ring entry follows its condition. When the words change, ops-watch rewrites the entry at most every 5 minutes; when only numbers change, at most hourly. A rewrite is a `raise` with `detail.updated`, and it adds nothing to digests or deadman mail. `liveness.alert_text_stale` is the rule, shared with ahd.
+
 Alert text is redacted when written to the ring and again when injected. The context line neutralizes instruction words, and a peer's alerts appear there as severity, host and key only.
 
 ## Alert path (canonical)

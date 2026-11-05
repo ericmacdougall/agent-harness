@@ -19,11 +19,25 @@ SILENT_S = 30 * 60
 HIGH_S = 60 * 60
 FINISH_GRACE_S = 30 * 60  # a just-stopped owner may be between turns or writing its handoff: not a drop yet
 
+# An active alert's ring entry is what agents read, so its text must follow the condition, but a live counter must not
+# fill the ring. Changed words refresh quickly; a change in numbers alone ("silent 31m") refreshes hourly.
+ALERT_REFRESH_S = 3600
+ALERT_REFRESH_MIN_S = 300
+_NUMBER = re.compile(r"\d+")
+
 _WAITING = re.compile(r"\bwaiting\s+(?:on|for)\s+([A-Za-z0-9_.:#\-]{1,60})", re.I)
 
 
 # Types that are owners only when main names them as one (a WAL scope/intent/decision note carrying the id).
 NAMEABLE_TYPES = ("general-purpose", "claude")
+
+
+def alert_text_stale(written: str, current: str, written_at: float, now: float) -> bool:
+    """Should an active alert whose ring entry says `written` (written at `written_at`) be rewritten to `current`?"""
+    if written == current:
+        return False
+    words_changed = _NUMBER.sub("#", written or "") != _NUMBER.sub("#", current or "")
+    return now - (written_at or 0) >= (ALERT_REFRESH_MIN_S if words_changed else ALERT_REFRESH_S)
 
 
 def waiting_on(note: str):

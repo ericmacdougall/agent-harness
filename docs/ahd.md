@@ -27,6 +27,8 @@ Alert keys:
 - `ask:<id>:stale` and `ask:<id>:no-evidence`: warning.
 - `wal:unsafe:<session8>`: high; see Unsafe WALs below.
 
+An active alert whose text or severity no longer matches is raised again with `detail.updated`, under the rule in `liveness.alert_text_stale`. A refresh posts no ticket comment. Only rows that `ah owners` marks as owners raise anything, so helpers never alert.
+
 If ahd cannot read a session's owners, it does not clear that session's liveness alerts. A missing `ah` verb is skipped for 10 min and logged once.
 
 **Clock.** Each tick compares the wall-clock delta with the monotonic delta. If they differ by more than 5 min, ahd logs `clock:jump` and holds liveness transitions for 1 tick. Clears still go through.

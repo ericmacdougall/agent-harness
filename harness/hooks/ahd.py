@@ -41,6 +41,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import ahd_peek as peek  # noqa: E402
+import liveness  # noqa: E402
 
 SOURCE = "ahd"
 OPEN_STATES = ("open", "assigned", "in_progress", "blocked")
@@ -108,6 +109,7 @@ def load_policy(path=None) -> dict:
     return pol
 
 
+MESSAGE_MAX = 400  # characters of an alert message handed to `ah alert raise`
 OUTPUT_CAP = 32 << 20  # bytes accepted from one child; a child past it is killed, never buffered
 
 
@@ -415,8 +417,9 @@ def ring_wrap_alert(events: list, ts: float, hostname: str) -> dict:
                           "message": f"alert ring on {hostname} wraps more than once an hour", "detail": {}}}
 
 
-def plan_transitions(desired: dict, ring: dict, hold=frozenset()) -> list:
-    """Deterministic diff: [(op, key, flag, ring_event)]. Keys in `hold` get no transition at all this tick."""
+def plan_transitions(desired: dict, ring: dict, hold=frozenset(), now=None) -> list:
+    """Deterministic diff: [(op, key, flag, ring_event)]. Keys in `hold` get no transition at all this tick.
+    `now` also refreshes an active alert whose ring text or severity no longer matches, marked detail.updated."""
     ops = []
     for k in sorted(desired):
         if k in hold:
@@ -426,6 +429,9 @@ def plan_transitions(desired: dict, ring: dict, hold=frozenset()) -> list:
         active = cur is not None and cur.get("event") == "raise"
         if not active or SEV.get(f["severity"], 0) > SEV.get(cur.get("severity"), 0):
             ops.append(("raise", k, f, cur))
+        elif now is not None and (f["severity"] != cur.get("severity") or liveness.alert_text_stale(
+                cur.get("message", ""), str(f.get("message", ""))[:MESSAGE_MAX], parse_ts(cur.get("at")) or 0, now)):
+            ops.append(("raise", k, dict(f, detail={**(f.get("detail") or {}), "updated": True}), cur))
     for k in sorted(ring):
         if k in hold:
             continue
@@ -570,7 +576,7 @@ class Daemon:
             hold |= {k for k in ring if k.startswith("liveness:") and k not in desired}
         if "asks" in bad or any("error" in a for a in asks):
             hold |= {k for k in ring if k.startswith("ask:") and k not in desired}
-        plan = plan_transitions(desired, ring, frozenset(hold))
+        plan = plan_transitions(desired, ring, frozenset(hold), now=ts)
         sent = step("alerts", lambda: self.send(plan, deadline)) or 0
         step("spool", lambda: self.call("spool drain", [], deadline))
         summary.update(sessions=len(sessions), owners=sum(len((d or {}).get("owners") or []) for d in docs.values()),
@@ -619,13 +625,15 @@ class Daemon:
             since = parse_ts((cur or {}).get("at")) or (cur or {}).get("seq", 0)
             kind = key.split(":", 1)[0]
             return write_key(self.host, kind, key.split(":", 1)[-1], "clear" + extra, since)
+        if (flag.get("detail") or {}).get("updated"):  # one ring write per distinct text, not one per alert
+            extra = "-u" + hashlib.sha256(str(flag.get("message", "")).encode()).hexdigest()[:8] + extra
         return write_key(self.host, flag.get("kind") or key.split(":", 1)[0], flag.get("subject") or key,
                          f"raise-{flag['severity']}{extra}", flag.get("since", 0))
 
     def alert_args(self, op: str, key, flag, source, cur=None, extra: str = "") -> list:
         args = ["--alert-key", str(key), "--source", source, "--key", self.key_for(op, key, flag or {}, cur, extra)]
         if op == "raise":
-            args += ["--severity", flag["severity"], "--message", str(flag.get("message", ""))[:400]]
+            args += ["--severity", flag["severity"], "--message", str(flag.get("message", ""))[:MESSAGE_MAX]]
             detail = dict(flag.get("detail") or {})
             if extra:
                 detail["reasserted"] = True
@@ -666,6 +674,8 @@ class Daemon:
     def ticket_comment(self, key: str, flag: dict, deadline: float) -> None:
         """High/critical owner alerts also go to the task's own ticket, through ah, from the Mac only."""
         ticket = (flag.get("detail") or {}).get("ticket")
+        if (flag.get("detail") or {}).get("updated"):
+            return
         if not ticket or flag.get("class") != "liveness" or flag["severity"] not in ("high", "critical") \
                 or not self.posts_goodqa():
             return
