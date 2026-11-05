@@ -1006,16 +1006,13 @@ class GuardCompositionTests(unittest.TestCase):
             self.skipTest('install_codex not importable here: %s' % error)
         groups = install_codex.merge_hooks({}, Path('/home/u/.codex'))['hooks']['PreToolUse']
         commands = [h['command'] for g in groups for h in g['hooks']]
-        order = ('wal.py', 'commit_policy.py', 'merge_gate.py', 'command_guard_hook.py', 'kill_guard.py')
+        order = ('wal.py', 'commit_policy.py', 'merge_gate.py', 'command_guard_hook.py', 'kill_guard.py', 'heavy_job_guard.py')
         self.assertEqual(len(commands), len(order))
         self.assertEqual([len(g['hooks']) for g in groups], [1] * len(order))  # trust is keyed on group:handler
         for command, name in zip(commands, order):
             self.assertIn(name, command)
         self.assertEqual(sum('kill_guard.py' in c for c in commands), 1)
 
-
-if __name__ == '__main__':
-    unittest.main()
 
 
 class ScriptArgumentTextIsData(WorldCase):
@@ -1029,6 +1026,15 @@ class ScriptArgumentTextIsData(WorldCase):
         "python3 -c 'import os; os.kill(5, 9)'",
         "python3 - <<'EOF'\nimport os\nos.kill(5, 9)\nEOF",
         "python3 -m somemod --note x -c 'os.kill(5,9)'",
+        # review F1: a flag value that looks like a script must not hide the inline code after it
+        "python3 -W x/y -c 'import os; os.kill(4242, 9)'",
+        "python3 -W ignore::a.py -c 'import os; os.kill(4242, 9)'",
+        "perl -I /opt/lib -e 'kill 9, 4242'",
+        "ruby -I /opt/lib -e 'Process.kill(9, 4242)'",
+        "php -d include_path=/x -r 'posix_kill(4242, 9);'",
+        # a script that runs its own arguments as a command
+        "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 -- kill -9 4242",
+        "python3 ./runner.py pkill -f node",
     ]
 
     def test_script_arguments_are_not_code(self):
@@ -1040,3 +1046,6 @@ class ScriptArgumentTextIsData(WorldCase):
         for cmd in self.CODE:
             with self.subTest(cmd=cmd):
                 self.assertEqual(self.decide(cmd)[0], 'block', cmd)
+
+if __name__ == '__main__':
+    unittest.main()
