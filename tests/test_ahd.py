@@ -714,7 +714,7 @@ class MemoryBounds(Scratch):
         d = self.blocked_tick(big)
         self.assertEqual(ahd.scan_sessions(self.policy, NOW)[0], [])
         self.assertEqual(self.alert_calls("clear"), [])  # the session's liveness alert stays up
-        self.assertIn(f"wal:unsafe:{SESSION[:8]}", d.last["desired"])
+        self.assertEqual(d.last["desired"][f"wal:unsafe:{SESSION[:8]}"]["severity"], "high")
 
     def test_symlinked_task_wal_is_never_handed_to_ah(self):
         def link(path):

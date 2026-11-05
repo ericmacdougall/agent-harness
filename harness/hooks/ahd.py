@@ -275,7 +275,7 @@ def active_sessions(policy: dict, ts: float) -> list:
 
 def wal_unsafe_alerts(blocked: dict, ts: float) -> dict:
     return {f"wal:unsafe:{sess[:8]}": {
-        "severity": "warning", "class": "self", "kind": "wal", "subject": sess[:8], "since": int(ts // 86400 * 86400),
+        "severity": "high", "class": "self", "kind": "wal", "subject": sess[:8], "since": int(ts // 86400 * 86400),
         "message": f"session {sess[:8]} not monitored for liveness: {why}"[:200], "detail": {}}
         for sess, why in blocked.items()}
 

@@ -25,7 +25,7 @@ Alert keys:
 - `liveness:<session8>/agent-<id>`: warning for SILENT; high for SILENT-HIGH and DROPPED.
 - `ask:<id>:unowned`: warning; high when the request is under 24 h old and has been unowned for 2 h.
 - `ask:<id>:stale` and `ask:<id>:no-evidence`: warning.
-- `wal:unsafe:<session8>`: warning; see Unsafe WALs below.
+- `wal:unsafe:<session8>`: high; see Unsafe WALs below.
 
 If ahd cannot read a session's owners, it does not clear that session's liveness alerts. A missing `ah` verb is skipped for 10 min and logged once.
 
@@ -33,7 +33,7 @@ If ahd cannot read a session's owners, it does not clear that session's liveness
 
 **Memory.** All daemon reads go through `safe_read`, which uses `O_NOFOLLOW` and `O_NONBLOCK`, accepts regular files only and caps the size. `run_cmd` caps each child's output at 32 MiB and then kills its process group. The systemd unit sets `MemoryMax=1G` and `MemorySwapMax=0`. launchd has no equivalent, so on the Mac the daemon runs `memory_guard`, which exits with code 70 once peak RSS passes `memory_cap_bytes`. It polls every 2 s, so it is a backstop and not a hard limit, and it does not cover `ah` children. ops-watch's footprint alert is the second backstop.
 
-**Unsafe WALs.** `ah owners` reads a session's main and task WALs. A session with a WAL over `owners_wal_max_bytes` (256 MiB), or one that isn't a regular file, is not passed to `ah`. Its liveness alerts are held, and `wal:unsafe:<session8>` raises a warning, so that session is visibly unmonitored.
+**Unsafe WALs.** `ah owners` reads a session's main and task WALs. A session with a WAL over `owners_wal_max_bytes` (256 MiB), or one that isn't a regular file, is not passed to `ah`. Its liveness alerts are held, and `wal:unsafe:<session8>` raises at high, so that session is visibly unmonitored. Every owner in that session loses liveness until the WAL shrinks; a per-WAL exclusion is planned.
 
 **Testing rule.** Run known-bad code and resource-abuse fixtures (`/dev/zero`, floods, FIFOs) only on dev2 or its successor, under `systemd-run --user --scope -p MemoryMax=2G -p MemorySwapMax=0` and `timeout`. Never run them on the Mac. A 2026 test run on the Mac without a limit reached a 75.9 GB footprint.
 
