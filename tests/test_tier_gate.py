@@ -319,6 +319,11 @@ class BashAdvisory(GateFixture):
             self.assertEqual(self.bash(line)[0], 'allow', line)
         self.assertEqual(self.bash('codex exec -m gpt-6-astra -')[0], 'deny')
         self.assertEqual(self.bash('$(which codex) exec -m gpt-6-astra -')[0], 'deny')
+        self.assertEqual(self.bash('sudo codex -m gpt-6-astra -')[0], 'deny')
+        self.assertEqual(self.bash('FOO=1 codex -m gpt-6-astra -')[0], 'deny')
+        # A bare `codex` argument of another program is a search term, not a launch (-m belongs to that program).
+        for line in ('grep -m 1 codex notes.txt', 'grep -m 1 "codex" notes.txt', 'rg -m 3 codex', 'git log --grep codex -m -1'):
+            self.assertEqual(self.bash(line)[0], 'allow', line)
 
     def test_oversize_launch_lines_are_refused_quickly_not_parsed(self):
         import time

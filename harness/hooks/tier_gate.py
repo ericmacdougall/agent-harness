@@ -249,6 +249,32 @@ def program_name(word, command_position=False):
     return tail.rsplit('/', 1)[-1].rstrip('`)\'"').lower()
 
 
+def command_program(words):
+    """The program in command position: past leading env assignments and wrappers (sudo, env, nice, time, command,
+    exec, nohup, timeout with their options), the first word or a substitution there."""
+    index = 0
+    while index < len(words):
+        word = words[index]
+        base = word.rsplit('/', 1)[-1].lower()
+        if base in ('sudo', 'env', 'nice', 'time', 'command', 'exec', 'nohup', 'timeout') or ('=' in word and not word.startswith('-') and '$(' not in word and '`' not in word):
+            index += 1
+            while index < len(words) and words[index].startswith('-'):
+                option = words[index]; index += 1
+                if option in WRAPPER_VALUE_OPTIONS.get(base, ()) and index < len(words):
+                    index += 1
+            if base == 'timeout' and index < len(words) and words[index][:1].isdigit():
+                index += 1
+            continue
+        if '$(' in word or '`' in word:
+            # shlex splits an unquoted substitution into several words: join until it closes.
+            joined, end = word, index
+            while end + 1 < len(words) and (joined.count('(') > joined.count(')') or joined.count('`') % 2 == 1):
+                end += 1; joined += ' ' + words[end]
+            return program_name(joined, command_position=True)
+        return program_name(word, command_position=True)
+    return ''
+
+
 def nested_strings(segment):
     return [text for text, _ in nested_items(segment)]
 
@@ -351,7 +377,7 @@ def _decide_launch(command, policy, ledger, env_model=None):
         return 'allow', None, None, {'quoted_only': True}
     for index, word in enumerate(words):
         if word == '--model' and index + 1 < len(words): model = words[index + 1]
-        if word == '-m' and 'codex' in programs and index + 1 < len(words): model = words[index + 1]
+        if word == '-m' and command_program(words) == 'codex' and index + 1 < len(words): model = words[index + 1]
         if word.startswith('--model='): model = word.split('=', 1)[1]
         if word == '--effort' and index + 1 < len(words): effort = words[index + 1]
         if word.startswith('--effort='): effort = word.split('=', 1)[1]
