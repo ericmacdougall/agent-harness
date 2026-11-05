@@ -46,7 +46,7 @@ file_age() { # seconds since modification of $1; BSD stat on Darwin, GNU stat el
 
 holder_alive() { # pid $1 is running and is a log-backup run (a recycled pid belongs to something else)
   kill -0 "$1" 2>/dev/null || return 1
-  ps -p "$1" -o command= 2>/dev/null | grep -q 'log-backup\.sh'
+  ps -p "$1" -o args= 2>/dev/null | awk '$1 ~ /(^|\/)(ba|da|z)?sh$/ && $2 ~ /log-backup\.sh$/ {f=1} END {exit !f}'
 }
 
 acquire_lock() {
@@ -85,14 +85,14 @@ if ! acquire_lock; then
   date -u +%FT%TZ > "$LOGDIR/log-backup.last-skip"
   exit 0
 fi
-trap 'rm -f "$LOCKD/pid"; rmdir "$LOCKD" 2>/dev/null' EXIT
+trap '[ "$(cat "$LOCKD/pid" 2>/dev/null)" = "$$" ] && { rm -f "$LOCKD/pid"; rmdir "$LOCKD" 2>/dev/null; }' EXIT
 
 command -v "$RCLONE" >/dev/null 2>&1 || fail "rclone not found (set LOG_BACKUP_RCLONE or fix PATH)" 127
 [ -r "$EXCLUDES" ] || fail "exclude file missing: $EXCLUDES (refusing to run without credential excludes)" 2
 for anchor in auth.json rclone.conf member.key '*.secret' '.env'; do
   grep -qxF -- "$anchor" "$EXCLUDES" || fail "exclude file lacks required pattern $anchor (refusing to run)" 2
 done
-case "$HOST" in ''|*[!A-Za-z0-9._-]*|-*) fail "invalid host label" 2 ;; esac
+case "$HOST" in ''|*[!A-Za-z0-9._-]*|-*|.*) fail "invalid host label" 2 ;; esac
 
 remotes=$("$RCLONE" listremotes --long --ask-password=false </dev/null 2>/dev/null)
 BASE=${LOG_BACKUP_REMOTE:-}
@@ -129,9 +129,10 @@ ok=0 found=0 primary=0
 for src in .claude/projects .claude/wals .claude/history.jsonl .codex/sessions .codex/archived_sessions .codex/history.jsonl .agent-harness/work \
     .agent-harness/work-assignments.json .agent-harness/work-ledger.json .agent-harness/work-ledger.events.jsonl \
     .agent-harness/work-ledger.archive.jsonl .agent-harness/work-ledger.failures.jsonl .agent-harness/work-ledger.spool.jsonl; do
-  [ -e "$HOME/$src" ] || continue
+  [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
+  if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
   if [ -d "$HOME/$src" ]; then dst="$R/$src"; else dst="$R/$(dirname "$src")"; fi
-  args=(copy --tpslimit 4 --transfers 4 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE --exclude-from "$EXCLUDES")
+  args=(copy --tpslimit 4 --transfers 4 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE --exclude-from "$EXCLUDES" --ignore-case)
   if [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ]; then args+=(--backup-dir "$R/versions/$STAMP/$src"); fi
   # Actively written files (live transcripts, WALs) can change mid-upload and Dropbox can rate-limit: retry the
   # source with a pause before calling it a failure. A source that still fails makes the whole run non-fresh.
@@ -145,7 +146,10 @@ for src in .claude/projects .claude/wals .claude/history.jsonl .codex/sessions .
   done
   if [ $copied -eq 1 ]; then
     found=$((found + 1))
-    case "$src" in .claude/projects|.codex/sessions) primary=$((primary + 1)) ;; esac
+    case "$src" in .claude/projects|.codex/sessions)
+      # An empty primary tree is not evidence of a backup.
+      if [ -n "$(find "$HOME/$src" -type f -print -quit 2>/dev/null)" ]; then primary=$((primary + 1)); fi ;;
+    esac
   else
     say "copy failed after $attempt attempts: $src"; ok=1
   fi
