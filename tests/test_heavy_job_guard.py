@@ -4,12 +4,14 @@ Run on dev2, not the Mac: the process tests allocate ~1.5 GB on purpose.
 """
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
@@ -510,12 +512,24 @@ def wait_dead(pid, seconds=8):
     return False
 
 
+class ScratchHome(unittest.TestCase):
+    """run_capped writes sidecars under $HOME/.agent-harness/state; keep every subprocess off the real HOME (GoodQA #14554)."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = tempfile.mkdtemp(prefix="run-capped-home-")
+        self.addCleanup(shutil.rmtree, self.home, True)
+        patcher = unittest.mock.patch.dict(os.environ, {"HOME": self.home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
 def state(pid):
     out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return out
 
 
-class BoundValidation(unittest.TestCase):
+class BoundValidation(ScratchHome):
     def run_script(self, script, flags):
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp, "ran")
@@ -545,7 +559,7 @@ class BoundValidation(unittest.TestCase):
         self.assertEqual((done.returncode, ran), (0, True), done.stdout + done.stderr)
 
 
-class AbsurdBounds(unittest.TestCase):
+class AbsurdBounds(ScratchHome):
     def test_finite_but_absurd_caps_are_refused(self):
         for script, flags in (("run_capped.py", ["--max-rss-gb", "1e300"]), ("run_capped.py", ["--max-rss-gb", "1025"]),
                               ("run_capped.py", ["--max-rss-gb", "1", "--timeout-s", "1e12"]),
@@ -563,7 +577,7 @@ class AbsurdBounds(unittest.TestCase):
                 self.assertEqual(guard.max_heavy_jobs(), expected, value)
 
 
-class RunCapped(unittest.TestCase):
+class RunCapped(ScratchHome):
     def spawn_tree(self, tmp, extra=None):
         """A parent that spawns a child that spawns a grandchild; pids written to files."""
         script = Path(tmp, "tree.py")
@@ -668,6 +682,12 @@ class RunCapped(unittest.TestCase):
             os.killpg(os.getpgid(kids[0]), signal.SIGCONT)
             self.assertEqual(proc.wait(timeout=30), 0)
             self.assertTrue(done_file.exists())
+
+    def test_children_see_the_scratch_home_not_the_real_one(self):
+        done = subprocess.run([sys.executable, str(HOOKS / "run_capped.py"), "--max-rss-gb", "1", "--", sys.executable,
+                               "-c", "import os;print(os.path.expanduser('~'))"], capture_output=True, text=True, timeout=30)
+        self.assertEqual(done.stdout.strip(), self.home, done.stderr)
+        self.assertTrue(Path(self.home, ".agent-harness", "state", "run_capped").is_dir())
 
     def test_normal_command_exit_code_passes_through(self):
         done = subprocess.run([sys.executable, str(HOOKS / "run_capped.py"), "--max-rss-gb", "1", "--", sys.executable,
