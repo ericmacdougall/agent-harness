@@ -100,7 +100,9 @@ def install(config):
             import shutil
             environment = args[env_position] if env_position is not None and env_position < len(args) else None
             search = (environment or os.environ).get('PATH') if hasattr(environment or os.environ, 'get') else None
-            resolved = shutil.which(name, path=search) or name
+            resolved = shutil.which(name, path=search)
+            if resolved is None:
+                return  # a bare name no PATH entry resolves starts nothing (the launch raises FileNotFoundError)
         real = os.path.realpath(resolved)
         import tempfile
         roots = {temp_root, os.path.realpath(tempfile.gettempdir())}

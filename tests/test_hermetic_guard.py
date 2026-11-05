@@ -57,7 +57,10 @@ class HermeticSuite(unittest.TestCase):
         # Scope limits in the spec): those globals are frozen before test_hermetic_guard is imported.
         if os.environ.get('HARNESS_SUITE_PINNED') != '1':
             self.skipTest('only meaningful when the gate wrapper pinned HOME before Python started')
-        self.assertEqual(hermetic.scan_frozen_paths(), [])
+        # escalation pins its roots to the passwd home on purpose (a caller's HOME must not relabel them, GoodQA
+        # #14686) and only reads it to verify receipts; the audit hook records any write into that store, so it stays the backstop.
+        by_design = {'escalation.DEFAULT_USAGE_ROOT'}
+        self.assertEqual([item for item in hermetic.scan_frozen_paths() if item.split('=')[0] not in by_design], [])
 
     def test_home_inside_a_protected_dir_is_a_violation(self):
         with mock.patch.dict(os.environ, {'HOME': str(hermetic.real_home() / '.claude')}):

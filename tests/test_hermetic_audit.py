@@ -117,6 +117,13 @@ class AuditHookLaunchStyles(unittest.TestCase):
         self.run_code("import subprocess\nsubprocess.run(['codex'])\n", env=env)
         self.assertIn('reviewer-launch', self.recorded())
 
+    def test_bare_reviewer_name_no_path_entry_resolves_is_not_recorded(self):
+        # install.py asks `claude --version`; with no claude on PATH nothing starts, so nothing may be recorded
+        # (GoodQA #14553: the gate reported 12 phantom launches against <tree>/claude).
+        self.run_code("import subprocess\ntry:\n    subprocess.run(['claude', '--version'])\nexcept OSError:\n    pass\n",
+                      env={'PATH': '/nonexistent-bin'})
+        self.assertEqual(self.recorded(), '')
+
     def test_fixture_reviewer_under_the_temp_root_is_not_recorded(self):
         with tempfile.TemporaryDirectory() as temp:
             fake = self._fake_reviewer(temp)
