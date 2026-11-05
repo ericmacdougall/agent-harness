@@ -758,7 +758,7 @@ class PeerReviewTests(unittest.TestCase):
             captured["prompt"] = prompt
             return 0, "", ""
         options = {"domain_section": "## Domain checklist\n- reentrancy"}
-        with mock.patch.object(pr, "run", fake_run), mock.patch.object(pr.shutil, "which", return_value="/x"), \
+        with mock.patch.object(pr, "run", fake_run), mock.patch.object(pr.diagnostics, "discover_executable", side_effect=lambda name, **_: {"name": name, "path": "/x", "source": "PATH", "rejected": [], "searched": []}), \
                 mock.patch.object(pr, "normalize_provider", return_value={
                     "result": "PASS", "report": "PLAN_RESULT: ACCEPT", "reason": "OK", "fallback_allowed": False,
                     "account_cooldown": None, "reset_at": None, "usage": None}), \
