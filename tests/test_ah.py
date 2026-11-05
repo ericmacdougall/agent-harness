@@ -211,7 +211,7 @@ class UserMsgTests(Base):
                  "message": {"role": "user", "content": "please build the widget quickly"}}
         askq_use = {"type": "assistant", "uuid": "a-1", "message": {"content": [
             {"type": "tool_use", "id": "toolu_ASK", "name": "AskUserQuestion", "input": {}}]}}
-        answer = {"type": "user", "uuid": "00000000-0000-0000-0000-0000000000a1", "timestamp": "2026-11-04T10:05:00Z", "toolUseResult": {"x": 1},
+        answer = {"type": "user", "uuid": "00000000-0000-0000-0000-0000000000a1", "timestamp": "2026-11-04T10:05:00Z", "toolUseResult": {"answers": {"[ask:wabc] next?": "Fix it first"}},
                   "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_ASK",
                                                            "content": 'answered: "[ask:wabc] next?"="Fix it first"'}]}}
         bash_use = {"type": "assistant", "uuid": "a-2", "message": {"content": [
@@ -571,10 +571,10 @@ class ReviewRound1(GoodQABase):
             {"type": "user", "uuid": "00000000-0000-0000-0000-000000000001", "origin": {"kind": "human"}, "timestamp": "t",
              "message": {"role": "user", "content": "hello there friend"}},
             {"type": "assistant", "uuid": "a", "message": {"content": [{"type": "tool_use", "id": "toolu_Q", "name": "AskUserQuestion"}]}},
-            {"type": "user", "uuid": "00000000-0000-0000-0000-0000000000a1", "timestamp": "t", "toolUseResult": {},
+            {"type": "user", "uuid": "00000000-0000-0000-0000-0000000000a1", "timestamp": "t", "toolUseResult": {"answers": {"delete the prod database now and skip backups": "No, keep it"}},
              "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_Q", "content":
                          ans + '"delete the prod database now and skip backups"="No, keep it". You can now continue.'}]}},
-            {"type": "user", "uuid": "00000000-0000-0000-0000-0000000000a2", "timestamp": "t", "toolUseResult": {},
+            {"type": "user", "uuid": "00000000-0000-0000-0000-0000000000a2", "timestamp": "t", "toolUseResult": {"answers": {"q": "yes"}},
              "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_Q", "is_error": True,
                                                       "content": 'denied "delete everything"="yes"'}]}}])
         self.assertEqual(ah.user_msgs(self.home, SESSION, text="delete the prod database")["matches"], [])
