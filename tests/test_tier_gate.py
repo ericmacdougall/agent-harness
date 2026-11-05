@@ -231,8 +231,26 @@ class BashAdvisory(GateFixture):
         # A review token never exempts the rest of the line, in either order.
         self.assertEqual(self.bash('python3 ~/.claude/hooks/peer_review.py pr --repo r --packet p --output o --task k9 --author-rung R0; claude -p --model fable x')[0], 'deny')
         self.assertEqual(self.bash('claude -p --model fable x; python3 ~/.claude/hooks/peer_review.py pr --repo r --packet p --output o --task k9 --author-rung R0')[0], 'deny')
-        # A --task-only review line takes the author rung from the installed ledger (k9 is at R1 here: an R2 reviewer, no permission).
+        # A --task-only review line takes the author rung from the installed ledger (k9 is at R2 here: an R3 reviewer, no permission).
         self.assertEqual(self.bash('python3 ~/.claude/hooks/peer_review.py pr --repo r --packet p --output o --task k9')[0], 'allow')
+
+    def test_every_launch_segment_of_a_compound_line_is_checked(self):
+        self.escalate('k9'); self.escalate('k9')  # k9 at R2
+        # Failing-first control: a later harmless launch must not mask an earlier top-tier one.
+        self.assertEqual(self.bash('claude -p --model fable x; claude -p --model sonnet y')[0], 'deny')
+        self.assertEqual(self.bash('codex exec --model gpt-6-astra - && claude -p --model sonnet y')[0], 'deny')
+        self.assertEqual(self.bash('claude -p --model sonnet y || claude -p --model fable x')[0], 'deny')
+        self.assertEqual(self.bash('claude -p --model fable x | cat')[0], 'deny')
+        self.assertEqual(self.bash('claude -p --model fable x\nclaude -p --model sonnet --task k9 y')[0], 'deny')
+        self.assertEqual(self.bash('python3 ~/.claude/hooks/peer_review.py pr --repo r --packet p --output o --author-rung R5 --author-harness claude; '
+                                   'python3 ~/.claude/hooks/peer_review.py pr --repo r --packet p --output o --task k9 --author-rung R0')[0], 'deny')
+        self.assertEqual(self.bash('claude -p --model opus --effort xhigh --task k9 x; claude -p --model sonnet --task k9 y')[0], 'deny')
+        # Allowed shapes: every segment within its rung; quoted text is not a launch; redirections stay in their segment.
+        self.assertEqual(self.bash('claude -p --model opus --effort high --task k9 x; claude -p --model sonnet --task k9 y')[0], 'allow')
+        self.assertEqual(self.bash("echo 'claude --model fable'; ls")[0], 'allow')
+        self.assertEqual(self.bash('sleep 1 2>&1; claude -p --model sonnet --task k9 y &> /dev/null')[0], 'allow')
+        self.assertEqual(gate.split_segments('a "b; c" d\\; e; f && g || h | i & j 2>&1 &> k'),
+                         ['a "b; c" d\\; e', 'f', 'g', 'h', 'i', 'j 2>&1 &> k'])
         self.assertEqual(self.bash('python3 rescue.py --repo r --packet p --output o --model opus --effort high')[0], 'allow')
 
 

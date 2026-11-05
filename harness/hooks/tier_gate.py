@@ -149,12 +149,56 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
 LAUNCH = re.compile(r'(^|[\s;&|(/])(claude|codex|rescue\.py|peer_review\.py)(\s|$)')
 
 
+def split_segments(command):
+    """Split a shell line on unquoted ;, &&, ||, |, & and newlines; quotes, backslashes and redirections
+    such as 2>&1 or &> are kept inside their segment. Subshell and brace grouping is not parsed: a launch
+    inside (...) still lands in some segment and is still checked."""
+    segments, current, quote, i = [], [], None, 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            current.append(ch)
+            if ch == '\\' and quote == '"' and i + 1 < len(command):
+                current.append(command[i + 1]); i += 2; continue
+            if ch == quote:
+                quote = None
+            i += 1; continue
+        if ch in ('"', "'"):
+            quote = ch; current.append(ch); i += 1; continue
+        if ch == '\\' and i + 1 < len(command):
+            current.append(ch); current.append(command[i + 1]); i += 2; continue
+        if ch == '\n' or ch in ';|&':
+            redirect = ch == '&' and ((i > 0 and command[i - 1] in '<>') or (i + 1 < len(command) and command[i + 1] == '>'))
+            if redirect:
+                current.append(ch); i += 1; continue
+            segments.append(''.join(current)); current = []
+            if ch in '|&' and i + 1 < len(command) and command[i + 1] == ch:
+                i += 1
+            i += 1; continue
+        current.append(ch); i += 1
+    segments.append(''.join(current))
+    return [segment.strip() for segment in segments if segment.strip()]
+
+
 def decide_bash(data, policy, ledger):
-    """Advisory check of claude/codex/rescue launch lines: same rule, reported as context or deny."""
+    """Advisory check of launch lines: every launch segment of a compound line is checked on its own and
+    any denied segment denies the line, so a later harmless launch cannot mask an earlier one."""
     tool_input = data.get('tool_input') if isinstance(data.get('tool_input'), dict) else {}
     command = str(tool_input.get('command') or '')
     if not LAUNCH.search(command):
         return 'allow', None, None, {}
+    results = [_decide_launch(segment, policy, ledger) for segment in split_segments(command) if LAUNCH.search(segment)]
+    if not results:
+        return 'allow', None, None, {'segments': 0}
+    for decision, reason, updated, facts in results:
+        if decision == 'deny':
+            return 'deny', reason, None, dict(facts, segments=len(results))
+    reasons = [reason for _, reason, _, _ in results if reason]
+    return 'allow', ('; '.join(reasons) or None), None, dict(results[0][3], segments=len(results))
+
+
+def _decide_launch(command, policy, ledger):
+    """One launch segment: same rule as a spawn, reported as context or deny."""
     try:
         words = shlex.split(command)
     except ValueError:
