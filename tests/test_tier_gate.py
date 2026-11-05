@@ -284,6 +284,39 @@ class BashAdvisory(GateFixture):
                      'claude -p --model opus --effort high --task k9 "$(date)"'):
             self.assertEqual(self.bash(line)[0], 'allow', line)
 
+    def test_round7_false_positive_controls(self):
+        # The attribution trailer rides every commit: prose naming Claude is not a launch, -m is codex's flag only.
+        for line in ('git commit -m "subject" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"',
+                     'grep -m 1 Claude notes.txt',
+                     'git commit -m "Claude --model fable regression"',
+                     "echo 'see claude' | wc -l"):
+            self.assertEqual(self.bash(line)[0], 'allow', line)
+        self.assertEqual(self.bash('codex exec -m gpt-6-astra -')[0], 'deny')
+
+    def test_round7_shell_strings_fed_without_dash_c(self):
+        self.escalate('k9'); self.escalate('k9')
+        for line in ("bash -c -- 'claude -p --model fable x'",
+                     "bash <<< 'claude -p --model fable x'",
+                     "bash <<<'claude -p --model fable x'",
+                     "echo 'claude -p --model fable x' | bash",
+                     "printf '%s\\n' 'claude -p --model fable x' | sh"):
+            self.assertEqual(self.bash(line)[0], 'deny', line)
+        self.assertEqual(self.bash("echo 'claude -p --model sonnet --task k9 x' | bash")[0], 'allow')
+        self.assertEqual(gate.split_segments('a | b ; c'), ['a', 'b', 'c'])
+        self.assertEqual(gate.split_segments_with_seps('a | b ; c && d'), (['a', 'b', 'c', 'd'], ['', '|', ';', '&&']))
+
+    def test_round7_exported_model_reaches_nested_strings_but_not_ssh(self):
+        self.escalate('k9'); self.escalate('k9')
+        for tail in ("bash -c 'claude -p x'", "eval 'claude -p x'", 'out=$(claude -p x)'):
+            self.assertEqual(self.bash('export ANTHROPIC_MODEL=claude-fable-5-1; ' + tail)[0], 'deny', tail)
+        # The remote environment does not inherit the local export, so this line names no model.
+        self.assertEqual(self.bash("export ANTHROPIC_MODEL=claude-fable-5-1; ssh dev2 'claude -p x'")[0], 'allow')
+
+    def test_round7_quoted_env_model_value(self):
+        self.escalate('k9'); self.escalate('k9')
+        self.assertEqual(self.bash('export ANTHROPIC_MODEL="claude-sonnet-4-5"; claude -p --task k9 x')[0], 'allow')
+        self.assertEqual(self.bash("export ANTHROPIC_MODEL='claude-fable-5-1'; claude -p x")[0], 'deny')
+
     def test_a_task_at_a_permission_rung_launches_nothing_below_it_either(self):
         self.policy = {**self.policy, 'ladder_limits': {'max_review_launches': 100, 'max_rung_climbs': 10, 'max_total_review_usd': 1000}}
         self.ledger = esc.Ledger(self.root, self.policy)

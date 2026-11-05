@@ -13,6 +13,10 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import safe_input  # noqa: E402
 
 
 class TierError(ValueError):
@@ -30,11 +34,13 @@ def load_policy(path=None):
     """Load and validate the table. Any defect raises TierError so callers fail closed."""
     path = Path(path or os.environ.get('AGENT_HARNESS_TIER_POLICY') or DEFAULT_PATH)
     try:
-        raw = path.read_bytes()
+        raw = safe_input.read_bounded(path, MAX_BYTES)
+    except safe_input.InputRejected as rejected:
+        if rejected.code == 'file-too-large':
+            raise TierError('tier table oversized') from None
+        raise TierError('tier table unreadable: %s' % rejected.code) from None
     except OSError as error:
         raise TierError('tier table unreadable: %s' % type(error).__name__) from None
-    if len(raw) > MAX_BYTES:
-        raise TierError('tier table oversized')
     try:
         policy = json.loads(raw.decode('utf-8'))
     except (ValueError, UnicodeError):
@@ -219,7 +225,7 @@ def set_mode(path, new_mode=None):
     previous = load_policy(path)['mode']
     if new_mode is None or new_mode == previous:
         return {'path': str(path), 'mode': previous, 'previous': previous, 'changed': False}
-    raw = json.loads(path.read_text(encoding='utf-8'))
+    raw = json.loads(safe_input.read_bounded(path, MAX_BYTES).decode('utf-8'))
     raw['mode'] = new_mode
     tmp = path.with_suffix(path.suffix + '.tmp')
     tmp.write_text(json.dumps(raw, indent=1, sort_keys=True) + '\n', encoding='utf-8')

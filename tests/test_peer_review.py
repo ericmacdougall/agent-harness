@@ -4,6 +4,7 @@ import json
 import os
 import resource
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1327,12 +1328,23 @@ else:
 '''
         self.fake('codex', body)
         self.fake('claude', body)
+        # Hermetic PATH: only the fake bin dir plus symlinks to the tools a review run needs, so removing the
+        # fake codex means codex is absent even where a real /usr/bin/codex exists (dev2).
+        self.tools = self.root / 'tools'; self.tools.mkdir(mode=0o700)
+        for name in ('git', 'python3', 'sh', 'env', 'cat', 'mkdir', 'rm', 'cp', 'mv', 'ln', 'ls', 'chmod', 'sed', 'grep',
+                     'awk', 'tr', 'sort', 'head', 'tail', 'wc', 'date', 'sleep', 'dirname', 'basename', 'uname', 'mktemp',
+                     'readlink', 'true', 'false', 'find', 'xargs', 'diff', 'tar'):
+            found = shutil.which(name, path='/usr/bin:/bin:/usr/local/bin')
+            if found:
+                (self.tools / name).symlink_to(found)
+        self.assertFalse((self.tools / 'codex').exists() or (self.tools / 'claude').exists())
         (self.root / 'verdict.txt').write_text('CODE_INSPECTION_RESULT: BLOCK\nF1: the handler drops the error\n')
 
     def run_review(self, *extra, stage='code-inspection', remove=()):
         for name in remove:
             (self.bin / name).unlink()
-        return self.invoke(stage=stage, env={'AGENT_HARNESS_ESCALATION_DIR': str(self.ladder)}, extra=list(extra))
+        return self.invoke(stage=stage, extra=list(extra), env={
+            'AGENT_HARNESS_ESCALATION_DIR': str(self.ladder), 'PATH': str(self.bin) + os.pathsep + str(self.tools)})
 
     def test_codex_primary_carries_the_rung_effort_and_the_headers_name_the_selection(self):
         result = self.run_review('--task', 'lad-1', '--author-rung', 'R2', '--author-harness', 'claude')

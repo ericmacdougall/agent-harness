@@ -876,7 +876,7 @@ def record_in_ladder(args, store, reference, head, policy):
     if not args.task or reference is None:
         return
     try:
-        receipt = (store._run_directory(reference['run_id']) / 'final.json').read_bytes()
+        receipt = (store._run_directory(reference['run_id']) / 'final.json').read_bytes()  # input-ok: final receipt just written by usage_guard, capped at write; the ledger bounds it again
         status = ladder.Ledger(policy=policy).record(args.task, receipt, kind='review', source='peer_review:' + args.stage,
                                                      head=head, notify=os.environ.get('AGENT_HARNESS_MAIN_WAL'))
         print('Ladder: task %s rung %s, failures at rung %d%s' % (

@@ -3,6 +3,7 @@
  "gates": {
   "commit-policy": ["hook"],
   "spec-flow": ["hook"],
+  "tier-gate": ["hook"],
   "wal": ["hook", "prompt", "pretool"]
  }
 }

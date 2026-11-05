@@ -22,6 +22,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import escalation as esc  # noqa: E402
 import model_tiers as tiers  # noqa: E402
+import safe_input  # noqa: E402
 
 SPAWN_TOOLS = {'Agent', 'Task', 'Workflow'}
 REVIEWER_TYPES = {'red-team', 'click-tester', 'reviewer'}
@@ -150,13 +151,38 @@ LAUNCH = re.compile(r'(^|[\s;&|(/`\'"=])(claude|codex|rescue\.py|peer_review\.py
 SHELL_STRING_HOSTS = ('bash', 'sh', 'zsh', 'dash', 'ksh', 'su', 'sudo')
 ENV_MODEL = re.compile(r'(?:^|\s)(?:export\s+)?(?:ANTHROPIC_MODEL|CLAUDE_MODEL)=([^\s;&|]+)')
 MAX_NESTING = 2
+PURE_SHELLS = ('bash', 'sh', 'zsh', 'dash', 'ksh')
+
+
+def _unquote(value):
+    """One layer of matching quotes: export ANTHROPIC_MODEL="claude-sonnet-4-5"."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+        return value[1:-1]
+    return value
+
+
+def reads_stdin_as_script(segment):
+    """True for a shell host with no -c: it runs what is piped into it."""
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        return False
+    if not words or words[0].rsplit('/', 1)[-1].lower() not in PURE_SHELLS:
+        return False
+    return not any(w.startswith('-') and not w.startswith('--') and 'c' in w[1:] for w in words[1:])
 
 
 def split_segments(command):
-    """Split a shell line on unquoted ;, &&, ||, |, & and newlines; quotes, backslashes and redirections
+    """The segments of split_segments_with_seps, without the separators."""
+    return split_segments_with_seps(command)[0]
+
+
+def split_segments_with_seps(command):
+    """Returns (segments, seps); seps[i] is the operator before segments[i] ('' for the first). Split a shell line on unquoted ;, &&, ||, |, & and newlines; quotes, backslashes and redirections
     such as 2>&1 or &> are kept inside their segment. Subshell and brace grouping is not parsed: a launch
     inside (...) still lands in some segment and is still checked."""
-    segments, current, quote, i = [], [], None, 0
+    segments, seps, current, quote, i = [], [], [], None, 0
+    pending = ''
     while i < len(command):
         ch = command[i]
         if quote:
@@ -174,34 +200,49 @@ def split_segments(command):
             redirect = ch == '&' and ((i > 0 and command[i - 1] in '<>') or (i + 1 < len(command) and command[i + 1] == '>'))
             if redirect:
                 current.append(ch); i += 1; continue
-            segments.append(''.join(current)); current = []
+            segments.append(''.join(current)); seps.append(pending); current = []
+            pending = ch if ch in '|&;' else ';'
             if ch in '|&' and i + 1 < len(command) and command[i + 1] == ch:
-                i += 1
+                pending = ch * 2; i += 1
             i += 1; continue
         current.append(ch); i += 1
-    segments.append(''.join(current))
-    return [segment.strip() for segment in segments if segment.strip()]
+    segments.append(''.join(current)); seps.append(pending)
+    kept = [(text.strip(), sep) for text, sep in zip(segments, seps) if text.strip()]
+    if kept:
+        kept[0] = (kept[0][0], '')
+    return [text for text, _ in kept], [sep for _, sep in kept]
 
 
 def nested_strings(segment):
+    return [text for text, _ in nested_items(segment)]
+
+
+def nested_items(segment):
     """Strings inside a segment that the shell would run as commands: substitutions ($(...), backticks) and
     the string argument of bash/sh/zsh -c, su/sudo -c, eval and ssh HOST. Quoted prose elsewhere is not one."""
     try:
         words = shlex.split(segment)
     except ValueError:
         return []
-    found = []
+    found = []  # (text, inherits_env): an ssh remote does not inherit the local export
+    shell_seen = False
     for index, word in enumerate(words):
         if '`' in word or '$(' in word:
-            found.append(word)
+            found.append((word, True))
+        if shell_seen and word.startswith('<<<'):
+            operand = word[3:] or (words[index + 1] if index + 1 < len(words) else '')
+            found.append((operand, True))
         base = word.rsplit('/', 1)[-1].lower()
         if base in SHELL_STRING_HOSTS:
+            shell_seen = True
             for later in range(index + 1, min(index + 6, len(words))):
                 flag = words[later]
                 if flag.startswith('-') and not flag.startswith('--') and 'c' in flag[1:] and later + 1 < len(words):
-                    found.append(words[later + 1]); break  # -c, -lc, -ic: the next word is the shell string
+                    operand = later + 1
+                    if words[operand] == '--' and operand + 1 < len(words): operand += 1  # bash -c -- 'string'
+                    found.append((words[operand], True)); break  # -c, -lc, -ic: the next word is the shell string
         elif base == 'eval':
-            found.append(' '.join(words[index + 1:]))
+            found.append((' '.join(words[index + 1:]), True))
         elif base == 'ssh':
             rest = words[index + 1:]
             host_seen = False
@@ -214,11 +255,11 @@ def nested_strings(segment):
                     continue
                 if not host_seen:
                     host_seen = True; continue
-                found.append(' '.join(rest[rest.index(item):])); break
-    return [text for text in found if LAUNCH.search(text)]
+                found.append((' '.join(rest[rest.index(item):]), False)); break
+    return [(text, env) for text, env in found if LAUNCH.search(text)]
 
 
-def decide_bash(data, policy, ledger, depth=0):
+def decide_bash(data, policy, ledger, depth=0, env_model=None):
     """Advisory check of launch lines: every launch segment of a compound line is checked on its own, as are
     the shell strings and substitutions inside it (one level down, bounded), and any denied part denies the
     line, so a later harmless launch cannot mask an earlier one. A model set by an earlier
@@ -228,16 +269,23 @@ def decide_bash(data, policy, ledger, depth=0):
     if not LAUNCH.search(command):
         return 'allow', None, None, {}
     results = []
-    env_model = None
-    for segment in split_segments(command):
+    segments, seps = split_segments_with_seps(command)
+    for number, segment in enumerate(segments):
         assignment = ENV_MODEL.search(segment)
         if assignment:
-            env_model = assignment.group(1)
+            env_model = _unquote(assignment.group(1))
         if LAUNCH.search(segment):
             results.append(_decide_launch(segment, policy, ledger, env_model=env_model))
         if depth < MAX_NESTING:
-            for inner in nested_strings(segment):
-                results.append(decide_bash({'tool_input': {'command': inner}}, policy, ledger, depth + 1))
+            items = nested_items(segment)
+            if number and seps[number] == '|' and reads_stdin_as_script(segment):
+                # `echo '<launch>' | bash`: the producer's quoted words are the script the shell runs.
+                try: producer = shlex.split(segments[number - 1])
+                except ValueError: producer = []
+                items += [(word, True) for word in producer[1:] if LAUNCH.search(word)]
+            for inner, inherits in items:
+                results.append(decide_bash({'tool_input': {'command': inner}}, policy, ledger, depth + 1,
+                                           env_model=env_model if inherits else None))
     if not results:
         return 'allow', None, None, {'segments': 0}
     for decision, reason, updated, facts in results:
@@ -280,7 +328,7 @@ def _decide_launch(command, policy, ledger, env_model=None):
         if word == '--author-harness' and index + 1 < len(words): author_harness = words[index + 1]
     task = task or esc.task_key_from(command)
     basenames = [w.rsplit('/', 1)[-1].lower() for w in words]
-    if model is None and env_model and 'claude' in basenames:
+    if model is None and env_model and 'claude' in programs:
         model = env_model  # set by an earlier segment's export
     facts = {'model': model, 'effort': effort, 'task': task}
     if 'peer_review.py' in basenames:
@@ -346,6 +394,13 @@ def live_path(session_id):
     return root / (re.sub(r'[^A-Za-z0-9_-]', '_', session_id or 'unknown')[:80] + '.json')
 
 
+def _read_live(path):
+    """The live-agent map ({} when absent); a file past 256 KiB is rejected, never read whole."""
+    if not path.exists():
+        return {}
+    return json.loads(safe_input.read_bounded(path, 262144).decode('utf-8'))
+
+
 def live_update(session_id, agent_id, *, start):
     import fcntl
     path = live_path(session_id)
@@ -353,9 +408,9 @@ def live_update(session_id, agent_id, *, start):
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            live = json.loads(path.read_text()) if path.exists() else {}
+            live = _read_live(path)
             if not isinstance(live, dict): live = {}
-        except (OSError, ValueError):
+        except (OSError, ValueError, safe_input.InputRejected):
             live = {}
         key = str(agent_id or 'unknown')
         live = _expire_live(live)
@@ -387,9 +442,9 @@ def _expire_live(live, ttl=None):
 def live_count(session_id):
     path = live_path(session_id)
     try:
-        live = json.loads(path.read_text()) if path.exists() else {}
+        live = _read_live(path)
         return len(_expire_live(live)) if isinstance(live, dict) else 0
-    except (OSError, ValueError):
+    except (OSError, ValueError, safe_input.InputRejected):
         return 0
 
 
@@ -397,8 +452,8 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     action = argv[0] if argv else 'hook'
     try:
-        data = json.load(sys.stdin)
-    except ValueError:
+        data = json.loads(safe_input.read_stdin_bounded().decode('utf-8', errors='replace'))
+    except (ValueError, safe_input.InputRejected):
         data = {}
     if not isinstance(data, dict):
         data = {}
