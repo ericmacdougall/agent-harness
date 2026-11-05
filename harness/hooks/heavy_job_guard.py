@@ -32,6 +32,7 @@ Contract
   output, `gradle tasks`, `xcodebuild -list`. Filtered forms (`gradle test --tests X`, `mvn -Dtest=X test`) are still
   denied because these tools configure the whole project first. `make -n`/`--dry-run`/`--just-print` is allowed: it only
   prints the recipe (GNU make still executes recipe lines that invoke $(MAKE) under -n; accepted for a careless agent).
+  These are also seen through xcrun, script, and `bash ./gradlew ...` / `sh mvnw ...` script launches.
   Wrapper chains deeper than MAX_WRAPPER_DEPTH (12) are denied as "too deep to analyse", even when they end in `ls`.
 
 Threat model: a CARELESS agent, not a hostile one. Wrapper and shell syntax (env/sudo/su/watch/nohup chains, ANSI-C
@@ -347,18 +348,19 @@ MVN_NAMES = {"mvn", "mvnw", "mvnw.cmd", "mvnw.bat", "mvnd"}
 BAZEL_NAMES = {"bazel", "bazelisk"}
 BUILD_TOOLS = MAKE_NAMES | GRADLE_NAMES | MVN_NAMES | BAZEL_NAMES | {"xcodebuild"}
 
-MAKE_TEST = re.compile(r"^(?:test|tests|check)(?:[_.-].*)?$")
-MAKE_BUILD = re.compile(r"^(?:all|build|install|package|dist|release)(?:[_.-].*)?$")
+MAKE_TEST = re.compile(r"^(?:test|tests|check|e2e|ci|coverage)(?:[_.-].*)?$")
+MAKE_BUILD = re.compile(r"^(?:all|build|compile|install|package|dist|release)(?:[_.-].*)?$")
 # -n/--dry-run/--just-print: bundles of value-less make flags (digits cover -j4) containing n.
 MAKE_DRY = re.compile(r"^-[kBeiLpqrRsStwj0-9]*n[kBeiLpqrRsStwj0-9]*$")
-GRADLE_TEST = re.compile(r"^(?:test|check|verify|integrationTest|connected\w*|test[A-Z]\w*|\w+Test|\w+Check)$")
-GRADLE_BUILD = re.compile(r"^(?:build\w*|assemble\w*|bundle\w*|install\w*|jar|war|dist\w+|publish\w*|compile\w*|package\w*)$")
-MVN_TEST = {"test", "verify", "integration-test", "surefire:test", "failsafe:integration-test"}
-MVN_BUILD = {"package", "install", "compile", "test-compile", "deploy", "site"}
+GRADLE_TEST = re.compile(r"^(?:test|check|verify|integrationTest|connected\w*|test[A-Z]\w*|\w+Test|\w+Check|jacoco\w+)$")
+GRADLE_BUILD = re.compile(r"^(?:build\w*|assemble\w*|bundle\w*|install\w*|classes|\w*[jJ]ar|war|dist\w+|publish\w*|compile\w*|package\w*)$")
+MVN_TEST = {"test", "verify", "integration-test", "pre-integration-test", "surefire:test", "failsafe:integration-test"}
+MVN_BUILD = {"package", "prepare-package", "process-classes", "install", "compile", "test-compile", "deploy", "site"}
 XCODE_TEST = {"test", "test-without-building"}
 XCODE_BUILD = {"build", "build-for-testing", "archive", "install", "installsrc"}
 XCODE_INFO = {"-version", "-list", "-showBuildSettings", "-showsdks", "-showdestinations", "-help", "-usage",
-              "-showBuildSettingsForIndex", "-showTestPlans", "-checkFirstLaunchStatus", "-runFirstLaunch"}
+              "-showBuildSettingsForIndex", "-showTestPlans", "-checkFirstLaunchStatus", "-runFirstLaunch",
+              "-exportArchive", "-resolvePackageDependencies"}
 
 
 def classify_build_tool(low, args):
@@ -388,7 +390,7 @@ def classify_build_tool(low, args):
             return None
         tasks = [t.split(":")[-1] for t in positional(args, (
             "-x", "--exclude-task", "-p", "--project-dir", "-c", "--settings-file", "-b", "--build-file", "-g",
-            "--gradle-user-home", "-I", "--init-script", "--tests", "--test", "--max-workers", "--console", "--warning-mode"))]
+            "--gradle-user-home", "-I", "--init-script", "--tests", "--test", "--task", "--dependency", "--configuration", "--max-workers", "--console", "--warning-mode"))]
         for t in tasks:
             if GRADLE_TEST.match(t):
                 return ("full-suite", f"{low} {t}")
@@ -397,7 +399,7 @@ def classify_build_tool(low, args):
                 return ("build", f"{low} {t}")
         return None
     if low in MVN_NAMES:
-        if any(a in ("--version", "-v", "-V", "--help", "-h") for a in args):
+        if any(a in ("--version", "-v", "--help", "-h") for a in args):
             return None
         goals = positional(args, ("-f", "--file", "-pl", "--projects", "-rf", "--resume-from", "-T", "--threads", "-s",
                                   "--settings", "-gs", "--global-settings", "-P", "--activate-profiles", "-l", "--log-file",
@@ -410,11 +412,12 @@ def classify_build_tool(low, args):
                 return ("build", f"{low} {g}")
         return None
     if low in BAZEL_NAMES:
-        sub = (positional(args) or [""])[0]
+        sub = (positional(args, ("--output_base", "--output_user_root", "--install_base", "--bazelrc", "--host_jvm_args",
+                                 "--server_javabase", "--host_jvm_profile")) or [""])[0]
         if sub in ("test", "coverage"):
             return ("full-suite", f"{low} {sub}")
-        if sub == "build":
-            return ("build", f"{low} build")
+        if sub in ("build", "run"):
+            return ("build", f"{low} {sub}")
         return None
     # xcodebuild
     if any(a in XCODE_INFO or a == "--help" for a in args):
@@ -423,7 +426,7 @@ def classify_build_tool(low, args):
                                 "-derivedDataPath", "-arch", "-xcconfig", "-resultBundlePath", "-testPlan", "-toolchain",
                                 "-jobs", "-archivePath", "-exportPath", "-exportOptionsPlist", "-xctestrun",
                                 "-testProductsPath", "-resultStreamPath", "-clonedSourcePackagesDirPath",
-                                "-destination-timeout", "-parallelizeTargets"))
+                                "-destination-timeout"))
     actions = [a for a in actions if "=" not in a]
     for a in actions:
         if a in XCODE_TEST:
@@ -535,6 +538,16 @@ def classify(argv, ctx, depth=0):
         return None
     if low in WRAPPERS:
         return unwrap(low, list(args), ctx, depth)
+    if low == "xcrun":  # xcrun [--sdk X] [--toolchain Y] [-v...] <tool> args
+        rest = list(args)
+        while rest and rest[0].startswith("-"):
+            rest = rest[2:] if rest[0] in ("--sdk", "-sdk", "--toolchain", "-toolchain") else rest[1:]
+        return classify(rest, ctx, depth + 1)
+    if low == "script":  # macOS `script [-q] file cmd...`; Linux `script -c 'cmd' file`
+        if "-c" in args and args.index("-c") + 1 < len(args):
+            return classify_text(args[args.index("-c") + 1], ctx, depth + 1)
+        rest = [a for a in args if not a.startswith("-")]
+        return classify(rest[1:], ctx, depth + 1)
     if low == "eval":
         return classify_text(" ".join(args), ctx, depth + 1)
     if low in ("timeout", "gtimeout"):
@@ -547,6 +560,8 @@ def classify(argv, ctx, depth=0):
             if re.match(r"^-[a-zA-Z]*c[a-zA-Z]*$", a) and i + 1 < len(args):
                 return classify_text(args[i + 1], ctx, depth + 1)
         script = (positional(args) or [None])[0]
+        if script and base(script).lower() in BUILD_TOOLS:  # `bash ./gradlew build`, `sh gradlew build`
+            return classify([script] + args[args.index(script) + 1:], ctx, depth + 1)
         if script and any(HOSTILE.search(s) for s in script_sources(script, ctx)):
             return ("adversarial", "shell script reads /dev/zero|urandom or makes a FIFO")
         return None

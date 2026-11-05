@@ -348,6 +348,42 @@ class BuildTools(unittest.TestCase):
                 self.assertEqual(decide(command, cwd="/nonexistent")["action"], "allow", command)
         self.assertEqual(decide("make test -n", cwd="/nonexistent")["action"], "allow")
 
+    def test_redteam_delta_false_allows_are_closed(self):
+        full = ["mvn -V verify", "bash ./gradlew test", "sh ./mvnw verify", "make e2e", "make ci", "make coverage",
+                "bazel --output_base x test //...", "bazel --bazelrc f test //...", "xcrun xcodebuild test -scheme A",
+                "xcrun --sdk iphoneos xcodebuild test", "xcrun make test", "script -q /dev/null make test",
+                "gradle jacocoTestReport", "mvn pre-integration-test"]
+        build = ["mvn -V clean install", "bash gradlew build", "sh gradlew build", "gradle shadowJar", "./gradlew bootJar",
+                 "gradle classes", "mvn prepare-package", "make compile", "bazel run //app:app", "bazel --batch build //...",
+                 "xcrun xcodebuild build", "script -q /dev/null gradle build", "script -c 'make all' /dev/null"]
+        for rule, commands in (("full-suite", full), ("build", build)):
+            self.assertGreater(len(commands), 10)
+            for command in commands:
+                with self.subTest(command=command):
+                    result = decide(command, cwd="/nonexistent")
+                    self.assertEqual((result["action"], result.get("rule")), ("deny", rule), command)
+
+    def test_redteam_delta_light_forms_stay_allowed(self):
+        light = ["gradle help --task test", "gradle help --task build", "gradle dependencyInsight --dependency test",
+                 "xcodebuild -exportArchive -archivePath a -exportPath b", "xcodebuild -resolvePackageDependencies",
+                 "xcodebuild -scheme test -list", "mvn -v", "mvn --version", "xcrun --find clang", "xcrun simctl list",
+                 "bash ./deploy.sh", "sh script.sh make", "script -q /dev/null ls", "bazel --output_base x info",
+                 "bazel --output_base x version", "bash -c 'ls gradlew'"]
+        self.assertGreater(len(light), 10)
+        for command in light:
+            with self.subTest(command=command):
+                self.assertEqual(decide(command, cwd="/nonexistent")["action"], "allow", command)
+
+    def test_redteam_delta_wrapper_forms_report_the_rule(self):
+        seen = 0
+        for command, rule in (("make test", "full-suite"), ("gradle build", "build"), ("mvn verify", "full-suite"),
+                              ("xcodebuild test", "full-suite"), ("bazel build //...", "build")):
+            for wrapped in self.wrap(command):
+                seen += 1
+                with self.subTest(command=wrapped):
+                    self.assertEqual(decide(wrapped, cwd="/nonexistent").get("rule"), rule, wrapped)
+        self.assertGreater(seen, 60)
+
     def chain(self, depth, tail="ls"):
         return "nohup " * depth + tail
 
