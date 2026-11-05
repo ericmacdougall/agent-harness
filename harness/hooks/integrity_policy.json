@@ -1,10 +1,17 @@
 {
  "schema": 1,
- "note": "integrity.py mirrors. ssh mirrors get <dir>/<host>.jsonl (append-only). Add T2 as another ssh entry when it is a harness host. goodqa: the registered 'Harness integrity mirror' ticket (goodqa#14593).",
+ "note": "integrity.py mirrors. ssh mirrors get <dir>/<host>.jsonl (append-only). dev2 goes away on 2026-11-09: move the mirrors_example entry into mirrors once T2 is a harness host; until then GoodQA is the surviving mirror. mirrors_example is not read. goodqa: the registered 'Harness integrity mirror' ticket (goodqa#14593). host_aliases: earlier labels of a machine, keyed by its integrity.py host-id.",
  "mirrors": [
   {
    "kind": "ssh",
    "host": "dev2",
+   "dir": "~/.agent-harness/integrity"
+  }
+ ],
+ "mirrors_example": [
+  {
+   "kind": "ssh",
+   "host": "t2",
    "dir": "~/.agent-harness/integrity"
   }
  ],
@@ -16,5 +23,11 @@
   "ref": "goodqa#14593",
   "issue_id": "fed4306f-81d9-4500-96a9-0f38b456adeb",
   "gq": "~/.claude/goodqa-p0p1/gq.py"
+ },
+ "host_aliases": {
+  "mac-3998119e2604aa87": [
+   "Mac-2",
+   "Erics-MacBook-Air"
+  ]
  }
 }

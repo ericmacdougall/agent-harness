@@ -1,5 +1,6 @@
 """harness/hooks/doctor.py: wiring check and rules registry. Fixtures only; canaries run under a scratch HOME."""
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -267,6 +268,78 @@ class RulesRegistry(unittest.TestCase):
                              "NOT-ENFORCED")
             (hd / "spec_policy.json").write_text("not json")
             self.assertEqual(doctor.rules_report([rule], wired, hd)[0]["state"], "ALERT-ONLY")  # unknown is never ENFORCED
+
+
+class CanaryModes(unittest.TestCase):
+    """Review item 1: the guard ships in warn mode; doctor must say so and stay green, and still catch a dead guard."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.claude = Path(tmp.name).resolve() / ".claude"
+        self.hooks = self.claude / "hooks"
+        shutil.copytree(ROOT / "harness" / "hooks", self.hooks, ignore=shutil.ignore_patterns("__pycache__"))
+        self.live = install.merged_settings({}, self.claude)
+        self.settings = self.claude / "settings.json"
+        self.settings.write_text(json.dumps(self.live))
+
+    def row(self):
+        rows = [r for r in MANIFEST["hooks"] if r["id"] == "holds_guard:hook"]
+        found = doctor.check_hooks({"hooks": rows}, "claude", self.live, self.hooks)
+        return found[0]
+
+    def set_mode(self, text):
+        (self.hooks / "holds_guard_policy.json").write_text(text)
+
+    def test_shipped_policy_is_warn_and_doctor_reports_wired_warn_and_passes(self):
+        shipped = json.loads((ROOT / "harness" / "hooks" / "holds_guard_policy.json").read_text())
+        self.assertEqual(shipped["mode"], "warn", "this test pins the shipped rollout mode; update it with the flip")
+        row = self.row()
+        self.assertEqual(row["state"], doctor.WIRED_WARN, row["detail"])
+        self.assertIn("warn mode", row["detail"])
+        self.assertEqual(doctor.main(["check", "--settings", str(self.settings), "--hooks-dir", str(self.hooks),
+                                      "--no-integrity", "--no-canary"]), 0)
+        self.assertEqual(doctor.verdict([row]), 0)
+
+    def test_full_check_of_the_shipped_tree_has_no_canary_failure_on_the_guard(self):
+        found = doctor.check_hooks(MANIFEST, "claude", self.live, self.hooks)
+        self.assertEqual([f["id"] for f in found if f["state"] == doctor.CANARY_FAIL and "holds" in f["id"]], [])
+
+    def test_enforce_mode_requires_a_real_deny(self):
+        self.set_mode('{"mode": "enforce"}')
+        self.assertEqual(self.row()["state"], doctor.WIRED)
+        (self.hooks / "holds_guard_policy.json").unlink()
+        self.assertEqual(self.row()["state"], doctor.WIRED)
+
+    def test_enforce_mode_does_not_accept_a_would_deny_message(self):
+        self.set_mode('{"mode": "enforce"}')
+        (self.hooks / "holds_guard.py").write_text(  # right about both canaries, but it only warns
+            'import json, sys\nif "member.key" in sys.stdin.read():\n'
+            '    print(json.dumps({"systemMessage": "would deny [x]: y"}))\n')
+        self.assertEqual(self.row()["state"], doctor.CANARY_FAIL)
+        self.set_mode('{"mode": "warn"}')
+        self.assertEqual(self.row()["state"], doctor.WIRED_WARN)
+
+    def test_warn_mode_still_fails_a_guard_that_says_nothing_or_crashes(self):
+        for body in ("import sys\nsys.stdin.read()\n", "raise RuntimeError('boom')\n",
+                     'import json, sys\nsys.stdin.read()\nprint(json.dumps({"systemMessage": "all fine"}))\n'):
+            (self.hooks / "holds_guard.py").write_text(body)
+            self.assertEqual(self.row()["state"], doctor.CANARY_FAIL, body)
+
+    def test_warn_mode_fails_a_guard_that_would_deny_everything(self):
+        (self.hooks / "holds_guard.py").write_text(
+            'import json, sys\nsys.stdin.read()\nprint(json.dumps({"systemMessage": "would deny [x]: y"}))\n')
+        self.assertEqual(self.row()["state"], doctor.CANARY_FAIL)
+
+    def test_wiring_only_paths_also_report_the_mode_and_rules_read_alert_only(self):
+        rows = [r for r in MANIFEST["hooks"] if r["id"] == "holds_guard:hook"]
+        found = doctor.check_hooks({"hooks": rows}, "claude", self.live, self.hooks, canary=False)
+        self.assertEqual(found[0]["state"], doctor.WIRED_WARN)
+        rule = {"id": "S08", "priority": "P0", "mechanisms": ["holds_guard:hook"]}
+        self.assertEqual(doctor.rules_report([rule], found, self.hooks)[0]["state"], "ALERT-ONLY")
+        self.set_mode('{"mode": "enforce"}')
+        found = doctor.check_hooks({"hooks": rows}, "claude", self.live, self.hooks, canary=False)
+        self.assertEqual(doctor.rules_report([rule], found, self.hooks)[0]["state"], "ENFORCED")
 
 
 if __name__ == "__main__":

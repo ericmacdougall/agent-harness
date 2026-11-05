@@ -245,6 +245,7 @@
   {
    "id": "holds_guard:hook",
    "script": "holds_guard.py",
+   "mode_file": "holds_guard_policy.json",
    "arg": null,
    "event": "PreToolUse",
    "tools": [

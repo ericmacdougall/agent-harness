@@ -101,10 +101,22 @@ def _rclone_env() -> dict:
     return {k: v for k, v in os.environ.items() if not k.startswith("RCLONE_") or k == "RCLONE_CONFIG"}
 
 
-def backup_location(session: str) -> str:
+def backup_hosts() -> list[str]:
+    """The labels a transcript backup of this machine can sit under: LOG_BACKUP_HOST alone when it is set; otherwise
+    the stable id (integrity.host_id), its recorded aliases, and the current host name, which is what log-backup.sh
+    uses by default. A host name that changed with the network is found through the aliases."""
+    explicit = os.environ.get("LOG_BACKUP_HOST")
+    if explicit:
+        return [explicit]
+    import integrity
+    ident = integrity.host_id()
+    names = [ident] + integrity.host_aliases(integrity.load_policy(HERE), ident) + [socket.gethostname().split(".")[0]]
+    return list(dict.fromkeys(names))
+
+
+def backup_location(session: str, host: str | None = None) -> str:
     """rclone path of the backed-up transcript, the layout harness/bin/log-backup.sh writes:
-    <LOG_BACKUP_REMOTE or lessons-dropbox:Backups/agent-logs>/<LOG_BACKUP_HOST or hostname -s>/.claude/projects/
-    <project dir>/<session>.jsonl."""
+    <LOG_BACKUP_REMOTE or lessons-dropbox:Backups/agent-logs>/<host label>/.claude/projects/<project dir>/<session>.jsonl."""
     import provenance
     try:
         local = provenance.find_transcript(session)
@@ -113,7 +125,7 @@ def backup_location(session: str) -> str:
     base = os.environ.get("LOG_BACKUP_REMOTE") or BACKUP_BASE
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*:[A-Za-z0-9_./-]*", base) or ".." in base:
         raise ValueError("LOG_BACKUP_REMOTE is not a plain NAME:path")
-    host = os.environ.get("LOG_BACKUP_HOST") or socket.gethostname().split(".")[0]
+    host = host or backup_hosts()[0]
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", host):
         raise ValueError("backup host label is not plain")
     return f"{base.rstrip('/')}/{host}/.claude/projects/{local.parent.name}/{session}.jsonl"
@@ -124,8 +136,12 @@ def backup_has_message(session: str, uuid: str, hold_id: str, run=subprocess.run
     """True when the backed-up transcript holds the human message `uuid` and it is the lift phrase for hold_id.
     False when the transcript or the message is not in the backup yet. BackupUnreachable when rclone can not answer.
     The copy goes to a private temporary directory removed afterwards; no secret is passed in argv."""
+    remotes = [remote] if remote else [backup_location(session, host) for host in backup_hosts()]
+    return any(_backup_copy_has(r, session, uuid, hold_id, run, rclone) for r in remotes)
+
+
+def _backup_copy_has(remote: str, session: str, uuid: str, hold_id: str, run, rclone: str) -> bool:
     import provenance
-    remote = remote or backup_location(session)
     try:
         st = run([rclone, "lsjson", "--stat", "--ask-password=false", "--", remote], stdin=subprocess.DEVNULL,
                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, env=_rclone_env(), check=False)

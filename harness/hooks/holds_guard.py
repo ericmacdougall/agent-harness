@@ -41,8 +41,10 @@ minimum policy; the file can only add holds.
 """
 from __future__ import annotations
 
+import datetime
 import fnmatch
 import glob
+import hashlib
 import itertools
 import json
 import os
@@ -59,6 +61,9 @@ if str(HERE) not in sys.path:  # -I -S: no script dir, no site; siblings (holds,
 POLICY = HERE / "holds.json"
 STATE = HERE / "holds.state.json"
 MODE_FILE = HERE / "holds_guard_policy.json"
+# rollout record of would-denies: no command text, only the rule kind, the tool name and a hash
+WARN_LOG = ".agent-harness/state/holds-warn.jsonl"
+WARN_LOG_CAP = 1 << 20
 MAX_INPUT = 4_000_000
 MAX_COMMAND = 64_000
 MAX_GLOB = 200
@@ -89,7 +94,21 @@ TEXT_FLAGS = {"--source", "-m", "--message", "--title", "--body", "--note", "--n
 VERB_TEXT_FLAGS = {"git": {"-S", "-G", "--pickaxe-regex", "--format", "--pretty"},
                    "curl": {"-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--json", "-F",
                             "--form", "-H", "--header"},
-                   "pytest": {"-k"}, "python3": {"-k"}, "python": {"-k"}, "gh": {"-b", "-t"}}
+                   "pytest": {"-k"}, "python3": {"-k"}, "python": {"-k"},
+                   "gh": {"-b", "-t", "--head", "-H", "--base", "-B", "--branch"}}
+# (flags with a value, flags whose value is text, flags whose value is a file naming the program): the first other
+# operand of these verbs is a pattern or a program, which is text and never a path
+_GREP_VALUES = {"-A", "-B", "-C", "-m", "-d", "-D", "--after-context", "--before-context", "--context", "--max-count",
+                "--include", "--exclude", "--exclude-dir"}
+_RG_VALUES = _GREP_VALUES | {"-g", "-t", "-T", "-j", "-M", "-r", "--glob", "--type", "--type-not", "--max-depth",
+                             "--threads", "--sort", "--replace", "--max-columns"}
+PATTERN_VERBS = {**dict.fromkeys(("grep", "egrep", "fgrep", "zgrep", "ag", "ack"),
+                                 (_GREP_VALUES, {"-e", "--regexp"}, {"-f", "--file"})),
+                 "rg": (_RG_VALUES, {"-e", "--regexp"}, {"-f", "--file"}),
+                 **dict.fromkeys(("sed", "gsed"), (set(), {"-e", "--expression"}, {"-f", "--file"})),
+                 **dict.fromkeys(("awk", "gawk"), ({"-F", "-v", "--field-separator", "--assign"},
+                                                   {"-e", "--source"}, {"-f", "--file"})),
+                 "jq": ({"-L", "--indent", "--slurpfile", "--rawfile"}, set(), {"-f", "--from-file"})}
 # verbs that read a credential when it is an operand
 READ_VERBS = {"cat", "less", "more", "head", "tail", "cp", "mv", "base64", "xxd", "od", "strings", "grep", "rg",
               "sed", "awk", "openssl", "scp", "rsync", "tar", "zip", "gzip", "curl", "wget", "cut", "tr", "diff",
@@ -100,6 +119,9 @@ RECURSIVE_READERS = {"tar", "zip", "cp", "rsync", "grep", "rg", "ag", "ack"}  # 
 # commands whose output is a list of paths named by their operands ($(...) bodies and xargs producers)
 EMITTERS = {"find", "ls", "echo", "printf", "realpath", "readlink", "dirname", "basename", "fd", "locate", "grep",
             "rg", "ag", "git", "stat", "du", "head", "tail", "sort", "uniq", "cat"}
+# On macOS /home and /net are automount points: every stat costs about 30 ms and nothing under them is a local symlink
+SLOW_ROOTS = ("/home", "/net") if sys.platform == "darwin" else ()
+_REAL: dict = {}
 SHELL_OUT_RE = re.compile(r"system\s*\(|subprocess|popen|spawn|execSync|exec\s*\(|`[^`]+`|%x\{")
 SHELL_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{", "}", "time"}
 TEXT_VERBS = {"for", "case", "select", "function", "done", "fi", "esac", "in"}  # operands are words, not paths
@@ -113,9 +135,14 @@ READERS = {"cat", "less", "more", "head", "tail", "grep", "egrep", "fgrep", "zgr
            "expand", "jq", "echo", "printf", "true", "false", ":", "pwd", "which", "type", "whereis", "date",
            "whoami", "id", "uname", "env", "printenv", "zcat", "gzcat", "bzcat", "xzcat", "lsof", "otool", "nm",
            "codesign", "mdls", "sleep", "wait", "hostname", "uptime", "ps", "pgrep", "tput", "seq",
-           "exit", "return", "set", "unset", "export", "local", "declare", "read", "shift", "trap", "source", "."}
+           "exit", "return", "set", "unset", "export", "local", "declare", "read", "shift", "trap", "source", ".",
+           "shellcheck", "pyflakes"}
+# a bare "." names a tree only for these: `gh -q .` or `python3 x.py .` run from the home directory do not touch it
+DOT_WRITERS = {"rm", "rmdir", "mv", "chmod", "chown", "chgrp", "shred", "ln", "touch", "truncate", "unlink", "trash",
+               "tee", "dd", "find", "tar", "bsdtar", "gtar", "unzip", "git", "cp", "rsync", "scp", "ditto", "install",
+               "gcp", "rclone", "sed", "gsed"}
 CONDITIONAL_READERS = {"sort", "uniq", "xxd", "base64", "find", "git", "tar", "unzip", "sed", "gsed", "awk", "gawk",
-                       "yq", "plutil"}
+                       "yq", "plutil", "ruff", "prettier", "npx"}
 READONLY_GIT = {"status", "log", "diff", "show", "blame", "ls-files", "ls-tree", "rev-parse", "grep", "cat-file",
                 "describe", "shortlog", "rev-list", "for-each-ref", "merge-base", "name-rev", "reflog", "branch",
                 "tag", "remote", "ls-remote", "fetch", "add", "commit", "var", "version", "help", "diff-tree",
@@ -258,18 +285,48 @@ def inside(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
+def on_slow_root(path: str) -> bool:
+    return any(path == r or path.startswith(r + "/") for r in SLOW_ROOTS)
+
+
+def real_path(path: str) -> str:
+    """realpath, memoized for one decision (decide clears it); a path on a slow automount root is only normalized."""
+    hit = _REAL.get(path)
+    if hit is None:
+        hit = os.path.normpath(path) if on_slow_root(path) else os.path.realpath(path)
+        _REAL[path] = hit
+    return hit
+
+
 def forms(path: str, cwd: str) -> set[str]:
     """The text of a path as written, normalized, and with symlinks resolved (relative to cwd when not absolute)."""
     text = clean(path)
     expanded = os.path.expanduser(text)
     if not os.path.isabs(expanded) and cwd:
         expanded = os.path.join(cwd, expanded)
-    return {text, os.path.normpath(expanded), os.path.realpath(expanded)}
+    return {text, os.path.normpath(expanded), real_path(expanded)}
 
 
 def resolve(path: str, cwd: str) -> str:
     expanded = os.path.expanduser(clean(path))
-    return os.path.realpath(expanded if os.path.isabs(expanded) or not cwd else os.path.join(cwd, expanded))
+    return real_path(expanded if os.path.isabs(expanded) or not cwd else os.path.join(cwd, expanded))
+
+
+MEMORY_NOTE_RE = re.compile(r"/\.claude/projects/[^/]+/memory/[^/]+\.md$")
+
+
+def memory_note(path: str, cwd: str, policy: dict, lifted: set[str]) -> bool:
+    """A note in the user's auto-memory whose FILE NAME holds a held word (feedback-do-not-touch-yates.md): reading it
+    explains the hold. Only the file name may hold the word; writing stays denied by the callers."""
+    absolute = [p for p in forms(path, cwd) if os.path.isabs(p) and ".." not in p.split("/")]
+    return bool(absolute) and all(MEMORY_NOTE_RE.search(p) for p in absolute) \
+        and held([os.path.dirname(p) for p in absolute], policy, lifted) is None
+
+
+def bytecode_path(path: str, cwd: str) -> bool:
+    """__pycache__ or a .pyc: the -I -S launch of a hook writes these into the hooks directory, and they are not hashed."""
+    p = os.path.normpath(os.path.join(cwd, os.path.expanduser(path)))
+    return os.path.basename(p) == "__pycache__" or "/__pycache__/" in p or p.endswith(".pyc")
 
 
 def protected(path_forms: set[str], globs: list[str]) -> str | None:
@@ -357,6 +414,8 @@ def expansions(word: str, cwd: str) -> list[str]:
     expanded = os.path.expanduser(word)
     if not os.path.isabs(expanded) and cwd:
         expanded = os.path.join(cwd, expanded)
+    if on_slow_root(expanded):
+        return []
     try:
         return sorted(itertools.islice(glob.iglob(expanded), MAX_GLOB))
     except Exception:  # noqa: BLE001 - a broken glob expands to nothing (a Deadline still propagates)
@@ -720,8 +779,93 @@ def program_targets(verb: str, program: str) -> list[str]:
     return re.findall(r">>?\s*\"([^\"]+)\"", program)
 
 
+def text_operands(verb: str, args: list[str]) -> set[int]:
+    """Indices of args that are a pattern or program of a searching or filtering verb: text, not a path."""
+    if verb not in PATTERN_VERBS:
+        return set()
+    values, text_flags, file_flags = PATTERN_VERBS[verb]
+    named = text_flags | file_flags
+    explicit = any(a in named or a.startswith(tuple(f + "=" for f in named if f.startswith("--"))) for a in args) or \
+        (verb not in ("awk", "gawk", "jq") and any(re.match(r"^-[A-Za-z]+e$", a) for a in args))
+    out, i = set(), 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            if not explicit and i + 1 < len(args):
+                out.add(i + 1)
+            return out
+        if a in ("--arg", "--argjson") and verb == "jq":
+            out.update((i + 1, i + 2))
+            i += 3
+        elif a in text_flags or (verb not in ("awk", "gawk", "jq") and re.match(r"^-[A-Za-z]+e$", a)):
+            out.add(i + 1)
+            i += 2
+        elif a in file_flags or a in values:
+            i += 2
+        elif a == "-i" and verb in ("sed", "gsed") and args[i + 1:i + 2] == [""]:  # BSD: sed -i '' PROGRAM FILE
+            i += 2
+        elif a.startswith("-") and a != "-":
+            i += 1
+        elif explicit:
+            i += 1
+        else:
+            out.add(i)
+            return out
+    return out
+
+
+PY_FLAGS = "BbdEIiOPqSsuvx"  # interpreter flags without a value, also clustered: -IS, -Ic CODE, -Im MODULE
+PY_CODE_RE = re.compile(rf"^-[{PY_FLAGS}]*c$")
+PY_MODULE_RE = re.compile(rf"^-[{PY_FLAGS}]*m$")
+PYTHONS = {"python3", "python"}
+# scripts and -m modules that only read their operands, wherever the file lives (first-word subcommands)
+READONLY_SCRIPTS = {"doctor.py": {"check", "rules-report"}, "integrity.py": {"verify", "host-id"}, "holds.py": {"status"}}
+READONLY_MODULES = {"py_compile", "pyflakes"}
+RUFF_WRITERS = {"--fix", "--fix-only", "--unsafe-fixes", "--add-noqa", "--output-file", "-o"}
+
+
+def python_call(args: list[str]) -> tuple:
+    """(inline code or None, module, script, the arguments after it) of a python command line. -W and -X are the only
+    flags with a separate value; -I, -S, -E ... have none (they do for perl and ruby, see inline_codes)."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if PY_CODE_RE.match(a):
+            return (args[i + 1] if i + 1 < len(args) else None), "", "", args[i + 2:]
+        if PY_MODULE_RE.match(a):
+            return None, (args[i + 1] if i + 1 < len(args) else ""), "", args[i + 2:]
+        if a in ("-W", "-X"):
+            i += 2
+        elif a.startswith("-") and a != "-":
+            i += 1
+        else:
+            return None, "", a, args[i + 1:]
+    return None, "", "", []
+
+
+def ruff_reads(args: list[str]) -> bool:
+    return args[:1] == ["check"] and not any(a in RUFF_WRITERS or a.startswith("--output-file=") for a in args)
+
+
+def python_reader(args: list[str]) -> bool:
+    """A named read-only checker: -m json.tool with one operand (a second is its output file), py_compile, pyflakes,
+    ruff check, or doctor.py check / integrity.py verify / holds.py status from any checkout."""
+    _code, module, script, rest = python_call(args)
+    if module == "json.tool":
+        return len(positionals(rest)) <= 1
+    if module == "ruff":
+        return ruff_reads(rest)
+    if module:
+        return module in READONLY_MODULES
+    subs = READONLY_SCRIPTS.get(os.path.basename(script))
+    return bool(subs) and bool(subs & set(rest)) and not {"record", "lift"} & set(rest)
+
+
 def inline_codes(verb: str, args: list[str]) -> tuple[list[str], str]:
     """(inline code strings, script path) of an interpreter call."""
+    if verb in PYTHONS:
+        code, _module, script, _rest = python_call(args)
+        return ([code] if code is not None else []), script
     codes, i = [], 0
     while i < len(args):
         a = args[i]
@@ -751,6 +895,8 @@ def reader_verb(verb: str, args: list[str], runs_hook: bool, codes: list[str]) -
     """True when this command never writes a file named by one of its operands (the allowlist)."""
     if runs_hook:
         return True
+    if verb in PYTHONS and python_reader(args):
+        return True
     if verb in INTERPRETERS:
         return bool(codes) and not inplace_edit(verb, args) and not any(WRITE_CALL_RE.search(c) for c in codes)
     if verb == "less" and any(f.startswith(("-o", "-O", "--log-file", "--LOG-FILE")) for f in args):
@@ -762,6 +908,13 @@ def reader_verb(verb: str, args: list[str], runs_hook: bool, codes: list[str]) -
     if verb not in CONDITIONAL_READERS:
         return False
     flags = [a for a in args if a.startswith("-")]
+    if verb == "ruff":
+        return ruff_reads(args)
+    if verb == "prettier":
+        return bool({"--check", "-c", "--list-different", "-l"} & set(args)) and not {"--write", "-w"} & set(args)
+    if verb == "npx":
+        inner = next((i for i, a in enumerate(args) if not a.startswith("-")), None)
+        return inner is not None and args[inner] in ("prettier", "ruff") and reader_verb(args[inner], args[inner + 1:], False, [])
     if verb == "sort":
         return not any(f in ("-o", "--output") or f.startswith(("--output=", "-o")) for f in flags)
     if verb == "uniq":
@@ -849,6 +1002,8 @@ def check_path(value: str, cwd: str, policy: dict, lifted: set[str], what: str, 
         if hit:
             return deny("policy-file", f"{what} of {hit} is not allowed: {SAFE_ALT}")
     h = held(pf, policy, lifted)
+    if h and not write and memory_note(value, cwd, policy, lifted):
+        return None
     if h:
         return deny("hold", f"hold '{h['id']}' is active ({h.get('note', '')}): {what} of a held path is not allowed")
     return None
@@ -885,6 +1040,8 @@ def decide_goodqa(tin: dict, policy: dict, lifted: set[str]):
 
 
 def decide(payload: dict, policy: dict, lifted: set[str], hooks_dir: Path | None = None, depth: int = 0):
+    if depth == 0:
+        _REAL.clear()
     tool = payload.get("tool_name")
     if not isinstance(tool, str) or not tool:
         raise Bad("tool_name is missing or not a string")
@@ -892,7 +1049,7 @@ def decide(payload: dict, policy: dict, lifted: set[str], hooks_dir: Path | None
     raw_cwd = payload.get("cwd", "")
     if not isinstance(raw_cwd, str):
         raise Bad("cwd is not a string")
-    cwd = os.path.realpath(raw_cwd) if raw_cwd else ""
+    cwd = real_path(raw_cwd) if raw_cwd else ""
     checked = tool in FILE_TOOLS or tool == "Bash" or tool.startswith("mcp__")
     if checked and not isinstance(tin, dict):
         raise Bad(f"tool_input of {tool} is not an object")
@@ -1152,12 +1309,14 @@ def decide_bash(command: str, cwd: str, policy: dict, lifted: set[str], depth: i
             continue
         # operands: positionals, option values, key=value values and redirects
         text_flags = TEXT_FLAGS | VERB_TEXT_FLAGS.get(verb, set())
+        text_idx = text_operands(verb, args)
+        path_args = [a for k, a in enumerate(args) if k not in text_idx]
         git_sub = git_subcommand(args)[0] if verb == "git" else ""
         ops: list[str] = []          # every operand (for the protected-set write check)
         cred_ops = list(inputs)      # read operands checked against credential globs
         hold_ops = [(t, True) for t in targets + inputs]
         text_next, force_next, positional = False, False, 0
-        for a in args:
+        for a in path_args:
             if text_next:
                 text_next = False
                 if a.startswith("@"):  # curl -d @file reads that file
@@ -1211,7 +1370,8 @@ def decide_bash(command: str, cwd: str, policy: dict, lifted: set[str], depth: i
                         return write_deny("redirect", cand)
         if not remote_only and verb:
             reader = reader_verb(verb, args, runs_hook, codes)
-            if sim_known and sim and not reader and protected_hit({sim}):
+            rm_bytecode = verb == "rm" and bool(ops) and all(bytecode_path(v, sim) for o in ops for v in brace_expand(o))
+            if sim_known and sim and not reader and not rm_bytecode and protected_hit({sim}):
                 return deny("policy-file", f"`{verb}` runs with the working directory inside the protected hooks "
                             f"directory; only pure readers may run there: {SAFE_ALT}")
             if not sim_known and sim_guard and not reader:
@@ -1221,7 +1381,7 @@ def decide_bash(command: str, cwd: str, policy: dict, lifted: set[str], depth: i
                 hit = protected_hit({sim}) or ancestor_hit(sim)
                 if hit:
                     return write_deny(verb, f"{sim} (the working directory, which contains protected files)")
-            wops = write_targets(verb, args, ops, runs_hook, codes)
+            wops = [] if rm_bytecode else write_targets(verb, args, ops, runs_hook, codes)
             for program in (script_writes(verb, args) if verb in ("sed", "gsed", "awk", "gawk") else []):
                 wops += [t.strip() for t in program_targets(verb, program)]
                 if re.search(r"/\.claude/(hooks\b|settings(\.local)?\.json)", program):
@@ -1249,15 +1409,15 @@ def decide_bash(command: str, cwd: str, policy: dict, lifted: set[str], depth: i
                         hit = protected_hit(pf)
                         if hit:
                             return write_deny(verb, cand)
-                        real = resolve(cand, sim)
-                        if ancestor_hit(real) and raw not in targets:
-                            return write_deny(verb, f"{real} (a directory that contains protected files)")
+                        if cand in (".", "./") and verb not in DOT_WRITERS:
+                            continue
+                        path = resolve(cand, sim)
+                        if ancestor_hit(path) and raw not in targets:
+                            return write_deny(verb, f"{path} (a directory that contains protected files)")
         # --- credentials
         is_read = verb in READ_VERBS
         dest = positionals(args)[-1] if verb in ("cp", "rsync", "ditto", "scp") and len(positionals(args)) > 1 else None
         recursive_grep = any(re.match(r"^-[A-Za-z]*[rR]", a) or a in ("--recursive", "--dereference-recursive") for a in args)
-        pattern_arg = next((a for a in args if not a.startswith("-")), None) if verb in ("grep", "egrep", "rg", "ag", "ack") \
-            and not any(a in ("-e", "-f", "--regexp", "--file") or a.startswith(("--regexp=", "-e")) for a in args) else None
         for raw in cred_ops + targets:
             if not raw or "\n" in raw or text_word(raw, sim):
                 continue  # text (a sed program, a sentence), not a path
@@ -1266,7 +1426,7 @@ def decide_bash(command: str, cwd: str, policy: dict, lifted: set[str], depth: i
                 is_path = pathlike(value, sim if sim_known else "")
                 sweeper = (verb in RECURSIVE_READERS and (verb != "grep" or recursive_grep)) or \
                     (verb == "find" and any(a in FIND_EXEC for a in args))
-                if sweeper and is_path and raw not in targets and raw != dest and raw != pattern_arg:
+                if sweeper and is_path and raw not in targets and raw != dest:
                     for cand in candidates:
                         if ancestor_of_secrets(resolve(cand, sim)):
                             return deny("protected-path", f"`{verb}` over the home directory would sweep credentials; "
@@ -1285,8 +1445,6 @@ def decide_bash(command: str, cwd: str, policy: dict, lifted: set[str], depth: i
         if sim_known and (verb in DEFAULT_CWD_SEARCHERS or (verb == "grep" and any(
                 re.match(r"^-[A-Za-z]*[rR]", a) or a in ("--recursive", "--dereference-recursive") for a in args))):
             explicit = [v for v in cred_ops if v and not v.startswith("-")]
-            if not any(a in ("-e", "-f", "--regexp", "--file") or a.startswith(("--regexp=", "-e")) for a in args):
-                explicit = explicit[1:]
             if not explicit and ancestor_of_secrets(sim):
                 return deny("protected-path", f"`{verb}` with no path searches the working directory, which is the "
                             "home directory (or above it) and would sweep credentials; name a narrower directory")
@@ -1298,7 +1456,7 @@ def decide_bash(command: str, cwd: str, policy: dict, lifted: set[str], depth: i
             if verb in REMOTE_ONLY and re.search(r"\s", raw):  # a remote command string: matched as text below
                 hold_texts.append(raw)
                 continue
-            for value in brace_expand(raw):
+            for value in ([raw] if raw in codes else brace_expand(raw)):
                 if verb in TEXT_ONLY and not forced:
                     continue
                 if forced is not None:
@@ -1311,6 +1469,9 @@ def decide_bash(command: str, cwd: str, policy: dict, lifted: set[str], depth: i
                 if is_path or verb in HOST_VERBS or url_like(value):
                     for cand in [value] + expansions(value, sim):
                         h = held(forms(cand, sim), policy, lifted)
+                        if h and verb and raw not in targets and reader_verb(verb, args, runs_hook, codes) \
+                                and memory_note(cand, sim, policy, lifted):
+                            continue
                         if h:
                             return deny("hold", f"hold '{h['id']}' is active ({h.get('note', '')}): `{verb or 'redirect'}` naming it is not allowed")
         if uses_xargs:
@@ -1326,12 +1487,12 @@ def decide_bash(command: str, cwd: str, policy: dict, lifted: set[str], depth: i
             if proj and proj in joined:
                 return deny("hold", "a held GoodQA project id is named in a command")
         # what this segment hands to the next one in a pipeline (xargs): paths it names
-        pipe_words = pipe_words + [v for a in args if not a.startswith("-") and not re.search(r"\s", a)
+        pipe_words = pipe_words + [v for a in path_args if not a.startswith("-") and not re.search(r"\s", a)
                                    for v in brace_expand(a) if pathlike(v)]
         if verb in EMITTERS:
-            pipe_paths = pipe_paths + [p for p in protected_named(args, [], sim if sim_known else "")
+            pipe_paths = pipe_paths + [p for p in protected_named(path_args, [], sim if sim_known else "")
                                        if protected_hit(forms(p, sim))]
-        pipe_creds = pipe_creds + [v for v in args if not v.startswith("-") and not re.search(r"\s", v)
+        pipe_creds = pipe_creds + [v for v in path_args if not v.startswith("-") and not re.search(r"\s", v)
                                    for v in brace_expand(v) if protected(forms(v, sim), policy["protected_paths"])]
     for k, body in enumerate(subs):
         if k not in checked_subs:
@@ -1366,8 +1527,46 @@ def load_mode(path: Path = None) -> str:
     return "warn" if isinstance(data, dict) and data.get("mode") == "warn" else "enforce"
 
 
-def emit_deny(kind: str, reason: str) -> None:
+def record_warn(kind: str, tool: str, digest: str) -> None:
+    """One JSONL line per would-deny, so the rollout can read its false-deny rate: the rule kind, the tool name and a
+    hash, never the command. 0600, rotated once at WARN_LOG_CAP. A failure here must not change the guard's answer."""
+    try:
+        path = Path(os.path.expanduser("~")) / WARN_LOG
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            if path.stat().st_size >= WARN_LOG_CAP:
+                os.replace(path, path.with_name(path.name + ".1"))
+        except FileNotFoundError:
+            pass
+        line = {"schema": 1, "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                "rule": kind, "tool": re.sub(r"[^\w.:-]", "", tool)[:120], "hash": digest}
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, (json.dumps(line, sort_keys=True) + "\n").encode())
+        finally:
+            os.close(fd)
+    except Exception:  # noqa: BLE001 - the record is best effort; the message below still reports the would-deny
+        pass
+
+
+def call_digest(raw: str, payload) -> tuple[str, str]:
+    """(tool name, sha256 prefix of what it was called with) for the warn record."""
+    tool = payload.get("tool_name") if isinstance(payload, dict) else ""
+    what = payload.get("tool_input") if isinstance(payload, dict) else raw
+    try:
+        text = json.dumps(what, sort_keys=True)
+    except (TypeError, ValueError, RecursionError):
+        text = raw
+    return (tool if isinstance(tool, str) else ""), hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def emit_deny(kind: str, reason: str, raw: str = "", payload=None) -> None:
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0)  # the answer goes out whatever the clock says
+    except (ValueError, OSError, AttributeError):
+        pass
     if load_mode() == "warn":  # rollout mode: say what would be denied, let the call proceed
+        record_warn(kind, *call_digest(raw, payload))
         print(json.dumps({"systemMessage": f"holds_guard (warn mode, not blocking) would deny [{kind}]: {reason}"}))
         return
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
@@ -1379,6 +1578,7 @@ def _on_alarm(_signum, _frame):
 
 
 def main() -> int:
+    raw, payload = "", None
     try:
         try:
             signal.signal(signal.SIGALRM, _on_alarm)
@@ -1400,13 +1600,13 @@ def main() -> int:
         if warning:
             print(warning, file=sys.stderr)
         if result:
-            emit_deny(*result)
+            emit_deny(*result, raw, payload)
     except Deadline:
-        emit_deny("input", f"checking this call took longer than {DEADLINE_S:g} s; failing closed")
+        emit_deny("input", f"checking this call took longer than {DEADLINE_S:g} s; failing closed", raw, payload)
     except Bad as exc:
-        emit_deny("input", f"{exc}; failing closed")
+        emit_deny("input", f"{exc}; failing closed", raw, payload)
     except Exception as exc:  # noqa: BLE001 - fail closed, never silently allow
-        emit_deny("guard-error", f"{type(exc).__name__} while checking this call; failing closed")
+        emit_deny("guard-error", f"{type(exc).__name__} while checking this call; failing closed", raw, payload)
     finally:
         try:
             signal.setitimer(signal.ITIMER_REAL, 0)

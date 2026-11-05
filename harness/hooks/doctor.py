@@ -31,6 +31,7 @@ MANIFEST = HERE / "hooks_manifest.json"
 RULES = HERE / "rules.json"
 
 WIRED, MISSING, SCRIPT_MISSING, PENDING, CANARY_FAIL = "WIRED", "MISSING", "SCRIPT_MISSING", "PENDING", "CANARY_FAIL"
+WIRED_WARN = "WIRED-WARN"  # wired and working in the hook's alert-only rollout mode: it reports, it does not block
 
 
 def load_json(path: Path):
@@ -96,9 +97,32 @@ def expected(manifest: dict, flavor: str, claude_dir: Path) -> list[dict]:
     return [row for row in manifest["hooks"] if flavor in row["flavors"]]
 
 
+def hook_mode(row: dict, script_path: Path) -> str:
+    """"warn" only when the row names a mode file next to the script and it says so (the guard's own rule: a missing or
+    invalid file means enforce)."""
+    if not row.get("mode_file"):
+        return "enforce"
+    try:
+        data = json.loads((script_path.parent / row["mode_file"]).read_text())
+    except (OSError, ValueError):
+        return "enforce"
+    return "warn" if isinstance(data, dict) and data.get("mode") == "warn" else "enforce"
+
+
+def would_deny(stdout: str) -> bool:
+    """The warn-mode answer: a systemMessage saying what it would deny. Only a warn-mode canary may count it as a deny."""
+    try:
+        message = json.loads(stdout).get("systemMessage", "")
+    except (ValueError, AttributeError):
+        return False
+    return isinstance(message, str) and "would deny" in message
+
+
 def run_canary(row: dict, script_path: Path) -> tuple[bool, str]:
     """Every canary payload goes to the hook on stdin under a scratch HOME. A deny is a deny decision in stdout or
-    exit 2; a crash (Traceback, usage error, any other exit code) satisfies neither an allow nor a deny canary."""
+    exit 2 (or, for a hook in warn mode, its "would deny" message); a crash (Traceback, usage error, any other exit
+    code) satisfies neither an allow nor a deny canary."""
+    warn = hook_mode(row, script_path) == "warn"
     canaries = row.get("canaries") or []
     if not canaries:
         return True, "no canary"
@@ -114,10 +138,11 @@ def run_canary(row: dict, script_path: Path) -> tuple[bool, str]:
                 return False, f"canary could not run: {type(exc).__name__}"
         out = r.stdout + r.stderr
         crashed = "Traceback" in out or "usage:" in out.lower() or r.returncode not in (0, 2)
-        denied = ('"permissionDecision": "deny"' in r.stdout.replace('":"', '": "')) or r.returncode == 2
+        denied = ('"permissionDecision": "deny"' in r.stdout.replace('":"', '": "')) or r.returncode == 2 \
+            or (warn and would_deny(r.stdout))
         want_deny = canary.get("expect") == "deny"
         ok = not crashed and denied == want_deny
-        notes.append(f"rc={r.returncode} denied={denied} want={'deny' if want_deny else 'allow'}")
+        notes.append(f"rc={r.returncode} {'would-deny' if warn else 'denied'}={denied} want={'deny' if want_deny else 'allow'}")
         if not ok:
             return False, "; ".join(notes) + (" (crashed)" if crashed else "")
     return True, "; ".join(notes)
@@ -137,11 +162,15 @@ def check_hooks(manifest: dict, flavor: str, live: dict, hooks_dir: Path, canary
         elif not (exists(row["script"]) if exists else script.exists()):
             state, detail = SCRIPT_MISSING, f"wired but {script} does not exist (hook would exit 0 silently)"
         else:
-            state, detail = WIRED, "wired"
+            warn = not exists and hook_mode(row, script) == "warn"
+            state, detail = (WIRED_WARN, "wired, warn mode (alert-only): it reports and does not block") if warn \
+                else (WIRED, "wired")
             if canary:
                 ok, info = run_canary(row, script)
                 if not ok:
                     state, detail = CANARY_FAIL, info
+                elif warn:
+                    detail += f"; {info}"
         out.append({"id": row["id"], "state": state, "detail": detail, "required": row["status"] == "installed",
                     "owner": row.get("owner", ""), "rules": row.get("rules", [])})
     return out
@@ -223,7 +252,7 @@ def check_integrity(manifest: dict, hooks_dir: Path, settings: str, run=subproce
 
 
 def verdict(findings: list[dict]) -> int:
-    return 0 if all(f["state"] == WIRED or not f["required"] for f in findings) else 1
+    return 0 if all(f["state"] in (WIRED, WIRED_WARN) or not f["required"] for f in findings) else 1
 
 
 def policy_mode(hooks_dir: Path, spec: dict | None) -> str:
@@ -242,11 +271,12 @@ def rules_report(rules: list[dict], findings: list[dict], hooks_dir: Path) -> li
     for rule in rules:
         mech = rule.get("mechanisms", [])
         if mech:
-            wired = all(by_id.get(m, {"state": MISSING})["state"] == WIRED for m in mech)
+            states = [by_id.get(m, {"state": MISSING})["state"] for m in mech]
+            wired = all(s in (WIRED, WIRED_WARN) for s in states)
             mode = policy_mode(hooks_dir, rule.get("mode"))
             if not wired:
                 state = "NOT-ENFORCED"
-            elif mode != "enforce":
+            elif mode != "enforce" or WIRED_WARN in states:
                 state = "ALERT-ONLY"
             else:
                 state = "PARTIAL" if rule.get("partial_reason") else "ENFORCED"

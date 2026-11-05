@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import os
 import unittest
 from pathlib import Path
@@ -1069,6 +1070,277 @@ class WarnMode(unittest.TestCase):
         self.assertIn("holds_guard_policy.json", install.HOOKS)
         manifest = json.loads((ROOT / "harness" / "hooks" / "hooks_manifest.json").read_text())
         self.assertIn("holds_guard_policy.json", manifest["integrity_files"])
+
+
+HOOKS_T = "~/.claude/hooks"
+
+
+class FinalInterpreterFlags(unittest.TestCase):
+    """Review item 4: python's -I, -S, -E ... take no value (perl's and ruby's -I does)."""
+
+    def test_installed_hook_runs_under_every_valueless_flag(self):
+        for flags in ("-I", "-I -S", "-S", "-B", "-E", "-s", "-u", "-O", "-OO", "-IS", "-W ignore", "-X utf8", "-I -W ignore"):
+            for py in ("python3", "/usr/bin/python3", "python3.12", "HOME=/x /usr/bin/python3"):
+                cmd = f"{py} {flags} {HOOKS_T}/provenance.py status"
+                self.assertIsNone(verdict(bash(cmd)), cmd)
+
+    def test_a_valueless_flag_does_not_hide_the_script_of_a_writer(self):
+        for flags in ("-I", "-E", "-S", "-I -S", "-u"):
+            for target in (f"{HOOKS_T}/holds.py", "~/.claude/settings.json"):
+                cmd = f"python3 {flags} /tmp/writer.py {target}"
+                self.assertEqual(verdict(bash(cmd)), "policy-file", cmd)
+
+    def test_clustered_code_and_module_flags_are_recognised(self):
+        self.assertEqual(hg.python_call(["-Ic", "print(1)", "a"]), ("print(1)", "", "", ["a"]))
+        self.assertEqual(hg.python_call(["-ISm", "json.tool", "f"]), (None, "json.tool", "", ["f"]))
+        self.assertEqual(hg.python_call(["-W", "x.py", "y.py"]), (None, "", "y.py", []))
+        self.assertEqual(verdict(bash(f"""python3 -Ic "open('{HOOKS_T}/x.py', 'w')" """)), "policy-file")
+        self.assertEqual(verdict(bash(f"""python3 -E -c "import shutil; shutil.rmtree('/Users/x/.claude/hooks')" """)), "policy-file")
+
+    def test_perl_keeps_its_include_flag_with_a_value(self):
+        self.assertEqual(hg.inline_codes("perl", ["-I", "lib", "x.pl"]), ([], "x.pl"))
+
+
+class FinalReaders(unittest.TestCase):
+    """Review item 5: named read-only checkers, bytecode cleanup and a bare "." do not count as writes."""
+
+    def test_named_checkers_on_protected_paths_are_allowed(self):
+        for cmd in ("python3 harness/hooks/doctor.py check --settings ~/.claude/settings.json",
+                    "python3 harness/hooks/doctor.py check --hooks-dir ~/.claude/hooks",
+                    "python3 harness/hooks/doctor.py check --ssh dev2 --settings /home/eric/.claude/settings.json "
+                    "--hooks-dir /home/eric/.claude/hooks",
+                    "python3 -m json.tool ~/.claude/settings.json",
+                    "python3 -I -m json.tool ~/.claude/settings.json > /tmp/x",
+                    f"python3 -m py_compile {HOOKS_T}/holds.py", f"python3 -m pyflakes {HOOKS_T}", f"pyflakes {HOOKS_T}",
+                    f"ruff check {HOOKS_T}", f"python3 -m ruff check {HOOKS_T}", f"shellcheck {HOOKS_T}/x.sh",
+                    "prettier --check ~/.claude/settings.json", "npx prettier --check ~/.claude/settings.json",
+                    "npx --yes prettier -c ~/.claude/settings.json",
+                    f"python3 integrity.py --hooks-dir {HOOKS_T} verify --json"):
+            self.assertIsNone(verdict(bash(cmd)), cmd)
+
+    def test_the_same_tools_writing_stay_denied(self):
+        for cmd in ("python3 -m json.tool /tmp/in.json ~/.claude/settings.json",
+                    f"ruff check --fix {HOOKS_T}", f"ruff format {HOOKS_T}", f"python3 -m ruff check --fix {HOOKS_T}",
+                    f"ruff check -o {HOOKS_T}/out.txt x.py",
+                    "prettier --write ~/.claude/settings.json", "prettier ~/.claude/settings.json",
+                    "prettier --check --write ~/.claude/settings.json", "npx prettier --write ~/.claude/settings.json",
+                    "npx eslint --fix ~/.claude/settings.json", f"python3 -m compileall -f {HOOKS_T}/x",
+                    f"python3 doctor.py repair {HOOKS_T}", f"python3 integrity.py --hooks-dir {HOOKS_T} record",
+                    f"python3 evil.py check {HOOKS_T}/holds.py"):
+            self.assertEqual(verdict(bash(cmd)), "policy-file", cmd)
+
+    def test_bytecode_under_the_hooks_directory_can_be_removed(self):
+        for cmd in (f"rm -rf {HOOKS_T}/__pycache__", f"rm {HOOKS_T}/*.pyc", f"rm -f {HOOKS_T}/__pycache__/*",
+                    f"rm -rf {HOOKS_T}/{{__pycache__,x.pyc}}", f"cd {HOOKS_T} && rm -rf __pycache__"):
+            self.assertIsNone(verdict(bash(cmd)), cmd)
+
+    def test_only_bytecode_and_only_rm(self):
+        for cmd in (f"rm {HOOKS_T}/holds.py", f"rm -rf {HOOKS_T}/__pycache__/../holds.py",
+                    f"rm -rf {HOOKS_T}/__pycache__ {HOOKS_T}/holds.py", f"rm -rf {HOOKS_T}/{{__pycache__,holds.py}}",
+                    f"mv {HOOKS_T}/__pycache__ /tmp/x", f"touch {HOOKS_T}/__pycache__/x.pyc", f"rm -rf {HOOKS_T}",
+                    f"cd {HOOKS_T} && rm holds.py"):
+            self.assertEqual(verdict(bash(cmd)), "policy-file", cmd)
+
+    def test_bare_dot_at_home_is_not_the_protected_set(self):
+        home = os.path.expanduser("~")
+        for cmd in ("gh pr view 50 --json title -q .", "gh api repos/a/b --jq .", "python3 foo.py .",
+                    "npm run build -- --out .", "gh pr view 5 -q ./"):
+            self.assertIsNone(verdict({**bash(cmd), "cwd": home}), cmd)
+
+    def test_bare_dot_with_a_destructive_verb_at_home_stays_denied(self):
+        home = os.path.expanduser("~")
+        for cmd in ("rm -rf .", "rm -rf ./", "find . -delete", "mv . /tmp/x", "chmod -R 700 .", "cp -r /tmp/x .",
+                    "rsync -a --delete /tmp/x/ .", "tar xf /tmp/a.tar -C ."):
+            self.assertEqual(verdict({**bash(cmd), "cwd": home}), "policy-file", cmd)
+
+
+class FinalHeldNameAsText(unittest.TestCase):
+    """Review item 6: a pattern, a program or a branch name is text; only path operands name a held project."""
+
+    def test_patterns_programs_and_branch_names_are_text(self):
+        for cmd in ("grep -rn 'petfiliate: ' docs", 'grep "yates:" .', "rg -n 'yates/' src", "egrep -c 'yates/x' a.txt",
+                    "grep -A 3 yates/ a.txt", "grep -e 'yates/' -e 'petfiliate/' a.txt", "grep -rne 'yates/' src",
+                    "rg -g '*.py' 'optinrouter/' src", "grep -- 'yates/' a.txt", "sed -i '' 's/petfiliate/PF/g' notes.md",
+                    "sed -n '/yates/p' f", "sed -e 's/yates/x/' f", "awk '/petfiliate/ {print}' f",
+                    "awk -F: '/yates/ {print $1}' f", """jq '.holds[] | select(.id=="yates")' holds.json""",
+                    "jq --arg h yates/x '.[$h]' f.json", "gh pr create --title t --head fix/optinrouter-hold-doc",
+                    "gh pr list --base yates/x", "gh pr checkout -B fix/yates-doc 5"):
+            self.assertIsNone(verdict(bash(cmd)), cmd)
+
+    def test_path_operands_of_the_same_verbs_stay_denied(self):
+        for cmd in ("grep foo /srv/yates/x", "grep -e foo /srv/yates/x", "grep -A 3 foo /srv/yates/x", "grep -r foo yates/",
+                    "grep -f /srv/yates/patterns a.txt", "grep -- foo /srv/yates/x", "rg foo /srv/petfiliate",
+                    "rg -g '*.py' foo /srv/petfiliate", "sed -n 1p /srv/petfiliate/f", "sed -i '' 's/a/b/' /srv/yates/f",
+                    "sed -e 's/a/b/' /srv/yates/f", "awk '{print}' /srv/optinrouter/f", "jq . /srv/yates/x.json",
+                    "gh pr create --repo org/yates --title t"):
+            self.assertEqual(verdict(bash(cmd)), "hold", cmd)
+
+    def test_a_pattern_never_counts_as_a_credential_path_but_the_operand_does(self):
+        self.assertIsNone(verdict(bash("grep '/.ssh/id_rsa' notes.md")))
+        self.assertEqual(verdict(bash("grep BEGIN ~/.ssh/id_rsa")), "protected-path")
+        self.assertEqual(verdict(bash("grep -e BEGIN ~/.ssh/id_rsa")), "protected-path")
+        self.assertEqual(verdict(bash("grep -r PRIVATE ~")), "protected-path")
+
+    def test_a_pattern_does_not_feed_xargs(self):
+        self.assertIsNone(verdict(bash("grep 'yates/' list.txt | xargs echo")))
+        self.assertEqual(verdict(bash("ls /srv/yates/x | xargs cat")), "hold")
+
+    NOTES = ("/Users/x/.claude/projects/-Users-x/memory/feedback-do-not-touch-yates.md",
+             "/Users/x/.claude/projects/-Users-x/memory/feedback-hold-petfiliate-optinrouter.md")
+
+    def test_memory_notes_with_a_held_word_can_be_read_not_written(self):
+        for note in self.NOTES:
+            self.assertIsNone(verdict(tool("Read", file_path=note)), note)
+            self.assertIsNone(verdict(bash(f"cat {note}")), note)
+            self.assertIsNone(verdict(bash(f"grep -n hold {note}")), note)
+            for name in ("Write", "Edit", "MultiEdit"):
+                self.assertEqual(verdict(tool(name, file_path=note)), "hold", name)
+            for cmd in (f"rm {note}", f"sed -i '' 's/a/b/' {note}", f"tee {note}", f"mv {note} /tmp/x"):
+                self.assertEqual(verdict(bash(cmd)), "hold", cmd)
+            self.assertEqual(verdict(bash(f"echo x > {note}")), "hold", note)
+
+    def test_only_the_note_file_name_may_hold_the_word(self):
+        for path in ("/Users/x/.claude/projects/-Users-x-yates/memory/a.md", "/Users/x/.claude/projects/p/memory/yates.txt",
+                     "/Users/x/.claude/projects/p/memory/../../yates/a.md", "/Users/x/notes/memory/yates.md",
+                     "/Users/x/.claude/projects/p/memory/yates/a.md"):
+            self.assertEqual(verdict(tool("Read", file_path=path)), "hold", path)
+
+
+class FinalSlowHome(unittest.TestCase):
+    """Review item 7: the macOS automounter under /home costs about 30 ms per stat; 16 operands hit the deadline."""
+
+    OPS = " ".join(f"/home/eric/dir{i}/file{i}.txt" for i in range(40))
+
+    def test_forty_home_operands_decide_in_under_a_second(self):
+        for cmd in (f"cat {self.OPS}", f"rm -f {self.OPS}"):
+            t = time.monotonic()
+            verdict(bash(cmd))
+            self.assertLess(time.monotonic() - t, 1.0, cmd[:20])
+
+    def test_no_realpath_under_a_slow_root_and_one_per_path_elsewhere(self):
+        seen = []
+        real = os.path.realpath
+
+        def counting(p, **kw):
+            seen.append(p)
+            return real(p, **kw)
+        ops = self.OPS + " /tmp/one /tmp/one /tmp/two"
+        with mock.patch.object(hg, "SLOW_ROOTS", ("/home", "/net")), mock.patch.object(hg.os.path, "realpath", counting):
+            self.assertIsNone(verdict(bash(f"cat {ops}")))
+        self.assertFalse([p for p in seen if p.startswith("/home")], "automounter touched")
+        self.assertEqual(seen.count("/tmp/one"), 1)
+        self.assertEqual(seen.count("/tmp/two"), 1)
+
+    def test_the_memo_does_not_outlive_a_decision(self):
+        with tempfile.TemporaryDirectory() as d:
+            link = Path(os.path.realpath(d)) / "link"
+            link.symlink_to("/srv/plain")
+            self.assertIsNone(verdict(bash(f"cat {link}")))
+            link.unlink()
+            link.symlink_to("/srv/yates")
+            self.assertEqual(verdict(bash(f"cat {link}")), "hold")
+
+    def test_a_home_path_naming_a_hold_is_still_denied(self):
+        with mock.patch.object(hg, "SLOW_ROOTS", ("/home", "/net")):
+            self.assertEqual(verdict(bash("cat /home/eric/yates/x")), "hold")
+            self.assertEqual(verdict(bash("rm /home/eric/.claude/settings.json")), "policy-file")
+
+
+class FinalWarnRecord(unittest.TestCase):
+    """Review item 11: the rollout must be able to read what it would have denied, without the commands."""
+
+    def run_in(self, home, mode, payload):
+        hooks = Path(home) / "h" / "hooks"
+        if not hooks.exists():
+            shutil.copytree(ROOT / "harness" / "hooks", hooks, ignore=shutil.ignore_patterns("__pycache__"))
+        (hooks / "holds_guard_policy.json").write_text(json.dumps({"mode": mode}))
+        r = subprocess.run([sys.executable, "-I", "-S", str(hooks / "holds_guard.py")], input=payload, capture_output=True,
+                           text=True, timeout=30, env={"HOME": home, "PATH": "/usr/bin:/bin"}, cwd=home)
+        return json.loads(r.stdout) if r.stdout.strip() else None
+
+    def log(self, home):
+        return Path(home) / ".agent-harness" / "state" / "holds-warn.jsonl"
+
+    def test_one_private_line_without_the_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = self.run_in(d, "warn", json.dumps(bash("ssh yates-cloud SECRETWORD")))
+            self.assertIn("would deny", out["systemMessage"])
+            self.assertEqual(self.log(d).stat().st_mode & 0o777, 0o600)
+            text = self.log(d).read_text()
+            self.assertNotIn("SECRETWORD", text)
+            self.assertNotIn("yates", text)
+            line = json.loads(text)
+            self.assertEqual(sorted(line), ["at", "hash", "rule", "schema", "tool"])
+            self.assertEqual((line["rule"], line["tool"], len(line["hash"])), ("hold", "Bash", 16))
+            self.run_in(d, "warn", json.dumps(bash("ssh yates-cloud SECRETWORD")))
+            self.run_in(d, "warn", "not json")
+            lines = [json.loads(x) for x in self.log(d).read_text().splitlines()]
+            self.assertEqual(len(lines), 3)
+            self.assertEqual(lines[0]["hash"], lines[1]["hash"])
+            self.assertEqual(lines[2]["rule"], "input")
+
+    def test_rotates_at_the_cap_and_keeps_one_old_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.log(d).parent.mkdir(parents=True)
+            self.log(d).write_text("x" * (hg.WARN_LOG_CAP + 1))
+            self.run_in(d, "warn", json.dumps(bash("ssh yates-cloud")))
+            self.assertEqual(self.log(d).with_name("holds-warn.jsonl.1").stat().st_size, hg.WARN_LOG_CAP + 1)
+            self.assertEqual(len(self.log(d).read_text().splitlines()), 1)
+
+    def test_allow_and_enforce_write_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(self.run_in(d, "warn", json.dumps(bash("ls"))))
+            out = self.run_in(d, "enforce", json.dumps(bash("ssh yates-cloud")))
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertFalse(self.log(d).exists())
+
+    def test_a_failing_record_does_not_change_the_answer(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / ".agent-harness").write_text("a file where the directory should be")
+            out = self.run_in(d, "warn", json.dumps(bash("ssh yates-cloud")))
+            self.assertIn("would deny", out["systemMessage"])
+        with tempfile.TemporaryDirectory() as d:
+            self.log(d).parent.mkdir(parents=True)
+            victim = Path(d) / "victim"
+            victim.write_text("keep")
+            self.log(d).symlink_to(victim)
+            out = self.run_in(d, "warn", json.dumps(bash("ssh yates-cloud")))
+            self.assertIn("would deny", out["systemMessage"])
+            self.assertEqual(victim.read_text(), "keep")
+
+
+class FinalBackupLabels(unittest.TestCase):
+    """Review item 9: the transcript backup is found under the stable id, an alias, or the host name log-backup.sh used."""
+
+    def test_explicit_label_wins_and_the_default_lists_all(self):
+        with mock.patch.dict(os.environ, {"LOG_BACKUP_HOST": "explicit"}):
+            self.assertEqual(holds.backup_hosts(), ["explicit"])
+        env = {k: v for k, v in os.environ.items() if k != "LOG_BACKUP_HOST"}
+        import integrity
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(integrity, "host_id", lambda: "mac-1"), \
+                mock.patch.object(integrity, "load_policy", lambda d: {"host_aliases": {"mac-1": ["Old-Name"]}}), \
+                mock.patch.object(holds.socket, "gethostname", lambda: "Now-Name.local"):
+            self.assertEqual(holds.backup_hosts(), ["mac-1", "Old-Name", "Now-Name"])
+
+    def test_every_label_is_tried_until_one_holds_the_message(self):
+        session, uuid = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+        line = json.dumps({"type": "user", "origin": {"kind": "human"}, "uuid": uuid,
+                           "message": {"role": "user", "content": "lift hold yates"}}, separators=(",", ":"))
+        seen = []
+
+        def fake(argv, **kw):
+            remote = argv[-1] if argv[1] == "lsjson" else argv[-2]
+            seen.append(remote)
+            if "/second/" not in remote:
+                return subprocess.CompletedProcess(argv, 3, b"", b"")
+            if argv[1] == "lsjson":
+                return subprocess.CompletedProcess(argv, 0, b"{}", b"")
+            Path(argv[-1]).write_text(line + "\n")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        with mock.patch.object(holds, "backup_hosts", lambda: ["first", "second"]), \
+                mock.patch.object(holds, "backup_location", lambda s, h=None: f"r:b/{h}/.claude/projects/-p/{s}.jsonl"):
+            self.assertTrue(REAL_BACKUP(session, uuid, "yates", run=fake))
+        self.assertEqual([s.split("/")[1] for s in seen], ["first", "second", "second"])
 
 
 if __name__ == "__main__":
