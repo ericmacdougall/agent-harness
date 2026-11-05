@@ -569,14 +569,13 @@ def answer_text(record, ask_ids):
         return None
     if blocks[0].get("is_error"):
         return None
-    content = blocks[0].get("content")
-    if isinstance(content, list):
-        content = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and isinstance(b.get("text"), str))
-    if not isinstance(content, str):
+    # Only the user's selections count (toolUseResult.answers: question -> answer). The rendered tool_result string
+    # embeds the agent's own question text, so it is never parsed; no structured answers means no answer.
+    answers = record["toolUseResult"].get("answers") if isinstance(record["toolUseResult"], dict) else None
+    if not isinstance(answers, dict):
         return None
-    # Only the user's selections count: the question text in the result is the agent's own words.
-    answers = re.findall(r'"="(.*?)"(?:, "|\. You can now|\s*$)', content, re.S)
-    return "\n".join(answers) if answers else None
+    values = [v.strip() for v in answers.values() if isinstance(v, str) and v.strip()]
+    return "\n".join(values) if values else None
 
 
 def excerpt_in(text: str, excerpt: str):
@@ -615,6 +614,18 @@ def user_turn(session: str, uid: str, home=None) -> dict:
     if text is None:
         raise Problem("not-user-authored", reason)
     return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session}
+
+
+def askuser_bound(path: Path, use_id) -> set:
+    """{use_id} when the transcript holds a main-conversation AskUserQuestion tool_use with that id, else empty."""
+    ids = set()
+    if isinstance(use_id, str) and use_id:
+        for line in _lines_containing(path, use_id.encode()):
+            try:
+                ids |= askuser_use_ids(loads_line(line)) if line is not None else set()
+            except ValueError:
+                continue
+    return ids & {use_id}
 
 
 def answer_turn(session: str, uid: str, home=None) -> dict:

@@ -403,6 +403,21 @@ def index_transcript(home: Path, session: str) -> dict:
     return idx
 
 
+def _line_at(fd: int, off: int, cap: int = 8 << 20) -> bytes:
+    """The line starting at off, read in growing steps (a row costs its own line, not the rest of the file)."""
+    out, step = b"", 1 << 16
+    while len(out) < cap:
+        chunk = os.pread(fd, step, off + len(out))
+        if not chunk:
+            break
+        nl = chunk.find(b"\n")
+        if nl >= 0:
+            return out + chunk[:nl]
+        out += chunk
+        step = min(step * 2, 4 << 20)
+    return out
+
+
 def verify_rows(path: Path, rows: list) -> list:
     """Keep only rows whose text still matches the transcript line at their recorded offset (cache is untrusted)."""
     ok = []
@@ -410,12 +425,13 @@ def verify_rows(path: Path, rows: list) -> list:
     try:
         for m in rows:
             off = m.get("off")
-            if not isinstance(off, int) or off < 0:
+            if not isinstance(off, int) or off < 0 or m.get("kind") not in ("uuid", "queued", "answer"):
                 continue
-            raw = os.pread(fd, 8 << 20, off).split(b"\n", 1)[0]
             try:
-                rec = json.loads(raw)
+                rec = json.loads(_line_at(fd, off))
             except ValueError:
+                continue
+            if not isinstance(rec, dict):
                 continue
             prov = _prov()
             if m["kind"] == "uuid":
@@ -425,7 +441,7 @@ def verify_rows(path: Path, rows: list) -> list:
                 text = prov.queue_user_text(rec)
                 good = text is not None and m["id"].endswith("#" + hashlib.sha256(text.encode()).hexdigest()[:12])
             else:
-                text = _answer_values_cache(rec)
+                text = _answer_values_cache(rec, path)
                 good = text is not None and rec.get("uuid") == m["id"].split("/", 1)[1]
             if good and text[:8000] == m["text"]:
                 ok.append(m)
@@ -434,11 +450,12 @@ def verify_rows(path: Path, rows: list) -> list:
     return ok
 
 
-def _answer_values_cache(rec):
-    """Answer text of an AskUserQuestion result record (binding to the tool_use was checked at index time)."""
+def _answer_values_cache(rec, path: Path):
+    """Answer text of an AskUserQuestion result record; the tool_use binding is re-checked in the transcript."""
     blocks = (rec.get("message") or {}).get("content") if isinstance(rec, dict) else None
     if isinstance(blocks, list) and len(blocks) == 1 and isinstance(blocks[0], dict):
-        return _prov().answer_text(rec, {blocks[0].get("tool_use_id")})
+        prov = _prov()
+        return prov.answer_text(rec, prov.askuser_bound(path, blocks[0].get("tool_use_id")))
     return None
 
 
@@ -789,7 +806,7 @@ def post_comment(ref: str, body: str, operation_id: str) -> None:
         raise AhError("ticket_unavailable", str(e), 3)
 
 
-def spool_drain(home: Path) -> dict:
+def spool_drain(home: Path, only_opid: str | None = None) -> dict:
     """Post spooled comments. A transport failure keeps the job; a ticket that does not exist moves it to dead/.
     The GoodQA operationId makes a re-post after a crash harmless. One drainer at a time."""
     import fcntl
@@ -801,7 +818,7 @@ def spool_drain(home: Path) -> dict:
         except OSError:
             return {"ok": True, "drained": 0, "pending": len(list(spool.glob("*.json"))), "busy": True}
         done, failed, dead = 0, 0, 0
-        for f in sorted(spool.glob("*.json")):
+        for f in sorted(spool.glob(f"*-{hashlib.sha256(only_opid.encode()).hexdigest()[:16]}.json" if only_opid else "*.json")):
             try:
                 job = json.loads(f.read_text())
                 post_comment(job["ticket"], job["body"], job["operation_id"])
@@ -973,7 +990,11 @@ def task_list(home: Path, open_only: bool = False) -> dict:
 def write(home: Path, op: str, args: dict, session: str, key: str | None = None) -> dict:
     precheck(op, args)
     import redact
-    args = _redact_args(args, redact.redact)  # secrets never reach the ledger, spool or WAL
+    if isinstance(args.get("source"), str):
+        import wal_note
+        if wal_note.SECRET_PATTERN.search(args["source"]):
+            raise AhError("bad_request", "source appears to contain a credential; cite it without the secret", 2)
+    args = {k: (v if k == "source" else _redact_args(v, redact.redact)) for k, v in args.items()}  # source is checked as typed
     key = key or derive_key(op, args, session)
     if not KEY_RE.match(key):
         raise AhError("bad_request", "idempotency key must be 8-128 chars of [A-Za-z0-9._:-]")
@@ -1008,8 +1029,16 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
     reply = {"ok": True, "result": "applied", "id": rid, "seq": seq, "key": key}
     reply.update(out)
     if out.get("comment") == "pending":  # post now, outside the lock; on failure it stays spooled for the next drain
-        drained = spool_drain(home)
-        reply["comment"] = "posted" if drained.get("pending", 0) == 0 and not drained.get("busy") else "pending"
+        opid = "ah:" + hashlib.sha256(key.encode()).hexdigest()[:24]
+        spool_drain(home, only_opid=opid)  # only this write's job: other queued jobs never delay or colour this reply
+        tag = hashlib.sha256(opid.encode()).hexdigest()[:16]
+        spool = store_dir(home) / "spool"
+        if list(spool.glob(f"*-{tag}.json")):
+            reply["comment"] = "pending"
+        elif list((spool / "dead").glob(f"*-{tag}.json")):
+            reply["comment"] = "dead"  # the ticket does not exist; nothing was posted
+        else:
+            reply["comment"] = "posted"
     return reply
 
 
