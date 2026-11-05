@@ -216,6 +216,20 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
     return summary
 
 
+def agent_limit(home: Path, session: str, agent: str):
+    """Usage-limit stop of one agent, read from the structured tail of its task output only."""
+    import safe_input
+    try:
+        with os.scandir(home / ".claude" / "projects") as it:
+            for proj in it:
+                cand = Path(proj.path) / session / "subagents" / f"agent-{agent}.jsonl"
+                if cand.is_file():
+                    return liveness.limit_stop(safe_input.read_tail(str(cand), liveness.LIMIT_TAIL_BYTES))
+    except (OSError, safe_input.InputRejected):
+        pass
+    return None
+
+
 def transcript_mtime(home: Path, session: str, agent: str) -> float:
     base = home / ".claude" / "projects"
     best = 0.0
@@ -326,7 +340,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None, sk
         verdict = liveness.classify(now, last_wal, tmtime, is_stopped,
                                     summary["outcome"], summary["last_note"], info["type"],
                                     agent in registered, owner=is_owner, last_kind=summary.get("last_kind"),
-                                    paused=bool(PAUSE_RE.search(" ".join(n for n in named if agent in n))))
+                                    paused=bool(PAUSE_RE.search(" ".join(n for n in named if agent in n))),
+                                    limit=agent_limit(home, session, agent))
         if agent in closed and is_stopped_or_idle(verdict):
             verdict = {"state": "closed", "idle_s": verdict["idle_s"], "severity": "info"}
         idle = verdict["idle_s"]
@@ -336,7 +351,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None, sk
                "restricted": restricted, "parent": info.get("parent"), "closed_by": closed.get(agent),
                "owner": bool(is_owner), "registered": agent in registered,
                "flags": (["unregistered-owner"] if is_owner and agent not in registered else []),
-               "state": verdict["state"], "severity": verdict["severity"],
+               "state": verdict["state"], "severity": verdict["severity"], "resets_at": verdict.get("resets_at"),
                "last_activity": iso(last_wal), "idle_s": None if idle == float("inf") else int(idle),
                "ticket": summary["tickets"][0] if summary["tickets"] else None,
                "ticket_comment_age_s": None}

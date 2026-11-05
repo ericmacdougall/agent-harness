@@ -172,6 +172,35 @@ class OwnersTests(Base):
         self.assertEqual(by["big"], "done")
         self.assertNotEqual(skipped["big"], "done")  # its WAL was not read
 
+    def test_limit_stopped_is_detected_from_the_structured_tail_only(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        sub = self.home / ".claude" / "projects" / "-p" / SESSION / "subagents"
+        sub.mkdir(parents=True)
+        agents = ("limhit", "limresumed", "limlookalike", "limpassed")
+        jl(w / "main.jsonl", [{"at": iso(NOW - 3000), "event": "scope", "note": " ".join(a + " owns a lane" for a in agents)}]
+           + [{"at": iso(NOW - 3000), "event": "subagent", "agent_id": a, "agent_type": "general-purpose"} for a in agents])
+        limit = {"type": "assistant", "timestamp": "2026-11-05T06:45:00Z", "apiError": "usage_limit_reached",
+                 "isApiErrorMessage": True, "apiErrorStatus": 429,
+                 "quotaLimits": {"resetsAt": NOW + 86400, "rateLimitType": "seven_day"},
+                 "message": {"content": [{"type": "text", "text": "You've hit your weekly limit"}]}}
+        normal = {"type": "assistant", "message": {"content": [{"type": "text", "text": "working again"}]}}
+        text_only = {"type": "assistant", "message": {"content": [{"type": "text", "text": "You've hit your weekly limit"}]}}
+        noise = {"type": "api-request", "hash": "x" * 50}
+        for agent, rows in (("limhit", [normal, limit, {"type": "user", "message": {"content": "msg"}}, noise]),
+                            ("limresumed", [limit, normal, noise]),
+                            ("limlookalike", [normal, text_only, noise]),  # same words, no structured error: not a limit stop
+                            ("limpassed", [dict(limit, quotaLimits={"resetsAt": NOW - 60, "rateLimitType": "seven_day"})])):
+            jl(w / f"agent-{agent}.jsonl", [{"at": iso(NOW - 3000), "event": "intent", "note": "work"}])
+            (sub / f"agent-{agent}.meta.json").write_text(json.dumps({"agentType": "general-purpose", "finished": False}))
+            jl(sub / f"agent-{agent}.jsonl", rows, mode="w")
+            os.utime(sub / f"agent-{agent}.jsonl", (NOW - 3000, NOW - 3000))
+        by = {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=NOW)["owners"]}
+        self.assertEqual(by["limhit"]["state"], "limit-stopped")
+        self.assertEqual((by["limhit"]["severity"], by["limhit"]["resets_at"]), ("warning", NOW + 86400))
+        self.assertEqual(by["limpassed"]["severity"], "high")  # reset has passed: main must resume it
+        self.assertNotEqual(by["limresumed"]["state"], "limit-stopped")
+        self.assertNotEqual(by["limlookalike"]["state"], "limit-stopped")
+
     def test_owner_close_settles_a_finished_owner_without_wal_notes(self):
         w = self.home / ".claude" / "wals" / SESSION
         jl(w / "main.jsonl", [
