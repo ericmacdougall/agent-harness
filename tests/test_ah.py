@@ -68,6 +68,12 @@ class FakeGoodQA(http.server.BaseHTTPRequestHandler):
         else:
             data = {}
         out = json.dumps({"result": {"content": [{"text": json.dumps(data)}]}}).encode()
+        if name == "comment_on_issue":
+            import uuid
+            try:
+                uuid.UUID(a["operationId"])
+            except ValueError:
+                out = json.dumps({"result": {"isError": True, "content": [{"text": json.dumps({"data": {"error": {"code": "validation"}}})}]}}).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.end_headers()
@@ -505,6 +511,12 @@ class WriteTests(GoodQABase):
         self.assertEqual(ah.spool_drain(self.home)["drained"], 1)
         self.assertEqual(len(FakeGoodQA.state["posted"]), 1)
         self.assertEqual(ah.spool_drain(self.home)["drained"], 0)
+
+    def test_operation_id_is_a_uuid_goodqa_accepts(self):
+        import uuid
+        ah.write(self.home, "ticket.comment", {"ticket": "GoodQA goodqa#77", "body": "hi"}, SESSION, "uuid-key-0001")
+        (opid,) = FakeGoodQA.state["posted"].keys()
+        self.assertEqual(str(uuid.UUID(opid)), opid)  # real GoodQA rejects any other operationId
 
     def test_comment_body_redacted(self):
         ah.write(self.home, "ticket.comment", {"ticket": "GoodQA goodqa#77", "body": "tok ghp_abcdefghijklmnopqrstuvwxyz0123456789"}, SESSION, "cmt-key-0002")

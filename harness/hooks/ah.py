@@ -706,6 +706,12 @@ def canonical(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def operation_id(key: str) -> str:
+    """GoodQA requires a UUID operationId; a UUID derived from the key keeps re-posts idempotent."""
+    import uuid
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "ah-operation:" + key))
+
+
 def derive_key(op: str, args: dict, session: str) -> str:
     return "ah:" + hashlib.sha256(canonical([op, args, session]).encode()).hexdigest()[:32]
 
@@ -830,6 +836,11 @@ def _spool_comment(home: Path, job: dict) -> str:
 
 def post_comment(ref: str, body: str, operation_id: str) -> None:
     import redact
+    import uuid
+    try:
+        uuid.UUID(operation_id)
+    except ValueError:  # jobs spooled by an earlier build carried a non-UUID id
+        operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "ah-operation:" + operation_id))
     adapter, mod = load_adapter()
     project, number = ticket_ref(ref)
     ticket = ticket_issue(adapter, mod, project, number)
@@ -949,7 +960,7 @@ def _evidence_ok(home: Path, ev: list, allowed: set, reg: dict) -> None:
 
 def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
     """Validate and perform one op; returns the result fields. Called under the store lock."""
-    opid = "ah:" + hashlib.sha256(key.encode()).hexdigest()[:24]
+    opid = operation_id(key)
     wid = "w" + hashlib.sha256(key.encode()).hexdigest()[:11]
     now = dt.datetime.now(dt.timezone.utc).isoformat()
     out = {}
@@ -1079,7 +1090,7 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
     reply = {"ok": True, "result": "applied", "id": rid, "seq": seq, "key": key}
     reply.update(out)
     if out.get("comment") == "pending":  # post now, outside the lock; on failure it stays spooled for the next drain
-        opid = "ah:" + hashlib.sha256(key.encode()).hexdigest()[:24]
+        opid = operation_id(key)
         spool_drain(home, only_opid=opid)  # only this write's job: other queued jobs never delay or colour this reply
         tag = hashlib.sha256(opid.encode()).hexdigest()[:16]
         spool = store_dir(home) / "spool"
