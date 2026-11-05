@@ -495,7 +495,7 @@ The registered command is `kill_guard.py hook`, a launcher that runs the analysi
 | 17 | an array-valued command name (goodqa#14683, high; both bash and zsh run the kill) | `K=(kill); $K 4004`, `a=(kill 4001); $a 4004` |
 | 18 | a command name assembled from variables and split with `${=R}` (goodqa#14684, medium) | `A=ki; B=ll; R="$A$B -15"; ${=R} 4004` |
 | 19 | `find -exec` with the Homebrew-prefixed verb (goodqa#14685, low; `find -exec kill` is blocked) | `find . -exec gkill 4004 \;` |
-| 20 | a printer piped to a shell when the shell is behind a wrapper or `printf` has a format; no parenthesis involved, no ticket yet | `echo "kill 4004" \| sudo sh`, `printf '%s ' "kill 4004" \| bash` |
+| 20 | a printer piped to a shell when the shell is behind a wrapper or `printf` has a format; no parenthesis involved (goodqa#14691, high); also `S=sh; echo "kill 4004" \| $S`, a heredoc piped to a shell, and `find . -exec gkill 4001(N) 4004 \;` | `echo "kill 4004" \| sudo sh`, `printf '%s ' "kill 4004" \| bash` |
 
 The guard therefore does not close the incident class. It closes the kill words it is shown.
 
