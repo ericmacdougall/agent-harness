@@ -1,5 +1,5 @@
 {
- "_doc": "Data only (rule S1): judged by decide() in the fake world of kill_guard_corpus.json, never executed or fed to a shell. shape names the BLOCK that found it: a commit hash for the six earlier fixes, with only rows that fix's parent let through, F6-F9 for the closed grammar, R2-R5 for later reviews, PKILL for goodqa#14617, OK for commands that must keep working. RR, TC, AH and RROK cover tag loss on re-parse, text-carried kills and array heads (goodqa#14691, goodqa#14683).",
+ "_doc": "Data only (rule S1): judged by decide() in the fake world of kill_guard_corpus.json, never executed or fed to a shell. shape names the BLOCK that found it: a commit hash for the six earlier fixes, with only rows that fix's parent let through, F6-F9 for the closed grammar, R2-R5 for later reviews, PKILL for goodqa#14617, OK for commands that must keep working. RR, TC, AH and RROK cover tag loss on re-parse, text-carried kills and array heads (goodqa#14691, goodqa#14683). WS, WV, VH and WSOK cover a pipe into a wrapped remote shell and a variable or array holding several words (goodqa#14712).",
  "rows": [
   {
    "cmd": "kill -9 -0 4004",
@@ -4207,6 +4207,979 @@
    "id": "OK-amp-redirect",
    "shape": "OK",
    "why": "a &> redirect on a kill of an owned PID must keep working"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | timeout 30 ssh dev2 bash",
+   "expect": "block",
+   "id": "WS-001",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "for p in 4001 4004; do echo \"kill $p\"; done | timeout 30 ssh dev2 bash",
+   "expect": "block",
+   "id": "WS-002",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | sudo ssh dev2 bash",
+   "expect": "block",
+   "id": "WS-003",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | nohup ssh dev2 bash",
+   "expect": "block",
+   "id": "WS-004",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | env X=1 ssh dev2 bash",
+   "expect": "block",
+   "id": "WS-005",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | nice ssh dev2 bash",
+   "expect": "block",
+   "id": "WS-006",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | command ssh dev2 bash",
+   "expect": "block",
+   "id": "WS-007",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | exec ssh dev2 bash",
+   "expect": "block",
+   "id": "WS-008",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | gtimeout 30 ssh dev2 bash",
+   "expect": "block",
+   "id": "WS-009",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | sshpass -p x ssh dev2 bash",
+   "expect": "block",
+   "id": "WS-010",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | timeout 5 docker exec -i c sh",
+   "expect": "block",
+   "id": "WS-011",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | sudo kubectl exec -i p -- sh",
+   "expect": "block",
+   "id": "WS-012",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | ssh jump ssh dev2 bash",
+   "expect": "block",
+   "id": "WS-013",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | ssh dev2 docker exec -i web sh",
+   "expect": "block",
+   "id": "WS-014",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | ssh dev2 'timeout 5 ssh jump bash'",
+   "expect": "block",
+   "id": "WS-015",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | timeout 30 ssh git bash",
+   "expect": "block",
+   "id": "WS-016",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | timeout --foreground 30 ssh -T dev2 bash -s",
+   "expect": "block",
+   "id": "WS-017",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | ssh -l git dev2 bash",
+   "expect": "block",
+   "id": "WV-001",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | ssh git bash",
+   "expect": "block",
+   "id": "WV-002",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | ssh -T node bash",
+   "expect": "block",
+   "id": "WV-003",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | docker exec -i node sh",
+   "expect": "block",
+   "id": "WV-004",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | docker run --rm -i node sh",
+   "expect": "block",
+   "id": "WV-005",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | kubectl exec node -i -- sh",
+   "expect": "block",
+   "id": "WV-006",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | sudo -u git bash",
+   "expect": "block",
+   "id": "WV-007",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | sudo --user git bash",
+   "expect": "block",
+   "id": "WV-008",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | docker-compose exec git sh",
+   "expect": "block",
+   "id": "WV-009",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | ssh dev2 sudo -u go bash",
+   "expect": "block",
+   "id": "WV-010",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | xargs -I{} ssh git sh -c {}",
+   "expect": "block",
+   "id": "WV-011",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | xargs -I{} ssh dev2 sh -c {}",
+   "expect": "block",
+   "id": "WV-012",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "SSH=\"ssh -T dev2\"; printf 'pkill -f x\\n' | $SSH bash",
+   "expect": "block",
+   "id": "VH-001",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "RUN=\"ssh dev2 bash\"; printf 'pkill -f x\\n' | $RUN",
+   "expect": "block",
+   "id": "VH-002",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=\"bash -s\"; echo \"kill 4004\" | $S",
+   "expect": "block",
+   "id": "VH-003",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=\"sudo sh\"; echo \"kill 4004\" | $S",
+   "expect": "block",
+   "id": "VH-004",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=(ssh dev2 bash); printf 'pkill -f x\\n' | \"${S[@]}\"",
+   "expect": "block",
+   "id": "VH-005",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=(ssh dev2 bash); printf 'pkill -f x\\n' | ${S[@]}",
+   "expect": "block",
+   "id": "VH-006",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=(ssh dev2 bash); printf 'pkill -f x\\n' | \"${S[*]}\"",
+   "expect": "block",
+   "id": "VH-007",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=(ssh dev2 bash); printf 'pkill -f x\\n' | $S[@]",
+   "expect": "block",
+   "id": "VH-008",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=(bash); echo \"kill 4004\" | \"${S[@]}\"",
+   "expect": "block",
+   "id": "VH-009",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=(timeout 5 ssh dev2); printf 'pkill -f x\\n' | \"${S[@]}\" bash",
+   "expect": "block",
+   "id": "VH-010",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "SSH=(ssh -T dev2); \"${SSH[@]}\" 'pkill -f x'",
+   "expect": "block",
+   "id": "VH-011",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "SSH=(ssh -T dev2); ${SSH[@]} 'pkill -f x'",
+   "expect": "block",
+   "id": "VH-012",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "SSH=(ssh -T dev2); \"${SSH[@]}\" kill 4004",
+   "expect": "block",
+   "id": "VH-013",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "SSH=\"ssh -T dev2\"; $SSH 'pkill -f x'",
+   "expect": "block",
+   "id": "VH-014",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "W=(timeout 5); \"${W[@]}\" kill 4004",
+   "expect": "block",
+   "id": "VH-015",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "RUN=\"ssh dev2 bash\"; printf 'pkill -f x\\n' | timeout 5 $RUN",
+   "expect": "block",
+   "id": "VH-016",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=sh; echo \"kill 4004\" | sudo $S",
+   "expect": "block",
+   "id": "VH-017",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=\"ssh dev2\"; printf 'pkill -f x\\n' | sudo $S bash",
+   "expect": "block",
+   "id": "VH-018",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=bash; echo \"kill 4004\" | ssh dev2 $S",
+   "expect": "block",
+   "id": "VH-019",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | ssh dev2 'cat > f'",
+   "expect": "allow",
+   "id": "WSOK-001",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | ssh dev2 cat",
+   "expect": "allow",
+   "id": "WSOK-002",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | timeout 30 ssh dev2 cat",
+   "expect": "allow",
+   "id": "WSOK-003",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | sudo tee f",
+   "expect": "allow",
+   "id": "WSOK-004",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "ps aux | grep kill | ssh -T dev2 grep bash",
+   "expect": "allow",
+   "id": "WSOK-005",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "ps aux | grep kill | timeout 5 grep sh",
+   "expect": "allow",
+   "id": "WSOK-006",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "ps aux | grep kill | sudo grep bash",
+   "expect": "allow",
+   "id": "WSOK-007",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "ps aux | grep kill | sudo --user=eric grep bash",
+   "expect": "allow",
+   "id": "WSOK-008",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | ssh dev2 bash -n",
+   "expect": "allow",
+   "id": "WSOK-009",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | ssh dev2 bash script.sh",
+   "expect": "allow",
+   "id": "WSOK-010",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | timeout 5 ssh dev2 bash -c 'echo hi'",
+   "expect": "allow",
+   "id": "WSOK-011",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | docker exec -i web cat",
+   "expect": "allow",
+   "id": "WSOK-012",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | docker exec -i web grep sh",
+   "expect": "allow",
+   "id": "WSOK-013",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | kubectl exec -i p -- grep sh",
+   "expect": "allow",
+   "id": "WSOK-014",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | xargs -I{} ssh dev2 echo {}",
+   "expect": "allow",
+   "id": "WSOK-015",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill switch\" | docker logs git",
+   "expect": "allow",
+   "id": "WSOK-016",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=\"grep bash\"; echo \"kill 4004\" | $S",
+   "expect": "allow",
+   "id": "WSOK-017",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=(grep bash); echo \"kill 4004\" | \"${S[@]}\"",
+   "expect": "allow",
+   "id": "WSOK-018",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=\"ssh dev2 cat\"; printf 'pkill -f x\\n' | $S",
+   "expect": "allow",
+   "id": "WSOK-019",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=(ssh dev2 cat); printf 'pkill -f x\\n' | \"${S[@]}\"",
+   "expect": "allow",
+   "id": "WSOK-020",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "SSH=\"ssh -T dev2\"; $SSH uptime",
+   "expect": "allow",
+   "id": "WSOK-021",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "SSH=(ssh -T dev2); \"${SSH[@]}\" uptime",
+   "expect": "allow",
+   "id": "WSOK-022",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "SSH=(ssh -T dev2); \"${SSH[@]}\" bash -s < setup.sh",
+   "expect": "allow",
+   "id": "WSOK-023",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=(ls -l); \"${S[@]}\"",
+   "expect": "allow",
+   "id": "WSOK-024",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "A=(a b c); echo \"${A[@]}\"",
+   "expect": "allow",
+   "id": "WSOK-025",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "H=dev2; ssh $H uptime | $PAGER",
+   "expect": "allow",
+   "id": "WSOK-026",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo hello | timeout 30 ssh dev2 bash",
+   "expect": "allow",
+   "id": "WSOK-027",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo hello | ssh -l git dev2 bash",
+   "expect": "allow",
+   "id": "WSOK-028",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=(ssh dev2 bash); echo hello | \"${S[@]}\"",
+   "expect": "allow",
+   "id": "WSOK-029",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=\"bash 'x\"; echo \"kill 4004\" | $S",
+   "expect": "block",
+   "id": "VH-020",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=\"   \"; echo \"kill 4004\" | $S",
+   "expect": "allow",
+   "id": "WSOK-030",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=(ssh dev2 bash); echo \"kill 4004\" | \"${S[0]}\"",
+   "expect": "block",
+   "id": "VH-021",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=(bash); echo \"kill 4004\" | \"${S[1]}\"",
+   "expect": "block",
+   "id": "VH-022",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=(bash); echo \"kill 4004\" | $S[1]",
+   "expect": "block",
+   "id": "VH-023",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=(bash); S=(cat); echo \"kill 4004\" | \"${S[@]}\"",
+   "expect": "allow",
+   "id": "WSOK-031",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=(cat); S+=(bash); echo \"kill 4004\" | \"${S[@]}\"",
+   "expect": "allow",
+   "id": "WSOK-032",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=(ssh dev2); S+=(bash); printf 'pkill -f x\\n' | \"${S[@]}\"",
+   "expect": "block",
+   "id": "VH-024",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | ssh dev2 -- bash",
+   "expect": "block",
+   "id": "WV-013",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | mosh dev2 -- bash",
+   "expect": "block",
+   "id": "WV-014",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | ssh -- dev2 bash",
+   "expect": "block",
+   "id": "WV-015",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | oc exec -i p -- sh",
+   "expect": "block",
+   "id": "WV-016",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | podman exec -i node sh",
+   "expect": "block",
+   "id": "WV-017",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | nerdctl run -i node sh",
+   "expect": "block",
+   "id": "WV-018",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | ssh -o ProxyCommand=none dev2 bash",
+   "expect": "block",
+   "id": "WV-019",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | ssh -p 22 -i key git bash",
+   "expect": "block",
+   "id": "WV-020",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | sudo -u git git bash",
+   "expect": "allow",
+   "id": "WSOK-033",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | sudo ssh -l git git bash",
+   "expect": "block",
+   "id": "WV-021",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | timeout 5 bash -s -- x",
+   "expect": "block",
+   "id": "WV-022",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | ssh dev2 \"ssh jump 'ssh far bash'\"",
+   "expect": "block",
+   "id": "WV-023",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | sudo \"ssh dev2 bash\"",
+   "expect": "block",
+   "id": "WV-024",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "S='bash -s'; printf 'pkill -f x\\n' | ssh dev2 \"$S\"",
+   "expect": "block",
+   "id": "VH-025",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "echo \"skill foo\" | timeout 5 ssh dev2 bash",
+   "expect": "allow",
+   "id": "WSOK-034",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "K=(kill 4004); \"${K[@]}\"",
+   "expect": "block",
+   "id": "VH-026",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "P=(4001 4004); kill \"${P[@]}\"",
+   "expect": "block",
+   "id": "VH-027",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "P=(4001); kill \"${P[@]}\"",
+   "expect": "block",
+   "id": "VH-028",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "W=(sudo); \"${W[@]}\" kill 4004",
+   "expect": "block",
+   "id": "VH-029",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "W=(ssh dev2); \"${W[@]}\" kill 4004",
+   "expect": "block",
+   "id": "VH-030",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "W=(ssh dev2); \"${W[@]}\" echo kill 4004",
+   "expect": "block",
+   "id": "VH-031",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "X=a; echo \"${X[@]}\" | sh",
+   "expect": "allow",
+   "id": "WSOK-035",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "'${S[@]}' | cat",
+   "expect": "allow",
+   "id": "WSOK-036",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=(ssh dev2 bash); echo '${S[@]}' kill",
+   "expect": "allow",
+   "id": "WSOK-037",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=(sh); echo \"kill 4004\" | sudo \"${S[@]}\"",
+   "expect": "block",
+   "id": "VH-032",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=(sh); echo \"kill 4004\" | timeout 5 \"${S[@]}\"",
+   "expect": "block",
+   "id": "VH-033",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=(cat); echo \"kill 4004\" | timeout 5 \"${S[@]}\"",
+   "expect": "allow",
+   "id": "WSOK-038",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=(grep bash); ps aux | grep kill | \"${S[@]}\"",
+   "expect": "allow",
+   "id": "WSOK-039",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "A=b; echo \"kill 4004\" | grep $A",
+   "expect": "allow",
+   "id": "WSOK-040",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "A=bash; echo \"kill 4004\" | grep $A",
+   "expect": "allow",
+   "id": "WSOK-041",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | grep -e $HOME",
+   "expect": "allow",
+   "id": "WSOK-042",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "git log --grep=kill | less -p $Q",
+   "expect": "allow",
+   "id": "WSOK-043",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo kill | git log --author git bash",
+   "expect": "allow",
+   "id": "WSOK-044",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | gosu git bash",
+   "expect": "block",
+   "id": "WV-025",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | flock node sh",
+   "expect": "block",
+   "id": "WV-026",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | sudo chroot git bash",
+   "expect": "block",
+   "id": "WV-027",
+   "shape": "WV",
+   "why": "a word that names a user, host or container is not a command and must not end the sink search"
+  },
+  {
+   "cmd": "ps aux | grep kill | sudo -u eric -- grep sh",
+   "expect": "allow",
+   "id": "WSOK-045",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "ps aux | grep kill | flock /tmp/l grep sh",
+   "expect": "allow",
+   "id": "WSOK-046",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "P=(4001); kill $P[@]",
+   "expect": "block",
+   "id": "VH-034",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "P=(4001); kill $P[1]",
+   "expect": "block",
+   "id": "VH-035",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=kill; ${K:-x} 4004",
+   "expect": "block",
+   "id": "VH-036",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=kill; ${K%x} 4004",
+   "expect": "block",
+   "id": "VH-037",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=kill; \"${K/x/y}\" 4001",
+   "expect": "block",
+   "id": "VH-038",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(kill); \"${K:-x}\" 4004",
+   "expect": "block",
+   "id": "VH-039",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=\"a b\"; echo hello | $S",
+   "expect": "allow",
+   "id": "WSOK-047",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=\"a b\"; echo \"kill 4004\" | $S",
+   "expect": "allow",
+   "id": "WSOK-048",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "W=(ssh dev2); $W[1] echo kill 4004",
+   "expect": "allow",
+   "id": "WSOK-049",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "W=(ssh dev2); $W[@] echo kill 4004",
+   "expect": "allow",
+   "id": "WSOK-050",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | ssh dev2 'cd /srv && /bin/bash'",
+   "expect": "block",
+   "id": "WS-018",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | ssh dev2 'cd /srv; sudo /usr/bin/sh'",
+   "expect": "block",
+   "id": "WS-019",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "printf 'pkill -f x\\n' | timeout 5 ssh dev2 'cd /srv && /bin/bash -s'",
+   "expect": "block",
+   "id": "WS-020",
+   "shape": "WS",
+   "why": "a stop word for a remote command ended the sink search before the shell"
+  },
+  {
+   "cmd": "rg kill | ssh dev2 'cat > /tmp/bash'",
+   "expect": "allow",
+   "id": "WSOK-051",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | timeout 5 ssh dev2 'cat > /tmp/sh'",
+   "expect": "allow",
+   "id": "WSOK-052",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | ssh dev2 'cat > /tmp/git' bash -n",
+   "expect": "allow",
+   "id": "WSOK-053",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
   }
  ]
 }
