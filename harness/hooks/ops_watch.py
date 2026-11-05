@@ -87,8 +87,10 @@ def defaults(host: str) -> dict:
         "delivery": [],
         "drift": {"repo": None, "ref": "origin/main", "claude_dir": "~/.claude"},
         "codex_dir": "~/.codex",
-        "liveness": {"enabled": True, "wal_root": "~/.claude/wals", "silent_min": 60, "lookback_h": 24,
-                     "ticket_quiet_h": 3, "max_ticket_lookups": 15, "gq": "~/.claude/goodqa-p0p1/gq.py",
+        # thresholds shared with ahd's liveness.py (DESIGN.md section 5): SILENT 30 min warning, 60 min high
+        "liveness": {"enabled": True, "wal_root": "~/.claude/wals", "silent_min": 30, "silent_high_min": 60,
+                     "lookback_h": 24, "lookback_active_h": 168, "ticket_quiet_h": 3, "max_ticket_lookups": 10,
+                     "ticket_budget_s": 90, "gq": "~/.claude/goodqa-p0p1/gq.py",
                      "projects": {"goodqa": "1ae27b6b-f8f2-4e61-ab2d-c9c43fd162c3"}},
         "peers": [],
         "sinks": {"comment": {"mode": "none"}, "deadman": []},
@@ -222,6 +224,11 @@ def emit(event: dict, path: Path | None = None, home: Path | None = None) -> int
         raise ValueError("bad severity or event")
     path = Path(path) if path else ring_path(home or Path.home())
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:  # mkdir's mode does not fix a pre-existing dir; the ring may name hosts, paths and tasks
+        if path.parent.stat().st_uid == os.getuid():
+            os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
     lock = os.open(str(path.with_suffix(".lock")), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -735,9 +742,27 @@ def memory_alerts(runner, p: dict) -> list:
     return out
 
 
-HEAVY_SUITES = (("unittest-discover", re.compile(r"\bunittest\s+discover\b")),
-                ("pytest", re.compile(r"(^|[\s/])(py\.test|pytest)(\s|$)|-m\s+pytest\b")),
-                ("gradle-test", re.compile(r"(^|[\s/])gradlew?(\s.*)?\s(test|check)\b")))
+def suite_kind(args: str):
+    """Classify a full-suite run from argv. Only the program (or `python -m <module>`) counts, so `rg pytest`,
+    `pip install pytest` or `git log --grep pytest` do not; a pytest run aimed at a file, node id (::) or -k
+    expression is a focused run, which the Mac allows."""
+    tok = args.split()
+    if not tok:
+        return None
+    prog = tok[0].rsplit("/", 1)[-1]
+    rest = tok[1:]
+    if prog.startswith("python") and len(rest) >= 2 and rest[0] == "-m":
+        prog, rest = rest[1], rest[2:]
+    elif prog.startswith("python") and len(rest) >= 3 and rest[0].startswith("-") and rest[1] == "-m":
+        prog, rest = rest[2], rest[3:]
+    if prog == "unittest":
+        return "unittest-discover" if rest[:1] == ["discover"] or not rest else None
+    if prog in ("pytest", "py.test"):
+        focused = any("::" in t or t.endswith(".py") or t == "-k" or t.startswith("-k=") for t in rest)
+        return None if focused else "pytest"
+    if prog in ("gradle", "gradlew") and any(t in ("test", "check") for t in rest):
+        return "gradle-test"
+    return None
 
 
 def heavy_suite_alerts(runner) -> list:
@@ -749,10 +774,9 @@ def heavy_suite_alerts(runner) -> list:
         parts = line.strip().split(None, 1)
         if len(parts) < 2 or not parts[0].isdigit() or int(parts[0]) == os.getpid():
             continue
-        for kind, rx in HEAVY_SUITES:
-            if rx.search(parts[1]):
-                hits.append({"pid": int(parts[0]), "kind": kind})
-                break
+        kind = suite_kind(parts[1])
+        if kind:
+            hits.append({"pid": int(parts[0]), "kind": kind})
     if not hits:
         return []
     kinds = sorted({h["kind"] for h in hits})
@@ -925,7 +949,7 @@ def check_peers(cfg, state, runner, now):
         try:
             rc, text = runner(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
                                "cat .agent-harness/state/ops-watch/active.json"], 30)
-            doc = json.loads(text) if rc == 0 else None
+            doc = json.loads(text) if rc == 0 and len(text or "") <= 262144 else None
         except (subprocess.TimeoutExpired, ValueError, OSError):
             doc = None
         if isinstance(doc, dict):
@@ -941,8 +965,10 @@ def check_peers(cfg, state, runner, now):
 
 # ---------------------------------------------------------------- 8. owner liveness
 
-TERMINAL_EVENTS = ("handoff", "done", "delivered")
-TERMINAL_NOTE = re.compile(r"\b(WORKDIR_DONE|DELIVERED|DONE)\b")
+TERMINAL_EVENTS = ("handoff", "result", "done", "delivered")
+TERMINAL_NOTE = re.compile(r"^\s*(WORKDIR_DONE|DELIVERED)\s*:")  # anchored: "not DONE yet" is not terminal
+HOOK_EVENTS = ("pretool", "subagent", "subagent_stop", "prompt", "session")  # metadata, not an owner's note
+OWNER_TYPES = ("task-owner", "fixer")
 WAITING_NOTE = re.compile(r"\b(waiting|blocked|wait)\s+(on|for)\s+\S+", re.I)
 TICKET_RE = re.compile(r"GoodQA\s+(?:([a-z0-9][a-z0-9-]*)#|#)(\d+)")
 CLOSED_STATUS = ("done", "closed", "wont_fix", "won't fix", "archived", "canceled", "cancelled", "resolved")
@@ -966,15 +992,45 @@ def _tail(path: Path, limit: int) -> bytes:
         os.close(fd)
 
 
-def last_event(path: Path):
-    for line in reversed(_tail(path, 65536).decode("utf-8", "replace").splitlines()):
+def last_events(path: Path):
+    """(last event of any kind, last owner-written event) from the WAL tail."""
+    last_any = last_note = None
+    for line in reversed(_tail(path, 262144).decode("utf-8", "replace").splitlines()):
         try:
             obj = json.loads(line)
         except ValueError:
             continue
-        if isinstance(obj, dict) and obj.get("event"):
-            return obj
-    return None
+        if not (isinstance(obj, dict) and obj.get("event")):
+            continue
+        last_any = last_any or obj
+        if obj.get("event") not in HOOK_EVENTS:
+            last_note = obj
+            break
+    return last_any, last_note
+
+
+def last_event(path: Path):
+    return last_events(path)[0]
+
+
+def subagent_lifecycle(main_wal: Path) -> dict:
+    """agent_id -> (agent_type, last lifecycle event, at) from the session's main WAL (SubagentStart/Stop)."""
+    out = {}
+    try:
+        data = _tail(main_wal, 8 * 1024 * 1024)
+    except OSError:
+        return out
+    for line in data.decode("utf-8", "replace").splitlines():
+        if '"subagent' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("event") in ("subagent", "subagent_stop") and obj.get("agent_id"):
+            prev = out.get(obj["agent_id"], ("", "", None))
+            out[obj["agent_id"]] = (obj.get("agent_type") or prev[0], obj["event"], parse_ts(obj.get("at")))
+    return out
 
 
 def wal_ticket(path: Path):
@@ -986,11 +1042,13 @@ def wal_ticket(path: Path):
     return max(sorted(counts), key=lambda r: counts[r]) if counts else None
 
 
-def is_terminal(ev: dict) -> bool:
+def is_terminal(ev) -> bool:
+    if not ev:
+        return False
     kind, note = str(ev.get("event", "")), str(ev.get("note", ""))
     if kind in TERMINAL_EVENTS:
         return True
-    if kind in ("status", "result") and TERMINAL_NOTE.search(note):
+    if kind == "status" and TERMINAL_NOTE.search(note):
         return True
     return kind == "blocker" and bool(WAITING_NOTE.search(note))
 
@@ -998,7 +1056,7 @@ def is_terminal(ev: dict) -> bool:
 def gq_call(runner, gq: str, tool: str, args: dict):
     import pwd
     env = dict(os.environ, HOME=pwd.getpwuid(os.getuid()).pw_dir)
-    rc, out = runner(["python3", "-I", gq, tool, json.dumps(args), "200000"], 60, env=env)
+    rc, out = runner(["python3", "-I", gq, tool, json.dumps(args), "200000"], 20, env=env)
     if rc != 0:
         return None
     try:
@@ -1028,17 +1086,26 @@ def ticket_info(lc: dict, runner, gq: str, ref: str, now: float):
 
 
 def check_liveness(cfg, state, runner, now):
-    """Owner WALs (~/.claude/wals/<session>/<task>.jsonl, not agent-* or main) whose last event is older than
-    silent_min and is not a terminal event (handoff, done, delivered, WORKDIR_DONE/DONE/DELIVERED status, or a
-    blocker naming what it waits on). Also a task whose open GoodQA ticket has had no comment for ticket_quiet_h.
-    WALs untouched for lookback_h are treated as abandoned history and ignored."""
+    """Owner liveness, one alert per owner (key liveness:<session8>/<task>):
+
+    owners   task WALs ~/.claude/wals/<session>/<task>.jsonl (not main), and subagent WALs agent-<id>.jsonl whose
+             SubagentStart in that session's main.jsonl has an owner type (task-owner, fixer)
+    SILENT   last event older than silent_min (30, warning) or silent_high_min (60, high), and the last owner
+             note is not terminal (handoff/result/done/delivered, a status "WORKDIR_DONE:"/"DELIVERED:", or a
+             blocker that names what it waits on)
+    DROPPED  a subagent owner whose last lifecycle event is SubagentStop and whose last note is not terminal (high)
+    QUIET    the task's open GoodQA ticket has had no comment for ticket_quiet_h (high; Mac, via gq.py)
+    Clears on new activity or a terminal note. WALs untouched for lookback_h are history, except that an owner
+    already alerting is followed for lookback_active_h so age alone never clears it."""
     lc = cfg["liveness"]
     home = home_of(cfg)
     root = Path(expand(home, lc["wal_root"]))
     gq = expand(home, lc.get("gq") or "")
     use_gq = bool(gq) and os.path.isfile(gq)
     cache = state.setdefault("ticket_cache", {})
+    alerting = {k for k in (state.get("active") or {}) if k.startswith("liveness:")}
     lookups = 0
+    ticket_deadline = time.monotonic() + lc.get("ticket_budget_s", 90)
     out = []
     try:
         sessions = [e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)]
@@ -1049,29 +1116,48 @@ def check_liveness(cfg, state, runner, now):
             files = [f for f in os.scandir(sess.path) if f.is_file(follow_symlinks=False)]
         except OSError:
             continue
+        life = None
         for f in sorted(files, key=lambda e: e.name):
-            if not f.name.endswith(".jsonl") or f.name.startswith("agent-") or f.name == "main.jsonl":
+            if not f.name.endswith(".jsonl") or f.name == "main.jsonl":
                 continue
+            task = f.name[:-6]
+            key = f"liveness:{sess.name[:8]}/{task}"
             try:
                 mtime = f.stat().st_mtime
-                if mtime < now - lc["lookback_h"] * 3600:
+                horizon = lc["lookback_active_h"] if key in alerting else lc["lookback_h"]
+                if mtime < now - horizon * 3600:
                     continue
-                ev = last_event(Path(f.path))
-                if ev is None or is_terminal(ev):
+                kind, agent = "task", None
+                if f.name.startswith("agent-"):
+                    if life is None:
+                        life = subagent_lifecycle(Path(sess.path) / "main.jsonl")
+                    agent = task[len("agent-"):]
+                    if life.get(agent, ("",))[0] not in OWNER_TYPES:
+                        continue
+                    kind = "subagent"
+                last_any, note = last_events(Path(f.path))
+                if last_any is None or is_terminal(note):
                     continue
                 ticket = wal_ticket(Path(f.path))
             except OSError:
                 continue
-            task = f.name[:-6]
-            last_at = parse_ts(ev.get("at")) or mtime
+            last_at = parse_ts(last_any.get("at")) or mtime
             silent = max(0.0, (now - last_at) / 60)
-            reasons = []
-            if silent >= lc["silent_min"]:
+            reasons, sev = [], None
+            if agent and life.get(agent, ("", ""))[1] == "subagent_stop":
+                reasons.append("DROPPED: stopped without handoff, result or a named wait")
+                sev = "high"
+            if silent >= lc["silent_high_min"]:
                 reasons.append(f"WAL silent {round(silent)}m")
+                sev = "high"
+            elif silent >= lc["silent_min"]:
+                reasons.append(f"WAL silent {round(silent)}m")
+                sev = sev or "warning"
             quiet_h = None
             if ticket and use_gq:
                 info = cache.get(ticket)
-                if (not info or now - info.get("at", 0) > 1800) and lookups < lc["max_ticket_lookups"]:
+                if ((not info or now - info.get("at", 0) > 1800) and lookups < lc["max_ticket_lookups"]
+                        and time.monotonic() < ticket_deadline):
                     lookups += 1
                     info = ticket_info(lc, runner, gq, ticket, now) or info
                     if info:
@@ -1081,13 +1167,15 @@ def check_liveness(cfg, state, runner, now):
                     if quiet >= lc["ticket_quiet_h"]:
                         quiet_h = round(quiet, 1)
                         reasons.append(f"ticket quiet {quiet_h}h")
+                        sev = "high"
             if reasons:
-                out.append(alert("liveness", f"liveness:{sess.name[:8]}/{task}", "high",
-                                 f"owner silent: {task} {('GoodQA ' + ticket) if ticket else 'no-ticket'} "
+                label = "owner dropped" if reasons[0].startswith("DROPPED") else "owner silent"
+                out.append(alert("liveness", key, sev,
+                                 f"{label}: {task} {('GoodQA ' + ticket) if ticket else 'no-ticket'} "
                                  f"{round(silent)}m ({'; '.join(reasons)})",
-                                 {"session": sess.name[:8], "task": task, "ticket": ticket,
-                                  "silent_min": round(silent), "last_event": str(ev.get("event"))[:20],
-                                  "ticket_quiet_h": quiet_h}))
+                                 {"session": sess.name[:8], "task": task, "kind": kind, "agent": agent,
+                                  "ticket": ticket, "silent_min": round(silent),
+                                  "last_event": str((note or last_any).get("event"))[:20], "ticket_quiet_h": quiet_h}))
     for ref in [r for r, v in cache.items() if now - v.get("at", 0) > 86400]:
         cache.pop(ref, None)
     return out
@@ -1197,6 +1285,26 @@ def send_comment(cfg, runner, events, deadline: float | None = None) -> int:
     return sent
 
 
+def drain_comments(cfg, runner, state: dict, deadline: float | None = None) -> None:
+    """Retry-stable delivery: the chunk being sent is pinned in state (comment_inflight) and re-sent byte for
+    byte until it succeeds, so a lost response retries the same body and the same uuid5 operationId instead of
+    a regrown first chunk (no duplicate posts)."""
+    while True:
+        inflight = state.get("comment_inflight")
+        if not inflight:
+            pending = state.get("pending_comment") or []
+            if not pending:
+                return
+            inflight = comment_chunks(pending)[0]
+            state["comment_inflight"] = inflight
+            state["pending_comment"] = pending[len(inflight):]
+        if deadline is not None and time.monotonic() > deadline:
+            return
+        if not _post_one(cfg, runner, comment_body(inflight)):
+            return
+        state["comment_inflight"] = None
+
+
 def send_deadman(cfg, runner, e) -> bool:
     subject = subject_of(e)
     body = f"{subject}\n\n{json.dumps(e.get('detail', {}), sort_keys=True)[:2000]}\n"
@@ -1250,8 +1358,16 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
     events = []
     for key, a in sorted(current.items()):
         prev = active.get(key)
-        if prev is None or SEVERITIES[a["severity"]] != SEVERITIES.get(prev.get("severity"), 0):
-            # new, escalated, or downgraded: one transition (a downgrade replaces the stale critical text)
+        down = state.setdefault("downgrade_pending", {})
+        new_sev, old_sev = SEVERITIES[a["severity"]], SEVERITIES.get((prev or {}).get("severity"), 0)
+        if prev is not None and new_sev < old_sev and down.get(key) != a["severity"]:
+            # hysteresis: a downgrade must hold for two runs, so a value hovering at a threshold does not flap
+            down[key] = a["severity"]
+            active[key] = dict(prev, detail=a["detail"])
+            continue
+        down.pop(key, None)
+        if prev is None or new_sev != old_sev:
+            # new, escalated, or a confirmed downgrade: one transition (a downgrade replaces the stale text)
             events.append(_transition(host, "raise", key, a))
         active[key] = {"severity": a["severity"], "message": a["message"], "detail": a["detail"], "check": a["check"],
                        "since": (prev or {}).get("since", now)}
@@ -1274,7 +1390,8 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
         state["pending_comment"] = ((state.get("pending_comment") or []) + [compact(e) for e in evs])[-500:]
         sent = state.setdefault("deadman_sent", {})
         for e in evs:  # critical raises, at most one deadman mail per key per 6 h (flapping thresholds)
-            if e["event"] == "raise" and e["severity"] == "critical" and now - sent.get(e["key"], 0) > 6 * 3600:
+            if (cfg["sinks"].get("deadman") and e["event"] == "raise" and e["severity"] == "critical"
+                    and now - sent.get(e["key"], 0) > 6 * 3600):  # no deadman configured: nothing to queue
                 state.setdefault("pending_deadman", []).append(compact(e))
                 sent[e["key"]] = now
         try:
@@ -1290,12 +1407,10 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
     if reassert:
         persist(reassert)
     failing = {}
-    pending = state.get("pending_comment") or []
-    if pending:
-        n = send_comment(cfg, runner, pending, deadline)
-        state["pending_comment"] = pending[n:]
-        if state["pending_comment"]:
-            failing["comment"] = len(state["pending_comment"])
+    drain_comments(cfg, runner, state, deadline)
+    queued = len(state.get("pending_comment") or []) + len(state.get("comment_inflight") or [])
+    if queued:
+        failing["comment"] = queued
     dead, still, tries = state.get("pending_deadman") or [], [], 0
     for e in dead[-50:]:
         if tries < 3 and time.monotonic() < deadline:
@@ -1363,7 +1478,22 @@ def injection_text(home: Path | None = None, max_chars: int = 700) -> str:
         stale = last and time.time() - last > 1800
         if not items and not stale:
             return ""
-        items.sort(key=lambda x: -SEVERITIES.get(x[0], 0))
+        # owner-liveness alerts are per owner in the ring; in the context line they fold into one entry per host
+        # so a burst of silent owners cannot crowd out disk, unit or process alerts
+        live = {}
+        rest = []
+        for s, h, k, m in items:
+            if str(k).startswith("liveness:"):
+                live.setdefault(h, []).append((s, k, m))
+            else:
+                rest.append((s, h, k, m))
+        for h, group in live.items():
+            group.sort(key=lambda x: -SEVERITIES.get(x[0], 0))
+            top = max(SEVERITIES.get(g[0], 0) for g in group)
+            names = ", ".join(str(g[1]).split("/", 1)[-1] for g in group[:4])
+            rest.append(([k for k, v in SEVERITIES.items() if v == top][0], h, "liveness",
+                         f"{len(group)} owner(s) silent or dropped: {names}{', ...' if len(group) > 4 else ''}"))
+        items = sorted(rest, key=lambda x: -SEVERITIES.get(x[0], 0))
 
         def clean(v, n):
             return SAFE_TEXT.sub("_", str(v))[:n]

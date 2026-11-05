@@ -393,7 +393,7 @@ class ReconcileAndRunTests(Base):
         self.assertEqual(rcs, [2, 2])
         self.assertEqual(len(posted), 2)  # retried on the second run
         st = ow.load_state(self.home)
-        self.assertTrue(st["pending_comment"])
+        self.assertTrue(st["pending_comment"] or st.get("comment_inflight"))
         self.assertFalse((self.home / ".agent-harness/logs/ops-watch.last-ok").exists())
 
     def test_check_error_does_not_clear_and_alerts(self):
@@ -608,6 +608,101 @@ class LivenessTests(Base):
         self.assertEqual(ow.check_liveness(cfg, {}, FakeRunner({("python3",): fresh}), now), [])
 
 
+class LivenessV2Tests(LivenessTests):
+    """Second review round: subagent owners (O1), anchored terminal notes (O2), shared thresholds (O3), and
+    no clear on age-out (N2)."""
+
+    def test_subagent_owner_silent_and_dropped(self):
+        now = time.time()
+        sess = "sess-bbbb2222"
+        main = [json.dumps({"at": ow.now_iso(now - 9000), "event": "subagent", "agent_id": "a1", "agent_type": "task-owner"}) + "\n",
+                json.dumps({"at": ow.now_iso(now - 9000), "event": "subagent", "agent_id": "a2", "agent_type": "red-team"}) + "\n",
+                json.dumps({"at": ow.now_iso(now - 9000), "event": "subagent", "agent_id": "a3", "agent_type": "task-owner"}) + "\n",
+                json.dumps({"at": ow.now_iso(now - 600), "event": "subagent_stop", "agent_id": "a3", "agent_type": "task-owner"}) + "\n"]
+        self.task("main.jsonl", main, session=sess)
+        self.task("agent-a1.jsonl", [wal_line(now - 7200, "intent", "GoodQA goodqa#7 work"),
+                                     json.dumps({"at": ow.now_iso(now - 7000), "event": "pretool"}) + "\n"],
+                  session=sess, mtime=now - 7000)
+        self.task("agent-a2.jsonl", [wal_line(now - 7200, "check", "x")], session=sess, mtime=now - 7200)
+        self.task("agent-a3.jsonl", [wal_line(now - 700, "check", "half way")], session=sess, mtime=now - 700)
+        a = keys(ow.check_liveness(self.cfg, {}, FakeRunner(), now))
+        self.assertEqual(sorted(a), ["liveness:sess-bbb/agent-a1", "liveness:sess-bbb/agent-a3"])
+        self.assertEqual(a["liveness:sess-bbb/agent-a1"]["severity"], "high")
+        self.assertTrue(a["liveness:sess-bbb/agent-a3"]["message"].startswith("owner dropped: agent-a3"))
+        self.assertEqual(a["liveness:sess-bbb/agent-a3"]["severity"], "high")
+
+    def test_thresholds_and_anchored_terminal(self):
+        now = time.time()
+        self.task("warm.jsonl", [wal_line(now - 45 * 60, "check", "x")], mtime=now - 45 * 60)
+        self.task("notyet.jsonl", [wal_line(now - 7200, "status", "not DONE yet, PENDING DONE?")], mtime=now - 7200)
+        self.task("result.jsonl", [wal_line(now - 7200, "result", "fast path fixed typo")], mtime=now - 7200)
+        a = keys(ow.check_liveness(self.cfg, {}, FakeRunner(), now))
+        self.assertEqual(a["liveness:sess-aaa/warm"]["severity"], "warning")
+        self.assertEqual(a["liveness:sess-aaa/notyet"]["severity"], "high")
+        self.assertNotIn("liveness:sess-aaa/result", a)
+
+    def test_age_out_does_not_clear(self):
+        now = time.time()
+        self.task("old.jsonl", [wal_line(now - 30 * 3600, "status", "x")], mtime=now - 30 * 3600)
+        self.assertEqual(ow.check_liveness(self.cfg, {}, FakeRunner(), now), [])  # history: never alerted
+        state = {"active": {"liveness:sess-aaa/old": {"severity": "high"}}}
+        self.assertIn("liveness:sess-aaa/old", keys(ow.check_liveness(self.cfg, state, FakeRunner(), now)))
+
+    def test_injection_folds_liveness(self):
+        for i in range(30):
+            ow.emit({"host": "mac", "source": "ops-watch", "event": "raise", "severity": "high",
+                     "key": f"liveness:sess-aaa/owner{i}", "message": "owner silent"}, home=self.home)
+        ow.emit({"host": "mac", "source": "ops-watch", "event": "raise", "severity": "warning",
+                 "key": "units:failed", "message": "2 failed units"}, home=self.home)
+        text = ow.injection_text(self.home, max_chars=400)
+        self.assertIn("30 owner(s) silent or dropped", text)
+        self.assertIn("units:failed", text)
+
+
+class ReviewRound2Tests(Base):
+    def test_default_sinks_critical_does_not_wedge(self):  # N1
+        a = {"check": "disk", "key": "disk:volume:/", "severity": "critical", "message": "98%", "detail": {}}
+        cfg = dict(self.cfg)  # default sinks: comment none, deadman []
+        rcs = [ow.run_once(cfg, self.home, runner=FakeRunner(), checks={"disk": lambda *x: [a]}) for _ in range(3)]
+        self.assertEqual(rcs, [0, 0, 0])
+        self.assertTrue((self.home / ".agent-harness/logs/ops-watch.last-ok").exists())
+        self.assertNotIn("ops-watch:sink:deadman", {e["key"] for e in ow.active_alerts(self.home)})
+
+    def test_hysteresis_no_flap(self):  # N3
+        cfg = dict(self.cfg)
+        sev = ["high", "warning", "high", "warning", "high", "warning"]
+        for s in sev:
+            ow.run_once(cfg, self.home, runner=FakeRunner(),
+                        checks={"disk": lambda *x, _s=s: [{"check": "disk", "key": "k", "severity": _s, "message": _s,
+                                                           "detail": {}}]})
+        raises = [e for e in ow.read_ring(ow.ring_path(self.home)) if e["key"] == "k"]
+        self.assertEqual(len(raises), 1)
+
+    def test_lost_response_resends_identical_chunk(self):  # N4
+        bodies = []
+        state = {"pending_comment": [{"host": "h", "event": "raise", "severity": "high", "key": "k1", "message": "m",
+                                      "detail": {}, "seq": 1, "at": "t"}]}
+        cfg = dict(self.cfg)
+        cfg["sinks"] = {"comment": {"mode": "cmd", "argv": ["c"]}}
+        ow.drain_comments(cfg, FakeRunner({("c",): lambda a, t, s: (bodies.append(s), (1, ""))[1]}), state)
+        state["pending_comment"].append({"host": "h", "event": "raise", "severity": "high", "key": "k2",
+                                         "message": "m", "detail": {}, "seq": 2, "at": "t"})
+        ow.drain_comments(cfg, FakeRunner({("c",): lambda a, t, s: (bodies.append(s), (0, ""))[1]}), state)
+        self.assertEqual(bodies[0], bodies[1])  # same bytes -> same operationId
+        self.assertEqual(len(bodies), 3)
+        self.assertIn("k2", bodies[2])
+        self.assertFalse(state["pending_comment"] or state["comment_inflight"])
+
+    def test_suite_kind(self):  # N5
+        cases = {"python3 -m unittest discover -s tests": "unittest-discover",
+                 "/usr/bin/python3 -m pytest -q": "pytest", "pytest": "pytest", "./gradlew test": "gradle-test",
+                 "rg pytest src": None, "pip install pytest": None, "git log --grep pytest": None,
+                 "pytest tests/test_x.py": None, "python3 -m pytest -k slow": None, "pytest a.py::T::t": None,
+                 "python3 -m unittest tests.test_ops_watch": None, "vim pytest_notes.txt": None}
+        for args, want in cases.items():
+            self.assertEqual(ow.suite_kind(args), want, args)
+
+
 class ReviewFixTests(Base):
     """Findings from the Opus-high review of 5a23c0e (B1, M1-M5, m1-m7)."""
 
@@ -688,7 +783,8 @@ class ReviewFixTests(Base):
         for x in seq:
             ow.run_once(cfg, self.home, runner=runner, checks={"disk": lambda *y, _x=x: [_x]})
         self.assertEqual(len(dead), 1)
-        ow.run_once(cfg, self.home, runner=runner, checks={"disk": lambda *x: [self.a("high")]})
+        for _ in range(2):  # a downgrade must hold for two runs (hysteresis)
+            ow.run_once(cfg, self.home, runner=runner, checks={"disk": lambda *x: [self.a("high")]})
         act = {e["key"]: e for e in ow.active_alerts(self.home)}
         self.assertEqual(act["disk:volume:/"]["message"], "high msg")
 
