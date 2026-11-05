@@ -38,7 +38,9 @@ class Fixture(unittest.TestCase):
         self.env = dict(os.environ, HOME=str(self.home))
         self.env.pop("GIT_DIR", None)
         # (a) repo with a branch commit not on its fake bare remote
-        self.bare = self.home / "remote.git"
+        rtmp = tempfile.TemporaryDirectory()  # the fake remote lives off-host, outside the scanned HOME
+        self.addCleanup(rtmp.cleanup)
+        self.bare = Path(rtmp.name).resolve() / "remote.git"
         subprocess.run(["git", "init", "-q", "--bare", str(self.bare)], check=True)
         self.work = self.home / "code" / "withremote"
         self.work.mkdir(parents=True)
@@ -67,6 +69,8 @@ class Fixture(unittest.TestCase):
         con.commit()
         con.close()
         shutil.copy(str(self.db), str(self.work / "inrepo.sqlite"))
+        git(self.work, "add", "inrepo.sqlite")  # tracked db lives in git: must not count
+        git(self.work, "commit", "-qm", "db")
         sqlite3.connect(str(self.home / "data" / "tiny.sqlite")).close()
         self.assertGreaterEqual(self.db.stat().st_size, 1000000)
 
@@ -94,7 +98,7 @@ class ScanTests(Fixture):
         self.assertFalse(r["partial"])
         self.assertTrue(r["host"] and r["scanned_at"])
         for row in r["rows"]:
-            self.assertEqual(set(row), {"class", "path", "age_days", "bytes", "decision"})
+            self.assertEqual(set(row), {"class", "path", "age_days", "bytes", "decision", "fp", "decision_stale"})
             self.assertIsNone(row["decision"])
         by = {x["class"]: x for x in r["rows"]}
         self.assertEqual(by["unpushed_branch"]["path"], "%s::work" % self.work)
@@ -155,6 +159,11 @@ class ScanTests(Fixture):
         r = self.scan()
         self.assertTrue(any(e["path"] == str(d) for e in r["errors"]), r["errors"])
         self.assertEqual(r["classes"]["no_remote_repo"], 1)
+        # a scan with errors cannot prove nothing is left, even with every row decided
+        for row in r["rows"]:
+            self.run_cli("decide", "--row", row["path"], "--decision", "moved", "--ticket", "t#1", expect=0)
+        p = self.run_cli("report", expect=1)
+        self.assertIn(str(d), p.stdout.decode())
 
     def test_max_seconds_reports_partial(self):
         r = self.scan("--max-seconds", "0.000001")
@@ -168,7 +177,63 @@ class ScanTests(Fixture):
         self.assertNotIn(secret, p.stdout.decode() + p.stderr.decode())
 
 
+class CoverageTests(Fixture):
+    def test_untracked_db_inside_repo_counts_tracked_does_not(self):
+        shutil.copy(str(self.db), str(self.noremote / "prod.db"))  # sqlite magic, untracked
+        r = self.scan()
+        paths = [x["path"] for x in r["rows"] if x["class"] == "state_db_outside_git"]
+        self.assertIn(str(self.noremote / "prod.db"), paths)
+        self.assertNotIn(str(self.work / "inrepo.sqlite"), paths)
+        self.assertEqual(len(paths), 2)
+
+    def test_bare_repo_and_its_worktree_counted_once(self):
+        bare = self.home / "bare" / "b.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(self.bare), str(bare)], check=True)
+        git(bare, "remote", "add", "o2", str(self.bare))
+        git(bare, "fetch", "-q", "o2")  # remote-tracking refs so main counts as pushed
+        wt = self.home / "wt"
+        git(bare, "worktree", "add", "-q", "-b", "feat", str(wt))
+        commit(wt, "w1")
+        r = self.scan()
+        rows = [x["path"] for x in r["rows"] if x["class"] == "unpushed_branch"]
+        self.assertEqual(sum(1 for x in rows if x.endswith("::feat")), 1, rows)
+        self.assertEqual(len(rows), 2, rows)  # work + feat
+
+    def test_lone_bare_repo_without_remote_is_reported(self):
+        bare = self.home / "bare2.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        r = self.scan()
+        self.assertEqual(r["classes"]["no_remote_repo"], 2)
+
+    def test_overlapping_roots_do_not_double_count(self):
+        p = self.run_cli("scan", "--root", str(self.home), "--root", str(self.home / "data"), "--json", expect=0)
+        self.assertEqual(json.loads(p.stdout)["classes"]["state_db_outside_git"], 1)
+
+
 class DecideReportTests(Fixture):
+    def test_decision_goes_stale_when_branch_moves(self):
+        self.scan()
+        path = "%s::work" % self.work
+        self.run_cli("decide", "--row", path, "--decision", "moved", "--ticket", "t#1", expect=0)
+        und = [x["path"] for x in json.loads(self.run_cli("report", "--json", expect=1).stdout)["undecided"]]
+        self.assertNotIn(path, und)
+        commit(self.work, "later")  # new unpushed work on the same branch
+        self.scan()
+        und = [x["path"] for x in json.loads(self.run_cli("report", "--json", expect=1).stdout)["undecided"]]
+        self.assertIn(path, und)
+
+    def test_undecodable_decision_store_does_not_crash(self):
+        self.scan()
+        sd = self.home / ".agent-harness/state/loss-inventory"
+        (sd / "decisions.jsonl").write_bytes(b"\xff\xfe\n")
+        self.scan()
+        self.run_cli("report", expect=1)
+
+    def test_malformed_last_scan_is_rejected_not_crash(self):
+        self.scan()
+        (self.home / ".agent-harness/state/loss-inventory/last-scan.json").write_text("[]")
+        self.assertEqual(self.run_cli("report").returncode, 2)
+
     def test_report_exit_codes_and_decide(self):
         self.assertEqual(self.run_cli("report").returncode, 2)  # no saved scan yet
         self.scan()
@@ -186,7 +251,7 @@ class DecideReportTests(Fixture):
         lines = (self.home / ".agent-harness/state/loss-inventory/decisions.jsonl").read_text().splitlines()
         self.assertEqual(len(lines), 5)
         e = json.loads(lines[0])
-        self.assertEqual(set(e), {"ts", "path", "class", "decision", "ticket", "by"})
+        self.assertEqual(set(e), {"ts", "path", "class", "decision", "ticket", "by", "fp"})
 
     def test_decide_validation(self):
         self.scan()
