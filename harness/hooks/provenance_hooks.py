@@ -302,6 +302,7 @@ def format_problems(bad: list) -> str:
 
 QUARANTINE_EVENTS = ("scope", "decision")
 QUARANTINE_MAX_BLOCKS = 3
+TOOL_WRITERS = frozenset({"escalation", "ahd", "dropped_gate", "ah-run"})
 
 
 def quarantined_entries(session: str, now: float, older_than_s: float) -> list:
@@ -321,9 +322,10 @@ def quarantined_entries(session: str, now: float, older_than_s: float) -> list:
             continue
         if isinstance(rec, dict):
             recs.append(rec)
-    recited = {r.get("recites") for r in recs if r.get("recites") and r.get("source")}  # a sourced re-cite clears the original (B1)
+    recited = {r.get("recites") for r in recs if r.get("recites") and r.get("source") and not r.get("unsourced")}  # only a backed re-cite clears (M2)
     for rec in recs:
-        if rec.get("event") not in QUARANTINE_EVENTS or not rec.get("unsourced") or rec.get("by") or rec.get("id") in recited:
+        if rec.get("event") not in QUARANTINE_EVENTS or not rec.get("unsourced") or rec.get("id") in recited \
+                or rec.get("by") in TOOL_WRITERS:  # the allowlist, not any claim (M1)
             continue
         ts = None
         try:
@@ -389,7 +391,10 @@ def cmd_stop_lint(payload: dict) -> dict:
     mode = prov.load_policy().get("stop_lint", "warn")
     if mode == "off":
         return quarantine
+    carried = quarantine.get("systemMessage")
     bad = lint_message(last_assistant_text(payload), session)
+    if not bad and carried:
+        return {"systemMessage": carried}
     if not bad:
         try:
             reminder_path(session).unlink()  # a clean message clears an older warn-mode reminder
@@ -407,7 +412,8 @@ def cmd_stop_lint(payload: dict) -> dict:
         path.write_text(text + "\n", encoding="utf-8")
     except OSError:
         pass
-    return {"systemMessage": "provenance warning (stop-lint, warn mode): " + str(len(bad)) + " ask item(s) without a traceable origin"}
+    return {"systemMessage": "provenance warning (stop-lint, warn mode): " + str(len(bad)) + " ask item(s) without a traceable origin"
+            + ((" " + carried) if carried else "")}
 
 
 def cmd_prompt(payload: dict) -> dict:

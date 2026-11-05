@@ -16,6 +16,7 @@ EVENTS = {'intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker', '
           'requirement', 'ask', 'ask_resolved'}
 # Events whose origin must be traceable (provenance.py). The mode per event is in provenance_policy.json.
 SOURCED = ('requirement', 'ask', 'blocker', 'scope', 'decision')
+TOOL_WRITERS = frozenset({'escalation', 'ahd', 'dropped_gate', 'ah-run'})  # rows these tools write on an agent's behalf (goodqa#14791)
 SECRET_PATTERN = re.compile(
     r'(?i)(?:\bgh[pousr]_[A-Za-z0-9_]+|\bgithub_pat_[A-Za-z0-9_]+|'
     r'\bsk-[A-Za-z0-9-]{12,}|\bAKIA[A-Z0-9]{12}|'
@@ -126,6 +127,10 @@ def main():
                               'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
                   file=sys.stderr)
             return 2
+        if not re.match(r'^(user:|answer:|queue:|ticket:)', args.source.strip()):
+            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue: or ticket:',
+                              'hint': 'an ask cannot be closed on an inferred: or file: source'}), file=sys.stderr)
+            return 2
         mode, problem, assumption = provenance_check('ask', args.source)  # the answer is sourced like an ask (M1)
         if problem:
             print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': problem[:300],
@@ -145,14 +150,16 @@ def main():
             if mode == 'warn':
                 warnings.append(problem[:300])
                 record['provenance'] = 'missing' if not args.source else 'unverified'
-                if not args.source or 'rejected' in problem:  # missing or rejected: quarantined, never dropped (P11)
+                if not args.source or 'rejected' in problem or 'failed' in problem:  # missing, rejected or unresolvable: quarantined (P11)
                     record['unsourced'] = True  # an unverifiable ticket (tracker unreachable) is not a quarantine case
         if args.source:
             record['source'] = args.source.strip()[:2000]
             if assumption:
                 record['assumption'] = True
     if args.by:
-        record['by'] = args.by.strip()[:40]
+        if args.by.strip() not in TOOL_WRITERS:
+            parser.error(f'--by must be one of {sorted(TOOL_WRITERS)}: tool-written rows are an allowlist, not a claim')
+        record['by'] = args.by.strip()
     if args.recites:
         if not re.fullmatch(r'w[0-9a-f]{11}', args.recites) or not args.source:
             parser.error('--recites needs an entry id (w + 11 hex) and a --source on this row')

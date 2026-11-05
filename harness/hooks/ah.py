@@ -1364,6 +1364,8 @@ def nearest_source(wal: Path, before_id: str | None = None) -> dict | None:
 def note_cmd(home: Path, args) -> dict:
     wal = Path(args.wal).expanduser()
     text = args.note
+    if args.id and not ASK_ID_RE.match(args.id):
+        raise AhError("bad_request", "note: --id must be a WAL entry id (w + 11 hex)")
     if args.id:  # re-cite an existing quarantined entry: its event kind is kept; its text unless --note overrides
         import safe_input  # noqa: PLC0415
         for raw in (safe_input.read_tail(wal, 4 << 20).splitlines() if wal.is_file() else []):
@@ -1401,6 +1403,10 @@ def note_cmd(home: Path, args) -> dict:
     if r.returncode != 0:
         plan["ok"] = False
         plan["stderr"] = r.stderr[-300:]
+    elif isinstance(plan.get("written"), dict) and plan["written"].get("warnings"):
+        plan["ok"] = False  # written, but quarantined: the source did not resolve here (M2); say so instead of ok
+        plan["quarantined"] = True
+        plan["warnings"] = plan["written"]["warnings"]
     return plan
 
 
