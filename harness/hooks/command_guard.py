@@ -315,7 +315,7 @@ class Budget:
 
 
 class Word:
-    __slots__ = ('alts', 'subs', 'vars', 'glob', 'quoted', 'dynamic', 'single_only')
+    __slots__ = ('alts', 'subs', 'vars', 'glob', 'quoted', 'dynamic', 'single_only', 'overflow')
 
     def __init__(self):
         self.alts = ['']
@@ -325,10 +325,22 @@ class Word:
         self.quoted = False
         self.dynamic = False  # contains an unresolved expansion
         self.single_only = False
+        self.overflow = None  # raw text of a brace expansion that exceeded the 32-alternative cap
 
     @property
     def text(self):
         return self.alts[0]
+
+    def all_alts(self):
+        """Every expansion for target checks: an overflowed brace word is re-expanded with a 4096 cap.
+        None means it is still too large, so its targets are unknown."""
+        if self.overflow is None:
+            return self.alts[:32]
+        raw = self.overflow
+        more = brace_expand(raw, limit=4096) if raw.count('{') <= 64 and len(raw) <= 65536 else []
+        if more and len(more) <= 4096:
+            return [_unq(a) for a in more]
+        return None
 
 
 class Redir:
@@ -463,7 +475,7 @@ def brace_expand(text, limit=32):
             for part in parts:
                 nxt.append(item[:start] + part + item[end:])
                 if len(nxt) > limit:
-                    return nxt[:limit]
+                    return nxt[:limit + 1]  # one extra item tells the caller the expansion overflowed
         out = nxt
         if not changed:
             break
@@ -567,7 +579,16 @@ class Lexer:
         if not any_char and i == started:
             return None, i
         raw = ''.join(buf)
-        alts = brace_expand(raw) if '{' in raw and ',' in raw and raw.count('{') <= 24 and len(raw) <= 2048 else [raw]
+        alts = [raw]
+        if '{' in raw and ',' in raw:
+            expandable = raw.count('{') <= 24 and len(raw) <= 2048
+            if expandable:
+                alts = brace_expand(raw)
+            if len(alts) > 32 or not expandable:
+                # too many alternatives (or too big to expand): target checks re-expand it with a larger cap
+                # and treat anything past that as unknown (see Analyzer.target_class)
+                w.overflow = raw
+                alts = alts[:32]
         w.alts = [_unq(a) for a in alts]
         return w, i
 
@@ -2277,8 +2298,8 @@ class Analyzer:
     def is_cred_path(self, text, word=None):
         ctx = self.ctx
         c = ctx.c
-        alts = word.alts if word is not None else [text]
-        for alt in alts[:32]:
+        alts = (word.all_alts() or word.alts[:32]) if word is not None else [text]
+        for alt in alts:
             if self._cred_one(alt):
                 return True
         return False
@@ -2436,6 +2457,16 @@ class Analyzer:
                 if self.RANK[other] > self.RANK[best]:
                     best = other
         if best == 'root' and not is_dynamic_path(path) and not self._kept(path):
+            real = _resolve_prefix(self._through_links(path))
+            if real and real.casefold() != folded and not any(ch in path for ch in GLOB_CHARS) \
+                    and not getattr(self, '_in_real', False):
+                # an exception must hold where the path really leads: a symlink inside the agent's own worktree
+                # can point into ~/.claude
+                self._in_real = True
+                try:
+                    return self._path_class(real)
+                finally:
+                    self._in_real = False
             work = self._under_work(path)
             literal = not any(ch in path for ch in GLOB_CHARS)
             if work is not None:
@@ -2556,7 +2587,12 @@ class Analyzer:
         best, shown, literal = None, '', True
         if ctx.cwd_protected_unknown and word.alts and not word.alts[0].startswith(('/', '~')):
             return 'unknown', word.alts[0], False
-        for alt in word.alts[:32]:
+        alts = word.all_alts()
+        if alts is None:
+            if PROTECTED_TEXT.search(_unq(word.overflow)):
+                return 'unknown', word.alts[0], False
+            alts = word.alts[:32]
+        for alt in alts:
             path = norm_path(alt, ctx)
             dynamic = is_dynamic_path(alt) or word.dynamic
             cls = self._path_class(path)
@@ -2652,7 +2688,7 @@ class Analyzer:
 
     def state_dest(self, word):
         ctx = self.ctx
-        for alt in word.alts[:32]:
+        for alt in word.all_alts() or word.alts[:32]:
             if norm_path(alt, ctx).casefold() in ctx.c.state_files:
                 ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or its key directly',
                         'use command_guard.py approve-delete after the Dropbox backup is verified')
@@ -3004,6 +3040,9 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
         try:
             text = command if isinstance(command, str) else ' '.join(map(str, command))
             raw = [f for f in fallback_scan(text, compiled) if modes.get(f.category) == 'enforce']
+            if not raw and raw_sensitive(command, compiled):
+                raw = [Finding(LOG_DELETE if PROTECTED_TEXT.search(text) else SECRET_DUMP, 'guard-error',
+                               'it names a protected location or secret', 'retry with a simpler command')]
         except Exception:  # noqa: BLE001
             raw = [Finding(SECRET_DUMP, 'guard-error', 'the guard failed twice', 'retry with a simpler command')]
         if raw:

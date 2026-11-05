@@ -253,6 +253,41 @@ class FailureModeTests(Fixture):
         written = "printf 'env\\n' > @HOME@/repo/tools/new.sh && bash @HOME@/repo/tools/new.sh"
         self.assertEqual(self.decide(written)[0], 'block')
 
+    def test_symlink_in_own_worktree_does_not_reach_protected(self):
+        """Red-team F3: the own-worktree exception must hold for the path a symlink really leads to."""
+        wt = self.home / '.agent-harness/work/S/T/wt'
+        for name, target in (('lnk_claude', self.home / '.claude'), ('lnk_task', self.home / '.agent-harness/work/S/T'),
+                             ('lnk_build', wt / 'build')):
+            if not os.path.lexists(wt / name):
+                os.symlink(str(target), str(wt / name))
+        self.assertEqual(self.decide('rm -f lnk_claude/settings.json', cwd='@WT@')[0], 'block')
+        self.assertEqual(self.decide('rm -f lnk_task/notes.md', cwd='@WT@')[0], 'block')
+        self.assertEqual(self.decide('rm -f lnk_build/a.o', cwd='@WT@')[0], 'allow')
+
+    def test_brace_overflow_is_not_dropped(self):
+        """Red-team F4: alternatives past the expansion cap are unknown, not absent."""
+        alts = ','.join('d%d' % k for k in range(40)) + ',.claude'
+        verdict, message = self.decide('rm -rf ~/{' + alts + '}/projects')
+        self.assertEqual(verdict, 'block')
+        self.assertIn('[log_delete/log-delete]', message)  # judged by the analyser, not its error fallback
+        self.assertEqual(self.decide('rm -rf ~/{d1,.claude}/projects')[0], 'block')
+        creds = ','.join('c%d' % k for k in range(40)) + ',.aws'
+        self.assertEqual(self.decide('cat ~/{' + creds + '}/credentials')[0], 'block')
+        self.assertEqual(self.decide('touch {' + ','.join('f%d' % k for k in range(40)) + '}')[0], 'allow')
+
+    def test_internal_error_uses_raw_sensitive(self):
+        """Red-team F6: an analyser bug must fail closed for commands that name protected locations."""
+        original = cg.Analyzer.run
+        def boom(self, *a, **k):
+            raise ValueError('seeded analyser bug')
+        cg.Analyzer.run = boom
+        try:
+            self.assertEqual(self.decide('rm -rf ~/.agent-harness/state')[0], 'block')
+            self.assertEqual(self.decide('rm -rf ~/.claude')[0], 'block')
+            self.assertEqual(self.decide('ls -la')[0], 'allow')
+        finally:
+            cg.Analyzer.run = original
+
     def test_over_budget_plain_text_does_not_block(self):
         padding = 'true; ' * 120000
         self.assertIn(self.decide(padding + 'echo ok')[0], ('warn', 'allow'))
