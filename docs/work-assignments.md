@@ -121,6 +121,11 @@ machine therefore mints a new key: earlier messages stop verifying, so asks canc
 removal check and need a fresh proof, and old messages cannot answer decisions. This fails safe: nothing is removed
 early.
 
+Headless runs are not human. A `claude -p` prompt (`CLAUDE_CODE_ENTRYPOINT=sdk-cli`, transcript `entrypoint`
+`sdk-*`) and a Codex rollout whose `session_meta` says `source: "exec"`, `originator: "codex_exec"` or
+`source: {"subagent": ...}` are never captured, caught up or accepted as cancel proof. Their prompts come from a
+program. A Codex rollout with no readable `session_meta` counts as interactive.
+
 ## Known limits
 
 A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt and no request cues, and an excerpt whose first 15 words look secret-adjacent

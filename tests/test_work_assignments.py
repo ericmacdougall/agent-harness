@@ -270,6 +270,61 @@ class CaptureTest(Base):
         self.assertEqual(msg["humanCheck"]["method"], "codex_user_message_item")
         self.check_schema()
 
+    def codex_rollout(self, name, meta, text, item_id):
+        rollout = Path(self.tmp.name) / "codex" / "sessions" / "2027" / "01" / "03" / name
+        rollout.parent.mkdir(parents=True, exist_ok=True)
+        item = {"type": "UserMessage", "id": item_id, "content": [{"type": "text", "text": text}]}
+        rollout.write_text(json.dumps({"timestamp": wa.iso(CLOCK[0]), "type": "session_meta", "payload": meta}) + "\n"
+                           + json.dumps({"timestamp": wa.iso(CLOCK[0] + 1), "type": "event_msg",
+                                         "payload": {"type": "item_completed", "item": item}}) + "\n")
+        return rollout
+
+    def test_codex_exec_and_subagent_rollouts_are_not_human(self):
+        """PR review 8ebc559 #2 (Codex half): `codex exec` and spawned-subagent rollouts were captured as human turns."""
+        metas = {"exec": {"source": "exec", "originator": "codex_exec"},
+                 "sub": {"source": {"subagent": {"thread_spawn": {"parent_thread_id": "p"}}}, "originator": "Codex Desktop"}}
+        for n, (label, meta) in enumerate(metas.items()):
+            uid = f"01a16512-0d07-78f3-b199-70f1db8736a{n}"
+            rollout = self.codex_rollout(f"rollout-{label}.jsonl", meta, "please refactor the billing exporter module", uid)
+            sid = f"codex-{label}-1"
+            self.hook("session", {"session_id": sid, "transcript_path": str(rollout)}, runtime="codex")
+            self.hook("prompt", {"session_id": sid, "transcript_path": str(rollout),
+                                 "prompt": "please refactor the billing exporter module"}, runtime="codex")
+            with wa.transaction() as data:
+                wa.sync_all(data, sid)
+                self.assertTrue(data["sessions"][sid].get("headless"), label)
+            self.assertEqual(self.data()["messages"], {}, label)
+            with self.assertRaises(wa.WAError, msg=label):
+                wa.verify_proof(str(rollout), 2, uid, "refactor the billing exporter")
+        self.check_schema()
+
+    def test_discovered_codex_exec_rollout_is_not_caught_up(self):
+        """The rollout watcher tracked `codex exec` rollouts and caught up their program-written prompts as human."""
+        wa.hive_identity()
+        CLOCK[0] += 10
+        day = Path(self.tmp.name) / "codex" / "sessions" / wa.iso(CLOCK[0])[:10].replace("-", "/")
+        day.mkdir(parents=True)
+        rollout = day / "rollout-2027-01-15T08-00-10-01a16a08-4480-78d3-83f9-b84140f2ebd9.jsonl"
+        item = {"type": "UserMessage", "id": "01a16512-0d07-78f3-b199-70f1db8736c0",
+                "content": [{"type": "text", "text": "review this diff and write the report"}]}
+        rollout.write_text(json.dumps({"timestamp": wa.iso(CLOCK[0]), "type": "session_meta",
+                                       "payload": {"source": "exec", "originator": "codex_exec"}}) + "\n"
+                           + json.dumps({"timestamp": wa.iso(CLOCK[0] + 1), "type": "event_msg",
+                                         "payload": {"type": "item_completed", "item": item}}) + "\n")
+        os.utime(rollout, (CLOCK[0], CLOCK[0]))
+        self.hook("session", {"session_id": SID, "transcript_path": str(self.transcript)})
+        self.assertEqual(self.data()["messages"], {})
+        self.assertTrue(self.data()["sessions"]["01a16a08-4480-78d3-83f9-b84140f2ebd9"]["headless"])
+
+    def test_codex_interactive_rollout_is_still_captured(self):
+        """Control for the headless check: a vscode/cli rollout header stays a human session."""
+        rollout = self.codex_rollout("rollout-ide.jsonl", {"source": "vscode", "originator": "Codex Desktop"},
+                                     "please refactor the billing exporter module", "01a16512-0d07-78f3-b199-70f1db8736b0")
+        self.hook("prompt", {"session_id": "codex-ide-1", "transcript_path": str(rollout),
+                             "prompt": "please refactor the billing exporter module"}, runtime="codex")
+        self.assertEqual(len(self.data()["messages"]), 1)
+        self.assertFalse(self.data()["sessions"]["codex-ide-1"].get("headless"))
+
     def test_codex_injected_agents_item_is_not_human(self):
         rollout = Path(self.tmp.name) / "codex" / "sessions" / "2027" / "01" / "01" / "rollout-y.jsonl"
         rollout.parent.mkdir(parents=True)

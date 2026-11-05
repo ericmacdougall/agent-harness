@@ -1021,11 +1021,33 @@ def valid_session(session: str) -> bool:
     return bool(prov.SESSION_RE.match(session)) and session not in (".", "..") and len(session) >= 8
 
 
+def codex_headless(path) -> bool:
+    """A Codex rollout started by `codex exec` or spawned as a subagent: its UserMessage items come from a program.
+
+    session_meta is the rollout's first line (about 20 KB): source "exec" / originator "codex_exec" for exec, and
+    source {"subagent": ...} for a spawned thread. An unreadable or unknown header counts as interactive.
+    """
+    if not path:
+        return False
+    try:
+        first = prov.read_small(path, 1 << 16).split(b"\n")[0]
+        record = prov.loads_line(first)
+    except (OSError, prov.Problem, ValueError):
+        return False
+    meta = record.get("payload") if isinstance(record, dict) and record.get("type") == "session_meta" else None
+    if not isinstance(meta, dict):
+        return False
+    source = meta.get("source")
+    return source == "exec" or meta.get("originator") == "codex_exec" or (isinstance(source, dict) and "subagent" in source)
+
+
 def session_record(data, session, runtime, transcript):
     ident = hive_identity()
     rec = data["sessions"].setdefault(session, {"provider": provider_of(runtime), "hiveId": ident["hiveId"],
                                                  "firstSeenAt": iso(now()), "stopBlocks": {}, "reinject": False})
     if transcript:
+        if runtime == "codex" and (rec.get("transcript") != transcript[:1024] or "headless" not in rec):
+            rec["headless"] = codex_headless(transcript)  # read once per rollout, not on every hook
         rec["transcript"] = transcript[:1024]
     rec["provider"] = provider_of(runtime)
     rec["lastSeenAt"] = iso(now())
@@ -1072,16 +1094,23 @@ def method_for(runtime: str, source: str) -> str:
     return "codex_user_message_item" if runtime == "codex" else "claude_user_turn"
 
 
+def headless_run(runtime: str, transcript) -> bool:
+    """`claude -p` sets CLAUDE_CODE_ENTRYPOINT=sdk-cli (checked live); Codex marks exec and subagent rollouts."""
+    if runtime == "claude":
+        return os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk")
+    return codex_headless(transcript)
+
+
 def prompt_capture_fields(payload: dict, runtime: str):
     session = str(payload.get("session_id") or "")
     if not valid_session(session) or payload.get("agent_id") or not isinstance(payload.get("prompt"), str):
         return None
-    if runtime == "claude" and os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"):
-        return None  # headless run: `claude -p` sets sdk-cli (checked); its prompt comes from a program
+    transcript = payload.get("transcript_path") if isinstance(payload.get("transcript_path"), str) else None
+    if headless_run(runtime, transcript):
+        return None
     found = classify_prompt(payload["prompt"])
     if found is None:
         return None
-    transcript = payload.get("transcript_path") if isinstance(payload.get("transcript_path"), str) else None
     return {"runtime": runtime, "session": session, "transcript": transcript, "text": found[0], "pasted": found[1],
             "source": "prompt", "method": method_for(runtime, "prompt")}
 
@@ -1160,6 +1189,8 @@ def sync_session(data: dict, session: str) -> int:
     if not rec or not rec.get("transcript"):
         return 0
     path, runtime = rec["transcript"], "codex" if rec.get("provider") == "codex" else "claude"
+    if rec.get("headless"):
+        return 0  # a `codex exec` or subagent rollout: no human turns to catch up
     changes = 0
     try:
         size = os.stat(path).st_size
@@ -1233,7 +1264,7 @@ def discover_codex(data: dict) -> None:
             except (OSError, prov.Problem, ValueError):
                 continue
             if started >= created - 60:
-                rec = session_record(data, match.group(1), "codex", path)
+                rec = session_record(data, match.group(1), "codex", path)  # sets headless from session_meta
                 rec["syncOffset"], rec["syncLine"] = 0, 0
 
 
@@ -1507,6 +1538,8 @@ def hook_ask_answer(payload: dict, runtime: str) -> dict:
     session = str(payload.get("session_id") or "")
     if load_policy()["capture"] == "off" or not valid_session(session) or payload.get("agent_id"):
         return {}
+    if headless_run(runtime, payload.get("transcript_path") if isinstance(payload.get("transcript_path"), str) else None):
+        return {}
     response = payload.get("tool_response", payload.get("tool_result"))
     text = json.dumps(response, ensure_ascii=False)[:20000] if response is not None else ""
     if not text.strip() or text in ("null", "{}", '""'):
@@ -1762,6 +1795,8 @@ def verify_proof(file: str, line: int, uuid: str, quote: str) -> dict:
     except ValueError:
         raise WAError(f"line {line} is not readable JSON")
     if isinstance(record, dict) and record.get("type") == "event_msg":
+        if codex_headless(file):
+            raise WAError(f"line {line} is in a `codex exec` or subagent rollout, written by a program")
         found = list(human_records(target, "codex", line))
     else:
         found = list(human_records(target, "claude", line)) if isinstance(record, dict) and record.get("uuid") == uuid else []
