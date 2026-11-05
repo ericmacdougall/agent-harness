@@ -24,15 +24,18 @@ For every process of the current user the observer emits one sample per interval
 |---|---|---|
 | `schema` | int | always `1` |
 | `host` | string | hostname |
-| `at` | string | ISO-8601 UTC |
+| `at` | string | RFC 3339 UTC; writers emit their native form (`Z` from Go, `+00:00` from Python) and every reader accepts both |
 | `pid`, `ppid` | int | from the kernel |
 | `pgid` | int or null | process group; null when unknown |
 | `cgroup` | string or null | Linux cgroup path when available |
 | `uid` | int | owner |
-| `start_token` | string | same scheme as the ledger (`proc:` or `ps:`) so pid reuse is detectable |
-| `rss_bytes`, `cpu_seconds` | number | cumulative where the platform gives cumulative values |
-| `disk_write_bytes`, `disk_read_bytes` | number or null | cumulative; null when the platform has no per-process counter |
-| `net_tx_bytes`, `net_rx_bytes` | number or null | cumulative; null when unavailable |
+| `start_token` | string | same scheme as the ledger: `proc:<starttime>` (Linux), `ps:<lstart under TZ=UTC>` (macOS, 1 s resolution), `win:<creation FILETIME decimal>` (Windows); pid reuse within the same second and under the same ppid is an accepted residual, so consumers needing stronger identity compare pid, token and ppid together |
+| `rss_bytes` | int64 | resident set size |
+| `cpu_seconds` | float64 | cumulative |
+| `disk_write_bytes`, `disk_read_bytes` | int64 or null | cumulative; null when the platform has no per-process counter |
+| `net_tx_bytes`, `net_rx_bytes` | int64 or null | cumulative; null when unavailable |
+
+`pid`, `ppid`, `pgid`, `uid` and every `*_bytes` field are integers (int64); `schema` is an int; `cpu_seconds` is the only float. A platform that cannot fill a nullable field emits null, never an invented value. Windows: environment reading is unsupported, so attribution there is `unattributed` unless ancestry reaches a ledger row; ah-run does not ship on Windows in this phase.
 | `argv_masked` | string | argv joined, passed through the harness secret mask (`usage_guard.SECRET`), at most 512 characters |
 | `attribution` | object | see below |
 
@@ -43,12 +46,12 @@ For every process of the current user the observer emits one sample per interval
   - `{"state": "attributed", "task": ..., "agent": ..., "ticket": ..., "session": ..., "run_id": ..., "via": "env" | "ancestry" | "both"}`
   - `{"state": "unattributed"}` when neither env nor ancestry gives an answer.
   - `{"state": "conflict", "env": {...}, "ancestry": {...}}` when they disagree; the observer never picks one.
-  - `{"state": "hook-ssh", ...}` when the row says the run came over an ssh line built by the hook (the remote cannot verify the local token; treated like `unattributed` for conflicts).
+  - `{"state": "hook-ssh", ...}` when the row says the run came over an ssh line built by the hook: it carries the attribution the line claimed (`task`, `agent`, `ticket`, `session`, `run_id`, `via`); when ancestry disagrees the state stays `hook-ssh` and an `ancestry` object is added beside the claimed fields; a hook-ssh row never produces `conflict`, consumers never raise a conflict alert from it, and it counts as unverified wherever verification matters.
 - A sample for a process whose environment holds a secret (for example `SECRET_X=...`) must not contain that value anywhere.
 
 ## Aggregates the deadman consumes
 
-`netwatch report --json` returns, besides the samples, per-volume disk use keyed by filesystem id (not mount name) with free bytes, a growth rate over the last hour, the top five growing directories under the watched roots, and the top five writers by `disk_write_bytes` delta with their attribution. `deadman.py` names them in alerts; when the observer is absent the deadman reports directory growth only and marks process attribution `unavailable`.
+`netwatch report --json` keeps every key it emits today and adds one top-level key `observer` holding exactly this schema-1 document (`schema`, `host`, `at`, `volumes`, `top_writers`, `samples`); `deadman.py` reads `report["observer"]`. The document returns, besides the samples, per-volume disk use keyed by filesystem id (not mount name) with free bytes, a growth rate over the last hour, the top five growing directories under the watched roots, and the top five writers by `disk_write_bytes` delta with their attribution. `deadman.py` names them in alerts; when the observer is absent the deadman reports directory growth only and marks process attribution `unavailable`.
 
 ## Conformance
 
