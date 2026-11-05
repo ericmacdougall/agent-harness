@@ -21,6 +21,7 @@ HOOKS = Path(__file__).resolve().parents[1] / 'harness/hooks'
 sys.path.insert(0, str(HOOKS))
 import ah_run
 import host_table
+from tests import shell_sandbox
 
 AH = str(HOOKS / 'ah_run.py')
 REAL_SUDO = re.compile(r'''(?:^|[^A-Za-z0-9_.-])s['"\\]*u['"\\]*d['"\\]*o(?:$|[^A-Za-z0-9_.-])''')
@@ -1062,6 +1063,11 @@ class ParserSync(HookFixture):
 class HeredocRule(HookFixture):
     """B6: a body is removed only when the opener is certain; everything else keeps all its lines in the checks."""
     # Data only for the touch rows. HIDDEN below is the only form that reaches a shell, and it is an echo.
+    @classmethod
+    def setUpClass(cls):
+        shell_sandbox.require()  # shape strings reach real shells: only inside the sandbox container
+        super().setUpClass()
+
     SHAPES = {
         'r2-shape': "echo $'a\\' <<EOF'\n%s\nEOF",
         'param-default': 'echo ${x:-<<EOF}\n%s\nEOF',
@@ -1400,6 +1406,11 @@ class HeredocScripts(HookFixture):
 class EndState(HookFixture):
     """The property behind rounds 1-4: if a real shell runs the hidden line, the hook's bypass decision is deny, for every
     scan status; and a certain scan means no shell ran it. The hidden line is an echo, the only command any row runs."""
+    @classmethod
+    def setUpClass(cls):
+        shell_sandbox.require()  # table strings reach real shells: only inside the sandbox container
+        super().setUpClass()
+
     LINE = 'echo HIDDEN-LINE'
     SHELLS = [s for s in ('/bin/bash', '/bin/zsh', '/bin/sh') if os.access(s, os.X_OK)]
     # name: (shape, scan status, whether /bin/bash runs the line)
@@ -1523,6 +1534,11 @@ class Differential(HookFixture):
     says so instead of hiding them. Live rows print only the echo marker; besides echo, true, read and cat they use shell builtins
     (alias, shopt, setopt, trap, ...), a shell or python3 handed that echo, and a stub ssh that copies stdin. A stub sudo sits first
     on PATH and fails, and a row that names sudo is data only (`live: false`, r6 S30): `stdout` refuses to run it."""
+    @classmethod
+    def setUpClass(cls):
+        shell_sandbox.require()  # table rows reach real shells: only inside the sandbox container
+        super().setUpClass()
+
     TABLE = json.loads((Path(__file__).resolve().parent / 'fixtures' / 'ah_run' / 'differential.json').read_text())
     RULE = 'Bash(echo HIDDEN-LINE:*)'
     MARKER = 'HIDDEN-LINE'
