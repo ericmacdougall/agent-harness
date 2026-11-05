@@ -5,11 +5,14 @@ module), to write inside the operator's real state directories, whether or not t
 Configuration comes from a JSON file, not from the environment, so children started with `env={}` or `python -I` are
 covered too: the path is HC_AUDIT_CONFIG when set, otherwise `hermetic_audit_config.json` next to this module.
     {"log": "...", "loaded_log": "...", "protect": ["/abs/dir", ...], "allow": ["/abs/dir", ...]}
-Limits: a child that execs another interpreter by absolute path (for example /usr/bin/python3) is not covered; sqlite
-and other C-level writers, os.utime/chown/mkfifo and xattr calls are not hooked.
+Limits: a child that execs another interpreter by absolute path (for example /usr/bin/python3), runs `python -S`, or is
+an env={} child resolving a bare `python3` through the default PATH is not covered; sqlite and other C-level writers
+are not hooked; a dir_fd-relative open() write is seen only through the 'opendir' record of the directory, and a write
+relative to a descriptor of an unprotected ancestor (for example ~/.agent-harness) is missed.
 """
 import os
 import sys
+import threading
 
 
 def _config():
@@ -38,7 +41,7 @@ def install(config):
     log = config['log']
     protect = [os.path.realpath(p) for p in config.get('protect', [])]
     allow = [os.path.realpath(p) for p in config.get('allow', [])]
-    busy = []
+    state = threading.local()  # re-entry guard per thread, so one thread's recording never hides another's writes
     write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
     # event -> (path argument indexes, (path index, dir_fd index) pairs for dir_fd-relative forms)
     events = {'os.mkdir': ((0,), ((0, 2),)), 'os.rmdir': ((0,), ((0, 1),)), 'os.remove': ((0,), ((0, 1),)),
@@ -53,7 +56,7 @@ def install(config):
         return any(path == base or path.startswith(base.rstrip('/') + '/') for base in bases)
 
     def record(event, path, note=''):
-        busy.append(1)
+        state.busy = True
         try:
             real = os.path.realpath(os.fsdecode(path))
             if inside(real, protect) and not inside(real, allow):
@@ -62,7 +65,7 @@ def install(config):
         except Exception:
             pass
         finally:
-            busy.pop()
+            state.busy = False
 
     def resolved(path, dir_fd):
         """Full path for a dir_fd-relative name, else the name as given."""
@@ -72,7 +75,7 @@ def install(config):
         return path
 
     def hook(event, args):
-        if busy:
+        if getattr(state, "busy", False):
             return
         if event == 'open':
             path, mode, flags = args
