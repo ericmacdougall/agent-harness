@@ -27,7 +27,20 @@ class Tmp(unittest.TestCase):
         self.store = ts.Store(self.dir / "store")
 
 
-def report(head, stage="code-inspection", verdict="CODE_INSPECTION_RESULT: ACCEPT", worktree="clean", packet_sha="0" * 64):
+PACKET_BYTES = b"scope, base head, results"
+PACKET_SHA = hashlib.sha256(PACKET_BYTES).hexdigest()
+
+
+def give_evidence(store, repo_id, head, directory):
+    """Register accepted evidence the way an owner would: a packet and a report whose digest matches it."""
+    packet = Path(directory) / "evidence-packet.md"
+    packet.write_bytes(PACKET_BYTES)
+    path = Path(directory) / f"evidence-{head[:8]}.txt"
+    path.write_text(report(head))
+    return ts.accept_evidence(store, repo_id, head, path, packet)
+
+
+def report(head, stage="code-inspection", verdict="CODE_INSPECTION_RESULT: ACCEPT", worktree="clean", packet_sha=PACKET_SHA):
     return (f"Reviewer: x\nStage: {stage}\nReviewed HEAD: {head}\nReviewed packet SHA-256: {packet_sha}\n"
             f"Review input: isolated committed snapshot\nWorktree status: {worktree}\n\n{verdict}\nbody\n")
 
@@ -143,17 +156,17 @@ class RaceWindow(Tmp):
         self.assertEqual(self.race(lambda i: ts.reserve_control(self.store, "r", SHA_A, f"t{i}")), 1)
 
     def test_exactly_one_full_run_is_admitted(self):
-        path = self.dir / "rep.txt"
-        path.write_text(report(SHA_A))
-        ts.accept_evidence(self.store, "r", SHA_A, path)
+        give_evidence(self.store, "r", SHA_A, self.dir)
         self.assertEqual(self.race(lambda i: ts.reserve_full(self.store, "r", SHA_A, f"t{i}")), 1)
 
 
 class Evidence(Tmp):
-    def accept(self, text, packet=None, head=SHA_A):
+    def accept(self, text, packet=True, head=SHA_A):
         path = self.dir / "report.txt"
         path.write_text(text)
-        return ts.accept_evidence(self.store, "r", head, path, packet)
+        pkt = self.dir / "packet.md"
+        pkt.write_bytes(PACKET_BYTES)
+        return ts.accept_evidence(self.store, "r", head, path, pkt if packet else self.dir / "missing.md")
 
     def test_accepted_report_registers_the_head_only(self):
         self.accept(report(SHA_A))
@@ -163,36 +176,37 @@ class Evidence(Tmp):
     def test_every_defect_is_refused(self):
         for text in (report(SHA_B), report(SHA_A, stage="plan"), report(SHA_A, stage="pr"),
                      report(SHA_A, verdict="CODE_INSPECTION_RESULT: BLOCK"), report(SHA_A, verdict="VERDICT: PASS"),
-                     report(SHA_A, worktree="dirty"), "", "CODE_INSPECTION_RESULT: ACCEPT\nno header"):
+                     report(SHA_A, worktree="dirty"), "", "CODE_INSPECTION_RESULT: ACCEPT\nno header",
+                     report(SHA_A).replace("\n\nCODE_INSPECTION_RESULT: ACCEPT", "\n\npreamble\nCODE_INSPECTION_RESULT: ACCEPT"),
+                     report(SHA_A).replace(f"Reviewed packet SHA-256: {PACKET_SHA}\n", "")):
             with self.assertRaises(ts.Refused, msg=text[:60]) as ctx:
                 self.accept(text)
             self.assertEqual(ctx.exception.code, "bad-evidence")
         self.assertIsNone(ts.has_evidence(self.store, "r", SHA_A))
 
-    def test_packet_digest_must_match_the_packet_bytes(self):
-        packet = self.dir / "packet.md"
-        packet.write_bytes(b"scope and results")
-        digest = hashlib.sha256(b"scope and results").hexdigest()
-        self.accept(report(SHA_A, packet_sha=digest), packet)
+    def test_packet_digest_must_match_the_packet_bytes_and_a_packet_is_required(self):
+        self.accept(report(SHA_A))
         with self.assertRaises(ts.Refused):
-            self.accept(report(SHA_A, packet_sha="1" * 64), packet)
+            self.accept(report(SHA_A, packet_sha="1" * 64))
+        with self.assertRaises(ts.Refused):
+            self.accept(report(SHA_A), packet=False)  # no packet file: the digest can not be checked
 
     def test_symlinked_or_missing_report_is_refused(self):
         real = self.dir / "real.txt"
         real.write_text(report(SHA_A))
         link = self.dir / "link.txt"
         link.symlink_to(real)
+        packet = self.dir / "packet.md"
+        packet.write_bytes(PACKET_BYTES)
         for path in (link, self.dir / "none.txt"):
             with self.assertRaises(ts.Refused):
-                ts.accept_evidence(self.store, "r", SHA_A, path)
+                ts.accept_evidence(self.store, "r", SHA_A, path, packet)
 
 
 class OneFullPerHead(Tmp):
     def setUp(self):
         super().setUp()
-        path = self.dir / "r.txt"
-        path.write_text(report(SHA_A))
-        ts.accept_evidence(self.store, "r", SHA_A, path)
+        give_evidence(self.store, "r", SHA_A, self.dir)
 
     def test_no_evidence_refuses_and_carries_the_focused_commands(self):
         with self.assertRaises(ts.Refused) as ctx:
@@ -231,21 +245,32 @@ class OneFullPerHead(Tmp):
         with self.assertRaises(ValueError):
             ts.release(self.store, "r", "full", SHA_A, "short")
 
-    def test_guarded_path_shares_the_same_records(self):
-        ts.guarded_full_start(SHA_A, "usage_guard:o1", root=self.store.root)
-        ts.guarded_full_start(SHA_A, "usage_guard:o1", root=self.store.root)  # same token: idempotent
-        with self.assertRaises(ts.Refused):
-            ts.guarded_full_start(SHA_A, "usage_guard:o2", root=self.store.root)
-        with self.assertRaises(ts.Refused):  # the hook path sees the guarded reservation
-            ts.reserve_full(self.store, "r", SHA_A, "hook-token")
-        ts.finish_full(self.store, "_guarded", SHA_A, "pass")
-        with self.assertRaises(ts.Refused):
-            ts.guarded_full_start(SHA_A, "usage_guard:o1", root=self.store.root)
+    def test_guarded_path_adopts_the_hook_reservation_of_the_same_launch(self):
+        ts.reserve_full(self.store, "r", SHA_A, "hook-token")  # the PreToolUse hook runs first
+        ts.guarded_full_start(SHA_A, "usage_guard:o1", root=self.store.root)  # then usage_guard inside the command
+        rec = self.store.read("r", f"full-{SHA_A}.json", {"repo_id": "r", "head": SHA_A, "kind": "full"})
+        self.assertEqual(rec["source"], "both")
+        with self.assertRaises(ts.Refused):  # a different owner is still a duplicate
+            ts.reserve_full(self.store, "r", SHA_A, "other-hook-token")
 
-    def test_hook_reservation_is_seen_by_the_guarded_path(self):
-        ts.reserve_full(self.store, "r", SHA_A, "hook-token")
+    def test_guarded_only_reservations_refuse_other_owners_and_finished_runs(self):
+        ts.guarded_full_start(SHA_B, "usage_guard:o1", root=self.store.root)
+        ts.guarded_full_start(SHA_B, "usage_guard:o1", root=self.store.root)  # same owner retry
         with self.assertRaises(ts.Refused):
-            ts.guarded_full_start(SHA_A, "usage_guard:o1", root=self.store.root)
+            ts.guarded_full_start(SHA_B, "usage_guard:o2", root=self.store.root)
+        give_evidence(self.store, "r", SHA_B, self.dir)
+        with self.assertRaises(ts.Refused):  # the hook path sees the guarded reservation
+            ts.reserve_full(self.store, "r", SHA_B, "hook-token")
+        ts.finish_full(self.store, "_guarded", SHA_B, "pass")
+        with self.assertRaises(ts.Refused):
+            ts.guarded_full_start(SHA_B, "usage_guard:o1", root=self.store.root)
+
+    def test_same_owner_inside_the_retry_window_only(self):
+        ts.reserve_full(self.store, "r", SHA_A, "t1")
+        self.assertTrue(ts.reserve_full(self.store, "r", SHA_A, "t1")["idempotent"])
+        with mock.patch.object(ts, "IDEMPOTENT_S", -1):  # the window has passed: a second launch is a duplicate
+            with self.assertRaises(ts.Refused):
+                ts.reserve_full(self.store, "r", SHA_A, "t1")
 
 
 def run(cwd, *cmd):
@@ -330,9 +355,7 @@ class Hook(Tmp):
         return run(self.repo, "git", "rev-parse", "HEAD")
 
     def accept(self, head):
-        path = self.dir / "rep.txt"
-        path.write_text(report(head))
-        ts.accept_evidence(ts.Store(self.dir / "store"), self.repo_id, head, path)
+        give_evidence(ts.Store(self.dir / "store"), self.repo_id, head, self.dir)
 
     def test_non_suite_commands_and_other_tools_are_untouched(self):
         for cmd in ("ls", "git status", "python3 -m unittest tests.test_a", "python3 harness/hooks/test_scope.py scope"):
@@ -402,6 +425,151 @@ class Hook(Tmp):
             r = subprocess.run([sys.executable, "-I", str(HOOKS / "test_scope.py"), "hook"], input=raw,
                                capture_output=True, text=True, timeout=30)
             self.assertEqual(r.returncode, 0, raw)
+
+
+class SecondReview(Tmp):
+    """Findings of the independent review of 39dc4f9."""
+
+    def hook_repo(self):
+        self.repo = make_repo(self.dir)
+        patcher = mock.patch.dict(os.environ, {"HARNESS_TEST_SCOPE_ROOT": str(self.dir / "store")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        run(self.repo, "git", "checkout", "-q", "-b", "feat")
+        (self.repo / "harness" / "hooks" / "a.py").write_text("VALUE = 5\n")
+        run(self.repo, "git", "commit", "-q", "-am", "delta")
+
+    def call(self, command, cwd=None, **extra):
+        return ts.hook_decision({"tool_name": "Bash", "tool_input": {"command": command}, "session_id": "s1",
+                                 "cwd": str(cwd or self.repo), **extra}, ts.load_policy())
+
+    def test_comments_and_earlier_segments_do_not_switch_the_hook_off(self):  # F1
+        self.hook_repo()
+        for cmd in (f"{FULL_CMD} # test_scope.py", f"echo test_scope.py; {FULL_CMD}", f"echo x && {FULL_CMD} test_scope.py"):
+            self.assertEqual(self.call(cmd)[0], 2, cmd)
+
+    def test_on_the_mac_every_store_command_goes_to_the_store_host(self):  # F2
+        policy = ts.load_policy()
+        calls = []
+
+        def fake(host, argv, timeout):
+            calls.append((host, argv))
+            return 0, {"ok": True}
+        packet = self.dir / "p.md"
+        packet.write_bytes(PACKET_BYTES)
+        rep = self.dir / "r.txt"
+        rep.write_text(report(SHA_A))
+        with mock.patch.object(ts, "store_is_remote", return_value=True), mock.patch.object(ts, "run_remote", fake), \
+                mock.patch.dict(os.environ, {"HARNESS_TEST_SCOPE_ROOT": ""}):
+            for argv in (["control", "--repo-id", "r", "--main-sha", SHA_A, "--token", "t"],
+                         ["baseline-get", "--repo-id", "r", "--main-sha", SHA_A],
+                         ["baseline-record", "--repo-id", "r", "--main-sha", SHA_A, "--command", "make test",
+                          "--result", "pass"],
+                         ["full", "--repo-id", "r", "--head", SHA_A, "--token", "t"],
+                         ["finish", "--repo-id", "r", "--head", SHA_A, "--result", "pass"],
+                         ["release", "--repo-id", "r", "--kind", "full", "--key", SHA_A, "--reason", "infra failure x"],
+                         ["accept", "--repo-id", "r", "--head", SHA_A, "--report", str(rep), "--packet", str(packet)]):
+                self.assertEqual(ts.cli(argv, capture=True)[0], 0, argv[0])
+        self.assertEqual(len(calls), 7)
+        self.assertTrue(all(host == "dev2" for host, _ in calls))
+        accept = [a for _, a in calls if a[0] == "register-accepted"][0]
+        self.assertIn(f"--report-sha256={hashlib.sha256(rep.read_text().encode()).hexdigest()}", accept)
+        self.assertFalse((Path.home() / ".agent-harness" / "test-scope" / "r" / f"accepted-{SHA_A}.json").exists())
+        with mock.patch.object(ts, "store_is_remote", return_value=True), mock.patch.object(ts, "run_remote", return_value=None):
+            code, data = ts.cli(["baseline-get", "--repo-id", "r", "--main-sha", SHA_A], capture=True)
+        self.assertEqual((code, data["error"]), (4, "store unreachable"))
+        with mock.patch.object(ts, "store_is_remote", return_value=True):
+            code, data = ts.cli(["run-control", "--", "true"], capture=True)
+        self.assertEqual(code, 3)
+
+    def test_store_host_comes_from_policy_not_from_the_operating_system(self):  # F3
+        policy = {"host": "t2-dev", "local_hostnames": ["t2-dev"]}
+        import socket
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_SCOPE_ROOT": ""}):
+            for name, expect in (("t2-dev.example.com", False), ("dev2", True), ("macbook", True)):
+                with mock.patch.object(socket, "gethostname", return_value=name):
+                    self.assertEqual(ts.store_is_remote(policy), expect, name)
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_SCOPE_ROOT": "/x"}):
+            self.assertFalse(ts.store_is_remote(policy))
+        self.assertFalse(ts.store_is_remote(policy, root="/y"))
+
+    def test_hook_with_no_identity_never_shares_a_token(self):  # F8
+        self.hook_repo()
+        head = run(self.repo, "git", "rev-parse", "HEAD")
+        give_evidence(ts.Store(self.dir / "store"), ts.repo_context(str(self.repo))["repo_id"], head, self.dir)
+        payload = {"tool_name": "Bash", "tool_input": {"command": FULL_CMD}, "cwd": str(self.repo)}
+        first = ts.hook_decision(payload, ts.load_policy())
+        second = ts.hook_decision(payload, ts.load_policy())
+        self.assertEqual(first[0], 0)
+        self.assertEqual(second[0], 2)
+
+    def test_repo_ids_hide_credentials_and_never_collide(self):  # F9
+        a = ts.repo_id_for("https://user:SECRETTOKEN@github.com/o/r2.git", "")
+        self.assertNotIn("SECRET", a)
+        self.assertNotIn("user", a)
+        self.assertEqual(ts.repo_id_for("git@github.com:o/r.git", ""), ts.repo_id_for("https://github.com/o/r", ""))
+        self.assertEqual(ts.repo_id_for("https://GitHub.com/O/R.git", ""), ts.repo_id_for("ssh://git@github.com/o/r", ""))
+        self.assertNotEqual(ts.repo_id_for("https://github.com/a/b-c", ""), ts.repo_id_for("https://github.com/a-b/c", ""))
+        self.assertNotEqual(ts.repo_id_for("", "1" * 40), ts.repo_id_for("", "2" * 40))
+        for rid in (a, ts.repo_id_for("", "1" * 40)):
+            self.assertTrue(ts.SAFE_RE.match(rid), rid)
+
+    def test_remoteless_repos_with_the_same_directory_name_get_different_ids(self):  # F9
+        ids = []
+        for n in (1, 2):
+            repo = self.dir / f"d{n}" / "repo"
+            repo.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            (repo / "f.txt").write_text(str(n))
+            run(repo, "git", "add", "-A")
+            run(repo, "git", "commit", "-q", "-m", f"root {n}")
+            ids.append(ts.repo_context(str(repo))["repo_id"])
+        self.assertNotEqual(*ids)
+
+    def test_cd_prefix_selects_the_repo_the_suite_runs_in(self):  # F10
+        self.hook_repo()
+        other = self.dir / "other"
+        other.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
+        (other / "f.txt").write_text("x")
+        run(other, "git", "add", "-A")
+        run(other, "git", "commit", "-q", "-m", "root")
+        self.assertEqual(ts.effective_cwd(f"cd {self.repo} && {FULL_CMD}", str(other)), str(self.repo))
+        self.assertEqual(ts.effective_cwd(f"FOO=1 cd '{other}'; {FULL_CMD}", str(self.repo)), str(other))
+        self.assertEqual(ts.effective_cwd(FULL_CMD, "/x"), "/x")
+        self.assertEqual(ts.effective_cwd("cd /nonexistent/zzz && ls", "/x"), "/x")
+        # judged against the repo cd selects: `other` has no origin/main, so it is a feature head without evidence
+        self.assertEqual(self.call(f"cd {other} && {FULL_CMD}", cwd=self.repo)[0], 2)
+
+    def test_hatch_after_a_cd_prefix_and_argparse_errors_fail_open(self):  # F11
+        self.hook_repo()
+        self.assertEqual(self.call(f"cd . && HARNESS_SCOPE_OK='bisecting a flaky test on dev2' {FULL_CMD}"), (0, ""))
+        env = {**os.environ, "HARNESS_TEST_SCOPE_ROOT": str(self.dir / "store")}
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": f"HARNESS_SCOPE_OK=-xxxxxxxxxxxx {FULL_CMD}"},
+                              "cwd": str(self.repo)})
+        r = subprocess.run([sys.executable, "-I", str(HOOKS / "test_scope.py"), "hook"], input=payload, capture_output=True,
+                           text=True, timeout=30, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_scope_mapper_handles_deleted_relative_and_aliased_imports_and_root_modules(self):  # F12
+        repo = make_repo(self.dir)
+        base = run(repo, "git", "rev-parse", "HEAD")
+        (repo / "harness" / "hooks" / "e.py").write_text("from . import a\nfrom .c import Y\nimport a as x, b\n")
+        (repo / "tests" / "test_e.py").write_text("import e\n")
+        (repo / "install.py").write_text("import a\n")
+        (repo / "tests" / "test_install.py").write_text("import install\n")
+        run(repo, "git", "add", "-A")
+        run(repo, "git", "commit", "-q", "-m", "more modules")
+        base = run(repo, "git", "rev-parse", "HEAD")
+        (repo / "harness" / "hooks" / "a.py").unlink()
+        run(repo, "git", "add", "-A")
+        run(repo, "git", "commit", "-q", "-m", "delete a")
+        out = ts.focused_scope(str(repo), base, run(repo, "git", "rev-parse", "HEAD"))
+        self.assertTrue({"a", "b", "d", "e", "install"} <= set(out["dependents"]), out["dependents"])
+        self.assertTrue({"test_b", "test_d", "test_e", "test_install"} <= set(out["tests"]), out["tests"])
+        for bad in ("--output=/tmp/x", "-p", "a b", ""):
+            with self.assertRaises(ValueError):
+                ts.focused_scope(str(repo), bad, "HEAD")
 
 
 class Cli(Tmp):

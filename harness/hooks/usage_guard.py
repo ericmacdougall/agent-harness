@@ -604,8 +604,6 @@ class UsageStore:
             except OSError:
                 resource_reason = 'UNKNOWN'
         with self._lock():
-            if kind == 'full' and isinstance(subject.get('head'), str):
-                self._one_full_per_head(subject['head'], owner)
             purpose = self._directory(self.root / 'purposes' / invocation['fingerprint'])
             previous, spent = [], 0
             for number in (1, 2):
@@ -647,6 +645,8 @@ class UsageStore:
             remaining = aggregate_timeout - spent
             if remaining <= 0:
                 raise GuardError('BUDGET_EXHAUSTED', 'Declared aggregate execution budget is exhausted')
+            if kind == 'full' and isinstance(subject.get('head'), str):  # last check: nothing after it can fail and leak it
+                self._one_full_per_head(subject['head'], owner)
             run_id = secrets.token_hex(16)
             directory = self._directory(self._run_directory(run_id))
             started = {'schema': SCHEMA, 'kind': 'start', 'run_id': run_id, 'owner': owner, 'label': label,

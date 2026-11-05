@@ -14,6 +14,10 @@ Rules, enforced where a full-suite launch is detected (PreToolUse Bash, on the M
      an infrastructure failure with `test_scope.py release`). A reservation nobody finishes expires after 12 hours.
   Investigation escape: prefix the command with HARNESS_SCOPE_OK=<reason of 10+ characters>; it is allowed and logged.
 
+This is a cooperative control: `accept` records evidence an owner presents (it checks the report's fields and packet
+digest, not that a reviewer really ran), and the HARNESS_SCOPE_OK hatch is logged, not authorized. It stops accidental
+duplicate and premature full suites, not a determined bypass.
+
 Store: <root>/<repo-id>/{baseline-<sha>,control-<sha>,full-<head>,accepted-<head>}.json, every mutation under one
 flock per repo directory. On the Mac the CLI runs the same command on the store host over ssh (BatchMode, short
 timeout); an unreachable store warns and allows (a guard must not stop work because dev2 is down). Records are
@@ -35,6 +39,7 @@ import shlex
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -44,10 +49,11 @@ MAX_RECORD = 65_536
 MAX_REPORT = 1_000_000
 CONTROL_TTL = 6 * 3600
 FULL_TTL = 12 * 3600
+IDEMPOTENT_S = 120  # the same owner re-sending a launch within this window is a retry, later it is a duplicate
 SAFE_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-HATCH_RE = re.compile(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*HARNESS_SCOPE_OK=(?:'([^']{10,200})'|\"([^\"]{10,200})\"|(\S{10,200}))")
-DEFAULT_POLICY = {"host": "dev2", "root": "~/.agent-harness/test-scope", "ssh_timeout_s": 8}
+HATCH_RE = re.compile(r"(?:^|&&|;)\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*HARNESS_SCOPE_OK=(?:'([^']{10,200})'|\"([^\"]{10,200})\"|(\S{10,200}))")
+DEFAULT_POLICY = {"host": "dev2", "local_hostnames": ["dev2"], "root": "~/.agent-harness/test-scope", "ssh_timeout_s": 8}
 
 
 class Refused(Exception):
@@ -78,7 +84,7 @@ def load_policy(path: Path = POLICY) -> dict:
         data = json.loads(path.read_text())
         if isinstance(data, dict):
             for key in DEFAULT_POLICY:
-                if isinstance(data.get(key), type(DEFAULT_POLICY[key])):
+                if isinstance(data.get(key), type(DEFAULT_POLICY[key])) and data[key] != "":
                     policy[key] = data[key]
     except (OSError, ValueError):
         pass
@@ -175,7 +181,7 @@ def reserve_control(store: Store, repo_id: str, main_sha: str, token: str) -> di
         name = f"control-{main_sha}.json"
         held = store.read(repo_id, name, {"repo_id": repo_id, "main_sha": main_sha, "kind": "control"})
         if held and held.get("state") == "reserved" and now() - held.get("at", 0) < CONTROL_TTL:
-            if held.get("token") == token:
+            if held.get("token") == token and now() - held.get("at", 0) < IDEMPOTENT_S:
                 return {"allowed": True, "idempotent": True, "reservation": held}
             raise Refused("control-in-flight", "another owner is already running the main control for this SHA: wait "
                           "for its baseline instead of starting a second one", record=held)
@@ -197,33 +203,45 @@ def parse_report(text: str) -> dict:
     return fields
 
 
-def accept_evidence(store: Store, repo_id: str, head: str, report: Path, packet: Path = None) -> dict:
+def validate_report(head: str, report: Path, packet: Path) -> str:
+    """Raise Refused unless the report is code-inspection ACCEPT evidence for this head over this packet; return its digest."""
     full_sha(head, "head")
     report = Path(report)
     if report.is_symlink() or not report.is_file() or report.stat().st_size > MAX_REPORT:
         raise Refused("bad-evidence", "the review report is missing, not a regular file or too large")
     text = report.read_text(errors="replace")
-    fields = parse_report(text)
+    header, _sep, body = text.partition("\n\n")
+    fields = parse_report(header)
     problems = []
     if fields.get("Stage") != "code-inspection":
         problems.append("stage is not code-inspection")
     if fields.get("Reviewed HEAD") != head:
         problems.append("Reviewed HEAD does not equal the head")
-    if fields["verdict"] != "CODE_INSPECTION_RESULT: ACCEPT":
-        problems.append("the report does not begin with CODE_INSPECTION_RESULT: ACCEPT")
+    if not body.lstrip().startswith("CODE_INSPECTION_RESULT: ACCEPT"):
+        problems.append("the report body does not begin with CODE_INSPECTION_RESULT: ACCEPT")
     if fields.get("Worktree status") != "clean":
         problems.append("the reviewed worktree was not clean")
-    if packet is not None:
-        packet = Path(packet)
-        digest = hashlib.sha256(packet.read_bytes()).hexdigest() if packet.is_file() else ""
-        if fields.get("Reviewed packet SHA-256") != digest:
-            problems.append("Reviewed packet SHA-256 does not match the packet")
+    packet = Path(packet)
+    digest = hashlib.sha256(packet.read_bytes()).hexdigest() if packet.is_file() and not packet.is_symlink() else ""
+    if not digest or fields.get("Reviewed packet SHA-256") != digest:
+        problems.append("Reviewed packet SHA-256 is absent or does not match the packet")
     if problems:
         raise Refused("bad-evidence", "not accepted code-inspection evidence: " + "; ".join(problems))
-    record = base_record(repo_id, kind="accepted", head=head, report_sha256=hashlib.sha256(text.encode()).hexdigest())
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def register_accepted(store: Store, repo_id: str, head: str, report_sha256: str) -> dict:
+    full_sha(head, "head")
+    if not re.match(r"^[0-9a-f]{64}$", str(report_sha256)):
+        raise ValueError("report digest must be 64 lowercase hex characters")
+    record = base_record(repo_id, kind="accepted", head=head, report_sha256=report_sha256)
     with store.lock(repo_id):
         store.write(repo_id, f"accepted-{head}.json", record)
     return record
+
+
+def accept_evidence(store: Store, repo_id: str, head: str, report: Path, packet: Path) -> dict:
+    return register_accepted(store, repo_id, head, validate_report(head, report, packet))
 
 
 def has_evidence(store: Store, repo_id: str, head: str):
@@ -233,7 +251,7 @@ def has_evidence(store: Store, repo_id: str, head: str):
 
 # ---- c. one full run per head -----------------------------------------------------------------------------------
 
-def reserve_full(store: Store, repo_id: str, head: str, token: str, focused: list = None) -> dict:
+def reserve_full(store: Store, repo_id: str, head: str, token: str, focused: list = None, source: str = "hook") -> dict:
     full_sha(head, "head")
     with store.lock(repo_id):
         if not has_evidence(store, repo_id, head):
@@ -248,12 +266,13 @@ def reserve_full(store: Store, repo_id: str, head: str, token: str, focused: lis
             if other and other.get("state") != "released":
                 fresh = now() - other.get("at", 0) < FULL_TTL
                 if other.get("state") == "finished" or fresh:
-                    if other is held and other.get("token") == token and other.get("state") == "reserved":
+                    if (other is held and other.get("token") == token and other.get("state") == "reserved"
+                            and now() - other.get("at", 0) < IDEMPOTENT_S):
                         return {"allowed": True, "idempotent": True, "reservation": other}
                     raise Refused("duplicate-full", "a full run for this head was already started or finished (one full "
-                                  "run per head); read its result, or release it if it was an infrastructure failure",
-                                  record=other)
-        record = base_record(repo_id, kind="full", head=head, token=token, state="reserved")
+                                  "run per head); read its result, or release it if it was an infrastructure failure: test_scope.py release "
+                                  "--kind full --key <head> --reason <10+ characters>", record=other)
+        record = base_record(repo_id, kind="full", head=head, token=token, state="reserved", source=source)
         store.write(repo_id, name, record)
         return {"allowed": True, "idempotent": False, "reservation": record}
 
@@ -288,25 +307,34 @@ def release(store: Store, repo_id: str, kind: str, key: str, reason: str) -> dic
 
 def guarded_full_start(head: str, token: str, root=None) -> None:
     """usage_guard's kind=full path: refuse a head whose full run already finished or is in flight under another
-    token, and reserve it. Local store only (dev2/T2 or HARNESS_TEST_SCOPE_ROOT); the caller treats OSError as
-    'no store here' and proceeds (fail open)."""
+    guarded owner, and reserve it. A reservation the PreToolUse hook made for this same launch is adopted. Local store
+    only (dev2/T2 or HARNESS_TEST_SCOPE_ROOT); the caller treats OSError as 'no store here' and proceeds (fail open)."""
     full_sha(head, "head")
     store = Store(root or os.environ.get("HARNESS_TEST_SCOPE_ROOT") or load_policy()["root"])
     repo_id = next((d.name for d in sorted(store.root.glob("*")) if (d / f"full-{head}.json").is_file()), "_guarded")
     with store.lock(repo_id):
         held = store.read(repo_id, f"full-{head}.json", {"repo_id": repo_id, "head": head, "kind": "full"})
         if held and held.get("state") != "released":
-            if held.get("state") == "finished" or (now() - held.get("at", 0) < FULL_TTL and held.get("token") != token):
-                raise Refused("duplicate-full", "a full run for this head was already started or finished (one full run "
-                              "per head); read its result or release it if it was an infrastructure failure", record=held)
+            if held.get("state") == "finished":
+                raise Refused("duplicate-full", "a full run for this head already finished (one full run per head); "
+                              "release it if it was an infrastructure failure", record=held)
+            if held.get("source") == "hook" and now() - held.get("at", 0) < FULL_TTL:
+                held.update(source="both", guarded_token=token)  # the hook reserved this very launch
+                store.write(repo_id, f"full-{head}.json", held)
+                return
+            if now() - held.get("at", 0) < FULL_TTL and held.get("token") != token:
+                raise Refused("duplicate-full", "a full run for this head was already started under another owner (one "
+                              "full run per head)", record=held)
             return
         store.write(repo_id, f"full-{head}.json", base_record(repo_id, kind="full", head=head, token=token,
-                                                             state="reserved"))
+                                                             state="reserved", source="guarded"))
 
 
 # ---- focused scope for repair deltas ----------------------------------------------------------------------------
 
-IMPORT_RE = re.compile(r"^[ \t]*(?:from[ \t]+([A-Za-z_]\w*)|import[ \t]+([A-Za-z_]\w*(?:[ \t]*,[ \t]*[A-Za-z_]\w*)*))", re.M)
+IMPORT_RE = re.compile(r"^[ \t]*(?:from[ \t]+\.*([A-Za-z_]\w*)(?:\.\w+)*[ \t]+import|from[ \t]+\.+[ \t]+import[ \t]+"
+                       r"([A-Za-z_]\w*(?:[ \t]*,[ \t]*[A-Za-z_]\w*)*)|import[ \t]+([A-Za-z_]\w*(?:\.\w+)*"
+                       r"(?:[ \t]+as[ \t]+\w+)?(?:[ \t]*,[ \t]*[A-Za-z_]\w*(?:\.\w+)*(?:[ \t]+as[ \t]+\w+)?)*))", re.M)
 
 
 def git(repo: str, *args: str) -> str:
@@ -326,25 +354,43 @@ def imports_of(path: Path, known: set) -> set:
         return set()
     names = set()
     for m in IMPORT_RE.finditer(text):
-        for part in ([m.group(1)] if m.group(1) else m.group(2).split(",")):
-            names.add(part.strip())
+        if m.group(1):
+            names.add(m.group(1))
+        for group in (m.group(2), m.group(3)):
+            for part in (group or "").split(","):
+                names.add(re.split(r"[ \t.]", part.strip())[0])
     return names & known
 
 
+REF_RE = re.compile(r"^[0-9A-Za-z._/~^@{}-]{1,200}$")
+
+
 def focused_scope(repo: str, base: str, head: str) -> dict:
-    """Changed files, the modules that depend on them, and the test modules to run (harness/hooks + tests layout)."""
-    changed = [p for p in git(repo, "diff", "--name-only", base, head).splitlines() if p]
+    """Changed files (deleted ones too), the modules that depend on them, and the test modules to run
+    (harness/hooks + tests layout, plus root-level modules such as install.py)."""
+    for ref in (base, head):
+        if not REF_RE.match(ref) or ref.startswith("-"):
+            raise ValueError("base and head must be plain git refs")
+    changed = [p for p in git(repo, "diff", "--name-only", base, head, "--").splitlines() if p]
     root = Path(repo)
-    src_dirs = [root / d for d in ("harness/hooks", "src", "lib") if (root / d).is_dir()] or [root]
+    src_dirs = [root / d for d in ("harness/hooks", "src", "lib") if (root / d).is_dir()] + [root]
     tests_dir = root / "tests"
     modules = {}
     for d in src_dirs:
         for f in d.glob("*.py"):
             modules[f.stem] = f
     known = set(modules)
+    deleted_mods = [Path(d).stem for d in git(repo, "diff", "--name-only", "--diff-filter=D", base, head, "--").splitlines()
+                    if d.endswith(".py") and Path(d).parts[0] != "tests"]
+    known.update(deleted_mods)  # an importer of a deleted module must still be found
     test_files = {f.stem: f for f in tests_dir.glob("test_*.py")} if tests_dir.is_dir() else {}
     deps = {name: imports_of(f, known) for name, f in modules.items()}  # module -> modules it imports
+    for name, f in list(modules.items()):
+        deps.setdefault(name, set())
     touched = set()
+    for name in deleted_mods:
+        deps.setdefault(name, set())
+        touched.add(("mod", name))
     for path in changed:
         p = Path(path)
         stem = re.sub(r"_(policy|checklists|template)$", "", p.stem) if p.suffix in (".json", ".md") else p.stem
@@ -374,6 +420,21 @@ def focused_scope(repo: str, base: str, head: str) -> dict:
 
 # ---- hook -------------------------------------------------------------------------------------------------------
 
+def repo_id_for(url: str, fallback: str) -> str:
+    """owner-name slug of the remote without credentials, plus a hash of the normalized URL (or of the fallback key for
+    a repo with no remote, such as its root commit), so different repos never share a store directory."""
+    key = fallback
+    slug = "repo"
+    if url:
+        norm = re.sub(r"^[a-z+]+://", "", url.strip().lower())
+        norm = re.sub(r"^[^@/]*@", "", norm).replace(":", "/", 1) if "@" in norm.split("/")[0] or ":" in norm.split("/")[0] \
+            else norm
+        norm = re.sub(r"\.git$", "", norm).strip("/")
+        key = norm
+        slug = re.sub(r"[^a-z0-9._-]+", "-", norm.replace("/", "-")).strip("-")[:60] or "repo"
+    return f"{slug}-{hashlib.sha256(key.encode()).hexdigest()[:8]}"
+
+
 def repo_context(cwd: str) -> dict:
     top = git(cwd, "rev-parse", "--show-toplevel").strip()
     head = git(top, "rev-parse", "HEAD").strip()
@@ -382,8 +443,11 @@ def repo_context(cwd: str) -> dict:
         url = git(top, "remote", "get-url", "origin").strip()
     except OSError:
         pass
-    repo_id = re.sub(r"[^A-Za-z0-9._-]+", "-", re.sub(r"^(?:https?://|git@|ssh://git@)", "", url).replace(":", "/")
-                     .removesuffix(".git") if url else Path(top).name).strip("-")[:100] or "repo"
+    try:
+        root_commit = git(top, "rev-list", "--max-parents=0", "HEAD").split()[0]
+    except (OSError, IndexError):
+        root_commit = top
+    repo_id = repo_id_for(url, root_commit if not url else "")
     main = ""
     for ref in ("origin/main", "origin/master"):
         try:
@@ -392,6 +456,19 @@ def repo_context(cwd: str) -> dict:
         except OSError:
             continue
     return {"top": top, "head": head, "repo_id": repo_id, "main_sha": main}
+
+
+CD_PREFIX_RE = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*cd\s+(\"[^\"]+\"|'[^']+'|\S+)\s*(?:&&|;)")
+
+
+def effective_cwd(command: str, cwd: str) -> str:
+    """The directory the suite will run in when the command starts with `cd <dir> &&` (the common form)."""
+    m = CD_PREFIX_RE.match(command or "")
+    if not m:
+        return cwd
+    target = os.path.expanduser(m.group(1).strip("\"'"))
+    path = target if os.path.isabs(target) else os.path.join(cwd, target)
+    return os.path.realpath(path) if os.path.isdir(path) else cwd
 
 
 def run_remote(host: str, args: list, timeout: int):
@@ -407,17 +484,24 @@ def run_remote(host: str, args: list, timeout: int):
         return None
 
 
+def store_is_remote(policy: dict, root=None) -> bool:
+    """True when the store lives on another host: not on the store host itself, and no local root override."""
+    if root or os.environ.get("HARNESS_TEST_SCOPE_ROOT") or not policy.get("host"):
+        return False
+    import socket
+    name = socket.gethostname().split(".")[0].lower()
+    return name not in [h.lower() for h in policy.get("local_hostnames", [])]
+
+
 def store_call(policy: dict, args: list):
-    """Run one CLI command on the store: locally on Linux/dev2 or with HARNESS_TEST_SCOPE_ROOT, else over ssh."""
-    root = os.environ.get("HARNESS_TEST_SCOPE_ROOT")
-    host = os.environ.get("HARNESS_TEST_SCOPE_HOST", policy["host"])
-    if root or sys.platform != "darwin" or not host:
-        return cli(["--root", root or policy["root"], *args], capture=True)
-    return run_remote(host, args, int(policy["ssh_timeout_s"]))
+    """Run one CLI command on the store: locally on the store host or with HARNESS_TEST_SCOPE_ROOT, else over ssh."""
+    if store_is_remote(policy):
+        return run_remote(os.environ.get("HARNESS_TEST_SCOPE_HOST", policy["host"]), args, int(policy["ssh_timeout_s"]))
+    return cli(["--root", os.environ.get("HARNESS_TEST_SCOPE_ROOT") or policy["root"], *args], capture=True)
 
 
 def hatch_reason(command: str):
-    m = HATCH_RE.match(command or "")
+    m = HATCH_RE.search(command or "")
     return next((g for g in m.groups() if g), "") if m else ""
 
 
@@ -431,7 +515,7 @@ def hook_decision(payload: dict, policy: dict):
     if payload.get("tool_name") != "Bash" or not isinstance(payload.get("tool_input"), dict):
         return 0, ""
     command = payload["tool_input"].get("command")
-    if not isinstance(command, str) or "test_scope.py" in command.split("&&")[0].split(";")[0]:
+    if not isinstance(command, str):
         return 0, ""
     import heavy_job_guard as hjg
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else os.getcwd()
@@ -439,14 +523,15 @@ def hook_decision(payload: dict, policy: dict):
     if not any(f[0] == "full-suite" for f in findings):
         return 0, ""
     reason = hatch_reason(command)
-    ctx = repo_context(cwd)
-    token = f"{payload.get('session_id', '')}:{payload.get('agent_id', '')}"
+    ctx = repo_context(effective_cwd(command, cwd))
+    owner = f"{payload.get('session_id', '')}:{payload.get('agent_id', '')}"
+    token = owner if owner != ":" else f"anon:{uuid.uuid4().hex}"  # no identity: never share one with another caller
     if reason:
-        store_call(policy, ["ungated", "--repo-id", ctx["repo_id"], "--head", ctx["head"], "--reason", reason])
+        store_call(policy, ["ungated", f"--repo-id={ctx['repo_id']}", f"--head={ctx['head']}", f"--reason={reason}"])
         return 0, ""
     is_control = bool(ctx["main_sha"]) and ctx["head"] == ctx["main_sha"]
     if is_control:
-        got = store_call(policy, ["control", "--repo-id", ctx["repo_id"], "--main-sha", ctx["head"], "--token", token])
+        got = store_call(policy, ["control", f"--repo-id={ctx['repo_id']}", f"--main-sha={ctx['head']}", f"--token={token}"])
         if got is None:
             return 0, "test_scope: store unreachable; allowing (warn only)"
         code, data = got
@@ -464,7 +549,7 @@ def hook_decision(payload: dict, policy: dict):
             focused = focused_scope(ctx["top"], base, ctx["head"])["commands"]
         except (OSError, subprocess.SubprocessError):
             focused = []
-    got = store_call(policy, ["full", "--repo-id", ctx["repo_id"], "--head", ctx["head"], "--token", token])
+    got = store_call(policy, ["full", f"--repo-id={ctx['repo_id']}", f"--head={ctx['head']}", f"--token={token}"])
     if got is None:
         return 0, "test_scope: store unreachable; allowing (warn only)"
     code, data = got
@@ -473,7 +558,7 @@ def hook_decision(payload: dict, policy: dict):
         if data.get("code") == "no-evidence":
             return 2, ("Test-scope guard [evidence]: " + data.get("message", "") + hint + " After accepted evidence: "
                        f"`python3 ~/.claude/hooks/test_scope.py accept --repo-id {ctx['repo_id']} --head {ctx['head']} "
-                       "--report <report>`. For an investigation, prefix HARNESS_SCOPE_OK=<reason>.")
+                       "--report <report> --packet <packet>`. For an investigation, prefix HARNESS_SCOPE_OK=<reason>.")
         return 2, "Test-scope guard [one full run per head]: " + data.get("message", "") + hint
     return 0, ""
 
@@ -489,12 +574,32 @@ def run_hook() -> int:
         if text:
             print(text, file=sys.stderr)
         return code
-    except Exception as exc:  # noqa: BLE001 - fail open: a guard bug must not block every Bash call
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - fail open: a guard bug must not block every Bash call
         print(f"test_scope: internal error {type(exc).__name__}; failing open", file=sys.stderr)
         return 0
 
 
 # ---- CLI --------------------------------------------------------------------------------------------------------
+
+REMOTE_CMDS = {"baseline-get", "baseline-record", "control", "full", "finish", "release", "ungated", "register-accepted"}
+REMOTE_FLAGS = {"baseline-get": ("repo_id", "main_sha"), "baseline-record": ("repo_id", "main_sha", "command", "result",
+                                                                            "counts", "failing"),
+                "control": ("repo_id", "main_sha", "token"), "full": ("repo_id", "head", "token"),
+                "finish": ("repo_id", "head", "result", "summary"), "release": ("repo_id", "kind", "key", "reason"),
+                "ungated": ("repo_id", "head", "reason"), "register-accepted": ("repo_id", "head", "report_sha256")}
+
+
+def remote_args(args) -> list:
+    """The parsed command re-rendered as (flag, value) pairs for the store host; the subcommand is the first pair."""
+    pairs = [("", args.cmd)]
+    for name in REMOTE_FLAGS[args.cmd]:
+        value = getattr(args, name, None)
+        if value not in (None, ""):
+            pairs.append((name.replace("_", "-"), value))
+    if getattr(args, "replace", False):
+        pairs.append(("", "--replace"))
+    return pairs
+
 
 def cli(argv: list, capture: bool = False):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -514,8 +619,8 @@ def cli(argv: list, capture: bool = False):
     p.add_argument("--failing", default="")
     p.add_argument("--replace", action="store_true")
     p = add("control", "--repo-id", "--main-sha", "--token")
-    p = add("accept", "--repo-id", "--head", "--report")
-    p.add_argument("--packet", default=None)
+    p = add("accept", "--repo-id", "--head", "--report", "--packet")
+    p = add("register-accepted", "--repo-id", "--head", "--report-sha256")
     p = add("full", "--repo-id", "--head", "--token")
     p = add("finish", "--repo-id", "--head", "--result")
     p.add_argument("--summary", default="")
@@ -530,7 +635,8 @@ def cli(argv: list, capture: bool = False):
     p.add_argument("--repo", default=".")
     p.add_argument("command", nargs=argparse.REMAINDER)
     args = ap.parse_args(argv)
-    store = Store(args.root or load_policy()["root"])
+    policy = load_policy()
+    store = Store(args.root or policy["root"])
 
     def out(code: int, data: dict):
         if capture:
@@ -541,6 +647,18 @@ def cli(argv: list, capture: bool = False):
     try:
         if args.cmd == "hook":
             return run_hook()
+        remote = store_is_remote(policy, args.root)
+        if args.cmd == "accept":
+            digest = validate_report(args.head, Path(args.report), Path(args.packet))  # checked here, filed on the store host
+            argv = ["register-accepted", f"--repo-id={args.repo_id}", f"--head={args.head}", f"--report-sha256={digest}"]
+            if remote:
+                got = run_remote(os.environ.get("HARNESS_TEST_SCOPE_HOST", policy["host"]), argv, int(policy["ssh_timeout_s"]))
+                return out(*(got or (4, {"error": "store unreachable"})))
+            return out(0, {"accepted": True, "record": register_accepted(store, args.repo_id, args.head, digest)})
+        if remote and args.cmd in REMOTE_CMDS:
+            got = run_remote(os.environ.get("HARNESS_TEST_SCOPE_HOST", policy["host"]),
+                             [f"--{k}={v}" if k else v for k, v in remote_args(args)], int(policy["ssh_timeout_s"]))
+            return out(*(got or (4, {"error": "store unreachable"})))
         if args.cmd == "scope":
             return out(0, focused_scope(args.repo, args.base, args.head))
         if args.cmd == "baseline-get":
@@ -552,9 +670,8 @@ def cli(argv: list, capture: bool = False):
             return out(0, {"recorded": True, "record": rec})
         if args.cmd == "control":
             return out(0, reserve_control(store, args.repo_id, args.main_sha, args.token))
-        if args.cmd == "accept":
-            return out(0, {"accepted": True, "record": accept_evidence(store, args.repo_id, args.head, Path(args.report),
-                                                                       Path(args.packet) if args.packet else None)})
+        if args.cmd == "register-accepted":
+            return out(0, {"accepted": True, "record": register_accepted(store, args.repo_id, args.head, args.report_sha256)})
         if args.cmd == "full":
             return out(0, reserve_full(store, args.repo_id, args.head, args.token))
         if args.cmd == "finish":
@@ -567,6 +684,8 @@ def cli(argv: list, capture: bool = False):
                     fh.write(json.dumps({"at": now(), "head": args.head, "reason": args.reason[:200]}) + "\n")
             return out(0, {"logged": True})
         if args.cmd == "run-control":
+            if remote:
+                return out(3, {"error": "run-control records into the store: run it on the store host (dev2/T2)"})
             cmd = [c for c in args.command if c != "--"]
             if not cmd:
                 return out(3, {"error": "usage: run-control --repo R -- <test command>"})
