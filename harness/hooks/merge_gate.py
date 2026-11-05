@@ -111,7 +111,7 @@ GH_HINT = re.compile(r"\bgh\b|merge|curl|wget|\bhttps?\b|python|node|perl|ruby|s
 STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals|receipts)", re.I)
 STATE_GLOB = re.compile(r"merge-gate-[war*?\[]", re.I)  # subagents: globs and split spellings of the state files
 WAIVE_CMD = re.compile(r"merge_gate(?:\.py)?['\"]?\s+(?:--\S+\s+\S+\s+)*waive\b")
-WAIVE_ANY = re.compile(r"waive|add_waiver|consume_waiver|put_stamp|take_stamp|receipt", re.I)
+WAIVE_ANY = re.compile(r"waive|add_waiver|consume_waiver|put_stamp|take_stamp|write_receipt|\breceipt\s+--", re.I)
 GRAPHQL_MERGE = re.compile(r"mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest", re.I)
 REST_MERGE = re.compile(r"(?:repos/([^/\s'\"]+)/([^/\s'\"]+)/)?pulls/(\d+)/merge\b")
 CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -1155,27 +1155,52 @@ def receipt_path(state_dir, repo, pr, head):
     return Path(state_dir) / RECEIPTS_DIR / (stamp_key(repo, pr, head, "receipt") + ".json")
 
 
+def _receipts_dir_problem(folder):
+    """None when the receipts directory is a real 0700 directory owned by the user; "missing" when absent."""
+    try:
+        info = os.lstat(str(folder))
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "the receipts directory cannot be read"
+    if not stat.S_ISDIR(info.st_mode):
+        return "the receipts directory is a symlink or not a directory"
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        return "the receipts directory is not a private (0700) directory owned by the current user"
+    return None
+
+
 def verify_receipt(state_dir, repo, pr, head):
     """Reasons (empty list = a valid receipt) for the exact repo, PR and head. Reads only; never writes."""
     path = receipt_path(state_dir, repo, pr, head)
+    problem = _receipts_dir_problem(path.parent)
+    if problem:
+        return [problem] if problem != "missing" else ["no receipt for this head (the main agent records one with "
+                                                       "merge_gate.py receipt)"]
     try:
-        before = os.lstat(str(path))
-    except FileNotFoundError:
-        return ["no receipt for this head (the main agent records one with merge_gate.py receipt)"]
+        fd = _open_evidence(os.path.abspath(str(path)))  # one open: the checks below are on this exact file
+    except ValueError as error:
+        if str(error) == "does not exist":
+            return ["no receipt for this head (the main agent records one with merge_gate.py receipt)"]
+        return ["the receipt cannot be used: " + str(error)]
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.geteuid():
+            return ["the receipt file owner is not the current user"]
+        if info.st_mode & 0o077:
+            return ["the receipt file permissions are not 0600"]
+        if info.st_size > MAX_RECEIPT_BYTES:
+            return ["the receipt file is too large"]
+        data = os.read(fd, MAX_RECEIPT_BYTES + 1)
+        if len(data) > MAX_RECEIPT_BYTES:
+            return ["the receipt file is too large"]
     except OSError:
         return ["the receipt cannot be read"]
-    if not stat.S_ISREG(before.st_mode):
-        return ["the receipt is not a regular file"]
-    if before.st_uid != os.geteuid():
-        return ["the receipt file owner is not the current user"]
-    if before.st_mode & 0o077:
-        return ["the receipt file permissions are not 0600"]
-    if before.st_size > MAX_RECEIPT_BYTES:
-        return ["the receipt file is too large"]
+    finally:
+        os.close(fd)
     try:
-        data = safe_input.read_bounded(str(path), MAX_RECEIPT_BYTES)
         record = json.loads(data.decode("utf-8"))
-    except (safe_input.InputRejected, OSError, ValueError):
+    except ValueError:
         return ["the receipt file is unreadable or not JSON"]
     return _check_record(record, repo, pr, head)
 
@@ -1218,8 +1243,11 @@ def write_receipt(state_dir, repo, pr, head, suite_log, suite_exit, suite_summar
     if problems:
         raise ValueError("; ".join(problems))
     folder = state_dir / RECEIPTS_DIR
-    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(str(folder), 0o700)
+    if _receipts_dir_problem(folder) == "missing":
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    problem = _receipts_dir_problem(folder)
+    if problem:
+        raise ValueError(problem)
     final = receipt_path(state_dir, repo, pr, head)
     tmp = folder / (final.name + "." + uuid.uuid4().hex[:8] + ".tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

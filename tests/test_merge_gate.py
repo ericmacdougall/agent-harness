@@ -620,7 +620,7 @@ class Receipts(Base):
                   "review": {"report_path": str(report), "report_sha256": sha(report),
                              "reviewed_head": reviewed or head, "packet_sha256": packet}}
         path = self.receipt_path(head)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         os.write(fd, json.dumps(record).encode())
         os.close(fd)
@@ -715,7 +715,7 @@ class Receipts(Base):
         from unittest import mock
         self.write()
         with mock.patch.object(mg.os, "geteuid", return_value=os.geteuid() + 1):
-            self.assertBlocked(needle="owner")
+            self.assertBlocked(needle="current user")
 
     def test_symlink_oversized_and_garbage_receipts_block(self):
         path = self.forge()
@@ -841,6 +841,28 @@ class Receipts(Base):
         code, text = self.merge("zero_unprotected")
         self.assertEqual(code, 0, text)
         self.assertEqual(mg.main(argv + ["--approved-by", "agent-9"], stdout=out, stderr=err), 3)
+
+    def test_receipts_directory_must_be_a_private_real_directory(self):
+        self.write()
+        folder = self.state / mg.RECEIPTS_DIR
+        os.chmod(str(folder), 0o755)
+        self.assertBlocked(needle="directory")
+        os.chmod(str(folder), 0o700)
+        code, text = self.merge("zero_unprotected")
+        self.assertEqual(code, 0, text)
+        moved = self.state / "elsewhere"
+        os.replace(str(folder), str(moved))
+        os.symlink(str(moved), str(folder))
+        self.assertBlocked(needle="directory")
+        with self.assertRaises(ValueError):
+            self.write(head=OTHER)
+
+    def test_guard_does_not_block_ordinary_subagent_commands_about_receipts(self):
+        sub = dict(agent_id="agent-sub-1", agent_type="task-owner")
+        for command in ("python3 -m unittest tests.test_merge_gate.Receipts", "grep -n receipt harness/hooks/merge_gate.py"):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **sub), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 0, text)
 
     def test_receipt_policy_documented(self):
         text = (ROOT / "docs" / "operations.md").read_text().lower()
