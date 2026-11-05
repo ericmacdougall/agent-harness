@@ -17,7 +17,7 @@ try:
 except ModuleNotFoundError:  # Codex installer requires Python 3.11+.
     tomllib = None
 
-from install import (DirectoryPins, netwatch_status, atomic_write, git_hook_status, markdown_marker_lines, read_regular,
+from install import (DirectoryPins, local_profile_status, migrate_local_profiles, netwatch_status, atomic_write, git_hook_status, markdown_marker_lines, read_regular,
                      safe_unlink)
 
 
@@ -37,6 +37,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     # Spec flow commands work by hand in Codex; its done hook is Claude Code only.
                     'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
                     'provenance_hooks.py', 'safe_input.py', 'domain_gates.py', 'domain_checklists.json',
+                    'commit_policy.local.json.example', 'spec_policy.local.json.example',
                     'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
                     'command_guard.py', 'command_guard_hook.py', 'redact.py', 'merge_gate.py',
@@ -139,14 +140,17 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             if handlers:
                 preserved.append({**group, 'hooks': handlers})
         preserved.append(managed)
-        if event == 'PreToolUse' and command_guard:
-            # Command guard for every tool (no matcher): Codex fails open, so the launcher blocks by itself, and
-            # write_stdin text typed into a running shell is never checked again by the host.
-            preserved.insert(0, {'hooks': [{'type': 'command', 'command': guard, 'timeout': 30}]})
         if event == 'PreToolUse':
             # Commit message policy for every tool (no matcher): shell argv, strings, stdin writes.
             preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 60}]})
             preserved.append({'hooks': [{'type': 'command', 'command': gate, 'timeout': 60}]})
+        if event == 'PreToolUse' and command_guard:
+            # Command guard for every tool (no matcher): Codex fails open, so the launcher blocks by itself, and
+            # write_stdin text typed into a running shell is never checked again by the host. Appended last:
+            # Codex keys hook trust by position (hooks.state "<file>:pre_tool_use:<group>:<handler>"), so adding
+            # it after the existing groups keeps their trusted hashes valid (GoodQA #14590). Codex runs every
+            # matching hook, so position does not change whether the guard can block.
+            preserved.append({'hooks': [{'type': 'command', 'command': guard, 'timeout': 30}]})
         hooks[event] = preserved
     merge_work_assignment_hooks(hooks, codex_home)
     return result
@@ -344,6 +348,7 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
         changes = [str(path) for path in managed]
         if not apply:
             return changes
+        migrate_local_profiles(codex_home, harness_dir)  # before the generic policies overwrite personal values
         for directory in directories[1:]:
             pins.create(directory)
         for directory in (codex_home, harness_dir, backup_root, wal_parent, wal_dir):
@@ -438,6 +443,7 @@ def main() -> None:
         print(f'  {path}')
     print(f'  {install_git_backstop(args.home, args.apply)}')
     print(f'  {netwatch_status(args.home, args.apply, args.netwatch)}')
+    print(f'  {local_profile_status(args.home, args.home / ".codex" / "agent-harness")}')
     if args.apply:
         print('Review and trust the new user hooks with /hooks in a new Codex session.')
 

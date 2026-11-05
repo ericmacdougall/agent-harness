@@ -1,0 +1,12 @@
+{
+  "backstop_repos": ["github\\.com[:/]example-org/"],
+  "ticket_systems": {
+    "goodqa": {
+      "repos": ["github\\.com[:/]example-org/"],
+      "org_id": "00000000-0000-4000-8000-000000000001",
+      "key_secret": {"name": "goodqa-api-key-example", "project": "example-gcp-project"},
+      "unreachable_projects": ["solve", "ai-course", "harness"],
+      "unreachable_reason": "the key reaches ExampleOrg only"
+    }
+  }
+}

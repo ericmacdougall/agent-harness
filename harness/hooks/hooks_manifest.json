@@ -324,19 +324,52 @@
    ]
   },
   {
-   "id": "escalation:hook",
-   "script": "escalation.py",
+   "id": "tier_gate:hook",
+   "script": "tier_gate.py",
    "arg": "hook",
    "event": "PreToolUse",
    "tools": [
-    "Agent"
+    "Agent",
+    "Task",
+    "Workflow",
+    "Bash"
    ],
    "flavors": [
-    "claude",
-    "codex"
+    "claude"
    ],
-   "status": "pending",
-   "owner": "a0e07708 harness-reliability (#14527)",
+   "status": "installed",
+   "rules": [
+    "S25"
+   ]
+  },
+  {
+   "id": "tier_gate:start",
+   "script": "tier_gate.py",
+   "arg": "start",
+   "event": "SubagentStart",
+   "tools": [
+    "task-owner"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S25"
+   ]
+  },
+  {
+   "id": "tier_gate:stop",
+   "script": "tier_gate.py",
+   "arg": "stop",
+   "event": "SubagentStop",
+   "tools": [
+    "task-owner"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
    "rules": [
     "S25"
    ]

@@ -30,6 +30,8 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "command_guard.py", "command_guard_hook.py", "redact.py",
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py",
          "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
+         "ahd.py", "ahd_peek.py", "ahd_policy.json",
+         "commit_policy.local.json.example", "spec_policy.local.json.example",
          "work_assignments.py", "work_assignments_policy.json", "work_ledger.schema.json")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
@@ -654,6 +656,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         changes = [str(path) for path in managed]
         if not apply:
             return changes
+        for note in migrate_local_profiles(claude):
+            print(f"  {note}")
         originals = {path: read_regular(path, pinned_parent=pins.fd(path.parent),
                                         retain_fd=pins.file_fds)
                      for path in managed}
@@ -832,6 +836,60 @@ def netwatch_status(home: Path, apply: bool, flag) -> str:
         return f"netwatch: skipped ({error.__class__.__name__}: {error})"
 
 
+def migrate_local_profiles(claude: Path, policy_dir: Path | None = None) -> list[str]:
+    """Before the shipped policies are overwritten, copy their personal values into new untracked 0600 profiles.
+    Never overwrites an existing profile. Without this an upgrade would silently turn ticket enforcement off."""
+    notes = []
+    hooks = policy_dir if policy_dir is not None else claude / "hooks"  # Codex keeps its policies in ~/.codex/agent-harness
+    def keep(name, build):
+        old, target = hooks / name, hooks / name.replace(".json", ".local.json")
+        if target.exists() or target.is_symlink() or not old.is_file():
+            return
+        try:
+            data = build(json.loads(old.read_text(encoding="utf-8")))
+        except (OSError, ValueError, AttributeError):
+            return
+        if data:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+            notes.append(f"migrated personal values from {name} to {target.name} (mode 0600)")
+    def commit(policy):
+        out = {}
+        if policy.get("backstop_repos"):
+            out["backstop_repos"] = policy["backstop_repos"]
+        keys = ("repos", "org_id", "key_file", "key_secret", "default_project", "projects", "unreachable_projects", "unreachable_reason")
+        systems = {n: {k: v for k, v in e.items() if k in keys and v not in ([], {}, "", None)}
+                   for n, e in (policy.get("ticket_systems") or {}).items() if isinstance(e, dict)}
+        for e in systems.values():  # the loader accepts only these route keys; an old extra key would break commits
+            if isinstance(e.get("projects"), dict):
+                e["projects"] = {s: {k: v for k, v in r.items() if k in ("project_id", "org_id", "key_file")}
+                                 for s, r in e["projects"].items() if isinstance(r, dict)}
+        systems = {n: e for n, e in systems.items() if e.get("repos") or e.get("org_id")}
+        if systems:
+            out["ticket_systems"] = systems
+        return out
+    def spec(policy):
+        out = {k: policy[k] for k in ("projects", "enforced_projects") if policy.get(k)}
+        if isinstance(out.get("projects"), dict):
+            out["projects"] = {s: {k: v for k, v in r.items() if k in ("project_id", "org_id", "key_file")}
+                               for s, r in out["projects"].items() if isinstance(r, dict)}
+        return out
+    keep("commit_policy.json", commit)
+    keep("spec_policy.json", spec)
+    return notes
+
+
+def local_profile_status(home: Path, policy_dir: Path | None = None) -> str:
+    """The shipped policy is generic, so a host without commit_policy.local.json has ticket enforcement off."""
+    hooks = policy_dir if policy_dir is not None else home.expanduser() / ".claude" / "hooks"
+    missing = [name for name in ("commit_policy.local.json", "spec_policy.local.json") if not (hooks / name).is_file()]
+    if not missing:
+        return f"policy profiles: commit_policy.local.json and spec_policy.local.json present in {hooks}"
+    return ("policy profiles: MISSING " + ", ".join(missing) + " -- ticket enforcement, the git backstop and spec "
+            "project routing match nothing until you copy each .example beside the installed hooks and fill it in")
+
+
 def command_guard_status(enabled: bool, runner=None) -> str:
     """Claude Code before 2.1.295 ignores onFailure, so fail-closed then rests on the launcher alone."""
     if not enabled:
@@ -894,6 +952,7 @@ def main() -> None:
     print(f"  {install_git_backstop(args.home, args.apply)}")
     print(f"  {scratch_status(args.home, args.apply, durable_tmp)}")
     print(f"  {netwatch_status(args.home, args.apply, args.netwatch)}")
+    print(f"  {local_profile_status(args.home)}")
     print(f"  {command_guard_status(args.command_guard)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")

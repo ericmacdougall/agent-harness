@@ -419,12 +419,19 @@ func (a *app) close() {
 	for _, c := range a.clients {
 		clients = append(clients, c)
 	}
+	var runs []*claudeRun
 	for _, s := range append(append([]*session{}, a.sessions...), a.reviews...) {
 		if s.claude != nil {
 			s.claude.cancel()
+			runs = append(runs, s.claude)
 		}
 	}
 	a.mu.Unlock()
+	// The process exits right after close, so a group that ignores the polite
+	// signal must be killed before we return, not on a goroutine that may never run.
+	for _, run := range runs {
+		run.waitStopped(300 * time.Millisecond)
+	}
 	for _, c := range clients {
 		c.close()
 	}

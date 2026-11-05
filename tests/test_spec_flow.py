@@ -23,6 +23,7 @@ from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
+os.environ["AGENT_HARNESS_POLICY_LOCAL"] = str(Path(__file__).resolve().parent / "data" / "policy_profile_fixture.json")  # hermetic profile (GoodQA #14538)
 import provenance  # noqa: E402
 sys.path.insert(0, str(HOOKS))
 import commit_policy as cp  # noqa: E402
@@ -33,7 +34,7 @@ sys.path.insert(0, str(HOOKS.parent.parent))
 import install  # noqa: E402
 
 ISSUE = "4e8e73fb-72e2-4604-bff5-56b75e4420f5"
-PROJECT = "75ebadd3-9b4c-4b8c-bc86-9a4c1cbd3a53"
+PROJECT = "00000000-0000-4000-8000-0000000000a1"
 SPEC = """# Spec: Done gate
 
 Ticket: GoodQA harness#168
@@ -250,6 +251,9 @@ class SpecFlowCase(unittest.TestCase):
                            org_id="org-1", timeout_seconds=5, total_deadline_seconds=30)
         self.policy["ticket_systems"]["goodqa"] = self.config
         self.spec_policy = sf.load_spec_policy(HOOKS / "spec_policy.json")
+        # The tracked policy names no projects (personal values live in spec_policy.local.json), so the tests carry
+        # their own fixture route for the one project they exercise.
+        self.spec_policy["projects"] = {"harness": {"project_id": PROJECT, "org_id": "00000000-0000-4000-8000-000000000001"}}
         loader = lambda _sp: (cp, self.policy, self.config)  # noqa: E731
         self.patches.append(mock.patch.object(sf, "ticket_config", loader))
         self.patches.append(mock.patch.object(sf, "load_spec_policy", lambda *a: self.spec_policy))
@@ -1168,7 +1172,7 @@ class HookDeadline(SpecFlowCase):
 
 
 class PlanGate(SpecFlowCase):
-    def repo(self, origin="https://github.com/ericmacdougall/agent-harness.git"):
+    def repo(self, origin="https://github.com/example-org/agent-harness.git"):
         repo = Path(tempfile.mkdtemp(dir=self.tmp))
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", origin], check=True)
