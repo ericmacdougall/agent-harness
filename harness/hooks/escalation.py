@@ -115,7 +115,8 @@ def classify(receipt, *, kind, claimed_heads=()):
         if receipt.get('result') == 'CHECK_OK':
             return 'PASS', 'tests green', None
         if reason == 'CODE_FINDINGS' and head and head in set(claimed_heads):
-            return 'FAIL', 'tests red at the same HEAD after a claimed fix', fingerprint(['tests', head, 'red'])
+            invocation = (receipt.get('invocation') or {}).get('fingerprint') or 'unknown-invocation'
+            return 'FAIL', 'tests red at the same HEAD after a claimed fix', fingerprint(['tests', invocation, 'red'])
         if reason == 'CODE_FINDINGS':
             return 'NOT_COUNTED', 'tests red but no claimed fix at this HEAD', None
         return 'NOT_COUNTED', 'result %s/%s' % (receipt.get('result'), reason), None
@@ -234,11 +235,44 @@ class Ledger:
         os.replace(temporary, path)
         os.chmod(path, 0o600)
 
+    def pending_reset(self, task, code, detail):
+        """Record a reset that could not take the lock (lock_timeout) in a lock-free O_APPEND side file."""
+        record = {'at': now(), 'code': code, 'prior_state_sha256': None, 'preserved_copy': None, 'detail': detail,
+                  'pending': True}
+        path = self.root / (task + '.pending-resets.jsonl')
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, sort_keys=True) + '\n')
+        self._notify(task, 'reset', record, None)
+        return record
+
+    def _absorb_pending(self, task, state):
+        path = self.root / (task + '.pending-resets.jsonl')
+        if not path.exists():
+            return False
+        try:
+            lines = path.read_text(encoding='utf-8').splitlines()[:256]
+        except OSError:
+            return False
+        absorbed = False
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record not in state['resets']:
+                state['resets'].append(record); absorbed = True
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return absorbed
+
     def load(self, task):
         fd = self._lock(task)
         try:
             state, reset = self._read(task)
-            if reset is not None:
+            if self._absorb_pending(task, state) or reset is not None:
                 self._write(task, state)
             return state
         finally:
@@ -256,6 +290,7 @@ class Ledger:
         fd = self._lock(task)
         try:
             state, reset = self._read(task)
+            self._absorb_pending(task, state)
             if any(event.get('receipt_sha256') == sha for event in state['events']):
                 status = ladder_status(state, self.policy)
                 status['replayed'] = True
@@ -273,6 +308,11 @@ class Ledger:
                      'rung_at': before['rung']}
             if kind == 'review' and klass != 'NOT_COUNTED':
                 state['launches'] = state.get('launches', 0) + 1
+                # Until helpers report real cost, each counted launch spends the rung's review budget
+                # as a conservative upper bound so the ceiling has effect.
+                rung_now = before['rung']
+                budget = self.policy['rungs'][rung_now].get('review_budget_usd') or 0
+                state['spend_usd'] = round(float(state.get('spend_usd', 0.0)) + float(budget), 4)
             state['events'].append(event)
             after = rung_of(state['events'], self.policy)
             if after['rung'] != before['rung']:
@@ -400,8 +440,12 @@ def verify_ask_pair(wal, ask_id, task):
     if ask is None or resolved is None:
         raise LedgerError('unclassifiable_evidence', 'no ask/ask_resolved pair for ' + ask_id)
     source = str(ask.get('source') or '')
-    if not source.startswith('user:') or task not in (ask.get('note') or ''):
-        raise LedgerError('unclassifiable_evidence', 'ask is not user-sourced or does not name the task')
+    note = str(ask.get('note') or '')
+    if not source.startswith('user:') or not re.search(r'\[task:' + re.escape(task) + r'\]', note):
+        raise LedgerError('unclassifiable_evidence', 'ask is not user-sourced or does not name [task:%s]' % task)
+    resolution = str(resolved.get('note') or '')
+    if resolved.get('decision') != 'approved' and not re.match(r'\s*approved\b', resolution, re.I):
+        raise LedgerError('unclassifiable_evidence', 'ask_resolved does not record an approval for ' + ask_id)
     return {'source': source, 'ask': ask_id}
 
 

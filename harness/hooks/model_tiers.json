@@ -5,7 +5,7 @@
   "top_writing_rung": "R5",
   "failures_per_rung": 2,
   "unknown_author_reviewer_rung": "R1",
-  "ladder_limits": {"max_review_launches": 8, "max_rung_climbs": 2, "max_total_review_usd": 60},
+  "ladder_limits": {"max_review_launches": 8, "max_rung_climbs": 3, "max_total_review_usd": 60},
   "preferred_review_harness": {"claude": "openai", "openai": "claude", "unknown": "openai"},
   "rungs": {
     "R0": {"effort": "medium", "effort_any": true, "writable": true, "reviewer_rung": "R1", "needs_user_permission": false, "ultracode": false, "review_budget_usd": 5, "timeout_minutes": 15,
@@ -35,6 +35,7 @@
       "astra": {"aliases": [], "id_pattern": "^gpt-[0-9.]+-astra$", "rung_by_effort": {"low": "R5", "medium": "R5", "high": "R6", "xhigh": "R6", "max": "R6"}}
     }
   },
+  "caps": {"session_live_agents": 40, "live_ttl_seconds": 1800},
   "default_effort": "medium",
   "efforts": ["low", "medium", "high", "xhigh", "max"]
 }

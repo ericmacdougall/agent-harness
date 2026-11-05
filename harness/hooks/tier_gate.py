@@ -63,30 +63,39 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
     facts = {'reviewer_spawn': is_reviewer, 'subagent_type': subagent_type}
     task = esc.task_key_from(prompt, description)
     resets = []
-    if task is None:
+    generated = task is None
+    if generated:
+        # A stable generated key: the first sighting is a recorded reset; later spawns reuse its ledger
+        # so failures keep counting (never wiped on every spawn).
         task = esc.generated_key(session_id or '', description or prompt[:200])
-        resets.append(('missing_task_key', 'spawn carried no [task:<key>] token; generated ' + task))
+        if not ledger.path(task).exists():
+            resets.append(('missing_task_key', 'spawn carried no [task:<key>] token; generated ' + task))
     facts['task'] = task
+    status = None
     try:
         status = ledger.status(task)
-        state = ledger.load(task)
-        if state.get('resets') and not state.get('generated_key') and task.startswith('auto-'):
-            pass
     except esc.LedgerError as error:
-        resets.append((error.code if error.code in esc.RESET_CODES else 'state_corrupt', error.message))
-        status = None
+        code = error.code if error.code in esc.RESET_CODES else 'state_corrupt'
+        if code == 'lock_timeout':
+            try: ledger.pending_reset(task, code, error.message)
+            except OSError: pass
+            facts['reset'] = ['lock_timeout']
+        else:
+            resets.append((code, error.message))
     except tiers.TierError as error:
         resets.append(('tier_table_error', str(error)))
-        status = None
     lowest = policy['lowest_rung']
-    if status is None or resets:
+    if resets:
         for code, detail in resets:
             try:
                 status = ledger.reset(task, code, detail)
             except (esc.LedgerError, tiers.TierError):
                 status = None
-        required = lowest
         facts['reset'] = [code for code, _ in resets]
+    if status is None or resets or facts.get('reset') == ['lock_timeout']:
+        required = lowest
+        if generated and status is not None and not resets:
+            required = status['rung']  # a known generated key keeps its earned rung
     else:
         required = status['rung']
     facts['required_rung'] = required
@@ -100,6 +109,10 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
     requested = requested_spec(tool_input, policy)
     facts['requested'] = requested
     blocked = status['blocked_by'] if status else []
+    # The user's own stop comes first: a computed rung that needs permission is reported as such even
+    # when the launch or spend ceilings are reached at the same time.
+    if not is_reviewer and policy['rungs'][target_rung]['needs_user_permission'] and not (status or {}).get('permission'):
+        return 'deny', 'task %s reached rung %s, which needs the user permission recorded by escalation.py approve-top' % (task, target_rung), None, facts
     if blocked and not is_reviewer:
         return 'deny', 'ladder limit reached for task %s (%s): human sign-off needed' % (task, ', '.join(blocked)), None, facts
     if requested is None:
@@ -127,7 +140,7 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
     return 'allow', 'requested %s %s is above rung %s; downgraded' % (requested['model'], requested['effort'], target_rung), updated, facts
 
 
-LAUNCH = re.compile(r'(^|[\s;&|(])(claude|codex|rescue\.py)(\s|$)')
+LAUNCH = re.compile(r'(^|[\s;&|(/])(claude|codex|rescue\.py)(\s|$)')
 
 
 def decide_bash(data, policy, ledger):
@@ -154,15 +167,22 @@ def decide_bash(data, policy, ledger):
     requested = tiers.classify(model, effort, policy)
     if requested is None:
         return 'deny', 'launch names a model not on the tier table: ' + model, None, facts
+    entry = policy['rungs'][requested['rung']]
+    status = None
+    if task is not None:
+        try:
+            status = ledger.status(task)
+        except (esc.LedgerError, tiers.TierError) as error:
+            facts['ladder_error'] = getattr(error, 'code', 'error')
+    # Permission and review-only checks come first: no task means no recorded permission.
+    if entry['needs_user_permission'] and not (status or {}).get('permission'):
+        return 'deny', 'launch at %s needs recorded user permission for task %s' % (requested['rung'], task or '(none)'), None, facts
+    if not entry['writable'] and 'rescue.py' in command:
+        return 'deny', 'rescue at %s is review-only' % requested['rung'], None, facts
     if task is None:
         return 'allow', 'launch without --task: lowest rung applies', None, facts
-    try:
-        status = ledger.status(task)
-    except (esc.LedgerError, tiers.TierError) as error:
-        return 'allow', 'ladder state unreadable (%s): lowest rung applies' % getattr(error, 'code', 'error'), None, facts
-    entry = policy['rungs'][requested['rung']]
-    if entry['needs_user_permission'] and not status.get('permission'):
-        return 'deny', 'launch at %s needs recorded user permission for task %s' % (requested['rung'], task), None, facts
+    if status is None:
+        return 'allow', 'ladder state unreadable (%s): lowest rung applies' % facts.get('ladder_error', 'error'), None, facts
     order = tiers.rung_order(policy)
     if order.index(requested['rung']) > order.index(status['rung']) and 'rescue.py' not in command:
         return 'deny', 'launch at %s is above task %s rung %s' % (requested['rung'], task, status['rung']), None, facts
@@ -183,6 +203,7 @@ def live_update(session_id, agent_id, *, start):
     except (OSError, ValueError):
         live = {}
     key = str(agent_id or 'unknown')
+    live = _expire_live(live)
     if start:
         live[key] = esc.now()
     else:
@@ -192,11 +213,25 @@ def live_update(session_id, agent_id, *, start):
     return len(live)
 
 
+def _expire_live(live, ttl=None):
+    """Drop entries older than the TTL (default 30 minutes): a crashed agent never stops."""
+    from datetime import datetime, timedelta, timezone
+    ttl = ttl if ttl is not None else int(tiers.load_policy().get('caps', {}).get('live_ttl_seconds', 1800))
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=ttl)
+    kept = {}
+    for key, at in live.items():
+        try:
+            if datetime.fromisoformat(str(at)) >= cutoff: kept[key] = at
+        except ValueError:
+            continue
+    return kept
+
+
 def live_count(session_id):
     path = live_path(session_id)
     try:
         live = json.loads(path.read_text()) if path.exists() else {}
-        return len(live) if isinstance(live, dict) else 0
+        return len(_expire_live(live)) if isinstance(live, dict) else 0
     except (OSError, ValueError):
         return 0
 

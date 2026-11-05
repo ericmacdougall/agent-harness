@@ -75,9 +75,18 @@ class SpawnDecisions(GateFixture):
         decision, reason, updated, facts = self.spawn('review it [task:k3]', model='opus', effort='max', subagent_type='red-team')
         self.assertEqual(decision, 'allow'); self.assertEqual(facts['reviewer_rung'], 'R4')
 
+    def test_opus_xhigh_is_reachable_and_the_fourth_climb_asks_the_user(self):
+        # Six FAILs on one finding: R0 -> R1 -> R2 -> R3, all automatic; an opus xhigh writer is allowed.
+        for _ in range(3): self.escalate('k12')
+        decision, reason, updated, facts = self.spawn('do it [task:k12]', model='opus', effort='xhigh')
+        self.assertEqual((decision, updated, facts['required_rung']), ('allow', None, 'R3'))
+        # Two more FAILs compute R5, which needs the user; the reason names approve-top, not a limit.
+        self.escalate('k12')
+        decision, reason, updated, facts = self.spawn('do it [task:k12]', model='fable')
+        self.assertEqual(decision, 'deny'); self.assertIn('approve-top', reason)
+
     def test_top_rung_is_blocked_without_user_permission_and_allowed_with_it(self):
-        # Reaching R5 takes four climbs, which the default ladder limits block first (that is the point of
-        # the limits); raise them here to exercise the permission gate itself.
+        # The launch and spend ceilings are raised so the permission gate itself is exercised.
         self.policy = {**self.policy, 'ladder_limits': {'max_review_launches': 100, 'max_rung_climbs': 10, 'max_total_review_usd': 1000}}
         self.ledger = esc.Ledger(self.root, self.policy)
         for _ in range(4): self.escalate('k4')
@@ -86,9 +95,11 @@ class SpawnDecisions(GateFixture):
         self.assertEqual(decision, 'deny'); self.assertIn('approve-top', reason)
         decision, reason, updated, facts = self.spawn('do it [task:k4]', model='opus', effort='xhigh')
         self.assertEqual(decision, 'deny')  # the computed rung needs permission; nothing is minted below it silently
+        # The spend ceiling counts each counted launch at the rung's review budget (conservative).
+        self.assertGreater(self.ledger.load('k4')['spend_usd'], 0)
         wal = Path(self.temp.name) / 'main.jsonl'
-        wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'fable for task k4', 'source': 'user:s/u "yes use fable for k4"'}) + '\n'
-                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1'}) + '\n')
+        wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'fable for [task:k4]', 'source': 'user:s/u "yes use fable for k4"'}) + '\n'
+                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'approved by the user'}) + '\n')
         self.ledger.approve_top('k4', 'w1', wal)
         decision, reason, updated, facts = self.spawn('do it [task:k4]', model='fable')
         self.assertEqual(decision, 'allow')
@@ -112,6 +123,12 @@ class Resets(GateFixture):
         self.assertEqual(state['resets'][-1]['code'], 'missing_task_key')
         again = self.spawn('no key at all', model='sonnet')
         self.assertEqual(again[3]['task'], facts['task'])  # the generated key is stable, so later failures count
+        self.assertNotIn('reset', again[3])  # a known generated key is loaded, never wiped again
+        self.escalate(facts['task'])
+        later = self.spawn('no key at all', model='opus', effort='medium')
+        self.assertEqual((later[0], later[1] and 'matches' in later[1], later[3]['required_rung']), ('allow', True, 'R1'))
+        self.assertEqual(len(self.ledger.load(facts['task'])['events']), 2)
+        self.assertEqual(len(list(self.root.glob(facts['task'] + '.reset.*'))), 0)
 
     def test_corrupt_state_resets_and_never_reaches_top(self):
         for _ in range(4): self.escalate('k6')
@@ -123,11 +140,26 @@ class Resets(GateFixture):
         self.assertEqual(facts['required_rung'], 'R0')
         self.assertEqual(self.ledger.load('k6')['resets'][-1]['code'], 'state_corrupt')
 
-    def test_lock_timeout_resets_to_lowest(self):
-        with mock.patch.object(esc.Ledger, 'status', side_effect=esc.LedgerError('lock_timeout', 'busy')):
-            decision, reason, updated, facts = self.spawn('do it [task:k7]', model='opus', effort='high')
+    def test_lock_timeout_resets_to_lowest_with_a_durable_record(self):
+        import fcntl
+        self.escalate('k7')
+        holder = os.open(self.root / 'k7.lock', os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        try:
+            with mock.patch.object(esc, 'LOCK_SECONDS', 0.2):
+                decision, reason, updated, facts = self.spawn('do it [task:k7]', model='opus', effort='high')
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN); os.close(holder)
         self.assertEqual(decision, 'allow'); self.assertEqual(updated['model'], 'sonnet')
-        self.assertIn('lock_timeout', facts['reset'])
+        self.assertEqual(facts['reset'], ['lock_timeout'])
+        pending = (self.root / 'k7.pending-resets.jsonl').read_text().splitlines()
+        self.assertEqual(json.loads(pending[-1])['code'], 'lock_timeout')
+        notes = [json.loads(l) for l in (self.root / 'notifications.jsonl').read_text().splitlines()]
+        self.assertEqual(notes[-1]['code'], 'lock_timeout')
+        # The next successful load absorbs the pending record into the state and keeps the earned rung.
+        state = self.ledger.load('k7')
+        self.assertEqual(state['resets'][-1]['code'], 'lock_timeout'); self.assertFalse((self.root / 'k7.pending-resets.jsonl').exists())
+        self.assertEqual(self.ledger.status('k7')['rung'], 'R1')
 
     def test_tier_table_error_fails_closed_at_the_hook_entry(self):
         with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, {'AGENT_HARNESS_TIER_POLICY': str(Path(temp) / 'none.json')}):
@@ -150,6 +182,12 @@ class BashAdvisory(GateFixture):
         self.assertEqual(self.bash('codex exec --model gpt-6.1-sol -c model_reasoning_effort=high --task k9 -')[0], 'allow')
         self.assertEqual(self.bash('codex exec --model gpt-6-astra --task k9 -')[0], 'deny')
         self.assertEqual(self.bash('claude -p --model gpt-4o --task k9 x')[0], 'deny')
+        # No --task means no recorded permission: the top tier is denied, also through a path or rescue.py.
+        self.assertEqual(self.bash('claude -p --model fable "x"')[0], 'deny')
+        self.assertEqual(self.bash('codex exec --model gpt-6-astra -')[0], 'deny')
+        self.assertEqual(self.bash('/opt/homebrew/bin/claude -p --model fable --task k9 x')[0], 'deny')
+        self.assertEqual(self.bash('python3 ~/.claude/hooks/rescue.py --repo r --packet p --output o --model fable --rung R5')[0], 'deny')
+        self.assertEqual(self.bash('python3 ~/.claude/hooks/rescue.py --repo r --packet p --output o --model opus --effort max')[0], 'deny')
         self.assertEqual(self.bash('python3 rescue.py --repo r --packet p --output o --model opus --effort xhigh --task k9')[0], 'allow')
         self.assertEqual(self.bash('claude -p --model opus "no task"')[0], 'allow')
 

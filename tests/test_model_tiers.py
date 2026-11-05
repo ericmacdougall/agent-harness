@@ -29,7 +29,8 @@ class TableShape(unittest.TestCase):
         self.assertEqual([rungs[r]['reviewer_rung'] for r in ('R0', 'R1', 'R2', 'R3', 'R4', 'R5', 'R6')],
                          ['R1', 'R2', 'R3', 'R4', None, 'R6', None])
         self.assertEqual(self.policy['unknown_author_reviewer_rung'], 'R1')  # user decision Q1
-        self.assertEqual(self.policy['ladder_limits'], {'max_review_launches': 8, 'max_rung_climbs': 2, 'max_total_review_usd': 60})
+        # Three automatic climbs (R0 -> R1 -> R2 -> R3); the fourth needs the user (cost numbers are assumptions).
+        self.assertEqual(self.policy['ladder_limits'], {'max_review_launches': 8, 'max_rung_climbs': 3, 'max_total_review_usd': 60})
         self.assertEqual(self.policy['mode'], 'warn')
 
     def test_next_writing_rung_skips_review_only_rungs_and_stops_at_top(self):
@@ -129,12 +130,14 @@ class Selection(unittest.TestCase):
             self.assertIsNone(choice['rung']); self.assertIn('review-only', choice['why'])
 
     def test_unavailable_harness_falls_back_to_same_harness_one_effort_up(self):
+        # "Same harness one effort up" is the reviewer rung (one above the author) on the author's harness;
+        # a writing rung that needs permission is never chosen while a review-only rung sits below it.
         choice = tiers.reviewer_for(self.policy, 'R1', 'claude', {'openai': False})
-        self.assertEqual((choice['rung'], choice['harness'], choice['effort']), ('R3', 'claude', 'xhigh'))
-        self.assertFalse(choice['cross_harness']); self.assertIn('one effort up', choice['why'])
+        self.assertEqual((choice['rung'], choice['harness'], choice['effort']), ('R2', 'claude', 'high'))
+        self.assertFalse(choice['cross_harness']); self.assertIn('one effort above the author', choice['why'])
         choice = tiers.reviewer_for(self.policy, 'R3', 'claude', {'openai': False})
-        self.assertEqual((choice['rung'], choice['harness']), ('R5', 'claude'))  # R4 reviewer, one up is R5 (needs permission)
-        self.assertTrue(choice['needs_user_permission'])
+        self.assertEqual((choice['rung'], choice['harness'], choice['effort']), ('R4', 'claude', 'max'))
+        self.assertFalse(choice['needs_user_permission']); self.assertFalse(choice['writable'])
         none = tiers.reviewer_for(self.policy, 'R0', 'claude', {'openai': False, 'claude': False})
         self.assertIsNone(none['harness']); self.assertEqual(none['rung'], 'R1')
 

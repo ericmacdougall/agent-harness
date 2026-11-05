@@ -196,13 +196,10 @@ def reviewer_for(policy, author_rung, author_harness='unknown', available=None):
     if available.get(preferred):
         chosen, cross, note = preferred, preferred != author_harness, 'cross-harness preferred'
     elif available.get(other):
+        # Same harness as the author at the reviewer rung (one effort above the author); a writing
+        # rung is never chosen as a reviewer while a review-only rung sits below it.
         chosen, cross = other, other != author_harness
-        # Same harness as the author: one effort up when the table has a higher rung on this harness.
-        above = next_rung_above(policy, rung)
-        if above is not None and author_harness == other:
-            rung, note = above, 'preferred harness unavailable: same harness one effort up'
-        else:
-            note = 'preferred harness unavailable: same harness at the reviewer rung'
+        note = 'preferred harness unavailable: same harness at the reviewer rung (one effort above the author)'
     else:
         return {'rung': rung, 'harness': None, 'model': None, 'effort': policy['rungs'][rung]['effort'],
                 'author_unknown': author_unknown, 'cross_harness': False, 'why': 'no review harness available'}

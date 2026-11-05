@@ -212,17 +212,21 @@ class Concurrency(LedgerFixture):
 
 
 class TopPermission(LedgerFixture):
-    def wal(self, *, source='user:s/u "please use fable on t13"', note='permission for task t13 top rung', resolved=True):
+    def wal(self, *, source='user:s/u "please use fable on t13"', note='permission for [task:t13] top rung', resolved=True,
+            resolution='approved: user said yes'):
         path = Path(self.temp.name) / 'main.jsonl'
         lines = [json.dumps({'id': 'wask1', 'event': 'ask', 'note': note, 'source': source})]
         if resolved:
-            lines.append(json.dumps({'id': 'wres1', 'event': 'ask_resolved', 'ref': 'wask1', 'note': 'user said yes'}))
+            lines.append(json.dumps({'id': 'wres1', 'event': 'ask_resolved', 'ref': 'wask1', 'note': resolution}))
         path.write_text('\n'.join(lines) + '\n')
         return path
 
     def test_top_needs_a_user_sourced_ask_pair_naming_the_task(self):
         for label, wal in {'unresolved': self.wal(resolved=False), 'agent-sourced': self.wal(source='wal:x#y'),
-                           'other-task': self.wal(note='permission for task other')}.items():
+                           'other-task': self.wal(note='permission for [task:other]'),
+                           'substring-task': self.wal(note='permission for [task:t13x]'),
+                           'declined': self.wal(resolution='user said NO, do not use fable'),
+                           'no-decision': self.wal(resolution='discussed')}.items():
             with self.subTest(label), self.assertRaises(esc.LedgerError):
                 self.ledger.approve_top('t13', 'wask1', wal)
         self.assertIsNone(self.ledger.status('t13')['permission'])
