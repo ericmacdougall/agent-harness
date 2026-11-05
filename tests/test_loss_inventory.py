@@ -18,7 +18,9 @@ from pathlib import Path
 REAL = Path(__file__).resolve().parents[1] / "harness" / "hooks" / "loss_inventory.py"
 SCRIPT = Path(os.environ.get("LOSS_INVENTORY_SCRIPT", REAL))
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
-           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+           # the fixtures push and clone `main`; git < 2.50 defaults to `master` unless told otherwise (dev2's 2.43 does)
+           "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "init.defaultBranch", "GIT_CONFIG_VALUE_0": "main"}
 
 
 def git(cwd, *argv):
@@ -51,7 +53,7 @@ class Fixture(unittest.TestCase):
         rtmp = tempfile.TemporaryDirectory()  # the fake remote lives off-host, outside the scanned HOME
         self.addCleanup(rtmp.cleanup)
         self.bare = Path(rtmp.name).resolve() / "remote.git"
-        subprocess.run(["git", "init", "-q", "--bare", str(self.bare)], check=True)
+        git(self.home, "init", "-q", "--bare", str(self.bare))
         self.work = self.home / "code" / "withremote"
         self.work.mkdir(parents=True)
         git(self.work, "init", "-q", "-b", "main")
@@ -134,7 +136,7 @@ class ScanTests(Fixture):
     def test_scan_never_fetches(self):
         # the real remote gets a new commit; the local view must not change (documented staleness)
         other = self.home / "other"
-        subprocess.run(["git", "clone", "-q", str(self.bare), str(other)], check=True)
+        git(self.home, "clone", "-q", str(self.bare), str(other))
         commit(other, "x")
         git(other, "push", "-q", "origin", "HEAD:main")
         before = git(self.work, "for-each-ref", "refs/remotes")
@@ -555,7 +557,7 @@ class CoverageTests(Fixture):
 
     def test_bare_repo_and_its_worktree_counted_once(self):
         bare = self.home / "bare" / "b.git"
-        subprocess.run(["git", "clone", "-q", "--bare", str(self.bare), str(bare)], check=True)
+        git(self.home, "clone", "-q", "--bare", str(self.bare), str(bare))
         git(bare, "remote", "add", "o2", str(self.bare))
         git(bare, "fetch", "-q", "o2")  # remote-tracking refs so main counts as pushed
         git(bare, "remote", "set-url", "o2", "https://remote.example.invalid/b.git")  # off-host stand-in
@@ -569,7 +571,7 @@ class CoverageTests(Fixture):
 
     def test_lone_bare_repo_without_remote_is_reported(self):
         bare = self.home / "bare2.git"
-        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        git(self.home, "init", "-q", "--bare", str(bare))
         r = self.scan()
         self.assertEqual(r["classes"]["no_remote_repo"], 2)
 
@@ -630,7 +632,32 @@ class DecideReportTests(Fixture):
     def test_malformed_last_scan_is_rejected_not_crash(self):
         self.scan()
         (self.home / ".agent-harness/state/loss-inventory/last-scan.json").write_text("[]")
-        self.assertEqual(self.run_cli("report").returncode, 2)
+        p = self.run_cli("report", expect=2)
+        self.assertIn(b"does not hold a saved scan", p.stderr)
+
+    def test_truncated_last_scan_json_is_an_error_not_a_pass(self):
+        self.scan()
+        saved = self.home / ".agent-harness/state/loss-inventory/last-scan.json"
+        saved.write_text('{"rows": [')
+        for argv in (("report",), ("report", "--json"),
+                     ("decide", "--row", str(self.db), "--decision", "moved", "--ticket", "goodqa#1")):
+            p = self.run_cli(*argv, expect=2)
+            self.assertIn(b"not valid JSON", p.stderr, argv)
+            self.assertNotIn(b"undecided", p.stdout, argv)
+
+    def test_oversized_last_scan_is_refused_without_reading_it_all(self):
+        self.scan()
+        saved = self.home / ".agent-harness/state/loss-inventory/last-scan.json"
+        limit = 64 * 1024 * 1024  # STATE_MAX_BYTES in the tool; a sparse file costs no disk
+        with open(saved, "r+b") as f:
+            f.truncate(limit + 1)
+        p = self.run_cli("report", expect=2)
+        self.assertIn(b"larger than %d bytes" % limit, p.stderr)
+        self.assertNotIn(b"undecided", p.stdout)
+        # control: exactly at the limit the file is read and judged on content (zero padding -> not JSON)
+        with open(saved, "r+b") as f:
+            f.truncate(limit)
+        self.assertIn(b"not valid JSON", self.run_cli("report", expect=2).stderr)
 
     def test_report_exit_codes_and_decide(self):
         self.assertEqual(self.run_cli("report").returncode, 2)  # no saved scan yet
