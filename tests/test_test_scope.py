@@ -572,6 +572,167 @@ class SecondReview(Tmp):
                 ts.focused_scope(str(repo), bad, "HEAD")
 
 
+class ThirdReview(Tmp):
+    """Findings of the delta review of cb4168f."""
+
+    def age(self, repo_id, name, seconds):
+        path = self.store.dir(repo_id) / name
+        rec = json.loads(path.read_text())
+        rec["at"] = time.time() - seconds
+        path.write_text(json.dumps(rec))
+
+    def test_ssh_launches_are_judged_by_the_inner_command(self):  # F1
+        for cmd, inner in (("ssh dev2 'cd r && python3 -m unittest discover -s tests'", "cd r && python3 -m unittest discover -s tests"),
+                           ("ssh -i ~/.ssh/k -p 22 dev2 make test", "make test"),
+                           ("FOO=1 ssh -o BatchMode=yes dev2 'pytest'", "pytest"), ("ssh dev2", ""), ("ls", "")):
+            self.assertEqual(ts.ssh_inner(cmd), inner, cmd)
+        self.assertTrue(ts.suite_launch("ssh dev2 'cd r && python3 -m unittest discover -s tests'", "/tmp"))
+        self.assertFalse(ts.suite_launch("ssh dev2 'uptime'", "/tmp"))
+        repo = make_repo(self.dir)
+        run(repo, "git", "checkout", "-q", "-b", "feat")
+        (repo / "harness" / "hooks" / "a.py").write_text("VALUE = 5\n")
+        run(repo, "git", "commit", "-q", "-am", "delta")
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_SCOPE_ROOT": str(self.dir / "store")}):
+            code, text = ts.hook_decision({"tool_name": "Bash", "session_id": "s", "cwd": str(repo),
+                                           "tool_input": {"command": "ssh dev2 'cd r && python3 -m unittest discover -s tests'"}},
+                                          ts.load_policy())
+        self.assertEqual(code, 2)
+        self.assertIn("[evidence]", text)
+
+    def test_unconfirmed_reservations_free_themselves_confirmed_ones_do_not(self):  # F2
+        ts.reserve_control(self.store, "r", SHA_A, "t1")
+        with self.assertRaises(ts.Refused):
+            ts.reserve_control(self.store, "r", SHA_A, "t2")
+        self.age("r", f"control-{SHA_A}.json", ts.UNCONFIRMED_TTL + 5)
+        self.assertTrue(ts.reserve_control(self.store, "r", SHA_A, "t2")["allowed"])  # t1 never started
+        self.assertTrue(ts.confirm_reservation(self.store, "r", "control", SHA_A, "t2")["confirmed"])
+        self.age("r", f"control-{SHA_A}.json", ts.UNCONFIRMED_TTL + 5)
+        with self.assertRaises(ts.Refused) as ctx:
+            ts.reserve_control(self.store, "r", SHA_A, "t3")
+        self.assertIn(f"release --kind control --key {SHA_A}", ctx.exception.message)
+
+    def test_full_reservation_lifecycle_and_release_text(self):  # F2
+        give_evidence(self.store, "r", SHA_A, self.dir)
+        ts.reserve_full(self.store, "r", SHA_A, "t1")
+        self.age("r", f"full-{SHA_A}.json", ts.UNCONFIRMED_TTL + 5)
+        self.assertTrue(ts.reserve_full(self.store, "r", SHA_A, "t2")["allowed"])
+        ts.confirm_reservation(self.store, "r", "full", SHA_A, "t2")
+        self.age("r", f"full-{SHA_A}.json", ts.UNCONFIRMED_TTL + 5)
+        with self.assertRaises(ts.Refused) as ctx:
+            ts.reserve_full(self.store, "r", SHA_A, "t3")
+        self.assertIn(f"release --kind full --key {SHA_A}", ctx.exception.message)
+        self.assertEqual(ts.confirm_reservation(self.store, "r", "full", SHA_A, "wrong")["confirmed"], False)
+
+    def test_post_hook_confirms_a_launch_that_really_ran(self):  # F2
+        repo = make_repo(self.dir)
+        run(repo, "git", "checkout", "-q", "-b", "feat")
+        (repo / "harness" / "hooks" / "a.py").write_text("VALUE = 5\n")
+        run(repo, "git", "commit", "-q", "-am", "delta")
+        head = run(repo, "git", "rev-parse", "HEAD")
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_SCOPE_ROOT": str(self.dir / "store")}):
+            rid = ts.repo_context(str(repo))["repo_id"]
+            give_evidence(self.store, rid, head, self.dir)
+            payload = {"tool_name": "Bash", "session_id": "s1", "agent_id": "a1", "cwd": str(repo),
+                       "tool_input": {"command": FULL_CMD}}
+            self.assertEqual(ts.hook_decision(payload, ts.load_policy()), (0, ""))
+            rec = self.store.read(rid, f"full-{head}.json", {"repo_id": rid, "head": head, "kind": "full"})
+            self.assertFalse(rec.get("confirmed"))
+            ts.post_decision(payload, ts.load_policy())
+            rec = self.store.read(rid, f"full-{head}.json", {"repo_id": rid, "head": head, "kind": "full"})
+            self.assertTrue(rec["confirmed"])
+            ts.post_decision({**payload, "session_id": "", "agent_id": ""}, ts.load_policy())  # anonymous: ignored
+
+    def test_post_hook_entry_point_fails_open(self):  # F2
+        for raw in ("not json", "", "[1]"):
+            r = subprocess.run([sys.executable, "-I", str(HOOKS / "test_scope.py"), "post"], input=raw, capture_output=True,
+                               text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, raw)
+
+    def test_guarded_reservation_that_never_starts_frees_itself_and_confirm_pins_it(self):  # F3
+        ts.guarded_full_start(SHA_A, "usage_guard:o1", root=self.store.root)
+        with self.assertRaises(ts.Refused):
+            ts.guarded_full_start(SHA_A, "usage_guard:o2", root=self.store.root)
+        self.age("_guarded", f"full-{SHA_A}.json", ts.UNCONFIRMED_TTL + 5)
+        ts.guarded_full_start(SHA_A, "usage_guard:o2", root=self.store.root)  # o1's start failed after reserving
+        ts.guarded_full_confirm(SHA_A, "usage_guard:o2", root=self.store.root)
+        self.age("_guarded", f"full-{SHA_A}.json", ts.UNCONFIRMED_TTL + 5)
+        with self.assertRaises(ts.Refused):
+            ts.guarded_full_start(SHA_A, "usage_guard:o3", root=self.store.root)
+
+    def test_hook_reservation_is_adopted_only_moments_after_it_was_made(self):  # F4
+        give_evidence(self.store, "r", SHA_A, self.dir)
+        ts.reserve_full(self.store, "r", SHA_A, "hook-owner-A")
+        self.age("r", f"full-{SHA_A}.json", ts.ADOPT_S + 5)
+        with self.assertRaises(ts.Refused):  # another owner's later launch is a duplicate, not the same launch
+            ts.guarded_full_start(SHA_A, "usage_guard:B", root=self.store.root)
+
+    def test_ssh_hop_is_marked_local_and_cli_obeys_it(self):  # F5
+        seen = []
+
+        def fake_run(cmd, **kw):
+            seen.append(cmd[-1])
+            return subprocess.CompletedProcess(cmd, 0, stdout='{"ok": true}', stderr="")
+        with mock.patch.object(subprocess, "run", fake_run):
+            ts.run_remote("dev2", ["control", "--repo-id=r"], 8)
+        self.assertIn("test_scope.py --local control", seen[0])
+        with mock.patch.object(ts, "store_is_remote", return_value=True), mock.patch.object(ts, "run_remote") as rr:
+            code, data = ts.cli(["--local", "--root", str(self.dir / "s"), "baseline-get", "--repo-id", "r",
+                                 "--main-sha", SHA_A], capture=True)
+        self.assertEqual(code, 1)
+        rr.assert_not_called()
+
+    def test_guarded_path_creates_no_store_on_a_non_store_host(self):  # F6
+        root = self.dir / "should-not-exist"
+        policy = ts.load_policy()
+        with mock.patch.object(ts, "store_is_remote", return_value=True):
+            ts.guarded_full_start(SHA_A, "usage_guard:o1")
+            ts.guarded_full_confirm(SHA_A, "usage_guard:o1")
+        self.assertFalse(root.exists())
+        self.assertFalse((Path.home() / ".agent-harness" / "test-scope" / "_guarded" / f"full-{SHA_A}.json").exists())
+
+    def test_real_peer_review_header_with_a_note_line_is_accepted(self):  # F8
+        packet = self.dir / "p.md"
+        packet.write_bytes(PACKET_BYTES)
+        header = (f"Reviewer: codex\nStage: code-inspection\nReviewed HEAD: {SHA_A}\nReviewed packet SHA-256: {PACKET_SHA}\n"
+                  "Review input: isolated committed snapshot (depth 1)\nWorktree status: clean\n")
+        for note in ("", "note: second reviewer unavailable"):
+            path = self.dir / "r.txt"
+            path.write_text(f"{header}{note}\nCODE_INSPECTION_RESULT: ACCEPT\nbody\n")
+            self.assertEqual(len(ts.validate_report(SHA_A, path, packet)), 64, repr(note))
+        path.write_text(f"{header}\nsome preamble\nCODE_INSPECTION_RESULT: ACCEPT\n")
+        with self.assertRaises(ts.Refused):
+            ts.validate_report(SHA_A, path, packet)
+
+    def test_repo_id_credentials_with_an_at_sign_and_ports(self):  # F7
+        for url in ("https://u:p@ss@github.com/o/r", "https://u:p%40ss@github.com/o/r.git"):
+            rid = ts.repo_id_for(url, "")
+            self.assertNotIn("ss-github", rid)
+            self.assertNotIn("u-p", rid)
+        self.assertEqual(ts.repo_id_for("ssh://git@github.com:22/o/r.git", ""), ts.repo_id_for("git@github.com:o/r", ""))
+
+    def test_package_qualified_imports_select_dependents(self):  # F7
+        repo = make_repo(self.dir)
+        (repo / "harness" / "hooks" / "core.py").write_text("V = 1\n")
+        (repo / "tests" / "test_other.py").write_text("from harness.hooks.core import V\n")
+        (repo / "tests" / "test_other2.py").write_text("from harness.hooks import core\n")
+        (repo / "tests" / "test_other3.py").write_text("import harness.hooks.core as c\n")
+        run(repo, "git", "add", "-A")
+        run(repo, "git", "commit", "-q", "-m", "core")
+        base = run(repo, "git", "rev-parse", "HEAD")
+        (repo / "harness" / "hooks" / "core.py").write_text("V = 2\n")
+        run(repo, "git", "commit", "-q", "-am", "change core")
+        out = ts.focused_scope(str(repo), base, run(repo, "git", "rev-parse", "HEAD"))
+        self.assertTrue({"test_other", "test_other2", "test_other3"} <= set(out["tests"]), out["tests"])
+
+    def test_installer_registers_the_post_hook(self):  # F2
+        import install
+        hooks = install.managed_hooks(Path("/h/.claude"), True)
+        groups = [g for g in hooks.get("PostToolUse", []) if "test_scope.py" in json.dumps(g)]
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["matcher"], "Bash")
+        self.assertIn('"post"', json.dumps(groups[0]))
+
+
 class Cli(Tmp):
     def test_cli_round_trip_and_exit_codes(self):
         def cli(*args):

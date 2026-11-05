@@ -566,11 +566,14 @@ class UsageStore:
         return True
 
     @staticmethod
-    def _one_full_per_head(head, owner):
-        """Rule B6 (test_scope.py): one full run per head. Fails open when no store is reachable."""
+    def _one_full_per_head(head, owner, confirm=False):
+        """Rule B6 (test_scope.py): one full run per head. The first call reserves (a reservation nobody confirms frees
+        itself in ten minutes); the call after the start record is published confirms it. Fails open without a store."""
         try:
             import test_scope
-            test_scope.guarded_full_start(head, 'usage_guard:' + str(owner))
+            test_scope.guarded_full_start(head, 'usage_guard:' + str(owner), confirm=confirm)
+            if confirm:
+                test_scope.guarded_full_confirm(head, 'usage_guard:' + str(owner))
         except test_scope.Refused as refused:
             raise GuardError('INPUT_CHANGED', refused.message)
         except Exception:  # noqa: BLE001 - no store, bad head: not this guard's job
@@ -645,7 +648,7 @@ class UsageStore:
             remaining = aggregate_timeout - spent
             if remaining <= 0:
                 raise GuardError('BUDGET_EXHAUSTED', 'Declared aggregate execution budget is exhausted')
-            if kind == 'full' and isinstance(subject.get('head'), str):  # last check: nothing after it can fail and leak it
+            if kind == 'full' and isinstance(subject.get('head'), str):  # unconfirmed until the start record is published
                 self._one_full_per_head(subject['head'], owner)
             run_id = secrets.token_hex(16)
             directory = self._directory(self._run_directory(run_id))
@@ -664,6 +667,8 @@ class UsageStore:
         if resource_reason != 'NONE':
             final = run.finish(execution='NOT_STARTED', result='NO_RESULT', reason=resource_reason)
             raise GuardError(resource_reason, 'Resource preflight prevented command launch', final)
+        if kind == 'full' and isinstance(subject.get('head'), str):  # the run really starts: the reservation now counts
+            self._one_full_per_head(subject['head'], owner, confirm=True)
         return run
 
     def _pool(self, provider, pool):

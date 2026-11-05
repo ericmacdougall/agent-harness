@@ -49,6 +49,8 @@ MAX_RECORD = 65_536
 MAX_REPORT = 1_000_000
 CONTROL_TTL = 6 * 3600
 FULL_TTL = 12 * 3600
+UNCONFIRMED_TTL = 600  # a reservation nobody confirmed (denied, never started) frees itself after 10 minutes
+ADOPT_S = 60  # usage_guard adopts the hook reservation of the launch that started it, not an older one
 IDEMPOTENT_S = 120  # the same owner re-sending a launch within this window is a retry, later it is a duplicate
 SAFE_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -64,6 +66,12 @@ class Refused(Exception):
 
 def now() -> float:
     return time.time()
+
+
+def live(record: dict, confirmed_ttl: int) -> bool:
+    """A reservation counts while it is fresh: the full TTL once confirmed, ten minutes before."""
+    ttl = confirmed_ttl if record.get("confirmed") else UNCONFIRMED_TTL
+    return now() - record.get("at", 0) < ttl
 
 
 def safe(value: str, what: str) -> str:
@@ -180,11 +188,12 @@ def reserve_control(store: Store, repo_id: str, main_sha: str, token: str) -> di
             raise Refused("baseline-exists", "a baseline for this main SHA is already recorded: reuse it", record=recorded)
         name = f"control-{main_sha}.json"
         held = store.read(repo_id, name, {"repo_id": repo_id, "main_sha": main_sha, "kind": "control"})
-        if held and held.get("state") == "reserved" and now() - held.get("at", 0) < CONTROL_TTL:
+        if held and held.get("state") == "reserved" and live(held, CONTROL_TTL):
             if held.get("token") == token and now() - held.get("at", 0) < IDEMPOTENT_S:
                 return {"allowed": True, "idempotent": True, "reservation": held}
             raise Refused("control-in-flight", "another owner is already running the main control for this SHA: wait "
-                          "for its baseline instead of starting a second one", record=held)
+                          "for its baseline instead of starting a second one (if that run never started: "
+                          f"test_scope.py release --kind control --key {main_sha} --reason <10+ characters>)", record=held)
         record = base_record(repo_id, kind="control", main_sha=main_sha, token=token, state="reserved")
         store.write(repo_id, name, record)
         return {"allowed": True, "idempotent": False, "reservation": record}
@@ -210,7 +219,12 @@ def validate_report(head: str, report: Path, packet: Path) -> str:
     if report.is_symlink() or not report.is_file() or report.stat().st_size > MAX_REPORT:
         raise Refused("bad-evidence", "the review report is missing, not a regular file or too large")
     text = report.read_text(errors="replace")
-    header, _sep, body = text.partition("\n\n")
+    lines = text.splitlines()
+    status_at = next((i for i, line in enumerate(lines[:40]) if line.startswith("Worktree status: ")), -1)
+    # peer_review writes the header, then one note line (possibly empty), then the verdict
+    verdict_at = next((i for i in range(status_at + 1, min(status_at + 3, len(lines))) if status_at >= 0
+                       and re.match(r"^(CODE_INSPECTION_RESULT|PLAN_RESULT|VERDICT): ", lines[i])), -1)
+    header, body = "\n".join(lines[:max(status_at + 1, 0)]), (lines[verdict_at] if verdict_at >= 0 else "")
     fields = parse_report(header)
     problems = []
     if fields.get("Stage") != "code-inspection":
@@ -264,14 +278,14 @@ def reserve_full(store: Store, repo_id: str, head: str, token: str, focused: lis
             if repo_id != "_guarded" else None  # a run reserved through usage_guard counts too
         for other in (guarded, held):
             if other and other.get("state") != "released":
-                fresh = now() - other.get("at", 0) < FULL_TTL
+                fresh = live(other, FULL_TTL)
                 if other.get("state") == "finished" or fresh:
                     if (other is held and other.get("token") == token and other.get("state") == "reserved"
                             and now() - other.get("at", 0) < IDEMPOTENT_S):
                         return {"allowed": True, "idempotent": True, "reservation": other}
                     raise Refused("duplicate-full", "a full run for this head was already started or finished (one full "
-                                  "run per head); read its result, or release it if it was an infrastructure failure: test_scope.py release "
-                                  "--kind full --key <head> --reason <10+ characters>", record=other)
+                                  f"run per head); read its result, or release it if it never ran or was an infrastructure failure: test_scope.py "
+                                  f"release --kind full --key {head} --reason <10+ characters>", record=other)
         record = base_record(repo_id, kind="full", head=head, token=token, state="reserved", source=source)
         store.write(repo_id, name, record)
         return {"allowed": True, "idempotent": False, "reservation": record}
@@ -305,29 +319,68 @@ def release(store: Store, repo_id: str, kind: str, key: str, reason: str) -> dic
         return held
 
 
-def guarded_full_start(head: str, token: str, root=None) -> None:
+def confirm_reservation(store: Store, repo_id: str, kind: str, key: str, token: str) -> dict:
+    """The launch really happened (PostToolUse, or usage_guard after its start record is published): the reservation
+    now counts for its full TTL instead of expiring in ten minutes."""
+    full_sha(key, "key")
+    name, field = (f"control-{key}.json", "main_sha") if kind == "control" else (f"full-{key}.json", "head")
+    with store.lock(repo_id):
+        held = store.read(repo_id, name, {"repo_id": repo_id, field: key, "kind": kind})
+        if not held or held.get("state") != "reserved" or held.get("token") != token:
+            return {"confirmed": False}
+        held.update(confirmed=True, confirmed_at=now())
+        store.write(repo_id, name, held)
+        return {"confirmed": True}
+
+
+def _guarded_store(root):
+    policy = load_policy()
+    if store_is_remote(policy, root):
+        return None  # not the store host: no private store here, the guarded path fails open
+    return Store(root or os.environ.get("HARNESS_TEST_SCOPE_ROOT") or policy["root"])
+
+
+def guarded_full_start(head: str, token: str, root=None, confirm: bool = False) -> None:
     """usage_guard's kind=full path: refuse a head whose full run already finished or is in flight under another
-    guarded owner, and reserve it. A reservation the PreToolUse hook made for this same launch is adopted. Local store
-    only (dev2/T2 or HARNESS_TEST_SCOPE_ROOT); the caller treats OSError as 'no store here' and proceeds (fail open)."""
+    guarded owner, and reserve it (unconfirmed, so a start that fails later frees itself in ten minutes; call
+    guarded_full_confirm once the start record is published). A reservation the PreToolUse hook made seconds ago for
+    this same launch is adopted. Only on the store host; elsewhere it does nothing (fail open)."""
     full_sha(head, "head")
-    store = Store(root or os.environ.get("HARNESS_TEST_SCOPE_ROOT") or load_policy()["root"])
+    store = _guarded_store(root)
+    if store is None:
+        return
     repo_id = next((d.name for d in sorted(store.root.glob("*")) if (d / f"full-{head}.json").is_file()), "_guarded")
     with store.lock(repo_id):
         held = store.read(repo_id, f"full-{head}.json", {"repo_id": repo_id, "head": head, "kind": "full"})
         if held and held.get("state") != "released":
             if held.get("state") == "finished":
                 raise Refused("duplicate-full", "a full run for this head already finished (one full run per head); "
-                              "release it if it was an infrastructure failure", record=held)
-            if held.get("source") == "hook" and now() - held.get("at", 0) < FULL_TTL:
-                held.update(source="both", guarded_token=token)  # the hook reserved this very launch
-                store.write(repo_id, f"full-{head}.json", held)
+                              f"test_scope.py release --kind full --key {head} --reason <10+ characters> if it was an "
+                              "infrastructure failure", record=held)
+            if held.get("source") == "hook" and now() - held.get("at", 0) < ADOPT_S:
+                held.update(source="both", guarded_token=token, **({"confirmed": True} if confirm else {}))
+                store.write(repo_id, f"full-{head}.json", held)  # the hook reserved this very launch moments ago
                 return
-            if now() - held.get("at", 0) < FULL_TTL and held.get("token") != token:
+            if live(held, FULL_TTL) and held.get("token") != token:
                 raise Refused("duplicate-full", "a full run for this head was already started under another owner (one "
-                              "full run per head)", record=held)
-            return
+                              f"full run per head); test_scope.py release --kind full --key {head} --reason <10+ "
+                              "characters> if it never ran", record=held)
+            if held.get("token") == token:
+                return
         store.write(repo_id, f"full-{head}.json", base_record(repo_id, kind="full", head=head, token=token,
-                                                             state="reserved", source="guarded"))
+                                                             state="reserved", source="guarded", confirmed=confirm))
+
+
+def guarded_full_confirm(head: str, token: str, root=None) -> None:
+    full_sha(head, "head")
+    store = _guarded_store(root)
+    if store is None:
+        return
+    for d in sorted(store.root.glob("*")):
+        if (d / f"full-{head}.json").is_file():
+            held = store.read(d.name, f"full-{head}.json", {"repo_id": d.name, "head": head, "kind": "full"})
+            if held and token in (held.get("token"), held.get("guarded_token")):
+                confirm_reservation(store, d.name, "full", head, held["token"])
 
 
 # ---- focused scope for repair deltas ----------------------------------------------------------------------------
@@ -358,7 +411,11 @@ def imports_of(path: Path, known: set) -> set:
             names.add(m.group(1))
         for group in (m.group(2), m.group(3)):
             for part in (group or "").split(","):
-                names.add(re.split(r"[ \t.]", part.strip())[0])
+                names.update(re.split(r"[ \t]", part.strip())[0].split("."))
+    for m in re.finditer(r"^[ \t]*from[ \t]+((?:[A-Za-z_]\w*\.)+[A-Za-z_]\w*)[ \t]+import[ \t]+([A-Za-z_]\w*(?:[ \t]*,[ \t]*[A-Za-z_]\w*)*)",
+                         text, re.M):
+        names.update(m.group(1).split("."))
+        names.update(x.strip() for x in m.group(2).split(","))
     return names & known
 
 
@@ -427,8 +484,10 @@ def repo_id_for(url: str, fallback: str) -> str:
     slug = "repo"
     if url:
         norm = re.sub(r"^[a-z+]+://", "", url.strip().lower())
-        norm = re.sub(r"^[^@/]*@", "", norm).replace(":", "/", 1) if "@" in norm.split("/")[0] or ":" in norm.split("/")[0] \
-            else norm
+        norm = re.sub(r"^[^/]*@", "", norm)  # userinfo, even when the password contains an @
+        if ":" in norm.split("/")[0]:
+            norm = norm.replace(":", "/", 1)  # scp-style host:owner/name (a numeric port reads the same way)
+        norm = re.sub(r"^([^/]+)/(\d+)/", r"\1/", norm)
         norm = re.sub(r"\.git$", "", norm).strip("/")
         key = norm
         slug = re.sub(r"[^a-z0-9._-]+", "-", norm.replace("/", "-")).strip("-")[:60] or "repo"
@@ -473,9 +532,9 @@ def effective_cwd(command: str, cwd: str) -> str:
 
 def run_remote(host: str, args: list, timeout: int):
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}", host,
-           "python3 ~/.claude/hooks/test_scope.py " + " ".join(shlex.quote(a) for a in args)]
+           "python3 ~/.claude/hooks/test_scope.py --local " + " ".join(shlex.quote(a) for a in args)]  # --local: no hop
     try:
-        done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 4)
     except (OSError, subprocess.SubprocessError):
         return None
     try:
@@ -510,6 +569,59 @@ def deny(text: str) -> int:
     return 2
 
 
+SSH_ARG_OPTS = set("iplFJLRDbcemowOSEBIQW")
+
+
+def ssh_inner(command: str) -> str:
+    """The remote command of `ssh [options] host <command>`, or ''. The usual way to run a suite is from the Mac on dev2."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return ""
+    while words and re.match(r"^[A-Za-z_]\w*=", words[0]):
+        words.pop(0)
+    if not words or os.path.basename(words[0]) != "ssh":
+        return ""
+    i, host_seen = 1, False
+    while i < len(words):
+        w = words[i]
+        if not host_seen and w.startswith("-") and len(w) >= 2:
+            i += 2 if (w[1] in SSH_ARG_OPTS and len(w) == 2) else 1
+            continue
+        if not host_seen:
+            host_seen = True
+            i += 1
+            continue
+        return " ".join(words[i:])
+    return ""
+
+
+def suite_launch(command: str, cwd: str) -> bool:
+    """True when the command (or the command it runs over ssh) is a full-suite launch, by heavy_job_guard's rules."""
+    import heavy_job_guard as hjg
+    for text in (command, ssh_inner(command)):
+        if text and any(f[0] == "full-suite" for f in hjg.scan_state(text, cwd)[1]):
+            return True
+    return False
+
+
+def post_decision(payload: dict, policy: dict) -> None:
+    """PostToolUse: the full-suite launch really ran, so its reservation now counts for its full TTL."""
+    if payload.get("tool_name") != "Bash" or not isinstance(payload.get("tool_input"), dict):
+        return
+    command = payload["tool_input"].get("command")
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else os.getcwd()
+    if not isinstance(command, str) or hatch_reason(command) or not suite_launch(command, cwd):
+        return
+    owner = f"{payload.get('session_id', '')}:{payload.get('agent_id', '')}"
+    if owner == ":":
+        return  # an anonymous reservation can not be matched; it expires on its own
+    ctx = repo_context(effective_cwd(command, cwd))
+    is_control = bool(ctx["main_sha"]) and ctx["head"] == ctx["main_sha"]
+    store_call(policy, ["confirm", f"--kind={'control' if is_control else 'full'}", f"--repo-id={ctx['repo_id']}",
+                        f"--key={ctx['head']}", f"--token={owner}"])
+
+
 def hook_decision(payload: dict, policy: dict):
     """(exit_code, stderr_text). 0 allows. Only full-suite launches are judged."""
     if payload.get("tool_name") != "Bash" or not isinstance(payload.get("tool_input"), dict):
@@ -517,10 +629,8 @@ def hook_decision(payload: dict, policy: dict):
     command = payload["tool_input"].get("command")
     if not isinstance(command, str):
         return 0, ""
-    import heavy_job_guard as hjg
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else os.getcwd()
-    _hatch, findings = hjg.scan_state(command, cwd)
-    if not any(f[0] == "full-suite" for f in findings):
+    if not suite_launch(command, cwd):
         return 0, ""
     reason = hatch_reason(command)
     ctx = repo_context(effective_cwd(command, cwd))
@@ -563,6 +673,17 @@ def hook_decision(payload: dict, policy: dict):
     return 0, ""
 
 
+def run_post() -> int:
+    try:
+        import safe_input
+        payload = json.loads(safe_input.read_stdin_bounded(8 * 1024 * 1024))
+        if isinstance(payload, dict):
+            post_decision(payload, load_policy())
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - fail open
+        print(f"test_scope: post hook error {type(exc).__name__}; ignored", file=sys.stderr)
+    return 0
+
+
 def run_hook() -> int:
     try:
         import safe_input
@@ -581,12 +702,14 @@ def run_hook() -> int:
 
 # ---- CLI --------------------------------------------------------------------------------------------------------
 
-REMOTE_CMDS = {"baseline-get", "baseline-record", "control", "full", "finish", "release", "ungated", "register-accepted"}
+REMOTE_CMDS = {"baseline-get", "baseline-record", "control", "full", "finish", "release", "ungated", "register-accepted",
+               "confirm"}
 REMOTE_FLAGS = {"baseline-get": ("repo_id", "main_sha"), "baseline-record": ("repo_id", "main_sha", "command", "result",
                                                                             "counts", "failing"),
                 "control": ("repo_id", "main_sha", "token"), "full": ("repo_id", "head", "token"),
                 "finish": ("repo_id", "head", "result", "summary"), "release": ("repo_id", "kind", "key", "reason"),
-                "ungated": ("repo_id", "head", "reason"), "register-accepted": ("repo_id", "head", "report_sha256")}
+                "ungated": ("repo_id", "head", "reason"), "register-accepted": ("repo_id", "head", "report_sha256"),
+                "confirm": ("repo_id", "kind", "key", "token")}
 
 
 def remote_args(args) -> list:
@@ -604,6 +727,7 @@ def remote_args(args) -> list:
 def cli(argv: list, capture: bool = False):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--root", default=None)
+    ap.add_argument("--local", action="store_true", help="use this host's store even if policy names another (set by ssh)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add(name, *flags):
@@ -631,6 +755,8 @@ def cli(argv: list, capture: bool = False):
     p.add_argument("--base", required=True)
     p.add_argument("--head", required=True)
     sub.add_parser("hook")
+    sub.add_parser("post")
+    p = add("confirm", "--repo-id", "--kind", "--key", "--token")
     p = sub.add_parser("run-control")
     p.add_argument("--repo", default=".")
     p.add_argument("command", nargs=argparse.REMAINDER)
@@ -647,7 +773,9 @@ def cli(argv: list, capture: bool = False):
     try:
         if args.cmd == "hook":
             return run_hook()
-        remote = store_is_remote(policy, args.root)
+        if args.cmd == "post":
+            return run_post()
+        remote = store_is_remote(policy, args.root) and not args.local
         if args.cmd == "accept":
             digest = validate_report(args.head, Path(args.report), Path(args.packet))  # checked here, filed on the store host
             argv = ["register-accepted", f"--repo-id={args.repo_id}", f"--head={args.head}", f"--report-sha256={digest}"]
@@ -670,6 +798,8 @@ def cli(argv: list, capture: bool = False):
             return out(0, {"recorded": True, "record": rec})
         if args.cmd == "control":
             return out(0, reserve_control(store, args.repo_id, args.main_sha, args.token))
+        if args.cmd == "confirm":
+            return out(0, confirm_reservation(store, args.repo_id, args.kind, args.key, args.token))
         if args.cmd == "register-accepted":
             return out(0, {"accepted": True, "record": register_accepted(store, args.repo_id, args.head, args.report_sha256)})
         if args.cmd == "full":
