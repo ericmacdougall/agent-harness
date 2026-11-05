@@ -368,7 +368,7 @@ def report(status, message, **extra):
     print(json.dumps({"status": status, "message": message, **extra}))
 
 
-FOCUSED_MODULE_RE = re.compile(r"^tests\.test_[A-Za-z0-9_]+$")
+FOCUSED_MODULE_RE = re.compile(r"tests\.test_[A-Za-z0-9_]+")  # used with fullmatch
 
 
 def focused_unittest(argv):
@@ -377,7 +377,7 @@ def focused_unittest(argv):
     if len(argv) >= 4 and argv[0] in {"python", "python3"} and argv[1:3] == ["-m", "unittest"]:
         modules = [item for item in argv[3:] if item != "-v"]
         if modules and len(modules) <= 60 and len(set(modules)) == len(modules) \
-                and all(FOCUSED_MODULE_RE.match(item) for item in modules):
+                and all(FOCUSED_MODULE_RE.fullmatch(item) for item in modules):
             return modules
     return None
 

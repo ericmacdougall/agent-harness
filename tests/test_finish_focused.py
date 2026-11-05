@@ -35,7 +35,7 @@ class Syntax(unittest.TestCase):
         self.assertEqual(il.focused_unittest(["python3", "-m", "unittest", "tests.test_a", "tests.test_b"]),
                          ["tests.test_a", "tests.test_b"])
         self.assertEqual(il.focused_unittest(["python", "-m", "unittest", "-v", "tests.test_a"]), ["tests.test_a"])
-        for bad in (WHOLE, ["python3", "-m", "unittest"], ["python3", "-m", "unittest", "tests.test_a;rm"],
+        for bad in (["python3", "-m", "unittest", "tests.test_a\n"], WHOLE, ["python3", "-m", "unittest"], ["python3", "-m", "unittest", "tests.test_a;rm"],
                     ["python3", "-m", "unittest", "tests.test_a", "--failfast"], ["python3", "-m", "unittest", "test_a"],
                     ["python3", "-m", "unittest", "tests.test_a", "tests.test_a"], ["python3", "-c", "x"],
                     ["python3", "-m", "unittest", "tests.helpers"], ["python3", "-m", "unittest", "tests.test_a.Case.test_x"],
@@ -156,37 +156,176 @@ class Approve(Fixture):
                                call=lambda policy, args: None)
         self.assertEqual(ctx.exception.code, "store-unreachable")
 
+    SUITE = ["python3", "-m", "unittest", "discover", "-s", "tests"]
+
+    def cli(self, *args):
+        r = subprocess.run([sys.executable, "-I", str(HOOKS / "test_scope.py"), "--root", str(self.dir / "store"), *args],
+                           capture_output=True, text=True, timeout=240,
+                           env={**os.environ, "PYTHONPATH": str(self.repo / "harness" / "hooks")})  # the stand-in suite imports a, b, c
+        return r.returncode, json.loads(r.stdout)
+
+    def write_test(self, name, body):
+        (self.repo / "tests" / name).write_text("import unittest\n\nclass T(unittest.TestCase):\n    def test_x(self):\n"
+                                                f"        {body}\n")  # untracked: the tracked tree stays clean
+
     def test_cli_round_trip_full_get_run_full_and_approve_check(self):
-        def cli(*args):
-            r = subprocess.run([sys.executable, "-I", str(HOOKS / "test_scope.py"), "--root", str(self.dir / "store"), *args],
-                               capture_output=True, text=True, timeout=120)
-            return r.returncode, json.loads(r.stdout)
-        self.assertEqual(cli("full-get", "--repo-id", self.repo_id, "--head", self.head)[0], 1)
+        self.assertEqual(self.cli("full-get", "--repo-id", self.repo_id, "--head", self.head)[0], 1)
         give_evidence(self.store, self.repo_id, self.head, self.dir)
-        code, data = cli("run-full", "--repo", str(self.repo), "--", sys.executable, "-c", "raise SystemExit(0)")
+        self.write_test("test_zzok.py", "pass")
+        code, data = self.cli("run-full", "--repo", str(self.repo), "--", *self.SUITE)
         self.assertEqual((code, data["finished"]), (0, True))
-        code, data = cli("full-get", "--repo-id", self.repo_id, "--head", self.head)
+        code, data = self.cli("full-get", "--repo-id", self.repo_id, "--head", self.head)
         self.assertEqual((code, data["record"]["result"], data["record"]["state"]), (0, "pass", "finished"))
-        code, data = cli("approve-check", "--repo", str(self.repo), "--base", self.base, "--head", self.head,
-                         "--command", "python3 -m unittest " + " ".join(self.REQUIRED))
+        code, data = self.cli("approve-check", "--repo", str(self.repo), "--base", self.base, "--head", self.head,
+                              "--command", "python3 -m unittest " + " ".join(self.REQUIRED))
         self.assertEqual((code, data["approved"]), (0, True))
-        code, data = cli("run-full", "--repo", str(self.repo), "--", sys.executable, "-c", "pass")
+        code, data = self.cli("run-full", "--repo", str(self.repo), "--", *self.SUITE)
         self.assertEqual((code, data["code"]), (2, "duplicate-full"))  # one full run per head
 
     def test_a_failing_run_full_records_fail_and_returns_its_exit_code(self):
         give_evidence(self.store, self.repo_id, self.head, self.dir)
-        r = subprocess.run([sys.executable, "-I", str(HOOKS / "test_scope.py"), "--root", str(self.dir / "store"), "run-full",
-                            "--repo", str(self.repo), "--", sys.executable, "-c", "raise SystemExit(3)"],
-                           capture_output=True, text=True, timeout=120)
-        self.assertEqual(r.returncode, 3)
+        self.write_test("test_zzfail.py", "self.fail('red')")
+        code, _ = self.cli("run-full", "--repo", str(self.repo), "--", *self.SUITE)
+        self.assertEqual(code, 1)
         self.assertEqual(ts.full_get(self.store, self.repo_id, self.head)["result"], "fail")
 
     def test_run_full_without_evidence_is_refused(self):
-        r = subprocess.run([sys.executable, "-I", str(HOOKS / "test_scope.py"), "--root", str(self.dir / "store"), "run-full",
-                            "--repo", str(self.repo), "--", sys.executable, "-c", "pass"], capture_output=True, text=True,
-                           timeout=120)
-        self.assertEqual(r.returncode, 2)
+        code, data = self.cli("run-full", "--repo", str(self.repo), "--", *self.SUITE)
+        self.assertEqual((code, data["code"]), (2, "no-evidence"))
         self.assertIsNone(ts.full_get(self.store, self.repo_id, self.head))
+
+    def test_run_full_refuses_a_subset_a_dirty_tree_and_records_an_interrupted_run(self):  # review F4
+        give_evidence(self.store, self.repo_id, self.head, self.dir)
+        for cmd in (["true"], ["python3", "-m", "unittest", "tests.test_a"], [sys.executable, "-c", "pass"]):
+            code, data = self.cli("run-full", "--repo", str(self.repo), "--", *cmd)
+            self.assertEqual(code, 3, cmd)
+            self.assertIn("whole-suite", data["error"])
+        (self.repo / "harness" / "hooks" / "a.py").write_text("VALUE = 99\n")  # tracked change: dirty
+        code, data = self.cli("run-full", "--repo", str(self.repo), "--", *self.SUITE)
+        self.assertEqual(code, 3)
+        self.assertIn("not clean", data["error"])
+        run(self.repo, "git", "checkout", "-q", "--", "harness/hooks/a.py")
+        self.assertIsNone(ts.full_get(self.store, self.repo_id, self.head))  # nothing was reserved by the refusals
+        self.write_test("test_zzslow.py", "__import__('time').sleep(30)")
+        r = subprocess.run([sys.executable, "-I", str(HOOKS / "test_scope.py"), "--root", str(self.dir / "store"), "run-full",
+                            "--repo", str(self.repo), "--", *self.SUITE], capture_output=True, text=True, timeout=120,
+                           env={**os.environ, "HARNESS_RUN_FULL_TIMEOUT_S": "2", "PYTHONPATH": str(self.repo / "harness" / "hooks")})
+        self.assertNotEqual(r.returncode, 0)
+        rec = ts.full_get(self.store, self.repo_id, self.head)
+        self.assertEqual((rec["state"], rec["result"]), ("finished", "fail"))  # not left reserved for 12 hours
+
+    def test_no_mapped_tests_refuses_a_focused_check(self):  # review F7
+        give_evidence(self.store, self.repo_id, self.head, self.dir)
+        ts.reserve_full(self.store, self.repo_id, self.head, "t")
+        ts.finish_full(self.store, self.repo_id, self.head, "pass", "ok")
+        run(self.repo, "git", "checkout", "-q", "-b", "docsonly", self.base)
+        (self.repo / "docs.md").write_text("changed\n")
+        run(self.repo, "git", "commit", "-q", "-am", "docs")
+        docs_head = run(self.repo, "git", "rev-parse", "HEAD")
+        give_evidence(self.store, self.repo_id, docs_head, self.dir)
+        ts.reserve_full(self.store, self.repo_id, docs_head, "t2")
+        ts.finish_full(self.store, self.repo_id, docs_head, "pass", "ok")
+        with self.assertRaises(ts.Refused) as ctx:
+            ts.approve_focused(str(self.repo), self.base, docs_head, ["python3", "-m", "unittest", "tests.test_a"])
+        self.assertEqual(ctx.exception.code, "no-mapped-tests")
+
+
+class ScopeFromGitObjects(Fixture):
+    """Review F1: the mapping is read from the head's tree, never from whatever is checked out."""
+
+    def setUp(self):
+        super().setUp()
+        run(self.repo, "git", "checkout", "-q", "-b", "newtest", self.head)
+        (self.repo / "harness" / "hooks" / "n.py").write_text("N = 1\n")
+        (self.repo / "tests" / "test_n.py").write_text("import n\n")
+        run(self.repo, "git", "add", "-A")
+        run(self.repo, "git", "commit", "-q", "-m", "add module n and its test")
+        self.new_head = run(self.repo, "git", "rev-parse", "HEAD")
+
+    def test_a_test_added_by_the_head_is_required_even_when_the_checkout_is_at_the_baseline(self):
+        for checkout in (self.new_head, self.base):
+            run(self.repo, "git", "checkout", "-q", "--detach", checkout)
+            out = ts.focused_scope(str(self.repo), self.base, self.new_head)
+            self.assertIn("test_n", out["tests"], checkout)
+            self.assertTrue((self.repo / "tests" / "test_n.py").exists() == (checkout == self.new_head))
+
+    def test_a_dirty_checkout_does_not_change_the_answer(self):
+        run(self.repo, "git", "checkout", "-q", "--detach", self.new_head)
+        clean = ts.focused_scope(str(self.repo), self.base, self.new_head)
+        (self.repo / "tests" / "test_b.py").write_text("# gutted: imports nothing\n")
+        (self.repo / "tests" / "test_extra.py").write_text("import a\n")  # untracked
+        self.assertEqual(ts.focused_scope(str(self.repo), self.base, self.new_head), clean)
+
+    def test_proof_from_the_baseline_checkout_refuses_a_check_that_omits_the_new_test(self):
+        ts.reserve_full  # silence linters: the store is prepared below
+        give_evidence(self.store, self.repo_id, self.new_head, self.dir)
+        ts.reserve_full(self.store, self.repo_id, self.new_head, "t")
+        ts.finish_full(self.store, self.repo_id, self.new_head, "pass", "ok")
+        run(self.repo, "git", "checkout", "-q", "--detach", self.base)
+        flow = SimpleNamespace(state={"source": str(self.dir / "gone"), "baseline": self.base, "source_head": self.new_head},
+                               original=self.repo)
+        with self.assertRaises(deliver.DeliveryError) as ctx:
+            deliver.focused_proof(flow, [["python3", "-m", "unittest", "tests.test_a", "tests.test_b", "tests.test_d"]])
+        self.assertIn("tests.test_n", ctx.exception.message)
+
+
+class RemoteTarget(Fixture):
+    """Review F2: remote mode checks out the merge target, so the focused tests must cover baseline..target."""
+
+    def test_recheck_requires_coverage_of_commits_that_landed_after_the_delta(self):
+        run(self.repo, "git", "checkout", "-q", "--detach", self.head)
+        (self.repo / "harness" / "hooks" / "c.py").write_text("Y = 11\n")
+        run(self.repo, "git", "commit", "-q", "-am", "someone else changed c")
+        target = run(self.repo, "git", "rev-parse", "HEAD")
+        flow = SimpleNamespace(original=self.repo, state={"baseline": self.base},
+                               focused_checks=[{"tests": ["tests.test_a", "tests.test_b", "tests.test_d"]}])
+        with self.assertRaises(deliver.DeliveryError) as ctx:
+            deliver.focused_recheck(flow, target)
+        self.assertIn("tests.test_c", ctx.exception.message)
+        flow.focused_checks = [{"tests": ["tests.test_a", "tests.test_b", "tests.test_c", "tests.test_d"]}]
+        deliver.focused_recheck(flow, target)  # covered: no error
+        deliver.focused_recheck(SimpleNamespace(original=self.repo, state={"baseline": self.base}), target)  # none: no-op
+
+    def test_resolve_baseline_refuses_a_focused_check(self):  # review F3
+        state = {"source": str(self.repo), "baseline": self.base, "source_head": self.head, "kit_digest": "x", "phase": "PR_READY"}
+        flow = SimpleNamespace(state=state, original=self.repo, load=lambda: state, completed=lambda: None, args=SimpleNamespace())
+        manager = mock.MagicMock()
+        manager.__enter__.return_value = flow
+        args = SimpleNamespace(prepare=[], check=["python3 -m unittest tests.test_a tests.test_b tests.test_d"], kit_file=None,
+                               resolve_baseline="a" * 40, resume=False, mode="remote")
+        with mock.patch.object(deliver, "Workflow", return_value=manager), mock.patch.object(deliver, "require_check_interpreters"):
+            with self.assertRaises(deliver.DeliveryError) as ctx:
+                deliver.finish(args)
+        self.assertIn("whole-suite", ctx.exception.message)
+
+
+class ReceiptShape(unittest.TestCase):
+    """Review F8: a receipt may carry focused_checks (a list of objects) and nothing else extra."""
+
+    def completed(self, **extra):
+        head = "b" * 40
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+        os.chmod(directory, 0o700)
+        receipt = directory / "receipt.json"
+        value = {"schema": 1, "kind": "delivery_receipt", "scope": "s", "task": "t", "generation": "g", "source_head": "a" * 40,
+                 "head": head, "mode": "remote", "repository": "r", "pr_number": 7, "checks_digest": "c" * 64,
+                 "guard_key": "k", **extra}
+        receipt.write_text(json.dumps(value))
+        os.chmod(receipt, 0o600)
+        state = {"phase": "DELIVERED", "source_head": "a" * 40, "repository": "r", "pr_number": 7, "guard_key": "k",
+                 "baseline": "a" * 40, "target": head, "checks_digest": "c" * 64}
+        flow = SimpleNamespace(receipt=receipt, state=state, scope="s", task="t", generation="g", original=Path("/o"), branch="main")
+        with mock.patch.object(deliver, "snapshot", return_value=head), mock.patch.object(deliver, "ancestry", return_value=True):
+            return deliver.Workflow.completed(flow)
+
+    def test_valid_old_and_new_receipts_load_and_malformed_ones_do_not(self):
+        self.assertEqual(self.completed()["head"], "b" * 40)
+        self.assertEqual(self.completed(focused_checks=[{"approved": True}])["focused_checks"], [{"approved": True}])
+        for extra in ({"focused_checks": "text"}, {"focused_checks": [1]}, {"focused_checks": [{}] * 21},
+                      {"surprise": 1}, {"focused_checks": [], "surprise": 1}):
+            with self.assertRaises(deliver.DeliveryError, msg=str(extra)[:40]):
+                self.completed(**extra)
 
 
 class DeliverProof(Fixture):
@@ -214,6 +353,7 @@ class DeliverProof(Fixture):
 
     def test_focused_proof_falls_back_to_the_original_checkout_when_the_source_is_gone(self):
         self.full_run()
+        run(self.repo, "git", "checkout", "-q", "--detach", self.base)  # after cleanup the original is NOT at the head
         flow = self.flow()
         flow.state["source"] = str(self.dir / "removed-worktree")
         self.assertEqual(len(deliver.focused_proof(flow, [["python3", "-m", "unittest", "tests.test_a", "tests.test_b",
@@ -301,6 +441,12 @@ class GitEditor(unittest.TestCase):
         self.assertEqual(out[0][0], "BLOCKED_POLICY")
         self.assertIn("GIT_DIR", out[0][1])
         self.assertIn("GIT_WORK_TREE", out[0][1])
+
+    def test_store_redirection_variables_are_removed_before_a_real_run(self):  # review F5
+        code, called, environ = self.main_with({"HARNESS_TEST_SCOPE_ROOT": "/tmp/x", "HARNESS_TEST_SCOPE_HOST": "evil"})
+        self.assertEqual((code, called), (0, True))
+        self.assertNotIn("HARNESS_TEST_SCOPE_ROOT", environ)
+        self.assertNotIn("HARNESS_TEST_SCOPE_HOST", environ)
 
     def test_allowed_variables_are_untouched(self):
         code, called, environ = self.main_with({"GIT_AUTHOR_NAME": "t", "GIT_PAGER": "cat"})

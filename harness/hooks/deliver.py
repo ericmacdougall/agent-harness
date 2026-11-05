@@ -170,6 +170,7 @@ def regular_bytes(path, limit=MAX_PRIVATE):
 
 
 IGNORED_GIT_ENV = ("GIT_EDITOR", "GIT_SEQUENCE_EDITOR")
+SCRUBBED_ENV = ("HARNESS_TEST_SCOPE_ROOT", "HARNESS_TEST_SCOPE_HOST")  # would redirect the focused-check gate
 
 
 def private_json(path):
@@ -241,6 +242,23 @@ def focused_proof(flow, focused):
             raise DeliveryError("BLOCKED_POLICY", "Focused check proof could not be verified" if failure else
                                 "Focused check proof needs a source or original checkout", code=2)
     return approvals
+
+
+def focused_recheck(flow, target):
+    """Remote delivery checks out the merge TARGET, which can carry other people's commits on top of the delta: the
+    focused tests must still cover everything mapped for baseline..target."""
+    if not getattr(flow, "focused_checks", None):
+        return
+    import test_scope
+    try:
+        required = {"tests." + t for t in test_scope.focused_scope(str(flow.original), flow.state["baseline"], target)["tests"]}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise DeliveryError("BLOCKED_POLICY", "Focused check coverage of the merge target could not be verified", code=2) from None
+    for approval in flow.focused_checks:
+        missing = sorted(required - set(approval.get("tests", [])))
+        if missing:
+            raise DeliveryError("BLOCKED_POLICY", "Focused check does not cover tests mapped to the merge target: "
+                                + " ".join(missing[:8]) + "; run a whole-suite check", code=2)
 
 
 def checks_digest(preparations, checks):
@@ -509,7 +527,9 @@ class Workflow:
         value = private_json(self.receipt)
         expected = {"schema", "kind", "scope", "task", "generation", "source_head", "head", "mode",
                     "repository", "pr_number", "checks_digest", "guard_key"}
-        if (set(value) - {"focused_checks"} != expected or type(value.get("schema")) is not int or value["schema"] != 1
+        extra = value.get("focused_checks", [])
+        if (not isinstance(extra, list) or len(extra) > 20 or any(not isinstance(item, dict) for item in extra)
+                or set(value) - {"focused_checks"} != expected or type(value.get("schema")) is not int or value["schema"] != 1
                 or value.get("kind") != "delivery_receipt" or value.get("scope") != self.scope
                 or value.get("task") != self.task or value.get("generation") != self.generation
                 or value.get("source_head") != self.state["source_head"]
@@ -1194,6 +1214,7 @@ def resume_remote_finish(flow, preparations, checks):
         write_journal(attempt / "start", start, first=True)
         try:
             revalidate()
+            focused_recheck(flow, guard.target)
             run_checks(flow.original, preparations, checks, args.check_timeout, flow.directory / "checks")
             revalidate()
             if origin_destination(flow.original)[0] != state["repository"]:
@@ -1290,6 +1311,7 @@ def remote_finish(flow, preparations, checks):
                         raise DeliveryError("BLOCKED_LOCAL", "Protected fast-forward was refused")
             if snapshot(flow.original, flow.branch) != target:
                 raise DeliveryError("DELIVERED_CHECK_FAILED", "Original changed during sync")
+            focused_recheck(flow, target)
             run_checks(flow.original, preparations, checks, args.check_timeout, flow.directory / "checks")
             if snapshot(flow.original, flow.branch) != target:
                 raise DeliveryError("DELIVERED_CHECK_FAILED", "Checks changed the delivered checkout")
@@ -1430,6 +1452,8 @@ def finish(args):
             raise DeliveryError("BLOCKED_POLICY", "Prepared generation is missing", code=2)
         if args.kit_file is not None and kit_digest(args.kit_file) != state["kit_digest"]:
             raise DeliveryError("BLOCKED_POLICY", "Run kit changed since prepare", code=2)
+        if focused and args.resolve_baseline is not None:
+            raise DeliveryError("BLOCKED_POLICY", "A recovery baseline needs a whole-suite check, not a focused one", code=2)
         flow.focused_checks = focused_proof(flow, focused) if focused else []
         if args.resolve_baseline is not None:
             return resolve_baseline(flow, preparations, checks)
@@ -1606,7 +1630,7 @@ def main():
     try:
         # Editor variables never route git (every git call here passes -m or -F), and Claude Code sessions export
         # GIT_EDITOR, so drop them for this process and its children instead of refusing the whole run.
-        for name in IGNORED_GIT_ENV:
+        for name in IGNORED_GIT_ENV + SCRUBBED_ENV:
             os.environ.pop(name, None)
         bad = sorted(name for name in os.environ if name.startswith("GIT_") and name not in ALLOWED_GIT_ENV)
         if bad:

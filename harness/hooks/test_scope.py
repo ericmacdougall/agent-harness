@@ -415,12 +415,9 @@ def git(repo: str, *args: str) -> str:
     return done.stdout
 
 
-def imports_of(path: Path, known: set) -> set:
-    try:
-        text = path.read_text(errors="replace")[:400_000]
-    except OSError:
-        return set()
+def imports_of_text(text: str, known: set) -> set:
     names = set()
+    text = text[:400_000]
     for m in IMPORT_RE.finditer(text):
         if m.group(1):
             names.add(m.group(1))
@@ -434,31 +431,54 @@ def imports_of(path: Path, known: set) -> set:
     return names & known
 
 
+def blob_texts(repo: str, rev: str, paths: list) -> dict:
+    """File contents AT a revision (git cat-file --batch), never the working tree."""
+    if not paths:
+        return {}
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path.home()), "GIT_TERMINAL_PROMPT": "0",
+           "GIT_OPTIONAL_LOCKS": "0"}
+    done = subprocess.run(["git", "-C", repo, "cat-file", "--batch"], input="".join(f"{rev}:{p}\n" for p in paths).encode(),
+                          capture_output=True, timeout=60, env=env)
+    out, data, i = {}, done.stdout, 0
+    for p in paths:
+        j = data.index(b"\n", i)
+        header = data[i:j].split()
+        if len(header) == 3 and header[1] == b"blob":
+            size = int(header[2])
+            out[p] = data[j + 1:j + 1 + size].decode("utf-8", "replace")
+            i = j + 1 + size + 1
+        else:
+            i = j + 1  # missing path
+    return out
+
+
 REF_RE = re.compile(r"^[0-9A-Za-z._/~^@{}-]{1,200}$")
 
 
 def focused_scope(repo: str, base: str, head: str) -> dict:
     """Changed files (deleted ones too), the modules that depend on them, and the test modules to run
-    (harness/hooks + tests layout, plus root-level modules such as install.py)."""
+    (harness/hooks + tests layout, plus root-level modules such as install.py). Everything is read from the HEAD
+    revision's tree and blobs, so the answer never depends on what the checkout on disk contains. It is a FLOOR:
+    only static Python imports are followed."""
     for ref in (base, head):
         if not REF_RE.match(ref) or ref.startswith("-"):
             raise ValueError("base and head must be plain git refs")
     changed = [p for p in git(repo, "diff", "--name-only", base, head, "--").splitlines() if p]
-    root = Path(repo)
-    src_dirs = [root / d for d in ("harness/hooks", "src", "lib") if (root / d).is_dir()] + [root]
-    tests_dir = root / "tests"
-    modules = {}
-    for d in src_dirs:
-        for f in d.glob("*.py"):
-            modules[f.stem] = f
-    known = set(modules)
+    files = git(repo, "ls-tree", "-r", "--name-only", head, "--").splitlines()
+    src_dirs = ("harness/hooks", "src", "lib", "")
+    mod_paths = {}
+    for path in files:
+        parent, _, name = path.rpartition("/")
+        if name.endswith(".py") and parent in src_dirs and not (parent == "" and name.startswith("test_")):
+            mod_paths[Path(name).stem] = path
+    test_paths = {Path(p).stem: p for p in files if p.startswith("tests/") and p.count("/") == 1
+                  and Path(p).name.startswith("test_") and p.endswith(".py")}
+    known = set(mod_paths)
     deleted_mods = [Path(d).stem for d in git(repo, "diff", "--name-only", "--diff-filter=D", base, head, "--").splitlines()
                     if d.endswith(".py") and Path(d).parts[0] != "tests"]
     known.update(deleted_mods)  # an importer of a deleted module must still be found
-    test_files = {f.stem: f for f in tests_dir.glob("test_*.py")} if tests_dir.is_dir() else {}
-    deps = {name: imports_of(f, known) for name, f in modules.items()}  # module -> modules it imports
-    for name, f in list(modules.items()):
-        deps.setdefault(name, set())
+    texts = blob_texts(repo, head, sorted(set(mod_paths.values()) | set(test_paths.values())))
+    deps = {name: imports_of_text(texts.get(path, ""), known) for name, path in mod_paths.items()}
     touched = set()
     for name in deleted_mods:
         deps.setdefault(name, set())
@@ -480,11 +500,11 @@ def focused_scope(repo: str, base: str, head: str) -> dict:
                 grew = True
     tests = {name for kind, name in touched if kind == "test"}
     for name in closure:
-        tests.update(t for t in test_files if t == f"test_{name}" or t.startswith(f"test_{name}_"))
-    for tname, f in test_files.items():
-        if imports_of(f, known) & closure:
+        tests.update(t for t in test_paths if t == f"test_{name}" or t.startswith(f"test_{name}_"))
+    for tname, path in test_paths.items():
+        if imports_of_text(texts.get(path, ""), known) & closure:
             tests.add(tname)
-    tests = sorted(t for t in tests if t in test_files)
+    tests = sorted(t for t in tests if t in test_paths)
     commands = [f"python3 -m unittest {' '.join('tests.' + t for t in tests)}"] if tests else []
     return {"changed": changed, "dependents": sorted(closure), "tests": tests, "commands": commands,
             "note": "" if tests else "no mapped tests: run the tests your plan names for the changed paths"}
@@ -492,7 +512,7 @@ def focused_scope(repo: str, base: str, head: str) -> dict:
 
 # ---- focused checks for deliver.py finish -----------------------------------------------------------------------
 
-FOCUSED_MODULE_RE = re.compile(r"^tests\.test_[A-Za-z0-9_]+$")  # same shape integrate_local.focused_unittest accepts
+FOCUSED_MODULE_RE = re.compile(r"tests\.test_[A-Za-z0-9_]+")  # used with fullmatch; same shape integrate_local accepts
 
 
 def focused_modules(argv):
@@ -500,9 +520,16 @@ def focused_modules(argv):
     if len(argv) >= 4 and argv[0] in ("python", "python3") and list(argv[1:3]) == ["-m", "unittest"]:
         modules = [a for a in argv[3:] if a != "-v"]
         if modules and len(modules) <= 60 and len(set(modules)) == len(modules) \
-                and all(FOCUSED_MODULE_RE.match(a) for a in modules):
+                and all(FOCUSED_MODULE_RE.fullmatch(a) for a in modules):
             return modules
     return None
+
+
+def whole_suite_command(argv) -> bool:
+    """True for the whole-suite shapes deliver.py already approves (never the focused form)."""
+    sys.path.insert(0, str(HERE))
+    from integrate_local import approved_check
+    return bool(approved_check(list(argv), False))
 
 
 def full_get(store: Store, repo_id: str, head: str):
@@ -522,6 +549,9 @@ def approve_focused(repo: str, base: str, head: str, argv, policy: dict = None, 
     full_sha(head, "head")
     scope = focused_scope(repo, base, head)
     required = sorted("tests." + t for t in scope["tests"])
+    if not required:
+        raise Refused("no-mapped-tests", "no test is mapped to the changed files, so a focused check proves nothing: use a "
+                      "whole-suite check", required=[])
     missing = [m for m in required if m not in modules]
     if missing:
         raise Refused("scope-incomplete", "the focused check omits tests mapped to the changed files and their dependents: "
@@ -922,15 +952,24 @@ def cli(argv: list, capture: bool = False):
             cmd = [c for c in args.command if c != "--"]
             if not cmd:
                 return out(3, {"error": "usage: run-full --repo R -- <suite command>"})
+            if not whole_suite_command(cmd):
+                return out(3, {"error": "run-full records a FULL run: the command must be a whole-suite command "
+                                        "(unittest discover, pytest, go test ./..., npm test), not a subset"})
             ctx = repo_context(args.repo)
-            token = f"run-full:{os.getpid()}"
+            if git(ctx["top"], "status", "--porcelain", "--untracked-files=no").strip():
+                return out(3, {"error": "the working tree is not clean: a full run is recorded against HEAD only"})
+            token = f"run-full:{os.getpid()}:{uuid.uuid4().hex[:8]}"
             reserve_full(store, ctx["repo_id"], ctx["head"], token, source="run-full")
             confirm_reservation(store, ctx["repo_id"], "full", ctx["head"], token)
-            started = now()
-            done = subprocess.run(cmd, cwd=ctx["top"])
-            finish_full(store, ctx["repo_id"], ctx["head"], "pass" if done.returncode == 0 else "fail",
-                        f"exit {done.returncode}, {int(now() - started)} s: {' '.join(cmd)[:160]}")
-            return out(done.returncode, {"finished": True, "head": ctx["head"], "exit": done.returncode})
+            started, code = now(), 1
+            try:
+                code = subprocess.run(cmd, cwd=ctx["top"], timeout=int(os.environ.get("HARNESS_RUN_FULL_TIMEOUT_S", "7200"))).returncode
+            except BaseException:  # interrupted, timed out or could not start: record it so the head is not stuck
+                finish_full(store, ctx["repo_id"], ctx["head"], "fail", f"did not complete after {int(now() - started)} s")
+                raise
+            finish_full(store, ctx["repo_id"], ctx["head"], "pass" if code == 0 else "fail",
+                        f"exit {code}, {int(now() - started)} s: {' '.join(cmd)[:160]}")
+            return out(code, {"finished": True, "head": ctx["head"], "exit": code})
         if args.cmd == "confirm":
             return out(0, confirm_reservation(store, args.repo_id, args.kind, args.key, args.token))
         if args.cmd == "register-accepted":
