@@ -834,6 +834,21 @@ Each Git command, preparation, check, and abort attempt has a positive `--timeou
 
 Approved preparation and check commands merge stdout and stderr into one pipe and drain it in fixed 64 KiB chunks without retaining the bytes. The helper keeps their exit status, not their output, and prints only its structured status report. It waits for pipe EOF, including same-group children that inherited the descriptors, and then waits for the command leader within the original deadline. On timeout, it continues bounded draining during the two-second TERM grace, kills the process group, then bounds final pipe cleanup before attempting a safe scratch merge abort. If cleanup itself fails, it reports `BLOCKED_LOCAL` with `merge_aborted: false` and retains the scratch worktree and journal because a child might still be active. A child that closes or redirects both descriptors, or detaches from the process group, can still outlive this check; do not rely on the helper to supervise detached services. Inspect the reported phase and scratch worktree before rerunning a command for diagnostics. If the phase reached original checkout checks, first inspect the actual original HEAD and user files. Merge, commit, and fast-forward hook output is discarded. Metadata Git inspections still capture output needed to verify branch, tree, and checkout state without a hard overall memory bound; an unusually large untracked set can stress memory or time.
 
+## Background jobs and chains (bg_job.py)
+
+Rule (`docs/rules/bg-launch.json`, GoodQA #14513 and #14472): a launch is reported only after `bg_job.py launch` prints `STARTED`; chains use `&&`, never `;` or `&`, before a success echo; a wait returns the job's real exit status. Incidents: `cmd1; nohup suite & echo started` printed "started" after `cmd1` failed and two reruns never ran (1.5 h lost); a wait loop exited 0 because its last command was `ls`; a garbage-collected systemd transient unit reports `Result=success` after failing; `PIPESTATUS` read after `X=$(a | b | c)` holds only the assignment's status, so a per-stage check written that way can never fail.
+
+```sh
+python3 ~/.claude/hooks/bg_job.py launch --name suite --log /abs/suite.log --deadline 30 --dir /abs/task/bg-jobs -- ./run-suite
+python3 ~/.claude/hooks/bg_job.py status --name suite --dir /abs/task/bg-jobs
+python3 ~/.claude/hooks/bg_job.py wait --name suite --timeout 3600 --dir /abs/task/bg-jobs
+```
+
+- `launch` takes an argv list (no shell string), detaches into its own session behind a wrapper, and prints `STARTED name= pid= ...` with exit 0 only when the PID is alive, the log exists and the log has grown within `--deadline` seconds. Otherwise it prints `FAILED_TO_START reason=...`, exits 3 and stops the process group it started. A job that is silent for the whole deadline therefore fails to start; make it print a first line. The job record (PID, start, log, status path, argv hash, nonce) goes in `--dir`, else `$BG_JOB_DIR`, else `$AGENT_HARNESS_TASK_DIR/bg-jobs`, else `./.bg-jobs`. Argv is stored in the record: never pass secrets as arguments.
+- `wait` exit codes: 0 the status file says exit 0; 1 the job ran and failed (`EXIT_STATUS=n`); 2 no trustworthy status (missing, garbled, belongs to another job, or the process is gone without a status, including a reused PID); 3 timeout while still running. PID liveness is proven by the wrapper nonce in the process command line, never by `kill -0` alone, and the status file is written atomically by the wrapper. Never use the last command of a loop, or a systemd unit `Result` alone, as the outcome.
+- Per-stage pipeline status: use `set -o pipefail`, or read `PIPESTATUS` immediately after the pipeline itself (not after `X=$(...)`), or write each stage's status to its own file.
+- `bg_lint.py` is an advisory PreToolUse hook (Claude Code only; Codex ships `bg_job.py` as a helper but has no lint hook). It warns, never blocks, and names `bg_job.py` for: a success echo after `;` or `&`; a wait/poll loop whose last command is `ls`, `cat` or `tail`; `PIPESTATUS` after a command-substitution assignment. It is a heuristic over a shell string, so it can miss wrapped or generated commands; the helper itself is opt-in.
+
 ## Test watcher
 
 ```sh

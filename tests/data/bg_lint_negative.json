@@ -1,0 +1,21 @@
+[
+  {"id": "and-chain", "command": "cmd1 && nohup suite > run.log 2>&1 & echo pid"},
+  {"id": "and-echo", "command": "cmd1 && echo started"},
+  {"id": "echo-first", "command": "echo started"},
+  {"id": "quoted-semicolon", "command": "echo \"prep; started\""},
+  {"id": "non-success-echo", "command": "cmd1; echo $?"},
+  {"id": "single-quoted-amp", "command": "echo 'a & done'"},
+  {"id": "redirect-amp", "command": "suite > log 2>&1 && echo ok"},
+  {"id": "bg-launch-helper", "command": "python3 ~/.claude/hooks/bg_job.py launch --name s --log s.log --deadline 20 -- ./suite"},
+  {"id": "wait-helper", "command": "python3 ~/.claude/hooks/bg_job.py wait --name s --timeout 3600"},
+  {"id": "loop-not-wait", "command": "for f in *.txt; do cat $f; done"},
+  {"id": "loop-then-explicit-check", "command": "while kill -0 $PID; do sleep 5; done; python3 bg_job.py wait --name s"},
+  {"id": "loop-ends-test", "command": "while kill -0 $PID; do sleep 5; done; test -f DONE"},
+  {"id": "plain-ls", "command": "ls -l"},
+  {"id": "pipestatus-direct", "command": "a | b | c > out; echo \"${PIPESTATUS[@]}\""},
+  {"id": "pipefail", "command": "set -o pipefail; H=$(a | b | c)"},
+  {"id": "subst-no-pipe-no-status", "command": "H=$(a | b); echo \"$H\""},
+  {"id": "or-chain", "command": "cmd1 || echo failed"},
+  {"id": "newline-echo-ordinary", "command": "cmd1\necho started"},
+  {"id": "empty", "command": ""}
+]
