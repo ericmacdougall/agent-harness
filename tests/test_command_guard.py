@@ -369,6 +369,50 @@ class FailureModeTests(Fixture):
         self.assertIn(self.decide(padding + 'echo ok')[0], ('warn', 'allow'))
 
 
+class LineContinuationTests(Fixture):
+    """A backslash-newline is removed only where the backslash quotes (GoodQA #14771). bash, dash, busybox sh and
+    `bash --posix` on dev2 (pr-guard-root/cont_probe.py, harmless echo only) all run the line after `# note \\`, after an
+    escaped backslash and after a backslash before CR LF, and end a quoted here-doc at its delimiter even when the line
+    before ends in a backslash. Joining every backslash-newline first hid that line. Rows are strings handed to decide();
+    nothing is run."""
+
+    HIDDEN = [
+        '# note \\\nrm -rf ~/.claude/projects',                       # CM1
+        'ls # list \\\nrm -rf ~/.claude/projects',                    # CM2
+        "bash -c 'ls # list \\\nrm -rf ~/.claude/projects'",          # CM3
+        'x=$(# note \\\nrm -rf ~/.claude/projects)',                  # a comment inside $(..)
+        'echo "$(# note \\\nrm -rf ~/.claude/projects)"',             # ... inside double quotes
+        'echo a\\\\\nrm -rf ~/.claude/projects',                      # an escaped backslash does not escape the newline
+        'echo a \\\r\nrm -rf ~/.claude/projects',                     # the backslash quotes the CR; the LF ends the line
+        '# note \\\r\nrm -rf ~/.claude/projects',
+        "cat <<'E'\nx \\\nE\nrm -rf ~/.claude/projects",              # a quoted here-doc body keeps its backslash
+        "cat <<-'E'\n\tx \\\n\tE\nrm -rf ~/.claude/projects",
+        'cat <<E\nx \\\\\nE\nrm -rf ~/.claude/projects',              # an escaped backslash in an unquoted body
+        'echo $((1<<2)) # note \\\nrm -rf ~/.claude/projects',        # `<<` in arithmetic is not a here-doc
+        'echo $((1<<2))\n# note \\\nrm -rf ~/.claude/projects',        # ... so no here-doc body joins the comment
+    ]
+    JOINED = [  # where the shell does remove it, the guard still reads the joined text
+        'rm -rf \\\n~/.claude/projects',
+        'r\\\nm -rf ~/.claude/projects',
+        'rm -rf "$HOME/.cl\\\naude/projects"',
+        'ls; rm -r\\\nf ~/.claude/projects # note \\',
+        'x=$(ls \\\n; rm -rf ~/.claude/projects)',
+        'cat <<E\nx\nE\nrm -rf \\\n~/.claude/projects',
+    ]
+
+    def test_a_backslash_the_shell_keeps_does_not_hide_the_next_line(self):
+        self.expect(self.HIDDEN, 'block', label='HIDDEN')
+        self.expect(['ls # list\nrm -rf ~/.claude/projects'], 'block', label='CM4 control')
+
+    def test_a_continuation_the_shell_removes_is_still_joined(self):
+        self.expect(self.JOINED, 'block', label='JOINED')
+
+    def test_harmless_continuations_and_comments_allow(self):
+        self.expect(['ls # list \\\necho fine', 'echo a \\\nb', 'echo a\\\\\necho b', "echo 'a\\\nb'", 'echo $\'a\\\nb\'',
+                     "cat <<'E'\na \\\nb\nE\necho done", 'cat <<E\na \\\nb\nE\necho done', 'echo a \\\r\necho b',
+                     'x=`# note \\\necho fine`'], 'allow', label='harmless')
+
+
 class PolicyFileTests(Fixture):
     """Red-team F2: a written or replaced policy file must not weaken the guard."""
 

@@ -180,6 +180,19 @@ class Corpus(WorldCase):
             self.assertIn(verb, text_rows)
 
 
+class CommentContinuation(WorldCase):
+    """A comment ending in a backslash does not continue onto the next line in real shells (GoodQA #14771), so the next
+    line runs. These rows are strings handed to decide(); nothing is run or signalled."""
+
+    def test_the_line_after_a_comment_ending_in_a_backslash_is_judged(self):
+        for text in ('# note \\\nkill 4004', 'ls # list \\\nkill 4004', 'ls # list \\\nK=ki; K+=ll; $K 4004',
+                     '# note \\\r\nkill 4004', 'echo a\\\\\nkill 4004', "bash -c 'ls # list \\\nkill 4004'"):
+            with self.subTest(text=text):
+                self.assertEqual(self.decide(text)[0], 'block')
+        self.assertEqual(self.decide('ls # list\nkill 4004')[0], 'block')  # CK3 control
+        self.assertEqual(self.decide('ls # list \\\necho fine')[0], 'allow')
+
+
 class ClobberReadings(WorldCase):
     """zsh takes `>! w` as one operator and bash as `>` onto a file named `!`, and the shared analyzer judges a script under
     both (GoodQA #14657). bash runs `kill` in `>! kill 4004` and zsh writes a file with that name, so losing a reading loses
