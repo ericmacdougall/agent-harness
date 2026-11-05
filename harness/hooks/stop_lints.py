@@ -154,8 +154,8 @@ def lint_pending_tests(rows: list[dict], other_rows: list[dict] | None = None) -
         opened = list(PENDING_RE.finditer(note))
         for m in opened:
             pending.setdefault(m.group(1), r.get("id") or "")
-        if not opened:  # a note that opens a pending test and mentions its future REALLY_TESTED does not close it
-            done.update(m.group(1) for m in REALLY_RE.finditer(note))
+        opened_ids = {m.group(1) for m in opened}  # a note that opens an id and mentions its future REALLY_TESTED does not close it
+        done.update(m.group(1) for m in REALLY_RE.finditer(note) if m.group(1) not in opened_ids)
     dangling = [i for i in pending if i not in done]
     if not dangling:
         return []
@@ -225,7 +225,7 @@ def lint_unpushed(cwd: str) -> list[str]:
     if not (git(cwd, "remote") or "").strip():
         return []  # nowhere to push: every commit would be "unpushed" on every turn
     out = []
-    dirty = git(cwd, "status", "--porcelain=v1", "--untracked-files=no")
+    dirty = git(cwd, "status", "--porcelain=v1", "--untracked-files=no", "--ignore-submodules=all")
     if dirty and dirty.strip():
         out.append(f"S18: {len(dirty.strip().splitlines())} tracked file(s) have uncommitted changes")
     ahead = git(cwd, "rev-list", "--count", "HEAD", "--not", "--remotes")

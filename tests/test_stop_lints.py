@@ -408,5 +408,42 @@ class SecondRound(WalFixture):
             self.assertEqual(self.lint(message=msg), [], msg)
 
 
+class ThirdRound(WalFixture):
+    def test_submodule_gitdir_config_filter_is_never_run(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        sub, sup, remote = root / "sm", root / "super", root / "r.git"
+        for path in (sub, sup):
+            subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+        (sub / "f.txt").write_text("1")
+        (sub / ".gitattributes").write_text("* filter=f\n")
+        run_git(sub, "add", "-A")
+        run_git(sub, "commit", "-q", "-m", "sub")
+        env = {**os.environ, "GIT_ALLOW_PROTOCOL": "file"}
+        subprocess.run(["git", "-C", str(sup), "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "sm"],
+                       check=True, capture_output=True, env=env)
+        run_git(sup, "commit", "-q", "-m", "add sm")
+        run_git(sup, "remote", "add", "origin", str(remote))
+        run_git(sup, "push", "-q", "origin", "main")
+        marker = root / "PWNED"
+        cfg = next((sup / ".git" / "modules").glob("*/config"), sup / ".git" / "modules" / "sm" / "config")
+        with open(cfg, "a") as fh:
+            fh.write(f'[filter "f"]\n\tclean = touch {marker}; cat\n')
+        (sup / "sm" / "f.txt").write_text("changed")
+        marker.unlink(missing_ok=True)
+        sl.lint_unpushed(str(sup))
+        self.assertFalse(marker.exists())
+
+    def test_a_note_can_close_one_id_and_open_another(self):
+        self.wal([row("check", 1, note="PENDING_REAL_TEST a1: x"),
+                  row("check", 2, note="REALLY_TESTED a1: ok; next PENDING_REAL_TEST a2: y"),
+                  row("check", 3, note="REALLY_TESTED a2: ok")])
+        self.assertEqual(self.lint(), [])
+        self.wal([row("check", 1, note="PENDING_REAL_TEST a1: will append REALLY_TESTED a1: later")])
+        self.assertEqual(len(self.lint()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
