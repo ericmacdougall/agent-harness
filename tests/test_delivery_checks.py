@@ -176,19 +176,41 @@ class CheckInterpreter(unittest.TestCase):
         os.chdir(self.root)
         self.addCleanup(os.chdir, previous)
         fake_python(self.root / 'rel', '3.12')
+        fake_python(self.root, '3.12')  # './python3' is a supported interpreter in the current directory
         old = fake_python(self.root / 'old-bin', '3.9')
-        with self.assertRaises(self.integrate.CheckInterpreterError):
-            self.resolve('rel', '', '.', old.parent)
+        for entries in (('rel', old.parent), ('', old.parent), ('.', old.parent)):
+            with self.subTest(entries=entries):
+                with self.assertRaises(self.integrate.CheckInterpreterError):
+                    self.resolve(*entries)
 
-    def test_neg3_hanging_erroring_or_malformed_probe_is_skipped_never_chosen(self):
-        hang = self.stub(self.root / 'hang', 'sleep 20\n')
+    def test_neg3_erroring_or_malformed_probe_is_skipped_never_chosen(self):
         err = self.stub(self.root / 'err', 'echo 3.12\nexit 1\n')
         junk = self.stub(self.root / 'junk', 'echo banana\n')
         good = fake_python(self.root / 'good', '3.11')
-        self.assertEqual(self.resolve(hang.parent, err.parent, junk.parent, good.parent, timeout=1), str(good))
+        self.assertEqual(self.resolve(err.parent, junk.parent, good.parent), str(good))
         with self.assertRaises(self.integrate.CheckInterpreterError) as raised:
-            self.resolve(hang.parent, err.parent, junk.parent, timeout=1)
+            self.resolve(err.parent, junk.parent)
         self.assertIn('could not report its version', str(raised.exception))
+
+    def test_finding2_hanging_probe_refuses_and_is_named_never_falls_through(self):
+        hang = self.stub(self.root / 'hang', 'sleep 20\n')
+        good = fake_python(self.root / 'good', '3.11')
+        with self.assertRaises(self.integrate.CheckInterpreterError) as raised:
+            self.resolve(hang.parent, good.parent, timeout=1)
+        self.assertIn(str(hang), str(raised.exception))
+        self.assertIn('did not report its version within 1 seconds', str(raised.exception))
+
+    def test_finding1_dotdot_through_a_symlink_checks_and_runs_the_same_file(self):
+        real = self.root / 'real'
+        (real / 'inner').mkdir(parents=True)
+        first = fake_python(real / 'bin', '3.12')
+        later = fake_python(self.root / 'later-bin', '3.11')
+        (self.root / 'x').mkdir()
+        os.symlink(real / 'inner', self.root / 'x' / 'link')
+        entry = f'{self.root}/x/link/../bin'  # the OS resolves it to real/bin; abspath() would say x/bin (absent)
+        self.assertEqual(self.resolve(entry, later.parent), os.path.join(entry, 'python3'))
+        self.assertNotEqual(self.resolve(entry, later.parent), str(later))
+        self.assertTrue(first.exists())
 
     def test_neg4_unusable_earlier_candidate_refuses_and_is_named_not_skipped(self):
         new = fake_python(self.root / 'new-bin', '3.12')

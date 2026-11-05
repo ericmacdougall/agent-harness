@@ -187,7 +187,7 @@ def resolve_check_interpreter(name, env=None, timeout=30):
     Bare names resolve through PATH at run time, so a system Python 3.9 could
     silently run a 3.10+ suite. Scan the absolute PATH entries in order and take
     the first candidate that reports 3.10 or newer. A candidate is skipped only
-    for its version or a failed probe (hang, error, malformed output). One that
+    for its version or a failed probe (error, malformed output). A probe that times out refuses and is named. One that
     exists but cannot be used for another reason (not executable, unreadable
     directory, dangling link) refuses and is named: a later, less trusted entry
     must not win silently. Relative and empty entries are never used.
@@ -210,11 +210,16 @@ def resolve_check_interpreter(name, env=None, timeout=30):
             raise CheckInterpreterError(
                 f'{name} candidate {candidate} exists but is not an executable file; refusing to fall through '
                 'to a later PATH entry. Python checks need 3.10 or newer')
-        found = os.path.abspath(candidate)
+        found = candidate  # already absolute; never abspath() it: collapsing '..' could name a different file
         try:
             probe = run_process([found, '-I', '-c', 'import sys; print("%d.%d" % sys.version_info[:2])'],
                                 timeout=timeout)
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
+            # A slow trusted interpreter (a loaded host) must not be passed over for a later, less trusted entry.
+            raise CheckInterpreterError(
+                f'{name} candidate {found} did not report its version within {timeout} seconds; refusing to '
+                'fall through to a later PATH entry. Python checks need 3.10 or newer') from None
+        except OSError:
             skipped.append(f'{found} could not report its version')
             continue
         match = re.fullmatch(r'(\d+)\.(\d+)\s*', probe.stdout or '')
