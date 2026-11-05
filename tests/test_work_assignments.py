@@ -779,17 +779,25 @@ class RemovalTest(Base):
         self.advance(new)
         self.assertNotIn("SUPERSEDED", self.cli("status")[1])
 
-    def test_superseded_ask_is_removable_only_after_the_superseding_ask_closes(self):
-        old, new = self.split2("exporting", "the old approach to exporting", "the new approach to exporting")
+    def test_superseded_ask_leaves_only_through_a_user_cancel(self):
+        """PR review 5d7efba #1: siblings are the agent's split, so "rotate credentials" superseded by "tidy readme
+        typo" was removed once the typo fix was done, with no evidence and no user words for the dropped request."""
+        old, new = self.split2("two things", "rotate the staging credentials", "tidy the readme typo")
         self.assertEqual(self.cli("update", old, "--state", "superseded")[0], 2)  # needs a superseded_by relation first
         self.cli("relate", old, "superseded_by", new)
         self.assertEqual(self.cli("update", old, "--state", "superseded")[0], 0)
-        CLOCK[0] += 25 * 3600
-        self.assertEqual(self.cli("remove", old)[0], 2)  # the superseding ask is still open
         self.advance(new)
-        CLOCK[0] += 1
+        CLOCK[0] += 25 * 3600
+        self.assertEqual(self.cli("remove", old)[0], 2)
+        self.assertEqual(self.cli("prune")[0], 0)
+        self.assertIn(old, self.asks())
+        msg = self.capture("cancel: do not rotate the staging credentials")
+        uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
+        line = len(self.transcript.read_text().splitlines())
+        self.assertEqual(self.cli(*self.cancel_args(old, uid, line, "cancel: do not rotate the staging credentials"))[0], 0)
+        CLOCK[0] += 25 * 3600
         self.assertEqual(self.cli("remove", old)[0], 0)
-        self.assertEqual(self.data()["tombstones"][old]["proofKind"], "superseded_by_closed")
+        self.assertEqual(self.data()["tombstones"][old]["proofKind"], "user_proof")
         self.check_schema()
 
     def test_removal_reverifies_evidence_so_a_vanished_commit_blocks_it(self):
@@ -1162,6 +1170,24 @@ class AttestGuardTest(Base):
                     "git diff harness/hooks/work_assignments.py", "cat docs/work-assignments.md"):
             self.assertEqual(self.guard("Bash", {"command": cmd}), {}, cmd)
         self.assertEqual(self.guard("Bash", {"command": f"cat {home}/*"}).get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+
+    def test_guard_covers_read_and_search_tools(self):
+        """PR review 5d7efba #2: Claude Code never sent Read/Grep/Glob to the guard, and a Grep rooted at the store passed."""
+        sys.path.insert(0, str(HOOKS.parent.parent))
+        import install
+        matcher = install.work_assignment_hook_groups(Path(self.tmp.name))["PreToolUse"][0]["matcher"].split("|")
+        for tool in ("Read", "Grep", "Glob", "LS", "Bash", "Write", "Edit"):
+            self.assertIn(tool, matcher)
+        home = str(wa.base())
+        deny = lambda r: r.get("hookSpecificOutput", {}).get("permissionDecision")
+        self.assertEqual(deny(self.guard("Read", {"file_path": str(wa.files()["key"])})), "deny")
+        for tool, inp in (("Grep", {"pattern": "x", "path": home}), ("Grep", {"pattern": "x", "path": str(Path(home).parent)}),
+                          ("Glob", {"pattern": home + "/*"}), ("Glob", {"pattern": "**/*", "path": home}), ("LS", {"path": home})):
+            self.assertEqual(deny(self.guard(tool, inp)), "deny", (tool, inp))
+        for tool, inp in (("Read", {"file_path": str(wa.files()["snap"])}), ("Grep", {"pattern": "work-ledger", "path": "/repo/src"}),
+                          ("Grep", {"pattern": "TODO"}), ("Glob", {"pattern": "src/**/*.py", "path": "/repo"}),
+                          ("Grep", {"pattern": "x", "path": home + "/work"})):
+            self.assertEqual(self.guard(tool, inp), {}, (tool, inp))
 
     def test_guard_allows_ordinary_globs_and_code(self):
         """PR review R1 (regression): a bare `*` counted as naming the key, so `ls *` and `x = 2 * 3` were denied."""

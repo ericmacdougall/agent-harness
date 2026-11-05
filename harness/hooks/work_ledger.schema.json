@@ -220,7 +220,9 @@
         "in_progress"
       ],
       "cancelled": [],
-      "superseded": []
+      "superseded": [
+        "cancelled"
+      ]
     },
     "askGuards": {
       "-> blocked": "blockReason required; kind=prerequisite needs at least one unsatisfied prerequisite",
@@ -228,7 +230,7 @@
       "-> done": "completion.status=verified and at least one evidence item with verification.status=verified",
       "done -> in_progress": "reopen: only by a human-sourced message (source.kind=user) and only before removal",
       "-> cancelled": "cancellation.proof present and verified against the transcript as a human turn captured by this ledger",
-      "-> superseded": "related contains superseded_by whose target exists and is not closed"
+      "-> superseded": "exactly one superseded_by, whose target is an open ask split from the same human message; superseded is not removable, only cancel with user proof removes it"
     },
     "decision": {
       "asked": [

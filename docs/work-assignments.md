@@ -52,9 +52,11 @@ event log at removal. A transcript line alone never proves anything. A decision 
 hook-captured message (typed or an AskUserQuestion answer) in that session after the question was recorded, never an
 agent's pick. A cancel through an answer needs the user's own words to retract the ask and name it (id or 3+ of its
 words); the question text does not count, because the agent wrote it. An ask has at most one `superseded_by`
-relation, and superseding is allowed only to an ask split from the same human message (one request refined); it is
-removable once that ask is done. A request the user replaced is cancelled with their words as proof. The guard looks
-at paths and shell commands, not file contents. It refuses a path or shell word that names the key or a glob that
+relation, to an ask split from the same human message. Superseding only marks the link for the digest: it never
+makes an ask removable, because which asks a message holds is the agent's own split. The older ask leaves only
+when the user cancels it. A request the user replaced is cancelled with their words as proof. The guard runs on Write, Edit, MultiEdit, NotebookEdit, Bash, Read, Grep, Glob and LS on Claude Code, and on every
+tool on Codex. It looks at paths and shell commands, not file contents, and refuses a search rooted at the store
+directory or above it. It refuses a path or shell word that names the key or a glob that
 could expand to it (a bare `*` does not count unless it is inside the store directory), recursive reads of the
 store directory, in-process use (`import work_assignments`, `capture_key`, `hook_prompt(`) and agent calls of
 `work_assignments.py hook`.
@@ -92,7 +94,7 @@ contain a cue stays flagged until it is split.
 ## Removal gate
 
 `remove` and `prune` refuse unless the ask has been `done` with re-verifying verified evidence, or `cancelled` with a
-user proof, for more than 24 hours (clock `stateSince`, cached as `removableAfter`), or `superseded` by a done ask split from the same human message.
+user proof, for more than 24 hours (clock `stateSince`, cached as `removableAfter`). A `superseded` ask is not removable; it can be cancelled with user proof.
 A cancel proof names `targets` and a `binding`: `same_message_retraction` (the ask's own message),
 `explicit_reference` (the quote names the ask id or shares 3 or more words with its request),
 `answer_to_decision` or `answer_to_cancel_question` (the human answer to a decision tied to the ask). It must also
@@ -124,7 +126,7 @@ early.
 A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt and no request cues, and an excerpt whose first 15 words look secret-adjacent
 (pass..., pw, key, token, secret, credential, login, ssh, auth..., PIN, OTP, common key prefixes) is withheld entirely.
 That check is a keyword heuristic too: a secret with none of those words nearby can still reach the excerpt, the
-event log and its backup. Request cues are English keyword heuristics: they miss requests phrased without them and flag some messages that are not requests. A superseded ask is removable only when its replacement, a different ask, is done with verified evidence.
+event log and its backup. Request cues are English keyword heuristics: they miss requests phrased without them and flag some messages that are not requests. A superseded ask is never removed on the agent's word; it waits for a user cancel.
 
 Agents run as the same Unix user as the hooks. A forged transcript line, a hand-written spool line and an invented or
 altered attestation are refused. A hand-written event that copies a real attestation is accepted only for the same

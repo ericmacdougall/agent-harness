@@ -47,7 +47,7 @@ TRANSITIONS = {
     "in_progress": ["ready", "blocked", "assigned", "open", "cancelled", "superseded"],
     "blocked": ["open", "assigned", "in_progress", "cancelled", "superseded"],
     "ready": ["done", "in_progress", "blocked", "cancelled", "superseded"],
-    "done": ["in_progress"], "cancelled": [], "superseded": []}
+    "done": ["in_progress"], "cancelled": [], "superseded": ["cancelled"]}
 CLOSED = ("done", "cancelled", "superseded")
 KINDS = ("request", "bug", "feature", "chore", "question", "follow_up")
 GATE_SECONDS = 24 * 3600
@@ -128,6 +128,24 @@ def names_key(tool_input) -> bool:
     if any(KEY_FILE.search(v) or (GLOB_TOKEN.fullmatch(v) and glob_could_name_key(v)) for v in paths):
         return True
     return bool(KEY_FILE.search(command)) or any(glob_could_name_key(t) for t in GLOB_TOKEN.findall(command))
+
+
+def searches_store(tool_input) -> bool:
+    """A Grep/Glob/LS rooted at the store directory or one of its ancestors (a recursive search reaches the key)."""
+    if not isinstance(tool_input, dict):
+        return False
+    home = os.path.realpath(str(base()))
+    for key in ("path", "pattern"):
+        value = tool_input.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        root = value.split("*", 1)[0].split("?", 1)[0].split("[", 1)[0]
+        root = os.path.realpath(os.path.expanduser(os.path.expandvars(root or ".")))
+        if home == root or home.startswith(root.rstrip("/") + "/"):
+            if key == "pattern" and "*" not in value and "?" not in value and "/" not in value:
+                continue  # a Grep regex, not a path
+            return True
+    return False
 
 
 def reads_store_recursively(command: str) -> bool:
@@ -1509,6 +1527,8 @@ def hook_guard(payload: dict, runtime: str) -> dict:
         reason = "Hooks take their input from the harness; agents may not run `work_assignments.py hook`."
     elif isinstance(command, str) and INPROCESS.search(command) and not SAFE_CLI.match(command):
         reason = "work_assignments is used only through its CLI (`python3 .../work_assignments.py <command>`), not imported."
+    elif re.fullmatch(r"(?i)grep|glob|ls|search", tool) and searches_store(tool_input):
+        reason = "Searching the agent-harness store directory would expose the capture key; read a named file instead."
     elif isinstance(command, str) and reads_store_recursively(command):
         reason = "Recursive reads of the agent-harness store would expose the capture key; read a named file instead."
     if reason:
@@ -1824,10 +1844,12 @@ def reverify_evidence(ask: dict, item: dict) -> bool:
 
 
 def eligible(ask: dict, ts: float, data=None) -> tuple:
-    """(ok, reason). The 24h clock is stateSince; done needs verified evidence, cancelled needs re-verifiable proof."""
+    """(ok, reason). The 24h clock is stateSince; done needs verified evidence, cancelled needs re-verifiable proof.
+    Superseded is never enough: which asks one message holds is the agent's split, so only the user's own words
+    (`cancel`) can drop the older ask, however done its replacement is."""
     state = ask["state"]
     if state not in CLOSED:
-        return False, f"state is {state}; only done, cancelled or superseded asks can be removed"
+        return False, f"state is {state}; only done or cancelled asks can be removed"
     age = ts - parse_ts(ask["stateSince"])
     if age <= GATE_SECONDS:
         return False, f"{state} for {age / 3600:.1f}h; removal needs more than 24h"
@@ -1844,10 +1866,7 @@ def eligible(ask: dict, ts: float, data=None) -> tuple:
         except (WAError, KeyError) as error:
             return False, f"cancel proof no longer verifies: {error}"
         return True, "cancelled with verified user proof for more than 24h"
-    other = supersede_target(data, ask) if data is not None else None
-    if other is not None and other["state"] == "done":  # the replacement itself passed the done gate (verified evidence)
-        return True, "superseded by a done ask"
-    return False, "the superseding ask is not a single done ask split from the same human message"
+    return False, "a superseded ask is removed only after the user cancels it (`cancel` with their words as proof)"
 
 
 # --------------------------------------------------------------------------- ask construction and cli

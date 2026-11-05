@@ -77,7 +77,7 @@ def work_assignment_hook_groups(claude: Path) -> dict[str, list[dict]]:
         "Stop": [{"hooks": [hook("stop")]}],
         "SessionStart": [{"hooks": [hook("session")]}],
         "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [hook("ask-answer")]}],
-        "PreToolUse": [{"matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash", "hooks": [hook("guard")]}],
+        "PreToolUse": [{"matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|Read|Grep|Glob|LS", "hooks": [hook("guard")]}],
         "SubagentStart": [{"matcher": SUBAGENT_MATCHER, "hooks": [hook("subagent-start")]}],
     }
 
