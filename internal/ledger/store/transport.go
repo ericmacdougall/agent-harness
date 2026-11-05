@@ -100,8 +100,8 @@ func ValidateURL(u string) error {
 			}
 			return nil
 		case "file":
-			if !strings.HasPrefix(pu.Path, "/") {
-				return errors.New("file URL must be absolute")
+			if !strings.HasPrefix(pu.Path, "/") || (pu.Host != "" && pu.Host != "localhost") {
+				return errors.New("file URL must be an absolute local path")
 			}
 			return nil
 		}

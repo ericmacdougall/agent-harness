@@ -2,6 +2,8 @@ package ledger_test
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -142,10 +144,11 @@ func TestTravelRefusesHostileURLs(t *testing.T) {
 	}
 	for _, u := range urls {
 		a.git(a.repo, "config", "remote.origin.url", u)
-		for _, args := range [][]string{{"travel", "enable", "--remote", "origin", "--yes-share", "00000000"}} {
-			if r := a.run(a.repo, nil, append([]string{"tickets"}, args...)...); r.code == 0 {
-				t.Errorf("accepted hostile URL %q", u)
-			}
+		// Present the exact token for this URL, so only URL validation can refuse it.
+		sum := sha256.Sum256([]byte(u + "\n" + u))
+		tok := hex.EncodeToString(sum[:])[:8]
+		if r := a.run(a.repo, nil, "tickets", "travel", "enable", "--remote", "origin", "--yes-share", tok); r.code == 0 {
+			t.Errorf("accepted hostile URL %q", u)
 		}
 	}
 	if _, err := os.Stat(marker); err == nil {

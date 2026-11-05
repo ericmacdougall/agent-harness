@@ -235,6 +235,7 @@ func (a *app) handler(host, token string) http.Handler {
 	mux.HandleFunc("POST /api/git/sync", a.gitSyncHTTP)
 	mux.HandleFunc("POST /api/git/remove", a.gitRemoveHTTP)
 	mux.HandleFunc("POST /api/launch", a.launchHTTP)
+	mux.HandleFunc("POST /api/ledger/sync-state", a.ledgerSyncHTTP)
 	mux.HandleFunc("POST /api/prs", a.prListHTTP)
 	mux.HandleFunc("POST /api/prs/review-map", a.prMapHTTP)
 	mux.HandleFunc("POST /api/prs/review-map/attach", a.prAttachHTTP)

@@ -41,6 +41,7 @@ func receiptFor(t *testing.T, doc map[string]any, mutate func(map[string]any)) s
 		"base_digest":    doc["base_digest"],
 		"frontier":       doc["frontier"],
 		"tickets":        []any{},
+		"redacted":       doc["redacted"],
 		"imported_at_ms": 1,
 	}
 	if mutate != nil {
