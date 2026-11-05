@@ -1239,8 +1239,9 @@ class AttestGuardTest(Base):
         self.assertEqual(deny(self.guard("Grep", {"pattern": "x", "path": home + "\x00"})), "deny")
 
     def test_guard_search_resolution_from_cwd_and_ancestors(self):
-        """PR review 62e5e5f #2/#3/#7/#8: a relative path into the store passed; every pathless search from an
-        ancestor (the home dir) was denied; a relative `../` Glob passed; a Grep regex starting with / was a path."""
+        """PR review 62e5e5f #2/#3/#7/#8: a relative path into the store passed; a relative `../` Glob passed; a Grep
+        regex starting with / was a path. WA-HIDDEN: Claude Code Grep searches dot-directories, so a pathless Grep from
+        the home dir reaches the key unless a filter excludes it; Glob and LS list names only."""
         hidden = Path(self.tmp.name) / "u" / ".agent-harness"
         hidden.mkdir(parents=True)
         user_home = str(hidden.parent)
@@ -1252,11 +1253,13 @@ class AttestGuardTest(Base):
                                    ("LS", {"path": ".agent-harness"}, user_home),
                                    ("Glob", {"pattern": "../*"}, str(hidden / "work")),
                                    ("Glob", {"pattern": ".agent-harness/*"}, user_home),
-                                   ("Glob", {"pattern": ".*/**", "path": user_home}, "/"),
                                    ("Grep", {"pattern": "x", "glob": ".agent-harness/**"}, user_home),
+                                   ("Grep", {"pattern": "x"}, user_home), ("Grep", {"pattern": "x", "path": "~"}, "/repo"),
+                                   ("Grep", {"pattern": "x", "glob": "*.key"}, user_home),
                                    ("Grep", {"pattern": "x"}, str(hidden))):
                 self.assertEqual(call(tool, inp, cwd), "deny", (tool, inp, cwd))
-            for tool, inp, cwd in (("Grep", {"pattern": "x"}, user_home), ("Glob", {"pattern": "**/*.md"}, user_home),
+            for tool, inp, cwd in (("Grep", {"pattern": "x", "glob": "*.md"}, user_home), ("Grep", {"pattern": "x", "type": "py"}, user_home),
+                                   ("Glob", {"pattern": "**/*.md"}, user_home), ("Glob", {"pattern": ".*/**", "path": user_home}, "/"),
                                    ("Glob", {"pattern": "/usr/lib/python3*/json/*.py"}, user_home),
                                    ("Grep", {"pattern": "/.*", "path": "/repo"}, user_home), ("Grep", {"pattern": "~/"}, "/repo"),
                                    ("LS", {"path": user_home}, user_home), ("Grep", {"pattern": "x", "path": "work"}, str(hidden))):

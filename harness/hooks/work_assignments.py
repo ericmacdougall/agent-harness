@@ -131,10 +131,14 @@ def names_key(tool_input) -> bool:
 
 
 def searches_store(tool: str, tool_input, cwd=None) -> bool:
-    """A Grep/Glob that reaches the store directory, or an LS of it. Paths resolve against the session cwd and a
-    Glob pattern against its path. From an ancestor, the store is reached only when no dot-directory lies between
-    (ripgrep and globs skip hidden directories unless the path or pattern names one). A Grep pattern is a regex,
-    never a path. A NUL byte fails closed."""
+    """Whether a search tool would read the capture key. Claude Code's Grep and Glob search dot-directories (checked
+    headless: a pathless Grep returned a file under `.hid/`), so the store is reachable from any ancestor.
+    - Grep returns file contents: denied when rooted at the store or an ancestor, unless a `glob` or `type` filter
+      cannot match the key's name.
+    - Glob and LS return names only (reading the key stays denied): denied only when rooted at the store itself.
+    Paths resolve against the session cwd and a Glob pattern against its path. A Grep pattern is a regex, never a
+    path. A NUL byte fails closed."""
+    import fnmatch
     if not isinstance(tool_input, dict):
         return False
     if any(isinstance(v, str) and "\x00" in v for v in tool_input.values()):
@@ -146,25 +150,24 @@ def searches_store(tool: str, tool_input, cwd=None) -> bool:
     def resolve(value: str, against: str) -> str:
         return os.path.realpath(os.path.join(against, os.path.expanduser(os.path.expandvars(value))))
 
-    def names_hidden(value) -> bool:
-        return isinstance(value, str) and any(part.startswith(".") and part not in (".",) for part in re.split(r"[\\/]", value))
-
-    def reaches(root: str, hidden_named: bool, recursive: bool = True) -> bool:
-        if root == home:
-            return True
-        if not recursive or not home.startswith(root.rstrip("/") + "/"):
-            return False
-        between = os.path.relpath(home, root).split(os.sep)
-        return hidden_named or not any(part.startswith(".") for part in between)
-
     path = tool_input.get("path") if isinstance(tool_input.get("path"), str) and tool_input["path"].strip() else None
     root = resolve(path, here) if path else os.path.realpath(here)
     if name == "glob" and isinstance(tool_input.get("pattern"), str):
         pattern = tool_input["pattern"]
         literal = re.split(r"[*?\[{]", pattern, 1)[0]
         prefix = literal if literal.endswith("/") or literal == pattern else literal.rpartition("/")[0]
-        return reaches(resolve(prefix or ".", root), names_hidden(path) or names_hidden(pattern))
-    return reaches(root, names_hidden(path) or names_hidden(tool_input.get("glob")), recursive=name != "ls")
+        return resolve(prefix or ".", root) == home
+    if name == "ls":
+        return root == home
+    if root != home and not home.startswith(root.rstrip("/") + "/"):
+        return False
+    filt = tool_input.get("glob")
+    if isinstance(tool_input.get("type"), str) and tool_input["type"].strip() and not filt:
+        return False  # a file-type filter (py, js, ...) never matches work-ledger.key
+    if isinstance(filt, str) and filt.strip():
+        globs = [g.strip() for g in re.split(r"[,\s]+", filt.strip("{}")) if g.strip()]
+        return any(fnmatch.fnmatchcase("work-ledger.key", g.rsplit("/", 1)[-1]) or g.startswith("!") for g in globs)
+    return True
 
 
 def reads_store_recursively(command: str) -> bool:
@@ -1550,8 +1553,9 @@ def hook_guard(payload: dict, runtime: str) -> dict:
     elif isinstance(command, str) and INPROCESS.search(command) and not SAFE_CLI.match(command):
         reason = "work_assignments is used only through its CLI (`python3 .../work_assignments.py <command>`), not imported."
     elif re.fullmatch(r"(?i)grep|glob|ls|search", tool) and searches_store(tool, tool_input, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None):
-        reason = ("Searching the agent-harness store directory would expose the capture key; pass a narrower `path` "
-                  "outside it, or read a named file instead.")
+        reason = ("This search would reach the agent-harness store and could expose the capture key (Claude Code searches "
+                  "hidden directories). Pass a `path` that does not contain the store, or a `glob`/`type` filter such as "
+                  "`*.py`, or read a named file.")
     elif isinstance(command, str) and reads_store_recursively(command):
         reason = "Recursive reads of the agent-harness store would expose the capture key; read a named file instead."
     if reason:

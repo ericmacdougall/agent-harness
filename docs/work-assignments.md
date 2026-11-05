@@ -55,10 +55,11 @@ words); the question text does not count, because the agent wrote it. An ask has
 relation, to an ask split from the same human message. Superseding only marks the link for the digest: it never
 makes an ask removable, because which asks a message holds is the agent's own split. The older ask leaves only
 when the user cancels it. A request the user replaced is cancelled with their words as proof. The guard runs on Write, Edit, MultiEdit, NotebookEdit, Bash, Read, Grep, Glob and LS on Claude Code, and on every
-tool on Codex. It looks at paths and shell commands, not file contents, and refuses a Grep or Glob that reaches the store
-directory, and an LS of it. Paths resolve against the session cwd (a Glob pattern against its path). From an
-ancestor such as the home directory, a search reaches the store only if the path or pattern names a dot-directory,
-because ripgrep and globs skip hidden directories by default; this assumes Claude Code keeps that default. It refuses a path or shell word that names the key or a glob that
+tool on Codex. It looks at paths and shell commands, not file contents, and refuses a Grep rooted at the store or any folder
+above it (such as the home directory) unless a `glob` or `type` filter cannot match the key's name, because Claude
+Code's Grep and Glob search hidden directories (checked headless on 2.1.318). Glob and LS list names only and are
+refused only at the store itself; reading the key stays refused. Paths resolve against the session cwd, and a Glob
+pattern against its path. It refuses a path or shell word that names the key or a glob that
 could expand to it (a bare `*` does not count unless it is inside the store directory), recursive reads of the
 store directory, in-process use (`import work_assignments`, `capture_key`, `hook_prompt(`) and agent calls of
 `work_assignments.py hook`.
