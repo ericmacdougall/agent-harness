@@ -62,9 +62,10 @@ class Base(unittest.TestCase):
         self.settings.write_text(json.dumps({"model": "x", "hooks": {"PreToolUse": [{"matcher": "Bash"}]}}))
         self.mirror_dir = str(self.root / "mirror")
         self.fake = FakeMirrors()
-        patcher = mock.patch.object(integrity.subprocess, "run", self.fake)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for patcher in (mock.patch.object(integrity.subprocess, "run", self.fake),
+                        mock.patch.object(integrity, "short_host", lambda: "testbox")):  # never the mirror host itself
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def record(self, **kw):
         return integrity.record(self.hooks, self.settings, self.mirror_dir, host="testhost", **kw)
@@ -533,13 +534,13 @@ class StableHostId(Base):
             self.assertRegex(integrity.host_id(), r"^linux-[0-9a-f]{16}$")
         with self.clean_env(), mock.patch.object(integrity.sys, "platform", "linux"), \
                 mock.patch.object(integrity.Path, "read_text", side_effect=OSError), \
-                mock.patch.object(integrity.socket, "gethostname", lambda: "box.lan"):
+                mock.patch.object(integrity, "short_host", lambda: "box"):
             self.assertEqual(integrity.host_id(), "box")
 
         def broken(argv, **kw):
             raise OSError("no ioreg")
         with self.clean_env(), mock.patch.object(integrity.sys, "platform", "darwin"), \
-                mock.patch.object(integrity.socket, "gethostname", lambda: "box.lan"):
+                mock.patch.object(integrity, "short_host", lambda: "box"):
             self.assertEqual(integrity.host_id(broken), "box")
         with mock.patch.dict(os.environ, {"HARNESS_HOST_ID": "fixed-label"}):
             self.assertEqual(integrity.host_id(broken), "fixed-label")

@@ -365,7 +365,7 @@ def ancestor_hit(real: str) -> str | None:
     dirs, files = protected_roots()
     if os.path.basename(real.rstrip("/")) == ".claude":
         return real
-    home = os.path.realpath(os.path.expanduser("~"))
+    home = real_path(os.path.expanduser("~"))
     if not inside(real, home):
         return None
     for r in dirs + files:
@@ -375,7 +375,7 @@ def ancestor_hit(real: str) -> str | None:
 
 
 def ancestor_of_secrets(real: str) -> bool:
-    home = os.path.realpath(os.path.expanduser("~"))
+    home = real_path(os.path.expanduser("~"))
     return real in (home, os.path.dirname(home), "/") or real == "/Users"
 
 

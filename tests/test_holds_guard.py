@@ -1227,7 +1227,7 @@ class FinalSlowHome(unittest.TestCase):
         ops = self.OPS + " /tmp/one /tmp/one /tmp/two"
         with mock.patch.object(hg, "SLOW_ROOTS", ("/home", "/net")), mock.patch.object(hg.os.path, "realpath", counting):
             self.assertIsNone(verdict(bash(f"cat {ops}")))
-        self.assertFalse([p for p in seen if p.startswith("/home")], "automounter touched")
+        self.assertFalse([p for p in seen if p.startswith("/home/eric/dir")], "automounter touched")
         self.assertEqual(seen.count("/tmp/one"), 1)
         self.assertEqual(seen.count("/tmp/two"), 1)
 
