@@ -1,3 +1,4 @@
+import atexit
 import importlib.util
 import json
 import os
@@ -28,6 +29,36 @@ SPEC.loader.exec_module(rescue)
 def git(repo, *args):
     result = subprocess.run(['git', '-C', str(repo), *args], capture_output=True, text=True, check=True)
     return result.stdout.strip()
+
+
+_SCRUBBED = None
+_REVIEWER_NAMES = {'codex', 'claude', 'ssh'}
+
+
+def scrubbed_system_path():
+    """A directory of symlinks to the system tools minus any reviewer CLI or ssh (GoodQA #14560, #14633).
+
+    The tests build PATH from the fixture bin plus /usr/bin:/bin. On a host that has a real /usr/bin/codex (dev2) the
+    "Astra executable unavailable" test would find and launch the real model CLI after the fixture codex is removed.
+    """
+    global _SCRUBBED
+    if _SCRUBBED is None:
+        _SCRUBBED = Path(os.path.realpath(tempfile.mkdtemp(prefix='rescue-syspath-')))
+        atexit.register(shutil.rmtree, _SCRUBBED, True)
+        for directory in ('/usr/bin', '/bin'):
+            try:
+                names = sorted(os.listdir(directory))
+            except OSError:
+                continue
+            for name in names:
+                target = _SCRUBBED / name
+                if name in _REVIEWER_NAMES or target.exists() or target.is_symlink():
+                    continue
+                try:
+                    target.symlink_to(Path(directory, name))
+                except OSError:
+                    pass
+    return str(_SCRUBBED)
 
 
 class RescueTests(unittest.TestCase):
@@ -255,7 +286,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
                    '--output', str(output or self.output)]
         if wal is not None:
             command += ['--wal', str(wal)]
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin', **(env or {})}
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + scrubbed_system_path(), **(env or {})}
         return subprocess.run(command, text=True, capture_output=True, env=environment,
                               timeout=watchdog_seconds)
 
@@ -840,6 +871,15 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertTrue(report['dirty'])
         self.assertIn('A disposable rescue packet', capture.read_text())
         self.assertNotIn('Fixture handoff', capture.read_text())
+
+    def test_scrubbed_system_path_cannot_resolve_a_real_reviewer_cli(self):
+        import shutil as sh
+        path = str(self.bin) + os.pathsep + scrubbed_system_path()
+        (self.bin / 'codex').unlink()
+        self.assertIsNone(sh.which('codex', path=path))
+        self.assertIsNone(sh.which('ssh', path=path))
+        self.assertIsNotNone(sh.which('git', path=path))
+        self.assertIsNotNone(sh.which('claude', path=path))  # only the fixture claude resolves
 
     def test_output_symlink_does_not_delete_target(self):
         target = self.root / 'important.txt'

@@ -4,7 +4,7 @@
 usage-touching modules are run on their own. It points HOME and AGENT_HARNESS_USAGE_DIR at a private temp root for
 the process so every child inherits them. Limits, stated plainly:
 - a child started with an empty environment still falls back to the pwd database (GoodQA #14561); the gate wrapper
-  (hermetic_check.sh) therefore also runs the suite under a sandbox that DENIES writes to the real state dirs;
+  (hermetic_check.sh) therefore loads a write-audit hook into every Python process of the suite through a virtualenv;
 - modules that froze a real-home path at import time (before install ran) are reported by scan_frozen_paths(), which the
   suite asserts only when the gate pinned HOME first; under a bare discover those globals are protected by the tests'
   own patches (see the spec's Scope limits).

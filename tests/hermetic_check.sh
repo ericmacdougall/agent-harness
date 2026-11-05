@@ -9,10 +9,10 @@
 # state dirs, swallowed or not. Every disposable file lives in a fresh mktemp dir outside ~/.agent-harness; the dir is
 # printed as REPORT_DIR.
 # PASS = suite rc 0 with "Ran N" (N>0) and a final OK line, 0 non-loopback ssh calls, an empty audit log (opendir records count), the hook
-# loaded at least twice, and two canaries: a write into a temp "protected" dir is recorded,
+# loaded at least twice, no ~/.codex created in the scratch HOME (a reviewer CLI ran), and two canaries: a write into a temp "protected" dir is recorded,
 # and the suite's own configuration loads with protected=9. Every FAIL path exits non-zero.
-# Limits: ssh is recorded only when found through PATH (bwrap runs in a network namespace with a working loopback, so
-# there is no outside network on dev2; the macOS gate does not cut the network); the temp dir is left behind for inspection (it is disposable
+# Limits: ssh is recorded only when found through PATH; the plain gate does not cut the network (only HC_BWRAP=1 does, for
+# single modules); the temp dir is left behind for inspection (it is disposable
 # and under TMPDIR; if TMPDIR is under the real home the run is refused with exit 6 after creating that empty dir); a child that execs another interpreter by absolute path (for example /usr/bin/python3) or a non-Python writer is
 # not audited; the before/after listing of the real dirs is informational because other agents write there.
 # Optional write protection (EPERM or EROFS, never a kill signal): HC_SANDBOX=1 (macOS sandbox-exec: deny writes below the
@@ -20,7 +20,6 @@
 # profile, so use it for single modules and failing controls) and HC_BWRAP=1 (Linux bubblewrap, no outside network: the whole filesystem is
 # read-only except the tree, its git common dir, the temp dir and a tmpfs /tmp; single modules and failing controls only: inside
 # bwrap's user namespace host root-owned directories look foreign, so the ownership tests (test_pyfront) fail there).
-# AGENT_HARNESS_REVIEW_POLICY, when set by the caller, is passed through (use a file with empty reviewer lists).
 # HC_UNPINNED=1 runs the old tests with the real HOME and no pin (failing controls on a base tree only) and REQUIRES
 # HC_SANDBOX=1 or HC_BWRAP=1 so a leak is blocked rather than written.
 set -u
@@ -65,8 +64,6 @@ env -i PATH="/usr/bin:/bin" "$vpy" -c "pass"
 grep -q "protected=9" "$LOGS_REAL/loaded.log" 2>/dev/null || { echo "audit hook did not load with the 9 protected paths"; exit 7; }
 pin=(HOME="$scratch" AGENT_HARNESS_USAGE_DIR="$scratch/usage" HARNESS_SUITE_PINNED=1)
 [ -n "${HC_UNPINNED:-}" ] && pin=(HOME="$R")
-# The caller may pass a reviewer policy that lists no reviewer binaries, so no test can ever find (and launch) a real model CLI.
-[ -n "${AGENT_HARNESS_REVIEW_POLICY:-}" ] && pin+=(AGENT_HARNESS_REVIEW_POLICY="$AGENT_HARNESS_REVIEW_POLICY")
 envtmp=(); [ -n "${HC_TMPDIR:-}" ] && envtmp=(TMPDIR="$HC_TMPDIR")
 args=(discover -s tests); [ -n "$pattern" ] && args+=(-p "$pattern")
 wrap=()
@@ -85,13 +82,16 @@ ${wrap[@]+"${wrap[@]}"} env -i "${pin[@]}" ${envtmp[@]+"${envtmp[@]}"} \
   "$vpy" -m unittest "${args[@]}" > "$LOGS_REAL/suite.log" 2>&1
 rc=$?
 snap > "$LOGS_REAL/after.snap"; diff "$LOGS_REAL/before.snap" "$LOGS_REAL/after.snap" > "$LOGS_REAL/snap.diff"; d=$(wc -l < "$LOGS_REAL/snap.diff" | tr -d ' ')
-# ssh to a loopback address is how tests/test_delivery_helpers.py fakes an unreachable git remote (ssh://127.0.0.1/missing.git);
-# it never leaves the machine, so it is counted separately and does not fail the gate. Any other host does.
+# Exempt only the exact form git uses for ssh://127.0.0.1/... remotes (tests/test_delivery_helpers.py fakes an unreachable
+# remote that way): "... 127.0.0.1 git-upload-pack|git-receive-pack|git-upload-archive ...". It never leaves the machine and is
+# counted separately. Any other ssh call, including other commands run on a loopback name, fails the gate.
 ssh=0; sshlo=0
 if [ -f "$LOGS_REAL/ssh.calls" ]; then
-  ssh=$(grep -Evc "(^| )(127\.0\.0\.1|localhost|::1)( |$)" "$LOGS_REAL/ssh.calls")
-  sshlo=$(grep -Ec "(^| )(127\.0\.0\.1|localhost|::1)( |$)" "$LOGS_REAL/ssh.calls")
+  gitlo='(^| )(127\.0\.0\.1|localhost) git-(upload-pack|receive-pack|upload-archive)( |$)'
+  ssh=$(grep -Evc "$gitlo" "$LOGS_REAL/ssh.calls")
+  sshlo=$(grep -Ec "$gitlo" "$LOGS_REAL/ssh.calls")
 fi
+codexhome=0; [ -e "$scratch/.codex" ] && codexhome=1
 audited=0; [ -f "$LOGS_REAL/audit.log" ] && audited=$(wc -l < "$LOGS_REAL/audit.log" | tr -d ' ')
 errors=0; [ -f "$LOGS_REAL/audit.log.error" ] && errors=$(wc -l < "$LOGS_REAL/audit.log.error" | tr -d ' ')
 opendirs=0; [ -f "$LOGS_REAL/audit.log" ] && opendirs=$(grep -c " opendir " "$LOGS_REAL/audit.log")
@@ -99,5 +99,5 @@ ran=$(sed -n 's/^Ran \([0-9][0-9]*\) tests\{0,1\} in .*/\1/p' "$LOGS_REAL/suite.
 finalok=0; tail -n 3 "$LOGS_REAL/suite.log" | grep -Eq '^OK( \(.*\))?$' && finalok=1
 loaded=$(wc -l < "$LOGS_REAL/loaded.log" | tr -d ' ')
 if command -v shasum >/dev/null; then sha=$(shasum -a 256 "$self" | cut -c1-16); else sha=$(sha256sum "$self" | cut -c1-16); fi
-echo "suite_rc=$rc tests_ran=$ran final_ok=$finalok audit_writes=$audited audit_opendir_records=$opendirs audit_log_errors=$errors ssh_calls=$ssh ssh_loopback_calls=$sshlo hook_loaded_in=$loaded snapshot_diff_lines=$d sandbox=${HC_SANDBOX:-no} bwrap=${HC_BWRAP:-no} pinned=$([ -n "${HC_UNPINNED:-}" ] && echo no || echo yes) tmpdir=${HC_TMPDIR:-unset} pattern=${pattern:-full} script_sha256=$sha $(grep -E '^Ran ' "$LOGS_REAL/suite.log")" | tee "$LOGS_REAL/result.txt"
-if [ "$rc" = 0 ] && [ "$audited" -eq 0 ] && [ "$errors" -eq 0 ] && [ "$ssh" -eq 0 ] && [ "$loaded" -ge 2 ] && [ "$ran" -gt 0 ] && [ "$finalok" -eq 1 ]; then echo HERMETIC_PASS | tee -a "$LOGS_REAL/result.txt"; echo "REPORT_DIR=$LOGS_REAL"; else echo HERMETIC_FAIL | tee -a "$LOGS_REAL/result.txt"; echo "REPORT_DIR=$LOGS_REAL (audit.log, suite.log, ssh.calls)"; exit 1; fi
+echo "suite_rc=$rc tests_ran=$ran final_ok=$finalok audit_writes=$audited audit_opendir_records=$opendirs audit_log_errors=$errors codex_home_created=$codexhome ssh_calls=$ssh ssh_loopback_calls=$sshlo hook_loaded_in=$loaded snapshot_diff_lines=$d sandbox=${HC_SANDBOX:-no} bwrap=${HC_BWRAP:-no} pinned=$([ -n "${HC_UNPINNED:-}" ] && echo no || echo yes) tmpdir=${HC_TMPDIR:-unset} pattern=${pattern:-full} script_sha256=$sha $(grep -E '^Ran ' "$LOGS_REAL/suite.log")" | tee "$LOGS_REAL/result.txt"
+if [ "$rc" = 0 ] && [ "$audited" -eq 0 ] && [ "$errors" -eq 0 ] && [ "$codexhome" -eq 0 ] && [ "$ssh" -eq 0 ] && [ "$loaded" -ge 2 ] && [ "$ran" -gt 0 ] && [ "$finalok" -eq 1 ]; then echo HERMETIC_PASS | tee -a "$LOGS_REAL/result.txt"; echo "REPORT_DIR=$LOGS_REAL"; else echo HERMETIC_FAIL | tee -a "$LOGS_REAL/result.txt"; echo "REPORT_DIR=$LOGS_REAL (audit.log, suite.log, ssh.calls)"; exit 1; fi
