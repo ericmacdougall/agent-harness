@@ -7318,6 +7318,106 @@
    ]
   },
   {
+   "cmd": "kill -0 $(printf \"%s \" -s KILL) 1",
+   "expect": "block",
+   "id": "P-rt5-subst-dash",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -0 `echo -s` KILL 1",
+   "expect": "block",
+   "id": "P-rt5-backtick-dash",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -0 [-]s KILL 1",
+   "expect": "block",
+   "id": "P-rt5-glob-class",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -0 ?s KILL 1",
+   "expect": "block",
+   "id": "P-rt5-glob-qmark",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -0 * 1",
+   "expect": "block",
+   "id": "P-rt5-glob-star",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -s 0 ${X} 1",
+   "expect": "block",
+   "id": "P-rt5-s0-var-pid",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -0 $a $b 1",
+   "expect": "block",
+   "id": "P-rt5-var-var-pid",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -0 \"$a\" \"$b\" 4004",
+   "expect": "block",
+   "id": "P-rt5-quoted-var-var-pid",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -0 $(printf \"%s \" -s KILL 4004)",
+   "expect": "block",
+   "id": "P-rt5-sole-subst",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -n 0 $(echo -n) 4004",
+   "expect": "block",
+   "id": "P-rt5-n0-subst",
+   "tags": [
+    "ownership",
+    "signal0",
+    "bash"
+   ]
+  },
+  {
    "cmd": "grep -n \"pkill -f pytest\" notes.md",
    "expect": "allow",
    "id": "N-text00-grep",
@@ -9721,6 +9821,38 @@
    "cmd": "kill -0 %1",
    "expect": "allow",
    "id": "N-rt4-ok-kill-0-job",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 $PID",
+   "expect": "allow",
+   "id": "N-rt5-ok-lone-var",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 \"$PID\"",
+   "expect": "allow",
+   "id": "N-rt5-ok-lone-quoted-var",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -0 4004 $x",
+   "expect": "allow",
+   "id": "N-rt5-ok-pid-then-var",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -s 0 \"$PID\"",
+   "expect": "allow",
+   "id": "N-rt5-ok-s0-lone-var",
    "tags": [
     "signal0"
    ]

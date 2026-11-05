@@ -902,7 +902,7 @@ def make_analyzer_class(cg):
                     k and args[k - 1].text in ('-s', '-n', '--signal')))) for k, a in enumerate(args)):
                 self.block('unprovable-target', 'a brace expansion is too large or hides an option')
                 return
-            if last_sig == '0' and not any(not w.dynamic and w.text.startswith('-') for w in targets):
+            if last_sig == '0' and liveness_only(targets):
                 return  # a liveness probe, unless a later dash word hides a real target (kill -0 -s KILL PID)
             if self.xargs:
                 self.block('pidfeed', 'kill through xargs takes its targets from another command, so none can be '
@@ -942,6 +942,21 @@ def make_analyzer_class(cg):
                     break
 
     return KillAnalyzer
+
+
+
+def liveness_only(targets):
+    """True when `kill -0 ...` can only probe. bash reads -s/-n/-l after the first signal option, so a word that expands
+    to one (a substitution, a glob, a variable that splits) placed before a real PID turns the probe into a kill."""
+    for w in targets:
+        plain = not (w.dynamic or w.subs or w.glob)
+        if plain and re.fullmatch(r'[0-9]{1,10}', w.text, re.ASCII):
+            return True  # bash stops reading options at the first PID
+        if plain and not w.text.startswith('-') and not any(a.startswith('-') for a in w.alts):
+            continue
+        # A lone plain variable (kill -0 $PID) stays a probe; its value is not visible here (see Known limits).
+        return len(targets) == 1 and w.dynamic and not w.subs and not w.glob
+    return True
 
 
 def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=None, home=None):
