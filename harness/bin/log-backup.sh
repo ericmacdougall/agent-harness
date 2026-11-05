@@ -12,6 +12,7 @@
 #   LOG_BACKUP_HOST         host label, letters digits . _ - only (default: hostname -s)
 #   LOG_BACKUP_EXCLUDES     exclude file (default: log-backup.excludes next to this script)
 #   LOG_BACKUP_RETRIES      extra attempts per source (default 2) and LOG_BACKUP_RETRY_SLEEP seconds between them (30)
+#   LOG_BACKUP_STAGE        local snapshot directory for live sources (default ~/.agent-harness/backup-stage)
 #   LOG_BACKUP_VERSIONS     exactly 0 turns off versions/STAMP (loud warning); anything else keeps them
 # Freshness contract: log-backup.last-ok is written (atomically, with the run START time) only after every source
 # copied cleanly and at least one primary source (.claude/projects or .codex/sessions) was copied. A run skipped
@@ -127,34 +128,62 @@ R="$BASE/$HOST"
 [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ] || say "WARNING: versions disabled; a truncated local file would overwrite its remote copy"
 
 ok=0 found=0 primary=0
-for src in .claude/projects .claude/wals .claude/history.jsonl .codex/sessions .codex/archived_sessions .codex/history.jsonl .agent-harness/work \
-    .agent-harness/work-assignments.json .agent-harness/work-ledger.json .agent-harness/work-ledger.events.jsonl \
-    .agent-harness/work-ledger.archive.jsonl .agent-harness/work-ledger.failures.jsonl .agent-harness/work-ledger.spool.jsonl; do
-  [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
-  if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
-  if [ -d "$HOME/$src" ]; then dst="$R/$src"; else dst="$R/$(dirname "$src")"; fi
+STAGE=${LOG_BACKUP_STAGE:-$HOME/.agent-harness/backup-stage}
+# Live sources (transcripts and WALs grow while uploaded, so Dropbox's hash check would fail) are snapshotted into a
+# local stage first and uploaded from there. Static sources upload in place, skipping files younger than 2 minutes.
+LIVE=(.claude/projects .claude/wals .claude/history.jsonl .codex/sessions .codex/history.jsonl
+  .agent-harness/work-assignments.json .agent-harness/work-ledger.json .agent-harness/work-ledger.events.jsonl
+  .agent-harness/work-ledger.archive.jsonl .agent-harness/work-ledger.failures.jsonl .agent-harness/work-ledger.spool.jsonl)
+DIRECT=(.codex/archived_sessions .agent-harness/work)
+command -v rsync >/dev/null 2>&1 || fail "rsync not found (needed to snapshot live files)" 127
+mkdir -p "$STAGE" && chmod 700 "$STAGE" || fail "cannot create the stage directory" 1
+
+upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
+  local p="$1" rel="$2" dst
+  shift 2
+  if [ -d "$p" ]; then dst="$R/$rel"; else dst="$R/$(dirname "$rel")"; fi
   args=(copy --dropbox-batch-mode sync --dropbox-batch-size 100 --tpslimit 2 --transfers 2 --checkers 4
-    --retries 10 --retries-sleep 30s --low-level-retries 20 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE --exclude-from "$EXCLUDES" --ignore-case)
-  if [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ]; then args+=(--backup-dir "$R/versions/$STAMP/$src"); fi
-  # Actively written files (live transcripts, WALs) can change mid-upload and Dropbox can rate-limit: retry the
-  # source with a pause before calling it a failure. A source that still fails makes the whole run non-fresh.
+    --retries 10 --retries-sleep 30s --low-level-retries 20 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE --exclude-from "$EXCLUDES" --ignore-case "$@")
+  if [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ]; then args+=(--backup-dir "$R/versions/$STAMP/$rel"); fi
+  # Dropbox can rate-limit (too_many_write_operations): retry the source with a pause before calling it a failure.
+  # A source that still fails makes the whole run non-fresh.
   attempt=0 copied=0
   while :; do
-    if "$RCLONE" "${args[@]}" -- "$HOME/$src" "$dst" </dev/null; then copied=1; break; fi
+    if "$RCLONE" "${args[@]}" -- "$p" "$dst" </dev/null; then copied=1; break; fi
     attempt=$((attempt + 1))
     [ $attempt -le "${LOG_BACKUP_RETRIES:-2}" ] || break
-    say "copy of $src failed; retry $attempt after ${LOG_BACKUP_RETRY_SLEEP:-30}s (file changed mid-copy or rate limit)"
+    say "copy of $rel failed; retry $attempt after ${LOG_BACKUP_RETRY_SLEEP:-30}s (file changed mid-copy or rate limit)"
     sleep "${LOG_BACKUP_RETRY_SLEEP:-30}"
   done
   if [ $copied -eq 1 ]; then
     found=$((found + 1))
-    case "$src" in .claude/projects|.codex/sessions)
+    case "$rel" in .claude/projects|.codex/sessions)
       # An empty primary tree is not evidence of a backup.
-      if [ -n "$(find "$HOME/$src" -type f -print -quit 2>/dev/null)" ]; then primary=$((primary + 1)); fi ;;
+      if [ -n "$(find "$p" -type f -print -quit 2>/dev/null)" ]; then primary=$((primary + 1)); fi ;;
     esac
   else
-    say "copy failed after $attempt attempts: $src"; ok=1
+    say "copy failed after $attempt attempts: $rel"; ok=1
   fi
+}
+
+for src in "${LIVE[@]}"; do
+  [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
+  if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
+  snap="$STAGE/$src"
+  mkdir -p "$(dirname "$snap")" || { say "cannot stage $src"; ok=1; continue; }
+  if [ -d "$HOME/$src" ]; then
+    # rsync -a keeps symlinks as links; rclone never follows them. Exit 24 = a file vanished mid-copy (not an error).
+    rsync -a "$HOME/$src/" "$snap/" </dev/null; rc=$?
+    [ $rc -eq 0 ] || [ $rc -eq 24 ] || { say "snapshot failed (rsync exit $rc): $src"; ok=1; continue; }
+  else
+    cp -p "$HOME/$src" "$snap" || { say "snapshot failed: $src"; ok=1; continue; }
+  fi
+  upload "$snap" "$src"
+done
+for src in "${DIRECT[@]}"; do
+  [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
+  if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
+  upload "$HOME/$src" "$src" --min-age 2m
 done
 [ $primary -gt 0 ] || { say "no primary source (.claude/projects or .codex/sessions) was copied"; ok=1; }
 
