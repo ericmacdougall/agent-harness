@@ -207,7 +207,30 @@ def lock_holder(home: Path) -> str:
         return f"held by pid {pid}"
 
 
+def status_json(home: Path, max_age: int = MAX_AGE_SECONDS) -> dict:
+    """Machine-readable status; the schema is documented in docs/operations.md (status --json) and kept stable."""
+    logs = logs_dir(home)
+    transcripts, bulk = classify(home, max_age=max_age), bulk_classify(home)
+
+    def tier(result, marker, limit):
+        age = result["age"]
+        return {"state": result["state"], "age_seconds": None if age is None else int(age),
+                "max_age_seconds": limit, "marker": marker}
+
+    return {"schema": 1,
+            "transcripts": tier(transcripts, LAST_OK, max_age),
+            "bulk": tier(bulk, BULK_OK, BULK_MAX_AGE_SECONDS),
+            "last_run": printable(read_small(logs / LAST_RUN) or ""),
+            "last_skip": printable(read_small(logs / LAST_SKIP) or ""),
+            "lock": lock_holder(home),
+            "ok": transcripts["state"] == "fresh" and bulk["state"] in ("fresh", "pending")}
+
+
 def cmd_status(args) -> int:
+    if args.json:
+        data = status_json(args.home, args.max_age)
+        print(json.dumps(data, sort_keys=True))
+        return 0 if data["ok"] else 1
     result = classify(args.home, max_age=args.max_age)
     logs = logs_dir(args.home)
     print(f"last success : {printable(read_small(logs / LAST_OK) or 'never')} (age {human_age(result['age'])}, {result['state']})")
@@ -423,7 +446,7 @@ def main(argv: list[str] | None = None) -> int:
     for name, handler in (("check", cmd_check), ("session-start", cmd_session_start), ("status", cmd_status)):
         cmd = sub.add_parser(name)
         cmd.add_argument("--max-age", type=int, default=MAX_AGE_SECONDS, help="seconds before stale (default 3600)")
-        if name == "check":
+        if name in ("check", "status"):
             cmd.add_argument("--json", action="store_true")
         cmd.set_defaults(func=handler)
     restore = sub.add_parser("restore", help="restore one source from the remote into an empty scratch directory")

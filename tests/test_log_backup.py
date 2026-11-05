@@ -179,6 +179,28 @@ class Status(Base):
         self.assertEqual(code, 1)
         self.assertIn("never", out.getvalue())
 
+    def test_status_json_schema_and_exit_code(self):
+        self.last_ok(stamp(time.time() - 60) + " sources=6\n")  # also writes a fresh bulk marker
+        (self.logs / "log-backup.last-run").write_text("x exit=0\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = lb.main(["--home", str(self.home), "status", "--json"])
+        data = json.loads(out.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(set(data), {"schema", "transcripts", "bulk", "last_run", "last_skip", "lock", "ok"})
+        self.assertEqual(data["schema"], 1)
+        self.assertEqual(data["transcripts"]["marker"], "log-backup.last-ok")
+        self.assertEqual(data["transcripts"]["max_age_seconds"], 3600)
+        self.assertEqual(data["bulk"]["marker"], "log-backup.bulk-last-ok")
+        self.assertEqual(data["bulk"]["max_age_seconds"], 21600)
+        self.assertEqual((data["transcripts"]["state"], data["bulk"]["state"], data["ok"]), ("fresh", "fresh", True))
+        self.last_ok(stamp(time.time() - 7200))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = lb.main(["--home", str(self.home), "status", "--json"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out.getvalue())["transcripts"]["state"], "stale")
+
     def test_status_reports_success_run_skip_and_lock(self):
         self.last_ok(stamp(time.time() - 60) + " sources=6\n")
         (self.logs / "log-backup.last-run").write_text("x exit=0\n")
