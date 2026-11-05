@@ -7,6 +7,17 @@ group by pull request.
 ## Unreleased
 
 ### Added
+- Heavy work off the Mac (goodqa#14817, P12). `heavy_job_guard.py` has a `copy` rule: cp, rsync, tar, ditto,
+  `git clone`, `gh repo clone` and `git worktree add` are sized (bounded walk, `ssh du`, GitHub repo size) and
+  refused at 1 GiB (`HARNESS_COPY_GIB`), unknown size counting as heavy. `HARNESS_LOCAL_OK` is limited to one use
+  per owner per hour (`HARNESS_HATCH_PER_HOUR`), audited to the WAL and the alert ring (source `heavy-guard`), and
+  never applies to a large copy above 85% disk. `ops_watch.py` gives each `work/<session>/<sub>` owner a 5 GiB disk
+  budget (kit `disk_budget_gib` up to 20), alerts `disk:owner:<agent>` by name and writes
+  `state/disk-budget/<agent>.json`; an over-budget owner cannot start a heavy copy. Nothing is killed or deleted.
+  `install_codex.py` installs the guard for Codex (trust it in Codex `/hooks`).
+- `command_guard.py`: `rm` of a top-level git clone needs no Dropbox backup when git proves it clean, with nothing
+  untracked, and every local commit reachable from a remote-tracking ref that matches the live remote
+  (`reproducible_clone` policy). Any doubt keeps the existing approve-delete rule.
 - `scripts/leak_scan.py`: scans tracked files (or history with `--history [--range]`) for
   tokens, private keys, real home-directory names, private and shared-address-space (RFC 6598) addresses,
   tailnet names and a local denylist. It never prints a matched value, and exits 2 if
