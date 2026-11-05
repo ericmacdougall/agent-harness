@@ -26,7 +26,8 @@ import sys
 from pathlib import Path
 
 PLACEHOLDER_USERS = {"someone", "you", "x", "u", "user", "username", "name", "runner", "me", "shared",
-                     "test", "tester", "example", "home", "your-name", "yourname", "alice", "bob"}
+                     "test", "tester", "example", "home", "your-name", "yourname", "alice", "bob",
+                     "cgremote", "remoteuser", "local"}  # synthetic names used by the command-guard and doctor tests
 IPV4 = r"(?<![\d.])(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01])|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7]))\.\d{1,3}\.\d{1,3}(?![\d.])"
 TOKEN_RULES = [
     ("aws-access-key", re.compile(r"AKIA[0-9A-Z]{16}")),

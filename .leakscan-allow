@@ -7,3 +7,4 @@ tests/test_review_map.py
 tests/test_spec_flow.py
 tests/test_wal.py
 internal/redact/testdata/gen_corpus.py
+tests/test_ah.py

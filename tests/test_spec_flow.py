@@ -63,6 +63,18 @@ An agent cannot mark a harness ticket done without proof.
 - NEG-1 (AC-1): a tampered attachment is not accepted.
   Source: ticket:GoodQA harness#14398
 
+
+## Resource budget
+Host: vm:fixture
+Capacity: fixture VM, 8 GB memory, 4 cores, 50 GB disk
+Fan-out: agents=1 jobs=1 processes=2 browser_pages=0 test_workers=1
+Peak memory: 1 GB (method: fixture)
+CPU: 1 cores (method: fixture)
+Disk: 1 GB (method: fixture)
+Network: 1 MB (method: fixture)
+Wall time: 1 min
+Cap and kill: none needed for a fixture; run_capped.py would pause on breach
+Checkpoint: none
 ## Risks
 
 - Hook breaks MCP calls: narrow matcher, warn first.
