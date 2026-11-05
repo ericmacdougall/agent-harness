@@ -104,6 +104,16 @@ class Darwin(Case):
         self.assertIn("deferred", message)
         self.assertEqual(runner.calls, [])
 
+    def test_a_legacy_lock_without_a_pid_defers_the_reload_so_the_running_job_is_not_killed(self):
+        lock = self.home / ".agent-harness/logs/log-backup.lock.d"
+        lock.mkdir(parents=True)
+        old = os.stat(lock).st_mtime - 6600
+        os.utime(lock, (old, old))
+        message, runner = self.apply("Darwin")
+        self.assertIn("deferred", message)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual((self.home / SCRIPT).read_bytes(), (ROOT / "harness/bin/log-backup.sh").read_bytes())
+
     def test_deferred_reload_is_finished_by_the_next_install(self):
         lock = self.home / ".agent-harness/logs/log-backup.lock.d"
         lock.mkdir(parents=True)
