@@ -332,6 +332,71 @@ class CoverageTests(Fixture):
         self.assertNotIn("SECRET", p.stdout.decode() + p.stderr.decode())
         self.assertGreaterEqual(by["dirty_worktree"]["count"], 1)
 
+    def test_untracked_files_visible_despite_showuntracked_no(self):
+        git(self.noremote, "config", "status.showUntrackedFiles", "no")
+        (self.noremote / "new.txt").write_text("x")
+        self.assertEqual(self.scan()["classes"]["dirty_worktree"], 1)
+
+    def test_dirty_decision_stale_after_edit_of_same_file(self):
+        git(self.noremote, "remote", "add", "o", "https://remote.example.invalid/n.git")
+        f = self.noremote / "n1"
+        f.write_text("edit one")
+        self.scan()
+        path = "%s::dirty" % self.noremote
+        self.run_cli("decide", "--row", path, "--decision", "moved", "--ticket", "t#1", expect=0)
+        f.write_text("edit two, longer")
+        self.scan()
+        und = [x["path"] for x in json.loads(self.run_cli("report", "--json", expect=1).stdout)["undecided"]]
+        self.assertIn(path, und)
+
+    def test_crontab_failure_is_an_error_not_empty(self):
+        ct = self.fakebin / "crontab"
+        ct.write_text('#!/bin/sh\necho "crontab: permission denied" >&2\nexit 1\n')
+        r = self.scan()
+        self.assertTrue(any(e["path"] == "crontab" for e in r["errors"]), r["errors"])
+        self.decide_all()
+        self.run_cli("report", expect=1)
+        r = json.loads(self.run_cli("scan", "--root", str(self.home), "--no-crontab", "--json", expect=0).stdout)
+        self.assertFalse(any(e["path"] == "crontab" for e in r["errors"]))
+        self.assertIn("NO_CRONTAB", self.run_cli("report", expect=1).stdout.decode())
+
+    def test_missing_crontab_binary_is_an_error(self):
+        env = dict(self.env, PATH="/nonexistent-dir")
+        p = subprocess.run([sys.executable, str(SCRIPT), "scan", "--root", str(self.home), "--json"], env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        r = json.loads(p.stdout)
+        self.assertTrue(any(e["path"] == "crontab" for e in r["errors"]), r["errors"])
+
+    def test_report_expect_host_and_db_threshold(self):
+        self.scan()
+        self.decide_all()
+        self.run_cli("report", "--expect-host", json.loads(self.saved().read_text())["host"], expect=0)
+        self.assertIn("HOST", self.run_cli("report", "--expect-host", "t2-dev", expect=1).stdout.decode())
+        self.run_cli("scan", "--root", str(self.home), "--min-db-bytes", "1000000000000", "--json", expect=0)
+        self.assertIn("DB_THRESHOLD", self.run_cli("report", expect=1).stdout.decode())
+
+    def test_loopback_and_helper_remotes_are_local(self):
+        for url in ("http://127.0.1.1/r.git", "ssh://127.5.5.5/r.git", "gcrypt::/mnt/backup/y", "git@[::1]:r.git",
+                    "http://0.0.0.0/r.git"):
+            git(self.work, "remote", "set-url", "origin", url)
+            self.assertEqual(self.scan()["classes"]["no_remote_repo"], 2, url)
+
+    def test_symlink_into_pruned_dir_is_not_covered(self):
+        real = self.home / ".cache" / "real"
+        real.mkdir(parents=True)
+        os.symlink(str(real), str(self.home / "work"))
+        r = self.scan()
+        self.assertIn(str(self.home / "work"), [x["path"] for x in r["skipped_symlinks"]])
+
+    def test_literal_pathspec_for_tracked_check(self):
+        sub = self.noremote
+        shutil.copy(str(self.db), str(sub / "a.db"))
+        git(sub, "add", "a.db")
+        git(sub, "commit", "-qm", "a")
+        shutil.copy(str(self.db), str(sub / "[ab].db"))  # untracked, but glob-matches tracked a.db
+        paths = [x["path"] for x in self.scan()["rows"] if x["class"] == "state_db_outside_git"]
+        self.assertIn(str(sub / "[ab].db"), paths)
+
     def test_untracked_db_inside_repo_counts_tracked_does_not(self):
         shutil.copy(str(self.db), str(self.noremote / "prod.db"))  # sqlite magic, untracked
         r = self.scan()
