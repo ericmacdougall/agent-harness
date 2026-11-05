@@ -1464,6 +1464,19 @@ class StoreTest(Base):
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": other}):
             self.assertNotIn("pick the billing vendor", self.cli("status")[1])
             self.assertIn("DECISION", self.cli("status")[1])
+            self.assertNotIn("pick the billing vendor", self.cli("status", "--json")[1])  # acceptance v12 W1: --json follows too
+            self.assertIn("pick the billing vendor", self.cli("status", "--json", "--all")[1])
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": SID}):
+            self.assertIn("pick the billing vendor", self.cli("status", "--json")[1])
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            self.assertNotIn("pick the billing vendor", self.cli("status", "--json")[1])
+            self.assertEqual(self.cli("decision", "ask", "--text", "choose the old hosting plan")[0], 0)  # W4: no recorded session
+            self.assertIn("choose the old hosting plan", self.cli("status")[1])
+            self.assertIn("choose the old hosting plan", self.cli("status", "--json")[1])
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": other}):
+            self.assertIn("choose the old hosting plan", self.cli("status")[1])
+            self.assertIn("choose the old hosting plan", self.cli("status", "--json")[1])
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": other}):  # acceptance v11 V5: the digest's hints lead to --json
             self.assertNotIn("refactor the billing", self.cli("status", "--json")[1])
             self.assertIn("refactor the billing", self.cli("status", "--json", "--all")[1])
@@ -2006,6 +2019,30 @@ class LatencyTest(Base):
                 self.assertEqual(run.returncode, 0)
                 self.assertLess(took, 3.0, size)
                 self.assertEqual(b'"deny"' in run.stdout, text.startswith("rm"), size)
+
+    def test_safe_cli_is_linear_and_keeps_its_language(self):
+        """Acceptance v12 W2: a long path after python3 took over 14 s at 64 KiB in SAFE_CLI, inside re, where the 6 s abort cannot fire."""
+        env = {**os.environ, "PYTHONPATH": str(HOOKS)}
+        removal = f"; {'r' + 'm'} {wa.base()}/work-ledger.json"
+        for text in (f"python3 /{'A' * 512 * 1024} {removal}", f"python3 x/work_assignments.py status{' ' * 512 * 1024}{removal}",
+                     f"python3 /{'A' * 512 * 1024} -c 'import work_assignments'"):
+            payload = {"session_id": SID, "tool_name": "Bash", "tool_input": {"command": text}, "cwd": self.tmp.name}
+            started = time.monotonic()
+            run = subprocess.run([sys.executable, str(HOOKS / "work_assignments.py"), "hook", "guard"],
+                                 input=json.dumps(payload).encode(), capture_output=True, env=env, timeout=20)
+            self.assertLess(time.monotonic() - started, 3.0, text[:30])
+            self.assertIn(b'"deny"', run.stdout, text[:30])
+        payload = {"session_id": SID, "tool_name": "Write", "tool_input": {"file_path": "/x/a/" + "*" * 512 * 1024 + " " + "b", "content": "x"}, "cwd": self.tmp.name}
+        started = time.monotonic()  # adversarial v12: a 32 KB run of * in a Write path took 12.5 s in GLOB_TOKEN.fullmatch
+        subprocess.run([sys.executable, str(HOOKS / "work_assignments.py"), "hook", "guard"], input=json.dumps(payload).encode(), capture_output=True, env=env, timeout=20)
+        self.assertLess(time.monotonic() - started, 3.0)
+        for good in ("python3 ~/.claude/hooks/work_assignments.py status", "python3 $HOME/.claude/hooks/work_assignments.py status --all",
+                     "  python3  /a/b/work_assignments.py  show  x  y ", "python3 ./work_assignments.py decision ask --text 'a b'",
+                     "python3 x/work_assignments.py status\n"):
+            self.assertTrue(wa.SAFE_CLI.match(good), good)
+        for bad in ("python3 x/work_assignments.py status; ls", "python3 x/work_assignments.py status a\n ls", "python3 $(x)/work_assignments.py status",
+                    "python3 x/work_assignments.py status > y", "python3 $HOME$HOME/work_assignments.py status", "python3 work_assignments.py status"):
+            self.assertFalse(wa.SAFE_CLI.match(bad), bad)
 
     def run_with_stuck_hook(self, name, policy):
         """The real run_hook with its timer shortened and the hook stuck: the timer's own exit path, in a real process."""

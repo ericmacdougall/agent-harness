@@ -466,3 +466,26 @@
 {"category": "key-glob-word", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -n \"a\\.\\w* =\" f.py"}
 {"category": "key-glob-word", "expect": "allow", "cwd": "@HOME@", "cmd": "sed -n \"/x\\|y\\.\\w*/p\" f.py"}
 {"category": "key-glob-word", "expect": "allow", "cwd": "@HOME@", "cmd": "grep -E \"(a|\\\\w*|b)\" f.py"}
+{"category": "ledger-writers", "expect": "deny", "cwd": "@HOME@", "cmd": "unlink @STORE@/work-ledger.json"}
+{"category": "ledger-writers", "expect": "deny", "cwd": "@HOME@", "cmd": "trash @STORE@/work-ledger.json"}
+{"category": "ledger-writers", "expect": "deny", "cwd": "@HOME@", "cmd": "srm @STORE@/work-ledger.json"}
+{"category": "ledger-writers", "expect": "deny", "cwd": "@HOME@", "cmd": "shred -u @STORE@/work-ledger.json"}
+{"category": "ledger-writers", "expect": "deny", "cwd": "@HOME@", "cmd": "touch @STORE@/work-ledger.json"}
+{"category": "ledger-writers", "expect": "deny", "cwd": "@HOME@", "cmd": "gzip @STORE@/work-ledger.json"}
+{"category": "ledger-writers", "expect": "deny", "cwd": "@HOME@", "cmd": "bzip2 @STORE@/work-ledger.json"}
+{"category": "ledger-writers", "expect": "deny", "cwd": "@HOME@", "cmd": "xz @STORE@/work-ledger.json"}
+{"category": "ledger-writers", "expect": "deny", "cwd": "@HOME@", "cmd": "chown eric @STORE@/work-ledger.json"}
+{"category": "ledger-writers", "expect": "deny", "cwd": "@HOME@", "cmd": "tar --remove-files -cf /tmp/x.tar @STORE@/work-ledger.json"}
+{"category": "ledger-writers", "expect": "deny", "cwd": "@HOME@", "cmd": "awk -i inplace 1 @STORE@/work-ledger.json"}
+{"category": "ledger-writers", "expect": "allow", "cwd": "@HOME@", "cmd": "touch work-assignments.md"}
+{"category": "ledger-writers", "expect": "allow", "cwd": "@HOME@", "cmd": "unlink /tmp/notes.txt"}
+{"category": "ledger-writers", "expect": "allow", "cwd": "@HOME@", "cmd": "gzip -k logs/app.log"}
+{"category": "ledger-writers", "expect": "allow", "cwd": "@HOME@", "cmd": "touch ../work-assignments/new.txt"}
+{"category": "failed-cd-chain", "expect": "deny", "cwd": "@STORE@", "cmd": "cd missing-dir && pwd; rm -rf *"}
+{"category": "failed-cd-chain", "expect": "deny", "cwd": "@STORE@", "cmd": "cd missing-dir && pwd\nrm -rf *"}
+{"category": "failed-cd-chain", "expect": "deny", "cwd": "@HOME@", "cmd": "cd missing-dir && pwd; rm -rf .agent-harness"}
+{"category": "failed-cd-chain", "expect": "deny", "cwd": "@STORE@", "cmd": "cd missing-dir && pwd || rm -rf *"}
+{"category": "failed-cd-chain", "expect": "deny", "cwd": "@STORE@", "cmd": "cd missing-dir && cd sub && pwd; rm -rf *"}
+{"category": "failed-cd-chain", "expect": "allow", "cwd": "@STORE@", "cmd": "cd missing-dir && rm -rf *"}
+{"category": "failed-cd-chain", "expect": "allow", "cwd": "@STORE@", "cmd": "cd missing-dir && pwd && rm -rf *"}
+{"category": "failed-cd-chain", "expect": "allow", "cwd": "@STORE@", "cmd": "cd /tmp && pwd; rm -rf *"}

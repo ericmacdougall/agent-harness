@@ -70,10 +70,11 @@ DEFAULT_POLICY = {"schema": 1, "capture": "enforce", "stop": "enforce", "guard":
                   "stale_hours": 12, "max_stop_blocks": 3}
 PROTECTED = re.compile(r"work-(?:assign|ledger)[A-Za-z0-9._*?-]*|work_assignments_policy[A-Za-z0-9._*?-]*|"
                        r"work_assign[a-z]*[*?]|work-[a-z]+[*?]|\bhive\.json\b")
-SAFE_CLI = re.compile(r"^\s*python3\s+(?:~|\$HOME|/[^\s;&|<>`$]*)?[^\s;&|<>`$]*/work_assignments\.py\s+[A-Za-z-]+(?:\s+[^;&|<>`$\n]*)?$")
+# Linear on purpose, with the same language as its older form: past the 10 s hook timeout the tool runs, and a regex holds
+# the GIL so the 6 s abort cannot fire. No two adjacent parts here may match the same character.
+SAFE_CLI = re.compile(r"^\s*python3\s+(?:\$HOME)?[^\s;&|<>`$]*/work_assignments\.py\s+[A-Za-z-]+(?:\s+(?:[^\s;&|<>`$][^;&|<>`$\n]*)?)?$")
 KEY_FILE = re.compile(r"(?i)work-ledger\.key")
-GLOB_TOKEN = re.compile(r"[^\s'\"=;&|<>()`]*[*?\[][^\s'\"=;&|<>()`]*")
-GLOB_WORD = re.compile(r"[^\s'\"=;&|<>()`]+")  # findall with GLOB_TOKEN was quadratic on one long token: 64 KB took 28 s
+GLOB_WORD = re.compile(r"[^\s'\"=;&|<>()`]+")  # an older two-star glob pattern was quadratic on one long token: 64 KB took 28 s
 HOOK_CALL = re.compile(r"\bhook\s+(?:prompt|stop|session|compact|ask-answer|guard|subagent-start)\b")
 INPROCESS = re.compile(r"\b(?:import|from)\s+work_assignments\b|__import__\(\s*['\"]work_assignments|\bcapture_key\b|"
                        r"\bhook_prompt\s*\(|\bhook_ask_answer\s*\(|\bbuild_capture\s*\(|\battest\s*\(")
@@ -200,7 +201,7 @@ def glob_could_name_key(token: str) -> bool:
 def names_key(tool_input, tool: str = "") -> bool:
     """Only paths and shell commands count: editing a file whose text mentions the key (these docs) is fine."""
     paths, command = guard_targets(tool_input, tool)
-    if any(KEY_FILE.search(v) or (GLOB_TOKEN.fullmatch(v) and glob_could_name_key(v)) for v in paths):
+    if any(KEY_FILE.search(v) or (GLOB_WORD.fullmatch(v) and re.search(r"[*?\[]", v) and glob_could_name_key(v)) for v in paths):
         return True
     return bool(KEY_FILE.search(command)) or any(glob_could_name_key(t) for t in GLOB_WORD.findall(command) if "*" in t or "?" in t or "[" in t)
 
@@ -488,11 +489,17 @@ class ShellState:
 
     def __init__(self, here: str):
         self.here, self.previous, self.stack, self.variables, self.unknown_cd = here, None, [], {}, False
+        self.before_failed_cd = None  # where the shell really is while a `cd missing && ...` chain is being skipped
 
     def fork(self):
         copy = ShellState(self.here)
         copy.previous, copy.stack, copy.variables, copy.unknown_cd = self.previous, list(self.stack), dict(self.variables), self.unknown_cd
         return copy
+
+    def chain_ended(self) -> None:
+        if self.before_failed_cd is not None:
+            self.here, self.previous, self.stack = self.before_failed_cd
+            self.before_failed_cd, self.unknown_cd = None, True
 
     def expand(self, word: str):
         """The word's value, or None when only the shell could know it."""
@@ -537,8 +544,12 @@ class ShellState:
         if path is None or path.startswith(("~", "+", "-")) or re.search(r"[*?\[]", path):
             self.unknown_cd = True
             return
-        if not chained and not os.path.isdir(os.path.join(self.here, path)):
-            return  # `cd missing; rm -rf *`: the cd fails and the next command still runs here
+        if not os.path.isdir(os.path.join(self.here, path)):
+            if not chained:  # `cd missing; rm -rf *`: the cd fails and the next command still runs here
+                self.unknown_cd = True  # or this same command made the directory, which the guard cannot see: say so
+                return
+            if self.before_failed_cd is None:  # `cd missing && a; rm -rf *`: only `a` is skipped
+                self.before_failed_cd = (self.here, self.previous, list(self.stack))
         if prog == "pushd":
             self.stack.append(self.here)
         self.unknown_cd = self.unknown_cd and not path.startswith("/")
@@ -604,6 +615,8 @@ def walk_shell(commands: list, state: ShellState, fed: bool, depth: int):
     `feeds` means its output goes on to become file arguments (xargs, a loop, or a substitution)."""
     feeding = outputs_feeding_reads(commands)
     for index, cmd in enumerate(commands):
+        if index > 0 and not commands[index - 1].chained:
+            state.chain_ended()
         piped_in = index > 0 and commands[index - 1].op == "|"
         isolated = piped_in or cmd.op in ("|", "&")  # pipeline stages and background jobs are subshells: a cd stays there
         feeds = fed or feeding[index]
@@ -888,7 +901,8 @@ def removal_denial(prog: str, root: str, unknown_cd: bool) -> str:
 
 
 WRITEISH = re.compile(r"(?:>|\btee\b|\brm\b|\bmv\b|\bcp\b|\bscp\b|\brsync\b|sed\s+-i|\btruncate\b|\bpython3?\b|\bperl\b|\bruby\b|\bnode\b|"
-                      r"\bdd\b|\bln\b|\bchmod\b|\binstall\b|\bgit\s+(?:checkout|restore|stash)\b)")
+                      r"\bdd\b|\bln\b|\bchmod\b|\bchown\b|\binstall\b|\bunlink\b|\btrash\b|\bsrm\b|\bshred\b|\btouch\b|\bgzip\b|\bbzip2\b|\bxz\b|--remove-files|\bawk\s+-i\b|"
+                      r"\bgit\s+(?:checkout|restore|stash)\b)")
 
 
 class WAError(Exception):
@@ -3240,6 +3254,8 @@ def cmd_status(args):
             if session is not None:  # the digest's hints point here, so it must not widen what the digest shows
                 out["messages"] = {k: v for k, v in data["messages"].items() if v["sessionId"] == session}
                 out["asks"] = {k: v for k, v in data["asks"].items() if v["origin"]["actor"].get("sessionId") == session}
+                out["decisions"] = {k: v for k, v in data["decisions"].items()
+                                    if v.get("origin", {}).get("actor", {}).get("sessionId") in (None, session)}
                 out.pop("index")
             print(json.dumps(out, indent=1, sort_keys=True))
             return
