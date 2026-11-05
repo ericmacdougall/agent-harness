@@ -372,7 +372,8 @@ FOCUSED_TEST_FILE = re.compile(r"test_[A-Za-z0-9_]{1,100}\.py")
 
 
 def focused_unittest(options):
-    """`-m unittest discover -s tests -p <one literal test_*.py name>`: a single file, no glob, path or extra argv.
+    """`-m unittest discover -s tests -p <one literal test_*.py name>`: one file name, no glob, path or extra argv
+    (discovery matches that name in tests/ and its subpackages).
 
     A name that matches no file is still safe: run() wraps every `-m unittest discover` check so that an empty or
     all-skipped discovery fails (Python before 3.12 would otherwise exit zero)."""

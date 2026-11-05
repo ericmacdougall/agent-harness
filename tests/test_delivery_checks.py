@@ -183,6 +183,28 @@ class CheckInterpreter(unittest.TestCase):
         self.assertFalse((self.root / 'absent').exists())
 
 
+    def test_finish_approves_the_focused_form_and_still_refuses_broader_ones(self):
+        # The focused form passes the approval step (the failure is the later interpreter pin, goodqa#14730);
+        # a glob or path name is refused at approval, before the interpreter is even looked at.
+        old = fake_python(self.root / 'old-bin2', '3.9')
+        for check, approved in (('python3 -m unittest discover -s tests -p test_merge_gate.py', True),
+                                ("python3 -m unittest discover -s tests -p 'test_*.py'", False),
+                                ('python3 -m unittest discover -s tests -p tests/test_a.py', False)):
+            with self.subTest(check=check):
+                argv = ['deliver.py', 'finish', '--task', 'focused-preflight', '--original', str(self.root / 'absent'),
+                        '--original-branch', 'main', '--mode', 'remote', '--check', check]
+                with patch.object(sys, 'argv', argv), patch.dict(os.environ, {'PATH': str(old.parent)}):
+                    args = self.delivery.parse_args()
+                    with self.assertRaises(self.delivery.DeliveryError) as raised:
+                        self.delivery.finish(args)
+                self.assertEqual((raised.exception.status, raised.exception.code), ('BLOCKED_POLICY', 2))
+                if approved:
+                    self.assertIn('Python 3.9', raised.exception.message)
+                else:
+                    self.assertIn('not approved', raised.exception.message)
+                self.assertFalse((self.root / 'absent').exists())
+
+
 class TailRedaction(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
