@@ -1914,6 +1914,23 @@ class LexerReasons(HookFixture):
             self.assertTrue(ah_run.parse_command(command).uncertain, command[:12])
         self.assertLess(time.monotonic() - started, 8)
 
+    def test_unterminated_bodies_are_read_once(self):
+        """Openers that never close: the first body reads to the end, later ones are not read again (the work counted, not
+        timed, so load cannot hide a quadratic). 2000 openers rescanned would be about two million body lines."""
+        real, seen = ah_run._body_line_runs_code, []
+
+        def counted(line):
+            seen.append(line)
+            return real(line)
+        with mock.patch.object(ah_run, '_body_line_runs_code', counted):
+            parsed = ah_run.parse_command('<<E\n' * 2000)
+            for opener in ('<<A\n', '<<-B\n', "<<'C'\n", '<<D\n'):
+                ah_run.parse_command('cat ' + opener + 'x\n' * 500 + '<<E\n' * 1000)
+        self.assertIn('heredoc-unterminated', parsed.reasons)
+        self.assertGreater(len(seen), 1999, 'vacuous: no body line was read')
+        self.assertLess(len(seen), 20000)
+        self.assertLessEqual({'heredoc-body', 'heredoc-unterminated'}, set(ah_run.parse_command('cat <<A\n$(x)\nA\n<<B\nrm y').reasons))
+
 
 class R6Shapes(HookFixture):
     """r6 B15-B21 and the quoted-code hosts, decision only (no shell): the hidden line is denied in every mode, never allowed

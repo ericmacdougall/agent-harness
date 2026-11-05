@@ -817,7 +817,7 @@ class _Lexer:
         self.commands, self.groups, self.group_texts = [], [], []
         self.bodies, self.openers, self.opener_spans, self.spans, self.pending = [], [], [], [], []
         self.continuations = []
-        self.newline = self.pipeline = self.substitution = self.saw_nesting = self.stopped = False
+        self.newline = self.pipeline = self.substitution = self.saw_nesting = self.stopped = self.ran_off_end = False
         self.first = self.n - len(text.lstrip(' \t\n'))
         self.last = len(text.rstrip(' \t\n'))
 
@@ -1024,13 +1024,16 @@ class _Lexer:
 
     def _read_bodies(self, i):
         """The bodies of the pending openers from the line at i. A body ends only on a line holding exactly its delimiter
-        (tabs stripped first for <<-). An unquoted body that a shell would read differently records a reason."""
+        (tabs stripped first for <<-). An unquoted body that a shell would read differently records a reason. Once one body
+        has run off the end the command is uncertain and later bodies are not read: each would rescan the rest of the text,
+        and 64 KiB of openers would cost the square of that."""
         text, n, position = self.text, self.n, i
         for delimiter, quoted, strip_tabs in self.pending:
             body = []
             while True:
-                if position > n:
+                if position > n or self.ran_off_end:
                     self.reason('heredoc-unterminated')
+                    self.ran_off_end = True
                     self.pending = []
                     return i
                 end = text.find('\n', position)
