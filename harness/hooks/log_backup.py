@@ -86,6 +86,11 @@ def classify(home: Path, now: float | None = None, max_age: int = MAX_AGE_SECOND
     return {"state": "fresh" if age <= max_age else "stale", "age": age}
 
 
+def printable(text: str) -> str:
+    """Control characters stripped: state files are untrusted when shown on a terminal."""
+    return "".join(c if c.isprintable() or c == " " else "?" for c in text.strip())
+
+
 def human_age(seconds: float | None) -> str:
     if seconds is None:
         return "unknown"
@@ -150,9 +155,9 @@ def lock_holder(home: Path) -> str:
 def cmd_status(args) -> int:
     result = classify(args.home, max_age=args.max_age)
     logs = logs_dir(args.home)
-    print(f"last success : {(read_small(logs / LAST_OK) or 'never').strip()} (age {human_age(result['age'])}, {result['state']})")
-    print(f"last run     : {(read_small(logs / LAST_RUN) or 'never').strip()}")
-    print(f"last skipped : {(read_small(logs / LAST_SKIP) or 'never').strip()} (a skipped run is not a backup)")
+    print(f"last success : {printable(read_small(logs / LAST_OK) or 'never')} (age {human_age(result['age'])}, {result['state']})")
+    print(f"last run     : {printable(read_small(logs / LAST_RUN) or 'never')}")
+    print(f"last skipped : {printable(read_small(logs / LAST_SKIP) or 'never')} (a skipped run is not a backup)")
     print(f"lock         : {lock_holder(args.home)}")
     return 0 if result["state"] == "fresh" else 1
 
@@ -221,7 +226,7 @@ def validate_host(host: str) -> str:
 def list_remotes(rclone: str) -> dict[str, str]:
     """{name: type} from `rclone listremotes --long` (names and types only; never configuration)."""
     try:
-        done = subprocess.run([rclone, "listremotes", "--long", "--ask-password=false"], stdin=subprocess.DEVNULL,
+        done = subprocess.run([rclone, "listremotes", "--long", "--ask-password=false"], stdin=subprocess.DEVNULL, env=clean_env(),
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, check=False)
     except (OSError, subprocess.SubprocessError) as error:
         raise RestoreError(f"cannot run {rclone} ({error.__class__.__name__})")
@@ -333,9 +338,9 @@ def cmd_restore(args) -> int:
             raise RestoreError(f"rclone copyto failed (exit {code})")
         # Remote and restored copy must agree by checksum (rclone check, source side only).
         if is_dir:
-            check = [args.rclone, "check", "--one-way", "--", remote, str(target)]
+            check = [args.rclone, "check", "--one-way", "--download", "--", remote, str(target)]
         else:
-            check = [args.rclone, "check", "--one-way", "--include", "/" + target.name, "--",
+            check = [args.rclone, "check", "--one-way", "--download", "--include", "/" + target.name, "--",
                      remote.rsplit("/", 1)[0], str(target.parent)]
         code, _ = run_rclone(check, args.timeout)
         if code != 0:

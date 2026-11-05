@@ -125,7 +125,7 @@ def status(home: Path, apply: bool, system: str | None = None, run=None, uid: in
                 units_changed = units_changed or is_unit
         if not apply:
             return "log backup: would install " + (", ".join(p.name for p in changed) if changed else "nothing (up to date)")
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{os.getpid()}"
         for path, data, mode, _unit in files:
             if path not in changed:
                 continue
@@ -134,14 +134,26 @@ def status(home: Path, apply: bool, system: str | None = None, run=None, uid: in
             write_atomic(path, data, mode)
         if activate is None:
             activate = home == real_home()
+        pending = home / ".agent-harness" / "logs" / "log-backup.reload-pending"
+        if pending.exists() and not units_changed and activate:
+            units_changed = True  # an earlier reload was deferred or failed: finish it now
         if not units_changed:
             return "log backup: up to date (no scheduler reload)" if not changed else \
                 "log backup: script updated (scheduler untouched)"
         if not activate:
             return "log backup: files written; scheduler not loaded (non-default --home)"
+        pending.parent.mkdir(parents=True, exist_ok=True)
         if backup_run_active(home):
-            return "log backup: units written; scheduler reload deferred while a backup runs; re-run install"
+            pending.write_text("reload deferred\n")
+            return "log backup: units written; scheduler reload deferred while a backup runs; re-run install to finish it"
         result = reload_scheduler(system, home, os.getuid() if uid is None else uid, run or default_runner)
+        if result in ("loaded", "enabled"):
+            try:
+                pending.unlink()
+            except OSError:
+                pass
+        else:
+            pending.write_text("reload failed\n")
         return f"log backup: installed, scheduler {result}"
     except (InstallRefused, OSError, subprocess.SubprocessError) as error:
         return f"log backup: skipped ({error.__class__.__name__}: {error})"
