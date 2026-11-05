@@ -11,6 +11,7 @@ import ast
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -463,12 +464,12 @@ class Policy(unittest.TestCase):
 def run_hook(payload_text, hooks_dir=None, mode='hook', timeout=60, env_extra=None):
     """Pipe text to the launcher. The text is only ever analysed, never executed."""
     hooks_dir = hooks_dir or HOOKS
-    home = tempfile.mkdtemp()
-    env = {'HOME': home, 'PATH': '/usr/bin:/bin'}
-    env.update(env_extra or {})
-    done = subprocess.run([sys.executable, '-I', str(Path(hooks_dir) / 'kill_guard.py'), mode],
-                          input=payload_text.encode('utf-8', 'replace'), stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, timeout=timeout, env=env, check=False)
+    with tempfile.TemporaryDirectory() as home:
+        env = {'HOME': home, 'PATH': '/usr/bin:/bin'}
+        env.update(env_extra or {})
+        done = subprocess.run([sys.executable, '-I', str(Path(hooks_dir) / 'kill_guard.py'), mode],
+                              input=payload_text.encode('utf-8', 'replace'), stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=timeout, env=env, check=False)
     return done.returncode, done.stdout.decode('utf-8', 'replace'), done.stderr.decode('utf-8', 'replace')
 
 
@@ -513,6 +514,7 @@ class Failure(unittest.TestCase):
 
     def staged(self, command_guard_source=None, policy=None):
         tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
         for name in ('kill_guard.py', 'kill_guard_policy.json', 'command_guard_policy.json', 'redact.py', 'safe_input.py'):
             src = HOOKS / name
             if src.exists():
@@ -585,6 +587,7 @@ class Spawn(unittest.TestCase):
 
     def test_refuses_outside_a_worktree_and_without_a_command(self):
         home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
         env = {'HOME': home, 'PATH': '/usr/bin:/bin'}
         done = subprocess.run([sys.executable, '-I', str(HOOKS / 'kill_guard.py'), 'spawn'], env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, cwd=home)
