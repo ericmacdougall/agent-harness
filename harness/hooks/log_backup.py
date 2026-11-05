@@ -205,8 +205,9 @@ def validate_into(into: str, home: Path) -> Path:
 
 
 def validate_src(src: str) -> str:
-    parts = Path(src).parts
-    if not src or src.startswith("/") or ".." in parts or "\x00" in src or src.startswith("-"):
+    parts = Path(src).parts if src else ()
+    if (not parts or src.startswith("/") or src.startswith("-")
+            or any(part in (".", "..") or not re.fullmatch(r"[A-Za-z0-9._@=+,-][A-Za-z0-9._ @=+,-]*", part) for part in parts)):
         raise RestoreError("--src must be a relative path such as .claude/projects")
     return "/".join(parts)
 
@@ -252,9 +253,14 @@ def resolve_base(rclone: str, environ=os.environ) -> str:
     raise RestoreError("no usable rclone remote (expected lessons-dropbox: or dropbox:); set LOG_BACKUP_REMOTE")
 
 
+def clean_env() -> dict:
+    """Inherited RCLONE_* options (other than the config path) must not redirect or reconfigure a restore."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("RCLONE_") or k == "RCLONE_CONFIG"}
+
+
 def run_rclone(argv: list[str], timeout: int) -> tuple[int, bytes]:
     try:
-        done = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+        done = subprocess.run(argv, env=clean_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError) as error:
         raise RestoreError(f"rclone failed to run ({error.__class__.__name__})")
     return done.returncode, done.stdout[:64 * 1024 * 1024]
