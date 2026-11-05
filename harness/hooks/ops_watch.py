@@ -505,13 +505,99 @@ def growth_alerts(state: dict, vols: list, dcfg: dict, now: float) -> list:
     return out
 
 
+# ---- per-owner disk budget (P12 / goodqa#14817)
+# Owners are the work/<session>/<sub> directories (sub is agent-<id> for a sub-agent). The observer measures each
+# recently active one, alerts BY NAME above the budget, and publishes state/disk-budget/<agent>.json for the guard
+# (heavy_job_guard blocks new heavy local copies for an over-budget owner) and for ahd/the console. It never kills,
+# moves or deletes anything: freeing space is the owner's job.
+
+OWNER_RECENT_S = 48 * 3600
+OWNER_MAX_DIRS = 60
+
+
+def owner_dirs(cfg: dict, now: float) -> list:
+    work = home_of(cfg) / ".agent-harness" / "work"
+    found = []
+    try:
+        for sess in os.scandir(work):
+            if not sess.is_dir(follow_symlinks=False):
+                continue
+            try:
+                for sub in os.scandir(sess.path):
+                    if sub.is_dir(follow_symlinks=False) and now - sub.stat(follow_symlinks=False).st_mtime < OWNER_RECENT_S:
+                        found.append((sub.stat(follow_symlinks=False).st_mtime, sub.path))
+            except OSError:
+                continue
+    except OSError:
+        return []
+    return [p for _, p in sorted(found, reverse=True)[:OWNER_MAX_DIRS]]
+
+
+def owner_identity(path: str) -> tuple:
+    """(agent, path_key) for work/<session>/<sub>: the sub-agent id, or '<session8>-<sub>' for a task folder."""
+    sess, sub = Path(path).parent.name, Path(path).name
+    agent = sub[len("agent-"):] if sub.startswith("agent-") and len(sub) > 6 else f"{sess[:8]}-{sub}"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", agent)[:80], f"{sess}/{sub}"
+
+
+def owner_budget_bytes(cfg_disk: dict, path: str) -> int:
+    default = float(cfg_disk.get("owner_budget_gib", 5))
+    cap = float(cfg_disk.get("owner_budget_max_gib", 20))
+    declared = None
+    try:
+        kit = json.loads(safe_read(Path(path) / "kit.json", 64 * 1024))
+        declared = float(kit.get("disk_budget_gib"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return int(min(max(declared, default) if declared else default, cap) * GIB)
+
+
+def owner_budget_alerts(cfg: dict, state: dict, now: float) -> list:
+    dirs = state.get("dirs", {})
+    out, directory = [], home_of(cfg) / ".agent-harness" / "state" / "disk-budget"
+    for path in owner_dirs(cfg, now):
+        d = dirs.get(path) or {}
+        if d.get("kib") is None or now - d.get("at", 0) > 3 * 3600:
+            continue  # never measured (or too slow to measure): never called over
+        agent, key = owner_identity(path)
+        used, budget = int(d["kib"]) * KIB, owner_budget_bytes(cfg["disk"], path)
+        record_path = directory / f"{agent}.json"
+        try:
+            previous = json.loads(safe_read(record_path, 64 * 1024))
+        except (OSError, ValueError):
+            previous = {}
+        over = used > budget
+        since = (previous.get("over_since") if isinstance(previous, dict) else None) or now_iso(now) if over else None
+        record = {"agent": agent, "path_key": key, "budget_bytes": budget, "used_bytes": used,
+                  "measured_at": now_iso(d["at"]), "measured_at_epoch": d["at"], "over_since": since,
+                  "rate_gib_h": d.get("rate_gib_h")}
+        try:
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            tmp = record_path.with_name(f".{agent}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(record))
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, record_path)
+        except OSError:
+            pass
+        if over:
+            out.append(alert("disk", f"disk:owner:{agent}", "high",
+                             f"owner {agent} is over its disk budget: {used / GIB:.1f} GiB of {budget / GIB:.0f} GiB in {key}",
+                             {"agent": agent, "path_key": key, "used_bytes": used, "budget_bytes": budget,
+                              "over_since": since, "rate_gib_h": d.get("rate_gib_h"),
+                              "next": "free space there or route the heavy work to dev2/T2; new heavy local copies are blocked"}))
+    return out
+
+
 def check_disk(cfg, state, runner, now):
     vols = volumes(cfg)
     record_volumes(vols, state, now)
     d = cfg["disk"]
     roots = expand_split(state, disk_roots(cfg), d["max_children"])
+    for extra in owner_dirs(cfg, now):
+        if extra not in roots:
+            roots.append(extra)
     measure_dirs(roots, state, runner, now, d["du_budget_s"], d["du_per_dir_s"], d["max_depth"], d["max_children"])
-    return volume_alerts(vols, d) + growth_alerts(state, vols, d, now)
+    return volume_alerts(vols, d) + growth_alerts(state, vols, d, now) + owner_budget_alerts(cfg, state, now)
 
 
 # ---------------------------------------------------------------- 2. systemd user units
