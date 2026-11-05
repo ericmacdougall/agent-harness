@@ -97,7 +97,7 @@ def is_patch(command) -> bool:
     return isinstance(command, str) and bool(PATCH_START.match(command))
 
 
-def guard_targets(tool_input) -> tuple:
+def guard_targets(tool_input, tool: str = "") -> tuple:
     """(paths, command): what a tool call reads or writes, never the text it writes. An apply_patch body counts only
     for its file headers, so editing a file whose text mentions the ledger (its docs, its tests) is not a write to it."""
     if not isinstance(tool_input, dict):
@@ -105,7 +105,7 @@ def guard_targets(tool_input) -> tuple:
     command = tool_input.get("command")
     if isinstance(command, list):
         command = " ".join(str(part) for part in command)
-    if is_patch(command):  # Codex apply_patch (documented: tool_input.command): only its file headers are targets
+    if tool == "apply_patch" and is_patch(command):  # Codex apply_patch (documented: tool_input.command): only its file headers are targets
         return PATCH_HEADER.findall(command), ""
     paths = []
     for key, value in tool_input.items():
@@ -134,9 +134,9 @@ def glob_could_name_key(token: str) -> bool:
     return fnmatch.fnmatchcase("work-ledger.key", name) and not fnmatch.fnmatchcase("zz9-unrelated.py", name)
 
 
-def names_key(tool_input) -> bool:
+def names_key(tool_input, tool: str = "") -> bool:
     """Only paths and shell commands count: editing a file whose text mentions the key (these docs) is fine."""
-    paths, command = guard_targets(tool_input)
+    paths, command = guard_targets(tool_input, tool)
     if any(KEY_FILE.search(v) or (GLOB_TOKEN.fullmatch(v) and glob_could_name_key(v)) for v in paths):
         return True
     return bool(KEY_FILE.search(command)) or any(glob_could_name_key(t) for t in GLOB_TOKEN.findall(command))
@@ -224,6 +224,37 @@ def reads_store_recursively(command: str, cwd=None) -> bool:
                 literal = literal if literal.endswith("/") else literal.rpartition("/")[0] or "."
             root = fold(os.path.realpath(os.path.join(here, os.path.expanduser(os.path.expandvars(literal or ".")))))
             if root == home or (recursive and home.startswith(root.rstrip("/") + "/")):
+                return True
+    return False
+
+
+REMOVERS = {"rm", "mv", "rmdir", "unlink", "trash", "srm"}
+
+
+def removes_store(command: str, cwd=None) -> bool:
+    """rm, mv, rmdir or unlink whose path is the store directory or an ancestor of it: the next hook would silently
+    start an empty ledger. Children of the store (scratch/, work/) may still be removed."""
+    fold = (lambda x: x.lower()) if sys.platform == "darwin" else (lambda x: x)
+    home = fold(os.path.realpath(str(base())))
+    here = cwd or os.getcwd()
+    for segment in re.split(r"\|\||&&|[;|&\n()`]", command):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            words = segment.split()
+        while words and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]) or words[0] in ("sudo", "env", "nice", "command", "exec", "xargs", "time")):
+            words = words[1:]
+        if not words or os.path.basename(words[0]) not in REMOVERS:
+            continue
+        args = [w for w in words[1:] if not w.startswith("-")]
+        if os.path.basename(words[0]) == "mv" and len(args) > 1 and not any(w in ("-t", "--target-directory") for w in words):
+            args = args[:-1]  # the destination is not removed; only the sources move away
+        for arg in args:
+            literal = re.split(r"[*?\[{]", arg, 1)[0]
+            if literal != arg:
+                literal = literal if literal.endswith("/") else literal.rpartition("/")[0] or "."
+            root = fold(os.path.realpath(os.path.join(here, os.path.expanduser(os.path.expandvars(literal or ".")))))
+            if root == home or home.startswith(root.rstrip("/") + "/"):
                 return True
     return False
 
@@ -1067,6 +1098,28 @@ def valid_session(session: str) -> bool:
     return bool(prov.SESSION_RE.match(session)) and session not in (".", "..") and len(session) >= 8
 
 
+HEADER_WINDOW = 1 << 20  # session_meta is about 20 KB; a header longer than 1 MiB is treated as unreadable
+
+
+def rollout_header(path):
+    """The rollout's first line, parsed, from a bounded prefix read (the file itself may be any size), or None."""
+    try:
+        fd = prov.open_regular(path)
+        try:
+            head = os.pread(fd, HEADER_WINDOW, 0)
+        finally:
+            os.close(fd)
+    except (OSError, prov.Problem):
+        return None
+    if b"\n" not in head:
+        return None
+    try:
+        record = prov.loads_line(head.split(b"\n", 1)[0])
+    except ValueError:
+        return None
+    return record if isinstance(record, dict) else None
+
+
 def codex_headless(path) -> bool:
     """A Codex rollout started by `codex exec` or spawned as a subagent: its UserMessage items come from a program.
 
@@ -1075,12 +1128,8 @@ def codex_headless(path) -> bool:
     """
     if not path:
         return False
-    try:
-        first = prov.read_small(path, 1 << 16).split(b"\n")[0]
-        record = prov.loads_line(first)
-    except (OSError, prov.Problem, ValueError):
-        return False
-    meta = record.get("payload") if isinstance(record, dict) and record.get("type") == "session_meta" else None
+    record = rollout_header(path)
+    meta = record.get("payload") if record and record.get("type") == "session_meta" else None
     if not isinstance(meta, dict):
         return False
     source = meta.get("source")
@@ -1309,9 +1358,11 @@ def discover_codex(data: dict) -> None:
                 if os.stat(path).st_mtime < created:
                     continue
                 budget[0] -= 1
-                first = prov.read_small(path, 1 << 16).split(b"\n")[0]
-                started = parse_ts(json.loads(first).get("timestamp"))
-            except (OSError, prov.Problem, ValueError):
+                header = rollout_header(path)
+                if header is None:
+                    continue
+                started = parse_ts(header.get("timestamp"))
+            except OSError:
                 continue
             if started >= created - 60:
                 rec = session_record(data, match.group(1), "codex", path)  # sets headless from session_meta
@@ -1400,8 +1451,10 @@ def no_ask_rows(data: dict, session=None) -> list:
     return rows
 
 
-def no_ask_line(row: dict) -> str:
+def no_ask_line(row: dict, full: bool = True) -> str:
     msg, triage = row["msg"], row["msg"]["triage"]
+    if not full:  # another session's no-ask: no excerpt, reason or hint here
+        return f"  NO-ASK {row['id']} (session {msg['sessionId'][:8]})" + (" !request-phrase" if row["cues"] else "")
     flag = ""
     if row["cues"]:
         flag = " !request-phrase(" + ",".join(row["cues"]) + (";excerpt" if row["basis"] == "excerpt" else "") + ")"
@@ -1442,13 +1495,37 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
              f"{len(flagged)} flagged (no owner, stopped owner or stale), {len(ix['openDecisions'])} open decision(s), "
              f"{len(no_asks)} no-ask(s), {sum(1 for r in no_asks if r['cues'])} flagged as a possible request, "
              f"{len(pending_supersessions(data, limit=10 ** 6))} superseded awaiting a user cancel."]
-    for mid in ix["untriagedMessages"][:8]:
-        tag = "" if data["messages"][mid]["humanCheck"].get("verified") else " [unverified: transcript only]"
-        lines.append(f"  UNTRIAGED {mid}{tag}: \"{data['messages'][mid]['text'].get('excerpt', '[pasted content]')}\" -> work_assignments.py split --msg {mid} --item '...' | no-ask")
+    def mine(rec_session) -> bool:
+        return session is None or rec_session == session  # `status` without --session shows everything
+
+    def text_of(ask, width) -> str:
+        if mine(ask["origin"]["actor"].get("sessionId")):
+            return prov.clip(ask["request"]["compressed"], width)
+        return f"(session {str(ask['origin']['actor'].get('sessionId') or '?')[:8]}; text shown only in its own session)"
+
+    own = [m for m in ix["untriagedMessages"] if m in data["messages"] and mine(data["messages"][m]["sessionId"])]
+    others = [m for m in ix["untriagedMessages"] if m in data["messages"] and m not in own]
+    try:
+        log_size = files()["events"].stat().st_size
+    except OSError:
+        log_size = 0
+    if log_size > MAX_STORE_BYTES // 2:
+        lines.append(f"  WARNING: the event log is {log_size >> 20} MiB, over half its {MAX_STORE_BYTES >> 20} MiB read bound; past "
+                     "the bound cancel, verify and recover stop working. Rotation is follow-up GoodQA 1ae27b6b#14605.")
+    for mid in own[:8]:
+        msg = data["messages"][mid]
+        tag = "" if msg["humanCheck"].get("verified") else " [unverified: transcript only]"
+        hint = f" --session {msg['sessionId']}" if session is None else ""
+        lines.append(f"  UNTRIAGED {mid}{tag}: \"{msg['text'].get('excerpt', '[pasted content]')}\" -> work_assignments.py "
+                     f"split --msg {mid}{hint} --item '...' | no-ask")
+    if others:
+        lines.append(f"  {len(others)} untriaged message(s) in other sessions (ids only; each session triages its own): "
+                     + ", ".join(others[:8]) + (" ..." if len(others) > 8 else ""))
     for ask in ordered[:limit]:
         flag = ",".join(ask_flags(ask, policy, ts))
+        nxt = f" -> {prov.clip(ask['nextStep'], 50)}" if ask.get("nextStep") and mine(ask["origin"]["actor"].get("sessionId")) else ""
         lines.append(f"  {ask['id']} [{ask['state']}] owner={owner_of(ask) or 'none'}{' !' + flag if flag else ''}: "
-                     f"{prov.clip(ask['request']['compressed'], 70)}" + (f" -> {prov.clip(ask['nextStep'], 50)}" if ask.get("nextStep") else ""))
+                     f"{text_of(ask, 70)}{nxt}")
     if len(ordered) > limit:
         lines.append(f"  ... {len(ordered) - limit} more: run `work_assignments.py status`")
     for d in ix["openDecisions"][:5]:
@@ -1458,18 +1535,17 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
         repl = supersede_target(data, ask)
         target = repl["id"] if repl else "?"
         lines.append(f"  SUPERSEDED {ask['id']} -> {target} [{repl['state'] if repl else 'missing'}]: "
-                     f"{prov.clip(ask['request']['compressed'], 60)} (shown until the user cancels it)")
+                     f"{text_of(ask, 60)} (shown until the user cancels it)")
     if len(pending) > 8:
         lines.append(f"  ... {len(pending) - 8} more superseded ask(s) awaiting a user cancel: `work_assignments.py status --json`")
     closed = sorted((a for a in data["asks"].values() if a["state"] in CLOSED and a.get("removableAfter")
                      and parse_ts(a["removableAfter"]) > ts), key=lambda a: a["removableAfter"])
     for ask in closed[:5]:
-        lines.append(f"  CLOSED {ask['id']} [{ask['state']}] removable after {ask['removableAfter']}: "
-                     f"{prov.clip(ask['request']['compressed'], 60)}")
+        lines.append(f"  CLOSED {ask['id']} [{ask['state']}] removable after {ask['removableAfter']}: {text_of(ask, 60)}")
     if len(closed) > 5:
         lines.append(f"  ... {len(closed) - 5} more closed in the last 24h: `work_assignments.py status --json`")
     shown = min(8, limit)
-    lines.extend(no_ask_line(row) for row in no_asks[:shown])
+    lines.extend(no_ask_line(row, full=mine(row["msg"]["sessionId"])) for row in no_asks[:shown])
     if len(no_asks) > shown:
         lines.append(f"  ... {len(no_asks) - shown} more no-ask(s): run `work_assignments.py status --json`")
     return "\n".join(lines)
@@ -1682,10 +1758,10 @@ def hook_guard(payload: dict, runtime: str) -> dict:
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if isinstance(command, list):
         command = " ".join(str(part) for part in command)
-    if is_patch(command):
+    if tool == "apply_patch" and is_patch(command):
         command = None  # a patch body is file text, not a shell command: only its headers are checked below
     reason = None
-    if names_key(tool_input):
+    if names_key(tool_input, tool):
         reason = "The capture key is read and written only by work_assignments.py; tools may not touch it."
     elif isinstance(command, str) and HOOK_CALL.search(command) and re.search(r"work.?assign|\[|\*|\?", command):
         reason = "Hooks take their input from the harness; agents may not run `work_assignments.py hook`."
@@ -1697,12 +1773,15 @@ def hook_guard(payload: dict, runtime: str) -> dict:
                   "`*.py`, or read a named file.")
     elif isinstance(command, str) and reads_store_recursively(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None):
         reason = "Recursive reads of the agent-harness store would expose the capture key; read a named file instead."
+    elif isinstance(command, str) and removes_store(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None):
+        reason = ("Removing or moving the agent-harness store (or a directory that contains it) would make the next hook "
+                  "start an empty ledger and lose every request; remove a named child such as scratch/ instead.")
     if reason:
         if mode == "enforce":
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
         return context("PreToolUse", "(warn mode) " + reason)
     # Paths and the command only: text that merely mentions the ledger (its docs, its tests) is not a write to it.
-    paths, cmd = guard_targets(tool_input)
+    paths, cmd = guard_targets(tool_input, tool)
     targets = " ".join(paths + [cmd])
     if not protected_hit(targets):
         return {}
@@ -2164,10 +2243,25 @@ def new_ask(data, *, description, kind="request", owner="unassigned", message=No
     return data["asks"][aid]
 
 
+def check_triage_session(msg: dict, given) -> None:
+    """A message is triaged from its own session. The caller's session is CLAUDE_CODE_SESSION_ID (set by Claude Code
+    for tool calls); `--session S` must name the message's session; with neither (e.g. Codex) the call is allowed."""
+    owner = msg["sessionId"]
+    if given:
+        if given != owner:
+            raise WAError(f"{msg['id']} belongs to session {owner[:8]}..., not {str(given)[:8]}...")
+        return
+    caller = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if caller and caller != owner:
+        raise WAError(f"{msg['id']} belongs to another session ({owner[:8]}...); that session triages it. Pass "
+                      f"--session {owner} only to triage it deliberately.")
+
+
 def cmd_split(args):
     who = cli_actor(args.actor)
     with transaction() as data:
         msg = find_message(data, args.msg)
+        check_triage_session(msg, args.session)
         prior = msg["triage"]
         made = [new_ask(data, description=text, kind=args.kind, owner=args.owner, message=msg["id"], who=who,
                         next_step=args.next or "", tickets=args.ticket or (), branch=args.branch or "") for text in args.item]
@@ -2187,6 +2281,7 @@ def cmd_no_ask(args):
     who = cli_actor(args.actor)
     with transaction() as data:
         msg = find_message(data, args.msg)
+        check_triage_session(msg, args.session)
         if msg["triage"].get("askIds"):
             raise WAError("message already has asks")
         emit(data, "triaged", "message", msg["id"], {"triage": {"status": "no_ask", "at": iso(now()), "by": who,
@@ -2677,7 +2772,9 @@ def build_parser():
     s = sub.add_parser("split"); s.add_argument("--msg", required=True); s.add_argument("--item", action="append", required=True)
     s.add_argument("--kind", default="request"); s.add_argument("--owner", default="unassigned"); s.add_argument("--next")
     s.add_argument("--ticket", action="append"); s.add_argument("--branch"); s.add_argument("--actor", default="main")
+    s.add_argument("--session", help="the message's session, to triage another session's message deliberately")
     s = sub.add_parser("no-ask"); s.add_argument("--msg", required=True); s.add_argument("--reason", required=True); s.add_argument("--actor", default="main")
+    s.add_argument("--session", help="the message's session, to triage another session's message deliberately")
     s = sub.add_parser("update"); s.add_argument("id"); s.add_argument("--state"); s.add_argument("--owner"); s.add_argument("--next")
     s.add_argument("--evidence", action="append"); s.add_argument("--branch"); s.add_argument("--ticket", action="append")
     s.add_argument("--description"); s.add_argument("--note"); s.add_argument("--repo"); s.add_argument("--actor", default="main")

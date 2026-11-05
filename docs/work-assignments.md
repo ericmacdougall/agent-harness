@@ -129,7 +129,7 @@ program. A Codex rollout with no readable `session_meta` counts as interactive.
 Long-lived data. The event log is read whole up to 128 MiB; an absent log is empty, but an unreadable or larger
 one fails loudly and is never folded as empty (the hook records a failure and exits 0). Session records are caches
 outside the fold: idle ones are dropped after 14 days (headless Codex rollouts after 2), unless the session holds an
-ask or an untriaged message. Rollout discovery reads at most 40 new rollout headers per hook call, newest first.
+ask or an untriaged message. Rollout discovery reads at most 40 new rollout headers per hook call, newest first; a header is the rollout's first line, read from a bounded prefix (rollouts are any size).
 
 Evidence. A `tested:<id>` item is verified only when that WAL entry's note starts with `REALLY_TESTED`, it sits in
 the ask's own session WAL directory (its main WAL or its agents' WALs), and it was written after the ask was created
@@ -138,6 +138,23 @@ or last reopened. A commit is verified when it exists in the named repo; whether
 Codex payloads. `apply_patch` carries its patch in `tool_input.command`; only its file headers are guard targets.
 Codex subagent hooks carry the parent session id and no `agent_id`; their prompts are recognised by the subagent
 rollout (`session_meta` `source.subagent`). Live Codex confirmation is pending (codex-live).
+
+Sessions. A session's digest shows its own untriaged messages, asks and no-asks in full. Other sessions' items
+appear as ids, states, owners and flags only (no excerpt, ask text or command hint), so text typed in one project
+or provider does not reach another's context; `work_assignments.py status` without `--session` shows everything.
+`split` and `no-ask` refuse a message from another session (the caller's session is `CLAUDE_CODE_SESSION_ID`)
+unless `--session <its id>` names it; with no session known (Codex) the call is allowed.
+
+Ask text. An ask whose source is `user` was split from a verified human message; its request text is the agent's
+paraphrase of that message (and `update --description` can change it). The message's redacted excerpt stays linked
+in `show` and in the owning session's digest.
+
+Store removal. The guard refuses `rm`, `mv`, `rmdir` and `unlink` of the store directory or any directory that
+contains it, because the next hook would start an empty ledger. Removing a named child (`scratch/`, `work/...`)
+is allowed. An out-of-store marker that detects a reset is follow-up GoodQA 1ae27b6b#14606.
+
+Log size. The digest warns once `work-ledger.events.jsonl` passes half the 128 MiB read bound. Past the bound,
+reads fail loudly and cancel, verify and recover stop; rotation or compaction is follow-up GoodQA 1ae27b6b#14605.
 
 ## Known limits
 
