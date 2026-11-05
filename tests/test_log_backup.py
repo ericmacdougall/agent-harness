@@ -122,6 +122,25 @@ class Freshness(Base):
         self.assertEqual(done.returncode, 1)
         self.assertIn(b"LOG BACKUP ALERT", done.stdout)
 
+    def test_alert_says_disabled_by_choice_only_when_the_saved_choice_is_off(self):
+        self.last_ok(stamp(time.time() - 7200) + "\n")
+        choice = self.home / ".agent-harness" / "log-backup-choice.json"
+        for body, expect in (('{"schema": 1, "enabled": false}', True), ('{"schema": 1, "enabled": true}', False),
+                             ("garbage", False), ('{"enabled": "no"}', False), (None, False)):
+            if body is None:
+                if choice.exists():
+                    choice.unlink()
+            else:
+                choice.write_text(body)
+            for argv in (("check",), ("session-start",)):
+                out = self.run_cli(*argv).stdout.decode()
+                self.assertEqual("DISABLED BY CHOICE" in out, expect, (argv, body, out[:80]))
+                self.assertIn("LOG BACKUP ALERT", out)  # the staleness text is still there either way
+        choice.write_text('{"schema": 1, "enabled": false}')
+        out = json.loads(self.run_cli("session-start").stdout)["systemMessage"]
+        self.assertIn("re-enable with install.py --apply --log-backup", out)
+        self.assertEqual(self.run_cli("check").returncode, 1)  # exit codes unchanged: it is still a stale backup
+
     def test_check_exit_codes(self):
         self.assertEqual(self.run_cli("check").returncode, 2)  # missing
         self.last_ok(stamp(time.time()))

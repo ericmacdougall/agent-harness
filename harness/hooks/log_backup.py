@@ -141,6 +141,24 @@ def alert_text(result: dict, max_age: int = MAX_AGE_SECONDS) -> str:
             "`python3 ~/.claude/hooks/log_backup.py status` shows a fresh backup.")
 
 
+def disabled_by_choice(home: Path) -> bool:
+    """True when the saved install choice (log-backup-choice.json, written by install.py --no-log-backup) is off."""
+    text = read_small(home / ".agent-harness" / "log-backup-choice.json")
+    try:
+        data = json.loads(text) if text else None
+    except ValueError:
+        return False
+    return isinstance(data, dict) and data.get("enabled") is False
+
+
+def choice_note(home: Path, text: str) -> str:
+    """A switched-off backup is not a broken one: say which, in fixed words."""
+    if disabled_by_choice(home):
+        return ("LOG BACKUP DISABLED BY CHOICE (re-enable with install.py --apply --log-backup): agent logs are NOT "
+                "being backed up on this host. " + text)
+    return text
+
+
 def run_note(home: Path) -> str:
     """Say so when a backup run is in progress: a long run does not hide a stale backup, it explains it."""
     lock = logs_dir(home) / LOCK_DIR
@@ -161,9 +179,9 @@ def cmd_check(args) -> int:
     if args.json:
         print(json.dumps({**result, "bulk": bulk["state"]}))
     elif result["state"] != "fresh":
-        print(alert_text(result, args.max_age) + run_note(args.home))
+        print(choice_note(args.home, alert_text(result, args.max_age)) + run_note(args.home))
     elif bulk["state"] in ("stale", "missing", "invalid"):
-        print(bulk_alert_text(bulk) + run_note(args.home))
+        print(choice_note(args.home, bulk_alert_text(bulk)) + run_note(args.home))
     else:
         print("fresh")
     if result["state"] != "fresh":
@@ -181,9 +199,9 @@ def cmd_session_start(args) -> int:
         bulk = bulk_classify(args.home)
         text = ""
         if result["state"] != "fresh":
-            text = alert_text(result, args.max_age) + run_note(args.home)
+            text = choice_note(args.home, alert_text(result, args.max_age)) + run_note(args.home)
         elif bulk["state"] in ("stale", "missing", "invalid"):
-            text = bulk_alert_text(bulk) + run_note(args.home)
+            text = choice_note(args.home, bulk_alert_text(bulk)) + run_note(args.home)
         if text:
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text},
                               "systemMessage": text}))

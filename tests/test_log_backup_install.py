@@ -257,7 +257,6 @@ class MacPersistentOptOut(Case):
         lbi.status(self.home, True, system="Darwin", run=launchd, uid=501, activate=True)
         self.assertTrue(launchd.disabled)
         lbi.save_choice(self.home, True)
-        (self.home / PLIST).write_text("changed so that the install reloads\n")
         message, _ = self.apply("Darwin", runner=launchd)
         self.assertTrue(launchd.loaded, message)
         self.assertFalse(launchd.disabled)
@@ -293,6 +292,184 @@ class MacPersistentOptOut(Case):
         self.assertEqual(alert_count(), 1)          # installed, then switched off: a stale backup must still be visible
         run()
         self.assertEqual(alert_count(), 1)
+
+
+class FakeScheduler:
+    """launchd or systemd --user, reduced to the facts that matter: is the job loaded, is it disabled (persistent), and
+    what a reboot does. fail = set of verbs that return 1; boom = (verb, exception) raised for that verb."""
+    def __init__(self, system, fail=(), boom=None):
+        self.system, self.fail, self.boom = system, set(fail), boom
+        self.loaded = self.disabled = False
+        self.calls = []
+
+    def __call__(self, argv):
+        self.calls.append(argv)
+        verb = argv[1] if argv[0] == "launchctl" else argv[2] if argv[1] == "--user" else argv[1]
+        if self.boom and verb == self.boom[0]:
+            raise self.boom[1]
+        if verb in self.fail:
+            return 1
+        if self.system == "Darwin":
+            if verb == "disable":
+                self.disabled = True
+            elif verb == "enable":
+                self.disabled = False
+            elif verb == "bootout":
+                was, self.loaded = self.loaded, False
+                return 0 if was else 3
+            elif verb == "bootstrap":
+                if self.disabled:
+                    return 5
+                self.loaded = True
+        else:
+            if verb == "enable":
+                self.disabled, self.loaded = False, True
+            elif verb == "disable":
+                self.disabled, self.loaded = True, False
+            elif verb == "restart":
+                self.loaded = True  # systemctl restart starts a stopped unit, even a disabled one
+        return 0
+
+    def reboot(self):
+        self.loaded = not self.disabled  # RunAtLoad / WantedBy=timers.target
+
+    @property
+    def enable_calls(self):
+        return [c for c in self.calls if "enable" in c or "bootstrap" in c]
+
+
+class SchedulerStateMachine(Case):
+    """The whole enable/disable state machine, per platform. States: unknown, enabled, disabled (scheduler-state file),
+    plus a retry marker (reload-pending). Transitions are driven by the remembered choice and by changed files; none of
+    these cases rewrites the plist or unit to force a path."""
+    SYSTEMS = ("Darwin", "Linux")
+
+    def go(self, system, sched, enabled, apply=True):
+        return lbi.status(self.home, apply, system=system, run=sched, uid=501, activate=True, enabled=enabled)
+
+    def state(self):
+        return lbi.read_scheduler_state(self.home)
+
+    def pending(self):
+        return (self.home / ".agent-harness/logs/log-backup.reload-pending").exists()
+
+    def each(self):
+        for system in self.SYSTEMS:
+            shutil.rmtree(self.home, ignore_errors=True)
+            self.home.mkdir()
+            yield system, FakeScheduler(system)
+
+    def test_opt_in_then_unchanged_files_is_idempotent(self):
+        for system, sched in self.each():
+            self.go(system, sched, True)
+            self.assertTrue(sched.loaded, system)
+            self.assertEqual(self.state(), "enabled")
+            before = len(sched.calls)
+            message = self.go(system, sched, True)
+            self.assertEqual(len(sched.calls), before, system)  # nothing touched
+            self.assertIn("up to date", message)
+
+    def test_changed_files_reload(self):
+        for system, sched in self.each():
+            self.go(system, sched, True)
+            target = self.home / (PLIST if system == "Darwin" else UNITS[1])
+            target.write_text("tampered\n")
+            before = len(sched.calls)
+            self.go(system, sched, True)
+            self.assertGreater(len(sched.calls), before, system)
+            self.assertTrue(sched.loaded)
+
+    def test_opt_out_is_persistent_and_idempotent(self):
+        for system, sched in self.each():
+            self.go(system, sched, True)
+            self.go(system, sched, False)
+            self.assertFalse(sched.loaded, system)
+            self.assertTrue(sched.disabled)
+            self.assertEqual(self.state(), "disabled")
+            sched.reboot()
+            self.assertFalse(sched.loaded, f"{system}: the job came back after a reboot")
+            before = len(sched.calls)
+            message = self.go(system, sched, False)
+            self.assertEqual(len(sched.calls), before, system)
+            self.assertIn("nothing changed", message)
+
+    def test_opt_in_after_opt_out_with_unchanged_files_re_enables(self):
+        for system, sched in self.each():
+            self.go(system, sched, True)
+            self.go(system, sched, False)
+            message = self.go(system, sched, True)  # the plist and units were NOT touched
+            self.assertTrue(sched.loaded, f"{system}: {message}")
+            self.assertFalse(sched.disabled, system)
+            self.assertNotIn("up to date", message)
+            self.assertEqual(self.state(), "enabled")
+            sched.reboot()
+            self.assertTrue(sched.loaded, system)
+            self.assertFalse(self.pending())
+
+    def test_opt_in_on_a_host_whose_scheduler_state_is_unknown_reloads_once(self):
+        for system, sched in self.each():
+            self.go(system, sched, True)
+            (self.home / ".agent-harness/logs/log-backup.scheduler").unlink()  # e.g. installed by an older version
+            self.go(system, FakeScheduler(system), True)
+            second = FakeScheduler(system)
+            self.go(system, second, True)
+            self.assertEqual(second.calls, [], system)
+
+    def test_failed_disable_is_reported_and_retried(self):
+        for system, _ in self.each():
+            good = FakeScheduler(system)
+            self.go(system, good, True)
+            bad = FakeScheduler(system, fail={"disable"})
+            bad.loaded = True
+            message = self.go(system, bad, False)
+            self.assertIn("failed", message, system)
+            self.assertNotEqual(self.state(), "disabled")
+            self.assertTrue(self.pending())
+            retry = FakeScheduler(system)
+            retry.loaded = True
+            self.go(system, retry, False)
+            self.assertFalse(retry.loaded, system)
+            self.assertEqual(self.state(), "disabled")
+            self.assertFalse(self.pending())
+
+    def test_failed_enable_is_not_up_to_date_and_is_retried_with_unchanged_files(self):
+        for system, _ in self.each():
+            bad = FakeScheduler(system, fail={"bootstrap" if system == "Darwin" else "enable"})
+            message = self.go(system, bad, True)
+            if system == "Darwin":  # on Linux the follow-up `restart` starts the unit even though `enable` failed
+                self.assertFalse(bad.loaded, system)
+            self.assertNotEqual(self.state(), "enabled")  # but it is not enabled across a reboot, so it is not 'done' 
+            self.assertTrue(self.pending())
+            self.assertNotIn("up to date", message)
+            good = FakeScheduler(system)
+            self.go(system, good, True)  # files unchanged since the failed attempt
+            self.assertTrue(good.loaded, system)
+            self.assertEqual(self.state(), "enabled")
+            self.assertFalse(self.pending())
+
+    def test_a_raising_disable_or_enable_is_retried(self):
+        for system, _ in self.each():
+            verb = "bootstrap" if system == "Darwin" else "enable"
+            self.go(system, FakeScheduler(system, boom=(verb, subprocess.TimeoutExpired(["x"], 60))), True)
+            self.assertTrue(self.pending(), system)
+            good = FakeScheduler(system)
+            self.go(system, good, True)
+            self.assertTrue(good.loaded, system)
+            self.assertFalse(self.pending())
+
+    def test_status_never_says_up_to_date_while_the_job_is_disabled(self):
+        for system, sched in self.each():
+            self.go(system, sched, True)
+            self.go(system, sched, False)
+            self.assertNotIn("up to date", self.go(system, sched, True), system)
+
+    def test_preview_changes_nothing(self):
+        for system, sched in self.each():
+            self.go(system, sched, True)
+            self.go(system, sched, False)
+            state = self.state()
+            self.assertEqual(self.go(system, sched, True, apply=False).count("would"), 1, system)
+            self.assertEqual(self.state(), state)
 
 
 class Raising:

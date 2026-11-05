@@ -45,6 +45,32 @@ def real_home() -> Path:
 
 
 CHOICE_FILE = "log-backup-choice.json"
+STATE_FILE = "log-backup.scheduler"      # what the installer last SUCCEEDED in doing to the scheduler: enabled | disabled
+PENDING_FILE = "log-backup.reload-pending"   # an enable/disable that was deferred, failed or raised and must be retried
+
+
+def logs_dir(home: Path) -> Path:
+    return home / ".agent-harness" / "logs"
+
+
+def read_scheduler_state(home: Path):
+    """'enabled', 'disabled' or None (unknown: never set, unreadable, or anything else). Never follows a link."""
+    try:
+        fd = os.open(logs_dir(home) / STATE_FILE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        text = os.read(fd, 64).decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return text if text in ("enabled", "disabled") else None
+
+
+def write_scheduler_state(home: Path, value: str) -> None:
+    logs_dir(home).mkdir(parents=True, exist_ok=True)
+    write_atomic(logs_dir(home) / STATE_FILE, (value + "\n").encode(), 0o600)
 
 
 def component_installed(home: Path) -> bool:
@@ -234,9 +260,21 @@ def status(home: Path, apply: bool, system: str | None = None, run=None, uid: in
                 activate = home == real_home()
             if not activate:
                 return "log backup: disabled by choice (non-default --home); scheduler not touched"
+            if read_scheduler_state(home) == "disabled" and not (logs_dir(home) / PENDING_FILE).exists():
+                return "log backup: disabled by choice; scheduler already stopped; nothing changed"
+            pending = logs_dir(home) / PENDING_FILE
+            pending.parent.mkdir(parents=True, exist_ok=True)
             if backup_run_active(home):
+                pending.write_text("disable deferred\n")
                 return "log backup: disabled by choice; scheduler stop deferred while a backup runs; re-run install"
+            pending.write_text("disable started\n")  # stays if the stop fails or raises
             result = disable_scheduler(system, home, os.getuid() if uid is None else uid, run or default_runner)
+            if result == "stopped":
+                write_scheduler_state(home, "disabled")
+                try:
+                    pending.unlink()
+                except OSError:
+                    pass
             return f"log backup: disabled by choice, scheduler {result}; files and remote copies stay"
         files = desired_files(home, system)
         changed, units_changed = [], False
@@ -256,9 +294,11 @@ def status(home: Path, apply: bool, system: str | None = None, run=None, uid: in
             write_atomic(path, data, mode)
         if activate is None:
             activate = home == real_home()
-        pending = home / ".agent-harness" / "logs" / "log-backup.reload-pending"
-        if pending.exists() and not units_changed and activate:
-            units_changed = True  # an earlier reload was deferred or failed: finish it now
+        pending = logs_dir(home) / PENDING_FILE
+        if activate and not units_changed and (pending.exists() or read_scheduler_state(home) != "enabled"):
+            # An earlier enable/disable was deferred or failed, or the job was last switched off (or never known to be
+            # on): the files being unchanged says nothing about the scheduler, so enable it now.
+            units_changed = True
         if not units_changed:
             return "log backup: up to date (no scheduler reload)" if not changed else \
                 "log backup: script updated (scheduler untouched)"
@@ -271,6 +311,7 @@ def status(home: Path, apply: bool, system: str | None = None, run=None, uid: in
         pending.write_text("reload started\n")  # stays if the reload fails or raises; the next install finishes it
         result = reload_scheduler(system, home, os.getuid() if uid is None else uid, run or default_runner)
         if result in ("loaded", "enabled"):
+            write_scheduler_state(home, "enabled")
             try:
                 pending.unlink()
             except OSError:
