@@ -369,6 +369,46 @@ class Locking(Case):
         self.assertEqual(self.run_script().returncode, 0)
         self.assertTrue(self.last_ok().exists())
 
+    def make_lock(self, name, age):
+        lock = self.logs / name
+        lock.mkdir(parents=True)
+        when = time.time() - age
+        os.utime(lock, (when, when))
+        return lock
+
+    def test_young_hand_installed_locks_mean_skip_and_stale_ones_mean_proceed(self):
+        cases = [("log-backup.transcripts.lock.d", 600, True), ("log-backup.transcripts.lock.d", 7200, False),
+                 ("log-backup.bulk.lock.d", 3 * 3600, True), ("log-backup.bulk.lock.d", 7 * 3600, False),
+                 ("log-backup.transcripts.lock.d", -1800, True),      # future, within the limit: assume live
+                 ("log-backup.transcripts.lock.d", -36000, False),    # future beyond the limit: cannot be a real run
+                 ("log-backup.bulk.lock.d", -36000, False)]
+        for name, age, skips in cases:
+            shutil.rmtree(self.logs, ignore_errors=True)
+            if self.calls.exists():
+                self.calls.unlink()
+            self.make_lock(name, age)
+            done = self.run_script()
+            self.assertEqual(done.returncode, 0, (name, age))
+            if skips:
+                self.assertEqual(self.recorded(), [], (name, age))
+                self.assertTrue((self.logs / "log-backup.last-skip").exists(), (name, age))
+                self.assertFalse(self.last_ok().exists(), (name, age))
+            else:
+                self.assertTrue(self.copies(), (name, age))
+                self.assertTrue(self.last_ok().exists(), (name, age))
+
+    def test_a_hand_installed_lock_with_an_unreadable_mtime_means_skip(self):
+        self.make_lock("log-backup.bulk.lock.d", 7 * 3600)  # would be stale, but its time cannot be read
+        fakebin = self.tmp / "statbin"
+        fakebin.mkdir()
+        stat = fakebin / "stat"
+        stat.write_text('#!/bin/sh\ncase "$*" in *bulk.lock.d*) exit 1 ;; esac\nexec /usr/bin/stat "$@"\n')
+        stat.chmod(0o755)
+        done = self.run_script(PATH=f"{fakebin}:/usr/bin:/bin")
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(self.recorded(), [])
+        self.assertFalse(self.last_ok().exists())
+
     def test_lookalike_process_is_not_a_live_holder(self):
         # a command line containing "log-backup" but not the script (tail of the log) must not wedge the backup
         other = subprocess.Popen(["/bin/sh", "-c", "sleep 60", "log-backup.log"])
