@@ -493,7 +493,7 @@ def build_index(data: dict) -> dict:
 
 def fold(events: list) -> dict:
     data = new_snapshot()
-    for ev in sorted(events, key=lambda e: (e["at"], e["hiveId"], e["seq"])):
+    for ev in sorted(events, key=lambda e: (e["hiveId"], e["seq"])):  # live order; `at` can go backwards
         apply_event(data, ev)
     data["rev"] = len(events)
     data["index"] = build_index(data)
@@ -521,7 +521,7 @@ def catch_up(data: dict) -> None:
         data.clear()
         data.update(replayed)
         return
-    for ev in sorted(missing, key=lambda e: (e["at"], e["hiveId"], e["seq"])):
+    for ev in sorted(missing, key=lambda e: (e["hiveId"], e["seq"])):
         apply_event(data, ev)
 
 
@@ -667,8 +667,15 @@ def short(text, limit=300) -> str:
     return prov.clip(redact(str(text)), limit)
 
 
+SECRET_HINT = re.compile(r"(?i)pass(?:word|wd|phrase)?\b|\bpwd\b|secret|token|api[_ -]?key|private key|credential|\bpin\b|\botp\b|2fa")
+
+
 def excerpt_of(text: str) -> str:
-    return prov.clip(redact(" ".join(text[:65536].split()[:15])), 160)
+    """15 redacted words; withheld entirely when they mention a secret (the redactor misses "password is X")."""
+    window = " ".join(text[:65536].split()[:15])
+    if SECRET_HINT.search(window):
+        return "[excerpt withheld: may contain a secret]"
+    return prov.clip(redact(window), 160)
 
 
 # Phrases that usually mean the human asked for something. A no-ask on a message that has one is flagged in the
@@ -682,13 +689,15 @@ IMPERATIVES = ("add", "build", "change", "check", "clean", "create", "delete", "
                "install", "investigate", "make", "merge", "move", "post", "remove", "rename", "review", "run", "send", "set",
                "ship", "start", "stop", "test", "update", "upgrade", "write")
 # An imperative verb at the start of a sentence (after optional filler such as "also" or "then") or right after "please".
-IMPERATIVE_RE = re.compile(r"(?:^|[.!?;:\n]\s*|\bplease\s+)(?:(?:also|and|then|now|just|so|ok(?:ay)?|pls|please),?\s+)*("
+# Whitespace is collapsed first (newline runs to one newline, other runs to one space) so every repeat below is
+# bounded; an unbounded \s* retried from each newline made this quadratic (20k newlines took 20 s).
+IMPERATIVE_RE = re.compile(r"(?:^|[.!?;:\n] ?|\bplease )(?:(?:also|and|then|now|just|so|ok(?:ay)?|pls|please),? ){0,3}("
                            + "|".join(IMPERATIVES) + r")\b")
 MAX_CUES = 8
 
 
 def request_cues(text: str) -> list:
-    low = str(text)[:65536].lower()
+    low = re.sub(r"\s+", lambda m: "\n" if "\n" in m.group() else " ", str(text)[:65536].lower())
     found = [name for name, rx in REQUEST_PHRASES if rx.search(low)]
     for match in IMPERATIVE_RE.finditer(low):
         cue = "imperative:" + match.group(1)
@@ -788,6 +797,9 @@ def spoolable(fields: dict) -> dict:
     return out
 
 
+CODEX_INJECTED = re.compile(r"\s*(?:<(?:environment_context|user_instructions|turn_aborted|INSTRUCTIONS)\b|# AGENTS\.md instructions)")
+
+
 def human_records(raw: bytes, runtime: str, first_line: int):
     """Yield (line_number, id, ts, text, pasted, line_sha) for genuine human turns in complete transcript lines."""
     marker = b'"origin"' if runtime == "claude" else b'"UserMessage"'
@@ -813,6 +825,8 @@ def human_records(raw: bytes, runtime: str, first_line: int):
                 continue
             uid, ts = item.get("id"), record.get("timestamp")
             joined = "\n".join(str(c.get("text", "")) for c in item.get("content") or [] if isinstance(c, dict))
+            if CODEX_INJECTED.match(joined):  # 146/146 real UserMessage items were typed text; keep the guard anyway
+                continue
             found = classify_prompt(joined)
             if found is None:
                 continue
@@ -1000,6 +1014,18 @@ def no_ask_line(row: dict) -> str:
             + (f" -> reopen with work_assignments.py split --msg {row['id']} --item '...'" if row["cues"] else ""))
 
 
+def pending_supersessions(data: dict, limit: int = 8) -> list:
+    """Superseded asks whose replacement is not done yet: superseding is not proof the work happened."""
+    out = []
+    for ask in data["asks"].values():
+        if ask["state"] != "superseded":
+            continue
+        target = next((r["target"] for r in ask.get("related", []) if r["kind"] == "superseded_by"), None)
+        if not target or data["asks"].get(target, {}).get("state") != "done":
+            out.append(ask)
+    return sorted(out, key=lambda a: a["id"])[:limit]
+
+
 def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
     ts = now()
     ix = data["index"]
@@ -1020,6 +1046,11 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
         lines.append(f"  ... {len(ordered) - limit} more: run `work_assignments.py status`")
     for d in ix["openDecisions"][:5]:
         lines.append(f"  DECISION {d['id']} [{d['state']}]: {prov.clip(d['compressed'], 80)}")
+    for ask in pending_supersessions(data):
+        target = next(r["target"] for r in ask["related"] if r["kind"] == "superseded_by")
+        repl = data["asks"].get(target)
+        lines.append(f"  SUPERSEDED {ask['id']} -> {target} [{repl['state'] if repl else 'missing'}]: "
+                     f"{prov.clip(ask['request']['compressed'], 60)} (shown until {target} is done)")
     shown = min(8, limit)
     lines.extend(no_ask_line(row) for row in no_asks[:shown])
     if len(no_asks) > shown:
@@ -1382,24 +1413,34 @@ def words_of(text: str) -> set:
     return {w for w in re.findall(r"[a-z0-9]{4,}", text.lower())}
 
 
+RETRACTION = re.compile(r"(?i)cancel|never ?mind|forget|scrap|\bdrop|\bstop|no wait|instead|retract|ignore|don'?t|"
+                        r"no longer|not needed|skip|abandon|withdraw|call (?:it|that) off")
+AFFIRM = re.compile(r"(?i)^\W*(?:yes|yep|yeah|y|ok(?:ay)?|sure|correct|confirmed?|do it|go ahead|please do)\b")
+
+
 def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, decision_id=None) -> None:
     """The proving turn must relate to THIS ask: its own origin message, a quote that names it, or the answer to a
     decision tied to it. A stranger's human message cannot cancel an unrelated ask."""
     if binding == "same_message_retraction":
         if ask["origin"].get("messageId") != msg["id"]:
             raise WAError("same_message_retraction needs the ask's own origin message")
-        if not re.search(r"(?i)cancel|never ?mind|forget|scrap|drop|stop|no wait|instead|retract|ignore|don'?t", quote):
+        if not RETRACTION.search(quote):
             raise WAError("same_message_retraction: the quote must be the retracting words")
     elif binding == "explicit_reference":
         ref = {ask["id"].lower(), (ask.get("migratedFrom", {}).get("id") or "").lower()} - {""}
         if not (any(r in quote.lower() for r in ref) or len(words_of(quote) & words_of(ask["request"]["compressed"])) >= 3):
             raise WAError("explicit_reference: the quote must name the ask id or share 3+ words with its request")
+        if not RETRACTION.search(quote):
+            raise WAError("explicit_reference: the quote must say to cancel, drop or stop it, not just mention it")
     elif binding in ("answer_to_decision", "answer_to_cancel_question"):
         dec = data["decisions"].get(decision_id or "")
         if not dec or dec["state"] != "answered" or dec["answer"]["messageId"] != msg["id"]:
             raise WAError(f"{binding}: decision {decision_id} is not answered by this message")
         if not any(r["target"] == ask["id"] for r in dec.get("related", [])):
             raise WAError(f"{binding}: decision {decision_id} is not related to {ask['id']}")
+        asked = json.dumps(dec.get("question", {}), ensure_ascii=False)
+        if not (RETRACTION.search(quote) or (RETRACTION.search(asked) and AFFIRM.search(quote))):
+            raise WAError(f"{binding}: the answer must retract the ask, or say yes to a question about cancelling it")
     else:
         raise WAError("unknown binding " + str(binding))
 

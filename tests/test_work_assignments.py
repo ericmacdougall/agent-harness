@@ -282,6 +282,21 @@ class CaptureTest(Base):
             wa.sync_all(data, "codex-sess-2")
         self.assertEqual(len(self.data()["messages"]), 1)  # only the typed "x"; the injected item was not caught up
 
+    def test_codex_bare_injected_context_items_are_not_human(self):
+        """Native review F6: real Codex context items carry no wrapper tag."""
+        rollout = Path(self.tmp.name) / "codex" / "sessions" / "2027" / "01" / "02" / "rollout-z.jsonl"
+        rollout.parent.mkdir(parents=True)
+        lines = []
+        for n, text in enumerate(["# AGENTS.md instructions for /repo\n\nbe careful", "<environment_context>\n  <cwd>/r</cwd>",
+                                  "<user_instructions>do x</user_instructions>", "<turn_aborted>"]):
+            item = {"type": "UserMessage", "id": f"01a16512-0d07-78f3-b199-70f1db87361{n}", "content": [{"type": "text", "text": text}]}
+            lines.append(json.dumps({"timestamp": wa.iso(CLOCK[0]), "type": "event_msg", "payload": {"type": "item_completed", "item": item}}))
+        rollout.write_text("\n".join(lines) + "\n")
+        self.hook("prompt", {"session_id": "codex-sess-3", "transcript_path": str(rollout), "prompt": "typed"}, runtime="codex")
+        with wa.transaction() as data:
+            wa.sync_all(data, "codex-sess-3")
+        self.assertEqual(len(self.data()["messages"]), 1)
+
 
 class TriageTest(Base):
     def test_split_and_no_ask(self):
@@ -331,6 +346,22 @@ class TriageTest(Base):
         self.assertEqual(cues("the fix landed yesterday"), [])  # verb not at a sentence start
         self.assertNotIn("requestCues", wa.text_ref("please do everything", pasted=True))
         self.assertLessEqual(len(cues(" ".join(["please can you could you would you i need i want make sure let us"] * 50))), 8)
+
+    def test_request_cues_are_linear_on_pathological_input(self):
+        """Native review F1 BLOCKING: 20k newlines took 20 s before whitespace was collapsed."""
+        for text in ("x" + "\n" * 60000 + "y", ". " * 30000, "please " * 9000 + "x", "\n \n\t" * 15000 + "fix it"):
+            start = time.perf_counter()
+            wa.request_cues(text)
+            self.assertLess(time.perf_counter() - start, 1.0, repr(text[:20]))
+        self.assertEqual(wa.request_cues("done.\n\n\n   fix the hook"), ["imperative:fix"])
+
+    def test_excerpt_withheld_when_it_mentions_a_secret(self):
+        """Native review F5: the redactor turned "password is hunter2" into "password [redacted] hunter2"."""
+        for text in ("my password is hunter2", "the secret is correcthorsebattery", "ssh pass is zzTop99", "api key = abc123xyz"):
+            ref = wa.text_ref(text)
+            self.assertEqual(ref["excerpt"], "[excerpt withheld: may contain a secret]", text)
+            self.assertNotIn(text.split()[-1], json.dumps(ref))
+        self.assertEqual(wa.text_ref("ship the release today")["excerpt"], "ship the release today")
 
     def test_legacy_no_ask_without_cues_falls_back_to_excerpt(self):
         msg = self.capture("could you remove the old cron job")
@@ -566,6 +597,26 @@ class RemovalTest(Base):
         self.assertEqual(self.data()["tombstones"][aid]["proofKind"], "user_proof")
         self.check_schema()
 
+    def test_cancel_needs_retraction_words_not_just_overlap(self):
+        """Native review F3: a progress remark sharing 3 words with the ask cancelled it."""
+        _, aid = self.split("start", "fix the login redirect bug in staging")
+        msg = human("the login redirect bug in staging is looking much better now, keep going")
+        self.append(msg)
+        code = self.cli(*self.cancel_args(aid, msg["uuid"], 2, "login redirect bug in staging is looking much better"))[0]
+        self.assertEqual(code, 2)
+        self.assertEqual(self.asks()[aid]["state"], "open")
+
+    def test_superseded_ask_stays_in_digest_until_replacement_done(self):
+        """Native review F4: superseding by any open ask hid the old one."""
+        _, old = self.split("old", "deploy the billing migration")
+        _, new = self.split("new", "unrelated cleanup chore")
+        self.cli("relate", old, "superseded_by", new)
+        self.assertEqual(self.cli("update", old, "--state", "superseded")[0], 0)
+        out = self.cli("status")[1]
+        self.assertIn(f"SUPERSEDED {old} -> {new} [open]", out)
+        self.advance(new)
+        self.assertNotIn("SUPERSEDED", self.cli("status")[1])
+
     def test_superseded_ask_is_removable_only_after_the_superseding_ask_closes(self):
         _, old = self.split("old thing", "the old approach to exporting")
         _, new = self.split("new thing", "the new approach to exporting")
@@ -777,6 +828,21 @@ class StoreTest(Base):
         CLOCK[0] -= 3600
         self.capture("two")
         self.assertTrue(any("clock went backwards" in p for p in wa.verify_events()))
+
+    def test_replay_after_clock_rollback_matches_live_state(self):
+        """Native review F2: folding by `at` put a later transition first and left lastSeq behind."""
+        _, aid = self.split("do it", "the thing to do")
+        self.cli("update", aid, "--owner", "main")
+        self.cli("update", aid, "--state", "in_progress")
+        self.cli("update", aid, "--state", "ready", "--evidence", "abc1234def")
+        CLOCK[0] -= 3600
+        self.cli("update", aid, "--state", "in_progress")
+        live = self.data()
+        replayed = wa.fold(wa.read_events())
+        self.assertEqual(live["asks"][aid]["state"], "in_progress")
+        self.assertEqual(replayed["asks"][aid]["state"], "in_progress")
+        hive = next(iter(live["writers"]))
+        self.assertEqual(replayed["writers"][hive]["lastSeq"], live["writers"][hive]["lastSeq"])
 
     def test_event_tamper_is_detected(self):
         msg = self.capture("x")

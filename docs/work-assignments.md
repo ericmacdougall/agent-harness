@@ -76,7 +76,11 @@ A cancel proof names `targets` and a `binding`: `same_message_retraction` (the a
 `explicit_reference` (the quote names the ask id or shares 3 or more words with its request),
 `answer_to_decision` or `answer_to_cancel_question` (the human answer to a decision tied to the ask). It must also
 be a human message this ledger captured from a transcript it tracks, not older than the ask, and the transcript
-line is re-read at removal. Removal appends the full record to the archive and leaves a tombstone.
+line is re-read at removal. Every binding also needs retraction words in the quote (cancel, drop, stop, never mind,
+no longer, skip and similar); an answer binding may instead be a plain yes to a decision whose question is about
+cancelling. Sharing words with the ask is not enough on its own. A superseded ask stays in the digest as
+`SUPERSEDED A -> B` until B is done, because superseding alone does not prove the work happened. Removal appends
+the full record to the archive and leaves a tombstone.
 
 ## Backup
 
@@ -92,9 +96,12 @@ restoring `work-ledger.events.jsonl` and running `work_assignments.py recover` r
 
 ## Known limits
 
-A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt and no request cues. Request cues are English keyword heuristics: they miss requests phrased without them and flag some messages that are not requests. A superseded ask is removable only when its replacement, a different ask, is done with verified evidence.
+A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt and no request cues, and an excerpt whose words mention a password, secret,
+token, key, credential, PIN or OTP is withheld entirely, because the redactor is a heuristic. Request cues are English keyword heuristics: they miss requests phrased without them and flag some messages that are not requests. A superseded ask is removable only when its replacement, a different ask, is done with verified evidence.
 
-The guard is best effort against shell tricks (a safety net for careless edits, not a sandbox); the event chain has
+Transcripts are the root of trust: an agent able to append a forged human line to its own transcript can forge
+a capture or a cancel proof, and the guard's pattern match can be evaded (for example by building the path from
+pieces). The guard is best effort against shell tricks (a safety net for careless edits, not a sandbox); the event chain has
 no external anchor; a payload over 8 MB is rejected and recorded as a failure; messages are not pruned (a triaged
 message could be archived later); decisions have no removal path yet; session caches (sync offsets, stop-block
 counters) are outside the fold by design. The first-touch sync window is the last 64 KB.
