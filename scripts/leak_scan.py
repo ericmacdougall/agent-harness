@@ -18,7 +18,6 @@ Placeholder names (someone, you, runner, user, example.invalid ...) are allowed.
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import hashlib
 import os
 import re
@@ -103,7 +102,7 @@ def git(repo: Path, *args: str) -> bytes:
 def label(path: str, denylist) -> str:
     """The path to print. A path that itself matches a rule (a denylisted name, a home directory, a tailnet host)
     is shown as a hash prefix, so the report never carries the value it flags."""
-    if check_line(path, denylist, False):
+    if check_line(path, denylist, True) or any(ord(c) < 32 or ord(c) == 127 for c in path):
         return "path#" + hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()[:10]
     return path
 
@@ -117,8 +116,8 @@ def load_allow(repo: Path) -> list[str]:
     patterns = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()
                 if line.strip() and not line.startswith("#")]
     for pattern in patterns:  # a pattern such as * would switch the token rules off for the whole repository
-        if not re.search(r"[A-Za-z0-9_.-]", pattern) or "**" in pattern or pattern.startswith(("*", "/")):
-            raise ScanError(f"{ALLOW_FILE}: pattern {pattern!r} is too broad; list exact paths")
+        if any(c in pattern for c in "*?[") or pattern.startswith("/"):
+            raise ScanError(f"{ALLOW_FILE}: pattern {pattern!r} is not an exact path; globs are not accepted")
     return patterns
 
 
@@ -129,11 +128,9 @@ def scan_tree(repo: Path, denylist):
     for name in git(repo, "ls-files", "-z").decode("utf-8", "surrogateescape").split("\0"):
         if not name:
             continue
-        findings += [(f"path:{label(name, denylist)}", rule) for rule in check_line(name, denylist, False)]
+        findings += [(f"path:{label(name, denylist)}", rule) for rule in check_line(name, denylist, True)]
         path = repo / name
-        if path.suffix.lower() in SKIP_SUFFIX:
-            continue
-        tokens = not any(fnmatch.fnmatch(name, pattern) for pattern in allow)
+        tokens = not name in allow
         if path.is_symlink():  # the target string is what is committed
             scanned += 1
             findings += [(f"{label(name, denylist)}:symlink", rule) for rule in check_line(os.readlink(path), denylist, tokens)]
@@ -145,7 +142,7 @@ def scan_tree(repo: Path, denylist):
             skipped += 1
             continue
         scanned += 1
-        for number, line in enumerate(raw.decode("utf-8", "replace").splitlines(), 1):
+        for number, line in enumerate(raw.decode("utf-8", "replace").split("\n"), 1):
             findings += [(f"{label(name, denylist)}:{number}", rule) for rule in check_line(line, denylist, tokens)]
     return findings, scanned, skipped
 
@@ -155,26 +152,33 @@ def scan_history(repo: Path, denylist, rev_range: str | None = None):
     findings, scanned, skipped = [], 0, 0
     allow = load_allow(repo)
     log = git(repo, "-c", "core.quotePath=false", "log", *([rev_range] if rev_range else ["--all"]), "-p", "-U0",
-              "--diff-merges=first-parent", "--no-color", "--format=\x01%h", "--no-ext-diff")
+              "--diff-merges=first-parent", "--no-color", "-a", "--no-textconv", "--format=\x01%h", "--no-ext-diff")
+    meta = git(repo, "log", *([rev_range] if rev_range else ["--all"]), "--format=%h%x00%an %ae %cn %ce%n%B%x01")
+    for entry in meta.decode("utf-8", "replace").split("\x01"):
+        sha, _, text = entry.lstrip("\n").partition("\x00")
+        for line in text.split("\n"):
+            findings += [(f"{sha}:commit-message", rule) for rule in check_line(line, denylist, True)]
     commit = path = ""
     in_hunk = False
-    for raw in log.decode("utf-8", "replace").splitlines():
+    # Split on newline only: str.splitlines also breaks on CR, FF, VT, NEL and U+2028, which would hide
+    # content after such a character and let it corrupt the hunk state.
+    for raw in log.decode("utf-8", "replace").split("\n"):
         if raw.startswith("\x01"):
             commit, scanned, in_hunk = raw[1:], scanned + 1, False
         elif raw.startswith("diff --git "):
             in_hunk = False  # headers follow; an added line that looks like "+++ x" is only content once a hunk starts
         elif not in_hunk and raw.startswith(("rename to ", "copy to ")):
             path = raw.split(" to ", 1)[1]  # a pure rename has no +++ line
-            findings += [(f"{commit}:path:{label(path, denylist)}", rule) for rule in check_line(path, denylist, False)]
+            findings += [(f"{commit}:path:{label(path, denylist)}", rule) for rule in check_line(path, denylist, True)]
         elif not in_hunk and raw.startswith("+++ "):
             path = raw[6:] if raw.startswith("+++ b/") else raw[4:]
-            findings += [(f"{commit}:path:{label(path, denylist)}", rule) for rule in check_line(path, denylist, False)]
+            findings += [(f"{commit}:path:{label(path, denylist)}", rule) for rule in check_line(path, denylist, True)]
         elif not in_hunk and raw.startswith("Binary files ") and raw.endswith(" differ"):
             skipped += 1
         elif raw.startswith("@@"):
             in_hunk = True
         elif in_hunk and raw.startswith("+"):
-            tokens = not any(fnmatch.fnmatch(path, pattern) for pattern in allow)
+            tokens = not path in allow
             findings += [(f"{commit}:{label(path, denylist)}", rule) for rule in check_line(raw[1:], denylist, tokens)]
     return findings, scanned, skipped
 

@@ -104,6 +104,9 @@ def load_policy(path: Path = POLICY_FILE) -> dict:
     local = Path(override) if override else Path(path).with_name(LOCAL_PROFILE_NAME)
     if override and not local.is_file():
         raise ValueError(f"AGENT_HARNESS_POLICY_LOCAL={local} does not exist")
+    if os.path.lexists(local) and not local.is_file():
+        # a dangling symlink, directory or FIFO must not read as "no profile" (that would silently drop enforcement)
+        raise ValueError(f"{local} exists but is not a readable regular file")
     if local.is_file():
         import safe_input  # same directory as this script; bounds size and nesting
         try:
@@ -122,6 +125,9 @@ def load_policy(path: Path = POLICY_FILE) -> dict:
             bad = sorted(k for k in entry if k not in LOCAL_TICKET_KEYS and not k.startswith("_"))
             if bad:
                 raise ValueError(f"{local}: ticket_systems.{name} may only set {sorted(LOCAL_TICKET_KEYS)}, not {bad}")
+            for slug, route in (entry.get("projects") or {}).items():  # a route must not redirect the endpoint
+                if not isinstance(route, dict) or set(route) - {"project_id", "org_id", "key_file"}:
+                    raise ValueError(f"{local}: project route {slug!r} may only set project_id, org_id, key_file")
         policy = _deep_merge(policy, overlay)
     if not isinstance(policy, dict) or policy.get("schema") != 1:
         raise ValueError(f"{path} is not a schema 1 commit policy")

@@ -558,6 +558,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         changes = [str(path) for path in managed]
         if not apply:
             return changes
+        for note in migrate_local_profiles(claude):
+            print(f"  {note}")
         originals = {path: read_regular(path, pinned_parent=pins.fd(path.parent),
                                         retain_fd=pins.file_fds)
                      for path in managed}
@@ -734,6 +736,42 @@ def netwatch_status(home: Path, apply: bool, flag) -> str:
         return netwatch_install.status(home, apply, enabled)
     except Exception as error:  # noqa: BLE001
         return f"netwatch: skipped ({error.__class__.__name__}: {error})"
+
+
+def migrate_local_profiles(claude: Path) -> list[str]:
+    """Before the shipped policies are overwritten, copy their personal values into new untracked 0600 profiles.
+    Never overwrites an existing profile. Without this an upgrade would silently turn ticket enforcement off."""
+    notes = []
+    hooks = claude / "hooks"
+    def keep(name, build):
+        old, target = hooks / name, hooks / name.replace(".json", ".local.json")
+        if target.exists() or target.is_symlink() or not old.is_file():
+            return
+        try:
+            data = build(json.loads(old.read_text(encoding="utf-8")))
+        except (OSError, ValueError, AttributeError):
+            return
+        if data:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+            notes.append(f"migrated personal values from {name} to {target.name} (mode 0600)")
+    def commit(policy):
+        out = {}
+        if policy.get("backstop_repos"):
+            out["backstop_repos"] = policy["backstop_repos"]
+        keys = ("repos", "org_id", "key_file", "key_secret", "default_project", "projects", "unreachable_projects", "unreachable_reason")
+        systems = {n: {k: v for k, v in e.items() if k in keys and v not in ([], {}, "", None)}
+                   for n, e in (policy.get("ticket_systems") or {}).items() if isinstance(e, dict)}
+        systems = {n: e for n, e in systems.items() if e.get("repos") or e.get("org_id")}
+        if systems:
+            out["ticket_systems"] = systems
+        return out
+    def spec(policy):
+        return {k: policy[k] for k in ("projects", "enforced_projects") if policy.get(k)}
+    keep("commit_policy.json", commit)
+    keep("spec_policy.json", spec)
+    return notes
 
 
 def local_profile_status(home: Path) -> str:

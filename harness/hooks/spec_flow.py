@@ -77,6 +77,8 @@ def load_spec_policy(path: Path = POLICY_FILE) -> dict:
     with open(path, encoding="utf-8") as handle:
         policy = json.load(handle)
     local = Path(path).with_name("spec_policy.local.json")
+    if os.path.lexists(local) and not local.is_file():
+        raise ValueError(f"{local} exists but is not a readable regular file")
     if local.is_file():
         try:
             overlay = safe_input.safe_json_loads(safe_input.read_bounded(local, 1 << 20))
@@ -87,6 +89,9 @@ def load_spec_policy(path: Path = POLICY_FILE) -> dict:
         forbidden = sorted(k for k in overlay if k not in SPEC_LOCAL_KEYS and not k.startswith("_"))
         if forbidden:
             raise ValueError(f"{local} may only set {list(SPEC_LOCAL_KEYS)}, not {forbidden}")
+        for slug, route in (overlay.get("projects") or {}).items():
+            if not isinstance(route, dict) or set(route) - {"project_id", "org_id", "key_file"}:
+                raise ValueError(f"{local}: project route {slug!r} may only set project_id, org_id, key_file")
         policy = {**policy, **{k: v for k, v in overlay.items() if k in SPEC_LOCAL_KEYS}}
     if not isinstance(policy, dict) or policy.get("schema") != 1:
         raise ValueError(f"{path} is not a schema 1 spec policy")

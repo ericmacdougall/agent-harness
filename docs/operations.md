@@ -450,7 +450,7 @@ When a repo shows blockchain work, the spec flow and the reviewers get a data-dr
 
 - **Keys and routing.** A GoodQA key is bound to one organization. `spec_policy.json` `projects` maps a project slug to its `project_id` and `org_id`, and to `key_file` when it needs a different key. `doctor --project <slug>` checks that the routed key can create attachments, comment and transition in that project.
   - `member.key` reaches one org, including the `work-tracker-automatic` tracker.
-  - The Harness project lives in org Eric, and no key file reaches it yet.
+  - The Harness project lives in the maintainer's own org, and no key file reaches it yet.
 - **Shipped mode:** `mode: warn`, `plan_ticket_gate: warn`, `enforced_projects: []`. No project is enforced in this release.
 - **Before enforcing any project:** resolve the remaining items in GoodQA work-tracker-automatic#35672 (per-project plan ticket gate, a policy for tickets opened before enforcement, bulk timing with several routed keys). `doctor` reports the permissions GoodQA lists for the key; it does not try a write. Re-run it after any key or membership change.
 - **Enforcing on `harness`:** once #35672 is resolved, add `{"key_file": ...}` to its route, run `doctor --project harness`, then set `"enforced_projects": ["harness"]` and `"mode": "enforce"`.

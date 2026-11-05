@@ -356,7 +356,7 @@ class RoundTwoFindings(unittest.TestCase):
             code, out = scan_repo(repo, tmp, "--history", "--range", "HEAD~2..HEAD")
             self.assertEqual(code, 1, out)
             self.assertNotIn(host, out)
-            self.assertIn("skipped=1", out)
+            self.assertIn("skipped=0", out)  # binary diffs are scanned as text (-a), not skipped
 
     def test_ticket_system_overlay_cannot_change_endpoint(self):
         import commit_policy as cp
@@ -386,6 +386,101 @@ class RoundTwoFindings(unittest.TestCase):
             done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                                   env=dict(os.environ, HOME=str(home), AGENT_HARNESS_POLICY_LOCAL=str(evil)))
             self.assertEqual(done.stdout.strip(), "False", done.stdout + done.stderr)
+
+
+class RoundThreeFindings(unittest.TestCase):
+    """Native round-3 review (GoodQA #14538): H1 line breaks, H2 migration, H3 metadata, M1-M5."""
+
+    def test_unicode_and_control_line_breaks_do_not_hide_added_content(self):
+        for sep in ("\r", "\x0c", "\x0b", "\x85", "\u2028"):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo, g = make_git(tmp, {"a.txt": "ok\n"})
+                (repo / "a.txt").write_text("ok\nhello" + sep + "host " + ip("100", "64", "0", "9") + "\n")
+                g("commit", "-qam", "d")
+                g("rm", "-q", "a.txt")
+                g("commit", "-qm", "gone")
+                code, out = scan_repo(repo, tmp, "--history", "--range", "HEAD~2..HEAD")
+                self.assertEqual(code, 1, (repr(sep), out))
+
+    def test_commit_message_and_author_are_scanned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, g = make_git(tmp, {"a.txt": "ok\n"})
+            (repo / "a.txt").write_text("two\n")
+            g("commit", "-qam", "Testing: ran in /Users/" + "realperson/x")
+            code, out = scan_repo(repo, tmp, "--history", "--range", "HEAD~1..HEAD")
+            self.assertEqual(code, 1, out)
+            self.assertIn("commit-message", out)
+            self.assertNotIn("realperson", out)
+
+    def test_text_file_with_binary_suffix_is_scanned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = make_git(tmp, {"creds.pdf": "k=" + FAKE_GH + "\n"})
+            self.assertEqual(scan_repo(repo, tmp)[0], 1)
+
+    def test_token_in_filename_is_not_printed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = make_git(tmp, {FAKE_GH + ".txt": "x\n"})
+            for extra in ((), ("--history",)):
+                code, out = scan_repo(repo, tmp, *extra)
+                self.assertEqual(code, 1, out)
+                self.assertNotIn(FAKE_GH, out)
+
+    def test_glob_allowlist_patterns_are_rejected(self):
+        for pattern in ("[!z]*", "tests/*", "a?.txt"):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo, _ = make_git(tmp, {"a.txt": "ok\n"}, allow=pattern + "\n")
+                self.assertEqual(scan_repo(repo, tmp)[0], 2, pattern)
+
+    def test_profile_that_is_not_a_regular_file_fails_closed(self):
+        import commit_policy as cp
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "commit_policy.json"
+            base.write_text((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
+            os.symlink(Path(tmp) / "nowhere", Path(tmp) / "commit_policy.local.json")
+            with mock.patch.dict(os.environ):
+                os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
+                with self.assertRaises(ValueError):
+                    cp.load_policy(base)
+
+    def test_project_route_cannot_carry_an_endpoint(self):
+        import commit_policy as cp
+        import spec_flow as sf
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "commit_policy.json"
+            base.write_text((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
+            (Path(tmp) / "commit_policy.local.json").write_text(json.dumps({"ticket_systems": {"goodqa": {
+                "projects": {"evil": {"project_id": "p", "endpoint": "https://attacker.invalid/"}}}}}))
+            with mock.patch.dict(os.environ):
+                os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
+                with self.assertRaises(ValueError):
+                    cp.load_policy(base)
+            sbase = Path(tmp) / "spec_policy.json"
+            sbase.write_text((ROOT / "harness" / "hooks" / "spec_policy.json").read_text())
+            (Path(tmp) / "spec_policy.local.json").write_text(json.dumps(
+                {"projects": {"evil": {"project_id": "p", "endpoint": "https://attacker.invalid/"}}}))
+            with self.assertRaises(ValueError):
+                sf.load_spec_policy(sbase)
+
+    def test_installer_migrates_existing_personal_values_before_overwrite(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        with tempfile.TemporaryDirectory() as tmp:
+            claude = Path(tmp) / ".claude"
+            (claude / "hooks").mkdir(parents=True)
+            (claude / "hooks" / "commit_policy.json").write_text(json.dumps({
+                "backstop_repos": ["example\\.invalid/"], "enforcement": "on",
+                "ticket_systems": {"goodqa": {"repos": ["example\\.invalid/"], "org_id": "o", "endpoint": "https://x.invalid/"}}}))
+            notes = install.migrate_local_profiles(claude)
+            target = claude / "hooks" / "commit_policy.local.json"
+            self.assertTrue(notes and target.is_file())
+            self.assertEqual(oct(target.stat().st_mode & 0o777), "0o600")
+            data = json.loads(target.read_text())
+            self.assertEqual(data["backstop_repos"], ["example\\.invalid/"])
+            self.assertNotIn("endpoint", data["ticket_systems"]["goodqa"])
+            self.assertNotIn("enforcement", data)
+            before = target.read_text()
+            self.assertEqual(install.migrate_local_profiles(claude), [])  # never overwrites
+            self.assertEqual(target.read_text(), before)
 
 
 if __name__ == "__main__":
