@@ -185,7 +185,11 @@ def _count_entries(repo, label, *args):
 
 
 def target_preflight(original, branch, mode=None):
-    """Refuse (or warn) before anything is published when the original checkout is a bad target."""
+    """Refuse (or warn) before anything is published when the original checkout is a bad target.
+
+    Runs before require_safe_source on purpose (a huge index would otherwise time out the strict
+    snapshot first). Only read-only listings run here: no filters, fsmonitor, untracked cache or hooks.
+    """
     mode = mode or TARGET_POLICY["mode"]
     original = Path(original)
     if original.is_symlink() or not original.is_dir():
@@ -216,7 +220,9 @@ def target_preflight(original, branch, mode=None):
     elif behind.strip().isdigit() and int(behind) > TARGET_POLICY["max_behind"]:
         problems.append((f"original checkout is {int(behind)} commits behind origin/{branch} "
                          f"(limit {TARGET_POLICY['max_behind']})", "ORIGINAL_BEHIND",
-                         f"update it first (git -C <original> pull --ff-only) and rebase the feature onto origin/{branch}"))
+                         f"for a new generation, update it first (git -C <original> pull --ff-only) and rebase the "
+                         f"feature onto origin/{branch}; to resume an in-flight generation, do not move the original: "
+                         f"use --reconcile-only or --target-policy warn"))
     if not problems:
         return
     message = "; ".join(item[0] for item in problems)
@@ -563,7 +569,8 @@ class Workflow:
         if not os.path.lexists(path):
             return [], 0
         try:
-            record = json.loads(regular_bytes(path))
+            # The record also holds exclude/ticket lists; allow far more than the 50 waivers shown.
+            record = json.loads(regular_bytes(path, WAIVER_RECORD_LIMIT))
             items = record.get("waivers", [])
             if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
                 return None, 0
@@ -984,6 +991,7 @@ def prepare_pr(flow, title, body):
 
 
 COMMIT_POLICY_RECORD = "commit-policy.json"
+WAIVER_RECORD_LIMIT = 1_048_576
 
 
 def commit_policy_gate(source, original_branch, branch, head, baseline, title, body, local_only):

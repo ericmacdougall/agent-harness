@@ -356,6 +356,14 @@ class WaiverVisibility(workflow.DeliveryWorkflow):
         self.assertEqual(data['commit_policy_waivers_total'], 60)
         self.assertEqual(data['commit_policy_waivers'][0]['wal'], 'main.jsonl')
 
+    def test_large_valid_record_is_listed_not_flagged(self):
+        waivers = [{'kind': 'commit', 'subject': 's' * 200, 'id': f'w{index}', 'wal': 'main.jsonl'}
+                   for index in range(200)]  # about 50 KiB, above the 32 KiB private-metadata default
+        code, data = self.prepare_with(waivers)
+        self.assertEqual(code, 0, data)
+        self.assertNotIn('commit_policy_waivers_unreadable', data)
+        self.assertEqual((len(data['commit_policy_waivers']), data['commit_policy_waivers_total']), (50, 200))
+
     def test_malformed_waiver_item_marks_the_record_unreadable(self):
         code, data = self.prepare_with([{'kind': 'commit', 'id': 'w1'}, 'not-a-dict'])
         self.assertEqual(code, 0, data)
