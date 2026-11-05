@@ -24,7 +24,7 @@ AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py",
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
          "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py",
-         "command_guard.py", "command_guard_hook.py", "redact.py")
+         "command_guard.py", "command_guard_hook.py", "redact.py", "kill_guard.py", "kill_guard_policy.json")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -41,7 +41,7 @@ class DirectoryPublicationError(OSError):
 
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
-            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "command_guard_hook.py")}
+            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "command_guard_hook.py", "kill_guard.py")}
 
 
 SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
@@ -69,6 +69,13 @@ def command_guard_group(claude: Path) -> dict:
     own when the analyser fails; onFailure covers the launcher itself."""
     return {"matcher": "Bash|PowerShell", "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "command_guard_hook.py")],
+        "timeout": 30, "onFailure": "block"}]}
+
+
+def kill_guard_group(claude: Path) -> dict:
+    """Broad-kill and unowned-PID kill guard (GoodQA #14506). Its launcher fails closed on its own."""
+    return {"matcher": "Bash|PowerShell", "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "kill_guard.py"), "hook"],
         "timeout": 30, "onFailure": "block"}]}
 
 
@@ -111,6 +118,7 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     }
     if command_guard:
         managed["PreToolUse"].insert(0, command_guard_group(claude))
+        managed["PreToolUse"].insert(1, kill_guard_group(claude))
     if provenance:
         for event, groups in provenance_hook_groups(claude).items():
             managed.setdefault(event, []).extend(groups)

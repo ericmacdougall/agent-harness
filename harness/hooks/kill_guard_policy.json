@@ -1,7 +1,7 @@
 {
   "_doc": "Policy for kill_guard.py (GoodQA #14506). mode: enforce | warn | off. Verb lists are matched against the basename of the command after wrapper, alias, quote and ANSI-C decoding by command_guard's parser.",
   "mode": "enforce",
-  "broad_verbs": ["pkill", "killall", "killall5", "skill", "slay", "pkill-all"],
+  "broad_verbs": ["pkill", "killall", "killall5", "skill", "slay"],
   "windows_verbs": ["taskkill", "stop-process", "spps", "wmic"],
   "service_kill": {"systemctl": ["kill"], "launchctl": ["kill"], "loginctl": ["kill-session", "kill-user"]},
   "script_kill_pattern": "os\\.kill|os\\.killpg|pthread_kill|process\\.kill\\(|Process\\.kill|psutil|\\bpkill\\b|\\bkillall\\b|\\btaskkill\\b",

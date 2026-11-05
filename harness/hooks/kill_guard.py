@@ -52,7 +52,7 @@ OVERRIDDEN = ('apply', 'inner_words', 'script', 'ssh', 'container', 'pipeline', 
 
 DEFAULT_POLICY = {
     'mode': 'enforce',
-    'broad_verbs': ['pkill', 'killall', 'killall5', 'skill', 'slay', 'pkill-all'],
+    'broad_verbs': ['pkill', 'killall', 'killall5', 'skill', 'slay'],
     'windows_verbs': ['taskkill', 'stop-process', 'spps', 'wmic'],
     'service_kill': {'systemctl': ['kill'], 'launchctl': ['kill'], 'loginctl': ['kill-session', 'kill-user']},
     'script_kill_pattern': r'os\.kill|os\.killpg|pthread_kill|process\.kill\(|Process\.kill|psutil|\bpkill\b|\bkillall\b|\btaskkill\b',
@@ -96,8 +96,13 @@ def norm_raw(text):
 
 
 def fallback_blocks(raw):
-    """Used when the analyser cannot run: block kill-looking or indirect input, allow the rest."""
+    """Used when the analyser cannot run: block kill-looking or indirect input, allow the rest. A hook payload is
+    reduced to its command text first, so a cwd such as .../kill-notes does not make `ls` look like a kill."""
     text = raw[:4_000_000]
+    try:
+        text = guarded_text(text)[1] or text
+    except Exception:  # noqa: BLE001
+        pass
     return bool(KILLISH.search(norm_raw(text)) or INDIRECT.search(text))
 
 
@@ -529,7 +534,11 @@ def make_analyzer_class(cg):
                 args = args[:host + 1] + args[host + 2:]  # `mosh host -- cmd`, `ssh host -- cmd`
             self.remote += 1
             try:
-                return super().ssh(args, depth)
+                result = super().ssh(args, depth)
+                host = self._ssh_host_index(texts)
+                if host is not None and host + 1 < len(args):  # the base joins words unquoted; judge the quoted form too
+                    self.script(' '.join(cg._quote_for_rebuild(a.text) for a in args[host + 1:]), depth + 1)
+                return result
             finally:
                 self.remote -= 1
 
@@ -557,8 +566,8 @@ def make_analyzer_class(cg):
             args = words[1:]
             texts = [a.text for a in args]
             head = words[0]
-            if head.dynamic and not head.subs:
-                hints = ' '.join(self.ctx.var_hints.values())
+            if head.dynamic:
+                hints = ' '.join(self.ctx.var_hints.values()) + ' ' + ' '.join(head.subs)
                 if KILLISH.search(norm_raw(head.text + ' ' + hints)):
                     self.block('dynamic-head', 'the command name is built at run time and the input mentions kill')
             if name in self.broad:
@@ -588,6 +597,24 @@ def make_analyzer_class(cg):
             elif name in cg.INTERPRETERS:
                 self.check_interpreter(name, texts, cmd)
             self.check_spawn(name, args, texts, depth, pl, idx)
+            self.check_text_runners(name, args, texts, cmd, depth)
+
+        def check_text_runners(self, name, args, texts, cmd, depth):
+            """Commands that run a text argument or here-string as shell code, which the base does not follow."""
+            if name in cg.SHELLS:
+                for redir in getattr(cmd, 'redirs', []):
+                    if redir.op == '<<<' and redir.target is not None:
+                        self.script(redir.target.text, depth + 1)
+            elif name == 'watch':
+                i = 0
+                while i < len(texts) and texts[i].startswith('-'):
+                    i += 2 if texts[i] in ('-n', '-d', '--interval') else 1
+                if i < len(texts):
+                    self.script(' '.join(texts[i:]), depth + 1)
+            elif name in ('cmd', 'cmd.exe'):
+                for i, t in enumerate(texts):
+                    if t.casefold() in ('/c', '/k') and i + 1 < len(texts):
+                        self.script(' '.join(texts[i + 1:]), depth + 1)
 
         def check_spawn(self, name, args, texts, depth, pl, idx):
             """`kill_guard.py spawn [--log F] -- CMD` runs CMD: judge CMD as if it were typed directly."""
@@ -763,6 +790,9 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
         own = ownership or Ownership(effective, home=home, policy=policy)
         analyzer = make_analyzer_class(cg)(compiled, effective, ps, own, policy, raw)
         findings = analyzer.run_kill_scan(command)
+        if analyzer.ctx.unterminated and not findings and fallback_blocks(raw):
+            findings = [('unterminated', 'the command has an unterminated quote or substitution and mentions a kill '
+                         'verb or indirection', ())]
     except Exception as error:  # noqa: BLE001 - Blocked, RecursionError and bugs alike: fail closed on kill-looking text
         if fallback_blocks(raw):
             rule = 'unanalysable'

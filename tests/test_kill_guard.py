@@ -48,7 +48,8 @@ class FakeProbe:
         return None if entry is None else entry[key]
 
     def uid(self, pid):
-        return self._get(pid, 'uid')
+        value = self._get(pid, 'uid')
+        return os.getuid() if value == 1000 else value  # 1000 in the corpus means "the caller"
 
     def comm(self, pid):
         return self._get(pid, 'comm')
@@ -567,7 +568,8 @@ class Failure(unittest.TestCase):
 
 
 class Spawn(unittest.TestCase):
-    """spawn starts a harmless sleeper that this test owns and stops it by its own PID through safe_signal."""
+    """Refusal paths of spawn only: nothing is started and nothing is signalled here (the real spawn plus signal run is
+    tests/live_kill_canary.py, dev2 only)."""
 
     def test_refuses_outside_a_worktree_and_without_a_command(self):
         home = tempfile.mkdtemp()
@@ -635,6 +637,55 @@ class Hygiene(unittest.TestCase):
         text = Path(__file__).read_text(encoding='utf-8')
         self.assertIn('json.loads', text)
         self.assertNotRegex(text, r'(?m)^\s*(?:import|from)\s+kill_guard_corpus')
+
+
+class Install(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        import install_codex
+        self.install, self.install_codex = install, install_codex
+        tmp = tempfile.TemporaryDirectory(prefix='kg-install-')
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+
+    @staticmethod
+    def kill_groups(groups, needle='kill_guard.py'):
+        return [g for g in groups if any(needle in ' '.join(h.get('args') or [h.get('command', '')])
+                                         for h in g.get('hooks', []))]
+
+    def test_claude_entry_is_separate_fail_closed_and_idempotent(self):
+        claude = self.home / '.claude'
+        user = {'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': 'echo mine'}]}
+        settings = self.install.merged_settings({'hooks': {'PreToolUse': [user]}}, claude)
+        groups = self.kill_groups(settings['hooks']['PreToolUse'])
+        self.assertEqual(len(groups), 1)
+        hook = groups[0]['hooks'][0]
+        self.assertEqual((hook['onFailure'], hook['timeout']), ('block', 30))
+        self.assertEqual(hook['args'][-1], 'hook')
+        self.assertIn('Bash', groups[0]['matcher'])
+        self.assertIn('PowerShell', groups[0]['matcher'])
+        self.assertIn(user, settings['hooks']['PreToolUse'])
+        again = self.install.merged_settings(settings, claude)
+        self.assertEqual(json.dumps(again, sort_keys=True), json.dumps(settings, sort_keys=True))
+        rolled = self.install.merged_settings(settings, claude, command_guard=False)
+        self.assertEqual(self.kill_groups(rolled['hooks']['PreToolUse']), [])
+        self.assertIn(user, rolled['hooks']['PreToolUse'])
+        for name in ('kill_guard.py', 'kill_guard_policy.json', 'command_guard.py', 'redact.py', 'safe_input.py'):
+            self.assertIn(name, self.install.HOOKS)
+
+    def test_codex_entry_has_no_matcher_and_is_idempotent(self):
+        codex = self.home / '.codex'
+        hooks = self.install_codex.merge_hooks({}, codex)
+        command = self.install_codex.kill_guard_command(codex)
+        groups = [g for g in hooks['hooks']['PreToolUse'] if g['hooks'][0]['command'] == command]
+        self.assertEqual(len(groups), 1)
+        self.assertNotIn('matcher', groups[0])
+        self.assertTrue(command.endswith(' hook'))
+        again = self.install_codex.merge_hooks(hooks, codex)
+        self.assertEqual(json.dumps(again, sort_keys=True), json.dumps(hooks, sort_keys=True))
+        for name in ('kill_guard.py', 'kill_guard_policy.json'):
+            self.assertIn(name, self.install_codex.DELIVERY_HELPERS)
 
 
 class Wiring(unittest.TestCase):
