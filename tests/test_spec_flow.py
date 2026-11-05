@@ -400,6 +400,13 @@ class Reviews(SpecFlowCase):
         self.wal(self.main_wal, {"at": "t", "event": "subagent", "agent_id": "x9", "agent_type": "fixer"})
         self.assertEqual(self.run_cli(*args, "--role", "adversarial")[0], 2)
         self.assertEqual(self.run_cli(*args, "--role", "acceptance")[0], 0)
+        # Each reviewer type is accepted on the acceptance path (a removed type would fail safe but is still a regression).
+        for agent_type in ("task-owner", "click-tester", "red-team"):
+            agent = "ok-" + agent_type
+            self.wal(self.main_wal, {"at": "t", "event": "subagent", "agent_id": agent, "agent_type": agent_type})
+            code, _, err = self.run_cli("review", str(spec), "--agent", agent, "--wal", str(self.main_wal), "--verdict",
+                                        "ACCEPT", "--report-file", str(report), "--role", "acceptance")
+            self.assertEqual(code, 0, (agent_type, err))
         # Every agent type is logged now (goodqa#14613); only the reviewer types may record a review.
         for agent_type in ("Explore", "statusline-setup", "claude-code-guide", "general-purpose"):
             agent = "r-" + agent_type.lower()

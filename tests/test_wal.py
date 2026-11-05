@@ -626,6 +626,10 @@ class DurableWorkDirHookTests(unittest.TestCase):
                                                     "agent_type": "task-owner"}))
         self.assertIn(f"{work}/agent-a1/", sub)
         self.assertIn("Read the main scope brief", sub)
+        # Every owner-capable type gets the brief (general-purpose is the type behind goodqa#14613).
+        for number, agent_type in enumerate(("task-owner", "fixer", "red-team", "click-tester", "general-purpose", "claude")):
+            owner = self.context(self.invoke("subagent", {"session_id": "durable-1", "agent_id": "o%d" % number, "agent_type": agent_type}))
+            self.assertIn("Read the main scope brief", owner, agent_type)
         # A short-lived type gets its WAL and a short note, never the owner brief or the main-WAL read (goodqa#14613).
         short = self.context(self.invoke("subagent", {"session_id": "durable-1", "agent_id": "e1", "agent_type": "Explore"}))
         self.assertIn("Your private WAL:", short)
