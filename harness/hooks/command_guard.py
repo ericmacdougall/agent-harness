@@ -373,6 +373,13 @@ class Pipeline:
     def __init__(self):
         self.cmds = []
         self.bg = False
+        # runs unconditionally in the current shell: not nested in a compound command, subshell or function body,
+        # not after && or ||, not in the background and not part of a multi-stage pipe (GoodQA #14589)
+        self.plain = False
+
+
+NEST_OPEN = {'if', 'while', 'until', 'for', 'select', 'case', '{', 'function', 'coproc'}
+NEST_CLOSE = {'fi', 'done', 'esac', '}'}
 
 
 Q = {'*': '', '?': '', '[': '', '{': '', '}': '', ',': '', ' ': ''}
@@ -852,6 +859,7 @@ def _strip_case_patterns(tokens):
 def parse(tokens):
     tokens = _strip_case_patterns(tokens)
     pipelines, pl, cmd = [], Pipeline(), Cmd()
+    nest, start_nest, prev_sep = 0, 0, None
 
     def end_cmd():
         nonlocal cmd
@@ -859,23 +867,38 @@ def parse(tokens):
             pl.cmds.append(cmd)
         cmd = Cmd()
 
-    def end_pl(bg=False):
-        nonlocal pl
+    def end_pl(sep=None):
+        nonlocal pl, start_nest, prev_sep
         end_cmd()
         if pl.cmds:
-            pl.bg = bg
+            pl.bg = sep == '&'
+            pl.plain = (start_nest == 0 and nest == 0 and len(pl.cmds) == 1 and prev_sep not in ('&&', '||')
+                        and sep not in ('&', '|', '|&'))
             pipelines.append(pl)
         pl = Pipeline()
+        start_nest, prev_sep = nest, sep
 
     for kind, val in tokens:
         if kind == 'w':
+            if not cmd.words and not val.quoted:
+                if val.text in NEST_OPEN:
+                    nest += 1
+                elif val.text in NEST_CLOSE:
+                    nest = max(0, nest - 1)
             cmd.words.append(val)
         elif kind == 'redir':
             cmd.redirs.append(val)
         elif val in ('|', '|&'):
             end_cmd()
+            start_nest = max(start_nest, 1)  # a pipe stage runs in a subshell
         else:
-            end_pl(val == '&')
+            if val == '(':
+                nest += 1
+            elif val == ')':
+                nest = max(0, nest - 1)
+            end_pl(val)
+            if val == '(':
+                start_nest = nest
     end_pl()
     return pipelines
 
@@ -1256,6 +1279,8 @@ class Ctx:
         self.cwd_protected_unknown = False  # cd to an unresolved path whose text names a protected location
         self.var_hints = {}  # raw text of dynamic assignments, for variables the guard cannot resolve
         self.temp_vars = set()  # NAME=$(mktemp ...): a name the command itself just created (GoodQA #14589)
+        self.temp_touched = set()  # names rebound anywhere, including nested scripts (eval, sourced text)
+        self.script_texts = []  # texts of the scripts being analysed, innermost last
         self.created = set()  # case-folded paths written earlier in this command (count as existing)
         self.links = {}  # symlinks created earlier in this command: link path -> target path
         self.written = {}  # case-folded path -> text written to it earlier in this command (echo/printf/heredoc)
@@ -1306,12 +1331,20 @@ class Analyzer:
             ctx.ps = ps
         if tail_visible is not None:
             ctx.tail_visible = tail_visible
+        # fresh-mktemp marks are valid only in the script text that made them: a child shell (`bash -c`, `$(..)`,
+        # a script file) cannot hand one back, and a name rebound inside nested text (eval) loses its mark outside
+        saved_temp, saved_touched = ctx.temp_vars, ctx.temp_touched
+        ctx.temp_vars, ctx.temp_touched = set(), set()
+        ctx.script_texts.append(text if isinstance(text, str) else '')
         try:
             tokens = Lexer(ctx, ctx.ps).lex(text)
             for pipeline in parse(tokens):
                 self.pipeline(pipeline, depth)
         finally:
             ctx.ps, ctx.tail_visible = saved_ps, saved_tail
+            inner = ctx.temp_touched
+            ctx.temp_vars, ctx.temp_touched = saved_temp - inner, saved_touched | inner
+            ctx.script_texts.pop()
 
     # ---- visibility of a stage's stdout
     def consumer_class(self, cmd):
@@ -1524,7 +1557,7 @@ class Analyzer:
             self.bind_loop_var(words)
             rest = []
         if not rest:
-            self.assignments(assigns, depth)
+            self.assignments(assigns, depth, pl)
             for w in (words if head_nonexec else []):
                 self.subs(w, depth, visible=False)
             return
@@ -1591,7 +1624,7 @@ class Analyzer:
                     self.ctx.flow_vars = set()
                 self.ctx.flow_vars.add(name)
             self.ctx.vars[name] = chosen.text
-            self.ctx.temp_vars.discard(name)
+            self._untemp(name)
             self.ctx.tainted.discard(name)
             # `for t in "$GH_TOKEN"`: the loop variable carries whatever secret its items expand to
             if any(self.c.secret_name(v.lstrip('!')) or v in self.ctx.tainted for item in items for v in item.vars):
@@ -1601,14 +1634,14 @@ class Analyzer:
         for inner in w.subs:
             self.script(inner, depth + 1, tail_visible=visible)
 
-    def assignments(self, assigns, depth):
+    def assignments(self, assigns, depth, pl=None):
         ctx = self.ctx
         for a in assigns:
             text = a.text
             name, _, value = text.partition('=')
             appended = name.endswith('+')
             name = name.rstrip('+')
-            ctx.temp_vars.discard(name)  # any reassignment ends the fresh-temp guarantee
+            self._untemp(name)  # any reassignment ends the fresh-temp guarantee
             before = ctx.secret_seen
             self.subs(a, depth, visible=False)
             tainted = ctx.secret_seen > before or any(ctx.c.secret_name(v.lstrip('!')) or v in ctx.tainted for v in a.vars)
@@ -1622,10 +1655,30 @@ class Analyzer:
                 ctx.vars.pop(name, None)
                 ctx.var_hints[name] = (value + ' ' + ' '.join(a.subs) + ' ' + ' '.join(
                     ctx.var_hints.get(v, '') for v in a.vars))[:4096]
-                if not tainted and not appended and self._fresh_mktemp(value, a):
+                if not tainted and not appended and pl is not None and pl.plain and self._fresh_mktemp(value, a) \
+                        and self._temp_scope_ok():
                     ctx.temp_vars.add(name)
 
-    MKTEMP_FLAGS = {'-d', '-q', '-u', '-t', '--directory', '--quiet', '--dry-run'}
+    MKTEMP_FLAGS = {'-d', '-q', '-t', '--directory', '--quiet'}  # not -u/--dry-run: the name is never created
+    # text that can rebind a name or mktemp itself, or plant links, outside what the tracker follows
+    TEMP_SCOPE_BREAKERS = re.compile(
+        r'(?:^|[\s;&|(`])(?:ln|link|eval|source|alias|enable|hash|printf\s+-v)(?=[\s;&|)]|$)'
+        r'|\b(?:declare|typeset|local)\s+(?:-\w+\s+)*-\w*n'
+        r'|[\w.:-]+\s*\(\s*\)\s*[{(]|\bfunction\s+[\w.:-]+'  # a function body can rebind any name when called
+        r'|(?<![\w$])[A-Za-z_]\w*\[[^\]\n]*\]\+?='  # `D[0]=x` rebinds D; the assignment tracker does not parse it  # nameref: `R=x` would assign the referenced name
+        r'|(?:^|[;&|(\n])\s*\.\s+\S|\bmktemp\s*\(\s*\)|\bfunction\s+mktemp\b|(?<![\w$])PATH\+?=|\bcp\s+[^;&|\n]*-\w*s'
+        r'|\bcp\s+[^;&|\n]*--symbolic', re.M)
+
+    def _untemp(self, name):
+        name = name.split('[', 1)[0]  # `D[0]=x` rebinds D
+        self.ctx.temp_vars.discard(name)
+        self.ctx.temp_touched.add(name)
+
+    def _temp_scope_ok(self):
+        """No text in this command can rebind names behind the tracker's back or create symlinks."""
+        ctx = self.ctx
+        texts = list(ctx.script_texts) + [getattr(ctx, 'raw_top', '') or '']
+        return not any(self.TEMP_SCOPE_BREAKERS.search(t[:200000]) for t in texts)
 
     @classmethod
     def _fresh_mktemp(cls, value, word):
@@ -1642,19 +1695,22 @@ class Analyzer:
             argv = shlex.split(inner)
         except ValueError:
             return False
-        if not argv or posixpath.basename(argv[0]) != 'mktemp':
+        if not argv or argv[0] not in ('mktemp', '/usr/bin/mktemp', '/bin/mktemp'):
             return False
         rest, positional = argv[1:], []
         i = 0
         while i < len(rest):
             item = rest[i]
-            if item in cls.MKTEMP_FLAGS or item.startswith(('--suffix=', '--tmpdir=')):
+            if item.startswith('--tmpdir='):
+                if '..' in item.split('=', 1)[1].split('/'):
+                    return False
+            elif item in cls.MKTEMP_FLAGS or item.startswith('--suffix=') and '/' not in item:
                 pass
             elif item in ('-p', '--tmpdir'):
                 i += 1
                 if i < len(rest) and '..' in rest[i].split('/'):
                     return False
-            elif re.fullmatch(r'-[dqut]+', item):
+            elif re.fullmatch(r'-[dqt]+', item):
                 pass
             elif item.startswith('-'):
                 return False
@@ -1669,10 +1725,15 @@ class Analyzer:
         ctx = self.ctx
         if not ctx.temp_vars:
             return False
-        m = re.match(r'\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?(/.*)?$', alt)
-        if not m or m.group(1) not in ctx.temp_vars or m.group(1) in ctx.tainted:
+        # `$NAME` or `${NAME}` exactly: `${NAME/pat/rep}`, `${NAME%x}` and friends are not the fresh name
+        m = re.match(r'\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))(/.*)?$', alt)
+        name = m and (m.group(1) or m.group(2))
+        if not m or name not in ctx.temp_vars or name in ctx.tainted:
             return False
-        rest = m.group(2) or ''
+        rest = m.group(3) or ''
+        # an empty value (mktemp failed) leaves `rest` as the whole path, so it must not name a protected place
+        if rest and (self._path_class(norm_path(rest, ctx)) is not None or self._dynamic_suffix_protected('$' + rest)):
+            return False
         return '..' not in rest.split('/') and not any(ch in rest for ch in GLOB_CHARS) and '$' not in rest \
             and SUB_MARK not in rest and ARITH_MARK not in rest
 
@@ -1886,7 +1947,7 @@ class Analyzer:
             return
         if name in ('unset', 'export', 'declare', 'typeset', 'local', 'readonly'):
             for a in args:  # rebinding or unsetting ends the fresh-mktemp guarantee (#14589)
-                ctx.temp_vars.discard(a.text.split('=', 1)[0])
+                self._untemp(a.text.split('=', 1)[0])
         if name in ('read', 'mapfile', 'readarray'):
             # `... | while read f`: the variable holds whatever the upstream stage printed
             if not hasattr(ctx, 'flow_vars'):
@@ -1895,7 +1956,7 @@ class Analyzer:
                 if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', a.text):
                     ctx.flow_vars.add(a.text)
                     ctx.vars.pop(a.text, None)
-                    ctx.temp_vars.discard(a.text)
+                    self._untemp(a.text)
             return
         if name in ('popd', 'pop-location'):
             ctx.cwd_unknown = True
@@ -3344,11 +3405,36 @@ class Analyzer:
             # `echo x > existing` replaces the file's content just as `: >` empties it, so an existing literal file
             # under a protected root is refused like `tee` is; new files and `>>` appends stay allowed. A dynamic
             # target keeps the narrower tiers: its existence cannot be checked, and new-file writes are common.
-            literal = pure or self.target_class(target_word)[2]
+            cls, path, literal = self.target_class(target_word)
+            literal = pure or literal
             tiers = ('log', 'root', 'unknown') if literal else ('log', 'unknown')
+            if not pure and cls == 'root' and self._plain_work_file(path):
+                # owners routinely rerun `cmd > <task dir>/x.log`; only receipts (*.json) and .keep-marked
+                # directories under the work dir keep the overwrite refusal (replay over real transcripts)
+                tiers = ('log', 'unknown')
             self.refuse('truncation by redirect' if pure else 'overwrite by redirect', target_word, tiers=tiers,
                         need_existing=True)
         self.note_created(target_word)
+
+    @staticmethod
+    def _plain_work_file(path):
+        """A file at least two levels below ~/.agent-harness/work that is not a JSON receipt and has no `.keep`
+        in any directory between it and the work dir (exclusive)."""
+        parts = path.split('/')
+        folded = [p.casefold() for p in parts]
+        for i in range(len(folded) - 1):
+            if folded[i] == '.agent-harness' and folded[i + 1] == 'work':
+                break
+        else:
+            return False
+        rest = parts[i + 2:]
+        if len(rest) < 2 or '..' in rest or not rest[-1] or rest[-1].casefold().endswith('.json'):
+            return False
+        base = '/'.join(parts[:i + 2])
+        for k in range(1, len(rest)):
+            if _lexists(base + '/' + '/'.join(rest[:k]) + '/.keep'):
+                return False
+        return True
 
     def note_created(self, word, text=None):
         for alt in word.alts[:32]:

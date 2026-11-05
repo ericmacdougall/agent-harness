@@ -605,6 +605,12 @@ class MktempScratchTests(Fixture):
         self.assertGreaterEqual(len(corpus.MKTEMP_SCRIPTS), 12)
         self.assertEqual(failures, [])
 
+    def test_script_rows_judged_inline(self):
+        # `bash FILE` adds checks of its own; the same text typed directly must reach the same verdict
+        failures = [(i, want, got) for i, (body, want) in enumerate(corpus.MKTEMP_SCRIPTS)
+                    for got in [self.decide(body, cwd='@TASK@')[0]] if got != want]
+        self.assertEqual(failures, [])
+
     def test_inline_commands(self):
         for cmd, want in corpus.MKTEMP_INLINE:
             self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], want, cmd)
@@ -615,14 +621,17 @@ class OverwriteExistingTests(Fixture):
 
     def test_overwrite_rows(self):
         for rel in ('.claude/wals/s/main.jsonl', '.claude/projects/p/s.jsonl', '.codex/sessions/2026/r.jsonl',
-                    '.claude/settings.json', 'repo/existing.txt'):
+                    '.claude/settings.json', 'repo/existing.txt', '.agent-harness/work/S/T/receipt.json',
+                    '.agent-harness/work/S/T/kept/.keep', '.agent-harness/work/S/T/kept/evidence.log',
+                    '.agent-harness/bin/tool', '.claude/hooks/hook.py', '.agent-harness/work/S/top.log',
+                    '.agent-harness/work/top.log'):
             p = self.home / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text('keep\n')
         (Path(fill('@TASK@', self.home)) / 'existing.log').write_text('keep\n')
         failures = [(cmd, want, got) for cmd, want in corpus.OVERWRITE_EXISTING
                     for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
-        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 15)
+        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 21)
         self.assertEqual(failures, [])
 
 
