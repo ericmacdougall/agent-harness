@@ -588,6 +588,50 @@ class LauncherTests(unittest.TestCase):
         self.assertLessEqual(mods, {'json', 'os', 're', 'subprocess', 'sys'})
 
 
+class GuardCompositionTests(unittest.TestCase):
+    """The command guard and the heavy-job guard (#53) both classify Bash commands. They are separate hook groups
+    and decide independently: neither one's allow, hatch or crash policy can override the other's block."""
+
+    def run_both(self, command):
+        import subprocess
+        home = tempfile.TemporaryDirectory(prefix='cg-compose-')
+        self.addCleanup(home.cleanup)
+        data = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'session_id': 's'}).encode()
+        env = {'PATH': '/usr/bin:/bin', 'HOME': home.name, 'HARNESS_HEAVY_GUARD_FORCE': '1'}
+        codes = {}
+        for name, argv in (('command', [str(HOOKS / 'command_guard_hook.py'), 'hook']),
+                           ('heavy', [str(HOOKS / 'heavy_job_guard.py')])):
+            done = subprocess.run([sys.executable] + argv, input=data, env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=60, check=False)
+            codes[name] = done.returncode
+        return codes
+
+    def test_each_guard_blocks_its_own_class_and_allows_the_other(self):
+        protected = PROTECTED_PAYLOAD['tool_input']['command']
+        self.assertEqual(self.run_both('ls -la'), {'command': 0, 'heavy': 0})
+        self.assertEqual(self.run_both('pytest'), {'command': 0, 'heavy': 2})
+        self.assertEqual(self.run_both(protected), {'command': 2, 'heavy': 0})
+        self.assertEqual(self.run_both('pytest; ' + protected), {'command': 2, 'heavy': 2})
+
+    def test_heavy_job_hatch_does_not_bypass_the_command_guard(self):
+        protected = PROTECTED_PAYLOAD['tool_input']['command']
+        hatch = 'HARNESS_LOCAL_OK=needs-the-local-mac-gpu '
+        self.assertEqual(self.run_both(hatch + 'pytest')['heavy'], 0)
+        self.assertEqual(self.run_both(hatch + protected)['command'], 2)
+
+    def test_install_keeps_the_guards_in_separate_groups(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        groups = install.managed_hooks(Path('/home/u/.claude'))['PreToolUse']
+        scripts = [[Path((h.get('args') or [''])[0]).name for h in g['hooks']] for g in groups]
+        self.assertEqual(scripts[0], ['command_guard_hook.py'])
+        self.assertEqual(groups[0]['hooks'][0]['onFailure'], 'block')
+        heavy = [g for g, s in zip(groups, scripts) if 'heavy_job_guard.py' in s]
+        self.assertEqual(len(heavy), 1)
+        self.assertEqual([Path(h['args'][0]).name for h in heavy[0]['hooks']], ['heavy_job_guard.py'])
+        self.assertNotIn('onFailure', heavy[0]['hooks'][0])  # fail-open by design (#53); the guard stays fail-closed
+
+
 class InstallTests(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, str(ROOT))
