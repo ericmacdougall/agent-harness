@@ -105,7 +105,7 @@ class Freshness(Base):
         done = self.run_cli("check")
         self.assertEqual(done.returncode, 3)
         self.assertIn(b"bulk tier", done.stdout)
-        self.assertIn(b"never completed", self.run_cli("session-start").stdout)
+        self.assertIn(b"not completed its first full pass yet", self.run_cli("session-start").stdout)
         # stale, invalid, future
         first.write_text(stamp(time.time() - 60) + "\n")
         bulk.write_text("garbage")  # present but unreadable is invalid even right after install

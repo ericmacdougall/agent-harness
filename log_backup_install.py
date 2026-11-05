@@ -189,7 +189,12 @@ def safe_run(run, argv: list[str]) -> int:
 
 def disable_scheduler(system: str, home: Path, uid: int, run) -> str:
     if system == "Darwin":
+        # `disable` is the persistent part: it survives logout and reboot, so RunAtLoad cannot bring the job back from
+        # the plist that stays in ~/Library/LaunchAgents. `bootout` then stops the loaded instance.
+        off = safe_run(run, ["launchctl", "disable", f"gui/{uid}/{LABEL}"])
         code = safe_run(run, ["launchctl", "bootout", f"gui/{uid}/{LABEL}"])
+        if off != 0:
+            return f"launchctl disable failed (exit {off}); the job may return at the next login"
         return "stopped" if code in (0, 3, 113) else f"launchctl bootout failed (exit {code})"  # 3/113: not loaded
     code = safe_run(run, ["systemctl", "--user", "disable", "--now", "log-backup.timer"])
     return "stopped" if code == 0 else f"systemctl disable failed (exit {code})"
@@ -200,6 +205,7 @@ def reload_scheduler(system: str, home: Path, uid: int, run) -> str:
     if system == "Darwin":
         domain = f"gui/{uid}"
         plist = str(home / "Library" / "LaunchAgents" / f"{LABEL}.plist")
+        run(["launchctl", "enable", f"{domain}/{LABEL}"])  # undo an earlier --no-log-backup, or bootstrap is refused
         run(["launchctl", "bootout", f"{domain}/{LABEL}"])  # fails harmlessly when not loaded
         code = run(["launchctl", "bootstrap", domain, plist])
         return "loaded" if code == 0 else f"launchctl bootstrap failed (exit {code})"

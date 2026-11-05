@@ -115,7 +115,7 @@ def bulk_classify(home: Path, now: float | None = None, max_age: int = BULK_MAX_
 
 
 def bulk_alert_text(result: dict, max_age: int = BULK_MAX_AGE_SECONDS) -> str:
-    when = "has never completed" if result["state"] == "missing" else (
+    when = "has not completed its first full pass yet (a large backlog can take days; transcripts are not affected)" if result["state"] == "missing" else (
         "has an unreadable marker" if result["state"] == "invalid" else f"last completed {human_age(result['age'])} ago")
     return (f"LOG BACKUP NOTICE: transcripts are backed up, but the bulk tier (archived sessions and work files) {when} "
             f"(limit {max_age // 3600} h). Check ~/.agent-harness/logs/log-backup.log.")

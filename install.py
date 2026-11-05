@@ -612,7 +612,7 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
             command_guard: bool = True, log_backup=None) -> list[str]:
     claude = home.expanduser().resolve() / ".claude"
     if log_backup is None:
-        log_backup = log_backup_enabled(home, None)
+        log_backup = log_backup_alert(home, None)
     files = [
         *((ROOT / "harness" / folder / name, claude / folder / name)
           for folder, names in (("agents", AGENTS), ("hooks", HOOKS), ("tools", TOOLS))
@@ -914,6 +914,16 @@ def log_backup_enabled(home: Path, flag) -> bool:
         return False
 
 
+def log_backup_alert(home: Path, flag) -> bool:
+    """The SessionStart alert stays registered wherever the component is installed, even after --no-log-backup: a
+    backup that was switched off on purpose is still a host whose logs are not being backed up, and the alert says so."""
+    try:
+        import log_backup_install
+        return log_backup_install.choice(home, flag) or log_backup_install.component_installed(home.expanduser().resolve())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def log_backup_status(home: Path, apply: bool, flag=None) -> str:
     """Scheduled log backup (script, excludes, launchd or systemd units); never fails the harness install."""
     try:
@@ -965,7 +975,7 @@ def main() -> None:
                            "real directory, not a symlink\n")
     try:
         changes = install(args.home, args.apply, durable_tmp=durable_tmp, provenance=args.provenance,
-                          command_guard=args.command_guard, log_backup=log_backup_enabled(args.home, args.log_backup))
+                          command_guard=args.command_guard, log_backup=log_backup_alert(args.home, args.log_backup))
     except DirectoryPublicationError as error:
         parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"

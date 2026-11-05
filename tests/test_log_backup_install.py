@@ -82,7 +82,8 @@ class Darwin(Case):
         self.assertIn("<key>Label</key><string>com.ericmacdougall.log-backup</string>", plist)
         self.assertIn(f"{self.home}/.agent-harness/bin/log-backup.sh", plist)
         self.assertNotIn("@HOME@", plist)
-        self.assertEqual(runner.calls, [["launchctl", "bootout", "gui/501/com.ericmacdougall.log-backup"],
+        self.assertEqual(runner.calls, [["launchctl", "enable", "gui/501/com.ericmacdougall.log-backup"],
+                                        ["launchctl", "bootout", "gui/501/com.ericmacdougall.log-backup"],
                                         ["launchctl", "bootstrap", "gui/501", str(self.home / PLIST)]])
 
     def test_second_apply_changes_nothing_and_reloads_nothing(self):
@@ -127,7 +128,7 @@ class Darwin(Case):
         self.lock_held_by(os.getpid())
         message, runner = self.apply("Darwin")
         self.assertNotIn("deferred", message)
-        self.assertEqual(len(runner.calls), 2)
+        self.assertEqual(len(runner.calls), 3)  # enable, bootout, bootstrap
 
     def test_a_spoofed_holder_command_line_does_not_defer_the_reload(self):
         other = subprocess.Popen(["/bin/sh", "-c", "sleep 60", "log-backup.sh"])  # script name only as a later argument
@@ -178,7 +179,7 @@ class Darwin(Case):
         (lock / "pid").unlink()
         lock.rmdir()
         message, runner = self.apply("Darwin")
-        self.assertEqual(len(runner.calls), 2)
+        self.assertEqual(len(runner.calls), 3)  # enable, bootout, bootstrap
         self.assertIn("scheduler loaded", message)
         message, runner = self.apply("Darwin")
         self.assertEqual(runner.calls, [])
@@ -207,6 +208,91 @@ class Linux(Case):
     def test_reload_failure_is_reported_not_raised(self):
         message, _ = self.apply("Linux", runner=Runner(code=1))
         self.assertIn("failed", message)
+
+
+class FakeLaunchd:
+    """Just enough launchd to tell a persistent opt-out from a temporary one: bootout unloads, `disable` is persistent,
+    bootstrap is refused while disabled, and a reboot loads every plist in LaunchAgents that is not disabled."""
+    def __init__(self, plist_present):
+        self.loaded, self.disabled, self.plist_present, self.calls = False, False, plist_present, []
+
+    def __call__(self, argv):
+        self.calls.append(argv)
+        verb = argv[1]
+        if verb == "disable":
+            self.disabled = True
+        elif verb == "enable":
+            self.disabled = False
+        elif verb == "bootout":
+            was = self.loaded
+            self.loaded = False
+            return 0 if was else 3
+        elif verb == "bootstrap":
+            if self.disabled:
+                return 5
+            self.loaded = True
+        return 0
+
+    def reboot(self):
+        self.loaded = self.plist_present and not self.disabled  # RunAtLoad: loaded again unless disabled
+
+
+class MacPersistentOptOut(Case):
+    def test_opt_out_survives_a_reboot_with_the_plist_still_present(self):
+        launchd = FakeLaunchd(True)
+        message, _ = self.apply("Darwin", runner=launchd)
+        self.assertTrue(launchd.loaded, message)
+        lbi.save_choice(self.home, False)
+        message = lbi.status(self.home, True, system="Darwin", run=launchd, uid=501, activate=True)
+        self.assertIn("disabled by choice", message)
+        self.assertFalse(launchd.loaded)
+        self.assertTrue((self.home / PLIST).exists())     # files stay, as documented
+        launchd.reboot()
+        self.assertFalse(launchd.loaded, "the job came back at the next login: the opt-out was not persistent")
+
+    def test_log_backup_flag_re_enables_after_a_disable(self):
+        launchd = FakeLaunchd(True)
+        self.apply("Darwin", runner=launchd)
+        lbi.save_choice(self.home, False)
+        lbi.status(self.home, True, system="Darwin", run=launchd, uid=501, activate=True)
+        self.assertTrue(launchd.disabled)
+        lbi.save_choice(self.home, True)
+        (self.home / PLIST).write_text("changed so that the install reloads\n")
+        message, _ = self.apply("Darwin", runner=launchd)
+        self.assertTrue(launchd.loaded, message)
+        self.assertFalse(launchd.disabled)
+        launchd.reboot()
+        self.assertTrue(launchd.loaded)
+
+    def test_a_failed_disable_is_reported_not_called_stopped(self):
+        def refusing(argv):
+            return 1 if argv[1] == "disable" else 0
+        lbi.save_choice(self.home, True)
+        self.apply("Darwin")
+        lbi.save_choice(self.home, False)
+        message = lbi.status(self.home, True, system="Darwin", run=refusing, uid=501, activate=True)
+        self.assertIn("disable failed", message)
+
+    def test_alert_hook_stays_registered_when_the_backup_is_switched_off_on_purpose(self):
+        import json
+        base = [sys.executable, str(ROOT / "install.py"), "--home", str(self.home), "--apply", "--no-netwatch", "--no-durable-tmp"]
+        env = {**os.environ, "HOME": str(self.home)}
+
+        def run(*extra):
+            done = subprocess.run(base + list(extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, env=env)
+            self.assertEqual(done.returncode, 0, done.stderr)
+
+        def alert_count():
+            settings = json.loads((self.home / ".claude/settings.json").read_text())
+            return sum(1 for g in settings["hooks"].get("SessionStart", []) for h in g["hooks"]
+                       if "log_backup.py" in " ".join(h.get("args", [])))
+        run("--no-log-backup")
+        self.assertEqual(alert_count(), 0)          # never installed here: nothing to warn about
+        run("--log-backup")
+        run("--no-log-backup")
+        self.assertEqual(alert_count(), 1)          # installed, then switched off: a stale backup must still be visible
+        run()
+        self.assertEqual(alert_count(), 1)
 
 
 class Raising:
@@ -280,12 +366,13 @@ class OptIn(Case):
         lbi.status(self.home, True, system="Linux", run=runner, uid=501, activate=True)
         self.assertFalse((self.home / UNITS[1]).exists())
 
-    def test_darwin_disable_boots_out_the_label(self):
+    def test_darwin_disable_disables_then_boots_out_the_label(self):
         self.apply("Darwin")
         lbi.save_choice(self.home, False)
         runner = Runner()
         lbi.status(self.home, True, system="Darwin", run=runner, uid=501, activate=True)
-        self.assertEqual(runner.calls, [["launchctl", "bootout", "gui/501/com.ericmacdougall.log-backup"]])
+        self.assertEqual(runner.calls, [["launchctl", "disable", "gui/501/com.ericmacdougall.log-backup"],
+                                        ["launchctl", "bootout", "gui/501/com.ericmacdougall.log-backup"]])
 
     def test_disable_is_deferred_while_a_run_is_active(self):
         self.apply("Linux")
@@ -318,10 +405,10 @@ class OptIn(Case):
         run()  # remembered
         self.assertEqual(alert_count(), 1)
         run("--no-log-backup")
-        self.assertEqual(alert_count(), 0)
+        self.assertEqual(alert_count(), 1)  # switched off on purpose: the alert stays, a stale backup must be visible
         self.assertTrue((self.home / SCRIPT).exists())  # files stay
         run()
-        self.assertEqual(alert_count(), 0)  # the opt-out survives a plain reinstall
+        self.assertEqual(alert_count(), 1)  # the opt-out survives a plain reinstall (and the alert with it)
 
 
 class UnitContents(unittest.TestCase):
