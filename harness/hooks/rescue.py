@@ -15,8 +15,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import escalation as ladder  # noqa: E402
+import model_tiers as tiers  # noqa: E402
 
 from wal import append as append_wal
 from process import run as run_process
@@ -224,12 +229,43 @@ def run(cmd: list[str], prompt: str, repo: Path) -> tuple[int, str, str]:
         return 125, "", str(error)
 
 
+def rescue_rung(policy, task, override):
+    """The writing rung a rescue runs at: the task ledger's computed rung, an explicit override, or the lowest."""
+    permission = None
+    if task:
+        status = ladder.Ledger(policy=policy).status(task)
+        permission = status.get("permission")
+        if override is None:
+            return status["rung"], permission, "ledger rung for task " + task
+    if override is not None:
+        if override not in policy["rungs"]:
+            raise tiers.TierError("undefined rung " + override)
+        return override, permission, "explicit --rung"
+    return policy["lowest_rung"], permission, "no task or rung given: lowest rung"
+
+
+def model_label(harness, spec):
+    return "%s %s %s (rung %s)" % ("Codex" if harness == "openai" else "Claude", spec["model"], spec["effort"], spec["rung"])
+
+
+def launch_command(harness, spec, repo, last):
+    if harness == "openai":
+        return ["codex", "exec", "--ephemeral", "--model", spec["model"], "-c", "model_reasoning_effort=" + spec["effort"],
+                "--sandbox", "workspace-write", "--cd", str(repo), "--output-last-message", str(last), "-"]
+    return ["claude", "--safe-mode", "--print", "--model", spec["model"], "--effort", spec["effort"],
+            "--permission-mode", "auto", "--output-format", "text", "--"]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, type=Path, help="Main-approved rescue worktree")
     parser.add_argument("--packet", required=True, type=Path, help="Scope, repeated findings, and acceptance tests")
     parser.add_argument("--output", required=True, type=Path, help="Private handoff report")
     parser.add_argument("--wal", type=Path, help="Main-session or rescue WAL")
+    parser.add_argument("--task", help="Ladder task key: the rung comes from its ledger and the top rung needs its permission")
+    parser.add_argument("--rung", help="Writing rung override (R0, R1, R2, R3, R5); the lowest rung when neither this nor --task is given")
+    parser.add_argument("--author-harness", choices=("claude", "openai", "unknown"), default="unknown",
+                        help="Harness that wrote the failing work; the other harness rescues when available")
     args = parser.parse_args()
     repo = args.repo.resolve()
     packet = args.packet.expanduser().absolute()
@@ -272,15 +308,33 @@ def main() -> int:
         "failure-first evidence, residual risks, and what the main agent must retest.\n\n"
         f"Rescue branch: {branch}\nBase: {base}\n\nPacket:\n{content}"
     )
-    log(wal, {"event": "rescue_start", "branch": branch, "base": base, "repo": str(repo)})
-    source = "Codex gpt-6-astra"
+    try:
+        policy = tiers.load_policy()
+        rung, permission, rung_why = rescue_rung(policy, args.task, args.rung)
+    except (tiers.TierError, ladder.LedgerError) as error:
+        parser.error(f"ladder state unusable: {getattr(error, 'message', error)}")
+    entry = policy["rungs"][rung]
+    if not entry["writable"]:
+        parser.error(f"rung {rung} is review-only; a rescue writes")
+    if entry["needs_user_permission"] and not permission:
+        parser.error(f"rung {rung} ({entry['models']['claude']}/{entry['models']['openai']}) needs the user's permission "
+                     f"recorded by escalation.py approve-top for task {args.task or '(none)'}; never launched automatically")
+    preferred = policy["preferred_review_harness"].get(args.author_harness, "openai")
+    other = "claude" if preferred == "openai" else "openai"
+    executables = {"openai": "codex", "claude": "claude"}
+    available = {name: shutil.which(executables[name]) is not None for name in ("openai", "claude")}
+    log(wal, {"event": "rescue_start", "branch": branch, "base": base, "repo": str(repo), "rung": rung,
+              "rung_why": rung_why, "preferred_harness": preferred, "available": available})
+    primary_harness = preferred
+    primary_spec = tiers.spawn_spec(policy, rung, primary_harness)
+    source = model_label(primary_harness, primary_spec)
     fallback_reason = ""
     handoff_ok = True
-    astra_available = shutil.which("codex") is not None
+    astra_available = available[primary_harness]
     if astra_available:
         with tempfile.TemporaryDirectory() as temp:
             last = Path(temp) / "last.txt"
-            cmd = ["codex", "exec", "--ephemeral", "--model", "gpt-6-astra", "--sandbox", "workspace-write", "--cd", str(repo), "--output-last-message", str(last), "-"]
+            cmd = launch_command(primary_harness, primary_spec, repo, last)
             code, stdout, stderr = run(cmd, prompt, repo)
             try:
                 model_handoff = read_handoff(last)
@@ -290,7 +344,7 @@ def main() -> int:
                 handoff = stdout[-30000:]
                 stderr = (stderr + "\nAstra handoff file unsafe or oversized.").strip()
     else:
-        code, handoff, stderr = 125, "", "Codex executable unavailable"
+        code, handoff, stderr = 125, "", executables[primary_harness] + " executable unavailable"
     try:
         # A launched model may have edited bytes that Git normalizes away under
         # pre-existing attributes or stat metadata. Never launch a second model
@@ -309,13 +363,22 @@ def main() -> int:
             if changed:
                 fallback_reason = "Worktree changed before fallback; preserve it for main-agent inspection."
             else:
-                fallback_reason = "Astra executable unavailable; trying Fable."
-                if shutil.which("claude"):
-                    source = "Claude Fable fallback"
-                    cmd = ["claude", "--safe-mode", "--print", "--model", "fable", "--permission-mode", "auto", "--output-format", "text", "--"]
-                    code, handoff, stderr = run(cmd, prompt, repo)
+                fallback_reason = f"{executables[primary_harness]} executable unavailable; trying {executables[other]} at the same rung."
+                if available[other]:
+                    fallback_spec = tiers.spawn_spec(policy, rung, other)
+                    source = model_label(other, fallback_spec) + " fallback"
+                    with tempfile.TemporaryDirectory() as temp:
+                        last = Path(temp) / "last.txt"
+                        cmd = launch_command(other, fallback_spec, repo, last)
+                        code, stdout, stderr = run(cmd, prompt, repo)
+                        try:
+                            model_handoff = read_handoff(last)
+                            handoff = model_handoff if model_handoff is not None else stdout
+                        except OSError:
+                            handoff_ok = False
+                            handoff = stdout[-30000:]
                 else:
-                    stderr = "Claude executable unavailable"
+                    stderr = executables[other] + " executable unavailable"
         head = git(repo, "rev-parse", "HEAD")
         dirty_after = dirty_state(repo, head)
         actual_branch = git(repo, "branch", "--show-current")
@@ -334,6 +397,8 @@ def main() -> int:
                 status = "needs-main-verification"
         report = {
             "source": source,
+            "rung": rung,
+            "rung_why": rung_why,
             "fallback_reason": fallback_reason,
             "repo": str(repo),
             "branch": branch,
