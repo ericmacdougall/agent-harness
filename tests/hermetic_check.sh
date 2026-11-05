@@ -19,6 +19,7 @@
 # real home except the tree, its git common dir and the temp dir; /bin/ps cannot be exec'd inside any sandbox-exec
 # profile, so use it for single modules and failing controls) and HC_BWRAP=1 (Linux bubblewrap, no outside network: the whole filesystem is
 # read-only except the tree, its git common dir, the temp dir and a tmpfs /tmp; usable for the full suite).
+# AGENT_HARNESS_REVIEW_POLICY, when set by the caller, is passed through (use a file with empty reviewer lists).
 # HC_UNPINNED=1 runs the old tests with the real HOME and no pin (failing controls on a base tree only) and REQUIRES
 # HC_SANDBOX=1 or HC_BWRAP=1 so a leak is blocked rather than written.
 set -u
@@ -63,6 +64,8 @@ env -i PATH="/usr/bin:/bin" "$vpy" -c "pass"
 grep -q "protected=9" "$LOGS_REAL/loaded.log" 2>/dev/null || { echo "audit hook did not load with the 9 protected paths"; exit 7; }
 pin=(HOME="$scratch" AGENT_HARNESS_USAGE_DIR="$scratch/usage" HARNESS_SUITE_PINNED=1)
 [ -n "${HC_UNPINNED:-}" ] && pin=(HOME="$R")
+# The caller may pass a reviewer policy that lists no reviewer binaries, so no test can ever find (and launch) a real model CLI.
+[ -n "${AGENT_HARNESS_REVIEW_POLICY:-}" ] && pin+=(AGENT_HARNESS_REVIEW_POLICY="$AGENT_HARNESS_REVIEW_POLICY")
 envtmp=(); [ -n "${HC_TMPDIR:-}" ] && envtmp=(TMPDIR="$HC_TMPDIR")
 args=(discover -s tests); [ -n "$pattern" ] && args+=(-p "$pattern")
 wrap=()
