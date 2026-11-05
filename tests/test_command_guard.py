@@ -596,13 +596,17 @@ class OverwriteExistingTests(Fixture):
                     '.claude/settings.json', 'repo/existing.txt', '.agent-harness/work/S/T/receipt.json',
                     '.agent-harness/work/S/T/kept/.keep', '.agent-harness/work/S/T/kept/evidence.log',
                     '.agent-harness/bin/tool', '.claude/hooks/hook.py', '.agent-harness/work/S/top.log',
-                    '.agent-harness/work/top.log', '.agent-harness/work/S/T/existing.log'):
+                    '.agent-harness/work/top.log', '.agent-harness/work/S/T/existing.log',
+                    '.agent-harness/work/S/T/journal.jsonl', '.agent-harness/work/S/T/state/run.txt',
+                    '.agent-harness/scratch/c/u/s/scratchpad/run.log',
+                    '.agent-harness/scratch/c/u/s/scratchpad/out.jsonl'):
             p = self.home / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text('keep\n')
+        (self.home / '.agent-harness/work/S/T/hooklink').symlink_to(self.home / '.claude/hooks')
         failures = [(cmd, want, got) for cmd, want in corpus.OVERWRITE_EXISTING
                     for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
-        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 26)
+        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 34)
         self.assertEqual(failures, [])
 
 

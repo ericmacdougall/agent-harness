@@ -1625,7 +1625,8 @@ class Analyzer:
         name = norm_name(words[0].text) if words else ''
         arg_texts = [w.text for w in words[1:]]
         # pure truncation: nothing (or nothing meaningful) is written, so the redirect only empties the file
-        has_body = any(r.op in ('<<', '<<-', '<<<') for r in cmd.redirs)  # `cat > f <<EOF` writes content
+        # `cat > f <<EOF` writes content; an empty heredoc writes nothing, so that stays a pure truncation
+        has_body = any(r.op == '<<<' or r.op in ('<<', '<<-') and r.body.strip('\n') for r in cmd.redirs)
         pure = (not words or name in (':', 'true', 'false')
                 or (name == 'cat' and not has_body and all(t == '/dev/null' for t in arg_texts))
                 or (name in ('echo', 'printf') and all(t in ('', '-n', '-e', '-ne', '-en') for t in arg_texts)))
@@ -1643,7 +1644,8 @@ class Analyzer:
             if r.target is not None:
                 self.subs(r.target, depth, visible=False)
             is_write = False
-            if r.op in ('>', '>|', '&>', '>&') and r.fd in (None, '1', '2') or r.op in ('>>', '&>>'):
+            # `3&> f`: bash and zsh read the digit as an argument, so `&>` always writes the file
+            if r.op in ('>', '>|', '>&') and r.fd in (None, '1', '2') or r.op in ('>>', '&>>', '&>'):
                 if target and r.op != '>&' or (r.op == '>&' and target and not re.fullmatch(r'[0-9-]+', target)):
                     self.write_target(r.target, truncating=r.op not in ('>>', '&>>'), via='redirect', pure=pure)
                     is_write = True
@@ -3283,32 +3285,48 @@ class Analyzer:
             cls, path, literal = self.target_class(target_word)
             literal = pure or literal
             tiers = ('log', 'root', 'unknown') if literal else ('log', 'unknown')
-            if not pure and cls == 'root' and self._plain_work_file(path):
+            # `link/../x`: the shell resolves `..` after following the link, so check that path as well
+            physical = self._physical_dotdot(target_word.text) if not target_word.dynamic else None
+            if not pure and cls == 'root' and self._plain_work_file(path) \
+                    and (physical is None or self._plain_work_file(physical)):
                 # owners routinely rerun `cmd > <task dir>/x.log`; only receipts (*.json) and .keep-marked
                 # directories under the work dir keep the overwrite refusal (replay over real transcripts)
                 tiers = ('log', 'unknown')
-            self.refuse('truncation by redirect' if pure else 'overwrite by redirect', target_word, tiers=tiers,
-                        need_existing=True)
+            what = 'truncation by redirect' if pure else 'overwrite by redirect'
+            if not self.refuse(what, target_word, tiers=tiers, need_existing=True) and physical \
+                    and physical.casefold() != norm_path(target_word.text, self.ctx).casefold():
+                real = Word()
+                real.alts = [physical]
+                self.refuse(what, real, tiers=tiers, need_existing=True)  # the file the shell really opens
         self.note_created(target_word)
 
-    @staticmethod
-    def _plain_work_file(path):
-        """A file at least two levels below ~/.agent-harness/work that is not a JSON receipt and has no `.keep`
-        in any directory between it and the work dir (exclusive)."""
-        parts = path.split('/')
-        folded = [p.casefold() for p in parts]
-        for i in range(len(folded) - 1):
-            if folded[i] == '.agent-harness' and folded[i + 1] == 'work':
-                break
-        else:
+    def _plain_work_file(self, path):
+        """A plain file at least two levels below this machine's ~/.agent-harness/work or ~/.agent-harness/scratch,
+        both as typed and where it really leads (symlinks): not a JSON receipt, not a kept name (kit.json, *.jsonl,
+        state), and no `.keep` in any directory between it and the work or scratch dir."""
+        try:
+            real = os.path.realpath(path)
+        except (OSError, ValueError):
             return False
-        rest = parts[i + 2:]
-        if len(rest) < 2 or '..' in rest or not rest[-1] or rest[-1].casefold().endswith('.json'):
-            return False
-        base = '/'.join(parts[:i + 2])
-        for k in range(1, len(rest)):
-            if _lexists(base + '/' + '/'.join(rest[:k]) + '/.keep'):
+        for cand in (path, real):
+            if self._kept(cand):
                 return False
+            segs = Compiled._segs(cand)
+            raw = [s for s in cand.replace('\\', '/').split('/') if s]
+            base_len = None
+            for h in self.c.homes:
+                for top in ('work', 'scratch'):
+                    base = Compiled._segs(h) + ['.agent-harness', top]
+                    if len(segs) > len(base) and segs[:len(base)] == base:
+                        base_len = len(base)
+            if base_len is None or len(raw) != len(segs):
+                return False
+            rest = segs[base_len:]
+            if len(rest) < 2 or '..' in rest or rest[-1].casefold().endswith('.json'):
+                return False
+            for k in range(1, len(rest)):
+                if _lexists('/' + '/'.join(raw[:base_len + k]) + '/.keep'):
+                    return False
         return True
 
     def note_created(self, word, text=None):

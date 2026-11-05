@@ -859,5 +859,16 @@ OVERWRITE_EXISTING = [
     ('ls &> /dev/null', 'allow'),
     ('echo x >&2', 'allow'),
     ('ls 2>&1 | cat', 'allow'),
+    # native review of 84aed24: a digit before `&>` is an argument; kept names; a symlinked work folder;
+    # an empty heredoc writes nothing; scratch reruns (disposable) stay allowed
+    ('echo x 3&> @HOME@/.claude/wals/s/main.jsonl', 'block'),
+    ('echo x 9&>> @HOME@/.claude/wals/s/main.jsonl', 'allow'),
+    ('echo x > @TASK@/journal.jsonl', 'block'),
+    ('echo x > @TASK@/state/run.txt', 'block'),
+    ('echo x > @TASK@/hooklink/hook.py', 'block'),
+    ('echo x > @TASK@/hooklink/../settings.json', 'block'),
+    ("cat <<'E' > @HOME@/.agent-harness/$X\nE", 'block'),
+    ('echo x > @HOME@/.agent-harness/scratch/c/u/s/scratchpad/run.log', 'allow'),
+    ('echo x > @HOME@/.agent-harness/scratch/c/u/s/scratchpad/out.jsonl', 'block'),
 ]
 SEED = 14471
