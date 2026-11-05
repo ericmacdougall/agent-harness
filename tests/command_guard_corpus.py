@@ -15,6 +15,13 @@ S, L, K = 'secret_dump', 'log_delete', 'broad_kill'
 
 # ------------------------------------------------------------------ AC-2 secret and config dumps (block)
 SECRET_POSITIVE = [
+    'env | grep -i GITHUB',
+    "env | grep -E '^(LANE|RUNNER_)[A-Z_]*='",
+    'env | grep -v PATH',
+    'case $x in a) env;; esac',
+    'python3 -c \'import os; print(os.environ["API_TOKEN"])\'',
+    'node -e "console.log(process.env.GH_TOKEN)"',
+    'for t in "$GH_TOKEN"; do echo "$t"; done',
     'rclone config show',
     'rclone config show dropbox',
     'rclone config show dropbox:',
@@ -223,6 +230,8 @@ NEG13_GH_TOKEN = [
 
 # ------------------------------------------------------------------ AC-1 Tier A / Tier B deletes (block)
 LOG_POSITIVE = [
+    'case $b in a) rm -rf ~/.claude/projects;; *) true;; esac',
+    'for d in build ~/.claude/wals; do rm -rf "$d"; done',
     'rm -rf ~/.claude/projects',
     'rm ~/.claude/history.jsonl',
     'rm -rf "$HOME/.claude/wals"',
@@ -392,6 +401,13 @@ KILL_POSITIVE_PS = ['Stop-Process -Name python -Force']
 
 # ------------------------------------------------------------------ allowed with no block and no warning
 NEGATIVE = [
+    'for f in $(git ls-files); do echo "$f"; done',
+    'case $b in a.cjs|b.cjs) cp x y;; *) ln -s x y;; esac',
+    "env | grep -E '^(HOME|SHELL)='",
+    'env | grep -w HOME',
+    'for pat in blocked_changed due_date; do grep -rn "$pat" src | head -3; done',
+    "python3 - <<'EOF'\nimport json,os\nd=json.load(open(os.environ['SCRATCH']+'/t.json'))\nprint({k:d.get(k) for k in ('status','key')})\nEOF",
+    'PAT=hello; echo "$PAT"',
     'rclone listremotes',
     'rclone listremotes --long',
     'rclone lsd dropbox:',

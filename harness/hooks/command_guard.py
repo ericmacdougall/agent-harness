@@ -278,6 +278,17 @@ class Compiled:
         return bool(self.secret_env.search(upper)) and not self.secret_env_excl.search(upper)
 
 
+def _looks_clean(value):
+    """A literal value the redactor leaves alone and that is not long and opaque."""
+    if len(value) > 200 or re.fullmatch(r'[A-Za-z0-9+/_=-]{24,}', value):
+        return False
+    try:
+        import redact
+        return redact.redact(value) == value
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _realpath(path):
     try:
         return os.path.realpath(path) if path and len(path) < 4096 else None
@@ -788,7 +799,52 @@ class Lexer:
         return i
 
 
+def _strip_case_patterns(tokens):
+    """`case X in a|b) cmd;; *) cmd;; esac`: drop the pattern lists so `a|b` is not a pipeline and `*` is not a
+    command whose name is a glob. The bodies stay as ordinary commands."""
+    out, stack, i, n = [], [], 0, len(tokens)
+    while i < n:
+        kind, val = tokens[i]
+        at_start = not out or out[-1][0] == 'op' or (out[-1][0] == 'w' and not out[-1][1].quoted
+                                                       and out[-1][1].text in RESERVED)
+        if kind == 'w' and not val.quoted and val.text == 'case' and at_start and i + 2 < n \
+                and tokens[i + 2][0] == 'w' and tokens[i + 2][1].text == 'in':
+            out.append(tokens[i])
+            out.append(tokens[i + 1])
+            stack.append('patterns')
+            i += 3
+            continue
+        if stack and stack[-1] == 'patterns':
+            if kind == 'w' and not val.quoted and val.text == 'esac':
+                stack.pop()
+                out.append(tokens[i])
+            elif kind == 'op' and val == ')':
+                stack[-1] = 'body'
+                out.append(('op', ';'))
+            # pattern words, `|` and a leading `(` are dropped; newlines between items are kept
+            elif kind == 'op' and val == '\n':
+                out.append(tokens[i])
+            i += 1
+            continue
+        if stack and kind == 'op' and val == ';' and i + 1 < n and tokens[i + 1] == ('op', ';'):
+            stack[-1] = 'patterns'
+            out.append(('op', ';'))
+            i += 2
+            continue
+        if stack and kind == 'op' and val == ';' and i + 1 < n and tokens[i + 1] in (('op', '&'), ('op', ';;&')):
+            stack[-1] = 'patterns'
+            out.append(('op', ';'))
+            i += 2
+            continue
+        if stack and kind == 'w' and not val.quoted and val.text == 'esac' and at_start:
+            stack.pop()
+        out.append(tokens[i])
+        i += 1
+    return out
+
+
 def parse(tokens):
+    tokens = _strip_case_patterns(tokens)
     pipelines, pl, cmd = [], Pipeline(), Cmd()
 
     def end_cmd():
@@ -1133,7 +1189,10 @@ def _build_fallback(c):
                            r'remove-item|rsync|find)\b')
     add((L, 'log-delete-text', ('and', protected, destroyer),
          'removes or rewrites Claude/Codex logs or WALs', 'back them up to Dropbox, run command_guard.py approve-delete, then delete'))
-    envs = re.compile(r'(?:environ|getenv|process\.env|\$env:|\bENV\b)[^\n]{0,80}?(?:secret|token|key|password|passwd|credential)', re.I)
+    # the secret word must be part of the variable's own name: `os.environ['API_TOKEN']`, `getenv("DB_PASSWORD")`,
+    # `process.env.GH_TOKEN`; quotes and brackets are already spaces here. Not `os.environ['SCRATCH'] ... 'key'`.
+    envs = re.compile(r'(?:\benviron(?:\.get)?|\bgetenv|\bprocess\.env\.?|\$env:|\benv\b(?:\.fetch)?)\s*'
+                      r'[a-z0-9_]*(?:secret|token|key|password|passwd|credential)', re.I)
     add((S, 'env-secret-text', envs, 'prints a secret environment variable', 'test it with `[ -n "$NAME" ]`; never print the value'))
     return rules
 
@@ -1467,17 +1526,25 @@ class Analyzer:
         """`for d in LIST`: bind d to the first protected-looking item (else the first item) so `rm "$d"` resolves."""
         if words[0].text != 'for' or len(words) < 4 or words[2].text != 'in':
             return
-        name, items = words[1].text, words[3:]
-        chosen = items[0]
-        for item in items:
-            if is_dynamic_path(item.text) or any(ch in item.text for ch in '*?['):
-                probe = norm_path(item.text, self.ctx)
-                if any(seg_match(Compiled._segs(probe), r) for r in self.c.protected):
-                    chosen = item
-                    break
+        name, items = words[1].text, [w for w in words[3:] if w.text not in (';', 'do')]
+        if not items:
+            return
+        # the loop runs the body once per item: bind the most protected one so every check sees the worst case
+        chosen, rank = items[0], -1
+        for item in items[:256]:
+            probe = norm_path(item.text, self.ctx)
+            r = self.RANK[self._path_class(probe)]
+            if r <= 0 and (is_dynamic_path(item.text) or any(ch in item.text for ch in '*?[')) \
+                    and any(seg_match(Compiled._segs(probe), pr) for pr in self.c.protected):
+                r = self.RANK['log']
+            if r > rank:
+                chosen, rank = item, r
         if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
             self.ctx.vars[name] = chosen.text
             self.ctx.tainted.discard(name)
+            # `for t in "$GH_TOKEN"`: the loop variable carries whatever secret its items expand to
+            if any(self.c.secret_name(v.lstrip('!')) or v in self.ctx.tainted for item in items for v in item.vars):
+                self.ctx.tainted.add(name)
 
     def subs(self, w, depth, visible):
         for inner in w.subs:
@@ -1609,6 +1676,10 @@ class Analyzer:
         ctx = self.ctx
         for v in word.vars:
             bare = v.lstrip('!')
+            known = ctx.vars.get(bare)
+            if isinstance(known, str) and bare not in ctx.tainted and not v.startswith('!') \
+                    and not is_dynamic_path(known) and _looks_clean(known):
+                continue  # bound earlier in this command to a literal non-secret value (`for pat in a b c`)
             if ctx.c.secret_name(bare) or v in ctx.tainted or bare in ctx.tainted:
                 ctx.add(SECRET_DUMP, 'print-secret-variable',
                         'prints a variable whose name or content marks it as a secret (%s)' % bare[:40],
@@ -1770,8 +1841,15 @@ class Analyzer:
         # An existing script is the repository's own tooling: only its deletions of protected logs count. Its
         # environment handling and secret lookups are routine there (replay false positives), and what it
         # prints is not knowable from here. Scripts written earlier in this same command are judged in full.
+        # It also runs as its own process, so its cd, variables and recorded files do not carry into this command.
         before = len(ctx.findings)
-        self.script(text, depth + 1, tail_visible=True)
+        keep = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
+                if k not in ('findings', 'budget', 'c', 'marker', 'files_read', 'unterminated')}
+        try:
+            self.script(text, depth + 1, tail_visible=True)
+        finally:
+            for k, v in keep.items():
+                setattr(ctx, k, v)
         ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
 
     def launcher(self, name, args, depth, pl, idx):
@@ -2229,9 +2307,44 @@ class Analyzer:
             return
         if dump:
             ctx.secret_seen += 1
-            if self.out_visible(pl, idx, True):
+            if self.out_visible(pl, idx, True) and not self._env_name_filter(pl, idx):
                 ctx.add(SECRET_DUMP, 'env-dump', '`%s` with no filter prints every environment variable, including tokens and keys' % name,
-                        'printenv NAME for one non-secret name, or env | cut -d= -f1 for names only')
+                        "printenv NAME, env | grep '^NAME=' for exact non-secret names (a prefix or substring "
+                        "filter also matches *_TOKEN names), or env | cut -d= -f1 for names only")
+
+    def _env_name_filter(self, pl, idx):
+        """`env | grep -E '^(LANE|RUNNER_)'`: the next stage keeps only lines naming the variables it lists, and
+        none of those names is secret. Inverted, empty or wildcard-led patterns do not count."""
+        if idx + 1 >= len(pl.cmds):
+            return False
+        words = self._skip_assigns(strip_reserved(pl.cmds[idx + 1].words))[1]
+        if not words or norm_name(words[0].text) not in GREP_CMDS:
+            return False
+        args = words[1:]
+        if _flag_letters(args) & set('vfr') or _longs(args) & {'--invert-match', '--file', '--recursive'}:
+            return False
+        pats, prev = [], ''
+        for a in args:
+            t = a.text
+            if prev in ('-e', '--regexp'):
+                pats.append(t)
+            elif not t.startswith('-') and not pats and prev not in ('-m', '-A', '-B', '-C', '--max-count'):
+                pats.append(t)
+            prev = t
+        if not pats or any(w.dynamic for w in args):
+            return False
+        for pat in pats:
+            names = re.findall(r'[A-Za-z][A-Za-z0-9_]{2,}', pat)
+            if not names or re.match(r'\^?\.', pat):
+                return False
+            if any(self.ctx.c.secret_name(n) or re.search(r'(?i)secret|token|key|pass|cred|auth', n) for n in names):
+                return False
+            # exact names only: `^HOME=`, `(HOME|SHELL)=` or grep -w. A prefix or substring (`-i GITHUB`,
+            # `^LANE[A-Z_]*=`) also matches GITHUB_TOKEN-style names, so it is not a filter.
+            exact = re.search(r'[A-Za-z0-9_)]=', pat) and not re.search(r'[*+?.\]]\)?=', pat)
+            if not exact and not ('w' in _flag_letters(args) or '--word-regexp' in _longs(args)):
+                return False
+        return True
 
     def echo_check(self, name, args, pl, idx):
         if not any(a.vars for a in args):
