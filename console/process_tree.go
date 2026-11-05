@@ -299,6 +299,17 @@ func (t *processTree) Reaped() bool {
 // group may then still hold unsupervised background work, and callers must treat
 // false as "possibly alive, not supervised". It never sleeps under the lock.
 func (t *processTree) Terminate(grace time.Duration) bool {
+	if !t.BeginStop() {
+		return false
+	}
+	t.FinishStop(grace)
+	return true
+}
+
+// BeginStop sends the polite signal now and returns without waiting, so a caller
+// that holds a lock still gets the stop on its way before it returns. It reports
+// false when the tree already decided its fate.
+func (t *processTree) BeginStop() bool {
 	t.mu.Lock()
 	if t.reaped {
 		t.mu.Unlock()
@@ -311,11 +322,17 @@ func (t *processTree) Terminate(grace time.Duration) bool {
 	if first {
 		close(t.stopCh)
 	}
+	return true
+}
+
+// FinishStop waits up to grace for the tree to end, then kills the group, then
+// waits for the leader to be reaped.
+func (t *processTree) FinishStop(grace time.Duration) {
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
 	select {
 	case <-t.done:
-		return true
+		return
 	case <-timer.C:
 	}
 	t.mu.Lock()
@@ -324,5 +341,4 @@ func (t *processTree) Terminate(grace time.Duration) bool {
 	}
 	t.mu.Unlock()
 	<-t.done
-	return true
 }

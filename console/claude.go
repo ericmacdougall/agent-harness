@@ -36,10 +36,14 @@ func (r *claudeRun) cancel() {
 		r.writeOnce.Do(func() { r.writer = newInputWriter(r.input) })
 		r.writer.close()
 		if r.tree != nil {
-			// Callers hold the app lock, so the bounded wait for the tree runs on its
-			// own goroutine; stop-work never waits for the process to finish.
+			// Callers hold the app lock. The polite signal goes out before cancel
+			// returns, so shutdown cannot skip it; only the grace wait and the kill
+			// run on their own goroutine. An explicit cancel overrides a leave
+			// verdict that was not yet recorded, and stops the group.
 			r.tree.Release(true)
-			go r.tree.Terminate(100 * time.Millisecond)
+			if r.tree.BeginStop() {
+				go r.tree.FinishStop(100 * time.Millisecond)
+			}
 		} else {
 			terminateProcess(r.command)
 		}
