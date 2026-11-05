@@ -293,6 +293,19 @@ class BashAdvisory(GateFixture):
             self.assertEqual(self.bash(line)[0], 'allow', line)
         self.assertEqual(self.bash('codex exec -m gpt-6-astra -')[0], 'deny')
 
+    def test_over_bound_or_malformed_hook_input_is_never_a_silent_allow(self):
+        import subprocess, sys as _sys
+        env = {**os.environ, 'AGENT_HARNESS_ESCALATION_DIR': str(self.root)}
+        huge = ('{"tool_name": "Bash", "tool_input": {"command": "' + 'x' * (4 * 1024 * 1024 + 64) + '"}}').encode()
+        big = subprocess.run([_sys.executable, str(HOOKS / 'tier_gate.py'), 'hook'], input=huge, capture_output=True, timeout=30, env=env)
+        self.assertEqual(big.returncode, 0)
+        out = json.loads(big.stdout)['hookSpecificOutput']
+        self.assertIn('hook input rejected', out.get('additionalContext', '') + out.get('permissionDecisionReason', ''))
+        bad = subprocess.run([_sys.executable, str(HOOKS / 'tier_gate.py'), 'hook'], input=b'{not json', capture_output=True, timeout=30, env=env)
+        self.assertEqual(bad.returncode, 0)
+        out = json.loads(bad.stdout)['hookSpecificOutput']
+        self.assertIn('not JSON', out.get('additionalContext', '') + out.get('permissionDecisionReason', ''))
+
     def test_oversize_launch_lines_are_refused_quickly_not_parsed(self):
         import time
         filler = "echo 'x'; " * 7000  # about 70 KiB of harmless segments

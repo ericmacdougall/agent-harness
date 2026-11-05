@@ -472,12 +472,25 @@ def live_count(session_id):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     action = argv[0] if argv else 'hook'
+    unreadable = None
     try:
         data = json.loads(safe_input.read_stdin_bounded().decode('utf-8', errors='replace'))
-    except (ValueError, safe_input.InputRejected):
-        data = {}
+    except safe_input.InputRejected as error:
+        data, unreadable = {}, 'hook input rejected (%s)' % getattr(error, 'code', 'stdin')
+    except ValueError:
+        data, unreadable = {}, 'hook input is not JSON'
     if not isinstance(data, dict):
-        data = {}
+        data, unreadable = {}, unreadable or 'hook input is not an object'
+    if unreadable and action == 'hook':
+        # Input the hook cannot read (an over-bound stdin from a huge command, or malformed JSON) is never a
+        # silent allow: the tool call is refused in enforce and flagged in warn, the same as an oversize line.
+        mode = 'enforce'
+        try: mode = tiers.load_policy().get('mode', 'enforce')
+        except Exception: pass  # noqa: BLE001
+        reason = unreadable + ': the ladder cannot check this call; split the command or run it from a file'
+        print(json.dumps(hook_result('context', context='ladder (warn mode): would deny: ' + reason) if mode == 'warn'
+                         else hook_result('deny', reason)))
+        return 0
     tool = str(data.get('tool_name') or '')
     command = str((data.get('tool_input') or {}).get('command') or '') if isinstance(data.get('tool_input'), dict) else ''
     applies = tool in SPAWN_TOOLS or (tool == 'Bash' and LAUNCH.search(command))
