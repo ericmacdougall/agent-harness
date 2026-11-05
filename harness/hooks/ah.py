@@ -40,6 +40,11 @@ class AhError(Exception):
         self.code, self.exit_code = code, exit_code
 
 
+def env_session() -> str:
+    """The calling agent's session id: CLAUDE_CODE_SESSION_ID (set in agent shells) first, then CLAUDE_SESSION_ID."""
+    return os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID") or ""
+
+
 def home_dir() -> Path:
     return Path(os.environ.get("AH_HOME") or Path.home())
 
@@ -56,9 +61,12 @@ def parse_ts(value):
     if not isinstance(value, str):
         return 0.0
     try:
-        return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return 0.0
+    if parsed.tzinfo is None:  # a naive ISO time is UTC, never the reader's local zone
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.timestamp()
 
 
 def state_dir(home: Path, *parts) -> Path:
@@ -154,6 +162,9 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         summary = json.loads(cache.read_text())
     except (OSError, ValueError):
         summary = {}
+    if summary.get("schema", 1) > SCHEMA:
+        raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
+    summary["schema"] = SCHEMA
     meta = summary.setdefault("meta", {})
     lines, rebuilt = read_new_lines(path, meta)
     if rebuilt or "first" not in summary:
@@ -364,6 +375,9 @@ def index_transcript(home: Path, session: str) -> dict:
         idx = json.loads(cache.read_text())
     except (OSError, ValueError):
         idx = {}
+    if idx.get("schema", 1) > SCHEMA:
+        raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
+    idx["schema"] = SCHEMA
     meta = idx.setdefault("meta", {})
     lines, rebuilt = read_new_lines(path, meta)
     if rebuilt or "msgs" not in idx:
@@ -647,7 +661,7 @@ def top_dirs(root: str, system: str, count: int = 10, budget_s: float = 20.0, ru
 
 def disk(host=None, root=None, count=10, budget_s=20.0, top=True) -> dict:
     if host:
-        if not re.fullmatch(r"[A-Za-z0-9._@][A-Za-z0-9._@-]{0,99}", host):
+        if not re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._-]{0,99}", host):
             raise AhError("bad_request", "host has characters ssh targets cannot have")
         argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host,
                 "python3 .claude/hooks/ah.py disk" + (" --no-top" if not top else f" --count {int(count)}")]
@@ -672,6 +686,7 @@ def disk(host=None, root=None, count=10, budget_s=20.0, top=True) -> dict:
 # Slow side effects (a GoodQA comment) that cannot complete go to a spool drained by the next ah call.
 
 LOCK_TIMEOUT_S = 10.0
+SCHEMA = 1  # on every ledger, audit, spool and index row; readers refuse a newer schema
 
 
 def store_dir(home: Path) -> Path:
@@ -754,6 +769,8 @@ class StoreLock:
 
 def _append_line(path: Path, record: dict) -> None:
     """One write() per line; a torn tail from a crash is closed with a newline first so it cannot swallow us."""
+    record = dict(record, schema=SCHEMA)
+    record["lsha"] = hashlib.sha256(canonical(record).encode()).hexdigest()[:16]
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     try:
         size = os.fstat(fd).st_size
@@ -764,16 +781,23 @@ def _append_line(path: Path, record: dict) -> None:
         os.close(fd)
 
 
-def _ledger(home: Path) -> list:
+def _ledger(home: Path, include_intents: bool = False) -> list:
+    """Applied rows (rows written before `state` existed count as applied); intents only on request."""
     path = store_dir(home) / "ledger.jsonl"
     out = []
     try:
         with open(path, "rb") as handle:
             for raw in handle:
                 try:
-                    out.append(json.loads(raw))
+                    row = json.loads(raw)
                 except ValueError:
-                    continue  # a torn last line from a crash is ignored, never fatal
+                    continue  # a torn line from a crash is ignored, never fatal
+                if not isinstance(row, dict):
+                    continue
+                if row.get("schema", 1) > SCHEMA:
+                    raise AhError("schema_newer", "the ledger was written by a newer ah; update this install", 4)
+                if row.get("state", "applied") == "applied" or include_intents:
+                    out.append(row)
     except OSError:
         pass
     return out
@@ -788,7 +812,7 @@ def _spool_comment(home: Path, job: dict) -> str:
     name = f"{int(time.time() * 1000):013d}-{tag}.json"
     fd = os.open(spool / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        os.write(fd, canonical(job).encode())
+        os.write(fd, canonical(dict(job, schema=SCHEMA)).encode())
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -806,7 +830,7 @@ def post_comment(ref: str, body: str, operation_id: str) -> None:
         raise AhError("ticket_unavailable", str(e), 3)
 
 
-def spool_drain(home: Path, only_opid: str | None = None) -> dict:
+def spool_drain(home: Path, only_opid: str | None = None, limit: int | None = None, budget_s: float | None = None) -> dict:
     """Post spooled comments. A transport failure keeps the job; a ticket that does not exist moves it to dead/.
     The GoodQA operationId makes a re-post after a crash harmless. One drainer at a time."""
     import fcntl
@@ -818,7 +842,10 @@ def spool_drain(home: Path, only_opid: str | None = None) -> dict:
         except OSError:
             return {"ok": True, "drained": 0, "pending": len(list(spool.glob("*.json"))), "busy": True}
         done, failed, dead = 0, 0, 0
-        for f in sorted(spool.glob(f"*-{hashlib.sha256(only_opid.encode()).hexdigest()[:16]}.json" if only_opid else "*.json")):
+        stop_at_ = time.monotonic() + budget_s if budget_s else None
+        for n_, f in enumerate(sorted(spool.glob(f"*-{hashlib.sha256(only_opid.encode()).hexdigest()[:16]}.json" if only_opid else "*.json"))):
+            if (limit is not None and n_ >= limit) or (stop_at_ and time.monotonic() > stop_at_):
+                break
             try:
                 job = json.loads(f.read_text())
                 post_comment(job["ticket"], job["body"], job["operation_id"])
@@ -871,7 +898,9 @@ def _task(ledger: list, name: str):
     return reg[-1] if reg else None
 
 
-def _evidence_ok(home: Path, ev: list, allowed: set) -> None:
+def _evidence_ok(home: Path, ev: list, allowed: set, reg: dict) -> None:
+    reg_ts = parse_ts(reg.get("received_at"))
+    reg_args = reg["args"]
     root = (home / ".claude" / "wals").resolve()
     for e in ev:
         if "really_tested" in e:
@@ -892,16 +921,21 @@ def _evidence_ok(home: Path, ev: list, allowed: set) -> None:
                     except ValueError:
                         continue
                     note = rec.get("note") if isinstance(rec, dict) and isinstance(rec.get("note"), str) else ""
-                    if note.startswith("REALLY_TESTED") and (rec.get("id") == wid or note.startswith(f"REALLY_TESTED {wid}:")):
+                    # token-exact, and written after the task was registered (an old test proves nothing for this task)
+                    if note.startswith(f"REALLY_TESTED {wid}:") and parse_ts(rec.get("at")) >= reg_ts:
                         found = True
                         break
             if not found:
                 raise AhError("evidence", f"no REALLY_TESTED entry {wid} in that WAL", 3)
         else:
-            r = subprocess.run(["git", "-C", e["repo"], "cat-file", "-e", e["commit"] + "^{commit}"],
-                               capture_output=True, timeout=20)
+            repo = reg_args.get("worktree") or e["repo"]  # the registered checkout wins over a caller-chosen repo
+            if reg_args.get("branch"):
+                argv = ["git", "-C", repo, "merge-base", "--is-ancestor", e["commit"], reg_args["branch"]]
+            else:
+                argv = ["git", "-C", repo, "cat-file", "-e", e["commit"] + "^{commit}"]
+            r = subprocess.run(argv, capture_output=True, timeout=20)
             if r.returncode != 0:
-                raise AhError("evidence", f"commit {e['commit']} not found in {e['repo'][:80]}", 3)
+                raise AhError("evidence", f"commit {e['commit']} is not in the registered checkout/branch", 3)
 
 
 def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
@@ -945,7 +979,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         if not reg:
             raise AhError("unknown_task", f"task {args['task']!r} is not registered", 3)
         allowed = {_wal_path(home, r_["session"], a_).resolve() for r_ in [reg["args"]] for a_ in ("main", r_["owner_agent"])}
-        _evidence_ok(home, args["evidence"], allowed)
+        _evidence_ok(home, args["evidence"], allowed, reg)
         r = reg["args"]
         cites = "; ".join(e.get("really_tested") or e["commit"] for e in args["evidence"])
         rec = {"at": now, "event": "result", "id": wid, "note": f"task {args['task']} done; evidence: {cites}"[:3900]}
@@ -1002,15 +1036,22 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
     who = actor(session)
     audit = store_dir(home) / "audit.jsonl"
     with StoreLock(home):
-        ledger = _ledger(home)
-        for row in ledger:
+        everything = _ledger(home, include_intents=True)
+        ledger = [r for r in everything if r.get("state", "applied") == "applied"]
+        intent = None
+        for row in everything:
             if row.get("key") == key:
-                if row["sha"] != body_sha:
+                if row.get("sha") != body_sha:
                     _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who,
                                          "result": "key_conflict"})
                     raise AhError("key_conflict", "that key was used with a different request", 3)
-                return {"ok": True, "result": "duplicate", "id": row["id"], "seq": row["seq"], "key": key}
-        seq = max([r.get("seq", 0) for r in ledger if isinstance(r.get("seq"), int)] or [0]) + 1
+                if row.get("state", "applied") == "applied":
+                    return {"ok": True, "result": "duplicate", "id": row["id"], "seq": row["seq"], "key": key}
+                intent = row  # an earlier attempt died after its intent: resume, side effects are idempotent
+        seq = intent["seq"] if intent else max([r.get("seq", 0) for r in everything if isinstance(r.get("seq"), int)] or [0]) + 1
+        if not intent:  # write-ahead: the key is durable before any side effect
+            _append_line(store_dir(home) / "ledger.jsonl", {"state": "intent", "key": key, "sha": body_sha, "seq": seq,
+                                                            "intent_op": op, "at": iso(time.time())})
         try:
             out = _apply(home, op, args, key, ledger)
         except AhError as e:
@@ -1023,7 +1064,7 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
             raise AhError("internal", f"{type(e).__name__} while applying {op}", 3)
         rid = "ah" + hashlib.sha256(key.encode()).hexdigest()[:10]
         _append_line(store_dir(home) / "ledger.jsonl", {
-            "seq": seq, "id": rid, "key": key, "sha": body_sha, "op": op, "args": args, "actor": who,
+            "state": "applied", "seq": seq, "id": rid, "key": key, "sha": body_sha, "op": op, "args": args, "actor": who,
             "received_at": iso(time.time())})
         _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who, "result": "applied", "seq": seq})
     reply = {"ok": True, "result": "applied", "id": rid, "seq": seq, "key": key}
@@ -1039,6 +1080,7 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
             reply["comment"] = "dead"  # the ticket does not exist; nothing was posted
         else:
             reply["comment"] = "posted"
+        spool_drain(home, limit=2, budget_s=10.0)  # a little of the backlog, bounded; ahd drains the rest
     return reply
 
 
@@ -1068,6 +1110,25 @@ def render_text(cmd: str, data: dict) -> str:
             lines.append(f"    {(e['bytes'] or 0) / 2**30:8.2f} GiB  {e['path']}" + ("  (timed out)" if e.get("timed_out") else ""))
         return "\n".join(lines)
     return json.dumps(data, indent=2)
+
+
+def doctor() -> dict:
+    """Partial installs are the common failure: import every module ah needs and hash the files."""
+    checks = []
+    for name in ("liveness", "provenance", "safe_input", "redact", "wal", "wal_note", "ticket_adapters"):
+        try:
+            __import__(name)
+            checks.append({"check": f"import {name}", "ok": True})
+        except Exception as e:
+            checks.append({"check": f"import {name}", "ok": False, "error": type(e).__name__})
+    here = Path(__file__).resolve().parent
+    for name in ("ah.py", "liveness.py", "provenance.py", "commit_policy.json"):
+        f = here / name
+        try:
+            checks.append({"check": f"file {name}", "ok": True, "sha256": hashlib.sha256(f.read_bytes()).hexdigest()[:16]})
+        except OSError:
+            checks.append({"check": f"file {name}", "ok": False})
+    return {"ok": all(c["ok"] for c in checks), "checks": checks}
 
 
 def build_parser():
@@ -1124,6 +1185,7 @@ def build_parser():
     for x in (r, st, dn, cc):
         x.add_argument("--session")
         x.add_argument("--key", help="idempotency key (default: derived from the request)")
+    sub.add_parser("doctor", help="check the import chain and file hashes of this install")
     sp = sub.add_parser("spool")
     sp.add_argument("action", choices=["drain"])
     w = sub.add_parser("write")
@@ -1135,21 +1197,20 @@ def build_parser():
 
 
 def session_of(args, home):
-    s = getattr(args, "session", None) or os.environ.get("CLAUDE_SESSION_ID") or ""
-    return s
+    return getattr(args, "session", None) or env_session()
 
 
 def run(args, home: Path) -> dict:
     cmd = args.cmd
     if cmd == "owners":
-        s = args.session or os.environ.get("CLAUDE_SESSION_ID") or newest_session(home)
+        s = args.session or env_session() or newest_session(home)
         if not s or not SESSION_RE.match(s):
             raise AhError("session_unknown", "no session: pass --session")
         return owners(home, s, comments=comment_age if args.comments else None)
     if cmd == "user-msg":
-        s = args.session or os.environ.get("CLAUDE_SESSION_ID")
+        s = args.session or env_session()
         if not s:  # never guess "the newest transcript": a running helper session would win
-            raise AhError("session_unknown", "no session: pass --session or set CLAUDE_SESSION_ID")
+            raise AhError("session_unknown", "no session: pass --session or set CLAUDE_CODE_SESSION_ID")
         return user_msgs(home, s, text=args.search, recent=args.recent, full=args.full)
     if cmd == "disk":
         return disk(args.host, args.root, args.count, args.budget, not args.no_top)
@@ -1178,6 +1239,8 @@ def run(args, home: Path) -> dict:
         ev = [{"really_tested": i, "wal": args.wal or ""} for i in args.really_tested]
         ev += [{"commit": c, "repo": args.repo or ""} for c in args.commit]
         return write(home, "task.done", {"task": args.task, "evidence": ev}, s, args.key)
+    if cmd == "doctor":
+        return doctor()
     if cmd == "spool":
         return spool_drain(home)
     if cmd == "write":
@@ -1198,6 +1261,10 @@ def main(argv=None) -> int:
         return e.exit_code
     except BrokenPipeError:
         return 0
+    except Exception as e:  # a partial install or a bug: one JSON line, never a traceback
+        json.dump({"ok": False, "code": "internal", "type": type(e).__name__}, sys.stdout)
+        sys.stdout.write("\n")
+        return 4
     if args.text:
         sys.stdout.write(render_text(args.cmd, data) + "\n")
     else:
