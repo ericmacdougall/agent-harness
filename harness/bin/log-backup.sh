@@ -56,6 +56,13 @@ chmod 700 "$LOGDIR" 2>/dev/null
 for v in $(env | sed -n 's/^\(RCLONE_[A-Za-z0-9_]*\)=.*/\1/p'); do
   [ "$v" = RCLONE_CONFIG ] || unset "$v"
 done
+# Keep the log bounded: past 10 MB it is renamed to log-backup.log.1 (one generation) before this run writes.
+rotate_log() {
+  local size
+  size=$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')
+  if [ -n "$size" ] && [ "$size" -gt 10485760 ]; then mv -f -- "$LOG" "$LOG.1" 2>/dev/null; fi
+}
+[ -f "$LOG" ] && rotate_log
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$LOG"; }
 fail() { say "$1"; echo "log-backup: $1" >&2; echo "$STARTED exit=$2" > "$LOGDIR/log-backup.last-run"; exit "$2"; }
 
@@ -261,7 +268,7 @@ for src in "${LIVE[@]}"; do
     # that rclone would upload as current. rsync renames within the stage volume, so a full disk fails the copy
     # (exit 11 or 23, source skipped, run non-fresh) instead of leaving a truncated file in place.
     mkdir -p "$STAGE/.rsync-tmp" || { say "cannot create the stage temp directory"; ok=1; continue; }
-    rsync -a --temp-dir="$STAGE/.rsync-tmp" --exclude-from="$RSYNC_EXCLUDES" -- "$HOME/$src/" "$snap/" </dev/null; rc=$?
+    rsync -a --temp-dir="$STAGE/.rsync-tmp" --include='*/' --exclude-from="$RSYNC_EXCLUDES" -- "$HOME/$src/" "$snap/" </dev/null; rc=$?
     if [ $rc -eq 23 ]; then
       # Partial transfer (e.g. one unreadable file): rsync renames files into place, so the stage is consistent.
       # Back up what was staged, but withhold last-ok for this run.
