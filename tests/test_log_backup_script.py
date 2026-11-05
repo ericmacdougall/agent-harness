@@ -380,7 +380,7 @@ class Failure(Case):
         self.assertTrue(self.last_ok().exists())
         self.assertIn("retry 1", (self.logs / "log-backup.log").read_text())
 
-    def test_rate_limit_failure_keeps_run_non_fresh_then_succeeds_on_retry(self):
+    def test_a_failing_copy_with_rate_limit_text_keeps_run_non_fresh_then_succeeds_on_retry(self):
         err = "ERROR : upload failed: batch upload failed: too_many_write_operations\n"
         done = self.run_script(FAKE_FAIL_FIRST="1", FAKE_ERR=err, LOG_BACKUP_RETRIES="0")
         self.assertNotEqual(done.returncode, 0)  # no retry budget: a rate-limited source fails the run
@@ -427,18 +427,41 @@ class Failure(Case):
         self.assertTrue((stage / ".rsync-tmp").is_dir())
         for argv in self.copies():
             self.assertFalse(argv[-2].startswith(str(stage / ".rsync-tmp")), argv)
+        # a stub rsync records its arguments: --temp-dir must be present and outside every staged tree
+        fakebin = self.tmp / "fakebin"
+        fakebin.mkdir()
+        record = self.tmp / "rsync-args"
+        stub = fakebin / "rsync"
+        stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" >> {record}\nexit 0\n')
+        stub.chmod(0o755)
+        self.run_script(PATH=f"{fakebin}:/usr/bin:/bin")
+        args = record.read_text().splitlines()
+        self.assertIn(f"--temp-dir={stage}/.rsync-tmp", args)
+        self.assertIn(f"--exclude-from={ROOT}/harness/bin/log-backup.excludes", args)
 
     def test_failed_snapshot_skips_upload_and_keeps_run_non_fresh(self):
         fakebin = self.tmp / "fakebin"
         fakebin.mkdir()
         rsync = fakebin / "rsync"
-        rsync.write_text("#!/bin/sh\nexit 23\n")
+        rsync.write_text("#!/bin/sh\nexit 11\n")
         rsync.chmod(0o755)
         done = self.run_script(PATH=f"{fakebin}:/usr/bin:/bin")
         self.assertNotEqual(done.returncode, 0)
         self.assertFalse(self.last_ok().exists())
         staged_dirs = (".claude/projects", ".claude/wals", ".codex/sessions")  # rsync-staged; files use cp
         self.assertFalse([c for c in self.copies() if ".agent-harness/backup-stage" in c[-2] and c[-2].endswith(staged_dirs)])
+
+    def test_partial_snapshot_uploads_what_was_staged_but_withholds_last_ok(self):
+        fakebin = self.tmp / "fakebin"
+        fakebin.mkdir()
+        real = shutil.which("rsync")
+        wrapper = fakebin / "rsync"
+        wrapper.write_text(f'#!/bin/sh\n{real} "$@"\nexit 23\n')
+        wrapper.chmod(0o755)
+        done = self.run_script(PATH=f"{fakebin}:/usr/bin:/bin")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.last_ok().exists())
+        self.assertTrue([c for c in self.copies() if c[-2].endswith(".claude/projects")])
 
     def test_rsync_vanished_files_exit_24_is_tolerated_but_other_codes_are_not(self):
         fakebin = self.tmp / "fakebin"
@@ -463,6 +486,53 @@ class Failure(Case):
         for path in (self.remote / "testhost").rglob("*"):
             if path.is_file():
                 self.assertNotIn(b"SECRET-MARKER", path.read_bytes())
+
+    def test_deleted_live_tree_with_a_stale_stage_is_not_a_backup(self):
+        self.assertEqual(self.local_run().returncode, 0)
+        shutil.rmtree(self.home / ".claude/projects")
+        shutil.rmtree(self.home / ".codex/sessions")
+        (self.home / ".claude/projects").mkdir()
+        (self.home / ".codex/sessions").mkdir()
+        os.unlink(self.last_ok())
+        done = self.local_run()
+        self.assertNotEqual(done.returncode, 0)  # the stage still holds old files, the live primary trees are empty
+        self.assertFalse(self.last_ok().exists())
+
+    def test_credential_files_are_not_even_copied_into_the_stage(self):
+        for source in (".claude/projects", ".codex/sessions"):
+            for name in ("auth.json", "member.key", "x.secret", "kit.json"):
+                self.put(f"{source}/{name}", b"SECRET-MARKER")
+        self.assertEqual(self.run_script().returncode, 0)
+        stage = self.home / ".agent-harness/backup-stage"
+        staged = {p.name for p in stage.rglob("*") if p.is_file()}
+        self.assertFalse(staged & {"auth.json", "member.key", "x.secret", "kit.json"}, staged)
+        self.assertIn("a.jsonl", staged)
+
+    def test_leftover_rsync_temp_files_are_cleared_at_start(self):
+        tmpdir = self.home / ".agent-harness/backup-stage/.rsync-tmp"
+        tmpdir.mkdir(parents=True)
+        (tmpdir / ".a.jsonl.partial").write_text("partial")
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertFalse((tmpdir / ".a.jsonl.partial").exists())
+
+    def test_hostile_or_unsafe_stage_locations_are_refused(self):
+        link_target = self.tmp / "decoy"
+        link_target.mkdir()
+        link = self.tmp / "stagelink"
+        os.symlink(link_target, link)
+        bad = ["relative/stage", "-x", str(self.home), str(self.home / ".claude/projects/stg"),
+               str(self.home / ".claude"), str(self.home / ".agent-harness/work/stg"),
+               str(self.home / ".agent-harness"), str(self.tmp / "a" / ".." / "b"), str(link)]
+        mode_before = link_target.stat().st_mode
+        home_mode = self.home.stat().st_mode
+        for value in bad:
+            if self.calls.exists():
+                self.calls.unlink()
+            done = self.run_script(LOG_BACKUP_STAGE=value)
+            self.assertEqual(done.returncode, 2, value)
+            self.assertEqual(self.copies(), [], value)
+        self.assertEqual(link_target.stat().st_mode, mode_before)
+        self.assertEqual(self.home.stat().st_mode, home_mode)
 
     def test_persistent_failure_exhausts_retries_and_is_not_fresh(self):
         done = self.run_script(FAKE_FAIL_FIRST="1000", LOG_BACKUP_RETRIES="1")

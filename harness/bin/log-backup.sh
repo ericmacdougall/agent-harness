@@ -136,7 +136,19 @@ LIVE=(.claude/projects .claude/wals .claude/history.jsonl .codex/sessions .codex
   .agent-harness/work-ledger.archive.jsonl .agent-harness/work-ledger.failures.jsonl .agent-harness/work-ledger.spool.jsonl)
 DIRECT=(.codex/archived_sessions .agent-harness/work)
 command -v rsync >/dev/null 2>&1 || fail "rsync not found (needed to snapshot live files)" 127
+# The stage must be a private directory of its own: absolute, no `..`, not a symlink, not HOME or any ancestor of a
+# source, and not inside a source (it would nest into itself or be uploaded as data).
+case "$STAGE" in /*) ;; *) fail "LOG_BACKUP_STAGE must be an absolute path" 2 ;; esac
+case "$STAGE" in *..*|*[[:cntrl:]]*) fail "LOG_BACKUP_STAGE is not a plain path" 2 ;; esac
+for guarded in "$HOME" "$HOME/.claude" "$HOME/.codex" "$HOME/.agent-harness/work"; do
+  case "$STAGE/" in "$guarded/"*) [ "$guarded" = "$HOME" ] && continue; fail "LOG_BACKUP_STAGE must not sit inside $guarded" 2 ;; esac
+  case "$guarded/" in "$STAGE/"*) fail "LOG_BACKUP_STAGE must not contain $guarded" 2 ;; esac
+done
+[ ! -L "$STAGE" ] || fail "LOG_BACKUP_STAGE must not be a symlink" 2
 mkdir -p "$STAGE" && chmod 700 "$STAGE" || fail "cannot create the stage directory" 1
+# Leftover partial files of a crashed snapshot are never data: start each run with an empty temp directory.
+rm -rf "$STAGE/.rsync-tmp"
+say "stage size $(du -sk "$STAGE" 2>/dev/null | cut -f1) KiB"
 
 upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   local p="$1" rel="$2" dst
@@ -159,7 +171,8 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
     found=$((found + 1))
     case "$rel" in .claude/projects|.codex/sessions)
       # An empty primary tree is not evidence of a backup.
-      if [ -n "$(find "$p" -type f -print -quit 2>/dev/null)" ]; then primary=$((primary + 1)); fi ;;
+      # (judged on the live tree: a stage that still holds deleted files must not count)
+      if [ -n "$(find "$HOME/$rel" -type f -print -quit 2>/dev/null)" ]; then primary=$((primary + 1)); fi ;;
     esac
   else
     say "copy failed after $attempt attempts: $rel"; ok=1
@@ -177,8 +190,14 @@ for src in "${LIVE[@]}"; do
     # that rclone would upload as current. rsync renames within the stage volume, so a full disk fails the copy
     # (exit 11 or 23, source skipped, run non-fresh) instead of leaving a truncated file in place.
     mkdir -p "$STAGE/.rsync-tmp" || { say "cannot create the stage temp directory"; ok=1; continue; }
-    rsync -a --temp-dir="$STAGE/.rsync-tmp" "$HOME/$src/" "$snap/" </dev/null; rc=$?
-    [ $rc -eq 0 ] || [ $rc -eq 24 ] || { say "snapshot failed (rsync exit $rc): $src"; ok=1; continue; }
+    rsync -a --temp-dir="$STAGE/.rsync-tmp" --exclude-from="$EXCLUDES" -- "$HOME/$src/" "$snap/" </dev/null; rc=$?
+    if [ $rc -eq 23 ]; then
+      # Partial transfer (e.g. one unreadable file): rsync renames files into place, so the stage is consistent.
+      # Back up what was staged, but withhold last-ok for this run.
+      say "snapshot partial (rsync exit 23): $src"; ok=1
+    elif [ $rc -ne 0 ] && [ $rc -ne 24 ]; then
+      say "snapshot failed (rsync exit $rc): $src"; ok=1; continue
+    fi
   else
     cp -p "$HOME/$src" "$snap" || { say "snapshot failed: $src"; ok=1; continue; }
   fi
