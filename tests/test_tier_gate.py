@@ -293,6 +293,12 @@ class BashAdvisory(GateFixture):
             self.assertEqual(self.bash(line)[0], 'allow', line)
         self.assertEqual(self.bash('codex exec -m gpt-6-astra -')[0], 'deny')
 
+    def test_piped_script_behind_a_wrapper_is_still_checked(self):
+        for line in ("echo 'claude -p --model fable x' | sudo bash", "echo 'claude -p --model fable x' | env -i sh",
+                     "echo 'claude -p --model fable x' | nice -n 5 bash", "echo 'claude -p --model fable x' | sudo -u eric /bin/bash"):
+            self.assertEqual(self.bash(line)[0], 'deny', line)
+        self.assertEqual(self.bash("echo 'see claude' | sudo tee /tmp/x")[0], 'allow')
+
     def test_round7_shell_strings_fed_without_dash_c(self):
         self.escalate('k9'); self.escalate('k9')
         for line in ("bash -c -- 'claude -p --model fable x'",

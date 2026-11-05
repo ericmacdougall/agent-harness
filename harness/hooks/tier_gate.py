@@ -167,9 +167,25 @@ def reads_stdin_as_script(segment):
         words = shlex.split(segment)
     except ValueError:
         return False
-    if not words or words[0].rsplit('/', 1)[-1].lower() not in PURE_SHELLS:
+    # The shell may sit behind wrappers (sudo, env, nice, time, command, exec, nohup): look past them.
+    index = 0
+    while index < len(words):
+        base = words[index].rsplit('/', 1)[-1].lower()
+        if base in ('sudo', 'env', 'nice', 'time', 'command', 'exec', 'nohup', 'timeout') or '=' in words[index] and not words[index].startswith('-'):
+            index += 1
+            while index < len(words) and words[index].startswith('-'):
+                option = words[index]; index += 1  # the wrapper's own options (sudo -u eric, nice -n 5, timeout -s KILL)
+                if option in ('-u', '-g', '-n', '-s', '-k', '-C', '-S', '-i') and base != 'env' and index < len(words):
+                    index += 1  # its value
+                elif option in ('-u', '-C', '-S') and base == 'env' and index < len(words):
+                    index += 1
+            if base == 'timeout' and index < len(words) and words[index][:1].isdigit():
+                index += 1
+            continue
+        break
+    if index >= len(words) or words[index].rsplit('/', 1)[-1].lower() not in PURE_SHELLS:
         return False
-    return not any(w.startswith('-') and not w.startswith('--') and 'c' in w[1:] for w in words[1:])
+    return not any(w.startswith('-') and not w.startswith('--') and 'c' in w[1:] for w in words[index + 1:])
 
 
 def split_segments(command):
