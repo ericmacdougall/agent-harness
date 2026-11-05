@@ -146,6 +146,33 @@ class OwnersTests(Base):
         self.assertEqual(by["helperfix"]["state"], "returned")  # helper without a WAL file: not a drop
         self.assertEqual(data["counts"]["DROPPED"], 2)
 
+    def test_discovers_agents_missing_from_main_wal(self):
+        """Owners that never appear as subagent events in main.jsonl (general-purpose) are found from task WALs and meta files."""
+        self.make()
+        w = self.home / ".claude" / "wals" / SESSION
+        sub = self.home / ".claude" / "projects" / "-p" / SESSION / "subagents"
+        sub.mkdir(parents=True)
+        jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "scope", "note": "gpnamed owns the lane"}])
+        for agent, meta, wal_age in (
+                ("gpnamed", {"agentType": "general-purpose", "description": "lane owner", "finished": False}, 7300),
+                ("gphelper", {"agentType": "general-purpose", "description": "lookup", "finished": False}, 7300),
+                ("gpfinished", {"agentType": "general-purpose", "description": "done lane", "finished": True}, 7300),
+                ("gpsolve", {"agentType": "general-purpose", "description": "Solve interview bot", "finished": False}, 20),
+                ("walonly", None, 7300)):
+            jl(w / f"agent-{agent}.jsonl", [{"at": iso(NOW - wal_age), "event": "intent", "note": "work"}])
+            if meta:
+                (sub / f"agent-{agent}.meta.json").write_text(json.dumps(meta))
+                (sub / f"agent-{agent}.jsonl").write_text("{}\n")  # content is never read
+        by = {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=NOW)["owners"]}
+        self.assertEqual(by["gpnamed"]["state"], "SILENT-HIGH")
+        self.assertIn("unregistered-owner", by["gpnamed"]["flags"])
+        self.assertEqual(by["gphelper"]["state"], "idle-helper")  # unnamed helper idle: not an alert
+        self.assertEqual(by["walonly"]["state"], "idle-helper")
+        self.assertEqual(by["gpfinished"]["state"], "returned")
+        self.assertTrue(by["gpsolve"]["restricted"])
+        self.assertIsNone(by["gpsolve"]["task"])  # restricted: liveness only
+        self.assertEqual(by["gpsolve"]["state"], "live")
+
     def test_incremental_wal_summary_survives_append_and_truncate(self):
         self.make()
         ah.owners(self.home, SESSION, now=NOW)
