@@ -110,3 +110,13 @@ This repository contains no account credentials, session logs, app fixtures, or 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs should include a reproducible failure, the affected agent edition and version, and evidence that a fix works without breaking the fast path or local delivery.
+
+## Local gates (no CI)
+
+Run before pushing, from a clean tree: `python3 scripts/leak_gate.py --range origin/main..HEAD`.
+It runs `scripts/leak_scan.py` on the tree and the pushed commits, and gitleaks
+if installed and pinned by SHA-256 (`--gitleaks-sha256`). It needs your personal denylist
+(`~/.agent-harness/leak-denylist.txt`, one regex per line, mode 0600, never committed) and
+refuses to pass without one unless you pass `--no-denylist`. Matched values are
+never printed. Personal identifiers live in the untracked
+`commit_policy.local.json`, not in the repo.
