@@ -347,6 +347,171 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(params, ['self', 'local_root', 'manifest', 'remote'])
 
 
+LAUNCHER_SRC = HOOKS / 'command_guard_hook.py'
+PROTECTED_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'rm -rf /home/x/.claude/projects'}}
+HARMLESS_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'ls -la'}}
+READ_PAYLOAD = {'tool_name': 'Read', 'tool_input': {'file_path': '/home/x/.claude/projects/a.jsonl'}}
+EXEC_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'echo eA== | base64 -d | sh; rm -f x'}}
+
+
+class LauncherTests(unittest.TestCase):
+    """command_guard_hook.py turns an analyser crash, hang or garbage into a raw-text decision (AC-6)."""
+
+    def launcher_dir(self, guard_source=None, child_timeout=None):
+        tmp = tempfile.TemporaryDirectory(prefix='cg-launcher-')
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        text = LAUNCHER_SRC.read_text()
+        if child_timeout is not None:
+            text = text.replace('CHILD_TIMEOUT = 10.0', 'CHILD_TIMEOUT = %r' % child_timeout)
+        (d / 'command_guard_hook.py').write_text(text)
+        if guard_source is None:
+            for name in ('command_guard.py', 'redact.py', 'safe_input.py'):
+                (d / name).write_text((HOOKS / name).read_text())
+        else:
+            (d / 'command_guard.py').write_text(guard_source)
+        return d
+
+    def run_launcher(self, d, payload):
+        import subprocess
+        data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        env = {'PATH': '/usr/bin:/bin', 'HOME': str(d)}
+        done = subprocess.run([sys.executable, str(d / 'command_guard_hook.py')], input=data, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
+        return done.returncode, done.stderr.decode()
+
+    def test_real_analyser_blocks_and_allows(self):
+        d = self.launcher_dir()
+        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
+        self.assertEqual(self.run_launcher(d, HARMLESS_PAYLOAD)[0], 0)
+        self.assertEqual(self.run_launcher(d, READ_PAYLOAD)[0], 0)
+
+    def test_crashing_analyser_fails_closed_for_sensitive_text(self):
+        d = self.launcher_dir('import sys\nraise SystemExit(7)\n')
+        code, err = self.run_launcher(d, PROTECTED_PAYLOAD)
+        self.assertEqual(code, 2, err)
+        self.assertEqual(self.run_launcher(d, EXEC_PAYLOAD)[0], 2)
+        self.assertEqual(self.run_launcher(d, HARMLESS_PAYLOAD)[0], 0)
+        self.assertEqual(self.run_launcher(d, READ_PAYLOAD)[0], 0)
+
+    def test_missing_analyser_fails_closed(self):
+        d = self.launcher_dir('')
+        (d / 'command_guard.py').unlink()  # this test's own temp copy
+        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
+
+    def test_hanging_analyser_times_out_closed(self):
+        d = self.launcher_dir('import time\ntime.sleep(30)\n', child_timeout=1.0)
+        started = time.monotonic()
+        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
+        self.assertLess(time.monotonic() - started, 20)
+
+    def test_garbage_output_fails_closed(self):
+        d = self.launcher_dir('print("not json")\n')
+        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
+
+    def test_unparsable_payload_is_probed(self):
+        d = self.launcher_dir('import sys\nraise SystemExit(7)\n')
+        self.assertEqual(self.run_launcher(d, b'{not json rm -rf ~/.claude/wals')[0], 2)
+
+    def test_large_non_shell_payload_is_fast(self):
+        d = self.launcher_dir()
+        big = {'tool_name': 'Write', 'tool_input': {'file_path': '/tmp/x', 'content': 'y' * (4 << 20)}}
+        started = time.monotonic()
+        self.assertEqual(self.run_launcher(d, big)[0], 0)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_launcher_is_stdlib_only(self):
+        tree = ast.parse(LAUNCHER_SRC.read_text())
+        mods = {a.name.split('.')[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        mods |= {n.module.split('.')[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
+        self.assertLessEqual(mods, {'json', 'os', 're', 'subprocess', 'sys'})
+
+
+class InstallTests(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        import install_codex
+        self.install, self.install_codex = install, install_codex
+        tmp = tempfile.TemporaryDirectory(prefix='cg-install-')
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+
+    def guard_groups(self, settings):
+        return [g for g in settings['hooks'].get('PreToolUse', [])
+                if any('command_guard_hook.py' in ' '.join(h.get('args') or [h.get('command', '')])
+                       for h in g.get('hooks', []))]
+
+    def test_claude_registration_and_rollback(self):
+        claude = self.home / '.claude'
+        settings = self.install.merged_settings({}, claude)
+        groups = self.guard_groups(settings)
+        self.assertEqual(len(groups), 1)
+        hook = groups[0]['hooks'][0]
+        self.assertEqual(hook['onFailure'], 'block')
+        self.assertEqual(hook['timeout'], 30)
+        self.assertIn('Bash', groups[0]['matcher'])
+        again = self.install.merged_settings(settings, claude)
+        self.assertEqual(len(self.guard_groups(again)), 1)  # idempotent
+        rolled_back = self.install.merged_settings(settings, claude, command_guard=False)
+        self.assertEqual(self.guard_groups(rolled_back), [])
+        for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py'):
+            self.assertIn(name, self.install.HOOKS)
+
+    def test_codex_registration_has_no_matcher_and_rolls_back(self):
+        codex = self.home / '.codex'
+        hooks = self.install_codex.merge_hooks({}, codex)
+        guard = self.install_codex.guard_command(codex)
+        groups = [g for g in hooks['hooks']['PreToolUse'] if g['hooks'][0]['command'] == guard]
+        self.assertEqual(len(groups), 1)
+        self.assertNotIn('matcher', groups[0])
+        self.assertEqual(len([g for g in self.install_codex.merge_hooks(hooks, codex)['hooks']['PreToolUse']
+                              if g['hooks'][0]['command'] == guard]), 1)
+        off = self.install_codex.merge_hooks(hooks, codex, command_guard=False)
+        self.assertFalse([g for g in off['hooks']['PreToolUse'] if g['hooks'][0]['command'] == guard])
+        for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py'):
+            self.assertIn(name, self.install_codex.DELIVERY_HELPERS)
+
+    def test_old_claude_version_warns(self):
+        self.assertIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.200 (Claude Code)'))
+        self.assertNotIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.295 (Claude Code)'))
+        self.assertIn('not registered', self.install.command_guard_status(False))
+
+
+class DoctorTests(unittest.TestCase):
+    def test_doctor_reports_unregistered_and_old_version(self):
+        with tempfile.TemporaryDirectory(prefix='cg-doctor-') as d:
+            home = Path(d)
+            (home / '.claude' / 'hooks').mkdir(parents=True)
+            checks = {name: ok for name, ok, _ in cg.doctor(home=home, version_runner=lambda: '2.1.100')}
+            self.assertFalse(checks['claude files'])
+            self.assertFalse(checks['claude registered'])
+            self.assertTrue(checks['self-test probes'])
+
+    def test_doctor_healthy_install(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        with tempfile.TemporaryDirectory(prefix='cg-doctor-') as d:
+            home = Path(d)
+            hooks = home / '.claude' / 'hooks'
+            hooks.mkdir(parents=True)
+            for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py'):
+                (hooks / name).write_text('#\n')
+            (home / '.claude' / 'settings.json').write_text(json.dumps(install.merged_settings({}, home / '.claude')))
+            checks = cg.doctor(home=home, version_runner=lambda: '2.1.300')
+            self.assertTrue(all(ok for _n, ok, _d in checks), checks)
+
+
+class DocsTests(unittest.TestCase):
+    def test_operations_section_and_readme_line(self):
+        ops = (ROOT / 'docs' / 'operations.md').read_text()
+        self.assertIn('## Command guard', ops)
+        for needle in ('approve-delete', 'doctor', '--no-command-guard', '#14500', 'not an ownership boundary',
+                       'git clean'):
+            self.assertIn(needle, ops)
+        self.assertIn('command_guard', (ROOT / 'README.md').read_text())
+
+
 class SafetyRuleTests(unittest.TestCase):
     """NEG-8 / S1: no test module passes corpus text to a shell."""
 

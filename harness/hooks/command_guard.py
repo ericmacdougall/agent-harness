@@ -3,8 +3,11 @@
 
     command_guard.py hook [--format exit2|json]    PreToolUse hook (JSON on stdin); exit 2 + stderr blocks
     command_guard.py check [--ps] 'COMMAND'        print the decision for a command, run nothing
-    command_guard.py approve-delete --path P --remote R [--backup-verified-sha256 D] [--ttl S]
-    command_guard.py revoke-delete                 remove the delete approval marker
+    command_guard.py explain --file F [--cwd D]   decision and findings for a command stored in a file
+    command_guard.py doctor                        check the installed guard and run its self-test probes
+    command_guard.py replay TRANSCRIPT.jsonl...    decision counts over real transcripts (never prints commands)
+    command_guard.py approve-delete --path P --remote R --wal W [--backup-verified-sha256 D] [--ttl S]
+    command_guard.py revoke-delete                 remove every delete approval
     command_guard.py scan-wal PATH...              report secret shapes in WAL/transcript files (never prints values)
 
 Categories (modes live in the installed command_guard_policy.json, never in an environment variable or a repo):
@@ -43,6 +46,8 @@ import unicodedata
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:  # python3 -I (3.11+) no longer puts the script's directory on sys.path
+    sys.path.insert(0, str(HERE))
 POLICY_FILE = HERE / 'command_guard_policy.json'
 
 DEFAULT_POLICY = {
@@ -3233,6 +3238,18 @@ class RcloneVerifier(Verifier):
         done = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=self.timeout, check=False)
         return done.returncode, done.stdout[:512 * 1024 * 1024]
 
+    def remote_types(self):
+        """{remote name: backend type} from `rclone listremotes --long` (names and types only, no secrets)."""
+        code, out = self.runner([self.rclone, 'listremotes', '--long'])
+        if code != 0:
+            return {}
+        found = {}
+        for line in out.decode('utf-8', 'replace').splitlines()[:500]:
+            m = re.match(r'\s*([^:\s][^:]*):\s+(\S+)', line)
+            if m:
+                found[m.group(1)] = m.group(2)
+        return found
+
     def verify(self, local_root, manifest, remote):
         code, out = self.runner([self.rclone, 'lsjson', '-R', '--hash', '--files-only', remote])
         if code != 0:
@@ -3516,63 +3533,76 @@ def payload_cwd(payload):
 
 
 def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
-    import safe_input
+    """PreToolUse entry point. Exit 2 + stderr blocks; exit 0 allows (warnings go to stdout as context).
+
+    Always run behind command_guard_hook.py, which turns a crash or timeout of this process into a raw-text
+    decision instead of the host's fail-open default."""
     limits = (compiled.limits if compiled else DEFAULT_POLICY['limits'])
     alarm = False
     if hasattr(signal, 'SIGALRM'):
         def _timeout(_s, _f):
             raise TimeoutError('command_guard wall-clock limit')
         signal.signal(signal.SIGALRM, _timeout)
-        signal.alarm(int(float(limits['max_seconds']) * 3) + 2)
+        signal.alarm(int(float(limits['max_seconds']) * 2) + 1)
         alarm = True
+    raw_text = ''
     try:
+        import safe_input
         try:
             data = stdin_bytes if stdin_bytes is not None else safe_input.read_stdin_bounded(int(limits['max_stdin_bytes']))
         except safe_input.InputRejected:
-            return emit('block', format_block(Finding(SECRET_DUMP, 'oversized-input', 'the tool input is larger than the guard will analyse',
-                                                      'write large content to a file with the Write tool instead')), fmt)
+            return emit('block', format_block(Finding(SECRET_DUMP, 'oversized-input', 'the tool input is larger than '
+                                                      'the guard will analyse', 'put the commands in a script file and '
+                                                      'run it')), fmt)
         raw_text = data.decode('utf-8', 'replace')
         try:
             payload = safe_input.safe_json_loads(raw_text)
         except Exception:  # noqa: BLE001
             payload = None
-        try:
-            c = compiled or Compiled(load_policy(), cwd=(payload or {}).get('cwd') if isinstance(payload, dict) and isinstance((payload or {}).get('cwd'), str) else None)
-            if payload is None:
-                hits = [f for f in fallback_scan(raw_text, c) if c.policy['modes'].get(f.category) == 'enforce']
-                if hits:
-                    return emit('block', format_block(hits[0]), fmt)
-                return 0
-            command, ps = extract_command(payload)
-            if command is None:
-                return 0
-            cwd = payload.get('cwd') if isinstance(payload.get('cwd'), str) else None
-            marker_fn = (lambda p: marker_covers(p, compiled=c)) if marker else None
-            verdict, message = decide(command, c, cwd=cwd, ps=ps, marker=marker_fn)
-        except TimeoutError:
-            raise
-        except Exception as error:  # noqa: BLE001
-            text = raw_text
-            hits = []
-            try:
-                cc = compiled or Compiled(DEFAULT_POLICY)
-                hits = [f for f in fallback_scan(text, cc) if f.category in ALWAYS_ENFORCED]
-            except Exception:  # noqa: BLE001
-                hits = [Finding(SECRET_DUMP, 'guard-error', 'guard failed', 'retry')]
-            if hits:
-                return emit('block', format_block(Finding(hits[0].category, hits[0].rule, 'guard error (%s) on a sensitive-looking command: %s' % (type(error).__name__, hits[0].reason), hits[0].alternative)), fmt)
-            print('command_guard: internal error (%s); allowed' % type(error).__name__, file=sys.stderr)
+        cwd = payload_cwd(payload)
+        c = compiled or Compiled(load_policy(), cwd=cwd)
+        if payload is None:
+            if raw_sensitive(raw_text, c):
+                return emit('block', format_block(Finding(SECRET_DUMP, 'unparsable-payload', 'the hook payload is not '
+                                                          'valid JSON and names a protected location or secret',
+                                                          'retry the command')), fmt)
             return 0
+        command, ps = extract_command(payload)
+        if command is None:
+            return 0
+        approvals = Approvals(compiled=c) if marker else None
+        verdict, message = decide(command, c, cwd=cwd, ps=ps, marker=approvals)
+        if verdict != 'block' and approvals is not None and approvals.used and not approvals.consume():
+            verdict, message = 'block', format_block(Finding(LOG_DELETE, 'approval-used', 'the delete approval was '
+                                                             'already used or changed', 'approve again after a fresh '
+                                                             'verified backup'))
         return emit(verdict, message, fmt)
     except TimeoutError:
-        return emit('block', format_block(Finding(SECRET_DUMP, 'unanalysable', 'analysis exceeded its wall-clock limit',
-                                                  'split it into smaller commands or put it in a script file')), fmt)
+        verdict = 'block' if raw_sensitive(raw_text) else 'warn'
+        return emit(verdict, format_block(Finding(SECRET_DUMP if verdict == 'block' else PARSE, 'unanalysable',
+                                                  'analysis exceeded its wall-clock limit', 'split it into smaller '
+                                                  'commands or put it in a script file'), warn=verdict == 'warn'), fmt)
+    except Exception as error:  # noqa: BLE001 - fail closed for sensitive-looking text, open for the rest
+        if not raw_text and stdin_bytes is None:
+            try:
+                raw_text = sys.stdin.buffer.read(8 << 20).decode('utf-8', 'replace')
+            except Exception:  # noqa: BLE001
+                raw_text = ''
+        if raw_sensitive(raw_text):
+            return emit('block', format_block(Finding(SECRET_DUMP, 'guard-error', 'guard internal error (%s) on a '
+                                                      'command that names a protected location or secret'
+                                                      % type(error).__name__, 'split the command into simple steps; '
+                                                      'run command_guard.py doctor')), fmt)
+        print('command_guard: internal error (%s); the command looked harmless and was allowed'
+              % type(error).__name__, file=sys.stderr)
+        return 0
     finally:
         if alarm:
             signal.alarm(0)
 
 
 def emit(verdict, message, fmt):
+    """Never emits an explicit allow decision: exit 0 with no decision leaves the host's own permission flow."""
     if verdict == 'allow':
         return 0
     if verdict == 'warn':
@@ -3581,9 +3611,167 @@ def emit(verdict, message, fmt):
     if fmt == 'json':
         print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
                                                  'permissionDecisionReason': message}}))
-        return 0
+        return 2
     print(message, file=sys.stderr)
     return 2
+
+
+# --------------------------------------------------------------------------- doctor, explain, replay
+
+MIN_CLAUDE_VERSION = (2, 1, 295)  # first Claude Code release with hook `onFailure: block`
+DOCTOR_PROBES = (  # (command text, expected verdict); data only, analysed and never executed
+    ('rclone config show', 'block'), ('rm -rf ~/.claude/projects', 'block'), ('printenv', 'block'),
+    ("cat <<'EOF'\nx\nEOF\nrm -rf ~/.codex/sessions", 'block'), ('git status', 'allow'), ('ls ~/.claude', 'allow'),
+)
+
+
+def _version_tuple(text):
+    m = re.search(r'(\d+)\.(\d+)\.(\d+)', text or '')
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def claude_version(runner=None):
+    try:
+        if runner:
+            return _version_tuple(runner())
+        done = subprocess.run(['claude', '--version'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20,
+                              check=False)
+        return _version_tuple(done.stdout.decode('utf-8', 'replace'))
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _hook_entries(data, needle):
+    out = []
+    groups = ((data or {}).get('hooks') or {}).get('PreToolUse') or []
+    for group in groups if isinstance(groups, list) else []:
+        for hook in (group.get('hooks') or []) if isinstance(group, dict) else []:
+            text = isinstance(hook, dict) and ' '.join([str(hook.get('command', ''))] + [str(a) for a in hook.get('args') or []])
+            if text and needle in text:
+                out.append((group, hook))
+    return out
+
+
+def doctor(home=None, version_runner=None):
+    """[(check, ok, detail)] for the installed guard on this machine."""
+    import safe_input
+    home = Path(home or os.path.expanduser('~'))
+    checks = [('python>=3.9', sys.version_info >= (3, 9), '%d.%d' % sys.version_info[:2])]
+    for label, d in (('claude', home / '.claude' / 'hooks'), ('codex', home / '.codex' / 'agent-harness')):
+        if not d.parent.is_dir():
+            continue
+        names = ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py')
+        missing = [n for n in names if not (d / n).is_file()]
+        checks.append(('%s files' % label, not missing, 'missing: ' + ', '.join(missing) if missing else str(d)))
+        settings = home / '.claude' / 'settings.json' if label == 'claude' else home / '.codex' / 'hooks.json'
+        try:
+            data = safe_input.safe_json_loads(safe_input.read_bounded(str(settings), 4 << 20).decode('utf-8'))
+        except Exception:  # noqa: BLE001
+            data = None
+        entries = _hook_entries(data, 'command_guard_hook.py')
+        checks.append(('%s registered' % label, bool(entries), str(settings)))
+        if label == 'claude' and entries:
+            group, hook = entries[0]
+            checks.append(('claude onFailure block', hook.get('onFailure') == 'block', 'hook entry'))
+            matcher = str(group.get('matcher', ''))
+            checks.append(('claude matcher covers Bash', matcher in ('', '*') or 'Bash' in matcher, matcher or '(all)'))
+            version = claude_version(version_runner)
+            ok = version is not None and version >= MIN_CLAUDE_VERSION
+            checks.append(('claude >= 2.1.295', ok, '.'.join(map(str, version)) if version else 'unknown: '
+                           'fail-closed then rests on the launcher alone'))
+        if label == 'codex' and entries:
+            group, _hook = entries[0]
+            checks.append(('codex no matcher', not group.get('matcher'), 'every tool reaches the guard (write_stdin)'))
+    c = Compiled(load_policy(), home=str(home), cwd=str(home))
+    bad = [cmd.split('\n')[0][:30] for cmd, want in DOCTOR_PROBES if decide(cmd, c, cwd=str(home))[0] != want]
+    checks.append(('self-test probes', not bad, 'wrong: ' + '; '.join(bad) if bad else '%d ok' % len(DOCTOR_PROBES)))
+    return checks
+
+
+def explain(text, cwd=None, ps=False):
+    c = Compiled(load_policy(), cwd=cwd)
+    analyzer = Analyzer(c, cwd=cwd, ps=ps)
+    try:
+        findings = analyzer.run(text)
+        detail = [{'category': f.category, 'rule': f.rule, 'reason': f.reason, 'alternative': f.alternative}
+                  for f in findings]
+    except Exception as error:  # noqa: BLE001
+        detail = [{'error': type(error).__name__}]
+    verdict, message = decide(text, c, cwd=cwd, ps=ps)
+    import redact
+    return {'verdict': verdict, 'message': message, 'findings': json.loads(redact.redact(json.dumps(detail)))}
+
+
+def iter_transcript_commands(path, max_bytes=256 << 20):
+    """(cwd, command) for every Bash-like tool call in a Claude Code or Codex JSONL transcript."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size > max_bytes:
+        return
+    with open(path, 'rb') as handle:
+        for raw in handle:
+            if len(raw) > 4 << 20:
+                continue
+            try:
+                record = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            cwd = record.get('cwd') if isinstance(record.get('cwd'), str) else None
+            stack = [record]
+            seen = 0
+            while stack and seen < 2000:
+                node = stack.pop()
+                seen += 1
+                if isinstance(node, dict):
+                    name = str(node.get('name') or node.get('tool_name') or '')
+                    args = node.get('input') if isinstance(node.get('input'), dict) else node.get('arguments')
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except ValueError:
+                            args = None
+                    if name and isinstance(args, dict):
+                        command, _ps = extract_command({'tool_name': name, 'tool_input': args})
+                        if command:
+                            yield (payload_cwd({'cwd': cwd, 'tool_input': args}),
+                                   command if isinstance(command, str) else ' '.join(command))
+                            continue
+                    stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+                elif isinstance(node, list):
+                    stack.extend(v for v in node if isinstance(v, (dict, list)))
+
+
+def replay(paths, max_commands=200000):
+    """Decision counts over real transcripts; commands are never printed, only rule counts and digests."""
+    counts = {'allow': 0, 'warn': 0, 'block': 0}
+    by_rule, failure_path, samples = {}, 0, []
+    c_cache = {}
+    total = 0
+    for path in paths:
+        for cwd, command in iter_transcript_commands(path):
+            total += 1
+            if total > max_commands:
+                break
+            c = c_cache.get(cwd)
+            if c is None:
+                c = c_cache[cwd] = Compiled(load_policy(), cwd=cwd)
+            verdict, message = decide(command, c, cwd=cwd)
+            counts[verdict] += 1
+            if verdict != 'allow':
+                m = re.match(r'command_guard \w+ \[([^\]]+)\]', message)
+                rule = m.group(1) if m else 'unknown'
+                by_rule[rule] = by_rule.get(rule, 0) + 1
+                if rule.endswith(('/unanalysable', '/guard-error', '/unterminated', '/unparsable-payload')):
+                    failure_path += 1
+                if len(samples) < 200:
+                    samples.append({'verdict': verdict, 'rule': rule,
+                                    'sha256': hashlib.sha256(command.encode('utf-8', 'replace')).hexdigest()[:16]})
+    return {'commands': total, 'counts': counts, 'by_rule': by_rule, 'failure_path_blocks_or_warnings': failure_path,
+            'samples': samples}
 
 
 def main(argv=None):
@@ -3591,13 +3779,21 @@ def main(argv=None):
     sub = parser.add_subparsers(dest='cmd', required=True)
     hook = sub.add_parser('hook')
     hook.add_argument('--format', choices=('exit2', 'json'), default='exit2')
-    check = sub.add_parser('check')
+    check = sub.add_parser('check', help='decision for one command given as an argument (runs nothing)')
     check.add_argument('command')
     check.add_argument('--ps', action='store_true')
     check.add_argument('--cwd')
+    exp = sub.add_parser('explain', help='decision and every finding for a command read from a file')
+    exp.add_argument('--file', required=True)
+    exp.add_argument('--ps', action='store_true')
+    exp.add_argument('--cwd')
+    sub.add_parser('doctor', help='check the installed guard, its registration and a self-test')
+    rep = sub.add_parser('replay', help='decision counts over transcript JSONL files (never prints commands)')
+    rep.add_argument('paths', nargs='+')
     appr = sub.add_parser('approve-delete')
     appr.add_argument('--path', required=True)
-    appr.add_argument('--remote', required=True, help='rclone remote directory mirroring --path, e.g. dropbox:backups/claude-projects')
+    appr.add_argument('--remote', required=True, help='named rclone remote mirroring --path, e.g. dropbox:backups/x')
+    appr.add_argument('--wal', required=True, help='WAL that records this approval')
     appr.add_argument('--backup-verified-sha256', dest='digest')
     appr.add_argument('--ttl', type=int)
     sub.add_parser('revoke-delete')
@@ -3608,23 +3804,40 @@ def main(argv=None):
         return hook_main(args.format)
     if args.cmd == 'check':
         c = Compiled(load_policy(), cwd=args.cwd)
-        verdict, message = decide(args.command, c, cwd=args.cwd, ps=args.ps, marker=lambda p: marker_covers(p, compiled=c))
+        verdict, message = decide(args.command, c, cwd=args.cwd, ps=args.ps, marker=Approvals(compiled=c))
         print(json.dumps({'verdict': verdict, 'message': message}))
         return 0 if verdict != 'block' else 2
+    if args.cmd == 'explain':
+        import safe_input
+        text = safe_input.read_bounded(args.file, 4 << 20).decode('utf-8', 'replace')
+        result = explain(text, cwd=args.cwd, ps=args.ps)
+        print(json.dumps(result, indent=1))
+        return 0 if result['verdict'] != 'block' else 2
+    if args.cmd == 'doctor':
+        checks = doctor()
+        for name, ok, detail in checks:
+            print(json.dumps({'check': name, 'ok': bool(ok), 'detail': detail}))
+        healthy = all(ok for _n, ok, _d in checks)
+        print(json.dumps({'status': 'HEALTHY' if healthy else 'UNHEALTHY'}))
+        return 0 if healthy else 1
+    if args.cmd == 'replay':
+        print(json.dumps(replay(args.paths), indent=1))
+        return 0
     if args.cmd == 'approve-delete':
         try:
-            entry = approve_delete(args.path, args.remote, pinned_digest=args.digest, ttl=args.ttl)
+            entry = approve_delete(args.path, args.remote, pinned_digest=args.digest, ttl=args.ttl, wal=args.wal)
         except (ValueError, OSError) as error:
             print('approve-delete refused: %s' % error, file=sys.stderr)
             return 2
         print(json.dumps({'status': 'APPROVED', 'path': entry['path'], 'expires_at': entry['expires_at'],
-                          'manifest_sha256': entry['manifest_sha256'], 'files_checked': entry['remote_digest_checked']}))
+                          'manifest_sha256': entry['manifest_sha256'], 'files': entry['files']}))
         return 0
     if args.cmd == 'revoke-delete':
         try:
-            os.unlink(str(state_dir() / 'log-delete-ok.json'))
+            os.unlink(str(state_dir() / MARKER_NAME))
         except FileNotFoundError:
             pass
+        audit('revoked', {})
         print('{"status": "REVOKED"}')
         return 0
     if args.cmd == 'scan-wal':
