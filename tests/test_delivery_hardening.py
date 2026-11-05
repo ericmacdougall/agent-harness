@@ -79,6 +79,24 @@ class GhCreateVerdict(workflow.DeliveryWorkflow):
                            create_stderr='HTTP 403: Resource not accessible by integration')
         result, data = self.invoke(*self.prepare_args())
         self.assertEqual((result.returncode, data['status']), (4, 'REMOTE_UNCERTAIN'), result.stdout)
+        self.assertIn('Likely cause', data['hint'])
+
+    def test_auth_failure_that_also_breaks_the_lookup_stays_uncertain_with_cause(self):
+        # The realistic path: bad credentials fail the create and the follow-up list alike.
+        self.configure_github()
+        self.change_github(create_exit=4, create_absent=True, fail_list_after_create=True,
+                           create_stderr='HTTP 401: Bad credentials (https://api.github.com/graphql)')
+        result, data = self.invoke(*self.prepare_args())
+        self.assertEqual((result.returncode, data['status'], data['gh_exit']), (4, 'REMOTE_UNCERTAIN', 4),
+                         result.stdout)
+        self.assertIn('gh auth login', data['hint'])
+        result, refused = self.invoke(*self.finish_args('local'))
+        self.assertNotEqual(refused['status'], 'LOCAL_DELIVERED', result.stdout)
+
+    def test_exit_4_is_gh_auth_code_even_without_stderr(self):
+        result, data = self.failing_create('', code=4)
+        self.assertEqual(data['status'], 'REMOTE_BLOCKED', result.stdout)
+        self.assertIn('gh auth login', data['hint'])
 
     def test_a_create_that_landed_despite_nonzero_exit_is_adopted(self):
         self.configure_github()
@@ -171,15 +189,27 @@ class RemoteBase(workflow.DeliveryWorkflow):
             return stack
 
         code, data = self.direct_finish(factory, self.prepare_args())
-        self.assertEqual((code, data['status']), (4, 'REMOTE_BLOCKED'), data)
-        self.assertNotIn('reason', data)
+        self.assertEqual((code, data['status'], data.get('reason')), (4, 'REMOTE_BLOCKED', 'BASE_CHECK_UNAVAILABLE'),
+                         data)
         pushed = command('git', 'show-ref', '--verify', 'refs/heads/codex/feature', cwd=self.remote,
                          env=self.env, check=False).returncode == 0
         self.assertFalse(pushed)
         self.assertEqual(json.loads(self.github_state.read_text())['creates'], 0)
-        # The generation stays INITIAL, so local fallback is still refused for it.
+        # Read-only and before any push: a settled, definite block, like a failed publisher preflight,
+        # so REMOTE_BLOCKED keeps its one meaning (reviewed local delivery is available).
+        result, delivered = self.invoke(*self.finish_args('local'))
+        self.assertEqual((result.returncode, delivered['status']), (0, 'LOCAL_DELIVERED'), result.stdout)
+
+    def test_missing_base_is_not_settled_and_can_be_retried(self):
+        self.configure_github()
+        command('git', 'update-ref', '-d', 'refs/heads/main', cwd=self.remote, env=self.env)
+        result, data = self.invoke(*self.prepare_args())
+        self.assertEqual(data.get('reason'), 'BASE_BRANCH_MISSING', result.stdout)
         result, refused = self.invoke(*self.finish_args('local'))
         self.assertNotEqual(refused['status'], 'LOCAL_DELIVERED', result.stdout)
+        command('git', 'push', '-q', str(self.remote), self.base + ':refs/heads/main', cwd=self.original, env=self.env)
+        result, data = self.invoke(*self.prepare_args())
+        self.assertEqual(data['status'], 'PR_READY', result.stdout)
 
 
 @own_tests_only
@@ -226,6 +256,21 @@ class TargetSanity(workflow.DeliveryWorkflow):
         code, data = self.run_prepare(max_untracked=3, mode='warn')
         # Warn mode proceeds to the strict clean check, which still refuses a dirty target.
         self.assertNotEqual(data.get('reason'), 'HUGE_UNTRACKED', data)
+
+    def test_operator_can_choose_warn_on_the_command_line(self):
+        for index in range(6):
+            (self.original / f'staged{index}.txt').write_text('x')
+        command('git', 'add', '.', cwd=self.original, env=self.env)
+        module = load_deliver()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err), mock.patch.dict(module.TARGET_POLICY, {'max_staged': 3}), \
+                mock.patch.object(sys, 'argv', [str(workflow.DELIVER), *self.prepare_args(), '--local-only',
+                                                '--target-policy', 'warn']):
+            module.main()
+        data = json.loads(out.getvalue())
+        self.assertIn('6 staged paths', err.getvalue())
+        self.assertNotEqual(data.get('reason'), 'HUGE_STAGED', data)
 
     def test_git_listing_error_is_refused_not_read_as_zero(self):
         # NEG-12: a git error in the preflight listing must not pass as "0 staged".
@@ -297,7 +342,14 @@ class WaiverVisibility(workflow.DeliveryWorkflow):
         for bad in ('\\u001b', '\\u0000', '\\u0007', '\\r', '\\n', '/Users/'):
             self.assertNotIn(bad, text)
         self.assertEqual(len(data['commit_policy_waivers']), 50)
+        self.assertEqual(data['commit_policy_waivers_total'], 60)
         self.assertEqual(data['commit_policy_waivers'][0]['wal'], 'main.jsonl')
+
+    def test_malformed_waiver_item_marks_the_record_unreadable(self):
+        code, data = self.prepare_with([{'kind': 'commit', 'id': 'w1'}, 'not-a-dict'])
+        self.assertEqual(code, 0, data)
+        self.assertTrue(data.get('commit_policy_waivers_unreadable'), data)
+        self.assertNotIn('commit_policy_waivers', data)
 
     def test_unreadable_record_is_flagged_not_hidden(self):
         module = load_deliver()

@@ -184,8 +184,9 @@ def _count_entries(repo, label, *args):
     return output.count("\0")
 
 
-def target_preflight(original, branch):
+def target_preflight(original, branch, mode=None):
     """Refuse (or warn) before anything is published when the original checkout is a bad target."""
+    mode = mode or TARGET_POLICY["mode"]
     original = Path(original)
     if original.is_symlink() or not original.is_dir():
         return  # snapshot() reports the precise policy error
@@ -219,7 +220,7 @@ def target_preflight(original, branch):
     if not problems:
         return
     message = "; ".join(item[0] for item in problems)
-    if TARGET_POLICY["mode"] == "warn":
+    if mode == "warn":
         print("WARNING: " + message, file=sys.stderr)
         return
     raise DeliveryError("BLOCKED_POLICY", "Original checkout is not a sane delivery target: " + message, code=2,
@@ -541,35 +542,38 @@ class Workflow:
     def facts(self):
         facts = {"generation": self.generation, "state": str(self.directory / "journal.json"),
                  "checkout": str(self.original), "source_head": self.state["source_head"]}
-        waivers = self.policy_waivers()
+        waivers, total = self.policy_waivers()
         if waivers is None:
             # A record that exists but cannot be read must not look like "no waivers".
             facts["commit_policy_waivers_unreadable"] = True
         elif waivers:
             facts["commit_policy_waivers"] = waivers
+            if total > len(waivers):
+                facts["commit_policy_waivers_total"] = total
         return facts
 
     def policy_waivers(self):
         """Waivers the checked range used, so a reviewer of the prepare output sees every bypass.
 
-        Returns [] when no record exists (local-only or pre-gate generations) and None when a
-        record exists but is unreadable or malformed.
+        Returns (items, total): ([], 0) when no record exists (local-only or pre-gate generations),
+        (None, 0) when a record exists but is unreadable or holds a malformed item, and at most 50
+        items with the full count otherwise.
         """
         path = self.directory / COMMIT_POLICY_RECORD
         if not os.path.lexists(path):
-            return []
+            return [], 0
         try:
             record = json.loads(regular_bytes(path))
             items = record.get("waivers", [])
-            if not isinstance(items, list):
-                return None
+            if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+                return None, 0
             return [{"kind": sanitize_gh_text(str(item.get("kind", "")), 40),
                      "subject": sanitize_gh_text(str(item.get("subject", "")), 64),
                      "id": sanitize_gh_text(str(item.get("id", "")), 64),
                      "wal": os.path.basename(sanitize_gh_text(str(item.get("wal", "")), 200))}
-                    for item in items[:50] if isinstance(item, dict)]
+                    for item in items[:50]], len(items)
         except (OSError, ValueError, DeliveryError, AttributeError, TypeError):
-            return None
+            return None, 0
 
     def complete(self, mode, head, digest):
         self.save(target=head, checks_digest=digest)
@@ -844,9 +848,13 @@ def require_remote_base(flow, url):
             raise
         code, output = 1, ""
     if code:
-        raise DeliveryError("REMOTE_BLOCKED", "Remote base branch could not be checked before publishing",
-                            code=4, hint="Check network and credentials for origin, then re-run prepare",
-                            **flow.facts())
+        # ls-remote is read-only and runs before any push or PR create, so nothing was published:
+        # this is the same settled, definite pre-publication block as a failed publisher preflight.
+        flow.save(phase="REMOTE_BLOCKED")
+        raise DeliveryError("REMOTE_BLOCKED", "Remote base branch could not be checked; nothing was published",
+                            code=4, reason="BASE_CHECK_UNAVAILABLE",
+                            hint="Check network and credentials for origin, then re-run prepare with "
+                                 "--new-generation, or finish --mode local", **flow.facts())
     # ls-remote tail-matches, so demand the exact ref name.
     found = [row.split("\t")[-1] for row in output.splitlines() if row.strip()]
     if ref not in found:
@@ -936,6 +944,7 @@ def prepare_pr(flow, title, body):
         if code:
             gh_error = sanitize_gh_text(error_text)
             hint = classify_gh_failure(code, error_text)
+            likely = hint
             try:
                 already = matching_pr(flow.state, flow.args.timeout)
             except DeliveryError:
@@ -945,9 +954,12 @@ def prepare_pr(flow, title, body):
                 return record_pr(flow, already)
             if hint is None:
                 flow.save(phase="REMOTE_UNCERTAIN")
+                # Auth or repository errors usually break the follow-up lookup too; keep the likely
+                # cause visible, but absence is unproven, so this stays uncertain.
                 raise DeliveryError("REMOTE_UNCERTAIN", "PR creation failed without a definite GitHub verdict",
                                     code=4, gh_exit=code, gh_error=gh_error,
-                                    hint="Check `gh pr list`, then run prepare --reconcile-only",
+                                    hint=(("Likely cause: " + likely + ". ") if likely else "")
+                                    + "Check `gh pr list`, then run prepare --reconcile-only",
                                     **flow.facts())
             flow.save(phase="REMOTE_BLOCKED")
             raise DeliveryError("REMOTE_BLOCKED", "GitHub refused to create the PR; nothing was created",
@@ -1099,7 +1111,8 @@ def prepare(args):
         return reconcile(args)
     if args.original is not None and isinstance(args.original_branch, str):
         # Before any strict snapshot, so a huge dirty set gets a specific message, not a status timeout.
-        target_preflight(args.original.expanduser().absolute(), args.original_branch)
+        target_preflight(args.original.expanduser().absolute(), args.original_branch,
+                         getattr(args, "target_policy", None))
     source, branch, head, baseline, kit = source_inputs(args)
     local_only = getattr(args, "local_only", False)
     title, body = "", b""
@@ -1765,6 +1778,8 @@ def parse_args():
                       help="mode-0600 PR body, e.g. ~/.agent-harness/work/<session-id>/<task>/pr-body.md")
     prep.add_argument("--reconcile-only", action="store_true", help="Query a pending remote outcome without publishing or changing checkout")
     prep.add_argument("--local-only", action="store_true", help="Explicitly choose guarded local delivery")
+    prep.add_argument("--target-policy", choices=("refuse", "warn"), default=None,
+                      help="Original-checkout sanity preflight: refuse (default) or warn and continue")
     prep.add_argument("--new-generation", action="store_true", help="Supersede only a settled generation")
     end = sub.choices["finish"]
     finish_mode = end.add_mutually_exclusive_group(required=True)
