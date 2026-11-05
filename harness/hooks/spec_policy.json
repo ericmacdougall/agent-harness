@@ -22,5 +22,10 @@
   "close_reason_min_chars": 20,
   "upload_host_suffixes": [
     ".digitaloceanspaces.com"
-  ]
+  ],
+  "resource_budget_gate": "enforce",
+  "domain_gates": {
+    "mode": "warn",
+    "disabled": false
+  }
 }

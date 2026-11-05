@@ -17,39 +17,26 @@ from pathlib import Path
 HOOKS = Path(__file__).resolve().parent.parent / "harness" / "hooks"
 ALLOW = re.compile(r"#\s*input-ok:\s*\S")
 # file -> number of unannotated unbounded reads that existed before safe_input. Only ever decrease these.
-BASELINE = {"commit_policy.py": 7, "deliver.py": 2, "peer_review.py": 2, "spec_flow.py": 13, "wal.py": 1, "workdir.py": 4}
+BASELINE = {"commit_policy.py": 6, "deliver.py": 2, "peer_review.py": 2, "spec_flow.py": 3, "wal.py": 1, "workdir.py": 4}
 # Counts are the ratchet; this also pins each baselined call by its source line so swapping an old violation for a
 # new one fails. Delete a line from here when you migrate it (fill with `python3 tests/test_input_lint.py --pins`).
-PINS = {'commit_policy.py': ['_HOOK_STATE["raw"] = sys.stdin.buffer.read().decode("utf-8", errors="replace")',
-                      'message = Path(args.file).read_text(encoding="utf-8") if args.file else '
-                      'sys.stdin.read()',
-                      'message = Path(args.file).read_text(encoding="utf-8") if args.file else '
-                      'sys.stdin.read()',
+PINS = {'commit_policy.py': ['policy = json.load(handle)',
                       'message = normalize(Path(path).read_text(encoding="utf-8", errors="replace"), '
                       'strip_commen',
-                      'parts.append(path.read_text(encoding="utf-8", errors="replace"))',
-                      'policy = json.load(handle)',
+                      'message = Path(args.file).read_text(encoding="utf-8") if args.file else '
+                      'sys.stdin.read()',
+                      'message = Path(args.file).read_text(encoding="utf-8") if args.file else '
+                      'sys.stdin.read()',
                       'previous = Path(args.previous_file).read_text(encoding="utf-8") if args.previous_file '
-                      'else'],
+                      'else',
+                      '_HOOK_STATE["raw"] = sys.stdin.buffer.read().decode("utf-8", errors="replace")'],
  'deliver.py': ['and (hooks / name).read_bytes() == data for name, data in observed.items())',
                 'observed = {name: (hooks / name).read_bytes() for name in names}'],
  'peer_review.py': ["last_message = last.read_text(errors='replace') if last.exists() else ''",
                     'listed = set(boundary.read_text().split() if boundary.exists() else ())'],
- 'spec_flow.py': ['"spec_file_sha": sha256_bytes(spec_path.read_bytes()),',
-                  '("reviews", reviews_path(spec_path).name, "text/plain", '
-                  'reviews_path(spec_path).read_bytes',
-                  'code, text = plan_ticket_gate(Path(args.repo), '
-                  'Path(args.packet).read_text(encoding="utf-8',
-                  'data = json.loads(path.read_text(encoding="utf-8"))',
-                  'files = [("spec", spec_path.name, "text/markdown", spec_path.read_bytes()),',
-                  'payload = json.load(sys.stdin)',
-                  'policy = json.load(handle)',
-                  'text = Path(args.spec).read_text(encoding="utf-8")',
-                  'text = Path(args.spec).read_text(encoding="utf-8")',
+ 'spec_flow.py': ['policy = json.load(handle)',
                   'text = TEMPLATE_FILE.read_text(encoding="utf-8").format(',
-                  'text = spec_path.read_text(encoding="utf-8")',
-                  'text = spec_path.read_text(encoding="utf-8")',
-                  'text = spec_path.read_text(encoding="utf-8")'],
+                  'payload = json.load(sys.stdin)'],
  'wal.py': ['data = json.load(sys.stdin)'],
  'workdir.py': ['config = json.loads(path.read_text())',
                 'lines = handle.read().splitlines()',

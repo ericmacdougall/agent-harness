@@ -132,6 +132,10 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         if expected_head is None:
             expected_head = subprocess.run(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'],
                                            check=True, capture_output=True, text=True).stdout.strip()
+        if stage == 'plan':  # plan packets now need a resource budget; the fixture host is a vm so no live capacity is read
+            target = Path(packet or self.packet)
+            if target.exists() and '## Resource budget' not in target.read_text():
+                target.write_text(target.read_text() + '\n## Resource budget\nHost: vm:fixture\nCapacity: fixture VM, 8 GB memory, 4 cores, 50 GB disk\nFan-out: agents=1 jobs=1 processes=2 browser_pages=0 test_workers=1\nPeak memory: 1 GB (method: fixture)\nCPU: 1 cores (method: fixture)\nDisk: 1 GB (method: fixture)\nNetwork: 1 MB (method: fixture)\nWall time: 1 min\nCap and kill: none needed for a fixture; run_capped.py would pause on breach\nCheckpoint: none\n')
         command = [sys.executable, str(REVIEW), stage, '--repo', str(self.repo),
                                '--packet', str(packet or self.packet), '--output', str(output or self.output),
                                *(['--expected-head', expected_head] if stage in {'pr', 'code-inspection'} else []), *extra]
@@ -409,6 +413,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                     stack.enter_context(patch.dict(os.environ, {'AGENT_HARNESS_USAGE_DIR': str(self.root / ('usage-' + failure))}))
                     stack.enter_context(patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(output)]))
+                    stack.enter_context(patch.object(module, 'plan_resource_gate', return_value=(0, '')))
                     stack.enter_context(patch.object(module, 'make_snapshot', side_effect=snapshot))
                     model = stack.enter_context(patch.object(module, 'review_snapshot', side_effect=review))
                     stack.enter_context(patch.object(module.tempfile.TemporaryDirectory, 'cleanup', cleanup))
@@ -876,6 +881,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         errors = io.StringIO()
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
+             patch.object(module, 'plan_resource_gate', return_value=(0, '')), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'fsync', side_effect=fsync_then_mutate), \
              contextlib.redirect_stderr(errors):
@@ -907,6 +913,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         errors = io.StringIO()
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
+             patch.object(module, 'plan_resource_gate', return_value=(0, '')), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'link', side_effect=link_then_mutate), \
              contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):

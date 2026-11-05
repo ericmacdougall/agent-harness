@@ -542,6 +542,21 @@ class Wiring(unittest.TestCase):
             self.assertIn(tool, group["matcher"])
         self.assertIn("merge_gate.py", install.HOOKS)
 
+    def test_composition_with_main_hooks_keeps_every_gate_and_helper(self):
+        """After merging main: the merge gate coexists with the commit, heavy-job, agent and domain wiring."""
+        sys.path.insert(0, str(ROOT))
+        import install
+        import install_codex
+        claude = Path("/home/example/.claude")
+        text = json.dumps(install.managed_hooks(claude)["PreToolUse"])
+        for script in ("merge_gate.py", "commit_policy.py", "heavy_job_guard.py", "agent_gate.py"):
+            self.assertIn(script, text, script)
+        for name in ("merge_gate.py", "domain_gates.py", "heavy_job_guard.py", "agent_gate.py", "safe_input.py"):
+            self.assertIn(name, install.HOOKS, name)
+            self.assertTrue((ROOT / "harness" / "hooks" / name).is_file(), name)
+        for name in ("merge_gate.py", "domain_gates.py", "safe_input.py"):
+            self.assertIn(name, install_codex.DELIVERY_HELPERS, name)
+
     def test_install_codex(self):
         sys.path.insert(0, str(ROOT))
         import install_codex
