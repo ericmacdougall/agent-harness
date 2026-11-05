@@ -1,26 +1,26 @@
 {
-  "version": "v0.1.2",
+  "version": "v0.1.3",
   "repo": "ericmacdougall/netwatch",
   "assets": {
     "darwin_arm64": {
-      "sha256": "8b32bba4b0d2078325e4c23d640550be685c9f4eaba78f098055c45397cc4c36",
-      "binary_sha256": "ed039ac2de414ebe2810e89d747efdea911b50a90014c490e63cfead0695af62"
+      "sha256": "ecc936d9139a6209212b7095822a7b82763d7d4a344b94d0950e2db75d9980bc",
+      "binary_sha256": "64a9948917946d4cdef30c30756459f8283bda364b29405370ed989824e48f6f"
     },
     "darwin_amd64": {
-      "sha256": "f27db172b17f094fb0025f1dbac828c89f018f4528c9167f0b1414ddcce5aa6f",
-      "binary_sha256": "73574cced242184faaacfdd103e783371029cc952da72c5d3d7658ccec0a2703"
+      "sha256": "1a5270fa5e2a29bffb11ef25324baf58ebf07c6fe6c050f39ababeab2e4e63dc",
+      "binary_sha256": "19cbf23d56cd2fe3b0cfa29626660fb4ceacfca7cc2da900b9587f9be686b637"
     },
     "linux_amd64": {
-      "sha256": "46dda0682de01cc7cdb87dd6261a88e2587822f944b0a8da96f4e50b560e2358",
-      "binary_sha256": "eee26a0f51aeb0724ba19a46bc3997dd3e08b2fe0b79268c9a4d73d0a9b38be0"
+      "sha256": "bb188a8789ffafff9a6ba24d933d6d960b2f473e44a558b9b919c8772d962183",
+      "binary_sha256": "8d9104d16ee1d49a6aa606599b0dc79af526ea2ff754af91a1212bc2c2182c57"
     },
     "linux_arm64": {
-      "sha256": "bdaf0dd36645b5164ec9de1025241d2bf69cfa8c51e983091dc7cbea15f594f8",
-      "binary_sha256": "f4d8257b8804672b21b4a15e32fe84d7096bb777270592a995bb82653c10b55a"
+      "sha256": "67b425d0d1ea6582ab088722a8972457779d6deabbb6493dc9312d220b5abf57",
+      "binary_sha256": "e5af98fcdfe11c884d3758cb76aa27f9ca35ece82cfa2f68f8225d0c8bf78d3c"
     },
     "windows_amd64": {
-      "sha256": "d61c62ebe8b0ced0ac8198c31aee019017fe4eb14d40e4f1101633693973b4e7",
-      "binary_sha256": "6d158b728f5df8075e8514bfb2177e53acc1869858bc2eaab4e9ce33a1d7e5f7"
+      "sha256": "0c083b00609dbb0fa0bb96bcbcf9e68efd8ef24aea569f9234aae53b85008161",
+      "binary_sha256": "3e07d8c3f949e5a18c2b8708a305fcd0fde6cad6d2e015b7450887739c864403"
     }
   }
 }
