@@ -19,6 +19,7 @@ sys.path.insert(0, str(HOOKS))
 import commit_policy as cp  # noqa: E402
 import ticket_adapters  # noqa: E402
 
+os.environ["AGENT_HARNESS_POLICY_LOCAL"] = str(Path(__file__).resolve().parent / "data" / "policy_profile_fixture.json")  # hermetic profile (GoodQA #14538)
 POLICY = cp.load_policy()
 
 # Hermetic: no test may reach the real Secret Manager. A fake gcloud first on PATH fails and
@@ -277,7 +278,7 @@ class RemoteShell(unittest.TestCase):
     def test_ssh_remote_commands_are_analyzed(self):
         cases = {
             "ssh dev2 'cd ~/r && git commit -m wip'": "wip",
-            "ssh -o BatchMode=yes -p 22 eric@100.86.166.93 \"cd r && git commit -qam 'wip'\"": "wip",
+            "ssh -o BatchMode=yes -p 22 user@dev.example.invalid \"cd r && git commit -qam 'wip'\"": "wip",
             "ssh t2 'ssh dev2 \"git commit -m wip\"'": "wip",
             "ssh dev2 'bash -lc \"cd r && git commit -m wip\"'": "wip",
             "ssh dev2 bash -s <<'EOF'\ncd r && git commit -m wip\nEOF": "wip",
@@ -349,7 +350,7 @@ def git(*args, cwd, env=None):
 class Fixture(unittest.TestCase):
     """A temp HOME, global git config, and a repo with a tracked GitHub origin."""
 
-    ORIGIN = "https://github.com/ericmacdougall/demo.git"
+    ORIGIN = "https://github.com/example-org/demo.git"
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="cp-fixture-"))
@@ -501,13 +502,13 @@ class GitHubRoute(Fixture):
         self.assertIn("PR title/body", titled.stderr)
         bad = self.fake_gh([CHORE, "wip"])
         remote = self.run_cli("hook", stdin=self.payload(
-            "ssh dev2 'cd r && gh pr create -R ericmacdougall/demo --head feat/x --base main --draft'"),
+            "ssh dev2 'cd r && gh pr create -R example-org/demo --head feat/x --base main --draft'"),
             extra_env=bad)
         self.assertEqual(remote.returncode, 2, remote.stderr)
-        cli = self.run_cli("check-github", "--repo", "ericmacdougall/demo", "--base", "main", "--head", "feat/x",
+        cli = self.run_cli("check-github", "--repo", "example-org/demo", "--base", "main", "--head", "feat/x",
                            extra_env=bad)
         self.assertEqual(cli.returncode, 2, cli.stdout + cli.stderr)
-        fork = self.run_cli("check-github", "--repo", "ericmacdougall/demo", "--base", "main", "--head",
+        fork = self.run_cli("check-github", "--repo", "example-org/demo", "--base", "main", "--head",
                             "someone:feat/x", "--no-tickets", extra_env=bad)
         self.assertEqual(fork.returncode, 2, fork.stdout + fork.stderr)
         self.assertIn("main...someone:feat/x", (self.root / "gh-calls.txt").read_text())
@@ -832,11 +833,11 @@ class TicketVerification(Fixture):
     def test_unreachable_project_warns_with_logged_reason(self):
         self.out_of_scope_head()
         self.policy["ticket_systems"]["goodqa"].update(unreachable_projects=["eric-app"],
-                                                       unreachable_reason="member key reaches FrameBright only")
+                                                       unreachable_reason="member key reaches ExampleOrg only")
         report = self.check()
         self.check()  # a second gate run on the same head must not add a second ledger row
         self.assertEqual((report["status"], report["tickets"][0]["status"]), ("PASS", "OUT_OF_SCOPE"))
-        self.assertIn("FrameBright only", cp.format_report(report))
+        self.assertIn("ExampleOrg only", cp.format_report(report))
         ledger = self.home / ".agent-harness" / "commit-policy" / "warnings.jsonl"
         rows = [json.loads(line) for line in ledger.read_text().splitlines()]
         self.assertEqual([(r["kind"], r["ticket"], r["head"]) for r in rows],
@@ -886,8 +887,8 @@ class TicketVerification(Fixture):
 
     def secret_source(self, value):
         Path(self.policy["ticket_systems"]["goodqa"]["key_file"]).unlink()
-        self.policy["ticket_systems"]["goodqa"]["key_secret"] = {"name": "goodqa-api-key-framebright",
-                                                                  "project": "goodqa-28dd3"}
+        self.policy["ticket_systems"]["goodqa"]["key_secret"] = {"name": "goodqa-api-key-example",
+                                                                  "project": "example-gcp-project"}
         if value is None:
             os.environ.pop("GCLOUD_FAKE_KEY", None)
         else:
@@ -902,7 +903,7 @@ class TicketVerification(Fixture):
         report = self.check()
         self.assertEqual((report["status"], report["tickets"][0]["status"]), ("PASS", "UPDATED"))
         calls = GCLOUD_LOG.read_text()
-        self.assertIn("secrets versions access latest --secret=goodqa-api-key-framebright --project=goodqa-28dd3",
+        self.assertIn("secrets versions access latest --secret=goodqa-api-key-example --project=example-gcp-project",
                       calls)
         self.assertNotIn("test-key", calls, "the secret value never appears in argv")
         self.assertEqual(sorted(str(path) for path in self.home.rglob("*")), before, "nothing cached on disk")

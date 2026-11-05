@@ -1,0 +1,10 @@
+{
+  "_comment": "Copy to spec_policy.local.json beside spec_policy.json (untracked; never overwritten by the installer). Sets only projects and enforced_projects.",
+  "projects": {
+    "my-project": {
+      "project_id": "00000000-0000-4000-8000-000000000000",
+      "org_id": "00000000-0000-4000-8000-000000000000"
+    }
+  },
+  "enforced_projects": []
+}

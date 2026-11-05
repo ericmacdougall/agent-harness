@@ -28,6 +28,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import safe_input
 import ticket_adapters as ta
 
 HERE = Path(__file__).resolve().parent
@@ -66,9 +67,27 @@ class SpecError(Exception):
 
 # --------------------------------------------------------------------------- configuration
 
+SPEC_LOCAL_KEYS = ("projects", "enforced_projects")
+
+
 def load_spec_policy(path: Path = POLICY_FILE) -> dict:
+    """The shipped policy is generic. Personal values (your GoodQA projects, which projects are enforced)
+    live in the untracked spec_policy.local.json beside it, which may set only SPEC_LOCAL_KEYS. A profile
+    that exists but cannot be read fails closed (ValueError)."""
     with open(path, encoding="utf-8") as handle:
         policy = json.load(handle)
+    local = Path(path).with_name("spec_policy.local.json")
+    if local.is_file():
+        try:
+            overlay = safe_input.safe_json_loads(safe_input.read_bounded(local, 1 << 20))
+        except (OSError, ValueError, safe_input.InputRejected) as error:
+            raise ValueError(f"{local} is not a readable JSON object: {error}") from error
+        if not isinstance(overlay, dict):
+            raise ValueError(f"{local} is not a JSON object")
+        forbidden = sorted(k for k in overlay if k not in SPEC_LOCAL_KEYS and not k.startswith("_"))
+        if forbidden:
+            raise ValueError(f"{local} may only set {list(SPEC_LOCAL_KEYS)}, not {forbidden}")
+        policy = {**policy, **{k: v for k, v in overlay.items() if k in SPEC_LOCAL_KEYS}}
     if not isinstance(policy, dict) or policy.get("schema") != 1:
         raise ValueError(f"{path} is not a schema 1 spec policy")
     for key in ("mode", "plan_ticket_gate"):

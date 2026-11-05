@@ -73,11 +73,11 @@ Recommendation: `stop_lint` ships and stays `warn`. Enforcement needs a calibrat
 
 ```json
 "PreToolUse": [ { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "python3",
-    "args": ["/Users/eric/.claude/hooks/provenance_hooks.py", "ask-gate"], "timeout": 10 } ] } ],
+    "args": ["/Users/you/.claude/hooks/provenance_hooks.py", "ask-gate"], "timeout": 10 } ] } ],
 "Stop": [ { "hooks": [ { "type": "command", "command": "python3",
-    "args": ["/Users/eric/.claude/hooks/provenance_hooks.py", "stop-lint"], "timeout": 10 } ] } ],
+    "args": ["/Users/you/.claude/hooks/provenance_hooks.py", "stop-lint"], "timeout": 10 } ] } ],
 "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "python3",
-    "args": ["/Users/eric/.claude/hooks/provenance_hooks.py", "prompt"], "timeout": 10 } ] } ]
+    "args": ["/Users/you/.claude/hooks/provenance_hooks.py", "prompt"], "timeout": 10 } ] } ]
 ```
 
 `install.py` registers these three entries on every install (replacing an earlier registration of the same script, so a re-install neither drops nor duplicates them). `python3 install.py --apply --no-provenance-hooks` unregisters them and leaves the files installed; the next plain install registers them again. Modes still come from `provenance_policy.json`. Typical cost on a 75 MB transcript: `stop-lint` about 30 ms, `ask-gate` about 60 ms (interpreter start is about 24 ms of each).

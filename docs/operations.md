@@ -261,13 +261,13 @@ Co-Authored-By: ...
    - **Results.** Neither failure creates delivery state.
      - `BLOCKED_COMMIT_POLICY` (exit 2) lists each failing commit and stale ticket, with the fix.
      - `TICKETS_UNVERIFIED` (exit 6) means GoodQA was unreachable or answered unexpectedly. The check fails closed.
-   - **Projects the credential cannot see.** The member key reaches the FrameBright org only (`org_id` is pinned to it), so GoodQA answers `project_not_found` for Eric-org refs such as `GoodQA solve#7`.
+   - **Projects the credential cannot see.** The key reaches one GoodQA org only (`org_id` is pinned to it), so GoodQA answers `project_not_found` for refs in other orgs such as `GoodQA solve#7`.
      - Only projects listed in `ticket_systems.goodqa.unreachable_projects` (shipped: `solve`, `ai-course`, `harness`) are reported as `OUT_OF_SCOPE`. The ref still has to be well formed. The range passes with a warning naming `unreachable_reason`. `deliver.py prepare` and the PR-review gate print it; the `gh pr create` hook passes silently. Each warning is recorded once per ticket and head in `~/.agent-harness/commit-policy/warnings.jsonl`. finish skips the ticket's comment and lists it as not verified on the other tickets' comments.
-     - Any other `project_not_found` fails closed as `TICKETS_UNVERIFIED`. That covers a typo, an invented slug, an Eric-org project not yet listed, and the default project `goodqa`, which is never treated as out of scope. A missing ticket in a project the key can see is still `MISSING` and blocks.
+     - Any other `project_not_found` fails closed as `TICKETS_UNVERIFIED`. That covers a typo, an invented slug, another org's project not yet listed, and the default project `goodqa`, which is never treated as out of scope. A missing ticket in a project the key can see is still `MISSING` and blocks.
      - Adding a confirmed slug is a config change. Empty the list once durable cross-org access lands.
    - Local-only delivery verifies tickets too.
    - **Credentials.** The member key file `~/.claude/goodqa-hive/member.key` (mode 600) is used first and keeps full access: verification, plus the finish and `notify` comments. Never copy it to another host.
-     - A host without that file (dev2) reads `key_secret` (Secret Manager `goodqa-api-key-framebright` in project `goodqa-28dd3`) in-process through `gcloud secrets versions access`. The value is never passed in argv or the environment, and never written to disk.
+     - A host without that file (dev2) reads `key_secret` (a Secret Manager secret named in your local profile) in-process through `gcloud secrets versions access`. The value is never passed in argv or the environment, and never written to disk.
      - That credential is **read-only** in code: only `list_orgs`, `list_projects`, `get_issue_by_number` and `get_issue_comments` are allowed. Any write (a comment, a status change) is refused before a request is sent. On dev2, `prepare` and PR review therefore verify tickets, but finish's ticket comment stays pending (exit 5). Post it from the Mac with the printed `notify` command.
      - If gcloud cannot read the secret, verification fails closed (`TICKETS_UNVERIFIED`).
    - **Project-qualified refs.** `GoodQA #N` means the default project `goodqa`. Tickets in another project need its slug, for example `GoodQA work-tracker-automatic#35633`. A `MISSING` result says so.
@@ -449,7 +449,7 @@ When a repo shows blockchain work, the spec flow and the reviewers get a data-dr
 ### Credentials and rollout
 
 - **Keys and routing.** A GoodQA key is bound to one organization. `spec_policy.json` `projects` maps a project slug to its `project_id` and `org_id`, and to `key_file` when it needs a different key. `doctor --project <slug>` checks that the routed key can create attachments, comment and transition in that project.
-  - `member.key` reaches FrameBright, including the `work-tracker-automatic` tracker.
+  - `member.key` reaches one org, including the `work-tracker-automatic` tracker.
   - The Harness project lives in org Eric, and no key file reaches it yet.
 - **Shipped mode:** `mode: warn`, `plan_ticket_gate: warn`, `enforced_projects: []`. No project is enforced in this release.
 - **Before enforcing any project:** resolve the remaining items in GoodQA work-tracker-automatic#35672 (per-project plan ticket gate, a policy for tickets opened before enforcement, bulk timing with several routed keys). `doctor` reports the permissions GoodQA lists for the key; it does not try a write. Re-run it after any key or membership change.
