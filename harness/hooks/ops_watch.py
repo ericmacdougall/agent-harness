@@ -113,7 +113,7 @@ def load_config(home: Path, host: str | None = None, overrides: dict | None = No
     layers = []
     path = home / ".agent-harness" / "ops-watch.json"
     if overrides is None and path.is_file():
-        layers.append(json.loads(path.read_text()))
+        layers.append(json.loads(read_text_capped(path)))
     if overrides:
         layers.append(overrides)
     for layer in layers:
@@ -181,6 +181,12 @@ def safe_read(path: Path, limit: int) -> bytes:
         return os.pread(fd, limit, 0)
     finally:
         os.close(fd)
+
+
+def read_text_capped(path, limit: int = 4 * 1024 * 1024) -> str:
+    """safe_read as text. Local rather than safe_input.py because the watcher runs alone on hosts without the
+    harness hooks. A file over the cap is cut, so JSON callers see a parse error, as for any malformed file."""
+    return safe_read(Path(path), limit).decode("utf-8", "replace")
 
 
 def encode_slot(event: dict) -> bytes:
@@ -568,9 +574,9 @@ def check_units(cfg, state, runner, now):
 def _crash_item(path: Path):
     if path.stat().st_size > 8 * 1024 * 1024:
         return None
-    with open(path, encoding="utf-8", errors="replace") as f:
-        header = json.loads(f.readline() or "{}")
-        body = json.loads(f.read() or "{}")
+    first, _, rest = read_text_capped(path, 8 * 1024 * 1024).partition("\n")
+    header = json.loads(first or "{}")
+    body = json.loads(rest or "{}")
     if not isinstance(body, dict) or not ("exception" in body or "termination" in body):
         return None
     proc = str(body.get("procName") or header.get("app_name") or "?")[:64]
@@ -848,7 +854,7 @@ def memory_alerts(runner, p: dict) -> list:
                              {"level": int(level)}))
     else:
         try:
-            info = dict(line.split(":", 1) for line in Path(p.get("meminfo", "/proc/meminfo")).read_text().splitlines()
+            info = dict(line.split(":", 1) for line in read_text_capped(p.get("meminfo", "/proc/meminfo"), 65536).splitlines()
                         if ":" in line)
             total = int(info["SwapTotal"].split()[0]) / 1024
             used = total - int(info["SwapFree"].split()[0]) / 1024
@@ -962,7 +968,7 @@ def check_drift(cfg, runner):
         raise RuntimeError("git show HARNESS.md failed")
     cm = claude / "CLAUDE.md"
     if cm.is_file():
-        block = managed_block(cm.read_text(errors="replace"))
+        block = managed_block(read_text_capped(cm))
         if block is None:
             out.append(alert("drift", "drift:claude-md", "warning", "CLAUDE.md has no single Agent Harness managed block",
                              {"path": str(cm)}))
@@ -986,7 +992,7 @@ def check_drift(cfg, runner):
             if name.endswith(".py"):
                 missing.append(name)
             continue
-        if git_blob_sha(installed.read_bytes()) != parts[2]:
+        if git_blob_sha(safe_read(installed, 16 * 1024 * 1024)) != parts[2]:
             differ.append(name)
     if differ or missing:
         out.append(alert("drift", "drift:hooks", "warning",
@@ -1020,7 +1026,7 @@ def codex_hook_hash(label: str, matcher, handler: dict) -> str:
 
 
 def codex_expected_trust(hooks_path: Path) -> dict:
-    data = json.loads(Path(hooks_path).read_text())
+    data = json.loads(read_text_capped(hooks_path))
     out = {}
     for event, groups in (data.get("hooks") or {}).items():
         label = snake(event)
@@ -1041,7 +1047,7 @@ def check_codex_trust(cfg):
     if not hooks.is_file():
         return []
     expected = codex_expected_trust(hooks)
-    trusted = dict(TRUST_RE.findall(conf.read_text(errors="replace"))) if conf.is_file() else {}
+    trusted = dict(TRUST_RE.findall(read_text_capped(conf))) if conf.is_file() else {}
     prefix = f"{hooks}:"
     untrusted = sorted(k[len(prefix):] for k in expected if k not in trusted)
     changed = sorted(k[len(prefix):] for k, v in expected.items() if k in trusted and trusted[k] != v)
