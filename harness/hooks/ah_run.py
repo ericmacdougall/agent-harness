@@ -40,7 +40,7 @@ def host_identity():
 
 def pid_exists(pid):
     if hasattr(usage_guard, 'pid_exists'):
-        return pid_exists(pid)
+        return usage_guard.pid_exists(pid)
     if type(pid) is not int or pid <= 0 or pid > 2 ** 31 - 1:
         return None
     try:
@@ -55,7 +55,7 @@ def pid_exists(pid):
 
 def process_start_token(pid):
     if hasattr(usage_guard, 'process_start_token'):
-        return process_start_token(pid)
+        return usage_guard.process_start_token(pid)
     try:
         after = Path('/proc/%d/stat' % pid).read_text().rsplit(')', 1)[1].split()  # input-ok: one-line kernel file
         return 'proc:' + after[19]
