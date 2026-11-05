@@ -37,6 +37,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     # Spec flow commands work by hand in Codex; its done hook is Claude Code only.
                     'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
                     'provenance_hooks.py', 'safe_input.py', 'domain_gates.py', 'domain_checklists.json',
+                    'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
                     'command_guard.py', 'command_guard_hook.py', 'redact.py', 'merge_gate.py')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key

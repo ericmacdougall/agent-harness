@@ -28,7 +28,8 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "heavy_job_guard.py", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "ops_watch.py", "resource_limits.json",
          "domain_gates.py", "domain_checklists.json",
          "command_guard.py", "command_guard_hook.py", "redact.py",
-         "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py")
+         "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py",
+         "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -46,7 +47,7 @@ class DirectoryPublicationError(OSError):
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
-                         "command_guard_hook.py", "merge_gate.py")}
+                         "command_guard_hook.py", "tier_gate.py", "merge_gate.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -107,20 +108,36 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             hook["onFailure"] = "block"
         return hook
 
+    # Model ladder (goodqa#14527): rung enforcement on spawns, launch lines and the live-agent cap.
+    # Fails open on its own errors (an unreadable tier table denies from inside the hook), so no onFailure.
+    def ladder(action: str, fail_closed: bool = False) -> dict:
+        hook = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "tier_gate.py"), action],
+                "timeout": 10}
+        if fail_closed:
+            hook["onFailure"] = "block"
+        return hook
+
     managed = {
         "SessionStart": [{"hooks": [command("session")]}],
         "UserPromptSubmit": [{"hooks": [command("prompt", True)]}],
         "SubagentStart": [{
             "matcher": SUBAGENT_MATCHER,
             "hooks": [command("subagent")],
+        }, {
+            "hooks": [ladder("start")],
         }],
         "SubagentStop": [{
             "matcher": SUBAGENT_MATCHER,
             "hooks": [command("subagent_stop")],
+        }, {
+            "hooks": [ladder("stop")],
         }],
         "PreToolUse": [{
             "matcher": "Agent|Task|Workflow|Bash|PowerShell|Write|Edit|MultiEdit|NotebookEdit",
             "hooks": [command("pretool", True), merge_gate_hook(claude)],
+        }, {
+            "matcher": "Agent|Task|Workflow|Bash",
+            "hooks": [ladder("hook", True)],
         }, {
             # Commit message policy: validates git commit / gh pr merge --squash before they run.
             "matcher": "Bash",
