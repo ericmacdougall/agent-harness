@@ -447,3 +447,25 @@ func readSmallFile(path string, env Env) ([]byte, error) {
 	}
 	return os.ReadFile(path)
 }
+
+// cmdUnbind forgets the GoodQA binding (and a pinned key) so the ledger can be imported afresh. The caller
+// must type the ledger's slug: it is a deliberate act, not something to run by accident.
+func cmdUnbind(args []string, env Env) error {
+	p, err := parseArgs(args, merge(spec{"confirm": true}))
+	if err != nil {
+		return err
+	}
+	l, err := open(p, env)
+	if err != nil {
+		return err
+	}
+	defer l.Close()
+	if p.get("confirm") != l.Slug {
+		return refusedf("unbind forgets the GoodQA binding and any pinned key; confirm with --confirm %s", l.Slug)
+	}
+	if err := l.Unbind(); err != nil {
+		return err
+	}
+	emit(env, p.has("json"), op.Obj{{K: "unbound", V: true}}, fmt.Sprintf("ledger %s is no longer bound to GoodQA\n", l.Slug))
+	return nil
+}

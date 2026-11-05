@@ -68,7 +68,7 @@ func (w *world) adoptToken(dir string) string {
 	// The user supplies the slug (here: read from the remote's root, as a person would from the project's
 	// README); adopt takes it from repository config, never from the writer.
 	if slug := remoteSlug(w, dir); slug != "" {
-		w.git(dir, "config", "harness.ledgerslug", slug)
+		w.git(dir, "config", "--global", "harness.ledgerslug", slug)
 	}
 	r := w.run(dir, nil, "tickets", "travel", "fetch", "--adopt", "--remote", "origin")
 	m := tokenRe.FindStringSubmatch(r.stderr + r.stdout)

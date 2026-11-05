@@ -500,10 +500,10 @@ func TravelAdopt(loc Location, remote, token, slugArg string, useCredentials boo
 	// remote's root op is only a cross-check that must agree.
 	slug := slugArg
 	if slug == "" {
-		slug = repo.ConfigGet("harness.ledgerslug")
+		slug = userGlobalConfig("harness.ledgerslug") // the user's own config, never the repository's (a clone could set it)
 	}
 	if !op.ValidSlug(slug) {
-		return nil, nil, wrap(ErrUsage, "adopt needs the project slug from you: pass --slug S or set `git config harness.ledgerslug S` (it is checked against the remote's root, never taken from it)")
+		return nil, nil, wrap(ErrUsage, "adopt needs the project slug from you: pass --slug S or set `git config --global harness.ledgerslug S` (it is checked against the remote's root, never taken from it)")
 	}
 	home, err := LedgersHome()
 	if err != nil {
@@ -676,4 +676,31 @@ func (l *Ledger) helpersFor(c *TravelConfig) []string {
 		return UserCredentialHelpers()
 	}
 	return nil
+}
+
+// userGlobalConfig reads one key from the user's global git configuration ("" if unset).
+func userGlobalConfig(key string) string {
+	h, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	res, err := proc.Run([]string{"git", "config", "--global", "--get", key},
+		proc.Options{Env: []string{"HOME=" + h, "PATH=" + os.Getenv("PATH"), "GIT_CONFIG_NOSYSTEM=1", "LC_ALL=C"}, Timeout: 5 * time.Second})
+	if err != nil || res.Code != 0 {
+		return ""
+	}
+	return strings.TrimSpace(string(res.Stdout))
+}
+
+// Unbind removes this HOME's GoodQA binding, including a pinned key (a lost or rotated key, or a ledger that
+// is to be imported afresh). The ledger itself is untouched; the next sync-state says local-only.
+func (l *Ledger) Unbind() error {
+	return l.Locked(func() error {
+		d, err := l.homeDir(false)
+		if err != nil {
+			return nil
+		}
+		defer d.Close()
+		return d.Remove(syncFile)
+	})
 }

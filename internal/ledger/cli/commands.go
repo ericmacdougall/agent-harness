@@ -31,6 +31,7 @@ const Usage = `usage: harness tickets <command> [options]
   export [--format md|json|goodqa-import] [--out PATH] [--since-bound] [--redact-secrets]
   sync-state
   bind --project UUID --receipt FILE [--goodqa-key FILE]
+  unbind --confirm SLUG
   trust-writer w_... --reviewed DIGEST
   block-writer w_...
   travel enable --remote NAME [--yes-share TOKEN] [--use-git-credentials] | status | push | fetch [--adopt --remote NAME --yes-share TOKEN --slug S]
@@ -150,6 +151,8 @@ func run(cmd string, args []string, env Env) error {
 		return cmdBind(args, env)
 	case "trust-writer":
 		return cmdTrustWriter(args, env)
+	case "unbind":
+		return cmdUnbind(args, env)
 	case "block-writer":
 		return cmdBlockWriter(args, env)
 	case "travel":

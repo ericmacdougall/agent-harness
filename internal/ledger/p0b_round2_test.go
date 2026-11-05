@@ -566,3 +566,65 @@ func TestReceiptCanonicalBytesArePinned(t *testing.T) {
 		t.Fatalf("canonical bytes changed:\n%s\n%s", got, want)
 	}
 }
+
+// A repository's own config cannot supply the adopt slug (a copied .git could plant a matching one).
+func TestAdoptIgnoresRepositoryLocalSlugConfig(t *testing.T) {
+	p := newPair(t)
+	a, b := p.a, p.b
+	a.ok(a.repo, nil, "init", "--slug", "localcfg")
+	a.newTicket(a.repo, nil, "alpha")
+	a.enable(a.repo)
+	a.ok(a.repo, nil, "travel", "push")
+	tok := b.adoptTokenNoSlug(b.repo)
+	b.git(b.repo, "config", "--local", "harness.ledgerslug", "localcfg")
+	if r := b.run(b.repo, nil, "tickets", "travel", "fetch", "--adopt", "--remote", "origin", "--yes-share", tok); r.code == 0 {
+		t.Fatalf("a repository-local slug config was honoured")
+	}
+	b.git(b.repo, "config", "--global", "harness.ledgerslug", "localcfg")
+	b.ok(b.repo, nil, "travel", "fetch", "--adopt", "--remote", "origin", "--yes-share", tok)
+}
+
+// A lost or rotated key is not a dead end: unbind (typed slug) forgets the binding and the pinned key.
+func TestUnbindReleasesAPinnedKey(t *testing.T) {
+	seed := make([]byte, ed25519.SeedSize)
+	for i := range seed {
+		seed[i] = byte(i + 7)
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	w := newWorld(t)
+	w.ok(w.repo, nil, "init", "--slug", "rot")
+	w.newTicket(w.repo, nil, "alpha")
+	key := filepath.Join(w.home, "k.pub")
+	os.WriteFile(key, []byte(hex.EncodeToString(priv.Public().(ed25519.PublicKey))), 0o600)
+	_, doc := w.exportDoc(w.repo, nil)
+	bindSigned := func(d map[string]any, k ed25519.PrivateKey, keyFile string) result {
+		p := receiptFor(t, d, nil)
+		raw, _ := os.ReadFile(p)
+		var rd ledger.ReceiptDoc
+		json.Unmarshal(raw, &rd)
+		env, _ := rd.Sign(k)
+		b, _ := json.Marshal(env)
+		os.WriteFile(p, b, 0o600)
+		return w.run(w.repo, nil, "tickets", "bind", "--project", goodqaUUID, "--receipt", p, "--goodqa-key", keyFile, "--json")
+	}
+	if r := bindSigned(doc, priv, key); r.code != 0 {
+		t.Fatalf("%s", r.stderr)
+	}
+	if r := w.run(w.repo, nil, "tickets", "unbind"); r.code == 0 {
+		t.Fatalf("unbind ran without the typed slug")
+	}
+	if r := w.run(w.repo, nil, "tickets", "unbind", "--confirm", "wrong"); r.code == 0 {
+		t.Fatalf("unbind accepted the wrong slug")
+	}
+	w.ok(w.repo, nil, "unbind", "--confirm", "rot")
+	if st := w.syncState(w.repo, nil); st["state"] != "local-only" || st["authenticated"] != false {
+		t.Fatalf("after unbind: %v", st)
+	}
+	// A new key can now be pinned with a fresh full import.
+	rot := ed25519.NewKeyFromSeed(append([]byte{1}, seed[1:]...))
+	key2 := filepath.Join(w.home, "k2.pub")
+	os.WriteFile(key2, []byte(hex.EncodeToString(rot.Public().(ed25519.PublicKey))), 0o600)
+	if r := bindSigned(doc, rot, key2); r.code != 0 {
+		t.Fatalf("a rotated key could not be pinned after unbind: %s", r.stderr)
+	}
+}

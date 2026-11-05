@@ -210,7 +210,8 @@ and offset only) unless `--redact-secrets` masks it and drops the raw ops.
 (`~/.agent-harness/ledgers/<proj>/sync.json`, never in the git dir, so a copied repository is never `synced`). `bind`
 rebuilds the document for the receipt's frontier and accepts the receipt only if the digests match. The receipt is
 advisory: its digest is public. With `bind --goodqa-key FILE` the user pins GoodQA's ed25519 public key; from then on only a receipt in
-GoodQA's signed envelope binds (see the contract), and `sync-state --json` reports `authenticated: true`.
+GoodQA's signed envelope binds (see the contract), and `sync-state --json` reports `authenticated: true`. A signed receipt carries no instance or expiry, so one pinned key means one GoodQA.
+`harness tickets unbind --confirm SLUG` forgets the binding and the pinned key (a lost or rotated key) so the ledger can be imported afresh.
 
 ### Git transport (`travel`)
 
@@ -234,7 +235,7 @@ GoodQA's signed envelope binds (see the contract), and `sync-state --json` repor
   directory under `~/.agent-harness/ledgers/<proj>/` (stopped past 64 MiB or 120 s; stale ones are removed), validates
   each with the bounded reader, and only then pushes it into the repository as a plain fast-forward, never over an own
   ref. A rewritten history stays rejected. `travel fetch --adopt --remote NAME --slug S` lets a second machine create its ledger
-  from a remote's (exactly one project). The slug comes from you (`--slug`, or `git config harness.ledgerslug S`), never from the
+  from a remote's (exactly one project). The slug comes from you (`--slug`, or `git config --global harness.ledgerslug S`; a repository's own config is ignored), never from the
   writer: the remote's root must carry the same slug and all fetched roots must agree. At most 64 unverified writers are kept
   (the root holder first, then others; known writers update freely), and blocked writers are never read.
 - **Trust.** Fetched writers are `unverified`: excluded from every view, export and the commit policy.

@@ -66,7 +66,7 @@ The user pins GoodQA's public key (32 raw bytes as hex, base64 or PEM SPKI) with
 Once pinned, a bare receipt, a different `key_id` or a bad signature is refused and `sync-state --json` reports
 `authenticated: true`; an unpinned ledger stays advisory. Fixture: `testdata/ledger-import/receipt.signed.json` with the
 test-only key `goodqa-test.pub` (a fixed public seed, never a real key). The signing key is a GoodQA server secret and the
-public key is published by GoodQA; rotation publishes a new key and the user pins it with a new full import.
+public key is published by GoodQA; rotation publishes a new key and the user runs `harness tickets unbind --confirm SLUG` and pins it with a new full import. The envelope carries no instance or expiry: one pinned key means one GoodQA.
 
 ## Endpoints
 
