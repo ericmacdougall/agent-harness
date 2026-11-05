@@ -63,7 +63,7 @@ MAX_SEGMENT_WORDS = 8192  # words in one shell command; bounds the quadratic wra
 MAX_NESTED_SECONDS = 0.4  # wall-clock budget per decision for nested scans and uncertain-wrapper probes
 MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enforce",
-                 "build": "enforce", "media": "warn", "fan-out": "warn", "oversize": "enforce"}
+                 "build": "enforce", "media": "warn", "fan-out": "warn", "oversize": "enforce", "copy": "enforce"}
 CAPPED_RULES = {"browser", "media", "fan-out"}  # memory hogs: hatch alone is not enough
 NEVER_BLOCK = {"adversarial"}  # red-team/fuzz work is legitimate: advise (dev2, group cleanup), never deny
 HATCH = "HARNESS_LOCAL_OK"
@@ -76,6 +76,7 @@ RULE_HELP = {
     "build": "a production build is CPU/memory heavy",
     "media": "large media work (ffmpeg/whisper) is CPU/memory heavy",
     "fan-out": "parallel fan-out multiplies memory use",
+    "copy": "a large copy, clone or worktree fills the Mac disk (it sits near full; work/pp407 grew 9 GB/h this way)",
     "oversize": "the guard cannot scan this whole command, so a heavy job could hide in the part it skips; "
                 "write it to a script file and run that (HARNESS_LOCAL_OK does not override this rule)",
 }
@@ -270,6 +271,289 @@ def positional(args, value_flags=()):
         elif not token.startswith("-"):
             out.append(token)
     return out
+
+
+# ---------------------------------------------------------------- large copies (P12 / goodqa#14817)
+# 2026-11-05: work/pp407 grew ~9 GB/h on the Mac from cp, tar, rsync, git clone and worktree review trees (one release
+# clone was 6.7 GB) with the disk at 94%. A copy is classified by ESTIMATED size, never by command name alone:
+# a bounded walk of the local source, `ssh host du` for a remote source, the GitHub repo size for a clone. At or above
+# the threshold (default 1 GiB, HARNESS_COPY_GIB) it is routed to dev2/T2. A source that cannot be measured inside
+# its time bound counts as heavy (unknown = heavy on an interactive host), except a shallow/filtered clone.
+
+GIB = 1024 ** 3
+COPY_WALK_SECONDS = 1.0
+COPY_WALK_ENTRIES = 300_000
+REMOTE_SPEC = re.compile(r"^(?:[\w.+-]+@)?(?:\[[0-9a-fA-F:]+\]|[\w.-]+):(?!//)")
+GITHUB_URL = re.compile(r"(?:github\.com[:/])([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
+GH_SLUG = re.compile(r"^([\w.-]+)/([\w.-]+)$")
+COMPRESSED = re.compile(r"\.(?:t?gz|bz2|tbz2?|xz|txz|zst|lz4|lzma|z)$", re.I)
+
+
+def copy_threshold_bytes() -> int:
+    value = 1.0
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
+        if os.path.exists(path):
+            value = float(load_json_file(path).get("copy_gib", value))
+    except Exception:
+        pass
+    env = os.environ.get("HARNESS_COPY_GIB", "")
+    if re.fullmatch(r"[0-9]{1,4}(?:\.[0-9]{1,3})?", env):
+        value = float(env)
+    return int(max(value, 0.001) * GIB)
+
+
+def path_size(path: str, cap: int = None, seconds: float = COPY_WALK_SECONDS):
+    """(bytes on disk, complete). Symlinks are not followed, hard links count once, the walk stops at `cap` bytes
+    (a known lower bound is enough to call a copy heavy) or at the time/entry bound (complete=False)."""
+    deadline = time.monotonic() + seconds
+    total, seen, entries, stack = 0, set(), 0, [path]
+    while stack:
+        current = stack.pop()
+        try:
+            st = os.lstat(current)
+        except OSError:
+            continue
+        entries += 1
+        if stat.S_ISDIR(st.st_mode):
+            if entries > COPY_WALK_ENTRIES or time.monotonic() > deadline:
+                return total, False
+            try:
+                with os.scandir(current) as it:
+                    stack.extend(e.path for e in it)
+            except OSError:
+                pass
+            continue
+        if st.st_nlink > 1:
+            if (st.st_dev, st.st_ino) in seen:
+                continue
+            seen.add((st.st_dev, st.st_ino))
+        total += getattr(st, "st_blocks", 0) * 512 or st.st_size
+        if cap is not None and total >= cap:
+            return total, True
+        if entries > COPY_WALK_ENTRIES or time.monotonic() > deadline:
+            return total, False
+    return total, True
+
+
+def remote_path_size(spec: str):
+    """Bytes of host:path via a read-only `ssh host du -sk`, bounded to 4 s; None when it cannot be measured."""
+    import subprocess
+    host, _, remote = spec.partition(":")
+    if not remote or remote.startswith("-"):
+        return None
+    try:
+        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2", "--", host, "du", "-sk", "--", remote],
+                             capture_output=True, text=True, timeout=4).stdout
+        first = out.split("\t", 1)[0].strip()
+        return int(first) * 1024 if first.isdigit() else None
+    except Exception:
+        return None
+
+
+def github_repo_bytes(owner: str, repo: str):
+    """GitHub's reported repository size (KiB -> bytes), cached 24 h; None when unknown (offline, no auth)."""
+    import json
+    import subprocess
+    key = f"{owner}/{repo}".lower()
+    cache_path = os.path.join(state_dir(), "repo-size-cache.json")
+    cache = {}
+    try:
+        cache = load_json_file(cache_path, 1024 * 1024)
+        hit = cache.get(key)
+        if isinstance(hit, dict) and time.time() - float(hit.get("at", 0)) < 86400:
+            return int(hit["bytes"])
+    except Exception:
+        cache = {}
+    try:
+        out = subprocess.run(["gh", "api", f"repos/{owner}/{repo}", "--jq", ".size"], capture_output=True, text=True,
+                             timeout=2.5).stdout.strip()
+        if not out.isdigit():
+            return None
+        size = int(out) * 1024
+        cache[key] = {"bytes": size, "at": time.time()}
+        os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+        tmp = f"{cache_path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as handle:
+            json.dump(dict(list(cache.items())[-500:]), handle)
+        os.replace(tmp, cache_path)
+        return size
+    except Exception:
+        return None
+
+
+def tracked_tree_bytes(repo_dir: str):
+    """Sum of blob sizes at HEAD (what `git worktree add` checks out); None if git cannot say within 2 s."""
+    import subprocess
+    try:
+        env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+        out = subprocess.run(["git", "-C", repo_dir, "ls-tree", "-r", "-l", "HEAD"], capture_output=True, text=True,
+                             timeout=2, env=env).stdout
+        total = 0
+        for line in out.splitlines():
+            meta = line.split("\t", 1)[0].split()
+            if len(meta) == 4 and meta[3].isdigit():
+                total += int(meta[3])
+        return total
+    except Exception:
+        return None
+
+
+def fmt_gib(n: float) -> str:
+    return f"{n / GIB:.1f} GiB"
+
+
+def sum_sources(sources, ctx, thr):
+    """(bytes, unmeasured_detail) over local and host:path sources, stopping once the threshold is reached."""
+    import glob as globmod
+    total = 0
+    for src in sources:
+        if REMOTE_SPEC.match(src) and not src.startswith(("/", ".", "~")):
+            size = remote_path_size(src)
+            if size is None:
+                return total, f"cannot measure {src.split(':')[0]}:... within the time bound"
+            total += size
+        else:
+            path = resolve(os.path.expanduser(src), ctx.cwd)
+            paths = globmod.glob(path)[:500] if any(c in path for c in "*?[") else [path]
+            for one in paths:
+                size, complete = path_size(one, cap=thr - total)
+                total += size
+                if total >= thr:
+                    return total, None
+                if not complete:
+                    return total, f"{os.path.basename(one) or one} is too large to measure within {COPY_WALK_SECONDS:g}s"
+        if total >= thr:
+            return total, None
+    return total, None
+
+
+def finish_copy(label, total, unknown, thr, extra=""):
+    if total >= thr:
+        return ("copy", f"{label} copies at least {fmt_gib(total)} onto this Mac (limit {fmt_gib(thr)}){extra}")
+    if unknown:
+        return ("copy", f"{label}: {unknown} (unknown size counts as heavy; limit {fmt_gib(thr)})")
+    return None
+
+
+RSYNC_VALUE_FLAGS = ("-e", "--rsh", "-f", "--filter", "--exclude", "--include", "--exclude-from", "--include-from",
+                     "--files-from", "--max-size", "--min-size", "--bwlimit", "--log-file", "--port", "--partial-dir",
+                     "--backup-dir", "--link-dest", "--compare-dest", "--copy-dest", "-B", "--block-size", "-T",
+                     "--temp-dir", "--timeout", "--contimeout", "--chmod", "--usermap", "--groupmap", "--iconv",
+                     "--rsync-path", "--out-format", "--info", "--debug", "--suffix", "--address", "--sockopts",
+                     "--password-file", "--stop-after", "--stop-at", "--compress-level", "--skip-compress")
+CLONE_VALUE_FLAGS = ("-b", "--branch", "--depth", "-o", "--origin", "-c", "--config", "--reference",
+                     "--reference-if-able", "--separate-git-dir", "--template", "--filter", "-j", "--jobs",
+                     "-u", "--upload-pack", "--server-option", "--shallow-since", "--shallow-exclude", "--revision",
+                     "--ref-format", "--bundle-uri")
+
+
+def classify_copy(low, args, ctx):
+    """Return ("copy", detail) when this command would write an estimated >= threshold onto the Mac, else None."""
+    thr = copy_threshold_bytes()
+    if low in ("cp", "ditto", "scp", "rsync"):
+        if low == "rsync" and any(a == "--dry-run" or re.match(r"^-[A-Za-z]*n[A-Za-z]*$", a) for a in args):
+            return None
+        target = None
+        flagged = [a for a in args if a in ("-t", "--target-directory")]
+        if flagged and args.index(flagged[0]) + 1 < len(args):
+            target = args[args.index(flagged[0]) + 1]
+        values = RSYNC_VALUE_FLAGS if low == "rsync" else ("-t", "--target-directory", "-S", "--suffix", "-P", "-i", "-F",
+                                                           "-l", "-o", "-c", "-J", "-S", "-D", "-X")
+        pos = positional(args, values)
+        if target is None and len(pos) < 2:
+            return None
+        sources, dest = (pos, target) if target else (pos[:-1], pos[-1])
+        if dest in ("/dev/null",) or (low in ("scp", "rsync") and REMOTE_SPEC.match(dest) and not dest.startswith(("/", ".", "~"))):
+            return None  # the copy lands on another host
+        if dest.startswith("rsync://"):
+            return None
+        total, unknown = sum_sources(sources, ctx, thr)
+        return finish_copy(low, total, unknown, thr)
+    if low == "tar" and args:
+        first = args[0]
+        bundle = first.lstrip("-") if (not first.startswith("--")) else ""
+        letters = bundle if (not first.startswith("-") or len(first) > 1) else ""
+        longs = [a for a in args if a.startswith("--")]
+        extract = "x" in letters.split("=")[0] or "--extract" in longs or "--get" in longs or any(
+            re.match(r"^-[A-Za-z]*x[A-Za-z]*$", a) for a in args[:1])
+        create = ("c" in letters and not extract) or "--create" in longs
+        archive = None
+        for i, a in enumerate(args):
+            if a in ("-f", "--file") and i + 1 < len(args):
+                archive = args[i + 1]
+            elif a.startswith("--file="):
+                archive = a.split("=", 1)[1]
+        if archive is None and "f" in letters and len(args) > 1:
+            archive = args[1] if not args[1].startswith("-") else None
+        if archive in (None, "-") or REMOTE_SPEC.match(archive):
+            return None  # a pipe: the other end decides (tar czf - . | ssh dev2 'tar x')
+        if extract:
+            size, complete = path_size(resolve(os.path.expanduser(archive), ctx.cwd))
+            est = size * (4 if COMPRESSED.search(archive) else 1)
+            return finish_copy("tar extract", est, None, thr)
+        if create:
+            skip = {archive}
+            skip_next = False
+            sources = []
+            for a in args[1:] if letters else args:
+                if skip_next:
+                    skip_next = False
+                elif a in ("-f", "--file", "-C", "--directory", "-X", "-T", "--exclude", "--use-compress-program", "-I"):
+                    skip_next = True
+                elif not a.startswith("-") and a not in skip:
+                    sources.append(a)
+            if letters and "C" in letters and sources:
+                sources = sources[1:]
+            total, unknown = sum_sources(sources, ctx, thr)
+            return finish_copy("tar create", total, unknown, thr)
+        return None
+    if low == "gh":
+        pos = positional(args)
+        if pos[:2] == ["repo", "clone"] and len(pos) > 2:
+            return clone_estimate(pos[2], [a for a in args if a.startswith("-")], ctx, thr, "gh repo clone")
+        return None
+    if low == "git":
+        cwd, i, rest = ctx.cwd, 0, list(args)
+        while i < len(rest) and rest[i].startswith("-"):
+            if rest[i] == "-C" and i + 1 < len(rest):
+                cwd = resolve(os.path.expanduser(rest[i + 1]), cwd)
+                i += 2
+            elif rest[i] in ("-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"):
+                i += 2
+            else:
+                i += 1
+        rest = rest[i:]
+        if not rest:
+            return None
+        if rest[0] == "clone":
+            pos = positional(rest[1:], CLONE_VALUE_FLAGS)
+            if not pos:
+                return None
+            return clone_estimate(pos[0], rest[1:], ctx, thr, "git clone")
+        if rest[0] == "worktree" and rest[1:2] == ["add"]:
+            size = tracked_tree_bytes(cwd)
+            return finish_copy("git worktree add", size or 0, None, thr, " (tracked tree at HEAD)")
+    return None
+
+
+def clone_estimate(url, flags, ctx, thr, label):
+    shallow = any(f.startswith(("--depth", "--shallow-since", "--filter", "--shallow-exclude")) for f in flags)
+    factor = 0.5 if shallow else 2.0
+    match = GITHUB_URL.search(url) or (GH_SLUG.match(url) if label == "gh repo clone" else None)
+    if match and not os.path.isdir(resolve(os.path.expanduser(url), ctx.cwd)):
+        size = github_repo_bytes(match.group(1), match.group(2))
+        if size is None:
+            return None if shallow else ("copy", f"{label} of {match.group(1)}/{match.group(2)}: size unknown "
+                                                f"(GitHub did not answer; unknown size counts as heavy; limit {fmt_gib(thr)})")
+        return finish_copy(label, int(size * factor), None, thr, f" (repository {fmt_gib(size)} as reported by GitHub)")
+    local = resolve(os.path.expanduser(url.replace("file://", "")), ctx.cwd)
+    if os.path.isdir(local):
+        size, complete = path_size(local, cap=thr)
+        return finish_copy(label, int(size * (0.5 if shallow else 1.0)), None if (complete or shallow) else
+                           "source is too large to measure", thr)
+    return None if shallow else ("copy", f"{label} of {url[:80]}: size unknown (not a GitHub repo or local path; unknown "
+                                         f"size counts as heavy; limit {fmt_gib(thr)})") if not REMOTE_SPEC.match(url) and "://" not in url else None
 
 
 # ---------------------------------------------------------------- classification
@@ -634,6 +918,13 @@ def classify(argv, ctx, depth=0):
     low = cmd.lower()
     args = argv[1:]
 
+    if low in ("cp", "ditto", "scp", "rsync", "tar", "git", "gh"):
+        try:
+            found = classify_copy(low, args, ctx)
+        except Exception:  # a sizing bug must never block ordinary work: fail open for this rule only
+            found = None
+        if found:
+            return found
     if low in REMOTE_CMDS:
         return None  # already off-box
     if cmd == "run_capped.py":
@@ -970,6 +1261,11 @@ def deny_message(rule, detail, hatch, capped):
         return (f"Heavy-job guard [{rule}] advisory (not blocked): {RULE_HELP[rule]} ({detail}). Hostile-input tests are "
                 f"legitimate. Prefer dev2 (ssh dev2 '<command>'), or on the Mac run under {cap} so stopping the test also "
                 "stops its children and a runaway is paused instead of resetting the machine.")
+    if rule == "copy":
+        return (f"Heavy-job guard [copy]: {RULE_HELP['copy']} ({detail}). Large copies, clones and review trees belong on "
+                "dev2/T2, not the Mac: run it there (ssh dev2 '<command>', or the T2 host) and fetch only the result; "
+                "clone with --depth 1 or --filter=blob:none, or delete finished trees first. A single unanticipated "
+                f"local step may use {HATCH}=<reason> (one use per owner per hour, audited, refused above 85% disk).")
     head = (f"Heavy-job guard [{rule}]: {RULE_HELP.get(rule, 'heavy work')} ({detail}). "
             "Large jobs belong on dev2, not the Mac (2026-11-04: an uncapped local process hit ~66 GB and reset the machine).")
     lines = [head, "Run it there: ssh dev2 '<command>' (sync the checkout first if needed), or"]
@@ -1066,6 +1362,152 @@ def log_hatch_to_wal(payload: dict, decision: dict) -> None:
         log_event({"event": "hatch-wal-failed", "error": type(error).__name__})
 
 
+# ---------------------------------------------------------------- hatch limit, disk budget, ring events (P12)
+
+def hatch_limit() -> int:
+    """Escape-hatch uses allowed per owner per hour. Default 1 (NEVER-LOSE P12/I13): the hatch is for one
+    unanticipated local step, and a sequence of copies is exactly the shape that filled the disk."""
+    env = os.environ.get("HARNESS_HATCH_PER_HOUR", "")
+    if re.fullmatch(r"[0-9]{1,4}", env) and int(env) > 0:
+        return int(env)
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
+        if os.path.exists(path):
+            value = int(load_json_file(path).get("hatch_per_hour", 1))
+            if value > 0:
+                return value
+    except Exception:
+        pass
+    return 1
+
+
+def owner_of(payload: dict) -> str:
+    """Stable owner key: the sub-agent id when there is one, else the session id."""
+    for key in ("agent_id", "session_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", value):
+            return value
+    return "unknown"
+
+
+def state_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".agent-harness", "state")
+
+
+def record_hatch_use(owner: str, limit: int, now: float = None):
+    """Atomically count this use. Returns (allowed, uses in the last hour, counting this one when allowed)."""
+    import fcntl
+    import json
+    now = time.time() if now is None else now
+    os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+    path = os.path.join(state_dir(), "heavy-hatch.json")
+    fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            data = load_json_file(path, 1024 * 1024)
+        except Exception:
+            data = {}
+        uses = {k: [t for t in v if isinstance(t, (int, float)) and now - t < 3600]
+                for k, v in data.items() if isinstance(v, list)}
+        mine = uses.get(owner, [])
+        if len(mine) >= limit:
+            return False, len(mine)
+        mine.append(now)
+        uses[owner] = mine
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as handle:
+            json.dump({k: v for k, v in uses.items() if v}, handle)
+        os.replace(tmp, path)
+        return True, len(mine)
+    finally:
+        os.close(fd)
+
+
+HATCH_DISK_REFUSE_PCT = 85.0
+
+
+def disk_used_pct() -> float:
+    import shutil
+    try:
+        probe = "/System/Volumes/Data" if os.path.isdir("/System/Volumes/Data") else os.path.expanduser("~")
+        usage = shutil.disk_usage(probe)
+        return 100.0 * usage.used / usage.total
+    except Exception:
+        return 0.0
+
+
+def work_owner_key(path):
+    """'session/sub' of the work dir owning `path`, else None."""
+    root = os.path.join(os.path.expanduser("~"), ".agent-harness", "work") + os.sep
+    real = os.path.realpath(path) if path else ""
+    for candidate in (path, real):
+        if candidate and candidate.startswith(root):
+            parts = candidate[len(root):].split(os.sep)
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                return f"{parts[0]}/{parts[1]}"
+    return None
+
+
+def over_budget(cwd):
+    """The over-budget record covering cwd, re-measured live so freeing space unblocks at once.
+
+    Source: state/disk-budget/<owner>.json written by ops_watch (used_bytes, budget_bytes, over_since, path_key)."""
+    try:
+        directory = os.path.join(state_dir(), "disk-budget")
+        records = [load_json_file(os.path.join(directory, n), 64 * 1024) for n in os.listdir(directory) if n.endswith(".json")]
+    except Exception:
+        return None
+    key = work_owner_key(cwd)
+    if not key:
+        return None
+    for rec in records:
+        try:
+            if rec.get("over_since") is None or rec.get("path_key") != key:
+                continue
+            if time.time() - float(rec.get("measured_at_epoch", 0)) > 3 * 3600:
+                continue  # a stale record must never block work for good
+            base = os.path.join(os.path.expanduser("~"), ".agent-harness", "work", key)
+            size, _complete = path_size(base, cap=int(rec["budget_bytes"]) + 1, seconds=1.0)
+            if size > int(rec["budget_bytes"]):
+                return dict(rec, used_bytes=size)
+        except Exception:
+            continue
+    return None
+
+
+def ring_event(key: str, severity: str, message: str, detail: dict) -> None:
+    """One ring event per refusal or hatch use (contract with ahd and the console): never command text or raw paths."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import ops_watch
+        ops_watch.emit({"host": ops_watch.default_host(), "source": "heavy-guard", "event": "raise",
+                        "severity": severity, "check": "heavy-guard", "key": key, "message": message[:300],
+                        "detail": detail})
+    except Exception as error:
+        log_event({"event": "ring-failed", "error": type(error).__name__})
+
+
+def path_digest(path) -> str:
+    import hashlib
+    return hashlib.sha256(str(path).encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def event_class(decision: dict) -> str:
+    detail = decision.get("detail", "")
+    if detail.startswith(("git clone", "gh repo clone")):
+        return "clone"
+    return "tar" if detail.startswith("tar") else "copy"
+
+
+def copy_event_detail(payload: dict, decision: dict, hatch_uses=None) -> dict:
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
+    match = re.search(r"at least ([0-9.]+) GiB", decision.get("detail", ""))
+    return {"agent": owner_of(payload), "task": work_owner_key(cwd) or "", "host": "mac",
+            "est_bytes": int(float(match.group(1)) * GIB) if match else None, "path_digest": path_digest(cwd),
+            "route": "dev2", "hatch_uses_1h": hatch_uses}
+
+
 def run(raw: bytes) -> int:
     import json
     try:
@@ -1074,14 +1516,55 @@ def run(raw: bytes) -> int:
         warn("payload too large, too deeply nested or malformed; failing open")
         log_event({"event": "fail-open", "reason": "payload-shape"})
         return 0
-    if not isinstance(payload, dict) or payload.get("tool_name", "Bash") != "Bash":
+    if not isinstance(payload, dict):
         return 0
-    tool_input = payload.get("tool_input")
-    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    tool = str(payload.get("tool_name") or payload.get("toolName") or "Bash").casefold()
+    tool_input = payload.get("tool_input") or payload.get("toolInput")
+    if not (tool == "bash" or tool.startswith(("shell", "exec", "local_shell"))):
+        return 0  # Codex names its shell tools shell/exec_command/local_shell; Claude Code says Bash
+    command = None
+    if isinstance(tool_input, dict):
+        command = tool_input.get("command") if tool_input.get("command") is not None else tool_input.get("cmd")
+        if isinstance(command, list) and all(isinstance(c, str) for c in command):
+            import shlex
+            command = shlex.join(command)
+        if isinstance(tool_input.get("workdir"), str) and not isinstance(payload.get("cwd"), str):
+            payload = dict(payload, cwd=tool_input["workdir"])
     if not isinstance(command, str):
         return 0
     decision = decide(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None)
     action = decision["action"]
+    owner = owner_of(payload)
+    if decision.get("rule") == "copy" and action != "warn":
+        budget = over_budget(payload.get("cwd"))
+        if budget:  # over its disk budget: new heavy local writes stop, hatch or not, until it frees space or routes
+            gib = lambda n: f"{int(n) / GIB:.1f}"  # noqa: E731
+            sys.stderr.write(f"Heavy-job guard [copy]: owner work dir {budget['path_key']} is over its {gib(budget['budget_bytes'])} GiB "
+                             f"disk budget ({gib(budget['used_bytes'])} GiB used). Free space there (nothing is deleted for you) or "
+                             "run the heavy copy on dev2/T2 (ssh dev2 '<command>').\n")
+            log_event({"event": "deny-over-budget", "rule": "copy"})
+            ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a heavy copy: over disk budget",
+                       dict(copy_event_detail(payload, decision), used_bytes=budget["used_bytes"],
+                            budget_bytes=budget["budget_bytes"]))
+            return 2
+    if action == "allow" and decision.get("hatch_reason") and decision.get("rule") not in NEVER_BLOCK:
+        if decision.get("rule") == "copy" and disk_used_pct() >= HATCH_DISK_REFUSE_PCT:
+            sys.stderr.write(f"Heavy-job guard [copy]: the disk is above {HATCH_DISK_REFUSE_PCT:.0f}% used, so {HATCH} does not "
+                             "apply to large copies. Run it on dev2/T2 (ssh dev2 '<command>') or free space first.\n")
+            log_event({"event": "deny-hatch-disk", "rule": "copy"})
+            ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a hatch copy: disk above 85%",
+                       copy_event_detail(payload, decision))
+            return 2
+        allowed, uses = record_hatch_use(owner, hatch_limit())
+        if not allowed:
+            sys.stderr.write(f"Heavy-job guard: {HATCH} was already used {uses} time(s) in the last hour by this owner "
+                             f"(limit {hatch_limit()}). More than that is heavy work on the Mac: run it on dev2/T2 "
+                             "(ssh dev2 '<command>') or raise the budget in the run kit.\n")
+            log_event({"event": "deny-hatch-limit", "rule": decision["rule"]})
+            ring_event(f"heavy:hatch:{owner}", "warning", f"{owner} exceeded the {HATCH} limit ({uses}/h)",
+                       dict(copy_event_detail(payload, decision), hatch_uses_1h=uses))
+            return 2
+        decision["hatch_uses_1h"] = uses
     if (action == "allow" and decision.get("hatch_reason") and decision.get("rule") not in NEVER_BLOCK
             and live_heavy_jobs() >= max_heavy_jobs()):
         sys.stderr.write(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
@@ -1092,8 +1575,13 @@ def run(raw: bytes) -> int:
         if decision.get("hatch_reason"):
             log_hatch_to_wal(payload, decision)
             log_event({"event": "hatch", "rule": decision["rule"]})
+            ring_event(f"heavy:hatch:{owner}", "warning", f"{owner} used {HATCH} for rule {decision['rule']}",
+                       dict(copy_event_detail(payload, decision, decision.get("hatch_uses_1h")), rule=decision["rule"]))
         return 0
     log_event({"event": action, "rule": decision["rule"]})  # never the command text: it may carry secrets
+    if action == "deny" and decision["rule"] == "copy":
+        ring_event(f"heavy:{event_class(decision)}:{owner}", "warning",
+                   f"{owner} refused a heavy {event_class(decision)} on the Mac", copy_event_detail(payload, decision))
     if action == "warn":
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
                                                  "additionalContext": "WARNING (warn mode) " + decision["message"]}}))

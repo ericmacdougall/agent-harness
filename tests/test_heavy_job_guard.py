@@ -430,12 +430,14 @@ class HookProcess(unittest.TestCase):
 
     def test_neg2_malformed_payloads_fail_open(self):
         for raw in ("", "not json", "{", "[]", "null", '{"tool_name":"Bash","tool_input":5}',
-                    '{"tool_name":"Bash","tool_input":{"command":["pytest"]}}',
+                    '{"tool_name":"Bash","tool_input":{"command":[5, {}]}}',
                     "[" * 200000 + "]" * 200000, '{"a":' * 5000 + "1" + "}" * 5000, "x" * (5 * 1024 * 1024)):
             with self.subTest(raw=raw[:30]):
                 done = self.run_hook(raw)
                 self.assertEqual(done.returncode, 0, done.stderr[-300:])
         self.assertIn("failing open", self.run_hook("[" * 200000).stderr)
+        # P12: a Codex-style argv list is analysed (it used to be ignored, leaving Codex unguarded)
+        self.assertEqual(self.run_hook('{"tool_name":"exec_command","tool_input":{"cmd":["pytest"]}}').returncode, 2)
 
     def test_safe_input_oversize_nonutf8_and_fifo_inputs_fail_open_quickly(self):
         env = dict(os.environ, HARNESS_HEAVY_GUARD_FORCE="1", HOME=tempfile.mkdtemp())
