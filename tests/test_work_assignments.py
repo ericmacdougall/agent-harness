@@ -746,6 +746,28 @@ class RemovalTest(Base):
         a, b = sorted(self.asks())[-2:]
         return a, b
 
+    def test_superseded_ask_can_be_reinstated_and_stop_signature_sees_new_messages(self):
+        """PR review 62e5e5f #4/#5/#6: a superseded ask could never return, and stuck items filled the 128-char Stop
+        signature so a new untriaged message got no block; a cancelled replacement left the old ask unflagged."""
+        stuck = []
+        for n in range(6):
+            old, new = self.split2(f"pair {n}", f"rotate the staging credentials {n}", f"tidy the readme typo {n}")
+            self.cli("relate", old, "superseded_by", new)
+            self.cli("update", old, "--state", "superseded")
+            self.advance(new)
+            stuck.append(old)
+        stop = lambda: self.hook("stop", {"session_id": SID, "transcript_path": str(self.transcript)})
+        first = stop()
+        self.assertEqual(first.get("decision"), "block")
+        self.assertIn("reinstate it", first["reason"])
+        self.capture("also please update the changelog for the release")
+        second = stop()
+        self.assertEqual(second.get("decision"), "block")
+        self.assertIn("1/", second["reason"])  # a new signature, so a fresh block count
+        self.assertEqual(self.cli("update", stuck[0], "--state", "open")[0], 0)
+        self.assertEqual(self.asks()[stuck[0]]["state"], "open")
+        self.check_schema()
+
     def test_second_superseded_by_relation_is_refused(self):
         """PR review R3: relate A->Z (other request) then A->B (sibling) passed the gate, and A was removed when Z was done."""
         a, b = self.split2("billing", "deploy the billing migration", "deploy billing migration in two steps")
@@ -868,6 +890,24 @@ class RemovalTest(Base):
         args = self.cancel_args(aid, uid, 2, "yes, cancel the billing exporter refactor", "answer_to_decision", "--decision", did)
         self.assertEqual(self.cli(*args)[0], 0)
         self.check_schema()
+
+    def test_refusal_is_not_cancel_proof(self):
+        """PR review 62e5e5f #1: "no, don't cancel A, I still want it" cancelled A with the quote "don't cancel A";
+        a retraction cut out of a refusal ("do not cancel ...") passed too."""
+        for said, quote in (("no, don't cancel the billing exporter refactor, I still want it", "don't cancel the billing exporter refactor"),
+                            ("please do not cancel the billing exporter refactor", "cancel the billing exporter refactor"),
+                            ("keep the billing exporter refactor, cancel nothing", "cancel nothing")):
+            _, aid = self.split("start something", "refactor the billing exporter module")
+            msg = self.capture(said)
+            uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
+            line = len(self.transcript.read_text().splitlines())
+            args = self.cancel_args(aid, uid, line, quote, "explicit_reference")
+            self.assertEqual(self.cli(*args)[0], 2, said)
+            self.assertEqual(self.asks()[aid]["state"], "open", said)
+        msg = self.capture("cancel the billing exporter refactor, not needed")
+        uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
+        line = len(self.transcript.read_text().splitlines())
+        self.assertEqual(self.cli(*self.cancel_args(aid, uid, line, "cancel the billing exporter refactor"))[0], 0)
 
     def test_silent_cancel_question_does_not_let_an_unrelated_reply_cancel(self):
         """PR review R2: the agent wrote "Cancel the billing exporter refactor?" without asking the user; the next
@@ -1197,6 +1237,30 @@ class AttestGuardTest(Base):
         in_store = lambda tool, inp: self.hook("guard", {"session_id": SID, "tool_name": tool, "tool_input": inp, "cwd": home})
         self.assertEqual(deny(in_store("Grep", {"pattern": "x"})), "deny")  # no path: the cwd is the store
         self.assertEqual(deny(self.guard("Grep", {"pattern": "x", "path": home + "\x00"})), "deny")
+
+    def test_guard_search_resolution_from_cwd_and_ancestors(self):
+        """PR review 62e5e5f #2/#3/#7/#8: a relative path into the store passed; every pathless search from an
+        ancestor (the home dir) was denied; a relative `../` Glob passed; a Grep regex starting with / was a path."""
+        hidden = Path(self.tmp.name) / "u" / ".agent-harness"
+        hidden.mkdir(parents=True)
+        user_home = str(hidden.parent)
+        deny = lambda r: r.get("hookSpecificOutput", {}).get("permissionDecision")
+        with mock.patch.dict(os.environ, {"AGENT_HARNESS_HOME": str(hidden)}):
+            call = lambda tool, inp, cwd: deny(self.hook("guard", {"session_id": SID, "tool_name": tool, "tool_input": inp, "cwd": cwd}))
+            for tool, inp, cwd in (("Grep", {"pattern": "x", "path": ".agent-harness"}, user_home),
+                                   ("Grep", {"pattern": "x", "path": "./.agent-harness/"}, user_home),
+                                   ("LS", {"path": ".agent-harness"}, user_home),
+                                   ("Glob", {"pattern": "../*"}, str(hidden / "work")),
+                                   ("Glob", {"pattern": ".agent-harness/*"}, user_home),
+                                   ("Glob", {"pattern": ".*/**", "path": user_home}, "/"),
+                                   ("Grep", {"pattern": "x", "glob": ".agent-harness/**"}, user_home),
+                                   ("Grep", {"pattern": "x"}, str(hidden))):
+                self.assertEqual(call(tool, inp, cwd), "deny", (tool, inp, cwd))
+            for tool, inp, cwd in (("Grep", {"pattern": "x"}, user_home), ("Glob", {"pattern": "**/*.md"}, user_home),
+                                   ("Glob", {"pattern": "/usr/lib/python3*/json/*.py"}, user_home),
+                                   ("Grep", {"pattern": "/.*", "path": "/repo"}, user_home), ("Grep", {"pattern": "~/"}, "/repo"),
+                                   ("LS", {"path": user_home}, user_home), ("Grep", {"pattern": "x", "path": "work"}, str(hidden))):
+                self.assertIsNone(call(tool, inp, cwd), (tool, inp, cwd))
 
     def test_guard_allows_ordinary_globs_and_code(self):
         """PR review R1 (regression): a bare `*` counted as naming the key, so `ls *` and `x = 2 * 3` were denied."""

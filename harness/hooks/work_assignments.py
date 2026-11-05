@@ -47,7 +47,7 @@ TRANSITIONS = {
     "in_progress": ["ready", "blocked", "assigned", "open", "cancelled", "superseded"],
     "blocked": ["open", "assigned", "in_progress", "cancelled", "superseded"],
     "ready": ["done", "in_progress", "blocked", "cancelled", "superseded"],
-    "done": ["in_progress"], "cancelled": [], "superseded": ["cancelled"]}
+    "done": ["in_progress"], "cancelled": [], "superseded": ["cancelled", "open"]}
 CLOSED = ("done", "cancelled", "superseded")
 KINDS = ("request", "bug", "feature", "chore", "question", "follow_up")
 GATE_SECONDS = 24 * 3600
@@ -131,29 +131,40 @@ def names_key(tool_input) -> bool:
 
 
 def searches_store(tool: str, tool_input, cwd=None) -> bool:
-    """A Grep/Glob rooted at the store directory or one of its ancestors (a recursive search reaches the key), or an
-    LS of the store directory itself. A missing path means the session cwd. A NUL byte fails closed."""
+    """A Grep/Glob that reaches the store directory, or an LS of it. Paths resolve against the session cwd and a
+    Glob pattern against its path. From an ancestor, the store is reached only when no dot-directory lies between
+    (ripgrep and globs skip hidden directories unless the path or pattern names one). A Grep pattern is a regex,
+    never a path. A NUL byte fails closed."""
     if not isinstance(tool_input, dict):
         return False
+    if any(isinstance(v, str) and "\x00" in v for v in tool_input.values()):
+        return True
     home = os.path.realpath(str(base()))
-    recursive = tool.lower() != "ls"
-    if not isinstance(tool_input.get("path"), str) or not tool_input["path"].strip():
-        tool_input = dict(tool_input, path=cwd or os.getcwd())
-    for key in ("path", "pattern"):
-        value = tool_input.get(key)
-        if not isinstance(value, str) or not value.strip():
-            continue
-        if "\x00" in value:
+    here = cwd or os.getcwd()
+    name = tool.lower()
+
+    def resolve(value: str, against: str) -> str:
+        return os.path.realpath(os.path.join(against, os.path.expanduser(os.path.expandvars(value))))
+
+    def names_hidden(value) -> bool:
+        return isinstance(value, str) and any(part.startswith(".") and part not in (".",) for part in re.split(r"[\\/]", value))
+
+    def reaches(root: str, hidden_named: bool, recursive: bool = True) -> bool:
+        if root == home:
             return True
-        if key == "pattern" and ("*" not in value and "?" not in value and "/" not in value):
-            continue  # a Grep regex, not a path
-        if key == "pattern" and not value.startswith(("/", "~", "$")):
-            continue  # a relative Glob pattern is resolved under path, checked above
-        root = value.split("*", 1)[0].split("?", 1)[0].split("[", 1)[0]
-        root = os.path.realpath(os.path.join(tool_input["path"], os.path.expanduser(os.path.expandvars(root or "."))))
-        if home == root or (recursive and home.startswith(root.rstrip("/") + "/")):
-            return True
-    return False
+        if not recursive or not home.startswith(root.rstrip("/") + "/"):
+            return False
+        between = os.path.relpath(home, root).split(os.sep)
+        return hidden_named or not any(part.startswith(".") for part in between)
+
+    path = tool_input.get("path") if isinstance(tool_input.get("path"), str) and tool_input["path"].strip() else None
+    root = resolve(path, here) if path else os.path.realpath(here)
+    if name == "glob" and isinstance(tool_input.get("pattern"), str):
+        pattern = tool_input["pattern"]
+        literal = re.split(r"[*?\[{]", pattern, 1)[0]
+        prefix = literal if literal.endswith("/") or literal == pattern else literal.rpartition("/")[0]
+        return reaches(resolve(prefix or ".", root), names_hidden(path) or names_hidden(pattern))
+    return reaches(root, names_hidden(path) or names_hidden(tool_input.get("glob")), recursive=name != "ls")
 
 
 def reads_store_recursively(command: str) -> bool:
@@ -1228,9 +1239,11 @@ def problems_for(data: dict, session: str, policy: dict, ts=None) -> list:
                               + f" - {prov.clip(ask['request']['compressed'], 60)}"))
             if ask["state"] == "superseded":
                 repl = supersede_target(data, ask)
-                if repl is None or repl["state"] == "done":  # the replacement is finished: only the user can drop this one
-                    found.append(("superseded", rid, f"{rid} superseded by {repl['id'] if repl else '?'} (done): ask the user "
-                                  f"whether to cancel it - {prov.clip(ask['request']['compressed'], 60)}"))
+                if repl is None or repl["state"] in CLOSED:  # the replacement is closed: only the user can drop this one
+                    found.append(("superseded", rid, f"{rid} superseded by {repl['id'] if repl else '?'} "
+                                  f"({repl['state'] if repl else 'missing'}): ask the user whether to cancel it "
+                                  f"(`cancel` with their words) or reinstate it (`update {rid} --state open`) - "
+                                  f"{prov.clip(ask['request']['compressed'], 60)}"))
     return found
 
 
@@ -1488,7 +1501,7 @@ def hook_stop(payload: dict, runtime: str) -> dict:
         if not found:
             rec["stopBlocks"] = {}
             return {}
-        signature = ",".join(sorted(f"{k}:{i}" for k, i, _ in found))[:128]
+        signature = hashlib.sha256(",".join(sorted(f"{k}:{i}" for k, i, _ in found)).encode()).hexdigest()[:32]
         entry = rec["stopBlocks"].get(signature)
         if entry and now() - parse_ts(entry.get("lastAt")) > BLOCK_MEMORY_SECONDS:
             entry = None  # the same unresolved problem returning hours later is blocked afresh
@@ -1537,7 +1550,8 @@ def hook_guard(payload: dict, runtime: str) -> dict:
     elif isinstance(command, str) and INPROCESS.search(command) and not SAFE_CLI.match(command):
         reason = "work_assignments is used only through its CLI (`python3 .../work_assignments.py <command>`), not imported."
     elif re.fullmatch(r"(?i)grep|glob|ls|search", tool) and searches_store(tool, tool_input, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None):
-        reason = "Searching the agent-harness store directory would expose the capture key; read a named file instead."
+        reason = ("Searching the agent-harness store directory would expose the capture key; pass a narrower `path` "
+                  "outside it, or read a named file instead.")
     elif isinstance(command, str) and reads_store_recursively(command):
         reason = "Recursive reads of the agent-harness store would expose the capture key; read a named file instead."
     if reason:
@@ -1720,8 +1734,16 @@ def words_of(text: str) -> set:
     return {w for w in re.findall(r"[a-z0-9]{4,}", text.lower())}
 
 
-RETRACTION = re.compile(r"(?i)cancel|never ?mind|forget|scrap|\bdrop|\bstop|no wait|instead|retract|ignore|don'?t|"
-                        r"no longer|not needed|skip|abandon|withdraw|call (?:it|that) off")
+RETRACTION = re.compile(r"(?i)cancel|never ?mind|forget|scrap|\bdrop|\bstop|no wait|instead|retract|ignore|"
+                        r"don'?t (?:do|bother|need|want)|no longer|not needed|skip|abandon|withdraw|call (?:it|that) off")
+# "don't cancel A", "do not drop it", "keep it", "I still want it": a refusal mentions the same verbs.
+NEGATED = re.compile(r"(?i)\b(?:don'?t|do not|doesn'?t|never|not|no need to|without|won'?t)\s+(?:\w+\s+){0,3}?"
+                     r"(?:cancel|drop|stop|scrap|forget|abandon|skip|remove|withdraw|ignore|retract)|\bkeep\b|"
+                     r"\bstill (?:want|need)\b")
+
+
+def retracts(text: str) -> bool:
+    return bool(RETRACTION.search(text)) and not NEGATED.search(text)
 
 
 def captured_after(mid: str, did: str, asked_at: float) -> bool:
@@ -1757,19 +1779,21 @@ def names_ask(ask: dict, text: str) -> bool:
     return any(r in text.lower() for r in ref) or len(words_of(text) & words_of(ask["request"]["compressed"])) >= 3
 
 
-def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, decision_id=None) -> None:
+def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, decision_id=None, full: str = "") -> None:
     """The proving turn must relate to THIS ask: its own origin message, a quote that names it, or the answer to a
-    decision tied to it. A stranger's human message cannot cancel an unrelated ask."""
+    decision tied to it. A stranger's human message cannot cancel an unrelated ask. Whether it retracts is judged on
+    the user's whole message (`full`), so a quote cut out of "don't cancel A" cannot pass."""
+    whole = full or quote
     if binding == "same_message_retraction":
         if ask["origin"].get("messageId") != msg["id"]:
             raise WAError("same_message_retraction needs the ask's own origin message")
-        if not RETRACTION.search(quote):
-            raise WAError("same_message_retraction: the quote must be the retracting words")
+        if not RETRACTION.search(quote) or not retracts(whole):
+            raise WAError("same_message_retraction: the quote must be the retracting words, in a message that retracts")
     elif binding == "explicit_reference":
         if not names_ask(ask, quote):
             raise WAError("explicit_reference: the quote must name the ask id or share 3+ words with its request")
-        if not RETRACTION.search(quote):
-            raise WAError("explicit_reference: the quote must say to cancel, drop or stop it, not just mention it")
+        if not RETRACTION.search(quote) or not retracts(whole):
+            raise WAError("explicit_reference: the message must say to cancel, drop or stop it, not keep or just mention it")
     elif binding in ("answer_to_decision", "answer_to_cancel_question"):
         dec = data["decisions"].get(decision_id or "")
         if not dec or dec["state"] != "answered" or dec["answer"]["messageId"] != msg["id"]:
@@ -1784,7 +1808,7 @@ def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, de
         if why:
             raise WAError(f"{binding}: {why}")
         # The question text is the agent's; nothing proves the user saw it. Only the user's own words count.
-        if not (RETRACTION.search(quote) and names_ask(ask, quote)):
+        if not (RETRACTION.search(quote) and retracts(whole) and names_ask(ask, quote)):
             raise WAError(f"{binding}: the answer must itself retract this ask, naming it (id or 3+ of its words)")
     else:
         raise WAError("unknown binding " + str(binding))
@@ -1810,7 +1834,7 @@ def proof_for(data: dict, ask: dict, file: str, line: int, uuid: str, quote: str
         raise WAError("proof message is not from a transcript this ledger tracks")
     if parse_ts(msg["origin"]["at"]) < parse_ts(ask["createdAt"]) - 1:
         raise WAError("proof message predates the ask")
-    check_binding(data, ask, msg, binding, quote, decision_id)
+    check_binding(data, ask, msg, binding, quote, decision_id, verified.get("text") or "")
     proof = {"messageId": msg["id"], "log": {"file": file[:1024], "lineStart": line, "lineEnd": line, "messageUuid": uuid,
                                               "lineSha256": verified["lineSha256"]},
              "quoteSha256": sha(quote), "quoteExcerpt": prov.clip(quote, 160), "verifiedAt": iso(now()),
@@ -1840,7 +1864,7 @@ def reverify_proof(data: dict, ask: dict) -> None:
         raise WAError("proof does not match the captured event in the log")
     if ask["id"] not in proof["targets"]:
         raise WAError("proof does not target this ask")
-    check_binding(data, ask, msg, proof["binding"], quote_stored, proof.get("decisionId"))
+    check_binding(data, ask, msg, proof["binding"], quote_stored, proof.get("decisionId"), verified.get("text") or "")
 
 
 def reverify_evidence(ask: dict, item: dict) -> bool:
