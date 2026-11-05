@@ -256,7 +256,24 @@ def merge_config(existing: str, wal_dir: Path, *, default_full_access: bool = Fa
     return result
 
 
-def install(home: Path, apply: bool, *, default_full_access: bool = False) -> list[str]:
+LEDGER_MODES = ('enforce', 'warn')
+LEDGER_POLICY = 'work_assignments_policy.json'
+
+
+def ledger_policy(mode: str) -> bytes:
+    """The installed work-assignments policy. `warn` holds Codex in warn mode until the live Codex check passes;
+    re-running the installer without the flag restores enforce."""
+    source = (ROOT / 'harness' / 'hooks' / LEDGER_POLICY).read_bytes()
+    if mode not in LEDGER_MODES:
+        raise ValueError(f'--ledger-mode must be one of {", ".join(LEDGER_MODES)}')
+    if mode == 'enforce':
+        return source
+    policy = json.loads(source)
+    policy.update({key: mode for key in ('capture', 'stop', 'guard')})
+    return (json.dumps(policy, indent=2) + '\n').encode()
+
+
+def install(home: Path, apply: bool, *, default_full_access: bool = False, ledger_mode: str = 'enforce') -> list[str]:
     home = home.expanduser().resolve()
     codex_home = home / '.codex'
     skill_dir = codex_home / 'skills' / 'agent-harness'
@@ -294,7 +311,9 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False) -> li
         instructions = merge_marked(existing_instructions, (SOURCE / 'AGENTS.md').read_text())
         hooks = merge_hooks(existing_hooks, codex_home)
         config = merge_config(existing_config, wal_dir, default_full_access=default_full_access)
-        payloads = [(destination, source.read_bytes()) for source, destination in files]
+        policy = ledger_policy(ledger_mode)
+        payloads = [(destination, policy if source.name == LEDGER_POLICY else source.read_bytes())
+                    for source, destination in files]
         payloads += [(instructions_path, instructions.encode()),
                      (hooks_path, (json.dumps(hooks, indent=2) + '\n').encode()),
                      (config_path, config.encode())]
@@ -369,6 +388,9 @@ def main() -> None:
     parser.add_argument('--default-full-access', action='store_true',
                         help='Explicitly select built-in Full Access and no approval prompts for new sessions')
     parser.add_argument('--home', type=Path, default=Path.home())
+    parser.add_argument('--ledger-mode', choices=LEDGER_MODES, default='enforce',
+                        help='work-assignments capture, stop and guard mode for Codex (warn until the live Codex '
+                             'check passes; a reinstall without this flag restores enforce)')
     netwatch = parser.add_mutually_exclusive_group()
     netwatch.add_argument('--no-netwatch', dest='netwatch', action='store_false', default=None,
                           help='do not install or upgrade the netwatch monitor (remembered)')
@@ -376,10 +398,13 @@ def main() -> None:
                           help='install or upgrade the pinned netwatch monitor (the default; remembered)')
     args = parser.parse_args()
     try:
-        changes = install(args.home, args.apply, default_full_access=args.default_full_access)
+        changes = install(args.home, args.apply, default_full_access=args.default_full_access,
+                          ledger_mode=args.ledger_mode)
     except (ValueError, RuntimeError) as error:
         parser.exit(2, f'error: {error}\n')
     print(('Installed' if args.apply else 'Would install') + f' Codex Agent Harness in {args.home / ".codex"}')
+    if args.ledger_mode != 'enforce':
+        print(f'Work-assignments ledger on Codex: {args.ledger_mode} (re-run without --ledger-mode to enforce).')
     if args.default_full_access:
         print('Full Access default requested: unrestricted local filesystem and network; approval prompts disabled.')
     for path in changes:

@@ -1397,21 +1397,33 @@ class StoreTest(Base):
 
     def test_other_sessions_messages_are_ids_only_and_cannot_be_triaged_by_accident(self):
         """Spec review v7 #1: session B saw A's excerpts with split/no-ask hints, and could no-ask A's message."""
-        msg = self.capture("rotate the staging credentials tonight")
+        msg = self.capture("refactor the billing exporter tonight")
+        self.assertIn("refactor the billing", self.cli("status", "--all")[1])  # the excerpt is real, not withheld
         other = "other-session-0002"
         text = self.hook("session", {"session_id": other, "transcript_path": str(self.transcript)})["hookSpecificOutput"]["additionalContext"]
         self.assertIn(msg["id"], text)
-        self.assertNotIn("rotate the staging", text)
+        self.assertNotIn("refactor the billing", text)
         self.assertNotIn(f"split --msg {msg['id']}", text)
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": other}):
             self.assertEqual(self.cli("no-ask", "--msg", msg["id"], "--reason", "looks like chatter to me")[0], 2)
             self.assertEqual(self.cli("split", "--msg", msg["id"], "--item", "x thing")[0], 2)
             self.assertEqual(self.cli("no-ask", "--msg", msg["id"], "--session", other, "--reason", "looks like chatter to me")[0], 2)
         self.assertEqual(self.data()["messages"][msg["id"]]["triage"]["status"], "untriaged")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": other}):  # spec review v8 #1: `status` too
+            out = self.cli("status")[1]
+            self.assertIn(msg["id"], out)
+            self.assertNotIn("refactor the billing", out)
+            self.assertNotIn(f"--session {SID}", out)
+            self.assertNotIn("--session", self.cli("status", "--all")[1])
+            self.assertIn("refactor the billing", self.cli("status", "--all")[1])
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": other}):  # deliberate, naming its session
-            self.assertEqual(self.cli("split", "--msg", msg["id"], "--session", SID, "--item", "rotate the credentials")[0], 0)
+            self.assertEqual(self.cli("split", "--msg", msg["id"], "--session", SID, "--item", "refactor the exporter")[0], 0)
         own = self.hook("session", {"session_id": SID, "transcript_path": str(self.transcript)})["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("rotate the credentials", own)
+        self.assertIn("refactor the exporter", own)
+        aid = sorted(self.asks())[-1]
+        shown = json.loads(self.cli("show", aid)[1])
+        self.assertEqual(shown["linkedMessage"], {"id": msg["id"], "excerpt": "refactor the billing exporter tonight"})
+        self.assertNotIn("linkedMessage", self.asks()[aid])  # printed, never stored
 
     def test_event_log_over_half_the_bound_is_warned(self):
         """Spec review v7 #4: nothing warned before the 128 MiB read bound."""
@@ -1464,12 +1476,16 @@ class GuardTest(Base):
         """Spec review v7 #3: `mv ~/.agent-harness ...` or `rm -rf` of it made the next hook start an empty ledger."""
         store = str(wa.base())
         parent = str(Path(store).parent)
+        elsewhere = Path(self.tmp.name) / "repo"
+        elsewhere.mkdir(exist_ok=True)
         for cmd in (f"mv {store} {store}.old", f"rm -rf {store}", f"rm -rf {store}/", f"cd {parent} && rm -r {Path(store).name}",
-                    f"rmdir {store}", f"rm -rf {parent}", f"sudo rm -rf {store}"):
-            reply = self.hook("guard", {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": self.tmp.name})
+                    f"rmdir {store}", f"rm -rf {parent}", f"sudo rm -rf {store}", f"cd {store} && rm -rf ./*",
+                    f"cd {store} && rm -rf *", f"cd {store}; rm -rf .", f"pushd {parent} && rm -rf {Path(store).name}"):
+            reply = self.hook("guard", {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(elsewhere)})
             self.assertEqual(reply.get("hookSpecificOutput", {}).get("permissionDecision"), "deny", cmd)
         for cmd in (f"rm -rf {store}/scratch/old-run", f"mv {store}/work/a.txt {store}/work/b.txt", "rm -rf build", "mv a b",
-                    f"mv notes.txt {parent}/", f"cp -r src {parent}/backup"):
+                    f"mv notes.txt {parent}/", f"cp -r src {parent}/backup", f"cd {store}/scratch && rm -rf ./*",
+                    f"cd {parent} && rm -rf repo/build"):
             self.assertEqual(self.hook("guard", {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": self.tmp.name}), {}, cmd)
 
     def test_bash_command_shaped_like_a_patch_is_still_a_command(self):
@@ -1824,10 +1840,11 @@ class LatencyTest(Base):
                               "cwd": self.tmp.name}}
         size = wa.files()["snap"].stat().st_size
         control = [sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import work_assignments", str(HOOKS)]
+        RUNS = 9  # acceptance review v8 M2: 5 runs left the gate at its margin
         medians, control_runs = {}, []
         for name, payload in payloads.items():
             timings = []
-            for _ in range(5):  # interleaved with an import-only control, so both see the same host load
+            for _ in range(RUNS):  # interleaved with an import-only control, so both see the same host load
                 started = time.monotonic()
                 subprocess.run(control, capture_output=True, env=env, timeout=20, check=True)
                 control_runs.append(time.monotonic() - started)
@@ -1837,11 +1854,12 @@ class LatencyTest(Base):
                 timings.append(time.monotonic() - started)
                 self.assertEqual(run.returncode, 0, run.stderr)
             timings.sort()
-            medians[name] = timings[2]
-            print(f"\n[latency] 600 asks ({size // 1024} KiB snapshot), {name} hook median {timings[2] * 1000:.0f} ms, "
-                  f"max {timings[-1] * 1000:.0f} ms (250 ms budget: {'met' if timings[2] < 0.25 else 'NOT met'})")
+            medians[name] = timings[RUNS // 2]
+            print(f"\n[latency] 600 asks ({size // 1024} KiB snapshot), {name} hook median {timings[RUNS // 2] * 1000:.0f} ms, "
+                  f"max {timings[-1] * 1000:.0f} ms (250 ms budget: {'met' if timings[RUNS // 2] < 0.25 else 'NOT met'})")
         base = sorted(control_runs)[len(control_runs) // 2]
-        print(f"[latency] import-only control median {base * 1000:.0f} ms; load {os.getloadavg()[0]:.0f}")
+        print(f"[latency] import-only control median {base * 1000:.0f} ms; load {os.getloadavg()[0]:.0f}; ratio to control "
+              + ", ".join(f"{n} {m / base:.2f}x" for n, m in medians.items()) + " (gate 3x)")
         for name, median in medians.items():
             self.assertLess(median, 1.0, name)  # AC-15 ceiling
             self.assertLessEqual(median, 3 * base, f"{name}: {median:.3f}s vs control {base:.3f}s")  # load-normalised

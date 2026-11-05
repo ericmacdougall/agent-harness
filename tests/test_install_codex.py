@@ -441,6 +441,38 @@ class CodexInstallerTests(unittest.TestCase):
             self.assertFalse(poison_marker.exists(), 'watcher imported a foreign process helper')
             self.assertFalse((home / '.claude').exists())
 
+    def test_ledger_mode_warn_is_explicit_and_a_plain_reinstall_restores_enforce(self):
+        """AC-16: Codex installs the ledger in warn until codex-live passes; no flag means enforce."""
+        source = json.loads((ROOT / 'harness' / 'hooks' / 'work_assignments_policy.json').read_text())
+        self.assertEqual([source[k] for k in ('capture', 'stop', 'guard')], ['enforce'] * 3)
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            installed = home / '.codex' / 'agent-harness' / 'work_assignments_policy.json'
+            self.assertIn(str(installed), install(home, apply=False, ledger_mode='warn'))
+            self.assertFalse(installed.exists())
+            install(home, apply=True, ledger_mode='warn')
+            warned = json.loads(installed.read_text())
+            self.assertEqual([warned[k] for k in ('capture', 'stop', 'guard')], ['warn'] * 3)
+            self.assertEqual({k: v for k, v in warned.items() if k not in ('capture', 'stop', 'guard')},
+                             {k: v for k, v in source.items() if k not in ('capture', 'stop', 'guard')})
+            probe = ('import json, sys; sys.path.insert(0, sys.argv[1]); import work_assignments as w; '
+                     'print(json.dumps(w.load_policy()))')  # the installed copy reads its own adjacent policy
+            run = subprocess.run([sys.executable, '-I', '-c', probe, str(installed.parent)], capture_output=True, text=True,
+                                 env={**os.environ, 'HOME': str(home), 'AGENT_HARNESS_HOME': str(home / '.agent-harness')})
+            self.assertEqual(run.returncode, 0, run.stderr)
+            loaded = json.loads(run.stdout)
+            self.assertNotIn('policy_error', loaded)
+            self.assertEqual([loaded[k] for k in ('capture', 'stop', 'guard')], ['warn'] * 3)
+            install(home, apply=True)
+            self.assertEqual(installed.read_bytes(), (ROOT / 'harness' / 'hooks' / 'work_assignments_policy.json').read_bytes())
+            with self.assertRaisesRegex(ValueError, 'ledger-mode'):
+                install(home, apply=True, ledger_mode='off')
+            self.assertEqual(json.loads(installed.read_text())['stop'], 'enforce')
+            run = subprocess.run([sys.executable, str(ROOT / 'install_codex.py'), '--home', str(home), '--ledger-mode', 'off'],
+                                 capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2)
+            self.assertIn('--ledger-mode', run.stderr)
+
     def test_existing_policy_is_not_overridden(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary).resolve()

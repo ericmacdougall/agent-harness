@@ -204,6 +204,10 @@ def reads_store_recursively(command: str, cwd=None) -> bool:
             words = segment.split()
         while words and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]) or words[0] in ("sudo", "env", "nice", "command", "exec", "xargs", "time")):
             words = words[1:]
+        if words and words[0] in ("cd", "pushd"):
+            target = words[1] if len(words) > 1 and words[1] != "-" else "~"
+            here = os.path.join(here, os.path.expanduser(os.path.expandvars(target)))
+            continue
         if not words:
             continue
         prog = os.path.basename(words[0])
@@ -244,6 +248,10 @@ def removes_store(command: str, cwd=None) -> bool:
             words = segment.split()
         while words and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]) or words[0] in ("sudo", "env", "nice", "command", "exec", "xargs", "time")):
             words = words[1:]
+        if words and words[0] in ("cd", "pushd"):
+            target = words[1] if len(words) > 1 and words[1] != "-" else "~"
+            here = os.path.join(here, os.path.expanduser(os.path.expandvars(target)))
+            continue
         if not words or os.path.basename(words[0]) not in REMOVERS:
             continue
         args = [w for w in words[1:] if not w.startswith("-")]
@@ -1515,9 +1523,8 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
     for mid in own[:8]:
         msg = data["messages"][mid]
         tag = "" if msg["humanCheck"].get("verified") else " [unverified: transcript only]"
-        hint = f" --session {msg['sessionId']}" if session is None else ""
         lines.append(f"  UNTRIAGED {mid}{tag}: \"{msg['text'].get('excerpt', '[pasted content]')}\" -> work_assignments.py "
-                     f"split --msg {mid}{hint} --item '...' | no-ask")
+                     f"split --msg {mid} --item '...' | no-ask")  # never --session: each session triages its own
     if others:
         lines.append(f"  {len(others)} untriaged message(s) in other sessions (ids only; each session triages its own): "
                      + ", ".join(others[:8]) + (" ..." if len(others) > 8 else ""))
@@ -2568,7 +2575,8 @@ def cmd_status(args):
         if args.json:
             print(json.dumps({k: data[k] for k in ("messages", "asks", "decisions", "index")}, indent=1, sort_keys=True))
             return
-        print(digest(data, policy, args.session, limit=args.limit))
+        session = None if args.all else (args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or None)
+        print(digest(data, policy, session, limit=args.limit))
     fails = pending_failures()
     if fails:
         print(f"CAPTURE FAILURES: {len(fails)} unacknowledged (work_assignments.py failures)")
@@ -2582,6 +2590,9 @@ def cmd_show(args):
         rec = data["asks"].get(args.id) or data["decisions"].get(args.id) or data["messages"].get(args.id) or data["tombstones"].get(args.id)
         if rec is None:
             rec = find_ask(data, args.id)
+        linked = data["messages"].get((rec.get("origin") or {}).get("messageId") or "")
+        if linked:  # an ask's text is the agent's paraphrase; show the user's redacted words next to it (not stored)
+            rec = {**rec, "linkedMessage": {"id": linked["id"], "excerpt": linked["text"].get("excerpt", "[pasted content]")}}
         print(json.dumps(rec, indent=1, sort_keys=True))
 
 
@@ -2769,6 +2780,7 @@ def build_parser():
     hook.add_argument("name", choices=sorted(HOOKS))
     hook.add_argument("--runtime", choices=("claude", "codex"), default="claude")
     s = sub.add_parser("status"); s.add_argument("--session"); s.add_argument("--json", action="store_true"); s.add_argument("--limit", type=int, default=400)
+    s.add_argument("--all", action="store_true", help="every session in full (default: the caller's session)")
     s = sub.add_parser("split"); s.add_argument("--msg", required=True); s.add_argument("--item", action="append", required=True)
     s.add_argument("--kind", default="request"); s.add_argument("--owner", default="unassigned"); s.add_argument("--next")
     s.add_argument("--ticket", action="append"); s.add_argument("--branch"); s.add_argument("--actor", default="main")
