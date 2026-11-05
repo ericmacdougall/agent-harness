@@ -52,7 +52,7 @@
     {"id": "branch-merge-api", "command": "gh api -X POST repos/o/r/merges -f base=main -f head=feature", "kinds": ["unverifiable"]},
     {"id": "graphql-merge-branch", "command": "gh api graphql -f query={SQ}mutation { mergeBranch(input:{repositoryId:\"R_x\", base:\"main\", head:\"f\"}) { clientMutationId } }{SQ}", "kinds": ["unverifiable"]},
     {"id": "pipe-into-sh", "command": "echo \"gh pr merge 5\" | sh", "kinds": ["unverifiable"]},
-    {"id": "su-c", "command": "su -c \"gh pr merge 5\" bob", "kinds": ["unverifiable"]},
+    {"id": "su-c", "command": "su -c \"gh pr merge 5\" bob", "kinds": ["pr_merge"]},
     {"id": "docker-exec", "command": "docker exec box gh pr merge 5", "kinds": ["pr_merge"]},
     {"id": "find-exec", "command": "find . -maxdepth 0 -exec gh pr merge 5 {} ;", "kinds": ["pr_merge"]},
     {"id": "subshell", "command": "(gh pr merge 5)", "kinds": ["pr_merge"]},

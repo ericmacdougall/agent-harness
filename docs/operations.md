@@ -444,6 +444,26 @@ GoodQA's own independent-acceptance rule for done transitions still applies.
 - **Enforcing on `harness`:** once #35672 is resolved, add `{"key_file": ...}` to its route, run `doctor --project harness`, then set `"enforced_projects": ["harness"]` and `"mode": "enforce"`.
 - **Rollback:** set the modes to `off`, or delete the `spec_flow.py hook` handler from `~/.claude/settings.json`.
 
+## Merge gate
+
+Why: an owner merged netwatch PR #1 while its CI was red (staticcheck and Windows vet failing). `harness/hooks/merge_gate.py` is a PreToolUse hook (Claude Code: Bash and the write tools, `onFailure: block`; Codex: PreToolUse, command ends in `|| exit 2`) that blocks a PR merge unless every required and every reported check run and commit status on the exact head SHA concluded success. GoodQA #14502, matrix D11. The rule is in `docs/rules/merge-gate.json` for the rules registry.
+
+What counts as a merge: `gh pr merge` (also `--auto` and `--admin`), `gh api` REST `pulls/<n>/merge`, GraphQL `mergePullRequest` and `enablePullRequestAutoMerge`, curl or an interpreter one-liner calling those endpoints, wrapped in `sh -c`, `bash -c`, `ssh`, `eval`, `xargs`, `env`, `timeout`, `sudo`, subshells, backticks, here-documents and pipes into a shell. Shapes that cannot be tied to one PR block with no waiver possible: the branch merge endpoint and `mergeBranch`, a GraphQL query read from a file or stdin that the hook cannot see, a target built at runtime, `xargs gh pr merge`, a repository that a `cd`, `ssh`, `GH_REPO` or `GH_HOST` could change (pass `-R owner/repo` or a PR URL). `gh pr merge --disable-auto` is not a merge.
+
+What it checks, with a fake-gh-tested read of `gh pr view --json statusCheckRollup`, the check-runs and combined-status endpoints, branch protection on the base branch, rulesets and `gh pr checks --required`:
+
+- Every check run and status must be `success`. Pending, queued, in progress, failed, cancelled, timed out, action required, stale, startup failure and any unknown value block. The latest run per check name wins when every run has a timestamp.
+- **Neutral and skipped policy:** accepted only for checks that are not required. A required check must be `success`; a required check that is neutral or skipped blocks. This is stricter than GitHub, which treats a skipped required check as passing; use a waiver when a path filter legitimately skips one.
+- The required set is the union of branch protection, rulesets and `gh pr checks --required`, and it must be known. When `gh pr checks --required` is the only readable source (protection returns 403), the PR must also report `mergeStateStatus` CLEAN or HAS_HOOKS, because that source lists only checks that already reported. A required check that has not reported blocks.
+- Zero reported checks block unless the repository has no workflows at all.
+- The merge command must carry the verified full head SHA as a real flag or field: `--match-head-commit <sha>`, REST `-f sha=<sha>`, GraphQL `expectedHeadOid`. GitHub then refuses a head that moved after the check, and the gate also re-reads the head at the end. A short or different SHA blocks.
+- Fail closed: a gh failure, timeout (8 s per call, 40 s total, output capped at 4 MB), non-JSON, truncated check list, closed PR or unreadable input blocks (exit 2).
+- `--auto`: the gate needs green now, so arming auto-merge on pending checks needs a waiver or a later plain merge.
+
+Waiver: `python3 ~/.claude/hooks/merge_gate.py waive --repo owner/name --pr N --head <full sha> --ticket 'GoodQA #N' --reason '<10+ characters>'`. It is bound to repo, PR and head, single use, expires after 24 hours and a waived merge still needs the head flag. The main agent runs it; the hook stamps the approver from the session, and refuses `waive` and any shell or write-tool access to the state files from a subagent (hook payload `agent_id`). Without a stamp (Codex, or the hook not installed) the caller passes `--approved-by main:<agent-id>` and the record is marked `asserted`. Limit: this is an honesty control against careless subagents, not authentication of the main agent; the log is hash-chained and a corrupt, truncated or edited log honours no waiver. State lives in `~/.agent-harness/state/` (`merge-gate-waivers.jsonl`, `merge-gate-audit.jsonl` with command hashes only). `merge_gate.py report` lists waivers (used, unused, expired, approval source) and recent decisions; `merge_gate.py check --repo owner/name --pr N` runs the check without a merge. A waiver is consumed when the hook allows the command, so a merge that then fails burns it.
+
+Known limits: merge queues (the PR head is checked, not the queue branch), MCP GitHub tools and browser merges (the Bash matcher never sees them), aliases defined outside the command, scripts that hide a merge in a file, and the check state changing in the seconds after the check. Heredoc text that names a gh merge outside quotes before a shell can be blocked; write commit messages to a file and use `git commit -F`. To uninstall, remove the `merge_gate.py` hook entries from `settings.json` (Claude Code) or `hooks.json` (Codex).
+
 ## PR review map
 
 `review_map.py` builds one self-contained HTML page for pair-programming a pull request:

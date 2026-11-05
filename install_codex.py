@@ -36,7 +36,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'ticket_adapters.py', 'commit_policy.py', 'commit_policy.json',
                     # Spec flow commands work by hand in Codex; its done hook is Claude Code only.
                     'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
-                    'provenance_hooks.py', 'safe_input.py')
+                    'provenance_hooks.py', 'safe_input.py', 'merge_gate.py')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
@@ -64,6 +64,11 @@ def policy_command(codex_home: Path) -> str:
     return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'commit_policy.py')) + ' hook'
 
 
+def gate_command(codex_home: Path) -> str:
+    """Merge gate; `|| exit 2` because a crash (exit 1) would otherwise count as allow."""
+    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'merge_gate.py')) + ' hook || exit 2'
+
+
 def merge_hooks(existing: dict, codex_home: Path) -> dict:
     if not isinstance(existing, dict):
         raise ValueError('hooks.json must contain an object')
@@ -73,6 +78,7 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
         raise ValueError('hooks.json hooks must be an object')
     command = managed_command(codex_home)
     policy = policy_command(codex_home)
+    gate = gate_command(codex_home)
     for event in HOOK_EVENTS:
         lifecycle = event in {'Stop', 'Interrupt'}
         managed = {'hooks': [{'type': 'command', 'command': command,
@@ -86,7 +92,7 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
                 raise ValueError(f'hooks.json {event} has an invalid hook group')
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
-                                and handler.get('command') in (command, policy))]
+                                and handler.get('command') in (command, policy, gate))]
             if lifecycle and len(handlers) != len(group['hooks']) and group != managed:
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')
@@ -96,6 +102,7 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
         if event == 'PreToolUse':
             # Commit message policy for every tool (no matcher): shell argv, strings, stdin writes.
             preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 60}]})
+            preserved.append({'hooks': [{'type': 'command', 'command': gate, 'timeout': 60}]})
         hooks[event] = preserved
     return result
 
