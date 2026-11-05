@@ -385,6 +385,14 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                                                                 and covered(d.get("ref"), (r["agent_id"],))))
         r["disposition"] = dict(d, live=alive) if d else None
         r["decision_required"] = bool(r["owner"] and r["state"] == "DROPPED" and not alive)
+    for r in rows:  # I9: a handoff is real only once someone takes it (a disposition at/after the handoff)
+        if r["owner"] and r["state"] == "handoff":
+            handed = parse_ts(r["last_activity"]) or 0.0
+            d = disp.get(r["agent_id"])
+            acked = bool(d and d.get("kind") in ("resumed", "reassigned", "closed") and float(d.get("at") or 0) >= handed - 10)
+            if not acked and now - handed >= HANDOFF_ACK_S:
+                r["decision_required"] = True
+                r["flags"] = list(r.get("flags") or []) + ["handoff-unacked"]
     # a wait on another agent holds only while that agent is live; a wait on a DROPPED, done or unknown agent is a drop
     states = {r["agent_id"]: r["state"] for r in rows}
     for r in rows:
@@ -399,8 +407,11 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     counts = {}
     for r in rows:
         counts[r["state"]] = counts.get(r["state"], 0) + 1
+    dls = deadlines(home, session, now)
+    missed = [d for d in dls if d["state"] == "missed" and not liveness.disposition_live(disp.get(d["id"]), now)]
     return {"session": session, "generated": iso(now), "counts": counts, "owners": rows, "source": "direct",
-            "undisposed": sorted(r["agent_id"] for r in rows if r["decision_required"])}
+            "deadlines": dls,
+            "undisposed": sorted([r["agent_id"] for r in rows if r["decision_required"]] + [d["id"] for d in missed])}
 
 
 # ------------------------------------------------------------------ user-msg
@@ -867,6 +878,18 @@ def precheck(op: str, args: dict) -> None:
             ev = args.get("evidence") or ""
             if not (TICKET_RE.match(ev) or ASK_ID_RE.match(ev) or re.fullmatch(r"[0-9a-f]{7,40}", ev)):
                 raise AhError("bad_request", "task.dispose closed: --evidence must be a ticket, a WAL id or a commit sha")
+    elif op == "deadline.add":
+        need("session", "at", "ref", "owner", "note")
+        if parse_ts(args["at"]) is None:
+            raise AhError("bad_request", "deadline.add: --at must be an ISO time")
+        if not (TICKET_RE.match(args["ref"]) or ASK_ID_RE.match(args["ref"])):
+            raise AhError("bad_request", "deadline.add: --ref must be a GoodQA ticket or an ask id")
+        if not OWNER_ID_RE.match(args["owner"]):
+            raise AhError("bad_request", "deadline.add: --owner must be an agent id or task name")
+    elif op == "deadline.done":
+        need("session", "id")
+        if not re.fullmatch(r"dl[0-9a-f]{10}", args["id"]):
+            raise AhError("bad_request", "deadline.done: --id must be a deadline id (dl + 10 hex)")
     elif op == "task.pending":
         need("agent", "session", "at")
         if not OWNER_ID_RE.match(args["agent"]) or parse_ts(args["at"]) is None:
@@ -1127,6 +1150,18 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         _wal_append(home, _wal_path(home, r["session"], r["owner_agent"]), rec)
         out["wal"] = wid
         comment(r["ticket"], rec["note"])
+    elif op in ("deadline.add", "deadline.done"):
+        main_wal = _wal_path(home, args["session"], "main")
+        if not main_wal.is_file():
+            raise AhError("session_unknown", f"no main WAL for session {args['session']!r}", 3)
+        if op == "deadline.add":
+            did = "dl" + hashlib.sha256(key.encode()).hexdigest()[:10]
+            _wal_append(home, main_wal, {"at": now, "event": "deadline", "id": did, "by": actor_id(), "due": args["at"],
+                                         "ref": args["ref"], "owner": args["owner"], "note": args["note"][:300]})
+            out["deadline"] = did
+        else:
+            _wal_append(home, main_wal, {"at": now, "event": "deadline_done", "id": wid, "by": actor_id(), "ref": args["id"],
+                                         "note": (args.get("note") or "")[:300]})
     elif op == "task.pending":
         wal = _wal_path(home, args["session"], args["agent"])
         if wal.is_file():  # the marker is written by the gate, never counted as the owner's activity
@@ -1184,6 +1219,37 @@ def _wal_has(path: Path, event: str, ident, agent=None) -> bool:
     except OSError:
         return False
     return False
+
+
+def deadlines(home: Path, session: str, now: float) -> list:
+    """Deadlines of a session from the ah ledger (G3): [{id, due, ref, owner, note, state: open|due|missed|done}]."""
+    rows, done = {}, set()
+    for r in _ledger(home):
+        a = r.get("args") or {}
+        if a.get("session") != session:
+            continue
+        if r.get("op") == "deadline.add":
+            did = "dl" + hashlib.sha256(r["key"].encode()).hexdigest()[:10]
+            rows[did] = {"id": did, "due": parse_ts(a.get("at")) or 0.0, "ref": a.get("ref"), "owner": a.get("owner"),
+                         "note": a.get("note")}
+        elif r.get("op") == "deadline.done":
+            done.add(a.get("id"))
+    out = []
+    for d in rows.values():
+        if d["id"] in done:
+            d["state"] = "done"
+        elif now >= d["due"]:
+            d["state"] = "missed"
+        elif d["due"] - now <= 3600:
+            d["state"] = "due"
+        else:
+            d["state"] = "open"
+        d["due_iso"] = iso(d["due"])
+        out.append(d)
+    return sorted(out, key=lambda d: d["due"])
+
+
+HANDOFF_ACK_S = 3600  # a handoff nobody acknowledged within this window is a drop in disguise (I9)
 
 
 def pending_stops(home: Path, session: str) -> dict:
@@ -1741,6 +1807,20 @@ def build_parser():
         v.add_argument("--all", action="store_true", help="every session with a main WAL")
         v.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
     sub.add_parser("sessions", help="sessions with a main WAL, newest first")
+    dl = sub.add_parser("deadline", help="dated one-shot obligations (goodqa#14791 G3)")
+    dls = dl.add_subparsers(dest="sub", required=True)
+    da = dls.add_parser("add")
+    da.add_argument("--at", required=True, help="ISO time it is due")
+    da.add_argument("--ref", required=True, help="GoodQA ticket or ask id")
+    da.add_argument("--owner", required=True)
+    da.add_argument("--note", required=True)
+    dd = dls.add_parser("done")
+    dd.add_argument("--id", required=True)
+    dd.add_argument("--note")
+    dls.add_parser("list")
+    for x in (da, dd):
+        x.add_argument("--session")
+        x.add_argument("--key")
     nt = sub.add_parser("note", help="write a WAL note through wal_note.py; --source auto picks the nearest sourced ancestor")
     nt.add_argument("--wal", required=True)
     nt.add_argument("--event", default="decision")
@@ -1848,6 +1928,14 @@ def run(args, home: Path) -> dict:
         ev = [{"really_tested": i, "wal": args.wal or ""} for i in args.really_tested]
         ev += [{"commit": c, "repo": args.repo or ""} for c in args.commit]
         return write(home, "task.done", {"task": args.task, "evidence": ev}, s, args.key)
+    if cmd == "deadline":
+        s = session_of(args, home) or newest_session(home)
+        if args.sub == "list":
+            return {"session": s, "deadlines": deadlines(home, s, time.time())}
+        if args.sub == "add":
+            return write(home, "deadline.add", {"session": s or "", "at": args.at, "ref": args.ref, "owner": args.owner,
+                                                "note": args.note}, s, args.key)
+        return write(home, "deadline.done", {"session": s or "", "id": args.id, "note": args.note or ""}, s, args.key)
     if cmd == "note":
         return note_cmd(home, args)
     if cmd == "doctor":

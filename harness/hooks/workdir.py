@@ -428,6 +428,30 @@ def _marked_done(wal: Path) -> bool:
     return False
 
 
+def _unpushed_repos(path: Path, max_depth: int = 3, budget_s: float = 20.0) -> list:
+    """Git checkouts under `path` with commits on no remote (bounded walk and time; a failed git read counts as
+    unpushed, because uncertainty must never delete work: goodqa#14791 G7)."""
+    import subprocess  # noqa: PLC0415
+    found, deadline = [], time.monotonic() + budget_s
+    base_depth = len(Path(path).parts)
+    for root, dirs, _files in os.walk(path):
+        if len(Path(root).parts) - base_depth >= max_depth:
+            dirs[:] = []
+        if ".git" in dirs or os.path.isfile(os.path.join(root, ".git")):
+            dirs[:] = [d for d in dirs if d != ".git"]
+            if time.monotonic() > deadline:
+                found.append({"repo": root, "reason": "budget exhausted: treated as unpushed"})
+                continue
+            try:
+                r = subprocess.run(["git", "-C", root, "log", "--branches", "--not", "--remotes", "--oneline", "-1"],
+                                   capture_output=True, text=True, timeout=10, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+                if r.returncode != 0 or r.stdout.strip():
+                    found.append({"repo": root, "reason": "unpushed commits" if r.returncode == 0 else f"git exit {r.returncode}"})
+            except (OSError, subprocess.SubprocessError):
+                found.append({"repo": root, "reason": "git unavailable: treated as unpushed"})
+    return found
+
+
 def _protected(path: Path) -> bool:
     real = os.path.realpath(path)
     for root in (home() / ".claude", home() / ".codex", home() / ".agent-harness" / "codex-wals"):
@@ -467,7 +491,7 @@ def candidates(now: float | None = None, *, done_days: float = DEFAULT_DONE_DAYS
             info = os.stat(marker, follow_symlinks=False)
         except OSError:
             continue  # not created by this module: never pruned
-        if not stat.S_ISREG(info.st_mode) or os.path.lexists(path / KEEP) or _protected(path):
+        if not stat.S_ISREG(info.st_mode) or os.path.lexists(path / KEEP) or _protected(path) or _unpushed_repos(path):
             continue
         try:
             recorded = json.loads(marker.read_text()).get("session_id")
