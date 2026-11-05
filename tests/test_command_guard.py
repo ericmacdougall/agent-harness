@@ -13,6 +13,7 @@ import json
 import os
 import random
 import re
+import shlex
 import sys
 import tempfile
 import threading
@@ -608,6 +609,88 @@ class OverwriteExistingTests(Fixture):
                     for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
         self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 122)
         self.assertEqual(failures, [])
+
+    def _seed_bang_rows(self):
+        for rel in ('.claude/wals/s/main.jsonl', '.claude/projects/p/s.jsonl', '.claude/hooks/hook.py',
+                    '.agent-harness/work/S/T/existing.log', '.agent-harness/work/S/T/kept/.keep'):
+            p = self.home / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('keep\n')
+        (self.home / 'proj').mkdir(exist_ok=True)
+
+    def test_bang_clobber_is_judged_under_both_readings(self):
+        self._seed_bang_rows()
+        self.assertGreaterEqual(len(corpus.BANG_READINGS), 120)
+        failures = [(cmd, want, got) for cmd, want in corpus.BANG_READINGS
+                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
+        self.assertEqual(failures, [])
+        self.assertGreaterEqual(len(corpus.BANG_READINGS_CWD), 9)
+        failures = [(cmd, want, got) for cmd, want, where in corpus.BANG_READINGS_CWD
+                    for got in [self.decide(cmd, cwd=where)[0]] if got != want]
+        self.assertEqual(failures, [])
+
+    def test_bash_reading_stops_the_operator_before_the_bang(self):
+        # the spellings and results observed from bash 5.2 and dash on dev2 (shell_probe rows C1-C8, N1, S1)
+        def lexed(text, bang):
+            lexer = cg.Lexer(cg.Ctx(cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))),
+                             bang_operators=bang)
+            tokens = lexer.lex(text)
+            words = [v.text for k, v in tokens if k == 'w']
+            redirs = [(v.fd, v.op, v.target.text if v.target else None) for k, v in tokens if k == 'redir']
+            return words, redirs, lexer.saw_bang
+        self.assertEqual(lexed('echo hi >! f1', False), (['echo', 'hi', 'f1'], [(None, '>', '!')], True))
+        self.assertEqual(lexed('echo hi >>! f1', False), (['echo', 'hi', 'f1'], [(None, '>>', '!')], True))
+        self.assertEqual(lexed('echo hi &>! f1', False), (['echo', 'hi', 'f1'], [(None, '&>', '!')], True))
+        self.assertEqual(lexed('echo hi >&! f1', False), (['echo', 'hi', 'f1'], [(None, '>&', '!')], True))
+        self.assertEqual(lexed('echo hi 2>! f1', False), (['echo', 'hi', 'f1'], [('2', '>', '!')], True))
+        self.assertEqual(lexed('echo hi >!f1', False), (['echo', 'hi'], [(None, '>', '!f1')], True))
+        self.assertEqual(lexed('echo hi >! ; true', False)[:2], (['echo', 'hi', 'true'], [(None, '>', '!')]))
+        self.assertEqual(lexed('echo hi >! f1', True), (['echo', 'hi'], [(None, '>|', 'f1')], True))
+        self.assertEqual(lexed('echo hi >>&! f1', True), (['echo', 'hi'], [(None, '&>>', 'f1')], True))
+        # only an unquoted operator is one, so nothing else starts a second reading
+        for text in ("echo '>!' f1", 'echo x \\>! f1', "echo x >'!' f1", 'echo x >\\! f1', 'echo x > ! f1', 'echo x >| f1',
+                     'echo x >> f1', 'echo x &> f1', 'echo "a >! b"', "cat <<'E'\n>! f1\nE"):
+            self.assertFalse(lexed(text, True)[2], text)
+
+    def test_a_finding_in_both_readings_is_reported_once(self):
+        self._seed_bang_rows()
+        plain = self.decide('rm -rf @HOME@/.claude/hooks', cwd='@TASK@')[1]
+        both = self.decide('rm -rf @HOME@/.claude/hooks >! /dev/null', cwd='@TASK@')[1]
+        self.assertEqual(both, plain)
+
+    def test_many_bang_operators_stay_two_parses(self):
+        # one shell reads every `>!` in a script alike: the count of parses must not grow with the operators
+        count = []
+        real = cg.Lexer.lex
+
+        def counted(lexer, text):
+            count.append(1)
+            return real(lexer, text)
+        cg.Lexer.lex = counted
+        try:
+            self.decide('; '.join('echo x >! @TASK@/f%d' % i for i in range(40)), cwd='@TASK@')
+        finally:
+            cg.Lexer.lex = real
+        self.assertEqual(len(count), 2)
+
+    def test_bang_forms_stay_fast_on_long_commands(self):
+        self._seed_bang_rows()
+        token = 'a' * 65536
+        forms = ('>! ' + token, 'echo x >! ' + token, token + ' >! x', '>! x ' + token, 'cat >! @TASK@/' + token,
+                 'echo ' + token + ' >! x; >! y', "bash -c '>! x " + token + "'", '>!' + token)
+        for text in forms:
+            started = time.monotonic()
+            self.decide(text, cwd='@TASK@')
+            self.assertLess(time.monotonic() - started, 3.0, text[:12])
+
+    def test_nested_bang_forks_are_bounded_by_the_budget(self):
+        # each nesting level with `>!` parses twice; the shared budget must stop this rather than the hook timeout
+        text = 'echo x >! y'
+        for _ in range(9):
+            text = 'eval %s >! z' % shlex.quote(text)
+        started = time.monotonic()
+        self.assertIn(self.decide(text, cwd='@TASK@')[0], ('allow', 'warn', 'block'))
+        self.assertLess(time.monotonic() - started, 5.0)
 
     def test_other_user_home_link_out_of_the_tree_is_refused(self):
         # a real /home/<user> on this machine cannot be made in a test, so its realpath is what is simulated

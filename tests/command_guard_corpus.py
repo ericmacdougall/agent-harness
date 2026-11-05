@@ -934,7 +934,7 @@ OVERWRITE_EXISTING = [
     ('echo x > /home/other/.agent-harness/work/S/T/wal.1', 'block'),
     ('echo x > /home/other/.agent-harness/work/S/T/walker/x.log', 'allow'),
     ('echo x > /tmp/[z-a]; rm -rf @HOME@/.claude', 'block'),
-    # code inspection of 20d4d6a. The `>!` word stays a word for bash's reading: heredoc and exec checks must see it
+    # code inspection of 20d4d6a. bash's reading of `>!` keeps the next word a command word: A1-A8 (GoodQA #14657)
     (">! bash <<'EOF'\nrm -rf @HOME@/.claude/projects\nEOF", 'block'),
     (">>! bash <<'EOF'\nrm -rf @HOME@/.claude/projects\nEOF", 'block'),
     ("&>! bash <<'EOF'\nrm -rf @HOME@/.claude/projects\nEOF", 'block'),
@@ -946,13 +946,13 @@ OVERWRITE_EXISTING = [
     ("cat >! @TASK@/NEW-b1.txt <<'E'\nplain words\nE", 'allow'),
     # a reversed range with a valid member still matches in a shell, and now on every Python
     ('echo x > @HOME@/.claude/proj[z-ae]cts/p/s.jsonl', 'block'),
-    # accepted (coordinator ruling, goodqa#14634): `>! f` with no content on a plain work file counts as an overwrite
-    ('cat >! @TASK@/existing.log', 'allow'),
-    ('echo >! @TASK@/existing.log', 'allow'),
-    ('printf >! @TASK@/existing.log', 'allow'),
-    ('>! @TASK@/existing.log', 'allow'),
-    ('&>! @TASK@/existing.log', 'allow'),
-    ('>&! @TASK@/existing.log', 'allow'),
+    # GoodQA #14634 AC-4 and #14657 AC-6: `>! f` with no content empties the file in zsh, so it is refused as `> f` is
+    ('cat >! @TASK@/existing.log', 'block'),
+    ('echo >! @TASK@/existing.log', 'block'),
+    ('printf >! @TASK@/existing.log', 'block'),
+    ('>! @TASK@/existing.log', 'block'),
+    ('&>! @TASK@/existing.log', 'block'),
+    ('>&! @TASK@/existing.log', 'block'),
     # the same forms stay refused on tier A and on tier B outside work and scratch
     ('cat >! @HOME@/.claude/wals/s/main.jsonl', 'block'),
     ('echo >! @HOME@/.claude/projects/p/s.jsonl', 'block'),
@@ -970,6 +970,157 @@ OVERWRITE_EXISTING = [
     ('>! @TASK@/kept/evidence.log', 'block'),
     ('cat >! /home/other/.claude/wals/s/main.jsonl', 'block'),
     ('>! /home/other/.agent-harness/bin/tool', 'block'),
+]
+# GoodQA #14657: bash and zsh read `>!` differently, so a script is judged under both readings. F-rows come from the
+# code inspection of cbfc4da, the rest from shell probes on dev2 and the ticket's negative cases.
+BANG_READINGS = [
+    ('>! @HOME@/.agent-harness/$X', 'block'),  # F1a
+    ('cat >! @HOME@/.claude/$X', 'block'),  # F1b
+    ('>! @TASK@/kept/$X', 'block'),  # F1c
+    ('echo >! @HOME@/.claude/$X', 'block'),  # F1d
+    ('printf >! @HOME@/.agent-harness/$X', 'block'),  # F1e
+    ('cat > @HOME@/.claude/$X', 'block'),  # F1z
+    (">! out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # F2a
+    (">! out.log bash <<'E'\nrm -rf @HOME@/.claude/projects\nE", 'block'),  # F2b
+    (">! out.log python3 - <<'PY'\nimport shutil\nshutil.rmtree('@HOME@/.claude/projects')\nPY", 'block'),  # F2c
+    (">! out.log ssh host <<'E'\nrm -rf /home/other/.claude/projects\nE", 'block'),  # F2d
+    (">! out.log source /dev/stdin <<'E'\nrm -rf @HOME@/.claude/projects\nE", 'block'),  # F2e
+    ('>! out.log exec 3<> @HOME@/.claude/wals/s/main.jsonl; echo x >&3', 'block'),  # F2f
+    (">out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # F2z
+    (">! run.sh <<'E'\nrm -rf @HOME@/.claude/hooks\nE\nbash run.sh", 'block'),  # F3a
+    (">! run.py <<'E'\nimport shutil\nshutil.rmtree('@HOME@/.claude/hooks')\nE\npython3 run.py", 'block'),  # F3b
+    ("> run.sh <<'E'\nrm -rf @HOME@/.claude/hooks\nE\nbash run.sh", 'block'),  # F3z
+    ('cat /dev/null >! @TASK@/existing.log', 'block'),  # F4a
+    ('echo -n >! @TASK@/existing.log', 'block'),  # F4b
+    ("printf '' >! @TASK@/existing.log", 'block'),  # F4c
+    ('cat /dev/null > @TASK@/existing.log', 'block'),  # F4z
+    ('echo hi >! ; rm -rf @HOME@/.claude/projects', 'block'),  # S1
+    ('echo hi >!\nrm -rf @HOME@/.claude/projects', 'block'),  # S2
+    ('echo hi >! && rm -rf @HOME@/.claude/projects', 'block'),  # S3
+    ('echo hi >! | rm -rf @HOME@/.claude/projects', 'block'),  # S4
+    ('echo hi >! # note\nrm -rf @HOME@/.claude/projects', 'block'),  # S5
+    ('>>! ; rm -rf @HOME@/.claude/hooks', 'block'),  # S6
+    ('&>! ; rm -rf @HOME@/.claude/hooks', 'block'),  # S7
+    ('rm -rf >! @HOME@/.claude/hooks', 'block'),  # O1
+    ('rm -rf >>! @HOME@/.claude/hooks', 'block'),  # O2
+    ('rm -rf &>! @HOME@/.claude/hooks', 'block'),  # O3
+    ('rm -rf >&! @HOME@/.claude/hooks', 'block'),  # O4
+    ('rm -rf &>>! @HOME@/.claude/hooks', 'block'),  # O5
+    ('rm -rf 2>! @HOME@/.claude/hooks', 'block'),  # O6
+    ('rm -rf 3>! @HOME@/.claude/hooks', 'block'),  # O7
+    (">>! out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # O8
+    ("&>! out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # O9
+    (">&! out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # O10
+    ("&>>! out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # O11
+    ("2>! out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # O12
+    (">>&! out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # O13
+    (">>&| out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # O14
+    (">>& out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # O15
+    ('echo x >>&! @TASK@/existing.log', 'allow'),  # O16
+    ('echo x >>& @TASK@/existing.log', 'allow'),  # O17
+    ('echo x >>&| @TASK@/existing.log', 'allow'),  # O18
+    ("bash >>& out.log <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # O19
+    ("bash >>&! out.log <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # O20
+    ("bash >>&| out.log <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # O21
+    ('cat >!@TASK@/existing.log', 'block'),  # N1
+    ('>!@HOME@/.claude/hooks/hook.py', 'block'),  # N2
+    ('echo x >!@TASK@/existing.log', 'allow'),  # N3
+    (">\\! bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # Q1
+    (">'!' bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # Q2
+    ('>"!" bash <<\'E\'\nrm -rf @HOME@/.claude/hooks\nE', 'block'),  # Q3
+    ("> ! bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # Q4
+    ('>! "bash" <<\'E\'\nrm -rf @HOME@/.claude/hooks\nE', 'block'),  # Q5
+    (">! ba'sh' <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # Q6
+    ("rm -rf >! '@HOME@/.claude/hooks'", 'block'),  # Q7
+    ("echo '>!' @TASK@/existing.log", 'allow'),  # Q8
+    ('echo x \\>! @TASK@/existing.log', 'allow'),  # Q9
+    ("echo x >'!' @TASK@/existing.log", 'allow'),  # Q10
+    ('exec >! @HOME@/.claude/wals/s/main.jsonl', 'block'),  # E1
+    ('exec 3>! @HOME@/.claude/wals/s/main.jsonl', 'block'),  # E2
+    ('>! out.log exec 3<> @HOME@/.claude/wals/s/main.jsonl', 'block'),  # E3
+    ('>>! out.log exec 3<> @HOME@/.claude/wals/s/main.jsonl; echo x >&3', 'block'),  # E4
+    ('>! exec 3<> @HOME@/.claude/wals/s/main.jsonl; echo x >&3', 'block'),  # E5
+    ('T=@HOME@/.claude/hooks; rm -rf >! $T', 'block'),  # V1
+    ('T=@HOME@/.claude/hooks; rm -rf >>! "$T"', 'block'),  # V2
+    ("X=out.log; >! $X bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # V3
+    (">! $X bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # V4
+    ('T=\'>!\'; eval "rm -rf $T @HOME@/.claude/hooks"', 'block'),  # V5
+    ('R="rm -rf"; $R >! @HOME@/.claude/hooks', 'block'),  # V6
+    ("T='>!'; echo hi $T @TASK@/existing.log", 'allow'),  # V7
+    ('alias z="rm -rf"; z >! @HOME@/.claude/hooks', 'block'),  # V8
+    ("ssh host 'rm -rf >! /home/other/.claude/hooks'", 'block'),  # H1
+    ("ssh host 'rm -rf >>! /home/other/.claude/hooks'", 'block'),  # H2
+    ("ssh host '>! /home/other/.claude/settings.json'", 'block'),  # H3
+    ("ssh host '>! out.log bash <<E\nrm -rf /home/other/.claude/hooks\nE'", 'block'),  # H4
+    ("ssh host >! out.log <<'E'\nrm -rf /home/other/.claude/hooks\nE", 'block'),  # H5
+    (">! out.log ssh host 'rm -rf /home/other/.claude/hooks'", 'block'),  # H6
+    ("ssh host 'cat >! /home/other/.agent-harness/work/S/T/x.log'", 'block'),  # H7
+    ("ssh host 'echo x >! /home/other/.agent-harness/work/S/T/x.log'", 'allow'),  # H8
+    ("sudo >! out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # W1
+    ('sudo rm -rf >! @HOME@/.claude/hooks', 'block'),  # W2
+    ('sudo rm -rf >>! @HOME@/.claude/hooks', 'block'),  # W3
+    ("sudo bash -c 'rm -rf >>! @HOME@/.claude/hooks'", 'block'),  # W4
+    ("env A=1 >! out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # W5
+    (">! out.log sudo bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # W6
+    ('nohup rm -rf >>! @HOME@/.claude/hooks', 'block'),  # W7
+    ('python3 >! out.log -c "import shutil; shutil.rmtree(\'@HOME@/.claude/projects\')"', 'block'),  # P1
+    ('>! out.log python3 -c "import shutil; shutil.rmtree(\'@HOME@/.claude/projects\')"', 'block'),  # P2
+    (">>! out.log python3 - <<'PY'\nimport shutil\nshutil.rmtree('@HOME@/.claude/projects')\nPY", 'block'),  # P3
+    (">! run.py <<'E'\nimport shutil\nshutil.rmtree('@HOME@/.claude/projects')\nE\npython3 run.py", 'block'),  # P4
+    ("cat >! run.py <<'E'\nimport shutil\nshutil.rmtree('@HOME@/.claude/projects')\nE\npython3 run.py", 'block'),  # P5
+    ("source >! out.log /dev/stdin <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # C1
+    (">! run.sh <<'E'\nrm -rf @HOME@/.claude/hooks\nE\nsource run.sh", 'block'),  # C2
+    (">! run.sh <<'E'\nrm -rf @HOME@/.claude/hooks\nE\n. ./run.sh", 'block'),  # C3
+    (">! run.sh <<'E'\nrm -rf @HOME@/.claude/hooks\nE\nsh run.sh", 'block'),  # C4
+    ("cat >! run.sh <<'E'\nrm -rf @HOME@/.claude/hooks\nE\nbash run.sh", 'block'),  # C5
+    ("echo 'rm -rf @HOME@/.claude/hooks' >! run.sh; bash run.sh", 'block'),  # C6
+    (">>! run.sh <<'E'\nrm -rf @HOME@/.claude/hooks\nE\nbash run.sh", 'block'),  # C7
+    (">! out.log bash -c 'rm -rf >>! @HOME@/.claude/hooks'", 'block'),  # M1
+    ('bash -c \'>! out.log bash -c "rm -rf >>! @HOME@/.claude/hooks"\'', 'block'),  # M2
+    ("eval '>! out.log bash <<E\nrm -rf @HOME@/.claude/hooks\nE'", 'block'),  # M3
+    ("x=$(>! out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE\n)", 'block'),  # M4
+    ('echo x | >! out.log bash', 'allow'),  # M5
+    ('cat >! @TASK@/existing.log', 'block'),  # T1
+    ('echo >! @TASK@/existing.log', 'block'),  # T2
+    ('printf >! @TASK@/existing.log', 'block'),  # T3
+    ('>! @TASK@/existing.log', 'block'),  # T4
+    ('&>! @TASK@/existing.log', 'block'),  # T5
+    ('>&! @TASK@/existing.log', 'block'),  # T6
+    (': >! @TASK@/existing.log', 'block'),  # T7
+    ('true >! @TASK@/existing.log', 'block'),  # T8
+    ('>| @TASK@/existing.log', 'block'),  # T9
+    ('cat > @TASK@/existing.log', 'block'),  # T10
+    ("> run.py <<'E'\nimport shutil\nshutil.rmtree('@HOME@/.claude/hooks')\nE\npython3 run.py", 'block'),  # D1
+    ("cat > run.py <<'E'\nimport pathlib\n(pathlib.Path.home() / '.claude' / 'settings.json').write_text('x')\nE\npython3 run.py", 'block'),  # D2
+    ("cat >! run.py <<'E'\nimport os\nos.remove(os.path.expanduser('~/.agent-harness/bin/tool'))\nE\npython3 run.py", 'block'),  # D3
+    ("cat > run.py <<'E'\nprint(open('@HOME@/.claude/hooks/hook.py').read())\nE\npython3 run.py", 'allow'),  # D4
+    ("cat > run.py <<'E'\nimport shutil\nshutil.rmtree('@TASK@/old')\nE\npython3 run.py", 'allow'),  # D5
+    ("cat > run.py <<'E'\nimport shutil\nshutil.rmtree('/tmp/x')\nprint('@HOME@/.claude/hooks')\nE\npython3 run.py", 'block'),  # D7
+    ('echo x >! @TASK@/existing.log', 'allow'),  # K1
+    ("cat >! @TASK@/NEW-k2.txt <<'E'\nplain words\nE", 'allow'),  # K2
+    ("cat >! @TASK@/existing.log <<'E'\nplain words\nE", 'allow'),  # K3
+    ('echo x >>! @TASK@/existing.log', 'allow'),  # K4
+    ('ls -la >! @TASK@/existing.log', 'allow'),  # K5
+    ('make test &>! @TASK@/existing.log', 'allow'),  # K6
+    ('echo x >! /tmp/plain-out.txt', 'allow'),  # K7
+    ('cat >! /tmp/plain-out.txt', 'allow'),  # K8
+    ('git log -1 >! @TASK@/NEW-k9.txt', 'allow'),  # K9
+    ('echo x > @TASK@/existing.log', 'allow'),  # K10
+    ('ls -la > @TASK@/existing.log', 'allow'),  # K11
+]
+# (row, verdict, working directory): one reading's `cd` must not move the other, and a directory they disagree on counts
+BANG_READINGS_CWD = [
+    ('>! x cd /tmp; rm -rf hooks', 'block', '@HOME@/.claude'),
+    ('>! cd @HOME@/.claude; rm -rf hooks', 'block', '@HOME@/proj'),
+    ('cd @HOME@/.claude >! out.log; rm -rf hooks', 'block', '@HOME@/proj'),
+    ("eval '>! cd @HOME@/.claude'; rm -rf hooks", 'block', '@HOME@/proj'),
+    ("eval '>! T=@HOME@/.claude/hooks'; rm -rf $T", 'block', '@HOME@/proj'),
+    ("eval '>! x T=@HOME@/.claude/hooks'; rm -rf $T", 'block', '@HOME@/proj'),
+    ("eval '>! x cd @HOME@/.claude'; rm -rf hooks", 'block', '@HOME@/proj'),
+    ("eval '>! cd /var/empty'; rm -rf plain", 'allow', '@HOME@/proj'),
+    ('>! x cd /var/empty; rm -rf plain', 'allow', '@HOME@/proj'),
+    ('cd @HOME@/proj >! out.log; rm -rf plain', 'allow', '@HOME@/proj'),
+    ("cat > run.py <<'E'\nimport shutil\nshutil.rmtree('.claude/tmp')\nE\npython3 run.py", 'allow', '@HOME@/proj'),
 ]
 # (target row, words the refusal must carry so the owner knows what to do instead)
 OVERWRITE_HINTS = [
