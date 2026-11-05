@@ -145,17 +145,57 @@ def clean(text, limit=80):
 
 # ---------------------------------------------------------------------------------------------------- detection
 
+def _strip_comments(text):
+    """Remove shell comments (an unquoted # at a word start) so flags written in a comment are not credited to the
+    command. Quote aware; leaves the newline. An unbalanced quote leaves the rest untouched."""
+    out, quote, i, n = [], None, 0, len(text)
+    while i < n:
+        c = text[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(text[i + 1])
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c == "\\" and i + 1 < n:
+            out.append(c + text[i + 1])
+            i += 1
+        elif c in "'\"":
+            quote = c
+            out.append(c)
+        elif c == "#" and (i == 0 or text[i - 1] in " \t\n;&|()"):
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def tokenize(text):
-    """(tokens, crude). shlex with punctuation splitting; a crude scan when quoting is unbalanced (heredocs)."""
-    text = text.replace("`", " ( ")
+    """(tokens, crude). shlex with punctuation splitting; unquoted newlines become ';'; a crude scan when quoting is
+    unbalanced (heredocs)."""
+    text = _strip_comments(text.replace("`", " ( "))
     try:
-        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>\n")
+        lex.whitespace = " \t\r"
         lex.whitespace_split = True
         lex.commenters = ""
-        return list(lex), False
+        tokens = []
+        for t in lex:
+            if "\n" in t:
+                rest = t.replace("\n", "")
+                if rest:
+                    tokens.append(rest)
+                tokens.append(";")
+            else:
+                tokens.append(t)
+        return tokens, False
     except ValueError:
         crude = re.sub(r"['\"`]", " ", text)
-        crude = re.sub(r"([;&|()<>])", r" \1 ", crude)
+        crude = re.sub(r"([;&|()<>])", r" \1 ", crude).replace("\n", " ; ")
         return crude.split(), True
 
 
@@ -198,6 +238,16 @@ def _strip_heredocs(tokens):
             k = i + 2
             while k < n and tokens[k] != delim:
                 k += 1
+            line_end = i + 2
+            while line_end < n and tokens[line_end] not in (";", "&&", "||"):
+                line_end += 1
+            tail = tokens[i + 2:line_end]
+            piped_on = [os.path.basename(x) for j, x in enumerate(tail) if j and tail[j - 1] in ("|", "|&")]
+            if any(w in SHELLS or w in ("eval", "source", ".", "xargs", "sudo", "env") or INTERPRETERS.match(w)
+                   for w in piped_on):
+                out.append(t)
+                i += 1
+                continue
             if word not in SHELLS and word not in ("eval", "source", ".", "xargs") and not INTERPRETERS.match(word):
                 out.extend((t, delim))
                 i = k + 1
@@ -364,8 +414,6 @@ def _http_scan(tokens):
     """curl, wget or an interpreter talking to the GitHub API."""
     found = []
     text = " ".join(tokens)
-    hint = any(t in ("PUT", "POST", "PATCH", "put", "post", "patch") or t.startswith(("-d", "--data", "--json", "-F"))
-               for t in tokens)
     if GRAPHQL_MERGE.search(text):
         found.append(_graphql_from_text(text))
     elif re.search(r"mergeBranch", text, re.I):
@@ -425,8 +473,10 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
                 rest = tokens[i + 1:b]
                 for k, t in enumerate(rest[:-1]):
                     if re.match(r"^-[A-Za-z]*c[A-Za-z]*$", t):
-                        found.extend(find_merges(rest[k + 1], cwd, _depth + 1, ctx))
-                        handled = True
+                        script = next((x for x in rest[k + 1:] if x != "--" and not x.startswith("-")), None)
+                        if script is not None:
+                            found.extend(find_merges(script, cwd, _depth + 1, ctx))
+                            handled = True
                         break
             elif name in ("ssh", "eval", "su", "env"):
                 sub_ctx = dict(ctx, implicit_ok=ctx["implicit_ok"] and name != "ssh")
@@ -455,6 +505,8 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
         if exempt and not piped:
             continue
         text = _normalize_code(" ".join(seg))
+        if ctx["http"]:
+            text = REST_MERGE.sub(" ", GRAPHQL_MERGE.sub(" ", text))  # the HTTP scan classifies these
         if RAW_MERGE.search(text):
             raw.append(Merge("unverifiable", reason="a merge string appears in a command the hook cannot read as a "
                                                       "plain gh call (variable, wrapper, script or other client)"))
@@ -463,10 +515,7 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
     if ctx["http"]:
         http_tokens = tokens
     if http_tokens:
-        scanned = _http_scan(http_tokens)
-        found.extend(scanned)
-        if ctx["http"] and scanned:
-            raw = []  # inside an interpreter string the HTTP scan already classified the merge
+        found.extend(_http_scan(http_tokens))
     found.extend(raw)
     seen, unique = set(), []
     for merge in found:
@@ -709,7 +758,7 @@ def evaluate_pr(client, slug, number, target=None):
         for name, app in (found or {}).items():
             required[name] = True
             if app not in (None, -1):
-                apps[name] = app
+                apps.setdefault(name, set()).add(app)
     known = req[0] in ("ok", "none") or (prot[0] in ("ok", "none") and rules[0] in ("ok", "none"))
     if not known:
         reasons.append("the required checks could not be read (branch protection, rulesets and gh pr checks all failed)")
@@ -729,7 +778,7 @@ def evaluate_pr(client, slug, number, target=None):
         mine = [e for e in entries if e["name"] == name]
         if not mine:
             reasons.append(f"required check '{clean(name)}' has not reported on this head")
-        elif name in apps and not any(e["src"] == "api" and e["app"] == apps[name] and e["v"] == "ok" for e in mine):
+        elif name in apps and not any(e["src"] == "api" and e["app"] in apps[name] and e["v"] == "ok" for e in mine):
             reasons.append(f"required check '{clean(name)}' has no success from the required app")
     if not entries and known and not required:
         try:
