@@ -130,8 +130,10 @@ DEFAULT_POLICY = {
     # goodqa#14817: deleting a git clone whose every commit is on the remote needs no Dropbox backup (see
     # reproducible_clone_refusal). ignored_ok: build/cache directory names that may be ignored in such a clone.
     'reproducible_clone': {'enabled': True, 'total_seconds': 4.0, 'remote_seconds': 2.5,
-                           'ignored_ok': ['node_modules', '__pycache__', '.venv', 'venv', 'dist', 'build', 'target',
-                                          '.next', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.gradle']},
+                           'remote_hosts': ['github.com', 'ssh.github.com', 'gitlab.com', 'bitbucket.org'],
+                           # at any depth: caches that are only ever generated; generic names only at the top level
+                           'ignored_ok': ['node_modules', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache'],
+                           'ignored_top_ok': ['.venv', 'venv', 'dist', 'build', 'target', '.next', '.gradle']},
     'marker': {'default_ttl_seconds': 900, 'max_ttl_seconds': 86400, 'max_walk_entries': 200000,
                'max_walk_seconds': 2.0, 'max_hash_bytes': 21474836480, 'recent_change_seconds': 600,
                'approve_remote_types': ['dropbox']},
@@ -1040,8 +1042,16 @@ CLONE_CONFIG_BAD_KEYS = {'core.fsmonitor', 'core.hookspath', 'core.sshcommand', 
                          'core.editor', 'core.askpass', 'core.attributesfile', 'core.excludesfile', 'core.worktree',
                          'core.alternaterefscommand',
                          'remote.proxy', 'remote.vcs', 'remote.uploadpack', 'remote.receivepack', 'remote.proxyauthmethod'}
-CLONE_URL_OK = re.compile(r'^(?:https://|ssh://|git://|(?:[\w.+-]+@)?[\w.-]+\.[A-Za-z]{2,}:(?!//))[^\s]+$')
-CLONE_URL_LOCAL = re.compile(r'^(?:file:|ext:|fd:|/|\.|~|[A-Za-z]:\\)|//(?:localhost|127\.|\[?::1|0\.0\.0\.0)', re.I)
+CLONE_CONFIG_BAD_KEYS_CORE = {'fsmonitor', 'hookspath', 'sshcommand', 'gitproxy', 'pager', 'editor',
+                              'askpass', 'attributesfile', 'excludesfile', 'worktree', 'alternaterefscommand'}
+CLONE_URL = re.compile(r'^(?:(?:https|ssh|git)://(?:[^/@\s]+@)?(?P<h1>[A-Za-z0-9.-]+)(?::[0-9]{1,5})?/[^\s]+'
+                       r'|(?:[A-Za-z0-9._+-]+@)?(?P<h2>[A-Za-z0-9.-]+):(?![:/])[^\s]+)$')
+
+
+def _remote_host(url):
+    """The host of an https/ssh/git/scp-style URL, lower-cased, else None (local paths, file:, ext::, fd:: ...)."""
+    match = CLONE_URL.match(url)
+    return (match.group('h1') or match.group('h2')).lower() if match else None
 
 
 def _clone_env():
@@ -1054,7 +1064,8 @@ def _clone_env():
 def _git_out(repo, args, timeout, stdin=None):
     import subprocess
     done = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
-                           '-c', 'protocol.ext.allow=never', '-c', 'protocol.file.allow=never', '-C', repo] + list(args),
+                           '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
+                           '-c', 'protocol.ssh.allow=always', '-c', 'protocol.git.allow=always', '-C', repo] + list(args),
                           capture_output=True, timeout=max(0.2, timeout), env=_clone_env(),
                           input=stdin.encode() if stdin is not None else None)
     if done.returncode != 0 or len(done.stdout) > 8 * 1024 * 1024:
@@ -1076,24 +1087,40 @@ def _live_remote_refs(url, repo, timeout):
 REMOTE_LS = _live_remote_refs
 
 
-def _config_refusal(config_text):
-    section = ''
-    for raw in config_text.splitlines():
-        line = raw.strip()
-        if not line or line[0] in '#;':
-            continue
-        head = re.match(r'^\[\s*([A-Za-z0-9.-]+)(?:\s+"[^"]*")?\s*\]\s*(.*)$', line)
-        if head:
-            section = head.group(1).lower()
-            if section not in CLONE_CONFIG_SECTIONS:
-                return 'the repository config has a [%s] section' % section[:20]
-            line = head.group(2).strip()
-            if not line:
-                continue
-        key = re.split(r'[\s=]', line, 1)[0].lower()
-        if '%s.%s' % (section, key) in CLONE_CONFIG_BAD_KEYS:
-            return 'the repository config sets %s.%s' % (section, key)
+def _config_refusal(listing):
+    """`git config --local -z --list` output (git's own parse: a BOM, quoting or case games cannot hide a key).
+    Refuses an include, a section outside the whitelist, or a key that names a program git would run."""
+    for item in filter(None, listing.split('\x00')):
+        key = item.split('\n', 1)[0].lower()
+        section, _, rest = key.partition('.')
+        leaf = key.rsplit('.', 1)[-1]
+        if section in ('include', 'includeif'):
+            return 'the repository config includes another file'
+        if section not in CLONE_CONFIG_SECTIONS:
+            return 'the repository config has a [%s] section' % section[:20]
+        if '%s.%s' % (section, leaf) in CLONE_CONFIG_BAD_KEYS or (section == 'core' and leaf in CLONE_CONFIG_BAD_KEYS_CORE):
+            return 'the repository config sets %s.%s' % (section, leaf)
     return None
+
+
+def _nested_repo(directory, limit=20000):
+    """A .git in the directory or one level below it (two under @scope folders). Too many entries counts as yes."""
+    seen = 0
+    stack = [(directory, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if os.path.lexists(os.path.join(current, '.git')):
+            return True
+        if depth >= 2:
+            continue
+        with os.scandir(current) as entries:
+            for entry in entries:
+                seen += 1
+                if seen > limit:
+                    return True
+                if entry.is_dir(follow_symlinks=False) and (depth == 0 or entry.name.startswith('@') or current.rsplit('/', 1)[-1].startswith('@')):
+                    stack.append((entry.path, depth + 1))
+    return False
 
 
 def reproducible_clone_refusal(path, policy=None, now=None):
@@ -1126,20 +1153,29 @@ def reproducible_clone_refusal(path, policy=None, now=None):
                 return why
         if os.path.lexists(os.path.join(path, '.gitmodules')):
             return 'it has submodules'
-        with open(os.path.join(gitdir, 'config'), 'rb') as handle:
-            text = handle.read(256 * 1024 + 1).decode('utf-8', 'replace')
-        if len(text) > 256 * 1024:
+        if os.path.getsize(os.path.join(gitdir, 'config')) > 256 * 1024:
             return 'the repository config is unusually large'
-        bad = _config_refusal(text)
+        bad = _config_refusal(_git_out(path, ['config', '--local', '-z', '--list'], min(left(), 2.0)))
         if bad:
             return bad
-        ignored_ok = set(cfg['ignored_ok'])
-        status = _git_out(path, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=traditional',
+        hooks_dir = os.path.join(gitdir, 'hooks')
+        if os.path.isdir(hooks_dir) and any(not n.endswith('.sample') for n in os.listdir(hooks_dir)):
+            return 'it has hand-written git hooks'
+        for entry in _git_out(path, ['ls-files', '-v', '-z'], min(left(), 3.0)).split('\x00'):
+            if entry and entry[0] != 'H':
+                return 'a tracked file is marked assume-unchanged, skip-worktree or otherwise hidden from git status'
+        ignored_ok, ignored_top_ok = set(cfg['ignored_ok']), set(cfg['ignored_top_ok'])
+        status = _git_out(path, ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--ignored=traditional',
                                  '--no-renames'], min(left(), 3.0))
         for entry in filter(None, status.split('\x00')):
             if entry.startswith('!! '):
-                if not (set(entry[3:].split('/')) & ignored_ok):
-                    return 'it holds an ignored file that is not a regenerable build directory'
+                name = entry[3:]
+                leaf = name.rstrip('/').rsplit('/', 1)[-1]
+                top = '/' not in name.rstrip('/')
+                if not (name.endswith('/') and (leaf in ignored_ok or (top and leaf in ignored_top_ok))):
+                    return 'it holds an ignored file or folder that is not a whole regenerable build directory'
+                if _nested_repo(os.path.join(path, name)):
+                    return 'an ignored build directory holds a nested repository'
             else:
                 return 'the working tree is not clean (modified, staged or untracked files)'
         refs = {}
@@ -1157,8 +1193,10 @@ def reproducible_clone_refusal(path, policy=None, now=None):
         live_all = {}
         for remote in remotes:
             urls = _git_out(path, ['remote', 'get-url', '--all', remote], min(left(), 2.0)).split()
-            if not urls or any(CLONE_URL_LOCAL.search(u) or not CLONE_URL_OK.match(u) for u in urls):
-                return 'remote %s is not a hosted remote (local path, file:// or unusual URL), so it is no backup' % remote[:30]
+            hosts = [_remote_host(u) for u in urls]
+            if not urls or any(h is None or h not in cfg['remote_hosts'] for h in hosts):
+                return 'remote %s is not on a known hosting service (%s), so it is no proof of a backup' % (
+                    remote[:30], ', '.join(cfg['remote_hosts'][:4]))
             live = REMOTE_LS(urls[0], path, min(left(), float(cfg['remote_seconds'])))
             if not live:
                 return 'the remote did not answer (cannot prove the commits are pushed)'
@@ -1179,6 +1217,7 @@ def reproducible_clone_refusal(path, policy=None, now=None):
             if name.startswith('refs/tags/') and any(v.get(name) == sha for v in live_all.values()):
                 verified.add(sha)
         local = {sha for name, sha in refs.items() if not name.startswith('refs/remotes/')} | {head}
+        local |= set(re.findall(r'[0-9a-f]{40,64}', _git_out(path, ['reflog', 'show', '--all', '--format=%H'], min(left(), 3.0))))
         if not verified:
             return 'no remote-tracking branch matches the remote'
         spec = '\n'.join(sorted(local)) + '\n--not\n' + '\n'.join(sorted(verified)) + '\n'
@@ -3638,6 +3677,15 @@ class Analyzer:
                 + self._clone_hint(path))
         return True
 
+    LONE_RM = re.compile(r'^\s*(?:sudo\s+)?(?:/bin/|/usr/bin/)?(?:rm|rmdir)(?:\s+-[A-Za-z-]+)*(?:\s+--)?(?:\s+[^\s;&|<>`$()\\\n"\'*?\[\]{}~#!]+)+\s*$')
+
+    def _lone_rm(self):
+        """The whole command is one plain rm of literal paths. Anything around it (an earlier write or commit, `cd`,
+        CDPATH, a variable, a redirect, a second command) could change what the rm deletes after the clone was judged
+        clean, so those keep the backup rule (red-team 2026-11-05)."""
+        raw = getattr(self.ctx, 'raw_top', '') or ''
+        return bool(self.LONE_RM.match(raw)) and '\n' not in raw.strip()
+
     def _clone_hint(self, path):
         reason = getattr(self.ctx, 'clone_reasons', {}).get(path)
         return '' if not reason else ('. Not exempt as a reproducible git clone: %s (a clean clone whose every commit is '
@@ -3646,14 +3694,19 @@ class Analyzer:
     def _reproducible_clone(self, path):
         """rm of a provably reproducible git clone (goodqa#14817). The time git and the network take is credited
         back to the analysis budget, bounded by the exemption's own total_seconds."""
-        if self._foreign_home(path) or getattr(self.ctx, 'dynamic_path', False):
+        if self._foreign_home(path) or not self._lone_rm():
             return False
+        cache = self.ctx.__dict__.setdefault('clone_cache', {})
+        if path in cache:
+            return cache[path]
+        cache[path] = False
         started = time.monotonic()
         try:
             reason = reproducible_clone_refusal(path, self.c.policy)
         finally:
             self.ctx.budget.deadline += time.monotonic() - started
         if reason is None:
+            cache[path] = True
             return True
         self.ctx.clone_reasons = getattr(self.ctx, 'clone_reasons', {})
         self.ctx.clone_reasons[path] = reason

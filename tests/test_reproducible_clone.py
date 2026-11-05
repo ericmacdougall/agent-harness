@@ -250,5 +250,94 @@ class MustRefuse(CloneCase):
         self.assertRefused(cg.decide('rm -rf %s' % self.clone, compiled, cwd=str(self.home)))
 
 
+class RedTeamRound(CloneCase):
+    """Each row reproduced against the first version of the exemption (red-team and review of #14817)."""
+
+    def run_marker_script(self):
+        marker = self.home / ('PWNED%d' % self.n)
+        script = self.home / ('run%d.sh' % self.n)
+        script.write_text('#!/bin/sh\ntouch %s\ncat\n' % marker)
+        script.chmod(0o755)
+        return marker, script
+
+    def test_byte_order_mark_and_include_cannot_smuggle_a_program(self):
+        marker, script = self.run_marker_script()
+        extra = self.home / ('extra%d.cfg' % self.n)
+        extra.write_text('[filter "x"]\n\tclean = %s\n[core]\n\tsshCommand = %s\n' % (script, script))
+        config = self.clone / '.git' / 'config'
+        config.write_bytes(b'\xef\xbb\xbf' + ('[include]\n\tpath = %s\n' % extra).encode() + config.read_bytes())
+        (self.clone / '.git' / 'info').mkdir(exist_ok=True)
+        (self.clone / '.git' / 'info' / 'attributes').write_text('* filter=x\n')
+        self.assertRefused(self.rm(), 'include')
+        self.assertFalse(marker.exists(), 'git ran a program named by an included config')
+
+    def test_hidden_modifications_are_refused(self):
+        for flag in ('--assume-unchanged', '--skip-worktree'):
+            (self.clone / 'a.txt').write_text('secret edit %s\n' % flag)
+            git(self.clone, 'update-index', flag, 'a.txt')
+            self.assertRefused(self.rm(), 'hidden')
+            git(self.clone, 'update-index', flag.replace('--', '--no-'), 'a.txt')
+            git(self.clone, 'checkout', '--', 'a.txt')
+
+    def test_remotes_that_loop_back_or_are_odd_are_not_a_backup(self):
+        for url in ('ssh://eric@localhost%s' % self.clone, 'ssh://u@127.0.0.1/x', 'x@127.0.0.1.nip.io:y',
+                    'u@localhost.localdomain:y', 'https://github.com.evil.example/a/b.git', 'host.example.com::x',
+                    'https://example.com/a/b.git', 'git@github.com.attacker.net:a/b.git'):
+            git(self.clone, 'remote', 'set-url', 'origin', url)
+            self.assertRefused(self.rm(), 'known hosting')
+
+    def test_the_real_remote_lookup_refuses_local_transports(self):
+        for url in (str(self.origin), 'file://' + str(self.origin), 'ext::sh -c true'):
+            with self.assertRaises(Exception):
+                cg._live_remote_refs(url, str(self.clone), 3)
+
+    def test_nothing_may_change_the_clone_between_the_check_and_the_delete(self):
+        base = str(self.base)
+        self.assertRefused(self.verdict('echo precious > %s/clone/new.txt && rm -rf %s/clone' % (base, base)))
+        self.assertRefused(self.verdict('git -C %s/clone commit --allow-empty -m x && rm -rf %s/clone' % (base, base)))
+        self.assertRefused(self.verdict('rm -rf %s/clone; echo done' % base))
+        self.assertRefused(self.verdict('cd %s && rm -rf clone' % base))
+
+    def test_cdpath_cannot_redirect_the_delete(self):
+        other = self.home / ('other%d' % self.n)
+        (other / 'x' / 'clone').mkdir(parents=True)
+        (self.base / 'x').mkdir()
+        shutil.copytree(self.clone, self.base / 'x' / 'clone', symlinks=True)
+        self.assertRefused(self.verdict('CDPATH=%s cd x && rm -rf clone' % other, cwd=str(self.base)))
+        self.assertRefused(self.verdict('export CDPATH=%s; cd x && rm -rf clone' % other, cwd=str(self.base)))
+
+    def test_ignored_content_must_be_a_whole_build_directory(self):
+        (self.clone / 'notes' / 'build').mkdir(parents=True)
+        (self.clone / 'notes' / 'keep.md').write_text('tracked\n')
+        git(self.clone, 'add', 'notes/keep.md')
+        git(self.clone, 'commit', '-q', '-m', 'notes')
+        git(self.clone, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+        self.live['refs/heads/main'] = git(self.clone, 'rev-parse', 'HEAD')
+        (self.clone / '.git' / 'info' / 'exclude').write_text('notes/build/thesis.md\nbuild\nnode_modules/\n')
+        (self.clone / 'notes' / 'build' / 'thesis.md').write_text('unique\n')
+        self.assertRefused(self.rm(), 'ignored')  # a file under a folder that happens to be named build
+        (self.clone / 'notes' / 'build' / 'thesis.md').unlink()
+        (self.clone / 'build').write_text('unique content in a file named build\n')
+        self.assertRefused(self.rm(), 'ignored')
+        (self.clone / 'build').unlink()
+        nested = self.clone / 'node_modules' / 'dep'
+        nested.mkdir(parents=True)
+        git(nested, 'init', '-q')
+        self.assertRefused(self.rm(), 'nested')
+
+    def test_commits_only_in_the_reflog_and_hand_written_hooks_are_local_work(self):
+        (self.clone / 'b.txt').write_text('x\n')
+        git(self.clone, 'add', '.')
+        git(self.clone, 'commit', '-q', '-m', 'orphaned')
+        git(self.clone, 'reset', '-q', '--hard', 'HEAD~1')
+        self.assertRefused(self.rm(), 'not on the remote')
+        git(self.clone, 'reflog', 'expire', '--expire=now', '--all')
+        hook = self.clone / '.git' / 'hooks' / 'pre-push'
+        hook.write_text('#!/bin/sh\nexit 0\n')
+        self.assertRefused(self.rm(), 'hooks')
+        hook.unlink()
+        self.assertAllowed(self.rm())  # control: the same clone is deletable once both are gone
+
+
 if __name__ == '__main__':
     unittest.main()
