@@ -40,7 +40,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'commit_policy.local.json.example', 'spec_policy.local.json.example',
                     'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
-                    'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json', 'merge_gate.py',
+                    'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json', 'merge_gate.py', 'bg_job.py',
                     # Heavy-job guard (goodqa#14817): keeps large copies, suites and builds off the Mac for Codex too.
                     'heavy_job_guard.py', 'resource_limits.json')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key

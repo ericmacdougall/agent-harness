@@ -38,6 +38,7 @@ import os
 import posixpath
 import re
 import secrets as _secrets
+import stat
 import signal
 import subprocess
 import sys
@@ -312,6 +313,145 @@ def _pw_home():
         return pwd.getpwuid(os.getuid()).pw_dir
     except Exception:  # noqa: BLE001
         return None
+
+
+# --------------------------------------------------------------------------- one-off pinned routes
+
+# Two credential tools the user chose to allow for the pve evacuation (GoodQA goodqa#14518). A route is the whole command
+# string, a file with this exact SHA-256 at this exact path, and a time before the expiry. This is a fixed table on purpose:
+# no policy file, flag or environment variable can add to it, and a later change removes it.
+# Paths are relative to HOME's work folder so no home name is published. The tools check their own names and values, so the
+# argument shapes only need to rule out shell syntax.
+PINNED_ROUTE_BASE = '.agent-harness/work/dev-decom'
+PINNED_ROUTE_EXPIRES = 1794182400  # 2026-11-09T00:00:00Z, the day the host these routes serve shuts down
+PINNED_ROUTES = (
+    ('unit-mig/t2-rclone/user-run-store-dropbox-secret.sh',
+     '92438a47d6b8083266e42922a2d151d0d0d65475fcc20744ea54359f2af501f3',
+     # -p (privileged mode): bash then runs no $BASH_ENV or $ENV file and imports no exported function before the script,
+     # which sets its own PATH and calls tools by absolute path
+     r'/bin/bash -p {path}'),
+    ('unit-mig/cf-dns/cf_dns_prod_move.py',
+     '30c688923554c09f93128a7d9b89831557acd06d1f04949c235b09ea05cf89a6',
+     r'/usr/bin/python3 -I {path} (?:list'
+     r'|set-ttl --name [a-z.]{{1,40}} --ttl [0-9]{{1,5}} --expect-ttl [0-9]{{1,5}}'
+     r'|set-content --name [a-z.]{{1,40}} --content [0-9.]{{7,15}} --expect-content [0-9.]{{7,15}})'),
+)
+# Existing scripts are otherwise judged only for log deletion, so a credential read inside one would pass. This refuses
+# scripts whose own text, outside comment lines, names the rclone config or the token secret or dumps the config. Text only.
+# Python prose does not count as a dump: there the command must open a string or be an argument list. It runs as its own
+# pass after main's analysis (credential_findings), so it only ever adds a finding and cannot use main's time. It does
+# not run inside scripts on disk, whose own commands are judged only for log deletion. It does not catch a
+# script that builds the name at runtime or calls another script, a name past the read limit, a path the guard cannot
+# resolve, a runner it does not unwrap (`uv run`, `tmux`, `python3 -m cProfile`), a test in a folder named tests, or one of
+# the guard's own files.
+_CREDENTIAL_NAMES = (rb'\.config/rclone/?(?=["\'\s;|&)*$]|\Z)'  # the config directory as a whole word, or a glob or variable
+                     rb'|/rclone/rclone\.conf(?![\w.-])'  # the file under any base, such as $XDG_CONFIG_HOME
+                     rb'|["\']rclone\.conf["\']'  # the quoted file name: os.path.join, pathlib, read("...")
+                     rb'|\bGOODQA_CLOUDFLARE_API_TOKEN\b')
+# The option count is bounded: an unbounded loop here is quadratic, and a padded script could then outlast the time limit.
+_RCLONE_DUMP = rb'rclone(?:\s|\\)+(?:-\S+(?:\s+"?\$?\{?\w+\}?"?)?\s+){0,8}config(?:\s|\\)+"?(?:show|dump)\b'
+CREDENTIAL_SHELL_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|\b' + _RCLONE_DUMP)
+CREDENTIAL_PYTHON_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|[f]?["\'](?:[^"\'\s]*/)?' + _RCLONE_DUMP
+                                    + rb'|["\']rclone["\']\s*,\s*["\']config["\']\s*,\s*["\'](?:show|dump)["\']')
+CREDENTIAL_SCRIPT_READ = 1048576
+# The check's own pass starts no new read after this long. Main's analysis (at most its 3 s limit) plus this stays under
+# the hook's 7 s alarm; a single read that stalls past the alarm ends the pass, and main's verdict stands.
+CREDENTIAL_PASS_SECONDS = 1.5
+CREDENTIAL_SCRIPT_SUFFIXES = ('.sh', '.bash', '.zsh', '.py')
+CREDENTIAL_DATA_SUFFIXES = ('.json', '.jsonl', '.md')
+CREDENTIAL_SCRIPT_SHEBANG = re.compile(rb'#![^\n]*\b(?:ba|z|k|da|)sh\b|#![^\n]*\bpython')
+GUARD_OWN_FILES = ('command_guard.py', 'command_guard_hook.py', 'command_guard_corpus.py', 'live_guard_canary.py',
+                   'holds_guard.py')
+ROUTE_HOME = re.compile(r'/[A-Za-z0-9_./-]+')  # HOME goes into a command string, so it must not hold shell syntax
+PYTHON_NAME = re.compile(r'(?:python|pypy)(?:[0-9.]+t?(?:-intel64)?|w)?')
+SHELL_LONG_OPTS = frozenset(('norc', 'noprofile', 'login', 'posix', 'verbose', 'version', 'help', 'restricted', 'noediting',
+                             'debugger', 'dump-strings', 'dump-po-strings', 'rpm-requires'))
+SHELL_LONG_VALUE_OPTS = frozenset(('rcfile', 'init-file'))
+
+
+def shell_script_word(texts):
+    """Index of the script a POSIX shell would run, or None for -c, -n or no script. Used only to add a credential check,
+    so a misreading here can miss a script but cannot weaken any other rule."""
+    i, on = 0, set()
+    while i < len(texts):
+        t = texts[i]
+        if t in ('-', '--'):
+            i += 1
+            break
+        if t[:1] not in ('-', '+'):
+            break
+        i += 1
+        word = t.lstrip('-')
+        if t[0] == '-' and word in SHELL_LONG_OPTS:
+            continue
+        if t[0] == '-' and word in SHELL_LONG_VALUE_OPTS:
+            i += 1
+            continue
+        if t.startswith('--'):
+            on.update('c' if word.startswith('command') else '')
+            continue
+        for ch in t[1:]:
+            if ch in 'oO':
+                i += 1
+            elif t[0] == '-':
+                on.add(ch)
+            else:
+                on.discard(ch)
+    return i if i < len(texts) and not on & {'c', 'n'} else None
+
+
+def python_script_word(texts):
+    """Index of the script Python would run, or None for -c, -m, stdin or no script. Same use as shell_script_word."""
+    i = 0
+    while i < len(texts):
+        t = texts[i]
+        if t == '--':
+            return i + 1 if i + 1 < len(texts) else None
+        if t == '-':
+            return None
+        if not t.startswith('-'):
+            return i
+        i += 1
+        if t.startswith('--'):
+            i += 1 if t == '--check-hash-based-pycs' else 0
+            continue
+        for pos, ch in enumerate(t[1:], 1):
+            if ch in 'cm':
+                return None
+            if ch in 'WX':  # takes a value: the rest of this word, or the next word
+                i += 1 if pos == len(t) - 1 else 0
+                break
+    return None
+
+
+def _read_prefix(path, limit):
+    """Read a regular file without blocking: a FIFO swapped in after a check would otherwise hang until the alarm."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))
+    with os.fdopen(fd, 'rb') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError('not a regular file')
+        return handle.read(limit)
+
+
+def pinned_route(command, now=None):
+    """True only for the exact command string of an unexpired route whose file is a regular file with the pinned hash."""
+    if not isinstance(command, str) or (time.time() if now is None else now) >= PINNED_ROUTE_EXPIRES:
+        return False
+    home = os.environ.get('HOME')
+    if not home or not ROUTE_HOME.fullmatch(home):
+        return False
+    for rel, digest, shape in PINNED_ROUTES:
+        path = os.path.join(home, PINNED_ROUTE_BASE, rel)
+        if not re.fullmatch(shape.format(path=re.escape(path)), command):
+            continue
+        try:
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                return False
+            data = _read_prefix(path, CREDENTIAL_SCRIPT_READ + 1)
+        except (OSError, ValueError):
+            return False
+        return len(data) <= CREDENTIAL_SCRIPT_READ and hashlib.sha256(data).hexdigest() == digest
+    return False
 
 
 # --------------------------------------------------------------------------- budget and data model
@@ -1641,6 +1781,13 @@ MAX_READING_FORKS = 3
 
 
 class Analyzer:
+    # The credential-script check (goodqa#14518) runs only in its own second pass, credential_findings(), so the analysis
+    # that decides everything else is exactly main's. disk_depth counts scripts on disk being analysed: their own
+    # commands are judged only for log deletion, so the check skips them rather than spend its time there.
+    credential_pass = False
+    credential_candidate = False
+    disk_depth = 0
+
     def __init__(self, compiled, cwd=None, ps=False, marker=None):
         self.ctx = Ctx(compiled, cwd, ps, marker)
         self.c = compiled
@@ -1800,6 +1947,7 @@ class Analyzer:
                                     tail_visible=True)
                     elif pname == 'cat':
                         for w in _nondash(prev[1:])[:4]:
+                            self.credential_entry(None, '.', [w], [w], [w.text])
                             self.script_file(w, depth)
         # `... | xargs rm`: the operands come from the earlier stages, so judge what those stages name
         for idx, cmd in enumerate(pl.cmds):
@@ -2225,6 +2373,7 @@ class Analyzer:
         ctx = self.ctx
         args = words[1:]
         texts = [a.text for a in args]
+        self.credential_entry(cmd, name, words, args, texts)
         if ctx.ps:
             name = {'remove-item': 'rm', 'ri': 'rm', 'del': 'rm', 'erase': 'rm', 'rd': 'rm', 'move-item': 'mv',
                     'mi': 'mv', 'move': 'mv', 'gc': 'cat', 'get-content': 'cat', 'type': 'cat', 'clear-content': 'truncate',
@@ -2357,6 +2506,83 @@ class Analyzer:
         if name in KILLERS:
             self.kill_cmd(name, args, texts)
 
+    def credential_entry(self, cmd, name, words, args, texts):
+        """Add a refusal when this command runs an existing script that names a credential (goodqa#14518). Only ever adds a
+        finding, and any failure here means no finding, so no other rule's verdict changes."""
+        if self.disk_depth:
+            return
+        if not self.credential_pass:
+            # main's pass only notes that a script is run, so the check's pass is skipped for commands that run none.
+            # Nothing here reads a file or adds a finding, and the alarm's TimeoutError is not caught.
+            if not self.credential_candidate:
+                try:
+                    self.credential_candidate = any(w is not None and not w.dynamic and w.text
+                                                    for w, _ in self._credential_words(cmd, name, words, args, texts))
+                except (IndexError, AttributeError, TypeError, ValueError):
+                    self.credential_candidate = True
+            return
+        try:
+            for word, runner in self._credential_words(cmd, name, words, args, texts):
+                if word is not None and not word.dynamic and word.text:
+                    self.credential_script(norm_path(word.text, self.ctx), runner)
+        except Blocked:
+            raise
+        except Exception:  # noqa: BLE001
+            return
+
+    def _credential_words(self, cmd, name, words, args, texts):
+        if self.ctx.ps:
+            return
+        if name in ('.', 'source'):
+            nd = _nondash(args)
+            yield (nd[0] if nd else None), 'shell'
+        if '/' in name or '/' in words[0].text:
+            yield words[0], None
+        if name in SHELLS:
+            at = shell_script_word(texts)
+            yield (args[at] if at is not None else None), 'shell'
+            for r in cmd.redirs:
+                if r.op == '<' and r.fd in (None, '0') and not any(t.startswith('-') and 'c' in t for t in texts):
+                    yield r.target, 'shell'
+        if PYTHON_NAME.fullmatch(name):
+            at = python_script_word(texts)
+            yield (args[at] if at is not None else None), 'python'
+
+    def credential_script(self, path, runner=None):
+        """`runner` is 'shell' or 'python' when one was named to run this file, so its name says nothing about what it is."""
+        lower = path.lower()
+        base = os.path.basename(path)
+        in_tests = os.path.basename(os.path.dirname(path)) == 'tests' and base.startswith('test_') and base.endswith('.py')
+        if base in GUARD_OWN_FILES or in_tests or lower.endswith(CREDENTIAL_DATA_SUFFIXES):
+            return  # these hold the names as data
+        # Each (path, runner) is read once per pass, so the second shell reading of `>!` repeats no read.
+        seen = self.__dict__.setdefault('credential_seen', {})
+        if (path, runner) in seen:
+            if seen[(path, runner)]:
+                self._credential_finding()
+            return
+        seen[(path, runner)] = False
+        if time.monotonic() > self.ctx.budget.deadline:
+            return  # the pass is out of time: start no new read
+        try:
+            if not os.path.isfile(path):
+                return
+            data = _read_prefix(path, CREDENTIAL_SCRIPT_READ)
+            shebang = CREDENTIAL_SCRIPT_SHEBANG.match(data)
+            if b'\0' in data or (runner is None and not lower.endswith(CREDENTIAL_SCRIPT_SUFFIXES) and not shebang):
+                return  # a data file or a binary, not a script
+            python = runner == 'python' or (runner is None and (lower.endswith('.py') or (shebang and b'python' in shebang.group())))
+            code = b'\n'.join(line for line in data.split(b'\n') if not line.lstrip().startswith(b'#'))
+            if (CREDENTIAL_PYTHON_TEXT if python else CREDENTIAL_SHELL_TEXT).search(code):
+                seen[(path, runner)] = True
+                self._credential_finding()
+        except (OSError, ValueError):
+            return
+
+    def _credential_finding(self):
+        self.ctx.add(SECRET_DUMP, 'credential-script', 'this script names a credential file or secret, and only a '
+                     'pinned route may run one', 'read the task for a pinned route, or take a path that does not need this credential')
+
     def script_file(self, word, depth, require_shell=False):
         """Analyse a shell script named on the command line (or written earlier in this command)."""
         ctx = self.ctx
@@ -2398,9 +2624,11 @@ class Analyzer:
         before = len(ctx.findings)
         keep = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
                 if k not in ('findings', 'budget', 'c', 'marker', 'files_read', 'unterminated', 'readings_capped')}
+        self.disk_depth += 1
         try:
             self.script(text, depth + 1, tail_visible=True)
         finally:
+            self.disk_depth -= 1
             for k, v in keep.items():
                 setattr(ctx, k, v)
             ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
@@ -4191,6 +4419,8 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
         command = ' '.join(_quote_for_rebuild(str(c)) for c in command)
     if len(command.encode('utf-8', 'replace')) > int(compiled.limits['max_command_bytes']):
         raise Blocked('command is larger than %d bytes' % int(compiled.limits['max_command_bytes']))
+    if pinned_route(command):
+        return []
     analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=marker)
     try:
         findings = analyzer.run(command)
@@ -4215,7 +4445,27 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
             findings.append(Finding(PARSE, 'readings-capped', '`>!` cannot be judged under both shell readings (too large, too '
                                     'deeply nested, or they disagree on what a later command uses)',
                                     'split the command, or use `>|`'))
+    modes = compiled.policy['modes']
+    if analyzer.credential_candidate and not any(modes.get(f.category) == 'enforce' for f in findings):
+        findings = findings + credential_findings(command, compiled, cwd=cwd, ps=ps)
     return findings
+
+
+def credential_findings(command, compiled, cwd=None, ps=False):
+    """The credential-script check (goodqa#14518) as a separate pass, run after main's analysis has finished with its own
+    budget untouched. It has its own time cap and adds only credential-script findings. Any stop here, including the
+    hook's alarm, keeps what it found before the stop and adds nothing more, so the verdict is never looser than main's.
+    The pass is skipped when main already blocks, since a further finding changes nothing, and when main's pass saw no
+    script being run."""
+    analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=None)
+    analyzer.credential_pass = True
+    budget = analyzer.ctx.budget
+    budget.deadline = time.monotonic() + min(CREDENTIAL_PASS_SECONDS, float(compiled.limits['max_seconds']))
+    try:
+        analyzer.run(command)
+    except Exception:  # noqa: BLE001 - a budget stop, the alarm's TimeoutError or a bug: main's verdict stands
+        pass
+    return [f for f in analyzer.ctx.findings if f.rule == 'credential-script']
 
 
 SECRET_TEXT = re.compile(r'(?i)\brclone\b|\bauth\s+token\b|--show-token|\bprintenv\b|(?:^|[;&|(\s])(?:env|set|export'
