@@ -175,12 +175,16 @@ class FakeGh:
                 if want == ".github/workflows":  # directory listing at a ref
                     if sc.get("dir_error"):
                         return 1, "", "HTTP 500"
+                    if sc.get("dir_error_nocommit"):
+                        return 1, "", "gh: No commit found for the ref aaaa (HTTP 404)"
                     if sc.get("dir_error_404digits"):
                         return 1, "", "gh: API rate limit exceeded for user ID 1404 (HTTP 403)"
                     files = [f for f in self.workflow_files() if self.served(f, ref)]
                     if not files:
                         return 1, '{"message":"Not Found"}', "gh: Not Found (HTTP 404)"
                     return 0, json.dumps([{"name": f[".path"].split("/")[-1], "path": f[".path"], "type": "file"} for f in files]), ""
+                if sc.get("file_error_nocommit"):
+                    return 1, "", "gh: No commit found for the ref aaaa (HTTP 404)"
                 if sc.get("file_error_404digits"):
                     return 1, "", "gh: Bad Gateway 5041404 (HTTP 502)"
                 for f in self.workflow_files():
@@ -757,6 +761,13 @@ class ActiveWorkflows(Base):
         added_inert = dict(added, content="on: workflow_dispatch\n")
         self.assertEqual(self.merge(self.scenario([inert, added_inert]))[0], 0)
 
+    def test_audit_marks_allows_that_rest_on_no_ci(self):
+        self.assertEqual(self.merge(self.scenario([]))[0], 0)
+        last = json.loads((self.state / mg.AUDIT_FILE).read_text().splitlines()[-1])
+        self.assertTrue(last["no_ci"])
+        self.assertEqual(self.merge(dict(SCENARIOS["green"], workflow_files=[]))[0], 0)
+        self.assertFalse(json.loads((self.state / mg.AUDIT_FILE).read_text().splitlines()[-1])["no_ci"])
+
     def test_directory_listing_error_fails_closed(self):
         self.assertEqual(self.merge(self.scenario([], dir_error=True))[0], 2)
 
@@ -773,6 +784,11 @@ class ActiveWorkflows(Base):
         inert = [{"name": "Release", "file": "release", "state": "active", "content": self.RELEASE}]
         self.assertEqual(self.merge(self.scenario(inert, dir_error_404digits=True))[0], 2)
         self.assertEqual(self.merge(self.scenario(inert, file_error_404digits=True))[0], 2)
+
+    def test_unresolvable_ref_is_not_a_missing_file(self):
+        inert = [{"name": "Release", "file": "release", "state": "active", "content": self.RELEASE}]
+        self.assertEqual(self.merge(self.scenario(inert, file_error_nocommit=True))[0], 2)
+        self.assertEqual(self.merge(self.scenario(inert, dir_error_nocommit=True))[0], 2)
 
     def test_workflow_only_on_the_base_branch_is_classified(self):
         only_base = {"name": "B", "file": "b", "state": "active", "base_only": True, "content": "on: pull_request\n"}

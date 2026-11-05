@@ -854,6 +854,9 @@ DELETED_STATE = "deleted"  # the file may have been restored since: classified w
 
 def _is_404(err, out):
     """gh prints `(HTTP 404)` on stderr for a real not-found; a bare 404 inside other text (ids, 5xx bodies) is not."""
+    text = (err or "") + " " + (out or "")
+    if re.search(r"(?i)no commit found|ref(erence)? .*not found|unknown revision", text):
+        return False  # an unresolvable ref is not an absent file: the file may exist at that ref
     return bool(re.search(r"\(HTTP 404\)", err or "")) or bool(re.search(r'"status"\s*:\s*"404"', out or ""))
 
 
@@ -997,16 +1000,19 @@ def evaluate_pr(client, slug, number, target=None):
             reasons.append(f"required check '{clean(name)}' has not reported on this head")
         elif name in apps and not any(e["src"] == "api" and e["app"] in apps[name] and e["v"] == "ok" for e in mine):
             reasons.append(f"required check '{clean(name)}' has no success from the required app")
+    no_ci = False
     if not entries and known and not required:
         # Zero reports: fine only when no ACTIVE workflow could have run on this head (GitHub CI switched off).
         try:
-            reasons.extend(_ci_capable_workflows(client, slug, head, base))
+            found = _ci_capable_workflows(client, slug, head, base)
+            reasons.extend(found)
+            no_ci = not found
         except (GateError, ValueError, TypeError, AttributeError):
             reasons.append("no checks reported and the workflow list could not be read")
     again = client.json(["pr", "view", str(number), "-R", slug, "--json", "headRefOid"], "the pull request head")
     if str((again or {}).get("headRefOid") or "").lower() != head:
         raise GateError("the pull request head moved while the checks were read")
-    return {"slug": slug, "number": number, "head": head}, reasons
+    return {"slug": slug, "number": number, "head": head, "no_ci": no_ci}, reasons
 
 
 def _resolve_graphql(client, node_ids):
@@ -1036,7 +1042,7 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
         if merge.kind == "graphql":
             slug, number = _resolve_graphql(client, merge.node_ids)
         details, soft = evaluate_pr(client, slug, number, merge.target)
-        info.update(repo=details["slug"], pr=details["number"], head=details["head"])
+        info.update(repo=details["slug"], pr=details["number"], head=details["head"], no_ci=details.get("no_ci"))
         if merge.kind != "check":
             if merge.head_unknown or not merge.head_vals:
                 hard.append(f"the merge must carry the verified head: add {merge.binding.replace('<full head sha>', details['head'])}")
@@ -1335,7 +1341,7 @@ def decide(payload, runner, state_dir, now=None):
         outcome = "waived" if info.get("waiver") else ("allow" if allowed else "block")
         _audit(state_dir, {"ts": now, "outcome": outcome, "repo": info.get("repo"), "pr": info.get("pr"),
                            "head": info.get("head"), "kind": merge.kind, "command_sha256": command_hash,
-                           "waiver": info.get("waiver"), "session": clean(payload.get("session_id") or "", 40)})
+                           "waiver": info.get("waiver"), "no_ci": info.get("no_ci"), "session": clean(payload.get("session_id") or "", 40)})
         if not allowed:
             blocks.append(text)
     if blocks:
