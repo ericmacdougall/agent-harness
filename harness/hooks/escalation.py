@@ -28,6 +28,10 @@ import model_tiers as tiers  # noqa: E402
 SCHEMA = 1
 TASK_KEY = re.compile(r'\[task:([A-Za-z0-9][A-Za-z0-9._-]{0,63})\]')
 SAFE_KEY = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+ACTOR = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:@-]{0,63}$')
+# A traceable reference, in the provenance kinds: a WAL entry, a ticket, a user message or a file line. Prose is refused.
+SOURCE_REF = re.compile(r'^(?:wal:\S+#[A-Za-z0-9_-]+|ticket:GoodQA [A-Za-z0-9._-]+#\d+|user:\S+/\S+ ".{1,200}"'
+                        r'|file:\S+:\d+@[0-9a-f]{7,64})$')
 MAX_STATE = 1 << 20
 MAX_EVENTS = 4096
 
@@ -173,6 +177,10 @@ def rung_of(events, policy):
     fails, current, climbs = 0, None, 0
     last_head, fixed_since = None, True
     for event in events:
+        if event.get('class') == 'ASSIGN' and event.get('rung') in policy['rungs']:
+            # An audited assignment (assign): the task really runs at this rung. Earlier failures belong to the old rung.
+            rung, fails, current, last_head, fixed_since = event['rung'], 0, None, None, True
+            continue
         if event.get('class') == 'CLAIM':
             fixed_since = True
             continue
@@ -427,6 +435,36 @@ class Ledger:
         finally:
             os.close(fd)
 
+    def assign(self, task, rung, *, source, actor):
+        """Audited rung assignment (goodqa#14840): the task is recorded at the rung it really runs at, so status, tier_gate and
+        reviewer selection stop showing R0 for work done at a higher rung. Appended to history, never rewritten. Raising only:
+        lowering below the computed rung is what `reset` is for. Permission rungs need an approve-top record."""
+        if not isinstance(rung, str) or rung not in self.policy['rungs']:
+            raise LedgerError('bad_rung', 'unknown rung %r' % (rung,))
+        entry = self.policy['rungs'][rung]
+        if not entry.get('writable'):
+            raise LedgerError('bad_rung', 'rung %s is review-only; a task cannot be assigned to it' % rung)
+        if not isinstance(source, str) or not SOURCE_REF.fullmatch(source):
+            raise LedgerError('bad_source', 'source must be a traceable reference: wal:<path>#<entry>, ticket:GoodQA <p>#<n>, '
+                                            'user:<session>/<id> "words" or file:<path>:<line>@<sha>')
+        if not isinstance(actor, str) or not ACTOR.fullmatch(actor):
+            raise LedgerError('bad_actor', 'actor must be a plain identifier (letters, digits, . _ : @ -)')
+        fd = self._lock(task)
+        try:
+            state, _ = self._read(task)
+            if entry['needs_user_permission'] and not (isinstance(state.get('permission'), dict) and state['permission'].get('ask_id')):
+                raise LedgerError('permission_required', 'rung %s needs the user permission recorded by approve-top first' % rung)
+            current = rung_of(state['events'], self.policy)['rung']
+            if tiers.rung_index(self.policy, rung) < tiers.rung_index(self.policy, current):
+                raise LedgerError('lowering_refused', 'the task is already at %s; lowering is a reset, not an assignment' % current)
+            state['events'].append({'seq': len(state['events']) + 1, 'at': now(), 'kind': 'assign', 'class': 'ASSIGN',
+                                    'why': 'rung assigned by %s' % actor, 'fingerprint': None, 'receipt_sha256': None,
+                                    'source': source, 'actor': actor, 'rung': rung, 'head': None, 'rung_at': current})
+            self._write(task, state)
+            return ladder_status(state, self.policy)
+        finally:
+            os.close(fd)
+
     def add_spend(self, task, usd):
         fd = self._lock(task)
         try:
@@ -597,6 +635,10 @@ def main(argv=None):
     reset = sub.add_parser('reset'); reset.add_argument('--task', required=True); reset.add_argument('--code', required=True, choices=sorted(RESET_CODES))
     reset.add_argument('--detail', required=True); reset.add_argument('--notify-wal')
     top = sub.add_parser('approve-top'); top.add_argument('--task', required=True); top.add_argument('--ask', required=True); top.add_argument('--wal', required=True)
+    assign = sub.add_parser('assign', help='record the rung a task really runs at (audited; raising only)')
+    assign.add_argument('--task', required=True); assign.add_argument('--rung', required=True)
+    assign.add_argument('--source', required=True, help='wal:<path>#<entry>, ticket:GoodQA <p>#<n>, user:<session>/<id> "words" or file:<path>:<line>@<sha>')
+    assign.add_argument('--actor', required=True)
     status = sub.add_parser('status'); status.add_argument('--task', required=True)
     sub.add_parser('digest')
     gate = sub.add_parser('gate-digest'); gate.add_argument('--limit', type=int, default=200)
@@ -625,6 +667,8 @@ def main(argv=None):
             value = ledger.reset(args.task, args.code, args.detail, notify=args.notify_wal)
         elif args.action == 'approve-top':
             value = ledger.approve_top(args.task, args.ask, args.wal)
+        elif args.action == 'assign':
+            value = ledger.assign(args.task, args.rung, source=args.source, actor=args.actor)
         elif args.action == 'status':
             value = ledger.status(args.task)
         elif args.action == 'gate-digest':
