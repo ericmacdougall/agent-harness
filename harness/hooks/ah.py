@@ -78,40 +78,52 @@ def atomic_json(path: Path, data) -> None:
 # ------------------------------------------------------------------ incremental line index
 
 def read_new_lines(path: Path, meta: dict):
-    """Yield complete lines appended since meta['offset']; resets meta when the file was replaced or truncated.
+    """(iterator of (offset, line), rebuilt) over complete lines appended since meta['offset'].
 
-    meta: inode, offset, tail (sha256 of the up-to-64 bytes before offset). Returns (lines, rebuilt).
+    Reads in bounded chunks, so memory stays flat for any file size. meta (inode, offset, tail = sha256 of the
+    up-to-64 bytes before offset) is cleared when the file was replaced or truncated and advanced once the
+    iterator is exhausted. A partial last line is left for the next call.
     """
     st = path.stat()
     rebuilt = False
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        offset = meta.get("offset", 0)
-        if offset:
+    offset = meta.get("offset", 0)
+    if offset:
+        fd = os.open(path, os.O_RDONLY)
+        try:
             ok = meta.get("inode") == st.st_ino and st.st_size >= offset
             if ok:
                 n = min(64, offset)
                 ok = hashlib.sha256(os.pread(fd, n, offset - n)).hexdigest() == meta.get("tail")
-            if not ok:
-                meta.clear()
-                offset, rebuilt = 0, True
-        data = b""
-        pos = offset
-        while True:
-            chunk = os.pread(fd, 8 << 20, pos)
-            if not chunk:
-                break
-            data += chunk
-            pos += len(chunk)
-        end = data.rfind(b"\n") + 1
-        lines = data[:end].split(b"\n")[:-1] if end else []
-        new_offset = offset + end
-        n = min(64, new_offset)
-        meta.update(inode=st.st_ino, offset=new_offset,
-                    tail=hashlib.sha256(os.pread(fd, n, new_offset - n)).hexdigest() if n else "")
-        return lines, rebuilt
-    finally:
-        os.close(fd)
+        finally:
+            os.close(fd)
+        if not ok:
+            meta.clear()
+            offset, rebuilt = 0, True
+
+    def gen():
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            pos, carry, carry_off = offset, b"", offset
+            while True:
+                chunk = os.pread(fd, 4 << 20, pos)
+                if not chunk:
+                    break
+                pos += len(chunk)
+                data = carry + chunk
+                start = 0
+                while True:
+                    nl = data.find(b"\n", start)
+                    if nl < 0:
+                        break
+                    yield carry_off + start, data[start:nl]
+                    start = nl + 1
+                carry, carry_off = data[start:], carry_off + start
+            n = min(64, carry_off)
+            meta.update(inode=st.st_ino, offset=carry_off,
+                        tail=hashlib.sha256(os.pread(fd, n, carry_off - n)).hexdigest() if n else "")
+        finally:
+            os.close(fd)
+    return gen(), rebuilt
 
 
 # ------------------------------------------------------------------ owners
@@ -146,7 +158,7 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
     lines, rebuilt = read_new_lines(path, meta)
     if rebuilt or "first" not in summary:
         summary.update(first=None, last_at=0.0, outcome=None, last_note="", tickets=[], events=0)
-    for raw in lines:
+    for _off, raw in lines:
         try:
             rec = json.loads(raw)
         except ValueError:
@@ -157,8 +169,10 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         summary["last_at"] = max(summary["last_at"], at)
         summary["events"] += 1
         event, note = rec.get("event"), rec.get("note") if isinstance(rec.get("note"), str) else ""
-        if event == "intent" and summary["first"] is None and note:
-            summary["first"] = note[:160]
+        if event == "intent":
+            summary["outcome"] = None  # new work after an earlier result/handoff: not finished
+            if summary["first"] is None and note:
+                summary["first"] = note[:160]
         if event in ("handoff", "result"):
             summary["outcome"] = event
         if event in ("handoff", "result", "status", "blocker", "decision") and note:
@@ -192,7 +206,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     if not main.is_file():
         raise AhError("session_unknown", f"no main WAL for session {session!r}")
     index_dir = state_dir(home, "ah-index")
-    spawned, stopped, named = {}, set(), []
+    spawned, stopped, named, stop_at = {}, set(), [], {}
     with open(main, "rb") as handle:
         for raw in handle:
             try:
@@ -208,6 +222,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                 spawned.setdefault(rec["agent_id"], {"type": rec.get("agent_type"), "at": parse_ts(rec.get("at"))})
             elif rec.get("event") == "subagent_stop":
                 stopped.add(rec["agent_id"])
+                stop_at[rec["agent_id"]] = parse_ts(rec.get("at"))
     registered = {r["args"].get("owner_agent") for r in _ledger(home) if r.get("op") == "task.register"}
     named_text = "\n".join(named)
     rows = []
@@ -216,7 +231,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         summary = summarize_agent_wal(path, index_dir) if path.is_file() else {
             "first": None, "last_at": 0.0, "outcome": None, "last_note": "", "tickets": []}
         last_wal = max(summary["last_at"], 0.0) or info["at"]
-        verdict = liveness.classify(now, last_wal, transcript_mtime(home, session, agent), agent in stopped,
+        tmtime = transcript_mtime(home, session, agent)
+        is_stopped = agent in stopped and max(last_wal, tmtime) <= stop_at.get(agent, 0.0) + 120
+        verdict = liveness.classify(now, last_wal, tmtime, is_stopped,
                                     summary["outcome"], summary["last_note"], info["type"],
                                     agent in registered,
                                     owner=(agent in registered or info["type"] in liveness.OWNER_TYPES
@@ -302,7 +319,7 @@ def index_transcript(home: Path, session: str) -> dict:
         idx.update(msgs=[], askq=[])
     askq = set(idx["askq"])
     prov = _prov()
-    for raw in lines:
+    for off, raw in lines:
         if b'"type"' not in raw:
             continue
         try:
@@ -318,30 +335,70 @@ def index_transcript(home: Path, session: str) -> dict:
             body, _ = prov.user_authorship(rec)
             if body and body.strip():
                 idx["msgs"].append(_msg("uuid", f"uuid:{session}/{rec.get('uuid')}", rec.get("timestamp"), body,
-                                        "human-origin turn"))
+                                        "human-origin turn", off))
                 continue
             answer = prov.answer_text(rec, askq)
             if answer is not None:
                 idx["msgs"].append(_msg("answer", f"answer:{session}/{rec.get('uuid')}", rec.get("timestamp"),
-                                        answer, prov.ANSWER_TRUST))
+                                        answer, prov.ANSWER_TRUST, off))
         elif kind == "queue-operation":
             content = prov.queue_user_text(rec)  # provenance.py owns the rule; wrappers are never user text
             if content is not None:
                 digest = hashlib.sha256(content.encode()).hexdigest()[:12]
                 idx["msgs"].append(_msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
-                                        rec.get("timestamp"), content, prov.QUEUE_TRUST))
+                                        rec.get("timestamp"), content, prov.QUEUE_TRUST, off))
     idx["askq"] = sorted(askq)
     atomic_json(cache, idx)
     return idx
 
 
-def _msg(kind, ident, ts, text, trust):
-    return {"id": ident, "kind": kind, "timestamp": ts, "trust": trust, "text": text[:8000], "chars": len(text)}
+def verify_rows(path: Path, rows: list) -> list:
+    """Keep only rows whose text still matches the transcript line at their recorded offset (cache is untrusted)."""
+    ok = []
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        for m in rows:
+            off = m.get("off")
+            if not isinstance(off, int) or off < 0:
+                continue
+            raw = os.pread(fd, 8 << 20, off).split(b"\n", 1)[0]
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            prov = _prov()
+            if m["kind"] == "uuid":
+                text, _ = prov.user_authorship(rec)
+                good = text is not None and rec.get("uuid") == m["id"].split("/", 1)[1]
+            elif m["kind"] == "queued":
+                text = prov.queue_user_text(rec)
+                good = text is not None and m["id"].endswith("#" + hashlib.sha256(text.encode()).hexdigest()[:12])
+            else:
+                text = _answer_values_cache(rec)
+                good = text is not None and rec.get("uuid") == m["id"].split("/", 1)[1]
+            if good and text[:8000] == m["text"]:
+                ok.append(m)
+    finally:
+        os.close(fd)
+    return ok
+
+
+def _answer_values_cache(rec):
+    """Answer text of an AskUserQuestion result record (binding to the tool_use was checked at index time)."""
+    blocks = (rec.get("message") or {}).get("content") if isinstance(rec, dict) else None
+    if isinstance(blocks, list) and len(blocks) == 1 and isinstance(blocks[0], dict):
+        return _prov().answer_text(rec, {blocks[0].get("tool_use_id")})
+    return None
+
+
+def _msg(kind, ident, ts, text, trust, off=None):
+    return {"id": ident, "kind": kind, "timestamp": ts, "trust": trust, "text": text[:8000], "chars": len(text),
+            "off": off}
 
 
 def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limit=20) -> dict:
     idx = index_transcript(home, session)
-    msgs = idx["msgs"]
+    msgs = verify_rows(find_transcript(home, session), idx["msgs"])
     # A queued message that later became a human turn is the same message: point the queue id at the uuid id.
     human = [(m["id"], norm(m["text"])) for m in msgs if m["kind"] == "uuid"]
     seen, out = set(), []
@@ -366,6 +423,9 @@ def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limi
         out = out[-int(recent):]
     else:
         raise AhError("bad_request", "give --text or --recent N")
+    if not any(m["kind"] == "uuid" for m in msgs):
+        # No human-origin turn: a `claude -p` helper session, whose prompt is agent text. Nothing here is a user.
+        out = []
     out = out[-limit:]
     for r in out:
         r["preview"] = re.sub(r"\s+", " ", r["text"]).strip()[:120]
@@ -508,18 +568,20 @@ def top_dirs(root: str, system: str, count: int = 10, budget_s: float = 20.0, ru
             kib = int(r.stdout.split()[0]) if r.stdout.split() else None
         except (subprocess.TimeoutExpired, ValueError, OSError):
             partial = True
+            entries.append({"path": t, "bytes": None, "timed_out": True})
             continue
         if kib is not None:
             entries.append({"path": t, "bytes": kib * 1024})
-    entries.sort(key=lambda e: -e["bytes"])
+    entries.sort(key=lambda e: -1 if e["bytes"] is None else -e["bytes"])
+    entries.sort(key=lambda e: 0 if e["bytes"] is None else 1)
     return {"root": root, "entries": entries[:count], "partial": partial, "skipped_protected": skipped}
 
 
 def disk(host=None, root=None, count=10, budget_s=20.0, top=True) -> dict:
     if host:
-        if not re.fullmatch(r"[A-Za-z0-9._@-]{1,100}", host):
+        if not re.fullmatch(r"[A-Za-z0-9._@][A-Za-z0-9._@-]{0,99}", host):
             raise AhError("bad_request", "host has characters ssh targets cannot have")
-        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host,
                 "python3 .claude/hooks/ah.py disk" + (" --no-top" if not top else f" --count {int(count)}")]
         try:
             r = subprocess.run(argv, capture_output=True, text=True, timeout=budget_s + 30)
@@ -571,7 +633,7 @@ def precheck(op: str, args: dict) -> None:
         need("task", "owner_agent", "session", "scope", "source")
         if not TICKET_RE.match(args.get("ticket") or ""):
             raise AhError("bad_request", "task.register: ticket must look like 'GoodQA <project>#<n>'")
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", args["session"]):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", args["session"]):
             raise AhError("bad_request", "task.register: session id is malformed")
         if not re.fullmatch(r"[A-Za-z0-9]{1,40}|main", args["owner_agent"]):
             raise AhError("bad_request", "task.register: owner_agent must be an agent id or 'main'")
@@ -586,7 +648,7 @@ def precheck(op: str, args: dict) -> None:
             raise AhError("evidence", "task.done needs evidence: --really-tested ID --wal PATH or --commit SHA --repo PATH")
         for e in ev:
             ok = isinstance(e, dict) and (
-                (isinstance(e.get("really_tested"), str) and e.get("wal")) or
+                (isinstance(e.get("really_tested"), str) and e["really_tested"].strip() and e.get("wal")) or
                 (re.fullmatch(r"[0-9a-f]{7,40}", str(e.get("commit", ""))) and e.get("repo")))
             if not ok:
                 raise AhError("evidence", "each evidence item is {really_tested, wal} or {commit, repo}")
@@ -623,9 +685,12 @@ class StoreLock:
 
 
 def _append_line(path: Path, record: dict) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    """One write() per line; a torn tail from a crash is closed with a newline first so it cannot swallow us."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     try:
-        os.write(fd, (canonical(record) + "\n").encode())
+        size = os.fstat(fd).st_size
+        prefix = b"\n" if size and os.pread(fd, 1, size - 1) != b"\n" else b""
+        os.write(fd, prefix + (canonical(record) + "\n").encode())
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -674,19 +739,40 @@ def post_comment(ref: str, body: str, operation_id: str) -> None:
 
 
 def spool_drain(home: Path) -> dict:
-    """Post spooled comments; the GoodQA operationId makes a re-post after a crash harmless."""
+    """Post spooled comments. A transport failure keeps the job; a ticket that does not exist moves it to dead/.
+    The GoodQA operationId makes a re-post after a crash harmless. One drainer at a time."""
+    import fcntl
     spool = store_dir(home) / "spool"
-    done, failed = 0, 0
-    for f in sorted(spool.glob("*.json")):
+    lockfd = os.open(store_dir(home) / "spool.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
         try:
-            job = json.loads(f.read_text())
-            post_comment(job["ticket"], job["body"], job["operation_id"])
-        except (AhError, OSError, ValueError, KeyError):
-            failed += 1
-            continue
-        f.unlink()
-        done += 1
-    return {"ok": True, "drained": done, "pending": failed}
+            fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return {"ok": True, "drained": 0, "pending": len(list(spool.glob("*.json"))), "busy": True}
+        done, failed, dead = 0, 0, 0
+        for f in sorted(spool.glob("*.json")):
+            try:
+                job = json.loads(f.read_text())
+                post_comment(job["ticket"], job["body"], job["operation_id"])
+            except AhError as e:
+                if e.code == "not_found":
+                    (spool / "dead").mkdir(exist_ok=True, mode=0o700)
+                    os.replace(f, spool / "dead" / f.name)
+                    dead += 1
+                else:
+                    failed += 1
+                continue
+            except (OSError, ValueError, KeyError):
+                failed += 1
+                continue
+            f.unlink(missing_ok=True)
+            done += 1
+        if done or dead:
+            _append_line(store_dir(home) / "audit.jsonl", {"at": iso(time.time()), "op": "spool.drain",
+                                                           "result": "drained", "drained": done, "dead": dead})
+        return {"ok": True, "drained": done, "pending": failed, "dead": dead}
+    finally:
+        os.close(lockfd)
 
 
 def _wal_path(home: Path, session: str, agent: str) -> Path:
@@ -695,6 +781,14 @@ def _wal_path(home: Path, session: str, agent: str) -> Path:
 
 def _wal_append(home: Path, path: Path, record: dict) -> None:
     import wal
+    try:  # a retry after a crash between this append and the ledger row must not duplicate the entry
+        with open(path, "rb") as handle:
+            handle.seek(0, 2)
+            handle.seek(max(0, handle.tell() - 262144))
+            if (b'"id":"%s"' % record["id"].encode()) in handle.read():
+                return
+    except OSError:
+        pass
     old = os.environ.get("HOME")
     try:
         os.environ["HOME"] = str(home)  # wal.append pins ~/.claude/wals under HOME
@@ -709,24 +803,32 @@ def _task(ledger: list, name: str):
     return reg[-1] if reg else None
 
 
-def _evidence_ok(home: Path, ev: list) -> None:
+def _evidence_ok(home: Path, ev: list, allowed: set) -> None:
     root = (home / ".claude" / "wals").resolve()
     for e in ev:
         if "really_tested" in e:
+            wid = e["really_tested"].strip()
             try:
                 p = Path(e["wal"]).expanduser().resolve(strict=True)
             except OSError:
                 raise AhError("evidence", f"WAL not found: {e['wal'][:80]}", 3)
             if root not in p.parents:
                 raise AhError("evidence", "evidence WAL must be under ~/.claude/wals", 3)
+            if p not in allowed:
+                raise AhError("evidence", "evidence WAL must be this task's session or owner WAL", 3)
             found = False
             with open(p, "rb") as handle:
                 for raw in handle:
-                    if e["really_tested"].encode() in raw and b"REALLY_TESTED" in raw:
+                    try:
+                        rec = json.loads(raw)
+                    except ValueError:
+                        continue
+                    note = rec.get("note") if isinstance(rec, dict) and isinstance(rec.get("note"), str) else ""
+                    if note.startswith("REALLY_TESTED") and (rec.get("id") == wid or note.startswith(f"REALLY_TESTED {wid}:")):
                         found = True
                         break
             if not found:
-                raise AhError("evidence", f"no REALLY_TESTED entry {e['really_tested']} in that WAL", 3)
+                raise AhError("evidence", f"no REALLY_TESTED entry {wid} in that WAL", 3)
         else:
             r = subprocess.run(["git", "-C", e["repo"], "cat-file", "-e", e["commit"] + "^{commit}"],
                                capture_output=True, timeout=20)
@@ -742,14 +844,13 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
     out = {}
 
     def comment(ticket, body):
-        try:
-            post_comment(ticket, body, opid)
-            out["comment"] = "posted"
-        except AhError:
-            _spool_comment(home, {"ticket": ticket, "body": body, "operation_id": opid})
-            out["comment"] = "pending"
+        # Queue only: the network call happens after the store lock is released (see write()).
+        _spool_comment(home, {"ticket": ticket, "body": body, "operation_id": opid})
+        out["comment"] = "pending"
 
     if op == "task.register":
+        if _task(ledger, args["task"]):
+            raise AhError("task_exists", f"task {args['task']!r} is already registered; ownership is not reassigned silently", 3)
         import provenance
         try:
             res = provenance.resolve(args["source"])
@@ -775,7 +876,8 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         reg = _task(ledger, args["task"])
         if not reg:
             raise AhError("unknown_task", f"task {args['task']!r} is not registered", 3)
-        _evidence_ok(home, args["evidence"])
+        allowed = {_wal_path(home, r_["session"], a_).resolve() for r_ in [reg["args"]] for a_ in ("main", r_["owner_agent"])}
+        _evidence_ok(home, args["evidence"], allowed)
         r = reg["args"]
         cites = "; ".join(e.get("really_tested") or e["commit"] for e in args["evidence"])
         rec = {"at": now, "event": "result", "id": wid, "note": f"task {args['task']} done; evidence: {cites}"[:3900]}
@@ -787,8 +889,40 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
     return out
 
 
+def _redact_args(obj, fn):
+    if isinstance(obj, str):
+        return fn(obj)
+    if isinstance(obj, list):
+        return [_redact_args(x, fn) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _redact_args(v, fn) for k, v in obj.items()}
+    return obj
+
+
+def task_list(home: Path, open_only: bool = False) -> dict:
+    """Fold the ledger into one row per task (the supported read path; nobody reads ledger.jsonl directly)."""
+    tasks = {}
+    for r in _ledger(home):
+        a = r.get("args") or {}
+        name = a.get("task")
+        if not name:
+            continue
+        if r.get("op") == "task.register":
+            tasks.setdefault(name, {"task": name, "owner_agent": a.get("owner_agent"), "session": a.get("session"),
+                                    "ticket": a.get("ticket"), "scope": a.get("scope"), "state": "registered",
+                                    "stage": None, "updated": r.get("received_at"), "seq": r.get("seq")})
+        elif name in tasks and r.get("op") == "task.status":
+            tasks[name].update(stage=a.get("stage"), note=a.get("note"), updated=r.get("received_at"))
+        elif name in tasks and r.get("op") == "task.done":
+            tasks[name].update(state="done", updated=r.get("received_at"))
+    rows = [t for t in tasks.values() if not (open_only and t["state"] == "done")]
+    return {"tasks": rows, "source": "direct"}
+
+
 def write(home: Path, op: str, args: dict, session: str, key: str | None = None) -> dict:
     precheck(op, args)
+    import redact
+    args = _redact_args(args, redact.redact)  # secrets never reach the ledger, spool or WAL
     key = key or derive_key(op, args, session)
     if not KEY_RE.match(key):
         raise AhError("bad_request", "idempotency key must be 8-128 chars of [A-Za-z0-9._:-]")
@@ -803,22 +937,28 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
                     _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who,
                                          "result": "key_conflict"})
                     raise AhError("key_conflict", "that key was used with a different request", 3)
-                return {"ok": True, "result": "duplicate", "id": row["id"], "seq": row["seq"], "key": key,
-                        "comment": row.get("comment")}
-        seq = len(ledger) + 1
+                return {"ok": True, "result": "duplicate", "id": row["id"], "seq": row["seq"], "key": key}
+        seq = max([r.get("seq", 0) for r in ledger if isinstance(r.get("seq"), int)] or [0]) + 1
         try:
             out = _apply(home, op, args, key, ledger)
         except AhError as e:
             _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who,
                                  "result": "rejected", "code": e.code})
             raise
+        except Exception as e:  # never an unaudited traceback
+            _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who,
+                                 "result": "rejected", "code": "internal"})
+            raise AhError("internal", f"{type(e).__name__} while applying {op}", 3)
         rid = "ah" + hashlib.sha256(key.encode()).hexdigest()[:10]
         _append_line(store_dir(home) / "ledger.jsonl", {
             "seq": seq, "id": rid, "key": key, "sha": body_sha, "op": op, "args": args, "actor": who,
-            "received_at": iso(time.time()), "comment": out.get("comment")})
+            "received_at": iso(time.time())})
         _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who, "result": "applied", "seq": seq})
     reply = {"ok": True, "result": "applied", "id": rid, "seq": seq, "key": key}
     reply.update(out)
+    if out.get("comment") == "pending":  # post now, outside the lock; on failure it stays spooled for the next drain
+        drained = spool_drain(home)
+        reply["comment"] = "posted" if drained.get("pending", 0) == 0 and not drained.get("busy") else "pending"
     return reply
 
 
@@ -845,7 +985,7 @@ def render_text(cmd: str, data: dict) -> str:
         for v in data["volumes"]:
             lines.append(f"  {v['path']:<24} {v['used_pct']:>5}% used  {v['avail_bytes'] / 2**30:7.1f} GiB free  [{v['role']}]")
         for e in (data.get("top") or {}).get("entries", []):
-            lines.append(f"    {e['bytes'] / 2**30:8.2f} GiB  {e['path']}")
+            lines.append(f"    {(e['bytes'] or 0) / 2**30:8.2f} GiB  {e['path']}" + ("  (timed out)" if e.get("timed_out") else ""))
         return "\n".join(lines)
     return json.dumps(data, indent=2)
 
@@ -893,6 +1033,8 @@ def build_parser():
     st.add_argument("--stage", required=True)
     st.add_argument("--note", required=True)
     st.add_argument("--ticket")
+    tl = ks.add_parser("list")
+    tl.add_argument("--open", action="store_true", help="hide done tasks")
     dn = ks.add_parser("done")
     dn.add_argument("--task", required=True)
     dn.add_argument("--really-tested", action="append", default=[], metavar="WALID")
@@ -925,9 +1067,9 @@ def run(args, home: Path) -> dict:
             raise AhError("session_unknown", "no session: pass --session")
         return owners(home, s, comments=comment_age if args.comments else None)
     if cmd == "user-msg":
-        s = args.session or os.environ.get("CLAUDE_SESSION_ID") or newest_transcript_session(home)
-        if not s:
-            raise AhError("session_unknown", "no session: pass --session")
+        s = args.session or os.environ.get("CLAUDE_SESSION_ID")
+        if not s:  # never guess "the newest transcript": a running helper session would win
+            raise AhError("session_unknown", "no session: pass --session or set CLAUDE_SESSION_ID")
         return user_msgs(home, s, text=args.search, recent=args.recent, full=args.full)
     if cmd == "disk":
         return disk(args.host, args.root, args.count, args.budget, not args.no_top)
@@ -939,6 +1081,8 @@ def run(args, home: Path) -> dict:
         return write(home, "ticket.comment", {"ticket": args.ticket, "body": args.body}, session_of(args, home), args.key)
     if cmd == "task":
         s = session_of(args, home)
+        if args.sub == "list":
+            return task_list(home, args.open)
         if args.sub == "register":
             a = {"task": args.task, "owner_agent": args.owner_agent, "session": s or "", "ticket": args.ticket,
                  "scope": args.scope, "source": args.source}
@@ -959,8 +1103,7 @@ def run(args, home: Path) -> dict:
     if cmd == "write":
         for row in _ledger(home):
             if row.get("key") == args.key:
-                return {"ok": True, "result": "applied", "id": row["id"], "seq": row["seq"], "key": args.key,
-                        "comment": row.get("comment")}
+                return {"ok": True, "result": "applied", "id": row["id"], "seq": row["seq"], "key": args.key}
         return {"ok": True, "result": "unknown", "key": args.key}
     raise AhError("unknown_command", cmd)
 
