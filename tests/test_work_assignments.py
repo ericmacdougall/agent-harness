@@ -769,15 +769,18 @@ class RemovalTest(Base):
         self.assertEqual(self.cli("update", old, "--state", "superseded")[0], 2)
         self.assertEqual(self.asks()[old]["state"], "open")
 
-    def test_superseded_ask_stays_in_digest_until_replacement_done(self):
-        """Native review F4: superseding by any open ask hid the old one."""
+    def test_superseded_ask_stays_in_digest_until_a_user_cancel(self):
+        """Native review F4: superseding by any open ask hid the old one; PR review 7d0fb89 #1: so did the replacement
+        finishing."""
         old, new = self.split2("do the billing work", "deploy the billing migration", "deploy billing migration in two steps")
         self.cli("relate", old, "superseded_by", new)
         self.assertEqual(self.cli("update", old, "--state", "superseded")[0], 0)
         out = self.cli("status")[1]
         self.assertIn(f"SUPERSEDED {old} -> {new} [open]", out)
         self.advance(new)
-        self.assertNotIn("SUPERSEDED", self.cli("status")[1])
+        out = self.cli("status")[1]
+        self.assertIn(f"SUPERSEDED {old} -> {new} [done]", out)
+        self.assertIn("1 superseded awaiting a user cancel", out)
 
     def test_superseded_ask_leaves_only_through_a_user_cancel(self):
         """PR review 5d7efba #1: siblings are the agent's split, so "rotate credentials" superseded by "tidy readme
@@ -791,6 +794,9 @@ class RemovalTest(Base):
         self.assertEqual(self.cli("remove", old)[0], 2)
         self.assertEqual(self.cli("prune")[0], 0)
         self.assertIn(old, self.asks())
+        # PR review 7d0fb89 #1: it also must not vanish from status and Stop once the replacement is done.
+        self.assertIn(f"SUPERSEDED {old}", self.cli("status")[1])
+        self.assertEqual(self.hook("stop", {"session_id": SID, "transcript_path": str(self.transcript)}).get("decision"), "block")
         msg = self.capture("cancel: do not rotate the staging credentials")
         uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
         line = len(self.transcript.read_text().splitlines())
@@ -1186,8 +1192,11 @@ class AttestGuardTest(Base):
             self.assertEqual(deny(self.guard(tool, inp)), "deny", (tool, inp))
         for tool, inp in (("Read", {"file_path": str(wa.files()["snap"])}), ("Grep", {"pattern": "work-ledger", "path": "/repo/src"}),
                           ("Grep", {"pattern": "TODO"}), ("Glob", {"pattern": "src/**/*.py", "path": "/repo"}),
-                          ("Grep", {"pattern": "x", "path": home + "/work"})):
+                          ("Grep", {"pattern": "x", "path": home + "/work"}), ("LS", {"path": str(Path(home).parent)})):
             self.assertEqual(self.guard(tool, inp), {}, (tool, inp))
+        in_store = lambda tool, inp: self.hook("guard", {"session_id": SID, "tool_name": tool, "tool_input": inp, "cwd": home})
+        self.assertEqual(deny(in_store("Grep", {"pattern": "x"})), "deny")  # no path: the cwd is the store
+        self.assertEqual(deny(self.guard("Grep", {"pattern": "x", "path": home + "\x00"})), "deny")
 
     def test_guard_allows_ordinary_globs_and_code(self):
         """PR review R1 (regression): a bare `*` counted as naming the key, so `ls *` and `x = 2 * 3` were denied."""

@@ -130,20 +130,28 @@ def names_key(tool_input) -> bool:
     return bool(KEY_FILE.search(command)) or any(glob_could_name_key(t) for t in GLOB_TOKEN.findall(command))
 
 
-def searches_store(tool_input) -> bool:
-    """A Grep/Glob/LS rooted at the store directory or one of its ancestors (a recursive search reaches the key)."""
+def searches_store(tool: str, tool_input, cwd=None) -> bool:
+    """A Grep/Glob rooted at the store directory or one of its ancestors (a recursive search reaches the key), or an
+    LS of the store directory itself. A missing path means the session cwd. A NUL byte fails closed."""
     if not isinstance(tool_input, dict):
         return False
     home = os.path.realpath(str(base()))
+    recursive = tool.lower() != "ls"
+    if not isinstance(tool_input.get("path"), str) or not tool_input["path"].strip():
+        tool_input = dict(tool_input, path=cwd or os.getcwd())
     for key in ("path", "pattern"):
         value = tool_input.get(key)
         if not isinstance(value, str) or not value.strip():
             continue
+        if "\x00" in value:
+            return True
+        if key == "pattern" and ("*" not in value and "?" not in value and "/" not in value):
+            continue  # a Grep regex, not a path
+        if key == "pattern" and not value.startswith(("/", "~", "$")):
+            continue  # a relative Glob pattern is resolved under path, checked above
         root = value.split("*", 1)[0].split("?", 1)[0].split("[", 1)[0]
-        root = os.path.realpath(os.path.expanduser(os.path.expandvars(root or ".")))
-        if home == root or home.startswith(root.rstrip("/") + "/"):
-            if key == "pattern" and "*" not in value and "?" not in value and "/" not in value:
-                continue  # a Grep regex, not a path
+        root = os.path.realpath(os.path.join(tool_input["path"], os.path.expanduser(os.path.expandvars(root or "."))))
+        if home == root or (recursive and home.startswith(root.rstrip("/") + "/")):
             return True
     return False
 
@@ -1218,6 +1226,11 @@ def problems_for(data: dict, session: str, policy: dict, ts=None) -> list:
             if flags:
                 found.append(("stale", rid, f"{rid} ({ask['state']}, owner {owner_of(ask) or 'none'}): " + ",".join(flags)
                               + f" - {prov.clip(ask['request']['compressed'], 60)}"))
+            if ask["state"] == "superseded":
+                repl = supersede_target(data, ask)
+                if repl is None or repl["state"] == "done":  # the replacement is finished: only the user can drop this one
+                    found.append(("superseded", rid, f"{rid} superseded by {repl['id'] if repl else '?'} (done): ask the user "
+                                  f"whether to cancel it - {prov.clip(ask['request']['compressed'], 60)}"))
     return found
 
 
@@ -1268,14 +1281,9 @@ def supersede_target(data: dict, ask: dict):
 
 
 def pending_supersessions(data: dict, limit: int = 8) -> list:
-    """Superseded asks whose replacement is not done yet: superseding is not proof the work happened."""
-    out = []
-    for ask in data["asks"].values():
-        if ask["state"] != "superseded":
-            continue
-        target = supersede_target(data, ask)
-        if target is None or target["state"] != "done":
-            out.append(ask)
+    """Every superseded ask: superseding is the agent's call, so the older request stays visible until the user
+    cancels it, however done its replacement is."""
+    out = [ask for ask in data["asks"].values() if ask["state"] == "superseded"]
     return sorted(out, key=lambda a: a["id"])[:limit]
 
 
@@ -1288,7 +1296,8 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
     no_asks = no_ask_rows(data, session)
     lines = [f"Work assignments: {len(ix['untriagedMessages'])} untriaged message(s), {len(asks)} open ask(s), "
              f"{len(flagged)} flagged (no owner, stopped owner or stale), {len(ix['openDecisions'])} open decision(s), "
-             f"{len(no_asks)} no-ask(s), {sum(1 for r in no_asks if r['cues'])} flagged as a possible request."]
+             f"{len(no_asks)} no-ask(s), {sum(1 for r in no_asks if r['cues'])} flagged as a possible request, "
+             f"{len(pending_supersessions(data, limit=10 ** 6))} superseded awaiting a user cancel."]
     for mid in ix["untriagedMessages"][:8]:
         tag = "" if data["messages"][mid]["humanCheck"].get("verified") else " [unverified: transcript only]"
         lines.append(f"  UNTRIAGED {mid}{tag}: \"{data['messages'][mid]['text'].get('excerpt', '[pasted content]')}\" -> work_assignments.py split --msg {mid} --item '...' | no-ask")
@@ -1305,9 +1314,9 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
         repl = supersede_target(data, ask)
         target = repl["id"] if repl else "?"
         lines.append(f"  SUPERSEDED {ask['id']} -> {target} [{repl['state'] if repl else 'missing'}]: "
-                     f"{prov.clip(ask['request']['compressed'], 60)} (shown until {target} is done)")
+                     f"{prov.clip(ask['request']['compressed'], 60)} (shown until the user cancels it)")
     if len(pending) > 8:
-        lines.append(f"  ... {len(pending) - 8} more superseded ask(s) waiting on their replacement: `work_assignments.py status --json`")
+        lines.append(f"  ... {len(pending) - 8} more superseded ask(s) awaiting a user cancel: `work_assignments.py status --json`")
     shown = min(8, limit)
     lines.extend(no_ask_line(row) for row in no_asks[:shown])
     if len(no_asks) > shown:
@@ -1527,7 +1536,7 @@ def hook_guard(payload: dict, runtime: str) -> dict:
         reason = "Hooks take their input from the harness; agents may not run `work_assignments.py hook`."
     elif isinstance(command, str) and INPROCESS.search(command) and not SAFE_CLI.match(command):
         reason = "work_assignments is used only through its CLI (`python3 .../work_assignments.py <command>`), not imported."
-    elif re.fullmatch(r"(?i)grep|glob|ls|search", tool) and searches_store(tool_input):
+    elif re.fullmatch(r"(?i)grep|glob|ls|search", tool) and searches_store(tool, tool_input, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None):
         reason = "Searching the agent-harness store directory would expose the capture key; read a named file instead."
     elif isinstance(command, str) and reads_store_recursively(command):
         reason = "Recursive reads of the agent-harness store would expose the capture key; read a named file instead."

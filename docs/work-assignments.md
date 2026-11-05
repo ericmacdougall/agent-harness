@@ -55,8 +55,8 @@ words); the question text does not count, because the agent wrote it. An ask has
 relation, to an ask split from the same human message. Superseding only marks the link for the digest: it never
 makes an ask removable, because which asks a message holds is the agent's own split. The older ask leaves only
 when the user cancels it. A request the user replaced is cancelled with their words as proof. The guard runs on Write, Edit, MultiEdit, NotebookEdit, Bash, Read, Grep, Glob and LS on Claude Code, and on every
-tool on Codex. It looks at paths and shell commands, not file contents, and refuses a search rooted at the store
-directory or above it. It refuses a path or shell word that names the key or a glob that
+tool on Codex. It looks at paths and shell commands, not file contents, and refuses a Grep or Glob rooted at the store
+directory or above it (no path means the session cwd), and an LS of the store directory. It refuses a path or shell word that names the key or a glob that
 could expand to it (a bare `*` does not count unless it is inside the store directory), recursive reads of the
 store directory, in-process use (`import work_assignments`, `capture_key`, `hook_prompt(`) and agent calls of
 `work_assignments.py hook`.
@@ -102,7 +102,8 @@ be a human message this ledger captured from a transcript it tracks, not older t
 line is re-read at removal. Every binding also needs retraction words in the quote (cancel, drop, stop, never mind,
 no longer, skip and similar); an answer binding may instead be a plain yes to a decision whose question is about
 cancelling. Sharing words with the ask is not enough on its own. A superseded ask stays in the digest as
-`SUPERSEDED A -> B` until B is done, because superseding alone does not prove the work happened. Removal appends
+`SUPERSEDED A -> B` until the user cancels it, and once B is done, Stop asks the agent to put that question to
+the user, because superseding is the agent's call. Removal appends
 the full record to the archive and leaves a tombstone.
 
 ## Backup
