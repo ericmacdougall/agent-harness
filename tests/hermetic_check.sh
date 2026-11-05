@@ -18,7 +18,8 @@
 # Optional write protection (EPERM or EROFS, never a kill signal): HC_SANDBOX=1 (macOS sandbox-exec: deny writes below the
 # real home except the tree, its git common dir and the temp dir; /bin/ps cannot be exec'd inside any sandbox-exec
 # profile, so use it for single modules and failing controls) and HC_BWRAP=1 (Linux bubblewrap, no outside network: the whole filesystem is
-# read-only except the tree, its git common dir, the temp dir and a tmpfs /tmp; usable for the full suite).
+# read-only except the tree, its git common dir, the temp dir and a tmpfs /tmp; single modules and failing controls only: inside
+# bwrap's user namespace host root-owned directories look foreign, so the ownership tests (test_pyfront) fail there).
 # AGENT_HARNESS_REVIEW_POLICY, when set by the caller, is passed through (use a file with empty reviewer lists).
 # HC_UNPINNED=1 runs the old tests with the real HOME and no pin (failing controls on a base tree only) and REQUIRES
 # HC_SANDBOX=1 or HC_BWRAP=1 so a leak is blocked rather than written.
@@ -98,5 +99,5 @@ ran=$(sed -n 's/^Ran \([0-9][0-9]*\) tests\{0,1\} in .*/\1/p' "$LOGS_REAL/suite.
 finalok=0; tail -n 3 "$LOGS_REAL/suite.log" | grep -Eq '^OK( \(.*\))?$' && finalok=1
 loaded=$(wc -l < "$LOGS_REAL/loaded.log" | tr -d ' ')
 if command -v shasum >/dev/null; then sha=$(shasum -a 256 "$self" | cut -c1-16); else sha=$(sha256sum "$self" | cut -c1-16); fi
-echo "suite_rc=$rc tests_ran=$ran final_ok=$finalok audit_writes=$audited audit_opendir_records=$opendirs audit_log_errors=$errors ssh_calls=$ssh ssh_loopback_calls=$sshlohook_loaded_in=$loaded snapshot_diff_lines=$d sandbox=${HC_SANDBOX:-no} bwrap=${HC_BWRAP:-no} pinned=$([ -n "${HC_UNPINNED:-}" ] && echo no || echo yes) tmpdir=${HC_TMPDIR:-unset} pattern=${pattern:-full} script_sha256=$sha $(grep -E '^Ran ' "$LOGS_REAL/suite.log")" | tee "$LOGS_REAL/result.txt"
+echo "suite_rc=$rc tests_ran=$ran final_ok=$finalok audit_writes=$audited audit_opendir_records=$opendirs audit_log_errors=$errors ssh_calls=$ssh ssh_loopback_calls=$sshlo hook_loaded_in=$loaded snapshot_diff_lines=$d sandbox=${HC_SANDBOX:-no} bwrap=${HC_BWRAP:-no} pinned=$([ -n "${HC_UNPINNED:-}" ] && echo no || echo yes) tmpdir=${HC_TMPDIR:-unset} pattern=${pattern:-full} script_sha256=$sha $(grep -E '^Ran ' "$LOGS_REAL/suite.log")" | tee "$LOGS_REAL/result.txt"
 if [ "$rc" = 0 ] && [ "$audited" -eq 0 ] && [ "$errors" -eq 0 ] && [ "$ssh" -eq 0 ] && [ "$loaded" -ge 2 ] && [ "$ran" -gt 0 ] && [ "$finalok" -eq 1 ]; then echo HERMETIC_PASS | tee -a "$LOGS_REAL/result.txt"; echo "REPORT_DIR=$LOGS_REAL"; else echo HERMETIC_FAIL | tee -a "$LOGS_REAL/result.txt"; echo "REPORT_DIR=$LOGS_REAL (audit.log, suite.log, ssh.calls)"; exit 1; fi
