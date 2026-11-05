@@ -558,5 +558,42 @@ class RoundFourFindings(unittest.TestCase):
                 cp.load_policy(base)  # must not raise
 
 
+class CodexInstallKeepsEnforcement(unittest.TestCase):
+    """Native review F1: install_codex copied the generic policies over a host's personal values."""
+
+    def test_upgrade_over_a_legacy_codex_home_keeps_repos_backstop_and_org(self):
+        sys.path.insert(0, str(ROOT))
+        import install_codex
+        import commit_policy as cp
+        if sys.version_info < (3, 11):
+            self.skipTest("install_codex needs Python 3.11+ (tomllib)")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            harness = home / ".codex" / "agent-harness"
+            harness.mkdir(parents=True)
+            legacy = json.loads((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
+            legacy["backstop_repos"] = ["example\\.invalid/"]
+            legacy["ticket_systems"]["goodqa"].update({"repos": ["example\\.invalid/"], "org_id": "00000000-0000-4000-8000-000000000042"})
+            (harness / "commit_policy.json").write_text(json.dumps(legacy))
+            install_codex.install(home, True)
+            with mock.patch.dict(os.environ):
+                os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
+                policy = cp.load_policy(harness / "commit_policy.json")
+            self.assertEqual(policy["backstop_repos"], ["example\\.invalid/"])
+            goodqa = policy["ticket_systems"]["goodqa"]
+            self.assertEqual(goodqa["repos"], ["example\\.invalid/"])
+            self.assertEqual(goodqa["org_id"], "00000000-0000-4000-8000-000000000042")
+            self.assertEqual(oct((harness / "commit_policy.local.json").stat().st_mode & 0o777), "0o600")
+            self.assertTrue((harness / "commit_policy.local.json.example").is_file())
+            self.assertIn("spec_policy.local.json", install_codex.local_profile_status(home, harness))  # the one still missing is named
+
+    def test_status_line_reports_missing_profiles_for_codex(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        with tempfile.TemporaryDirectory() as tmp:
+            line = install.local_profile_status(Path(tmp), Path(tmp) / "agent-harness")
+            self.assertIn("MISSING", line)
+
+
 if __name__ == "__main__":
     unittest.main()

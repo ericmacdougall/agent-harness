@@ -777,11 +777,11 @@ def netwatch_status(home: Path, apply: bool, flag) -> str:
         return f"netwatch: skipped ({error.__class__.__name__}: {error})"
 
 
-def migrate_local_profiles(claude: Path) -> list[str]:
+def migrate_local_profiles(claude: Path, policy_dir: Path | None = None) -> list[str]:
     """Before the shipped policies are overwritten, copy their personal values into new untracked 0600 profiles.
     Never overwrites an existing profile. Without this an upgrade would silently turn ticket enforcement off."""
     notes = []
-    hooks = claude / "hooks"
+    hooks = policy_dir if policy_dir is not None else claude / "hooks"  # Codex keeps its policies in ~/.codex/agent-harness
     def keep(name, build):
         old, target = hooks / name, hooks / name.replace(".json", ".local.json")
         if target.exists() or target.is_symlink() or not old.is_file():
@@ -821,9 +821,9 @@ def migrate_local_profiles(claude: Path) -> list[str]:
     return notes
 
 
-def local_profile_status(home: Path) -> str:
+def local_profile_status(home: Path, policy_dir: Path | None = None) -> str:
     """The shipped policy is generic, so a host without commit_policy.local.json has ticket enforcement off."""
-    hooks = home.expanduser() / ".claude" / "hooks"
+    hooks = policy_dir if policy_dir is not None else home.expanduser() / ".claude" / "hooks"
     missing = [name for name in ("commit_policy.local.json", "spec_policy.local.json") if not (hooks / name).is_file()]
     if not missing:
         return f"policy profiles: commit_policy.local.json and spec_policy.local.json present in {hooks}"
