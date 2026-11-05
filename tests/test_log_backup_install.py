@@ -328,7 +328,7 @@ class UnitContents(unittest.TestCase):
     def test_timer_and_service_are_exactly_as_intended(self):
         timer = (ROOT / "harness/schedulers/log-backup.timer").read_text().splitlines()
         self.assertEqual(timer, ["[Unit]", "Description=Agent log backup every 15 min", "[Timer]", "OnBootSec=2min",
-                                 "OnUnitActiveSec=15min", "[Install]", "WantedBy=timers.target"])
+                                 "OnUnitActiveSec=15min", "RandomizedDelaySec=120", "[Install]", "WantedBy=timers.target"])
         self.assertNotIn("Persistent=true", timer)  # a no-op for OnBootSec/OnUnitActiveSec timers
         service = (ROOT / "harness/schedulers/log-backup.service").read_text().splitlines()
         self.assertIn("Type=oneshot", service)
@@ -341,6 +341,7 @@ class UnitContents(unittest.TestCase):
         self.assertEqual(data["Label"], "com.ericmacdougall.log-backup")
         self.assertEqual(data["StartInterval"], 900)
         self.assertEqual(data["ProgramArguments"], ["/bin/bash", "/h/.agent-harness/bin/log-backup.sh"])
+        self.assertEqual(data["EnvironmentVariables"]["LOG_BACKUP_JITTER_SECONDS"], "120")  # stagger hosts on one account
 
 
 class Refusals(Case):
