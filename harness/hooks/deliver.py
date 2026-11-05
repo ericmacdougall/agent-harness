@@ -944,7 +944,8 @@ def prepare_pr(flow, title, body):
         if code:
             gh_error = sanitize_gh_text(error_text)
             hint = classify_gh_failure(code, error_text)
-            likely = hint
+            # Under REMOTE_UNCERTAIN a new generation is refused, so drop the "re-run" advice.
+            likely = hint.split(", then re-run")[0] if hint else None
             try:
                 already = matching_pr(flow.state, flow.args.timeout)
             except DeliveryError:

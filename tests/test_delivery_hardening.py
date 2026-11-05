@@ -90,6 +90,7 @@ class GhCreateVerdict(workflow.DeliveryWorkflow):
         self.assertEqual((result.returncode, data['status'], data['gh_exit']), (4, 'REMOTE_UNCERTAIN', 4),
                          result.stdout)
         self.assertIn('gh auth login', data['hint'])
+        self.assertNotIn('--new-generation', data['hint'])  # an uncertain generation cannot be superseded
         result, refused = self.invoke(*self.finish_args('local'))
         self.assertNotEqual(refused['status'], 'LOCAL_DELIVERED', result.stdout)
 
