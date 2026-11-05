@@ -1240,6 +1240,10 @@ class Install(unittest.TestCase):
         pre = [h for entry in settings["hooks"]["PreToolUse"] for h in entry["hooks"]
                if (h.get("args") or [""])[0].endswith("spec_flow.py")]
         stops = [h for entry in settings["hooks"]["SubagentStop"] for h in entry["hooks"]]
+        # The model ladder (tier_gate.py stop) is a second, separate SubagentStop hook; each must appear once.
+        ladder = [h for h in stops if (h.get("args") or [""])[0].endswith("tier_gate.py")]
+        stops = [h for h in stops if h not in ladder]
+        self.assertEqual(len(ladder), 1)
         self.assertEqual(len(pre), 1)
         self.assertEqual((pre[0]["timeout"], pre[0]["onFailure"]), (60, "block"))
         self.assertEqual(len(stops), 1)

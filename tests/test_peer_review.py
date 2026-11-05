@@ -4,6 +4,7 @@ import json
 import os
 import resource
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -647,7 +648,8 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(capture.exists())
         self.assertEqual(launches.read_text().split(), ['codex', 'claude'])
-        self.assertIn('Blind Claude Opus fallback', self.output.read_text())
+        self.assertIn('Reviewer: Claude opus medium (rung R1)', self.output.read_text())
+        self.assertIn('Fallback reason: Primary reviewer unavailable (AUTH)', self.output.read_text())
 
     def test_structured_failure_overrides_exit_zero_and_last_message_pass(self):
         capture = self.root / 'fallback.capture'
@@ -1366,3 +1368,109 @@ class ProviderEnvelopeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LadderSelectionTests(unittest.TestCase):
+    """AC-9 of goodqa#14527: the reviewer comes from the tier table and the result feeds the task ledger."""
+    fake = PeerReviewTests.fake
+    invoke = PeerReviewTests.invoke
+    evidence = staticmethod(PeerReviewTests.evidence)
+
+    def setUp(self):
+        PeerReviewTests.setUp(self)
+        self.ladder = self.root / 'ladder'; self.ladder.mkdir(mode=0o700)
+        self.argv_file = self.root / 'argv.json'
+        body = f'''import json, sys
+from pathlib import Path
+Path({str(self.argv_file)!r}).write_text(json.dumps(sys.argv))
+if '--output-last-message' in sys.argv:
+    Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text(Path({str(self.root / 'verdict.txt')!r}).read_text())
+else:
+    print(Path({str(self.root / 'verdict.txt')!r}).read_text())
+'''
+        self.fake('codex', body)
+        self.fake('claude', body)
+        # Hermetic PATH: only the fake bin dir plus symlinks to the tools a review run needs, so removing the
+        # fake codex means codex is absent even where a real /usr/bin/codex exists (dev2).
+        self.tools = self.root / 'tools'; self.tools.mkdir(mode=0o700)
+        for name in ('git', 'python3', 'sh', 'env', 'cat', 'mkdir', 'rm', 'cp', 'mv', 'ln', 'ls', 'chmod', 'sed', 'grep',
+                     'awk', 'tr', 'sort', 'head', 'tail', 'wc', 'date', 'sleep', 'dirname', 'basename', 'uname', 'mktemp',
+                     'readlink', 'true', 'false', 'find', 'xargs', 'diff', 'tar'):
+            found = shutil.which(name, path='/usr/bin:/bin:/usr/local/bin')
+            if found:
+                (self.tools / name).symlink_to(found)
+        self.assertFalse((self.tools / 'codex').exists() or (self.tools / 'claude').exists())
+        (self.root / 'verdict.txt').write_text('CODE_INSPECTION_RESULT: BLOCK\nF1: the handler drops the error\n')
+
+    def run_review(self, *extra, stage='code-inspection', remove=()):
+        for name in remove:
+            (self.bin / name).unlink()
+        return self.invoke(stage=stage, extra=list(extra), env={
+            'AGENT_HARNESS_ESCALATION_DIR': str(self.ladder), 'PATH': str(self.bin) + os.pathsep + str(self.tools)})
+
+    def test_codex_primary_carries_the_rung_effort_and_the_headers_name_the_selection(self):
+        result = self.run_review('--task', 'lad-1', '--author-rung', 'R2', '--author-harness', 'claude')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        argv = json.loads(self.argv_file.read_text())
+        self.assertEqual(argv[0].rsplit('/', 1)[-1], 'codex')
+        self.assertIn('gpt-6.1-sol', argv); self.assertIn('model_reasoning_effort=xhigh', argv)
+        report = self.output.read_text()
+        self.assertIn('Author-Rung: R2\n', report); self.assertIn('Reviewer-Rung: R3\n', report)
+        self.assertIn('Reviewer-Selection: openai gpt-6.1-sol xhigh;', report)
+        receipts = list((self.ladder / 'selections').glob('*.json'))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertEqual((receipt['task'], receipt['stage'], receipt['author_rung'], receipt['selection']['rung']),
+                         ('lad-1', 'code-inspection', 'R2', 'R3'))
+        self.assertEqual(receipt['packet_sha256'], hashlib.sha256(self.packet.read_bytes()).hexdigest())
+
+    def test_permission_rung_reviewer_needs_a_recorded_permission(self):
+        import escalation as ladder
+        import model_tiers as tiers
+        refused = self.run_review('--author-rung', 'R5', '--author-harness', 'claude')
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn('needs user permission', refused.stderr)
+        self.assertFalse(self.argv_file.exists()); self.assertFalse((self.ladder / 'selections').exists())
+        wals = self.root / 'wals'; (wals / 's').mkdir(parents=True)
+        wal = wals / 's' / 'main.jsonl'
+        wal.write_text(json.dumps({'id': 'w9', 'event': 'ask', 'note': 'fable review for [task:lad-5]', 'source': 'user:s/u "yes"'}) + '\n'
+                       + json.dumps({'id': 'w10', 'event': 'ask_resolved', 'ref': 'w9', 'note': 'approved'}) + '\n')
+        os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
+        ladder.Ledger(self.ladder, tiers.load_policy()).approve_top('lad-5', 'w9', wal)
+        allowed = self.run_review('--task', 'lad-5', '--author-rung', 'R5', '--author-harness', 'claude')
+        self.assertEqual(allowed.returncode, 3, allowed.stderr)
+        argv = json.loads(self.argv_file.read_text())
+        # Claude author, Codex present: the cross-harness reviewer is Astra high, launched only with the record.
+        self.assertIn('gpt-6-astra', argv); self.assertIn('Permission: w9\n', self.output.read_text())
+
+    def test_claude_fallback_carries_effort_and_budget_when_codex_is_absent(self):
+        result = self.run_review('--task', 'lad-2', '--author-rung', 'R1', '--author-harness', 'claude', remove=('codex',))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        argv = json.loads(self.argv_file.read_text())
+        self.assertEqual(argv[0].rsplit('/', 1)[-1], 'claude')
+        self.assertIn('--effort', argv); self.assertEqual(argv[argv.index('--effort') + 1], 'high')
+        self.assertIn('--max-budget-usd', argv); self.assertEqual(argv[argv.index('--max-budget-usd') + 1], '8')
+        self.assertEqual(argv[argv.index('--model') + 1], 'opus')
+        self.assertIn('Reviewer-Rung: R2\n', self.output.read_text())
+
+    def test_block_feeds_one_fail_event_and_a_replay_is_a_noop(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        import escalation as ladder, model_tiers as tiers
+        self.run_review('--task', 'lad-3', '--author-rung', 'R0')
+        state = ladder.Ledger(self.ladder, tiers.load_policy()).load('lad-3')
+        self.assertEqual(len(state['events']), 1)
+        event = state['events'][0]
+        self.assertEqual((event['class'], event['kind'], event['why']), ('FAIL', 'review', 'material review finding'))
+        self.assertEqual(event['source'], 'peer_review:code-inspection')
+        final = next((self.root / 'usage-state' / 'runs').glob('*/final.json'))
+        self.assertEqual(event['receipt_sha256'], hashlib.sha256(final.read_bytes()).hexdigest())
+        status = ladder.Ledger(self.ladder, tiers.load_policy()).record('lad-3', final.read_bytes(), kind='review', source='replay')
+        self.assertTrue(status['replayed']); self.assertEqual(status['failures_at_rung'], 1)
+
+    def test_unknown_author_is_reviewed_at_opus_sol_medium_and_flagged(self):
+        self.run_review()  # no task and no author rung: the author is unknown
+        report = self.output.read_text()
+        self.assertIn('Author-Rung: unknown (author unknown: lowest writer rung reviewer)', report)
+        self.assertIn('Reviewer-Rung: R1\n', report)
+        argv = json.loads(self.argv_file.read_text())
+        self.assertIn('model_reasoning_effort=medium', argv)

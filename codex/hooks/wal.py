@@ -100,8 +100,10 @@ def ops_alert_context(event: str) -> str:
     try:
         import importlib.util
         here = Path(__file__).resolve().parent
-        candidates = [here / "ops_watch.py", Path.home() / ".claude" / "hooks" / "ops_watch.py",
-                      here.parent.parent / "harness" / "hooks" / "ops_watch.py"]
+        candidates = [here / "ops_watch.py", Path.home() / ".claude" / "hooks" / "ops_watch.py"]
+        checkout = here.parent.parent
+        if (checkout / ".git").exists():  # a repo checkout only: installed under ~/.codex this would be ~/harness/hooks
+            candidates.append(checkout / "harness" / "hooks" / "ops_watch.py")
         for candidate in candidates:
             if candidate.is_file():
                 spec = importlib.util.spec_from_file_location("ops_watch_codex", candidate)
