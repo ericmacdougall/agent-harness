@@ -102,6 +102,7 @@ class Case(unittest.TestCase):
 
     def run_script(self, script=SCRIPT, **extra):
         extra.setdefault("LOG_BACKUP_RETRY_SLEEP", "0")
+        extra.setdefault("LOG_BACKUP_BULK_EVERY_SECONDS", "0")  # tests run the bulk tier every time unless they test the gap
         done = subprocess.run(["/bin/bash", str(script)], env=self.env(**extra), cwd=str(self.tmp),
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
         self.assertEqual(self.canary.read_text(), "alive")
@@ -242,6 +243,41 @@ class Exclusion(Case):
         self.assertEqual((self.logs / "log-backup.log.1").stat().st_size, 10 * 1024 * 1024 + 10)
         self.assertLess((self.logs / "log-backup.log").stat().st_size, 100000)
 
+    def test_write_rate_settings_are_validated_and_reach_rclone(self):
+        self.run_script(LOG_BACKUP_TPSLIMIT="3", LOG_BACKUP_TRANSFERS="5")
+        argv = self.copies()[0]
+        self.assertEqual((argv[argv.index("--tpslimit") + 1], argv[argv.index("--transfers") + 1]), ("3", "5"))
+        for name in ("LOG_BACKUP_TPSLIMIT", "LOG_BACKUP_TRANSFERS"):
+            for value in ("0", "00", "100", "1.5", "-1", "abc", "$(id)", " 2"):
+                if self.calls.exists():
+                    self.calls.unlink()
+                done = self.run_script(**{name: value})
+                self.assertEqual(done.returncode, 2, (name, value))
+                self.assertEqual(self.copies(), [], (name, value))
+
+    def test_bulk_tier_runs_at_most_once_per_gap_while_transcripts_run_every_time(self):
+        first = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue(self.bulk_ok().exists())
+        os.unlink(self.last_ok())
+        os.unlink(self.bulk_ok())
+        self.calls.unlink()
+        second = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertTrue(self.last_ok().exists())            # transcripts ran again
+        self.assertFalse(self.bulk_ok().exists())           # the bulk tier was skipped, no marker claimed
+        self.assertFalse([c for c in self.copies() if "--min-age" in c])
+        self.assertIn("bulk tier skipped", (self.logs / "log-backup.log").read_text())
+        old = time.time() - 7200
+        os.utime(self.logs / "log-backup.bulk-last-try", (old, old))
+        self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")  # the gap has passed: bulk runs again
+        self.assertTrue(self.bulk_ok().exists())
+
+    def test_jitter_is_validated_and_a_run_still_completes_with_it(self):
+        self.assertEqual(self.run_script(LOG_BACKUP_JITTER_SECONDS="1").returncode, 0)
+        for value in ("abc", "1.5", "-3", "007", "123456"):
+            self.assertEqual(self.run_script(LOG_BACKUP_JITTER_SECONDS=value).returncode, 2, value)
+
     def test_vm_dumps_never_appear_in_the_remote(self):
         for name in ("dump.vma", "dump.vma.zst"):
             self.put(f".agent-harness/work/t1/{name}", b"VMA")
@@ -279,7 +315,7 @@ class CopyOnly(Case):
 
     def test_control_variant_with_a_delete_flag_or_moveto_fails_the_checker(self):
         text = SCRIPT.read_text()
-        for needle, repl in (("args=(copy ", "args=(moveto "), ("--tpslimit 2", "--delete-after --tpslimit 2")):
+        for needle, repl in (("args=(copy ", "args=(moveto "), ('--tpslimit "$TPSLIMIT"', '--delete-after --tpslimit "$TPSLIMIT"')):
             variant = self.tmp / "variant.sh"
             variant.write_text(text.replace(needle, repl))
             (self.tmp / "log-backup.excludes").write_text("*.secret\n")
@@ -515,7 +551,7 @@ class Failure(Case):
     def test_rate_limit_settings_match_the_reviewed_live_script(self):
         self.run_script()
         argv = self.copies()[0]
-        want = {"--transfers": "2", "--tpslimit": "2", "--checkers": "4", "--dropbox-batch-mode": "sync",
+        want = {"--transfers": "2", "--tpslimit": "1", "--checkers": "4", "--dropbox-batch-mode": "sync",
                 "--dropbox-batch-size": "100", "--retries": "10", "--retries-sleep": "30s", "--low-level-retries": "20"}
         for flag, value in want.items():
             self.assertEqual(argv[argv.index(flag) + 1], value, flag)
