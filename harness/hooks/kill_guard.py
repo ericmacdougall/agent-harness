@@ -1039,7 +1039,11 @@ def make_analyzer_class(cg):
             if hit:
                 self.block('indirect-kill', '`%s` runs a kill verb on targets the guard cannot list' % name)
 
+        INLINE_CODE_FLAGS = frozenset(('-c', '-e', '-E', '-p', '-r', '-m', '-x', '-eval', '-command', '-encodedcommand',
+                                       '--eval', '--print', '--command', '--exec', '--import', '--require'))
+
         def check_interpreter(self, name, texts, cmd):
+            texts = self.drop_script_arguments(texts)
             body = ' '.join(texts)
             for redir in getattr(cmd, 'redirs', []):
                 if redir.body:
@@ -1050,6 +1054,24 @@ def make_analyzer_class(cg):
             body = re.sub(r'\b(?:os|process)\.kill\(\s*[\w.]+(?:\(\))?\s*,\s*0\s*\)', '', body)  # liveness probe
             if self.script_kill is not None and self.script_kill.search(body):
                 self.block('script-kill', 'interpreter code signals processes the guard cannot check')
+
+        def drop_script_arguments(self, texts):
+            """`interp script.py ARGS`: ARGS are data for the script, not code the interpreter runs (goodqa#14817).
+            Only when the first non-flag word is a script path and no inline-code flag (or a flag we do not know,
+            which could take code) comes before it; wrappers such as `uv run python` keep the whole list."""
+            for i, t in enumerate(texts):
+                low = t.lower()
+                if low in self.INLINE_CODE_FLAGS or (low.startswith('-') and low != '-' and not low.startswith('--')
+                                                     and any(f in low[1:] for f in 'cemrx')):
+                    return texts
+                if t == '-' or low.startswith('--'):
+                    return texts  # stdin program, or a long flag we cannot place: keep scanning everything
+                if t.startswith('-'):
+                    continue
+                if re.search(r'\.(?:py|rb|pl|js|mjs|cjs|ts|php|sh|lua|r)$', low) or '/' in t:
+                    return texts[:i + 1]
+                return texts
+            return texts
 
         def check_netwatch(self, args):
             texts = [a.text for a in args]

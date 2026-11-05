@@ -1016,3 +1016,27 @@ class GuardCompositionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ScriptArgumentTextIsData(WorldCase):
+    """goodqa#14817: words in a script's ARGUMENTS (a note, a JSON body) are data, not interpreter code."""
+    DATA = [
+        "python3 ~/.claude/hooks/wal_note.py --wal ~/w.jsonl --event status --note 'owner will kill nothing; delete later'",
+        "python3 tool.py --note 'os.kill is not called here'",
+        "python3 ./gq.py comment 14817 --json '{\"body\": \"a kill-guard false positive\"}'",
+    ]
+    CODE = [  # inline code and heredoc bodies are still scanned
+        "python3 -c 'import os; os.kill(5, 9)'",
+        "python3 - <<'EOF'\nimport os\nos.kill(5, 9)\nEOF",
+        "python3 -m somemod --note x -c 'os.kill(5,9)'",
+    ]
+
+    def test_script_arguments_are_not_code(self):
+        for cmd in self.DATA:
+            with self.subTest(cmd=cmd):
+                self.assertNotEqual(self.decide(cmd)[0], 'block', cmd)
+
+    def test_inline_code_still_blocks(self):
+        for cmd in self.CODE:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.decide(cmd)[0], 'block', cmd)
