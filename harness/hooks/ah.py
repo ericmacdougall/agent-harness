@@ -1281,7 +1281,41 @@ def doctor() -> dict:
             checks.append({"check": f"file {name}", "ok": True, "sha256": hashlib.sha256(_bounded(f, 16 << 20)).hexdigest()[:16]})
         except OSError:
             checks.append({"check": f"file {name}", "ok": False})
+    running = ahd_running_check(home_dir())
+    if os.environ.get("AH_EXPECT_AHD", "1") == "0":  # hosts without the daemon (and partial-install tests) only report it
+        running = dict(running, ok=True, expected=False)
+    checks.append(running)
     return {"ok": all(c["ok"] for c in checks), "checks": checks}
+
+
+def ahd_running_check(home: Path, now: float | None = None, max_beat_age: float = 300.0) -> dict:
+    """ahd is the deterministic manager (goodqa#14791): doctor fails while it is not running on this host. Running =
+    its lock is held (a non-blocking flock attempt fails) or its heartbeat is fresher than max_beat_age."""
+    import fcntl  # noqa: PLC0415
+    now = time.time() if now is None else now
+    lock = home / ".agent-harness" / "run" / "ahd.lock"
+    held = False
+    try:
+        fd = os.open(lock, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                held = True
+        finally:
+            os.close(fd)
+    except OSError:
+        held = False
+    beat = home / ".agent-harness" / "state" / "ahd" / "heartbeat.json"
+    beat_age = None
+    try:
+        beat_age = now - beat.stat().st_mtime
+    except OSError:
+        pass
+    ok = held or (beat_age is not None and beat_age <= max_beat_age)
+    return {"check": "ahd running", "ok": ok, "lock_held": held, "heartbeat_age_s": None if beat_age is None else int(beat_age),
+            "fix": None if ok else "python3 ~/.claude/hooks/ahd.py install --apply (or install.py --apply --services)"}
 
 
 def build_parser():

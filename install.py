@@ -617,8 +617,25 @@ def read_regular(path: Path, *, pinned_parent=None, retain_fd=None):
         return None
 
 
+def service_commands(claude: Path) -> list[list[str]]:
+    """Host services the harness runs: ahd, the deterministic monitor and scheduler (goodqa#14791). Each is
+    registered through its own unit installer after the files are in place; detector-only until S2 lands."""
+    return [[sys.executable, str(claude / "hooks" / "ahd.py"), "install", "--apply"]]
+
+
+def install_services(claude: Path, runner=None) -> list[str]:
+    import subprocess  # noqa: PLC0415
+
+    runner = runner or (lambda argv: subprocess.run(argv, stdin=subprocess.DEVNULL, check=False, timeout=120))
+    done = []
+    for argv in service_commands(claude):
+        runner(argv)
+        done.append(" ".join(argv[1:]))
+    return done
+
+
 def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool = True,
-            command_guard: bool = True, log_backup=None) -> list[str]:
+            command_guard: bool = True, log_backup=None, services: bool = False) -> list[str]:
     claude = home.expanduser().resolve() / ".claude"
     if log_backup is None:
         log_backup = log_backup_alert(home, None)
@@ -719,6 +736,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
                 raise RuntimeError(f"Installation failed; rollback incomplete for {', '.join(failures)}; "
                                    f"restore from {backups}") from error
             raise
+        if apply and services:  # host services last, after every file is in place (goodqa#14791 S1d)
+            changes.extend("service: " + c for c in install_services(claude))
         return changes
     finally:
         pins.close()
@@ -951,6 +970,8 @@ def log_backup_status(home: Path, apply: bool, flag=None) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
+    parser.add_argument("--services", action="store_true",
+                        help="also register the host services (the ahd launchd/systemd job) after the files are installed")
     parser.add_argument("--home", type=Path, default=Path.home(), help=argparse.SUPPRESS)
     choice = parser.add_mutually_exclusive_group()
     choice.add_argument("--no-durable-tmp", dest="durable_tmp", action="store_false", default=None,
@@ -987,7 +1008,8 @@ def main() -> None:
                            "real directory, not a symlink\n")
     try:
         changes = install(args.home, args.apply, durable_tmp=durable_tmp, provenance=args.provenance,
-                          command_guard=args.command_guard, log_backup=log_backup_alert(args.home, args.log_backup))
+                          command_guard=args.command_guard, log_backup=log_backup_alert(args.home, args.log_backup),
+                          services=args.services)
     except DirectoryPublicationError as error:
         parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"

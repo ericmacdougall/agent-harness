@@ -634,7 +634,9 @@ class ReviewRound1(GoodQABase):
             rc = ah.main(["doctor"])
         self.assertEqual(rc, 4)
         self.assertEqual(json.loads(out.getvalue()), {"ok": False, "code": "internal", "type": "ModuleNotFoundError"})
-        self.assertTrue(ah.doctor()["ok"])
+        with mock.patch.dict(os.environ, {"AH_EXPECT_AHD": "0"}):  # this test is about partial installs, not the daemon (goodqa#14791 S1d)
+            self.assertTrue(ah.doctor()["ok"])
+        self.assertFalse(ah.doctor()["ok"])  # with the daemon expected and not running, doctor fails
 
     def test_naive_iso_is_utc_and_user_at_host_rejected(self):
         self.assertEqual(ah.parse_ts("2026-11-04T10:00:00"), ah.parse_ts("2026-11-04T10:00:00Z"))
