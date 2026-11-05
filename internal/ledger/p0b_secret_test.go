@@ -11,7 +11,9 @@ import (
 	"github.com/ericmacdougall/agent-harness/internal/ledger/store"
 )
 
-const plantedSecret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123"
+// An invented, sequential token shape built at run time, so no token-shaped literal sits in the source
+// (the repository is public and scanned for them). It is not a credential.
+var plantedSecret = "gh" + "p_" + strings.Repeat("ABCDEFGHIJ", 2) + "abcdef0123456789"
 
 // plantSecretComment appends a comment holding a secret-shaped token to this machine's own writer ref in the
 // HOME mirror, bypassing the write-time scan (as a restored ref or an older version could have).
