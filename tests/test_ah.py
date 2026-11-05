@@ -420,7 +420,7 @@ class WriteTests(GoodQABase):
         self.assertIn("[review] ok so far", self.wal_rows("ownerx")[-1]["note"])
         self.assertEqual(len(FakeGoodQA.state["posted"]), 1)  # WAL and comment in one call
         wal = self.home / ".claude" / "wals" / SESSION / "main.jsonl"
-        jl(wal, [{"at": "x", "event": "REALLY_TESTED", "id": "wq1", "note": "REALLY_TESTED t1: ran it"}])
+        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "REALLY_TESTED", "id": "wq1", "note": "REALLY_TESTED t1: ran it"}])
         d = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"really_tested": "t1", "wal": str(wal)}]}, SESSION, "done-key-001")
         self.assertEqual(d["result"], "applied")
         self.assertEqual(self.wal_rows("ownerx")[-1]["event"], "result")
@@ -606,6 +606,34 @@ class ReviewRound1(GoodQABase):
         self.assertEqual(by["resumed"]["state"], "live")
         self.assertEqual(by["reopened"]["state"], "DROPPED")
 
+    def test_h2_code_session_env_is_read(self):
+        self.transcript([{"type": "user", "uuid": "00000000-0000-0000-0000-000000000001", "origin": {"kind": "human"},
+                          "timestamp": "t", "message": {"role": "user", "content": "typed by the real human"}}])
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": SESSION, "CLAUDE_SESSION_ID": ""}):
+            got = ah.run(ah.build_parser().parse_args(["user-msg", "--recent", "1"]), self.home)
+        self.assertEqual(len(got["matches"]), 1)
+
+    def test_partial_install_gives_json_not_traceback(self):
+        out = io.StringIO()
+        with mock.patch.object(ah, "run", side_effect=ModuleNotFoundError("safe_input")), contextlib.redirect_stdout(out):
+            rc = ah.main(["doctor"])
+        self.assertEqual(rc, 4)
+        self.assertEqual(json.loads(out.getvalue()), {"ok": False, "code": "internal", "type": "ModuleNotFoundError"})
+        self.assertTrue(ah.doctor()["ok"])
+
+    def test_naive_iso_is_utc_and_user_at_host_rejected(self):
+        self.assertEqual(ah.parse_ts("2026-11-04T10:00:00"), ah.parse_ts("2026-11-04T10:00:00Z"))
+        with self.assertRaises(ah.AhError):
+            ah.disk(host="eric@dev2")
+
+    def test_newer_ledger_schema_is_refused(self):
+        store = self.home / ".agent-harness" / "state" / "ah" / "store"
+        store.mkdir(parents=True)
+        (store / "ledger.jsonl").write_text('{"schema": 99, "seq": 1, "key": "k"}\n')
+        with self.assertRaises(ah.AhError) as c:
+            ah._ledger(self.home)
+        self.assertEqual(c.exception.code, "schema_newer")
+
     def test_l_input_hardening(self):
         with self.assertRaises(ah.AhError):
             ah.disk(host="-oProxyCommand=x")
@@ -647,8 +675,13 @@ class WriterReview(WriteTests):
             ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"really_tested": "wother", "wal": str(other)}]},
                      SESSION, "ev-other-0001")
         self.assertEqual(c.exception.code, "evidence")
-        jl(wal, [{"at": "x", "event": "result", "id": "wgood", "note": "REALLY_TESTED t1: ran it, exit 0"}])
-        ok = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"really_tested": "wgood", "wal": str(wal)}]},
+        jl(wal, [{"at": "2000-01-01T00:00:00Z", "event": "result", "id": "wold", "note": "REALLY_TESTED t1: before the task existed"}])
+        with self.assertRaises(ah.AhError) as c:  # older than the register row proves nothing for this task
+            ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"really_tested": "t1", "wal": str(wal)}]},
+                     SESSION, "ev-old-00001")
+        self.assertEqual(c.exception.code, "evidence")
+        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "result", "id": "wgood", "note": "REALLY_TESTED t1: ran it, exit 0"}])
+        ok = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"really_tested": "t1", "wal": str(wal)}]},
                       SESSION, "ev-good-0001")
         self.assertEqual(ok["result"], "applied")
 
@@ -673,8 +706,8 @@ class WriterReview(WriteTests):
         real = ah._append_line
 
         def boom(path, record):
-            if path.name == "ledger.jsonl":
-                raise OSError("simulated crash before the ledger row")
+            if path.name == "ledger.jsonl" and record.get("state") == "applied":
+                raise OSError("simulated crash after the side effects, before the applied row")
             return real(path, record)
         with mock.patch.object(ah, "_append_line", boom):
             with self.assertRaises(OSError):
@@ -684,6 +717,54 @@ class WriterReview(WriteTests):
         self.assertEqual(len([x for x in self.wal_rows("ownerx") if x["event"] == "status"]), 1)
         self.assertEqual(len(list((self.home / ".agent-harness" / "state" / "ah" / "store" / "spool").glob("*.json"))), 0)
         self.assertEqual(len(FakeGoodQA.state["posted"]), 1)
+
+    def test_c1_torn_tail_then_write_then_result_finds_key_and_seq_increases(self):
+        self.reg()
+        ledger = self.home / ".agent-harness" / "state" / "ah" / "store" / "ledger.jsonl"
+        with open(ledger, "a") as f:
+            f.write('{"schema": 1, "seq": 99, "key": "torn')
+        before = max(r["seq"] for r in ah._ledger(self.home))
+        r = ah.write(self.home, "task.status", {"task": "t1", "stage": "x", "note": "after torn"}, SESSION, "torn-key-0002")
+        self.assertGreater(r["seq"], before)
+        states = [x["state"] for x in ah._ledger(self.home, include_intents=True) if x.get("key") == "torn-key-0002"]
+        self.assertEqual(states, ["intent", "applied"])  # neither row was swallowed by the torn fragment
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = ah.main(["write", "result", "--key", "torn-key-0002"])
+        self.assertEqual((rc, json.loads(out.getvalue())["seq"]), (0, r["seq"]))
+        for line in open(ledger):
+            self.assertTrue(line.strip().startswith("{") or not line.strip())
+
+    def test_h9_intent_row_precedes_side_effects(self):
+        self.reg()
+        seen = []
+        real = ah._wal_append
+
+        def spy(home, path, rec):
+            seen.append([r.get("state") for r in ah._ledger(self.home, include_intents=True)][-1])
+            return real(home, path, rec)
+        with mock.patch.object(ah, "_wal_append", spy):
+            ah.write(self.home, "task.status", {"task": "t1", "stage": "x", "note": "ordered"}, SESSION, "order-key-001")
+        self.assertEqual(seen, ["intent"])  # the key was durable before the WAL append
+
+    def test_h1_commit_must_be_in_registered_checkout(self):
+        repo = self.home / "wt"
+        other = self.home / "other"
+        env = dict(os.environ, GIT_AUTHOR_NAME="a", GIT_AUTHOR_EMAIL="a@b", GIT_COMMITTER_NAME="a", GIT_COMMITTER_EMAIL="a@b")
+        shas = []
+        for d in (repo, other):
+            d.mkdir()
+            subprocess.run(["git", "init", "-q", str(d)], check=True, env=env)
+            subprocess.run(["git", "-C", str(d), "commit", "-q", "--allow-empty", "-m", d.name], check=True, env=env)
+            shas.append(subprocess.run(["git", "-C", str(d), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip())
+        (self.home / ".claude" / "wals" / SESSION).mkdir(parents=True, exist_ok=True)
+        ah.write(self.home, "task.register", {"task": "t9", "owner_agent": "ownerx", "session": SESSION, "ticket": "GoodQA goodqa#77",
+                                              "scope": "s", "source": "inferred: ok x", "worktree": str(repo)}, SESSION, "reg-wt-00001")
+        with self.assertRaises(ah.AhError) as c:  # a real commit, but in some other repository
+            ah.write(self.home, "task.done", {"task": "t9", "evidence": [{"commit": shas[1], "repo": str(other)}]}, SESSION, "done-wt-0001")
+        self.assertEqual(c.exception.code, "evidence")
+        ok = ah.write(self.home, "task.done", {"task": "t9", "evidence": [{"commit": shas[0], "repo": str(other)}]}, SESSION, "done-wt-0002")
+        self.assertEqual(ok["result"], "applied")
 
     def test_m2_reregister_does_not_reassign(self):
         self.reg()
