@@ -341,6 +341,16 @@ class RedTeamRound(CloneCase):
         self.assertAllowed(self.rm())  # control: the same clone is deletable once both are gone
 
 
+class NoContactWithOddHosts(CloneCase):
+    def test_a_remote_outside_the_allowlist_is_refused_without_being_contacted(self):
+        called = []
+        with mock.patch.object(cg, 'REMOTE_LS', lambda url, cwd, timeout: called.append(url) or dict(self.live)):
+            for url in ('https://evil.example/a/b.git', 'ssh://u@10.0.0.5/x', 'git@gitlab.com.evil.example:a/b.git'):
+                git(self.clone, 'remote', 'set-url', 'origin', url)
+                self.assertRefused(self.rm(), 'known hosting')
+        self.assertEqual(called, [], 'the guard contacted a host that is not on the hosting allowlist')
+
+
 class RoundThree(CloneCase):
     def test_bare_repository_inside_a_build_directory(self):
         (self.clone / '.git' / 'info' / 'exclude').write_text('build/\n')

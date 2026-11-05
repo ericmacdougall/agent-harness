@@ -413,7 +413,7 @@ def tracked_tree_bytes(repo_dir: str):
 
 
 def fmt_gib(n: float) -> str:
-    return f"{n / GIB:.1f} GiB"
+    return f"{n / GIB:.1f} GiB" if n >= GIB // 10 else f"{n / 1048576:.1f} MiB"
 
 
 def sum_sources(sources, ctx, thr, remote_ok=False, deref=False, budget_s=2.5):
@@ -1325,7 +1325,31 @@ def decide(command: str, cwd: str = None, modes=None):
     return best
 
 
+def route_host() -> str:
+    """Where refused heavy work should go: HARNESS_ROUTE_HOST or heavy_job_guard.json "route_host" (default dev2;
+    set to t2 when dev2 is retired). Only a plain host name is accepted."""
+    value = os.environ.get("HARNESS_ROUTE_HOST", "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,60}", value):
+        value = ""
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
+            if os.path.exists(path):
+                candidate = str(load_json_file(path).get("route_host", ""))
+                value = candidate if re.fullmatch(r"[A-Za-z0-9._-]{1,60}", candidate) else ""
+        except Exception:
+            value = ""
+    return value or "dev2"
+
+
+def routed(text: str) -> str:
+    return text.replace("ssh dev2 ", f"ssh {route_host()} ")
+
+
 def deny_message(rule, detail, hatch, capped):
+    return routed(_deny_message(rule, detail, hatch, capped))
+
+
+def _deny_message(rule, detail, hatch, capped):
     cap = "python3 ~/.claude/hooks/run_capped.py --max-rss-gb <declared peak x1.5> --timeout-s <expected x2> -- <command>"
     if rule in NEVER_BLOCK:
         return (f"Heavy-job guard [{rule}] advisory (not blocked): {RULE_HELP[rule]} ({detail}). Hostile-input tests are "
@@ -1478,7 +1502,7 @@ def record_hatch_use(owner: str, limit: int, now: float = None):
             data = load_json_file(path, 1024 * 1024)
         except Exception:
             data = {}
-        uses = {k: [t for t in v if isinstance(t, (int, float)) and now - t < 3600]
+        uses = {k: [min(t, now) for t in v if isinstance(t, (int, float)) and -300 <= now - t < 3600]
                 for k, v in data.items() if isinstance(v, list)}
         mine = uses.get(owner, [])
         if len(mine) >= limit:
@@ -1561,8 +1585,9 @@ def over_budget(cwd):
                 continue
             if rec.get("path_key") != key and rec.get("agent") != agent_of_key(key):
                 continue
-            if time.time() - record_epoch(rec) > 3 * 3600:
-                continue  # a stale record must never block work for good
+            age = time.time() - record_epoch(rec)
+            if age > 3 * 3600 or age < -300:
+                continue  # stale, or stamped in the future: a record must never block work for good
             base = os.path.join(os.path.expanduser("~"), ".agent-harness", "work", key)
             budget = int(rec["budget_bytes"])
             size, complete = path_size(base, cap=budget + 1, seconds=1.0)
@@ -1602,7 +1627,7 @@ def copy_event_detail(payload: dict, decision: dict, hatch_uses=None) -> dict:
     match = re.search(r"at least ([0-9.]+) GiB", decision.get("detail", ""))
     return {"agent": owner_of(payload), "task": work_owner_key(cwd) or "", "host": "mac",
             "est_bytes": int(float(match.group(1)) * GIB) if match else None, "path_digest": path_digest(cwd),
-            "route": "dev2", "hatch_uses_1h": hatch_uses}
+            "route": route_host(), "hatch_uses_1h": hatch_uses}
 
 
 def run(raw: bytes) -> int:
@@ -1632,36 +1657,36 @@ def run(raw: bytes) -> int:
     decision = decide(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None)
     action = decision["action"]
     owner = owner_of(payload)
-    if decision.get("rule") == "copy" and action != "warn":
+    if decision.get("rule") in ("copy", "build") and action != "warn":
         budget = over_budget(payload.get("cwd"))
         if budget:  # over its disk budget: new heavy local writes stop, hatch or not, until it frees space or routes
             gib = lambda n: f"{int(n) / GIB:.1f}"  # noqa: E731
-            sys.stderr.write(f"Heavy-job guard [copy]: owner work dir {budget['path_key']} is over its {gib(budget['budget_bytes'])} GiB "
+            sys.stderr.write(routed(f"Heavy-job guard [{decision['rule']}]: owner work dir {budget['path_key']} is over its {gib(budget['budget_bytes'])} GiB "
                              f"disk budget ({gib(budget['used_bytes'])} GiB used). Free space there (nothing is deleted for you) or "
-                             "run the heavy copy on dev2/T2 (ssh dev2 '<command>').\n")
-            log_event({"event": "deny-over-budget", "rule": "copy"})
-            ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a heavy copy: over disk budget",
+                             "run the heavy job on dev2/T2 (ssh dev2 '<command>').\n"))
+            log_event({"event": "deny-over-budget", "rule": decision["rule"]})
+            ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a heavy {decision['rule']}: over disk budget",
                        dict(copy_event_detail(payload, decision), used_bytes=budget["used_bytes"],
                             budget_bytes=budget["budget_bytes"]))
             return 2
     if action == "allow" and decision.get("hatch_reason") and decision.get("rule") not in NEVER_BLOCK:
         if decision.get("rule") == "copy" and disk_used_pct() >= HATCH_DISK_REFUSE_PCT:
-            sys.stderr.write(f"Heavy-job guard [copy]: the disk is above {HATCH_DISK_REFUSE_PCT:.0f}% used, so {HATCH} does not "
-                             "apply to large copies. Run it on dev2/T2 (ssh dev2 '<command>') or free space first.\n")
+            sys.stderr.write(routed(f"Heavy-job guard [copy]: the disk is above {HATCH_DISK_REFUSE_PCT:.0f}% used, so {HATCH} does not "
+                             "apply to large copies. Run it on dev2/T2 (ssh dev2 '<command>') or free space first.\n"))
             log_event({"event": "deny-hatch-disk", "rule": "copy"})
             ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a hatch copy: disk above 85%",
                        copy_event_detail(payload, decision))
             return 2
         if live_heavy_jobs() >= max_heavy_jobs():  # refuse BEFORE spending this owner's hourly use
-            sys.stderr.write(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
-                             f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n")
+            sys.stderr.write(routed(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
+                             f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n"))
             log_event({"event": "deny-concurrency", "rule": decision["rule"]})
             return 2
         allowed, uses = record_hatch_use(owner, hatch_limit())
         if not allowed:
-            sys.stderr.write(f"Heavy-job guard: {HATCH} was already used {uses} time(s) in the last hour by this owner "
+            sys.stderr.write(routed(f"Heavy-job guard: {HATCH} was already used {uses} time(s) in the last hour by this owner "
                              f"(limit {hatch_limit()}). More than that is heavy work on the Mac: run it on dev2/T2 "
-                             "(ssh dev2 '<command>') or raise the budget in the run kit.\n")
+                             "(ssh dev2 '<command>') or raise the budget in the run kit.\n"))
             log_event({"event": "deny-hatch-limit", "rule": decision["rule"]})
             ring_event(f"heavy:hatch:{owner}", "warning", f"{owner} exceeded the {HATCH} limit ({uses}/h)",
                        dict(copy_event_detail(payload, decision), hatch_uses_1h=uses))
@@ -1669,8 +1694,8 @@ def run(raw: bytes) -> int:
         decision["hatch_uses_1h"] = uses
     if (action == "allow" and decision.get("hatch_reason") and decision.get("rule") not in NEVER_BLOCK
             and live_heavy_jobs() >= max_heavy_jobs()):
-        sys.stderr.write(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
-                         f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n")
+        sys.stderr.write(routed(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
+                         f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n"))
         log_event({"event": "deny-concurrency", "rule": decision["rule"]})
         return 2
     if action == "allow":

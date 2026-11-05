@@ -259,6 +259,27 @@ class RunGates(unittest.TestCase):
         self.assertIn(("heavy:hatch:agentA", "warning"), keys)
         self.assertEqual(self.call(cmd, agent="agentB")[0], 0)  # another owner has its own allowance
 
+    def test_future_timestamps_and_a_corrupt_hatch_file_do_not_lock_an_owner_out_or_in_forever(self):
+        now = time.time()
+        guard.record_hatch_use("fut", 5, now)
+        path = os.path.join(guard.state_dir(), "heavy-hatch.json")
+        Path(path).write_text(json.dumps({"fut": [now + 10 * 3600], "o": ["x", None]}))
+        self.assertEqual(guard.record_hatch_use("fut", 1, now + 3601)[0], True)  # the future stamp was clamped to now
+        Path(path).write_text("{not json")
+        self.assertEqual(guard.record_hatch_use("o", 1, now)[0], True)  # corrupt file: fails open, and heals
+        self.assertEqual(guard.record_hatch_use("o", 1, now)[0], False)
+
+    def test_env_assignments_in_the_command_cannot_raise_the_limits(self):
+        cmd = "HARNESS_HATCH_PER_HOUR=99 HARNESS_COPY_GIB=999 HARNESS_LOCAL_OK='one local step' cp -r /bigsrc /Users/eric/x"
+        self.assertEqual(self.call(cmd)[0], 0)
+        self.assertEqual(self.call(cmd)[0], 2)  # the hook reads its own environment, not the command's
+
+    def test_a_future_stamped_budget_record_does_not_block(self):
+        cwd = self.work_cwd()
+        self.budget_record("sess/agent-A", age=-3600)
+        with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
+            self.assertEqual(self.call("HARNESS_LOCAL_OK='one local step' cp -r /bigsrc ./c", cwd=cwd)[0], 0)
+
     def test_hatch_window_slides(self):
         now = time.time()
         self.assertEqual(guard.record_hatch_use("o", 1, now)[0], True)
@@ -354,6 +375,35 @@ class RunGates(unittest.TestCase):
         self.budget_record("sess/agent-A", age=2 * 3600)
         with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
             self.assertEqual(self.call("HARNESS_LOCAL_OK='one local step' cp -r /bigsrc ./c2", cwd=cwd, agent="agentD")[0], 2)
+
+    def test_over_budget_owner_cannot_start_a_local_build_either(self):
+        cwd = self.work_cwd()
+        self.budget_record("sess/agent-A")
+        with mock.patch.object(guard, "path_size", fake_size({cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
+            code, err = self.call("HARNESS_LOCAL_OK='needs the mac' npm run build", cwd=cwd)
+            self.assertEqual(code, 2)
+            self.assertIn("[build]", err)
+            self.assertEqual(self.call("ls", cwd=cwd)[0], 0)
+        other = Path(self.home.name, ".agent-harness", "work", "sess", "agent-B")
+        other.mkdir(parents=True)
+        self.assertEqual(self.call("HARNESS_LOCAL_OK='needs the mac' npm run build", cwd=str(other))[0], 0)
+
+    def test_hatch_overuse_raises_a_warning_alert_and_the_route_is_configurable(self):
+        cmd = "HARNESS_LOCAL_OK='one local step' cp -r /bigsrc /Users/eric/x"
+        self.call(cmd)
+        code, err = self.call(cmd)
+        self.assertEqual(code, 2)
+        refusals = [e for e in self.ring() if e["key"] == "heavy:hatch:agentA" and "exceeded" in e["message"]]
+        self.assertEqual([e["severity"] for e in refusals], ["warning"])
+        self.assertEqual(refusals[0]["detail"]["hatch_uses_1h"], 1)
+        with mock.patch.dict(os.environ, {"HARNESS_ROUTE_HOST": "t2"}):
+            code, err = self.call("cp -r /bigsrc /Users/eric/y", agent="agentR")
+            self.assertEqual(code, 2)
+            self.assertIn("ssh t2 ", err)
+            self.assertNotIn("ssh dev2 ", err)
+            self.assertEqual(self.ring()[-1]["detail"]["route"], "t2")
+        with mock.patch.dict(os.environ, {"HARNESS_ROUTE_HOST": "bad host;rm"}):
+            self.assertEqual(guard.route_host(), "dev2")
 
     def test_codex_payload_shapes_are_guarded(self):
         for tool_input in ({"cmd": "cp -r /bigsrc /Users/eric/x"}, {"command": ["bash", "-lc", "cp -r /bigsrc /Users/eric/x"]},
