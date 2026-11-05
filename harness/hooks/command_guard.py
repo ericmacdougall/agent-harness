@@ -1834,6 +1834,8 @@ class Analyzer:
         if name in ('eval', 'invoke-expression', 'iex'):
             self.eval_words(args, depth, pl, idx)
             return
+        if self.package_runner(name, args, depth, pl, idx):
+            return
         if name in ('.', 'source'):
             nd = _nondash(args)
             if nd:
@@ -2087,6 +2089,7 @@ class Analyzer:
             if name in ('start-process', 'start', 'call'):
                 pass
         elif name == 'xargs':
+            self.xargs_input(args, pl.cmds[idx] if pl is not None and idx < len(pl.cmds) else None)
             while i < len(args) and texts[i].startswith('-'):
                 i += 2 if texts[i] in ('-n', '-I', '-P', '-d', '-L', '-a', '-E', '-s', '-i', '-l') else 1
             if i < len(args):
@@ -2099,6 +2102,27 @@ class Analyzer:
         if i < len(args):
             self.inner_words(args[i:], depth, pl, idx)
 
+    def xargs_input(self, args, cmd):
+        """xargs deleting what its own input names: a here-string, `< <(..)` or `-a <(..)`."""
+        joined = ' '.join(a.text for a in args)
+        if not re.search(r'(?:^|[\s/])(?:rm|rmdir|unlink|shred|srm|mv|truncate|rimraf|trash(?:-put)?)(?:\s|$)', joined):
+            return
+        sources = [r.target for r in (cmd.redirs if cmd is not None else []) if r.target is not None and (
+            r.op == '<<<' or (r.op in ('<', '<>') and r.fd in (None, '0') and r.target.subs))]
+        for i, a in enumerate(args[:-1]):
+            if a.text in ('-a', '--arg-file') and args[i + 1].subs:
+                sources.append(args[i + 1])
+        for src in sources:
+            if self.refuse('xargs deletion of paths given on its input', src):
+                return
+            bodies = [src.text] + list(src.subs)
+            if any(self._raw_path_class(m.group(0)) in ('log', 'root', 'ancestor', 'unknown')
+                   for body in bodies for m in self.RAW_PATH.finditer(body[:200000])):
+                self.ctx.add(LOG_DELETE, 'log-delete',
+                             'xargs deletes paths given on its input, and that input names a protected harness location',
+                             'delete only paths inside your own task worktree, named directly')
+                return
+
     def inner_words(self, words, depth, pl, idx, via_xargs=False):
         if not words:
             return
@@ -2109,9 +2133,47 @@ class Analyzer:
         if via_xargs and norm_name(words[0].text) in PRINT_FILE_CMDS:
             pass
 
+    PKG_RUNNERS = {'npx': 0, 'bunx': 0, 'pnpx': 0, 'uvx': 0, 'pnpm': ('dlx', 'exec'), 'yarn': ('dlx', 'exec'),
+                   'bun': ('x',), 'npm': ('exec', 'x'), 'pipx': ('run',)}
+    PKG_DELETERS = {'del-cli': 'rm', 'trash-cli': 'trash', 'rimraf': 'rimraf', 'del': 'rm', 'trash': 'trash'}
+
+    def package_runner(self, name, args, depth, pl, idx):
+        """`npx rimraf PATH`, `pnpm dlx del-cli PATH`, `uvx trash-cli PATH`: the package runs as a command."""
+        sub = self.PKG_RUNNERS.get(name)
+        if sub is None:
+            return False
+        i = 0
+        if sub:
+            if not args or args[0].text not in sub:
+                return False
+            i = 1
+        while i < len(args):
+            t = args[i].text
+            if t == '--':
+                i += 1
+                break
+            if t in ('-c', '--call', '-x', '--shell') and i + 1 < len(args):
+                self.script(args[i + 1].text, depth + 1, tail_visible=True)
+                i += 2
+            elif t in ('-p', '--package', '--from', '--spec', '--python', '--with') and i + 1 < len(args):
+                i += 2
+            elif t.startswith('-'):
+                i += 1
+            else:
+                break
+        if i >= len(args):
+            return True
+        pkg = re.sub(r'(?<=.)@[^/]*$', '', args[i].text)  # rimraf@5, @scope/tool@1.2
+        base = norm_name(pkg.rsplit('/', 1)[-1])
+        head = _literal_word(self.PKG_DELETERS.get(base, base))
+        self.inner_words([head] + list(args[i + 1:]), depth, pl, idx)
+        return True
+
     def eval_words(self, args, depth, pl, idx):
         text = ' '.join(a.text for a in args)
         for a in args:
+            if a.subs:
+                self.program_text(a, depth)  # eval "$(echo rm ...)": the substitution's output is the program
             if any(self._decoder_in(s) for s in a.subs):
                 self.ctx.add(SECRET_DUMP, 'obfuscated-eval', 'eval of decoded (obfuscated) text hides the command from the guard',
                              'write the command in plain text')
@@ -2288,7 +2350,14 @@ class Analyzer:
                     j += 1
                 exec_cmds.append(body)
         if '-delete' in texts or any(norm_name(b[0].text) in RM_CMDS | MV_CMDS | {'unlink', 'shred', 'truncate'} for b in exec_cmds if b):
+            safe_filter = self._find_filter_safe(texts)
             for r in roots:
+                if safe_filter and not r.dynamic and not any(ch in r.text for ch in GLOB_CHARS):
+                    # `find . -name '*.pyc' -delete` from the worktree top: find removes matching entries below
+                    # the start directory, never the directory itself, so judge a child of it
+                    child = norm_path(r.text, ctx).rstrip('/') + '/__command_guard_probe__'
+                    if self._path_class(child) is None:
+                        continue
                 self.protected_target('find -delete/-exec', r)
         for body in exec_cmds:
             if not body:
@@ -2744,6 +2813,10 @@ class Analyzer:
     def _path_class(self, path):
         c = self.c
         folded = path.casefold()
+        if any(ch in path for ch in GLOB_CHARS) and not getattr(self, '_in_glob', False):
+            expanded = self._expand_work_glob(path)
+            if expanded is not self.NO_EXPANSION:
+                return expanded
         best = classify_segs(c, Compiled._segs(folded))
         if best == 'log-name':
             # a WAL-shaped name outside the harness trees: test data inside a git working tree is not a WAL
@@ -2779,6 +2852,58 @@ class Analyzer:
             elif literal and self._inside_repo(path):
                 return None
         return best
+
+    NO_EXPANSION = object()
+
+    def _expand_work_glob(self, path):
+        """`rm -rf build/*` under ~/.agent-harness/work: judge what the glob actually matches on disk (as the
+        shell will expand it) instead of every name it could match. Only for globs whose wildcard segments
+        cannot match dot-names; NO_EXPANSION means "judge the pattern as before"."""
+        if is_dynamic_path(path) or self._foreign_home(path) or self._under_work(path) is None:
+            return self.NO_EXPANSION
+        segs = [x for x in path.replace('\\', '/').split('/') if x]  # original case: Linux is case-sensitive
+        if any(_has_glob(x) and x[:1] in ('.', '?', '[') for x in segs) or '..' in segs:
+            return self.NO_EXPANSION
+        first = next(i for i, x in enumerate(segs) if _has_glob(x))
+        prefix = '/' + '/'.join(segs[:first])
+        top = self._git_top(prefix, self._under_work(path) + 3)
+        if not top or len(Compiled._segs(top)) >= first:
+            return self.NO_EXPANSION  # a wildcard directly in the worktree top level (or above it) empties the tree
+        import glob as _glob
+        import itertools
+        try:
+            matches = list(itertools.islice(_glob.iglob(path), 2001))
+        except (OSError, ValueError, re.error):
+            return self.NO_EXPANSION
+        if len(matches) > 2000:
+            return self.NO_EXPANSION
+        if not matches:
+            # nothing matches yet: the shell passes the pattern through literally, so judge one ordinary name in
+            # place of each wildcard segment (a later match is judged when that command runs)
+            matches = ['/'.join(re.sub(r'\[[^\]]*\]|[*?]', 'x', x) if _has_glob(x) else x for x in path.split('/'))]
+        self._in_glob = True
+        try:
+            classes = [self._path_class(m) for m in matches]
+        finally:
+            self._in_glob = False
+        return max(classes, key=lambda k: self.RANK[k])
+
+    def _find_filter_safe(self, texts):
+        """find's -name/-iname filters can only match names that are never protected (no -o, -path, -regex,
+        negation or symlink following that could widen them)."""
+        if any(t in ('-o', '-or', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex', '!', '-not',
+                     '-L', '-H', '-follow') for t in texts):
+            return False
+        pats = [texts[i + 1] for i, t in enumerate(texts) if t in ('-name', '-iname') and i + 1 < len(texts)]
+        if not pats:
+            return False
+        c = self.c
+        samples = set(c.seg_names) | set(c.file_names) | {'x' + s for s in c.file_suffixes} | {'.git', 'state'}
+        for p in pats:
+            for sample in samples:
+                if fnmatch.fnmatchcase(sample, p.casefold()) or fnmatch.fnmatchcase(sample.upper(), p):
+                    return False
+        return True
 
     def _task_tmp(self, path, work_len):
         """Inside work/<session>/<task>/tmp/: the place for an agent's disposable packets and scripts."""

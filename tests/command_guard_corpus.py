@@ -247,6 +247,18 @@ NEG13_GH_TOKEN = [
 
 # ------------------------------------------------------------------ AC-1 Tier A / Tier B deletes (block)
 LOG_POSITIVE = [
+    # fresh hold-out misses at 91e8752 (GoodQA #14471, final round)
+    'xargs rm -rf <<< "$HOME/.claude/projects"',
+    'eval "$(echo rm -rf ~/.claude/wals)"',
+    'npx rimraf ~/.claude/projects',
+    'xargs rm -f < <(echo ~/.claude/wals)',
+    'xargs -a <(printf "%s\\n" ~/.codex/sessions) rm',
+    'pnpm dlx rimraf ~/.claude',
+    'bunx rimraf ~/.codex/sessions',
+    'yarn dlx del-cli ~/.claude/projects',
+    'npm exec -- rimraf ~/.claude/projects',
+    'npx --yes rimraf ~/.claude/projects',
+    'uvx trash-cli ~/.claude/projects',
     # red-team hold-out misses at 98eefb7 (GoodQA #14471 F1)
     'export D=~/.claude/wals; rm -rf "$D"',
     'declare -r W=$HOME/.codex/sessions; rm -rf $W',
@@ -419,8 +431,33 @@ NEG15_WORK_BLOCK = [
     {'cmd': 'rm ~/.agent-harness/scratch/a/b/c/tasks/d/session.txt', 'cwd': '@HOME@'},
     {'cmd': 'rm -rf ~/.agent-harness/scratch/a/*', 'cwd': '@HOME@'},
     {'cmd': 'ln -s ~/.claude/projects /tmp/x/wals && rm -rf /tmp/x/wals/', 'cwd': '@HOME@'},
+    # own-worktree globs and find filters (GoodQA #14471, final round)
+    {'cmd': 'rm -rf out/*', 'cwd': '@WT@'},
+    {'cmd': 'rm -rf */*', 'cwd': '@WT@'},
+    {'cmd': 'rm -rf *', 'cwd': '@WT@'},
+    {'cmd': 'rm -rf build/*.jsonl', 'cwd': '@WT@'},
+    {'cmd': 'rm -rf build/*.wal.jsonl', 'cwd': '@WT@'},
+    {'cmd': 'rm -rf build/*', 'cwd': '@HOME@/.agent-harness/work/S/T/fake'},
+    {'cmd': 'find . -name "*.jsonl" -delete', 'cwd': '@WT@'},
+    {'cmd': 'find . -delete', 'cwd': '@WT@'},
+    {'cmd': 'find . -name "*" -delete', 'cwd': '@WT@'},
+    {'cmd': 'find . -not -name "*.pyc" -delete', 'cwd': '@WT@'},
+    {'cmd': 'find . -name "*.pyc" -o -name "*.jsonl" -delete', 'cwd': '@WT@'},
+    {'cmd': 'find . -path "*wal*" -delete', 'cwd': '@WT@'},
+    {'cmd': 'find .. -name "*.pyc" -delete', 'cwd': '@WT@'},
+    {'cmd': 'find -L . -name "*.pyc" -delete', 'cwd': '@WT@'},
+    {'cmd': 'find . -follow -name "*.pyc" -delete', 'cwd': '@WT@'},
+    {'cmd': 'find ~/.claude -name "*.pyc" -delete', 'cwd': '@WT@'},
 ]
 NEG15_WORK_ALLOW = [
+    # fresh hold-out false positives at 91e8752 (GoodQA #14471, final round)
+    {'cmd': 'rm -rf build/*', 'cwd': '@WT@'},
+    {'cmd': 'find . -name "*.pyc" -delete', 'cwd': '@WT@'},
+    {'cmd': 'find . -name __pycache__ -exec rm -rf {} +', 'cwd': '@WT@'},
+    {'cmd': 'find build -name "*.o" -delete', 'cwd': '@WT@'},
+    {'cmd': 'rm -rf build/nope*/*', 'cwd': '@WT@'},
+    {'cmd': 'npx rimraf dist', 'cwd': '@WT@'},
+    {'cmd': 'xargs rm -rf <<< "build/a.o"', 'cwd': '@WT@'},
     {'cmd': 'rm -rf build', 'cwd': '@WT@'},
     {'cmd': 'rm -f out/*.o', 'cwd': '@WT@'},
     {'cmd': 'rm -f *.o', 'cwd': '@WT@'},
@@ -460,6 +497,14 @@ KILL_POSITIVE_PS = ['Stop-Process -Name python -Force']
 
 # ------------------------------------------------------------------ allowed with no block and no warning
 NEGATIVE = [
+    # package runners, eval and xargs input that stay allowed (GoodQA #14471, final round)
+    'eval "$(echo ls ~/.claude)"',
+    'eval "$(ssh-agent -s)"',
+    'eval "$(direnv export bash)"',
+    'xargs echo <<< "$HOME/.claude/projects"',
+    'npx prettier --write src',
+    'npx rimraf dist',
+    'pnpm dlx create-vite app',
     # red-team hold-out misses at 98eefb7 (GoodQA #14471 F1)
     'rm -rf src/walker/__pycache__',
     'rm -rf src/wallet/build',
