@@ -2,8 +2,10 @@
 
 LOSS_INVENTORY_SCRIPT may point at a mutated copy of the script; the suite must then fail.
 """
+import importlib.util
 import json
 import os
+import stat
 import shutil
 import sqlite3
 import subprocess
@@ -35,7 +37,14 @@ class Fixture(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.home = Path(tmp.name).resolve()
-        self.env = dict(os.environ, HOME=str(self.home))
+        fb = tempfile.TemporaryDirectory()
+        self.addCleanup(fb.cleanup)
+        self.fakebin = Path(fb.name).resolve()
+        ct = self.fakebin / "crontab"
+        ct.write_text('#!/bin/sh\ncat "$FAKE_CRONTAB" 2>/dev/null || { echo "no crontab" >&2; exit 1; }\n')
+        ct.chmod(0o755)
+        self.env = dict(os.environ, HOME=str(self.home), PATH="%s:%s" % (self.fakebin, os.environ.get("PATH", "")))
+        self.env.pop("FAKE_CRONTAB", None)
         self.env.pop("GIT_DIR", None)
         # (a) repo with a branch commit not on its fake bare remote
         rtmp = tempfile.TemporaryDirectory()  # the fake remote lives off-host, outside the scanned HOME
@@ -48,6 +57,8 @@ class Fixture(unittest.TestCase):
         commit(self.work, "c1")
         git(self.work, "remote", "add", "origin", str(self.bare))
         git(self.work, "push", "-q", "origin", "main")  # creates refs/remotes/origin/main
+        # the bare dir stands in for an off-host remote: a local-path URL would (correctly) count as same-host
+        git(self.work, "remote", "set-url", "origin", "https://remote.example.invalid/r.git")
         git(self.work, "checkout", "-q", "-b", "work")
         commit(self.work, "c2")  # one commit on no remote
         # (b) repo with no remote
@@ -93,7 +104,9 @@ class ScanTests(Fixture):
     def test_counts_and_row_shape(self):
         r = self.scan()
         self.assertEqual(r["classes"], {"unpushed_branch": 1, "no_remote_repo": 1, "systemd_user_unit": 1,
-                                        "timer": 1, "state_db_outside_git": 1}, r)
+                                        "timer": 1, "state_db_outside_git": 1, "git_stash": 0, "local_tag": 0,
+                                        "dirty_worktree": 0, "crontab": 0}, r)
+        self.assertEqual(r["schema"], 2)
         self.assertEqual(len(r["rows"]), 5)
         self.assertFalse(r["partial"])
         self.assertTrue(r["host"] and r["scanned_at"])
@@ -109,7 +122,8 @@ class ScanTests(Fixture):
     def test_control_remote_ref_changes_unpushed_count(self):
         self.assertEqual(self.counts()["unpushed_branch"], 1)
         # push work: the remote-tracking ref now contains it -> 0
-        git(self.work, "push", "-q", "origin", "work")
+        git(self.work, "push", "-q", str(self.bare), "work")  # origin URL is fake; push by path
+        git(self.work, "update-ref", "refs/remotes/origin/work", "work")
         self.assertEqual(self.counts()["unpushed_branch"], 0)
         # drop the remote-tracking refs: nothing is known to be on a remote -> main and work both unpushed
         git(self.work, "update-ref", "-d", "refs/remotes/origin/main")
@@ -178,6 +192,146 @@ class ScanTests(Fixture):
 
 
 class CoverageTests(Fixture):
+    def saved(self):
+        return self.home / ".agent-harness/state/loss-inventory/last-scan.json"
+
+    def decide_all(self):
+        for row in json.loads(self.run_cli("report", "--json").stdout)["undecided"]:
+            self.run_cli("decide", "--row", row["path"], "--decision", "moved", "--ticket", "t#1", expect=0)
+
+    def test_symlinked_git_and_dir_block_report_unless_target_scanned(self):
+        out = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, str(out))
+        # off-root repo with an unpushed branch, reachable only through symlinks
+        ext = out / "ext"
+        ext.mkdir()
+        git(ext, "init", "-q", "-b", "main")
+        commit(ext, "e1")
+        git(ext, "remote", "add", "origin", "https://remote.example.invalid/e.git")
+        lr = self.home / "linkrepo"
+        lr.mkdir()
+        os.symlink(str(ext / ".git"), str(lr / ".git"))
+        os.symlink(str(out), str(self.home / "linkdir"))
+        r = self.scan()
+        sk = [x["path"] for x in r["skipped_symlinks"]]
+        self.assertIn(str(lr / ".git"), sk)
+        self.assertIn(str(self.home / "linkdir"), sk)
+        self.decide_all()
+        self.assertEqual(self.run_cli("report", expect=1).returncode, 1)  # nothing undecided, still blocked
+        self.assertIn("SKIPPED_SYMLINK", self.run_cli("report").stdout.decode())
+        # scanning the target as a root resolves the dir link (the .git symlink stays blocking)
+        p = self.run_cli("scan", "--root", str(self.home), "--root", str(out), "--json", expect=0)
+        r2 = json.loads(p.stdout)
+        self.assertNotIn(str(self.home / "linkdir"), [x["path"] for x in r2["skipped_symlinks"]])
+        # explicit acknowledgement is recorded
+        p = self.run_cli("scan", "--root", str(self.home), "--allow-symlink-target", str(out), "--json", expect=0)
+        r3 = json.loads(p.stdout)
+        self.assertEqual(r3["skipped_symlinks"], [x for x in r3["skipped_symlinks"] if x["path"] == str(lr / ".git")])
+        self.assertEqual(r3["symlink_allow"], [str(out)])
+
+    def test_any_decision_on_branch_goes_stale_when_recreated(self):
+        self.scan()
+        path = "%s::work" % self.work
+        self.run_cli("decide", "--row", path, "--decision", "accepted-loss", "--ticket", "t#1", expect=0)
+        git(self.work, "checkout", "-q", "main")
+        git(self.work, "branch", "-D", "work")
+        git(self.work, "checkout", "-q", "-b", "work")
+        commit(self.work, "new")
+        self.scan()
+        und = [x["path"] for x in json.loads(self.run_cli("report", "--json", expect=1).stdout)["undecided"]]
+        self.assertIn(path, und)
+
+    def test_report_does_not_trust_arbitrary_saved_scan(self):
+        self.saved().parent.mkdir(parents=True, exist_ok=True)
+        self.saved().write_text(json.dumps({"scanned_at": "1970-01-01T00:00:00Z", "rows": []}))
+        p = self.run_cli("report", expect=1)
+        self.assertIn("incomplete", p.stdout.decode())
+
+    def test_report_blocks_scan_of_wrong_roots_and_old_scans(self):
+        empty = self.home / "emptydir"
+        empty.mkdir()
+        self.run_cli("scan", "--root", str(empty), "--json", expect=0)
+        self.decide_all()
+        p = self.run_cli("report", expect=1)  # roots do not include $HOME
+        self.assertIn("ROOTS", p.stdout.decode())
+        self.run_cli("report", "--allow-partial-roots", expect=0)
+        d = json.loads(self.saved().read_text())
+        d["scanned_at"] = "2020-01-01T00:00:00Z"
+        self.saved().write_text(json.dumps(d))
+        p = self.run_cli("report", "--allow-partial-roots", expect=1)
+        self.assertIn("older than", p.stdout.decode())
+        self.run_cli("report", "--allow-partial-roots", "--max-age", "1000000", expect=0)
+
+    def test_same_host_remotes_do_not_count_as_pushed(self):
+        git(self.work, "remote", "set-url", "origin", str(self.bare))  # local path
+        r = self.scan()
+        self.assertEqual(r["classes"]["no_remote_repo"], 2, r["rows"])
+        self.assertEqual(r["classes"]["unpushed_branch"], 0)
+        import socket
+        git(self.work, "remote", "set-url", "origin", "ssh://%s/srv/r.git" % socket.gethostname())
+        self.assertEqual(self.scan()["classes"]["no_remote_repo"], 2)
+        git(self.work, "remote", "set-url", "origin", "git@%s:r.git" % socket.gethostname())
+        self.assertEqual(self.scan()["classes"]["no_remote_repo"], 2)
+        git(self.work, "remote", "set-url", "origin", "git@github.example.invalid:r.git")
+        self.assertEqual(self.scan()["classes"]["no_remote_repo"], 1)
+
+    def test_skipped_mounts_block_report(self):
+        self.scan()
+        self.decide_all()
+        self.run_cli("report", expect=0)
+        d = json.loads(self.saved().read_text())
+        d["skipped_mounts"], d["skipped_mounts_total"] = ["/mnt/x"], 1
+        self.saved().write_text(json.dumps(d))
+        self.assertIn("SKIPPED_MOUNT", self.run_cli("report", expect=1).stdout.decode())
+
+    def test_builtin_prune_names_listed(self):
+        r = self.scan()
+        self.assertIn("node_modules", r["prune"])
+        self.assertIn("PRUNED_DIR_NAMES", self.run_cli("report").stdout.decode())
+
+    def test_state_files_private(self):
+        sd = self.home / ".agent-harness/state/loss-inventory"
+        sd.mkdir(parents=True)
+        sd.chmod(0o755)
+        self.scan()
+        self.assertEqual(stat.S_IMODE(sd.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(self.saved().stat().st_mode), 0o600)
+
+    def test_none_fingerprint_makes_decision_stale(self):
+        spec = importlib.util.spec_from_file_location("li_under_test", str(SCRIPT))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        old = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
+        self.addCleanup(lambda: os.environ.__setitem__("HOME", old))
+        sd = Path(mod.state_dir())
+        sd.mkdir(parents=True)
+        (sd / "decisions.jsonl").write_text(json.dumps({"path": "/r::b", "decision": "moved", "fp": None}) + "\n")
+        rows = mod.merge_decisions([{"class": "unpushed_branch", "path": "/r::b", "fp": None}])
+        self.assertIsNone(rows[0]["decision"])
+
+    def test_stash_local_tag_dirty_crontab_and_extra_units(self):
+        (self.work / "c1").write_text("changed")  # tracked file modified -> dirty
+        git(self.work, "stash", "-q")
+        (self.work / "c1").write_text("again")
+        git(self.work, "tag", "v-local", "work")
+        ud = self.home / ".local" / "share" / "systemd" / "user"
+        ud.mkdir(parents=True)
+        (ud / "s.socket").write_text("[Socket]\n")
+        (ud / "p.path").write_text("[Path]\n")
+        cron = self.home / "cron.txt"
+        cron.write_text("# SECRET-IN-COMMENT\n\n0 * * * * /bin/backup --token=SECRET-TOKEN-9\n30 1 * * * /bin/x\n")
+        self.env["FAKE_CRONTAB"] = str(cron)
+        p = self.run_cli("scan", "--root", str(self.home), "--json", expect=0)
+        r = json.loads(p.stdout)
+        c = r["classes"]
+        self.assertEqual((c["git_stash"], c["local_tag"], c["dirty_worktree"], c["crontab"]), (1, 1, 1, 1), r["rows"])
+        self.assertEqual(c["systemd_user_unit"], 3)  # a.service + .socket + .path
+        by = {x["class"]: x for x in r["rows"]}
+        self.assertEqual(by["crontab"]["count"], 2)
+        self.assertNotIn("SECRET", p.stdout.decode() + p.stderr.decode())
+        self.assertGreaterEqual(by["dirty_worktree"]["count"], 1)
+
     def test_untracked_db_inside_repo_counts_tracked_does_not(self):
         shutil.copy(str(self.db), str(self.noremote / "prod.db"))  # sqlite magic, untracked
         r = self.scan()
@@ -191,6 +345,7 @@ class CoverageTests(Fixture):
         subprocess.run(["git", "clone", "-q", "--bare", str(self.bare), str(bare)], check=True)
         git(bare, "remote", "add", "o2", str(self.bare))
         git(bare, "fetch", "-q", "o2")  # remote-tracking refs so main counts as pushed
+        git(bare, "remote", "set-url", "o2", "https://remote.example.invalid/b.git")  # off-host stand-in
         wt = self.home / "wt"
         git(bare, "worktree", "add", "-q", "-b", "feat", str(wt))
         commit(wt, "w1")
@@ -313,7 +468,7 @@ class MutantTest(unittest.TestCase):
 
     def test_mutant_is_detected(self):
         src = REAL.read_text()
-        needle = 'if not self.contained_in(repo, sha, "refs/remotes"):'
+        needle = 'if not self.contained_in(repo, sha, *ns):'
         self.assertEqual(src.count(needle), 1)
         with tempfile.TemporaryDirectory() as d:
             m = Path(d) / "loss_inventory.py"
