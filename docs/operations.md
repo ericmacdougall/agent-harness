@@ -107,6 +107,32 @@ These actions retain history and record actor/reason/evidence; they never manufa
 
 Before expensive commands, disk probes cover work/build, temp and receipt filesystems. Default floors are 2 GiB for compile/test work and 256 MiB otherwise, with `--minimum-free-bytes` for a declared override or known higher peak. Missing data or low space prevents launch. Floors are not predictions and are subject to concurrent consumption. No automatic cache deletion or broad process killing occurs. Process-group cleanup retains its existing detached-descendant limitations. Hashes/permissions catch accidental staleness or mutation; same-user receipts are cooperative evidence, not signed attestations.
 
+## Model ladder
+
+`~/.claude/hooks/model_tiers.json` is the one tier table (R0 Sonnet/Terra; R1 to R3 Opus/Sol at medium, high and xhigh; R4 Opus/Sol max and R6 Fable/Astra high are review-only; R5 Fable/Astra medium needs the user's permission). `model_tiers.py` answers deterministic questions about it:
+
+```sh
+python3 ~/.claude/hooks/model_tiers.py table
+python3 ~/.claude/hooks/model_tiers.py classify --model opus --effort high        # -> R2, claude
+python3 ~/.claude/hooks/model_tiers.py reviewer --author-rung R2 --author-harness claude   # -> R3 on the other harness
+```
+
+`escalation.py` keeps one locked, mode-0600 state file per task under `~/.agent-harness/escalation/`. Failure events come only from machine receipts: a usage-guard FINAL whose review verdict is BLOCK with named findings, or a guarded test FINAL that is red at a HEAD the owner claimed fixed (`claim-fix`). Zero-launch attempts, TRANSIENT_INFRA, LOW_DISK, QUOTA, AUTH, TIMEOUT and UNKNOWN never count. Each event is keyed by the receipt's sha256, so replaying it is a no-op. The rung is a pure function of the events: two failures on the same finding fingerprint advance one writing rung, a new fingerprint resets the count, review-only rungs are skipped, and the top automatic rung stays put until the user approves the next one.
+
+```sh
+python3 ~/.claude/hooks/escalation.py record --task TASK --run-id RUN_ID --kind review --source peer_review:code-inspection
+python3 ~/.claude/hooks/escalation.py claim-fix --task TASK --head FULL_SHA
+python3 ~/.claude/hooks/escalation.py status --task TASK
+python3 ~/.claude/hooks/escalation.py digest
+python3 ~/.claude/hooks/escalation.py approve-top --task TASK --ask ASK_ID --wal ~/.claude/wals/SESSION_ID/main.jsonl
+```
+
+`approve-top` records the user's permission for the top writing rung only when the WAL holds an `ask` with a `user:` source naming the task and an `ask_resolved` that references it. A state file that is missing, corrupt or locked resets the task to the lowest rung with a durable reset record (reason code, prior state hash, preserved copy) and a notification in `notifications.jsonl`; a corrupt file can never raise a rung. Every escalation or reset also appends a decision entry to the WAL named by `AGENT_HARNESS_MAIN_WAL`. Ladder limits (8 failing review launches, 3 automatic climbs, $60 per task, each counted launch spending the rung's review budget until helpers report real cost) block further writer spawns until a human signs off; `escalation.py gate-digest` lists what the hook refused or would have refused. On its own errors (an unreadable table, a symlinked or unwritable state directory) the hook denies spawns and `claude`/`codex`/`rescue.py`/`peer_review.py` launch lines only and never blocks plain shell use. `python3 ~/.claude/hooks/model_tiers.py mode` shows the installed mode and `mode --set warn` is the one-command rollback after the enforce flip (the rewrite reformats the table: sorted keys, indent 1). The Bash check reads literal tokens: `$c` and `--model $M` variable indirection, `xargs` and data-driven forms are not parsed (a `claude --model $M` line is denied as an off-table model under enforce: spell the model out), and a heredoc body mentioning a launch is split like text, so under enforce write such text to a file instead of a heredoc.
+
+`tier_gate.py` is the PreToolUse hook for Agent, Task, Workflow and Bash. Bash lines launching `claude`, `codex`, `rescue.py` or `peer_review.py` are checked segment by segment (the line is split on unquoted `;`, `&&`, `||`, `|`, `&` and newlines; any denied segment denies the line; a review line at a permission rung needs the installed ledger's permission). A spawn names its task with `[task:KEY]` in the prompt or description; without it the hook generates a key and resets to the lowest rung. The requested model and effort must match the task's rung: above it is downgraded through `updatedInput`, below it needs a `[rung-below:REASON]` token, review-only rungs never write, reviewer spawns (red-team, click-tester, reviewer) sit one rung above, and the top writing rung needs the recorded permission. `mode` in `model_tiers.json` is `warn` (the hook only adds context and logs what enforce would do to `~/.agent-harness/escalation/gate.jsonl`) or `enforce`; an unreadable table denies. SubagentStart and SubagentStop keep a per-session live-agent count under `caps.session_live_agents` (default 40).
+
+`peer_review.py --task TASK [--author-rung R] [--author-harness claude|openai]` picks the reviewer from the table (one rung above the author, the other harness preferred, the same harness one effort up when the other is unavailable, an unknown author reviewed at Opus/Sol medium and flagged), writes a selection receipt under `~/.agent-harness/escalation/selections/`, stamps `Author-Rung`, `Reviewer-Rung` and `Reviewer-Selection` on the report, and records the FINAL receipt in the task ledger so reviews count where they are consumed. `rescue.py --task TASK` runs at the task's computed writing rung on the other harness; `--rung` overrides it; a rung that needs permission is refused before any launch unless `approve-top` recorded it.
+
 ## Review and rescue
 
 ```sh
