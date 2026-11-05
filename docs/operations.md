@@ -390,6 +390,62 @@ Run `replay` over recent transcripts and the red-team hold-out set before the en
 
 **Known gap.** Claude Code `Write`, `Edit`, `MultiEdit`, `NotebookEdit` and Codex `apply_patch` are not shell tools. The guard does not see them, so they can still overwrite or empty a transcript or WAL. Follow-up: GoodQA #14500.
 
+## Kill guard
+
+`kill_guard.py` (GoodQA #14506, matrix X05) is a PreToolUse guard that stops an agent from killing processes it does not own. It exists because an owner piped `pgrep -f` into `xargs kill`, and another ran `pkill -f`, and both stopped other owners' test runs on a shared host. It is separate from the command guard and reuses its parser, so wrappers (`sudo`, `env`, `nohup`, `timeout`, `sh -c`, `eval`, here-documents, aliases, script files) are followed. Threat model: careless agents and common obfuscation, not an agent that edits its own hooks.
+
+### What is blocked
+
+| Form | Result |
+|---|---|
+| `pkill`, `killall`, `killall5`, `skill`, `slay`, `fuser -k`, `taskkill`, `Stop-Process`, `systemctl kill`, `launchctl kill`, `loginctl kill-*`, the PowerShell `kill` alias | blocked in any form |
+| `kill` fed by `xargs`, `$(...)`, backticks, `while read` or a `for` loop variable, or any variable, glob or negative, zero or non-ASCII PID | blocked: the targets cannot be proven yours |
+| interpreter code that signals (`os.kill`, `os.killpg`, `process.kill`, `psutil`, or naming the verbs above) in `-c`, `-e`, here-documents and here-strings | blocked; set `script_kill_pattern` to an empty string in the policy to turn this check off |
+| `find -exec kill`, `parallel kill`, `netwatch orphans --kill` with `--all`, `--force`, `--match` or without `--pid` | blocked |
+| `kill PID...` with literal PIDs | allowed only when every PID is proven yours (below) |
+| `kill -0`, `kill -l`, `kill -L`, `kill %N`, `kill $!` after a background job in the same input, `pgrep`, `ps`, `lsof`, `timeout -s KILL`, text that only contains the word | allowed |
+
+### How ownership is proven
+
+A PID is yours when it is not PID 1, not the hook process or any ancestor of it (the agent CLI and its shell), not a protected program (`claude`, `codex`, `sshd`, `launchd`, `systemd`, `init`, `tmux`, `screen`, `netwatch`), has your uid, and one of these holds:
+
+1. its cwd (Linux `/proc/PID/cwd`, macOS `lsof -a -d cwd -p PID`) is inside your git worktree;
+2. its program (`argv[0]`) is a path inside your worktree, or `argv[0]` is an interpreter or shell and `argv[1]` is a path inside your worktree (a `tail` or editor that merely names a file there does not count);
+3. it is in this worktree's spawn ledger with the same start time.
+
+Your worktree is the git toplevel of the tool call's working directory, not of a `cd` inside the command, so a `cd` into another owner's worktree proves nothing. Worktrees nested inside yours are excluded, and `/`, HOME and its ancestors are never used. Anything that cannot be read, times out (2 s per probe) or does not parse is unprovable and blocked. The probes run only after a kill verb is found, so ordinary commands cost nothing extra.
+
+Process ancestry is deliberately not a proof: subagents share the CLI process, so another owner's processes are descendants of it too.
+
+### Starting processes you will need to stop
+
+`python3 ~/.claude/hooks/kill_guard.py spawn [--log FILE] -- CMD ARGS...` starts the command detached from inside a git worktree, records its PID and start time in `~/.agent-harness/state/kill-guard/ledger-<hash>.jsonl` with an HMAC under a 0600 key in a 0700 directory, and prints the PID. `spawn` takes a command, never a PID, and the guard judges the spawned command as if you had typed it. The ledger protects against accident: anyone who can read the key can forge a line. A later call's `kill "$SERVER_PID"` is blocked by design; use the printed PID literally, or `netwatch orphans --kill --pid N`.
+
+### Remote kills
+
+Ownership cannot be checked on another machine, so every kill verb and every kill with a numeric PID inside `ssh`, `mosh`, `docker exec` or `kubectl exec` is blocked, as is the code of `ssh -o ProxyCommand=` and `-o LocalCommand=`. Remote listing and `kill -0` are allowed. The only remote kill is `ssh HOST netwatch orphans --kill --pid N[,N...]` (digits only; flags `--json` allowed). netwatch signals only processes it lists as orphans, and the guard recognises it by name. A local `netwatch orphans --kill --pid N` is allowed without the ownership proof, so an orphan of another owner can still be named by PID; that trust is accepted.
+
+### Block messages and audit
+
+Every block is one line and names `netwatch orphans --kill --pid <pid>`. It carries a rule code and PIDs, never the command, a secret or another process's command line. Each block appends a redacted line (time, rule, PIDs, a 16-character hash of the command) to `~/.agent-harness/state/kill-guard/audit.jsonl`.
+
+### Fail closed
+
+The registered command is `kill_guard.py hook`, a launcher that runs the analysis in a child process with a 10 s limit (8 s watchdog inside). If the child crashes, cannot start, times out, prints garbage, or the input exceeds 8 MiB, the launcher blocks when the normalised raw text (quotes, backslashes and `$` removed) contains `kill`, `fuser`, `Stop-Process` or an indirection marker (ANSI-C quote, `eval`, `base64`, `xxd`), and otherwise allows with a note. A harmless `eval` is therefore blocked while the analyser is broken. The Claude Code entry matches `Bash|PowerShell` with `onFailure: block`; the Codex entry has no matcher. The guard never blocks reading or editing its own files. Policy is `kill_guard_policy.json` (`mode`: `enforce`, `warn` or `off`; the file is human-edited, there is no override variable).
+
+### Known limits
+
+A verb assembled from several variables at run time, kill calls inside script files the guard cannot read, `make` or `npm` targets and compiled programs, `docker kill`, `pm2`, `tmux kill-server` and `supervisorctl` are not covered. `sleep N; kill PID` is judged when the hook runs, not when the kill runs, so a PID reused in between is a residual risk. On macOS `ps` loses argument boundaries, so only the first two whitespace-separated words are read and a path with spaces is unprovable.
+
+### Commands and rollout
+
+| Command | Purpose |
+|---|---|
+| `kill_guard.py spawn [--log F] -- CMD...` | Start a process you can later kill. |
+| `kill_guard.py explain FILE [--cwd D]` | Show the decision for a command stored in a file. Runs nothing. |
+
+Install with `install.py --apply` and `install_codex.py --apply`; both register the kill guard together with the command guard, and `--no-command-guard` removes both registrations. Tests: `python3 -m unittest tests.test_kill_guard` (decides text only, signals nothing, safe anywhere). The live canary test, `tests/live_kill_canary.py`, starts its own sleepers and a canary, and runs only on dev2: `env -i HOME=$(mktemp -d) PATH=/usr/bin:/bin KILL_GUARD_LIVE=1 python3 tests/live_kill_canary.py`. Rules registry entry: `docs/rules/kill-guard.json`.
+
 ## Spec-driven tickets
 
 Every want, need, finding or bug is a GoodQA ticket. When an agent picks one up, it writes a spec, gets the spec reviewed and attaches it to the ticket. As it works, it attaches proof for each acceptance criterion. After deploy, it attaches the click-test record. Once signed off, the ticket can be marked done.
