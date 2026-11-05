@@ -398,3 +398,68 @@
 {"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "mv ~/.agent-harness /tmp/y"}
 {"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "find ~/.agent-harness -delete"}
 {"category": "removal", "expect": "deny", "cwd": "/tmp", "cmd": "find ~ -delete"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "echo x > @STORE@/work-assignments.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/work-assignments.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm \"@STORE@/work-assignments.json\""}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm '@STORE@/work-assignments.json'"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm .agent-harness/work-assignments.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm ~/.agent-harness/work-assignments.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm $HOME/.agent-harness/work-assignments.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm ${HOME}/.agent-harness/work-assignments.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~/.agent-harness && rm work-assignments.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "cd @STORE@; mv work-assignments.json x"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "cd .agent-harness && rm ./work-assignments.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~ && cd .agent-harness && rm work-assignments"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "cd ~/.agent-harness && rm work-assignments"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "pushd ~/.agent-harness && rm work-assignments"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/work-assign*"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/work-assignments.j*"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/work-assign?ents.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm '@STORE@/work-assign*'"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "cd @STORE@ && rm work-assign*"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/work-assign[m]ents.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/work-assignments.{json,bak}"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/{work-assignments,x}.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/work-assign{ments,x}.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "cp x @STORE@/work-assignments{,.bak}"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/work-assignments$X"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "ssh h 'rm ~/.agent-harness/work-assignments.json'"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "ssh h \"cat > .agent-harness/work-assignments.json\""}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "ssh h 'cd ~/.agent-harness && rm work-assignments'"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "scp x h:.agent-harness/work-assignments.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "echo x > ~/.agent-harness/work-assignments.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "echo x >> @STORE@/work-assignments.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "cd @STORE@ && echo x >work-assignments"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "tee @STORE@/work-assignments.json < x"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/work-assignments"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "mv x ~/.agent-harness/work-assignments"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "python3 x.py > @STORE@/work-assignments"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "mv x @STORE@/work-assignments/y"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm ../u/.agent-harness/work-assignments"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/work-ledger.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "echo x > @STORE@/work-ledger.events.jsonl"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/work-ledger*"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/work-ledger"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "cd @STORE@ && rm work-ledger.lock"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/hive.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@HOME@", "cmd": "rm @STORE@/work_assignments_policy.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@STORE@", "cmd": "rm work-assignments.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@STORE@", "cmd": "rm ./work-assignments.json"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@STORE@", "cmd": "rm work-assignments"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@STORE@", "cmd": "rm ./work-assignments"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@STORE@", "cmd": "mv x work-assignments"}
+{"category": "ledger-name", "expect": "deny", "cwd": "@STORE@", "cmd": "echo x > work-assignments"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "python3 ~/.claude/hooks/spec_flow.py evidence --spec ~/.agent-harness/work/work-assignments/spec.md --ac AC-1"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "python3 ~/.claude/hooks/deliver.py finish --task work-assignments --generation 1 --original ~/repos/agent-harness --original-branch main --mode remote --check 'python3 -m unittest tests.test_work_assignments'"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "ssh h 'cd ~/repos/agent-harness-work-assignments && python3 -m unittest tests.test_work_assignments'"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "python3 x.py > ~/.agent-harness/work/task/work-assignments/note.md"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "python3 x.py > @STORE@/work/task/work-assignments/note.md"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "cp a ~/repos/agent-harness-work-assignments/b"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "cd ~/repos/agent-harness-work-assignments && python3 x.py"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "mkdir -p @STORE@/work/task/work-assignments"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "rm ~/repos/x/work-assignments"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "python3 n.py --note 'fixed work-assignments.'"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "python3 t.py --task work-ledger"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "cd /opt/elsewhere && rm work-assignments"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "cd ~/.agent-harness/work && rm -rf work-assignments/old"}
+{"category": "ledger-name", "expect": "allow", "cwd": "@HOME@", "cmd": "python3 x.py > docs/work-assignments.md"}

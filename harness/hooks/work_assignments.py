@@ -115,10 +115,66 @@ def guard_targets(tool_input, tool: str = "") -> tuple:
     return paths, command if isinstance(command, str) else ""
 
 
-def protected_hit(text: str) -> bool:
-    """A store name, or a glob that could become one; the repo's own work-assignments.md or .py are not the store."""
-    return any("*" in m.group(0) or "?" in m.group(0) or not re.search(r"\.(?:md|rst|txt|py|html)$", m.group(0))
-               for m in PROTECTED.finditer(text))
+def expand_home(word: str) -> str:
+    home = str(Path.home())
+    for form in ("${AGENT_HARNESS_HOME}", "$AGENT_HARNESS_HOME"):
+        word = word.replace(form, str(base()))
+    word = word.replace("${HOME}", home).replace("$HOME", home)
+    return home + word[1:] if word == "~" or word.startswith("~/") else word
+
+
+def shell_places(text: str, cwd=None) -> set:
+    """The session cwd and every directory a `cd` or `pushd` in the text reaches, inside ssh or `sh -c` quotes too: a
+    bare name is judged from all of them, which can over-deny but never skips one. A `$VAR` target is not followed."""
+    here = str(cwd or os.getcwd())
+    places = {os.path.normpath(here)}
+    for m in re.finditer(r"(?:^|[\s;&|(`'\"])(?:cd|pushd)(?![\w-])(?:\s+['\"]?([^\s;&|'\")`]+))?", text):
+        target = expand_home(m.group(1) or "~")
+        if "$" not in target and target != "-":
+            here = os.path.normpath(os.path.join(here, target))
+            places.add(here)
+    return places
+
+
+def in_store_root(prefix: str, places: set) -> bool:
+    """Whether a name written after this prefix sits directly in the store directory."""
+    fold = (lambda x: x.lower()) if sys.platform == "darwin" else (lambda x: x)
+    roots = {fold(os.path.normpath(str(base()))), fold(os.path.realpath(str(base())))}
+    word = expand_home(prefix)
+    if "$" in word:  # an unresolved variable; the real files are still caught by their extension
+        return False
+    return any(fold(os.path.normpath(os.path.join(place, word))) in roots for place in places)
+
+
+LEDGER_NAME = re.compile(r"work-(?:assign|ledger)")
+
+
+def protected_hit(text: str, cwd=None) -> bool:
+    """A store name, or a glob that could become one. `work-assignments` as a repo name, task name or work directory is
+    not the store: such a word counts only when it is shaped like a file (extension, glob, brace or variable next to
+    it) or resolves directly inside the store directory. The repo's work-assignments.md or .py are not the store."""
+    places = None
+    for m in PROTECTED.finditer(text):
+        name = m.group(0)
+        is_doc = re.search(r"\.(?:md|rst|txt|py|html)$", name)
+        if not LEDGER_NAME.match(name):
+            if "*" in name or "?" in name or not is_doc:
+                return True
+            continue
+        before, after = text[m.start() - 1:m.start()], text[m.end():m.end() + 1]
+        if before and (before.isalnum() or before in "_-."):
+            continue  # agent-harness-work-assignments is a different name
+        if "*" in name or "?" in name or (after and after in "{[$") or (before and before in "{,"):
+            return True
+        if "." in name.rstrip("."):  # a sentence's closing dot is not an extension
+            if not is_doc:
+                return True
+            continue
+        if places is None:
+            places = shell_places(text, cwd)
+        if in_store_root(re.search(r"[^\s'\"=;&|<>()`:,{]*$", text[:m.start()]).group(), places):
+            return True
+    return False
 
 
 def glob_could_name_key(token: str) -> bool:
@@ -823,7 +879,7 @@ def removal_denial(prog: str, root: str, unknown_cd: bool) -> str:
     return text + (CD_NOTE if unknown_cd else "")
 
 
-WRITEISH = re.compile(r"(?:>|\btee\b|\brm\b|\bmv\b|\bcp\b|sed\s+-i|\btruncate\b|\bpython3?\b|\bperl\b|\bruby\b|\bnode\b|"
+WRITEISH = re.compile(r"(?:>|\btee\b|\brm\b|\bmv\b|\bcp\b|\bscp\b|\brsync\b|sed\s+-i|\btruncate\b|\bpython3?\b|\bperl\b|\bruby\b|\bnode\b|"
                       r"\bdd\b|\bln\b|\bchmod\b|\binstall\b|\bgit\s+(?:checkout|restore|stash)\b)")
 
 
@@ -2379,7 +2435,7 @@ def hook_guard(payload: dict, runtime: str) -> dict:
     # Paths and the command only: text that merely mentions the ledger (its docs, its tests) is not a write to it.
     paths, cmd = guard_targets(tool_input, tool)
     targets = " ".join(paths + [cmd])
-    if not protected_hit(targets):
+    if not protected_hit(targets, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None):
         return {}
     if isinstance(command, str) and SAFE_CLI.match(command):  # exactly one CLI call: no redirection, chaining or substitution
         return {}
@@ -3161,10 +3217,15 @@ def cmd_decision(args):
 def cmd_status(args):
     policy = load_policy()
     with reading() as data:
-        if args.json:
-            print(json.dumps({k: data[k] for k in ("messages", "asks", "decisions", "index")}, indent=1, sort_keys=True))
-            return
         session = None if args.all else (args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or "")
+        if args.json:
+            out = {k: data[k] for k in ("messages", "asks", "decisions", "index")}
+            if session is not None:  # the digest's hints point here, so it must not widen what the digest shows
+                out["messages"] = {k: v for k, v in data["messages"].items() if v["sessionId"] == session}
+                out["asks"] = {k: v for k, v in data["asks"].items() if v["origin"]["actor"].get("sessionId") == session}
+                out.pop("index")
+            print(json.dumps(out, indent=1, sort_keys=True))
+            return
         print(digest(data, policy, session, limit=args.limit))
     fails = pending_failures()
     if fails:

@@ -168,6 +168,14 @@ adversarial shapes that must stay denied.
 Log size. The digest warns once `work-ledger.events.jsonl` passes half the 128 MiB read bound. Past the bound,
 reads fail loudly and cancel, verify and recover stop; rotation or compaction is follow-up GoodQA 1ae27b6b#14605.
 
+## Ledger names
+
+The direct-edit check judges a store name as a path, not a word. `work-assign*` and `work-ledger*` count when shaped like a file
+(an extension other than md, rst, txt, py or html, or a glob, brace or variable next to the name) or when a bare name resolves
+directly inside the store directory, from the session cwd or any `cd` or `pushd` in the command, including inside ssh quotes.
+`agent-harness-work-assignments`, `--task work-assignments` and a `work/.../work-assignments/` directory are not the store.
+A bare name after an unresolved `$VAR` is not judged; the real files are still caught by their extension.
+
 ## Known limits
 
 A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt and no request cues, and an excerpt whose first 15 words look secret-adjacent
@@ -187,16 +195,15 @@ no external anchor; a payload over 8 MB is rejected and recorded as a failure; `
 24 hours have passed, or after 30 days for a no-ask; decisions have no removal path yet; session caches (sync offsets, stop-block
 counters) are outside the fold by design. The first-touch sync window is the last 64 KB.
 
-## dev2 sync (proposal, not built)
-
-Each hive appends its own events; sync unions event files by `(hiveId, seq)` and re-folds (see the schema DESIGN notes:
-scalar last-writer-wins by `(at, hiveId, seq)`, sets are unions, a transition conflict records `sync_conflict`).
-Never copy `privateRef` or absolute log paths off the capturing machine.
-
-## Known limits
-
 - `claude -p` started from a VS Code, Desktop or local-agent session may keep an inherited non-`sdk-` entrypoint and be captured as human (hypothesis from Claude Code 2.1.318; all user lines seen so far are `cli`).
 - `tested:` evidence must be a `REALLY_TESTED` note in the ask's own session WAL. Notes from other sessions or hosts are refused, and migrated or imported asks have no origin session, so they cannot verify this way (fails safe; GoodQA 1ae27b6b#14597).
 - On Codex with `--ledger-mode warn`, the Codex guard only warns, including over the shared store and policy files. Claude's guard still denies.
 - Past the 128 MiB event-log bound, cancel, remove and recover refuse until rotation exists (GoodQA 1ae27b6b#14605).
 - Hooks cost about 280 ms on a loaded dev2; the hard gate is a 1 s ceiling and the profile target is tracked in its own ticket.
+- `DECISION` lines show their agent-written summary to every session: decisions record no session id yet.
+
+## dev2 sync (proposal, not built)
+
+Each hive appends its own events; sync unions event files by `(hiveId, seq)` and re-folds (see the schema DESIGN notes:
+scalar last-writer-wins by `(at, hiveId, seq)`, sets are unions, a transition conflict records `sync_conflict`).
+Never copy `privateRef` or absolute log paths off the capturing machine.

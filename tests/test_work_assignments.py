@@ -1458,6 +1458,10 @@ class StoreTest(Base):
             self.assertIn(msg["id"], out)
             self.assertNotIn("refactor the billing", out)
             self.assertIn("refactor the billing", self.cli("status", "--session", SID)[1])
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": other}):  # acceptance v11 V5: the digest's hints lead to --json
+            self.assertNotIn("refactor the billing", self.cli("status", "--json")[1])
+            self.assertIn("refactor the billing", self.cli("status", "--json", "--all")[1])
+        self.assertIn("refactor the billing", self.cli("status", "--json", "--session", SID)[1])
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": other}):  # spec review v8 #1: `status` too
             out = self.cli("status")[1]
             self.assertIn(msg["id"], out)
@@ -1618,6 +1622,17 @@ class GuardTest(Base):
             self.assertGreaterEqual(sum(n for key, n in seen.items() if key[0] == expect), least)
         self.assertFalse(wrong["allow"] or wrong["deny"], f"{len(wrong['allow'])} allow rows denied, {len(wrong['deny'])} deny rows allowed, of {len(rows)}: {wrong}")
         self.assertEqual(wa.pending_failures(), [])  # a crash fails open, so it would otherwise pass every allow row
+
+    def test_tool_paths_under_a_work_assignments_directory_are_not_the_store(self):
+        """Acceptance v11 V1: a task or work directory named work-assignments was denied by name."""
+        user, store = self.corpus_home()
+        decide = lambda tool, path: self.hook("guard", {"session_id": SID, "tool_name": tool, "tool_input": {"file_path": str(path)},
+                                                        "cwd": str(user)}).get("hookSpecificOutput", {}).get("permissionDecision", "allow")
+        for path in (store / "work" / "task" / "work-assignments" / "note.md", user / "repos" / "agent-harness-work-assignments" / "x.py"):
+            self.assertEqual(decide("Write", path), "allow", path)
+        for path in (store / "work-assignments.json", store / "work-assignments", store / "work-assignments" / "x", store / "work-ledger.json"):
+            self.assertEqual(decide("Write", path), "deny", path)
+            self.assertEqual(decide("Edit", path), "deny", path)
 
     def test_guard_deny_text_names_the_root_and_the_way_out(self):
         """PR review 2a1da45 #2: "Recursive reads of the agent-harness store" misled an agent running `cd ~ && grep -rn x .`."""
