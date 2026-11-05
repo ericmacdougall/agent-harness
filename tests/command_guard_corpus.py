@@ -983,7 +983,7 @@ BANG_READINGS = [
     (">! out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # F2a
     (">! out.log bash <<'E'\nrm -rf @HOME@/.claude/projects\nE", 'block'),  # F2b
     (">! out.log python3 - <<'PY'\nimport shutil\nshutil.rmtree('@HOME@/.claude/projects')\nPY", 'block'),  # F2c
-    (">! out.log ssh host <<'E'\nrm -rf /home/other/.claude/projects\nE", 'block'),  # F2d
+    (">! out.log ssh host <<'E'\nrm -rf /home/someone/.claude/projects\nE", 'block'),  # F2d
     (">! out.log source /dev/stdin <<'E'\nrm -rf @HOME@/.claude/projects\nE", 'block'),  # F2e
     ('>! out.log exec 3<> @HOME@/.claude/wals/s/main.jsonl; echo x >&3', 'block'),  # F2f
     (">out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # F2z
@@ -1048,14 +1048,14 @@ BANG_READINGS = [
     ('R="rm -rf"; $R >! @HOME@/.claude/hooks', 'block'),  # V6
     ("T='>!'; echo hi $T @TASK@/existing.log", 'allow'),  # V7
     ('alias z="rm -rf"; z >! @HOME@/.claude/hooks', 'block'),  # V8
-    ("ssh host 'rm -rf >! /home/other/.claude/hooks'", 'block'),  # H1
-    ("ssh host 'rm -rf >>! /home/other/.claude/hooks'", 'block'),  # H2
-    ("ssh host '>! /home/other/.claude/settings.json'", 'block'),  # H3
-    ("ssh host '>! out.log bash <<E\nrm -rf /home/other/.claude/hooks\nE'", 'block'),  # H4
-    ("ssh host >! out.log <<'E'\nrm -rf /home/other/.claude/hooks\nE", 'block'),  # H5
-    (">! out.log ssh host 'rm -rf /home/other/.claude/hooks'", 'block'),  # H6
-    ("ssh host 'cat >! /home/other/.agent-harness/work/S/T/x.log'", 'block'),  # H7
-    ("ssh host 'echo x >! /home/other/.agent-harness/work/S/T/x.log'", 'allow'),  # H8
+    ("ssh host 'rm -rf >! /home/someone/.claude/hooks'", 'block'),  # H1
+    ("ssh host 'rm -rf >>! /home/someone/.claude/hooks'", 'block'),  # H2
+    ("ssh host '>! /home/someone/.claude/settings.json'", 'block'),  # H3
+    ("ssh host '>! out.log bash <<E\nrm -rf /home/someone/.claude/hooks\nE'", 'block'),  # H4
+    ("ssh host >! out.log <<'E'\nrm -rf /home/someone/.claude/hooks\nE", 'block'),  # H5
+    (">! out.log ssh host 'rm -rf /home/someone/.claude/hooks'", 'block'),  # H6
+    ("ssh host 'cat >! /home/someone/.agent-harness/work/S/T/x.log'", 'block'),  # H7
+    ("ssh host 'echo x >! /home/someone/.agent-harness/work/S/T/x.log'", 'allow'),  # H8
     ("sudo >! out.log bash <<'E'\nrm -rf @HOME@/.claude/hooks\nE", 'block'),  # W1
     ('sudo rm -rf >! @HOME@/.claude/hooks', 'block'),  # W2
     ('sudo rm -rf >>! @HOME@/.claude/hooks', 'block'),  # W3

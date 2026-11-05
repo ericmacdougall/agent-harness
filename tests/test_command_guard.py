@@ -938,7 +938,7 @@ class OverwriteExistingTests(Fixture):
                 self.assertFalse(cg.written_code_destroys_root(text, str(self.home)))
                 self.assertLess(time.monotonic() - started, 1.0, repr((tail, size)))
         # a run the name class of /users/ and /home/ could also match, which made this quadratic: 3.5 s at 64 KB
-        for text in ('/users/a' + '+' * 50000 + 'y', '/home/a' + '+' * 50000 + 'y', '/users/a' + '\\' * 50000 + 'y'):
+        for text in ('/users/x' + '+' * 50000 + 'y', '/home/x' + '+' * 50000 + 'y', '/users/x' + '\\' * 50000 + 'y'):
             started = time.monotonic()
             self.assertFalse(cg.written_code_destroys_root(text, str(self.home)))
             self.assertLess(time.monotonic() - started, 1.0, text[:9])
