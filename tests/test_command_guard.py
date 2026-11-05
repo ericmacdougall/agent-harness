@@ -864,9 +864,19 @@ class OverwriteExistingTests(Fixture):
         self.assertEqual(self.decide("eval '>! plain.sh echo hi'; bash plain.sh", cwd='@HOME@/proj')[0], 'allow')
         # Known limit: a disk read that stops the analysis costs the recorded text its reading, so that text goes only to
         # the raw-text check, which sees no protected location in this glob inside $(..). This warns; 60cf346 blocked it.
+        # In a child: parsing this file adds about 70 MiB, and tests that bound their own children's peak inherit this
+        # process's high-water mark on Linux.
+        import subprocess
         (proj / 'big.sh').write_text(':\n' * 128000)
         text = 'x=$(>! big.sh echo rm -rf ~/.c*/projects); bash big.sh'
-        self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'warn', text)
+        code = ('import sys\nsys.path.insert(0, sys.argv[1])\nimport command_guard as cg\n'
+                "comp = cg.Compiled(cg.load_policy(sys.argv[2] + '/none.json'), home=sys.argv[2], cwd=sys.argv[3])\n"
+                'print(cg.decide(sys.argv[4], comp, cwd=sys.argv[3])[0])\n')
+        child = subprocess.run([sys.executable, '-c', code, os.path.dirname(cg.__file__), str(self.home), str(proj), text],
+                               env=dict(os.environ, HOME=str(self.home)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=60, check=False)
+        self.assertEqual(child.returncode, 0, child.stderr.decode('utf-8', 'replace')[-400:])
+        self.assertEqual(child.stdout.decode().strip(), 'warn', text)
         # a small file does it too: this one stops on the nesting limit, with budget left to read the recorded text
         (proj / 'self.sh').write_text('bash self.sh\n')
         text = 'x=$(>! self.sh echo rm -rf ~/.c*/projects); bash self.sh'
