@@ -278,7 +278,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         if info.get("finished") and agent not in stopped:  # transcript meta says it ended; hook never saw the stop
             stopped.add(agent)
             stop_at[agent] = max(tmtime, last_wal)
-        is_stopped = agent in stopped and max(last_wal, tmtime) <= stop_at.get(agent, 0.0) + 120
+        is_stopped = agent in stopped and max(last_wal, tmtime) <= stop_at.get(agent, 0.0) + 10
         by_name = info["type"] in liveness.NAMEABLE_TYPES and agent in named_text
         is_owner = agent in registered or info["type"] in liveness.OWNER_TYPES or by_name
         verdict = liveness.classify(now, last_wal, tmtime, is_stopped,

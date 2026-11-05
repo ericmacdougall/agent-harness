@@ -17,6 +17,7 @@ LIVE_WAL_S = 20 * 60
 LIVE_TRANSCRIPT_S = 10 * 60
 SILENT_S = 30 * 60
 HIGH_S = 60 * 60
+FINISH_GRACE_S = 10 * 60  # a just-stopped owner may still be writing its handoff: not a drop yet
 
 _WAITING = re.compile(r"\bwaiting\s+(?:on|for)\s+([A-Za-z0-9_.:#\-]{1,60})", re.I)
 
@@ -53,7 +54,9 @@ def classify(now: float, last_wal: float, transcript_mtime: float, stopped: bool
                 state = f"waiting-on-{wait}"
             else:
                 is_owner = owner if owner is not None else (registered or (agent_type or "task-owner") in OWNER_TYPES)
-                state = "DROPPED" if is_owner else "returned"
+                state = "returned"
+                if is_owner:
+                    state = "finishing" if idle < FINISH_GRACE_S else "DROPPED"
         return {"state": state, "idle_s": idle, "severity": "high" if state == "DROPPED" else "info"}
     wal_idle = now - last_wal if last_wal else float("inf")
     tr_idle = now - transcript_mtime if transcript_mtime else float("inf")
