@@ -11,6 +11,9 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/ericmacdougall/agent-harness/internal/ledger/op"
+	"github.com/ericmacdougall/agent-harness/internal/ledger/store"
 )
 
 // Phase 0b: travel (push, fetch, adopt), the trust registry and the git behaviours around them.
@@ -62,6 +65,11 @@ func (w *world) token(dir string) string {
 // adoptToken reads the consent token from a bare adopt attempt (no ledger exists yet to enable travel on).
 func (w *world) adoptToken(dir string) string {
 	w.t.Helper()
+	// The user supplies the slug (here: read from the remote's root, as a person would from the project's
+	// README); adopt takes it from repository config, never from the writer.
+	if slug := remoteSlug(w, dir); slug != "" {
+		w.git(dir, "config", "harness.ledgerslug", slug)
+	}
 	r := w.run(dir, nil, "tickets", "travel", "fetch", "--adopt", "--remote", "origin")
 	m := tokenRe.FindStringSubmatch(r.stderr + r.stdout)
 	if r.code == 0 || m == nil {
@@ -465,4 +473,32 @@ func TestTrackedWinsEvenWhenTheLedgerIsUnusable(t *testing.T) {
 	if st["state"] != "tracked" || st["ledger"] != "unusable" {
 		t.Fatalf("%v", st)
 	}
+}
+
+// remoteSlug finds the slug in the project root op of the first ledger ref of dir's origin ("" if none).
+func remoteSlug(w *world, dir string) string {
+	url := strings.TrimSpace(w.git(dir, "config", "remote.origin.url"))
+	g := &store.Git{GitDir: url}
+	refs, _, err := g.Refs()
+	if err != nil {
+		return ""
+	}
+	for name, tip := range refs {
+		proj, writer, ok := store.ParseRefName(name)
+		if !ok {
+			continue
+		}
+		packs, err := g.ReadRef(proj, writer, tip)
+		if err != nil {
+			continue
+		}
+		for _, p := range packs {
+			for _, o := range p.Ops {
+				if o.Kind == op.KindProjectCreate && strings.TrimPrefix(o.ID, op.PrefixOp) == strings.TrimPrefix(proj, op.PrefixProject) {
+					return o.Str("slug")
+				}
+			}
+		}
+	}
+	return ""
 }

@@ -223,3 +223,20 @@ func TestLedgerSyncRealRunnerNoShellAndDeadline(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Wait()
 }
+
+func TestLedgerSyncCacheIsBounded(t *testing.T) {
+	ledgerReset(t)
+	ledgerRun = func(context.Context, string) ([]byte, error) { return []byte(`{"state":"synced"}`), nil }
+	base := realDir(t)
+	for i := 0; i < ledgerCacheMax+50; i++ {
+		d := filepath.Join(base, fmt.Sprintf("d%d", i))
+		os.Mkdir(d, 0o755)
+		ledgerFor(context.Background(), d)
+	}
+	ledgerMu.Lock()
+	n := len(ledgerCache)
+	ledgerMu.Unlock()
+	if n > ledgerCacheMax {
+		t.Fatalf("cache grew to %d (max %d)", n, ledgerCacheMax)
+	}
+}

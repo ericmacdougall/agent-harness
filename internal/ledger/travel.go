@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ericmacdougall/agent-harness/internal/proc"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -40,23 +41,25 @@ var remoteNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // TravelConfig is the recorded consent.
 type TravelConfig struct {
-	Remote     string
-	Endpoint   string // sha256 of the fetch and push URLs consented to
-	PushedMs   int64
-	FetchedMs  int64
-	PushedOps  map[string]int // writer -> ops at the last push
-	FetchedOps map[string]int // writer -> ops at the last fetch
+	Remote      string
+	Endpoint    string // sha256 of the fetch and push URLs consented to
+	Credentials bool   // use the user's credential helpers for https (opt-in)
+	PushedMs    int64
+	FetchedMs   int64
+	PushedOps   map[string]int // writer -> ops at the last push
+	FetchedOps  map[string]int // writer -> ops at the last fetch
 }
 
 type travelJSON struct {
-	V          int            `json:"v"`
-	Ledger     string         `json:"ledger_project"`
-	Remote     string         `json:"remote"`
-	Endpoint   string         `json:"endpoint_sha256"`
-	PushedMs   int64          `json:"pushed_ms"`
-	FetchedMs  int64          `json:"fetched_ms"`
-	PushedOps  map[string]int `json:"pushed_ops"`
-	FetchedOps map[string]int `json:"fetched_ops"`
+	V           int            `json:"v"`
+	Ledger      string         `json:"ledger_project"`
+	Remote      string         `json:"remote"`
+	Endpoint    string         `json:"endpoint_sha256"`
+	Credentials bool           `json:"credentials"`
+	PushedMs    int64          `json:"pushed_ms"`
+	FetchedMs   int64          `json:"fetched_ms"`
+	PushedOps   map[string]int `json:"pushed_ops"`
+	FetchedOps  map[string]int `json:"fetched_ops"`
 }
 
 // ConsentError is returned by TravelEnable when the token is missing or wrong; its text is the warning.
@@ -126,12 +129,12 @@ func (l *Ledger) ReadTravel() *TravelConfig {
 	if j.FetchedOps == nil {
 		j.FetchedOps = map[string]int{}
 	}
-	return &TravelConfig{Remote: j.Remote, Endpoint: j.Endpoint, PushedMs: j.PushedMs, FetchedMs: j.FetchedMs,
+	return &TravelConfig{Remote: j.Remote, Endpoint: j.Endpoint, Credentials: j.Credentials, PushedMs: j.PushedMs, FetchedMs: j.FetchedMs,
 		PushedOps: j.PushedOps, FetchedOps: j.FetchedOps}
 }
 
 func (l *Ledger) writeTravel(c *TravelConfig) error {
-	j := travelJSON{V: 1, Ledger: l.Project, Remote: c.Remote, Endpoint: c.Endpoint, PushedMs: c.PushedMs,
+	j := travelJSON{V: 1, Ledger: l.Project, Remote: c.Remote, Endpoint: c.Endpoint, Credentials: c.Credentials, PushedMs: c.PushedMs,
 		FetchedMs: c.FetchedMs, PushedOps: c.PushedOps, FetchedOps: c.FetchedOps}
 	body, err := json.Marshal(j)
 	if err != nil {
@@ -142,7 +145,7 @@ func (l *Ledger) writeTravel(c *TravelConfig) error {
 
 // TravelEnable records consent for remote. It refuses (with a ConsentError carrying the token) unless
 // token equals URLToken of the remote's current URLs.
-func (l *Ledger) TravelEnable(remote, token string) error {
+func (l *Ledger) TravelEnable(remote, token string, useCredentials bool) error {
 	fetch, push, err := l.endpoints(remote)
 	if err != nil {
 		return err
@@ -151,7 +154,7 @@ func (l *Ledger) TravelEnable(remote, token string) error {
 	if token != want {
 		return &ConsentError{Token: want, Remote: remote, Fetch: fetch, Push: push}
 	}
-	return l.writeTravel(&TravelConfig{Remote: remote, Endpoint: endpointSum(fetch, push),
+	return l.writeTravel(&TravelConfig{Remote: remote, Endpoint: endpointSum(fetch, push), Credentials: useCredentials,
 		PushedOps: map[string]int{}, FetchedOps: map[string]int{}})
 }
 
@@ -213,11 +216,14 @@ type PushResult struct{ Refs []string }
 
 // TravelPush pushes this HOME's own writer refs (from the mirror) to the consented remote.
 func (l *Ledger) TravelPush() (*PushResult, error) {
-	c, _, push, err := l.consented()
+	tc, _, push, err := l.consented()
 	if err != nil {
 		return nil, err
 	}
 	mirror := l.homeMirror()
+	if mirror != nil {
+		mirror.Helpers = l.helpersFor(tc)
+	}
 	if mirror == nil {
 		return nil, wrap(ErrRefused, "this HOME has no mirror of the ledger, so nothing of its own can be pushed")
 	}
@@ -269,11 +275,13 @@ func (l *Ledger) TravelPush() (*PushResult, error) {
 	if err := mirror.PushRefs(push, refs); err != nil {
 		return nil, wrap(ErrRefused, "the remote refused or could not take the ledger refs (not a fast-forward, a host that refuses non-branch refs, or unreachable): %v", err)
 	}
-	c.PushedMs, _ = Now()
-	for w, n := range counts {
-		c.PushedOps[w] = n
-	}
-	if err := l.writeTravel(c); err != nil {
+	now, _ := Now()
+	if err := l.UpdateTravel(func(c *TravelConfig) {
+		c.PushedMs = now
+		for w, n := range counts {
+			c.PushedOps[w] = n
+		}
+	}); err != nil {
 		return nil, err
 	}
 	return &PushResult{Refs: refs}, nil
@@ -302,7 +310,7 @@ func cleanStale(dir string) {
 }
 
 // fetchToTemp fetches the refs matching pattern into a new disposable bare directory under parent.
-func fetchToTemp(parent, fetchURL, pattern, refspec string) (*store.Git, map[string]string, func(), error) {
+func fetchToTemp(parent, fetchURL, pattern, refspec string, helpers []string) (*store.Git, map[string]string, func(), error) {
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return nil, nil, func() {}, wrap(ErrRefused, "cannot create %s: %v", parent, err)
 	}
@@ -316,7 +324,7 @@ func fetchToTemp(parent, fetchURL, pattern, refspec string) (*store.Git, map[str
 		cleanup()
 		return nil, nil, func() {}, err
 	}
-	g := &store.Git{GitDir: tmp}
+	g := &store.Git{GitDir: tmp, Helpers: helpers}
 	if _, err := g.LsRemote(fetchURL, pattern); err != nil {
 		cleanup()
 		return nil, nil, func() {}, wrap(ErrRefused, "%v", err)
@@ -335,7 +343,7 @@ func fetchToTemp(parent, fetchURL, pattern, refspec string) (*store.Git, map[str
 
 // TravelFetch fetches other writers' refs for this ledger's project.
 func (l *Ledger) TravelFetch() (*FetchResult, error) {
-	c, fetch, _, err := l.consented()
+	fc, fetch, _, err := l.consented()
 	if err != nil {
 		return nil, err
 	}
@@ -350,17 +358,29 @@ func (l *Ledger) TravelFetch() (*FetchResult, error) {
 		return nil, err
 	}
 	me := l.CurrentWriterID()
-	g, got, cleanup, err := fetchToTemp(homePath, fetch, store.RefPrefix+l.Project+"/log/*", store.RefPrefix+l.Project+"/log/*:"+store.RefPrefix+l.Project+"/log/*")
+	g, got, cleanup, err := fetchToTemp(homePath, fetch, store.RefPrefix+l.Project+"/log/*", store.RefPrefix+l.Project+"/log/*:"+store.RefPrefix+l.Project+"/log/*", l.helpersFor(fc))
 	if err != nil {
 		return nil, err
 	}
 	defer cleanup()
 	res := &FetchResult{Rejected: map[string]string{}, Project: l.Project}
+	fetchedOps := map[string]int{}
 	names := make([]string, 0, len(got))
 	for n := range got {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	// Writers already known update freely; new ones share what is left of the unverified budget (blocked
+	// and trusted writers do not use it).
+	existing, _, _ := l.Git.Refs()
+	room := MaxUnverifiedRefs
+	for r := range existing {
+		if pr, w, ok := store.ParseRefName(r); ok && pr == l.Project {
+			if cl := classes[w]; cl != "self" && cl != "blocked" && cl != "trusted" {
+				room--
+			}
+		}
+	}
 	for _, name := range names {
 		proj, w, ok := store.ParseRefName(name)
 		switch {
@@ -371,18 +391,32 @@ func (l *Ledger) TravelFetch() (*FetchResult, error) {
 		case classes[w] == "blocked":
 			res.Skipped = append(res.Skipped, w)
 		default:
+			if _, known := existing[store.RefName(proj, w)]; !known {
+				if room <= 0 {
+					res.Rejected[w] = fmt.Sprintf("more than %d unverified writers; block or trust some first", MaxUnverifiedRefs)
+					continue
+				}
+			}
 			if why := validateAndLand(g, l.Root, proj, w, name, got[name]); why != "" {
 				res.Rejected[w] = why
 			} else {
+				if _, known := existing[store.RefName(proj, w)]; !known {
+					room--
+				}
 				res.Accepted = append(res.Accepted, w)
 				if refOps, err := countOps(g, proj, w, got[name]); err == nil {
-					c.FetchedOps[w] = refOps
+					fetchedOps[w] = refOps
 				}
 			}
 		}
 	}
-	c.FetchedMs, _ = Now()
-	if err := l.writeTravel(c); err != nil {
+	now, _ := Now()
+	if err := l.UpdateTravel(func(c *TravelConfig) {
+		c.FetchedMs = now
+		for w, n := range fetchedOps {
+			c.FetchedOps[w] = n
+		}
+	}); err != nil {
 		return nil, err
 	}
 	return res, nil
@@ -436,7 +470,7 @@ var errAdopt = errors.New("adopt")
 // TravelAdopt creates this repository's ledger from a remote's ledger refs (a second machine joining an
 // existing ledger). The fetched writers stay unverified, so the ledger cannot be used until they are
 // reviewed with `writers --show` and trusted with `trust-writer`.
-func TravelAdopt(loc Location, remote, token string) (*Ledger, *FetchResult, error) {
+func TravelAdopt(loc Location, remote, token, slugArg string, useCredentials bool) (*Ledger, *FetchResult, error) {
 	common, inRepo, err := store.CommonDir(loc.Cwd)
 	if err != nil {
 		return nil, nil, err
@@ -462,11 +496,24 @@ func TravelAdopt(loc Location, remote, token string) (*Ledger, *FetchResult, err
 	if want := URLToken(fetch, push); token != want {
 		return nil, nil, &ConsentError{Token: want, Remote: remote, Fetch: fetch, Push: push}
 	}
+	// The slug comes from the user (--slug) or this repository's own config, never from the writer: the
+	// remote's root op is only a cross-check that must agree.
+	slug := slugArg
+	if slug == "" {
+		slug = repo.ConfigGet("harness.ledgerslug")
+	}
+	if !op.ValidSlug(slug) {
+		return nil, nil, wrap(ErrUsage, "adopt needs the project slug from you: pass --slug S or set `git config harness.ledgerslug S` (it is checked against the remote's root, never taken from it)")
+	}
 	home, err := LedgersHome()
 	if err != nil {
 		return nil, nil, err
 	}
-	g, got, cleanup, err := fetchToTemp(home, fetch, store.RefPrefix+"*/log/*", store.RefPrefix+"*:"+store.RefPrefix+"*")
+	var helpers []string
+	if useCredentials {
+		helpers = UserCredentialHelpers()
+	}
+	g, got, cleanup, err := fetchToTemp(home, fetch, store.RefPrefix+"*/log/*", store.RefPrefix+"*:"+store.RefPrefix+"*", helpers)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -490,7 +537,8 @@ func TravelAdopt(loc Location, remote, token string) (*Ledger, *FetchResult, err
 	}
 	sort.Strings(names)
 	res := &FetchResult{Rejected: map[string]string{}, Project: project}
-	slug, rootName := "", ""
+	rootSlugs := map[string]bool{}
+	holders := map[string]bool{}
 	for _, name := range names {
 		_, w, ok := store.ParseRefName(name)
 		if !ok {
@@ -505,29 +553,48 @@ func TravelAdopt(loc Location, remote, token string) (*Ledger, *FetchResult, err
 		for _, p := range packs {
 			for _, o := range p.Ops {
 				if o.Kind == op.KindProjectCreate && strings.TrimPrefix(o.ID, op.PrefixOp) == strings.TrimPrefix(project, op.PrefixProject) {
-					slug, rootName = o.Str("slug"), o.Str("name")
+					rootSlugs[o.Str("slug")] = true
+					holders[w] = true
 				}
 			}
 		}
 	}
-	_ = rootName
-	if slug == "" || !op.ValidSlug(slug) {
+	if len(rootSlugs) == 0 {
 		return nil, nil, wrap(ErrRefused, "the remote's ledger has no readable project root; nothing adopted")
+	}
+	if len(rootSlugs) > 1 {
+		return nil, nil, wrap(ErrRefused, "the fetched writers disagree about the project root (more than one slug); nothing adopted")
+	}
+	if !rootSlugs[slug] {
+		return nil, nil, wrap(ErrRefused, "the remote's root slug does not match the slug you gave (%q); nothing adopted", slug)
 	}
 	if p, err := slugTaken(slug); err != nil {
 		return nil, nil, err
 	} else if p != "" {
 		return nil, nil, wrap(ErrRefused, "slug %q is already used on this machine by %s", slug, p)
 	}
+	// The writer holding the root lands first; the rest are capped like any unverified writers, so a
+	// collaborator who plants many writers cannot crowd the real one out.
+	sort.SliceStable(names, func(i, j int) bool {
+		_, wi, _ := store.ParseRefName(names[i])
+		_, wj, _ := store.ParseRefName(names[j])
+		return holders[wi] && !holders[wj]
+	})
+	room := MaxUnverifiedRefs
 	for _, name := range names {
 		_, w, ok := store.ParseRefName(name)
 		if !ok || res.Rejected[w] != "" {
+			continue
+		}
+		if room <= 0 {
+			res.Rejected[w] = fmt.Sprintf("more than %d unverified writers; block or trust some first", MaxUnverifiedRefs)
 			continue
 		}
 		if why := validateAndLand(g, common, project, w, name, got[name]); why != "" {
 			res.Rejected[w] = why
 		} else {
 			res.Accepted = append(res.Accepted, w)
+			room--
 		}
 	}
 	if len(res.Accepted) == 0 {
@@ -549,7 +616,7 @@ func TravelAdopt(loc Location, remote, token string) (*Ledger, *FetchResult, err
 	if err := writeMeta(project, slug, "mirror"); err != nil {
 		l.warn = append(l.warn, "ledger registry entry could not be written: "+err.Error())
 	}
-	if err := l.writeTravel(&TravelConfig{Remote: remote, Endpoint: endpointSum(fetch, push),
+	if err := l.writeTravel(&TravelConfig{Remote: remote, Endpoint: endpointSum(fetch, push), Credentials: useCredentials,
 		PushedOps: map[string]int{}, FetchedOps: map[string]int{}}); err != nil {
 		l.warn = append(l.warn, "travel consent could not be recorded: "+err.Error())
 	}
@@ -573,4 +640,40 @@ func shownURL(u string) string {
 		}
 		return r
 	}, u)
+}
+
+// UpdateTravel applies fn to the consent as it is now (re-read under the writer lock), so a push or fetch
+// that started earlier cannot write back a stale consent over a newer `travel enable`.
+func (l *Ledger) UpdateTravel(fn func(*TravelConfig)) error {
+	return l.Locked(func() error {
+		c := l.ReadTravel()
+		if c == nil {
+			return wrap(ErrRefused, "travel is no longer enabled for this ledger")
+		}
+		fn(c)
+		return l.writeTravel(c)
+	})
+}
+
+// UserCredentialHelpers reads the credential.helper values of the user's global git configuration (nothing
+// else from it), keeping only vetted ones. It is called only for a remote the user opted in with
+// --use-git-credentials.
+func UserCredentialHelpers() []string {
+	h, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	res, err := proc.Run([]string{"git", "config", "--global", "--get-all", "credential.helper"},
+		proc.Options{Env: []string{"HOME=" + h, "PATH=" + os.Getenv("PATH"), "GIT_CONFIG_NOSYSTEM=1", "LC_ALL=C"}, Timeout: 5 * time.Second})
+	if err != nil || res.Code != 0 {
+		return nil
+	}
+	return store.SafeHelpers(strings.Split(strings.TrimSpace(string(res.Stdout)), "\n")) // a whole line is one helper
+}
+
+func (l *Ledger) helpersFor(c *TravelConfig) []string {
+	if c != nil && c.Credentials {
+		return UserCredentialHelpers()
+	}
+	return nil
 }

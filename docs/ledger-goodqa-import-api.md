@@ -52,7 +52,21 @@ Events are in fold order (`wall_ms`, `ctr`, writer, op id).
 Exactly these fields, no others. `export_digest`, `base_digest`, `frontier` and `redacted` echo the document that was
 imported. `tickets` maps each ledger handle to the GoodQA issue number. The receipt is **advisory and
 unauthenticated**: its digest is public, so it proves that harness and GoodQA agree on content, not that GoodQA stored
-it. (A signed receipt is a possible later addition; it would not change the fields above.)
+it, unless it arrives in the signed envelope below and the user pinned GoodQA's key.
+
+### Signed receipts
+
+GoodQA should sign what it returns. The envelope is
+`{"format":"goodqa-ledger-receipt-signed/v1","receipt":{...},"alg":"ed25519","key_id":"<first 16 hex of sha256(raw 32-byte public key)>","sig":"<base64url, no padding, 64 bytes>"}`.
+The signature covers the ASCII tag `goodqa-ledger-receipt/v1` plus a newline, then the canonical receipt: compact JSON,
+keys sorted at every level, separators `,` and `:`, ASCII only, integers as plain digits, no trailing newline (Python:
+`json.dumps(receipt, sort_keys=True, separators=(',', ':'), ensure_ascii=True)`). `import_id` must match
+`[A-Za-z0-9._:-]{1,64}` so Go and Python give identical bytes. The receipt inside keeps exactly the fields above.
+The user pins GoodQA's public key (32 raw bytes as hex, base64 or PEM SPKI) with `harness tickets bind --goodqa-key FILE`.
+Once pinned, a bare receipt, a different `key_id` or a bad signature is refused and `sync-state --json` reports
+`authenticated: true`; an unpinned ledger stays advisory. Fixture: `testdata/ledger-import/receipt.signed.json` with the
+test-only key `goodqa-test.pub` (a fixed public seed, never a real key). The signing key is a GoodQA server secret and the
+public key is published by GoodQA; rotation publishes a new key and the user pins it with a new full import.
 
 ## Endpoints
 

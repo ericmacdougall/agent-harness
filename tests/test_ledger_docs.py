@@ -19,6 +19,11 @@ class Contract(unittest.TestCase):
                         "Limits and errors", "Trust and privacy", "What GoodQA has to build"):
             self.assertRegex(self.text, rf"(?m)^## {re.escape(heading)}$", heading)
 
+    def test_signed_receipt_format_is_specified(self):
+        for needle in ("goodqa-ledger-receipt-signed/v1", "key_id", "base64url", "sort_keys=True", "ensure_ascii=True", "--goodqa-key",
+                       "authenticated: true", "[A-Za-z0-9._:-]{1,64}"):
+            self.assertIn(needle, self.text, needle)
+
     def test_it_says_plainly_that_the_server_side_is_not_built(self):
         self.assertRegex(self.text, r"(?i)\*\*Status: proposal")
         self.assertIn("not built", self.text)

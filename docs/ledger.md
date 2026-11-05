@@ -209,7 +209,8 @@ and offset only) unless `--redact-secrets` masks it and drops the raw ops.
 `harness tickets bind --project UUID --receipt FILE` records a GoodQA receipt in this HOME's state
 (`~/.agent-harness/ledgers/<proj>/sync.json`, never in the git dir, so a copied repository is never `synced`). `bind`
 rebuilds the document for the receipt's frontier and accepts the receipt only if the digests match. The receipt is
-advisory: its digest is public.
+advisory: its digest is public. With `bind --goodqa-key FILE` the user pins GoodQA's ed25519 public key; from then on only a receipt in
+GoodQA's signed envelope binds (see the contract), and `sync-state --json` reports `authenticated: true`.
 
 ### Git transport (`travel`)
 
@@ -225,15 +226,19 @@ advisory: its digest is public.
   re-scan of every op. Nothing is added to `remote.<name>.push` or `.fetch`, so ordinary `git push` and `git fetch`
   never move the ledger, and a plain `git clone` does not carry it.
 - **Transport environment.** ssh, https and file only (`GIT_ALLOW_PROTOCOL`), no `ext::`, `fd::` or helper URLs, no
-  credential helper (use an ssh remote for private repositories), hooks off, fsck on every object, a URL validated
+  credential helper by default (for a private https remote opt in per remote with `travel enable --use-git-credentials`: only the
+  `credential.helper` entries of your global git config that are a bare name or an absolute path are used, `!` shell helpers and
+  arguments are dropped, nothing else from that config is read; ssh uses your ssh config and agent), hooks off, fsck on every object, a URL validated
   before git sees it.
 - **Fetch.** `travel fetch` lists the remote's ledger refs (more than 128 is refused), fetches them into a disposable
   directory under `~/.agent-harness/ledgers/<proj>/` (stopped past 64 MiB or 120 s; stale ones are removed), validates
   each with the bounded reader, and only then pushes it into the repository as a plain fast-forward, never over an own
-  ref. A rewritten history stays rejected. `travel fetch --adopt --remote NAME` lets a second machine create its ledger
-  from a remote's (exactly one project).
+  ref. A rewritten history stays rejected. `travel fetch --adopt --remote NAME --slug S` lets a second machine create its ledger
+  from a remote's (exactly one project). The slug comes from you (`--slug`, or `git config harness.ledgerslug S`), never from the
+  writer: the remote's root must carry the same slug and all fetched roots must agree. At most 64 unverified writers are kept
+  (the root holder first, then others; known writers update freely), and blocked writers are never read.
 - **Trust.** Fetched writers are `unverified`: excluded from every view, export and the commit policy.
-  `writers --show w_...` prints the ops and a review digest; `trust-writer w_... --reviewed DIGEST` folds exactly the
+  `writers --show w_...` prints every op whole (no truncation) and a review digest; `trust-writer w_... --reviewed DIGEST` folds exactly the
   reviewed ops (`~/.agent-harness/ledgers/<proj>/trust.json`, never read from the git dir). Ops the writer appends later
   are held back (counted as `held_ops` in the export) until you review again. `block-writer` excludes a writer; neither
   command accepts your own writer.

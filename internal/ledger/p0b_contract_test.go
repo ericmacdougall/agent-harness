@@ -1,12 +1,15 @@
 package ledger_test
 
 import (
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/ericmacdougall/agent-harness/internal/ledger"
 	"github.com/ericmacdougall/agent-harness/internal/ledger/op"
 	"github.com/ericmacdougall/agent-harness/internal/ledger/store"
 )
@@ -39,6 +42,21 @@ func TestWriteImportFixture(t *testing.T) {
 	})
 	b2, _ := os.ReadFile(rc)
 	os.WriteFile(filepath.Join(out, "receipt.json"), b2, 0o644)
+	// The signed envelope GoodQA would return, with a fixed, public, test-only key (never a real key).
+	seed := make([]byte, ed25519.SeedSize)
+	for i := range seed {
+		seed[i] = byte(0xA0 + i%16)
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	var rd ledger.ReceiptDoc
+	json.Unmarshal(b2, &rd)
+	env, err := rd.Sign(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, _ := json.Marshal(env)
+	os.WriteFile(filepath.Join(out, "receipt.signed.json"), sb, 0o644)
+	os.WriteFile(filepath.Join(out, "goodqa-test.pub"), []byte(hex.EncodeToString(priv.Public().(ed25519.PublicKey))+"\n"), 0o644)
 }
 
 // hydrate builds a bare remote that holds the fixture export's ops as one writer ref, as another machine
@@ -123,6 +141,36 @@ func TestImportContractFixture(t *testing.T) {
 	}
 	if st := w2.syncState(w2.repo, nil); st["state"] == "synced" {
 		t.Fatalf("state: %v", st)
+	}
+}
+
+// The signed fixture binds only through the pinned test key, and the same file is refused under another key.
+func TestImportContractSignedFixture(t *testing.T) {
+	exportRaw, err := os.ReadFile(filepath.Join(fixtureDir, "export.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	json.Unmarshal(exportRaw, &doc)
+	w := newWorld(t)
+	remote := hydrate(t, w, doc)
+	w.git(w.repo, "remote", "add", "origin", remote)
+	w.ok(w.repo, nil, "travel", "fetch", "--adopt", "--remote", "origin", "--yes-share", w.adoptToken(w.repo))
+	wid := doc["frontier"].([]any)[0].(map[string]any)["writer"].(string)
+	w.ok(w.repo, nil, "trust-writer", wid, "--reviewed", w.jsonOK(w.repo, nil, "writers", "--show", wid)["review_digest"].(string))
+	signed := filepath.Join(fixtureDir, "receipt.signed.json")
+	pub := filepath.Join(fixtureDir, "goodqa-test.pub")
+	abs := func(p string) string { a, _ := filepath.Abs(p); return a }
+	otherKey := filepath.Join(t.TempDir(), "other.pub")
+	os.WriteFile(otherKey, []byte(strings.Repeat("ab", 32)), 0o600)
+	if r := w.run(w.repo, nil, "tickets", "bind", "--project", goodqaUUID, "--receipt", abs(signed), "--goodqa-key", otherKey); r.code == 0 {
+		t.Fatalf("the signed fixture bound under another key")
+	}
+	if r := w.run(w.repo, nil, "tickets", "bind", "--project", goodqaUUID, "--receipt", abs(signed), "--goodqa-key", abs(pub)); r.code != 0 {
+		t.Fatalf("the signed fixture was refused: %s", r.stderr)
+	}
+	if st := w.syncState(w.repo, nil); st["state"] != "synced" || st["authenticated"] != true {
+		t.Fatalf("%v", st)
 	}
 }
 

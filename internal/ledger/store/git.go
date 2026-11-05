@@ -50,6 +50,8 @@ func (e *GitError) Error() string { return fmt.Sprintf("git %s failed (exit %d)"
 // Git runs ledger git commands against one git dir.
 type Git struct {
 	GitDir string
+	// Helpers are vetted credential helpers for transport calls (see TransportEnvWith); empty by default.
+	Helpers []string
 	// Env, when set, replaces the computed environment (tests use it to prove isolation); never set in
 	// production.
 	extraEnv []string

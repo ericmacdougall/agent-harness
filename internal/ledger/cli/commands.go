@@ -30,10 +30,10 @@ const Usage = `usage: harness tickets <command> [options]
   rebuild
   export [--format md|json|goodqa-import] [--out PATH] [--since-bound] [--redact-secrets]
   sync-state
-  bind --project UUID --receipt FILE
+  bind --project UUID --receipt FILE [--goodqa-key FILE]
   trust-writer w_... --reviewed DIGEST
   block-writer w_...
-  travel enable --remote NAME [--yes-share TOKEN] | status | push | fetch [--adopt --remote NAME --yes-share TOKEN]
+  travel enable --remote NAME [--yes-share TOKEN] [--use-git-credentials] | status | push | fetch [--adopt --remote NAME --yes-share TOKEN --slug S]
 common: --json (reads and writes), --slug S (select a repo-less ledger outside a repository),
         --redact-secrets (mask secret-shaped text instead of refusing), --actor-label L
 exit codes: 0 ok, 2 usage/validation, 3 refused/not found/ambiguous, 6 ledger busy`

@@ -104,6 +104,7 @@ type Binding struct {
 	ExportDigest  string
 	BoundMs       int64
 	Frontier      []Frontier
+	GoodQAKey     string // hex ed25519 public key pinned by the user; empty = receipts are advisory
 }
 
 type frontierJSON struct {
@@ -122,6 +123,7 @@ type bindingJSON struct {
 	ExportDigest  string         `json:"export_digest"`
 	BoundMs       int64          `json:"bound_ms"`
 	Frontier      []frontierJSON `json:"frontier"`
+	GoodQAKey     string         `json:"goodqa_key"`
 }
 
 func (l *Ledger) homeDir(create bool) (*safefs.Dir, error) {
@@ -158,7 +160,7 @@ func (l *Ledger) ReadBinding() *Binding {
 	if json.Unmarshal(b, &j) != nil || j.V != 1 || j.Ledger != l.Project {
 		return nil
 	}
-	out := &Binding{GoodQAProject: j.GoodQAProject, ImportID: j.ImportID, ExportDigest: j.ExportDigest, BoundMs: j.BoundMs}
+	out := &Binding{GoodQAProject: j.GoodQAProject, ImportID: j.ImportID, ExportDigest: j.ExportDigest, BoundMs: j.BoundMs, GoodQAKey: j.GoodQAKey}
 	for _, f := range j.Frontier {
 		out.Frontier = append(out.Frontier, Frontier{f.Writer, f.Ops, f.WallMs, f.Ctr, f.LastOp})
 	}
@@ -168,7 +170,7 @@ func (l *Ledger) ReadBinding() *Binding {
 // WriteBinding replaces this HOME's binding.
 func (l *Ledger) WriteBinding(b *Binding) error {
 	j := bindingJSON{V: 1, Ledger: l.Project, GoodQAProject: b.GoodQAProject, ImportID: b.ImportID,
-		ExportDigest: b.ExportDigest, BoundMs: b.BoundMs, Frontier: []frontierJSON{}}
+		ExportDigest: b.ExportDigest, BoundMs: b.BoundMs, Frontier: []frontierJSON{}, GoodQAKey: b.GoodQAKey}
 	for _, f := range b.Frontier {
 		j.Frontier = append(j.Frontier, frontierJSON{f.Writer, f.Ops, f.WallMs, f.Ctr, f.LastOp})
 	}

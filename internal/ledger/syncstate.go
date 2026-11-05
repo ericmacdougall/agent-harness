@@ -17,7 +17,8 @@ type SyncReport struct {
 	State         string
 	Unsynced      int // folded ops not covered by the binding (all folded ops when never bound)
 	GoodQAProject string
-	Writers       int // folded writers
+	Writers       int  // folded writers
+	Authenticated bool // the binding's receipt was verified against a pinned GoodQA key
 }
 
 // SyncState classifies the ledger from one snapshot. tracked says a GoodQA repos pattern matches a remote;
@@ -38,6 +39,7 @@ func (l *Ledger) SyncState(in fold.Input, tracked bool) SyncReport {
 		return r
 	}
 	r.GoodQAProject = b.GoodQAProject
+	r.Authenticated = b.GoodQAKey != ""
 	rel, extra := Compare(in, b.Frontier)
 	switch rel {
 	case RelDiverged:

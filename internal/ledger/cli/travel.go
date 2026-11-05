@@ -42,7 +42,7 @@ func cmdTravel(args []string, env Env) error {
 }
 
 func travelEnable(args []string, env Env) error {
-	p, err := parseArgs(args, merge(spec{"remote": true, "yes-share": true}))
+	p, err := parseArgs(args, merge(spec{"remote": true, "yes-share": true, "use-git-credentials": false}))
 	if err != nil {
 		return err
 	}
@@ -54,7 +54,7 @@ func travelEnable(args []string, env Env) error {
 		return err
 	}
 	defer l.Close()
-	if err := l.TravelEnable(p.get("remote"), p.get("yes-share")); err != nil {
+	if err := l.TravelEnable(p.get("remote"), p.get("yes-share"), p.has("use-git-credentials")); err != nil {
 		return consentRefusal(err)
 	}
 	emit(env, p.has("json"), op.Obj{{K: "travel", V: "enabled"}, {K: "remote", V: p.get("remote")}},
@@ -93,7 +93,7 @@ func travelStatus(args []string, env Env) error {
 		pushed, fetched = c.PushedMs, c.FetchedMs
 	}
 	emit(env, p.has("json"), op.Obj{{K: "remote", V: remote}, {K: "consent", V: ok}, {K: "enabled", V: c != nil},
-		{K: "pushed_ms", V: pushed}, {K: "fetched_ms", V: fetched}, {K: "writers", V: rows}}, b.String())
+		{K: "credentials", V: c != nil && c.Credentials}, {K: "pushed_ms", V: pushed}, {K: "fetched_ms", V: fetched}, {K: "writers", V: rows}}, b.String())
 	return nil
 }
 
@@ -117,7 +117,7 @@ func travelPush(args []string, env Env) error {
 }
 
 func travelFetch(args []string, env Env) error {
-	p, err := parseArgs(args, merge(spec{"adopt": false, "remote": true, "yes-share": true}))
+	p, err := parseArgs(args, merge(spec{"adopt": false, "remote": true, "yes-share": true, "use-git-credentials": false}))
 	if err != nil {
 		return err
 	}
@@ -127,7 +127,7 @@ func travelFetch(args []string, env Env) error {
 		if !p.has("remote") {
 			return usagef("usage: travel fetch --adopt --remote NAME [--yes-share TOKEN]")
 		}
-		l, res, err = ledger.TravelAdopt(ledger.Location{Cwd: env.Cwd}, p.get("remote"), p.get("yes-share"))
+		l, res, err = ledger.TravelAdopt(ledger.Location{Cwd: env.Cwd}, p.get("remote"), p.get("yes-share"), p.get("slug"), p.has("use-git-credentials"))
 	} else {
 		if l, err = open(p, env); err == nil {
 			res, err = l.TravelFetch()

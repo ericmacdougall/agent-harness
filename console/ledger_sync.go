@@ -130,9 +130,35 @@ func ledgerFor(ctx context.Context, dir string) ledgerState {
 		st.Slug = doc.Slug
 	}
 	ledgerMu.Lock()
-	ledgerCache[real] = ledgerCacheEntry{at: ledgerNow(), state: st}
+	ledgerCachePut(real, st)
 	ledgerMu.Unlock()
 	return st
+}
+
+// ledgerCacheMax bounds the cache: an authenticated caller naming endless directories cannot grow it.
+const ledgerCacheMax = 256
+
+// ledgerCachePut stores an entry (the caller holds ledgerMu), evicting expired entries and then the oldest.
+func ledgerCachePut(dir string, st ledgerState) {
+	now := ledgerNow()
+	if len(ledgerCache) >= ledgerCacheMax {
+		for k, v := range ledgerCache {
+			if now.Sub(v.at) >= ledgerCacheWindow {
+				delete(ledgerCache, k)
+			}
+		}
+	}
+	for len(ledgerCache) >= ledgerCacheMax {
+		oldest, first := "", true
+		var at time.Time
+		for k, v := range ledgerCache {
+			if first || v.at.Before(at) {
+				oldest, at, first = k, v.at, false
+			}
+		}
+		delete(ledgerCache, oldest)
+	}
+	ledgerCache[dir] = ledgerCacheEntry{at: now, state: st}
 }
 
 func slugOK(s string) bool {

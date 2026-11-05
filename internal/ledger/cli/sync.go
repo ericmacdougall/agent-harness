@@ -4,6 +4,8 @@ package cli
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 
 	"github.com/ericmacdougall/agent-harness/internal/ledger"
 	"github.com/ericmacdougall/agent-harness/internal/ledger/fold"
@@ -25,8 +28,9 @@ const (
 )
 
 var (
-	uuidRe   = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
-	digestRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	uuidRe     = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	importIDRe = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
+	digestRe   = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 func refusedf(format string, a ...any) error {
@@ -72,92 +76,83 @@ func cmdSyncState(args []string, env Env) error {
 	}
 	doc := op.Obj{{K: "state", V: report.State}, {K: "ledger", V: presence}, {K: "slug", V: slug}, {K: "project", V: project},
 		{K: "unsynced_ops", V: report.Unsynced}, {K: "writers", V: report.Writers}, {K: "goodqa_project", V: report.GoodQAProject},
-		{K: "tracked", V: tracked}, {K: "tracked_known", V: known}}
+		{K: "tracked", V: tracked}, {K: "tracked_known", V: known}, {K: "authenticated", V: report.Authenticated}}
 	emit(env, p.has("json"), doc, fmt.Sprintf("%s\n", report.State))
 	return nil
 }
 
 // ---------------------------------------------------------------------------------------- receipt
 
-type receiptFrontier struct {
-	Writer string `json:"writer"`
-	Ops    int    `json:"ops"`
-	WallMs int64  `json:"wall_ms"`
-	Ctr    int64  `json:"ctr"`
-	LastOp string `json:"last_op"`
-}
-
-type receiptTicket struct {
-	Handle string `json:"handle"`
-	Number int    `json:"number"`
-}
-
-type receipt struct {
-	Format        string            `json:"format"`
-	GoodQAProject string            `json:"goodqa_project"`
-	ImportID      string            `json:"import_id"`
-	LedgerProject string            `json:"ledger_project"`
-	ExportDigest  string            `json:"export_digest"`
-	BaseDigest    string            `json:"base_digest"`
-	Redacted      *bool             `json:"redacted"`
-	Frontier      []receiptFrontier `json:"frontier"`
-	Tickets       []receiptTicket   `json:"tickets"`
-	ImportedMs    int64             `json:"imported_at_ms"`
-}
-
-func readReceipt(path string, env Env) (*receipt, error) {
+func readReceipt(path string, env Env) (*ledger.ReceiptDoc, *ledger.SignedReceipt, error) {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(env.Cwd, path)
 	}
-	fh, err := os.Open(path)
+	if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
+		return nil, nil, usagef("--receipt must be a regular file")
+	}
+	fh, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, usagef("cannot read --receipt")
+		return nil, nil, usagef("cannot read --receipt")
 	}
 	defer fh.Close()
+	if fi, err := fh.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return nil, nil, usagef("--receipt must be a regular file")
+	}
 	raw, err := io.ReadAll(io.LimitReader(fh, maxReceiptBytes+1))
 	if err != nil || len(raw) > maxReceiptBytes {
-		return nil, refusedf("receipt is unreadable or larger than %d bytes", maxReceiptBytes)
+		return nil, nil, refusedf("receipt is unreadable or larger than %d bytes", maxReceiptBytes)
 	}
+	var probe struct {
+		Format string `json:"format"`
+	}
+	_ = json.Unmarshal(raw, &probe)
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
-	var r receipt
-	if err := dec.Decode(&r); err != nil || dec.More() {
-		return nil, refusedf("receipt is not the goodqa-ledger-receipt/v1 document (unknown or missing fields)")
+	var r ledger.ReceiptDoc
+	var signed *ledger.SignedReceipt
+	if probe.Format == ledger.SignedReceiptFormat {
+		signed = &ledger.SignedReceipt{}
+		if err := dec.Decode(signed); err != nil || dec.More() {
+			return nil, nil, refusedf("receipt envelope is not goodqa-ledger-receipt-signed/v1 (unknown or missing fields)")
+		}
+		r = signed.Receipt
+	} else if err := dec.Decode(&r); err != nil || dec.More() {
+		return nil, nil, refusedf("receipt is not the goodqa-ledger-receipt/v1 document (unknown or missing fields)")
 	}
 	if len(r.Tickets) > maxReceiptTickets {
-		return nil, refusedf("receipt lists more than %d tickets", maxReceiptTickets)
+		return nil, nil, refusedf("receipt lists more than %d tickets", maxReceiptTickets)
 	}
 	switch {
 	case r.Redacted == nil:
-		return nil, refusedf("receipt must say whether the export was redacted (redacted: true or false)")
+		return nil, nil, refusedf("receipt must say whether the export was redacted (redacted: true or false)")
 	case r.Format != ledger.ReceiptFormat:
-		return nil, refusedf("receipt format is not %s", ledger.ReceiptFormat)
+		return nil, nil, refusedf("receipt format is not %s", ledger.ReceiptFormat)
 	case !uuidRe.MatchString(r.GoodQAProject):
-		return nil, refusedf("receipt goodqa_project is not a UUID")
-	case r.ImportID == "" || len(r.ImportID) > 64 || strings.ContainsAny(r.ImportID, "\r\n\x00"):
-		return nil, refusedf("receipt import_id is empty or malformed")
+		return nil, nil, refusedf("receipt goodqa_project is not a UUID")
+	case !importIDRe.MatchString(r.ImportID):
+		return nil, nil, refusedf("receipt import_id is empty or malformed")
 	case !op.ValidID(r.LedgerProject, op.PrefixProject):
-		return nil, refusedf("receipt ledger_project is malformed")
+		return nil, nil, refusedf("receipt ledger_project is malformed")
 	case !digestRe.MatchString(r.ExportDigest) || (r.BaseDigest != "" && !digestRe.MatchString(r.BaseDigest)):
-		return nil, refusedf("receipt digests must be 64 hex characters")
+		return nil, nil, refusedf("receipt digests must be 64 hex characters")
 	case len(r.Frontier) == 0 || len(r.Frontier) > 4096:
-		return nil, refusedf("receipt frontier is empty or too large")
+		return nil, nil, refusedf("receipt frontier is empty or too large")
 	}
 	seenW := map[string]bool{}
 	for _, f := range r.Frontier {
 		if seenW[f.Writer] {
-			return nil, refusedf("receipt frontier lists a writer twice")
+			return nil, nil, refusedf("receipt frontier lists a writer twice")
 		}
 		seenW[f.Writer] = true
 		if !op.ValidID(f.Writer, op.PrefixWriter) || !op.ValidID(f.LastOp, op.PrefixOp) || f.Ops < 1 || f.Ops > 1<<30 {
-			return nil, refusedf("receipt frontier entry is malformed")
+			return nil, nil, refusedf("receipt frontier entry is malformed")
 		}
 	}
-	return &r, nil
+	return &r, signed, nil
 }
 
 func cmdBind(args []string, env Env) error {
-	p, err := parseArgs(args, merge(spec{"project": true, "receipt": true}))
+	p, err := parseArgs(args, merge(spec{"project": true, "receipt": true, "goodqa-key": true}))
 	if err != nil {
 		return err
 	}
@@ -167,7 +162,7 @@ func cmdBind(args []string, env Env) error {
 	if !uuidRe.MatchString(p.get("project")) {
 		return usagef("--project must be a GoodQA project UUID")
 	}
-	rc, err := readReceipt(p.get("receipt"), env)
+	rc, signed, err := readReceipt(p.get("receipt"), env)
 	if err != nil {
 		return err
 	}
@@ -200,6 +195,36 @@ func cmdBind(args []string, env Env) error {
 		if rc.BaseDigest != base {
 			return refusedf("the receipt's base_digest is not this ledger's current binding")
 		}
+		// A pinned GoodQA key makes the receipt authenticated: once pinned, an unsigned or badly signed receipt
+		// is refused. Without one the receipt stays advisory (its digest is public).
+		var key ed25519.PublicKey
+		if kf := p.get("goodqa-key"); kf != "" {
+			raw, kerr := readSmallFile(kf, env)
+			if kerr != nil {
+				return kerr
+			}
+			if key, kerr = ledger.ParseKey(raw); kerr != nil {
+				return usagef("%v", kerr)
+			}
+		}
+		pinned := ""
+		if cur != nil {
+			pinned = cur.GoodQAKey
+		}
+		if key != nil && pinned != "" && hex.EncodeToString(key) != pinned {
+			return refusedf("a different GoodQA key is already pinned for this ledger")
+		}
+		if key == nil && pinned != "" {
+			key, _ = ledger.ParseKey([]byte(pinned))
+		}
+		if key != nil {
+			if signed == nil {
+				return refusedf("a GoodQA key is pinned for this ledger, so the receipt must be a signed envelope")
+			}
+			if verr := signed.Verify(key); verr != nil {
+				return refusedf("%v", verr)
+			}
+		}
 		to := make([]ledger.Frontier, len(rc.Frontier))
 		for i, f := range rc.Frontier {
 			to[i] = ledger.Frontier{Writer: f.Writer, Ops: f.Ops, WallMs: f.WallMs, Ctr: f.Ctr, LastOp: f.LastOp}
@@ -225,6 +250,9 @@ func cmdBind(args []string, env Env) error {
 			return err
 		}
 		bound = &ledger.Binding{GoodQAProject: rc.GoodQAProject, ImportID: rc.ImportID, ExportDigest: rc.ExportDigest, BoundMs: now, Frontier: to}
+		if key != nil {
+			bound.GoodQAKey = hex.EncodeToString(key)
+		}
 		return l.WriteBinding(bound)
 	})
 	if err != nil {
@@ -406,4 +434,16 @@ func writersWithoutRoot(p parsed, l *ledger.Ledger, env Env, viewErr error) erro
 	}
 	emit(env, p.has("json"), op.Obj{{K: "project", V: l.Project}, {K: "writers", V: rows}}, b.String())
 	return nil
+}
+
+// readSmallFile reads a regular file of at most 4 KiB (a key file).
+func readSmallFile(path string, env Env) ([]byte, error) {
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(env.Cwd, path)
+	}
+	fi, err := os.Stat(path)
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() > 4096 {
+		return nil, usagef("--goodqa-key must be a regular file of at most 4 KiB")
+	}
+	return os.ReadFile(path)
 }

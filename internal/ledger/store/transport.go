@@ -27,6 +27,8 @@ import (
 const (
 	MaxRemoteLedgerRefs = 128
 	FetchTimeout        = 120 * time.Second
+	// MaxLsRemoteBytes caps what a remote may stream while listing refs (128 refs need about 20 KiB).
+	MaxLsRemoteBytes = 256 << 10
 )
 
 var transportSettings = append(append([]gitx.Setting{}, ledgerSettings...),
@@ -42,8 +44,37 @@ var transportSettings = append(append([]gitx.Setting{}, ledgerSettings...),
 )
 
 // TransportEnv is the environment for push, fetch and ls-remote against a remote.
-func TransportEnv(extra ...string) []string {
-	env := gitx.Default(gitx.Options{Isolated: true, Settings: transportSettings})
+func TransportEnv(extra ...string) []string { return TransportEnvWith(nil, extra...) }
+
+var (
+	namedHelper = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,31}$`)
+	pathHelper  = regexp.MustCompile(`^/[A-Za-z0-9._/-]{1,200}$`)
+)
+
+// SafeHelpers keeps only credential helpers that cannot run an arbitrary command line: a bare helper name
+// (osxkeychain, store, cache, manager, ...) or an absolute path without arguments. Shell helpers ("!cmd"),
+// arguments and anything else are dropped.
+func SafeHelpers(in []string) []string {
+	var out []string
+	for _, h := range in {
+		if namedHelper.MatchString(h) || pathHelper.MatchString(h) {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// TransportEnvWith is TransportEnv plus the given (already vetted) credential helpers. Nothing else from the
+// user's git configuration is read.
+func TransportEnvWith(helpers []string, extra ...string) []string {
+	settings := transportSettings
+	if len(helpers) > 0 {
+		settings = append(append([]gitx.Setting{}, transportSettings...), gitx.Setting{Key: "credential.helper", Value: ""})
+		for _, h := range SafeHelpers(helpers) {
+			settings = append(settings, gitx.Setting{Key: "credential.helper", Value: h})
+		}
+	}
+	env := gitx.Default(gitx.Options{Isolated: true, Settings: settings})
 	add := []string{"LC_ALL=C", "SSH_ASKPASS_REQUIRE=never", "GIT_SSH_COMMAND=ssh -o BatchMode=yes -o StrictHostKeyChecking=yes",
 		"GIT_ALLOW_PROTOCOL=ssh:https:file"}
 	if runtime.GOOS != "windows" {
@@ -54,7 +85,7 @@ func TransportEnv(extra ...string) []string {
 
 func (g *Git) runT(timeout time.Duration, args ...string) ([]byte, error) {
 	argv := append([]string{"git", "--git-dir=" + g.GitDir}, args...)
-	res, err := proc.Run(argv, proc.Options{Env: TransportEnv(), Timeout: timeout})
+	res, err := proc.Run(argv, proc.Options{Env: TransportEnvWith(g.Helpers), Timeout: timeout})
 	if err != nil {
 		return nil, fmt.Errorf("git %s could not run or timed out: %w", args[0], err)
 	}
@@ -121,7 +152,7 @@ func (g *Git) LsRemote(remote, pattern string) (map[string]string, error) {
 	if err := ValidateURL(remote); err != nil {
 		return nil, err
 	}
-	out, err := g.runT(FetchTimeout, "ls-remote", "--refs", "--", remote, pattern)
+	out, err := g.runCapped(FetchTimeout, MaxLsRemoteBytes, "ls-remote", "--refs", "--", remote, pattern)
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +240,7 @@ func (g *Git) FetchCapped(remote, refspec string, maxBytes int64) error {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "--git-dir="+g.GitDir, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
 		"--no-recurse-submodules", "--", remote, refspec)
-	cmd.Env = TransportEnv()
+	cmd.Env = TransportEnvWith(g.Helpers)
 	cmd.WaitDelay = 2 * time.Second
 	var stderr bytes.Buffer
 	cmd.Stderr = &limitedWriter{b: &stderr, max: 32 << 10}
@@ -257,4 +288,48 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+// ErrOutputTooBig means a transport command produced more output than allowed and was stopped.
+var ErrOutputTooBig = errors.New("the remote's listing exceeded its output cap (output cap); refusing")
+
+// runCapped is runT with a hard cap on stdout: past maxOut bytes the process is killed.
+func (g *Git) runCapped(timeout time.Duration, maxOut int, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir=" + g.GitDir}, args...)...)
+	cmd.Env = TransportEnvWith(g.Helpers)
+	cmd.WaitDelay = 2 * time.Second
+	var out bytes.Buffer
+	over := false
+	cmd.Stdout = &capWriter{b: &out, max: maxOut, over: &over, cancel: cancel}
+	var stderr bytes.Buffer
+	cmd.Stderr = &limitedWriter{b: &stderr, max: 32 << 10}
+	err := cmd.Run()
+	if over {
+		return nil, ErrOutputTooBig
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("git %s timed out after %s", args[0], timeout)
+		}
+		return out.Bytes(), &GitError{Sub: args[0], Code: 1, Stderr: stderr.String()}
+	}
+	return out.Bytes(), nil
+}
+
+type capWriter struct {
+	b      *bytes.Buffer
+	max    int
+	over   *bool
+	cancel context.CancelFunc
+}
+
+func (w *capWriter) Write(p []byte) (int, error) {
+	if w.b.Len()+len(p) > w.max {
+		*w.over = true
+		w.cancel()
+		return len(p), nil
+	}
+	return w.b.Write(p)
 }
