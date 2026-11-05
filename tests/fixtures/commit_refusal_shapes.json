@@ -1,0 +1,2624 @@
+[
+{
+"subject_len": 68,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 71,
+"What": 72,
+"Testing": 67,
+"Refs": 21,
+"Risk": 60
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA NaeNbNP#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 990
+},
+{
+"subject_len": 72,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 73,
+"What": 72,
+"Testing": 61,
+"Refs": 21,
+"Risk": 69
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA NaeNbNP#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1011
+},
+{
+"subject_len": 67,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 60,
+"What": 58,
+"Testing": 299,
+"Refs": 21,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA NaeNbNP#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1198
+},
+{
+"subject_len": 37,
+"type": "chore",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 16,
+"What": 8,
+"Testing": 16,
+"Refs": 14,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": true,
+"refs_form": "none (fixture)",
+"has_trailer": false,
+"blank_after_subject": true,
+"body_chars": 84
+},
+{
+"subject_len": 70,
+"type": "chore",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 83,
+"What": 74,
+"Testing": 86,
+"Refs": 43,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "none (disposable fixture, no ticket need",
+"has_trailer": false,
+"blank_after_subject": true,
+"body_chars": 316
+},
+{
+"subject_len": 27,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 328
+},
+{
+"subject_len": 78,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 70,
+"What": 65,
+"Testing": 67,
+"Refs": 28,
+"Risk": 70
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N, GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1798
+},
+{
+"subject_len": 10,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 1776
+},
+{
+"subject_len": 10,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 1730
+},
+{
+"subject_len": 63,
+"type": "docs",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 97,
+"What": 129,
+"Testing": 74,
+"Refs": 35,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 424
+},
+{
+"subject_len": 46,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 771
+},
+{
+"subject_len": 65,
+"type": "docs",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 94,
+"What": 172,
+"Testing": 74,
+"Refs": 35,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 464
+},
+{
+"subject_len": 152,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 0
+},
+{
+"subject_len": 11,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 1737
+},
+{
+"subject_len": 11,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 1737
+},
+{
+"subject_len": 70,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 229,
+"What": 499,
+"Testing": 141,
+"Refs": 19,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 977
+},
+{
+"subject_len": 31,
+"type": "chore",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 27,
+"What": 9,
+"Testing": 16,
+"Refs": 25,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": true,
+"refs_form": "none (disposable fixture)",
+"has_trailer": false,
+"blank_after_subject": true,
+"body_chars": 110
+},
+{
+"subject_len": 78,
+"type": "test",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 161,
+"What": 682,
+"Testing": 252,
+"Refs": 35,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1219
+},
+{
+"subject_len": 11,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 2630
+},
+{
+"subject_len": 10,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": true,
+"body_chars": 2275
+},
+{
+"subject_len": 2,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 0
+},
+{
+"subject_len": 61,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 65,
+"What": 66,
+"Testing": 41,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1027
+},
+{
+"subject_len": 61,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 65,
+"What": 66,
+"Testing": 41,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1027
+},
+{
+"subject_len": 218,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": true,
+"body_chars": 541
+},
+{
+"subject_len": 352,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": true,
+"body_chars": 200
+},
+{
+"subject_len": 3,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 37
+},
+{
+"subject_len": 3,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 37
+},
+{
+"subject_len": 59,
+"type": "test",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 69,
+"What": 52,
+"Testing": 164,
+"Refs": 35,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 952
+},
+{
+"subject_len": 75,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 60,
+"What": 64,
+"Testing": 303,
+"Refs": 35,
+"Risk": 140
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1270
+},
+{
+"subject_len": 69,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 67,
+"What": 66,
+"Testing": 208,
+"Refs": 35,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 766
+},
+{
+"subject_len": 69,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 67,
+"What": 66,
+"Testing": 208,
+"Refs": 35,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 766
+},
+{
+"subject_len": 64,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 69,
+"What": 69,
+"Testing": 69,
+"Refs": 23,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 849
+},
+{
+"subject_len": 159,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 1335
+},
+{
+"subject_len": 53,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 74,
+"What": 71,
+"Testing": 61,
+"Refs": 23,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 387
+},
+{
+"subject_len": 52,
+"type": "chore",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 69,
+"What": 66,
+"Testing": 71,
+"Refs": 53,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": true,
+"refs_form": "none (merge commit, no behaviour of its ",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 464
+},
+{
+"subject_len": 151,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 0
+},
+{
+"subject_len": 77,
+"type": "docs",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 233,
+"What": 306,
+"Testing": 128,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 769
+},
+{
+"subject_len": 57,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 69,
+"What": 68,
+"Testing": 71,
+"Refs": 13,
+"Risk": 68
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1612
+},
+{
+"subject_len": 57,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 69,
+"What": 68,
+"Testing": 71,
+"Refs": 13,
+"Risk": 68
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1612
+},
+{
+"subject_len": 70,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 71,
+"What": 69,
+"Testing": 162,
+"Refs": 23,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 626
+},
+{
+"subject_len": 70,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 71,
+"What": 69,
+"Testing": 162,
+"Refs": 23,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 626
+},
+{
+"subject_len": 70,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 71,
+"What": 69,
+"Testing": 162,
+"Refs": 23,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 626
+},
+{
+"subject_len": 12,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 328
+},
+{
+"subject_len": 68,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 67,
+"What": 63,
+"Testing": 58,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 737
+},
+{
+"subject_len": 68,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 67,
+"What": 63,
+"Testing": 58,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 737
+},
+{
+"subject_len": 22,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 172
+},
+{
+"subject_len": 64,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 123,
+"What": 401,
+"Testing": 90,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": true,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 716
+},
+{
+"subject_len": 91,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 286,
+"What": 591,
+"Testing": 223,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1202
+},
+{
+"subject_len": 238,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": true,
+"body_chars": 3434
+},
+{
+"subject_len": 70,
+"type": "test",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 184,
+"What": 187,
+"Testing": 166,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 639
+},
+{
+"subject_len": 76,
+"type": "test",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 158,
+"What": 127,
+"Testing": 262,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 649
+},
+{
+"subject_len": 69,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 228,
+"What": 472,
+"Testing": 237,
+"Refs": 35,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1061
+},
+{
+"subject_len": 76,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 121
+},
+{
+"subject_len": 67,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 65,
+"What": 44,
+"Testing": 288,
+"Refs": 23,
+"Risk": 66
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1430
+},
+{
+"subject_len": 59,
+"type": "test",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 73,
+"What": 78,
+"Testing": 154,
+"Refs": 35,
+"Risk": 38
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 797
+},
+{
+"subject_len": 84,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 67,
+"What": 68,
+"Testing": 116,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 665
+},
+{
+"subject_len": 75,
+"type": "test",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 68,
+"What": 72,
+"Testing": 41,
+"Refs": 28,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N, GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 647
+},
+{
+"subject_len": 0,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 579
+},
+{
+"subject_len": 190,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": true,
+"body_chars": 745
+},
+{
+"subject_len": 35,
+"type": "chore",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 143,
+"What": 149,
+"Testing": 64,
+"Refs": 73,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "none (pin bump of an already-reviewed re",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 518
+},
+{
+"subject_len": 61,
+"type": "chore",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 80,
+"What": 78,
+"Testing": 482,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1748
+},
+{
+"subject_len": 62,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 56,
+"What": 60,
+"Testing": 52,
+"Refs": 40,
+"Risk": 60
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N, GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1531
+},
+{
+"subject_len": 62,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 56,
+"What": 60,
+"Testing": 52,
+"Refs": 40,
+"Risk": 60
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N, GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1531
+},
+{
+"subject_len": 32,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 1838
+},
+{
+"subject_len": 32,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 1838
+},
+{
+"subject_len": 68,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 64,
+"What": 61,
+"Testing": 209,
+"Refs": 48,
+"Risk": 57
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N, GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 808
+},
+{
+"subject_len": 67,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 66,
+"What": 70,
+"Testing": 199,
+"Refs": 12,
+"Risk": 59
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 951
+},
+{
+"subject_len": 39,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 369
+},
+{
+"subject_len": 74,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 71,
+"What": 68,
+"Testing": 240,
+"Refs": 19,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 764
+},
+{
+"subject_len": 20,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 1957
+},
+{
+"subject_len": 47,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 65,
+"What": 61,
+"Testing": 55,
+"Refs": 19,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 389
+},
+{
+"subject_len": 47,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 65,
+"What": 61,
+"Testing": 55,
+"Refs": 19,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 389
+},
+{
+"subject_len": 75,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 68,
+"What": 56,
+"Testing": 246,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1025
+},
+{
+"subject_len": 73,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 239,
+"What": 406,
+"Testing": 198,
+"Refs": 23,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 955
+},
+{
+"subject_len": 60,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 225,
+"What": 392,
+"Testing": 241,
+"Refs": 48,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N, GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 995
+},
+{
+"subject_len": 73,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 229,
+"What": 332,
+"Testing": 192,
+"Refs": 23,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 865
+},
+{
+"subject_len": 76,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 193,
+"What": 477,
+"Testing": 381,
+"Refs": 48,
+"Risk": 148
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N, GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1343
+},
+{
+"subject_len": 38,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 864
+},
+{
+"subject_len": 25,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 926
+},
+{
+"subject_len": 79,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 69,
+"What": 65,
+"Testing": 72,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 668
+},
+{
+"subject_len": 79,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 69,
+"What": 65,
+"Testing": 72,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 668
+},
+{
+"subject_len": 68,
+"type": "test",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 242,
+"What": 166,
+"Testing": 171,
+"Refs": 28,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N, GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 696
+},
+{
+"subject_len": 60,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 158,
+"What": 513,
+"Testing": 66,
+"Refs": 28,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N, GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 854
+},
+{
+"subject_len": 64,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 169,
+"What": 185,
+"Testing": 170,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 626
+},
+{
+"subject_len": 64,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 169,
+"What": 185,
+"Testing": 170,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 626
+},
+{
+"subject_len": 73,
+"type": "test",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 232,
+"What": 381,
+"Testing": 214,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 929
+},
+{
+"subject_len": 76,
+"type": "docs",
+"has_scope": false,
+"subject_parses": true,
+"sections": {
+"Why": 321,
+"What": 413,
+"Testing": 159,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 995
+},
+{
+"subject_len": 73,
+"type": "test",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 232,
+"What": 381,
+"Testing": 214,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 929
+},
+{
+"subject_len": 76,
+"type": "docs",
+"has_scope": false,
+"subject_parses": true,
+"sections": {
+"Why": 321,
+"What": 413,
+"Testing": 159,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 995
+},
+{
+"subject_len": 59,
+"type": "docs",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 313,
+"What": 388,
+"Testing": 159,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 962
+},
+{
+"subject_len": 59,
+"type": "docs",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 313,
+"What": 388,
+"Testing": 159,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 962
+},
+{
+"subject_len": 25,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 0
+},
+{
+"subject_len": 68,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 65,
+"What": 65,
+"Testing": 64,
+"Refs": 43,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N, GoodQA #N, GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1386
+},
+{
+"subject_len": 62,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 176,
+"What": 321,
+"Testing": 100,
+"Refs": 13,
+"Risk": 71
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 777
+},
+{
+"subject_len": 56,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 60,
+"What": 64,
+"Testing": 109,
+"Refs": 19,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 553
+},
+{
+"subject_len": 56,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 60,
+"What": 64,
+"Testing": 109,
+"Refs": 19,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 553
+},
+{
+"subject_len": 64,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 197,
+"What": 428,
+"Testing": 153,
+"Refs": 28,
+"Risk": 98
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N, GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1000
+},
+{
+"subject_len": 114,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 515
+},
+{
+"subject_len": 64,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 67,
+"What": 64,
+"Testing": 61,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 764
+},
+{
+"subject_len": 69,
+"type": "test",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 204,
+"What": 210,
+"Testing": 177,
+"Refs": 23,
+"Risk": 52
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 762
+},
+{
+"subject_len": 15,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 242
+},
+{
+"subject_len": 3,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 0
+},
+{
+"subject_len": 81,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 286,
+"What": 258,
+"Testing": 308,
+"Refs": 23,
+"Risk": 222
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1193
+},
+{
+"subject_len": 77,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 68,
+"What": 63,
+"Testing": 225,
+"Refs": 19,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 763
+},
+{
+"subject_len": 40,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 486
+},
+{
+"subject_len": 55,
+"type": "chore",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 59,
+"What": 104,
+"Testing": 64,
+"Refs": 35,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": true,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 351
+},
+{
+"subject_len": 66,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 69,
+"What": 65,
+"Testing": 70,
+"Refs": 19,
+"Risk": 56
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1393
+},
+{
+"subject_len": 78,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 71,
+"What": 70,
+"Testing": 306,
+"Refs": 19,
+"Risk": 34
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1212
+},
+{
+"subject_len": 75,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 71,
+"What": 70,
+"Testing": 306,
+"Refs": 19,
+"Risk": 34
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1212
+},
+{
+"subject_len": 74,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 281,
+"What": 422,
+"Testing": 189,
+"Refs": 19,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1000
+},
+{
+"subject_len": 72,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 222,
+"What": 296,
+"Testing": 152,
+"Refs": 19,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 778
+},
+{
+"subject_len": 27,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 1448
+},
+{
+"subject_len": 60,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 275,
+"What": 705,
+"Testing": 287,
+"Refs": 73,
+"Risk": 135
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N, GoodQA P#N, GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1569
+},
+{
+"subject_len": 71,
+"type": "merge",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 156,
+"What": 218,
+"Testing": 178,
+"Refs": 28,
+"Risk": 74
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N, GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 750
+},
+{
+"subject_len": 55,
+"type": "merge",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 156,
+"What": 218,
+"Testing": 183,
+"Refs": 28,
+"Risk": 78
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N, GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 759
+},
+{
+"subject_len": 66,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 180,
+"What": 316,
+"Testing": 268,
+"Refs": 13,
+"Risk": 133
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1006
+},
+{
+"subject_len": 20,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 834
+},
+{
+"subject_len": 80,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 229,
+"What": 394,
+"Testing": 237,
+"Refs": 28,
+"Risk": 105
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N, GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1089
+},
+{
+"subject_len": 64,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 182,
+"What": 241,
+"Testing": 151,
+"Refs": 19,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 682
+},
+{
+"subject_len": 68,
+"type": "test",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 181,
+"What": 373,
+"Testing": 231,
+"Refs": 19,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 893
+},
+{
+"subject_len": 35,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 464
+},
+{
+"subject_len": 51,
+"type": "docs",
+"has_scope": false,
+"subject_parses": true,
+"sections": {
+"Why": 72,
+"What": 60,
+"Testing": 60,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": true,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 348
+},
+{
+"subject_len": 309,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": true,
+"body_chars": 540
+},
+{
+"subject_len": 69,
+"type": "test",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 119,
+"What": 144,
+"Testing": 106,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 471
+},
+{
+"subject_len": 82,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 178,
+"What": 201,
+"Testing": 195,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 676
+},
+{
+"subject_len": 77,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 178,
+"What": 201,
+"Testing": 195,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 676
+},
+{
+"subject_len": 65,
+"type": "chore",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 139,
+"What": 212,
+"Testing": 233,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 686
+},
+{
+"subject_len": 68,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 134,
+"What": 587,
+"Testing": 273,
+"Refs": 13,
+"Risk": 156
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1259
+},
+{
+"subject_len": 76,
+"type": "feat",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 123,
+"What": 217,
+"Testing": 168,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 610
+},
+{
+"subject_len": 76,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 62,
+"What": 64,
+"Testing": 267,
+"Refs": 13,
+"Risk": 131
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 1425
+},
+{
+"subject_len": 31,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": null,
+"Testing": null,
+"Refs": null,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": null,
+"has_trailer": false,
+"blank_after_subject": false,
+"body_chars": 1716
+},
+{
+"subject_len": 72,
+"type": "docs",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 69,
+"What": 65,
+"Testing": 87,
+"Refs": 35,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA P#N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 469
+},
+{
+"subject_len": 286,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": 126,
+"Testing": 0,
+"Refs": 28,
+"Risk": 0
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N, GoodQA #N",
+"has_trailer": false,
+"blank_after_subject": true,
+"body_chars": 1612
+},
+{
+"subject_len": 286,
+"type": null,
+"has_scope": false,
+"subject_parses": false,
+"sections": {
+"Why": null,
+"What": 126,
+"Testing": 0,
+"Refs": 28,
+"Risk": 0
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N, GoodQA #N",
+"has_trailer": false,
+"blank_after_subject": true,
+"body_chars": 1615
+},
+{
+"subject_len": 70,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 73,
+"What": 73,
+"Testing": 133,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": false,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 516
+},
+{
+"subject_len": 73,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 259,
+"What": 349,
+"Testing": 155,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 865
+},
+{
+"subject_len": 73,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 259,
+"What": 349,
+"Testing": 155,
+"Refs": 13,
+"Risk": null
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 865
+},
+{
+"subject_len": 66,
+"type": "fix",
+"has_scope": true,
+"subject_parses": true,
+"sections": {
+"Why": 243,
+"What": 305,
+"Testing": 134,
+"Refs": 13,
+"Risk": 128
+},
+"testing_has_backticks": true,
+"testing_not_run": false,
+"refs_form": "GoodQA #N",
+"has_trailer": true,
+"blank_after_subject": true,
+"body_chars": 919
+}
+]
