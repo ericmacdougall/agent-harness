@@ -27,7 +27,7 @@ from urllib.parse import quote
 from github_identity import github_repository, repository_name
 from git_safety import git_environment, require_safe_source
 from integrate_local import (ALLOWED_GIT_ENV, CheckInterpreterError, CheckLog, ExternalApplyError,
-                             OriginalScope, acquire_scope_lock, approved_check, approved_prepare,
+                             OriginalScope, acquire_scope_lock, approved_check, approved_prepare, focused_unittest,
                              require_check_interpreters,
                              checkout_identity, git_common_directory, journal_key,
                              fsync_directory, private_directory, read_journal, run as run_check,
@@ -169,6 +169,9 @@ def regular_bytes(path, limit=MAX_PRIVATE):
         raise DeliveryError("RECOVERY_REQUIRED", "Private input is missing, unsafe, or exceeds its limit") from None
 
 
+IGNORED_GIT_ENV = ("GIT_EDITOR", "GIT_SEQUENCE_EDITOR")
+
+
 def private_json(path):
     try:
         value = json.loads(regular_bytes(path))
@@ -199,7 +202,7 @@ def kit_digest(path):
     return hashlib.sha256(data).hexdigest()
 
 
-def approved_commands(values, *, prepare=False):
+def approved_commands(values, *, prepare=False, allow_focused=False):
     if not values and not prepare:
         raise DeliveryError("BLOCKED_POLICY", "At least one focused check is required", code=2)
     commands = []
@@ -208,10 +211,36 @@ def approved_commands(values, *, prepare=False):
             argv = shlex.split(value)
         except ValueError:
             raise DeliveryError("BLOCKED_POLICY", "Check command could not be parsed", code=2) from None
-        if not (approved_prepare(argv) if prepare else approved_check(argv)):
+        if not (approved_prepare(argv) if prepare else approved_check(argv, allow_focused)):
             raise DeliveryError("BLOCKED_POLICY", "Check command is not approved", code=2)
         commands.append(argv)
     return commands
+
+
+def focused_proof(flow, focused):
+    """test_scope.py's approval of each focused check: it names every test mapped to the changed files and their
+    dependents, and a finished passing full run is on record for the frozen source head. Nothing is accepted without it."""
+    try:
+        import test_scope
+    except ImportError:
+        raise DeliveryError("BLOCKED_POLICY", "Focused checks need test_scope.py, which is not installed", code=2) from None
+    approvals = []
+    for argv in focused:
+        failure = None
+        for repo in (flow.state.get("source"), str(flow.original)):
+            if not repo:
+                continue
+            try:
+                approvals.append(test_scope.approve_focused(str(repo), flow.state["baseline"], flow.state["source_head"], argv))
+                break
+            except test_scope.Refused as refused:
+                raise DeliveryError("BLOCKED_POLICY", "Focused check is not approved: " + refused.message, code=2) from None
+            except (OSError, ValueError, subprocess.SubprocessError):
+                failure = True  # this checkout lacks the commits; try the next one
+        else:
+            raise DeliveryError("BLOCKED_POLICY", "Focused check proof could not be verified" if failure else
+                                "Focused check proof needs a source or original checkout", code=2)
+    return approvals
 
 
 def checks_digest(preparations, checks):
@@ -452,8 +481,11 @@ class Workflow:
             raise DeliveryError("RECOVERY_REQUIRED", "Workflow generation or state changed during delivery")
 
     def facts(self):
-        return {"generation": self.generation, "state": str(self.directory / "journal.json"),
-                "checkout": str(self.original), "source_head": self.state["source_head"]}
+        facts = {"generation": self.generation, "state": str(self.directory / "journal.json"),
+                 "checkout": str(self.original), "source_head": self.state["source_head"]}
+        if getattr(self, "focused_checks", None):
+            facts["focused_checks"] = self.focused_checks
+        return facts
 
     def complete(self, mode, head, digest):
         self.save(target=head, checks_digest=digest)
@@ -462,6 +494,8 @@ class Workflow:
                 "generation": self.generation, "source_head": self.state["source_head"], "head": head,
                 "mode": mode, "repository": self.state["repository"], "pr_number": self.state["pr_number"],
                 "checks_digest": digest, "guard_key": self.state["guard_key"]}
+        if getattr(self, "focused_checks", None):
+            data["focused_checks"] = self.focused_checks  # the test_scope approval of each focused check
         private_directory(self.receipt.parent)
         write_journal(self.receipt.parent, data, first=True)
         self.save(phase="DELIVERED" if mode == "remote" else "LOCAL_DELIVERED", target=head,
@@ -475,7 +509,7 @@ class Workflow:
         value = private_json(self.receipt)
         expected = {"schema", "kind", "scope", "task", "generation", "source_head", "head", "mode",
                     "repository", "pr_number", "checks_digest", "guard_key"}
-        if (set(value) != expected or type(value.get("schema")) is not int or value["schema"] != 1
+        if (set(value) - {"focused_checks"} != expected or type(value.get("schema")) is not int or value["schema"] != 1
                 or value.get("kind") != "delivery_receipt" or value.get("scope") != self.scope
                 or value.get("task") != self.task or value.get("generation") != self.generation
                 or value.get("source_head") != self.state["source_head"]
@@ -1362,6 +1396,8 @@ def local_finish(flow, preparations, checks):
     for name in ("prepare", "check"):
         for value in getattr(flow.args, name):
             command.extend(("--" + name, value))
+    if getattr(flow, "focused_checks", None):
+        command.append("--allow-focused-checks")  # only after focused_proof approved every focused check
     try:
         # Each preparation/check gets its check deadline; Git steps keep --timeout.
         code, output = bounded(command, timeout=2 * (len(checks) + len(preparations)) * flow.args.check_timeout
@@ -1380,7 +1416,8 @@ def local_finish(flow, preparations, checks):
 
 
 def finish(args):
-    preparations, checks = approved_commands(args.prepare, prepare=True), approved_commands(args.check)
+    preparations, checks = approved_commands(args.prepare, prepare=True), approved_commands(args.check, allow_focused=True)
+    focused = [argv for argv in checks if not approved_check(argv)]  # accepted syntactically; proven below
     try:
         # Before any checkout effect: a bare python3 that resolves to an
         # unsupported interpreter would only fail after the fast-forward.
@@ -1393,6 +1430,7 @@ def finish(args):
             raise DeliveryError("BLOCKED_POLICY", "Prepared generation is missing", code=2)
         if args.kit_file is not None and kit_digest(args.kit_file) != state["kit_digest"]:
             raise DeliveryError("BLOCKED_POLICY", "Run kit changed since prepare", code=2)
+        flow.focused_checks = focused_proof(flow, focused) if focused else []
         if args.resolve_baseline is not None:
             return resolve_baseline(flow, preparations, checks)
         if args.resume:
@@ -1566,8 +1604,13 @@ def parse_args():
 def main():
     args = parse_args()
     try:
-        if any(name.startswith("GIT_") and name not in ALLOWED_GIT_ENV for name in os.environ):
-            raise DeliveryError("BLOCKED_POLICY", "Unsupported Git routing environment", code=2)
+        # Editor variables never route git (every git call here passes -m or -F), and Claude Code sessions export
+        # GIT_EDITOR, so drop them for this process and its children instead of refusing the whole run.
+        for name in IGNORED_GIT_ENV:
+            os.environ.pop(name, None)
+        bad = sorted(name for name in os.environ if name.startswith("GIT_") and name not in ALLOWED_GIT_ENV)
+        if bad:
+            raise DeliveryError("BLOCKED_POLICY", "Unsupported Git routing environment: " + ", ".join(bad[:5]), code=2)
         return prepare(args) if args.phase == "prepare" else finish(args)
     except DeliveryError as error:
         report(error.status, error.message, **error.facts)
