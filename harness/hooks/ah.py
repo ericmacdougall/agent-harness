@@ -1364,7 +1364,7 @@ def nearest_source(wal: Path, before_id: str | None = None) -> dict | None:
 def note_cmd(home: Path, args) -> dict:
     wal = Path(args.wal).expanduser()
     text = args.note
-    if args.id and not text:  # re-cite an existing quarantined entry: same text, now sourced
+    if args.id:  # re-cite an existing quarantined entry: its event kind is kept; its text unless --note overrides
         import safe_input  # noqa: PLC0415
         for raw in (safe_input.read_tail(wal, 4 << 20).splitlines() if wal.is_file() else []):
             try:
@@ -1372,7 +1372,7 @@ def note_cmd(home: Path, args) -> dict:
             except ValueError:
                 continue
             if isinstance(rec, dict) and rec.get("id") == args.id:
-                text = f"[re-cites {args.id}] " + str(rec.get("note") or "")
+                text = f"[re-cites {args.id}] " + str(args.note or rec.get("note") or "")
                 args.event = rec.get("event") or args.event
     if not text:
         raise AhError("bad_request", "note: --note text or --id of an existing entry is required")
@@ -1383,13 +1383,15 @@ def note_cmd(home: Path, args) -> dict:
         if not picked:
             raise AhError("no_source", "note: no sourced scope/decision/requirement/ask ancestor in this WAL; cite the user turn "
                                        "(ah user-msg), a ticket, or write it as an assumption with --source 'inferred: ...'", 2)
-        source = picked["source"] if not picked["assumption"] else f"inferred: from {picked['source']} -- follows an assumption"
+        # auto never mints provenance: the nearest sourced ancestor is a guess about relation, so it is an assumption (M4)
+        source = f"inferred: from {picked['source']} -- auto-picked nearest sourced ancestor" + (
+            " (itself an assumption)" if picked["assumption"] else "")
     plan = {"ok": True, "dry_run": bool(args.dry_run), "wal": str(wal), "event": args.event, "source": source,
             "ancestor": picked, "note": text[:200]}
     if args.dry_run:
         return plan
     argv = [sys.executable, str(Path(__file__).resolve().parent / "wal_note.py"), "--wal", str(wal), "--event", args.event,
-            "--note", text, "--source", source]
+            "--note", text, "--source", source] + (["--recites", args.id] if args.id else [])
     r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
     plan["wal_note_rc"] = r.returncode
     try:

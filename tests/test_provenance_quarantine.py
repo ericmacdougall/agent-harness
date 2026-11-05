@@ -88,8 +88,13 @@ class AskResolvedSourcing(base.Env):
         rc, doc = self.note("--event", "ask_resolved", "--ref", ask["id"], "--note", "user said go")
         self.assertEqual(rc, 2, doc)
         self.assertIn("--source", doc.get("problem", ""))
+        rc, doc = self.note("--event", "ask_resolved", "--ref", ask["id"], "--note", "user said go", "--source", "whatever I say")
+        self.assertEqual(rc, 2, doc)  # M1: a garbage source is refused, not stored
         rc, doc = self.note("--event", "ask_resolved", "--ref", ask["id"], "--note", "user said go", "--source", src)
         self.assertEqual(rc, 0, doc)
+        rows = [json.loads(l) for l in (self.wals / "main.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[-1]["event"], "ask_resolved")
+        self.assertEqual(rows[-1]["source"], src)  # M1: stored
         rc, doc = self.note("--event", "ask_resolved", "--ref", ask["id"], "--note", "again", "--source", src)
         self.assertEqual(rc, 2, doc)  # already resolved: not open
 
@@ -129,33 +134,62 @@ class Quarantine(Base):
         self.assertNotIn("decision", ph.quarantine_block(SESSION, active, now=now))
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}):
             self.assertEqual(ph.quarantine_block(SESSION, payload, now=now), {})  # headless sessions are not gated
+        # M3: a tool-written row (by set) is never quarantined
+        with open(self.wal, "a") as fh:
+            fh.write(json.dumps({"at": iso(now - 3600), "event": "decision", "id": "wquar0000009", "note": "LADDER tool row",
+                                 "unsourced": True, "by": "escalation"}) + "\n")
+        self.assertNotIn("wquar0000009", [r["id"] for r in ph.quarantined_entries(SESSION, now, 600)])
 
 
-class NoteSourceAuto(Base):
+class NoteSourceAuto(base.Env):
+    """`ah note --source auto` over a WAL whose ancestor is grounded in a real human turn (the fixture transcript)."""
+
+    def setUp(self):
+        super().setUp()
+        self.wal = self.wals / "main.jsonl"
+        self.wal.write_text("")
+        self.env = dict(os.environ, HOME=str(self.home), AH_HOME=str(self.home))
+
+    def rows(self):
+        return [json.loads(l) for l in self.wal.read_text().splitlines() if l.strip()]
+
+    def ah(self, *args):
+        p = subprocess.run([sys.executable, "-I", str(HOOKS / "ah.py"), *args], capture_output=True, text=True, env=self.env, timeout=60)
+        try:
+            return p.returncode, json.loads(p.stdout)
+        except ValueError:
+            return p.returncode, {"raw": p.stdout + p.stderr}
+
     def test_dry_run_picks_the_nearest_sourced_ancestor_and_writes_nothing(self):
         now = time.time()
         with open(self.wal, "a") as fh:
             fh.write(json.dumps({"at": iso(now - 600), "event": "scope", "id": "wsrc00000001", "note": "user asked for X",
-                                 "source": "ticket:GoodQA goodqa#14791"}) + "\n")
-            fh.write(json.dumps({"at": iso(now - 300), "event": "decision", "id": "wunsrc000001", "note": "we pick Y", "unsourced": True}) + "\n")
+                                 "source": self.user(base.HUMAN, base.QUOTE)}) + "\n")
+            fh.write(json.dumps({"at": iso(now - 300), "event": "decision", "id": "wab5c0000001", "note": "we pick Y", "unsourced": True}) + "\n")
         before = len(self.rows())
         rc, plan = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--dry-run", "--note", "we pick Y")
         self.assertEqual(rc, 0, plan)
         self.assertTrue(plan["dry_run"])
-        self.assertEqual(plan["source"], f"wal:{self.wal}#wsrc00000001")
+        self.assertEqual(plan["source"], f"inferred: from wal:{self.wal}#wsrc00000001 -- auto-picked nearest sourced ancestor")  # M4
         self.assertEqual(plan["ancestor"]["id"], "wsrc00000001")
         self.assertEqual(len(self.rows()), before)
-        rc, plan = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--dry-run", "--id", "wunsrc000001")
+        rc, plan = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--dry-run", "--id", "wab5c0000001")
         self.assertEqual(rc, 0, plan)
         self.assertEqual(plan["ancestor"]["id"], "wsrc00000001")  # ancestor search stops before the re-cited entry
-        self.assertIn("[re-cites wunsrc000001]", plan["note"])
-        rc, done = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--id", "wunsrc000001")
+        self.assertIn("[re-cites wab5c0000001]", plan["note"])
+        rc, done = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--id", "wab5c0000001")
         self.assertEqual(rc, 0, done)
         self.assertTrue(done["ok"], done)
         last = self.rows()[-1]
         self.assertEqual(last["event"], "decision")
         self.assertIn("wsrc00000001", last.get("source", ""))
+        self.assertTrue(last.get("assumption"))  # M4: auto is an assumption, labelled
+        self.assertEqual(last.get("recites"), "wab5c0000001")
         self.assertFalse(last.get("unsourced"))
+        # B1: the sanctioned fix clears the quarantine; the lint must not block again
+        payload = {"session_id": SESSION, "hook_event_name": "Stop", "stop_hook_active": False}
+        self.assertEqual(ph.quarantined_entries(SESSION, now + 3600, 0), [])
+        self.assertEqual(ph.quarantine_block(SESSION, payload, now=now + 3600), {})
 
     def test_no_ancestor_is_refused_not_guessed(self):
         rc, plan = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--dry-run", "--note", "orphan decision")

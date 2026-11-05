@@ -313,12 +313,17 @@ def quarantined_entries(session: str, now: float, older_than_s: float) -> list:
         tail = safe_input.read_tail(path, 4 << 20)
     except Exception:  # noqa: BLE001
         return out
+    recs = []
     for raw in tail.splitlines():
         try:
             rec = json.loads(raw)
         except ValueError:
             continue
-        if not isinstance(rec, dict) or rec.get("event") not in QUARANTINE_EVENTS or not rec.get("unsourced"):
+        if isinstance(rec, dict):
+            recs.append(rec)
+    recited = {r.get("recites") for r in recs if r.get("recites") and r.get("source")}  # a sourced re-cite clears the original (B1)
+    for rec in recs:
+        if rec.get("event") not in QUARANTINE_EVENTS or not rec.get("unsourced") or rec.get("by") or rec.get("id") in recited:
             continue
         ts = None
         try:
@@ -375,14 +380,14 @@ def quarantine_block(session: str, payload: dict, now: float | None = None) -> d
 
 
 def cmd_stop_lint(payload: dict) -> dict:
-    mode = prov.load_policy().get("stop_lint", "warn")
-    if mode == "off":
-        return {}
     session = str(payload.get("session_id") or "")
     if not valid_session(session):
         return {}
-    quarantine = quarantine_block(session, payload)
+    quarantine = quarantine_block(session, payload)  # its own policy key, independent of stop_lint (review minor)
     if quarantine.get("decision") == "block":
+        return quarantine
+    mode = prov.load_policy().get("stop_lint", "warn")
+    if mode == "off":
         return quarantine
     bad = lint_message(last_assistant_text(payload), session)
     if not bad:
@@ -448,14 +453,14 @@ def last_human_turn(session: str) -> float:
                 except ValueError:
                     continue
                 if isinstance(rec, dict) and rec.get("event") == "prompt":
-                    ts = prov.parse_ts(rec.get("at")) if hasattr(prov, "parse_ts") else None
-                    if ts is None:
-                        import datetime as dt  # noqa: PLC0415
-                        try:
-                            ts = dt.datetime.fromisoformat(str(rec.get("at")).replace("Z", "+00:00")).timestamp()
-                        except (TypeError, ValueError):
-                            ts = None
-                    newest = max(newest, ts or 0.0)
+                    import datetime as dt  # noqa: PLC0415
+                    try:
+                        ts = dt.datetime.fromisoformat(str(rec.get("at")).replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=dt.timezone.utc)
+                        newest = max(newest, ts.timestamp())
+                    except (TypeError, ValueError):
+                        pass
     except OSError:
         return 0.0
     return newest

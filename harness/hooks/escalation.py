@@ -506,7 +506,7 @@ class Ledger:
             try:
                 # No invented source: the entry is unsourced (the hook warns) and cites the state file in its text.
                 subprocess.run([sys.executable, str(Path(__file__).resolve().parent / 'wal_note.py'), '--wal', str(wal),
-                                '--event', 'decision', '--note', note + ' state=' + str(self.path(task))],
+                                '--event', 'decision', '--note', note + ' state=' + str(self.path(task)), '--by', 'escalation'],
                                capture_output=True, text=True, timeout=20)
             except (OSError, subprocess.SubprocessError):
                 pass
