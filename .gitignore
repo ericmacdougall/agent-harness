@@ -10,6 +10,7 @@ __pycache__/
 dist/
 build/
 *.zip
+!testdata/mutants/LEDGER.jsonl
 console/console
 
 # Personal values: local profile, never committed (see harness/hooks/commit_policy.local.json.example)
