@@ -180,7 +180,7 @@ def _count_entries(repo, label, *args):
     except DeliveryError:
         return None
     if code:
-        return 0  # unreadable here; the strict clean snapshot afterwards still decides
+        return -1  # git refused the listing (ownership, corrupt index): never read as "zero"
     return output.count("\0")
 
 
@@ -194,7 +194,12 @@ def target_preflight(original, branch):
             ("staged", "max_staged", ("diff", "--cached", "--name-only")),
             ("untracked", "max_untracked", ("ls-files", "--others", "--exclude-standard"))):
         count = _count_entries(original, label, *args)
-        if count is None or count > TARGET_POLICY[limit_name]:
+        if count == -1:
+            problems.append((f"original checkout {label} paths could not be listed by git",
+                             "TARGET_UNREADABLE",
+                             "run `git status` in the original checkout to see the error (ownership, "
+                             "corrupt index) and fix it before delivering"))
+        elif count is None or count > TARGET_POLICY[limit_name]:
             shown = "more than the inspectable bound" if count is None else str(count)
             problems.append((f"original checkout has {shown} {label} paths (limit {TARGET_POLICY[limit_name]})",
                              f"HUGE_{label.upper()}",
@@ -202,7 +207,12 @@ def target_preflight(original, branch):
                              "target branch, or inspect and clear the index before delivering"))
     code, behind = git(original, "rev-list", "--count", f"HEAD..refs/remotes/origin/{branch}",
                        timeout=TARGET_POLICY["timeout"]) if _safe_branch(branch) else (1, "")
-    if code == 0 and behind.strip().isdigit() and int(behind) > TARGET_POLICY["max_behind"]:
+    if code:
+        # No usable origin/<branch> tracking ref: the behind check cannot run. Say so rather than
+        # passing silently; the count is only as fresh as the last fetch either way.
+        print("WARNING: behind-origin check skipped (no refs/remotes/origin/<branch> tracking ref; "
+              "fetch first to enable it)", file=sys.stderr)
+    elif behind.strip().isdigit() and int(behind) > TARGET_POLICY["max_behind"]:
         problems.append((f"original checkout is {int(behind)} commits behind origin/{branch} "
                          f"(limit {TARGET_POLICY['max_behind']})", "ORIGINAL_BEHIND",
                          f"update it first (git -C <original> pull --ff-only) and rebase the feature onto origin/{branch}"))
@@ -532,22 +542,34 @@ class Workflow:
         facts = {"generation": self.generation, "state": str(self.directory / "journal.json"),
                  "checkout": str(self.original), "source_head": self.state["source_head"]}
         waivers = self.policy_waivers()
-        if waivers:
+        if waivers is None:
+            # A record that exists but cannot be read must not look like "no waivers".
+            facts["commit_policy_waivers_unreadable"] = True
+        elif waivers:
             facts["commit_policy_waivers"] = waivers
         return facts
 
     def policy_waivers(self):
-        """Waivers the checked range used, so a reviewer of the prepare output sees every bypass."""
+        """Waivers the checked range used, so a reviewer of the prepare output sees every bypass.
+
+        Returns [] when no record exists (local-only or pre-gate generations) and None when a
+        record exists but is unreadable or malformed.
+        """
+        path = self.directory / COMMIT_POLICY_RECORD
+        if not os.path.lexists(path):
+            return []
         try:
-            record = json.loads(regular_bytes(self.directory / COMMIT_POLICY_RECORD))
+            record = json.loads(regular_bytes(path))
             items = record.get("waivers", [])
+            if not isinstance(items, list):
+                return None
             return [{"kind": sanitize_gh_text(str(item.get("kind", "")), 40),
                      "subject": sanitize_gh_text(str(item.get("subject", "")), 64),
                      "id": sanitize_gh_text(str(item.get("id", "")), 64),
                      "wal": os.path.basename(sanitize_gh_text(str(item.get("wal", "")), 200))}
-                    for item in items[:50] if isinstance(item, dict)] if isinstance(items, list) else []
+                    for item in items[:50] if isinstance(item, dict)]
         except (OSError, ValueError, DeliveryError, AttributeError, TypeError):
-            return []
+            return None
 
     def complete(self, mode, head, digest):
         self.save(target=head, checks_digest=digest)
@@ -615,19 +637,25 @@ GH_TRANSIENT = re.compile(r"(?i)(?:timed? ?out|timeout|deadline exceeded|connect
                           r"broken pipe|\beof\b|temporar|try again|rate limit|too many requests|\b429\b|"
                           r"something went wrong|internal server error|\b50[0234]\b|bad gateway|"
                           r"service unavailable|no such host|network is unreachable|\btls\b|"
-                          r"could not add|could not request|after (?:creating|the pull request))")
-# Failures GitHub reports before creating anything. Anchored to gh's own message shapes, never to
-# free words such as "not found" or "permission" that a label, branch or later step could contain.
+                          r"could not add|could not request|after (?:creating|the pull request)|"
+                          # A PR that already exists is positive evidence of a create, never "nothing created",
+                          # even when an eventually consistent `gh pr list` does not show it yet.
+                          r"already exists)")
+# Failures GitHub reports before creating anything. Every pattern is anchored to the start of a line
+# in gh's own message shape (after gh's fixed prefixes), never to free words such as "not found" or
+# to phrases that could appear mid-line next to an echoed branch, label or later-step message.
+_GH_LINE = r"(?im)^\s*(?:(?:pull request create failed|aborted|error|gh|graphql)\s*:\s*)*"
 GH_DEFINITE = (
-    (re.compile(r"(?im)gh auth login|^\s*(?:gh: )?(?:HTTP 401\b|bad credentials)|authentication required"),
+    (re.compile(_GH_LINE + r"(?:to get started with github cli, please run:\s+gh auth login|http 401\b|"
+                           r"bad credentials|authentication required)"),
      "GitHub authentication failed; run `gh auth login` for this host, then re-run prepare with --new-generation"),
-    (re.compile(r"(?im)^\s*(?:gh: )?(?:graphql: )?(?:HTTP 403\b|resource not accessible)"),
+    (re.compile(_GH_LINE + r"(?:http 403\b|resource not accessible)"),
      "GitHub denied write access to this repository; check the account's write access, then re-run prepare with --new-generation"),
-    (re.compile(r"(?im)base ref must be a branch|^\s*(?:gh: )?(?:graphql: )?could not resolve to a (?:ref|branch)\b"),
+    (re.compile(_GH_LINE + r"(?:base ref must be a branch|could not resolve to a (?:ref|branch)\b)"),
      "The base branch does not exist on GitHub; push it or pass the right --original-branch, then re-run with --new-generation"),
-    (re.compile(r"(?im)^\s*(?:gh: )?(?:HTTP 404\b|(?:graphql: )?could not resolve to a repository\b)"),
+    (re.compile(_GH_LINE + r"(?:http 404\b|could not resolve to a repository\b)"),
      "GitHub cannot find the repository (or you cannot see it); check origin and access, then re-run with --new-generation"),
-    (re.compile(r"(?im)^\s*(?:gh: )?(?:graphql: )?(?:validation failed|HTTP 422\b)|no commits between|must first push"),
+    (re.compile(_GH_LINE + r"(?:validation failed|http 422\b|no commits between|you must first push)"),
      "GitHub rejected the PR as invalid (for example no commits between base and head); fix it, then re-run with --new-generation"),
 )
 

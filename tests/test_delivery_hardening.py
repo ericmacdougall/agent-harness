@@ -53,7 +53,32 @@ class GhCreateVerdict(workflow.DeliveryWorkflow):
         'echoed_branch': ('Creating draft pull request for fix/permission-denied-not-found into main in o/r',
                           'REMOTE_UNCERTAIN', None),
         'rate': ('HTTP 429: Too Many Requests; not found', 'REMOTE_UNCERTAIN', None),
+        # A PR that already exists is evidence of a create even when the list lags (spec NEG-9).
+        'already_exists': ('GraphQL: Validation Failed: A pull request already exists for '
+                           'fixture:codex/feature.', 'REMOTE_UNCERTAIN', None),
+        'already_exists_prefixed': ('pull request create failed: GraphQL: A pull request already exists for '
+                                    'fixture:codex/feature.', 'REMOTE_UNCERTAIN', None),
+        # Definite phrases mid-line (next to echoed names or other text) are not gh verdicts (NEG-10).
+        'midline_phrases': ('unexpected reply for head no-commits: no commits between; base ref must be a branch',
+                            'REMOTE_UNCERTAIN', None),
+        'midline_auth': ('warning from hook: please run gh auth login later', 'REMOTE_UNCERTAIN', None),
+        'prefixed_definite': ('pull request create failed: GraphQL: No commits between main and codex/feature',
+                              'REMOTE_BLOCKED', 'invalid'),
     }
+
+    def test_already_exists_with_visible_pr_is_adopted(self):
+        self.configure_github()
+        self.change_github(create_exit=1, create_stderr='GraphQL: Validation Failed: A pull request already exists')
+        result, data = self.invoke(*self.prepare_args())
+        self.assertEqual((result.returncode, data['status']), (0, 'PR_READY'), result.stdout)
+
+    def test_definite_verdict_needs_a_successful_absence_lookup(self):
+        # A definite stderr with a failing `gh pr list` cannot prove absence: stay uncertain.
+        self.configure_github()
+        self.change_github(create_exit=1, create_absent=True, fail_list_after_create=True,
+                           create_stderr='HTTP 403: Resource not accessible by integration')
+        result, data = self.invoke(*self.prepare_args())
+        self.assertEqual((result.returncode, data['status']), (4, 'REMOTE_UNCERTAIN'), result.stdout)
 
     def test_a_create_that_landed_despite_nonzero_exit_is_adopted(self):
         self.configure_github()
@@ -128,6 +153,34 @@ class RemoteBase(workflow.DeliveryWorkflow):
         result, data = self.invoke(*self.prepare_args())
         self.assertEqual(data['status'], 'PR_READY', result.stdout)
 
+    def test_unreachable_remote_is_not_absence_and_settles_nothing(self):
+        # NEG-11: an ls-remote error is not "branch missing"; nothing is pushed or settled.
+        self.configure_github()
+        def factory(module):
+            real = module.transport
+
+            def failing(repo, url, repository, args, timeout, **kwargs):
+                if args[:1] == ['ls-remote']:
+                    return 128, ''
+                return real(repo, url, repository, args, timeout, **kwargs)
+
+            stack = contextlib.ExitStack()
+            # The commit-policy gate imports its sibling module at run time.
+            stack.enter_context(mock.patch.object(sys, 'path', [str(workflow.DELIVER.parent), *sys.path]))
+            stack.enter_context(mock.patch.object(module, 'transport', side_effect=failing))
+            return stack
+
+        code, data = self.direct_finish(factory, self.prepare_args())
+        self.assertEqual((code, data['status']), (4, 'REMOTE_BLOCKED'), data)
+        self.assertNotIn('reason', data)
+        pushed = command('git', 'show-ref', '--verify', 'refs/heads/codex/feature', cwd=self.remote,
+                         env=self.env, check=False).returncode == 0
+        self.assertFalse(pushed)
+        self.assertEqual(json.loads(self.github_state.read_text())['creates'], 0)
+        # The generation stays INITIAL, so local fallback is still refused for it.
+        result, refused = self.invoke(*self.finish_args('local'))
+        self.assertNotEqual(refused['status'], 'LOCAL_DELIVERED', result.stdout)
+
 
 @own_tests_only
 class TargetSanity(workflow.DeliveryWorkflow):
@@ -174,6 +227,32 @@ class TargetSanity(workflow.DeliveryWorkflow):
         # Warn mode proceeds to the strict clean check, which still refuses a dirty target.
         self.assertNotEqual(data.get('reason'), 'HUGE_UNTRACKED', data)
 
+    def test_git_listing_error_is_refused_not_read_as_zero(self):
+        # NEG-12: a git error in the preflight listing must not pass as "0 staged".
+        module = load_deliver()
+        with mock.patch.object(module, 'bounded', return_value=(128, '')):
+            with self.assertRaises(module.DeliveryError) as raised:
+                module.target_preflight(self.original, 'main')
+        self.assertEqual(raised.exception.facts.get('reason'), 'TARGET_UNREADABLE')
+
+    def test_missing_tracking_ref_warns_instead_of_passing_silently(self):
+        module = load_deliver()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            module.target_preflight(self.original, 'no-such-branch')
+        self.assertIn('behind-origin check skipped', err.getvalue())
+
+    def test_limits_are_inclusive(self):
+        for index in range(3):
+            (self.original / f'loose{index}.txt').write_text('x')
+        module = load_deliver()
+        with mock.patch.dict(module.TARGET_POLICY, {'max_untracked': 3}):
+            module.target_preflight(self.original, 'main')  # exactly at the limit passes
+        (self.original / 'loose3.txt').write_text('x')
+        with mock.patch.dict(module.TARGET_POLICY, {'max_untracked': 3}):
+            with self.assertRaises(module.DeliveryError):
+                module.target_preflight(self.original, 'main')
+
     def test_sane_checkout_and_odd_branch_names_pass_preflight(self):
         module = load_deliver()
         module.target_preflight(self.original, 'main')
@@ -203,6 +282,32 @@ class WaiverVisibility(workflow.DeliveryWorkflow):
     def test_no_waivers_means_no_key(self):
         code, data = self.prepare_with([])
         self.assertEqual(code, 0, data)
+        self.assertNotIn('commit_policy_waivers', data)
+        self.assertNotIn('commit_policy_waivers_unreadable', data)
+
+    def test_hostile_waiver_fields_are_sanitised(self):
+        # NEG-13: waiver fields are a display channel; escapes, controls, tokens and paths are cleaned.
+        secret = 'ghp_' + 'B' * 36
+        waiver = {'kind': 'commit\x1b[2J', 'subject': 'x \x1b]0;title\x07 ' + secret + '\r\n',
+                  'id': 'w\x00id', 'wal': '/Users/someone/.claude/wals/s/../../secret/main.jsonl'}
+        code, data = self.prepare_with([waiver] * 60)
+        self.assertEqual(code, 0, data)
+        text = json.dumps(data['commit_policy_waivers'])
+        self.assertNotIn(secret, text)
+        for bad in ('\\u001b', '\\u0000', '\\u0007', '\\r', '\\n', '/Users/'):
+            self.assertNotIn(bad, text)
+        self.assertEqual(len(data['commit_policy_waivers']), 50)
+        self.assertEqual(data['commit_policy_waivers'][0]['wal'], 'main.jsonl')
+
+    def test_unreadable_record_is_flagged_not_hidden(self):
+        module = load_deliver()
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(out), \
+                mock.patch.object(module, 'commit_policy_gate', return_value={'waivers': 'not-a-list'}), \
+                mock.patch.object(sys, 'argv', [str(workflow.DELIVER), *self.prepare_args(), '--local-only']):
+            module.main()
+        data = json.loads(out.getvalue())
+        self.assertTrue(data.get('commit_policy_waivers_unreadable'), data)
         self.assertNotIn('commit_policy_waivers', data)
 
 
