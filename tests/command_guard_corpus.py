@@ -884,5 +884,21 @@ OVERWRITE_EXISTING = [
     ('echo x > {@TASK@/existing.log,@HOME@/.claude/settings.json}', 'block'),
     ('echo x >! @TASK@/existing.log', 'allow'),
     ('echo x >! @TASK@/NEW-c.txt', 'allow'),
+    # delta review of afa1e1a. F1: bash has no `>!`; it writes a file named `!` and the next word is an
+    # argument, so that word is judged as both. F2: multios with a new first alt. F3: `N<>` written via a dup or
+    # an exec. F4: a redirect glob that matches an existing file
+    ('rm -f >>! @HOME@/.claude/wals/s/main.jsonl', 'block'),
+    ('rm -rf >! @HOME@/.claude', 'block'),
+    ('rm -rf >! @HOME@/.agent-harness/work/S/T2', 'block'),
+    ('truncate -s 0 &>>! @HOME@/.claude/projects/p/s.jsonl', 'block'),
+    ('echo x > {@TASK@/NEW-z.log,@HOME@/.claude/settings.json}', 'block'),
+    ('echo x <> @HOME@/.claude/wals/s/main.jsonl >&0', 'block'),
+    ('echo x 3<> @HOME@/.claude/wals/s/main.jsonl >&3', 'block'),
+    ('exec 3<>@HOME@/.claude/wals/s/main.jsonl; echo x >&3', 'block'),
+    ('cat 0<> @HOME@/.claude/wals/s/main.jsonl', 'allow'),
+    ('echo x > @HOME@/.claude/settings.jso?', 'block'),
+    ('echo x > @TASK@/existing.lo?', 'allow'),
+    ('echo x > @HOME@/.claude/NEW-*.txt', 'allow'),
+    ('echo x >! @TASK@/existing.log >>! @HOME@/.claude/wals/s/main.jsonl', 'allow'),
 ]
 SEED = 14471

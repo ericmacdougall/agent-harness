@@ -732,6 +732,7 @@ class Lexer:
         tokens, pending = [], []
         prev_end = -1
         wait_target = None
+        also_arg = False
         while i < n:
             self.budget.tick()
             c = s[i]
@@ -759,6 +760,9 @@ class Lexer:
                     rd = Redir(fd, ZSH_CLOBBER.get(op, op))
                     tokens.append(('redir', rd))
                     wait_target = rd
+                    # bash has no `>!`: it reads `>` onto a file named `!`, so the next word is an argument of the
+                    # command. Judge both shells: zsh's redirect target and bash's argument (delta review F1)
+                    also_arg = op.endswith('!') and s[i + len(op):i + len(op) + 1] in WS
                     if op in ('<<', '<<-'):
                         rd.strip = op == '<<-'
                         pending.append(rd)
@@ -777,6 +781,9 @@ class Lexer:
                     wait_target.delim = w.text
                     wait_target.quoted = w.quoted
                 wait_target = None
+                if also_arg:
+                    tokens.append(('w', w))
+                    also_arg = False
             else:
                 tokens.append(('w', w))
             prev_end = j
@@ -1659,9 +1666,11 @@ class Analyzer:
                 if target:
                     self.write_target(r.target, truncating=r.op in ('>', '>|'), via='redirect', pure=pure)
                     is_write = True
-            elif r.op == '<>' and r.fd in ('1', '2') and target:
+            elif r.op == '<>' and target and (r.fd in ('1', '2') or name == 'exec' or any(
+                    x.op == '>&' and x.target is not None and x.target.text == (r.fd or '0') for x in cmd.redirs)):
                 # `1<> f`: stdout opened read-write without truncation; what the command prints overwrites the file
-                # in place, so it is judged like `>` (an fd-0 `<>` only feeds input and stays a read)
+                # in place, so it is judged like `>`. So is any `N<> f` that a `>&N` dup writes to, and an `exec N<>`
+                # whose descriptor later commands can write; a plain fd-0 `<>` only feeds input and stays a read
                 self.write_target(r.target, truncating=True, via='redirect', pure=False)
                 is_write = True
             if is_write and written is not None and r.target is not None:
@@ -3306,8 +3315,33 @@ class Analyzer:
                 # directories under the work dir keep the overwrite refusal (replay over real transcripts)
                 tiers = ('log', 'unknown')
             what = 'truncation by redirect' if pure else 'overwrite by redirect'
-            if not self.refuse(what, target_word, tiers=tiers, need_existing=True) and physical \
-                    and physical.casefold() != norm_path(target_word.text, self.ctx).casefold():
+            done = self.refuse(what, target_word, tiers=tiers, need_existing=True)
+            raw_alts = target_word.all_alts() or target_word.alts
+            if not done and len(raw_alts) > 1:
+                # refuse() checks existence only for the strongest alt it shows; multios writes all of them,
+                # so an existing protected file behind a new first alt must still count (delta review F2)
+                if len(raw_alts) > 256:  # too many to stat one by one: judge them as if they all existed
+                    done = self.refuse(what, target_word, tiers=tiers)
+                for alt in ([] if len(raw_alts) > 256 else raw_alts):
+                    one = Word()
+                    one.alts, one.dynamic = [alt], target_word.dynamic
+                    if self.refuse(what, one, tiers=tiers, need_existing=True):
+                        done = True
+                        break
+            if not done and not target_word.dynamic and any(ch in target_word.text for ch in GLOB_CHARS):
+                # `> ~/.claude/settings.jso?`: bash and zsh expand a redirect glob that matches one file, so judge
+                # the files it matches now as literal targets (delta review F4)
+                import glob as _glob
+                pattern = norm_path(target_word.text, self.ctx)
+                for hit in sorted(_glob.glob(pattern))[:64] if pattern.startswith('/') else []:
+                    one = Word()
+                    one.alts = [hit]
+                    hit_tiers = ('log', 'unknown') if not pure and self._plain_work_file(hit) \
+                        else ('log', 'root', 'unknown')
+                    if self.refuse(what, one, tiers=hit_tiers, need_existing=True):
+                        done = True
+                        break
+            if not done and physical and physical.casefold() != norm_path(target_word.text, self.ctx).casefold():
                 real = Word()
                 real.alts = [physical]
                 self.refuse(what, real, tiers=tiers, need_existing=True)  # the file the shell really opens

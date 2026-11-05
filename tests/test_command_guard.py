@@ -606,7 +606,7 @@ class OverwriteExistingTests(Fixture):
         (self.home / '.agent-harness/work/S/T/hooklink').symlink_to(self.home / '.claude/hooks')
         failures = [(cmd, want, got) for cmd, want in corpus.OVERWRITE_EXISTING
                     for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
-        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 47)
+        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 61)
         self.assertEqual(failures, [])
 
 
