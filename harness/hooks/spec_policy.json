@@ -23,5 +23,9 @@
   "upload_host_suffixes": [
     ".digitaloceanspaces.com"
   ],
-  "resource_budget_gate": "enforce"
+  "resource_budget_gate": "enforce",
+  "domain_gates": {
+    "mode": "warn",
+    "disabled": false
+  }
 }
