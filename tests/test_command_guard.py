@@ -412,6 +412,45 @@ class LineContinuationTests(Fixture):
                      "cat <<'E'\na \\\nb\nE\necho done", 'cat <<E\na \\\nb\nE\necho done', 'echo a \\\r\necho b',
                      'x=`# note \\\necho fine`'], 'allow', label='harmless')
 
+    # Review 6 of #14771 (pr-guard-root/review-6/r6a.py): a pre-pass that guessed comment and here-doc contexts kept a
+    # continuation in code, and the lexer then read a newline into the next word (E, H1-H3). bash, zsh and dash read
+    # each `#` here mid-word and join the next line. H4, H8, T1, T2 and D1 are the same class on the base.
+    REVIEW6 = [
+        'rm -rf a\\ # \\\n~/.claude/projects',                                     # E1
+        'rm -rf a\\;# \\\n~/.claude/projects',                                     # E2
+        'rm -rf $(echo a)# \\\n~/.claude/projects',                                # E3
+        'rm -rf $((1))# \\\n~/.claude/projects',                                   # E4
+        'rm -rf ${x:- #} \\\n~/.claude/projects',                                  # E5
+        'rm -rf a\\)# \\\n~/.claude/projects',                                     # E6
+        "echo $$'a\\' ; rm -rf /tmp/zz \\\n~/.claude/projects #'",                 # E7
+        'cat <<E\\\nX\nbody\nEX\nrm -rf /tmp/zz \\\n~/.claude/projects',           # H1
+        'cat <<"a\\"b"\nbody\na"b\nrm -rf /tmp/zz \\\n~/.claude/projects',         # H2
+        "cat <<$'E'\nbody\nE\nrm -rf /tmp/zz \\\n~/.claude/projects",             # H3
+        'cat <<E\r\nbody\r\nE\r\n# c \\\nrm -rf ~/.claude/projects\n',             # H4
+        "cat <\\\n<'E'\nx \\\nE\nrm -rf ~/.claude/projects",                       # H8: `<` continuation `<` is `<<`
+        'x="$\\\n(echo a # c \\\nrm -rf ~/.claude/projects)"',                     # T1: `$` continuation `(` is `$(`
+        'x=$\\\n(echo a # c \\\nrm -rf ~/.claude/projects)',                       # T2
+        'x=$((echo a); # c \\\nrm -rf ~/.claude/projects)',                        # D1
+        # bash and dash run the deletion line in each (pr-guard-root/split_probe.py, echo in its place)
+        'cat <<E\nx\\\nE\necho "\nE\nrm -rf ~/.claude/projects\necho "',           # an unquoted body joins `x\` and E
+        "cat <\\\n<E\n'\nE\nrm -rf ~/.claude/projects\n'",                          # `<` continuation `<E`: a here-doc
+        'ls; \\\n rm -rf ~/.claude/projects',                                      # a continuation alone is no word
+    ]
+
+    def test_review6_rows_block(self):
+        self.expect(self.REVIEW6, 'block', label='REVIEW6')
+
+    def test_words_are_read_as_the_shell_passes_them(self):
+        # argv as bash 3.2, bash 5, dash and zsh pass it (review-6/shell_ctx_probe.py, pr-guard-root/cont_argv.py)
+        compiled = cg.Compiled(self.policy, home=str(self.home), cwd=str(self.home / 'repo'))
+        rows = [('A a\\ # \\\nb', ('a #', 'b')), ('A x\\\ny', ('xy',)), ('A "x\\\ny"', ('xy',)),
+                ("A 'x\\\ny'", ('x\\\ny',)), ('A a\\\\\nA b', ('a\\',)), ('A a # c \\\nA b', ('a',)),
+                ('A x$\\\n{HOME}', ('x' + str(self.home),)), ('A 1 >\\\n> out', ('1',)), ('A a &\\\n& A b', ('a',))]
+        for text, want in rows:
+            with self.subTest(text=text):
+                words = [c.words for pl in cg.parse(cg.Lexer(cg.Ctx(compiled, str(self.home))).lex(text)) for c in pl.cmds]
+                self.assertEqual(tuple(w.text for w in words[0][1:]), want)
+
 
 class PolicyFileTests(Fixture):
     """Red-team F2: a written or replaced policy file must not weaken the guard."""

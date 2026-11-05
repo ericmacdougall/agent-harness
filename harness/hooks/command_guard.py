@@ -479,169 +479,11 @@ def scan_backtick(s, i):
     return n + 1
 
 
-def _heredoc_delim(s, i):
-    """The delimiter word after `<<` or `<<-`, starting at s[i]: (text, quoted). Only used to find where a body ends."""
-    n = len(s)
-    while i < n and s[i] in ' \t':
-        i += 1
-    text, quoted = [], False
-    while i < n and s[i] not in ' \t\n;&|()<>':
-        c = s[i]
-        if c == '\\':
-            quoted = True
-            text.append(s[i + 1:i + 2])
-            i += 2
-        elif c in '\'"':
-            quoted = True
-            j = s.find(c, i + 1)
-            j = n if j < 0 else j
-            text.append(s[i + 1:j])
-            i = j + 1
-        else:
-            text.append(c)
-            i += 1
-    return ''.join(text), quoted
-
-
-def join_continuations(s):
-    """Remove each backslash-newline the shell removes and keep the ones it keeps (GoodQA #14771).
-
-    A backslash-newline is a line continuation only where the backslash quotes: unquoted text, double quotes, backticks
-    and unquoted here-document bodies. In a comment, single quotes, $'..' and a quoted here-document body the backslash
-    is literal, so the newline still ends the line. An escaped backslash (two of them) does not escape the newline, and a
-    backslash before CR LF quotes the CR, so the LF still ends the line. bash, dash, busybox sh and `bash --posix` all
-    behave so (pr-guard-root/cont_probe.py). Removing every one first let `# note \\` hide the next line.
-
-    One linear pass over text already capped by max_command_bytes, so it takes no budget ticks. Inside backticks the
-    shell removes them before it parses the inner text, so they are all removed there."""
-    if '\\\n' not in s:
-        return s
-    n, i = len(s), 0
-    out = []
-    modes = ['top']   # top, sub ($(..) <(..) >(..)), arith ($((..))), dq, bq
-    depths = [0]      # open parentheses per sub or arith frame
-    pending = []      # here-documents whose bodies start at the next newline: (delimiter, strip tabs, quoted)
-    while i < n:
-        c = s[i]
-        mode = modes[-1]
-        if c == '\\':
-            if s[i + 1:i + 2] == '\n':
-                i += 2
-            else:
-                out.append(s[i:i + 2])
-                i += 2
-            continue
-        if mode == 'bq':
-            if c == '`':
-                modes.pop()
-                depths.pop()
-            out.append(c)
-            i += 1
-            continue
-        if mode == 'dq':
-            if c == '"':
-                modes.pop()
-                depths.pop()
-            elif c == '`':
-                modes.append('bq')
-                depths.append(0)
-            elif s.startswith('$(', i):
-                modes.append('arith' if s.startswith('$((', i) else 'sub')
-                depths.append(0)
-                out.append(s[i:i + 2])
-                i += 2
-                continue
-            out.append(c)
-            i += 1
-            continue
-        if mode == 'arith':  # no comments, quotes or here-documents: `<<` is a shift
-            if c == '(':
-                depths[-1] += 1
-            elif c == ')':
-                if depths[-1] == 0:
-                    modes.pop()
-                    depths.pop()
-                else:
-                    depths[-1] -= 1
-            out.append(c)
-            i += 1
-            continue
-        # top or sub: unquoted shell text
-        if c == '#' and (not out or out[-1][-1:] in ' \t\n;&|()<>'):
-            j = s.find('\n', i)
-            j = n if j < 0 else j
-            out.append(s[i:j])  # a comment keeps its backslashes; the newline after it still ends the line
-            i = j
-            continue
-        if c == "'":
-            j = s.find("'", i + 1)
-            j = n if j < 0 else j + 1
-            out.append(s[i:j])
-            i = j
-            continue
-        if s.startswith("$'", i):
-            j = i + 2
-            while j < n and s[j] != "'":
-                j += 2 if s[j] == '\\' else 1
-            j = min(j + 1, n)
-            out.append(s[i:j])
-            i = j
-            continue
-        if c in '"`':
-            modes.append('dq' if c == '"' else 'bq')
-            depths.append(0)
-            out.append(c)
-            i += 1
-            continue
-        if c in '$<>' and s[i + 1:i + 2] == '(':
-            modes.append('arith' if s.startswith('$((', i) else 'sub')
-            depths.append(0)
-            out.append(s[i:i + 2])
-            i += 2
-            continue
-        if mode == 'sub' and c == '(':
-            depths[-1] += 1
-        elif mode == 'sub' and c == ')':
-            if depths[-1] == 0:
-                modes.pop()
-                depths.pop()
-            else:
-                depths[-1] -= 1
-        if s.startswith('<<', i):
-            if s.startswith('<<<', i):
-                out.append('<<<')
-                i += 3
-                continue
-            strip = s.startswith('<<-', i)
-            k = i + 2 + strip
-            delim, quoted = _heredoc_delim(s, k)
-            pending.append((delim, strip, quoted))
-            out.append(s[i:k])
-            i = k
-            continue
-        out.append(c)
-        i += 1
-        if c == '\n' and pending:
-            for delim, strip, quoted in pending:
-                while i < n:
-                    parts = []
-                    while True:  # one logical line: an unquoted body joins a line ending in an odd run of backslashes
-                        j = s.find('\n', i)
-                        seg = s[i:] if j < 0 else s[i:j]
-                        i = n if j < 0 else j + 1
-                        tail = len(seg) - len(seg.rstrip('\\'))
-                        if not quoted and j >= 0 and tail % 2 == 1:
-                            parts.append(seg[:-1])
-                            continue
-                        parts.append(seg)
-                        break
-                    line = ''.join(parts)
-                    out.append(line + ('\n' if j >= 0 else ''))
-                    check = line.lstrip('\t') if strip else line
-                    if check.rstrip('\r') == delim:  # as Lexer._heredoc_body ends it
-                        break
-            pending = []
-    return ''.join(out)
+def _skip_cont(s, i):
+    """Index past any line continuations (backslash-newline) starting at s[i]."""
+    while s.startswith('\\\n', i):
+        i += 2
+    return i
 
 
 def brace_expand(text, limit=32):
@@ -721,6 +563,9 @@ class Lexer:
                 break
             any_char = True
             if (not self.ps and c == '\\') or (self.ps and c == '`'):
+                if not self.ps and s[i + 1:i + 2] == '\n':
+                    i += 2  # a line continuation: the word goes on after it
+                    continue
                 if i + 1 < n:
                     ch = s[i + 1]
                     buf.append(Q.get(ch, ch))
@@ -817,6 +662,8 @@ class Lexer:
 
     def _dollar(self, s, i, w, buf, in_dq):
         n = len(s)
+        if not self.ps and s.startswith('\\\n', i + 1):
+            i = _skip_cont(s, i + 1) - 1  # `$\\` newline `(`: the shell drops the continuation first (GoodQA #14771)
         nxt = s[i + 1] if i + 1 < n else ''
         if nxt == "'" and not in_dq:
             j = i + 2
@@ -906,7 +753,12 @@ class Lexer:
     # ---- tokens
     def lex(self, text):
         s = text.replace('\x00', '')
-        s = re.sub(r'`\r?\n', '', s) if self.ps else join_continuations(s)
+        if self.ps:
+            s = re.sub(r'`\r?\n', '', s)
+        # A backslash-newline is a line continuation only where the backslash quotes (GoodQA #14771): in code, double
+        # quotes and unquoted here-doc bodies, where this loop, read_word, _double, _operator, _dollar and _heredoc_body
+        # drop it. A comment, single quotes, $'..' and a quoted here-doc body keep it, so the newline still ends the line:
+        # removing them all before lexing let `# note \` hide the next line. A backslash before CR LF quotes the CR.
         n, i = len(s), 0
         tokens, pending = [], []
         prev_end = -1
@@ -914,6 +766,9 @@ class Lexer:
         while i < n:
             self.budget.tick()
             c = s[i]
+            if c == '\\' and not self.ps and s[i + 1:i + 2] == '\n':
+                i += 2
+                continue
             if c in WS:
                 i += 1
                 continue
@@ -929,7 +784,7 @@ class Lexer:
                 i = n if j < 0 else j
                 continue
             if c in ';&|()<>' and not (c in '<>' and s[i + 1:i + 2] == '('):
-                op = self._operator(s, i)
+                op, end = self._operator(s, i)
                 # the whole operator, not its first character: `&>` and `&>>` start with `&` (GoodQA #14471 follow-up)
                 if op in ('<', '>', '&>', '>&', '<&', '<>', '<<', '<<<', '<<-', '&>>', '>>', '>|') or op in ZSH_CLOBBER:
                     fd = None
@@ -941,16 +796,16 @@ class Lexer:
                     if op in ('<<', '<<-'):
                         rd.strip = op == '<<-'
                         pending.append(rd)
-                    i += len(op)
+                    i = end
                     continue
                 tokens.append(('op', op))
-                i += len(op)
+                i = end
                 continue
             w, j = self.read_word(s, i)
             if w is None:
                 i += 1
                 continue
-            w.raw = s[i:j]
+            w.raw = s[i:j] if self.ps else s[i:j].replace('\\\n', '')
             if wait_target is not None:
                 wait_target.target = w
                 if wait_target.op in ('<<', '<<-'):
@@ -964,24 +819,44 @@ class Lexer:
         return tokens
 
     def _operator(self, s, i):
+        """The operator at s[i] and the index just past it. The shell drops a line continuation inside an operator, so
+        `<\\` newline `<` is `<<` (GoodQA #14771)."""
+        view, ends, j, n = [], [], i, len(s)
+        while j < n and len(view) < 4:
+            if view and not self.ps:
+                j = _skip_cont(s, j)
+                if j >= n:
+                    break
+            view.append(s[j])
+            j += 1
+            ends.append(j)
+        view = ''.join(view)
         for op in ('>>&!', '>>&|', '&>>!', '&>>|', '<<<', '<<-', '>>&', '&>>', '>>!', '>>|', '&>!', '&>|', '>&!', '>&|', '&&',
                    '||', '|&', '>>', '>&', '<&', '<>', '<<', '&>', '>|', '>!', ';', '&', '|', '(', ')', '<', '>'):
-            if s.startswith(op, i):
+            if view.startswith(op):
                 if op.endswith('!'):
                     self.saw_bang = True
                     if not self.bang_operators:
-                        return op[:-1]
-                return op
-        return s[i]
+                        op = op[:-1]
+                return op, ends[len(op) - 1]
+        return s[i], i + 1
 
     def _heredoc_body(self, s, i, rd):
         n, lines, delim = len(s), [], (rd.delim or '')
         size = 0
         while i < n:
-            self.budget.tick()
-            j = s.find('\n', i)
-            line = s[i:] if j < 0 else s[i:j]
-            i = n if j < 0 else j + 1
+            parts = []
+            while True:  # an unquoted body joins a line ending in an odd run of backslashes to the next (GoodQA #14771)
+                self.budget.tick()
+                j = s.find('\n', i)
+                seg = s[i:] if j < 0 else s[i:j]
+                i = n if j < 0 else j + 1
+                if not rd.quoted and j >= 0 and (len(seg) - len(seg.rstrip('\\'))) % 2:
+                    parts.append(seg[:-1])
+                    continue
+                parts.append(seg)
+                break
+            line = ''.join(parts)
             check = line.lstrip('\t') if rd.strip else line
             if check.rstrip('\r') == delim:
                 break
