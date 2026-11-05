@@ -51,6 +51,7 @@ const (
 	lockFile          = "writer.lock"
 	metaFile          = "meta.json"
 	mirrorWritersFile = "mirror-writers.json"
+	mirrorWritersLock = "mirror-writers.lock"
 	cacheKeyFile      = "cache.key"
 )
 
@@ -948,7 +949,8 @@ func (l *Ledger) appendLocked(drafts []op.Draft, opts AppendOptions, check func(
 		}
 		nv, err := l.View()
 		if err != nil {
-			return nil, err
+			// The ops are already committed: say so, because a retry would append them twice.
+			return nil, wrap(ErrRefused, "the change was committed (%s) but the view could not be refreshed; do not retry: %v", ops[0].ID, err)
 		}
 		return &Result{Ops: ops, Writer: w, View: nv}, nil
 	}
@@ -1024,6 +1026,9 @@ func (l *Ledger) registry() map[string]string {
 	return out
 }
 
+// registryLockWait bounds how long a registration waits for another checkout of the same project.
+const registryLockWait = 10 * time.Second
+
 // registerWriter records (writer, lease hash) in this HOME's registry. It must succeed before a newly
 // minted writer appends anything, or that writer's ops would not count as self.
 func (l *Ledger) registerWriter(w, lease string) error {
@@ -1040,8 +1045,19 @@ func (l *Ledger) registerWriter(w, lease string) error {
 		return wrap(ErrRefused, "cannot open the ledger registry: %v", err)
 	}
 	defer d.Close()
-	// Several checkouts of one project share this file without a common lock: Replace is a compare-and-swap
-	// against the snapshot, so re-read and retry when another writer got there first.
+	// Several checkouts of one project share this file and each has its own writer.lock, so serialise the
+	// read-modify-write on a lock beside the file. Replace alone is not enough: its check and rename are
+	// not atomic, so two registrations can both pass the check and the later rename drops the earlier entry.
+	lk, err := lock.Acquire(filepath.Join(dir, mirrorWritersLock), lock.Wait(registryLockWait))
+	if err != nil {
+		if errors.Is(err, lock.ErrBusy) {
+			return wrap(ErrBusy, "the ledger registry is busy; try again")
+		}
+		return wrap(ErrRefused, "cannot lock the ledger registry: %v", err)
+	}
+	defer lk.Close()
+	// Replace is still a compare-and-swap against the snapshot, so re-read and retry on a stale snapshot
+	// (for example a non-cooperating writer).
 	for attempt := 0; attempt < 5; attempt++ {
 		cur := map[string]any{}
 		prior, err := d.Snapshot(mirrorWritersFile, 1<<20)
