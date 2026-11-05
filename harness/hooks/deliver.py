@@ -676,9 +676,12 @@ def classify_gh_failure(code, error_text):
     """Return a hint for a failure GitHub reported before acting, or None when completion is unknown."""
     # gh echoes "Creating draft pull request for <branch> into <base>"; the branch name is not evidence.
     error_text = ANSI.sub("", error_text[:GH_STDERR_LIMIT])
-    error_text = "\n".join(line for line in error_text.splitlines() if not line.lstrip().startswith("Creating "))
+    # Any transient phrase anywhere, including the echoed line, keeps the outcome uncertain.
     if GH_TRANSIENT.search(error_text):
         return None
+    # Split on "\n" only: str.splitlines() would also break on \r, \v, \f, \x1c-\x1e, \x85 and
+    #   and so promote a mid-line phrase to a line start when the lines are rejoined.
+    error_text = "\n".join(line for line in error_text.split("\n") if not line.lstrip().startswith("Creating "))
     if code == 4:
         return GH_DEFINITE[0][1]
     for pattern, hint in GH_DEFINITE:

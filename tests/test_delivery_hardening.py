@@ -116,6 +116,16 @@ class GhCreateVerdict(workflow.DeliveryWorkflow):
         self.assertNotIn('\x1b', text)
         self.assertLessEqual(len(data['gh_error']), 300)
 
+    def test_classifier_line_rules(self):
+        module = load_deliver()
+        classify = module.classify_gh_failure
+        # A transient phrase on the echoed "Creating" line still keeps the outcome uncertain.
+        self.assertIsNone(classify(1, 'Creating pull request for a into main: i/o timeout\nHTTP 403: Forbidden'))
+        # Separators other than "\n" never promote a mid-line phrase to a line start.
+        for separator in ('\r', '\x0b', '\x0c', '\x1c', '\x85', ' '):
+            self.assertIsNone(classify(1, 'unexpected reply' + separator + 'HTTP 403: Forbidden'), repr(separator))
+        self.assertIsNotNone(classify(1, 'unexpected reply\nHTTP 403: Forbidden'))
+
     def test_controls_cannot_split_a_token_past_redaction(self):
         module = load_deliver()
         text = module.sanitize_gh_text('ghp_abcdef\x01ghijklmnopSECRETTAIL0123456789')
