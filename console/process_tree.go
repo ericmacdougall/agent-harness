@@ -68,6 +68,7 @@ type processTreeOptions struct {
 	WaitDelay    time.Duration
 	Drain        time.Duration // idle bound on the pipe after leader exit
 	ConsumeGrace time.Duration // how long the decision waits for the consumer
+	MergeStderr  bool          // send stderr into the same stream as stdout
 }
 
 const (
@@ -101,6 +102,9 @@ func startProcessTreeWith(cmd *exec.Cmd, stopOnExit func() bool, opt processTree
 		return nil, err
 	}
 	cmd.Stdout = writer
+	if opt.MergeStderr {
+		cmd.Stderr = writer
+	}
 	cmd.WaitDelay = opt.WaitDelay
 	if err = cmd.Start(); err != nil {
 		_ = reader.Close()
