@@ -278,6 +278,21 @@ class Exclusion(Case):
         for value in ("abc", "1.5", "-3", "007", "123456"):
             self.assertEqual(self.run_script(LOG_BACKUP_JITTER_SECONDS=value).returncode, 2, value)
 
+    def test_goodqa_trash_never_appears_in_the_remote(self):
+        """Quarantined deletions (the goodqa trash folder) are not logs; it held 8 GB on dev2 (B7)."""
+        for rel in (".agent-harness/work/t1/.goodqa-trash/old/f.md", ".claude/projects/p1/.goodqa-trash/g.jsonl"):
+            self.put(rel, b"trashed")
+        done = self.local_run()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        files = self.remote_files()
+        self.assertEqual(files, set(ORDINARY))  # exact, non-empty set
+        self.assertFalse([f for f in files if ".goodqa-trash" in f])
+        # rsync anchors patterns that contain a slash, so the snapshot stage must be checked too (nested trash)
+        staged = [str(p) for p in (self.home / ".agent-harness/backup-stage").rglob("*")]
+        self.assertTrue([s for s in staged if "p1" in s], "stage empty: the check would be vacuous")
+        self.assertFalse([s for s in staged if ".goodqa-trash" in s], staged)
+        self.assertIn(".goodqa-trash/**", (ROOT / "harness" / "bin" / "log-backup.excludes").read_text().split())
+
     def test_vm_dumps_never_appear_in_the_remote(self):
         for name in ("dump.vma", "dump.vma.zst"):
             self.put(f".agent-harness/work/t1/{name}", b"VMA")

@@ -281,8 +281,9 @@ for src in "${LIVE[@]}"; do
     # --temp-dir sits outside every uploaded tree: a crash mid-copy leaves its partial files there, never beside data
     # that rclone would upload as current. rsync renames within the stage volume, so a full disk fails the copy
     # (exit 11 or 23, source skipped, run non-fresh) instead of leaving a truncated file in place.
+    # The trash directory is pruned before the catch-all directory include below (first rsync rule wins), at any depth (B7).
     mkdir -p "$STAGE/.rsync-tmp" || { say "cannot create the stage temp directory"; ok=1; continue; }
-    rsync -a --temp-dir="$STAGE/.rsync-tmp" --include='*/' --exclude-from="$RSYNC_EXCLUDES" -- "$HOME/$src/" "$snap/" </dev/null; rc=$?
+    rsync -a --temp-dir="$STAGE/.rsync-tmp" --exclude='.[gG][oO][oO][dD][qQ][aA]-[tT][rR][aA][sS][hH]/' --include='*/' --exclude-from="$RSYNC_EXCLUDES" -- "$HOME/$src/" "$snap/" </dev/null; rc=$?
     if [ $rc -eq 23 ]; then
       # Partial transfer (e.g. one unreadable file): rsync renames files into place, so the stage is consistent.
       # Back up what was staged, but withhold last-ok for this run.
