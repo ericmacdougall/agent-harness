@@ -270,6 +270,7 @@ def pin(output):
     binary.mkdir()
     for name, text in (('ssh', SSH_STUB), ('sudo', SUDO_STUB)):
         (binary / name).write_text(text); (binary / name).chmod(0o755)
+    (BASE / 'home').mkdir(exist_ok=True)  # an existing HOME, as the fuzz has: `~/../bin/x` resolves only through one (r7 M2)
     env = {**os.environ, 'PATH': '%s:%s' % (binary, os.environ['PATH']), 'HOME': str(BASE / 'home')}
 
     def stdout(path, command):

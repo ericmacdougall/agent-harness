@@ -5453,7 +5453,14 @@
 "group": "r7-H1",
 "kind": "hidden",
 "name": "nice-attached",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "nice -n5 %s",
 "unstable": [],
@@ -5464,7 +5471,14 @@
 "group": "r7-H1",
 "kind": "hidden",
 "name": "nice-long-space",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "nice --adjustment 5 %s",
 "unstable": [],
@@ -5475,7 +5489,14 @@
 "group": "r7-H1",
 "kind": "hidden",
 "name": "nice-long-equals",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "nice --adjustment=5 %s",
 "unstable": [],
@@ -5486,7 +5507,14 @@
 "group": "r7-H1",
 "kind": "hidden",
 "name": "nice-double-dash-number",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "nice --10 %s",
 "unstable": [],
@@ -5497,7 +5525,14 @@
 "group": "r7-H1",
 "kind": "hidden",
 "name": "timeout-long-signal",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "timeout --signal KILL 5 %s",
 "unstable": [],
@@ -5508,7 +5543,14 @@
 "group": "r7-H1",
 "kind": "hidden",
 "name": "timeout-long-kill-after",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "timeout --kill-after 1 5 %s",
 "unstable": [],
@@ -5519,7 +5561,14 @@
 "group": "r7-H1",
 "kind": "hidden",
 "name": "env-cluster-split",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "env -vS '%s'",
 "unstable": [],
@@ -5541,7 +5590,12 @@
 "group": "r7-H1",
 "kind": "hidden",
 "name": "exec-cluster-name",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "exec -la x %s",
 "unstable": [],
@@ -5563,7 +5617,14 @@
 "group": "r7-H1",
 "kind": "hidden",
 "name": "nice-attached-nohup",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "nice -n5 nohup %s",
 "unstable": [],
@@ -5574,7 +5635,14 @@
 "group": "r7-H1",
 "kind": "hidden",
 "name": "nice-attached-bash-heredoc",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "nice -n5 bash <<'E'\n%s\nE",
 "unstable": [],
@@ -5597,7 +5665,11 @@
 "group": "r7-M1",
 "kind": "hidden",
 "name": "source-procsub",
-"ran": [],
+"ran": [
+"bash5",
+"ksh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "source <(echo %s)",
 "unstable": [],
@@ -5608,7 +5680,11 @@
 "group": "r7-M1",
 "kind": "hidden",
 "name": "dot-procsub",
-"ran": [],
+"ran": [
+"bash5",
+"ksh",
+"zsh"
+],
 "rewritten": "none",
 "shape": ". <(echo %s)",
 "unstable": [],
@@ -5619,7 +5695,13 @@
 "group": "r7-M1",
 "kind": "hidden",
 "name": "source-proc-fd-here-string",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "source /proc/self/fd/0 <<< '%s'",
 "unstable": [],
@@ -5630,7 +5712,11 @@
 "group": "r7-M1",
 "kind": "hidden",
 "name": "dot-proc-fd-pipe",
-"ran": [],
+"ran": [
+"bash5",
+"dash",
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo '%s' | . /proc/self/fd/0",
 "unstable": [],
@@ -5641,7 +5727,12 @@
 "group": "r7-M1",
 "kind": "hidden",
 "name": "dot-dev-stdin-pipe",
-"ran": [],
+"ran": [
+"bash5",
+"dash",
+"ksh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "echo '%s' | . /dev/stdin",
 "unstable": [],
@@ -5663,7 +5754,11 @@
 "group": "r7-L1",
 "kind": "hidden",
 "name": "arith-variable",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"sh"
+],
 "rewritten": "none",
 "shape": "p='$('; t=\"a[${p}%s >&3)]\"; { echo $((t)); } 3>&1",
 "unstable": [],
@@ -5674,7 +5769,10 @@
 "group": "r7-L1",
 "kind": "hidden",
 "name": "printf-dynamic-name",
-"ran": [],
+"ran": [
+"bash5",
+"zsh"
+],
 "rewritten": "none",
 "shape": "p='$('; v=\"a[${p}%s >&3)]\"; { printf -v \"$v\" x; } 3>&1",
 "unstable": [],
@@ -5685,7 +5783,14 @@
 "group": "r7-M1",
 "kind": "hidden",
 "name": "dot-proc-fd-heredoc",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": ". /proc/self/fd/3 3<<'E'\n%s\nE",
 "unstable": [],
@@ -5696,7 +5801,14 @@
 "group": "r7-M1",
 "kind": "hidden",
 "name": "bash-proc-fd-heredoc",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "bash /proc/self/fd/3 3<<'E'\n%s\nE",
 "unstable": [],

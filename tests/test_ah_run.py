@@ -1606,7 +1606,9 @@ class Differential(HookFixture):
         assert_no_real_sudo(command)
         with tempfile.TemporaryDirectory(dir=self.temp.name) as cwd:
             try:
-                return subprocess.run([shell, '-c', command], env={**self.env, 'PATH': '%s:%s' % (self.bin, os.environ['PATH'])}, capture_output=True, timeout=5,
+                # HOME is this test's own directory, as in the pin and the fuzz: a ~ row then resolves the same way on every host
+                return subprocess.run([shell, '-c', command], env={**self.env, 'PATH': '%s:%s' % (self.bin, os.environ['PATH']), 'HOME': str(self.home)},
+                                      capture_output=True, timeout=5,
                                       stdin=subprocess.DEVNULL, cwd=cwd).stdout.decode('utf-8', 'replace')  # bytes: text mode turns a printed CR into a line end
             except subprocess.TimeoutExpired:
                 return None
