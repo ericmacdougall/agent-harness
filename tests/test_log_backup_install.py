@@ -40,6 +40,25 @@ class Case(unittest.TestCase):
         path.write_text(text)
         return path
 
+    def holder(self, directory="holder"):
+        """A live process that looks like a backup run: `sh <dir>/log-backup.sh` (the dir name may hold a space)."""
+        script = self.tmp / directory / "log-backup.sh"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("#!/bin/sh\nsleep 60\n")
+        proc = subprocess.Popen(["/bin/sh", str(script)])
+        self.addCleanup(lambda: (proc.terminate(), proc.wait()))
+        time.sleep(0.3)
+        return proc
+
+    def lock_held_by(self, pid, age=0):
+        lock = self.home / ".agent-harness/logs/log-backup.lock.d"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text(str(pid))
+        if age:
+            when = time.time() - age
+            os.utime(lock, (when, when))
+        return lock
+
     def apply(self, system, runner=None, **kw):
         runner = runner if runner is not None else Runner()
         message = lbi.status(self.home, True, system=system, run=runner, uid=501, activate=kw.pop("activate", True), **kw)
@@ -98,9 +117,33 @@ class Darwin(Case):
         self.assertEqual(plistlib.loads(text.encode())["Label"], "com.ericmacdougall.log-backup")
 
     def test_reload_deferred_while_a_backup_runs(self):
-        lock = self.home / ".agent-harness/logs/log-backup.lock.d"
-        lock.mkdir(parents=True)
-        (lock / "pid").write_text(str(os.getpid()))
+        self.lock_held_by(self.holder().pid)
+        message, runner = self.apply("Darwin")
+        self.assertIn("deferred", message)
+        self.assertEqual(runner.calls, [])
+
+    def test_a_live_pid_that_is_not_a_backup_run_does_not_defer_the_reload(self):
+        # failing control for F3: the pid is alive (this test process) but is no log-backup run
+        self.lock_held_by(os.getpid())
+        message, runner = self.apply("Darwin")
+        self.assertNotIn("deferred", message)
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_a_spoofed_holder_command_line_does_not_defer_the_reload(self):
+        other = subprocess.Popen(["/bin/sh", "-c", "sleep 60", "log-backup.sh"])  # script name only as a later argument
+        self.addCleanup(lambda: (other.terminate(), other.wait()))
+        time.sleep(0.3)
+        self.lock_held_by(other.pid)
+        message, runner = self.apply("Darwin")
+        self.assertNotIn("deferred", message)
+
+    def test_a_lock_over_a_day_old_does_not_defer_even_for_a_real_holder_pid(self):
+        self.lock_held_by(self.holder().pid, age=90000)
+        message, runner = self.apply("Darwin")
+        self.assertNotIn("deferred", message)
+
+    def test_a_backup_run_whose_path_contains_a_space_defers_the_reload(self):
+        self.lock_held_by(self.holder("my dir").pid)
         message, runner = self.apply("Darwin")
         self.assertIn("deferred", message)
         self.assertEqual(runner.calls, [])
@@ -130,9 +173,7 @@ class Darwin(Case):
             self.assertEqual(runner.calls == [], deferred, (name, age))
 
     def test_deferred_reload_is_finished_by_the_next_install(self):
-        lock = self.home / ".agent-harness/logs/log-backup.lock.d"
-        lock.mkdir(parents=True)
-        (lock / "pid").write_text(str(os.getpid()))
+        lock = self.lock_held_by(self.holder().pid)
         self.apply("Darwin")
         (lock / "pid").unlink()
         lock.rmdir()
