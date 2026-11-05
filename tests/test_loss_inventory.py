@@ -211,6 +211,36 @@ class CoverageTests(Fixture):
 
 
 class DecideReportTests(Fixture):
+    def test_no_remote_decision_goes_stale_on_side_branch_commit(self):
+        self.scan()
+        path = str(self.noremote)
+        self.run_cli("decide", "--row", path, "--decision", "moved", "--ticket", "t#1", expect=0)
+        git(self.noremote, "checkout", "-q", "-b", "side")
+        commit(self.noremote, "s1")
+        git(self.noremote, "checkout", "-q", "main")  # HEAD sha unchanged, work is on side
+        self.scan()
+        und = [x["path"] for x in json.loads(self.run_cli("report", "--json", expect=1).stdout)["undecided"]]
+        self.assertIn(path, und)
+
+    def test_accepted_loss_survives_db_churn(self):
+        self.scan()
+        path = str(self.db)
+        self.run_cli("decide", "--row", path, "--decision", "accepted-loss", "--ticket", "t#1", expect=0)
+        con = sqlite3.connect(path)
+        con.execute("insert into t values (?)", (b"y" * 10,))
+        con.commit()
+        con.close()
+        self.scan()
+        und = [x["path"] for x in json.loads(self.run_cli("report", "--json", expect=1).stdout)["undecided"]]
+        self.assertNotIn(path, und)
+
+    def test_excludes_are_recorded_and_shown(self):
+        p = self.run_cli("scan", "--root", str(self.home), "--exclude", "data", "--json", expect=0)
+        r = json.loads(p.stdout)
+        self.assertEqual(r["excludes"], ["data"])
+        self.assertEqual(r["classes"]["state_db_outside_git"], 0)
+        self.assertIn("EXCLUDED_DIR_NAMES", self.run_cli("report", expect=1).stdout.decode())
+
     def test_decision_goes_stale_when_branch_moves(self):
         self.scan()
         path = "%s::work" % self.work
