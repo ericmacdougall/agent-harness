@@ -27,7 +27,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "heavy_job_guard.py", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "resource_limits.json",
          "domain_gates.py", "domain_checklists.json",
          "command_guard.py", "command_guard_hook.py", "redact.py",
-         "doctor.py", "hooks_manifest.json", "rules.json")
+         "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -193,6 +193,11 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
             allowed.append(rule)
     for action in ("check", "capacity"):  # read-only; run_capped.py/run_probe.py run arbitrary commands, so stay prompted
         rule = f"Bash(python3 ~/.claude/hooks/resource_budget.py {action} *)"
+        if rule not in allowed:
+            allowed.append(rule)
+    # ah reads are local or GoodQA reads; ah writes (task, ticket comment, spool) stay prompted.
+    for action in ("owners", "user-msg", "disk", "ticket get", "ticket comments", "write result", "task list"):
+        rule = f"Bash(python3 ~/.claude/hooks/ah.py {action}*)"
         if rule not in allowed:
             allowed.append(rule)
     rule = "Bash(python3 ~/.claude/hooks/workdir.py prune)"  # dry run only; --apply still asks
