@@ -361,7 +361,7 @@ class RealLedger(unittest.TestCase):
         subprocess.run(['git', 'init', '-q', self.root], check=True)
         sub = os.path.join(self.root, 'a', 'b')
         os.makedirs(sub)
-        root, nested = kg.find_worktree(sub, home='/home/nobody')
+        root, nested = kg.find_worktree(sub, home='/home/someone')
         self.assertEqual(root, os.path.realpath(self.root))
         self.assertEqual(nested, [])
         # a HOME that is inside the repo makes the repo unusable as a proof boundary
@@ -904,6 +904,7 @@ class GuardCompositionTests(unittest.TestCase):
         commands = [h['command'] for g in groups for h in g['hooks']]
         order = ('wal.py', 'commit_policy.py', 'merge_gate.py', 'command_guard_hook.py', 'kill_guard.py')
         self.assertEqual(len(commands), len(order))
+        self.assertEqual([len(g['hooks']) for g in groups], [1] * len(order))  # trust is keyed on group:handler
         for command, name in zip(commands, order):
             self.assertIn(name, command)
         self.assertEqual(sum('kill_guard.py' in c for c in commands), 1)
