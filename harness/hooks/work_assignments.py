@@ -18,11 +18,13 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import random
 import re
 import socket
+import stat
 import string
 import subprocess
 import sys
@@ -58,11 +60,16 @@ SYNC_MAX_BYTES = 64 * 1024 * 1024
 LOCK_SECONDS = 3.0
 HOOK_SECONDS = 6.0
 ZERO = "0" * 64
+# Captures delivered by the harness to a hook (never read back from a transcript). Only these are verified human.
+CAPTURE_VIAS = ("hook_prompt", "hook_post_tool")
+PRUNE_NO_ASK_DAYS = 30
 DEFAULT_POLICY = {"schema": 1, "capture": "enforce", "stop": "enforce", "guard": "enforce",
                   "stale_hours": 12, "max_stop_blocks": 3}
 PROTECTED = re.compile(r"work-(?:assign|ledger)[A-Za-z0-9._*?-]*|work_assignments_policy[A-Za-z0-9._*?-]*|"
                        r"work_assign[a-z]*[*?]|work-[a-z]+[*?]|\bhive\.json\b")
 SAFE_CLI = re.compile(r"^\s*python3\s+(?:~|\$HOME|/[^\s;&|<>`$]*)?[^\s;&|<>`$]*/work_assignments\.py\s+[A-Za-z-]+(?:\s+[^;&|<>`$\n]*)?$")
+KEY_FILE = re.compile(r"work-ledger\.key|work-ledger\.k[*?]|work-ledger\.\*")
+HOOK_CALL = re.compile(r"work_assignments(?:\.py)?['\"]?\s+hook\b|agent-harness/work_assignments\.py['\"]?\s+hook\b")
 WRITEISH = re.compile(r"(?:>|\btee\b|\brm\b|\bmv\b|\bcp\b|sed\s+-i|\btruncate\b|\bpython3?\b|\bperl\b|\bruby\b|\bnode\b|"
                       r"\bdd\b|\bln\b|\bchmod\b|\binstall\b|\bgit\s+(?:checkout|restore|stash)\b)")
 
@@ -129,7 +136,7 @@ def files() -> dict:
     return {"dir": d, "snap": d / "work-ledger.json", "events": d / "work-ledger.events.jsonl",
             "archive": d / "work-ledger.archive.jsonl", "lock": d / "work-ledger.lock", "hive": d / "hive.json",
             "fail": d / "work-ledger.failures.jsonl", "spool": d / "work-ledger.spool.jsonl",
-            "v1": d / "work-assignments.json"}
+            "v1": d / "work-assignments.json", "key": d / "work-ledger.key"}
 
 
 def private_dir() -> Path:
@@ -138,14 +145,25 @@ def private_dir() -> Path:
     return d
 
 
+def write_all(fd: int, payload: bytes) -> None:
+    """os.write may write less than asked (signals, full disks, pipes); loop until all of it is down."""
+    view = memoryview(payload)
+    while view:
+        done = os.write(fd, view)
+        if done <= 0:
+            raise OSError("short write: 0 bytes written")
+        view = view[done:]
+
+
 def write_private(path: Path, payload: bytes) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC, 0o600)
     try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
+        try:
+            write_all(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -153,6 +171,79 @@ def write_private(path: Path, payload: bytes) -> None:
         except OSError:
             pass
         raise
+
+
+_KEY_CACHE = {}
+
+
+def capture_key() -> bytes:
+    """Per-machine 32-byte HMAC key (0600, outside agent work dirs), created atomically on first use.
+    Agents run as the same Unix user, so this resists forged transcript lines and hand-written events, not a
+    deliberate agent that evades the guard and reads the file (see docs, Known limits)."""
+    path = files()["key"]
+    cached = _KEY_CACHE.get(str(path))
+    if cached:
+        return cached
+    private_dir()
+    if not path.exists():
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            write_all(fd, os.urandom(32).hex().encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(tmp, path)  # fails if another process won the race; then its key is used
+        except FileExistsError:
+            pass
+        finally:
+            os.unlink(tmp)
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077 or st.st_uid != os.getuid():
+        raise WAError("capture key must be a private regular file owned by this user (chmod 600)")
+    raw = prov.read_small(path, 256).strip()
+    if not re.fullmatch(rb"[0-9a-f]{64}", raw):
+        raise WAError("capture key is malformed")
+    _KEY_CACHE[str(path)] = key = bytes.fromhex(raw.decode())
+    return key
+
+
+def capture_claims(session, tref: dict, pasted, method: str, item, spool_id="") -> dict:
+    return {"v": 1, "session": str(session or ""), "textSha256": tref["sha256"], "pasted": bool(pasted),
+            "method": method, "item": str(item or "")[:200], "spoolId": str(spool_id or "")[:64]}
+
+
+def attest(claims: dict) -> dict:
+    key = capture_key()
+    body = json.dumps(claims, sort_keys=True, separators=(",", ":")).encode()
+    return {"alg": "hmac-sha256", "keyId": sha(key)[:16], "claims": claims,
+            "mac": hmac.new(key, body, hashlib.sha256).hexdigest()}
+
+
+def attestation_valid(att) -> bool:
+    if not isinstance(att, dict) or att.get("alg") != "hmac-sha256" or not isinstance(att.get("claims"), dict):
+        return False
+    try:
+        key = capture_key()
+    except (WAError, OSError, prov.Problem):
+        return False
+    body = json.dumps(att["claims"], sort_keys=True, separators=(",", ":")).encode()
+    return hmac.compare_digest(hmac.new(key, body, hashlib.sha256).hexdigest(), str(att.get("mac", "")))
+
+
+def verified_human(msg) -> bool:
+    """Captured by a hook from harness-delivered input, with an attestation this machine's key confirms and claims
+    that match the record. A transcript line alone never qualifies."""
+    if not isinstance(msg, dict):
+        return False
+    check = msg.get("humanCheck") or {}
+    att = check.get("attestation")
+    if check.get("isHuman") is not True or check.get("verified") is not True or not attestation_valid(att):
+        return False
+    claims = att["claims"]
+    return (claims.get("session") == msg.get("sessionId") and claims.get("textSha256") == msg["text"].get("sha256")
+            and claims.get("method") == check.get("method") and claims.get("pasted") == bool(msg.get("pastedOnly")))
 
 
 def hive_identity() -> dict:
@@ -540,7 +631,7 @@ def commit(data: dict) -> None:
     if queued:
         fd = os.open(files()["events"], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
-            os.write(fd, ("".join(json.dumps(e, ensure_ascii=False, separators=(",", ":")) + "\n" for e in queued)).encode())
+            write_all(fd, ("".join(json.dumps(e, ensure_ascii=False, separators=(",", ":")) + "\n" for e in queued)).encode())
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -584,7 +675,7 @@ def record_failure(event: str, error) -> None:
         line = json.dumps({"ts": iso(now()), "event": event, "error": prov.clip(f"{type(error).__name__}: {error}", 300)})
         fd = os.open(files()["fail"], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
-            os.write(fd, (line + "\n").encode())
+            write_all(fd, (line + "\n").encode())
         finally:
             os.close(fd)
     except OSError:
@@ -608,10 +699,11 @@ def pending_failures() -> list:
 def spool_message(fields: dict) -> None:
     """Lock-free fallback for a capture the store could not take: one O_APPEND line, drained by the next transaction."""
     private_dir()
-    record = dict(fields, spoolId=sha(os.urandom(16))[:16], spooledAt=iso(now()))
+    record = dict(fields, spooledAt=iso(now()))
+    record.setdefault("spoolId", sha(os.urandom(16))[:16])
     fd = os.open(files()["spool"], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        os.write(fd, (json.dumps(record, ensure_ascii=False) + "\n").encode())
+        write_all(fd, (json.dumps(record, ensure_ascii=False) + "\n").encode())
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -640,14 +732,22 @@ def drain_spool(data: dict) -> None:
             rec = json.loads(line)
         except ValueError:
             continue
-        if not isinstance(rec, dict) or "tref" not in rec:
+        if not isinstance(rec, dict) or not line.strip():
+            continue
+        missing = [k for k in ("runtime", "session", "pasted", "source", "method", "tref", "spoolId") if k not in rec]
+        if missing or not isinstance(rec["tref"], dict) or "sha256" not in rec["tref"]:
+            record_failure("spool:malformed", ValueError("spool record lacks " + ",".join(missing or ["tref.sha256"])))
             continue
         key = rec.get("item") or f"spool:{rec['spoolId']}"
         if key in seen:
             continue
         seen.add(key)
+        att = rec.get("attestation")
+        want = capture_claims(rec["session"], rec["tref"], rec["pasted"], rec["method"], rec.get("item"), rec["spoolId"])
+        if not (attestation_valid(att) and att["claims"] == want):
+            att = None  # a hand-written or altered spool line is captured, but never as a verified human turn
         build_capture(data, rec["runtime"], rec["session"], rec.get("transcript"), "", rec["pasted"], rec["source"],
-                      via="spool", method=rec["method"], provider_item=key, tref=rec["tref"])
+                      via="spool", method=rec["method"], provider_item=key, tref=rec["tref"], attestation=att)
     data["_unlink_draining"] = True
 
 
@@ -746,7 +846,7 @@ def session_record(data, session, runtime, transcript):
 
 
 def build_capture(data, runtime, session, transcript, text, pasted, source="prompt", *, via, method, uuid=None, line=None,
-                  at=None, line_sha=None, provider_item=None, tref=None):
+                  at=None, line_sha=None, provider_item=None, tref=None, attestation=None, spool_id=""):
     if uuid and any(m["origin"]["log"].get("messageUuid") == uuid for m in data["messages"].values()):
         return None
     if uuid and uuid in tombstoned_uuids(data):
@@ -762,10 +862,17 @@ def build_capture(data, runtime, session, transcript, text, pasted, source="prom
         if line_sha:
             log["lineSha256"] = line_sha
         binding = {"status": "bound", "boundAt": iso(now()), "attempts": 1} if line else binding
+    tref = tref or text_ref(text, pasted)
+    if via in CAPTURE_VIAS:
+        attestation = attest(capture_claims(session, tref, pasted, method, provider_item, spool_id))
+    elif via != "spool":
+        attestation = None  # transcript and rollout sync: unverified, whatever the caller passed
     msg = {"id": mid, "sessionId": session, "writer": who["hiveId"],
            "origin": {"actor": who, "at": at or iso(now()), "log": log, "binding": binding}, "capturedAt": iso(now()),
-           "capturedVia": via, "pastedOnly": pasted, "text": tref or text_ref(text, pasted), "triage": {"status": "untriaged"},
-           "humanCheck": {"isHuman": True, "method": method}}
+           "capturedVia": via, "pastedOnly": pasted, "text": tref, "triage": {"status": "untriaged"},
+           "humanCheck": {"isHuman": True, "method": method, "verified": bool(attestation)}}
+    if attestation:
+        msg["humanCheck"]["attestation"] = attestation
     if provider_item:
         msg["humanCheck"]["providerItemId"] = str(provider_item)[:200]
     emit(data, "captured", "message", mid, {"message": msg}, actor("harness", provider_of(runtime), session, "work-assignments-hook"))
@@ -794,6 +901,12 @@ def spoolable(fields: dict) -> dict:
     """Spool the redacted text reference only: raw human text never reaches disk outside the transcript."""
     out = {k: v for k, v in fields.items() if k != "text"}
     out["tref"] = text_ref(fields["text"], fields["pasted"])
+    out["spoolId"] = sha(os.urandom(16))[:16]
+    try:
+        out["attestation"] = attest(capture_claims(fields["session"], out["tref"], fields["pasted"], fields["method"],
+                                                   fields.get("item"), out["spoolId"]))
+    except (WAError, OSError, prov.Problem):
+        pass  # spooled unverified rather than lost
     return out
 
 
@@ -1037,7 +1150,8 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
              f"{len(flagged)} flagged (no owner, stopped owner or stale), {len(ix['openDecisions'])} open decision(s), "
              f"{len(no_asks)} no-ask(s), {sum(1 for r in no_asks if r['cues'])} flagged as a possible request."]
     for mid in ix["untriagedMessages"][:8]:
-        lines.append(f"  UNTRIAGED {mid}: \"{data['messages'][mid]['text'].get('excerpt', '[pasted content]')}\" -> work_assignments.py split --msg {mid} --item '...' | no-ask")
+        tag = "" if data["messages"][mid]["humanCheck"].get("verified") else " [unverified: transcript only]"
+        lines.append(f"  UNTRIAGED {mid}{tag}: \"{data['messages'][mid]['text'].get('excerpt', '[pasted content]')}\" -> work_assignments.py split --msg {mid} --item '...' | no-ask")
     for ask in ordered[:limit]:
         flag = ",".join(ask_flags(ask, policy, ts))
         lines.append(f"  {ask['id']} [{ask['state']}] owner={owner_of(ask) or 'none'}{' !' + flag if flag else ''}: "
@@ -1108,19 +1222,31 @@ def surface_warnings(data: dict, session: str) -> list:
     return lines
 
 
+_PENDING = {}  # capture to spool if the hook times out mid-transaction (the timer thread cannot see locals)
+
+
 def hook_prompt(payload: dict, runtime: str) -> dict:
     policy = load_policy()
     session = str(payload.get("session_id") or "")
     if policy["capture"] == "off":
         return {}
     fields = prompt_capture_fields(payload, runtime)
+    pending = None
+    if fields:
+        fields["item"] = None
+        pending = spoolable(fields)
+        fields["item"] = f"spool:{pending['spoolId']}"  # the store capture and any spool copy dedupe on this key
+        fields["tref"] = pending["tref"]  # computed once
+        _PENDING["prompt"] = pending
     try:
         return prompt_with_store(payload, runtime, policy, session, fields)
     except Exception as error:  # whatever stopped the store: keep the message in the spool
-        if fields:
-            spool_message({**spoolable(fields), "item": None})
+        if pending:
+            spool_message(pending)
             record_failure("prompt:spooled", error)
         raise
+    finally:
+        _PENDING.pop("prompt", None)
 
 
 def prompt_with_store(payload, runtime, policy, session, fields):
@@ -1128,8 +1254,10 @@ def prompt_with_store(payload, runtime, policy, session, fields):
     with transaction() as data:
         if fields:
             session_record(data, session, runtime, fields["transcript"])
-            build_capture(data, runtime, session, fields["transcript"], fields["text"], fields["pasted"], via="hook_prompt",
-                          method=fields["method"])
+            if not any(m["humanCheck"].get("providerItemId") == fields["item"] for m in data["messages"].values()):
+                build_capture(data, runtime, session, fields["transcript"], fields["text"], fields["pasted"], via="hook_prompt",
+                              method=fields["method"], provider_item=fields["item"], tref=fields.get("tref"),
+                              spool_id=fields["item"].split(":", 1)[1])
         if valid_session(session):
             sync_all(data, session)
         out += surface_warnings(data, session)
@@ -1246,6 +1374,15 @@ def hook_guard(payload: dict, runtime: str) -> dict:
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if isinstance(command, list):
         command = " ".join(str(part) for part in command)
+    reason = None
+    if KEY_FILE.search(blob):
+        reason = "The capture key is read and written only by work_assignments.py; tools may not touch it."
+    elif isinstance(command, str) and HOOK_CALL.search(command):
+        reason = "Hooks take their input from the harness; agents may not run `work_assignments.py hook`."
+    if reason:
+        if mode == "enforce":
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
+        return context("PreToolUse", "(warn mode) " + reason)
     if not PROTECTED.search(blob):
         return {}
     if isinstance(command, str) and SAFE_CLI.match(command):  # exactly one CLI call: no redirection, chaining or substitution
@@ -1266,6 +1403,12 @@ HOOKS = {"prompt": hook_prompt, "stop": hook_stop, "session": hook_session, "com
 
 def run_hook(name: str, runtime: str) -> int:
     def timeout():
+        pending = _PENDING.get("prompt")
+        if pending:
+            try:
+                spool_message(pending)  # deduped against a capture that did commit by its spool key
+            except OSError as error:
+                record_failure(f"{name}:timeout-spool", error)
         record_failure(f"{name}:timeout", TimeoutError(f"hook exceeded {HOOK_SECONDS:.0f}s"))
         os._exit(0)
 
@@ -1445,11 +1588,21 @@ def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, de
         raise WAError("unknown binding " + str(binding))
 
 
+def capture_event(mid: str) -> dict:
+    """The `captured` event that created message `mid`, from the event log (not the snapshot)."""
+    for ev in read_events():
+        if ev["op"] == "captured" and ev["target"]["id"] == mid:
+            return ev
+    raise WAError(f"no captured event for {mid} in the event log")
+
+
 def proof_for(data: dict, ask: dict, file: str, line: int, uuid: str, quote: str, binding: str, decision_id=None) -> dict:
     verified = verify_proof(file, line, uuid, quote)
     msg = next((m for m in data["messages"].values() if m["origin"]["log"].get("messageUuid") == uuid), None)
-    if not msg or msg.get("humanCheck", {}).get("isHuman") is not True or msg["origin"]["actor"]["kind"] != "human":
+    if not msg or msg["origin"]["actor"]["kind"] != "human":
         raise WAError("proof uuid is not a human message captured by this ledger (run `sync` first if it is recent)")
+    if not verified_human(msg):
+        raise WAError("proof message was not captured by a hook (transcript-only or unattested); it cannot cancel")
     tracked = data["sessions"].get(msg["sessionId"], {}).get("transcript")
     if not tracked or os.path.realpath(tracked) != os.path.realpath(file):
         raise WAError("proof message is not from a transcript this ledger tracks")
@@ -1459,7 +1612,8 @@ def proof_for(data: dict, ask: dict, file: str, line: int, uuid: str, quote: str
     proof = {"messageId": msg["id"], "log": {"file": file[:1024], "lineStart": line, "lineEnd": line, "messageUuid": uuid,
                                               "lineSha256": verified["lineSha256"]},
              "quoteSha256": sha(quote), "quoteExcerpt": prov.clip(quote, 160), "verifiedAt": iso(now()),
-             "verifiedBy": actor("harness", "harness", label="work-assignments"), "targets": [ask["id"]], "binding": binding}
+             "verifiedBy": actor("harness", "harness", label="work-assignments"), "targets": [ask["id"]], "binding": binding,
+             "eventId": capture_event(msg["id"])["id"], "attestationMac": msg["humanCheck"]["attestation"]["mac"]}
     if decision_id:
         proof["decisionId"] = decision_id
     return proof
@@ -1476,6 +1630,12 @@ def reverify_proof(data: dict, ask: dict) -> None:
     msg = data["messages"].get(proof["messageId"])
     if not msg:
         raise WAError("proof message is no longer in the ledger")
+    if not verified_human(msg) or msg["humanCheck"]["attestation"]["mac"] != proof.get("attestationMac"):
+        raise WAError("proof message is no longer a verified hook capture")
+    ev = capture_event(msg["id"])
+    if ev["id"] != proof.get("eventId") or (ev["data"].get("message") or {}).get("humanCheck", {}).get("attestation", {}).get("mac") \
+            != proof.get("attestationMac"):
+        raise WAError("proof does not match the captured event in the log")
     if ask["id"] not in proof["targets"]:
         raise WAError("proof does not target this ask")
     check_binding(data, ask, msg, proof["binding"], quote_stored, proof.get("decisionId"))
@@ -1566,7 +1726,8 @@ def new_ask(data, *, description, kind="request", owner="unassigned", message=No
         msg_rec = data["messages"][message]
         origin = {"actor": msg_rec["origin"]["actor"], "at": msg_rec["origin"]["at"], "messageId": message,
                   "log": msg_rec["origin"]["log"], "binding": msg_rec["origin"]["binding"]}
-        src = {"kind": "user", "ref": message}
+        src = {"kind": "user", "ref": message} if verified_human(msg_rec) else \
+            {"kind": "inferred", "ref": message, "why": "transcript-only capture with no hook attestation; not a verified user turn"}
     else:
         origin = {"actor": origin_actor or who, "at": at or iso(now())}
         src = source or {"kind": "inferred", "ref": "cli", "why": "created without a captured message"}
@@ -1660,8 +1821,10 @@ def cmd_update(args):
                     raise WAError(f"transition {cur} -> {args.state} is not allowed")
                 if cur == "done":  # reopen: only by a human-sourced message
                     msg = find_message(data, args.reopen_by) if args.reopen_by else None
-                    if not msg or not msg["humanCheck"]["isHuman"]:
-                        raise WAError("reopening a done ask needs --reopen-by M-... (a human-captured message)")
+                    if not msg or not verified_human(msg):
+                        raise WAError("reopening a done ask needs --reopen-by M-... (a hook-captured human message)")
+                    if parse_ts(msg["origin"]["at"]) < parse_ts(ask["stateSince"]) - 1:
+                        raise WAError("--reopen-by must be a message sent after the ask was done")
                     emit(data, "reopened", "ask", aid, {"by": msg["id"]}, who)
                 else:
                     payload = {"from": cur, "to": args.state, "reason": short(args.note or "update")}
@@ -1721,7 +1884,7 @@ def drop(data, ask, why, proof, kind):
     fd = os.open(archive, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         number = (os.fstat(fd).st_size and prov.read_small(archive, MAX_STORE_BYTES).count(b"\n")) or 0
-        os.write(fd, (line + "\n").encode())
+        write_all(fd, (line + "\n").encode())
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -1753,6 +1916,46 @@ def cmd_remove(args):
     print(f"{args.id} removed ({why})")
 
 
+def message_prunable(data: dict, msg: dict, ts: float) -> bool:
+    """A triaged message whose asks and decisions are all gone, past 24h (30 days for a no-ask, which the digest lists),
+    and not referenced by a live cancel proof or decision answer."""
+    age = ts - parse_ts(msg["capturedAt"])
+    triage = msg["triage"]
+    if triage["status"] == "untriaged":
+        return False
+    if triage["status"] == "no_ask":
+        if age < PRUNE_NO_ASK_DAYS * 86400:
+            return False
+    elif age < 24 * 3600 or any(a in data["asks"] for a in triage.get("askIds", [])) \
+            or any(d in data["decisions"] for d in triage.get("decisionIds", [])):
+        return False
+    for ask in data["asks"].values():
+        if (ask.get("cancellation") or {}).get("proof", {}).get("messageId") == msg["id"] or ask["origin"].get("messageId") == msg["id"]:
+            return False
+    for dec in data["decisions"].values():
+        if (dec.get("answer") or {}).get("messageId") == msg["id"]:
+            return False
+    return True
+
+
+def drop_message(data: dict, msg: dict) -> None:
+    archive = files()["archive"]
+    line = json.dumps({"archivedAt": iso(now()), "message": msg}, ensure_ascii=False, sort_keys=True)
+    fd = os.open(archive, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        number = (os.fstat(fd).st_size and prov.read_small(archive, MAX_STORE_BYTES).count(b"\n")) or 0
+        write_all(fd, (line + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    uuid = msg["origin"]["log"].get("messageUuid")
+    tomb = {"id": msg["id"], "type": "message", "finalState": "triaged", "stateSince": msg["triage"].get("at", msg["capturedAt"]),
+            "removedAt": iso(now()), "removedBy": actor("harness", "harness", label="work-assignments"),
+            "proofKind": "triaged_closed", "messageUuids": [uuid] if uuid else [],
+            "archive": {"file": archive.name, "line": number + 1}, "snapshotSha256": sha(line)}
+    emit(data, "tombstoned", "message", msg["id"], {"tombstone": tomb}, tomb["removedBy"])
+
+
 def cmd_prune(args):
     ts, removed, kept = now(), [], 0
     with transaction() as data:
@@ -1766,6 +1969,11 @@ def cmd_prune(args):
                 removed.append(ask["id"] + " (dry run)")
             else:
                 kept += 1
+        for msg in list(data["messages"].values()):
+            if message_prunable(data, msg, ts):
+                if args.apply:
+                    drop_message(data, msg)
+                removed.append(msg["id"] + ("" if args.apply else " (dry run)"))
     print(f"{'removed' if args.apply else 'would remove'} {len(removed)}: {', '.join(removed[:20])}; kept {kept}")
 
 
@@ -1823,8 +2031,8 @@ def cmd_decision(args):
             msg = find_message(data, args.msg)
             if not dec or dec["state"] not in ("asked", "assumed"):
                 raise WAError("decision not found or already closed")
-            if not msg["humanCheck"]["isHuman"] or msg["origin"]["binding"]["status"] != "bound":
-                raise WAError("an answer needs a human message bound to a transcript line (run `sync`)")
+            if not verified_human(msg) or msg["origin"]["binding"]["status"] != "bound":
+                raise WAError("an answer needs a hook-captured human message bound to a transcript line (run `sync`)")
             answer = {"actor": msg["origin"]["actor"], "at": msg["origin"]["at"], "messageId": msg["id"], "log": msg["origin"]["log"],
                       "binding": msg["origin"]["binding"], "text": msg["text"]}
             emit(data, "answered", "decision", dec["id"], {"answer": answer}, msg["origin"]["actor"])

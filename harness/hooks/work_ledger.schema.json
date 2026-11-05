@@ -155,7 +155,14 @@
     "tombstones": {
       "type": "object",
       "propertyNames": {
-        "$ref": "#/$defs/recordId"
+        "anyOf": [
+          {
+            "$ref": "#/$defs/recordId"
+          },
+          {
+            "$ref": "#/$defs/messageId"
+          }
+        ]
       },
       "additionalProperties": {
         "$ref": "#/$defs/tombstone"
@@ -1119,7 +1126,9 @@
         "verifiedAt",
         "verifiedBy",
         "targets",
-        "binding"
+        "binding",
+        "eventId",
+        "attestationMac"
       ],
       "properties": {
         "messageId": {
@@ -1171,6 +1180,14 @@
         },
         "decisionId": {
           "$ref": "#/$defs/decisionId"
+        },
+        "eventId": {
+          "$ref": "#/$defs/eventId",
+          "description": "The captured event of the proving message; re-read from the event log at removal."
+        },
+        "attestationMac": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         }
       }
     },
@@ -2273,13 +2290,21 @@
       ],
       "properties": {
         "id": {
-          "$ref": "#/$defs/recordId"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/recordId"
+            },
+            {
+              "$ref": "#/$defs/messageId"
+            }
+          ]
         },
         "type": {
           "type": "string",
           "enum": [
             "ask",
-            "decision"
+            "decision",
+            "message"
           ]
         },
         "finalState": {
@@ -2289,7 +2314,8 @@
             "cancelled",
             "superseded",
             "answered",
-            "withdrawn"
+            "withdrawn",
+            "triaged"
           ]
         },
         "stateSince": {
@@ -2306,7 +2332,8 @@
           "enum": [
             "verified_evidence",
             "user_proof",
-            "superseded_by_closed"
+            "superseded_by_closed",
+            "triaged_closed"
           ]
         },
         "proof": {
@@ -2837,6 +2864,74 @@
           "type": "string",
           "maxLength": 200,
           "description": "Claude message uuid or Codex rollout item id, used for dedup."
+        },
+        "verified": {
+          "type": "boolean",
+          "description": "True only for a capture delivered to a hook by the harness (UserPromptSubmit, AskUserQuestion PostToolUse, or a spool line those hooks wrote) whose attestation this machine's key confirms. Transcript and rollout sync captures are false."
+        },
+        "attestation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "alg",
+            "keyId",
+            "claims",
+            "mac"
+          ],
+          "description": "HMAC-SHA256 over the canonical JSON of claims, keyed by the per-machine work-ledger.key (0600).",
+          "properties": {
+            "alg": {
+              "const": "hmac-sha256"
+            },
+            "keyId": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{16}$"
+            },
+            "mac": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "claims": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "v",
+                "session",
+                "textSha256",
+                "pasted",
+                "method",
+                "item",
+                "spoolId"
+              ],
+              "properties": {
+                "v": {
+                  "const": 1
+                },
+                "session": {
+                  "type": "string",
+                  "maxLength": 128
+                },
+                "textSha256": {
+                  "$ref": "#/$defs/sha256"
+                },
+                "pasted": {
+                  "type": "boolean"
+                },
+                "method": {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                "item": {
+                  "type": "string",
+                  "maxLength": 200
+                },
+                "spoolId": {
+                  "type": "string",
+                  "maxLength": 64
+                }
+              }
+            }
+          }
         }
       }
     }

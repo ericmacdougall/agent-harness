@@ -38,6 +38,19 @@ cannot take (lock stall over 3 s, store error) is appended lock-free to the spoo
 drained exactly once by the next transaction. Codex hooks need the one-time `/hooks` trust; until then any harness hook
 on the machine also discovers new `~/.codex/sessions` rollouts and catches up their human turns.
 
+### Verified captures
+
+Only a capture made from input the harness hands to a hook is a verified human turn. That means UserPromptSubmit,
+AskUserQuestion PostToolUse, or a spool line one of those hooks wrote. Each one gets `humanCheck.attestation`: an
+HMAC-SHA256 over the session, the text sha256, the pasted flag, the method, the provider item and a spool nonce. The
+key is a 32-byte per-machine key in `$AGENT_HARNESS_HOME/work-ledger.key` (mode 0600, created atomically on first use,
+outside `~/.agent-harness/work`). Turns caught up from a transcript or Codex rollout are still captured, so a missed
+hook loses nothing, but with `verified: false`. They show in the digest as `[unverified: transcript only]`, and an ask
+split from one has source kind `inferred`, not `user`. A cancel proof, a decision answer and `--reopen-by` all need a
+verified message. A cancel proof also records the captured event id and its MAC, and both are re-checked against the
+event log at removal. A transcript line alone never proves anything. The guard refuses any tool call that names the
+key, and any agent call of `work_assignments.py hook`.
+
 ## CLI
 
 ```
@@ -99,11 +112,13 @@ restoring `work-ledger.events.jsonl` and running `work_assignments.py recover` r
 A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt and no request cues, and an excerpt whose words mention a password, secret,
 token, key, credential, PIN or OTP is withheld entirely, because the redactor is a heuristic. Request cues are English keyword heuristics: they miss requests phrased without them and flag some messages that are not requests. A superseded ask is removable only when its replacement, a different ask, is done with verified evidence.
 
-Transcripts are the root of trust: an agent able to append a forged human line to its own transcript can forge
-a capture or a cancel proof, and the guard's pattern match can be evaded (for example by building the path from
-pieces). The guard is best effort against shell tricks (a safety net for careless edits, not a sandbox); the event chain has
-no external anchor; a payload over 8 MB is rejected and recorded as a failure; messages are not pruned (a triaged
-message could be archived later); decisions have no removal path yet; session caches (sync offsets, stop-block
+Agents run as the same Unix user as the hooks. A forged transcript line, a hand-written spool line or event, and a
+copied or invented attestation are all refused. An agent that deliberately evades the guard (for example by building
+the key path from pieces) can still read the key or run the hook entry point with forged input. The attestation turns
+forging from appending one line into deliberately getting around a control, but it is not a cryptographic boundary;
+that needs a separate Unix user or a key the OS holds. The guard is best effort against shell tricks (a safety net for careless edits, not a sandbox); the event chain has
+no external anchor; a payload over 8 MB is rejected and recorded as a failure; `prune` archives a triaged message (with a tombstone that refuses re-capture) once its asks and decisions are gone and
+24 hours have passed, or after 30 days for a no-ask; decisions have no removal path yet; session caches (sync offsets, stop-block
 counters) are outside the fold by design. The first-touch sync window is the last 64 KB.
 
 ## dev2 sync (proposal, not built)

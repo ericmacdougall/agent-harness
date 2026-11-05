@@ -713,6 +713,8 @@
             "lineSha256": "aaaa000000000000000000000000000000000000000000000000000000000002"
           },
           "quoteSha256": "aaaa000000000000000000000000000000000000000000000000000000000003",
+          "eventId": "E-m2air-104",
+          "attestationMac": "aaaa000000000000000000000000000000000000000000000000000000000004",
           "quoteExcerpt": "[fake] never mind the csv removal, cancel it",
           "verifiedAt": "2026-11-03T08:02:00Z",
           "verifiedBy": {
