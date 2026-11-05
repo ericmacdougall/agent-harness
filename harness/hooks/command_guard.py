@@ -1672,6 +1672,12 @@ class Analyzer:
     def heredoc(self, rd, name, words, pl, idx, depth):
         ctx = self.ctx
         body = rd.body
+        if body and PROTECTED_TEXT.search(body) and any(f.category == LOG_DELETE for f in fallback_scan(body, ctx.c)):
+            # writing deletion text for a protected location through a shell heredoc (even into a data file) is the
+            # incident mechanism: warn, and point at the file-writing tool. A real deletion still blocks below.
+            ctx.add(PARSE, 'heredoc-destructive-text',
+                    'a heredoc body contains a deletion of a protected harness location, and heredoc text passes '
+                    'through the shell', 'write test data or scripts with the editor\'s file-writing tool instead')
         if name in SHELLS or name in PS_SHELLS or name in ('at', 'batch') or (
                 name in ('source', '.') and any(w.text in ('/dev/stdin', '-') for w in words[1:])):
             self.script(body, depth + 1, tail_visible=True, ps=name in PS_SHELLS)

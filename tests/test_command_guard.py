@@ -124,6 +124,14 @@ class CorpusTests(Fixture):
     def test_work_tree_allows(self):
         self.expect(corpus.NEG15_WORK_ALLOW, 'allow', label='NEG15_WORK_ALLOW')
 
+    def test_heredoc_with_destructive_text_is_never_silent(self):
+        # warn, never block: writing or printing the text is not a deletion, but it must not pass silently
+        self.expect(corpus.HEREDOC_DESTRUCTIVE_WARN, 'warn', label='HEREDOC_DESTRUCTIVE_WARN')
+        for cmd in corpus.HEREDOC_DESTRUCTIVE_WARN:
+            self.assertIn('heredoc-destructive-text', self.decide(cmd)[1], cmd)
+        self.expect(corpus.HEREDOC_DESTRUCTIVE_BLOCK, 'block', label='HEREDOC_DESTRUCTIVE_BLOCK')
+        self.expect(corpus.HEREDOC_PLAIN_ALLOW, 'allow', label='HEREDOC_PLAIN_ALLOW')
+
     def test_kill_positive_warns_or_blocks(self):
         self.expect(corpus.KILL_POSITIVE, ('warn', 'block'), label='KILL_POSITIVE')
 

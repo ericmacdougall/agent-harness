@@ -356,6 +356,8 @@ Blocked: `rclone config show|dump|file|redacted|reconnect|paste`, a bare `rclone
 
 The command is lexed like a shell before any rule runs. The lexer handles quotes, `$'..'`, escapes, line continuations, heredocs (the body ends at its delimiter and the rest of the text is commands again), `$(..)`, backticks, pipes, redirects, brace expansion, prefix assignments, wrappers (`sudo`, `env`, `nice -n`, `timeout`, `xargs` including its here-string, `< <(..)` and `-a` input, package runners `npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `npm exec`, `uvx` and `pipx run`, `eval "$(..)"`, `flock`, `script -c`, `tmux send-keys`, `osascript`, `at`), `sh -c` strings, `ssh` and `docker exec` commands, scripts written and then run in the same command, `$(which rm)`, absolute binary paths, and case and Unicode lookalikes. An unterminated quote or substitution, nesting that is too deep, or input over the analysis budget is blocked when the raw text names a protected location, a secret source, or a code-execution step (a pipe into a shell, `eval`, `-c` or `-e` code, a decoder) together with a destructive verb. Otherwise it is a warning. Block messages are passed through `redact.py` and never echo a secret.
 
+A heredoc whose body contains a deletion of a protected location gets an advisory warning even when the heredoc only prints the text or writes it to a file, such as test data or a commit message. Heredoc text passes through the shell, which is how the incident happened. The warning points to the editor's file-writing tool and does not block. Interpreter heredocs are scanned as code and still block.
+
 The guard never emits an explicit allow, so the host's own permission flow still applies.
 
 ### Fail closed

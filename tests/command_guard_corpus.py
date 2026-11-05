@@ -595,7 +595,6 @@ NEGATIVE = [
     'git status',
     'git log --oneline',
     'git commit -m "docs: never run rclone config show"',
-    "git commit -m \"$(cat <<'EOF'\nfeat: guard rclone config show\n\nrm -rf ~/.claude/projects is blocked\nEOF\n)\"",
     'git commit -F /tmp/msg.txt',
     'echo "rclone config show" > notes.txt',
     'grep "rclone config show" docs/operations.md',
@@ -681,7 +680,6 @@ NEGATIVE = [
     'echo done > /tmp/flag',
     'touch ~/.claude/x.flag',
     'cat <<EOF > /tmp/note.txt\nhello\nEOF',
-    "cat <<'EOF'\nrm -rf ~/.claude/projects\nEOF",
 ]
 NEGATIVE_PS = [
     'Get-Content README.md',
@@ -702,5 +700,25 @@ WRAPPERS_POSITIVE = [
 WRAPPERS_NEGATIVE = [
     'env A=1 {}', 'command {}', 'timeout 9 {}', 'nice {}', '({})', '{{ {}; }}', 'true && {}', 'time {}',
     "bash -c '{}'", 'echo pre; {}',
+]
+# heredocs that only write a data file but carry protected-location deletion text through the shell: the owner's
+# own slip in the final round of GoodQA #14471 (advisory warning, never silent)
+HEREDOC_DESTRUCTIVE_WARN = [
+    "cat > rows.py <<'PY'\nROWS = [{'cmd': 'rm -rf ~/.claude/projects'}]\nPY",
+    "cat >> probe.txt <<EOF\nxargs rm -rf <<< \"$HOME/.claude/projects\"\nEOF",
+    "tee data.json > /dev/null <<'J'\n[\"rm -rf ~/.codex/sessions\"]\nJ",
+    # formerly a must-allow row: a commit message built in a heredoc that quotes the deletion. It still runs
+    # (warn is advisory), but the agent is told to use a message file written with the file tool
+    "git commit -m \"$(cat <<'EOF'\nfeat: guard rclone config show\n\nrm -rf ~/.claude/projects is blocked\nEOF\n)\"",
+    # formerly a must-allow row: printing the text (not running it) still warns, and is never blocked
+    "cat <<'EOF'\nrm -rf ~/.claude/projects\nEOF",
+]
+# interpreter code is scanned as code, and its deletion text already blocks
+HEREDOC_DESTRUCTIVE_BLOCK = [
+    "python3 - <<'PY'\nopen('rows.py', 'w').write(\"ROWS = ['rm -rf ~/.claude/wals']\")\nPY",
+]
+HEREDOC_PLAIN_ALLOW = [
+    "cat > notes.md <<'EOF'\nThe guard protects ~/.claude/projects.\nEOF",
+    "cat > clean.sh <<'EOF'\nrm -rf build\nEOF",
 ]
 SEED = 14471
