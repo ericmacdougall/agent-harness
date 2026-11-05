@@ -1389,6 +1389,10 @@
                 "endedAt": {
                   "$ref": "#/$defs/timestamp"
                 },
+                "reopenedAt": {
+                  "$ref": "#/$defs/timestamp",
+                  "description": "Last reopen; a tested evidence note must be written after it."
+                },
                 "lastCheckedAt": {
                   "$ref": "#/$defs/timestamp",
                   "description": "Last time an actor confirmed owner and state; stale after policy stale_hours."

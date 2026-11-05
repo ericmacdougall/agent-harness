@@ -45,6 +45,10 @@ def validator(ref=None):
     return jsonschema.Draft202012Validator(schema)
 
 
+REAL_WAL_HAS_TEST = wa.wal_has_test
+REAL_REDACT = wa.redact
+
+
 class Base(unittest.TestCase):
     real_redact = staticmethod(wa.redact)
 
@@ -62,7 +66,7 @@ class Base(unittest.TestCase):
                                                 "CLAUDE_CODE_ENTRYPOINT": "cli"}),
                    mock.patch.object(wa, "now", lambda: CLOCK[0]),
                    mock.patch.object(wa, "commit_exists", lambda sha, repo=None: sha.startswith("abc")),
-                   mock.patch.object(wa, "wal_has_test", lambda entry: entry.startswith("wal")),
+                   mock.patch.object(wa, "wal_has_test", lambda entry, session=None, since=0.0: entry.startswith("wal")),
                    mock.patch.object(wa, "redact", lambda text: text.replace("sk-secretsecretsecret1", "[redacted]"))]
         for patch in patches:
             patch.start()
@@ -315,6 +319,15 @@ class CaptureTest(Base):
         self.hook("session", {"session_id": SID, "transcript_path": str(self.transcript)})
         self.assertEqual(self.data()["messages"], {})
         self.assertTrue(self.data()["sessions"]["01a16a08-4480-78d3-83f9-b84140f2ebd9"]["headless"])
+
+    def test_codex_subagent_prompt_with_parent_session_id_is_not_human(self):
+        """Spec review v5 #9b: Codex subagent hooks carry the parent session id and no agent_id (documented); the
+        subagent rollout header identifies them."""
+        rollout = self.codex_rollout("rollout-sub-parent.jsonl", {"source": {"subagent": {"thread_spawn": {"parent_thread_id": "p"}}}},
+                                     "write the review report now", "01a16512-0d07-78f3-b199-70f1db8736e0")
+        self.hook("prompt", {"session_id": "codex-parent-1", "transcript_path": str(rollout),
+                             "prompt": "write the review report now", "turn_id": "t1"}, runtime="codex")
+        self.assertEqual(self.data().get("messages", {}), {})
 
     def test_codex_interactive_rollout_is_still_captured(self):
         """Control for the headless check: a vscode/cli rollout header stays a human session."""
@@ -1221,6 +1234,43 @@ class StoreTest(Base):
         self.assertEqual(self.cli("recover")[0], 0)
         self.assertIn(aid, self.asks())
 
+    def test_real_wal_check_needs_a_fresh_really_tested_note_in_this_session(self):
+        """Spec review v5 #3: any line on the host containing REALLY_TESTED, from any session, verified a tested id."""
+        _, aid = self.split("ship it", "ship the exporter fix")
+        ask = self.asks()[aid]
+        wal = Path(self.tmp.name) / ".claude" / "wals" / SID / "main.jsonl"
+        other = Path(self.tmp.name) / ".claude" / "wals" / "other-session-9999" / "main.jsonl"
+        wal.parent.mkdir(parents=True, exist_ok=True)
+        other.parent.mkdir(parents=True, exist_ok=True)
+        at = wa.iso(CLOCK[0] + 5)
+        rows = [{"id": "wgood00001", "at": at, "event": "check", "note": "REALLY_TESTED exp-1: unittest Ran 3 OK"},
+                {"id": "wmention01", "at": at, "event": "result", "note": "review result; REALLY_TESTED ids pending"},
+                {"id": "wold000001", "at": wa.iso(CLOCK[0] - 3600), "event": "check", "note": "REALLY_TESTED old-1: before the ask"}]
+        wal.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        other.write_text(json.dumps({"id": "wother0001", "at": at, "event": "check", "note": "REALLY_TESTED x: other"}) + "\n")
+        session, since = wa.evidence_scope(ask)
+        got = {e: REAL_WAL_HAS_TEST(e, session, since) for e in ("wgood00001", "wmention01", "wold000001", "wother0001")}
+        self.assertEqual(got, {"wgood00001": True, "wmention01": False, "wold000001": False, "wother0001": False})
+        self.assertFalse(REAL_WAL_HAS_TEST("wgood00001", None, 0.0))
+        with mock.patch.object(wa, "wal_has_test", REAL_WAL_HAS_TEST):
+            self.cli("update", aid, "--owner", "main")
+            self.assertEqual(self.cli("update", aid, "--evidence", "tested:wother0001")[0], 2)
+            self.assertEqual(self.cli("update", aid, "--evidence", "tested:wgood00001")[0], 0)
+
+    def test_real_redactor_removes_credential_and_pii_shapes(self):
+        """Spec review v5 #8: live keys, GitLab tokens, JWTs, card numbers and SSNs survived into excerpts."""
+        corpus = {"sk_live_" + "a1B2c3D4e5F6g7H8": "stripe", "glpat-" + "Abc123def456ghi789jk": "gitlab",
+                  "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig": "jwt", "4111 1111 1111 1111": "card",
+                  "4111-1111-1111-1111": "card-dash", "078-05-1120": "ssn", "ghp_" + "A" * 36: "github",
+                  "xoxb-" + "1234567890-abcdef": "slack"}
+        with mock.patch.object(wa, "redact", REAL_REDACT):
+            for raw, label in corpus.items():
+                out = wa.excerpt_of(f"please deploy with {raw} today")
+                self.assertNotIn(raw, out, label)
+                self.assertNotIn(raw.replace(" ", "")[:10], out.replace(" ", ""), label)
+            self.assertEqual(wa.excerpt_of("please fix issue 1234 on line 56 by 2027-01-15"),
+                             "please fix issue 1234 on line 56 by 2027-01-15")
+
     def test_no_cli_option_sets_a_time(self):
         """NEG-33 (spec review v5 F12): timestamps are harness-minted; no subcommand may accept a time or date."""
         import argparse
@@ -1355,12 +1405,21 @@ class GuardTest(Base):
 
     def test_guard_denies_codex_payload_shapes(self):
         snap = str(wa.files()["snap"])
-        for payload in ({"tool_name": "apply_patch", "tool_input": {"input": f"*** Update File: {snap}\n+x"}},
+        for payload in ({"tool_name": "apply_patch", "tool_input": {"command": f"*** Begin Patch\n*** Update File: {snap}\n+x\n*** End Patch"}},
+                        {"tool_name": "apply_patch", "tool_input": {"input": f"*** Update File: {snap}\n+x"}},
                         {"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", f"echo x > {snap}"]}},
                         {"tool_name": "local_shell", "tool_input": {"command": ["rm", snap]}}):
             reply = self.hook("guard", payload, runtime="codex")
             self.assertEqual(reply["hookSpecificOutput"]["permissionDecision"], "deny", payload["tool_name"])
         self.assertEqual(self.hook("guard", {"tool_name": "shell", "tool_input": {"command": ["cat", snap]}}, runtime="codex"), {})
+
+    def test_codex_apply_patch_body_is_file_text_not_a_command(self):
+        """Spec review v5 #9c: the documented apply_patch shape (tool_input.command) editing the docs, whose text names
+        the ledger files and the hook command, was denied."""
+        body = ("*** Begin Patch\n*** Update File: docs/work-assignments.md\n+The ledger is ~/.agent-harness/work-ledger.json; "
+                "never run `python3 work_assignments.py hook prompt`; the key is work-ledger.key.\n"
+                "+import work_assignments\n*** End Patch")
+        self.assertEqual(self.hook("guard", {"tool_name": "apply_patch", "tool_input": {"command": body}}, runtime="codex"), {})
 
     def test_guard_crash_exits_zero_and_records_a_failure(self):
         with mock.patch.object(wa, "load_policy", side_effect=RuntimeError("policy exploded")):

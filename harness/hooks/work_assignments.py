@@ -90,6 +90,13 @@ CONTENT_KEYS = {"content", "old_string", "new_string", "new_source", "edits"}
 PATCH_HEADER = re.compile(r"(?m)^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$")
 
 
+PATCH_START = re.compile(r"\s*\*\*\* Begin Patch\b")
+
+
+def is_patch(command) -> bool:
+    return isinstance(command, str) and bool(PATCH_START.match(command))
+
+
 def guard_targets(tool_input) -> tuple:
     """(paths, command): what a tool call reads or writes, never the text it writes. An apply_patch body counts only
     for its file headers, so editing a file whose text mentions the ledger (its docs, its tests) is not a write to it."""
@@ -98,6 +105,8 @@ def guard_targets(tool_input) -> tuple:
     command = tool_input.get("command")
     if isinstance(command, list):
         command = " ".join(str(part) for part in command)
+    if is_patch(command):  # Codex apply_patch (documented: tool_input.command): only its file headers are targets
+        return PATCH_HEADER.findall(command), ""
     paths = []
     for key, value in tool_input.items():
         if key in CONTENT_KEYS or key == "command" or not isinstance(value, str):
@@ -652,6 +661,7 @@ def apply_event(data: dict, ev: dict) -> None:
         touch(rec, ev)
     elif op == "reopened":
         rec["state"], rec["stateSince"] = "in_progress", ev["at"]
+        rec.setdefault("times", {})["reopenedAt"] = ev["at"]
         rec.pop("removableAfter", None)
         rec["completion"] = {"status": "none"}
         rec.get("times", {}).pop("endedAt", None)
@@ -957,11 +967,25 @@ def drain_spool(data: dict) -> None:
 
 # --------------------------------------------------------------------------- capture
 
+# Credential and PII shapes the shared redactor does not know. Applied to a bounded window (at most 15 x 40 chars).
+SECRET_SHAPES = tuple(re.compile(rx) for rx in (
+    r"\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{8,}",              # Stripe-style keys
+    r"\bglpat-[A-Za-z0-9_-]{12,}",                                # GitLab personal access token
+    r"\bgh[pousr]_[A-Za-z0-9]{20,}",                              # GitHub tokens
+    r"\bxox[abprs]-[A-Za-z0-9-]{10,}",                            # Slack tokens
+    r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)?",  # JWT header.payload[.signature]
+    r"(?<![\d-])(?:\d[ -]?){12,18}\d(?![\d-])",                    # card-like 13-19 digit runs
+    r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)",                            # SSN shape
+))
+
+
 def redact(text: str) -> str:
     try:
         from integrate_local import redact_output
         text = redact_output(text)
         text = re.sub(r"(?i)\b(pass(?:word|wd)?|pwd|secret|token|api[_ -]?key)\s+(?![\[\"'])\S+", r"\1 [redacted]", text)
+        for pattern in SECRET_SHAPES:
+            text = pattern.sub("[redacted]", text)
         return re.sub(r"\b[0-9a-fA-F]{32,}\b", "[redacted]", text)
     except Exception:  # never store an unredacted excerpt when the redactor is unavailable
         return "[excerpt withheld: redactor unavailable]"
@@ -1658,6 +1682,8 @@ def hook_guard(payload: dict, runtime: str) -> dict:
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if isinstance(command, list):
         command = " ".join(str(part) for part in command)
+    if is_patch(command):
+        command = None  # a patch body is file text, not a shell command: only its headers are checked below
     reason = None
     if names_key(tool_input):
         reason = "The capture key is read and written only by work_assignments.py; tools may not touch it."
@@ -1748,13 +1774,18 @@ def git_branch(repo=None) -> str:
         return "HEAD"
 
 
-def wal_has_test(entry: str) -> bool:
-    """A REALLY_TESTED WAL note with this id exists in a session or Codex WAL on this host (bounded scan)."""
-    roots = [Path.home() / ".claude" / "wals", base() / "codex-wals"]
-    deadline, needle = time.monotonic() + 4.0, f'"id":"{entry}"'.encode()
-    for root in roots:
+def wal_has_test(entry: str, session=None, since: float = 0.0) -> bool:
+    """A WAL note with this entry id whose text starts with REALLY_TESTED, in the ask's own session WAL directory
+    (its main WAL or its agents' WALs), written at or after `since` (the ask's creation or last reopen). A note that
+    only mentions REALLY_TESTED, another session's note, or an older note does not count."""
+    if not session or not valid_session(str(session)):
+        return False
+    name = prov.safe_name(str(session))
+    dirs = [Path.home() / ".claude" / "wals" / name, base() / "codex-wals" / name]
+    deadline, needle = time.monotonic() + 4.0, f'"{entry}"'.encode()  # any separator style; the parsed id decides
+    for folder in dirs:
         try:
-            paths = [Path(e.path) for d in os.scandir(root) if d.is_dir() for e in os.scandir(d.path) if e.name.endswith(".jsonl")]
+            paths = [Path(e.path) for e in os.scandir(folder) if e.name.endswith(".jsonl") and e.is_file()]
         except OSError:
             continue
         for path in paths:
@@ -1762,11 +1793,24 @@ def wal_has_test(entry: str) -> bool:
                 return False
             try:
                 for line in prov._lines_containing(path, needle):
-                    if line and b"REALLY_TESTED" in line:
+                    try:
+                        rec = prov.loads_line(line) if line else None
+                    except ValueError:
+                        continue
+                    if not isinstance(rec, dict) or rec.get("id") != entry or not isinstance(rec.get("note"), str):
+                        continue
+                    if rec["note"].lstrip().startswith("REALLY_TESTED") and parse_ts(rec.get("at")) >= since:
                         return True
             except prov.Problem:
                 continue
     return False
+
+
+def evidence_scope(ask: dict) -> tuple:
+    """(session, since) for a tested id: the ask's origin session, and its creation or last reopen time."""
+    times = ask.get("times", {})
+    since = max(parse_ts(ask.get("createdAt")), parse_ts(times.get("reopenedAt")))
+    return ask["origin"]["actor"].get("sessionId"), since
 
 
 def verification(status, method="none", system=None, who=None, detail=None) -> dict:
@@ -1780,7 +1824,7 @@ def verification(status, method="none", system=None, who=None, detail=None) -> d
     return out
 
 
-def parse_evidence(text: str, who: dict, repo=None, span_id=None) -> dict:
+def parse_evidence(text: str, who: dict, repo=None, span_id=None, ask=None) -> dict:
     """Format plus what can be checked offline: a commit must exist locally (git-object), a tested id must be a
     REALLY_TESTED WAL note (wal-really-tested). PR numbers and URLs cannot be checked here and stay attested."""
     text = text.strip()
@@ -1795,8 +1839,10 @@ def parse_evidence(text: str, who: dict, repo=None, span_id=None) -> dict:
                 raise WAError(f"commit {ref} not found in {repo or os.getcwd()} (pass --repo PATH)")
             item["verification"] = verification("verified", "git-object", f"git:{repo or os.getcwd()}")
         elif kind == "tested":
-            if not wal_has_test(ref):
-                raise WAError(f"no REALLY_TESTED WAL note with id {ref} on this host")
+            session, since = evidence_scope(ask) if ask else (None, 0.0)
+            if not wal_has_test(ref, session, since):
+                raise WAError(f"no WAL note {ref} starting with REALLY_TESTED in this ask's session WAL, written after the "
+                              "ask was created or reopened")
             item["verification"] = verification("verified", "wal-really-tested", "agent WAL")
         else:
             item["verification"] = verification("attested")
@@ -2013,7 +2059,7 @@ def reverify_evidence(ask: dict, item: dict) -> bool:
         repo = next((c["repo"] for c in ask.get("completion", {}).get("commits", []) if c["sha"] == item["ref"]), None)
         return commit_exists(item["ref"], repo)
     if item["kind"] == "tested":
-        return wal_has_test(item["ref"])
+        return wal_has_test(item["ref"], *evidence_scope(ask))
     return False
 
 
@@ -2173,7 +2219,7 @@ def cmd_update(args):
             if target["state"] in CLOSED:
                 raise WAError("the superseding ask is already closed")
         for text in args.evidence or ():
-            item = parse_evidence(text, who, args.repo)
+            item = parse_evidence(text, who, args.repo, ask=ask)
             item["id"] = f"V-{len(ask['evidence']) + 1}"
             emit(data, "evidence", "ask", aid, {"evidence": item}, who)
         if args.owner is not None:

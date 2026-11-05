@@ -131,6 +131,14 @@ one fails loudly and is never folded as empty (the hook records a failure and ex
 outside the fold: idle ones are dropped after 14 days (headless Codex rollouts after 2), unless the session holds an
 ask or an untriaged message. Rollout discovery reads at most 40 new rollout headers per hook call, newest first.
 
+Evidence. A `tested:<id>` item is verified only when that WAL entry's note starts with `REALLY_TESTED`, it sits in
+the ask's own session WAL directory (its main WAL or its agents' WALs), and it was written after the ask was created
+or last reopened. A commit is verified when it exists in the named repo; whether it fixes the ask is main's review.
+
+Codex payloads. `apply_patch` carries its patch in `tool_input.command`; only its file headers are guard targets.
+Codex subagent hooks carry the parent session id and no `agent_id`; their prompts are recognised by the subagent
+rollout (`session_meta` `source.subagent`). Live Codex confirmation is pending (codex-live).
+
 ## Known limits
 
 A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt and no request cues, and an excerpt whose first 15 words look secret-adjacent
