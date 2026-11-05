@@ -24,7 +24,9 @@ def tuples_from_hooks(hooks: dict):
             for h in g["hooks"]:
                 toks = doctor.flatten(h)
                 script = next((Path(t).name for t in toks if t.endswith(".py")), None)
-                arg = toks[-1] if script and toks[-1] != toks[[Path(t).name for t in toks].index(script)] else None
+                names = [Path(t).name for t in toks]
+                # the verb right after the script; a Codex handler may end in `|| exit 2`
+                arg = toks[names.index(script) + 1] if script and names.index(script) + 1 < len(toks) else None
                 out.add((event, script, arg))
     return out
 

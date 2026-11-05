@@ -65,7 +65,7 @@ Claude Code's `--safe-mode` disables `CLAUDE.md` and hooks, including the WAL ga
 To uninstall, follow these steps:
 
 1. Remove the marked block from `CLAUDE.md`.
-2. Remove the harness entries from `settings.json`: the hook entries pointing at `~/.claude/hooks/wal.py`, `~/.claude/hooks/commit_policy.py`, `~/.claude/hooks/spec_flow.py` or `~/.claude/hooks/command_guard_hook.py`, and the harness permission rules.
+2. Remove the harness entries from `settings.json`: the hook entries pointing at `~/.claude/hooks/wal.py`, `~/.claude/hooks/commit_policy.py`, `~/.claude/hooks/spec_flow.py`, `~/.claude/hooks/merge_gate.py` or `~/.claude/hooks/command_guard_hook.py`, and the harness permission rules.
 3. Run `python3 ~/.claude/hooks/commit_policy.py uninstall-git-hook`.
 4. If installed, run `~/.agent-harness/bin/netwatch uninstall`, delete the binary, and pass `--no-netwatch` to any later install.
 5. Remove the copied agents and helper scripts. Restore a backup if you want the exact earlier state.
