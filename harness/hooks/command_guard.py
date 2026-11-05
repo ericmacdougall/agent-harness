@@ -327,7 +327,7 @@ class Budget:
 
 
 class Word:
-    __slots__ = ('alts', 'subs', 'vars', 'glob', 'quoted', 'dynamic', 'single_only', 'overflow')
+    __slots__ = ('alts', 'subs', 'vars', 'glob', 'quoted', 'dynamic', 'single_only', 'overflow', 'raw')
 
     def __init__(self):
         self.alts = ['']
@@ -338,6 +338,7 @@ class Word:
         self.dynamic = False  # contains an unresolved expansion
         self.single_only = False
         self.overflow = None  # raw text of a brace expansion that exceeded the 32-alternative cap
+        self.raw = None       # the word's exact source text; None for a word the lexer did not read from the input
 
     @property
     def text(self):
@@ -765,6 +766,7 @@ class Lexer:
             if w is None:
                 i += 1
                 continue
+            w.raw = s[i:j]
             if wait_target is not None:
                 wait_target.target = w
                 if wait_target.op in ('<<', '<<-'):
@@ -1294,6 +1296,9 @@ class Analyzer:
                     'on its own', 'run that gh command by itself')
         return ctx.findings
 
+    def check_tokens(self, tokens):
+        """Seam for a subclass that must see the token stream before parse() ends a command at an operator."""
+
     def script(self, text, depth, tail_visible=None, ps=None):
         ctx = self.ctx
         if depth > ctx.budget.max_depth:
@@ -1305,6 +1310,7 @@ class Analyzer:
             ctx.tail_visible = tail_visible
         try:
             tokens = Lexer(ctx, ctx.ps).lex(text)
+            self.check_tokens(tokens)
             for pipeline in parse(tokens):
                 self.pipeline(pipeline, depth)
         finally:
@@ -1494,6 +1500,7 @@ class Analyzer:
         out.alts = [VAR_MARKER.sub(sub, a) for a in word.alts]
         out.subs, out.vars, out.glob, out.quoted = word.subs, word.vars, word.glob, word.quoted
         out.dynamic = word.dynamic or unresolved
+        out.raw = word.raw
         return out
 
     # ---- single command

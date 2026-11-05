@@ -430,7 +430,7 @@ Run `replay` over recent transcripts and the red-team hold-out set before the en
 | interpreter code (`-c`, `-e`, here-documents, here-strings) or PowerShell text that mentions `kill`, `terminate(`, `send_signal`, `taskkill`, `Invoke-CimMethod` or `GetProcessById` (a liveness probe `os.kill(pid, 0)` is exempt) | blocked; this is deliberately broad and can block code that merely prints the word. Set `script_kill_pattern` to an empty string in the policy to turn this check off |
 | `find -exec kill`, `parallel kill`, `netwatch orphans --kill` with `--all`, `--force`, `--match` or without `--pid` | blocked |
 | `kill PID...` with literal PIDs | allowed only when every PID is proven yours (below) |
-| `kill -0` with literal PIDs or one quoted simple variable (`"$PID"`), `kill -l`, `kill -L`, `kill %N`, `kill $!` after a background job in the same input, `pgrep`, `ps`, `lsof`, `timeout -s KILL`, text that only contains the word | allowed |
+| `kill -0` with literal PIDs or one quoted simple variable (`"$PID"`), `kill -l`, `kill -L`, job specs (`kill %N`, `%%`, `%+`, `%-`, `%name`), `pgrep`, `ps`, `lsof`, `timeout -s KILL`, text that only contains the word | allowed |
 | `kill -0` with a dash word anywhere among its targets (procps `/usr/bin/kill` reads options after the PID), an unquoted or operator variable (`$PID`, `${x:-..}`), `"$@"`, an array, a substitution or glob, or fed by `xargs` | blocked: the probe shortcut ends, and the targets are judged like any kill |
 | a `kill` whose option words (the words before the PID list) are not single literal tokens: `-SIG`, `-NUM`, `-s SIG`, `-n SIG`, `--signal SIG`, `--signal=SIG`, `--`; or that has a quoted, expanded, braced or globbed option word, an unknown long option, or any dash word after the first signal option; `kill -l` with an expanded or quoted word | blocked as `unprovable-target`; bash and zsh read these words differently from each other and from a text scan, so no PID after them can be proven yours |
 
@@ -445,6 +445,16 @@ A PID is yours when it is not PID 1, not the hook process or any ancestor of it 
 Your worktree is the git toplevel of the tool call's working directory, not of a `cd` inside the command, so a `cd` into another owner's worktree proves nothing. Worktrees nested inside yours are excluded, and `/`, HOME and its ancestors are never used. Anything that cannot be read, times out (2 s per probe) or does not parse is unprovable and blocked. The probes run only after a kill verb is found, so ordinary commands cost nothing extra.
 
 Process ancestry is deliberately not a proof: subagents share the CLI process, so another owner's processes are descendants of it too.
+
+### Kill grammar
+
+A `kill` command line is accepted only if every word fits a closed grammar, checked against the word's exact source text so a form the lexer does not understand cannot pass as a literal (`kill_guard.py`, `parse_kill_words`):
+
+- option, first word only and unquoted: `-SIG`, `-s SIG`, `-n SIG`, `--signal SIG`, `--signal=SIG`, then an optional `--`; or `-l`, `-L`, `--list`, `-t`, `--table` with plain signal values;
+- target: a literal integer, a job spec `%N`, `%%`, `%+`, `%-` or `%name` matching `[A-Za-z_][A-Za-z0-9_.-]*`, unquoted or wholly inside one pair of quotes;
+- `kill -0` only: one target that is exactly `"$NAME"` or `"${NAME}"`.
+
+Everything else fails closed, whatever it would expand to: `$!`, `PID=4001; kill $PID`, `{4001,4016}`, `\\4001`, `$'4001'`, `$x""`, `%a$=x`, `%?str`, and a parenthesis after a kill word (`kill 4001(N) 4004`, where zsh drops the first word). After a background job use `kill %1`, or start it with `kill_guard.py spawn` and use the printed PID.
 
 ### Starting processes you will need to stop
 
@@ -464,7 +474,7 @@ The registered command is `kill_guard.py hook`, a launcher that runs the analysi
 
 ### Known limits
 
-A verb assembled from several variables at run time, text transformed into a command by `tr`, `rev` or `cut` pipes, `eval "$(cat file)"`, process substitution fed to a shell, kill calls inside script files or interpreter files that were not typed in the same input (`python3 file.py`), `make` or `npm` targets, compiled programs, `docker kill`, `kubectl delete pod`, `supervisorctl`, `launchctl remove` and `scp -S`, `rsync -e` or `git -c core.sshCommand` local command options, code run by `awk`, `sed 1e`, `tar --to-command`, `vim -c` or `emacs --eval`, `tmux send-keys`, and a wrapper option whose value is itself the name of an ordinary command (`exec -a echo pkill x`; the scan ends at the first ordinary command so `sudo grep kill file` stays allowed) are not covered. Between 1 and 8 MiB the crash fallback is weaker than the analyser (it does not rebuild a verb split by variables). Not verified: busybox and util-linux `kill` option parsing, live `docker exec` and `kubectl exec` kills, and interactive zsh with Claude Code's shell snapshot (the zsh-only forms `${=x}`, `$=x`, `${(z)x}`, `${~x}` and `=(cmd)` are covered by classifier rows only; they were never run in a shell). A zsh null-glob qualifier on a literal PID (`kill -0 4001(N)`) is allowed because it can only match a file named like the PID. `sleep N; kill PID` is judged when the hook runs, not when the kill runs, so a PID reused in between is a residual risk. On macOS `ps` loses argument boundaries, so only the first two whitespace-separated words are read and a path with spaces is unprovable.
+A verb assembled from several variables at run time, text transformed into a command by `tr`, `rev` or `cut` pipes, `eval "$(cat file)"`, process substitution fed to a shell, kill calls inside script files or interpreter files that were not typed in the same input (`python3 file.py`), `make` or `npm` targets, compiled programs, `docker kill`, `kubectl delete pod`, `supervisorctl`, `launchctl remove` and `scp -S`, `rsync -e` or `git -c core.sshCommand` local command options, code run by `awk`, `sed 1e`, `tar --to-command`, `vim -c` or `emacs --eval`, `tmux send-keys`, and a wrapper option whose value is itself the name of an ordinary command (`exec -a echo pkill x`; the scan ends at the first ordinary command so `sudo grep kill file` stays allowed) are not covered. Between 1 and 8 MiB the crash fallback is weaker than the analyser (it does not rebuild a verb split by variables). Not verified: busybox and util-linux `kill` option parsing, live `docker exec` and `kubectl exec` kills, and interactive zsh with Claude Code's shell snapshot (the zsh-only forms are refused by the closed grammar and were never run in a shell). `sleep N; kill PID` is judged when the hook runs, not when the kill runs, so a PID reused in between is a residual risk. On macOS `ps` loses argument boundaries, so only the first two whitespace-separated words are read and a path with spaces is unprovable.
 
 ### Commands and rollout
 

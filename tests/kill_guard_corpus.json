@@ -5012,7 +5012,7 @@
    ]
   },
   {
-   "cmd": "\uff50kill -f x",
+   "cmd": "ｐkill -f x",
    "expect": "block",
    "id": "P-ob-fullwidth",
    "tags": [
@@ -5477,7 +5477,7 @@
    ]
   },
   {
-   "cmd": "kill \uff11\uff12\uff13",
+   "cmd": "kill １２３",
    "expect": "block",
    "id": "P-own-fullwidth",
    "tags": [
@@ -9374,8 +9374,8 @@
   },
   {
    "cmd": "kill {4001,4016}",
-   "expect": "allow",
-   "id": "N-own-brace",
+   "expect": "block",
+   "id": "P-grammar-own-brace",
    "tags": [
     "ownership"
    ]
@@ -9414,16 +9414,16 @@
   },
   {
    "cmd": "PID=4001; kill $PID",
-   "expect": "allow",
-   "id": "N-own-var-literal",
+   "expect": "block",
+   "id": "P-grammar-own-var-literal",
    "tags": [
     "ownership"
    ]
   },
   {
    "cmd": "PID=4001; kill \"$PID\"",
-   "expect": "allow",
-   "id": "N-own-var-literal-quoted",
+   "expect": "block",
+   "id": "P-grammar-own-var-literal-quoted",
    "tags": [
     "ownership"
    ]
@@ -9470,16 +9470,16 @@
   },
   {
    "cmd": "sleep 99 & kill $!",
-   "expect": "allow",
-   "id": "N-job-bang",
+   "expect": "block",
+   "id": "P-grammar-job-bang",
    "tags": [
     "job"
    ]
   },
   {
    "cmd": "sleep 99 & kill -9 $!",
-   "expect": "allow",
-   "id": "N-job-bang-9",
+   "expect": "block",
+   "id": "P-grammar-job-bang-9",
    "tags": [
     "job"
    ]
@@ -9510,16 +9510,16 @@
   },
   {
    "cmd": "sleep 99 & PID=$!; kill $PID",
-   "expect": "allow",
-   "id": "N-job-var-bang",
+   "expect": "block",
+   "id": "P-grammar-job-var-bang",
    "tags": [
     "job"
    ]
   },
   {
    "cmd": "sleep 99 & kill $! 4001",
-   "expect": "allow",
-   "id": "N-job-bang-and-owned",
+   "expect": "block",
+   "id": "P-grammar-job-bang-and-owned",
    "tags": [
     "job"
    ]

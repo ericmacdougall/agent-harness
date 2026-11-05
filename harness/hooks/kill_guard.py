@@ -13,8 +13,9 @@ What it blocks, before the command runs, on Claude Code (Bash, PowerShell) and C
     per-worktree spawn ledger written by `kill_guard.py spawn -- CMD...`;
   * every kill inside ssh, mosh, docker exec and kubectl exec (ownership cannot be checked locally) except
     `netwatch orphans --kill --pid N[,N...]`.
-Allowed: kill -0, kill -l, kill %N and kill $! after a background job in the same input, process listing, and text
-that merely contains the word.
+Allowed: kill -0 on literal targets or one quoted simple variable, kill -l, job specs (%N, %%, %+, %-, %name), process
+listing, and text that merely contains the word. Every kill word must fit the closed grammar below; anything else fails
+closed, including $!, a variable with a known value and a brace list.
 
 It reuses command_guard.Analyzer for lexing, parsing, wrappers, aliases, heredocs, ssh and script files, and only
 overrides the methods listed in OVERRIDDEN (a test pins their signatures). Threat model: careless agents and common
@@ -67,7 +68,7 @@ STOP_COMMANDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'echo', 'printf', 'cat', 
                  'cp', 'mv', 'rm', 'mkdir', 'touch', 'chmod', 'chown', 'make', 'cargo', 'go', 'docker', 'kubectl',
                  'python', 'python3', 'node', 'ruby', 'perl', 'sleep', 'true', 'false', 'test', 'wc', 'sort', 'uniq',
                  'tee', 'diff', 'find', 'curl', 'wget', 'pytest', 'ssh', 'scp', 'rsync', 'tar', 'zip', 'unzip', 'date'}
-OVERRIDDEN = ('apply', 'inner_words', 'script', 'ssh', 'container', 'pipeline', 'bind_loop_var')
+OVERRIDDEN = ('apply', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'bind_loop_var')
 
 DEFAULT_POLICY = {
     'mode': 'enforce',
@@ -83,10 +84,15 @@ DEFAULT_POLICY = {
 
 KILLISH = re.compile(r'kill|fuser|stop-process|spps|slay|wmic')
 INDIRECT = re.compile(r"\$'|\\x[0-9a-fA-F]{2}|\\[0-7]{3}|\beval\b|base64|\bxxd\b", re.I)
-JOB_SPEC = re.compile(r'%(?:[0-9]+|[%+\-]|\?\S+|[A-Za-z_]\S*)?')
 LIST_FLAGS = {'-l', '-L', '--list', '-t', '--table', '-Ll', '-lL'}
-SIGNAL_NAME = re.compile(r'-(?:sig)?([A-Za-z0-9+]+)', re.I)
-SIGNAL_VALUE = re.compile(r'[A-Za-z0-9+]{0,32}')
+# The closed grammar of a kill command line. Each pattern is matched against text that word_text() has first tied to the
+# word's exact source, so a form the lexer does not understand (zsh ${=x}, $=x, ${(z)x}, =(cmd), a glob qualifier, the
+# unquoted $x in $x"") can never pass as a literal. Add a form only by showing it is one literal word in bash and zsh.
+INTEGER = re.compile(r'0|[1-9][0-9]{0,9}')
+JOB_SPEC = re.compile(r'%(?:[0-9]{1,10}|[%+-]|[A-Za-z_][A-Za-z0-9_.-]*)')
+SIGNAL_OPTION = re.compile(r'-(?:[Ss][Ii][Gg])?([A-Za-z0-9+]{1,32})')
+SIGNAL_VALUE = re.compile(r'[A-Za-z0-9+]{1,32}')
+QUOTED_VARIABLE = re.compile(r'"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})"')
 FUNCTION_KW = re.compile(r'\bfunction\s+([A-Za-z_][\w.:-]*)\s*(?:\(\s*\))?\s*\{')
 COPROC_KW = re.compile(r'\bcoproc\s+(?:[A-Za-z_]\w*\s*)?\{')
 INTERPRETER_NAME = re.compile(r'(?:python|pypy)[0-9.]*|node(?:js)?[0-9]*|ruby[0-9.]*|perl[0-9.]*|php[0-9.]*|deno|bun|lua[0-9.]*')
@@ -512,7 +518,6 @@ def make_analyzer_class(cg):
             self.kf = []          # (rule, reason, pids)
             self.remote = 0
             self.xargs = 0
-            self.bg_seen = False
             self.broad = set(policy['broad_verbs'])
             self.windows = set(policy['windows_verbs'])
             self.script_kill = re.compile(policy['script_kill_pattern']) if policy['script_kill_pattern'] else None
@@ -536,10 +541,21 @@ def make_analyzer_class(cg):
             finally:
                 self.xargs = saved
 
-        def pipeline(self, pl, depth):
-            super().pipeline(pl, depth)
-            if getattr(pl, 'bg', False):
-                self.bg_seen = True
+        def check_tokens(self, tokens):
+            # parse() ends a command at `(`, so the words after it never reach check_kill. `kill 4001(N) 4004` is a syntax
+            # error in bash, but in zsh (N) is a glob qualifier: the word vanishes and 4004 is signalled, and (e:...:) runs
+            # code. Only `kill() {` (the name alone, then an empty pair) defines a function.
+            words = []
+            for k, (kind, value) in enumerate(tokens):
+                if kind == 'w':
+                    words.append(cg.norm_name(value.text))
+                elif kind == 'op':
+                    if value == '(' and 'kill' in words:
+                        defines = len(words) == 1 and tokens[k + 1:k + 2] == [('op', ')')]
+                        if not defines:
+                            self.block('unprovable-target', 'a kill word is followed by a parenthesis, which zsh reads '
+                                       'as a glob qualifier that can drop the word or run code')
+                    words = []
 
         def bind_loop_var(self, words):
             # `for p in A B; do kill $p`: the base binds only one item; make the variable unresolvable instead so
@@ -858,95 +874,41 @@ def make_analyzer_class(cg):
                            '--all, --force and --match need the user' % bad)
 
         def check_kill(self, args, pl, idx):
-            texts = [a.text for a in args]
-            targets, i, n, signal_seen, last_sig = [], 0, len(args), False, None
-            while i < n:
-                t, w = texts[i], args[i]
-                if not targets and not w.dynamic:
-                    if signal_seen and t != '--':
-                        # After the first signal option no later dash word may count as a signal or list flag: zsh reads
-                        # them as targets (-0 is process group 0, -s an illegal pid) and bash still honours -s/-n/-l, so
-                        # either reading can add a real target. The judge below finds it is not a plain PID and blocks.
-                        targets.append(w)
-                        i += 1
-                        continue
-                    if t == '--':
-                        i += 1
-                        while i < n:
-                            targets.append(args[i])
-                            i += 1
-                        break
-                    if t.startswith('-') and unsafe_word(w, self.remote):
-                        self.block('unprovable-target', 'a kill option is quoted, expanded, braced or a glob, so the '
-                                   'shell may read it as something else')
-                        return
-                    if t in LIST_FLAGS:
-                        if any(unsafe_word(a, self.remote) for a in args[i + 1:]):
-                            self.block('unprovable-target', 'kill -l with an expanded or quoted word is not provable')
-                        return
-                    if t in ('-s', '-n', '--signal'):
-                        value = args[i + 1] if i + 1 < n else None
-                        if value is not None and bad_signal_value(value, self.remote):
-                            self.block('unprovable-target', 'the signal value is an expansion, a glob or several '
-                                       'words, and the shell may split it into more kill options or targets')
-                            return
-                        last_sig = texts[i + 1] if i + 1 < n else ''
-                        signal_seen = True
-                        i += 2
-                        continue
-                    if t.startswith('--signal='):
-                        if not SIGNAL_VALUE.fullmatch(t.split('=', 1)[1]):
-                            self.block('unprovable-target', 'the signal value is not one plain signal name or number')
-                            return
-                        last_sig = t.split('=', 1)[1]
-                        signal_seen = True
-                        i += 1
-                        continue
-                    if t.startswith('--'):
-                        self.block('unprovable-target', 'kill option %s is outside the literal grammar the guard '
-                                   'proves (-SIG, -s SIG, -n SIG, --signal SIG, --)' % one_line(t.split('=', 1)[0], 20))
-                        return
-                    match = SIGNAL_NAME.fullmatch(t)
-                    if match:
-                        last_sig = match.group(1)
-                        signal_seen = True
-                        i += 1
-                        continue
-                targets.append(w)
-                i += 1
-            if any(len(a.alts) >= 32 or (len(a.alts) > 1 and (any(x.startswith('-') for x in a.alts) or (
-                    k and args[k - 1].text in ('-s', '-n', '--signal')))) for k, a in enumerate(args)):
-                self.block('unprovable-target', 'a brace expansion is too large or hides an option')
+            error, signal, targets = parse_kill_words(args, self.remote)
+            if error:
+                self.block('unprovable-target', error)
                 return
-            if last_sig == '0' and not self.xargs and liveness_only(targets):
-                return  # a liveness probe, unless a later dash word hides a real target (kill -0 -s KILL PID)
+            if targets is None:
+                return  # kill -l and friends only print
             if self.xargs:
                 self.block('pidfeed', 'kill through xargs takes its targets from another command, so none can be '
                            'proven yours')
                 return
             if not targets:
                 return
+            probe = signal == '0'
+            if probe and len(targets) == 1 and QUOTED_VARIABLE.fullmatch(targets[0].raw or ''):
+                return  # exactly one word in both shells, and one word cannot hold both a signal and a target
             pids, problems = [], []
             for w in targets:
-                if w.dynamic or w.subs or w.glob:
+                text = word_text(w, quoted_ok=True)
+                if text is not None and JOB_SPEC.fullmatch(text):
+                    continue
+                if text is not None and INTEGER.fullmatch(text) and (probe or 0 < int(text) <= MAX_PID):
+                    pids.append(int(text))
+                elif w.dynamic or w.subs or w.glob:
                     finder = self.finder_before(pl, idx, w.subs) or any(
                         re.search(r'pgrep|pidof|lsof|ps\b', h) for h in self.ctx.var_hints.values())
                     problems.append(('pidfeed' if finder else 'unprovable-target',
                                      'a kill target comes from %s, so it cannot be proven yours' % (
                                          'a pid finder' if finder else 'a variable, substitution or glob')))
-                    continue
-                for alt in w.alts[:32]:
-                    if alt == '$!':
-                        if not self.bg_seen:
-                            problems.append(('unprovable-target', '$! has no background job in this input'))
-                    elif JOB_SPEC.fullmatch(alt):
-                        continue
-                    elif re.fullmatch(r'[0-9]{1,10}', alt, re.ASCII) and 0 < int(alt) <= MAX_PID:
-                        pids.append(int(alt))
-                    else:
-                        problems.append(('unprovable-target', 'a kill target is not a plain positive PID'))
+                else:
+                    problems.append(('unprovable-target', 'a kill target is not a literal PID or job spec (%N, %%, %+, '
+                                     '%-, %name) typed in this command'))
             for rule, reason in problems[:1]:
                 self.block(rule, reason)
+            if probe and not problems:
+                return
             if self.remote:
                 self.block('remote-kill', 'kill on a remote host or container cannot be checked for ownership',
                            pids)
@@ -961,42 +923,63 @@ def make_analyzer_class(cg):
 
 
 
-UNSAFE_CHARS = re.compile(r'[$`*?\[\]{}"\'\\\s;&|<>()]')
+def word_text(word, quoted_ok=False, remote=False):
+    """The word's text when its source proves it is that one literal word in bash and zsh, else None. Whole-word quotes
+    are accepted only where asked; a remote command line is rebuilt with every word single-quoted, so they say nothing
+    there. Anything else (escapes, $'..', concatenation, expansions, braces) is not proof, even if it would be literal."""
+    if word.dynamic or word.subs or word.glob or len(word.alts) != 1:
+        return None
+    text = word.text
+    forms = {text}
+    if quoted_ok or remote:
+        forms.add("'%s'" % text)
+    if quoted_ok:
+        forms.add('"%s"' % text)
+    return text if word.raw in forms else None
 
 
-def unsafe_word(word, remote=False):
-    """A word the shell may expand, split, glob, brace-expand or re-quote into something other than its text.
-    Words of an ssh/docker command line are re-parsed from a string, so the quoted mark says nothing there."""
-    return bool(word.dynamic or word.subs or word.glob or (word.quoted and not remote) or len(word.alts) > 1
-                or UNSAFE_CHARS.search(word.text))
-
-
-def bad_signal_value(word, remote=False):
-    """The word after -s/-n/--signal must be one plain name or number: bash splits an expanded value, so `-s $S`
-    with S='KILL -1' becomes `kill -s KILL -1` (every process)."""
-    return unsafe_word(word, remote) or not SIGNAL_VALUE.fullmatch(word.text)
-
-
-LONE_VAR = re.compile(r'\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})')
-
-
-def liveness_only(targets):
-    """True when `kill -0 ...` can only probe. Options can sit anywhere: the bash builtin stops at the first PID but
-    procps /usr/bin/kill reorders, and an unquoted or operator variable can split into `-s KILL PID`. So every target
-    must be a literal PID or job spec; the one exception is a lone quoted simple variable (`"$PID"`), which stays
-    one word."""
-    if len(targets) == 1:
-        w = targets[0]
-        if w.dynamic and w.quoted and not w.subs and not w.glob and w.alts == [w.text] and LONE_VAR.fullmatch(w.text):
-            return True
-    for w in targets:
-        # Whitelist, not blacklist: zsh-only forms (${=x}, $=x, ${(z)x}, ${~x}, =(cmd), glob qualifiers) are not parsed
-        # as expansions here, so a plain-looking word must be digits or a job spec to count as a probe target.
-        if w.dynamic or w.subs or w.glob or len(w.alts) > 1:
-            return False
-        if not (re.fullmatch(r'[0-9]{1,10}', w.text, re.ASCII) or JOB_SPEC.fullmatch(w.text)):
-            return False
-    return True
+def parse_kill_words(args, remote=False):
+    """Read `kill [SIGNAL] [--] TARGET...` or `kill LIST_FLAG [VALUE...]`. Returns (error, signal, targets); targets is
+    None for the printing form. Only the first word can be an option: bash stops there, zsh reads later dash words as
+    targets and procps reorders, so a later dash word is left in targets for the target grammar to refuse."""
+    if not args:
+        return None, None, []
+    first = args[0]
+    text = first.text
+    if not text.startswith('-'):
+        return None, None, list(args)
+    if word_text(first, remote=remote) is None:
+        return 'a kill option is quoted, expanded, braced or a glob, so the shell may read it as something else', None, None
+    rest = 1
+    signal = None
+    if text in LIST_FLAGS:
+        for w in args[1:]:
+            value = word_text(w, remote=remote)
+            if value is None or not SIGNAL_VALUE.fullmatch(value):
+                return 'kill -l takes only plain signal names or numbers', None, None
+        return None, None, None
+    if text in ('-s', '-n', '--signal'):
+        if len(args) > 1:
+            signal = word_text(args[1], remote=remote)
+            if signal is None or not SIGNAL_VALUE.fullmatch(signal):
+                return 'the signal value is not one plain name or number, and the shell may split it into more kill ' \
+                       'options or targets', None, None
+        rest = 2
+    elif text.startswith('--signal='):
+        signal = text.split('=', 1)[1]
+        if not SIGNAL_VALUE.fullmatch(signal):
+            return 'the signal value is not one plain signal name or number', None, None
+    elif text != '--':
+        match = SIGNAL_OPTION.fullmatch(text)
+        if match is None:
+            return 'kill option %s is outside the literal grammar the guard proves (-SIG, -s SIG, -n SIG, --signal SIG, ' \
+                   '--)' % one_line(text.split('=', 1)[0], 20), None, None
+        signal = match.group(1)
+    if text == '--':
+        return None, None, list(args[1:])
+    if rest < len(args) and args[rest].text == '--' and word_text(args[rest], remote=remote) == '--':
+        rest += 1
+    return None, signal, list(args[rest:])
 
 
 def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=None, home=None):

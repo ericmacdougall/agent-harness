@@ -108,6 +108,40 @@ def judge_rows(rows, decide_fn):
     return bad
 
 
+class GrammarCorpus(WorldCase):
+    """The closed kill grammar: every shape that ever got past the guard, plus what must keep working."""
+    SHAPES = {'cc473a3', 'ce11b1e', '1949bbc', 'a9432ef', '4a6982f', 'a03f8ac', 'F6', 'F7', 'F8', 'F9', 'PKILL', 'OK'}
+
+    @classmethod
+    def setUpClass(cls):
+        path = Path(__file__).resolve().parent / 'kill_guard_grammar_corpus.json'
+        cls.rows = json.loads(path.read_text(encoding='utf-8'))['rows']
+
+    def test_every_shape_has_rows(self):
+        counts = {}
+        for row in self.rows:
+            counts[row['shape']] = counts.get(row['shape'], 0) + 1
+        self.assertEqual(set(counts), self.SHAPES)
+        for shape, count in counts.items():
+            self.assertGreaterEqual(count, 6, shape)
+        ids = [r['id'] for r in self.rows]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_verdicts(self):
+        bad = judge_rows(self.rows, lambda r: self.decide(r['cmd']))
+        self.assertEqual(bad, [], '\n'.join(bad[:40]))
+
+    def test_generic_pkill_blocks_through_the_hook_as_a_deny(self):
+        # Through the launcher, so a warn-only path cannot satisfy it (goodqa#14617).
+        for cmd in ('ssh dev2 \'pkill -f "unittest discover"; sleep 1\'', 'killall node'):
+            payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': cmd}, 'cwd': self.home})
+            done = subprocess.run([sys.executable, str(HOOKS / 'kill_guard.py'), 'hook'], input=payload, text=True,
+                                  capture_output=True, timeout=30, env=dict(os.environ, HOME=self.home))
+            self.assertEqual(done.returncode, 2, cmd)
+            self.assertIn('BLOCKED', done.stderr, cmd)
+            self.assertIn(LITERAL, done.stderr, cmd)
+
+
 class Corpus(WorldCase):
     def rows(self, expect):
         return [r for r in ROWS if r['expect'] == expect]
@@ -454,7 +488,7 @@ class Policy(unittest.TestCase):
                     'script': ['self', 'text', 'depth', 'tail_visible', 'ps'],
                     'ssh': ['self', 'args', 'depth'],
                     'container': ['self', 'name', 'args', 'words', 'depth', 'pl', 'idx'],
-                    'pipeline': ['self', 'pl', 'depth'],
+                    'check_tokens': ['self', 'tokens'],
                     'bind_loop_var': ['self', 'words']}
         self.assertEqual(sorted(expected), sorted(kg.OVERRIDDEN))
         for name, params in expected.items():

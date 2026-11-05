@@ -1,0 +1,1489 @@
+{
+ "_doc": "Data only (rule S1): judged by decide() in the fake world of kill_guard_corpus.json, never executed or fed to a shell. shape names the BLOCK that found it: a commit hash for the six earlier fixes, with only rows that fix's parent let through, F6-F9 for the closed grammar, PKILL for goodqa#14617, OK for commands that must keep working.",
+ "rows": [
+  {
+   "cmd": "kill -9 -0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-0",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -KILL -0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-KILL-0",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -s 9 -0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-s9-0",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -9 -s 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-s-pid",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -9 -s 0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-s0-pid",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -9 -n 0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-n0-pid",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -9 -t 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-t-pid",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -9 --table 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-table-pid",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -9 -l 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-l-pid",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -9 -L 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-L-pid",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -9 --list 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-list-pid",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -s 0 -s 0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-s0-s0",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -s 9 -s 0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-s9-s0",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -n 9 -n 0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-n9-n0",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill --signal=9 --signal=0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-sig-sig",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -9 --signal=0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-sig0",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -9 --signal 0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-9-signal-0",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -s 0 -0 4004",
+   "expect": "block",
+   "id": "P-rt4-kill-s0-0",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -9 -0 4001",
+   "expect": "block",
+   "id": "P-rt4-kill-9-0-own",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "sudo kill -9 -0 4004",
+   "expect": "block",
+   "id": "P-rt4-sudo-kill-9-0",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "bash -c 'kill -9 -s 4004'",
+   "expect": "block",
+   "id": "P-rt4-bash-c-kill-9-s",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "ssh host kill -9 -0 4004",
+   "expect": "block",
+   "id": "P-rt4-ssh-kill-9-0",
+   "shape": "cc473a3",
+   "why": "later dash words read as signals"
+  },
+  {
+   "cmd": "kill -0 $(printf \"%s \" -s KILL) 1",
+   "expect": "block",
+   "id": "P-rt5-subst-dash",
+   "shape": "ce11b1e",
+   "why": "expansion hiding a target behind kill -0"
+  },
+  {
+   "cmd": "kill -0 `echo -s` KILL 1",
+   "expect": "block",
+   "id": "P-rt5-backtick-dash",
+   "shape": "ce11b1e",
+   "why": "expansion hiding a target behind kill -0"
+  },
+  {
+   "cmd": "kill -0 [-]s KILL 1",
+   "expect": "block",
+   "id": "P-rt5-glob-class",
+   "shape": "ce11b1e",
+   "why": "expansion hiding a target behind kill -0"
+  },
+  {
+   "cmd": "kill -0 ?s KILL 1",
+   "expect": "block",
+   "id": "P-rt5-glob-qmark",
+   "shape": "ce11b1e",
+   "why": "expansion hiding a target behind kill -0"
+  },
+  {
+   "cmd": "kill -0 * 1",
+   "expect": "block",
+   "id": "P-rt5-glob-star",
+   "shape": "ce11b1e",
+   "why": "expansion hiding a target behind kill -0"
+  },
+  {
+   "cmd": "kill -s 0 ${X} 1",
+   "expect": "block",
+   "id": "P-rt5-s0-var-pid",
+   "shape": "ce11b1e",
+   "why": "expansion hiding a target behind kill -0"
+  },
+  {
+   "cmd": "kill -0 $a $b 1",
+   "expect": "block",
+   "id": "P-rt5-var-var-pid",
+   "shape": "ce11b1e",
+   "why": "expansion hiding a target behind kill -0"
+  },
+  {
+   "cmd": "kill -0 \"$a\" \"$b\" 4004",
+   "expect": "block",
+   "id": "P-rt5-quoted-var-var-pid",
+   "shape": "ce11b1e",
+   "why": "expansion hiding a target behind kill -0"
+  },
+  {
+   "cmd": "kill -0 $(printf \"%s \" -s KILL 4004)",
+   "expect": "block",
+   "id": "P-rt5-sole-subst",
+   "shape": "ce11b1e",
+   "why": "expansion hiding a target behind kill -0"
+  },
+  {
+   "cmd": "kill -n 0 $(echo -n) 4004",
+   "expect": "block",
+   "id": "P-rt5-n0-subst",
+   "shape": "ce11b1e",
+   "why": "expansion hiding a target behind kill -0"
+  },
+  {
+   "cmd": "kill -s $(printf 'KILL -1')",
+   "expect": "block",
+   "id": "P-rt6-s-subst-split",
+   "shape": "1949bbc",
+   "why": "signal value splitting into options"
+  },
+  {
+   "cmd": "S='KILL -1'; kill -s $S",
+   "expect": "block",
+   "id": "P-rt6-s-var-split",
+   "shape": "1949bbc",
+   "why": "signal value splitting into options"
+  },
+  {
+   "cmd": "S='KILL -1'; kill --signal=$S",
+   "expect": "block",
+   "id": "P-rt6-signal-eq-var",
+   "shape": "1949bbc",
+   "why": "signal value splitting into options"
+  },
+  {
+   "cmd": "S='KILL -1'; kill --signal $S",
+   "expect": "block",
+   "id": "P-rt6-signal-var-split",
+   "shape": "1949bbc",
+   "why": "signal value splitting into options"
+  },
+  {
+   "cmd": "kill -n $X 4001",
+   "expect": "block",
+   "id": "P-rt6-n-var-pid",
+   "shape": "1949bbc",
+   "why": "signal value splitting into options"
+  },
+  {
+   "cmd": "kill -s K* 4001",
+   "expect": "block",
+   "id": "P-rt6-s-glob-pid",
+   "shape": "1949bbc",
+   "why": "signal value splitting into options"
+  },
+  {
+   "cmd": "kill -s 'KILL -1' 4001",
+   "expect": "block",
+   "id": "P-rt6-s-quoted-space",
+   "shape": "1949bbc",
+   "why": "signal value splitting into options"
+  },
+  {
+   "cmd": "sudo kill -s $(printf 'KILL -1')",
+   "expect": "block",
+   "id": "P-rt6-sudo-s-subst",
+   "shape": "1949bbc",
+   "why": "signal value splitting into options"
+  },
+  {
+   "cmd": "bash -c \"S='KILL -1'; kill -s \\$S\"",
+   "expect": "block",
+   "id": "P-rt6-bash-c-s-var",
+   "shape": "1949bbc",
+   "why": "signal value splitting into options"
+  },
+  {
+   "cmd": "ssh host kill -s $(printf 'KILL -1')",
+   "expect": "block",
+   "id": "P-rt6-ssh-s-subst",
+   "shape": "1949bbc",
+   "why": "signal value splitting into options"
+  },
+  {
+   "cmd": "kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-quoted-sig",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "kill -'9' 4001",
+   "expect": "block",
+   "id": "P-rt7-squoted-sig",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "kill -$'9' 4001",
+   "expect": "block",
+   "id": "P-rt7-ansic-sig",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "kill -9\"\" 4001",
+   "expect": "block",
+   "id": "P-rt7-empty-concat-sig",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "kill \"-s\" KILL 4001",
+   "expect": "block",
+   "id": "P-rt7-quoted-s-opt",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "kill -s \"KILL\" 4001",
+   "expect": "block",
+   "id": "P-rt7-quoted-s-value",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "kill -s K\"IL\"L 4001",
+   "expect": "block",
+   "id": "P-rt7-concat-s-value",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "kill -\\9 4001",
+   "expect": "block",
+   "id": "P-rt7-backslash-sig",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "kill --foo 4001",
+   "expect": "block",
+   "id": "P-rt7-unknown-long",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "kill --list=9 4001",
+   "expect": "block",
+   "id": "P-rt7-unknown-list-eq",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "kill --help 4001",
+   "expect": "block",
+   "id": "P-rt7-help",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "kill -l $x",
+   "expect": "block",
+   "id": "P-rt7-l-with-var",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "kill -l $(echo 9)",
+   "expect": "block",
+   "id": "P-rt7-l-with-subst",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "kill -l '9'",
+   "expect": "block",
+   "id": "P-rt7-l-quoted",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "sudo kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-sudo-quoted-sig",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "env kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-env-quoted-sig",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "command kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-command-quoted-sig",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "builtin kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-builtin-quoted-sig",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "exec kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-exec-quoted-sig",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "/bin/kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-bin-kill-quoted-sig",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "/usr/bin/kill -\"9\" 4001",
+   "expect": "block",
+   "id": "P-rt7-usr-bin-kill-quoted-sig",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "eval 'kill -\"9\" 4001'",
+   "expect": "block",
+   "id": "P-rt7-eval-quoted-sig",
+   "shape": "a9432ef",
+   "why": "quoted or unknown option words"
+  },
+  {
+   "cmd": "/bin/kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-bin-kill-after-pid",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "/usr/bin/kill -0 4004 -s 9",
+   "expect": "block",
+   "id": "P-rt8-usrbin-kill-after-pid",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "/bin/kill -0 4004 --signal=KILL",
+   "expect": "block",
+   "id": "P-rt8-bin-kill-signal-eq",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "/bin/kill -s 0 4004 -s 9",
+   "expect": "block",
+   "id": "P-rt8-bin-kill-s0-s9",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "env kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-env-after-pid",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "exec kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-exec-after-pid",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "nice kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-nice-after-pid",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "nohup kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-nohup-after-pid",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "timeout 5 kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-timeout-after-pid",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-builtin-after-pid",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "kill -0 4004 -- -s KILL",
+   "expect": "block",
+   "id": "P-rt8-dash-dash-then-dash",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "docker exec c kill -0 1 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-docker-after-pid",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "ssh dev2 /bin/kill -0 4004 -s KILL",
+   "expect": "block",
+   "id": "P-rt8-ssh-bin-after-pid",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "kill -0 ${x:--s KILL 4004}",
+   "expect": "block",
+   "id": "P-rt8-default-op",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "kill -0 ${x=-s KILL 4004}",
+   "expect": "block",
+   "id": "P-rt8-assign-op",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "kill -0 ${@:--s KILL 4004}",
+   "expect": "block",
+   "id": "P-rt8-at-default",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "set -- -s KILL 4004; kill -0 \"$@\"",
+   "expect": "block",
+   "id": "P-rt8-set-dashdash-at",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "for x in '-s KILL 4004'; do kill -0 $x; done",
+   "expect": "block",
+   "id": "P-rt8-for-loop-var",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "printf -v x %s '-s KILL 4004'; kill -0 $x",
+   "expect": "block",
+   "id": "P-rt8-printf-v",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "read x <<< '-s KILL 4004'; kill -0 $x",
+   "expect": "block",
+   "id": "P-rt8-read-herestring",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "read -a x <<< '-s KILL 4004'; kill -0 \"${x[@]}\"",
+   "expect": "block",
+   "id": "P-rt8-read-array",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "x=$(printf -- '-s KILL 4004'); kill -0 $x",
+   "expect": "block",
+   "id": "P-rt8-assign-subst-var",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "f() { kill -0 \"$@\"; }; f -s KILL 4004",
+   "expect": "block",
+   "id": "P-rt8-function-at",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "kill -0 $1",
+   "expect": "block",
+   "id": "P-rt8-positional",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "kill -0 $PID",
+   "expect": "block",
+   "id": "P-rt8-unquoted-var",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "kill -0 4004 $x",
+   "expect": "block",
+   "id": "P-rt8-pid-then-var",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "kill -0 \"${a[@]}\"",
+   "expect": "block",
+   "id": "P-rt8-array-expansion",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "echo 4004 -s KILL | xargs kill -0",
+   "expect": "block",
+   "id": "P-rt8-xargs-literal-opts",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "pgrep x | xargs kill -0",
+   "expect": "block",
+   "id": "P-rt8-xargs-pgrep",
+   "shape": "4a6982f",
+   "why": "options after a target; operator and positional expansions"
+  },
+  {
+   "cmd": "kill -0 ${=x}",
+   "expect": "block",
+   "id": "P-rt9-zsh-force-split",
+   "shape": "a03f8ac",
+   "why": "zsh-only expansions as a bare target"
+  },
+  {
+   "cmd": "kill -0 $=x",
+   "expect": "block",
+   "id": "P-rt9-zsh-force-split-short",
+   "shape": "a03f8ac",
+   "why": "zsh-only expansions as a bare target"
+  },
+  {
+   "cmd": "kill -0 \"${=x}\"",
+   "expect": "block",
+   "id": "P-rt9-zsh-quoted-force-split",
+   "shape": "a03f8ac",
+   "why": "zsh-only expansions as a bare target"
+  },
+  {
+   "cmd": "kill -0 ${(z)x}",
+   "expect": "block",
+   "id": "P-rt9-zsh-z-flag",
+   "shape": "a03f8ac",
+   "why": "zsh-only expansions as a bare target"
+  },
+  {
+   "cmd": "kill -0 ${~x}",
+   "expect": "block",
+   "id": "P-rt9-zsh-glob-subst",
+   "shape": "a03f8ac",
+   "why": "zsh-only expansions as a bare target"
+  },
+  {
+   "cmd": "kill -0 =(echo 1)",
+   "expect": "block",
+   "id": "P-rt9-zsh-proc-subst-file",
+   "shape": "a03f8ac",
+   "why": "zsh-only expansions as a bare target"
+  },
+  {
+   "cmd": "kill -0 ^x",
+   "expect": "block",
+   "id": "P-rt9-zsh-extended-glob",
+   "shape": "a03f8ac",
+   "why": "zsh-only expansions as a bare target"
+  },
+  {
+   "cmd": "kill -0 4001 $=x",
+   "expect": "block",
+   "id": "P-rt9-zsh-pid-then-split",
+   "shape": "a03f8ac",
+   "why": "zsh-only expansions as a bare target"
+  },
+  {
+   "cmd": "zsh -c \"kill -0 \\${=x}\"",
+   "expect": "block",
+   "id": "P-rt9-zsh-sh-c-split",
+   "shape": "a03f8ac",
+   "why": "zsh-only expansions as a bare target"
+  },
+  {
+   "cmd": "kill %a$=x",
+   "expect": "block",
+   "id": "F6-00",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill -0 %a$=x",
+   "expect": "block",
+   "id": "F6-01",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill %a${=x}",
+   "expect": "block",
+   "id": "F6-02",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill -0 %a${=x}",
+   "expect": "block",
+   "id": "F6-03",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill %a${(z)x}",
+   "expect": "block",
+   "id": "F6-04",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill -0 %a${(z)x}",
+   "expect": "block",
+   "id": "F6-05",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill -0 %a${~x}",
+   "expect": "block",
+   "id": "F6-06",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill %a$=x 4001",
+   "expect": "block",
+   "id": "F6-07",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "sudo kill %a$=x",
+   "expect": "block",
+   "id": "F6-08",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "/bin/kill -0 %a$=x",
+   "expect": "block",
+   "id": "F6-09",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "ssh host kill -0 %a$=x",
+   "expect": "block",
+   "id": "F6-10",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "sh -c 'kill -0 %a$=x'",
+   "expect": "block",
+   "id": "F6-11",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill %$=x",
+   "expect": "block",
+   "id": "F6-12",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill %?$=x",
+   "expect": "block",
+   "id": "F6-13",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill %?a",
+   "expect": "block",
+   "id": "F6-14",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill %",
+   "expect": "block",
+   "id": "F6-15",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill -0 %a=(cmd)",
+   "expect": "block",
+   "id": "F6-16",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill -0 %a~x",
+   "expect": "block",
+   "id": "F6-17",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill %a#b",
+   "expect": "block",
+   "id": "F6-18",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill %a%b",
+   "expect": "block",
+   "id": "F6-19",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill %1^",
+   "expect": "block",
+   "id": "F6-20",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill %é",
+   "expect": "block",
+   "id": "F6-21",
+   "shape": "F6",
+   "why": "%job-spec joined to a zsh word-splitting expansion"
+  },
+  {
+   "cmd": "kill 4001(N) 4004",
+   "expect": "block",
+   "id": "F7-00",
+   "shape": "F7",
+   "why": "a parenthesis after a kill word: the parser ended the command, zsh reads a glob qualifier"
+  },
+  {
+   "cmd": "kill -0 4001(N) 4004",
+   "expect": "block",
+   "id": "F7-01",
+   "shape": "F7",
+   "why": "a parenthesis after a kill word: the parser ended the command, zsh reads a glob qualifier"
+  },
+  {
+   "cmd": "kill -0 4001(N)",
+   "expect": "block",
+   "id": "F7-02",
+   "shape": "F7",
+   "why": "a parenthesis after a kill word: the parser ended the command, zsh reads a glob qualifier"
+  },
+  {
+   "cmd": "kill 4001(e:x:)",
+   "expect": "block",
+   "id": "F7-03",
+   "shape": "F7",
+   "why": "a parenthesis after a kill word: the parser ended the command, zsh reads a glob qualifier"
+  },
+  {
+   "cmd": "kill 4001 (4004)",
+   "expect": "block",
+   "id": "F7-04",
+   "shape": "F7",
+   "why": "a parenthesis after a kill word: the parser ended the command, zsh reads a glob qualifier"
+  },
+  {
+   "cmd": "kill (4004)",
+   "expect": "block",
+   "id": "F7-05",
+   "shape": "F7",
+   "why": "a parenthesis after a kill word: the parser ended the command, zsh reads a glob qualifier"
+  },
+  {
+   "cmd": "kill %1(N) 4004",
+   "expect": "block",
+   "id": "F7-06",
+   "shape": "F7",
+   "why": "a parenthesis after a kill word: the parser ended the command, zsh reads a glob qualifier"
+  },
+  {
+   "cmd": "sudo kill 4001(N) 4004",
+   "expect": "block",
+   "id": "F7-07",
+   "shape": "F7",
+   "why": "a parenthesis after a kill word: the parser ended the command, zsh reads a glob qualifier"
+  },
+  {
+   "cmd": "kill -0 \"$x\"(N) 4004",
+   "expect": "block",
+   "id": "F7-08",
+   "shape": "F7",
+   "why": "a parenthesis after a kill word: the parser ended the command, zsh reads a glob qualifier"
+  },
+  {
+   "cmd": "sh -c 'kill 4001(N) 4004'",
+   "expect": "block",
+   "id": "F7-09",
+   "shape": "F7",
+   "why": "a parenthesis after a kill word: the parser ended the command, zsh reads a glob qualifier"
+  },
+  {
+   "cmd": "ssh host 'kill -0 12(N) 4004'",
+   "expect": "block",
+   "id": "F7-10",
+   "shape": "F7",
+   "why": "a parenthesis after a kill word: the parser ended the command, zsh reads a glob qualifier"
+  },
+  {
+   "cmd": "kill -9=(x) 4004",
+   "expect": "block",
+   "id": "F7-11",
+   "shape": "F7",
+   "why": "a parenthesis after a kill word: the parser ended the command, zsh reads a glob qualifier"
+  },
+  {
+   "cmd": "kill -0 $x\"\"",
+   "expect": "block",
+   "id": "F8-00",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill -0 \"\"$x",
+   "expect": "block",
+   "id": "F8-01",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill -0 $x''",
+   "expect": "block",
+   "id": "F8-02",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill -0 \"$x\"$y",
+   "expect": "block",
+   "id": "F8-03",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill -0 \"$x\"\"\"",
+   "expect": "block",
+   "id": "F8-04",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill -0 \"$x\" 4001",
+   "expect": "block",
+   "id": "F8-05",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill \"$PID\"",
+   "expect": "block",
+   "id": "F8-06",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill \\4001",
+   "expect": "block",
+   "id": "F8-07",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill $'4001'",
+   "expect": "block",
+   "id": "F8-08",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill 4001''",
+   "expect": "block",
+   "id": "F8-09",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill 40\"01\"",
+   "expect": "block",
+   "id": "F8-10",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill 04004",
+   "expect": "block",
+   "id": "F8-11",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill 4001{,}",
+   "expect": "block",
+   "id": "F8-12",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill -0 \"$@\"",
+   "expect": "block",
+   "id": "F8-13",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill -0 \"$1\"",
+   "expect": "block",
+   "id": "F8-14",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "kill -0 \"${x:-4004}\"",
+   "expect": "block",
+   "id": "F8-15",
+   "shape": "F8",
+   "why": "a word that only reads as literal or quoted once the lexer has normalised it"
+  },
+  {
+   "cmd": "PID=4001; kill $PID",
+   "expect": "block",
+   "id": "F9-00",
+   "shape": "F9",
+   "why": "resolved variables, $! and braces are outside the closed grammar"
+  },
+  {
+   "cmd": "PID=4001; kill \"$PID\"",
+   "expect": "block",
+   "id": "F9-01",
+   "shape": "F9",
+   "why": "resolved variables, $! and braces are outside the closed grammar"
+  },
+  {
+   "cmd": "S=-9; kill $S 4001",
+   "expect": "block",
+   "id": "F9-02",
+   "shape": "F9",
+   "why": "resolved variables, $! and braces are outside the closed grammar"
+  },
+  {
+   "cmd": "sleep 99 & kill $!",
+   "expect": "block",
+   "id": "F9-03",
+   "shape": "F9",
+   "why": "resolved variables, $! and braces are outside the closed grammar"
+  },
+  {
+   "cmd": "kill {4001,4016}",
+   "expect": "block",
+   "id": "F9-04",
+   "shape": "F9",
+   "why": "resolved variables, $! and braces are outside the closed grammar"
+  },
+  {
+   "cmd": "kill -{9,TERM} 4001",
+   "expect": "block",
+   "id": "F9-05",
+   "shape": "F9",
+   "why": "resolved variables, $! and braces are outside the closed grammar"
+  },
+  {
+   "cmd": "pkill -f \"unittest discover\"",
+   "expect": "block",
+   "id": "PKILL-00",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "ssh dev2 'pkill -f \"unittest discover\"; sleep 1; echo done'",
+   "expect": "block",
+   "id": "PKILL-01",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "ssh dev2 pkill -f x",
+   "expect": "block",
+   "id": "PKILL-02",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "ssh dev2 \"killall python3\"",
+   "expect": "block",
+   "id": "PKILL-03",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "ssh -o BatchMode=yes dev2 'cd /x && pkill -f \"unittest discover\"'",
+   "expect": "block",
+   "id": "PKILL-04",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "ssh dev2 'nohup pkill -f x &'",
+   "expect": "block",
+   "id": "PKILL-05",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "ssh dev2 bash -lc 'killall node'",
+   "expect": "block",
+   "id": "PKILL-06",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "ssh dev2 <<'EOF'\npkill -f x\nEOF",
+   "expect": "block",
+   "id": "PKILL-07",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "killall node",
+   "expect": "block",
+   "id": "PKILL-08",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "sudo killall node",
+   "expect": "block",
+   "id": "PKILL-09",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "/usr/bin/pkill -f x",
+   "expect": "block",
+   "id": "PKILL-10",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "ssh dev2 sudo /usr/bin/pkill -9 -f x",
+   "expect": "block",
+   "id": "PKILL-11",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "ssh dev2 'for i in 1 2; do pkill -f \"x$i\"; done'",
+   "expect": "block",
+   "id": "PKILL-12",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "mosh dev2 -- killall node",
+   "expect": "block",
+   "id": "PKILL-13",
+   "shape": "PKILL",
+   "why": "goodqa#14617: a generic pkill or killall, local or over ssh, is blocked and not warned"
+  },
+  {
+   "cmd": "kill 4001",
+   "expect": "allow",
+   "id": "OK-00",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -9 4001",
+   "expect": "allow",
+   "id": "OK-01",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -TERM 4001 4016",
+   "expect": "allow",
+   "id": "OK-02",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -SIGTERM 4001",
+   "expect": "allow",
+   "id": "OK-03",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -s TERM 4001",
+   "expect": "allow",
+   "id": "OK-04",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -- 4001",
+   "expect": "allow",
+   "id": "OK-05",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill 4010",
+   "expect": "allow",
+   "id": "OK-06",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill 4001 2>/dev/null",
+   "expect": "allow",
+   "id": "OK-07",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill 4001 || true",
+   "expect": "allow",
+   "id": "OK-08",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill 4001 && sleep 1",
+   "expect": "allow",
+   "id": "OK-09",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill 4001  # stop the server",
+   "expect": "allow",
+   "id": "OK-10",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "(kill 4001) && (sleep 1)",
+   "expect": "allow",
+   "id": "OK-11",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "sudo kill 4001",
+   "expect": "allow",
+   "id": "OK-12",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill \"4001\"",
+   "expect": "allow",
+   "id": "OK-13",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill '4001'",
+   "expect": "allow",
+   "id": "OK-14",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -0 4004",
+   "expect": "allow",
+   "id": "OK-15",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -0 4004 4001",
+   "expect": "allow",
+   "id": "OK-16",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -s 0 4004",
+   "expect": "allow",
+   "id": "OK-17",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -0 \"4004\"",
+   "expect": "allow",
+   "id": "OK-18",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -0 0",
+   "expect": "allow",
+   "id": "OK-19",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -0 \"$PID\"",
+   "expect": "allow",
+   "id": "OK-20",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -0 \"${PID}\"",
+   "expect": "allow",
+   "id": "OK-21",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "if kill -0 4004; then echo up; fi",
+   "expect": "allow",
+   "id": "OK-22",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "while kill -0 4004 2>/dev/null; do sleep 1; done",
+   "expect": "allow",
+   "id": "OK-23",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill %1",
+   "expect": "allow",
+   "id": "OK-24",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -9 %1",
+   "expect": "allow",
+   "id": "OK-25",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill %%",
+   "expect": "allow",
+   "id": "OK-26",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill %+",
+   "expect": "allow",
+   "id": "OK-27",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill %-",
+   "expect": "allow",
+   "id": "OK-28",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill %server-1.py",
+   "expect": "allow",
+   "id": "OK-29",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -0 %1",
+   "expect": "allow",
+   "id": "OK-30",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "ssh host kill -0 12",
+   "expect": "allow",
+   "id": "OK-31",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "ssh host 'kill -0 12'",
+   "expect": "allow",
+   "id": "OK-32",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "ssh host 'kill -0 \"$PID\"'",
+   "expect": "allow",
+   "id": "OK-33",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -l",
+   "expect": "allow",
+   "id": "OK-34",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill -l 9",
+   "expect": "allow",
+   "id": "OK-35",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "kill() { :; }",
+   "expect": "allow",
+   "id": "OK-36",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "function kill() { :; }",
+   "expect": "allow",
+   "id": "OK-37",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "echo \"kill(1)\"",
+   "expect": "allow",
+   "id": "OK-38",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "ps aux | grep kill",
+   "expect": "allow",
+   "id": "OK-39",
+   "shape": "OK",
+   "why": "ordinary kill and kill -0 on a literal target must keep working"
+  }
+ ]
+}
