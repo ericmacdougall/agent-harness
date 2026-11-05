@@ -754,18 +754,24 @@ class InstallTests(unittest.TestCase):
         # Codex trust is keyed by "<hooks.json>:pre_tool_use:<group>:<handler>" (GoodQA #14590)
         codex = self.home / '.codex'
         user = {'hooks': {'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': 'my-hook'}]}]}}
+        # The request ledger's guard is newer than the command guard, so it goes after it and shifts no existing key.
+        def is_ledger(group):
+            return 'work_assignments.py' in group['hooks'][0]['command']
+
         without = self.install_codex.merge_hooks(user, codex, command_guard=False)['hooks']['PreToolUse']
-        with_guard = self.install_codex.merge_hooks(user, codex)['hooks']['PreToolUse']
+        with_ledger = self.install_codex.merge_hooks(user, codex)['hooks']['PreToolUse']
+        self.assertTrue(is_ledger(with_ledger[-1]))
+        without, with_guard = [g for g in without if not is_ledger(g)], with_ledger[:-1]
         self.assertEqual(with_guard[:len(without)], without)
         self.assertEqual(len(with_guard), len(without) + 1)
         self.assertEqual(with_guard[-1]['hooks'][0]['command'], self.install_codex.guard_command(codex))
         self.assertNotIn('matcher', with_guard[-1])
-        again = self.install_codex.merge_hooks({'hooks': {'PreToolUse': with_guard}}, codex)['hooks']['PreToolUse']
-        self.assertEqual(again, with_guard)  # idempotent: a reinstall keeps every index
+        again = self.install_codex.merge_hooks({'hooks': {'PreToolUse': with_ledger}}, codex)['hooks']['PreToolUse']
+        self.assertEqual(again, with_ledger)  # idempotent: a reinstall keeps every index
         # upgrade from the 220c37e layout (guard first): one guard group, moved last
         old = [with_guard[-1]] + with_guard[:-1]
         upgraded = self.install_codex.merge_hooks({'hooks': {'PreToolUse': old}}, codex)['hooks']['PreToolUse']
-        self.assertEqual(upgraded, with_guard)
+        self.assertEqual(upgraded, with_ledger)
 
     def test_old_claude_version_warns(self):
         self.assertIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.200 (Claude Code)'))
