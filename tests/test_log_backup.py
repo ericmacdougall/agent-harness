@@ -78,6 +78,18 @@ class Freshness(Base):
         self.assertEqual(done.returncode, 1)
         self.assertIn(b"LOG BACKUP ALERT", done.stdout)
 
+    def test_alert_fires_during_a_long_run_and_says_a_run_is_in_progress(self):
+        self.last_ok(stamp(time.time() - 7200) + "\n")
+        lock = self.logs / "log-backup.lock.d"
+        lock.mkdir()
+        (lock / "pid").write_text(str(os.getpid()))
+        done = self.run_cli("check")
+        self.assertEqual(done.returncode, 1)  # the lock does not make a stale backup fresh
+        self.assertIn(b"has held the lock", done.stdout)
+        self.assertIn(b"has held the lock", self.run_cli("session-start").stdout)
+        (lock / "pid").write_text("999999999")
+        self.assertNotIn(b"has held the lock", self.run_cli("check").stdout)
+
     def test_check_exit_codes(self):
         self.assertEqual(self.run_cli("check").returncode, 2)  # missing
         self.last_ok(stamp(time.time()))

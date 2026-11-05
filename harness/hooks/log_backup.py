@@ -111,12 +111,24 @@ def alert_text(result: dict, max_age: int = MAX_AGE_SECONDS) -> str:
             "`python3 ~/.claude/hooks/log_backup.py status` shows a fresh backup.")
 
 
+def run_note(home: Path) -> str:
+    """Say so when a backup run is in progress: a long run does not hide a stale backup, it explains it."""
+    lock = logs_dir(home) / LOCK_DIR
+    if "held by pid" not in lock_holder(home):
+        return ""
+    try:
+        since = max(0, int(time.time() - lock.stat().st_mtime))
+    except OSError:
+        return ""
+    return f" A backup run has held the lock for {human_age(since)} and has not finished."
+
+
 def cmd_check(args) -> int:
     result = classify(args.home, max_age=args.max_age)
     if args.json:
         print(json.dumps(result))
     else:
-        print("fresh" if result["state"] == "fresh" else alert_text(result, args.max_age))
+        print("fresh" if result["state"] == "fresh" else alert_text(result, args.max_age) + run_note(args.home))
     return {"fresh": 0, "stale": 1}.get(result["state"], 2)
 
 
@@ -128,7 +140,7 @@ def cmd_session_start(args) -> int:
             pass
         result = classify(args.home, max_age=args.max_age)
         if result["state"] != "fresh":
-            text = alert_text(result, args.max_age)
+            text = alert_text(result, args.max_age) + run_note(args.home)
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text},
                               "systemMessage": text}))
     except Exception:  # noqa: BLE001 - a status hook must never break a session
