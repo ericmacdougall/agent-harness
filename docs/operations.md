@@ -448,7 +448,7 @@ Process ancestry is deliberately not a proof: subagents share the CLI process, s
 
 ### Kill grammar
 
-A `kill` command line is accepted only if every word fits a closed grammar, checked against the word's exact source text so a form the lexer does not understand cannot pass as a literal (`kill_guard.py`, `parse_kill_words`):
+Once the shared command parser has handed the guard a `kill` command, the guard accepts it only if every word fits a closed grammar, checked against the word's exact source text so a form the lexer does not understand cannot pass as a literal (`kill_guard.py`, `parse_kill_words`). This covers the kill words only. A kill the parser never presents to the guard is not judged at all; those gaps are listed under Known limits below and tracked in goodqa#14654:
 
 - option, first word only and unquoted: `-SIG`, `-s SIG`, `-n SIG`, `--signal SIG`, `--signal=SIG`, then an optional `--`; or `-l`, `-L`, `--list`, `-t`, `--table` with plain signal values;
 - target: a literal integer, a job spec `%N`, `%%`, `%+`, `%-` or `%name` matching `[A-Za-z_][A-Za-z0-9_.-]*`, unquoted or wholly inside one pair of quotes;
@@ -474,7 +474,26 @@ The registered command is `kill_guard.py hook`, a launcher that runs the analysi
 
 ### Known limits
 
-A verb assembled from several variables at run time, text transformed into a command by `tr`, `rev` or `cut` pipes, `eval "$(cat file)"`, process substitution fed to a shell, kill calls inside script files or interpreter files that were not typed in the same input (`python3 file.py`), `make` or `npm` targets, compiled programs, `docker kill`, `kubectl delete pod`, `supervisorctl`, `launchctl remove` and `scp -S`, `rsync -e` or `git -c core.sshCommand` local command options, code run by `awk`, `sed 1e`, `tar --to-command`, `vim -c` or `emacs --eval`, `tmux send-keys`, and a wrapper option whose value is itself the name of an ordinary command (`exec -a echo pkill x`; the scan ends at the first ordinary command so `sudo grep kill file` stays allowed) are not covered. Between 1 and 8 MiB the crash fallback is weaker than the analyser (it does not rebuild a verb split by variables). Not verified: busybox and util-linux `kill` option parsing, live `docker exec` and `kubectl exec` kills, and interactive zsh with Claude Code's shell snapshot (the zsh-only forms are refused by the closed grammar and were never run in a shell). `sleep N; kill PID` is judged when the hook runs, not when the kill runs, so a PID reused in between is a residual risk. On macOS `ps` loses argument boundaries, so only the first two whitespace-separated words are read and a path with spaces is unprovable.
+**Not covered: kills the shared parser never hands to the guard (goodqa#14654; the protected-log variant is goodqa#14655).** Found by the red-team of `4922c22`; the lexer in `command_guard.py` predates the kill guard and is being changed by another owner. Payload shapes (real-shell results are macOS bash 3.2 and zsh 5.9 on sleepers only):
+
+| # | Shape | Example |
+|---|---|---|
+| 1 | a command piped into a remote shell (the goodqa#14617 incident shape; `| bash` locally is blocked) | `printf 'pkill -f x\n' \| ssh dev2 bash` |
+| 2 | `&>` and `&>>` are not parsed as redirects, so the word after them starts a new command | `kill -9 4001 &>/dev/null 4004` |
+| 3 | backslash-newline continuation inside a comment, after a heredoc last line, or after an escaped backslash | `# note \` then a `kill` on the next line |
+| 4 | substitutions inside `${...}`, `$((...))` and case patterns are not read | `echo ${x:-$(kill -9 4004)}` |
+| 5 | case state entered from an argument | `echo then case x in; kill -9 4004` |
+| 6 | heredoc delimiter taken from expanded text | `cat <<$x` then a `kill` after the body |
+| 9 | a variable head whose value is never visible | `read x <<< kill; $x -9 4004` |
+| 10 | zsh command forms | `=kill`, `nocorrect kill`, `repeat 1 kill`, `zargs`, `zpty`, `hash k=/bin/kill` |
+| 11 | subscripted assignment prefix | `a[1]+=1 kill -9 4004` |
+| 12 | local stdin shells | `source /dev/stdin <<< 'kill ...'` |
+| 13 | a literal PID rewritten at parse time | `alias -g 4001=4004; eval "kill -9 4001"` |
+| 14 | wrappers and remote tools the guard does not list | `xcrun kill`, `tailscale ssh`, `pdsh`, `ansible -a`, `fd -x` |
+
+The guard therefore does not close the incident class. It closes the kill words it is shown.
+
+**Other limits.** A verb assembled from several variables at run time, text transformed into a command by `tr`, `rev` or `cut` pipes, `eval "$(cat file)"`, process substitution fed to a shell, kill calls inside script files or interpreter files that were not typed in the same input (`python3 file.py`), `make` or `npm` targets, compiled programs, `docker kill`, `kubectl delete pod`, `supervisorctl`, `launchctl remove` and `scp -S`, `rsync -e` or `git -c core.sshCommand` local command options, code run by `awk`, `sed 1e`, `tar --to-command`, `vim -c` or `emacs --eval`, `tmux send-keys`, and a wrapper option whose value is itself the name of an ordinary command (`exec -a echo pkill x`; the scan ends at the first ordinary command so `sudo grep kill file` stays allowed) are not covered. Between 1 and 8 MiB the crash fallback is weaker than the analyser (it does not rebuild a verb split by variables). Not verified: busybox and util-linux `kill` option parsing, live `docker exec` and `kubectl exec` kills, and interactive zsh with Claude Code's shell snapshot (the zsh-only forms are refused by the closed grammar; only `kill A(N) B` and the `#` comment form were run, on macOS zsh 5.9 against sleepers). `sleep N; kill PID` is judged when the hook runs, not when the kill runs, so a PID reused in between is a residual risk. On macOS `ps` loses argument boundaries, so only the first two whitespace-separated words are read and a path with spaces is unprovable.
 
 ### Commands and rollout
 

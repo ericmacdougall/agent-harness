@@ -110,7 +110,7 @@ def judge_rows(rows, decide_fn):
 
 class GrammarCorpus(WorldCase):
     """The closed kill grammar: every shape that ever got past the guard, plus what must keep working."""
-    SHAPES = {'cc473a3', 'ce11b1e', '1949bbc', 'a9432ef', '4a6982f', 'a03f8ac', 'F6', 'F7', 'F8', 'F9', 'PKILL', 'OK'}
+    SHAPES = {'cc473a3', 'ce11b1e', '1949bbc', 'a9432ef', '4a6982f', 'a03f8ac', 'F6', 'F7', 'F8', 'F9', 'R2', 'PKILL', 'OK'}
 
     @classmethod
     def setUpClass(cls):

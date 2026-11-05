@@ -546,16 +546,19 @@ def make_analyzer_class(cg):
             # error in bash, but in zsh (N) is a glob qualifier: the word vanishes and 4004 is signalled, and (e:...:) runs
             # code. Only `kill() {` (the name alone, then an empty pair) defines a function.
             words = []
+            held = []  # words of this command that hold an expansion: a variable may carry the verb (K=kill; $K 4001(N) 4004)
+            kill_mentioned = any('kill' in (value.text or '').lower() for kind, value in tokens if kind == 'w')
             for k, (kind, value) in enumerate(tokens):
                 if kind == 'w':
                     words.append(cg.norm_name(value.text))
+                    held.append(bool(value.dynamic or value.subs or '$' in (value.raw or value.text) or '`' in (value.raw or '')))
                 elif kind == 'op':
-                    if value == '(' and 'kill' in words:
+                    if value == '(' and ('kill' in words or (kill_mentioned and any(held))):
                         defines = len(words) == 1 and tokens[k + 1:k + 2] == [('op', ')')]
                         if not defines:
                             self.block('unprovable-target', 'a kill word is followed by a parenthesis, which zsh reads '
                                        'as a glob qualifier that can drop the word or run code')
-                    words = []
+                    words, held = [], []
 
         def bind_loop_var(self, words):
             # `for p in A B; do kill $p`: the base binds only one item; make the variable unresolvable instead so
@@ -621,7 +624,7 @@ def make_analyzer_class(cg):
                 return self.apply(name[1:], words, cmd, pl, idx, depth)  # Homebrew coreutils: gtimeout, gxargs ...
             args = words[1:]
             if name in ('command', 'builtin', 'type', 'which', 'whereis', 'hash') and (
-                    name in ('type', 'which', 'whereis', 'hash') or any(a.text in ('-v', '-V') for a in args)):
+                    name in ('type', 'which', 'whereis', 'hash') or leading_lookup(args)):
                 return None  # asks where a program is; runs nothing
             if name in ('export', 'declare', 'local', 'readonly', 'typeset'):
                 for a in args:
@@ -921,6 +924,18 @@ def make_analyzer_class(cg):
 
     return KillAnalyzer
 
+
+
+def leading_lookup(args):
+    """`command -v kill` looks a name up; `command kill 4004 -v` runs kill. Only a bundled -p/-v/-V option before the
+    first operand (or before `--`) can make it a lookup."""
+    for a in args:
+        t = a.text
+        if a.dynamic or a.subs or a.glob or not re.fullmatch(r'-[pvV]+', t):
+            return False
+        if 'v' in t or 'V' in t:
+            return True
+    return False
 
 
 def word_text(word, quoted_ok=False, remote=False):

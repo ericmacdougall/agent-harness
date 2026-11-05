@@ -863,7 +863,7 @@
    "why": "%job-spec joined to a zsh word-splitting expansion"
   },
   {
-   "cmd": "kill %é",
+   "cmd": "kill %\u00e9",
    "expect": "block",
    "id": "F6-21",
    "shape": "F6",
@@ -1484,6 +1484,160 @@
    "id": "OK-39",
    "shape": "OK",
    "why": "ordinary kill and kill -0 on a literal target must keep working"
+  },
+  {
+   "cmd": "K=kill; $K 4001(N) 4004",
+   "expect": "block",
+   "id": "R2-00",
+   "shape": "R2",
+   "why": "F7 head held in a variable: the paren rule never saw the word kill"
+  },
+  {
+   "cmd": "K=kill; \"$K\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R2-01",
+   "shape": "R2",
+   "why": "F7 quoted variable head"
+  },
+  {
+   "cmd": "k=kill; ${k} 4001(N) 4004",
+   "expect": "block",
+   "id": "R2-02",
+   "shape": "R2",
+   "why": "F7 braced variable head"
+  },
+  {
+   "cmd": "K=kill; $K -0 4001(N) 4004",
+   "expect": "block",
+   "id": "R2-03",
+   "shape": "R2",
+   "why": "F7 variable head, signal-0"
+  },
+  {
+   "cmd": "K=kill; sudo $K 4001(N) 4004",
+   "expect": "block",
+   "id": "R2-04",
+   "shape": "R2",
+   "why": "F7 variable head behind sudo"
+  },
+  {
+   "cmd": "K=kill; $K 4001 (4004)",
+   "expect": "block",
+   "id": "R2-05",
+   "shape": "R2",
+   "why": "F7 variable head, bare parenthesis"
+  },
+  {
+   "cmd": "command kill -9 4004 -v",
+   "expect": "block",
+   "id": "R2-06",
+   "shape": "R2",
+   "why": "F8 -v after the operand is a kill, not a lookup"
+  },
+  {
+   "cmd": "builtin kill 4004 -v",
+   "expect": "block",
+   "id": "R2-07",
+   "shape": "R2",
+   "why": "F8 builtin, -v after operand"
+  },
+  {
+   "cmd": "command -p kill -9 4004 -v",
+   "expect": "block",
+   "id": "R2-08",
+   "shape": "R2",
+   "why": "F8 -p then the verb then -v"
+  },
+  {
+   "cmd": "command kill -9 4004 -V",
+   "expect": "block",
+   "id": "R2-09",
+   "shape": "R2",
+   "why": "F8 -V after operand"
+  },
+  {
+   "cmd": "command -p kill 4004 -v",
+   "expect": "block",
+   "id": "R2-10",
+   "shape": "R2",
+   "why": "F8"
+  },
+  {
+   "cmd": "sudo command kill -9 4004 -v",
+   "expect": "block",
+   "id": "R2-11",
+   "shape": "R2",
+   "why": "F8 behind sudo"
+  },
+  {
+   "cmd": "command pkill -f x -v",
+   "expect": "block",
+   "id": "R2-12",
+   "shape": "R2",
+   "why": "F8 pkill with -v after the operand"
+  },
+  {
+   "cmd": "command -- kill 4004 -v",
+   "expect": "block",
+   "id": "R2-13",
+   "shape": "R2",
+   "why": "F8 after --"
+  },
+  {
+   "cmd": "builtin -- kill 4004 -V",
+   "expect": "block",
+   "id": "R2-14",
+   "shape": "R2",
+   "why": "F8 builtin after --"
+  },
+  {
+   "cmd": "command -v kill",
+   "expect": "allow",
+   "id": "R2-OK-00",
+   "shape": "R2",
+   "why": "a lookup before the operand"
+  },
+  {
+   "cmd": "command -V kill",
+   "expect": "allow",
+   "id": "R2-OK-01",
+   "shape": "R2",
+   "why": "a lookup"
+  },
+  {
+   "cmd": "command -pv kill",
+   "expect": "allow",
+   "id": "R2-OK-02",
+   "shape": "R2",
+   "why": "bundled -p -v lookup"
+  },
+  {
+   "cmd": "command -v pkill",
+   "expect": "allow",
+   "id": "R2-OK-03",
+   "shape": "R2",
+   "why": "lookup of pkill"
+  },
+  {
+   "cmd": "builtin -v kill",
+   "expect": "allow",
+   "id": "R2-OK-04",
+   "shape": "R2",
+   "why": "lookup"
+  },
+  {
+   "cmd": "kill 4001 # stop it",
+   "expect": "allow",
+   "id": "R2-OK-05",
+   "shape": "R2",
+   "why": "ordinary literal kill with a comment"
+  },
+  {
+   "cmd": "echo $HOME (x)",
+   "expect": "allow",
+   "id": "R2-OK-06",
+   "shape": "R2",
+   "why": "a variable and a parenthesis, no kill anywhere"
   }
  ]
 }
