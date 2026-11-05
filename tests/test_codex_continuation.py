@@ -158,6 +158,20 @@ class AlertParityAndDegrade(unittest.TestCase):
             context = json.loads(result.stdout)['hookSpecificOutput']['additionalContext']
             self.assertIn('ALERT-MARKER-41', context, payload['hook_event_name'])
 
+    def test_checkout_loader_candidate_is_not_used_from_an_install_dir(self):
+        # Installed under <home>/.codex/agent-harness the checkout-relative candidate would be <home>/harness/hooks;
+        # it must only apply inside a git checkout, so an installed copy with no ops_watch beside it injects nothing.
+        import shutil
+        install_dir = Path(self.home.name) / '.codex' / 'agent-harness'; install_dir.mkdir(parents=True)
+        shutil.copy(self.hook, install_dir / 'wal.py')
+        decoy = Path(self.home.name) / 'harness' / 'hooks'; decoy.mkdir(parents=True)
+        (decoy / 'ops_watch.py').write_text('def injection_text(home, max_chars=700):\n    return " DECOY-LOADED"\n')
+        result = subprocess.run([sys.executable, str(install_dir / 'wal.py'), 'hook'],
+                                input=json.dumps({'hook_event_name': 'UserPromptSubmit', 'session_id': 'ld', 'prompt': 'hi'}),
+                                text=True, capture_output=True, env=self.env, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('DECOY-LOADED', json.loads(result.stdout)['hookSpecificOutput']['additionalContext'])
+
     def test_unwritable_wal_dir_degrades_to_a_note_instead_of_blocking(self):
         first = self.run_hook({'hook_event_name': 'UserPromptSubmit', 'session_id': 'ro', 'prompt': 'hi'})
         self.assertEqual(first.returncode, 0, first.stderr)
