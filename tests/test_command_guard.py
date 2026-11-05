@@ -872,6 +872,36 @@ class OverwriteExistingTests(Fixture):
         text = 'x=$(>! self.sh echo rm -rf ~/.c*/projects); bash self.sh'
         self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'warn', text)
 
+    def test_known_limits_worse_than_the_base_are_pinned(self):
+        # Each of these blocks at cbfc4da and runs with no refusal here, so each is a regression accepted for now, listed in
+        # the PR: goodqa#14722 (the disk read) and goodqa#14723 (a script's state carrying past its process). The allows reach
+        # a deletion with no warning. These rows are not wanted behaviour: a repair should change them on purpose.
+        self._seed_bang_rows()
+        fx = self.home / 'fx'
+        fx.mkdir()
+        (fx / 'del.sh').write_text('rm -rf ' + str(self.home / '.claude/projects') + '\n')
+        (fx / 'a1.sh').write_text('echo plain\n')
+        (fx / 'a8.sh').write_text(''.join('bash %s/c%d.sh\n' % (fx, n) for n in range(1, 9)))
+        (fx / 'self.sh').write_text('bash %s/self.sh\n' % fx)
+        for n in range(1, 9):
+            (fx / ('c%d.sh' % n)).write_text('echo plain\n')
+        allows = (
+            ('P1', 'x=$(echo bash del.sh >! a8.sh); bash a8.sh', str(fx)),
+            ('P2', "eval 'echo bash del.sh >! a8.sh'; bash a8.sh", str(fx)),
+            ('P3', "bash -c 'echo bash del.sh >! a8.sh'; bash a8.sh", str(fx)),
+            ('R3', 'x=$(echo hi >! a8.sh); echo bash del.sh > a8.sh; bash a8.sh', str(fx)),
+            ('T1', 'T=@HOME@/.claude/projects; x=$(echo T=/tmp/plain >! a1.sh); bash a1.sh; rm -rf $T', str(fx)),
+            ('D5', "eval '>! a1.sh echo cd /tmp'; bash a1.sh; rm -rf .claude/projects", '@HOME@'),
+        )
+        warns = (
+            ('U1', 'x=$(echo hi >! self.sh); bash self.sh; rm -rf ~/.c*/projects', str(fx)),
+            ('R1', 'x=$(echo hi >! self.sh); echo rm -rf ~/.c*/projects > self.sh; bash self.sh', str(fx)),
+        )
+        for want, rows in (('allow', allows), ('warn', warns)):
+            for name, text, cwd in rows:
+                with self.subTest(name):
+                    self.assertEqual(self.decide(text, cwd=cwd)[0], want)
+
     def test_only_enforced_findings_survive_a_stop(self):
         # broad_kill warns by default, so a warning raised before the stop must not turn into a refusal
         self._seed_bang_rows()
