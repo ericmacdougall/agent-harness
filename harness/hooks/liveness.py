@@ -59,6 +59,8 @@ def classify(now: float, last_wal: float, transcript_mtime: float, stopped: bool
     tr_idle = now - transcript_mtime if transcript_mtime else float("inf")
     if wal_idle <= LIVE_WAL_S or tr_idle <= LIVE_TRANSCRIPT_S:
         return {"state": "live", "idle_s": idle, "severity": "info"}
+    if owner is False:  # a helper nobody named as owner: idle is expected, never an alert
+        return {"state": "idle-helper", "idle_s": idle, "severity": "info"}
     if idle < SILENT_S:
         return {"state": "quiet", "idle_s": idle, "severity": "info"}
     if idle >= HIGH_S:

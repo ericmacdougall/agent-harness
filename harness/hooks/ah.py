@@ -199,6 +199,45 @@ def transcript_mtime(home: Path, session: str, agent: str) -> float:
     return best
 
 
+RESTRICTED = re.compile(r"\b(solve|interview)", re.I)  # fail-closed: show liveness only, never the task text
+
+
+def discover_agents(home: Path, session: str, wal: Path) -> dict:
+    """agent id -> {type, description, parent, finished, tmtime} from the two sources that exist for every
+    sub-agent (the main WAL only lists the few types whose spawn is hooked): task WALs and transcript meta files."""
+    found = {}
+    try:
+        with os.scandir(wal) as it:
+            for e in it:
+                if e.name.startswith("agent-") and e.name.endswith(".jsonl"):
+                    found.setdefault(e.name[6:-6], {})
+    except OSError:
+        pass
+    try:
+        with os.scandir(home / ".claude" / "projects") as projects:
+            for proj in projects:
+                sub_dir = Path(proj.path) / session / "subagents"
+                try:
+                    with os.scandir(sub_dir) as it:
+                        for e in it:
+                            if not (e.name.startswith("agent-") and e.name.endswith(".meta.json")):
+                                continue
+                            agent = e.name[6:-10]
+                            info = found.setdefault(agent, {})
+                            try:  # the meta file only: transcript content is never read here
+                                if e.stat().st_size <= 65536:
+                                    meta = json.loads(Path(e.path).read_text())
+                                    info.update(type=meta.get("agentType"), description=meta.get("description"),
+                                                parent=meta.get("parentAgentId"), finished=bool(meta.get("finished")))
+                            except (OSError, ValueError):
+                                pass
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return found
+
+
 def owners(home: Path, session: str, now: float | None = None, comments=None) -> dict:
     now = time.time() if now is None else now
     wal = wal_dirs(home) / session
@@ -223,6 +262,10 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             elif rec.get("event") == "subagent_stop":
                 stopped.add(rec["agent_id"])
                 stop_at[rec["agent_id"]] = parse_ts(rec.get("at"))
+    for agent, meta in discover_agents(home, session, wal).items():
+        info = spawned.setdefault(agent, {"type": None, "at": 0.0})
+        info["type"] = info["type"] or meta.get("type")
+        info.update({k: meta[k] for k in ("description", "parent", "finished") if k in meta})
     registered = {r["args"].get("owner_agent") for r in _ledger(home) if r.get("op") == "task.register"}
     named_text = "\n".join(named)
     rows = []
@@ -232,14 +275,22 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             "first": None, "last_at": 0.0, "outcome": None, "last_note": "", "tickets": []}
         last_wal = max(summary["last_at"], 0.0) or info["at"]
         tmtime = transcript_mtime(home, session, agent)
+        if info.get("finished") and agent not in stopped:  # transcript meta says it ended; hook never saw the stop
+            stopped.add(agent)
+            stop_at[agent] = max(tmtime, last_wal)
         is_stopped = agent in stopped and max(last_wal, tmtime) <= stop_at.get(agent, 0.0) + 120
+        by_name = info["type"] in liveness.NAMEABLE_TYPES and agent in named_text
+        is_owner = agent in registered or info["type"] in liveness.OWNER_TYPES or by_name
         verdict = liveness.classify(now, last_wal, tmtime, is_stopped,
                                     summary["outcome"], summary["last_note"], info["type"],
-                                    agent in registered,
-                                    owner=(agent in registered or info["type"] in liveness.OWNER_TYPES
-                                           or (info["type"] in liveness.NAMEABLE_TYPES and agent in named_text)))
+                                    agent in registered, owner=is_owner)
         idle = verdict["idle_s"]
-        row = {"agent_id": agent, "type": info["type"], "task": summary["first"],
+        text = " ".join(filter(None, [info.get("description"), summary["first"]]))
+        restricted = bool(RESTRICTED.search(text))
+        row = {"agent_id": agent, "type": info["type"], "task": None if restricted else (summary["first"] or info.get("description")),
+               "restricted": restricted, "parent": info.get("parent"),
+               "owner": bool(is_owner), "registered": agent in registered,
+               "flags": (["unregistered-owner"] if is_owner and agent not in registered else []),
                "state": verdict["state"], "severity": verdict["severity"],
                "last_activity": iso(last_wal), "idle_s": None if idle == float("inf") else int(idle),
                "ticket": summary["tickets"][0] if summary["tickets"] else None,
