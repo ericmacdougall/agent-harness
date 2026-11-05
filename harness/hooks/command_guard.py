@@ -746,7 +746,8 @@ class Lexer:
                 continue
             if c in ';&|()<>' and not (c in '<>' and s[i + 1:i + 2] == '('):
                 op = self._operator(s, i)
-                if op[0] in ('<', '>', '&>', '>&', '<&', '<>', '<<', '<<<', '<<-', '&>>', '>>', '>|'):
+                # the whole operator, not its first character: `&>` and `&>>` start with `&` (GoodQA #14471 follow-up)
+                if op in ('<', '>', '&>', '>&', '<&', '<>', '<<', '<<<', '<<-', '&>>', '>>', '>|'):
                     fd = None
                     if tokens and tokens[-1][0] == 'w' and prev_end == i and re.fullmatch(r'[0-9]', tokens[-1][1].text or 'x'):
                         fd = tokens.pop()[1].text
@@ -1624,8 +1625,9 @@ class Analyzer:
         name = norm_name(words[0].text) if words else ''
         arg_texts = [w.text for w in words[1:]]
         # pure truncation: nothing (or nothing meaningful) is written, so the redirect only empties the file
+        has_body = any(r.op in ('<<', '<<-', '<<<') for r in cmd.redirs)  # `cat > f <<EOF` writes content
         pure = (not words or name in (':', 'true', 'false')
-                or (name == 'cat' and all(t == '/dev/null' for t in arg_texts))
+                or (name == 'cat' and not has_body and all(t == '/dev/null' for t in arg_texts))
                 or (name in ('echo', 'printf') and all(t in ('', '-n', '-e', '-ne', '-en') for t in arg_texts)))
         written = None
         if name in ('echo', 'printf'):
@@ -3275,9 +3277,39 @@ class Analyzer:
         if self.state_dest(target_word):
             return
         if truncating:
-            tiers = ('log', 'root', 'unknown') if pure else ('log', 'unknown')
-            self.refuse('truncation by redirect', target_word, tiers=tiers, need_existing=True)
+            # `echo x > existing` replaces the file's content just as `: >` empties it, so an existing literal file
+            # under a protected root is refused like `tee` is; new files and `>>` appends stay allowed. A dynamic
+            # target keeps the narrower tiers: its existence cannot be checked, and new-file writes are common.
+            cls, path, literal = self.target_class(target_word)
+            literal = pure or literal
+            tiers = ('log', 'root', 'unknown') if literal else ('log', 'unknown')
+            if not pure and cls == 'root' and self._plain_work_file(path):
+                # owners routinely rerun `cmd > <task dir>/x.log`; only receipts (*.json) and .keep-marked
+                # directories under the work dir keep the overwrite refusal (replay over real transcripts)
+                tiers = ('log', 'unknown')
+            self.refuse('truncation by redirect' if pure else 'overwrite by redirect', target_word, tiers=tiers,
+                        need_existing=True)
         self.note_created(target_word)
+
+    @staticmethod
+    def _plain_work_file(path):
+        """A file at least two levels below ~/.agent-harness/work that is not a JSON receipt and has no `.keep`
+        in any directory between it and the work dir (exclusive)."""
+        parts = path.split('/')
+        folded = [p.casefold() for p in parts]
+        for i in range(len(folded) - 1):
+            if folded[i] == '.agent-harness' and folded[i + 1] == 'work':
+                break
+        else:
+            return False
+        rest = parts[i + 2:]
+        if len(rest) < 2 or '..' in rest or not rest[-1] or rest[-1].casefold().endswith('.json'):
+            return False
+        base = '/'.join(parts[:i + 2])
+        for k in range(1, len(rest)):
+            if _lexists(base + '/' + '/'.join(rest[:k]) + '/.keep'):
+                return False
+        return True
 
     def note_created(self, word, text=None):
         for alt in word.alts[:32]:

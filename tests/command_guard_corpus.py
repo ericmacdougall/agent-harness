@@ -828,4 +828,36 @@ HEREDOC_PLAIN_ALLOW = [
     "cat > notes.md <<'EOF'\nThe guard protects ~/.claude/projects.\nEOF",
     "cat > clean.sh <<'EOF'\nrm -rf build\nEOF",
 ]
+# Replacing the content of an EXISTING protected file is as destructive as truncating it. `&>` used to lex as a
+# background `&` plus a separate redirect and was not seen at all. The test creates every file named here except
+# the ones marked NEW. Plain files under the work dir stay writable: owners rerun `cmd > <task>/x.log` routinely
+# (replay: 505 new refusals of 23,963 Mac commands before the narrowing).
+OVERWRITE_EXISTING = [
+    ('ls &> @HOME@/.claude/wals/s/main.jsonl', 'block'),
+    ('echo x &>@HOME@/.claude/projects/p/s.jsonl', 'block'),
+    ('date &> @HOME@/.codex/sessions/2026/r.jsonl', 'block'),
+    ('echo {} > @HOME@/.claude/settings.json', 'block'),
+    ('echo {} > @TASK@/receipt.json', 'block'),
+    ('make &> @TASK@/kept/evidence.log', 'block'),
+    ('echo x > @HOME@/.agent-harness/bin/tool', 'block'),
+    ('echo x > @HOME@/.claude/hooks/hook.py', 'block'),
+    ('echo x > @HOME@/.agent-harness/work/top.log', 'block'),
+    ("cat > @HOME@/.claude/settings.json <<'E'\n{}\nE", 'block'),
+    ("> @TASK@/existing.log <<'E'\nx\nE", 'block'),
+    ('echo x > @TASK@/existing.log', 'allow'),
+    ('printf x >| @TASK@/existing.log', 'allow'),
+    ('python3 gen.py 1> @TASK@/existing.log', 'allow'),
+    ('make &> @TASK@/existing.log', 'allow'),
+    ("cat > @TASK@/existing.log <<'E'\nx\nE", 'allow'),
+    ('echo x > @HOME@/.agent-harness/work/S/top.log', 'allow'),
+    ('echo x > @TASK@/NEW-report.md', 'allow'),
+    ('make &> @TASK@/NEW-build.log', 'allow'),
+    ('echo x >> @TASK@/existing.log', 'allow'),
+    ('ls &>> @HOME@/.claude/wals/s/main.jsonl', 'allow'),
+    ('echo x | tee -a @TASK@/existing.log', 'allow'),
+    ('echo x > @HOME@/repo/existing.txt', 'allow'),
+    ('ls &> /dev/null', 'allow'),
+    ('echo x >&2', 'allow'),
+    ('ls 2>&1 | cat', 'allow'),
+]
 SEED = 14471

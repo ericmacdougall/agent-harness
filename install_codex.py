@@ -102,13 +102,16 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             if handlers:
                 preserved.append({**group, 'hooks': handlers})
         preserved.append(managed)
-        if event == 'PreToolUse' and command_guard:
-            # Command guard for every tool (no matcher): Codex fails open, so the launcher blocks by itself, and
-            # write_stdin text typed into a running shell is never checked again by the host.
-            preserved.insert(0, {'hooks': [{'type': 'command', 'command': guard, 'timeout': 30}]})
         if event == 'PreToolUse':
             # Commit message policy for every tool (no matcher): shell argv, strings, stdin writes.
             preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 60}]})
+        if event == 'PreToolUse' and command_guard:
+            # Command guard for every tool (no matcher): Codex fails open, so the launcher blocks by itself, and
+            # write_stdin text typed into a running shell is never checked again by the host. Appended last:
+            # Codex keys hook trust by position (hooks.state "<file>:pre_tool_use:<group>:<handler>"), so adding
+            # it after the existing groups keeps their trusted hashes valid (GoodQA #14590). Codex runs every
+            # matching hook, so position does not change whether the guard can block.
+            preserved.append({'hooks': [{'type': 'command', 'command': guard, 'timeout': 30}]})
         hooks[event] = preserved
     return result
 
