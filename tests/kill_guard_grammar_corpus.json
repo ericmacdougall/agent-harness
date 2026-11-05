@@ -5180,6 +5180,370 @@
    "id": "WSOK-053",
    "shape": "WSOK",
    "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "K=(echo kill); ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-040",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); \"${K[1]}\" 4004",
+   "expect": "block",
+   "id": "VH-041",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); ${K[-1]} 4004",
+   "expect": "block",
+   "id": "VH-042",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); ${K[1]} -9 4004",
+   "expect": "block",
+   "id": "VH-043",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); ${K[1]} %1 4004",
+   "expect": "block",
+   "id": "VH-044",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); ${K[2]} 4004",
+   "expect": "block",
+   "id": "VH-045",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); ssh dev2 ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-046",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); sudo ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-047",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); timeout 5 ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-048",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(true pkill); ${K[1]} -f node",
+   "expect": "block",
+   "id": "VH-049",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); echo ${K[1]} 4004",
+   "expect": "allow",
+   "id": "WSOK-054",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "declare -a K=(echo kill); ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-050",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo fuser); ${K[1]} -k 8080/tcp",
+   "expect": "block",
+   "id": "VH-051",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); { ${K[1]} 4004; }",
+   "expect": "block",
+   "id": "VH-052",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); ${K[1]} -- 4004",
+   "expect": "block",
+   "id": "VH-053",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); ${K[1]} 4004 &",
+   "expect": "block",
+   "id": "VH-054",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); A=1 ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-055",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); bash -c \"${K[1]} 4004\"",
+   "expect": "block",
+   "id": "VH-056",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); command ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-057",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); docker exec c ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-058",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); echo \"${K[1]} 4004\" | sh",
+   "expect": "block",
+   "id": "VH-059",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); echo ${K[1]} 4004 | ssh dev2 bash",
+   "expect": "block",
+   "id": "VH-060",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); echo 4004 | xargs ${K[1]}",
+   "expect": "block",
+   "id": "VH-061",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); env ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-062",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); eval ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-063",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); exec ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-064",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); for i in 1; do ${K[1]} 4004; done",
+   "expect": "block",
+   "id": "VH-065",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); if true; then ${K[1]} 4004; fi",
+   "expect": "block",
+   "id": "VH-066",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); kubectl exec p -- ${K[1]} 1",
+   "expect": "block",
+   "id": "VH-067",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); nice ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-068",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); nohup ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-069",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); ssh dev2 \"${K[1]} 4004\"",
+   "expect": "block",
+   "id": "VH-070",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); watch ${K[1]} 4004",
+   "expect": "block",
+   "id": "VH-071",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "K=(echo kill); x=$(${K[1]} 4004)",
+   "expect": "block",
+   "id": "VH-072",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "P=(4004); K=(echo kill); ${K[1]} ${P[0]}",
+   "expect": "block",
+   "id": "VH-073",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | \"/opt/my dir/bash\"",
+   "expect": "block",
+   "id": "VH-074",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | '/opt/my dir/bash' -s",
+   "expect": "block",
+   "id": "VH-075",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | timeout 5 \"/opt/my dir/bash\"",
+   "expect": "block",
+   "id": "VH-076",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | sudo \"/Volumes/Macintosh HD/bin/bash\"",
+   "expect": "block",
+   "id": "VH-077",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | nice \"/opt/a b/sh\" -s",
+   "expect": "block",
+   "id": "VH-078",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | env \"/opt/my dir/bash\"",
+   "expect": "block",
+   "id": "VH-079",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | nohup \"$HOME/my tools/bash\"",
+   "expect": "block",
+   "id": "VH-080",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | /opt/my\\ dir/bash",
+   "expect": "block",
+   "id": "VH-081",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | timeout 5 /opt/my\\ dir/bash",
+   "expect": "block",
+   "id": "VH-082",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "B=\"/opt/my dir/bash\"; echo \"kill 4004\" | \"$B\"",
+   "expect": "block",
+   "id": "VH-083",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | ssh dev2 \"'/opt/my dir/bash'\"",
+   "expect": "block",
+   "id": "VH-084",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | ssh dev2 \"/opt/my dir/bash\"",
+   "expect": "allow",
+   "id": "WSOK-055",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | \"/opt/my dir/cat\"",
+   "expect": "allow",
+   "id": "WSOK-056",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "echo \"kill 4004\" | timeout 5 \"/opt/my dir/cat\" bash",
+   "expect": "allow",
+   "id": "WSOK-057",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=(cat bash); echo \"kill 4004\" | \"${S[1]}\"",
+   "expect": "block",
+   "id": "VH-085",
+   "shape": "VH",
+   "why": "a variable or array holding several words is split by the shell, so the sink or the kill is in the value"
+  },
+  {
+   "cmd": "S=(cat grep); echo \"kill 4004\" | \"${S[1]}\" x",
+   "expect": "allow",
+   "id": "WSOK-058",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "S=(cat bash); echo hello | \"${S[1]}\"",
+   "expect": "allow",
+   "id": "WSOK-059",
+   "shape": "WSOK",
+   "why": "text down a pipe that is not read as a program must stay allowed"
   }
  ]
 }

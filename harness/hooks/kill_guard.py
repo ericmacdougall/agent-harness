@@ -683,10 +683,13 @@ def make_analyzer_class(cg):
             words = self._skip_assigns(cg.strip_reserved(words))[1]
             if not words:
                 return False
+            picked = self.picked_elements(words[0])
+            if picked:  # S=(cat bash); ... | "${S[1]}": which element runs depends on the shell, so any of them may
+                return any(self.reads_program([e] + words[1:]) for e in picked)
             head = words[0].text.strip()
-            if re.search(r'\s', head) and not head.startswith('-'):  # S="ssh -T dev2"; ... | $S bash: the shell splits a held value
+            if re.search(r'\s', head) and not head.startswith('-') and self.shell_splits(words[0]):  # S="ssh -T dev2"; ... | $S bash
                 split = [v for k, v in cg.Lexer(self.ctx, self.ctx.ps).lex(head) if k == 'w']
-                if [w.text for w in split] != [head]:  # a no-break space stays one word, and would recurse forever
+                if [w.text for w in split] != [head]:  # defensive: a word the lexer cannot split must not recurse forever
                     return self.reads_program(split + words[1:])
             name, args = cg.norm_name(words[0].text), words[1:]
             if name.startswith('g') and name[1:] in GNU_PREFIXED:
@@ -707,12 +710,14 @@ def make_analyzer_class(cg):
                 return True
             if name in WRAPPER_NAMES or name in REMOTE_EXEC or name in REMOTE_WRAPPERS:
                 host = self._ssh_host_index([a.text for a in args]) if name in ('ssh', 'mosh') else None
+                remote = name in REMOTE_EXEC or name in REMOTE_WRAPPERS
                 for i, a in enumerate(args):
                     if re.search(r'\s', a.text.strip()) and name not in ('xargs', 'parallel'):  # ssh host 'cd /srv && bash -s'
                         lexed = cg.Lexer(self.ctx, self.ctx.ps).lex(a.text)
                         if any(self.reads_program(c.words) for pl in cg.parse(lexed) for c in pl.cmds):
                             return True
-                        continue
+                        if remote:
+                            continue  # a remote command line; a local wrapper's word is one argv word, a path
                     n = cg.norm_name(a.text)
                     if n in cg.SHELLS:
                         if name in ('xargs', 'parallel'):  # the text reaches the shell only when it is the whole -c program
@@ -728,6 +733,25 @@ def make_analyzer_class(cg):
                     if n in STOP_COMMANDS:
                         return False
             return False
+
+        @staticmethod
+        def shell_splits(word):
+            """A held value is split into words only when it came from an unquoted variable, or from a quoted `[@]` or `[*]`.
+            A quoted path with a space (`"/opt/my dir/bash"`, `"$B"`) stays one word."""
+            raw = word.raw or ''
+            if not word.vars:
+                return False
+            return not raw.startswith('"') or bool(re.search(r'\[[@*]\]', raw))
+
+        def picked_elements(self, word):
+            """The elements of a known array when this word picks one of them: `"${S[1]}"`, zsh `$S[1]`, `${S[-1]}`."""
+            match = re.fullmatch(r'"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\[([^\]]*)\]\}?"?', word.raw or '')
+            if not match or match.group(2) in ('@', '*'):
+                return None
+            name = match.group(1)
+            if name not in self.ctx.vars or name in self.ctx.tainted:
+                return None
+            return [v for k, v in cg.Lexer(self.ctx, self.ctx.ps).lex(self.ctx.vars[name]) if k == 'w'] or None
 
         @staticmethod
         def names_a_value(name, args, i):
@@ -789,11 +813,11 @@ def make_analyzer_class(cg):
             return out
 
         def array_value(self, word):
-            """`"${S[@]}"` and zsh's `$S[@]` hold the words normalize_assignments gave S; the base keeps them as text. Every
-            subscript reads as the whole value. A kill target held in a variable is refused either way."""
+            """`"${S[@]}"` and zsh's `$S[@]` hold the words normalize_assignments gave S; the base keeps them as text. One
+            element (`${S[1]}`) stays unresolved, as before, so a command name picked from an array is judged as unknown."""
             if word is None or not word.vars:
                 return word
-            use = r'\$\{([A-Za-z_][A-Za-z0-9_]*)\[[^\]]*\]\}|%s([A-Za-z_][A-Za-z0-9_]*)%s\[[^\]]*\]' % (cg.VAR_OPEN, cg.VAR_CLOSE)
+            use = r'\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}|%s([A-Za-z_][A-Za-z0-9_]*)%s\[[@*]\]' % (cg.VAR_OPEN, cg.VAR_CLOSE)
             alts = [re.sub(use, lambda m: cg.VAR_OPEN + (m.group(1) or m.group(2)) + cg.VAR_CLOSE, a) for a in word.alts]
             if alts == word.alts:
                 return word
@@ -862,6 +886,8 @@ def make_analyzer_class(cg):
                 self.remote -= 1
 
         def apply(self, name, words, cmd, pl, idx, depth):
+            if words[0].vars and name.endswith(']'):
+                name = re.sub(r'\[[^\]]*\]$', '', name)  # zsh subscript on an array head: $K[1]
             if name.startswith('g') and name[1:] in GNU_PREFIXED:
                 return self.apply(name[1:], words, cmd, pl, idx, depth)  # Homebrew coreutils: gtimeout, gxargs ...
             args = words[1:]
