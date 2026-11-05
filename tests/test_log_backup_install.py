@@ -61,7 +61,7 @@ class Case(unittest.TestCase):
 
     def apply(self, system, runner=None, **kw):
         runner = runner if runner is not None else Runner()
-        message = lbi.status(self.home, True, system=system, run=runner, uid=501, activate=kw.pop("activate", True), **kw)
+        message = lbi.status(self.home, True, system=system, run=runner, uid=501, activate=kw.pop("activate", True), enabled=kw.pop("enabled", True), **kw)
         return message, runner
 
 
@@ -102,7 +102,7 @@ class Darwin(Case):
         self.assertEqual((self.home / SCRIPT).read_bytes(), (ROOT / "harness/bin/log-backup.sh").read_bytes())
 
     def test_preview_writes_nothing(self):
-        message = lbi.status(self.home, False, system="Darwin")
+        message = lbi.status(self.home, False, system="Darwin", enabled=True)
         self.assertIn("would install", message)
         self.assertEqual(list(self.home.rglob("*")), [])
 
@@ -209,6 +209,121 @@ class Linux(Case):
         self.assertIn("failed", message)
 
 
+class Raising:
+    """A scheduler runner that raises like a hung or missing launchctl or systemctl."""
+    def __init__(self, error):
+        self.error, self.calls = error, []
+
+    def __call__(self, argv):
+        self.calls.append(argv)
+        raise self.error
+
+
+class ReloadFailures(Case):
+    def test_a_raising_runner_leaves_a_pending_marker_and_the_next_install_retries(self):
+        for system in ("Darwin", "Linux"):
+            for error in (subprocess.TimeoutExpired(["x"], 60), FileNotFoundError("no launchctl or systemctl")):
+                shutil.rmtree(self.home, ignore_errors=True)
+                self.home.mkdir()
+                message, runner = self.apply(system, runner=Raising(error))
+                self.assertNotIn("up to date", message, (system, error))
+                self.assertTrue((self.home / ".agent-harness/logs/log-backup.reload-pending").exists(), (system, error))
+                self.assertIn("failed", message)
+                message, runner = self.apply(system)  # a working runner finishes the reload
+                self.assertTrue(runner.calls, (system, error))
+                self.assertFalse((self.home / ".agent-harness/logs/log-backup.reload-pending").exists())
+                message, runner = self.apply(system)
+                self.assertEqual(runner.calls, [])
+
+
+class OptIn(Case):
+    COMPONENT = ".agent-harness/bin/log-backup.excludes"
+
+    def test_a_host_without_the_component_gets_nothing_by_default(self):
+        self.seed(SCRIPT, "hand installed script, no excludes file\n")  # dev2 and the Mac today
+        self.assertFalse(lbi.choice(self.home, None))
+        message = lbi.status(self.home, True, system="Linux", run=Runner(), uid=501, activate=True)
+        self.assertIn("not installed on this host", message)
+        self.assertEqual((self.home / SCRIPT).read_text(), "hand installed script, no excludes file\n")
+        self.assertFalse((self.home / ".config/systemd/user").exists())
+
+    def test_default_install_leaves_a_running_hand_installed_scheduler_alone(self):
+        self.seed(SCRIPT, "hand installed\n")
+        self.seed(UNITS[1], "[Timer]\nOnBootSec=2min\n")
+        runner = Runner()
+        message = lbi.status(self.home, True, system="Linux", run=runner, uid=501, activate=True)
+        self.assertEqual(runner.calls, [])  # no stop, no disable, no reload
+        self.assertEqual((self.home / UNITS[1]).read_text(), "[Timer]\nOnBootSec=2min\n")
+        self.assertIn("nothing changed", message)
+
+    def test_explicit_flag_installs_and_is_remembered(self):
+        self.assertTrue(lbi.choice(self.home, True))
+        lbi.save_choice(self.home, True)
+        self.assertTrue(lbi.choice(self.home, None))
+        message, runner = self.apply("Linux")
+        self.assertIn("enabled", message)
+        self.assertTrue((self.home / self.COMPONENT).exists())
+        self.assertTrue(lbi.choice(self.home, None))  # an installed host keeps updating
+
+    def test_no_log_backup_is_remembered_and_stops_the_job_but_keeps_files(self):
+        self.apply("Linux")
+        lbi.save_choice(self.home, False)
+        self.assertFalse(lbi.choice(self.home, None))
+        runner = Runner()
+        message = lbi.status(self.home, True, system="Linux", run=runner, uid=501, activate=True)
+        self.assertEqual(runner.calls, [["systemctl", "--user", "disable", "--now", "log-backup.timer"]])
+        self.assertIn("disabled by choice", message)
+        self.assertTrue((self.home / SCRIPT).exists() and (self.home / UNITS[1]).exists())
+        # a reinstall without a flag does not recreate or restart anything
+        runner = Runner()
+        os.unlink(self.home / UNITS[1])
+        lbi.status(self.home, True, system="Linux", run=runner, uid=501, activate=True)
+        self.assertFalse((self.home / UNITS[1]).exists())
+
+    def test_darwin_disable_boots_out_the_label(self):
+        self.apply("Darwin")
+        lbi.save_choice(self.home, False)
+        runner = Runner()
+        lbi.status(self.home, True, system="Darwin", run=runner, uid=501, activate=True)
+        self.assertEqual(runner.calls, [["launchctl", "bootout", "gui/501/com.ericmacdougall.log-backup"]])
+
+    def test_disable_is_deferred_while_a_run_is_active(self):
+        self.apply("Linux")
+        self.lock_held_by(self.holder().pid)
+        lbi.save_choice(self.home, False)
+        runner = Runner()
+        message = lbi.status(self.home, True, system="Linux", run=runner, uid=501, activate=True)
+        self.assertIn("deferred", message)
+        self.assertEqual(runner.calls, [])
+
+    def test_cli_default_registers_no_alert_and_flag_registers_it_and_no_flag_removes_it(self):
+        import json
+        def alert_count():
+            settings = json.loads((self.home / ".claude/settings.json").read_text())
+            return sum(1 for g in settings["hooks"].get("SessionStart", []) for h in g["hooks"]
+                       if "log_backup.py" in " ".join(h.get("args", [])))
+        base = [sys.executable, str(ROOT / "install.py"), "--home", str(self.home), "--apply", "--no-netwatch", "--no-durable-tmp"]
+        env = {**os.environ, "HOME": str(self.home)}
+        def run(*extra):
+            done = subprocess.run(base + list(extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, env=env)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return done.stdout
+        out = run()
+        self.assertEqual(alert_count(), 0)
+        self.assertIn(b"not installed on this host", out)
+        self.assertFalse((self.home / SCRIPT).exists())
+        run("--log-backup")
+        self.assertEqual(alert_count(), 1)
+        self.assertTrue((self.home / SCRIPT).exists())
+        run()  # remembered
+        self.assertEqual(alert_count(), 1)
+        run("--no-log-backup")
+        self.assertEqual(alert_count(), 0)
+        self.assertTrue((self.home / SCRIPT).exists())  # files stay
+        run()
+        self.assertEqual(alert_count(), 0)  # the opt-out survives a plain reinstall
+
+
 class UnitContents(unittest.TestCase):
     def test_timer_and_service_are_exactly_as_intended(self):
         timer = (ROOT / "harness/schedulers/log-backup.timer").read_text().splitlines()
@@ -258,8 +373,8 @@ class Refusals(Case):
 class Wiring(Case):
     def test_install_registers_one_session_start_hook_and_is_idempotent(self):
         import json
-        install.install(self.home, apply=True, durable_tmp=False)
-        install.install(self.home, apply=True, durable_tmp=False)
+        install.install(self.home, apply=True, durable_tmp=False, log_backup=True)
+        install.install(self.home, apply=True, durable_tmp=False, log_backup=True)
         settings = json.loads((self.home / ".claude/settings.json").read_text())
         found = [h for g in settings["hooks"]["SessionStart"] for h in g["hooks"] if "log_backup.py" in " ".join(h.get("args", []))]
         self.assertEqual(len(found), 1)
@@ -270,14 +385,14 @@ class Wiring(Case):
         (self.home / ".claude").mkdir()
         foreign = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo", "args": ["mine"]}]}]}}
         (self.home / ".claude/settings.json").write_text(json.dumps(foreign))
-        install.install(self.home, apply=True, durable_tmp=False)
+        install.install(self.home, apply=True, durable_tmp=False, log_backup=True)
         settings = json.loads((self.home / ".claude/settings.json").read_text())
         commands = [h.get("args") for g in settings["hooks"]["SessionStart"] for h in g["hooks"]]
         self.assertIn(["mine"], commands)
 
     def test_main_prints_a_log_backup_line_and_never_touches_the_real_scheduler(self):
         done = subprocess.run([sys.executable, str(ROOT / "install.py"), "--home", str(self.home), "--apply",
-                               "--no-netwatch", "--no-durable-tmp"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               "--no-netwatch", "--no-durable-tmp", "--log-backup"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               timeout=120, env={**os.environ, "HOME": str(self.home)})
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn(b"log backup: files written; scheduler not loaded", done.stdout)
