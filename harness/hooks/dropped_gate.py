@@ -28,9 +28,10 @@ def state_path(session: str) -> Path:
 
 def load_state(session: str) -> dict:
     try:
-        data = json.loads(state_path(session).read_text(encoding="utf-8"))
+        import safe_input  # noqa: PLC0415
+        data = safe_input.safe_json_loads(safe_input.read_bounded(state_path(session), 65536).decode("utf-8", "replace"))
         return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+    except Exception:  # noqa: BLE001 - a damaged counter file only loses the bound, never the decision
         return {}
 
 
@@ -161,8 +162,9 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
 
 def main(argv=None) -> int:
     try:
-        payload = json.load(sys.stdin)
-    except ValueError:
+        import safe_input  # noqa: PLC0415
+        payload = safe_input.safe_json_loads(safe_input.read_stdin_bounded(1 << 20).decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 - oversized or malformed hook input: gate nothing, never block on garbage
         payload = {}
     mode = (argv or sys.argv[1:] or ["stop"])[0]
     try:

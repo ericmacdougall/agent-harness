@@ -498,6 +498,34 @@
    ],
    "status": "installed",
    "rules": []
+  },
+  {
+   "id": "dropped-gate:stop",
+   "script": "dropped_gate.py",
+   "arg": null,
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
+  },
+  {
+   "id": "dropped-gate:subagent-stop",
+   "script": "dropped_gate.py",
+   "arg": "subagent-stop",
+   "event": "SubagentStop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
   }
  ]
 }
