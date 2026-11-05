@@ -37,6 +37,9 @@ if argv and argv[0] == "copy":
         if seen < first:
             sys.stderr.write(os.environ.get("FAKE_ERR", ""))
             sys.exit(1)
+    forced = os.environ.get("FAKE_EXIT")
+    if forced:
+        sys.exit(int(forced))
     match = os.environ.get("FAKE_FAIL_MATCH")
     if match and any(match in a for a in argv):
         sys.exit(1)
@@ -128,7 +131,7 @@ class Case(unittest.TestCase):
 
 ALLOWED_FLAGS = {"--tpslimit", "--transfers", "--contimeout", "--timeout", "--log-file", "--log-level", "--exclude-from", "--backup-dir", "--ignore-case",
                  "--dropbox-batch-mode", "--dropbox-batch-size", "--checkers", "--retries", "--retries-sleep",
-                 "--low-level-retries", "--min-age"}
+                 "--low-level-retries", "--min-age", "--max-duration", "--max-size", "--max-transfer"}
 
 
 def assert_copy_only(test, calls):
@@ -233,7 +236,8 @@ class CopyOnly(Case):
             (self.tmp / "log-backup.excludes").write_text("*.secret\n")
             if self.calls.exists():
                 self.calls.unlink()
-            self.run_script(script=variant, LOG_BACKUP_EXCLUDES=str(ROOT / "harness/bin/log-backup.excludes"))
+            self.run_script(script=variant, LOG_BACKUP_EXCLUDES=str(ROOT / "harness/bin/log-backup.excludes"),
+                            LOG_BACKUP_WORK_EXCLUDES=str(ROOT / "harness/bin/log-backup.work-excludes"))
             with self.assertRaises(AssertionError):
                 assert_copy_only(self, self.recorded())
 
@@ -533,6 +537,50 @@ class Failure(Case):
             self.assertEqual(self.copies(), [], value)
         self.assertEqual(link_target.stat().st_mode, mode_before)
         self.assertEqual(self.home.stat().st_mode, home_mode)
+
+    def test_work_tree_backs_up_only_small_durable_state(self):
+        base = ".agent-harness/work/t1"
+        self.put(f"{base}/wt1/.git", b"gitdir: /elsewhere")          # a git worktree: .git is a file
+        self.put(f"{base}/wt1/src/code.py", b"code")
+        self.put(f"{base}/co/.git/HEAD", b"ref")                      # a checkout: .git is a directory
+        self.put(f"{base}/co/src/main.py", b"code")
+        self.put(f"{base}/shots/a.png", b"png")
+        self.put(f"{base}/shots/b.webm", b"video")
+        self.put(f"{base}/big.json", b"x" * 5000)
+        self.put(f"{base}/odd[1]/.git", b"gitdir: /elsewhere")        # glob characters cannot be excluded safely
+        self.put(f"{base}/state.json", b"{}")
+        done = self.local_run(LOG_BACKUP_WORK_MAX_SIZE="1k")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        files = {f for f in self.remote_files() if f.startswith(".agent-harness/work/")}
+        self.assertEqual(files, {".agent-harness/work/t1/notes.md", f"{base}/state.json", f"{base}/odd[1]/.git"})
+        for argv in self.copies():
+            if argv[-2].endswith(".agent-harness/work"):
+                self.assertIn("--max-size", argv)
+                self.assertIn("--max-transfer", argv)
+
+    def test_budget_exit_codes_leave_a_partial_run_non_fresh_without_retry(self):
+        for code in (8, 10):
+            if self.calls.exists():
+                self.calls.unlink()
+            done = self.run_script(FAKE_EXIT=str(code))
+            self.assertNotEqual(done.returncode, 0, code)
+            self.assertFalse(self.last_ok().exists())
+            n_sources = len(self.copies())
+            self.assertGreater(n_sources, 0)
+            self.assertEqual(len({tuple(c[-2:]) for c in self.copies()}), n_sources)  # one attempt per source, no retry
+
+    def test_used_up_time_budget_skips_the_remaining_sources_and_stays_non_fresh(self):
+        done = self.run_script(LOG_BACKUP_BUDGET_SECONDS="0")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.copies(), [])
+        self.assertFalse(self.last_ok().exists())
+        self.assertIn("budget", (self.logs / "log-backup.log").read_text())
+
+    def test_every_copy_carries_a_max_duration_inside_the_budget(self):
+        self.run_script(LOG_BACKUP_BUDGET_SECONDS="300")
+        for argv in self.copies():
+            seconds = int(argv[argv.index("--max-duration") + 1].rstrip("s"))
+            self.assertTrue(20 <= seconds <= 300, argv)
 
     def test_persistent_failure_exhausts_retries_and_is_not_fresh(self):
         done = self.run_script(FAKE_FAIL_FIRST="1000", LOG_BACKUP_RETRIES="1")
