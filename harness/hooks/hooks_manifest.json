@@ -306,7 +306,7 @@
   {
    "id": "command_guard:hook",
    "script": "command_guard_hook.py",
-   "arg": null,
+   "arg": "hook",
    "event": "PreToolUse",
    "tools": [
     "Bash"
@@ -315,8 +315,7 @@
     "claude",
     "codex"
    ],
-   "status": "pending",
-   "owner": "ad1fe816 feat/command-guard (#14471)",
+   "status": "installed",
    "rules": [
     "S01",
     "S02",
@@ -389,11 +388,26 @@
    "flavors": [
     "claude"
    ],
-   "status": "pending",
-   "owner": "PR #53",
+   "status": "installed",
    "rules": [
     "S20"
    ]
+  },
+  {
+   "id": "agent_gate:hook",
+   "script": "agent_gate.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Agent",
+    "Task",
+    "Workflow"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
   },
   {
    "id": "stop_lints:stop",
