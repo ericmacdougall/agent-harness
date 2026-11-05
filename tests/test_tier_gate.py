@@ -313,8 +313,12 @@ class BashAdvisory(GateFixture):
                      '\\claude -p --model fable x'):
             self.assertEqual(self.bash(line)[0], 'deny', line)
         for line in ('$(which claude) -p --model sonnet --task k9 x', '"claude" -p --model opus --effort high --task k9 x',
-                     'which claude', 'echo "claude"'):
+                     'which claude', 'echo "claude"',
+                     'git commit -m "feat(review): route reviews to codex" -m "Why: parity"', 'git commit -m "route reviews to codex"',
+                     'gh pr create --title "review via codex"', "grep -m 1 'ask claude' notes.txt"):
             self.assertEqual(self.bash(line)[0], 'allow', line)
+        self.assertEqual(self.bash('codex exec -m gpt-6-astra -')[0], 'deny')
+        self.assertEqual(self.bash('$(which codex) exec -m gpt-6-astra -')[0], 'deny')
 
     def test_oversize_launch_lines_are_refused_quickly_not_parsed(self):
         import time

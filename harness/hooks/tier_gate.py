@@ -230,13 +230,23 @@ def split_segments_with_seps(command):
     return [text for text, _ in kept], [sep for _, sep in kept]
 
 
-def program_name(word):
-    """The program a shlex word names, past `=`, quotes, backticks and `$(`; for a substitution such as
-    `$(which claude)` the last token is the candidate (the substitution yields that program's path)."""
+def program_name(word, command_position=False):
+    """The program a shlex word names, past `=`, quotes, backticks and `$(`. A substitution such as
+    `$(which claude)` names its last token (the substitution yields that program's path). A quoted word
+    is a candidate only in command position (`"claude" -p ...`); elsewhere it is prose (`-m "... codex"`)."""
+    quoted = word[:1] in ('"', "'")
+    substitution = '$(' in word or '`' in word
+    if quoted and not substitution and not command_position:
+        return ''
     pieces = [piece for piece in re.split(r'[=`$(\'"]', word) if piece.strip()]
     if not pieces:
         return ''
-    return pieces[-1].split()[-1].rsplit('/', 1)[-1].rstrip('`)\'"').lower()
+    tail = pieces[-1].strip()
+    if substitution:
+        tail = tail.split()[-1]
+    elif ' ' in tail:
+        return ''
+    return tail.rsplit('/', 1)[-1].rstrip('`)\'"').lower()
 
 
 def nested_strings(segment):
@@ -334,7 +344,7 @@ def _decide_launch(command, policy, ledger, env_model=None):
         return 'deny', 'launch line cannot be parsed (unterminated quote)', None, {'unparsed': True}
     model = effort = task = author_rung = None
     author_harness = 'unknown'
-    programs = [program_name(w) for w in words]
+    programs = [program_name(w, command_position=(index == 0)) for index, w in enumerate(words)]
     if not any(name in programs for name in ('claude', 'codex', 'rescue.py', 'peer_review.py')):
         # The launch name sits only inside quoted text (prose, or a shell string that nested_strings
         # checks on its own): the flags of this program are not launch flags (`git commit -m "..."`).
