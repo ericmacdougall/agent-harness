@@ -516,62 +516,88 @@ def state(pid):
 
 
 class PathologicalInput(unittest.TestCase):
-    """GoodQA #14505: shlex is quadratic in CPython 3.9, so a 1 MB token hung every hook for 100 s+.
+    """GoodQA #14505: shlex is quadratic in CPython 3.9, so a 1 MB token hung every hook for 100 s+, and review
+    found more superlinear paths (heredoc terminators, per-invocation rescans, wrapper argv slicing).
 
     Each case builds its string inside a child process with a hard timeout, so a regression fails the test
-    instead of hanging the suite. The strings are only ever passed to decide(); nothing executes them."""
+    instead of hanging the suite. The strings are only ever passed to decide(); nothing executes them. The
+    child uses DEFAULT_MODES and a throwaway HOME, so the developer's guard mode and log are never involved."""
 
-    def timed(self, expression, limit=5):
+    def timed(self, expression, limit=5, cwd="/tmp"):
         code = ("import sys,time; sys.path.insert(0, %r); import heavy_job_guard as g\n"
-                "cmd = %s\nt = time.time(); r = g.decide(cmd, '/tmp'); "
-                "print(round(time.time() - t, 3), r['action'], r.get('rule'))" % (str(HOOKS), expression))
-        try:
-            done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=limit)
-        except subprocess.TimeoutExpired:
-            self.fail("no decision within %ss for %s" % (limit, expression))
+                "cmd = %s\nt = time.time(); r = g.decide(cmd, %r, g.DEFAULT_MODES); "
+                "print(round(time.time() - t, 3), r['action'], r.get('rule'))" % (str(HOOKS), expression, cwd))
+        with tempfile.TemporaryDirectory() as home:
+            env = {k: v for k, v in os.environ.items() if not k.startswith("HARNESS_")}
+            env["HOME"] = home
+            try:
+                done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=limit,
+                                      env=env)
+            except subprocess.TimeoutExpired:
+                self.fail("no decision within %ss for %s" % (limit, expression))
         self.assertEqual(done.returncode, 0, done.stderr)
         elapsed, action, rule = done.stdout.split()
         return float(elapsed), action, rule
 
+    def fast(self, expression, action, rule="oversize", **kwargs):
+        elapsed, got_action, got_rule = self.timed(expression, **kwargs)
+        self.assertLess(elapsed, 1.0, expression)
+        self.assertEqual(got_action, action, expression)
+        if action == "deny" and rule:
+            self.assertEqual(got_rule, rule, expression)
+
     def test_ac1_one_megabyte_token_decides_in_under_a_second(self):
         for expression in ("'echo ' + 'a' * 1000000", "'echo \"' + 'a' * 1000000 + '\"'",
                            "\"echo $'\" + 'a' * 1000000 + \"'\"", "'echo ' + 'a\\\\' * 500000"):
-            elapsed, action, rule = self.timed(expression)
-            self.assertLess(elapsed, 1.0, expression)
-            self.assertEqual((action, rule), ("deny", "oversize"), expression)
+            self.fast(expression, "deny")
 
     def test_ac1_million_character_command_of_many_segments_decides_in_under_a_second(self):
-        elapsed, action, rule = self.timed("'ls; ' * 250000")
-        self.assertLess(elapsed, 1.0)
-        self.assertEqual((action, rule), ("deny", "oversize"))
+        self.fast("'ls; ' * 250000", "deny")
 
     def test_ac1_large_token_under_the_cap_is_scanned_linearly_and_allowed(self):
-        elapsed, action, _rule = self.timed("'echo ' + 'a' * 250000")
-        self.assertLess(elapsed, 1.0)
-        self.assertEqual(action, "allow")
+        self.fast("'echo ' + 'a' * 250000", "allow")
 
-    def test_neg1_heavy_invocation_past_the_cap_is_not_silently_allowed(self):
-        _e, action, rule = self.timed("'echo ' + 'a' * 300000 + '; pytest'")
-        self.assertEqual((action, rule), ("deny", "oversize"))
-        _e, action, rule = self.timed("'HARNESS_LOCAL_OK=needs-the-mac echo ' + 'a' * 300000 + '; pytest'")
-        self.assertEqual(action, "allow")  # the documented hatch still works, and is logged to the WAL
+    def test_scan_cap_boundary_is_exact(self):
+        self.fast("'ls; ' * 65536", "allow")  # exactly 262144 characters
+        self.fast("'ls; ' * 65536 + 'x'", "deny")  # one more
+
+    def test_word_cap_boundary_is_exact(self):
+        self.fast("'echo ' + 'a ' * 2047", "allow")  # 2048 words
+        self.fast("'echo ' + 'a ' * 2048", "deny")
+
+    def test_neg1_heavy_invocation_past_the_cap_is_not_silently_allowed_even_with_the_hatch(self):
+        self.fast("'echo ' + 'a' * 300000 + '; pytest'", "deny")
+        # The tail may hold a browser/media/fan-out job that needs the resource cap, so the hatch cannot waive it.
+        self.fast("'HARNESS_LOCAL_OK=needs-the-mac echo ' + 'a' * 300000 + '; chromium --headless'", "deny")
+        self.fast("'HARNESS_LOCAL_OK=needs-the-mac echo ' + 'a ' * 3000", "deny")
 
     def test_neg1_long_heredoc_body_does_not_count_toward_the_cap(self):
-        body = "x" * 400000
-        result = decide("cat > big.txt <<'EOF'\n" + body + "\nEOF\nls")
-        self.assertEqual(result["action"], "allow", result)
+        self.fast("'cat > big.txt <<EOF\\n' + 'x' * 400000 + '\\nEOF\\nls'", "allow")
 
     def test_neg2_nested_wrappers_with_long_tokens_stay_bounded(self):
-        elapsed, action, _rule = self.timed("'bash -c ' + repr('sudo ' * 50 + 'x' * 1000000)")
-        self.assertLess(elapsed, 1.0)
-        self.assertEqual(action, "deny")
-        elapsed, action, _rule = self.timed("'bash -c ' + repr('env ' * 200 + 'x' * 200000)")
-        self.assertLess(elapsed, 1.0)
+        self.fast("'bash -c ' + repr('sudo ' * 50 + 'x' * 1000000)", "deny")
+        self.fast("'bash -c ' + repr('env ' * 200 + 'x' * 200000)", "deny", rule=None)  # depth limit, not size
+
+    def test_many_distinct_unterminated_heredoc_markers_stay_linear(self):
+        self.fast("' '.join('<<T%d' % i for i in range(1000)) + '\\n' * 50000", "allow")
+
+    def test_repeated_python_invocations_do_not_rescan_a_large_heredoc_body(self):
+        self.fast("'cat <<EOF\\n' + 'x' * 700000 + '\\nEOF\\n' + 'python3 y\\n' * 2000", "allow")
+
+    def test_repeated_script_invocations_do_not_reread_a_large_file(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            Path(cwd, "big.py").write_text("x = 1\n" * 300000)
+            self.fast("'python3 big.py\\n' * 3000", "allow", cwd=cwd)
+
+    def test_wrapper_argv_slicing_paths_are_bounded(self):
+        for expression in ("'env -Z ' + 'a ' * 80000", "'do ' * 80000 + 'ls'", "'xcrun ' + '-v ' * 80000 + 'ls'",
+                           "'timeout ' + '-x ' * 80000 + '1 ls'"):
+            self.fast(expression, "deny")
 
     def test_ac2_linear_split_matches_shlex_on_seeded_random_input(self):
         import random
         import shlex
-        rng, alphabet, cases = random.Random(14505), "ab '\"\\\t\n\r$#;", 0
+        rng, alphabet, cases = random.Random(14505), "ab '\"\\\t\n\r$#;\x0b\x0c\0\u00a0\u2028\u00e9", 0
         for _ in range(20000):
             text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 12)))
             try:
@@ -583,6 +609,41 @@ class PathologicalInput(unittest.TestCase):
             except ValueError:
                 got = "ValueError"
             self.assertEqual(got, want, "seed 14505, input %r" % text)
+            cases += 1
+        self.assertEqual(cases, 20000)
+
+    def test_ac2_heredoc_extraction_matches_the_reference_scan(self):
+        import random
+        rng = random.Random(14505)
+        parts = ["cat <<EOF", "cat <<-EOF", "x <<A <<B", "EOF", "\tEOF", "A", "B", "echo hi", "<<<EOF",
+                 "cat <<'EOF'", "  EOF", "ls", "<<EOF <<EOF2", "EOF2"]
+
+        def reference(text):  # the pre-#14505 implementation: rescan the remaining lines for each new terminator
+            lines, out, bodies, i, missing = text.split("\n"), [], [], 0, set()
+            while i < len(lines):
+                line = lines[i]
+                out.append(line)
+                i += 1
+                for match in guard.HEREDOC.finditer(line):
+                    if line[max(0, match.start() - 1):match.start()] == "<":
+                        continue
+                    strip_tabs, term = match.group(1) == "-", match.group(3)
+                    if term in missing:
+                        continue
+                    j = i
+                    while j < len(lines) and (lines[j].strip() if strip_tabs else lines[j]) != term:
+                        j += 1
+                    if j < len(lines):
+                        bodies.append("\n".join(lines[i:j]))
+                        i = j + 1
+                    else:
+                        missing.add(term)
+            return "\n".join(out), bodies
+
+        cases = 0
+        for _ in range(20000):
+            text = "\n".join(rng.choice(parts) for _ in range(rng.randint(0, 9)))
+            self.assertEqual(guard.extract_heredocs(text), reference(text), "seed 14505, input %r" % text)
             cases += 1
         self.assertEqual(cases, 20000)
 

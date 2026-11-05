@@ -41,6 +41,10 @@ command (a false denial names HARNESS_LOCAL_OK and dev2; a false allow is the bu
 best-effort and out of scope: command substitution such as `$(which pytest)`, variable indirection (`p=pytest; $p`),
 scripts that launch heavy work internally, and aliases. The runtime backstops (run_capped.py, netwatch) cover those.
 
+Size bounds (GoodQA #14505): a command over 1 MB, more than 256 KiB of text after heredoc bodies are removed, or one
+command of more than 2048 words is denied as rule "oversize" (fail closed: the unscanned part could hide a heavy job).
+HARNESS_LOCAL_OK does NOT override it; write the work to a script file instead. Tokenizing is linear (posix_split).
+
 Classification looks at the command word of each shell segment, never at quoted
 text, so `git commit -m "run pytest"` or `grep pytest` are never flagged.
 Stdlib only, Python 3.9 compatible, lazy imports to keep startup small.
@@ -54,6 +58,7 @@ import sys
 
 MAX_COMMAND_CHARS = 1_000_000
 MAX_SCAN_CHARS = 256 * 1024  # command text left after heredoc bodies are removed; ~0.3 s worst case, linear
+MAX_SEGMENT_WORDS = 2048  # words in one shell command; bounds the quadratic wrapper-slicing paths
 MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enforce",
                  "build": "enforce", "media": "warn", "fan-out": "warn", "oversize": "enforce"}
@@ -69,7 +74,8 @@ RULE_HELP = {
     "build": "a production build is CPU/memory heavy",
     "media": "large media work (ffmpeg/whisper) is CPU/memory heavy",
     "fan-out": "parallel fan-out multiplies memory use",
-    "oversize": "the guard cannot scan the whole command, so a heavy job could hide past the cap; put the work in a script file",
+    "oversize": "the guard cannot scan this whole command, so a heavy job could hide in the part it skips; "
+                "write it to a script file and run that (HARNESS_LOCAL_OK does not override this rule)",
 }
 
 
@@ -92,10 +98,26 @@ HEREDOC = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][\w.-]*)\2")
 
 
 def extract_heredocs(text: str):
-    """Return (text without heredoc bodies, [bodies]). Unterminated heredocs are left alone."""
+    """Return (text without heredoc bodies, [bodies]). Unterminated heredocs are left alone.
+
+    Terminator lookup uses a line->indices map built once per mode and bisect, so any number of distinct
+    (possibly missing) terminators costs O(lines log lines), not a rescan of every remaining line each (#14505)."""
+    from bisect import bisect_left
     lines = text.split("\n")
     out, bodies, i = [], [], 0
-    missing = set()  # terminators already proven absent below this point: never rescan for them (was quadratic)
+    index = {False: None, True: None}  # strip_tabs -> {line text: [line numbers]}
+    missing = set()  # terminators proven absent (keyed by text alone, as before: behaviour is unchanged)
+
+    def find(term, start, strip_tabs):
+        if index[strip_tabs] is None:
+            table = {}
+            for number, line in enumerate(lines):
+                table.setdefault(line.strip() if strip_tabs else line, []).append(number)
+            index[strip_tabs] = table
+        found = index[strip_tabs].get(term, ())
+        k = bisect_left(found, start)
+        return found[k] if k < len(found) else len(lines)
+
     while i < len(lines):
         line = lines[i]
         out.append(line)
@@ -106,9 +128,7 @@ def extract_heredocs(text: str):
             strip_tabs, term = match.group(1) == "-", match.group(3)
             if term in missing:
                 continue
-            j = i
-            while j < len(lines) and (lines[j].strip() if strip_tabs else lines[j]) != term:
-                j += 1
+            j = find(term, i, strip_tabs)
             if j < len(lines):
                 bodies.append("\n".join(lines[i:j]))
                 i = j + 1
@@ -321,6 +341,14 @@ class Ctx:
         self.cwd = cwd or os.getcwd()
         self.heredocs = heredocs
         self.capped = False
+        self._disk, self._hits = {}, {}  # GoodQA #14505: repeat invocations must not re-read or re-regex big sources
+
+    def search(self, pattern, text):
+        """pattern.search(text) is not None, memoised per source text (str hashes are cached by CPython)."""
+        key = (pattern.pattern, text)
+        if key not in self._hits:
+            self._hits[key] = pattern.search(text) is not None
+        return self._hits[key]
 
 
 def resolve(path: str, cwd: str) -> str:
@@ -343,7 +371,12 @@ def read_script(path: str, cwd: str):
 def script_sources(script, ctx):
     """The script's on-disk text plus any heredoc bodies in the same command (it may be written then run)."""
     sources = list(ctx.heredocs)
-    disk = read_script(script, ctx.cwd) if script and script != "-" else None
+    disk = None
+    if script and script != "-":
+        key = resolve(script, ctx.cwd)
+        if key not in ctx._disk:
+            ctx._disk[key] = read_script(script, ctx.cwd)
+        disk = ctx._disk[key]
     if disk:
         sources.append(disk)
     return sources
@@ -365,9 +398,9 @@ def python_findings(args, ctx):
         browser_src = script_sources(script, ctx)
         hostile_src = list(ctx.heredocs) + (browser_src[len(ctx.heredocs):] if disk_probe_dir(script, ctx) else [])
     resolved = resolve(script, ctx.cwd) if script and script != "-" else ctx.cwd
-    if any(HOSTILE.search(x) for x in hostile_src) or SCRATCH_RT.search(resolved):
+    if any(ctx.search(HOSTILE, x) for x in hostile_src) or SCRATCH_RT.search(resolved):
         return ("adversarial", "script reads /dev/zero|urandom, makes a FIFO, or lives in a scratchpad rt/ dir")
-    if any(PY_BROWSER_IMPORT.search(x) and BROWSER_LAUNCH.search(x) for x in browser_src):
+    if any(ctx.search(PY_BROWSER_IMPORT, x) and ctx.search(BROWSER_LAUNCH, x) for x in browser_src):
         return ("browser", "python script that drives a browser (imports playwright/selenium)")
     return None
 
@@ -617,7 +650,7 @@ def classify(argv, ctx, depth=0):
         script = (positional(args) or [None])[0]
         if script and base(script).lower() in BUILD_TOOLS:  # `bash ./gradlew build`, `sh gradlew build`
             return classify([script] + args[args.index(script) + 1:], ctx, depth + 1)
-        if script and any(HOSTILE.search(s) for s in script_sources(script, ctx)):
+        if script and any(ctx.search(HOSTILE, s) for s in script_sources(script, ctx)):
             return ("adversarial", "shell script reads /dev/zero|urandom or makes a FIFO")
         return None
     if low in ("uv", "poetry", "pipenv", "pdm", "hatch", "rye") and "run" in args:
@@ -698,9 +731,9 @@ def classify(argv, ctx, depth=0):
         script = next(iter(positional(args)), None)
         if script and re.search(r"\.[cm]?[jt]s$", script):
             sources = script_sources(script, ctx)
-            if any(HOSTILE.search(s) for s in sources):
+            if any(ctx.search(HOSTILE, s) for s in sources):
                 return ("adversarial", "node script reads /dev/zero|urandom or makes a FIFO")
-            if any(JS_BROWSER_IMPORT.search(s) and BROWSER_LAUNCH.search(s) for s in sources):
+            if any(ctx.search(JS_BROWSER_IMPORT, s) and ctx.search(BROWSER_LAUNCH, s) for s in sources):
                 return ("browser", "node script that drives a browser (imports playwright/puppeteer)")
         return None
 
@@ -812,6 +845,11 @@ def scan_state(command: str, cwd: str):
                          f"bodies; the guard scans at most {MAX_SCAN_CHARS})", False, ""))
     for segment in split_segments(text):
         argv = tokenize(segment)
+        if len(argv) > MAX_SEGMENT_WORDS:
+            # Wrapper parsing slices argv per word (quadratic); no real command has this many words. Fail closed.
+            findings.append(("oversize", f"one command has {len(argv)} words; the guard scans at most "
+                             f"{MAX_SEGMENT_WORDS} per command", False, segment[:80]))
+            continue
         assigns, rest = split_assignments(argv)
         if argv and argv[0] == "export":
             assigns = [t for t in argv[1:] if ASSIGN.match(t)]
@@ -884,7 +922,7 @@ def decide(command: str, cwd: str = None, modes=None):
         mode = modes.get(rule, "enforce")
         if mode == "off" or (rule in NEVER_BLOCK and capped):
             continue
-        if valid_reason(hatch) and (capped or rule not in CAPPED_RULES):
+        if valid_reason(hatch) and rule != "oversize" and (capped or rule not in CAPPED_RULES):
             outcome = {"action": "allow", "rule": rule, "detail": detail, "hatch_reason": hatch.strip()}
         else:
             outcome = {"action": "deny" if mode == "enforce" else "warn", "rule": rule, "detail": detail,
