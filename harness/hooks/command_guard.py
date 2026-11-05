@@ -1269,7 +1269,7 @@ ROOT_DELETE_VERB = re.compile(r'\b(?:rm|rmdir|unlink|shred|truncate|rmtree|remov
 def _root_text(home):
     start = r'(?<![\w./-])'  # the start of a path or a name: /tmp/fake/home/.claude and /tmp/root/.claude are not homes
     # the real home's spellings. A bare `home` is a variable, often a test's temp dir, and variables are not followed
-    anchor = (r'(?:' + start + r'(?:~|/users/[^/\s]+|/home/[^/\s]+|/root\b|' + re.escape(home.casefold().rstrip('/'))
+    anchor = (r'(?:' + start + r'(?:~|/users/[^/\s+\\]+|/home/[^/\s+\\]+|/root\b|' + re.escape(home.casefold().rstrip('/'))
               + r')|\.home\b|(?:\$\s*|\benviron(?:\.get)?\s+|\bgetenv\s+)home\b)')
     return re.compile(anchor + _ROOT_SEP + r'\.(?:(?:claude|codex)(?![\w-])|agent-harness(?![\w-])(?!' + _ROOT_SEP
                       + r'(?:work|scratch)(?![\w.-])))')
@@ -1321,6 +1321,7 @@ class Ctx:
         self.created = set()  # case-folded paths written earlier in this command (count as existing)
         self.links = {}  # symlinks created earlier in this command: link path -> target path
         self.written = {}  # case-folded path -> text written to it earlier in this command (echo/printf/heredoc)
+        self.one_sided = set()  # files only one reading of `>!` wrote: what is on disk may still be what runs
         self.secret_files = set()  # files that received a secret value earlier in this command
         self.unterminated = False
         self.vars = {}
@@ -1356,7 +1357,8 @@ class Ctx:
         """Can a later command depend on which reading was right? Sets and flags combine without loss. These values do
         not: a merged variable is only a hint on a path operand, and is lost as a command name, an option or a script."""
         return (any(getattr(self, k) != other[k] for k in ('vars', 'var_hints', 'aliases', 'links', 'cwd', 'cwd_unknown'))
-                # not bash's file named `!`: every nested `>!` writes it, and no later command depends on it
+                # not bash's file named `!`: every nested `>!` rewrites it, so it would always differ. merge keeps
+                # both texts, so running it is still judged
                 or any(other['written'].get(path, text) != text for path, text in self.written.items()
                        if os.path.basename(path) != '!'))
 
@@ -1382,6 +1384,7 @@ class Ctx:
                 for path, text in (mine or {}).items():
                     both[path] = text if both.get(path) in (None, text) else (both[path] + '\n' + text)[:524288]
                 self.written = both
+                self.one_sided = self.one_sided | (set(theirs) ^ set(mine or {}))
             elif isinstance(theirs, set):
                 setattr(self, k, (mine or set()) | theirs)
             elif isinstance(theirs, dict):
@@ -2129,7 +2132,8 @@ class Analyzer:
         key = path.casefold()
         if key in ctx.written:
             self.script(ctx.written[key], depth + 1, tail_visible=True)
-            return
+            if key not in ctx.one_sided:
+                return
         ctx.files_read = getattr(ctx, 'files_read', 0) + 1
         if ctx.files_read > 8:
             return

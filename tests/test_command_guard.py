@@ -814,12 +814,57 @@ class OverwriteExistingTests(Fixture):
         other['written']['/p/x!'] = 'two'
         self.assertTrue(ctx.disputes(other))
 
+    def test_a_file_one_reading_wrote_is_also_judged_on_disk(self):
+        # bash leaves the file as it was, or zsh appends to it, so what is on disk can still be what runs
+        self._seed_bang_rows()
+        proj = self.home / 'proj'
+        (proj / 'ondisk.sh').write_text('rm -rf ' + str(self.home / '.claude/projects') + '\n')
+        (proj / 'plain.sh').write_text('echo plain\n')
+        for form in ("eval '%s echo hi'; bash %s", "bash -c '%s echo hi'; bash %s", 'x=$(%s echo hi); bash %s',
+                     "ssh h '%s echo hi'; bash %s"):
+            for op in ('>!', '>>!'):
+                text = form % (op + ' ondisk.sh', 'ondisk.sh')
+                self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'block', text)
+                text = form % (op + ' plain.sh', 'plain.sh')
+                self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'allow', text)
+                text = form % (op + ' absent.sh', 'absent.sh')
+                self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'allow', text)
+        # the other direction: only bash's reading wrote this one, and zsh would leave what is on disk
+        (proj / '!').write_text('rm -rf ' + str(self.home / '.claude/projects') + '\n')
+        self.assertEqual(self.decide("eval 'echo hi >! x'; bash '!'", cwd='@HOME@/proj')[0], 'block')
+        # both readings replaced the file, so what was on disk is gone and is not what runs
+        for text in ('echo hi > ondisk.sh; bash ondisk.sh', "eval 'echo hi > ondisk.sh'; bash ondisk.sh"):
+            self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'allow', text)
+
+    def test_only_enforced_findings_survive_a_stop(self):
+        # broad_kill warns by default, so a warning raised before the stop must not turn into a refusal
+        self._seed_bang_rows()
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home), cwd=str(self.home / 'proj'))
+        self.assertNotEqual(comp.policy['modes'].get(cg.PARSE), 'enforce')
+
+        def run(analyzer, command):
+            analyzer.ctx.add(cg.PARSE, 'r', 'only a warning', 'a')
+            raise self.stop
+        real = cg.Analyzer.run
+        cg.Analyzer.run = run
+        try:
+            for self.stop in (TimeoutError('alarm'), cg.Blocked('budget')):
+                self.assertNotEqual(cg.decide('echo plain', comp)[0], 'block', repr(self.stop))
+        finally:
+            cg.Analyzer.run = real
+
+    def test_the_fork_cap_is_three(self):
+        self._seed_bang_rows()
+        self.assertEqual(self.decide(self._nested(3, 'word'), cwd='@HOME@/proj')[0], 'allow')
+        self.assertEqual(self.decide(self._nested(4, 'word'), cwd='@HOME@/proj')[0], 'warn')
+
     def test_written_rule_reads_the_real_home_not_a_variable_named_home(self):
         code = "%s\nshutil.rmtree(%s)\n"
         for target in ("home / '.claude'", "os.path.join(home, '.claude')"):
             self.assertFalse(cg.written_code_destroys_root(code % ('home = tmp', target), str(self.home)), target)
         for target in ("Path.home() / '.claude'", "os.environ['HOME'] + '/.claude'", "os.environ.get('HOME') + '/.claude'",
-                       "os.getenv('HOME') + '/.claude'", "'$HOME/.claude'", "'${HOME}/.claude'", "'~/.claude'"):
+                       "os.getenv('HOME') + '/.claude'", "'$HOME/.claude'", "'${HOME}/.claude'", "'~/.claude'",
+                       "'/users/x/.claude'", "'/home/x/.claude'", "'/root/.claude'"):
             self.assertTrue(cg.written_code_destroys_root(code % ('', target), str(self.home)), target)
 
     def test_readings_merge_keeps_what_either_one_knows(self):
@@ -892,6 +937,11 @@ class OverwriteExistingTests(Fixture):
                 started = time.monotonic()
                 self.assertFalse(cg.written_code_destroys_root(text, str(self.home)))
                 self.assertLess(time.monotonic() - started, 1.0, repr((tail, size)))
+        # a run the name class of /users/ and /home/ could also match, which made this quadratic: 3.5 s at 64 KB
+        for text in ('/users/a' + '+' * 50000 + 'y', '/home/a' + '+' * 50000 + 'y', '/users/a' + '\\' * 50000 + 'y'):
+            started = time.monotonic()
+            self.assertFalse(cg.written_code_destroys_root(text, str(self.home)))
+            self.assertLess(time.monotonic() - started, 1.0, text[:9])
 
     def test_other_user_home_link_out_of_the_tree_is_refused(self):
         # a real /home/<user> on this machine cannot be made in a test, so its realpath is what is simulated
