@@ -162,6 +162,9 @@ class Dispatch(unittest.TestCase):
 GATES = json.loads((ROOT / "cmd" / "harness" / "gates.json").read_text(encoding="utf-8"))["gates"]
 SUBCOMMAND = {"wal.py": "wal", "commit_policy.py": "commit-policy", "spec_flow.py": "spec-flow",
               "command_guard_hook.py": "command-guard", "tier_gate.py": "tier-gate", "merge_gate.py": "merge-gate"}
+# The request ledger records its own failures and must never stop a turn (docs/work-assignments.md). Its guard denies by
+# printing a decision, and a crash there allows the call. That is the documented accident-grade threat model.
+FAIL_OPEN_BY_DESIGN = {"work_assignments.py"}
 
 
 class GateTable(unittest.TestCase):
@@ -198,7 +201,10 @@ class GateTable(unittest.TestCase):
                 continue  # Codex only blocks on these events
             for group in groups:
                 for hook in group["hooks"]:
-                    self.assert_gate(shlex.split(hook["command"])[1:])
+                    argv = shlex.split(hook["command"])[1:]
+                    if Path(argv[0]).name in FAIL_OPEN_BY_DESIGN:
+                        continue
+                    self.assert_gate(argv)
                     checked += 1
         self.assertGreaterEqual(checked, 3)
 

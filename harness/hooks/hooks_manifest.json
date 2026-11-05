@@ -344,7 +344,7 @@
   {
    "id": "work_assignments:guard",
    "script": "work_assignments.py",
-   "arg": null,
+   "arg": "hook",
    "event": "PreToolUse",
    "tools": [
     "Write",
@@ -355,12 +355,90 @@
     "claude",
     "codex"
    ],
-   "status": "pending",
-   "owner": "afe2e8b8 work-assignments (#14465)",
+   "status": "installed",
    "rules": [
     "W01",
     "S24"
    ]
+  },
+  {
+   "id": "work_assignments:prompt",
+   "script": "work_assignments.py",
+   "arg": "hook",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "work_assignments:stop",
+   "script": "work_assignments.py",
+   "arg": "hook",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "work_assignments:session",
+   "script": "work_assignments.py",
+   "arg": "hook",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "work_assignments:ask-answer",
+   "script": "work_assignments.py",
+   "arg": "hook",
+   "event": "PostToolUse",
+   "tools": [
+    "AskUserQuestion"
+   ],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "work_assignments:subagent-start",
+   "script": "work_assignments.py",
+   "arg": "hook",
+   "event": "SubagentStart",
+   "tools": [],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "work_assignments:compact",
+   "script": "work_assignments.py",
+   "arg": "hook",
+   "event": "PostCompact",
+   "tools": [],
+   "flavors": [
+    "codex"
+   ],
+   "status": "installed",
+   "rules": []
   },
   {
    "id": "kill_guard:hook",
