@@ -402,6 +402,25 @@ def ask_alerts(asks: list, policy: dict, ts: float) -> dict:
     return out
 
 
+def wal_ask_alerts(pending: list, ts: float) -> dict:
+    """P16 (goodqa#14791 I16): open WAL asks escalate on the bounded schedule in ask_reminders: stage 0 info,
+    stage 1 warning, stage 2+ high, so the ring (transitions on severity rise), the prompt context and the digest
+    re-surface them without a loop; a resolved ask is not in `pending`, so its alert clears."""
+    import ask_reminders  # noqa: PLC0415 - installed beside ahd
+    out = {}
+    for a in pending:
+        opened = a.get("at") or 0.0
+        stage = ask_reminders.stage_at(float(opened), ts) if opened else None
+        if stage is None:
+            continue
+        sev = "info" if stage == 0 else "warning" if stage == 1 else "high"
+        out[f"ask:{a['id']}:due"] = {"severity": sev, "class": "ask", "kind": "ask-due", "subject": a["id"], "since": int(opened),
+                                     "message": f"ask {a['id']} awaits the user (reminder {stage + 1}): {a.get('text', '')}"[:300],
+                                     "detail": {"ask": a["id"], "session": a.get("session"), "stage": stage,
+                                                "stop_block": False}}
+    return out
+
+
 def ring_wrap_alert(events: list, ts: float, hostname: str) -> dict:
     """The ring holds 1024 transitions. Full and its oldest entry under an hour old means it wraps more than once
     an hour, so raises can vanish before anyone reads them (review item 7)."""
@@ -555,6 +574,7 @@ class Daemon:
         desired = {}
         desired.update(liveness_alerts(docs, self.policy))
         desired.update(ask_alerts(asks, self.policy, ts))
+        desired.update(wal_ask_alerts(pending, ts))
         desired.update(ring_wrap_alert(events, ts, self.host))
         desired.update(wal_unsafe_alerts(blocked, ts))
         ring = ring_state(events, SOURCE, self.host)
