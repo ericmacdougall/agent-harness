@@ -271,9 +271,13 @@ class BashAdvisory(GateFixture):
                      "ANTHROPIC_MODEL=claude-fable-5-1; claude -p x",
                      'Claude -p --model fable x',
                      '/opt/homebrew/bin/CLAUDE -p --model fable x',
-                     'claude -p --model fable "x'):
+                     'claude -p --model fable "x',
+                     'codex exec -m gpt-6-astra -'):
             self.assertEqual(self.bash(line)[0], 'deny', line)
         for line in ("echo 'claude --model fable'",
+                     'git commit -m "claude --model fable notes"',
+                     'git commit -m "see claude"',
+                     "python3 -m unittest 'claude'",
                      "bash -c 'claude -p --model sonnet --task k9 x'",
                      "ssh dev2 'git log'",
                      "export ANTHROPIC_MODEL=claude-sonnet-4-5; claude -p --task k9 x",

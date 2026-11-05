@@ -256,8 +256,14 @@ def _decide_launch(command, policy, ledger, env_model=None):
         return 'deny', 'launch line cannot be parsed (unterminated quote)', None, {'unparsed': True}
     model = effort = task = author_rung = None
     author_harness = 'unknown'
+    programs = [re.split(r'[=`$(\'"]', w)[-1].rsplit('/', 1)[-1].rstrip('`)\'"').lower() for w in words]
+    if not any(name in programs for name in ('claude', 'codex', 'rescue.py', 'peer_review.py')):
+        # The launch name sits only inside quoted text (prose, or a shell string that nested_strings
+        # checks on its own): the flags of this program are not launch flags (`git commit -m "..."`).
+        return 'allow', None, None, {'quoted_only': True}
     for index, word in enumerate(words):
-        if word in ('--model', '-m') and index + 1 < len(words): model = words[index + 1]
+        if word == '--model' and index + 1 < len(words): model = words[index + 1]
+        if word == '-m' and 'codex' in programs and index + 1 < len(words): model = words[index + 1]
         if word.startswith('--model='): model = word.split('=', 1)[1]
         if word == '--effort' and index + 1 < len(words): effort = words[index + 1]
         if word.startswith('--effort='): effort = word.split('=', 1)[1]
