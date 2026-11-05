@@ -248,6 +248,25 @@ class TargetSanity(workflow.DeliveryWorkflow):
         command('git', 'push', '-q', 'origin', 'main', cwd=clone, env=self.env)
         command('git', 'fetch', '-q', 'origin', cwd=self.original, env=self.env)
 
+    def test_warn_with_symlinked_original_does_not_crash(self):
+        # GoodQA #14511: target_preflight returned None for a symlinked original, so
+        # --target-policy warn raised TypeError instead of reaching snapshot()'s precise refusal.
+        link = self.root / 'original-link'
+        link.symlink_to(self.original)
+        module = load_deliver()
+        out = io.StringIO()
+        argv = [str(workflow.DELIVER), *self.prepare_args(), '--local-only',
+                '--target-policy', 'warn', '--wal', str(self.wal_path())]
+        argv[argv.index('--original') + 1] = str(link)
+        with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(out), \
+                mock.patch.object(sys, 'path', [str(workflow.DELIVER.parent), *sys.path]), \
+                mock.patch.object(sys, 'argv', argv):
+            code = module.main()
+        data = json.loads(out.getvalue())
+        self.assertEqual(data['status'], 'BLOCKED_POLICY', data)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(module.target_preflight(link, 'main', 'warn'), [])
+
     def test_huge_staged_set_gets_a_specific_refusal(self):
         for index in range(6):
             (self.original / f'staged{index}.txt').write_text('x')
