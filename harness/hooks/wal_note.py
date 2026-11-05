@@ -58,6 +58,28 @@ def provenance_check(event, source):
         return 'enforce' if event in ('requirement', 'ask') else 'warn', f'provenance check failed ({type(error).__name__})', False
 
 
+def open_ask_exists(path, ref: str) -> bool:
+    """True when `ref` is an `ask` entry of this WAL with no later `ask_resolved` naming it (bounded tail read)."""
+    try:
+        import safe_input  # noqa: PLC0415
+        tail = safe_input.read_tail(path, 4 << 20)
+    except Exception:  # noqa: BLE001 - a WAL that cannot be read cannot hold an open ask
+        return False
+    seen, resolved = False, False
+    for raw in tail.splitlines():
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if rec.get('event') == 'ask' and rec.get('id') == ref:
+            seen, resolved = True, False
+        elif rec.get('event') == 'ask_resolved' and rec.get('ref') == ref:
+            resolved = True
+    return seen and not resolved
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--wal', type=Path, required=True)
@@ -91,6 +113,17 @@ def main():
     if args.event == 'ask_resolved':
         if not args.ref or not re.fullmatch(r'[A-Za-z0-9_-]{4,40}', args.ref):
             parser.error('ask_resolved needs --ref <ask id>')
+        # G5 (goodqa#14791): a resolution names an open ask of this WAL and carries the source of the answer
+        if not open_ask_exists(path, args.ref):
+            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': f'no open ask {args.ref} in this WAL',
+                              'hint': 'ask_resolved --ref must name an ask entry of this WAL that is not already resolved'}),
+                  file=sys.stderr)
+            return 2
+        if not args.source or not args.source.strip():
+            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved needs --source',
+                              'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
+                  file=sys.stderr)
+            return 2
         record['ref'] = args.ref
     if args.event in SOURCED:
         mode, problem, assumption = provenance_check(args.event, args.source)
@@ -102,6 +135,7 @@ def main():
             if mode == 'warn':
                 warnings.append(problem[:300])
                 record['provenance'] = 'missing' if not args.source else 'unverified'
+                record['unsourced'] = True  # quarantined, never dropped (P11): the stop lint surfaces it until cited
         if args.source:
             record['source'] = args.source.strip()[:2000]
             if assumption:

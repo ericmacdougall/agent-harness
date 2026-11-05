@@ -1332,6 +1332,76 @@ def render_text(cmd: str, data: dict) -> str:
     return json.dumps(data, indent=2)
 
 
+def nearest_source(wal: Path, before_id: str | None = None) -> dict | None:
+    """The newest sourced scope/decision/requirement/ask entry of `wal` (before `before_id` when given): a wal: source
+    that follows that entry's own source, so a re-cited note never invents provenance (goodqa#14791 P11)."""
+    import safe_input  # noqa: PLC0415
+    try:
+        tail = safe_input.read_tail(wal, 4 << 20)
+    except Exception:  # noqa: BLE001
+        return None
+    rows = []
+    for raw in tail.splitlines():
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("id"):
+            rows.append(rec)
+    cut = len(rows)
+    if before_id:
+        for i, rec in enumerate(rows):
+            if rec.get("id") == before_id:
+                cut = i
+                break
+    for rec in reversed(rows[:cut]):
+        if rec.get("event") in ("scope", "decision", "requirement", "ask") and rec.get("source") and not rec.get("unsourced"):
+            return {"id": rec["id"], "event": rec["event"], "source": f"wal:{wal}#{rec['id']}",
+                    "note80": str(rec.get("note") or "")[:80], "assumption": bool(rec.get("assumption"))}
+    return None
+
+
+def note_cmd(home: Path, args) -> dict:
+    wal = Path(args.wal).expanduser()
+    text = args.note
+    if args.id and not text:  # re-cite an existing quarantined entry: same text, now sourced
+        import safe_input  # noqa: PLC0415
+        for raw in (safe_input.read_tail(wal, 4 << 20).splitlines() if wal.is_file() else []):
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("id") == args.id:
+                text = f"[re-cites {args.id}] " + str(rec.get("note") or "")
+                args.event = rec.get("event") or args.event
+    if not text:
+        raise AhError("bad_request", "note: --note text or --id of an existing entry is required")
+    source = args.source
+    picked = None
+    if source == "auto":
+        picked = nearest_source(wal, args.id)
+        if not picked:
+            raise AhError("no_source", "note: no sourced scope/decision/requirement/ask ancestor in this WAL; cite the user turn "
+                                       "(ah user-msg), a ticket, or write it as an assumption with --source 'inferred: ...'", 2)
+        source = picked["source"] if not picked["assumption"] else f"inferred: from {picked['source']} -- follows an assumption"
+    plan = {"ok": True, "dry_run": bool(args.dry_run), "wal": str(wal), "event": args.event, "source": source,
+            "ancestor": picked, "note": text[:200]}
+    if args.dry_run:
+        return plan
+    argv = [sys.executable, str(Path(__file__).resolve().parent / "wal_note.py"), "--wal", str(wal), "--event", args.event,
+            "--note", text, "--source", source]
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    plan["wal_note_rc"] = r.returncode
+    try:
+        plan["written"] = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else None
+    except ValueError:
+        plan["written"] = None
+    if r.returncode != 0:
+        plan["ok"] = False
+        plan["stderr"] = r.stderr[-300:]
+    return plan
+
+
 def doctor() -> dict:
     """Partial installs are the common failure: import every module ah needs and hash the files."""
     checks = []
@@ -1663,6 +1733,13 @@ def build_parser():
         v.add_argument("--all", action="store_true", help="every session with a main WAL")
         v.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
     sub.add_parser("sessions", help="sessions with a main WAL, newest first")
+    nt = sub.add_parser("note", help="write a WAL note through wal_note.py; --source auto picks the nearest sourced ancestor")
+    nt.add_argument("--wal", required=True)
+    nt.add_argument("--event", default="decision")
+    nt.add_argument("--note", help="the note text (omit with --id to re-cite an existing quarantined entry)")
+    nt.add_argument("--id", help="re-cite an existing unsourced entry of this WAL by id")
+    nt.add_argument("--source", default="auto", help="a Source: string, or auto")
+    nt.add_argument("--dry-run", action="store_true", help="print the Source that would be written; write nothing")
     sub.add_parser("doctor", help="check the import chain and file hashes of this install")
     sp = sub.add_parser("spool")
     sp.add_argument("action", choices=["drain"])
@@ -1763,6 +1840,8 @@ def run(args, home: Path) -> dict:
         ev = [{"really_tested": i, "wal": args.wal or ""} for i in args.really_tested]
         ev += [{"commit": c, "repo": args.repo or ""} for c in args.commit]
         return write(home, "task.done", {"task": args.task, "evidence": ev}, s, args.key)
+    if cmd == "note":
+        return note_cmd(home, args)
     if cmd == "doctor":
         return doctor()
     if cmd == "spool":
