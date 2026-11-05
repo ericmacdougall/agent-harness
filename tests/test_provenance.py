@@ -357,7 +357,7 @@ class Enforcement(Env):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("one other thing that bothers me", out.stdout)  # the exact user message
         self.assertIn("ORIGIN: USER-SOURCED", out.stdout)
-        self.run_note("--event", "ask_resolved", "--note", "done", "--ref", gid)
+        self.run_note("--event", "ask_resolved", "--note", "done", "--ref", gid, "--source", self.user(HUMAN, QUOTE))  # goodqa#14791 G5
         self.assertEqual(provenance.render_asks(SID)[1]["traced"], 0)
 
     def test_concurrent_appends(self):  # AC-6

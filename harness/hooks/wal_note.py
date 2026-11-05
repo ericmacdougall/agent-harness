@@ -88,6 +88,8 @@ def main():
     parser.add_argument('--source', help='origin: user:<session>/<uuid> "excerpt" | ticket: | wal: | file: | inferred: (see provenance.py)')
     parser.add_argument('--reason', help='why this is asked of the user (required for ask)')
     parser.add_argument('--ref', help='id of the ask being closed (ask_resolved)')
+    parser.add_argument('--by', help='tool that writes this row on an agent\'s behalf (never quarantined; cites its state in the note)')
+    parser.add_argument('--recites', help='id of an unsourced entry of this WAL that this sourced row re-cites (clears its quarantine)')
     args = parser.parse_args()
     root = Path.home() / '.claude' / 'wals'
     path = args.wal.absolute()
@@ -124,7 +126,15 @@ def main():
                               'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
                   file=sys.stderr)
             return 2
+        mode, problem, assumption = provenance_check('ask', args.source)  # the answer is sourced like an ask (M1)
+        if problem:
+            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': problem[:300],
+                              'hint': 'the resolution source must resolve: user:, answer:, queue: or ticket:'}), file=sys.stderr)
+            return 2
         record['ref'] = args.ref
+        record['source'] = args.source.strip()[:2000]
+        if assumption:
+            record['assumption'] = True
     if args.event in SOURCED:
         mode, problem, assumption = provenance_check(args.event, args.source)
         if problem:
@@ -135,11 +145,18 @@ def main():
             if mode == 'warn':
                 warnings.append(problem[:300])
                 record['provenance'] = 'missing' if not args.source else 'unverified'
-                record['unsourced'] = True  # quarantined, never dropped (P11): the stop lint surfaces it until cited
+                if not args.source or 'rejected' in problem:  # missing or rejected: quarantined, never dropped (P11)
+                    record['unsourced'] = True  # an unverifiable ticket (tracker unreachable) is not a quarantine case
         if args.source:
             record['source'] = args.source.strip()[:2000]
             if assumption:
                 record['assumption'] = True
+    if args.by:
+        record['by'] = args.by.strip()[:40]
+    if args.recites:
+        if not re.fullmatch(r'w[0-9a-f]{11}', args.recites) or not args.source:
+            parser.error('--recites needs an entry id (w + 11 hex) and a --source on this row')
+        record['recites'] = args.recites
     append(path, record)
     for warning in warnings:
         print('wal_note: provenance warning: ' + warning, file=sys.stderr)
