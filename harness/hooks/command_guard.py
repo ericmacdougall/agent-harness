@@ -2120,6 +2120,10 @@ class Analyzer:
                 sources.append(args[i + 1])
         heredocs = [r.body for r in (cmd.redirs if cmd is not None else []) if r.op in ('<<', '<<-') and r.body]
         for body in heredocs:
+            for line in body.splitlines()[:2000]:
+                line = line.strip().strip('\'"')
+                if line and self.refuse('xargs deletion of paths given in its heredoc', _literal_word(line)):
+                    return  # each line is an operand, relative to the working directory
             if any(self._raw_path_class(m.group(0)) in ('log', 'root', 'ancestor', 'unknown')
                    for m in self.RAW_PATH.finditer(body[:200000])):
                 self.ctx.add(LOG_DELETE, 'log-delete',
@@ -2164,6 +2168,10 @@ class Analyzer:
             if rest:
                 self.inner_words(rest, depth, pl, idx)
             return True
+        if name == 'cross-env-shell':
+            self.script(' '.join(a.text for a in args if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', a.text)),
+                        depth + 1, tail_visible=True)  # cross-env-shell 'cmd': the string runs in a shell
+            return True
         sub = self.PKG_RUNNERS.get(name)
         if sub is None:
             return False
@@ -2171,6 +2179,9 @@ class Analyzer:
         if sub:
             if args and name in ('yarn', 'pnpm') and norm_name(args[0].text) in self.PKG_PASSTHROUGH:
                 i = 0  # `yarn rimraf PATH`: a package bin run directly
+            elif len(args) > 1 and name in ('yarn', 'pnpm') and args[0].text == 'run' \
+                    and norm_name(args[1].text) in self.PKG_PASSTHROUGH:
+                i = 1  # `yarn run rimraf PATH`
             elif not args or args[0].text not in sub:
                 return False
             else:
@@ -2361,10 +2372,29 @@ class Analyzer:
         ctx = self.ctx
         texts = [a.text for a in args]
         roots = []
-        for a in args:
+        k = 0
+        # leading global options come before the start directories: GNU -P -H -L -D ARG -O<n>, BSD -E -X -d -s -x
+        # -f ROOT, and `--`; skipping them keeps `find -P ~/.claude ...` from defaulting to `.`
+        while k < len(args):
+            t = texts[k]
+            if t in ('-P', '-H', '-L', '-E', '-X', '-d', '-s', '-x', '--') or re.fullmatch(r'-O\d*', t):
+                k += 1
+            elif t == '-D' and k + 1 < len(args):
+                k += 2
+            elif t == '-f' and k + 1 < len(args):
+                roots.append(args[k + 1])  # BSD: -f names a start directory
+                k += 2
+            else:
+                break
+        for a in args[k:]:
             if a.text.startswith('-') or a.text in ('(', '!', ')'):
                 break
             roots.append(a)
+        if '-files0-from' in texts:
+            unknown = Word()
+            unknown.alts = ['$FILES0_FROM']
+            unknown.dynamic = True
+            roots.append(unknown)  # start directories read from a file: not known to the guard
         if not roots:
             roots = [Word()]
             roots[0].alts = ['.']
@@ -2377,15 +2407,20 @@ class Analyzer:
                     body.append(args[j])
                     j += 1
                 exec_cmds.append(body)
-        if '-delete' in texts or any(norm_name(b[0].text) in RM_CMDS | MV_CMDS | {'unlink', 'shred', 'truncate'} for b in exec_cmds if b):
+        destroyers = RM_CMDS | MV_CMDS | {'unlink', 'shred', 'truncate'}
+        if '-delete' in texts or any(norm_name(b[0].text) in destroyers for b in exec_cmds if b):
             for r in roots:
-                if self._find_root_relaxed(r, texts):
-                    continue
                 self.protected_target('find -delete/-exec', r)
         for body in exec_cmds:
             if not body:
                 continue
             bname = norm_name(body[0].text)
+            if bname in destroyers:
+                # `-exec rm -rf ~/.claude/projects {} +`, `-exec mv {} ~/.claude/hooks/ \;`: the body's own operands
+                for w in body[1:]:
+                    if w.text in ('{}', ';', '+', '\\;') or w.text.startswith('-') or '{}' in w.text:
+                        continue
+                    self.protected_target('find -exec %s' % bname, w)
             if bname in PRINT_FILE_CMDS or bname in GREP_CMDS or bname in EXFIL_CMDS:
                 for r in roots:
                     p = norm_path(r.text, ctx, ctx.cwd)
@@ -2948,54 +2983,6 @@ class Analyzer:
         finally:
             self._in_glob = False
         return max(classes, key=lambda k: self.RANK[k])
-
-    GIT_INTERNAL_NAMES = {'.git', 'head', 'orig_head', 'fetch_head', 'merge_head', 'config', 'index', 'objects',
-                          'refs', 'logs', 'hooks', 'info', 'packed-refs', 'description', 'worktrees', 'modules',
-                          'commondir', 'gitdir', 'shallow', 'exclude', 'commit-graph', 'x.pack', 'x.idx', 'x.rev',
-                          'x.lock', 'x.sample', 'x.keep', 'x.bitmap', 'x.promisor', 'x.midx'}
-
-    def _find_root_relaxed(self, root, texts):
-        """A find deletion is judged by its -name filters only when the start directory resolves (with no
-        symlink) strictly inside the agent's own worktree and is not .git. From the worktree top itself, where
-        the walk reaches .git, only extension patterns (`-name '*.pyc'`) qualify. Every other start directory
-        (home, /, a parent of a protected root, anything unresolvable) gets the normal target rule."""
-        if root.dynamic or any(ch in root.text for ch in GLOB_CHARS) or not self._find_filter_safe(texts):
-            return False
-        path = norm_path(root.text, self.ctx).rstrip('/') or '/'
-        work = self._under_work(path)
-        inner = path + '/x'  # _git_top and _own_worktree look at ancestors; this locates the top that holds `path`
-        if work is None or '.git' in Compiled._segs(path) or not self._own_worktree(inner, work):
-            return False
-        try:
-            if os.path.realpath(path) != os.path.abspath(path) or not os.path.isdir(path):
-                return False  # a symlinked start directory (or one that does not exist yet)
-        except (OSError, ValueError):
-            return False
-        top = self._git_top(inner, work + 3)
-        if not top:
-            return False
-        if len(Compiled._segs(path)) <= len(Compiled._segs(top)):
-            pats = [texts[i + 1] for i, t in enumerate(texts) if t in ('-name', '-iname') and i + 1 < len(texts)]
-            return all(re.fullmatch(r'\*\.[A-Za-z0-9_]+', p) for p in pats)
-        return True
-
-    def _find_filter_safe(self, texts):
-        """find's -name/-iname filters can only match names that are never protected or git-internal (no -o,
-        -path, -regex, negation or symlink following that could widen them)."""
-        if any(t in ('-o', '-or', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex', '!', '-not',
-                     '-L', '-H', '-follow') for t in texts):
-            return False
-        pats = [texts[i + 1] for i, t in enumerate(texts) if t in ('-name', '-iname') and i + 1 < len(texts)]
-        if not pats:
-            return False
-        c = self.c
-        samples = set(c.seg_names) | set(c.file_names) | {'x' + s for s in c.file_suffixes} | {'state'} \
-            | self.GIT_INTERNAL_NAMES
-        for p in pats:
-            for sample in samples:
-                if fnmatch.fnmatchcase(sample, p.casefold()) or fnmatch.fnmatchcase(sample.upper(), p):
-                    return False
-        return True
 
     def _task_tmp(self, path, work_len):
         """Inside work/<session>/<task>/tmp/: the place for an agent's disposable packets and scripts."""

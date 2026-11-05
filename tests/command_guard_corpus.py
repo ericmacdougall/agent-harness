@@ -268,6 +268,8 @@ LOG_POSITIVE = [
     'npx cross-env A=1 rimraf ~/.claude',
     'yarn rimraf ~/.claude',
     'pnpm rimraf ~/.claude',
+    "cross-env-shell 'rm -rf ~/.claude/projects'",
+    'yarn run rimraf ~/.claude/projects',
     # red-team hold-out misses at 98eefb7 (GoodQA #14471 F1)
     'export D=~/.claude/wals; rm -rf "$D"',
     'declare -r W=$HOME/.codex/sessions; rm -rf $W',
@@ -490,16 +492,38 @@ NEG15_WORK_BLOCK = [
     {'cmd': 'find . -name __pycache__ -exec rm -rf {} +', 'cwd': '@WT@'},
     {'cmd': 'find . -maxdepth 1 -name ".gi*" -exec rm -rf {} +', 'cwd': '@WT@'},
     {'cmd': 'find . -iname ".GIT" -exec rm -rf {} +', 'cwd': '@WT@'},
+    # deliberately refused, a disclosed false positive: find deletes from the worktree top reach its .git, and
+    # every attempt to relax them by -name filters regressed (native delta inspection of c6d28cc)
+    {'cmd': 'find . -name "*.pyc" -delete', 'cwd': '@WT@'},
+    {'cmd': 'find . -type f -name "*.o" -exec rm -f {} +', 'cwd': '@WT@'},
+    # native delta inspection of c6d28cc: leading find options, action before filter, comma operator
+    {'cmd': 'find -P ~/.claude -name "*.json" -delete', 'cwd': '@WT@'},
+    {'cmd': 'find -P ~ -name "*.py" -delete', 'cwd': '@WT@/build'},
+    {'cmd': 'find -D tree ~ -name "*.py" -delete', 'cwd': '@WT@/build'},
+    {'cmd': 'find -O3 ~/.claude -name "*.md" -exec rm -f {} +', 'cwd': '@WT@'},
+    {'cmd': 'find -- ~/.claude -name "*.json" -delete', 'cwd': '@WT@/build'},
+    {'cmd': 'find -H -L ~/.codex -name "*.jsonl" -delete', 'cwd': '@WT@/build'},
+    {'cmd': 'find -files0-from list.txt -name "*.json" -delete', 'cwd': '@WT@/build'},
+    {'cmd': 'find . -delete -name "*.pyc"', 'cwd': '@WT@'},
+    {'cmd': 'find . -name "*.pyc" , -delete', 'cwd': '@WT@'},
+    {'cmd': 'find .. -delete -name "*.pyc"', 'cwd': '@WT@/build'},
+    # -exec operands other than {} (pre-existing gap, same review)
+    {'cmd': 'find build -name "*.o" -exec rm -rf ~/.claude/projects {} +', 'cwd': '@WT@'},
+    {'cmd': 'find build -name "*.o" -execdir rm -rf ~/.claude/wals \\;', 'cwd': '@WT@'},
+    {'cmd': 'find build -name "*.o" -exec mv {} ~/.claude/settings.json \\;', 'cwd': '@WT@'},
+    {'cmd': 'find build -name "*.o" -exec mv {} ~/.claude/hooks/ \\;', 'cwd': '@WT@'},
+    {'cmd': 'xargs rm -rf <<EOF\n../../../../.claude/projects\nEOF', 'cwd': '@WT@'},
     {'cmd': 'find . -follow -name "*.pyc" -delete', 'cwd': '@WT@'},
     {'cmd': 'find ~/.claude -name "*.pyc" -delete', 'cwd': '@WT@'},
 ]
 NEG15_WORK_ALLOW = [
-    # fresh hold-out false positives at 91e8752 (GoodQA #14471, final round)
+    # fresh hold-out false positive at 91e8752 (GoodQA #14471, final round)
     {'cmd': 'rm -rf build/*', 'cwd': '@WT@'},
-    {'cmd': 'find . -name "*.pyc" -delete', 'cwd': '@WT@'},
+    # find below the worktree top is judged by its start directory (the a81e511 rule)
     {'cmd': 'find build -name __pycache__ -exec rm -rf {} +', 'cwd': '@WT@'},
-    {'cmd': 'find . -type f -name "*.o" -exec rm -f {} +', 'cwd': '@WT@'},
+    {'cmd': 'find build -type f -name "*.o" -exec rm -f {} +', 'cwd': '@WT@'},
     {'cmd': 'find build -name "*.o" -delete', 'cwd': '@WT@'},
+    {'cmd': 'find build -name "*.o" -exec mv {} /tmp/old/ \\;', 'cwd': '@WT@'},
     {'cmd': 'rm -rf build/nope*/*', 'cwd': '@WT@'},
     {'cmd': 'npx rimraf dist', 'cwd': '@WT@'},
     {'cmd': 'xargs rm -rf <<< "build/a.o"', 'cwd': '@WT@'},
@@ -768,7 +792,8 @@ LINK_GLOB_ROWS = [
     ('shopt -s dotglob; rm -rf linkfx/d/*/', 'block'),
     ('rm -rf linkfx/d/e/*', 'allow'),
     ('find linkfx/b/c -name "*.pyc" -delete', 'block'),
-    ('find linkfx/d -name "*.pyc" -delete', 'allow'),
+    ('find linkfx/b/c/.. -name "*.py" -delete', 'block'),
+    ('find linkfx/d/e -name "*.pyc" -delete', 'allow'),
 ]
 # interpreter code is scanned as code, and its deletion text already blocks
 HEREDOC_DESTRUCTIVE_BLOCK = [
