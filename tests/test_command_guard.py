@@ -631,7 +631,7 @@ class OverwriteExistingTests(Fixture):
         (Path(fill('@TASK@', self.home)) / 'existing.log').write_text('keep\n')
         failures = [(cmd, want, got) for cmd, want in corpus.OVERWRITE_EXISTING
                     for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
-        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 21)
+        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 24)
         self.assertEqual(failures, [])
 
 

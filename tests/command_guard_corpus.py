@@ -874,6 +874,18 @@ MKTEMP_SCRIPTS = [
     ('D=$(mktemp -d /nonexistent/tmp.XXXXXX)\nrm -rf "$D@HOME@/.claude/projects"\n', 'block'),
     ('D=$(mktemp -d)\nrm -rf "$D/.claude"\n', 'block'),
     ('D=$(mktemp -d) || exit 1\necho x > "$D/a"\nrm -rf "$D"\n', 'allow'),
+    # the test-hygiene owner's hermetic_check.sh shape: a resolved alias of the temp dir, helper functions that do
+    # not touch it, `env PATH=...` on a continuation line
+    ('LOGS=$(mktemp -d "${TMPDIR:-/tmp}/hc.XXXXXX") || { echo f; exit 9; }\n'
+     'LOGS_REAL=$(cd "$LOGS" && pwd -P) || { echo f; exit 9; }\n'
+     'json_list() { local out="" item; for item in "$@"; do out="$out,$item"; done; echo "[$out]"; }\n'
+     'printf "(deny default)\\n" > "$LOGS_REAL/deny.sb"\n'
+     'env -i HOME=/x \\\n  PATH="/usr/bin:/bin" python3 -m unittest > "$LOGS_REAL/suite.log" 2>&1\n'
+     'echo done | tee "$LOGS_REAL/result.txt"\necho ok | tee -a "$LOGS_REAL/result.txt"\nrm -rf "$LOGS"\n', 'allow'),
+    ('D=@HOME@/.claude\nLR=$(cd "$D" && pwd -P)\nrm -rf "$LR/projects"\n', 'block'),
+    ('D=$(mktemp -d)\nLR=$(cd "$D" && pwd -P)\nLR=@HOME@/.claude/projects\nrm -rf "$LR"\n', 'block'),
+    ('D=$(mktemp -d)\nf() { D=@HOME@/.claude/projects; }\nf\nrm -rf "$D"\n', 'block'),
+    ('D=$(mktemp -d)\n  PATH=/tmp/evil:$PATH\nrm -rf "$D"\n', 'block'),
     ('set -eu\nexport LC_ALL=C\nread -r X < /dev/null || true\nD=$(mktemp -d)\nrm -rf "$D"\n', 'allow'),
 ]
 MKTEMP_INLINE = [
@@ -901,6 +913,9 @@ OVERWRITE_EXISTING = [
     ('echo x > @HOME@/.claude/hooks/hook.py', 'block'),
     ('echo x > @HOME@/.agent-harness/work/S/top.log', 'allow'),
     ('echo x > @HOME@/.agent-harness/work/top.log', 'block'),
+    ("cat > @TASK@/existing.log <<'E'\nx\nE", 'allow'),
+    ("cat > @HOME@/.claude/settings.json <<'E'\n{}\nE", 'block'),
+    ("> @TASK@/existing.log <<'E'\nx\nE", 'block'),
     ('echo {} > @HOME@/.claude/settings.json', 'block'),
     ('echo x > @TASK@/NEW-report.md', 'allow'),
     ('make &> @TASK@/NEW-build.log', 'allow'),

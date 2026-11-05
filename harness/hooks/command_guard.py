@@ -1655,8 +1655,8 @@ class Analyzer:
                 ctx.vars.pop(name, None)
                 ctx.var_hints[name] = (value + ' ' + ' '.join(a.subs) + ' ' + ' '.join(
                     ctx.var_hints.get(v, '') for v in a.vars))[:4096]
-                if not tainted and not appended and pl is not None and pl.plain and self._fresh_mktemp(value, a) \
-                        and self._temp_scope_ok():
+                if not tainted and not appended and pl is not None and pl.plain and (self._fresh_mktemp(value, a) or self._derived_temp(value, a)) \
+                        and self._temp_scope_ok() and self._temp_name_ok(name):
                     ctx.temp_vars.add(name)
 
     MKTEMP_FLAGS = {'-d', '-q', '-t', '--directory', '--quiet'}  # not -u/--dry-run: the name is never created
@@ -1664,10 +1664,32 @@ class Analyzer:
     TEMP_SCOPE_BREAKERS = re.compile(
         r'(?:^|[\s;&|(`])(?:ln|link|eval|source|alias|enable|hash|printf\s+-v)(?=[\s;&|)]|$)'
         r'|\b(?:declare|typeset|local)\s+(?:-\w+\s+)*-\w*n'
-        r'|[\w.:-]+\s*\(\s*\)\s*[{(]|\bfunction\s+[\w.:-]+'  # a function body can rebind any name when called
         r'|(?<![\w$])[A-Za-z_]\w*\[[^\]\n]*\]\+?='  # `D[0]=x` rebinds D; the assignment tracker does not parse it  # nameref: `R=x` would assign the referenced name
-        r'|(?:^|[;&|(\n])\s*\.\s+\S|\bmktemp\s*\(\s*\)|\bfunction\s+mktemp\b|(?<![\w$])PATH\+?=|\bcp\s+[^;&|\n]*-\w*s'
+        r'|(?:^|[;&|(\n])\s*\.\s+\S|\bmktemp\s*\(\s*\)|\bfunction\s+mktemp\b|(?:^|[;&|(]|\bexport)\s*PATH\+?=|\bcp\s+[^;&|\n]*-\w*s'
         r'|\bcp\s+[^;&|\n]*--symbolic', re.M)
+
+    def _derived_temp(self, value, word):
+        """NAME=$(cd "$T" && pwd -P) or $(realpath "$T") for a fresh temp name T: the same directory, resolved."""
+        if len(word.subs) != 1 or value.replace('"', '') != SUB_MARK:
+            return False
+        inner = word.subs[0].strip()
+        m = re.fullmatch(r'cd\s+"?\$\{?([A-Za-z_]\w*)\}?"?\s*(?:&&|;)\s*pwd(?:\s+-P)?'
+                         r'|(?:realpath|readlink\s+-f)\s+"?\$\{?([A-Za-z_]\w*)\}?"?', inner)
+        name = m and (m.group(1) or m.group(2))
+        return bool(name) and name in self.ctx.temp_vars and name not in self.ctx.tainted
+
+    def _temp_name_ok(self, name):
+        """The name is bound exactly once in all text of this command, so no other line (a function body run
+        later, a branch, a loop) can rebind it."""
+        n = re.escape(name)
+        assign = re.compile(r'(?<![\w$])' + n + r'(?:\[[^\]\n]*\])?\+?=')
+        other = re.compile(r'\b(?:read|mapfile|readarray|for|select|unset|export|declare|local|typeset|readonly|getopts)'
+                           r'\b[^;&|\n]*(?<![\w$])' + n + r'\b')
+        for t in list(self.ctx.script_texts) + [getattr(self.ctx, 'raw_top', '') or '']:
+            t = t[:200000].replace('\\\n', ' ')
+            if len(assign.findall(t)) > 1 or other.search(t):
+                return False
+        return True
 
     def _untemp(self, name):
         name = name.split('[', 1)[0]  # `D[0]=x` rebinds D
@@ -1678,7 +1700,8 @@ class Analyzer:
         """No text in this command can rebind names behind the tracker's back or create symlinks."""
         ctx = self.ctx
         texts = list(ctx.script_texts) + [getattr(ctx, 'raw_top', '') or '']
-        return not any(self.TEMP_SCOPE_BREAKERS.search(t[:200000]) for t in texts)
+        # a backslash-newline continues the same command line
+        return not any(self.TEMP_SCOPE_BREAKERS.search(t[:200000].replace('\\\n', ' ')) for t in texts)
 
     @classmethod
     def _fresh_mktemp(cls, value, word):
@@ -1744,8 +1767,9 @@ class Analyzer:
         name = norm_name(words[0].text) if words else ''
         arg_texts = [w.text for w in words[1:]]
         # pure truncation: nothing (or nothing meaningful) is written, so the redirect only empties the file
+        has_body = any(r.op in ('<<', '<<-', '<<<') for r in cmd.redirs)  # `cat > f <<EOF` writes content
         pure = (not words or name in (':', 'true', 'false')
-                or (name == 'cat' and all(t == '/dev/null' for t in arg_texts))
+                or (name == 'cat' and not has_body and all(t == '/dev/null' for t in arg_texts))
                 or (name in ('echo', 'printf') and all(t in ('', '-n', '-e', '-ne', '-en') for t in arg_texts)))
         written = None
         if name in ('echo', 'printf'):
@@ -3280,6 +3304,8 @@ class Analyzer:
         """(class, shown path, literal) for the strongest protection any expansion of `word` hits."""
         ctx = self.ctx
         best, shown, literal = None, '', True
+        if word.alts and all(self._fresh_temp_path(a) for a in word.alts[:32]) and word.overflow is None:
+            return None, word.alts[0], False  # the command's own fresh mktemp name, wherever cwd went
         if ctx.cwd_protected_unknown and word.alts and not word.alts[0].startswith(('/', '~')):
             return 'unknown', word.alts[0], False
         alts = word.all_alts()
