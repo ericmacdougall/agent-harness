@@ -1,0 +1,515 @@
+{
+  "schema": 1,
+  "sources": [
+    "https://scs.owasp.org/sctop10 (OWASP Smart Contract Top 10 2026, checked 2026-11-04)",
+    "https://getfoundry.sh/forge/invariant-testing (checked 2026-11-04)"
+  ],
+  "items": {
+    "reentrancy": {
+      "title": "Reentrancy and callback ordering",
+      "keywords": [
+        "reentran",
+        "re-enter",
+        "checks-effects"
+      ],
+      "neg": "{subject} must not let a callback or external call re-enter a state-changing path before state is updated; test a malicious receiver that re-enters {surface} and assert balances and accounting are unchanged.",
+      "verify": "Reentrant attacker contract/test plus an invariant that total accounted value equals total held value."
+    },
+    "access-control": {
+      "title": "Access control and privileged roles",
+      "keywords": [
+        "access control",
+        "unauthori",
+        "privilege",
+        "onlyowner",
+        "owner check",
+        "signer check"
+      ],
+      "neg": "{subject} must refuse every privileged action ({surface}) from an unauthorized caller, a revoked role holder and an uninitialized owner.",
+      "verify": "One negative test per privileged entry point asserting the exact revert/error; a test that enumerates public entry points against an expected role table."
+    },
+    "precision": {
+      "title": "Integer and decimal precision, rounding, overflow",
+      "keywords": [
+        "precision",
+        "decimals",
+        "rounding",
+        "overflow",
+        "underflow",
+        "truncat",
+        "dust"
+      ],
+      "neg": "{subject} must not lose, mint or round value in its favour at boundary amounts (0, 1 unit, max, mixed decimals) for {surface}; rounding must favour the protocol/ledger and never create value.",
+      "verify": "Property or fuzz test over amount and decimals ranges asserting conservation (sum in == sum out + fees) and exact boundary expectations."
+    },
+    "replay-chainid": {
+      "title": "Signature replay, domain separation and chain id",
+      "keywords": [
+        "replay",
+        "chain id",
+        "chainid",
+        "domain separat",
+        "eip-712",
+        "eip712"
+      ],
+      "neg": "{subject} must reject a signature or signed message replayed on another chain, another contract or after use, and must bind chain id, verifying contract and purpose for {surface}.",
+      "verify": "Test replaying a valid signature across chain id, contract address and a second submission; malleable or truncated signatures are refused."
+    },
+    "nonce-idempotency": {
+      "title": "Nonce handling and idempotency",
+      "keywords": [
+        "nonce",
+        "idempot",
+        "duplicate submi",
+        "double spend",
+        "double-spend",
+        "sequence number"
+      ],
+      "neg": "{subject} must process a retried, duplicated or out-of-order submission of {surface} at most once and keep nonces/sequence numbers consistent after a crash and restart.",
+      "verify": "Submit the same request twice and concurrently, kill and restart mid-flow, assert one effect and a stable nonce."
+    },
+    "finality-reorg": {
+      "title": "Finality, confirmations and reorgs",
+      "keywords": [
+        "finality",
+        "reorg",
+        "confirmations",
+        "orphaned"
+      ],
+      "neg": "{subject} must not treat {surface} as final before the required confirmations, and must reverse or reconcile derived state when the observed block, ledger or slot is reorganized or dropped.",
+      "verify": "Simulate a reorg (anvil snapshot/revert, ledger rewind or dropped transaction) and assert credits are reversed and no duplicate credit occurs on replay."
+    },
+    "key-custody": {
+      "title": "Key custody, MPC and signing boundaries",
+      "keywords": [
+        "key custody",
+        "custody",
+        "mpc",
+        "private key",
+        "hsm",
+        "seed phrase",
+        "mnemonic"
+      ],
+      "neg": "{subject} must never log, persist or transmit key material, and {surface} must sign only through the approved custody/MPC boundary with policy limits; a compromised app server must not be able to sign arbitrary payloads.",
+      "verify": "Log/grep scan with seeded fake key, test that the signer refuses out-of-policy payloads, and that test fixtures use throwaway keys only."
+    },
+    "gas-dos": {
+      "title": "Gas, resource limits and denial of service",
+      "keywords": [
+        "gas limit",
+        "gas griefing",
+        "denial of service",
+        "unbounded",
+        "compute budget",
+        "out of gas",
+        "dos",
+        "fee griefing"
+      ],
+      "neg": "{subject} must stay within gas/compute/fee limits and not allow an attacker to block {surface} through unbounded loops, huge arrays, dust spam, forced reverts or fee griefing.",
+      "verify": "Gas/compute snapshot with worst-case inputs; test with maximum-size collections and a reverting recipient."
+    },
+    "upgradeability": {
+      "title": "Upgradeability, initialization and migration",
+      "keywords": [
+        "upgradeab",
+        "proxy",
+        "initializer",
+        "reinitializ",
+        "storage layout",
+        "uups",
+        "timelock",
+        "program authority"
+      ],
+      "neg": "{subject} must not allow re-initialization, an unauthorized upgrade, or a storage/account layout change that corrupts existing state for {surface}; upgrades need a delay or multisig and a tested rollback path.",
+      "verify": "Upgrade test against a fork or snapshot of existing state, storage layout diff in CI, re-initialize attempt asserted to fail."
+    },
+    "oracle-trust": {
+      "title": "Oracle and external data trust",
+      "keywords": [
+        "oracle",
+        "price feed",
+        "twap",
+        "stale price",
+        "flash loan",
+        "flash-loan",
+        "manipulat"
+      ],
+      "neg": "{subject} must reject stale, zero, out-of-range or manipulated external data (price, rate, message) for {surface}, including single-block flash-loan manipulation, and must fail safe when the source is unavailable.",
+      "verify": "Mock oracle returning stale/zero/extreme values and a fork test that manipulates a pool within one transaction."
+    }
+  },
+  "domains": {
+    "evm": {
+      "title": "EVM (Solidity, Foundry, Hardhat, ethers/viem/web3)",
+      "subject": "the contract or EVM client",
+      "surface": "each external or public function and each value transfer",
+      "items": [
+        "reentrancy",
+        "access-control",
+        "precision",
+        "replay-chainid",
+        "nonce-idempotency",
+        "finality-reorg",
+        "key-custody",
+        "gas-dos",
+        "upgradeability",
+        "oracle-trust"
+      ],
+      "overrides": {
+        "reentrancy": {
+          "verify": "forge invariant test with a handler plus a malicious receiver contract; Slither reentrancy detectors; assert nonReentrant or checks-effects-interactions on every value-moving path."
+        },
+        "replay-chainid": {
+          "verify": "EIP-712 domain includes chainId and verifyingContract; test with vm.chainId() changed and with an ecrecover malleable signature."
+        },
+        "finality-reorg": {
+          "verify": "Indexer/backend tests that revert to an anvil snapshot (evm_snapshot/evm_revert, a hint, not a true reorg) and tests with the finalized block tag; require N confirmations or finalized before crediting."
+        }
+      },
+      "scaffolds": [
+        {
+          "id": "anvil-fork",
+          "title": "Local anvil and fork tests",
+          "commands": [
+            "anvil --fork-url $RPC_URL --fork-block-number $BLOCK --chain-id 31337",
+            "forge test --fork-url $RPC_URL --fork-block-number $BLOCK -vvv"
+          ],
+          "notes": "Pin the fork block for determinism; keep RPC URLs and keys out of the repo and logs."
+        },
+        {
+          "id": "forge-invariant",
+          "title": "Foundry invariant tests with handlers",
+          "commands": [
+            "forge test --match-test invariant_ -vvv",
+            "forge coverage --report summary"
+          ],
+          "notes": "Use a handler with ghost variables and targetContract/targetSelector; set invariant runs/depth in foundry.toml and review fail_on_revert and show_metrics so reverting handlers cannot hide a vacuous run."
+        },
+        {
+          "id": "fuzz-echidna",
+          "title": "Property fuzzing with Echidna or Medusa",
+          "commands": [
+            "echidna . --contract Properties --config echidna.yaml",
+            "slither . --exclude-dependencies"
+          ],
+          "notes": "Echidna properties return bool; keep a failing control (a deliberately broken variant) to prove the property can fail."
+        },
+        {
+          "id": "hardhat-test",
+          "title": "Hardhat local network tests",
+          "commands": [
+            "npx hardhat node",
+            "npx hardhat test"
+          ],
+          "notes": "Use hardhat_reset/forking with a pinned block for fork tests."
+        }
+      ],
+      "prompts": [
+        "List every external/public entry point and its access modifier, and show a negative test for each privileged one.",
+        "Walk each value-moving function for reentrancy and cross-function reentrancy; show the attacker test.",
+        "Write a Foundry handler-based invariant test for the conservation of value, with a deliberately broken variant that must fail.",
+        "Check upgrade safety: initializer guards, storage layout diff, and a fork test of the upgrade against live state.",
+        "Review signature flows for chainId, verifyingContract, nonce and deadline binding and malleability."
+      ]
+    },
+    "solana": {
+      "title": "Solana / Anchor",
+      "subject": "the program",
+      "surface": "each instruction and each account it accepts",
+      "items": [
+        "access-control",
+        "precision",
+        "replay-chainid",
+        "nonce-idempotency",
+        "finality-reorg",
+        "key-custody",
+        "gas-dos",
+        "upgradeability",
+        "oracle-trust",
+        "reentrancy"
+      ],
+      "overrides": {
+        "access-control": {
+          "neg": "{subject} must reject an instruction when a signer, owner, PDA seed/bump, program id or account discriminator check fails, and when accounts are substituted, duplicated or passed with the wrong owner for {surface}.",
+          "verify": "Anchor tests passing wrong signer, wrong owner, fake PDA and duplicate mutable accounts; has_one/constraint on every account."
+        },
+        "reentrancy": {
+          "neg": "{subject} must not be exploitable through cross-program invocation (CPI) re-entry or arbitrary CPI target program ids for {surface}.",
+          "verify": "Test a malicious program as CPI callee; verify program id of every CPI target."
+        },
+        "precision": {
+          "verify": "checked_add/checked_mul on all u64/u128 math, tests at u64::MAX and token decimals 0/6/9; proptest over amounts."
+        },
+        "gas-dos": {
+          "neg": "{subject} must stay within the compute-unit budget and account size/rent limits for {surface}; an attacker must not be able to bloat, close-and-revive or starve accounts.",
+          "verify": "Measure compute units in tests at worst-case account counts; test account closing and revival."
+        },
+        "upgradeability": {
+          "verify": "Upgrade authority held by a multisig or revoked; account struct versioning and realloc tests against old serialized data."
+        },
+        "replay-chainid": {
+          "neg": "{subject} must not let a signed transaction or message be replayed: stale recent_blockhash, reused durable nonce account state, or a signature reused across programs and clusters for {surface}.",
+          "verify": "Test an expired blockhash, a reused durable nonce and a message signed for another program id; assert refusal."
+        },
+        "finality-reorg": {
+          "neg": "{subject} must act on {surface} only at the required commitment level (confirmed or finalized, never processed for value) and handle dropped transactions and forks by re-checking signature status.",
+          "verify": "Test with commitment levels and a dropped/expired transaction; assert no credit before finalized and no duplicate credit on resubmit."
+        }
+      },
+      "scaffolds": [
+        {
+          "id": "anchor-test",
+          "title": "Anchor tests on a local validator",
+          "commands": [
+            "anchor build",
+            "anchor test"
+          ],
+          "notes": "anchor test starts a local validator itself; run solana-test-validator --reset separately only with --skip-local-validator, and never both on the same port."
+        },
+        {
+          "id": "bankrun",
+          "title": "Fast SBF unit and in-process tests (cargo test-sbf, LiteSVM or solana-bankrun)",
+          "commands": [
+            "cargo test-sbf",
+            "cargo test"
+          ],
+          "notes": "Use for clock warps and compute-unit assertions."
+        },
+        {
+          "id": "trident",
+          "title": "Fuzzing with Trident or proptest",
+          "commands": [
+            "trident fuzz run fuzz_0",
+            "cargo test --features proptest"
+          ],
+          "notes": "Add a deliberately broken variant to prove the harness can fail."
+        }
+      ],
+      "prompts": [
+        "For each instruction list the accounts, their owner/signer/seed constraints and the test that passes a wrong one.",
+        "Check every CPI for program id validation and signer-seed use, and arithmetic for checked math.",
+        "Review account close/realloc paths and upgrade authority custody."
+      ]
+    },
+    "substrate": {
+      "title": "Substrate / Polkadot SDK pallets and runtimes",
+      "subject": "the pallet or runtime",
+      "surface": "each dispatchable and each hook (on_initialize, on_finalize)",
+      "items": [
+        "access-control",
+        "precision",
+        "nonce-idempotency",
+        "finality-reorg",
+        "key-custody",
+        "gas-dos",
+        "upgradeability",
+        "oracle-trust",
+        "replay-chainid"
+      ],
+      "overrides": {
+        "access-control": {
+          "neg": "{subject} must reject unsigned, wrong-origin and non-root calls to {surface}; every dispatchable checks ensure_signed/ensure_root/EnsureOrigin as intended.",
+          "verify": "Mock-runtime tests with each origin type; assert BadOrigin."
+        },
+        "gas-dos": {
+          "neg": "{subject} must charge correct weights and bound storage iteration for {surface}; no unbounded loops or storage growth that an attacker can force.",
+          "verify": "Benchmarks with worst-case components, weight regression check, and BoundedVec limits tested."
+        },
+        "upgradeability": {
+          "neg": "{subject} must ship a storage migration with version checks for every storage layout change, and runtime upgrades must be tested against a snapshot of live state.",
+          "verify": "try-runtime on-runtime-upgrade against live state; StorageVersion bumped and checked."
+        },
+        "precision": {
+          "verify": "Saturating/checked arithmetic and Perbill/FixedU128 rounding tests at boundaries; proptest over amounts."
+        },
+        "replay-chainid": {
+          "neg": "{subject} must bind signed extrinsics to the genesis hash, spec version, transaction version, nonce and mortality era so {surface} cannot be replayed on another chain or after a runtime upgrade.",
+          "verify": "Test an extrinsic signed for another genesis hash and an expired era; assert InvalidTransaction."
+        },
+        "finality-reorg": {
+          "neg": "{subject} must treat {surface} as final only at the GRANDPA-finalized head, not the best head, and must reconcile derived state when a fork is abandoned.",
+          "verify": "Test with a best-head fork switch and assert credits happen only after finalization (chain_getFinalizedHead)."
+        }
+      },
+      "scaffolds": [
+        {
+          "id": "mock-runtime",
+          "title": "Pallet mock runtime unit tests",
+          "commands": [
+            "cargo test -p pallet-example",
+            "cargo test --features runtime-benchmarks"
+          ],
+          "notes": "Test each origin and error variant."
+        },
+        {
+          "id": "try-runtime",
+          "title": "try-runtime and zombienet",
+          "commands": [
+            "cargo build --release --features try-runtime",
+            "try-runtime --runtime ./target/release/wbuild/runtime.wasm on-runtime-upgrade live --uri $WS_URL"
+          ],
+          "notes": "Run upgrade tests against a snapshot, not a production endpoint with write access."
+        },
+        {
+          "id": "proptest",
+          "title": "Property tests",
+          "commands": [
+            "cargo test --features proptest"
+          ],
+          "notes": "Prove failure with a seeded broken variant."
+        }
+      ],
+      "prompts": [
+        "List each dispatchable with its origin check, weight and the test for the wrong origin.",
+        "Check storage migrations and StorageVersion for every storage item changed in this diff.",
+        "Review hooks for unbounded work and weight accounting."
+      ]
+    },
+    "xrpl": {
+      "title": "XRP Ledger (xrpl.js, xrpl-py, rippled)",
+      "subject": "the XRPL client or service",
+      "surface": "each transaction type submitted or observed",
+      "items": [
+        "precision",
+        "nonce-idempotency",
+        "finality-reorg",
+        "key-custody",
+        "replay-chainid",
+        "access-control",
+        "gas-dos",
+        "oracle-trust"
+      ],
+      "overrides": {
+        "precision": {
+          "neg": "{subject} must handle XRP drops (integer) and issued-currency amounts (15-digit mantissa) without floating point, rounding or truncation for {surface}; amounts must be strings, never JS numbers or floats. Credit the delivered_amount of a payment, never its Amount field (partial payments).",
+          "verify": "Boundary tests with 1 drop, max supply, 1e-15 issued amounts, and round-trip through the library's amount types."
+        },
+        "nonce-idempotency": {
+          "neg": "{subject} must manage account Sequence/Ticket numbers and LastLedgerSequence so a retried or duplicated {surface} applies at most once and an expired transaction is never silently resubmitted with a new sequence.",
+          "verify": "Resubmit identical signed blob, expire via LastLedgerSequence, and assert one validated result by transaction hash."
+        },
+        "finality-reorg": {
+          "neg": "{subject} must treat {surface} as final only when the transaction is in a validated ledger (validated: true) with tesSUCCESS, never from tentative or tec/tem/ter results alone.",
+          "verify": "Standalone rippled test that submits without ledger_accept (not validated) and with it; assert credits only after validated result."
+        },
+        "replay-chainid": {
+          "neg": "{subject} must set NetworkID for networks that require it and reject signed blobs for another network for {surface}.",
+          "verify": "Test submit of a mainnet-signed blob against testnet/standalone config."
+        },
+        "access-control": {
+          "neg": "{subject} must honour account flags (RequireAuth, DisallowXRP, deposit authorization, regular key vs master key disabled) when handling {surface}.",
+          "verify": "Standalone tests with each account flag set."
+        }
+      },
+      "scaffolds": [
+        {
+          "id": "rippled-standalone",
+          "title": "Local standalone rippled",
+          "commands": [
+            "rippled -a --start --conf ./rippled.cfg",
+            "curl -s localhost:5005 -d '{\"method\":\"ledger_accept\"}'"
+          ],
+          "notes": "Standalone mode does not advance ledgers automatically; call ledger_accept to validate. Pin any container image by digest; the faucet exists only on test networks."
+        },
+        {
+          "id": "xrpl-property",
+          "title": "Property tests for amounts",
+          "commands": [
+            "python3 -m pytest -q tests/ --hypothesis-seed=0",
+            "npx vitest run"
+          ],
+          "notes": "Use hypothesis (xrpl-py) or fast-check (xrpl.js) over drops and issued amounts."
+        }
+      ],
+      "prompts": [
+        "Show how each submitted transaction is tracked to a validated ledger, with LastLedgerSequence and the retry policy.",
+        "Review all amount handling for float use and drops/issued-currency boundaries.",
+        "Check regular-key, signing-list and deposit-auth handling for the accounts involved."
+      ]
+    },
+    "ledger-messaging": {
+      "title": "Ledger/journal over protobuf and NATS",
+      "subject": "the ledger service",
+      "surface": "each posting, journal entry and message subject",
+      "items": [
+        "precision",
+        "nonce-idempotency",
+        "finality-reorg",
+        "access-control",
+        "key-custody",
+        "gas-dos",
+        "upgradeability"
+      ],
+      "overrides": {
+        "precision": {
+          "neg": "{subject} must store money as integer minor units or fixed-point decimal and never float; protobuf int64/uint64 fields must be checked for overflow and sign for {surface}.",
+          "verify": "Property test that every journal balances to zero (debits == credits) across random amounts, currencies and scales."
+        },
+        "nonce-idempotency": {
+          "neg": "{subject} must apply a redelivered, duplicated or reordered message ({surface}) exactly once using a durable idempotency key, including after consumer crash and JetStream redelivery.",
+          "verify": "Deliver each message twice and out of order, kill the consumer between apply and ack, assert balances unchanged by the duplicate."
+        },
+        "finality-reorg": {
+          "neg": "{subject} must not acknowledge a message before the posting is durably committed, and must define behaviour for a lost ack, a poison message and a replay from sequence zero.",
+          "verify": "Fault test killing the process before/after commit and before ack; replay the stream into an empty store and compare balances."
+        },
+        "access-control": {
+          "neg": "{subject} must authorize publishers and subscribers per subject (NATS accounts/permissions) and reject postings from an unauthorized or tenant-mismatched publisher for {surface}.",
+          "verify": "NATS permission test with a client lacking publish rights; tenant isolation test."
+        },
+        "upgradeability": {
+          "neg": "{subject} must keep protobuf schema evolution backward and forward compatible (no reused field numbers, unknown fields preserved) for {surface}.",
+          "verify": "buf breaking in CI and a test that decodes messages produced by the previous schema."
+        },
+        "key-custody": {
+          "neg": "{subject} must keep NATS credentials, signing keys and database secrets out of logs, messages and config in the repo, and rotate them without replaying {surface}.",
+          "verify": "Secret scan in CI and a test that message payload logging redacts credential fields."
+        },
+        "gas-dos": {
+          "neg": "{subject} must bound message size, consumer backlog, pending acks and per-tenant rate for {surface} so a flood or poison message cannot stall the ledger.",
+          "verify": "Load test with oversized, flooded and poison messages; assert dead-lettering and bounded memory."
+        }
+      },
+      "scaffolds": [
+        {
+          "id": "nats-local",
+          "title": "Local NATS JetStream",
+          "commands": [
+            "nats-server -js -sd $(mktemp -d)",
+            "buf lint && buf breaking --against '.git#branch=main'"
+          ],
+          "notes": "Use a throwaway store dir; test redelivery with MaxDeliver and AckWait set small."
+        },
+        {
+          "id": "ledger-property",
+          "title": "Ledger property tests",
+          "commands": [
+            "python3 -m pytest -q --hypothesis-seed=0",
+            "go test -run Property -count=1 ./..."
+          ],
+          "notes": "Assert the double-entry invariant after every random operation sequence."
+        }
+      ],
+      "prompts": [
+        "Prove that every journal balances and that redelivery cannot post twice, with a crash between commit and ack.",
+        "Check protobuf schema evolution rules and subject-level authorization.",
+        "Review amount types end to end for float or overflow."
+      ]
+    }
+  },
+  "aliases": {
+    "solidity": "evm",
+    "foundry": "evm",
+    "hardhat": "evm",
+    "ethers": "evm",
+    "viem": "evm",
+    "web3": "evm",
+    "evm-js": "evm",
+    "anchor": "solana",
+    "solana-program": "solana",
+    "polkadot": "substrate",
+    "ripple": "xrpl",
+    "nats": "ledger-messaging",
+    "ledger": "ledger-messaging"
+  }
+}

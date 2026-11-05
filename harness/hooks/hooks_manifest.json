@@ -1,0 +1,503 @@
+{
+ "schema": 1,
+ "note": "status installed = required on every listed flavor; pending = owner PR not merged, reported NOT-ENFORCED. tests/test_doctor.py fails when a pending row's script already ships in harness/hooks (promote it and make the installer wire it). known_gap marks a shipped script that one flavor does not wire yet; it names the batch that fixes it.",
+ "hooks": [
+  {
+   "id": "wal:session",
+   "script": "wal.py",
+   "arg": "session",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ]
+  },
+  {
+   "id": "wal:prompt",
+   "script": "wal.py",
+   "arg": "prompt",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ]
+  },
+  {
+   "id": "wal:subagent",
+   "script": "wal.py",
+   "arg": "subagent",
+   "event": "SubagentStart",
+   "tools": [
+    "task-owner"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ]
+  },
+  {
+   "id": "wal:subagent_stop",
+   "script": "wal.py",
+   "arg": "subagent_stop",
+   "event": "SubagentStop",
+   "tools": [
+    "task-owner"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ]
+  },
+  {
+   "id": "wal:pretool",
+   "script": "wal.py",
+   "arg": "pretool",
+   "event": "PreToolUse",
+   "tools": [
+    "Agent",
+    "Bash",
+    "Write",
+    "Edit"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04",
+    "W05"
+   ]
+  },
+  {
+   "id": "commit_policy:hook",
+   "script": "commit_policy.py",
+   "arg": "hook",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [
+    "S21"
+   ],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "ls"
+      }
+     },
+     "expect": "allow"
+    },
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "git commit -m \"added stuff\""
+      }
+     },
+     "expect": "deny"
+    }
+   ]
+  },
+  {
+   "id": "spec_flow:hook",
+   "script": "spec_flow.py",
+   "arg": "hook",
+   "event": "PreToolUse",
+   "tools": [
+    "mcp__goodqa__close_issue_done"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S22"
+   ]
+  },
+  {
+   "id": "provenance:ask-gate",
+   "script": "provenance_hooks.py",
+   "arg": "ask-gate",
+   "event": "PreToolUse",
+   "tools": [
+    "AskUserQuestion"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
+  },
+  {
+   "id": "provenance:stop-lint",
+   "script": "provenance_hooks.py",
+   "arg": "stop-lint",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
+  },
+  {
+   "id": "provenance:prompt",
+   "script": "provenance_hooks.py",
+   "arg": "prompt",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
+  },
+  {
+   "id": "codex-wal:SessionStart",
+   "script": "wal.py",
+   "arg": "hook",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ]
+  },
+  {
+   "id": "codex-wal:UserPromptSubmit",
+   "script": "wal.py",
+   "arg": "hook",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ]
+  },
+  {
+   "id": "codex-wal:PreToolUse",
+   "script": "wal.py",
+   "arg": "hook",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ]
+  },
+  {
+   "id": "codex-wal:SubagentStart",
+   "script": "wal.py",
+   "arg": "hook",
+   "event": "SubagentStart",
+   "tools": [],
+   "flavors": [
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ]
+  },
+  {
+   "id": "codex-wal:Stop",
+   "script": "wal.py",
+   "arg": "hook",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ]
+  },
+  {
+   "id": "codex-wal:Interrupt",
+   "script": "wal.py",
+   "arg": "hook",
+   "event": "Interrupt",
+   "tools": [],
+   "flavors": [
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ]
+  },
+  {
+   "id": "codex-provenance:ask-gate",
+   "script": "provenance_hooks.py",
+   "arg": "ask-gate",
+   "event": "PreToolUse",
+   "tools": [
+    "AskUserQuestion"
+   ],
+   "flavors": [
+    "codex"
+   ],
+   "status": "pending",
+   "owner": "unassigned (B5)",
+   "rules": [
+    "S23"
+   ],
+   "known_gap": "B5"
+  },
+  {
+   "id": "codex-spec_flow:hook",
+   "script": "spec_flow.py",
+   "arg": "hook",
+   "event": "PreToolUse",
+   "tools": [
+    "mcp__goodqa__close_issue_done"
+   ],
+   "flavors": [
+    "codex"
+   ],
+   "status": "pending",
+   "owner": "unassigned (B5)",
+   "rules": [
+    "S22"
+   ],
+   "known_gap": "B5"
+  },
+  {
+   "id": "command_guard:hook",
+   "script": "command_guard_hook.py",
+   "arg": "hook",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [
+    "S01",
+    "S02",
+    "S04",
+    "S05"
+   ]
+  },
+  {
+   "id": "tier_gate:hook",
+   "script": "tier_gate.py",
+   "arg": "hook",
+   "event": "PreToolUse",
+   "tools": [
+    "Agent",
+    "Task",
+    "Workflow",
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S25"
+   ]
+  },
+  {
+   "id": "tier_gate:start",
+   "script": "tier_gate.py",
+   "arg": "start",
+   "event": "SubagentStart",
+   "tools": [
+    "task-owner"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S25"
+   ]
+  },
+  {
+   "id": "tier_gate:stop",
+   "script": "tier_gate.py",
+   "arg": "stop",
+   "event": "SubagentStop",
+   "tools": [
+    "task-owner"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S25"
+   ]
+  },
+  {
+   "id": "work_assignments:guard",
+   "script": "work_assignments.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Write",
+    "Bash",
+    "Read"
+   ],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "pending",
+   "owner": "afe2e8b8 work-assignments (#14465)",
+   "rules": [
+    "W01",
+    "S24"
+   ]
+  },
+  {
+   "id": "kill_guard:hook",
+   "script": "kill_guard.py",
+   "arg": "hook",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [
+    "S27"
+   ]
+  },
+  {
+   "id": "heavy_job_guard:hook",
+   "script": "heavy_job_guard.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S20"
+   ]
+  },
+  {
+   "id": "agent_gate:hook",
+   "script": "agent_gate.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Agent",
+    "Task",
+    "Workflow"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "merge_gate:hook",
+   "script": "merge_gate.py",
+   "arg": "hook",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [
+    "S19"
+   ]
+  },
+  {
+   "id": "ledger-reminder:SessionStart",
+   "script": "ledger_reminder.py",
+   "arg": null,
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "ledger-reminder:UserPromptSubmit",
+   "script": "ledger_reminder.py",
+   "arg": null,
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "log_backup:session-start",
+   "script": "log_backup.py",
+   "arg": "session-start",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S04"
+   ]
+  }
+ ]
+}

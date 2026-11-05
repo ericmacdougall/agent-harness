@@ -41,6 +41,7 @@ type rpcClient struct {
 	pending     map[string]chan rpcPacket
 	input       io.WriteCloser
 	command     *exec.Cmd
+	tree        *processTree
 	done        chan struct{}
 	closeOnce   sync.Once
 	onEvent     func(*rpcClient, string, json.RawMessage)
@@ -61,23 +62,22 @@ func startRPCWithAuthority(binary string, env []string, authAdmit inputAdmission
 	if err != nil {
 		return nil, err
 	}
-	output, err := command.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
 	// Provider diagnostics can contain local paths and account information.
 	// They remain outside the HTTP response and are bounded in memory.
 	command.Stderr = &cappedBuffer{limit: 32768}
-	if err = command.Start(); err != nil {
+	tree, err := startProcessTree(command, nil)
+	if err != nil {
 		return nil, err
 	}
-	client := &rpcClient{pending: map[string]chan rpcPacket{}, input: input, command: command, done: make(chan struct{}), authAdmit: authAdmit, onEvent: onEvent, onRequest: onRequest, onClose: onClose}
+	output := tree.Stdout()
+	client := &rpcClient{pending: map[string]chan rpcPacket{}, input: input, command: command, tree: tree, done: make(chan struct{}), authAdmit: authAdmit, onEvent: onEvent, onRequest: onRequest, onClose: onClose}
 	go func() {
 		client.read(output)
-		// Once its stream ends this provider cannot be supervised. Stop the whole
-		// group before Wait reaps the leader, so the group ID cannot have been reused.
-		terminateProcess(command)
-		client.finish(command.Wait())
+		// Once its stream ends this provider cannot be supervised. The tree stops
+		// the whole group while the leader still pins the group ID.
+		client.stopTree()
+		<-tree.Done()
+		client.finish(tree.Err())
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -190,7 +190,7 @@ func (c *rpcClient) writeAdmitted(ctx context.Context, value any, admit inputAdm
 		return releaseAll, nil
 	})
 	if err != nil && !isDispatchRefused(err) {
-		go func() { c.finish(err); terminateProcess(c.command) }()
+		go func() { c.finish(err); c.stopTree() }()
 	}
 	return err
 }
@@ -251,6 +251,16 @@ func (c *rpcClient) close() {
 	case <-c.done:
 		return
 	case <-time.After(500 * time.Millisecond):
+	}
+	c.stopTree()
+}
+
+// stopTree ends the provider's whole process group.
+func (c *rpcClient) stopTree() {
+	if c.tree != nil {
+		c.tree.Release(true)
+		c.tree.Terminate(100 * time.Millisecond)
+		return
 	}
 	terminateProcess(c.command)
 }

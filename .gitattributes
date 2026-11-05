@@ -1,0 +1,3 @@
+# Normalize line endings: gofmt -l (CI "Format and vet") and the golden/corpus byte comparisons
+# fail on Windows runners that check files out as CRLF.
+* text=auto eol=lf

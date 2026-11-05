@@ -314,8 +314,8 @@ class Reader(Base):
 
 class ShippedHooksAreInstalled(unittest.TestCase):
     """Install coverage: a hook file that install.HOOKS does not copy never reaches ~/.claude/hooks."""
-    # Owned by feat/command-guard (#14471); that PR must install them and then delete these entries.
-    PENDING_OWNER = {"command_guard.py", "command_guard_policy.json", "redact.py"}
+    # loss_inventory.py (PL-03, merged on main without an installer entry) is a scan tool, not a hook: its owner decides.
+    PENDING_OWNER = {"loss_inventory.py"}
 
     def test_every_tracked_hook_file_is_installed_or_explicitly_pending(self):
         sys.path.insert(0, str(ROOT))
@@ -325,6 +325,35 @@ class ShippedHooksAreInstalled(unittest.TestCase):
         self.assertEqual(missing, set(), "hook files not copied by install.HOOKS")
         stale = self.PENDING_OWNER & set(install.HOOKS)
         self.assertEqual(stale, set(), "owner PR installed these; drop them from PENDING_OWNER")
+
+
+class BoundedReads(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def test_an_oversized_state_file_is_treated_as_corrupt_without_being_read_whole(self):
+        path = self.dir / "state.json"
+        path.write_text('{"code": 0, "at": 1, "pad": "' + "x" * (bw.MAX_STATE_BYTES + 10) + '"}')
+        self.assertEqual(bw._read_state(path, now=10), {})
+        small = self.dir / "small.json"
+        small.write_text('{"code": 0, "at": 1}')
+        self.assertEqual(bw._read_state(small, now=10)["code"], 0)
+
+    def test_a_symlinked_or_missing_state_file_is_ignored(self):
+        real = self.dir / "real.json"
+        real.write_text('{"code": 0, "at": 1}')
+        link = self.dir / "link.json"
+        link.symlink_to(real)
+        self.assertEqual(bw._read_state(link, now=10), {})
+        self.assertEqual(bw._read_state(self.dir / "absent.json", now=10), {})
+
+    def test_read_small_never_returns_more_than_the_limit(self):
+        path = self.dir / "f.txt"
+        path.write_text("abcdef")
+        self.assertEqual(bw._read_small(path, 6), "abcdef")
+        self.assertIsNone(bw._read_small(path, 5))
 
 
 if __name__ == "__main__":

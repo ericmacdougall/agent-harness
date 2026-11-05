@@ -9,8 +9,11 @@ Subcommands:
   waive           record a reasoned exception in the WAL and the waiver ledger
   notify          comment delivery evidence on referenced tickets
 
-Rules live in commit_policy.json beside this file. There is no environment
-bypass: the only exception path is `waive`, which records a reason in the WAL.
+Rules live in commit_policy.json beside this file; personal values (your org, repos) live in the
+untracked commit_policy.local.json, which may set only backstop_repos and ticket_systems. There is no
+environment bypass: the only exception path is `waive`, which records a reason in the WAL. (The
+AGENT_HARNESS_POLICY_LOCAL test variable is honoured only for files under the repository's tests/data,
+so on an installed copy it does nothing.)
 Runs on Python 3.9 with the standard library only.
 """
 
@@ -26,12 +29,14 @@ import shlex
 import stat
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 POLICY_FILE = HERE / "commit_policy.json"
+LOCAL_PROFILE_NAME = "commit_policy.local.json"
 LEDGER = Path.home() / ".agent-harness" / "commit-policy" / "waivers.jsonl"
 SECTION_NAMES = ("Why", "What", "Testing", "Refs", "Risk", "Reason", "Authorized-by")
 SECTION_LINE = re.compile(r"^(Why|What|Testing|Refs|Risk|Reason|Authorized-by)\s*:\s?(.*)$", re.I)
@@ -55,9 +60,79 @@ class Unresolvable(Exception):
 
 # --------------------------------------------------------------------------- policy
 
+def _deep_merge(base: dict, extra: dict) -> dict:
+    """Objects merge key by key; every other value (lists included) is replaced by the profile."""
+    merged = dict(base)
+    for key, value in extra.items():
+        merged[key] = _deep_merge(merged[key], value) if isinstance(value, dict) and isinstance(merged.get(key), dict) else value
+    return merged
+
+
+LOCAL_PROFILE_KEYS = ("backstop_repos", "ticket_systems")
+LOCAL_TICKET_KEYS = ("repos", "org_id", "key_file", "key_secret", "default_project", "projects",
+                     "unreachable_projects", "unreachable_reason")
+
+
+def _override_allowed(candidate: Path) -> bool:
+    """Test fixtures only: the override must resolve inside <repo>/tests/data. An installed copy of the
+    hooks has no such directory, so there the override is inert."""
+    try:
+        here = Path(__file__).resolve()
+        root = here.parents[2]
+        # Only inside a source checkout (<root>/harness/hooks/ with install.py at <root>). An installed copy lives at
+        # ~/.claude/hooks, where parents[1] is ".claude", so a ~/tests/data directory someone creates does not count.
+        if not (here.parent.name == "hooks" and here.parents[1].name == "harness" and (root / "install.py").is_file()):
+            return False
+        data_dir = (root / "tests" / "data").resolve()
+        return data_dir.is_dir() and candidate.resolve().is_relative_to(data_dir)
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def load_policy(path: Path = POLICY_FILE) -> dict:
+    """Read the shipped (generic) policy, then overlay commit_policy.local.json beside it if present.
+
+    The local profile holds personal values (your org, repos, key location) and is never tracked or
+    overwritten by the installer. A profile that exists but cannot be parsed fails closed (ValueError)."""
     with open(path, encoding="utf-8") as handle:
         policy = json.load(handle)
+    override = os.environ.get("AGENT_HARNESS_POLICY_LOCAL")
+    if override and not _override_allowed(Path(override)):
+        # A variable set on one command line must never be able to swap the enforcement profile.
+        print("commit_policy: AGENT_HARNESS_POLICY_LOCAL ignored (only files under the repository's tests/data "
+              "are accepted)", file=sys.stderr)
+        override = None
+    local = Path(override) if override else Path(path).with_name(LOCAL_PROFILE_NAME)
+    if override and not local.is_file():
+        raise ValueError(f"AGENT_HARNESS_POLICY_LOCAL={local} does not exist")
+    if os.path.lexists(local) and not local.is_file():
+        # a dangling symlink, directory or FIFO must not read as "no profile" (that would silently drop enforcement)
+        raise ValueError(f"{local} exists but is not a readable regular file")
+    if local.is_file():
+        import safe_input  # same directory as this script; bounds size and nesting
+        try:
+            overlay = safe_input.safe_json_loads(safe_input.read_bounded(local, 1 << 20))
+        except (OSError, ValueError, safe_input.InputRejected) as error:
+            raise ValueError(f"{local} is not a readable JSON object: {error}") from error
+        if not isinstance(overlay, dict):
+            raise ValueError(f"{local} is not a JSON object")
+        forbidden = sorted(k for k in overlay if k not in LOCAL_PROFILE_KEYS and not k.startswith("_"))
+        if forbidden:  # a profile holds personal values only; it cannot switch off enforcement rules
+            raise ValueError(f"{local} may only set {sorted(LOCAL_PROFILE_KEYS)}, not {forbidden}")
+        systems = overlay.get("ticket_systems", {})
+        if not isinstance(systems, dict) or any(not isinstance(v, dict) for v in systems.values()):
+            raise ValueError(f"{local}: ticket_systems must map names to objects")
+        for name, entry in systems.items():  # endpoint, ref_pattern and the like change verification, not who you are
+            bad = sorted(k for k in entry if k not in LOCAL_TICKET_KEYS and not k.startswith("_"))
+            if bad:
+                raise ValueError(f"{local}: ticket_systems.{name} may only set {sorted(LOCAL_TICKET_KEYS)}, not {bad}")
+            routes = entry.get("projects") or {}
+            if not isinstance(routes, dict):
+                raise ValueError(f"{local}: ticket_systems.{name}.projects must be an object")
+            for slug, route in routes.items():  # a route must not redirect the endpoint
+                if not isinstance(route, dict) or set(route) - {"project_id", "org_id", "key_file"}:
+                    raise ValueError(f"{local}: project route {slug!r} may only set project_id, org_id, key_file")
+        policy = _deep_merge(policy, overlay)
     if not isinstance(policy, dict) or policy.get("schema") != 1:
         raise ValueError(f"{path} is not a schema 1 commit policy")
     for key in ("subject", "body", "refs", "exempt", "ticket_systems", "waivers"):
@@ -89,13 +164,31 @@ def _clean(value: str) -> str:
     return "\n".join(line for line in lines if line).strip()
 
 
-def ticket_refs(text: str, policy: dict):
+def is_ledger_system(config: dict) -> bool:
+    return config.get("adapter") == "ledger"
+
+
+def ticket_refs(text: str, policy: dict, *, include_ledger: bool = False):
+    """Remote ticket refs as (system, project, number).
+
+    Local ledger refs (system, slug, hex) are returned only with include_ledger=True, so
+    every remote-ticket caller (verification, delivery comments, Authorized-by) keeps
+    ignoring them and the GoodQA rules are unchanged.
+    """
     found = []
     for system, config in policy["ticket_systems"].items():
+        ledger = is_ledger_system(config)
+        if ledger and not include_ledger:
+            continue
         for match in re.finditer(config["ref_pattern"], text, re.I):
             project = (match.groupdict().get("project") or config.get("default_project") or "").lower()
-            found.append((system, project, int(match.group("number"))))
+            found.append((system, project, match.group("id").lower() if ledger else int(match.group("number"))))
     return list(dict.fromkeys(found))
+
+
+def ledger_refs(text: str, policy: dict):
+    return [ref for ref in ticket_refs(text, policy, include_ledger=True)
+            if is_ledger_system(policy["ticket_systems"][ref[0]])]
 
 
 def parse_message(message: str):
@@ -143,13 +236,130 @@ def tickets_required_for(origin: str | None, policy: dict) -> bool:
                for pattern in config.get("repos", []))
 
 
+def remote_urls(repo) -> list:
+    """Every fetch and push URL of every remote, raw and after insteadOf rewriting.
+
+    Raises OSError (or TimeoutExpired) when git cannot answer; callers fail closed.
+    """
+    urls = []
+    raw = git(repo, "config", "--get-regexp", r"^remote\..*\.(url|pushurl)$", check=False)
+    names = set()
+    for line in raw.splitlines():
+        key, _, value = line.partition(" ")
+        urls.append(value.strip())
+        names.add(key[len("remote."):key.rindex(".")])
+    for name in sorted(names | set(git(repo, "remote").split())):
+        for args in (("get-url", "--all", name), ("get-url", "--push", "--all", name)):
+            urls += [line.strip() for line in git(repo, "remote", *args, check=False).splitlines()]
+    return sorted({url for url in urls if url})
+
+
+SCP_URL = re.compile(r"^(?:[^@/\s]+@)?(?P<host>[^/:\s]+):(?P<path>.*)$")
+
+
+def normalized_urls(url: str) -> set:
+    """Canonical spellings of a remote URL for the tracked-repo match (only ever adds candidates).
+
+    Git and hosts treat these as the same repository, so none of them may hide a tracked path:
+    letter case and a trailing dot in the host, an explicit port, scp-style "host:/path",
+    percent-encoding, "." and ".." segments, doubled slashes and a trailing ".git".
+    """
+    from posixpath import normpath
+    from urllib.parse import unquote, urlsplit
+    url = url.strip()
+    if "://" in url:
+        try:
+            parts = urlsplit(url)
+            host, path = parts.hostname or "", parts.path
+        except ValueError:
+            return set()
+    else:
+        match = SCP_URL.match(url)
+        if not match or len(match.group("host")) == 1:  # "C:\..." is a local path, not scp syntax
+            return set()
+        host, path = match.group("host"), match.group("path")
+    host = host.lower().rstrip(".")
+    path = normpath("/" + unquote(path)).lstrip("/")
+    path = re.sub(r"(?:\.git)?/*$", "", path)
+    if not host:
+        return set()
+    return {f"https://{host}/{path}/", f"{host}:{path}/"}
+
+
+def repo_ticket_context(repo, policy: dict, *, push_url: str | None = None):
+    """N11 tracked-repo rule. None outside a repository.
+
+    tracked: any remote url/pushurl (or the explicit push destination) matches a ticket
+    system's repos pattern, so renaming, re-pointing or adding remotes cannot shed the rule.
+    ledger_allowed: local ledger refs may count - only in an untracked repo that has a remote,
+    or in a remote-less repo whose absolute top-level path fully matches ledger.allowed_repos.
+    When git cannot be read the repo is treated as tracked and the ledger is not allowed.
+    """
+    try:
+        top = git(repo, "rev-parse", "--show-toplevel").strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        urls = remote_urls(top)
+    except (OSError, subprocess.TimeoutExpired):
+        return {"top": top, "tracked": True, "ledger_allowed": False, "urls": []}
+    if push_url:
+        urls = sorted(set(urls) | {push_url})
+    patterns = [pattern for config in policy["ticket_systems"].values() if not is_ledger_system(config)
+                for pattern in config.get("repos", [])]
+    # Hosts are case-insensitive and an explicit port (ssh://git@ssh.github.com:443/...) must not hide a
+    # tracked path, so match each URL as written and with ":<port>/" removed, ignoring case. This only
+    # makes more repositories tracked. SSH host aliases from ~/.ssh/config cannot be seen (known limit).
+    variants = set(urls) | {re.sub(r":\d+/", "/", url) for url in urls}
+    for url in urls:
+        variants |= normalized_urls(url)
+    tracked = any(re.search(pattern, url, re.I) for url in variants for pattern in patterns)
+    allowed = False
+    ledgers = [config for config in policy["ticket_systems"].values() if is_ledger_system(config)]
+    if ledgers and not tracked:
+        if urls:
+            allowed = True
+        else:
+            real = os.path.realpath(top)
+            allowed = any(re.fullmatch(pattern, real) for config in ledgers
+                          for pattern in config.get("allowed_repos", []))
+    return {"top": top, "tracked": tracked, "ledger_allowed": allowed, "urls": urls}
+
+
+def ledger_checker(policy: dict, context, as_of_ms: int):
+    """A validate() ledger callback for this repo context, or None when ledger refs may not count."""
+    if not context or not context["ledger_allowed"]:
+        return None
+    adapters = {}
+
+    def check(system, slug, handle):
+        from ticket_adapters import adapter_for, TicketSystemUnavailable
+        try:
+            adapter = adapters.get(system) or adapter_for(policy["ticket_systems"][system])
+            adapters[system] = adapter
+            status, _ = adapter.resolve(slug, handle, cwd=context["top"], as_of_ms=as_of_ms)
+        except TicketSystemUnavailable as error:
+            return f"could not verify Ledger {slug}#{handle} ({str(error)[:160]})"
+        if status == "ok":
+            return None
+        if status == "ambiguous":
+            return f"Ledger {slug}#{handle} is ambiguous; use more hex digits"
+        when = datetime.fromtimestamp(as_of_ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return (f"Ledger {slug}#{handle} does not exist in this machine's ledger before the commit date ({when}); "
+                "the ticket must predate the commit's author date. After rewording an older commit to cite a "
+                "newer ticket, run git commit --amend --reset-author")
+    return check
+
+
 def validate(message: str, *, policy: dict, previous: str | None = None, is_merge: bool = False,
              allow_autosquash: bool = False, strip_comments: bool = False,
-             tickets_required: bool = True) -> list:
+             tickets_required: bool = True, ledger=None) -> list:
     """Return a list of human-readable violations (empty means compliant).
 
     tickets_required is False for repos no ticket system tracks: Refs must still
     be present and meaningful, but 'none (<reason>)' is accepted for any type.
+    ledger is a callback (system, slug, handle) -> problem or None from ledger_checker();
+    without it `Ledger` refs never count. They never satisfy tickets_required.
     """
     text = normalize(message, strip_comments=strip_comments)
     if not text:
@@ -246,6 +456,15 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
     if "Refs" in sections:
         value = _clean(sections["Refs"])
         tickets = ticket_refs(value, policy)
+        local = ledger_refs(value, policy)
+        verified_local = []
+        if ledger is not None and not tickets_required:
+            for system, slug, handle in local:
+                problem = ledger(system, slug, handle)
+                if problem:
+                    problems.append("Refs: " + problem)
+                else:
+                    verified_local.append((system, slug, handle))
         none = NONE_REF.match(value)
         unverifiable = any(re.search(p, value) for p in ref_rules["unverifiable_patterns"])
         if none:
@@ -254,8 +473,13 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
             if tickets_required and kind and kind not in ref_rules["none_allowed_types"]:
                 problems.append(f"Refs: {kind} commits must reference a ticket (e.g. 'GoodQA #1234'); "
                                 f"'none' is allowed only for {', '.join(ref_rules['none_allowed_types'])}")
-        elif not (tickets or PR_REF.search(value) or unverifiable):
-            problems.append("Refs: name a ticket (GoodQA #N), PR, or 'none (<reason>)' for chore/docs")
+        elif not (tickets or verified_local or PR_REF.search(value) or unverifiable):
+            if not local:
+                problems.append("Refs: name a ticket (GoodQA #N), PR, or 'none (<reason>)' for chore/docs")
+            elif ledger is None or tickets_required:
+                problems.append("Refs: name a ticket (GoodQA #N), PR, or 'none (<reason>)' for chore/docs; "
+                                "Ledger refs count only in untracked repos or repos listed in ledger.allowed_repos")
+            # otherwise each unverified Ledger ref already added its own problem
         if tickets_required and kind in ref_rules["ticket_required_types"] and not tickets and not none:
             extra = " (R- coordinator records cannot be verified and do not count)" if unverifiable else ""
             problems.append(f"Refs: {kind} commits must reference a GoodQA ticket, e.g. 'GoodQA #1234'{extra}")
@@ -277,7 +501,7 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
     return problems
 
 
-def validate_pr(title: str, body: str, policy: dict, *, tickets_required: bool = True) -> list:
+def validate_pr(title: str, body: str, policy: dict, *, tickets_required: bool = True, ledger=None) -> list:
     """GitHub squash uses '<title> (#N)' plus the PR body; both must form a compliant message."""
     limit = int(policy["subject"]["max_length"]) - 8
     problems = []
@@ -285,7 +509,8 @@ def validate_pr(title: str, body: str, policy: dict, *, tickets_required: bool =
         problems.append(f"PR title: {len(title)} chars; keep it <= {limit} so the squash subject "
                         f"'<title> (#N)' fits {policy['subject']['max_length']}")
     message = title.strip() + "\n\n" + body
-    problems += ["PR " + item for item in validate(message, policy=policy, tickets_required=tickets_required)
+    problems += ["PR " + item for item in validate(message, policy=policy, tickets_required=tickets_required,
+                                                   ledger=ledger)
                  if not item.startswith("message:")]
     return problems
 
@@ -698,10 +923,14 @@ def resolve_commit(args, cwd, stdin_body, facts):
                                    f"{opts['file']} cannot be located; use an absolute -F path")
             path = path if path.is_absolute() else Path(cwd) / path
             try:
-                info = path.stat()
-                if info.st_size > 65536:
-                    raise Unresolvable("message file exceeds 64 KiB")
-                parts.append(path.read_text(encoding="utf-8", errors="replace"))
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)  # never wait on a FIFO
+                with os.fdopen(fd, "rb") as handle:
+                    info = os.fstat(handle.fileno())
+                    if not stat.S_ISREG(info.st_mode):
+                        raise Unresolvable(f"message file {opts['file']} is not a regular file")
+                    if info.st_size > 65536:
+                        raise Unresolvable("message file exceeds 64 KiB")
+                    parts.append(handle.read(65537).decode("utf-8", errors="replace"))
             except FileNotFoundError:
                 raise Unresolvable(f"message file {opts['file']} does not exist yet; write it in a separate "
                                    "step, then run git commit -F <file>") from None
@@ -1274,13 +1503,17 @@ def run_hook(payload: dict, policy: dict) -> tuple:
         previous = None
         if facts:
             previous = facts["parent"] if context.get("amend") else facts["head"]
+        if context.get("remote") or context.get("unknown_repo"):
+            required, ledger = bool(policy.get("remote_tickets_required", True)), None
+        else:
+            ticket_context = repo_ticket_context(facts["top"], policy) if facts else None
+            required = bool(ticket_context and ticket_context["tracked"])
+            ledger = ledger_checker(policy, ticket_context, int(time.time() * 1000))
         problems = validate(message, policy=policy, previous=previous,
                             is_merge=bool(facts and facts["merging"]),
                             allow_autosquash=bool(facts and not facts["published"]
                                                   and facts["branch"] not in ("main", "master", "")),
-                            tickets_required=(bool(policy.get("remote_tickets_required", True))
-                                              if context.get("remote") or context.get("unknown_repo")
-                                              else tickets_required_for(facts and facts["origin"], policy)))
+                            tickets_required=required, ledger=ledger)
         if problems:
             subject = digest(message)
             if session_dir is not None and find_waiver("message", subject, policy, session_dir=session_dir):
@@ -1376,8 +1609,9 @@ def run_git_hook(path: str, policy: dict) -> tuple:
     if policy.get("enforcement") == "off" or not agent_environment():
         return 0, ""
     facts = repo_facts(".")
-    if not (facts and facts["origin"] and any(re.search(pattern, facts["origin"])
-                                              for pattern in policy.get("backstop_repos", []))):
+    ticket_context = repo_ticket_context(facts["top"], policy) if facts else None
+    if not (ticket_context and any(re.search(pattern, url) for url in ticket_context["urls"]
+                                   for pattern in policy.get("backstop_repos", []))):
         return 0, ""
     try:
         message = normalize(Path(path).read_text(encoding="utf-8", errors="replace"), strip_comments=True)
@@ -1390,7 +1624,8 @@ def run_git_hook(path: str, policy: dict) -> tuple:
     problems = validate(message, policy=policy, previous=facts["parent"] if same_as_head else facts["head"],
                         is_merge=facts["merging"],
                         allow_autosquash=not facts["published"] and facts["branch"] not in ("main", "master", ""),
-                        tickets_required=tickets_required_for(facts["origin"], policy))
+                        tickets_required=ticket_context["tracked"],
+                        ledger=ledger_checker(policy, ticket_context, int(time.time() * 1000)))
     if not problems or find_waiver("message", digest(message), policy):
         return 0, ""
     text = block_text(problems, message, policy, subject=digest(message))
@@ -1424,7 +1659,7 @@ def _commit_refs(message: str, policy: dict):
 
 
 def check_range(repo, base, head, policy, *, branch=None, pr=None, verify_tickets=False, adapters=None,
-                exclude=()):
+                exclude=(), push_url=None):
     """Validate every commit in base..head; optionally verify referenced tickets were updated.
 
     Freshness: a ticket comment naming the commit SHA (7+ hex) necessarily
@@ -1435,11 +1670,17 @@ def check_range(repo, base, head, policy, *, branch=None, pr=None, verify_ticket
         return {"base": base, "head": head, "exclude": list(exclude), "commits": [], "tickets": [],
                 "waivers": [], "status": "PASS", "enforcement": "off"}
     commits = range_commits(repo, base, head, exclude)
-    origin = git(repo, "remote", "get-url", "origin", check=False).strip() or None
+    ticket_context = repo_ticket_context(repo, policy, push_url=push_url)
     previous = git(repo, "log", "-1", "--format=%B", base, check=False) or None
+
+    def ledger_for(commit):
+        # Handles resolve against tickets that existed when the commit was authored (to the
+        # second, plus one), so a later ticket cannot make an earlier 8-hex handle ambiguous.
+        return ledger_checker(policy, ticket_context, (int(commit["author_time"]) + 1) * 1000)
     return evaluate(commits, policy, base=base, head=head, exclude=exclude, previous=previous,
-                    tickets_required=tickets_required_for(origin, policy), branch=branch, pr=pr,
-                    verify_tickets=verify_tickets, adapters=adapters)
+                    tickets_required=True if ticket_context is None else ticket_context["tracked"],
+                    branch=branch, pr=pr, verify_tickets=verify_tickets, adapters=adapters,
+                    ledger_for=ledger_for)
 
 
 def check_github(slug, base, head, policy, *, verify_tickets=True, adapters=None, timeout=30):
@@ -1481,7 +1722,7 @@ def check_github(slug, base, head, policy, *, verify_tickets=True, adapters=None
 
 
 def evaluate(commits, policy, *, base, head, exclude, previous, tickets_required, branch, pr,
-             verify_tickets, adapters):
+             verify_tickets, adapters, ledger_for=None):
     report = {"base": base, "head": head, "exclude": list(exclude), "commits": [], "tickets": [],
               "waivers": [], "status": "PASS"}
     required = tickets_required
@@ -1491,7 +1732,8 @@ def evaluate(commits, policy, *, base, head, exclude, previous, tickets_required
     for commit in commits:
         merge = len(commit["parents"]) > 1
         problems = validate(commit["message"], policy=policy, previous=None if merge else previous,
-                            is_merge=merge, tickets_required=required)
+                            is_merge=merge, tickets_required=required,
+                            ledger=ledger_for(commit) if ledger_for and not merge else None)
         # Author time survives rebase/cherry-pick/amend; committer time does not.
         legacy = bool(problems) and cutover_ts is not None and commit["author_time"] < cutover_ts
         waiver = find_waiver("commit", commit["sha"], policy) if problems and not legacy else None
@@ -1760,6 +2002,7 @@ def main(argv=None) -> int:
     check = sub.add_parser("check-message")
     check.add_argument("--file")
     check.add_argument("--previous-file")
+    check.add_argument("--repo", help="apply this repository's ticket rule (N11) and resolve Ledger refs in it")
     rng = sub.add_parser("check-range")
     rng.add_argument("--repo", required=True)
     rng.add_argument("--base", required=True)
@@ -1768,6 +2011,7 @@ def main(argv=None) -> int:
     rng.add_argument("--pr")
     rng.add_argument("--verify-tickets", action="store_true")
     rng.add_argument("--json", action="store_true")
+    rng.add_argument("--push-url", help="destination URL being pushed to; counts toward the tracked-repo rule")
     gh_check = sub.add_parser("check-github", help="check a pushed branch range through the GitHub API")
     gh_check.add_argument("--repo", required=True, help="owner/name")
     gh_check.add_argument("--base", required=True)
@@ -1829,14 +2073,23 @@ def main(argv=None) -> int:
     if args.command == "check-message":
         message = Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
         previous = Path(args.previous_file).read_text(encoding="utf-8") if args.previous_file else None
-        problems = validate(message, policy=policy, previous=previous)
+        if args.repo:
+            ticket_context = repo_ticket_context(args.repo, policy)
+            if ticket_context is None:
+                print(f"commit-policy: {args.repo} is not a git repository", file=sys.stderr)
+                return 2
+            sys.path.insert(0, str(HERE))
+            problems = validate(message, policy=policy, previous=previous, tickets_required=ticket_context["tracked"],
+                                ledger=ledger_checker(policy, ticket_context, int(time.time() * 1000)))
+        else:
+            problems = validate(message, policy=policy, previous=previous)
         print(json.dumps({"status": "BLOCKED" if problems else "PASS", "problems": problems,
                           "digest": digest(message)}, indent=1))
         return 2 if problems else 0
     if args.command == "check-range":
         sys.path.insert(0, str(HERE))
         report = check_range(args.repo, args.base, args.head, policy, branch=args.branch, pr=args.pr,
-                             verify_tickets=args.verify_tickets)
+                             verify_tickets=args.verify_tickets, push_url=args.push_url)
         print(json.dumps(report, indent=1) if args.json else format_report(report))
         return {"PASS": 0, "BLOCKED": 2, "UNVERIFIED": 4}[report["status"]]
     if args.command == "check-github":

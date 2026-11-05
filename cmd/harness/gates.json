@@ -1,0 +1,12 @@
+{
+ "comment": "Fail-closed hook surfaces: a crash or an unported call on any of these exits 2 (block), never 1 or 3, which Codex and Claude treat as allow. tests/test_pyfront.py checks every hook the installers register as blocking (Claude onFailure block, every Codex hook) is listed. The gate is matched when the subcommand is a key and any argument equals one of its verbs, so a flag before the verb cannot drop gate status.",
+ "gates": {
+  "command-guard": ["hook"],
+  "commit-policy": ["hook"],
+  "kill-guard": ["hook"],
+  "merge-gate": ["hook"],
+  "spec-flow": ["hook"],
+  "tier-gate": ["hook"],
+  "wal": ["hook", "prompt", "pretool"]
+ }
+}

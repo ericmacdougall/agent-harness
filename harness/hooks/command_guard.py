@@ -3,8 +3,11 @@
 
     command_guard.py hook [--format exit2|json]    PreToolUse hook (JSON on stdin); exit 2 + stderr blocks
     command_guard.py check [--ps] 'COMMAND'        print the decision for a command, run nothing
-    command_guard.py approve-delete --path P --remote R [--backup-verified-sha256 D] [--ttl S]
-    command_guard.py revoke-delete                 remove the delete approval marker
+    command_guard.py explain --file F [--cwd D]   decision and findings for a command stored in a file
+    command_guard.py doctor                        check the installed guard and run its self-test probes
+    command_guard.py replay TRANSCRIPT.jsonl...    decision counts over real transcripts (never prints commands)
+    command_guard.py approve-delete --path P --remote R --wal W [--backup-verified-sha256 D] [--ttl S]
+    command_guard.py revoke-delete                 remove every delete approval
     command_guard.py scan-wal PATH...              report secret shapes in WAL/transcript files (never prints values)
 
 Categories (modes live in the installed command_guard_policy.json, never in an environment variable or a repo):
@@ -43,6 +46,8 @@ import unicodedata
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:  # python3 -I (3.11+) no longer puts the script's directory on sys.path
+    sys.path.insert(0, str(HERE))
 POLICY_FILE = HERE / 'command_guard_policy.json'
 
 DEFAULT_POLICY = {
@@ -50,13 +55,47 @@ DEFAULT_POLICY = {
     'modes': {'secret_dump': 'enforce', 'log_delete': 'enforce', 'broad_kill': 'warn'},
     'limits': {'max_command_bytes': 262144, 'max_depth': 8, 'max_nodes': 600000, 'max_seconds': 3.0,
                'max_stdin_bytes': 4194304},
+    # Tier A: logs, WALs and approval state. Every destructive form is refused, including overwrites.
     'protected_log_roots': ['{home}/.claude/projects', '{home}/.claude/wals', '{home}/.claude/sessions',
                             '{home}/.claude/transcripts', '{home}/.claude/history.jsonl',
+                            '{home}/.claude/file-history',
                             '{home}/.codex/sessions', '{home}/.codex/archived_sessions',
-                            '{home}/.codex/history*'],
-    'protected_work_wal_regex': r'^{home}/\.agent-harness/work/[^/]+/(?:.*/)?(?:wals?|wal[^/]*|[^/]*\.wal\.jsonl)(?:/.*)?$',
+                            '{home}/.codex/history*', '{home}/.agent-harness/state',
+                            '{home}/.agent-harness/codex-wals', '{home}/.claude/.credentials.json',
+                            '{home}/.codex/auth.json',
+                            # the guard itself: deleting or replacing it would switch the protection off
+                            '{home}/.claude/hooks/command_guard*', '{home}/.claude/hooks/redact.py',
+                            '{home}/.claude/hooks/safe_input.py',
+                            '{home}/.codex/agent-harness/command_guard*', '{home}/.codex/agent-harness/redact.py',
+                            '{home}/.codex/agent-harness/safe_input.py'],
+    # The guard's own files (and any policy file next to it): refused even when the target does not exist yet,
+    # because creating one is how the protection would be replaced or reconfigured.
+    'guard_files': ['{home}/.claude/hooks/command_guard*', '{home}/.claude/hooks/redact.py',
+                    '{home}/.claude/hooks/safe_input.py', '{home}/.codex/agent-harness/command_guard*',
+                    '{home}/.codex/agent-harness/redact.py', '{home}/.codex/agent-harness/safe_input.py'],
+    # wal, wals, wal-*, wal_*, wal.* and *.wal.jsonl; not walker/ or wallet/
+    'protected_work_wal_regex': r'^{home}/\.agent-harness/work/[^/]+/(?:.*/)?(?:wals?|wal[-_.][^/]*|[^/]*\.wal\.jsonl)(?:/.*)?$',
+    # Tier A anywhere on disk: a `wals` directory segment, main.jsonl and *.wal.jsonl files.
+    'protected_segment_names': ['wals'],
+    'protected_file_names': ['main.jsonl'],
+    'protected_file_suffixes': ['.wal.jsonl'],
+    # Tier B: whole harness trees. Deletes, moves out and truncation are refused; edits and new files are not.
+    'protected_roots': ['{home}/.claude', '{home}/.codex', '{home}/.agent-harness'],
+    # Literal paths inside these stay deletable (disposable scratch). A wildcard position must be filled by a
+    # literal name: a glob there could reach other sessions. Under work/ only the agent's own git worktree is
+    # deletable (see Analyzer._own_worktree); cleanup of task folders goes through workdir.py prune --apply.
+    'allow_subtrees': ['{home}/.agent-harness/scratch/*/*/*/*'],
+    # Never deletable anywhere under a harness root, whatever exception applies: run kits, JSONL logs, state.
+    'keep_names': ['kit.json'],
+    'keep_suffixes': ['.jsonl'],
+    'keep_segments': ['state'],
+    # Homes on other machines (ssh targets) are matched with these patterns as well as the local homes.
+    'generic_homes': ['/users/*', '/home/*', '/root', '/var/root'],
     'ancestor_roots': ['{home}', '{home}/.claude', '{home}/.codex', '{home}/.agent-harness',
                        '{home}/.agent-harness/work'],
+    'rclone_allow_redacted': False,
+    # Temp trees where the anywhere-on-disk WAL names (wals/, main.jsonl) are test data, not real WALs.
+    'temp_roots': ['/tmp', '/private/tmp', '/var/tmp', '/var/folders', '/private/var/folders'],
     'state_files': ['{home}/.agent-harness/state/log-delete-ok.json', '{home}/.agent-harness/state/log-delete.key'],
     'credential_path_regexes': [
         r'(^|/)\.config/rclone/rclone\.conf$', r'(^|/)rclone\.conf$',
@@ -70,7 +109,7 @@ DEFAULT_POLICY = {
         r'(^|/)\.vault-token$',
         r'(^|/)\.config/gcloud/(?:credentials\.db|access_tokens\.db|application_default_credentials\.json|legacy_credentials/.*)$',
         r'(^|/)\.gnupg/(?:private-keys-v1\.d/.*|secring\.gpg)$',
-        r'^/proc/(?:self|[0-9]+|\*)/environ$'],
+        r'^/proc/(?:self|[0-9]+|\*)/environ$', r'^/proc/[^/]+/environ$'],
     'credential_allow_regexes': [r'\.pub$', r'\.env\.(?:example|sample|template|dist|defaults)$', r'-cert\.pub$'],
     'credential_dirs': ['{home}/.ssh', '{home}/.aws', '{home}/.config/rclone', '{home}/.claude/goodqa-hive',
                         '{home}/.gnupg', '{home}/.docker', '{home}/.config/gh', '{home}/.config/gcloud',
@@ -82,29 +121,54 @@ DEFAULT_POLICY = {
                            '{home}/.codex/auth.json', '{home}/.pgpass', '{home}/.git-credentials', '{cwd}/.env'],
     'secret_env_regex': r'(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|APIKEY|ACCESSKEY|PRIVATEKEY)|(?:^|_)(?:KEY|PAT)(?:_|$)',
     'secret_env_exclude_regex': r'(?:_FILE|_PATH|_DIR|_NAME|_COUNT|_LIMIT|_BUDGET|_URL|_ID|_TTL|_EXPIRY|_TIMEOUT)$|^(?:KEYCHAIN|SSH_AUTH_SOCK)',
-    'rclone_blocked_config': ['show', 'dump', 'reconnect'],
+    'rclone_blocked_config': ['show', 'dump', 'reconnect', 'file', 'redacted', 'paste'],
     'kill': {'min_pattern_length': 12,
              'generic_names': ['python', 'python3', 'node', 'nodejs', 'claude', 'codex', 'unittest', 'pytest', 'chrome',
                                'chromium', 'ssh', 'sshd', 'bash', 'sh', 'zsh', 'java', 'ruby', 'go', 'npm', 'pnpm',
                                'yarn', 'tmux', 'git', 'rclone', 'docker', 'electron', 'code', 'safari', 'firefox',
                                'tests', 'test', 'server', 'worker', 'agent', 'harness', 'deliver', 'peer_review']},
     'marker': {'default_ttl_seconds': 900, 'max_ttl_seconds': 86400, 'max_walk_entries': 200000,
-               'max_walk_seconds': 2.0, 'max_hash_bytes': 21474836480},
+               'max_walk_seconds': 2.0, 'max_hash_bytes': 21474836480, 'recent_change_seconds': 600,
+               'approve_remote_types': ['dropbox']},
 }
 
 SECRET_DUMP, LOG_DELETE, BROAD_KILL = 'secret_dump', 'log_delete', 'broad_kill'
+PARSE = 'parse'  # warn-only notes: input the guard could not fully parse
 ALWAYS_ENFORCED = (SECRET_DUMP, LOG_DELETE)
 
 
 # --------------------------------------------------------------------------- policy
 
+# A policy file can only add protection: these lists are unioned with the defaults, broad_kill's mode may be set,
+# and every other key in the file is ignored. Allow-lists, regexes and limits are never taken from a file, so a
+# written or replaced policy cannot switch the guard off.
+ADDITIVE_LISTS = ('protected_log_roots', 'protected_segment_names', 'protected_file_names', 'protected_file_suffixes',
+                  'protected_roots', 'keep_names', 'keep_suffixes', 'keep_segments', 'generic_homes', 'ancestor_roots',
+                  'state_files', 'credential_path_regexes', 'credential_dirs', 'credential_samples',
+                  'rclone_blocked_config', 'guard_files')
+
+
 def _merge(base, override):
-    out = dict(base)
-    for key, value in (override or {}).items():
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            out[key] = _merge(base[key], value)
-        else:
-            out[key] = value
+    out = json.loads(json.dumps(base))
+    if not isinstance(override, dict):
+        return out
+    for key in ADDITIVE_LISTS:
+        extra = override.get(key)
+        if isinstance(extra, list):
+            for item in extra:
+                if isinstance(item, str) and item and item not in out[key]:
+                    if key == 'credential_path_regexes':
+                        try:
+                            re.compile(item)
+                        except re.error:
+                            continue
+                    out[key].append(item)
+    kill = override.get('kill')
+    if isinstance(kill, dict) and isinstance(kill.get('generic_names'), list):
+        out['kill']['generic_names'] += [n for n in kill['generic_names'] if isinstance(n, str) and n]
+    modes = override.get('modes')
+    if isinstance(modes, dict) and modes.get(BROAD_KILL) in ('warn', 'enforce'):
+        out['modes'][BROAD_KILL] = modes[BROAD_KILL]
     return out
 
 
@@ -139,18 +203,46 @@ class Compiled:
         self.policy = policy
         homes = []
         for candidate in (home, os.path.expanduser('~'), _pw_home()):
-            if candidate and candidate not in homes:
-                homes.append(os.path.normpath(candidate))
+            if not candidate:
+                continue
+            for variant in (os.path.normpath(candidate), _realpath(candidate)):
+                if variant and variant not in homes:
+                    homes.append(variant)
         self.homes = homes
         self.home = homes[0]
-        self.cwd = cwd or os.getcwd()
+        try:
+            self.cwd = cwd or os.getcwd()
+        except OSError:
+            self.cwd = self.home
         self.limits = policy['limits']
         fmt = lambda template, h: template.replace('{home}', h).replace('{cwd}', self.cwd)  # noqa: E731
-        self.protected = [self._segs(fmt(t, h)) for t in policy['protected_log_roots'] for h in homes]
+        # Matching homes: the local ones (exact) plus glob patterns for other machines' homes.
+        match_homes = homes + [g for g in policy.get('generic_homes', []) if isinstance(g, str)]
+        self.match_homes = [self._segs(g.casefold()) for g in policy.get('generic_homes', []) if isinstance(g, str)]
+        self.protected = [self._segs(fmt(t, h)) for t in policy['protected_log_roots'] for h in match_homes]
+        self.roots = [self._segs(fmt(t, h)) for t in policy.get('protected_roots', []) for h in match_homes]
+        self.allow = []
+        for t in policy.get('allow_subtrees', []):
+            if not isinstance(t, str):
+                continue
+            for h in match_homes:
+                segs = self._segs(fmt(t, h))
+                if self._safe_allow(segs, h):
+                    self.allow.append(segs)
+        self.temp_roots = [self._segs(t) for t in policy.get('temp_roots', []) if isinstance(t, str)]
+        self.seg_names = {s.casefold() for s in policy.get('protected_segment_names', [])}
+        self.file_names = {s.casefold() for s in policy.get('protected_file_names', [])}
+        self.file_suffixes = tuple(s.casefold() for s in policy.get('protected_file_suffixes', []))
+        self.keep_names = {s.casefold() for s in policy.get('keep_names', [])}
+        self.keep_suffixes = tuple(s.casefold() for s in policy.get('keep_suffixes', []))
+        self.keep_segments = {s.casefold() for s in policy.get('keep_segments', [])}
         self.ancestors = [self._segs(fmt(t, h)) for t in policy['ancestor_roots'] for h in homes]
+        self.guard_globs = [fmt(t, h).casefold() for t in policy.get('guard_files', []) for h in homes]
         self.state_files = [fmt(t, h).casefold() for t in policy['state_files'] for h in homes]
-        self.wal_regexes = [re.compile(policy['protected_work_wal_regex'].replace('{home}', re.escape(h)), re.I)
-                            for h in homes]
+        # every home form, not only this machine's: a WAL under another host's work dir is still a WAL
+        self.wal_regexes = [re.compile(policy['protected_work_wal_regex'].replace(
+            '{home}', re.escape(h).replace(r'\*', '[^/]+')), re.I)
+            for h in homes + [g for g in policy.get('generic_homes', []) if isinstance(g, str)]]
         self.cred = [re.compile(r, re.I) for r in policy['credential_path_regexes']]
         self.cred_allow = [re.compile(r, re.I) for r in policy['credential_allow_regexes']]
         self.cred_dirs = [self._segs(fmt(t, h)) for t in policy['credential_dirs'] for h in homes]
@@ -166,9 +258,45 @@ class Compiled:
     def _segs(path):
         return [s for s in path.casefold().replace('\\', '/').split('/') if s]
 
+    def _safe_allow(self, segs, home):
+        """An allow_subtrees entry must sit at least two levels below a protected root and not cover Tier A."""
+        if any(s in ('..', '.', '**') for s in segs):
+            return False
+        for r in self.protected:
+            if _prefix_match(segs, r):
+                return False
+        deep_enough = False
+        for r in self.roots:
+            if _prefix_match(segs, r) and len(segs) >= len(r) + 2:
+                deep_enough = True
+        return deep_enough
+
+    def is_guard_file(self, path):
+        folded = path.casefold()
+        real = (_realpath(path) or path).casefold()
+        return any(_fnmatchcase(p, g) for g in self.guard_globs for p in (folded, real))
+
     def secret_name(self, name):
         upper = name.upper()
         return bool(self.secret_env.search(upper)) and not self.secret_env_excl.search(upper)
+
+
+def _looks_clean(value):
+    """A literal value the redactor leaves alone and that is not long and opaque."""
+    if len(value) > 200 or re.fullmatch(r'[A-Za-z0-9+/_=-]{24,}', value):
+        return False
+    try:
+        import redact
+        return redact.redact(value) == value
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _realpath(path):
+    try:
+        return os.path.realpath(path) if path and len(path) < 4096 else None
+    except (OSError, ValueError):
+        return None
 
 
 def _pw_home():
@@ -201,7 +329,7 @@ class Budget:
 
 
 class Word:
-    __slots__ = ('alts', 'subs', 'vars', 'glob', 'quoted', 'dynamic', 'single_only')
+    __slots__ = ('alts', 'subs', 'vars', 'glob', 'quoted', 'dynamic', 'single_only', 'overflow', 'raw')
 
     def __init__(self):
         self.alts = ['']
@@ -211,10 +339,23 @@ class Word:
         self.quoted = False
         self.dynamic = False  # contains an unresolved expansion
         self.single_only = False
+        self.overflow = None  # raw text of a brace expansion that exceeded the 32-alternative cap
+        self.raw = None       # the word's exact source text; None for a word the lexer did not read from the input
 
     @property
     def text(self):
         return self.alts[0]
+
+    def all_alts(self):
+        """Every expansion for target checks: an overflowed brace word is re-expanded with a 4096 cap.
+        None means it is still too large, so its targets are unknown."""
+        if self.overflow is None:
+            return self.alts[:32]
+        raw = self.overflow
+        more = brace_expand(raw, limit=4096) if raw.count('{') <= 64 and len(raw) <= 65536 else []
+        if more and len(more) <= 4096:
+            return [_unq(a) for a in more]
+        return None
 
 
 class Redir:
@@ -349,7 +490,7 @@ def brace_expand(text, limit=32):
             for part in parts:
                 nxt.append(item[:start] + part + item[end:])
                 if len(nxt) > limit:
-                    return nxt[:limit]
+                    return nxt[:limit + 1]  # one extra item tells the caller the expansion overflowed
         out = nxt
         if not changed:
             break
@@ -377,6 +518,11 @@ def _find_brace(text):
             return i, j, parts
         i = text.find('{', i + 1)
     return None
+
+
+# zsh clobber forms (the Bash tool may run zsh): judged as the bash operator with the same effect
+ZSH_CLOBBER = {'>!': '>|', '>>!': '>>', '>>|': '>>', '&>!': '&>', '&>|': '&>', '>&!': '&>', '>&|': '&>',
+               '&>>!': '&>>', '&>>|': '&>>'}
 
 
 class Lexer:
@@ -409,6 +555,8 @@ class Lexer:
                 continue
             if c == "'":
                 j = s.find("'", i + 1)
+                if j < 0:
+                    self.ctx.unterminated = True
                 body = s[i + 1:] if j < 0 else s[i + 1:j]
                 buf.append(''.join(Q.get(ch, ch) for ch in body))
                 w.quoted = True
@@ -451,7 +599,16 @@ class Lexer:
         if not any_char and i == started:
             return None, i
         raw = ''.join(buf)
-        alts = brace_expand(raw) if '{' in raw and ',' in raw and raw.count('{') <= 24 and len(raw) <= 2048 else [raw]
+        alts = [raw]
+        if '{' in raw and ',' in raw:
+            expandable = raw.count('{') <= 24 and len(raw) <= 2048
+            if expandable:
+                alts = brace_expand(raw)
+            if len(alts) > 32 or not expandable:
+                # too many alternatives (or too big to expand): target checks re-expand it with a larger cap
+                # and treat anything past that as unknown (see Analyzer.target_class)
+                w.overflow = raw
+                alts = alts[:32]
         w.alts = [_unq(a) for a in alts]
         return w, i
 
@@ -478,6 +635,8 @@ class Lexer:
             else:
                 buf.append(Q.get(c, c))
                 i += 1
+        if i >= n:
+            self.ctx.unterminated = True
         return i + 1
 
     def _dollar(self, s, i, w, buf, in_dq):
@@ -499,6 +658,8 @@ class Lexer:
                 buf.append(ARITH_MARK)
                 return min(j + 1, n)
             j = scan_balanced(s, i + 2)
+            if j > n:
+                self.ctx.unterminated = True
             w.subs.append(s[i + 2:j - 1] if j <= n else s[i + 2:])
             w.dynamic = True
             buf.append(SUB_MARK)
@@ -520,6 +681,9 @@ class Lexer:
             self._use_var(m.group(0), w, buf)
             return i + 1 + len(m.group(0))
         if nxt and nxt in '?$!@*#0123456789-':
+            if nxt in '@*0123456789':
+                w.vars.append(nxt)  # positional parameter: a flow variable (see _hint_points_at_protected)
+                w.dynamic = True
             buf.append('$' + nxt)
             return i + 2
         if self.ps and s[i + 1:i + 5].lower() == 'env:':
@@ -571,6 +735,7 @@ class Lexer:
         tokens, pending = [], []
         prev_end = -1
         wait_target = None
+        also_arg = False
         while i < n:
             self.budget.tick()
             c = s[i]
@@ -590,13 +755,17 @@ class Lexer:
                 continue
             if c in ';&|()<>' and not (c in '<>' and s[i + 1:i + 2] == '('):
                 op = self._operator(s, i)
-                if op[0] in ('<', '>', '&>', '>&', '<&', '<>', '<<', '<<<', '<<-', '&>>', '>>', '>|'):
+                # the whole operator, not its first character: `&>` and `&>>` start with `&` (GoodQA #14471 follow-up)
+                if op in ('<', '>', '&>', '>&', '<&', '<>', '<<', '<<<', '<<-', '&>>', '>>', '>|') or op in ZSH_CLOBBER:
                     fd = None
                     if tokens and tokens[-1][0] == 'w' and prev_end == i and re.fullmatch(r'[0-9]', tokens[-1][1].text or 'x'):
                         fd = tokens.pop()[1].text
-                    rd = Redir(fd, op)
+                    rd = Redir(fd, ZSH_CLOBBER.get(op, op))
                     tokens.append(('redir', rd))
                     wait_target = rd
+                    # bash has no `>!`: it reads `>` onto a file named `!`, so the next word is an argument of the
+                    # command. Judge both shells: zsh's redirect target and bash's argument (delta review F1)
+                    also_arg = op.endswith('!') and s[i + len(op):i + len(op) + 1] in WS
                     if op in ('<<', '<<-'):
                         rd.strip = op == '<<-'
                         pending.append(rd)
@@ -609,12 +778,16 @@ class Lexer:
             if w is None:
                 i += 1
                 continue
+            w.raw = s[i:j]
             if wait_target is not None:
                 wait_target.target = w
                 if wait_target.op in ('<<', '<<-'):
                     wait_target.delim = w.text
                     wait_target.quoted = w.quoted
                 wait_target = None
+                if also_arg:
+                    tokens.append(('w', w))
+                    also_arg = False
             else:
                 tokens.append(('w', w))
             prev_end = j
@@ -623,7 +796,8 @@ class Lexer:
 
     @staticmethod
     def _operator(s, i):
-        for op in ('<<<', '<<-', '&>>', '&&', '||', '|&', '>>', '>&', '<&', '<>', '<<', '&>', '>|', ';', '&', '|', '(', ')', '<', '>'):
+        for op in ('&>>!', '&>>|', '<<<', '<<-', '&>>', '>>!', '>>|', '&>!', '&>|', '>&!', '>&|', '&&', '||', '|&', '>>', '>&',
+                   '<&', '<>', '<<', '&>', '>|', '>!', ';', '&', '|', '(', ')', '<', '>'):
             if s.startswith(op, i):
                 return op
         return s[i]
@@ -647,7 +821,52 @@ class Lexer:
         return i
 
 
+def _strip_case_patterns(tokens):
+    """`case X in a|b) cmd;; *) cmd;; esac`: drop the pattern lists so `a|b` is not a pipeline and `*` is not a
+    command whose name is a glob. The bodies stay as ordinary commands."""
+    out, stack, i, n = [], [], 0, len(tokens)
+    while i < n:
+        kind, val = tokens[i]
+        at_start = not out or out[-1][0] == 'op' or (out[-1][0] == 'w' and not out[-1][1].quoted
+                                                       and out[-1][1].text in RESERVED)
+        if kind == 'w' and not val.quoted and val.text == 'case' and at_start and i + 2 < n \
+                and tokens[i + 2][0] == 'w' and tokens[i + 2][1].text == 'in':
+            out.append(tokens[i])
+            out.append(tokens[i + 1])
+            stack.append('patterns')
+            i += 3
+            continue
+        if stack and stack[-1] == 'patterns':
+            if kind == 'w' and not val.quoted and val.text == 'esac':
+                stack.pop()
+                out.append(tokens[i])
+            elif kind == 'op' and val == ')':
+                stack[-1] = 'body'
+                out.append(('op', ';'))
+            # pattern words, `|` and a leading `(` are dropped; newlines between items are kept
+            elif kind == 'op' and val == '\n':
+                out.append(tokens[i])
+            i += 1
+            continue
+        if stack and kind == 'op' and val == ';' and i + 1 < n and tokens[i + 1] == ('op', ';'):
+            stack[-1] = 'patterns'
+            out.append(('op', ';'))
+            i += 2
+            continue
+        if stack and kind == 'op' and val == ';' and i + 1 < n and tokens[i + 1] in (('op', '&'), ('op', ';;&')):
+            stack[-1] = 'patterns'
+            out.append(('op', ';'))
+            i += 2
+            continue
+        if stack and kind == 'w' and not val.quoted and val.text == 'esac' and at_start:
+            stack.pop()
+        out.append(tokens[i])
+        i += 1
+    return out
+
+
 def parse(tokens):
+    tokens = _strip_case_patterns(tokens)
     pipelines, pl, cmd = [], Pipeline(), Cmd()
 
     def end_cmd():
@@ -703,15 +922,133 @@ def norm_name(text):
 
 
 def norm_path(text, ctx, cwd=None):
-    """Absolute, normalised, case-folded path with / separators. Unresolved variables stay as $NAME."""
+    """Absolute, normalised path with / separators (case kept; match with casefold). Unresolved vars stay $NAME."""
     text = unicodedata.normalize('NFKC', text.replace('\\', '/') if ctx.ps else text)
     text = ''.join(ch for ch in text if unicodedata.category(ch) != 'Cf')
-    if text.startswith('~'):
+    if text == '~' or text.startswith('~/'):
         text = ctx.home + text[1:]
-    text = re.sub(r'^(?:\$env:USERPROFILE|%USERPROFILE%)', ctx.home, text, flags=re.I)
+    elif re.match(r'~[A-Za-z0-9_.][A-Za-z0-9_.-]*(?:/|$)', text):
+        # ~user/...: that user's home; an unknown user still lands under a generic home pattern
+        user, _, rest = text[1:].partition('/')
+        expanded = os.path.expanduser('~' + user)
+        base = expanded if expanded != '~' + user else '/home/' + user
+        text = base + ('/' + rest if rest else '')
+    text = re.sub(r'^(?:\$env:USERPROFILE|%USERPROFILE%)', lambda _m: ctx.home, text, flags=re.I)
     if not text.startswith('/') and not re.match(r'^[A-Za-z]:/', text):
         text = posixpath.join(cwd if cwd is not None else ctx.cwd_value(), text)
-    return posixpath.normpath(text).casefold() if text else ''
+    return posixpath.normpath(text) if text else ''
+
+
+GLOB_CHARS = '*?['
+
+
+def _has_glob(seg):
+    return any(ch in seg for ch in GLOB_CHARS)
+
+
+def _fnmatchcase(name, pattern):
+    """fnmatch that cannot raise: Python 3.9 raises re.error on a reversed range such as [z-a], and an exception here
+    would cost the whole command its findings. It may still match in a shell ([z-ae] matches e), so an unreadable
+    pattern counts as a match: every caller only gets stricter."""
+    try:
+        return fnmatch.fnmatchcase(name, pattern)
+    except re.error:
+        return True
+
+
+def _seg_eq(p, r):
+    """One path segment against one pattern segment; either side may be a glob."""
+    if p == r:
+        return True
+    gp, gr = _has_glob(p), _has_glob(r)
+    if gp and gr:
+        return True  # two patterns may overlap: assume they do
+    if gp:
+        return _fnmatchcase(r, p)
+    if gr:
+        return _fnmatchcase(p, r)
+    return False
+
+
+def _prefix_match(path_segs, root_segs):
+    n = min(len(path_segs), len(root_segs))
+    return all(_seg_eq(path_segs[k], root_segs[k]) for k in range(n))
+
+
+# Raw text that names a protected location: used for unresolved variables, substitutions and fallbacks.
+PROTECTED_TEXT = re.compile(r'(?i)\.(?:claude|codex|agent-harness)(?![\w-])|(?:^|[/\s\'"])wals?(?:/|$|[\s\'"])|'
+                            r'main\.jsonl|\.wal\.jsonl')
+PROTECTED_VAR_NAME = re.compile(r'(?i)claude|codex|harness|(?:^|_)wals?(?:_|$)')
+RELATIVE_PROTECTED_NAMES = {'projects', 'wals', 'sessions', 'history.jsonl', 'transcripts', 'archived_sessions',
+                            '.claude', '.codex', '.agent-harness', 'file-history', 'main.jsonl'}
+
+
+def _lexists(path):
+    try:
+        return len(path) < 4096 and os.path.lexists(path)
+    except (OSError, ValueError):
+        return False
+
+
+def _resolve_prefix(path):
+    """realpath of the longest existing prefix (symlinks resolved), with the unresolved rest appended."""
+    if not path or len(path) > 4096 or '\x00' in path:
+        return None
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _real_git_marker(marker):
+    """A .git directory holding HEAD, or a .git file starting with `gitdir:` (linked worktree)."""
+    try:
+        if os.path.isdir(marker) and not os.path.islink(marker):
+            return os.path.isfile(os.path.join(marker, 'HEAD'))
+        if os.path.isfile(marker) and not os.path.islink(marker):
+            with open(marker, 'rb') as handle:
+                return handle.read(8) == b'gitdir: '
+    except OSError:
+        return False
+    return False
+
+
+def classify_segs(c, segs):
+    """'log' (Tier A), 'root' (Tier B), 'ancestor' (contains a protected root) or None, for case-folded segments."""
+    for r in c.protected:
+        if _prefix_match(segs, r):
+            return 'log' if len(segs) >= len(r) else 'ancestor'
+    leaf = segs[-1] if segs else ''
+    in_root = None
+    for r in c.roots:
+        if _prefix_match(segs, r):
+            in_root = 'root' if len(segs) >= len(r) else 'ancestor'
+            break
+    in_temp = not in_root and any(len(segs) > len(t) and segs[:len(t)] == t for t in c.temp_roots)
+    if not in_temp and (any(s in c.seg_names for s in segs)
+                        or (leaf and (leaf in c.file_names or leaf.endswith(c.file_suffixes)))):
+        return 'log' if in_root else 'log-name'
+    if in_root == 'root':
+        # inside a harness tree a glob that can reach a WAL name counts as a WAL path
+        for s in segs:
+            if _has_glob(s) and any(_fnmatchcase(n, s) for n in c.seg_names | c.file_names):
+                return 'log'
+        if _has_glob(leaf) and any(_fnmatchcase('x' + suf, leaf) for suf in c.file_suffixes):
+            return 'log'
+        if leaf in c.keep_names or leaf.endswith(c.keep_suffixes) or any(x in c.keep_segments for x in segs):
+            return 'root'
+        if leaf.endswith(('.output', '.log')) or 'tasks' in segs[len(r):]:
+            return 'root'  # agent task output and logs: never deleted without a verified backup
+        for a in c.allow:
+            if len(segs) >= len(a) and all(
+                    (segs[k] == a[k]) or (a[k] == '*' and not _has_glob(segs[k])) for k in range(len(a))):
+                return None
+    if in_root:
+        return in_root
+    for a in c.ancestors:
+        if _prefix_match(segs, a) and len(segs) <= len(a):
+            return 'ancestor'
+    return None
 
 
 def is_dynamic_path(text):
@@ -726,7 +1063,7 @@ def seg_match(pattern_segs, concrete_segs):
     """Pattern (may have globs) vs concrete path segments, over the shorter length: True if one reaches the other."""
     n = min(len(pattern_segs), len(concrete_segs))
     for k in range(n):
-        if not fnmatch.fnmatchcase(concrete_segs[k], pattern_segs[k]):
+        if not _fnmatchcase(concrete_segs[k], pattern_segs[k]):
             return False
     return True
 
@@ -758,6 +1095,12 @@ SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'bus
 PS_SHELLS = {'pwsh', 'powershell'}
 INTERPRETERS = {'python', 'python3', 'python2', 'node', 'nodejs', 'perl', 'ruby', 'php', 'deno', 'bun', 'lua', 'rscript',
                 'osascript', 'pypy', 'pypy3', 'tclsh', 'awk-script'}
+WRAPPER_VALUE_OPTS = {'nice': ('-n', '--adjustment'), 'ionice': ('-c', '-n', '-p', '-t'), 'chrt': ('-p',),
+                      'stdbuf': ('-i', '-o', '-e'), 'caffeinate': ('-t', '-w'), 'watch': ('-n', '-d', '--interval'),
+                      'strace': ('-o', '-e', '-p', '-s', '-u'), 'ltrace': ('-o', '-e', '-p', '-s', '-u'),
+                      'runuser': ('-u', '-g', '-G'), 'su': ('-s', '-g', '-G'), 'sg': (), 'setsid': (),
+                      'nsenter': ('-t', '--target'), 'firejail': ('--profile',), 'sandbox-exec': ('-f', '-p', '-n'),
+                      'start-process': ('-FilePath', '-ArgumentList'), 'unbuffer': (), 'time': ('-o', '-f')}
 WRAPPERS_SIMPLE = {'command', 'builtin', 'exec', 'nohup', 'time', 'nice', 'ionice', 'setsid', 'stdbuf', 'caffeinate',
                    'noglob', 'unbuffer', 'chrt', 'taskset', 'doas', 'sudo', 'env', 'xargs', 'timeout', 'watch', 'gosu',
                    'chroot', 'runuser', 'strace', 'ltrace', 'script', 'dtruss', 'arch', 'nsenter', 'firejail', 'sandbox-exec',
@@ -812,6 +1155,9 @@ SECRET_CLIS = [
     ('aws', ('configure', 'get'), r'secret|access_key|session_token', 'aws sts get-caller-identity'),
     ('aws', ('ecr', 'get-login-password'), None, 'pipe it straight into docker login --password-stdin'),
     ('gh', ('auth', 'token'), None, 'gh auth status (shows login, never the token)'),
+    ('gh', ('config', 'get'), r'oauth_token|token', 'gh auth status'),
+    ('kubectl', ('config', 'view'), r'--raw|--flatten', 'kubectl config view (redacted by default)'),
+    ('aws', ('configure', 'export-credentials'), None, 'aws sts get-caller-identity'),
     ('gh', ('auth', 'status'), r'(?:^| )(?:-t|--show-token)(?: |$)', 'gh auth status without --show-token'),
     ('gcloud', ('secrets', 'versions', 'access'), None, 'gcloud secrets versions list / describe (metadata only)'),
     ('gcloud', ('print-access-token',), None, 'let the tool call gcloud itself; never print the token'),
@@ -878,13 +1224,22 @@ def _build_fallback(c):
                             r'cut|bat|nl|tac|readfile|read_text|read_bytes|file_get_contents|readfilesync|dump|echo)\b')
         add((S, 'credential-file-text', ('and', cred, reader),
              'reads a credential file and prints it', 'check that the file exists with `test -s FILE`; never print it'))
-    protected = re.compile(r'(?:~|\$home|\$\{home\}|\$env:userprofile|%userprofile%|/users/[^/\s]+|/home/[^/\s]+)?/?\.(?:claude/(?:projects|wals|sessions|transcripts|history)|'
-                           r'codex/(?:sessions|archived_sessions|history))|\.agent-harness/work/[^\s/]+/[^\s]*wal', re.I)
+    # path pieces may be joined by /, path.join commas, + or pathlib's / (quotes are spaces by now)
+    sep = r'(?:\s*[/,+\\]\s*|\s+)'
+    protected = re.compile(r'\.(?:claude' + sep + r'(?:projects|wals|sessions|transcripts|history|file-history)|'
+                           r'codex' + sep + r'(?:sessions|archived_sessions|history)|'
+                           r'agent-harness' + sep + r'(?:state|codex-wals)(?![\w-])|'
+                           r'agent-harness' + sep + r'work' + sep + r'[^\s/]+' + sep + r'[^\s]*wal)', re.I)
     destroyer = re.compile(r'\b(?:rm|rmdir|unlink|mv|shred|truncate|rmtree|remove|delete|rimraf|trash|rename|unlinksync|rmsync|'
-                           r'remove-item|rsync|find)\b')
+                           r'remove-item|rsync|find|rm_rf|rm_r|remove_tree|remove_dir|removedirs|rmdirsync|unlink_|'
+                           r'write_text|write_bytes|writefilesync|file_put_contents|sponge)\b|'
+                           r'\bopen\b[^\n]{0,200}?\s(?:w|wb|w\+|a\+)(?:\s|$)|\bfs\.(?:rm|rmdir|unlink)\b')
     add((L, 'log-delete-text', ('and', protected, destroyer),
          'removes or rewrites Claude/Codex logs or WALs', 'back them up to Dropbox, run command_guard.py approve-delete, then delete'))
-    envs = re.compile(r'(?:environ|getenv|process\.env|\$env:|\bENV\b)[^\n]{0,80}?(?:secret|token|key|password|passwd|credential)', re.I)
+    # the secret word must be part of the variable's own name: `os.environ['API_TOKEN']`, `getenv("DB_PASSWORD")`,
+    # `process.env.GH_TOKEN`; quotes and brackets are already spaces here. Not `os.environ['SCRATCH'] ... 'key'`.
+    envs = re.compile(r'(?:\benviron(?:\.get)?|\bgetenv|\bprocess\.env\.?|\$env:|\benv\b(?:\.fetch)?)\s*'
+                      r'[a-z0-9_]*(?:secret|token|key|password|passwd|credential)', re.I)
     add((S, 'env-secret-text', envs, 'prints a secret environment variable', 'test it with `[ -n "$NAME" ]`; never print the value'))
     return rules
 
@@ -917,7 +1272,20 @@ class Ctx:
         self.budget = Budget(compiled.limits)
         self.home = compiled.home
         self.cwd = cwd or compiled.cwd
+        self.origin_cwd = cwd  # the payload's working directory, None when the host sent none
+        self.cwd_known = bool(cwd)  # becomes True after an absolute or home `cd` in the command
+        self.work_refusal = False
+        self.token_sink_ok = False
+        self.token_allowed = 0
+        self.top_commands = 0
         self.cwd_unknown = False
+        self.cwd_protected_unknown = False  # cd to an unresolved path whose text names a protected location
+        self.var_hints = {}  # raw text of dynamic assignments, for variables the guard cannot resolve
+        self.created = set()  # case-folded paths written earlier in this command (count as existing)
+        self.links = {}  # symlinks created earlier in this command: link path -> target path
+        self.written = {}  # case-folded path -> text written to it earlier in this command (echo/printf/heredoc)
+        self.secret_files = set()  # files that received a secret value earlier in this command
+        self.unterminated = False
         self.vars = {}
         self.tainted = set()
         self.aliases = {}
@@ -944,11 +1312,18 @@ class Analyzer:
     # ---- entry
     def run(self, text):
         ctx = self.ctx
+        ctx.raw_top = text if isinstance(text, str) else ' '.join(map(str, text))
         self.script(text, depth=0)
         if ctx.kill_seen:
             for finding in ctx.pending_kill:
                 ctx.findings.append(finding)
+        if ctx.token_allowed and ctx.top_commands > 1:
+            ctx.add(SECRET_DUMP, 'gh-secret', 'gh auth token is allowed only as VAR=$(gh auth token) gh <subcommand> '
+                    'on its own', 'run that gh command by itself')
         return ctx.findings
+
+    def check_tokens(self, tokens):
+        """Seam for a subclass that must see the token stream before parse() ends a command at an operator."""
 
     def script(self, text, depth, tail_visible=None, ps=None):
         ctx = self.ctx
@@ -961,6 +1336,7 @@ class Analyzer:
             ctx.tail_visible = tail_visible
         try:
             tokens = Lexer(ctx, ctx.ps).lex(text)
+            self.check_tokens(tokens)
             for pipeline in parse(tokens):
                 self.pipeline(pipeline, depth)
         finally:
@@ -1028,7 +1404,8 @@ class Analyzer:
             if not words or idx == 0:
                 continue
             name = norm_name(words[0].text)
-            if name in SHELLS | PS_SHELLS and not any(a.text in ('-c', '-command', '-Command', '/c') or re.fullmatch(r'-[a-z]*c[a-z]*', a.text) for a in words[1:]) \
+            job_queue = name in ('at', 'batch') and not any(a.text == '-f' for a in words[1:])
+            if job_queue or name in SHELLS | PS_SHELLS and not any(a.text in ('-c', '-command', '-Command', '/c') or re.fullmatch(r'-[a-z]*c[a-z]*', a.text) for a in words[1:]) \
                     and not [a for a in words[1:] if not a.text.startswith('-')]:
                 for prev in pl.cmds[:idx]:
                     pw = self._skip_assigns(strip_reserved(prev.words))[1]
@@ -1037,6 +1414,59 @@ class Analyzer:
                                 'a shell is fed a decoded (obfuscated) program, so the guard cannot see what runs',
                                 'write the command in plain text')
                         break
+                # `echo 'cmd' | sh`, `printf ... | bash`, `cat file.sh | sh`: the text is the program
+                prev = self._skip_assigns(strip_reserved(pl.cmds[idx - 1].words))[1]
+                if prev:
+                    pname = norm_name(prev[0].text)
+                    ptexts = [w.text for w in prev[1:]]
+                    if pname in ('echo', 'printf', 'print'):
+                        body = ' '.join(t for t in ptexts if t not in ('-n', '-e', '-ne', '-en'))
+                        self.script(decode_ansi(body) if pname == 'printf' or '-e' in ptexts else body, depth + 1,
+                                    tail_visible=True)
+                    elif pname == 'cat':
+                        for w in _nondash(prev[1:])[:4]:
+                            self.script_file(w, depth)
+        # `... | xargs rm`: the operands come from the earlier stages, so judge what those stages name
+        for idx, cmd in enumerate(pl.cmds):
+            words = self._skip_assigns(strip_reserved(cmd.words))[1]
+            if idx == 0 or not words or norm_name(words[0].text) not in ('xargs', 'parallel'):
+                continue
+            inner = [norm_name(w.text) for w in words[1:] if not w.text.startswith('-')]
+            joined = ' '.join(w.text for w in words[1:])
+            if not (set(inner) & (RM_CMDS | MV_CMDS | {'truncate', 'shred', 'unlink'})
+                    or re.search(r'\b(?:rm|rmdir|unlink|shred|mv|truncate)\b', joined)):
+                continue
+            for prev in pl.cmds[:idx]:
+                pw = self._skip_assigns(strip_reserved(prev.words))[1]
+                for w in pw[1:]:
+                    if w.text.startswith('-') or w.text in ('(', ')', '!'):
+                        continue
+                    if self.refuse('xargs deletion of paths listed by an earlier stage', w,
+                                   tiers=('log', 'root', 'ancestor', 'unknown')):
+                        break
+        # `find ~/.aws -type f | xargs cat`: a printing reader over paths listed by an earlier stage
+        for idx, cmd in enumerate(pl.cmds):
+            words = self._skip_assigns(strip_reserved(cmd.words))[1]
+            if idx == 0 or not words or norm_name(words[0].text) not in ('xargs', 'parallel'):
+                continue
+            inner = [norm_name(w.text) for w in words[1:] if not w.text.startswith('-')]
+            if not inner or inner[0] not in PRINT_FILE_CMDS | GREP_CMDS | {'base64', 'strings'}:
+                continue
+            if not self.out_visible(pl, idx, True):
+                continue
+            hit = False
+            for prev in pl.cmds[:idx]:
+                for w in self._skip_assigns(strip_reserved(prev.words))[1][1:]:
+                    t = w.text
+                    if t.startswith('-') or not t:
+                        continue
+                    if self._home_cred(t, w) or self.under_cred_dir(norm_path(t, ctx), or_above=False):
+                        hit = True
+                        break
+            if hit:
+                ctx.secret_seen += 1
+                ctx.add(SECRET_DUMP, 'credential-file', 'xargs %s prints credential files listed by an earlier stage'
+                        % inner[0][:20], 'list names only: find DIR -type f, or ls -l')
         # a kill verb anywhere in the pipeline makes the pid-finding stages relevant
         kills = [i for i, cmd in enumerate(pl.cmds) if self._is_kill_stage(cmd)]
         if kills:
@@ -1096,6 +1526,7 @@ class Analyzer:
         out.alts = [VAR_MARKER.sub(sub, a) for a in word.alts]
         out.subs, out.vars, out.glob, out.quoted = word.subs, word.vars, word.glob, word.quoted
         out.dynamic = word.dynamic or unresolved
+        out.raw = word.raw
         return out
 
     # ---- single command
@@ -1127,30 +1558,73 @@ class Analyzer:
             for w in (words if head_nonexec else []):
                 self.subs(w, depth, visible=False)
             return
+        if depth == 0:
+            ctx.top_commands += 1
+        token_ok = (depth == 0 and len(assigns) == 1 and len(pl.cmds) == 1 and not cmd.redirs and norm_name(rest[0].text) == 'gh'
+                    and not rest[0].dynamic and self._gh_sub_ok(rest[1:]))
         for a in assigns:
-            self.subs(a, depth, visible=False)
+            ctx.token_sink_ok = token_ok
+            try:
+                self.subs(a, depth, visible=False)
+            finally:
+                ctx.token_sink_ok = False
         # substitutions inside arguments run first; their output is visible only when the outer command prints it
         outer = norm_name(rest[0].text)
         printer = outer in ECHO_CMDS or outer in PRINT_FILE_CMDS or outer in PASS_FILTERS
         for w in rest:
             self.subs(w, depth, visible=printer and self.out_visible(pl, idx, False))
+        if printer and any(v.startswith('!') for w in rest[1:] for v in w.vars) and self.out_visible(pl, idx, False):
+            ctx.secret_seen += 1
+            ctx.add(SECRET_DUMP, 'indirect-var', 'printing ${!name} prints the value of whatever variable name holds',
+                    'print variable names only (compgen -v), never their values')
+        before = ctx.secret_seen
         self.dispatch(rest, cmd, pl, idx, depth)
+        if outer in ('cp', 'install', 'ditto', 'ln', 'rsync', 'mv') and len(rest) >= 3:
+            ops = _nondash(rest[1:])
+            if len(ops) >= 2 and any(self._cred_one(norm_path(o.text, ctx)) for o in ops[:-1]):
+                ctx.secret_files.add(norm_path(ops[-1].text, ctx).casefold())
+                dest = norm_path(ops[-1].text, ctx)
+                for o in ops[:-1]:
+                    ctx.secret_files.add((dest.rstrip('/') + '/' + posixpath.basename(o.text)).casefold())
+        if ctx.secret_seen > before:
+            for r in cmd.redirs:
+                if r.op in ('>', '>>', '>|', '&>', '&>>') and r.target is not None:
+                    for alt in r.target.alts[:8]:
+                        ctx.secret_files.add(norm_path(alt, ctx).casefold())
+            if norm_name(rest[0].text) == 'tee' or any(norm_name(c.words[0].text) == 'tee'
+                                                       for c in pl.cmds[idx + 1:] if c.words):
+                for c in pl.cmds[idx:]:
+                    if c.words and norm_name(c.words[0].text) == 'tee':
+                        for w in _nondash(c.words[1:]):
+                            ctx.secret_files.add(norm_path(w.text, ctx).casefold())
 
     def bind_loop_var(self, words):
         """`for d in LIST`: bind d to the first protected-looking item (else the first item) so `rm "$d"` resolves."""
         if words[0].text != 'for' or len(words) < 4 or words[2].text != 'in':
             return
-        name, items = words[1].text, words[3:]
-        chosen = items[0]
-        for item in items:
-            if is_dynamic_path(item.text) or any(ch in item.text for ch in '*?['):
-                probe = norm_path(item.text, self.ctx)
-                if any(seg_match(Compiled._segs(probe), r) for r in self.c.protected):
-                    chosen = item
-                    break
+        name, items = words[1].text, [w for w in words[3:] if w.text not in (';', 'do')]
+        if not items:
+            return
+        # the loop runs the body once per item: bind the most protected one so every check sees the worst case
+        chosen, rank = items[0], -1
+        for item in items[:256]:
+            probe = norm_path(item.text, self.ctx)
+            r = self.RANK[self._path_class(probe)]
+            if r <= 0 and (is_dynamic_path(item.text) or any(ch in item.text for ch in '*?[')) \
+                    and any(seg_match(Compiled._segs(probe), pr) for pr in self.c.protected):
+                r = self.RANK['log']
+            if r > rank:
+                chosen, rank = item, r
         if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+            if any(item.dynamic or item.glob or item.subs for item in items):
+                if not hasattr(self.ctx, 'flow_vars'):
+                    self.ctx.flow_vars = set()
+                self.ctx.flow_vars.add(name)
             self.ctx.vars[name] = chosen.text
             self.ctx.tainted.discard(name)
+            # `for t in "$GH_TOKEN"`: the loop variable carries whatever secret its items expand to
+            if any(self.c.secret_name(v.lstrip('!')) or v in self.ctx.tainted for item in items for v in item.vars):
+                self.ctx.tainted.add(name)
 
     def subs(self, w, depth, visible):
         for inner in w.subs:
@@ -1170,22 +1644,58 @@ class Analyzer:
             if not a.dynamic and not tainted:
                 ctx.vars[name] = value
                 ctx.tainted.discard(name)
+                ctx.var_hints.pop(name, None)
             elif a.dynamic:
                 ctx.vars.pop(name, None)
+                ctx.var_hints[name] = (value + ' ' + ' '.join(a.subs) + ' ' + ' '.join(
+                    ctx.var_hints.get(v, '') for v in a.vars))[:4096]
 
     # ---- redirections and heredocs
     def redirects(self, cmd, pl, idx, has_command, depth):
         ctx = self.ctx
         words = self._skip_assigns(strip_reserved(cmd.words))[1]
+        # a `>! word` target is also in `words` for bash's reading, and heredoc and exec checks below must see it. So
+        # `cat >! f` and a bare `>! f` count as content writes here: on a plain work file they are allowed
         name = norm_name(words[0].text) if words else ''
+        arg_texts = [w.text for w in words[1:]]
+        # pure truncation: nothing (or nothing meaningful) is written, so the redirect only empties the file
+        # `cat > f <<EOF` writes content; an empty heredoc writes nothing, so that stays a pure truncation
+        has_body = any(r.op == '<<<' or r.op in ('<<', '<<-') and r.body.strip('\n') for r in cmd.redirs)
+        pure = (not words or name in (':', 'true', 'false')
+                or (name == 'cat' and not has_body and all(t == '/dev/null' for t in arg_texts))
+                or (name in ('echo', 'printf') and all(t in ('', '-n', '-e', '-ne', '-en') for t in arg_texts)))
+        written = None
+        if name in ('echo', 'printf'):
+            written = ' '.join(t for t in arg_texts if t not in ('-n', '-e', '-ne', '-en'))
+            if name == 'printf' or '-e' in arg_texts:
+                written = decode_ansi(written)
+        bodies = [r.body for r in cmd.redirs if r.op in ('<<', '<<-')]
+        if bodies and name in ('cat', 'tee', ''):
+            written = '\n'.join(bodies)
         for r in cmd.redirs:
             r.target = self.resolve(r.target)
             target = r.target.text if r.target is not None else ''
             if r.target is not None:
                 self.subs(r.target, depth, visible=False)
-            if r.op in ('>', '>|', '&>', '>&') and r.fd in (None, '1', '2') or r.op in ('>>', '&>>'):
+            is_write = False
+            # `3&> f`: bash and zsh read the digit as an argument, so `&>` always writes the file
+            if r.op in ('>', '>|', '>&') and r.fd in (None, '1', '2') or r.op in ('>>', '&>>', '&>'):
                 if target and r.op != '>&' or (r.op == '>&' and target and not re.fullmatch(r'[0-9-]+', target)):
-                    self.write_target(target, truncating=r.op not in ('>>', '&>>'), via='redirect')
+                    self.write_target(r.target, truncating=r.op not in ('>>', '&>>'), via='redirect', pure=pure)
+                    is_write = True
+            elif r.op in ('>>', '&>>') or r.op in ('>', '>|') and r.fd not in (None, '1', '2'):
+                if target:
+                    self.write_target(r.target, truncating=r.op in ('>', '>|'), via='redirect', pure=pure)
+                    is_write = True
+            elif r.op == '<>' and target and (r.fd in ('1', '2') or name == 'exec' or any(
+                    x.op == '>&' and x.target is not None and x.target.text == (r.fd or '0') for x in cmd.redirs)):
+                # `1<> f`: stdout opened read-write without truncation; what the command prints overwrites the file
+                # in place, so it is judged like `>`. So is any `N<> f` that a `>&N` dup writes to, and an `exec N<>`
+                # whose descriptor later commands can write; a plain fd-0 `<>` only feeds input and stays a read
+                self.write_target(r.target, truncating=True, via='redirect', pure=False)
+                is_write = True
+            if is_write and written is not None and r.target is not None:
+                self.note_created(r.target, written)
             if r.op in ('<', '<>') and target:
                 if self.is_cred_path(target, r.target):
                     ctx.secret_seen += 1
@@ -1207,9 +1717,25 @@ class Analyzer:
     def heredoc(self, rd, name, words, pl, idx, depth):
         ctx = self.ctx
         body = rd.body
-        if name in SHELLS or name in PS_SHELLS:
+        if body and PROTECTED_TEXT.search(body) and any(f.category == LOG_DELETE for f in fallback_scan(body, ctx.c)):
+            # writing deletion text for a protected location through a shell heredoc (even into a data file) is the
+            # incident mechanism: warn, and point at the file-writing tool. A real deletion still blocks below.
+            ctx.add(PARSE, 'heredoc-destructive-text',
+                    'a heredoc body contains a deletion of a protected harness location, and heredoc text passes '
+                    'through the shell', 'write test data or scripts with the editor\'s file-writing tool instead')
+        if name in SHELLS or name in PS_SHELLS or name in ('at', 'batch') or (
+                name in ('source', '.') and any(w.text in ('/dev/stdin', '-') for w in words[1:])):
             self.script(body, depth + 1, tail_visible=True, ps=name in PS_SHELLS)
             return
+        if name in WRAPPERS_SIMPLE or name in ('flock', 'unshare'):
+            # sudo bash <<EOF, env X=1 sh <<EOF: find the real consumer behind the wrapper words
+            inner = [norm_name(w.text) for w in words[1:] if not w.text.startswith('-') and '=' not in w.text]
+            if any(n in SHELLS or n in ('ssh',) for n in inner):
+                self.script(body, depth + 1, tail_visible=True)
+                return
+            if any(n in INTERPRETERS for n in inner):
+                self.code(body, depth)
+                return
         if name in INTERPRETERS:
             self.code(body, depth)
             return
@@ -1248,6 +1774,10 @@ class Analyzer:
         ctx = self.ctx
         for v in word.vars:
             bare = v.lstrip('!')
+            known = ctx.vars.get(bare)
+            if isinstance(known, str) and bare not in ctx.tainted and not v.startswith('!') \
+                    and not is_dynamic_path(known) and _looks_clean(known):
+                continue  # bound earlier in this command to a literal non-secret value (`for pat in a b c`)
             if ctx.c.secret_name(bare) or v in ctx.tainted or bare in ctx.tainted:
                 ctx.add(SECRET_DUMP, 'print-secret-variable',
                         'prints a variable whose name or content marks it as a secret (%s)' % bare[:40],
@@ -1261,7 +1791,29 @@ class Analyzer:
         if depth > ctx.budget.max_depth:
             raise Blocked('command nesting is deeper than %d levels' % ctx.budget.max_depth)
         head = words[0]
+        if ctx.ps:
+            # the lexer splits at the parentheses, so read the call (and its argument) from the raw command
+            joined_ps = (getattr(ctx, 'raw_top', '') or '')[:20000] + ' ' + ' '.join(w.text for w in words)
+            m = re.search(r'(?i)\[(?:system\.)?environment\]::getenvironmentvariable(s?)\b\s*\(?\s*[\'"]?([A-Za-z0-9_]*)', joined_ps)
+            if m and (m.group(1) or ctx.c.secret_name(m.group(2) or 'X_TOKEN') or not m.group(2)) \
+                    and self.out_visible(pl, idx, True):
+                ctx.secret_seen += 1
+                ctx.add(SECRET_DUMP, 'env-dump', '[Environment]::GetEnvironmentVariable(s) prints environment values',
+                        'test presence with [string]::IsNullOrEmpty($env:NAME)')
+        if head.vars and not head.quoted and re.search(r'\s', head.text) and all(v in ctx.vars for v in head.vars) \
+                and not getattr(self, '_resplit', False):
+            # `R="rm -rf"; $R path`: an unquoted expansion is split into words, so it names a command plus flags
+            rebuilt = head.text + ' ' + ' '.join(_quote_for_rebuild(w.text) for w in words[1:])
+            self._resplit = True
+            try:
+                self.script(rebuilt, depth + 1, tail_visible=ctx.tail_visible)
+            finally:
+                self._resplit = False
+            return
         names = self.names_for(head)
+        which = self._which_name(head)
+        if which:
+            names = [which]
         if head.dynamic and not head.text.strip('') or (head.dynamic and any(v not in ctx.vars for v in head.vars) or SUB_MARK in head.text):
             # unresolved command word: judge the whole line as text
             joined = ' '.join(w.text for w in words)
@@ -1272,13 +1824,20 @@ class Analyzer:
         for name in names:
             self.apply(name, words, cmd, pl, idx, depth)
 
+    def _which_name(self, head):
+        """`$(which rm)`, `$(command -v rm)`, `` `type -p rm` ``: the named command."""
+        if len(head.subs) != 1 or head.text.replace(SUB_MARK, '').strip():
+            return None
+        m = re.fullmatch(r'\s*(?:which|command\s+-[vV]|type\s+-[pP]|whence\s+-p)\s+([^\s;|&]+)\s*', head.subs[0])
+        return norm_name(m.group(1)) if m else None
+
     def names_for(self, head):
         out = []
         for alt in head.alts[:32]:
             name = norm_name(alt)
             if head.glob or any(ch in name for ch in '*?['):
                 for known in KNOWN_NAMES:
-                    if fnmatch.fnmatchcase(known, name):
+                    if _fnmatchcase(known, name):
                         out.append(known)
             if name:
                 out.append(name)
@@ -1311,11 +1870,65 @@ class Analyzer:
         if name in ('cd', 'pushd', 'set-location', 'sl', 'chdir'):
             self.chdir(args)
             return
+        if name in ('read', 'mapfile', 'readarray'):
+            # `... | while read f`: the variable holds whatever the upstream stage printed
+            if not hasattr(ctx, 'flow_vars'):
+                ctx.flow_vars = set()
+            for a in args:
+                if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', a.text):
+                    ctx.flow_vars.add(a.text)
+                    ctx.vars.pop(a.text, None)
+            return
+        if name in ('popd', 'pop-location'):
+            ctx.cwd_unknown = True
+            return
         if name in ('eval', 'invoke-expression', 'iex'):
             self.eval_words(args, depth, pl, idx)
             return
-        if name in ('.', 'source'):
+        if self.package_runner(name, args, depth, pl, idx):
             return
+        if name in ('.', 'source'):
+            nd = _nondash(args)
+            if nd:
+                if nd[0].subs:
+                    self.program_text(nd[0], depth)  # source <(echo ...)
+                else:
+                    self.script_file(nd[0], depth)
+            return
+        if '/' in name or '/' in words[0].text:
+            # ./run.sh or /path/to/script: analyse the script text when it is a shell script
+            self.script_file(words[0], depth, require_shell=True)
+        if name in ('flock', 'unshare', 'parallel', 'tmux', 'screen', 'osascript', 'at', 'batch', 'script'):
+            if self.launcher(name, args, depth, pl, idx):
+                return
+        if name == 'busybox' and args and not args[0].text.startswith('-') \
+                and norm_name(args[0].text) not in ('sh', 'ash', 'hush'):
+            self.dispatch(args, cmd, pl, idx, depth)  # busybox APPLET ARGS runs the applet
+            return
+        if name == 'gio' and args and args[0].text in ('trash', 'remove', 'rm'):
+            for w in _nondash(args[1:]):
+                self.refuse('gio ' + args[0].text, w)
+            return
+        if name == 'sponge':
+            for w in _nondash(args):
+                if not self.state_dest(w):
+                    self.overwrite_dest('sponge', w)
+        if name == 'sort':
+            for k, a in enumerate(args):
+                val = args[k + 1] if (a.text == '-o' or re.fullmatch(r'-[A-Za-z]*o', a.text)) and k + 1 < len(args) \
+                    else (_literal_word(a.text.split('=', 1)[1]) if a.text.startswith('--output=') else None)
+                if val is not None and not self.state_dest(val):
+                    self.overwrite_dest('sort -o', val)
+        if name in ('fd', 'fdfind'):
+            texts_ = [a.text for a in args]
+            for k, t in enumerate(texts_):
+                if t in ('-x', '-X', '--exec', '--exec-batch') and k + 1 < len(texts_):
+                    inner = norm_name(texts_[k + 1])
+                    if inner in RM_CMDS or inner in MV_CMDS or inner in ('truncate', 'shred'):
+                        pos = [a for a in args[:k] if not a.text.startswith('-')]
+                        for w in pos[1:] or pos:
+                            self.refuse('fd --exec ' + inner, w)
+                    break
         if name in SHELLS or name in PS_SHELLS:
             self.shell(name, args, depth, pl, idx)
             return
@@ -1323,7 +1936,14 @@ class Analyzer:
             self.ssh(args, depth)
             return
         if name in ('docker', 'podman', 'nerdctl', 'kubectl', 'oc'):
+            self.secret_clis(name, [a.text for a in args], visible=self.out_visible(pl, idx, True))
             self.container(name, args, words, depth, pl, idx)
+            return
+        if name.startswith('docker-credential-') and 'get' in [a.text for a in args] \
+                and self.out_visible(pl, idx, True):
+            ctx.secret_seen += 1
+            ctx.add(SECRET_DUMP, 'docker-credential', '%s get prints the stored registry password' % name[:40],
+                    'docker login status: docker info, or test with docker pull')
             return
         if name == 'goodqa':
             self.goodqa(args, depth, pl, idx)
@@ -1344,15 +1964,121 @@ class Analyzer:
             self.env_dump(name, args, pl, idx)
         if name in ECHO_CMDS or name in ('cat',):
             self.echo_check(name, args, pl, idx)
-        self.secret_clis(name, texts)
-        if name in INTERPRETERS:
+        self.secret_clis(name, texts, visible=self.out_visible(pl, idx, True))
+        if name in INTERPRETERS or name in ('awk', 'gawk', 'mawk', 'nawk'):
             self.interpreter(name, args, texts, depth)
+        if (name.startswith('python') or name.startswith('pypy')) and '-m' in texts:
+            # python3 -m json.tool FILE (and other printing modules) prints the file
+            k = texts.index('-m')
+            if k + 1 < len(texts) and texts[k + 1] in ('json.tool', 'base64', 'tokenize', 'pickletools', 'quopri',
+                                                       'uu', 'zipfile', 'tarfile', 'gzip', 'http.server'):
+                self.read_creds('cat', args[k + 2:], pl, idx)
         if name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS or name in ('openssl', 'source'):
             self.read_creds(name, args, pl, idx)
-        if name in RM_CMDS or name in MV_CMDS or name in OVERWRITE_CMDS or name in ('sed', 'perl', 'rsync', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content', 'out-file'):
+        if name in RM_CMDS or name in MV_CMDS or name in OVERWRITE_CMDS or name in (
+                'sed', 'perl', 'ruby', 'awk', 'gawk', 'rsync', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content',
+                'out-file', 'curl', 'wget', 'touch', 'mkdir', 'unzip', 'bsdtar', 'gtar'):
             self.destructive(name, args, texts)
+        if not (name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS):
+            self.unlisted_cred_reader(name, args, cmd, pl, idx)
         if name in KILLERS:
             self.kill_cmd(name, args, texts)
+
+    def script_file(self, word, depth, require_shell=False):
+        """Analyse a shell script named on the command line (or written earlier in this command)."""
+        ctx = self.ctx
+        if word is None or word.dynamic or not word.text:
+            return
+        path = norm_path(word.text, ctx)
+        key = path.casefold()
+        if key in ctx.written:
+            self.script(ctx.written[key], depth + 1, tail_visible=True)
+            return
+        ctx.files_read = getattr(ctx, 'files_read', 0) + 1
+        if ctx.files_read > 8:
+            return
+        try:
+            if not os.path.isfile(path) or os.path.getsize(path) > 262144:
+                return
+            with open(path, 'rb') as handle:
+                data = handle.read(262145)
+        except (OSError, ValueError):
+            return
+        text = data.decode('utf-8', 'replace')
+        if require_shell:
+            first = text.split('\n', 1)[0]
+            if not (first.startswith('#!') and re.search(r'\b(?:ba|z|k|da|)sh\b', first)) \
+                    and not path.endswith(('.sh', '.bash', '.zsh')):
+                return
+        # An existing script is the repository's own tooling: only its deletions of protected logs count. Its
+        # environment handling and secret lookups are routine there (replay false positives), and what it
+        # prints is not knowable from here. Scripts written earlier in this same command are judged in full.
+        # It also runs as its own process, so its cd, variables and recorded files do not carry into this command.
+        before = len(ctx.findings)
+        keep = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
+                if k not in ('findings', 'budget', 'c', 'marker', 'files_read', 'unterminated')}
+        try:
+            self.script(text, depth + 1, tail_visible=True)
+        finally:
+            for k, v in keep.items():
+                setattr(ctx, k, v)
+        ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
+
+    def launcher(self, name, args, depth, pl, idx):
+        """Commands that run another command given as text or as trailing words. True when handled."""
+        texts = [a.text for a in args]
+        if name == 'flock':
+            for k, t in enumerate(texts):
+                if t in ('-c', '--command') and k + 1 < len(texts):
+                    self.script(texts[k + 1], depth + 1, tail_visible=True)
+                    return True
+            pos = [k for k, t in enumerate(texts) if not t.startswith('-')]
+            if len(pos) >= 2:
+                self.inner_words(args[pos[1]:], depth, pl, idx)
+            return True
+        if name in ('unshare', 'script'):
+            for k, t in enumerate(texts):
+                if (t in ('-c', '--command') or name == 'script' and re.fullmatch(r'-[A-Za-z]*c', t)) \
+                        and k + 1 < len(texts):
+                    self.script(texts[k + 1], depth + 1, tail_visible=True)
+                    return True
+                if t.startswith('--command='):
+                    self.script(t.split('=', 1)[1], depth + 1, tail_visible=True)
+                    return True
+            k = 0
+            while k < len(texts) and texts[k].startswith('-'):
+                k += 1
+            if name == 'unshare' and k < len(args):
+                self.inner_words(args[k:], depth, pl, idx)
+            return True
+        if name == 'parallel':
+            if ':::' in texts:
+                cut = texts.index(':::')
+                head = [t for t in texts[:cut] if not t.startswith('-')]
+                for item in texts[cut + 1:][:32]:
+                    self.script(' '.join(head).replace('{}', _quote_for_rebuild(item)) + ' ' +
+                                _quote_for_rebuild(item), depth + 1, tail_visible=True)
+            else:
+                k = 0
+                while k < len(texts) and texts[k].startswith('-'):
+                    k += 1
+                if k < len(args):
+                    self.inner_words(args[k:], depth, pl, idx)
+            return True
+        if name in ('tmux', 'screen'):
+            if 'send-keys' in texts or 'send' in texts or 'stuff' in texts:
+                payload = [t for t in texts if not t.startswith('-') and t not in ('send-keys', 'send', 'stuff', 'Enter', 'C-m')]
+                self.script(' '.join(payload[1:] if 'send-keys' in texts and len(payload) > 1 else payload),
+                            depth + 1, tail_visible=True)
+            return False
+        if name == 'osascript':
+            for t in texts:
+                for m in re.finditer(r'do shell script\s+"((?:[^"\\]|\\.)*)"', t, re.I):
+                    self.script(m.group(1).replace('\\"', '"'), depth + 1, tail_visible=True)
+            return False  # interpreter() still text-scans the AppleScript (Finder delete)
+        if name in ('at', 'batch'):
+            return False  # the heredoc body is analysed by heredoc()
+        return False
 
     # ---- wrappers
     def wrapper(self, name, args, depth, pl, idx):
@@ -1369,7 +2095,13 @@ class Analyzer:
                 if t.startswith('-S') and len(t) > 2:
                     self.script(t[2:] + ' ' + ' '.join(_quote_for_rebuild(x) for x in texts[i + 1:]), depth + 1)
                     return
-                if t in ('-u', '-C', '--unset', '--chdir'):
+                if t in ('-C', '--chdir') and i + 1 < len(args):
+                    self.chdir([args[i + 1]])
+                    i += 2
+                elif t.startswith('--chdir='):
+                    self.chdir([_literal_word(t.split('=', 1)[1])])
+                    i += 1
+                elif t in ('-u', '--unset'):
                     i += 2
                 elif t.startswith('-') or re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', t):
                     i += 1
@@ -1395,8 +2127,9 @@ class Analyzer:
                 i += 2 if texts[i] in ('-s', '-k', '--signal', '--kill-after') else 1
             i += 1  # duration
         elif name in ('nice', 'ionice', 'chrt', 'taskset', 'stdbuf', 'caffeinate', 'watch', 'strace', 'ltrace', 'setsid', 'arch', 'nohup', 'unbuffer', 'dtruss', 'chroot', 'nsenter', 'firejail', 'sandbox-exec', 'script', 'gosu', 'runuser', 'su', 'sg', 'time', 'noglob', 'command', 'builtin', 'exec', 'start-process', 'start', 'call', 'invoke-command', 'icm'):
+            valued = WRAPPER_VALUE_OPTS.get(name, ())
             while i < len(args) and texts[i].startswith('-'):
-                i += 2 if texts[i] in ('-n', '-c', '-p', '-o', '-u', '-g', '-s', '-i', '-d', '-t', '-f', '-FilePath', '-ArgumentList') and False else 1
+                i += 2 if texts[i] in valued else 1
             if name in ('chroot', 'gosu', 'runuser', 'sg', 'taskset', 'chrt'):
                 i += 1
             if name == 'su':
@@ -1407,6 +2140,7 @@ class Analyzer:
             if name in ('start-process', 'start', 'call'):
                 pass
         elif name == 'xargs':
+            self.xargs_input(args, pl.cmds[idx] if pl is not None and idx < len(pl.cmds) else None)
             while i < len(args) and texts[i].startswith('-'):
                 i += 2 if texts[i] in ('-n', '-I', '-P', '-d', '-L', '-a', '-E', '-s', '-i', '-l') else 1
             if i < len(args):
@@ -1419,6 +2153,39 @@ class Analyzer:
         if i < len(args):
             self.inner_words(args[i:], depth, pl, idx)
 
+    def xargs_input(self, args, cmd):
+        """xargs deleting what its own input names: a here-string, `< <(..)` or `-a <(..)`."""
+        joined = ' '.join(a.text for a in args)
+        if not re.search(r'(?:^|[\s/])(?:rm|rmdir|unlink|shred|srm|mv|truncate|rimraf|trash(?:-put)?)(?:\s|$)', joined):
+            return
+        sources = [r.target for r in (cmd.redirs if cmd is not None else []) if r.target is not None and (
+            r.op == '<<<' or (r.op in ('<', '<>') and r.fd in (None, '0') and r.target.subs))]
+        for i, a in enumerate(args[:-1]):
+            if a.text in ('-a', '--arg-file') and args[i + 1].subs:
+                sources.append(args[i + 1])
+        heredocs = [r.body for r in (cmd.redirs if cmd is not None else []) if r.op in ('<<', '<<-') and r.body]
+        for body in heredocs:
+            for line in body.splitlines()[:2000]:
+                line = line.strip().strip('\'"')
+                if line and self.refuse('xargs deletion of paths given in its heredoc', _literal_word(line)):
+                    return  # each line is an operand, relative to the working directory
+            if any(self._raw_path_class(m.group(0)) in ('log', 'root', 'ancestor', 'unknown')
+                   for m in self.RAW_PATH.finditer(body[:200000])):
+                self.ctx.add(LOG_DELETE, 'log-delete',
+                             'xargs deletes paths given in its heredoc, and that heredoc names a protected harness '
+                             'location', 'delete only paths inside your own task worktree, named directly')
+                return
+        for src in sources:
+            if self.refuse('xargs deletion of paths given on its input', src):
+                return
+            bodies = [src.text] + list(src.subs)
+            if any(self._raw_path_class(m.group(0)) in ('log', 'root', 'ancestor', 'unknown')
+                   for body in bodies for m in self.RAW_PATH.finditer(body[:200000])):
+                self.ctx.add(LOG_DELETE, 'log-delete',
+                             'xargs deletes paths given on its input, and that input names a protected harness location',
+                             'delete only paths inside your own task worktree, named directly')
+                return
+
     def inner_words(self, words, depth, pl, idx, via_xargs=False):
         if not words:
             return
@@ -1429,9 +2196,68 @@ class Analyzer:
         if via_xargs and norm_name(words[0].text) in PRINT_FILE_CMDS:
             pass
 
+    PKG_RUNNERS = {'npx': 0, 'bunx': 0, 'pnpx': 0, 'uvx': 0, 'pnpm': ('dlx', 'exec'), 'yarn': ('dlx', 'exec'),
+                   'bun': ('x',), 'npm': ('exec', 'x'), 'pipx': ('run',)}
+    PKG_DELETERS = {'del-cli': 'rm', 'trash-cli': 'trash', 'rimraf': 'rimraf', 'del': 'rm', 'trash': 'trash'}
+    PKG_PASSTHROUGH = set(PKG_DELETERS) | {'shx', 'cross-env', 'trash-put'}
+
+    def package_runner(self, name, args, depth, pl, idx):
+        """`npx rimraf PATH`, `pnpm dlx del-cli PATH`, `uvx trash-cli PATH`: the package runs as a command."""
+        if name == 'shx' and args:
+            self.inner_words(list(args), depth, pl, idx)  # shx rm -rf PATH: the first word is the command
+            return True
+        if name == 'cross-env':
+            rest = list(args)
+            while rest and (rest[0].text.startswith('-') or re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', rest[0].text)):
+                rest = rest[1:]
+            if rest:
+                self.inner_words(rest, depth, pl, idx)
+            return True
+        if name == 'cross-env-shell':
+            self.script(' '.join(a.text for a in args if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', a.text)),
+                        depth + 1, tail_visible=True)  # cross-env-shell 'cmd': the string runs in a shell
+            return True
+        sub = self.PKG_RUNNERS.get(name)
+        if sub is None:
+            return False
+        i = 0
+        if sub:
+            if args and name in ('yarn', 'pnpm') and norm_name(args[0].text) in self.PKG_PASSTHROUGH:
+                i = 0  # `yarn rimraf PATH`: a package bin run directly
+            elif len(args) > 1 and name in ('yarn', 'pnpm') and args[0].text == 'run' \
+                    and norm_name(args[1].text) in self.PKG_PASSTHROUGH:
+                i = 1  # `yarn run rimraf PATH`
+            elif not args or args[0].text not in sub:
+                return False
+            else:
+                i = 1
+        while i < len(args):
+            t = args[i].text
+            if t == '--':
+                i += 1
+                break
+            if t in ('-c', '--call', '-x', '--shell') and i + 1 < len(args):
+                self.script(args[i + 1].text, depth + 1, tail_visible=True)
+                i += 2
+            elif t in ('-p', '--package', '--from', '--spec', '--python', '--with') and i + 1 < len(args):
+                i += 2
+            elif t.startswith('-'):
+                i += 1
+            else:
+                break
+        if i >= len(args):
+            return True
+        pkg = re.sub(r'(?<=.)@[^/]*$', '', args[i].text)  # rimraf@5, @scope/tool@1.2
+        base = norm_name(pkg.rsplit('/', 1)[-1])
+        head = _literal_word(self.PKG_DELETERS.get(base, base))
+        self.inner_words([head] + list(args[i + 1:]), depth, pl, idx)
+        return True
+
     def eval_words(self, args, depth, pl, idx):
         text = ' '.join(a.text for a in args)
         for a in args:
+            if a.subs:
+                self.program_text(a, depth)  # eval "$(echo rm ...)": the substitution's output is the program
             if any(self._decoder_in(s) for s in a.subs):
                 self.ctx.add(SECRET_DUMP, 'obfuscated-eval', 'eval of decoded (obfuscated) text hides the command from the guard',
                              'write the command in plain text')
@@ -1439,6 +2265,38 @@ class Analyzer:
 
     def _decoder_in(self, script):
         return bool(re.search(r'\b(?:base64|base32|xxd|openssl)\b[^|;&]*(?:\s-d\b|\s-D\b|--decode|\s-r\b|-base64)', script))
+
+    def program_text(self, word, depth):
+        """A shell program given as `$(..)` or `<(..)`: judge what the inner command prints. Literal
+        echo/printf text is analysed as a script; anything else is scanned as raw text, and a decoder
+        stage means the program is hidden."""
+        ctx = self.ctx
+        for inner in word.subs:
+            if self._decoder_in(inner):
+                ctx.add(SECRET_DUMP, 'obfuscated-shell-input',
+                        'a shell is fed a decoded (obfuscated) program, so the guard cannot see what runs',
+                        'write the command in plain text')
+                return
+            m = re.match(r'\s*(echo|printf|print)\s+(.*)$', inner, re.S)
+            if m:
+                body = re.sub(r'^(?:-[neE]+\s+)+', '', m.group(2))
+                body = body.strip().strip('\'"')
+                self.script(decode_ansi(body) if m.group(1) == 'printf' else body, depth + 1, tail_visible=True)
+            for f in fallback_scan(inner, ctx.c):
+                ctx.findings.append(f)
+
+    def shell_stdin(self, cmd, depth):
+        """`bash <<< 'text'`, `sh < file`: the shell reads its program from the redirect."""
+        for r in cmd.redirs:
+            if r.op == '<<<' and r.target is not None:
+                if r.target.subs:
+                    self.program_text(r.target, depth)
+                self.script(r.target.text, depth + 1, tail_visible=True)
+            elif r.op == '<' and r.fd in (None, '0') and r.target is not None:
+                if r.target.subs:
+                    self.program_text(r.target, depth)
+                else:
+                    self.script_file(r.target, depth)
 
     def shell(self, name, args, depth, pl, idx):
         texts = [a.text for a in args]
@@ -1455,9 +2313,22 @@ class Analyzer:
                     except Exception:  # noqa: BLE001
                         self.ctx.add(SECRET_DUMP, 'obfuscated-shell-input', 'encoded PowerShell cannot be inspected', 'pass the command in plain text')
                         return
+                if not ps and args[i + 1].subs:
+                    self.program_text(args[i + 1], depth)
                 self.script(payload, depth + 1, tail_visible=True, ps=ps)
                 return
-        # `bash script.sh`, `bash -s` + heredoc handled by heredoc(); nothing to parse here
+        if not ps:
+            self.shell_stdin(pl.cmds[idx], depth)
+        # `bash script.sh`: read and analyse the script; `bash -s` + heredoc is handled by heredoc()
+        if not ps:
+            k = 0
+            while k < len(args) and args[k].text.startswith('-'):
+                k += 2 if args[k].text in ('-o', '+o', '-O', '+O', '--rcfile', '--init-file') else 1
+            if k < len(args):
+                if args[k].subs:
+                    self.program_text(args[k], depth)  # bash <(echo ...)
+                else:
+                    self.script_file(args[k], depth)
 
     def ssh(self, args, depth):
         texts = [a.text for a in args]
@@ -1478,6 +2349,8 @@ class Analyzer:
                 break
             i += 1
         rest = texts[i:]
+        if rest and rest[0] == '--':
+            rest = rest[1:]
         if rest:
             self.script(' '.join(rest), depth + 1, tail_visible=True)
 
@@ -1523,23 +2396,59 @@ class Analyzer:
         pos = _nondash(args)
         if not pos:
             ctx.cwd = ctx.home
+            ctx.cwd_unknown = ctx.cwd_protected_unknown = False
+            ctx.cwd_known = True
             return
-        target = pos[0].text
-        if target == '-' or is_dynamic_path(target):
+        word = pos[0]
+        target = word.text
+        if target == '-' or is_dynamic_path(target) or word.dynamic:
             ctx.cwd_unknown = True
+            ctx.cwd_protected_unknown = bool(PROTECTED_TEXT.search(target) or self._hint_points_at_protected(word))
             return
+        if ctx.cwd_unknown and not target.startswith(('/', '~')):
+            return  # relative to a directory the guard could not resolve: still unknown
+        if target.startswith(('/', '~')):
+            ctx.cwd_known = True
         ctx.cwd = norm_path(target, ctx, ctx.cwd)
-        ctx.cwd_unknown = False
+        ctx.cwd_unknown = ctx.cwd_protected_unknown = False
 
     # ---- find
     def find(self, args, depth, pl, idx):
         ctx = self.ctx
         texts = [a.text for a in args]
         roots = []
-        for a in args:
+        k = 0
+        # leading global options come before the start directories: GNU -P -H -L -D ARG -O<n>, BSD -E -X -d -s -x
+        # -f ROOT, and `--`; skipping them keeps `find -P ~/.claude ...` from defaulting to `.`
+        while k < len(args):
+            t = texts[k]
+            if t in ('-P', '-H', '-L', '-E', '-X', '-d', '-s', '-x', '--') or re.fullmatch(r'-O\d*', t) \
+                    or re.fullmatch(r'-[EHLPXdsx]+', t):
+                k += 1  # BSD getopt also accepts clusters such as -xd or -sE
+            elif t.startswith('-f') and len(t) > 2:
+                # BSD -fPATH, or a GNU expression such as -fprint, -fls, -false: judge both readings (the attached
+                # path and the default `.`) and stop scanning options, since what follows is an expression
+                roots.append(_literal_word(t[2:]))
+                default_root = Word()
+                default_root.alts = ['.']
+                roots.append(default_root)
+                break
+            elif t == '-D' and k + 1 < len(args):
+                k += 2
+            elif t == '-f' and k + 1 < len(args):
+                roots.append(args[k + 1])  # BSD: -f names a start directory
+                k += 2
+            else:
+                break
+        for a in args[k:]:
             if a.text.startswith('-') or a.text in ('(', '!', ')'):
                 break
             roots.append(a)
+        if '-files0-from' in texts:
+            unknown = Word()
+            unknown.alts = ['$FILES0_FROM']
+            unknown.dynamic = True
+            roots.append(unknown)  # start directories read from a file: not known to the guard
         if not roots:
             roots = [Word()]
             roots[0].alts = ['.']
@@ -1552,13 +2461,27 @@ class Analyzer:
                     body.append(args[j])
                     j += 1
                 exec_cmds.append(body)
-        if '-delete' in texts or any(norm_name(b[0].text) in RM_CMDS | MV_CMDS | {'unlink', 'shred', 'truncate'} for b in exec_cmds if b):
+        destroyers = RM_CMDS | MV_CMDS | {'unlink', 'shred', 'truncate'}
+        if '-delete' in texts or any(norm_name(b[0].text) in destroyers for b in exec_cmds if b):
+            leading = texts[:k]
+            if '-follow' in texts or any(re.fullmatch(r'-[EHLPXdsx]*L[EHLPXdsx]*', t) for t in leading):
+                # following symlinks while deleting walks into whatever a link inside the tree points at
+                ctx.add(LOG_DELETE, 'log-delete',
+                        'find follows symlinks (-L or -follow) while deleting, so a link inside the tree can lead '
+                        'into a protected harness location',
+                        'drop -L/-follow; find does not need to follow links to clean a build tree')
             for r in roots:
                 self.protected_target('find -delete/-exec', r)
         for body in exec_cmds:
             if not body:
                 continue
             bname = norm_name(body[0].text)
+            if bname in destroyers:
+                # `-exec rm -rf ~/.claude/projects {} +`, `-exec mv {} ~/.claude/hooks/ \;`: the body's own operands
+                for w in body[1:]:
+                    if w.text in ('{}', ';', '+', '\\;') or w.text.startswith('-') or '{}' in w.text:
+                        continue
+                    self.protected_target('find -exec %s' % bname, w)
             if bname in PRINT_FILE_CMDS or bname in GREP_CMDS or bname in EXFIL_CMDS:
                 for r in roots:
                     p = norm_path(r.text, ctx, ctx.cwd)
@@ -1581,9 +2504,12 @@ class Analyzer:
         ctx = self.ctx
         texts = [a.text for a in args]
         i = 0
+        cwd_word = None
         while i < len(texts):
             t = texts[i]
             if t in ('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env'):
+                if t in ('-C', '--work-tree') and i + 1 < len(args):
+                    cwd_word = args[i + 1]
                 i += 2
             elif t.startswith('-'):
                 i += 1
@@ -1591,6 +2517,16 @@ class Analyzer:
                 break
         sub = texts[i] if i < len(texts) else ''
         rest = texts[i + 1:]
+        if sub == 'clean':
+            self.git_clean(args[i + 1:], rest, cwd_word)
+        if sub == 'worktree' and rest[:1] in (['remove'], ['prune']):
+            for w in _nondash(args[i + 2:]):
+                self.refuse('git worktree remove', w)
+        if sub == 'init' and rest:
+            for w in _nondash(args[i + 1:])[-1:]:
+                self.note_created(_join_word(w, '.git'))
+        elif sub == 'init':
+            self.note_created(_literal_word(posixpath.join(ctx.cwd, '.git')))
         if sub == 'config':
             letters = _flag_letters(args[i + 1:])
             longs = {t.split('=')[0] for t in rest if t.startswith('--')}
@@ -1619,6 +2555,7 @@ class Analyzer:
         low = [t.casefold() for t in texts]
         if any(t.startswith('--dump') for t in low):
             vals = [t.split('=', 1)[1] for t in low if t.startswith('--dump=')]
+            vals += [t[len('--dump-'):] for t in low if t.startswith('--dump-')]
             for k, t in enumerate(low):
                 if t == '--dump' and k + 1 < len(low):
                     vals.append(low[k + 1])
@@ -1629,7 +2566,10 @@ class Analyzer:
         nd = [t for t in low if not t.startswith('-')]
         if 'config' in nd:
             after = nd[nd.index('config') + 1:]
-            if any(a in ctx.c.rclone_blocked for a in after[:2]):
+            sub = after[0] if after else ''
+            secret_args = (not after or sub == 'password' or sub == 'create' and len(after) > 3
+                           or sub == 'update' and len(after) > 2)
+            if secret_args or any(a in ctx.c.rclone_blocked for a in after[:2]):
                 ctx.secret_seen += 1
                 ctx.add(SECRET_DUMP, 'rclone-config-dump',
                         'rclone config show/dump/reconnect prints OAuth access and refresh tokens into the transcript',
@@ -1653,7 +2593,18 @@ class Analyzer:
             ctx.secret_seen += 1
             ctx.add(SECRET_DUMP, 'keychain-dump', 'security dump-keychain -d prints decrypted keychain items', 'security list-keychains')
 
-    def secret_clis(self, name, texts):
+    GH_TOKEN_BANNED_SUBS = {'auth', 'config', 'extension', 'extensions', 'ext', 'alias', 'secret'}
+
+    def _gh_sub_ok(self, args):
+        for a in args:
+            if a.dynamic:
+                return False
+            if a.text.startswith('-'):
+                continue
+            return a.text.casefold() not in self.GH_TOKEN_BANNED_SUBS
+        return False
+
+    def secret_clis(self, name, texts, visible=True):
         ctx = self.ctx
         nd = [t for t in texts if not t.startswith('-')]
         joined = ' '.join(texts).casefold()
@@ -1665,6 +2616,12 @@ class Analyzer:
             if extra and not re.search(extra, joined):
                 continue
             ctx.secret_seen += 1
+            if binary == 'gh' and required == ('auth', 'token'):
+                if not visible and ctx.token_sink_ok:
+                    ctx.token_allowed += 1
+                    return  # VAR=$(gh auth token) gh <subcommand>: the value goes straight into gh's environment
+            elif not visible and binary in ('aws', 'gcloud', 'az', 'op', 'heroku', 'fly', 'flyctl'):
+                return  # the value goes into a variable or a --password-stdin sink, not the transcript
             ctx.add(SECRET_DUMP, '%s-secret' % binary, '%s %s prints a secret value into the transcript' % (binary, ' '.join(required) or 'decrypt'), alt)
             return
 
@@ -1698,7 +2655,8 @@ class Analyzer:
         elif name == 'ps':
             for a in args:
                 t = a.text
-                if t and not t.startswith('-') and 'e' in t and re.fullmatch(r'[a-zA-Z]+', t) and 'w' in t + 'e':
+                if t and (not t.startswith('-') and 'e' in t and re.fullmatch(r'[a-zA-Z]+', t)
+                          or re.fullmatch(r'-[A-Za-z]*E[A-Za-z]*', t)):
                     ctx.secret_seen += 1
                     ctx.add(SECRET_DUMP, 'ps-environment', '`ps e` prints every process environment, including secrets', 'ps -o pid,command -p PID')
                     break
@@ -1709,9 +2667,44 @@ class Analyzer:
             return
         if dump:
             ctx.secret_seen += 1
-            if self.out_visible(pl, idx, True):
+            if self.out_visible(pl, idx, True) and not self._env_name_filter(pl, idx):
                 ctx.add(SECRET_DUMP, 'env-dump', '`%s` with no filter prints every environment variable, including tokens and keys' % name,
-                        'printenv NAME for one non-secret name, or env | cut -d= -f1 for names only')
+                        "printenv NAME, env | grep '^NAME=' for exact non-secret names (a prefix or substring "
+                        "filter also matches *_TOKEN names), or env | cut -d= -f1 for names only")
+
+    def _env_name_filter(self, pl, idx):
+        """`env | grep -E '^(LANE|RUNNER_)'`: the next stage keeps only lines naming the variables it lists, and
+        none of those names is secret. Inverted, empty or wildcard-led patterns do not count."""
+        if idx + 1 >= len(pl.cmds):
+            return False
+        words = self._skip_assigns(strip_reserved(pl.cmds[idx + 1].words))[1]
+        if not words or norm_name(words[0].text) not in GREP_CMDS:
+            return False
+        args = words[1:]
+        if _flag_letters(args) & set('vfr') or _longs(args) & {'--invert-match', '--file', '--recursive'}:
+            return False
+        pats, prev = [], ''
+        for a in args:
+            t = a.text
+            if prev in ('-e', '--regexp'):
+                pats.append(t)
+            elif not t.startswith('-') and not pats and prev not in ('-m', '-A', '-B', '-C', '--max-count'):
+                pats.append(t)
+            prev = t
+        if not pats or any(w.dynamic for w in args):
+            return False
+        for pat in pats:
+            names = re.findall(r'[A-Za-z][A-Za-z0-9_]{2,}', pat)
+            if not names or re.match(r'\^?\.', pat):
+                return False
+            if any(self.ctx.c.secret_name(n) or re.search(r'(?i)secret|token|key|pass|cred|auth', n) for n in names):
+                return False
+            # exact names only: `^HOME=`, `(HOME|SHELL)=` or grep -w. A prefix or substring (`-i GITHUB`,
+            # `^LANE[A-Z_]*=`) also matches GITHUB_TOKEN-style names, so it is not a filter.
+            exact = re.search(r'[A-Za-z0-9_)]=', pat) and not re.search(r'[*+?.\]]\)?=', pat)
+            if not exact and not ('w' in _flag_letters(args) or '--word-regexp' in _longs(args)):
+                return False
+        return True
 
     def echo_check(self, name, args, pl, idx):
         if not any(a.vars for a in args):
@@ -1728,11 +2721,58 @@ class Analyzer:
                     pass
 
     # ---- credential reads
+    NON_REVEALING = {'ssh', 'ssh-add', 'ssh-keygen', 'ssh-copy-id', 'cp', 'mv', 'ln', 'chmod', 'chown', 'chgrp',
+                     'chflags', 'xattr', 'ls', 'stat', 'test', '[', '[[', 'wc', 'file', 'touch', 'shasum', 'sha1sum',
+                     'sha256sum', 'sha512sum', 'md5sum', 'md5', 'cksum', 'b2sum', 'rm', 'unlink', 'trash', 'mkdir',
+                     'git', 'docker', 'docker-compose', 'podman', 'source', '.', 'export', 'rsync', 'rclone', 'install',
+                     'realpath', 'readlink', 'dirname', 'basename', 'du', 'find', 'echo', 'printf', 'cd', 'pushd',
+                     'open', 'code', 'gpg', 'age', 'sops', 'op', 'aws', 'gh', 'gcloud', 'kubectl', 'helm', 'terraform',
+                     'npm', 'pnpm', 'yarn', 'pip', 'uv', 'make', 'dotenv', 'direnv', 'env', 'sudo', 'command', 'type',
+                     'which', 'tar', 'zip', 'gzip', 'xz', 'zstd', 'scp', 'sftp', 'curl', 'wget', 'nc', 'set-acl',
+                     'get-acl', 'test-path', 'get-item', 'icacls', 'setfacl', 'getfacl', 'lsof', 'fuser'}
+
+    def unlisted_cred_reader(self, name, args, cmd, pl, idx):
+        """Fallback for readers missing from the printing-reader list: a home credential file in a positional
+        slot of a verb outside the non-revealing allowlist, with stdout reaching the transcript."""
+        ctx = self.ctx
+        if name in self.NON_REVEALING or name in SHELLS or name in INTERPRETERS or name in WRAPPERS_SIMPLE \
+                or name in KILLERS or self.stdout_redirected(cmd):
+            return
+        prev = ''
+        for w in args:
+            t = w.text
+            flag_value = prev.startswith('-') and '=' not in prev and len(prev) > 1
+            prev = t
+            if t.startswith('-') or flag_value:
+                continue
+            if self._home_cred(t, w):
+                ctx.secret_seen += 1
+                if self.out_visible(pl, idx, True):
+                    ctx.add(SECRET_DUMP, 'credential-file',
+                            '`%s` is given a credential file and its output reaches the transcript' % name[:40],
+                            'check existence with `test -s FILE`; pass the file through the owning tool\'s own '
+                            '--config or -i flag')
+                return
+
+    def _home_cred(self, text, word):
+        """A credential path in a home credential location (not a project's .env or a repo's test key)."""
+        if not self.is_cred_path(text, word):
+            return False
+        path = norm_path(text, self.ctx)
+        folded = path.casefold()
+        if self.under_cred_dir(path) or folded in self.ctx.secret_files:
+            return True
+        samples = {norm_path(x, self.ctx, self.ctx.cwd).casefold() for x in self.c.cred_samples if '{cwd}' not in x}
+        if folded in samples:
+            return True
+        return any(_prefix_match(Compiled._segs(folded), r) and len(Compiled._segs(folded)) > len(r)
+                   for r in self.c.roots)
+
     def is_cred_path(self, text, word=None):
         ctx = self.ctx
         c = ctx.c
-        alts = word.alts if word is not None else [text]
-        for alt in alts[:32]:
+        alts = (word.all_alts() or word.alts[:32]) if word is not None else [text]
+        for alt in alts:
             if self._cred_one(alt):
                 return True
         return False
@@ -1743,10 +2783,12 @@ class Analyzer:
         if not text or len(text) > 4096:
             return False
         path = norm_path(text, ctx)
+        if path.casefold() in ctx.secret_files:
+            return True
         candidates = {path}
         try:
             if os.path.lexists(path) and len(path) < 1024:
-                candidates.add(os.path.realpath(path).casefold())
+                candidates.add(os.path.realpath(path))
         except (OSError, ValueError):
             pass
         for p in candidates:
@@ -1754,7 +2796,7 @@ class Analyzer:
                 return True
         if any(ch in text for ch in '*?['):
             for sample in c.cred_samples:
-                if fnmatch.fnmatchcase(norm_path(sample, ctx, ctx.cwd), path):
+                if _fnmatchcase(norm_path(sample, ctx, ctx.cwd).casefold(), path.casefold()):
                     return True
         if is_dynamic_path(text):
             tail = path.split('$')[-1] if '$' in path else ''
@@ -1763,10 +2805,12 @@ class Analyzer:
                 return True
         return False
 
-    def under_cred_dir(self, path):
+    def under_cred_dir(self, path, or_above=False):
         segs = Compiled._segs(path)
         for d in self.c.cred_dirs:
             if len(segs) >= len(d) and segs[:len(d)] == d:
+                return True
+            if or_above and len(segs) < len(d) and d[:len(segs)] == segs:
                 return True
         return False
 
@@ -1815,7 +2859,7 @@ class Analyzer:
                 if ':' in t and not t.startswith('/') and name in ('scp', 'rsync', 'sftp'):
                     continue
             hit = self.is_cred_path(t, w) if t == w.text else self._cred_one(t)
-            dir_hit = recursive and self.under_cred_dir(norm_path(t, ctx))
+            dir_hit = recursive and self.under_cred_dir(norm_path(t, ctx), or_above=True)
             if hit or dir_hit:
                 ctx.secret_seen += 1
                 if count_only:
@@ -1830,7 +2874,7 @@ class Analyzer:
                             'check existence with `test -s FILE` or `ls -l FILE`; use the owning tool\'s own config flag; to count entries use `grep -c`')
                     return
 
-    def interpreter(self, name, args, texts, depth):
+    def interpreter(self, name, args, texts, depth, words=None):
         code = None
         flags = {'python': ('-c',), 'node': ('-e', '--eval', '-p', '--print'), 'perl': ('-e', '-E'), 'ruby': ('-e',),
                  'php': ('-r',), 'deno': ('eval',), 'bun': ('-e', '--eval'), 'lua': ('-e',), 'osascript': ('-e',),
@@ -1841,112 +2885,575 @@ class Analyzer:
                 if i + 1 < len(texts):
                     code = texts[i + 1]
                     break
+        if code is None and name in ('awk', 'gawk', 'mawk', 'nawk'):
+            nd = [t for t in texts if not t.startswith('-')]
+            code = nd[0] if nd else None
         if code:
             self.code(code, depth)
+            return
+        # `python3 file.py` for a script written earlier in this same command: judge its text. Existing files are
+        # the repository's or harness's own tooling; a raw text scan of their source would block routine runs.
+        if key in flags or key == 'python':
+            nd = [a for a in args if not a.text.startswith('-')] if args else []
+            if nd and nd[0].text != '-':
+                text = self.ctx.written.get(norm_path(nd[0].text, self.ctx).casefold())
+                if text:
+                    self.code(text, depth)
 
     def code(self, code, depth):
         ctx = self.ctx
         for f in fallback_scan(code, ctx.c):
             ctx.findings.append(f)
         low = code.casefold()
-        if re.search(r'print\s*\(\s*(?:dict\s*\(\s*)?os\.environ\s*\)?|json\.dumps\s*\(\s*(?:dict\s*\(\s*)?os\.environ|console\.log\s*\(\s*process\.env\s*\)|puts\s+env\.to_h|print\s+join\s*\([^)]*%env', low):
+        if re.search(r'print\s*\(\s*(?:dict\s*\(\s*)?os\.environ\s*\)|json\.dumps\s*\(\s*(?:dict\s*\(\s*)?os\.environ(?![.\[\w])|'
+                     r'os\.environ\.(?:items|values)\s*\(|\{\s*\*\*\s*os\.environ\s*\}|'
+                     r'console\.(?:log|dir)\s*\(\s*process\.env\s*\)|json\.stringify\s*\(\s*process\.env\s*[,)]|'
+                     r'object\.(?:entries|values)\s*\(\s*process\.env\s*\)|^\s*process\.env\s*;?\s*$|'
+                     r'puts\s+env\.to_h|env\.(?:to_h|each|inspect|to_a)\b|\bp{1,2}\s+env\b|'
+                     r'print\s+join\s*\([^)]*%env|\bkeys\s*%env\b|print[^;]*%env\b|'
+                     r'for\s*\(\s*\w+\s+in\s+environ\s*\)|getenvironmentvariables\s*\(', low):
             ctx.add(SECRET_DUMP, 'interpreter-env-dump', 'script code prints the whole environment', 'print only specific non-secret names')
         for sample in ctx.c.state_files:
             if sample in low.replace('\\', '/') and re.search(r'open|write|copy|rename|replace|echo|dump', low):
                 ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or key directly', 'use command_guard.py approve-delete')
 
     # ---- destructive
-    def write_target(self, target, truncating, via):
+    #
+    # Every target goes through target_class(): it expands the word's alternatives (brace expansion), resolves
+    # ~, $HOME, cd and symlinks, and returns the strongest protection that applies:
+    #   'log'      Tier A: logs, WALs, approval state. Every destructive form is refused.
+    #   'root'     Tier B: anything else in ~/.claude, ~/.codex, ~/.agent-harness (minus allow_subtrees).
+    #   'ancestor' a directory that contains a protected root (/, /Users, ~, ~/.claude, a glob reaching one).
+    #   'unknown'  an unresolved variable or substitution whose text points at a protected location.
+    # A literal, existing target covered by a single-use approval (approve-delete) is let through.
+
+    RANK = {None: 0, 'root': 1, 'unknown': 2, 'log': 3, 'ancestor': 3}
+
+    def _path_class(self, path):
+        c = self.c
+        folded = path.casefold()
+        if any(ch in path for ch in GLOB_CHARS) and not getattr(self, '_in_glob', False):
+            expanded = self._expand_work_glob(path)
+            if expanded is not self.NO_EXPANSION:
+                return expanded
+        best = classify_segs(c, Compiled._segs(folded))
+        if best == 'log-name':
+            # a WAL-shaped name outside the harness trees: test data inside a git working tree is not a WAL
+            best = None if self._git_top(path, 0) else 'log'
+        if folded in c.state_files:
+            return 'log'
+        if best != 'log' and any(rx.search(folded) for rx in c.wal_regexes):
+            best = 'log'
+        if best is None or best == 'root':
+            real = _resolve_prefix(self._through_links(path))
+            if real and real.casefold() != folded:
+                other = classify_segs(c, Compiled._segs(real.casefold()))
+                other = 'log' if other == 'log-name' else other
+                if self.RANK[other] > self.RANK[best]:
+                    best = other
+        if best == 'root' and not is_dynamic_path(path) and not self._kept(path):
+            real = None if self._foreign_home(path) else _resolve_prefix(self._through_links(path))
+            if real and real.casefold() != folded and not any(ch in path for ch in GLOB_CHARS) \
+                    and not getattr(self, '_in_real', False):
+                # an exception must hold where the path really leads: a symlink inside the agent's own worktree
+                # can point into ~/.claude
+                self._in_real = True
+                try:
+                    return self._path_class(real)
+                finally:
+                    self._in_real = False
+            work = self._under_work(path)
+            literal = not any(ch in path for ch in GLOB_CHARS)
+            if work is not None:
+                if literal and self._task_tmp(path, work) or self._own_worktree(path, work):
+                    return None
+                self.ctx.work_refusal = True
+            elif literal and self._inside_repo(path):
+                return None
+        return best
+
+    NO_EXPANSION = object()
+    GLOB_MATCH_CAP = 2000  # across the whole command; beyond it the pattern rule applies (fail closed)
+
+    def _glob_with_hidden(self, pattern, limit):
+        """Expand `pattern` like a shell with dotglob set (a wildcard also matches names starting with a dot,
+        never `.` or `..`), so a hidden symlink cannot hide behind `*`. None when over `limit` or unreadable."""
+        out = ['/']
+        segs = [x for x in pattern.split('/') if x]
+        for k, seg in enumerate(segs):
+            last = k == len(segs) - 1
+            nxt = []
+            for base in out:
+                if not _has_glob(seg):
+                    cand = os.path.join(base, seg)
+                    if os.path.lexists(cand) if last else os.path.isdir(cand):
+                        nxt.append(cand)
+                    continue
+                if not os.path.isdir(base):
+                    continue
+                try:
+                    names = sorted(e.name for e in os.scandir(base))
+                except OSError:
+                    return None
+                for name in names:
+                    if not _fnmatchcase(name, seg):
+                        continue
+                    cand = os.path.join(base, name)
+                    if last or os.path.isdir(cand):
+                        self.ctx.budget.tick()
+                        nxt.append(cand)
+                        if len(nxt) > limit:
+                            return None
+            out = nxt
+            if not out:
+                return []
+        return out
+
+    def _expand_work_glob(self, path):
+        """`rm -rf build/*` under ~/.agent-harness/work: judge what the glob actually matches on disk (as the
+        shell will expand it) instead of every name it could match. Only for globs whose wildcard segments
+        cannot match dot-names; NO_EXPANSION means "judge the pattern as before"."""
+        if is_dynamic_path(path) or self._foreign_home(path) or self._under_work(path) is None:
+            return self.NO_EXPANSION
+        segs = [x for x in path.replace('\\', '/').split('/') if x]  # original case: Linux is case-sensitive
+        if any(_has_glob(x) and x[:1] in ('.', '?', '[') for x in segs) or '..' in segs:
+            return self.NO_EXPANSION
+        first = next(i for i, x in enumerate(segs) if _has_glob(x))
+        prefix = '/' + '/'.join(segs[:first])
+        top = self._git_top(prefix, self._under_work(path) + 3)
+        if not top or len(Compiled._segs(top)) >= first:
+            return self.NO_EXPANSION  # a wildcard directly in the worktree top level (or above it) empties the tree
+        try:
+            if os.path.realpath(prefix) != os.path.abspath(prefix):
+                return self.NO_EXPANSION  # the shell walks the link (and resolves `..` physically after it)
+        except (OSError, ValueError):
+            return self.NO_EXPANSION
         ctx = self.ctx
-        if not target or target in ('/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty') or target.startswith('&'):
-            return
-        path = norm_path(target, ctx)
-        if path in ctx.c.state_files or any(path == s for s in ctx.c.state_files):
-            ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or its key directly',
-                    'use command_guard.py approve-delete after the Dropbox backup is verified')
-            return
-        if truncating:
-            self.protected_path(path, target, 'truncates via redirect', exact_only=False, allow_ancestor=False)
+        remaining = self.GLOB_MATCH_CAP - getattr(ctx, 'glob_matches', 0)
+        matches = self._glob_with_hidden('/' + '/'.join(segs), remaining)
+        if matches is None:
+            return self.NO_EXPANSION
+        ctx.glob_matches = getattr(ctx, 'glob_matches', 0) + len(matches)
+        if not matches:
+            # nothing matches yet: the shell passes the pattern through literally, so judge one ordinary name in
+            # place of each wildcard segment (a later match is judged when that command runs)
+            matches = ['/'.join(re.sub(r'\[[^\]]*\]|[*?]', 'x', x) if _has_glob(x) else x for x in path.split('/'))]
+        self._in_glob = True
+        try:
+            classes = [self._path_class(m) for m in matches]
+        finally:
+            self._in_glob = False
+        return max(classes, key=lambda k: self.RANK[k])
+
+    def _task_tmp(self, path, work_len):
+        """Inside work/<session>/<task>/tmp/: the place for an agent's disposable packets and scripts."""
+        segs = Compiled._segs(path)
+        return len(segs) > work_len + 3 and segs[work_len + 2] == 'tmp'
+
+    def _kept(self, path):
+        segs = Compiled._segs(path.casefold())
+        leaf = segs[-1] if segs else ''
+        c = self.c
+        return leaf in c.keep_names or leaf.endswith(c.keep_suffixes) or any(x in c.keep_segments for x in segs)
+
+    def _under_work(self, path):
+        """Segment count of the matching ~/.agent-harness/work prefix when `path` is below it, else None."""
+        segs = Compiled._segs(path)
+        for h in self.c.homes:
+            base = Compiled._segs(h) + ['.agent-harness', 'work']
+            if len(segs) > len(base) and segs[:len(base)] == base:
+                return len(base)
+        return None
+
+    def _own_worktree(self, path, work_len):
+        """Inside the git worktree that contains the hook's working directory, at work/<session>/<task>/..."""
+        ctx = self.ctx
+        if not ctx.cwd_known or ctx.cwd_unknown or not ctx.cwd:
+            return False  # neither the host nor the command says where the agent is working
+        origin = ctx.cwd
+        segs = Compiled._segs(path)
+        if '.git' in segs:
+            return False
+        top = self._git_top(path, work_len + 3)  # strictly below work/<session>/<task>
+        if not top:
+            return False
+        top_len = len(Compiled._segs(top))
+        if any(_has_glob(x) for x in segs[:top_len]):
+            return False  # a wildcard at or above the top level could reach the worktree itself or its siblings
+        if any(_has_glob(x) and x[:1] in ('.', '?', '[') for x in segs[top_len:]):
+            return False  # could match .git, . or .. (and so reach the top or a parent)
+        try:
+            here = os.path.realpath(origin)
+            top_real = os.path.realpath(top)
+        except (OSError, ValueError):
+            return False
+        return here == top_real or here.startswith(top_real.rstrip('/') + '/')
+
+    def _through_links(self, path):
+        """Rewrite a prefix that is a symlink created earlier in this command to the link's target."""
+        folded = path.casefold()
+        for link, target in self.ctx.links.items():
+            lf = link.casefold()
+            if folded == lf or folded.startswith(lf + '/'):
+                return target + path[len(link):]
+        return path
+
+    def _session_file(self, path):
+        """A regular file directly in ~/.agent-harness/work/<session>/ (no longer an exception; used in messages)."""
+        segs = Compiled._segs(path)
+        for h in self.c.homes:
+            base = Compiled._segs(h) + ['.agent-harness', 'work']
+            if len(segs) == len(base) + 2 and segs[:len(base)] == base:
+                return not os.path.isdir(path) and not os.path.islink(path)
+        return False
+
+    def _inside_repo(self, path):
+        """Inside a git working tree whose top level is strictly below a Tier B root (never the root itself)."""
+        segs = Compiled._segs(path)
+        root_len = None
+        for r in self.c.roots:
+            if len(segs) > len(r) and _prefix_match(segs, r):
+                root_len = len(r)
+                break
+        if root_len is None:
+            return False
+        # the top must sit two or more levels below the root, so ~/.claude/hooks or ~/.agent-harness/work being
+        # a repository never exempts the harness's own infrastructure
+        min_len = root_len + 2
+        return bool(self._git_top(path, min_len))
+
+    def _git_top(self, path, min_len):
+        """True when an ancestor of `path` (not path itself) with at least min_len segments holds a `.git` that
+        existed before this command."""
+        parts = [s for s in path.split('/') if s]
+        for k in range(len(parts) - 1, max(min_len, 1) - 1, -1):
+            top = '/' + '/'.join(parts[:k])
+            marker = top + '/.git'
+            if marker.casefold() in self.ctx.created:
+                return None  # made by this same command
+            try:
+                if os.path.lexists(marker):
+                    return top if _real_git_marker(marker) else None
+            except (OSError, ValueError):
+                return None
+        return None
+
+    FLOW_POSITIONAL = re.compile(r'[0-9@*#]')
+    RAW_ASSIGN = re.compile(r'(?:^|[\s;&|(])(?:(?:export|declare|typeset|readonly|local)(?:\s+-\w+)*\s+)?'
+                            r'([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|\'[^\']*\'|[^\s;&|)]*)')
+    RAW_PATH = re.compile(r"(?:~[A-Za-z0-9_.-]*|\$HOME|\$\{HOME\}|\$env:USERPROFILE|/)[^\s'\";|&()<>`,]*")
+
+    def _raw_path_class(self, text):
+        text = text.strip('\'"')
+        text = re.sub(r'^(?:\$\{HOME\}|\$HOME|(?i:\$env:USERPROFILE))', '~', text).replace('\\', '/')
+        if text.startswith('~') and not text.startswith('~/') and text != '~':
+            text = '~/' + text.split('/', 1)[1] if '/' in text else '~'  # ~user: some home
+        if len(text) < 2 and text != '~':
+            return None
+        return self._path_class(norm_path(text.rstrip('/') or '/', self.ctx))
+
+    def _raw_protected_paths(self):
+        """Some path written anywhere in this command resolves into a protected tier (cached per command)."""
+        ctx = self.ctx
+        cached = getattr(ctx, 'raw_protected', None)
+        if cached is not None:
+            return cached
+        ctx.raw_protected = False
+        raw = getattr(ctx, 'raw_top', '') or ''
+        if not PROTECTED_TEXT.search(raw):
+            return False
+        for m in self.RAW_PATH.finditer(raw[:200000]):
+            if self._raw_path_class(m.group(0)) in ('log', 'root', 'ancestor', 'unknown'):
+                ctx.raw_protected = True
+                break
+        return ctx.raw_protected
+
+    def _hint_points_at_protected(self, word):
+        texts = list(word.subs)
+        ctx = self.ctx
+        for inner in word.subs:  # `rm -rf "$(ls -d ~/.c*)"`: the substitution lists protected paths
+            for m in self.RAW_PATH.finditer(inner[:20000]):
+                if self._raw_path_class(m.group(0)) in ('log', 'root', 'ancestor'):
+                    return True
+        raw = getattr(ctx, 'raw_top', '') or ''
+        for v in word.vars:
+            name = v.lstrip('!')
+            # positional parameters and loop/read variables carry paths from elsewhere in the command: that is
+            # undecidable here, so they fail closed when the command names a protected location anywhere
+            if (self.FLOW_POSITIONAL.fullmatch(name) or name in getattr(ctx, 'flow_vars', ())) \
+                    and self._raw_protected_paths():
+                return True
+            # export/declare/readonly/local NAME=value, which the assignment tracker does not bind
+            for m in self.RAW_ASSIGN.finditer(raw[:200000]):
+                if m.group(1) == name and (PROTECTED_TEXT.search(m.group(2))
+                                           or self._raw_path_class(m.group(2)) in ('log', 'root', 'ancestor')):
+                    return True
+        for v in word.vars:
+            name = v.lstrip('!')
+            if name not in self.ctx.vars and PROTECTED_VAR_NAME.search(name):
+                return True
+            hint = self.ctx.var_hints.get(name)
+            if hint:
+                texts.append(hint)
+        return any(PROTECTED_TEXT.search(t) for t in texts)
+
+    def target_class(self, word):
+        """(class, shown path, literal) for the strongest protection any expansion of `word` hits."""
+        ctx = self.ctx
+        best, shown, literal = None, '', True
+        if ctx.cwd_protected_unknown and word.alts and not word.alts[0].startswith(('/', '~')):
+            return 'unknown', word.alts[0], False
+        alts = word.all_alts()
+        if alts is None:
+            if PROTECTED_TEXT.search(_unq(word.overflow)):
+                return 'unknown', word.alts[0], False
+            alts = word.alts[:32]
+        for alt in alts:
+            path = norm_path(alt, ctx)
+            dynamic = is_dynamic_path(alt) or word.dynamic
+            cls = self._path_class(path)
+            physical = None if dynamic else self._physical_dotdot(alt)
+            if physical and physical != path:
+                other = self._path_class(physical)
+                if self.RANK[other] > self.RANK[cls]:
+                    cls, path = other, physical
+            if dynamic:
+                literal = False
+                if cls is None and self._dynamic_suffix_protected(path):
+                    cls = 'unknown'
+                if cls is None and self._hint_points_at_protected(word):
+                    cls = 'unknown'
+            if any(ch in alt for ch in GLOB_CHARS):
+                literal = False
+            if ctx.cwd_unknown and not alt.startswith(('/', '~')) and cls is None:
+                head = posixpath.normpath(alt).split('/')[0].casefold()
+                if head in RELATIVE_PROTECTED_NAMES or head.startswith('history'):
+                    cls = 'unknown'
+            if self.RANK[cls] > self.RANK[best]:
+                best, shown = cls, path
+        return best, shown, literal
+
+    def _physical_dotdot(self, alt):
+        """`sub/link/../../x`: the shell (and the kernel) resolve `..` after following `link`, so the real target
+        can differ from the lexically normalised path. Resolve the part up to the last `..` physically."""
+        text = alt.replace('\\', '/')
+        parts = text.split('/')
+        if '..' not in parts:
+            return None
+        last = len(parts) - 1 - parts[::-1].index('..')
+        head, rest = '/'.join(parts[:last + 1]), '/'.join(parts[last + 1:])
+        ctx = self.ctx
+        if head.startswith('~/') or head == '~':
+            head = (ctx.home or '') + head[1:]
+        elif not head.startswith('/'):
+            if not ctx.cwd or ctx.cwd_unknown:
+                return None
+            head = ctx.cwd.rstrip('/') + '/' + head
+        if head.startswith('~'):
+            return None
+        try:
+            real = os.path.realpath(head)
+        except (OSError, ValueError):
+            return None
+        return norm_path(real.rstrip('/') + ('/' + rest if rest else ''), ctx)
+
+    def _dynamic_suffix_protected(self, path):
+        """`$X/projects`, `$DIR/.claude`, `$(..)/wals`: an unresolved prefix followed by a protected tail."""
+        folded = path.casefold()
+        marker = folded.rfind('$')
+        for m in (SUB_MARK, ARITH_MARK):
+            marker = max(marker, folded.rfind(m))
+        tail = folded[marker + 1:]
+        tail = tail.split('/', 1)[1] if '/' in tail else ''
+        tail_segs = Compiled._segs(tail)
+        if not tail_segs:
+            return False
+        if any(s in self.c.seg_names for s in tail_segs) or tail_segs[-1] in self.c.file_names:
+            return True
+        for r in self.c.protected + self.c.roots:
+            for k in range(1, len(r) + 1):
+                if all(_seg_eq(tail_segs[i], r[len(r) - k + i]) for i in range(min(k, len(tail_segs)))) \
+                        and r[len(r) - k].startswith('.'):
+                    return True
+        return False
+
+    def refuse(self, what, word, tiers=('log', 'root', 'ancestor', 'unknown'), need_existing=False, instead=None):
+        """Add a log_delete finding when `word` resolves into one of `tiers`. Returns True when it did."""
+        ctx = self.ctx
+        cls, path, literal = self.target_class(word)
+        if cls is None or cls not in tiers:
+            return False
+        if need_existing and literal and cls in ('log', 'root') and not _lexists(path) \
+                and path.casefold() not in ctx.created and not self._foreign_home(path) \
+                and not self.c.is_guard_file(path):
+            return False  # creating a new file is not destructive
+        if literal and cls in ('log', 'root') and ctx.marker is not None and ctx.marker(path):
+            return False
+        label = {'log': 'a protected log, WAL or approval-state location', 'root': 'a protected harness directory',
+                 'ancestor': 'a directory that contains protected logs', 'unknown':
+                 'a path the guard cannot resolve that points at protected logs'}[cls]
+        name = posixpath.basename(path.rstrip('/')) or path
+        ctx.add(LOG_DELETE, 'log-delete',
+                ('%s targets %s (%s). Claude/Codex/harness logs and state are never deleted, moved or truncated '
+                 'without a verified backup' % (what, label, name[:60]))[:300],
+                instead or 'back up to Dropbox (rclone copy), then `command_guard.py approve-delete --path P --remote '
+                'REMOTE`, then delete the literal path' + ('' if literal else '; spell out the literal path, globs and '
+                                                           'variables cannot be approved'))
+        return True
+
+    def _foreign_home(self, path):
+        """A /home/x or /Users/x path that is not one of this machine's homes (an ssh or container target)."""
+        folded = path.casefold()
+        if any(folded == h.casefold() or folded.startswith(h.casefold().rstrip('/') + '/') for h in self.c.homes):
+            return False
+        return any(_prefix_match(Compiled._segs(folded), g) for g in self.c.match_homes)
 
     def protected_target(self, what, word):
-        for alt in word.alts[:32]:
-            self.protected_path(norm_path(alt, self.ctx), alt, what)
+        self.refuse(what, word)
 
-    def protected_path(self, path, shown, what, exact_only=False, allow_ancestor=True):
-        ctx = self.ctx
-        c = ctx.c
-        hit = None
+    def write_target(self, target_word, truncating, via, pure=True):
+        if target_word is None:
+            return
+        target = target_word.text
+        if not target or target in ('/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty') or target.startswith('&'):
+            return
+        if self.state_dest(target_word):
+            return
+        if truncating:
+            # `echo x > existing` replaces the file's content just as `: >` empties it, so an existing literal file
+            # under a protected root is refused like `tee` is; new files and `>>` appends stay allowed. A dynamic
+            # target keeps the narrower tiers: its existence cannot be checked, and new-file writes are common.
+            cls, path, exact = self.target_class(target_word)
+            literal = pure or exact
+            tiers = ('log', 'root', 'unknown') if literal else ('log', 'unknown')
+            # another host's home: nothing can be checked from here, so only a fully literal path may be narrowed
+            foreign = cls == 'root' and self._foreign_home(path)
+            if foreign and not exact:
+                tiers = ('log', 'root', 'unknown')
+            # `link/../x`: the shell resolves `..` after following the link, so check that path as well
+            physical = self._physical_dotdot(target_word.text) if not target_word.dynamic else None
+            # zsh multios: `> {a,b}` writes every expansion, so each one must be a plain work file
+            every = [norm_path(a, self.ctx) for a in (target_word.all_alts() or target_word.alts)]
+            dotted = any('..' in a.replace('\\', '/').split('/') for a in (target_word.all_alts() or target_word.alts))
+            if not pure and cls == 'root' and self._plain_work_file(path) and all(map(self._plain_work_file, every)) \
+                    and (physical is None or self._plain_work_file(physical)) and not (foreign and (dotted or not exact)):
+                # owners routinely rerun `cmd > <task dir>/x.log`; only receipts (*.json) and .keep-marked
+                # directories under the work dir keep the overwrite refusal (replay over real transcripts)
+                tiers = ('log', 'unknown')
+            what = 'truncation by redirect' if pure else 'overwrite by redirect'
+            done = self.refuse(what, target_word, tiers=tiers, need_existing=True, instead=self._overwrite_hint(path))
+            raw_alts = target_word.all_alts() or target_word.alts
+            if not done and len(raw_alts) > 1:
+                # refuse() checks existence only for the strongest alt it shows; multios writes all of them,
+                # so an existing protected file behind a new first alt must still count (delta review F2)
+                if len(raw_alts) > 256:  # too many to stat one by one: judge them as if they all existed
+                    done = self.refuse(what, target_word, tiers=tiers)
+                for alt in ([] if len(raw_alts) > 256 else raw_alts):
+                    one = Word()
+                    one.alts, one.dynamic = [alt], target_word.dynamic
+                    if self.refuse(what, one, tiers=tiers, need_existing=True):
+                        done = True
+                        break
+            if not done and cls is not None and target_word.glob and not target_word.dynamic:
+                # `> ~/.claude/settings.jso?`: bash and zsh expand a redirect glob that matches one file, so judge
+                # the files it matches now as literal targets (delta review F4). Only below a protected root, and
+                # through the budgeted walker: an exception or a stall here would lose every other finding in the
+                # command, because the launcher then falls back to its raw-text check (re-review N1)
+                pattern = norm_path(target_word.text, self.ctx)
+                hits = self._glob_with_hidden(pattern, 256) if pattern.startswith('/') and '\x00' not in pattern else None
+                if hits is None:  # too many matches, unreadable or not expandable: its targets are not known
+                    done = self.refuse(what, target_word, tiers=('log', 'root', 'unknown'))
+                for hit in hits or []:
+                    one = Word()
+                    one.alts = [hit]
+                    hit_tiers = ('log', 'unknown') if not pure and self._plain_work_file(hit) \
+                        else ('log', 'root', 'unknown')
+                    if self.refuse(what, one, tiers=hit_tiers, need_existing=True):
+                        done = True
+                        break
+            if not done and physical and physical.casefold() != norm_path(target_word.text, self.ctx).casefold():
+                real = Word()
+                real.alts = [physical]
+                self.refuse(what, real, tiers=tiers, need_existing=True)  # the file the shell really opens
+        self.note_created(target_word)
+
+    def _work_base(self, segs):
+        """Segment count of the ~/.agent-harness/work or /scratch prefix of `segs`, for this machine's homes and for
+        /home/<user> on another host (`ssh dev2 'cmd > /home/someone/...'`), else None."""
+        other = ['/'.join(segs[:2])] if len(segs) > 2 and segs[0] == 'home' else []
+        for h in list(self.c.homes) + other:
+            for top in ('work', 'scratch'):
+                base = Compiled._segs(h) + ['.agent-harness', top]
+                if len(segs) > len(base) and segs[:len(base)] == base:
+                    return len(base)
+        return None
+
+    def _overwrite_hint(self, path):
+        """What to do instead when a redirect is refused for a layout reason under work or scratch, else None."""
         segs = Compiled._segs(path)
-        dynamic = '$' in path or SUB_MARK.casefold() in path
-        if dynamic:
-            pieces = path.split('$')
-            tail_part = pieces[-1]
-            tail_segs = Compiled._segs(tail_part.split('/', 1)[1]) if '/' in tail_part else []
-            for r in c.protected:
-                for k in range(1, len(r) + 1):
-                    if tail_segs and r[-k:] == tail_segs[:k]:
-                        hit = 'a path with an unresolved variable ending in a protected log location'
-                        break
-                if hit:
-                    break
-            if not hit and ctx.cwd_unknown and not path.startswith('/'):
-                hit = None
-        else:
-            if ctx.cwd_unknown and not shown.startswith(('/', '~')) and not os.path.isabs(shown):
-                leaf = Compiled._segs(path)[:1]
-                names = {'projects', 'wals', 'sessions', 'history.jsonl', 'transcripts', 'archived_sessions'}
-                if any(p in names or p.startswith('history') for p in [posixpath.normpath(shown).split('/')[0].casefold()]):
-                    hit = 'a relative log path after a cd the guard could not resolve'
-            for r in c.protected:
-                under = len(segs) >= len(r) and all(fnmatch.fnmatchcase(segs[k], r[k]) for k in range(len(r)))
-                if under or (any(ch in path for ch in '*?[') and seg_match(segs, r)):
-                    hit = hit or 'a protected log location'
-                    break
-            if not hit and allow_ancestor:
-                for a in c.ancestors:
-                    if (segs == a) or (any(ch in path for ch in '*?[') and seg_match(segs, a) and len(segs) <= len(a)):
-                        hit = hit or 'a parent directory of protected logs'
-                        break
-                    if any(ch in path for ch in '*?[') and len(segs) < len(a) + 4 and seg_match(segs, a) and len(segs) <= len(a) + 1:
-                        for r in c.protected:
-                            if seg_match(segs, r):
-                                hit = hit or 'a glob that expands to a protected log location'
-                                break
-            if not hit:
-                for rx in c.wal_regexes:
-                    if rx.search(path):
-                        hit = 'a work-directory WAL'
-                        break
-            if not hit:
-                try:
-                    if os.path.lexists(path) and len(path) < 1024:
-                        real = os.path.realpath(path).casefold()
-                        if real != path:
-                            rsegs = Compiled._segs(real)
-                            for r in c.protected:
-                                if len(rsegs) >= len(r) and rsegs[:len(r)] == r:
-                                    hit = 'a symlink into a protected log location'
-                                    break
-                except (OSError, ValueError):
-                    pass
-        if hit is None:
-            return
-        glob_or_dynamic = dynamic or any(ch in path for ch in '*?[')
-        if not glob_or_dynamic and ctx.marker is not None and ctx.marker(path):
-            return
-        ctx.add(LOG_DELETE, 'log-delete',
-                '%s: %s. Claude/Codex logs and WALs are never deleted without a verified backup (target is %s)' % (what, hit, posixpath.basename(path) or path)[:300],
-                'back up to Dropbox (rclone copy), then `command_guard.py approve-delete --path P --remote REMOTE`, then delete the literal path' + ('; spell out the literal path, globs and variables cannot be approved' if glob_or_dynamic else ''))
+        base_len = self._work_base(segs)
+        if base_len is None:
+            return None
+        rest = segs[base_len:]
+        if len(rest) == 1:
+            return 'write to a subfolder of it instead; files directly in the work or scratch dir are not replaced'
+        if any(s in self.c.keep_segments for s in rest[:-1]):
+            return 'write to a differently named folder instead; files under a folder named state are kept'
+        return None
+
+    def _plain_work_file(self, path):
+        """A plain file at least two levels below ~/.agent-harness/work or ~/.agent-harness/scratch, both as typed
+        and where it really leads (symlinks): not a JSON receipt, not a kept name (kit.json, *.jsonl, state), and no
+        `.keep` in any directory between it and the work or scratch dir. Also true for another host's
+        /home/<user>/.agent-harness tree, where the `.keep` and symlink checks can only see this machine's disk."""
+        try:
+            real = os.path.realpath(path)
+        except (OSError, ValueError):
+            return False
+        # macOS makes /home itself a symlink, so that prefix alone must not fail the check. A /home/<user> path that
+        # does exist here (another user on this machine) is still followed, so a link out of the tree is refused
+        if real.startswith('/System/Volumes/Data/home/') and self._foreign_home(path):
+            real = real[len('/System/Volumes/Data'):]
+        for cand in (path, real):
+            if self._kept(cand) or any(rx.search(cand.casefold()) for rx in self.c.wal_regexes):
+                return False
+            segs = Compiled._segs(cand)
+            raw = [s for s in cand.replace('\\', '/').split('/') if s]
+            base_len = self._work_base(segs)
+            if base_len is None or len(raw) != len(segs):
+                return False
+            rest = segs[base_len:]
+            if len(rest) < 2 or '..' in rest or rest[-1].casefold().endswith('.json'):
+                return False
+            for k in range(1, len(rest)):
+                if _lexists('/' + '/'.join(raw[:base_len + k]) + '/.keep'):
+                    return False
+        return True
+
+    def note_created(self, word, text=None):
+        for alt in word.alts[:32]:
+            path = norm_path(alt, self.ctx).casefold()
+            self.ctx.created.add(path)
+            if text is not None:
+                self.ctx.written[path] = text[:262144]
+
+    def state_dest(self, word):
+        ctx = self.ctx
+        for alt in word.all_alts() or word.alts[:32]:
+            if norm_path(alt, ctx).casefold() in ctx.c.state_files:
+                ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or its key directly',
+                        'use command_guard.py approve-delete after the Dropbox backup is verified')
+                return True
+        return False
 
     def destructive(self, name, args, texts):
         ctx = self.ctx
         nd = _nondash(args)
         if name in RM_CMDS:
             if ctx.ps:
-                nd = [a for a in args if not a.text.startswith('-') or True]
-                nd = [a for a in nd if not re.match(r'^-[A-Za-z]+$', a.text)]
+                nd = [a for a in args if not re.match(r'^-[A-Za-z]+$', a.text)]
             for w in nd:
-                self.protected_target(name, w)
+                self.refuse(name, w)
         elif name in MV_CMDS:
             dest, sources = None, nd
             if '-t' in texts or '--target-directory' in texts:
@@ -1956,85 +3463,172 @@ class Analyzer:
             elif len(nd) >= 2:
                 dest, sources = nd[-1], nd[:-1]
             for w in sources:
-                self.protected_target(name, w)
-            if dest is not None:
-                self.exact_protected(dest, name)
-                self.state_dest(dest)
+                self.refuse(name + ' (moves it away)', w)
+            if dest is not None and not self.state_dest(dest):
+                self.overwrite_dest(name, dest)
         elif name == 'truncate':
-            for w in nd:
-                if re.fullmatch(r'[+-<>/%]?[0-9]+[KMGTPEZY]?B?', w.text, re.I):
+            skip = False
+            for i, w in enumerate(args):
+                if skip:
+                    skip = False
                     continue
-                self.protected_target('truncate', w)
+                if w.text in ('-s', '--size', '-r', '--reference'):
+                    skip = True
+                    continue
+                if w.text.startswith('-'):
+                    continue
+                self.refuse('truncate', w, tiers=('log', 'root', 'unknown'), need_existing=True)
         elif name in ('tee', 'out-file', 'set-content'):
-            if not (_flag_letters(args) & {'a'} or '--append' in texts or any(t.lower() == '-append' for t in texts)):
-                for w in nd:
-                    self.protected_target(name + ' (overwrites)', w)
+            if ctx.ps:  # -Value/-FilePath/-LiteralPath are not bundles of short flags in PowerShell
+                appending = any(len(t) >= 3 and '-append'.startswith(t.lower()) for t in texts)
+            else:
+                appending = _flag_letters(args) & {'a'} or '--append' in texts or any(t.lower() == '-append' for t in texts)
             for w in nd:
-                self.state_dest(w)
+                if self.state_dest(w):
+                    continue
+                if not appending:
+                    self.refuse(name + ' (overwrites)', w, tiers=('log', 'root', 'unknown'), need_existing=True)
         elif name == 'dd':
             for a in args:
                 if a.text.startswith('of='):
                     fake = Word()
-                    fake.alts = [a.text[3:]]
-                    self.protected_target('dd of=', fake)
-                    self.state_dest(fake)
+                    fake.alts = [x[3:] for x in a.alts]
+                    fake.dynamic, fake.subs, fake.vars = a.dynamic, a.subs, a.vars
+                    if not self.state_dest(fake):
+                        self.refuse('dd of=', fake, tiers=('log', 'root', 'unknown'), need_existing=True)
+        elif name in ('touch', 'mkdir'):
+            for w in nd:
+                self.note_created(w)
+        elif name in ('curl', 'wget'):
+            flags = ('-o', '--output') if name == 'curl' else ('-O', '--output-document')
+            for k, a in enumerate(args):
+                val = None
+                short = flags[0][1]
+                if (a.text in flags or re.fullmatch(r'-[A-Za-z]*' + short, a.text)) and k + 1 < len(args):
+                    val = args[k + 1]
+                elif a.text.startswith(flags[1] + '='):
+                    val = _literal_word(a.text.split('=', 1)[1])
+                if val is not None and val.text != '-' and not self.state_dest(val):
+                    self.overwrite_dest(name + ' download', val)
+                    self.note_created(val)
+        elif name in ('awk', 'gawk', 'ruby'):
+            if any(t in ('-i', '-iinplace') or t.startswith('-i') and name == 'ruby' for t in texts) and \
+                    (name == 'ruby' or 'inplace' in ' '.join(texts)):
+                for w in nd[1:] if name != 'ruby' else nd:
+                    self.refuse(name + ' in-place rewrite', w, tiers=('log', 'unknown'))
+        elif name == 'unzip':
+            if '-d' in texts and texts.index('-d') + 1 < len(args) and ('-o' in texts or '-of' in texts):
+                self.refuse('unzip -o (overwrites files)', args[texts.index('-d') + 1], tiers=('log', 'unknown'))
         elif name in ('cp', 'copy-item', 'cpi', 'copy', 'install', 'ln'):
-            if nd:
-                self.exact_protected(nd[-1], name)
-                self.state_dest(nd[-1])
+            if name == 'ln' and _flag_letters(args) & {'s'} and len(nd) >= 2:
+                target_path = norm_path(nd[0].text, ctx)
+                link = norm_path(nd[-1].text, ctx)
+                if os.path.isdir(link) and not os.path.islink(link):
+                    link = posixpath.join(link, posixpath.basename(target_path.rstrip('/')))
+                ctx.links[link] = target_path
+            elif name == 'ln' and _flag_letters(args) & {'s'} and len(nd) == 1:
+                target_path = norm_path(nd[0].text, ctx)
+                ctx.links[posixpath.join(ctx.cwd, posixpath.basename(target_path.rstrip('/')))] = target_path
+            if len(nd) >= 2 or (nd and name == 'ln'):
+                dest = nd[-1]
+                if self.state_dest(dest):
+                    return
+                sources = [a.text for a in nd[:-1]]
+                if any(s in ('/dev/null', '/dev/zero') for s in sources):
+                    self.refuse(name + ' from /dev/null (truncates)', dest, tiers=('log', 'root', 'unknown'),
+                                need_existing=True)
+                else:
+                    self.overwrite_dest(name, dest)
         elif name in ('sed', 'perl'):
             if _flag_letters(args) & {'i'} or any(t.startswith('-i') or t.startswith('--in-place') for t in texts):
-                for w in nd[1:] if name == 'sed' and nd else nd:
-                    self.protected_target(name + ' -i', w)
-                    self.state_dest(w)
+                for w in (nd[1:] if name == 'sed' and nd else nd):
+                    if not self.state_dest(w):
+                        self.refuse(name + ' -i (rewrites in place)', w, tiers=('log', 'unknown'))
         elif name == 'rsync':
-            if any(t.startswith('--delete') or t == '--remove-source-files' for t in texts) or '--del' in texts:
-                pos = [a for a in nd]
-                if any(t.startswith('--delete') or t == '--del' for t in texts) and pos:
-                    self.protected_target('rsync --delete (destination)', pos[-1])
-                if '--remove-source-files' in texts:
-                    for w in pos[:-1]:
-                        self.protected_target('rsync --remove-source-files (source)', w)
+            if any(t.startswith('--delete') or t.startswith('--del') or t == '--remove-source-files'
+                   or t == '--remove-sent-files' for t in texts):
+                pos = [a for a in nd if not self._remote_spec(a.text)]
+                if any(t.startswith('--del') for t in texts) and nd and not self._remote_spec(nd[-1].text):
+                    self.refuse('rsync --delete (destination)', nd[-1])
+                if '--remove-source-files' in texts or '--remove-sent-files' in texts:
+                    for w in pos[:-1] if pos and pos[-1] is nd[-1] else pos:
+                        self.refuse('rsync --remove-source-files (source)', w)
         elif name == 'rclone':
-            sub = [a for a in nd if True]
-            subs = [a.text.casefold() for a in sub]
+            # flags without `=` take the next word as their value unless they are known switches, so
+            # `--exclude '*.tmp' SRC` and `--min-age 30d SRC` still name SRC as the target
+            switches = {'-v', '-vv', '-vvv', '-q', '-p', '-n', '-i', '-l', '-c', '-u', '-l', '--progress', '--dry-run',
+                        '--interactive', '--verbose', '--quiet', '--fast-list', '--checksum', '--update',
+                        '--ignore-existing', '--no-traverse', '--rmdirs', '--leave-root', '--stats-one-line', '--links',
+                        '--copy-links', '--ignore-case', '--ignore-size', '--size-only', '--immutable', '--check-first',
+                        '--no-update-modtime', '--delete-empty-src-dirs', '--create-empty-src-dirs', '--delete-before',
+                        '--delete-during', '--delete-after', '--track-renames', '--metadata', '-m', '--human-readable',
+                        '--use-server-modtime', '--no-check-dest', '--server-side-across-configs', '--resync', '--force'}
+            nd, skip = [], False
+            for a in args:
+                if skip:
+                    skip = False
+                    continue
+                t = a.text.casefold()
+                if t.startswith('-') and len(t) > 1:
+                    if '=' not in t and t not in switches and not re.fullmatch(r'-[a-z]+', t):
+                        skip = True
+                    continue
+                nd.append(a)
+            subs = [a.text.casefold() for a in nd]
             for i, s in enumerate(subs):
                 if s in ('move', 'moveto'):
-                    for w in sub[i + 1:i + 2]:
-                        self.protected_target('rclone %s (deletes the source after copy)' % s, w)
+                    for w in nd[i + 1:i + 2]:
+                        self.refuse('rclone %s (deletes the source after copy)' % s, w)
                     break
-                if s in ('sync', 'copy', 'copyto'):
-                    if s == 'sync':
-                        for w in sub[i + 2:i + 3]:
-                            self.protected_target('rclone sync (deletes extra files in the destination)', w)
+                if s in ('sync', 'bisync'):
+                    for w in nd[i + 1:i + 3] if s == 'bisync' else nd[i + 2:i + 3]:
+                        self.refuse('rclone %s (deletes files in the destination)' % s, w)
+                    break
+                if s in ('copy', 'copyto', 'check', 'ls', 'lsf', 'lsd', 'lsjson', 'size', 'about'):
                     break
                 if s in ('delete', 'deletefile', 'purge', 'rmdir', 'rmdirs', 'cleanup'):
-                    for w in sub[i + 1:i + 2]:
-                        self.protected_target('rclone %s' % s, w)
+                    for w in nd[i + 1:i + 2]:
+                        self.refuse('rclone %s' % s, w)
                     break
-        elif name in ('tar', 'zip'):
+        elif name in ('tar', 'zip', 'bsdtar', 'gtar'):
             if '--remove-files' in texts or (name == 'zip' and (_flag_letters(args) & {'m'} or '--move' in texts)):
                 for w in nd:
-                    self.protected_target(name + ' (removes source files)', w)
+                    self.refuse(name + ' (removes source files)', w)
+
+    @staticmethod
+    def _remote_spec(text):
+        return bool(re.match(r'^[A-Za-z0-9_.@-]+:(?!/)', text)) or bool(re.match(r'^[A-Za-z0-9_.@-]+::', text)) \
+            or bool(re.match(r'^[A-Za-z0-9_.@-]+:/', text) and not text.startswith('/'))
+
+    def overwrite_dest(self, what, word):
+        """cp/mv/ln/install onto an existing Tier A file (or into a protected dir by glob/variable)."""
+        cls, path, literal = self.target_class(word)
+        if cls == 'log' and literal and os.path.isdir(path):
+            return  # copying into a log directory adds a file; it does not replace one
+        if cls in ('log', 'unknown') or cls == 'ancestor' and literal and not os.path.isdir(path):
+            self.refuse(what + ' (overwrites)', word, tiers=('log', 'unknown', 'ancestor'), need_existing=True)
+        self.note_created(word)
 
     def exact_protected(self, word, what):
-        ctx = self.ctx
-        for alt in word.alts[:32]:
-            path = norm_path(alt, ctx)
-            segs = Compiled._segs(path)
-            for r in ctx.c.protected:
-                if segs == r and ctx.marker is None or segs == r and not ctx.marker(path):
-                    ctx.add(LOG_DELETE, 'log-overwrite', '%s overwrites a protected log location' % what,
-                            'back up first and use command_guard.py approve-delete')
-                    return
+        self.overwrite_dest(what, word)
 
-    def state_dest(self, word):
-        ctx = self.ctx
-        for alt in word.alts[:32]:
-            if norm_path(alt, ctx) in ctx.c.state_files:
-                ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or its key directly',
-                        'use command_guard.py approve-delete after the Dropbox backup is verified')
-                return
+    def git_clean(self, args, texts, cwd_word):
+        """git clean -f inside a protected tree removes untracked logs and state."""
+        letters = _flag_letters(args)
+        if not ('f' in letters or '--force' in texts) or 'n' in letters or '--dry-run' in texts:
+            return
+        base = norm_path(cwd_word.text, self.ctx) if cwd_word is not None and not cwd_word.dynamic else (
+            None if cwd_word is not None else self.ctx.cwd)
+        if base is None:
+            self.refuse('git clean', cwd_word)
+            return
+        specs = [a for a in _nondash(args) if a.text not in ('--',)]
+        targets = [norm_path(a.text, self.ctx, base) for a in specs] or [base]
+        for t in targets:
+            # git clean removes untracked files below t, so judge a path inside it, not t itself
+            fake = Word()
+            fake.alts = [t.rstrip('/') + '/.git-clean-interior']
+            self.refuse('git clean', fake)
 
     # ---- kills
     def kill_cmd(self, name, args, texts):
@@ -2138,6 +3732,19 @@ class Analyzer:
         self._kill_scope('kill via ' + source, pat, strong, scoped, True, False)
 
 
+def _literal_word(text):
+    w = Word()
+    w.alts = [text]
+    return w
+
+
+def _join_word(word, leaf):
+    w = Word()
+    w.alts = [posixpath.join(a, leaf) for a in word.alts[:8]]
+    w.dynamic, w.subs, w.vars = word.dynamic, word.subs, word.vars
+    return w
+
+
 def _quote_for_rebuild(text):
     return "'" + text.replace("'", "'\\''") + "'"
 
@@ -2156,7 +3763,43 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
     if len(command.encode('utf-8', 'replace')) > int(compiled.limits['max_command_bytes']):
         raise Blocked('command is larger than %d bytes' % int(compiled.limits['max_command_bytes']))
     analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=marker)
-    return analyzer.run(command)
+    findings = analyzer.run(command)
+    if analyzer.ctx.unterminated and not any(f.category in ALWAYS_ENFORCED for f in findings):
+        if raw_sensitive(command, compiled, cwd=cwd):
+            findings.append(Finding(LOG_DELETE if PROTECTED_TEXT.search(command) else SECRET_DUMP, 'unanalysable',
+                                    'the command has an unterminated quote or substitution and names a protected '
+                                    'location or secret', 'close the quote, or split the command'))
+        else:
+            findings.append(Finding(PARSE, 'unterminated', 'the command has an unterminated quote or substitution',
+                                    'check the quoting'))
+    return findings
+
+
+SECRET_TEXT = re.compile(r'(?i)\brclone\b|\bauth\s+token\b|--show-token|\bprintenv\b|(?:^|[;&|(\s])(?:env|set|export'
+                         r'|declare|typeset)(?:\s+-[px])?\s*(?:$|[;&|)])|credentials|\bid_(?:rsa|dsa|ecdsa|ed25519)\b'
+                         r'|\.env\b|auth\.json|\.npmrc|\.netrc|\.pgpass|hosts\.yml|rclone\.conf|find-(?:generic|'
+                         r'internet)-password|dump-keychain|/environ\b|(?:TOKEN|SECRET|PASSWORD|API_?KEY)\b')
+
+
+def raw_sensitive(text, compiled=None, cwd=None):
+    """Cheap raw-text probe: does this text name a protected location or a secret source? A destructive verb run
+    from a working directory inside a harness root counts too (`cd ~/.claude` then `rm -rf projects`)."""
+    if not isinstance(text, str):
+        text = ' '.join(map(str, text))
+    t = text[:4_000_000]
+    if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t):
+        return True
+    if cwd and DESTROY_TEXT.search(t):
+        for place in (cwd, _realpath(cwd) or cwd):
+            if PROTECTED_TEXT.search(place.replace('\\', '/') + '/'):
+                return True
+    # code execution the guard could not follow, combined with a destructive verb
+    return bool(EXEC_TEXT.search(t) and DESTROY_TEXT.search(t))
+
+
+EXEC_TEXT = re.compile(r'(?i)\|\s*(?:sudo\s+)?(?:ba|z|k|da|)sh\b|\beval\b|\b(?:ba|z|)sh\s+-[a-z]*c\b|'
+                       r'\b(?:python[0-9.]*|node|perl|ruby)\s+-[a-z]*[ce]\b|base64\s+-[dD]|xxd\s+-r|\bsource\s+<\(')
+DESTROY_TEXT = re.compile(r'(?i)\b(?:rm|rmdir|unlink|shred|truncate|mv|rmtree|remove|unlinksync|rmsync|dd|find)\b')
 
 
 def decide(command, compiled=None, cwd=None, ps=False, marker=None):
@@ -2165,14 +3808,21 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
     modes = compiled.policy['modes']
     try:
         findings = analyze(command, compiled, cwd=cwd, ps=ps, marker=marker)
-    except Blocked as stop:
-        return 'block', format_block(Finding(SECRET_DUMP, 'unanalysable', str(stop), 'split it into smaller commands or put it in a script file'))
-    except RecursionError:
-        return 'block', format_block(Finding(SECRET_DUMP, 'unanalysable', 'command nesting is too deep', 'simplify the command'))
+    except (Blocked, RecursionError) as stop:
+        reason = str(stop) if isinstance(stop, Blocked) else 'command nesting is too deep'
+        if raw_sensitive(command, compiled, cwd=cwd):
+            category = LOG_DELETE if PROTECTED_TEXT.search(command if isinstance(command, str) else ' '.join(command)) \
+                else SECRET_DUMP
+            return 'block', format_block(Finding(category, 'unanalysable', reason + ' and it names a protected location '
+                                                 'or secret', 'split it into smaller commands or put it in a script file'))
+        return 'warn', format_block(Finding(PARSE, 'unanalysable', reason, 'split it into smaller commands'), warn=True)
     except Exception as error:  # noqa: BLE001 - fail closed for sensitive-looking text, open for the rest
         try:
             text = command if isinstance(command, str) else ' '.join(map(str, command))
             raw = [f for f in fallback_scan(text, compiled) if modes.get(f.category) == 'enforce']
+            if not raw and raw_sensitive(command, compiled, cwd=cwd):
+                raw = [Finding(LOG_DELETE if PROTECTED_TEXT.search(text) else SECRET_DUMP, 'guard-error',
+                               'it names a protected location or secret', 'retry with a simpler command')]
         except Exception:  # noqa: BLE001
             raw = [Finding(SECRET_DUMP, 'guard-error', 'the guard failed twice', 'retry with a simpler command')]
         if raw:
@@ -2191,14 +3841,30 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
 def format_block(f, more=0, warn=False):
     head = 'command_guard WARNING' if warn else 'command_guard BLOCKED'
     text = '%s [%s/%s]: %s. Safe alternative: %s.' % (head, f.category, f.rule, f.reason, f.alternative)
+    try:  # names taken from the command (basenames) must never carry a secret into the transcript
+        import redact
+        text = redact.redact(text)
+    except Exception:  # noqa: BLE001 - without the redactor, drop everything after the rule label
+        text = '%s [%s/%s]: blocked; see the command_guard docs.' % (head, f.category, f.rule)
     if more > 0:
         text += ' (%d more finding(s))' % more
     if not warn:
-        text += ' This policy lives in the installed command_guard_policy.json; there is no override variable.'
+        text += ' There is no override variable; ask the user if this command is really needed.'
     return text[:1500]
 
 
-# --------------------------------------------------------------------------- delete approval marker
+# --------------------------------------------------------------------------- delete approval (single use)
+#
+# approve-delete writes one entry per approved path into ~/.agent-harness/state/log-delete-ok.json, MAC'd with a
+# local key. The hook lets a destructive command through only when every protected operand is the exact approved
+# path, the path's device, inode and stat manifest are unchanged, and the entry can be removed under an exclusive
+# lock (so two commands cannot share one approval). Everything is appended to log-delete-audit.jsonl and, for
+# approve-delete, to the WAL named with --wal. The agent itself may approve after a verified Dropbox backup: the
+# safeguard is the verified copy, the single use and the audit trail, not a human prompt.
+
+MARKER_NAME, KEY_NAME, AUDIT_NAME, LOCK_NAME = 'log-delete-ok.json', 'log-delete.key', 'log-delete-audit.jsonl', \
+    'log-delete.lock'
+
 
 def state_dir(home=None):
     return Path(home or os.path.expanduser('~')) / '.agent-harness' / 'state'
@@ -2217,60 +3883,166 @@ def _read_small(path, limit):
 def load_marker(home=None):
     sd = state_dir(home)
     try:
-        data = json.loads(_read_small(sd / 'log-delete-ok.json', 1 << 20).decode('utf-8'))
-        key = _read_small(sd / 'log-delete.key', 256)
-    except Exception:  # noqa: BLE001
+        data = json.loads(_read_small(sd / MARKER_NAME, 1 << 20).decode('utf-8'))
+        key = _read_small(sd / KEY_NAME, 256)
+    except Exception:  # noqa: BLE001 - no marker, no approvals
         return [], b''
     entries = data.get('entries') if isinstance(data, dict) else None
     return (entries if isinstance(entries, list) else []), key
 
 
-def marker_covers(path, home=None, now=None, compiled=None):
-    """True when a valid, unexpired, MAC-checked approval covers `path` and nothing under it changed since."""
-    now = time.time() if now is None else now
-    entries, key = load_marker(home)
-    if not key or not entries:
-        return False
-    target = os.path.normpath(path).casefold()
-    limits = (compiled.policy['marker'] if compiled else DEFAULT_POLICY['marker'])
-    for entry in entries:
-        try:
-            if not hmac.compare_digest(_mac(key, entry), str(entry.get('mac', ''))):
-                continue
-            if float(entry['expires_at']) <= now or float(entry['verified_at']) > now + 60:
-                continue
-            root = os.path.normpath(entry['path']).casefold()
-            if not (target == root or target.startswith(root + '/')):
-                continue
-            if _changed_since(entry['path'], float(entry['verified_at']), limits):
-                continue
-            return True
-        except (KeyError, ValueError, TypeError):
-            continue
-    return False
-
-
-def _changed_since(path, since, limits):
-    """True if any file under path is newer than `since`, or the walk cannot finish inside its budget."""
-    deadline = time.monotonic() + float(limits['max_walk_seconds'])
-    budget = int(limits['max_walk_entries'])
-    stack = [path]
+def audit(event, fields, home=None, wal=None):
+    """Append one redacted line to the approval audit log (and the WAL when given). Never raises."""
+    record = {'ts': round(time.time(), 3), 'event': event}
+    record.update({k: v for k, v in fields.items() if k in ('path', 'remote', 'manifest_sha256', 'files', 'reason',
+                                                             'expires_at', 'nonce', 'rule')})
     try:
-        while stack:
-            current = stack.pop()
-            st = os.lstat(current)
-            budget -= 1
-            if budget < 0 or time.monotonic() > deadline:
-                return True
-            if st.st_mtime > since + 1e-6 and not os.path.isdir(current):
-                return True
-            if os.path.isdir(current) and not os.path.islink(current):
-                with os.scandir(current) as it:
-                    for e in it:
-                        stack.append(e.path)
+        import redact
+        line = redact.redact(json.dumps(record, sort_keys=True))
+    except Exception:  # noqa: BLE001
+        line = json.dumps({'ts': record['ts'], 'event': event})
+    try:
+        sd = state_dir(home)
+        sd.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(sd / AUDIT_NAME), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, 'a') as handle:
+            handle.write(line + '\n')
     except OSError:
+        pass
+    if wal:
+        note = 'command_guard %s: %s' % (event, line[:900])
+        helper = HERE / 'wal_note.py'
+        try:
+            if helper.is_file():
+                subprocess.run([sys.executable, str(helper), '--wal', str(wal), '--event', 'status', '--note', note,
+                                '--source', 'inferred: from command_guard approve-delete ; ticket:GoodQA goodqa#14471 '
+                                            '-- approval audit record'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)
+            else:
+                fd = os.open(str(wal), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                with os.fdopen(fd, 'a') as handle:
+                    handle.write(json.dumps({'ts': record['ts'], 'event': 'status', 'note': note}) + '\n')
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def _identity(path):
+    st = os.stat(path)
+    return st.st_dev, st.st_ino
+
+
+def stat_manifest(path, limits, deadline=None):
+    """sha256 over (relative path, type, size, mtime_ns) of a tree; raises ValueError when over budget."""
+    max_entries = int(limits.get('max_approve_files', 20000))
+    deadline = deadline if deadline is not None else time.monotonic() + float(limits['max_walk_seconds'])
+    h = hashlib.sha256()
+    count = 0
+    root = path
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        st = os.lstat(current)
+        count += 1
+        if count > max_entries + 1 or time.monotonic() > deadline:
+            raise ValueError('tree is too large to check inside the time budget; approve a smaller subtree')
+        rel = os.path.relpath(current, root)
+        kind = 'd' if os.path.isdir(current) and not os.path.islink(current) else ('l' if os.path.islink(current) else 'f')
+        h.update(('%s\0%s\0%d\0%d\n' % (rel, kind, st.st_size if kind == 'f' else 0,
+                                        st.st_mtime_ns if kind != 'd' else 0)).encode('utf-8', 'surrogateescape'))
+        if kind == 'd':
+            with os.scandir(current) as it:
+                stack.extend(sorted((e.path for e in it), reverse=True))
+    return h.hexdigest()
+
+
+class Approvals:
+    """Marker callable for the analyser: covers(path) -> bool, remembering which entries a command would use."""
+
+    def __init__(self, home=None, compiled=None, now=None):
+        self.home = home
+        self.limits = (compiled.policy['marker'] if compiled else DEFAULT_POLICY['marker'])
+        self.now = time.time() if now is None else now
+        self.entries, self.key = load_marker(home)
+        self.used = {}
+
+    def __call__(self, path):
+        return self.covers(path)
+
+    def _valid(self, entry):
+        try:
+            if not self.key or not hmac.compare_digest(_mac(self.key, entry), str(entry.get('mac', ''))):
+                return False
+            if float(entry['expires_at']) <= self.now or float(entry['verified_at']) > self.now + 60:
+                return False
+            return True
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def covers(self, path):
+        if not self.entries:
+            return False
+        try:
+            real = os.path.realpath(path)
+        except (OSError, ValueError):
+            return False
+        for entry in self.entries:
+            if not isinstance(entry, dict) or not self._valid(entry):
+                continue
+            if os.path.normpath(str(entry.get('path'))) != real:
+                continue
+            try:
+                if list(_identity(real)) != list(entry.get('identity') or []):
+                    continue
+                if stat_manifest(real, self.limits) != entry.get('stat_sha256'):
+                    continue
+            except (OSError, ValueError):
+                continue
+            self.used[real] = entry.get('nonce')
+            return True
+        return False
+
+    def consume(self):
+        """Remove every used entry under an exclusive lock. True when all of them were still present."""
+        if not self.used:
+            return True
+        sd = state_dir(self.home)
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - non-POSIX: refuse rather than allow a reusable approval
+            return False
+        try:
+            fd = os.open(str(sd / LOCK_NAME), os.O_WRONLY | os.O_CREAT, 0o600)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            entries, key = load_marker(self.home)
+            wanted = set(self.used.values())
+            remaining = [e for e in entries if not (isinstance(e, dict) and e.get('nonce') in wanted)]
+            if len(entries) - len(remaining) != len(wanted):
+                return False  # another command used one of them first
+            tmp = sd / ('.marker.%d.%s.tmp' % (os.getpid(), _secrets.token_hex(4)))
+            wfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(wfd, 'w') as handle:
+                json.dump({'version': 2, 'entries': remaining}, handle, indent=1)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(tmp), str(sd / MARKER_NAME))
+        except OSError:
+            return False
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        for path, nonce in self.used.items():
+            audit('consumed', {'path': path, 'nonce': nonce}, home=self.home)
         return True
-    return False
+
+
+def marker_covers(path, home=None, now=None, compiled=None):
+    """Read-only check (used by `check`): does a valid approval cover exactly this path?"""
+    return Approvals(home=home, compiled=compiled, now=now).covers(path)
 
 
 class VerifyResult:
@@ -2326,6 +4098,18 @@ class RcloneVerifier(Verifier):
     def _run(self, argv):
         done = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=self.timeout, check=False)
         return done.returncode, done.stdout[:512 * 1024 * 1024]
+
+    def remote_types(self):
+        """{remote name: backend type} from `rclone listremotes --long` (names and types only, no secrets)."""
+        code, out = self.runner([self.rclone, 'listremotes', '--long'])
+        if code != 0:
+            return {}
+        found = {}
+        for line in out.decode('utf-8', 'replace').splitlines()[:500]:
+            m = re.match(r'\s*([^:\s][^:]*):\s+(\S+)', line)
+            if m:
+                found[m.group(1)] = m.group(2)
+        return found
 
     def verify(self, local_root, manifest, remote):
         code, out = self.runner([self.rclone, 'lsjson', '-R', '--hash', '--files-only', remote])
@@ -2396,31 +4180,101 @@ def manifest_digest(manifest):
     return hashlib.sha256('\n'.join('%s\t%d\t%s' % e for e in manifest).encode()).hexdigest()
 
 
-def approve_delete(path, remote, verifier=None, pinned_digest=None, ttl=None, home=None, policy=None, now=None):
-    """Verify the backup, then write a signed approval for `path`. Returns the entry. Raises ValueError on refusal."""
+def _approval_refusal(real, policy, home=None):
+    """Reason an approval for `real` must be refused (protected roots, top-level log dirs, ancestors), or None."""
+    c = Compiled(policy, home=home)
+    segs = Compiled._segs(real.casefold())
+    for group in (c.roots, c.protected, c.ancestors):
+        for r in group:
+            if _prefix_match(segs, r) and len(segs) <= len(r):
+                return 'approving a protected root, a top-level log directory or one of their parents is refused; ' \
+                       'approve a subdirectory or file inside it'
+    if len(segs) <= 2:
+        return 'approving a home directory or a top-level directory is refused'
+    return None
+
+
+def _check_remote(remote, policy, verifier):
+    """Only named remotes of an allowed backend type (default dropbox); never local paths or on-the-fly backends."""
+    if not isinstance(remote, str) or ':' not in remote or remote.startswith((':', '/', '.', '~')) or ',' in \
+            remote.split(':', 1)[0] or '\\x00' in remote:
+        raise ValueError('remote must be a named rclone remote such as dropbox:backups/claude (not a local path, '
+                         'an on-the-fly :backend: or a connection string)')
+    name = remote.split(':', 1)[0]
+    allowed = [t.casefold() for t in policy['marker'].get('approve_remote_types', ['dropbox'])]
+    types = getattr(verifier, 'remote_types', None)
+    found = types() if callable(types) else {}
+    kind = (found or {}).get(name)
+    if kind is None:
+        raise ValueError('remote %r is not configured in rclone' % name[:40])
+    if kind.casefold() not in allowed:
+        raise ValueError('remote %r has backend type %r; approvals need one of %s' % (name[:40], kind[:20], allowed))
+
+
+def _recent_change(path, seconds, now, limits):
+    deadline = time.monotonic() + max(10.0, float(limits['max_walk_seconds']) * 10)
+    for root, dirs, names in os.walk(path):
+        for name in names + dirs:
+            if time.monotonic() > deadline:
+                return True
+            try:
+                if os.lstat(os.path.join(root, name)).st_mtime > now - seconds:
+                    return True
+            except OSError:
+                return True
+    try:
+        return os.lstat(path).st_mtime > now - seconds and os.path.isfile(path)
+    except OSError:
+        return True
+
+
+def approve_delete(path, remote, verifier=None, pinned_digest=None, ttl=None, home=None, policy=None, now=None,
+                   wal=None):
+    """Verify the backup, then write a signed single-use approval for `path`. Returns the entry.
+
+    Raises ValueError on refusal (and audits the refusal)."""
     policy = policy or load_policy()
     limits = policy['marker']
     now = time.time() if now is None else now
+    verifier = verifier or RcloneVerifier()
     real = os.path.realpath(path)
-    if not os.path.exists(real):
-        raise ValueError('path does not exist')
-    ttl = int(ttl or limits['default_ttl_seconds'])
-    if ttl <= 0 or ttl > int(limits['max_ttl_seconds']):
-        raise ValueError('ttl must be between 1 and %d seconds' % int(limits['max_ttl_seconds']))
-    manifest = tree_manifest(real, limits)
-    if not manifest:
-        raise ValueError('nothing to approve: the path holds no files')
-    digest = manifest_digest(manifest)
-    if pinned_digest and pinned_digest.lower() != digest:
-        raise ValueError('--backup-verified-sha256 does not match the local manifest digest (%s)' % digest)
-    result = (verifier or RcloneVerifier()).verify(real, manifest, remote)
-    if not result.ok:
-        raise ValueError('backup is not verified: checked=%d missing=%s mismatched=%s %s' % (
-            result.checked, result.missing[:5], result.mismatched[:5], result.error))
+    try:
+        if any(ch in path for ch in GLOB_CHARS) or '$' in path:
+            raise ValueError('spell out the literal path; globs and variables cannot be approved')
+        if not os.path.exists(real):
+            raise ValueError('path does not exist')
+        reason = _approval_refusal(real, policy, home=home)
+        if reason:
+            raise ValueError(reason)
+        ttl = int(ttl or limits['default_ttl_seconds'])
+        if ttl <= 0 or ttl > int(limits['max_ttl_seconds']):
+            raise ValueError('ttl must be between 1 and %d seconds' % int(limits['max_ttl_seconds']))
+        recent = int(limits.get('recent_change_seconds', 600))
+        if recent > 0 and _recent_change(real, recent, now, limits):
+            raise ValueError('something under the path changed in the last %d seconds (a live log?); wait, back it '
+                             'up again and retry' % recent)
+        _check_remote(remote, policy, verifier)
+        manifest = tree_manifest(real, limits)
+        if not manifest:
+            raise ValueError('nothing to approve: the path holds no files')
+        if len(manifest) > int(limits.get('max_approve_files', 20000)):
+            raise ValueError('more than %d files; approve smaller subtrees' % int(limits.get('max_approve_files', 20000)))
+        digest = manifest_digest(manifest)
+        if pinned_digest and pinned_digest.lower() != digest:
+            raise ValueError('--backup-verified-sha256 does not match the local manifest digest')
+        result = verifier.verify(real, manifest, remote)
+        if not result.ok:
+            raise ValueError('backup is not verified: checked=%d missing=%d mismatched=%d %s' % (
+                result.checked, len(result.missing), len(result.mismatched), (result.error or '')[:120]))
+        stat_digest = stat_manifest(real, limits, deadline=time.monotonic() + 60)
+        identity = list(_identity(real))
+    except ValueError as error:
+        audit('refused', {'path': real, 'remote': remote, 'reason': str(error)[:200]}, home=home, wal=wal)
+        raise
     sd = state_dir(home)
     sd.mkdir(parents=True, exist_ok=True)
     os.chmod(str(sd), 0o700)
-    key_path = sd / 'log-delete.key'
+    key_path = sd / KEY_NAME
     try:
         fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, 'wb') as handle:
@@ -2428,17 +4282,29 @@ def approve_delete(path, remote, verifier=None, pinned_digest=None, ttl=None, ho
     except FileExistsError:
         pass
     key = _read_small(key_path, 256)
-    entry = {'path': real, 'remote_digest_checked': result.checked, 'manifest_sha256': digest, 'remote': remote,
-             'verified_at': now, 'expires_at': now + ttl, 'nonce': _secrets.token_hex(8)}
+    entry = {'path': real, 'identity': identity, 'files': len(manifest), 'manifest_sha256': digest,
+             'stat_sha256': stat_digest, 'remote': remote, 'verified_at': now, 'expires_at': now + ttl,
+             'nonce': _secrets.token_hex(8)}
     entry['mac'] = _mac(key, entry)
-    entries, _ = load_marker(home)
-    live = [e for e in entries if isinstance(e, dict) and float(e.get('expires_at', 0)) > now and e.get('path') != real]
-    live.append(entry)
-    tmp = sd / ('.marker.%d.tmp' % os.getpid())
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'w') as handle:
-        json.dump({'version': 1, 'entries': live}, handle, indent=1)
-    os.replace(str(tmp), str(sd / 'log-delete-ok.json'))
+    import fcntl
+    lock = os.open(str(sd / LOCK_NAME), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        entries, _ = load_marker(home)
+        live = [e for e in entries if isinstance(e, dict) and float(e.get('expires_at', 0) or 0) > now
+                and e.get('path') != real]
+        live.append(entry)
+        tmp = sd / ('.marker.%d.%s.tmp' % (os.getpid(), _secrets.token_hex(4)))
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as handle:
+            json.dump({'version': 2, 'entries': live}, handle, indent=1)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(tmp), str(sd / MARKER_NAME))
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+    audit('approved', entry, home=home, wal=wal)
     return entry
 
 
@@ -2482,20 +4348,48 @@ def scan_paths(paths, max_files=2000, max_seconds=60.0):
 
 # --------------------------------------------------------------------------- hook and CLI
 
-SHELL_TOOLS = {'bash', 'powershell', 'shell', 'local_shell', 'exec_command', 'container.exec', 'unified_exec'}
+SHELL_TOOLS = {'bash', 'powershell', 'shell', 'local_shell', 'exec_command', 'container.exec', 'unified_exec',
+               'write_stdin'}
+COMMAND_KEYS = ('command', 'cmd', 'script', 'chars', 'input')
 
 
 def extract_command(payload):
-    """(command string or argv list, is_powershell) from a PreToolUse payload, or (None, False)."""
+    """(command string or argv list, is_powershell) from a PreToolUse payload, or (None, False).
+
+    Codex sends exec_command/shell as tool_name Bash; write_stdin text typed into a running shell is not checked
+    again by the host, so its `chars` are analysed as shell input here."""
     if not isinstance(payload, dict):
         return None, False
     tool = str(payload.get('tool_name') or payload.get('toolName') or '')
     tool_input = payload.get('tool_input') or payload.get('toolInput') or {}
+    if isinstance(tool_input, str) and tool_input.lstrip().startswith('{'):
+        try:  # a host that sends tool_input as a JSON-encoded string
+            decoded = json.loads(tool_input)
+            if isinstance(decoded, dict):
+                tool_input = decoded
+        except ValueError:
+            pass
+    if isinstance(tool_input, (str, list)) and tool.casefold() in SHELL_TOOLS:
+        tool_input = {'command': tool_input}
     if not isinstance(tool_input, dict):
         return None, False
-    if tool and tool.casefold() not in SHELL_TOOLS:
+    if tool and tool.casefold() not in SHELL_TOOLS and not tool.casefold().startswith(('bash', 'shell', 'exec')):
         return None, False
-    command = tool_input.get('command', tool_input.get('cmd', tool_input.get('script')))
+    command, texts = None, []
+    for key in COMMAND_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            if value not in texts:
+                texts.append(value)
+        elif isinstance(value, list) and value and command is None:
+            command = value
+    if command is not None and texts:
+        # a list command and a string field together: judge both
+        texts.insert(0, ' '.join(_quote_for_rebuild(str(c)) for c in command))
+        command = None
+    if texts:
+        # every non-blank command field is judged: a blank `command` must not hide a real `cmd`
+        command = '\n'.join(texts) if len(texts) > 1 else texts[0]
     if isinstance(command, list):
         command = [str(c) for c in command]
         if len(command) >= 3 and norm_name(command[0]) in SHELLS and command[1] in ('-c', '-lc', '-ic', '-l', '-i'):
@@ -2505,64 +4399,90 @@ def extract_command(payload):
     return None, False
 
 
+def payload_cwd(payload):
+    """Working directory for relative paths: Codex tool_input.workdir, else the payload cwd."""
+    if not isinstance(payload, dict):
+        return None
+    tool_input = payload.get('tool_input') if isinstance(payload.get('tool_input'), dict) else {}
+    if str(payload.get('tool_name') or '').casefold() == 'write_stdin' and not tool_input.get('workdir'):
+        return None  # text typed into a running shell: its directory may have changed since the session cwd
+    for value in (tool_input.get('workdir'), tool_input.get('cwd'), payload.get('cwd')):
+        if isinstance(value, str) and value.startswith('/') and len(value) < 4096 and '\x00' not in value:
+            return value
+    return None
+
+
 def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
-    import safe_input
+    """PreToolUse entry point. Exit 2 + stderr blocks; exit 0 allows (warnings go to stdout as context).
+
+    Always run behind command_guard_hook.py, which turns a crash or timeout of this process into a raw-text
+    decision instead of the host's fail-open default."""
     limits = (compiled.limits if compiled else DEFAULT_POLICY['limits'])
     alarm = False
     if hasattr(signal, 'SIGALRM'):
         def _timeout(_s, _f):
             raise TimeoutError('command_guard wall-clock limit')
         signal.signal(signal.SIGALRM, _timeout)
-        signal.alarm(int(float(limits['max_seconds']) * 3) + 2)
+        signal.alarm(int(float(limits['max_seconds']) * 2) + 1)
         alarm = True
+    raw_text = ''
     try:
+        import safe_input
         try:
             data = stdin_bytes if stdin_bytes is not None else safe_input.read_stdin_bounded(int(limits['max_stdin_bytes']))
         except safe_input.InputRejected:
-            return emit('block', format_block(Finding(SECRET_DUMP, 'oversized-input', 'the tool input is larger than the guard will analyse',
-                                                      'write large content to a file with the Write tool instead')), fmt)
+            return emit('block', format_block(Finding(SECRET_DUMP, 'oversized-input', 'the tool input is larger than '
+                                                      'the guard will analyse', 'put the commands in a script file and '
+                                                      'run it')), fmt)
         raw_text = data.decode('utf-8', 'replace')
         try:
             payload = safe_input.safe_json_loads(raw_text)
         except Exception:  # noqa: BLE001
             payload = None
-        try:
-            c = compiled or Compiled(load_policy(), cwd=(payload or {}).get('cwd') if isinstance(payload, dict) and isinstance((payload or {}).get('cwd'), str) else None)
-            if payload is None:
-                hits = [f for f in fallback_scan(raw_text, c) if c.policy['modes'].get(f.category) == 'enforce']
-                if hits:
-                    return emit('block', format_block(hits[0]), fmt)
-                return 0
-            command, ps = extract_command(payload)
-            if command is None:
-                return 0
-            cwd = payload.get('cwd') if isinstance(payload.get('cwd'), str) else None
-            marker_fn = (lambda p: marker_covers(p, compiled=c)) if marker else None
-            verdict, message = decide(command, c, cwd=cwd, ps=ps, marker=marker_fn)
-        except TimeoutError:
-            raise
-        except Exception as error:  # noqa: BLE001
-            text = raw_text
-            hits = []
-            try:
-                cc = compiled or Compiled(DEFAULT_POLICY)
-                hits = [f for f in fallback_scan(text, cc) if f.category in ALWAYS_ENFORCED]
-            except Exception:  # noqa: BLE001
-                hits = [Finding(SECRET_DUMP, 'guard-error', 'guard failed', 'retry')]
-            if hits:
-                return emit('block', format_block(Finding(hits[0].category, hits[0].rule, 'guard error (%s) on a sensitive-looking command: %s' % (type(error).__name__, hits[0].reason), hits[0].alternative)), fmt)
-            print('command_guard: internal error (%s); allowed' % type(error).__name__, file=sys.stderr)
+        cwd = payload_cwd(payload)
+        c = compiled or Compiled(load_policy(), cwd=cwd)
+        if payload is None:
+            if raw_sensitive(raw_text, c):
+                return emit('block', format_block(Finding(SECRET_DUMP, 'unparsable-payload', 'the hook payload is not '
+                                                          'valid JSON and names a protected location or secret',
+                                                          'retry the command')), fmt)
             return 0
+        command, ps = extract_command(payload)
+        if command is None:
+            return 0
+        approvals = Approvals(compiled=c) if marker else None
+        verdict, message = decide(command, c, cwd=cwd, ps=ps, marker=approvals)
+        if verdict != 'block' and approvals is not None and approvals.used and not approvals.consume():
+            verdict, message = 'block', format_block(Finding(LOG_DELETE, 'approval-used', 'the delete approval was '
+                                                             'already used or changed', 'approve again after a fresh '
+                                                             'verified backup'))
         return emit(verdict, message, fmt)
     except TimeoutError:
-        return emit('block', format_block(Finding(SECRET_DUMP, 'unanalysable', 'analysis exceeded its wall-clock limit',
-                                                  'split it into smaller commands or put it in a script file')), fmt)
+        verdict = 'block' if raw_sensitive(raw_text) else 'warn'
+        return emit(verdict, format_block(Finding(SECRET_DUMP if verdict == 'block' else PARSE, 'unanalysable',
+                                                  'analysis exceeded its wall-clock limit', 'split it into smaller '
+                                                  'commands or put it in a script file'), warn=verdict == 'warn'), fmt)
+    except Exception as error:  # noqa: BLE001 - fail closed for sensitive-looking text, open for the rest
+        if not raw_text and stdin_bytes is None:
+            try:
+                raw_text = sys.stdin.buffer.read(8 << 20).decode('utf-8', 'replace')
+            except Exception:  # noqa: BLE001
+                raw_text = ''
+        if raw_sensitive(raw_text):
+            return emit('block', format_block(Finding(SECRET_DUMP, 'guard-error', 'guard internal error (%s) on a '
+                                                      'command that names a protected location or secret'
+                                                      % type(error).__name__, 'split the command into simple steps; '
+                                                      'run command_guard.py doctor')), fmt)
+        print('command_guard: internal error (%s); the command looked harmless and was allowed'
+              % type(error).__name__, file=sys.stderr)
+        return 0
     finally:
         if alarm:
             signal.alarm(0)
 
 
 def emit(verdict, message, fmt):
+    """Never emits an explicit allow decision: exit 0 with no decision leaves the host's own permission flow."""
     if verdict == 'allow':
         return 0
     if verdict == 'warn':
@@ -2571,9 +4491,167 @@ def emit(verdict, message, fmt):
     if fmt == 'json':
         print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
                                                  'permissionDecisionReason': message}}))
-        return 0
+        return 2
     print(message, file=sys.stderr)
     return 2
+
+
+# --------------------------------------------------------------------------- doctor, explain, replay
+
+MIN_CLAUDE_VERSION = (2, 1, 295)  # first Claude Code release with hook `onFailure: block`
+DOCTOR_PROBES = (  # (command text, expected verdict); data only, analysed and never executed
+    ('rclone config show', 'block'), ('rm -rf ~/.claude/projects', 'block'), ('printenv', 'block'),
+    ("cat <<'EOF'\nx\nEOF\nrm -rf ~/.codex/sessions", 'block'), ('git status', 'allow'), ('ls ~/.claude', 'allow'),
+)
+
+
+def _version_tuple(text):
+    m = re.search(r'(\d+)\.(\d+)\.(\d+)', text or '')
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def claude_version(runner=None):
+    try:
+        if runner:
+            return _version_tuple(runner())
+        done = subprocess.run(['claude', '--version'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20,
+                              check=False)
+        return _version_tuple(done.stdout.decode('utf-8', 'replace'))
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _hook_entries(data, needle):
+    out = []
+    groups = ((data or {}).get('hooks') or {}).get('PreToolUse') or []
+    for group in groups if isinstance(groups, list) else []:
+        for hook in (group.get('hooks') or []) if isinstance(group, dict) else []:
+            text = isinstance(hook, dict) and ' '.join([str(hook.get('command', ''))] + [str(a) for a in hook.get('args') or []])
+            if text and needle in text:
+                out.append((group, hook))
+    return out
+
+
+def doctor(home=None, version_runner=None):
+    """[(check, ok, detail)] for the installed guard on this machine."""
+    import safe_input
+    home = Path(home or os.path.expanduser('~'))
+    checks = [('python>=3.9', sys.version_info >= (3, 9), '%d.%d' % sys.version_info[:2])]
+    for label, d in (('claude', home / '.claude' / 'hooks'), ('codex', home / '.codex' / 'agent-harness')):
+        if not d.parent.is_dir():
+            continue
+        names = ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py')
+        missing = [n for n in names if not (d / n).is_file()]
+        checks.append(('%s files' % label, not missing, 'missing: ' + ', '.join(missing) if missing else str(d)))
+        settings = home / '.claude' / 'settings.json' if label == 'claude' else home / '.codex' / 'hooks.json'
+        try:
+            data = safe_input.safe_json_loads(safe_input.read_bounded(str(settings), 4 << 20).decode('utf-8'))
+        except Exception:  # noqa: BLE001
+            data = None
+        entries = _hook_entries(data, 'command_guard_hook.py')
+        checks.append(('%s registered' % label, bool(entries), str(settings)))
+        if label == 'claude' and entries:
+            group, hook = entries[0]
+            checks.append(('claude onFailure block', hook.get('onFailure') == 'block', 'hook entry'))
+            matcher = str(group.get('matcher', ''))
+            checks.append(('claude matcher covers Bash', matcher in ('', '*') or 'Bash' in matcher, matcher or '(all)'))
+            version = claude_version(version_runner)
+            ok = version is not None and version >= MIN_CLAUDE_VERSION
+            checks.append(('claude >= 2.1.295', ok, '.'.join(map(str, version)) if version else 'unknown: '
+                           'fail-closed then rests on the launcher alone'))
+        if label == 'codex' and entries:
+            group, _hook = entries[0]
+            checks.append(('codex no matcher', not group.get('matcher'), 'every tool reaches the guard (write_stdin)'))
+    c = Compiled(load_policy(), home=str(home), cwd=str(home))
+    bad = [cmd.split('\n')[0][:30] for cmd, want in DOCTOR_PROBES if decide(cmd, c, cwd=str(home))[0] != want]
+    checks.append(('self-test probes', not bad, 'wrong: ' + '; '.join(bad) if bad else '%d ok' % len(DOCTOR_PROBES)))
+    return checks
+
+
+def explain(text, cwd=None, ps=False):
+    c = Compiled(load_policy(), cwd=cwd)
+    analyzer = Analyzer(c, cwd=cwd, ps=ps)
+    try:
+        findings = analyzer.run(text)
+        detail = [{'category': f.category, 'rule': f.rule, 'reason': f.reason, 'alternative': f.alternative}
+                  for f in findings]
+    except Exception as error:  # noqa: BLE001
+        detail = [{'error': type(error).__name__}]
+    verdict, message = decide(text, c, cwd=cwd, ps=ps)
+    import redact
+    return {'verdict': verdict, 'message': message, 'findings': json.loads(redact.redact(json.dumps(detail)))}
+
+
+def iter_transcript_commands(path, max_bytes=256 << 20):
+    """(cwd, command) for every Bash-like tool call in a Claude Code or Codex JSONL transcript."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size > max_bytes:
+        return
+    with open(path, 'rb') as handle:
+        for raw in handle:
+            if len(raw) > 4 << 20:
+                continue
+            try:
+                record = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            cwd = record.get('cwd') if isinstance(record.get('cwd'), str) else None
+            stack = [record]
+            seen = 0
+            while stack and seen < 2000:
+                node = stack.pop()
+                seen += 1
+                if isinstance(node, dict):
+                    name = str(node.get('name') or node.get('tool_name') or '')
+                    args = node.get('input') if isinstance(node.get('input'), dict) else node.get('arguments')
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except ValueError:
+                            args = None
+                    if name and isinstance(args, dict):
+                        command, _ps = extract_command({'tool_name': name, 'tool_input': args})
+                        if command:
+                            yield (payload_cwd({'cwd': cwd, 'tool_input': args}),
+                                   command if isinstance(command, str) else ' '.join(command))
+                            continue
+                    stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+                elif isinstance(node, list):
+                    stack.extend(v for v in node if isinstance(v, (dict, list)))
+
+
+def replay(paths, max_commands=200000):
+    """Decision counts over real transcripts; commands are never printed, only rule counts and digests."""
+    counts = {'allow': 0, 'warn': 0, 'block': 0}
+    by_rule, failure_path, samples = {}, 0, []
+    c_cache = {}
+    total = 0
+    for path in paths:
+        for cwd, command in iter_transcript_commands(path):
+            total += 1
+            if total > max_commands:
+                break
+            c = c_cache.get(cwd)
+            if c is None:
+                c = c_cache[cwd] = Compiled(load_policy(), cwd=cwd)
+            verdict, message = decide(command, c, cwd=cwd)
+            counts[verdict] += 1
+            if verdict != 'allow':
+                m = re.match(r'command_guard \w+ \[([^\]]+)\]', message)
+                rule = m.group(1) if m else 'unknown'
+                by_rule[rule] = by_rule.get(rule, 0) + 1
+                if rule.endswith(('/unanalysable', '/guard-error', '/unterminated', '/unparsable-payload')):
+                    failure_path += 1
+                if len(samples) < 200:
+                    samples.append({'verdict': verdict, 'rule': rule,
+                                    'sha256': hashlib.sha256(command.encode('utf-8', 'replace')).hexdigest()[:16]})
+    return {'commands': total, 'counts': counts, 'by_rule': by_rule, 'failure_path_blocks_or_warnings': failure_path,
+            'samples': samples}
 
 
 def main(argv=None):
@@ -2581,13 +4659,21 @@ def main(argv=None):
     sub = parser.add_subparsers(dest='cmd', required=True)
     hook = sub.add_parser('hook')
     hook.add_argument('--format', choices=('exit2', 'json'), default='exit2')
-    check = sub.add_parser('check')
+    check = sub.add_parser('check', help='decision for one command given as an argument (runs nothing)')
     check.add_argument('command')
     check.add_argument('--ps', action='store_true')
     check.add_argument('--cwd')
+    exp = sub.add_parser('explain', help='decision and every finding for a command read from a file')
+    exp.add_argument('--file', required=True)
+    exp.add_argument('--ps', action='store_true')
+    exp.add_argument('--cwd')
+    sub.add_parser('doctor', help='check the installed guard, its registration and a self-test')
+    rep = sub.add_parser('replay', help='decision counts over transcript JSONL files (never prints commands)')
+    rep.add_argument('paths', nargs='+')
     appr = sub.add_parser('approve-delete')
     appr.add_argument('--path', required=True)
-    appr.add_argument('--remote', required=True, help='rclone remote directory mirroring --path, e.g. dropbox:backups/claude-projects')
+    appr.add_argument('--remote', required=True, help='named rclone remote mirroring --path, e.g. dropbox:backups/x')
+    appr.add_argument('--wal', required=True, help='WAL that records this approval')
     appr.add_argument('--backup-verified-sha256', dest='digest')
     appr.add_argument('--ttl', type=int)
     sub.add_parser('revoke-delete')
@@ -2598,23 +4684,40 @@ def main(argv=None):
         return hook_main(args.format)
     if args.cmd == 'check':
         c = Compiled(load_policy(), cwd=args.cwd)
-        verdict, message = decide(args.command, c, cwd=args.cwd, ps=args.ps, marker=lambda p: marker_covers(p, compiled=c))
+        verdict, message = decide(args.command, c, cwd=args.cwd, ps=args.ps, marker=Approvals(compiled=c))
         print(json.dumps({'verdict': verdict, 'message': message}))
         return 0 if verdict != 'block' else 2
+    if args.cmd == 'explain':
+        import safe_input
+        text = safe_input.read_bounded(args.file, 4 << 20).decode('utf-8', 'replace')
+        result = explain(text, cwd=args.cwd, ps=args.ps)
+        print(json.dumps(result, indent=1))
+        return 0 if result['verdict'] != 'block' else 2
+    if args.cmd == 'doctor':
+        checks = doctor()
+        for name, ok, detail in checks:
+            print(json.dumps({'check': name, 'ok': bool(ok), 'detail': detail}))
+        healthy = all(ok for _n, ok, _d in checks)
+        print(json.dumps({'status': 'HEALTHY' if healthy else 'UNHEALTHY'}))
+        return 0 if healthy else 1
+    if args.cmd == 'replay':
+        print(json.dumps(replay(args.paths), indent=1))
+        return 0
     if args.cmd == 'approve-delete':
         try:
-            entry = approve_delete(args.path, args.remote, pinned_digest=args.digest, ttl=args.ttl)
+            entry = approve_delete(args.path, args.remote, pinned_digest=args.digest, ttl=args.ttl, wal=args.wal)
         except (ValueError, OSError) as error:
             print('approve-delete refused: %s' % error, file=sys.stderr)
             return 2
         print(json.dumps({'status': 'APPROVED', 'path': entry['path'], 'expires_at': entry['expires_at'],
-                          'manifest_sha256': entry['manifest_sha256'], 'files_checked': entry['remote_digest_checked']}))
+                          'manifest_sha256': entry['manifest_sha256'], 'files': entry['files']}))
         return 0
     if args.cmd == 'revoke-delete':
         try:
-            os.unlink(str(state_dir() / 'log-delete-ok.json'))
+            os.unlink(str(state_dir() / MARKER_NAME))
         except FileNotFoundError:
             pass
+        audit('revoked', {})
         print('{"status": "REVOKED"}')
         return 0
     if args.cmd == 'scan-wal':

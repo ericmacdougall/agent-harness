@@ -130,3 +130,64 @@ class ContinuationTests(unittest.TestCase):
         self.assertEqual(self.event('Stop', turn_id='later', stop_hook_active=False), {})
         self.state('active')
         self.assertEqual(self.event('Stop', turn_id='later', stop_hook_active=False)['decision'], 'block')
+
+
+class AlertParityAndDegrade(unittest.TestCase):
+    """goodqa#14613 M9: the Codex hook injects active ops-watch alerts and degrades instead of blocking on ENOSPC."""
+
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory(); self.addCleanup(self.home.cleanup)
+        self.env = {**os.environ, 'HOME': self.home.name}
+        self.hook = Path(__file__).resolve().parents[1] / 'codex' / 'hooks' / 'wal.py'
+
+    def run_hook(self, payload):
+        return subprocess.run([sys.executable, str(self.hook), 'hook'], input=json.dumps(payload), text=True,
+                              capture_output=True, env=self.env, timeout=30)
+
+    def test_active_alert_reaches_prompt_session_and_subagent_context(self):
+        # Run an installed-style copy (hook + ops_watch.py beside it, as install_codex ships them) so the positive
+        # path is proven without the checkout-relative candidate; the test then passes from an archive without .git.
+        import shutil
+        install_dir = Path(self.home.name) / '.codex' / 'agent-harness'; install_dir.mkdir(parents=True)
+        shutil.copy(self.hook, install_dir / 'wal.py')
+        shutil.copy(Path(__file__).resolve().parents[1] / 'harness' / 'hooks' / 'ops_watch.py', install_dir / 'ops_watch.py')
+        self.hook = install_dir / 'wal.py'
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'harness' / 'hooks'))
+        import ops_watch
+        ops_watch.emit({'schema': 1, 'at': '2026-11-05T08:00:00+00:00', 'host': 'testhost', 'source': 'test-alert',
+                        'event': 'raise', 'severity': 'high', 'key': 'disk:volume:/', 'message': 'ALERT-MARKER-41 disk 97 percent'},
+                       home=Path(self.home.name))
+        for payload in ({'hook_event_name': 'SessionStart', 'session_id': 'alerts', 'source': 'startup'},
+                        {'hook_event_name': 'UserPromptSubmit', 'session_id': 'alerts', 'prompt': 'hi'},
+                        {'hook_event_name': 'SubagentStart', 'session_id': 'alerts', 'agent_id': 'a1', 'agent_type': 'general-purpose'}):
+            result = self.run_hook(payload)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            context = json.loads(result.stdout)['hookSpecificOutput']['additionalContext']
+            self.assertIn('ALERT-MARKER-41', context, payload['hook_event_name'])
+
+    def test_checkout_loader_candidate_is_not_used_from_an_install_dir(self):
+        # Installed under <home>/.codex/agent-harness the checkout-relative candidate would be <home>/harness/hooks;
+        # it must only apply inside a git checkout, so an installed copy with no ops_watch beside it injects nothing.
+        import shutil
+        install_dir = Path(self.home.name) / '.codex' / 'agent-harness'; install_dir.mkdir(parents=True)
+        shutil.copy(self.hook, install_dir / 'wal.py')
+        decoy = Path(self.home.name) / 'harness' / 'hooks'; decoy.mkdir(parents=True)
+        (decoy / 'ops_watch.py').write_text('def injection_text(home, max_chars=700):\n    return " DECOY-LOADED"\n')
+        result = subprocess.run([sys.executable, str(install_dir / 'wal.py'), 'hook'],
+                                input=json.dumps({'hook_event_name': 'UserPromptSubmit', 'session_id': 'ld', 'prompt': 'hi'}),
+                                text=True, capture_output=True, env=self.env, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('DECOY-LOADED', json.loads(result.stdout)['hookSpecificOutput']['additionalContext'])
+
+    def test_unwritable_wal_dir_degrades_to_a_note_instead_of_blocking(self):
+        first = self.run_hook({'hook_event_name': 'UserPromptSubmit', 'session_id': 'ro', 'prompt': 'hi'})
+        self.assertEqual(first.returncode, 0, first.stderr)
+        session_dir = Path(self.home.name, '.agent-harness') / 'codex-wals' / 'ro'
+        self.assertTrue(session_dir.is_dir(), sorted(str(p) for p in (Path(self.home.name) / '.agent-harness').rglob('*'))[:10])
+        wal_file = session_dir / 'main.jsonl'
+        os.chmod(wal_file, 0o400); self.addCleanup(lambda: os.chmod(wal_file, 0o600))
+        result = self.run_hook({'hook_event_name': 'UserPromptSubmit', 'session_id': 'ro', 'prompt': 'again'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        context = json.loads(result.stdout)['hookSpecificOutput']['additionalContext']
+        self.assertIn('WAL append failed', context); self.assertIn('EACCES', context)
+        self.assertNotIn('"decision"', result.stdout)

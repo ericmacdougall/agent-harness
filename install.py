@@ -23,7 +23,16 @@ END = "<!-- agent-harness:end -->"
 AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py",
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
-         "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py", "log_backup.py", "backup_watch.py")
+         "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "review_map.py",
+         "review_diagnostics.py", "review_policy.json", "merge_gate.py",
+         "heavy_job_guard.py", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "ops_watch.py", "resource_limits.json",
+         "domain_gates.py", "domain_checklists.json",
+         "command_guard.py", "command_guard_hook.py", "redact.py", "kill_guard.py", "kill_guard_policy.json",
+         "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py",
+         "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
+         "ahd.py", "ahd_peek.py", "ahd_policy.json",
+         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py",
+         "log_backup.py", "backup_watch.py")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -40,10 +49,13 @@ class DirectoryPublicationError(OSError):
 
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
-            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "log_backup.py")}
+            for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
+                         "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py")}
 
 
-SUBAGENT_MATCHER = "^(task-owner|click-tester|fixer|red-team)$"
+# Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
+# SubagentStart/Stop WAL record, so no liveness check could see them stop (goodqa#14613, the Solve drop).
+SUBAGENT_MATCHER = ".*"
 GOODQA_STATUS_TOOLS = (r"^mcp__.*[Gg][Oo][Oo][Dd][Qq][Aa].*__(close_issue_done|close_issue_wont_fix|update_issue|"
                        r"bulk_update_issues|archive_issue|reassign_issue|call_api)$")
 
@@ -63,7 +75,31 @@ def provenance_hook_groups(claude: Path) -> dict[str, list[dict]]:
     }
 
 
-def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]]:
+def merge_gate_hook(claude: Path) -> dict:
+    """Merge gate (docs/operations.md#merge-gate): blocks PR merges unless every check on the head is green.
+    It rides in the WAL pretool group, whose matcher already covers Bash and the write tools (the waiver state
+    files must not be edited by hand). Its own deadline is 40 s; onFailure block turns a crash into a block."""
+    return {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "merge_gate.py"), "hook"],
+            "timeout": 60, "onFailure": "block"}
+
+
+def command_guard_group(claude: Path) -> dict:
+    """Destructive and config-dump command guard (GoodQA #14471, docs/operations.md). The launcher blocks on its
+    own when the analyser fails; onFailure covers the launcher itself. The `hook` verb marks it a fail-closed
+    gate for the Go front door (cmd/harness/gates.json); the launcher ignores its arguments."""
+    return {"matcher": "Bash|PowerShell", "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "command_guard_hook.py"), "hook"],
+        "timeout": 30, "onFailure": "block"}]}
+
+
+def kill_guard_group(claude: Path) -> dict:
+    """Broad-kill and unowned-PID kill guard (GoodQA #14506). Its launcher fails closed on its own."""
+    return {"matcher": "Bash|PowerShell", "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "kill_guard.py"), "hook"],
+        "timeout": 30, "onFailure": "block"}]}
+
+
+def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = True) -> dict[str, list[dict]]:
     script = str(claude / "hooks" / "wal.py")
     policy = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "commit_policy.py"), "hook"],
               "timeout": 60, "onFailure": "block"}  # gh pr create checks GitHub and GoodQA
@@ -71,8 +107,22 @@ def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]
     spec_gate = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "spec_flow.py"), "hook"],
                  "timeout": 60, "onFailure": "block"}
 
+    # Resource guards fail OPEN (no onFailure=block): a guard bug must never stop all Bash or Agent calls.
+    heavy_guard = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "heavy_job_guard.py")],
+                   "timeout": 10}
+    agent_gate = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "agent_gate.py")], "timeout": 10}
+
     def command(event: str, fail_closed: bool = False) -> dict:
         hook = {"type": "command", "command": "python3", "args": [script, event], "timeout": 10}
+        if fail_closed:
+            hook["onFailure"] = "block"
+        return hook
+
+    # Model ladder (goodqa#14527): rung enforcement on spawns, launch lines and the live-agent cap.
+    # Fails open on its own errors (an unreadable tier table denies from inside the hook), so no onFailure.
+    def ladder(action: str, fail_closed: bool = False) -> dict:
+        hook = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "tier_gate.py"), action],
+                "timeout": 10}
         if fail_closed:
             hook["onFailure"] = "block"
         return hook
@@ -86,26 +136,47 @@ def managed_hooks(claude: Path, provenance: bool = True) -> dict[str, list[dict]
         "SubagentStart": [{
             "matcher": SUBAGENT_MATCHER,
             "hooks": [command("subagent")],
+        }, {
+            "hooks": [ladder("start")],
         }],
         "SubagentStop": [{
             "matcher": SUBAGENT_MATCHER,
             "hooks": [command("subagent_stop")],
+        }, {
+            "hooks": [ladder("stop")],
         }],
         "PreToolUse": [{
             "matcher": "Agent|Task|Workflow|Bash|PowerShell|Write|Edit|MultiEdit|NotebookEdit",
-            "hooks": [command("pretool", True)],
+            "hooks": [command("pretool", True), merge_gate_hook(claude)],
+        }, {
+            "matcher": "Agent|Task|Workflow|Bash",
+            "hooks": [ladder("hook", True)],
         }, {
             # Commit message policy: validates git commit / gh pr merge --squash before they run.
             "matcher": "Bash",
             "hooks": [policy],
         }, {
+            # Route heavy Mac work (browsers, full suites, builds) to dev2; advisory for hostile probes.
+            "matcher": "Bash",
+            "hooks": [heavy_guard],
+        }, {
+            "matcher": "Agent|Task|Workflow",
+            "hooks": [agent_gate],
+        }, {
             "matcher": GOODQA_STATUS_TOOLS,
             "hooks": [spec_gate],
         }],
     }
+    if command_guard:
+        managed["PreToolUse"].insert(0, command_guard_group(claude))
+        managed["PreToolUse"].insert(1, kill_guard_group(claude))
     if provenance:
         for event, groups in provenance_hook_groups(claude).items():
             managed.setdefault(event, []).extend(groups)
+    # Local-ledger reminder (docs/ledger.md): rate limited and dismissible; fails open, so no onFailure.
+    reminder = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "ledger_reminder.py")], "timeout": 3}
+    for event in ("SessionStart", "UserPromptSubmit"):
+        managed.setdefault(event, []).append({"hooks": [reminder]})
     return managed
 
 
@@ -114,7 +185,8 @@ def durable_scratch(claude: Path) -> Path:
     return claude.parent / ".agent-harness" / "scratch"
 
 
-def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, provenance: bool = True) -> dict:
+def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, provenance: bool = True,
+                    command_guard: bool = True) -> dict:
     settings = json.loads(json.dumps(current))
     env = settings.get("env", {})
     if not isinstance(env, dict):
@@ -129,7 +201,7 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
         settings["env"] = {key: value for key, value in env.items() if key != TMPDIR_KEY}
     hooks = settings.setdefault("hooks", {})
     scripts = managed_scripts(claude)
-    wanted = managed_hooks(claude, provenance)
+    wanted = managed_hooks(claude, provenance, command_guard)
     for event in sorted(set(wanted) | set(managed_hooks(claude, True))):
         managed = wanted.get(event, [])
         entries = hooks.setdefault(event, [])
@@ -160,9 +232,22 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
         rule = f"Bash(python3 ~/.claude/hooks/commit_policy.py {action} *)"
         if rule not in allowed:
             allowed.append(rule)
+    for action in ("check", "report"):  # merge gate reads; `waive` is deliberately not preapproved
+        rule = f"Bash(python3 ~/.claude/hooks/merge_gate.py {action} *)"
+        if rule not in allowed:
+            allowed.append(rule)
     # Read-only spec checks are preapproved; commands that post to tickets are not.
     for action in ("lint", "status"):
         rule = f"Bash(python3 ~/.claude/hooks/spec_flow.py {action} *)"
+        if rule not in allowed:
+            allowed.append(rule)
+    for action in ("check", "capacity"):  # read-only; run_capped.py/run_probe.py run arbitrary commands, so stay prompted
+        rule = f"Bash(python3 ~/.claude/hooks/resource_budget.py {action} *)"
+        if rule not in allowed:
+            allowed.append(rule)
+    # ah reads are local or GoodQA reads; ah writes (task, ticket comment, spool) stay prompted.
+    for action in ("owners", "user-msg", "disk", "ticket get", "ticket comments", "write result", "task list"):
+        rule = f"Bash(python3 ~/.claude/hooks/ah.py {action}*)"
         if rule not in allowed:
             allowed.append(rule)
     rule = "Bash(python3 ~/.claude/hooks/workdir.py prune)"  # dry run only; --apply still asks
@@ -520,7 +605,8 @@ def read_regular(path: Path, *, pinned_parent=None, retain_fd=None):
         return None
 
 
-def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool = True) -> list[str]:
+def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool = True,
+            command_guard: bool = True) -> list[str]:
     claude = home.expanduser().resolve() / ".claude"
     files = [
         *((ROOT / "harness" / folder / name, claude / folder / name)
@@ -552,7 +638,7 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
         if not isinstance(current_settings, dict):
             raise ValueError("settings.json must contain an object")
-        settings = merged_settings(current_settings, claude, durable_tmp, provenance)
+        settings = merged_settings(current_settings, claude, durable_tmp, provenance, command_guard)
         # Read every payload before any managed write (also validate it in preview).
         payloads = [(destination, source.read_bytes()) for source, destination in files]
         payloads += [(instructions_path, instructions.encode()),
@@ -560,6 +646,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         changes = [str(path) for path in managed]
         if not apply:
             return changes
+        for note in migrate_local_profiles(claude):
+            print(f"  {note}")
         originals = {path: read_regular(path, pinned_parent=pins.fd(path.parent),
                                         retain_fd=pins.file_fds)
                      for path in managed}
@@ -747,6 +835,80 @@ def log_backup_status(home: Path, apply: bool) -> str:
         return f"log backup: skipped ({error.__class__.__name__}: {error})"
 
 
+def migrate_local_profiles(claude: Path, policy_dir: Path | None = None) -> list[str]:
+    """Before the shipped policies are overwritten, copy their personal values into new untracked 0600 profiles.
+    Never overwrites an existing profile. Without this an upgrade would silently turn ticket enforcement off."""
+    notes = []
+    hooks = policy_dir if policy_dir is not None else claude / "hooks"  # Codex keeps its policies in ~/.codex/agent-harness
+    def keep(name, build):
+        old, target = hooks / name, hooks / name.replace(".json", ".local.json")
+        if target.exists() or target.is_symlink() or not old.is_file():
+            return
+        try:
+            data = build(json.loads(old.read_text(encoding="utf-8")))
+        except (OSError, ValueError, AttributeError):
+            return
+        if data:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+            notes.append(f"migrated personal values from {name} to {target.name} (mode 0600)")
+    def commit(policy):
+        out = {}
+        if policy.get("backstop_repos"):
+            out["backstop_repos"] = policy["backstop_repos"]
+        keys = ("repos", "org_id", "key_file", "key_secret", "default_project", "projects", "unreachable_projects", "unreachable_reason")
+        systems = {n: {k: v for k, v in e.items() if k in keys and v not in ([], {}, "", None)}
+                   for n, e in (policy.get("ticket_systems") or {}).items() if isinstance(e, dict)}
+        for e in systems.values():  # the loader accepts only these route keys; an old extra key would break commits
+            if isinstance(e.get("projects"), dict):
+                e["projects"] = {s: {k: v for k, v in r.items() if k in ("project_id", "org_id", "key_file")}
+                                 for s, r in e["projects"].items() if isinstance(r, dict)}
+        systems = {n: e for n, e in systems.items() if e.get("repos") or e.get("org_id")}
+        if systems:
+            out["ticket_systems"] = systems
+        return out
+    def spec(policy):
+        out = {k: policy[k] for k in ("projects", "enforced_projects") if policy.get(k)}
+        if isinstance(out.get("projects"), dict):
+            out["projects"] = {s: {k: v for k, v in r.items() if k in ("project_id", "org_id", "key_file")}
+                               for s, r in out["projects"].items() if isinstance(r, dict)}
+        return out
+    keep("commit_policy.json", commit)
+    keep("spec_policy.json", spec)
+    return notes
+
+
+def local_profile_status(home: Path, policy_dir: Path | None = None) -> str:
+    """The shipped policy is generic, so a host without commit_policy.local.json has ticket enforcement off."""
+    hooks = policy_dir if policy_dir is not None else home.expanduser() / ".claude" / "hooks"
+    missing = [name for name in ("commit_policy.local.json", "spec_policy.local.json") if not (hooks / name).is_file()]
+    if not missing:
+        return f"policy profiles: commit_policy.local.json and spec_policy.local.json present in {hooks}"
+    return ("policy profiles: MISSING " + ", ".join(missing) + " -- ticket enforcement, the git backstop and spec "
+            "project routing match nothing until you copy each .example beside the installed hooks and fill it in")
+
+
+def command_guard_status(enabled: bool, runner=None) -> str:
+    """Claude Code before 2.1.295 ignores onFailure, so fail-closed then rests on the launcher alone."""
+    if not enabled:
+        return "command guard: not registered (--no-command-guard)"
+    import subprocess
+    try:
+        out = runner() if runner else subprocess.run(["claude", "--version"], capture_output=True, text=True,
+                                                     timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    found = re.search(r"(\d+)\.(\d+)\.(\d+)", out or "")
+    version = tuple(int(x) for x in found.groups()) if found else None
+    if version is None:
+        return "command guard: registered; Claude Code version unknown, fail-closed rests on the launcher"
+    if version < (2, 1, 295):
+        return ("command guard: registered; WARNING Claude Code %s predates onFailure (2.1.295), fail-closed "
+                "rests on the launcher alone" % ".".join(map(str, version)))
+    return "command guard: registered with onFailure block"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
@@ -764,6 +926,9 @@ def main() -> None:
     parser.add_argument("--no-provenance-hooks", dest="provenance", action="store_false",
                         help="do not register the provenance hooks (ask-gate, stop-lint, prompt) and remove any "
                              "registered by an earlier install; the files stay installed; not remembered")
+    parser.add_argument("--no-command-guard", dest="command_guard", action="store_false",
+                        help="do not register the destructive/config-dump command guard and remove an earlier "
+                             "registration (rollback); the files stay installed; not remembered")
     args = parser.parse_args()
     durable_tmp = durable_tmp_choice(args.home, args.durable_tmp)
     if args.apply and args.durable_tmp is not None:
@@ -775,7 +940,8 @@ def main() -> None:
                            f"{args.home / '.agent-harness'} ({error.__class__.__name__}); it must be a "
                            "real directory, not a symlink\n")
     try:
-        changes = install(args.home, args.apply, durable_tmp=durable_tmp, provenance=args.provenance)
+        changes = install(args.home, args.apply, durable_tmp=durable_tmp, provenance=args.provenance,
+                          command_guard=args.command_guard)
     except DirectoryPublicationError as error:
         parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"
@@ -786,6 +952,8 @@ def main() -> None:
     print(f"  {scratch_status(args.home, args.apply, durable_tmp)}")
     print(f"  {netwatch_status(args.home, args.apply, args.netwatch)}")
     print(f"  {log_backup_status(args.home, args.apply)}")
+    print(f"  {local_profile_status(args.home)}")
+    print(f"  {command_guard_status(args.command_guard)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")
 

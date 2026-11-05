@@ -61,11 +61,33 @@ def verdict(home: Path, now: float | None = None) -> dict:
             "bulk_age": b.get("age")}
 
 
-def _read_state(path: Path, now: float | None = None) -> dict:
-    """Previous verdict, or {} when the file is missing, corrupt, the wrong shape or dated in the future."""
+MAX_STATE_BYTES = 65536
+
+
+def _read_small(path: Path, limit: int) -> str | None:
+    """The file's text when it is a regular file of at most `limit` bytes, else None (missing, a symlink, oversized or
+    unreadable). Never reads more than limit + 1 bytes."""
     try:
-        d = json.loads(path.read_text())
-    except (OSError, ValueError):
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        data = os.read(fd, limit + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return data.decode("utf-8", "replace") if len(data) <= limit else None
+
+
+def _read_state(path: Path, now: float | None = None) -> dict:
+    """Previous verdict, or {} when the file is missing, corrupt, oversized, the wrong shape or dated in the future."""
+    text = _read_small(path, MAX_STATE_BYTES)
+    try:
+        d = json.loads(text) if text is not None else None
+    except ValueError:
+        return {}
+    if d is None:
         return {}
     now = time.time() if now is None else now
     if (not isinstance(d, dict) or not isinstance(d.get("code"), int) or isinstance(d.get("code"), bool)
@@ -192,7 +214,7 @@ def install(home: Path, apply: bool, system: str | None = None, run=default_runn
     for path, text in unit_files(home, system):
         if path.is_symlink() or path.parent.is_symlink():
             return out + [f"refused symlink {path}"], 5
-        same = path.exists() and path.read_text() == text
+        same = path.exists() and _read_small(path, len(text.encode("utf-8")) + 1) == text  # oversized or unreadable counts as different
         out.append(f"{'unchanged' if same else ('wrote' if apply else 'would write')} {path}")
         if apply and not same:
             path.parent.mkdir(parents=True, exist_ok=True)

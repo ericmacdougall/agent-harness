@@ -1,4 +1,5 @@
 import json
+import re
 import os
 import stat
 import subprocess
@@ -24,6 +25,32 @@ class InstallerTests(unittest.TestCase):
         self.home = Path(self.temp.name).resolve()
         self.claude = self.home / ".claude"
         self.claude.mkdir()
+
+    def test_subagent_hooks_fire_for_every_agent_type(self):
+        # goodqa#14613: the matcher covered four agent types, so a general-purpose owner never got a
+        # SubagentStart/Stop WAL record and no liveness check could see it stop.
+        install(self.home, apply=True)
+        hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+        for event, action in (("SubagentStart", "subagent"), ("SubagentStop", "subagent_stop")):
+            groups = [g for g in hooks[event]
+                      if any(os.path.basename(str((h.get("args") or [""])[0])) == "wal.py" for h in g.get("hooks", []))]
+            self.assertEqual(len(groups), 1, event)
+            matcher = groups[0].get("matcher")
+            self.assertIn(matcher, (None, ".*", "*"), (event, matcher))  # every type, not a list of named types
+            matcher = matcher or ".*"
+            for agent_type in ("general-purpose", "claude", "Explore", "Plan", "task-owner", "red-team", "fixer",
+                               "click-tester", "statusline-setup", "any-new-type-123"):
+                self.assertTrue(re.fullmatch(matcher if matcher != "*" else ".*", agent_type), (event, matcher, agent_type))
+            hook = [h for h in groups[0]["hooks"] if os.path.basename(str(h["args"][0])) == "wal.py"][0]
+            self.assertEqual(hook["args"][1], action)
+            result = subprocess.run([sys.executable, *[str(a) for a in hook["args"]]],
+                                    input=json.dumps({"session_id": "s-gp", "agent_id": "owner-gp", "agent_type": "general-purpose"}),
+                                    text=True, capture_output=True, timeout=30, env={**os.environ, "HOME": str(self.home)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+        wal = self.claude / "wals" / "s-gp" / "main.jsonl"
+        self.assertTrue(wal.exists(), list((self.claude / "wals").rglob("*")))
+        events = [json.loads(line).get("event") for line in wal.read_text().splitlines() if line.strip()]
+        self.assertIn("subagent", events); self.assertIn("subagent_stop", events)
 
     def test_preview_does_not_write(self):
         paths = install(self.home, apply=False)
@@ -109,7 +136,7 @@ class InstallerTests(unittest.TestCase):
         first = json.loads((self.claude / "settings.json").read_text())
         self.assertEqual(first["model"], "sonnet")
         self.assertEqual(first["permissions"]["deny"], ["Read(**/.env)"])
-        self.assertEqual(len(first["hooks"]["PreToolUse"]), 5)  # user + WAL + commit policy + spec gate + ask gate
+        self.assertEqual(len(first["hooks"]["PreToolUse"]), 10)  # user + command guard + kill guard + WAL + ladder + commit policy + heavy-job guard + agent gate + spec gate + ask gate
         self.assertNotIn("skipDangerousModePermissionPrompt", first)
         self.assertIn("My existing instructions.", (self.claude / "CLAUDE.md").read_text())
         self.assertEqual((self.claude / "CLAUDE.md").read_text().count(START), 1)
@@ -118,6 +145,54 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual((self.claude / "CLAUDE.md").read_text().count(START), 1)
         self.assertTrue(list((self.claude / "agent-harness-backups").rglob("settings.json")))
+
+    def test_installs_resource_guards_wiring_and_red_team_idempotently(self):
+        install(self.home, apply=True)
+        for name in ("heavy_job_guard.py", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py",
+                     "resource_limits.json"):
+            self.assertEqual((self.claude / "hooks" / name).read_bytes(), (ROOT / "harness/hooks" / name).read_bytes(), name)
+        self.assertIn("run_probe.py", (self.claude / "agents" / "red-team.md").read_text())
+        settings = json.loads((self.claude / "settings.json").read_text())
+        groups = {tuple(group["hooks"][0].get("args", [""])[:1]): group for group in settings["hooks"]["PreToolUse"]}
+        heavy = groups[(str(self.claude / "hooks" / "heavy_job_guard.py"),)]
+        gate = groups[(str(self.claude / "hooks" / "agent_gate.py"),)]
+        self.assertEqual(heavy["matcher"], "Bash")
+        self.assertEqual(gate["matcher"], "Agent|Task|Workflow")
+        for group in (heavy, gate):  # fail-open: a guard bug must never block every Bash or Agent call
+            self.assertNotIn("onFailure", group["hooks"][0])
+        limits = json.loads((self.claude / "hooks" / "resource_limits.json").read_text())
+        self.assertEqual((limits["warn_agents"], limits["max_agents"]), (12, 20))
+        before = (self.claude / "settings.json").read_bytes()
+        hook_bytes = {n: (self.claude / "hooks" / n).read_bytes() for n in ("heavy_job_guard.py", "agent_gate.py")}
+        install(self.home, apply=True)  # second run changes nothing
+        self.assertEqual((self.claude / "settings.json").read_bytes(), before)
+        self.assertEqual(sum(1 for g in json.loads(before)["hooks"]["PreToolUse"] if g["hooks"][0].get("args", [""])[0].endswith("heavy_job_guard.py")), 1)
+        self.assertEqual(hook_bytes, {n: (self.claude / "hooks" / n).read_bytes() for n in hook_bytes})
+
+    def test_reinstall_keeps_exactly_one_of_each_group_from_both_feature_sets(self):
+        for _ in range(3):
+            install(self.home, apply=True)
+        hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+        counts = {}
+        for event, groups in hooks.items():
+            for group in groups:
+                for hook in group.get("hooks", []):
+                    args = hook.get("args") or []
+                    if args and str(args[0]).startswith(str(self.claude / "hooks")):
+                        key = (event, group.get("matcher"), os.path.basename(args[0]), tuple(args[1:]))
+                        counts[key] = counts.get(key, 0) + 1
+        self.assertTrue(counts and all(v == 1 for v in counts.values()), counts)
+        names = {k[2] for k in counts}
+        self.assertTrue({"heavy_job_guard.py", "agent_gate.py", "provenance_hooks.py", "wal.py", "commit_policy.py",
+                         "spec_flow.py"} <= names, names)
+        self.assertTrue(any(k[:3] == ("PreToolUse", "Bash", "heavy_job_guard.py") for k in counts))
+        self.assertTrue(any(k[:3] == ("PreToolUse", "Agent|Task|Workflow", "agent_gate.py") for k in counts))
+        install(self.home, apply=True, provenance=False)  # provenance can still be removed without touching the guards
+        after = json.loads((self.claude / "settings.json").read_text())["hooks"]
+        flat = json.dumps(after)
+        self.assertNotIn("provenance_hooks.py", flat)
+        self.assertIn("heavy_job_guard.py", flat)
+        self.assertIn("agent_gate.py", flat)
 
     def provenance_entries(self):
         settings = json.loads((self.claude / "settings.json").read_text())
@@ -129,6 +204,30 @@ class InstallerTests(unittest.TestCase):
                     if script in (hook.get("args") or []):
                         found.append((event, group.get("matcher"), hook["args"][1]))
         return sorted(found, key=str)
+
+    def test_ledger_reminder_hook_is_registered_failopen_once_and_preserves_foreign_hooks(self):
+        foreign = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "other-start"}]}]}}
+        (self.claude / "settings.json").write_text(json.dumps(foreign))
+        install(self.home, apply=True)
+        install(self.home, apply=True)
+
+        def entries():
+            hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+            return {event: [h for g in hooks.get(event, []) for h in g["hooks"]
+                            if (h.get("args") or [""])[0].endswith("ledger_reminder.py")]
+                    for event in ("SessionStart", "UserPromptSubmit")}
+
+        found = entries()
+        for event, hooks in found.items():
+            self.assertEqual(len(hooks), 1, event)  # registered once, not duplicated by a reinstall
+            self.assertNotIn("onFailure", hooks[0])
+            self.assertLessEqual(hooks[0]["timeout"], 3)
+        start = json.loads((self.claude / "settings.json").read_text())["hooks"]["SessionStart"]
+        self.assertTrue(any(h.get("command") == "other-start" for g in start for h in g["hooks"]))
+        before = (self.claude / "settings.json").read_bytes()
+        install(self.home, apply=True)
+        self.assertEqual((self.claude / "settings.json").read_bytes(), before)  # a further run changes nothing
+        self.assertTrue((self.claude / "hooks" / "ledger_reminder.py").exists())
 
     def test_provenance_gates_are_registered_once_and_survive_reinstall(self):
         foreign = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other-stop"}]}]}}
@@ -182,7 +281,7 @@ class InstallerTests(unittest.TestCase):
         ))
         install(self.home, apply=True)
         settings = json.loads((self.claude / "settings.json").read_text())
-        self.assertEqual(len(settings["hooks"]["PreToolUse"]), 5)  # + spec gate + ask gate
+        self.assertEqual(len(settings["hooks"]["PreToolUse"]), 10)  # + command guard + kill guard + ladder + heavy-job guard + agent gate + spec gate + ask gate
         self.assertEqual(settings["hooks"]["PreToolUse"][0]["hooks"][0]["args"], [])
 
     def test_backups_are_private(self):
@@ -211,7 +310,7 @@ class InstallerTests(unittest.TestCase):
         install(self.home, apply=True)
         groups = json.loads((self.claude / "settings.json").read_text())["hooks"]["PreToolUse"]
         self.assertEqual(groups[0], {**group, "hooks": [foreign]})
-        self.assertEqual(len(groups), 5)  # foreign + WAL + commit policy + spec gate + ask gate
+        self.assertEqual(len(groups), 10)  # foreign + command guard + kill guard + WAL + ladder + commit policy + heavy-job guard + agent gate + spec gate + ask gate
 
     def test_refuses_symlinked_parent_directories_before_writing(self):
         for name in ("agents", "hooks", "tools", "agent-harness-backups", ".claude"):

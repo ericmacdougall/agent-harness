@@ -23,6 +23,7 @@ from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
+os.environ["AGENT_HARNESS_POLICY_LOCAL"] = str(Path(__file__).resolve().parent / "data" / "policy_profile_fixture.json")  # hermetic profile (GoodQA #14538)
 import provenance  # noqa: E402
 sys.path.insert(0, str(HOOKS))
 import commit_policy as cp  # noqa: E402
@@ -33,7 +34,7 @@ sys.path.insert(0, str(HOOKS.parent.parent))
 import install  # noqa: E402
 
 ISSUE = "4e8e73fb-72e2-4604-bff5-56b75e4420f5"
-PROJECT = "75ebadd3-9b4c-4b8c-bc86-9a4c1cbd3a53"
+PROJECT = "00000000-0000-4000-8000-0000000000a1"
 SPEC = """# Spec: Done gate
 
 Ticket: GoodQA harness#168
@@ -62,6 +63,18 @@ An agent cannot mark a harness ticket done without proof.
 - NEG-1 (AC-1): a tampered attachment is not accepted.
   Source: ticket:GoodQA harness#14398
 
+
+## Resource budget
+Host: vm:fixture
+Capacity: fixture VM, 8 GB memory, 4 cores, 50 GB disk
+Fan-out: agents=1 jobs=1 processes=2 browser_pages=0 test_workers=1
+Peak memory: 1 GB (method: fixture)
+CPU: 1 cores (method: fixture)
+Disk: 1 GB (method: fixture)
+Network: 1 MB (method: fixture)
+Wall time: 1 min
+Cap and kill: none needed for a fixture; run_capped.py would pause on breach
+Checkpoint: none
 ## Risks
 
 - Hook breaks MCP calls: narrow matcher, warn first.
@@ -238,6 +251,9 @@ class SpecFlowCase(unittest.TestCase):
                            org_id="org-1", timeout_seconds=5, total_deadline_seconds=30)
         self.policy["ticket_systems"]["goodqa"] = self.config
         self.spec_policy = sf.load_spec_policy(HOOKS / "spec_policy.json")
+        # The tracked policy names no projects (personal values live in spec_policy.local.json), so the tests carry
+        # their own fixture route for the one project they exercise.
+        self.spec_policy["projects"] = {"harness": {"project_id": PROJECT, "org_id": "00000000-0000-4000-8000-000000000001"}}
         loader = lambda _sp: (cp, self.policy, self.config)  # noqa: E731
         self.patches.append(mock.patch.object(sf, "ticket_config", loader))
         self.patches.append(mock.patch.object(sf, "load_spec_policy", lambda *a: self.spec_policy))
@@ -388,6 +404,21 @@ class Reviews(SpecFlowCase):
         self.wal(self.main_wal, {"at": "t", "event": "subagent", "agent_id": "x9", "agent_type": "fixer"})
         self.assertEqual(self.run_cli(*args, "--role", "adversarial")[0], 2)
         self.assertEqual(self.run_cli(*args, "--role", "acceptance")[0], 0)
+        # Each reviewer type is accepted on the acceptance path (a removed type would fail safe but is still a regression).
+        for agent_type in ("task-owner", "click-tester", "red-team"):
+            agent = "ok-" + agent_type
+            self.wal(self.main_wal, {"at": "t", "event": "subagent", "agent_id": agent, "agent_type": agent_type})
+            code, _, err = self.run_cli("review", str(spec), "--agent", agent, "--wal", str(self.main_wal), "--verdict",
+                                        "ACCEPT", "--report-file", str(report), "--role", "acceptance")
+            self.assertEqual(code, 0, (agent_type, err))
+        # Every agent type is logged now (goodqa#14613); only the reviewer types may record a review.
+        for agent_type in ("Explore", "statusline-setup", "claude-code-guide", "general-purpose"):
+            agent = "r-" + agent_type.lower()
+            self.wal(self.main_wal, {"at": "t", "event": "subagent", "agent_id": agent, "agent_type": agent_type})
+            code, _, err = self.run_cli("review", str(spec), "--agent", agent, "--wal", str(self.main_wal), "--verdict",
+                                        "ACCEPT", "--report-file", str(report), "--role", "acceptance")
+            self.assertEqual(code, 2, agent_type)
+            self.assertIn("may record a review", err)
 
     def test_edit_after_review_makes_reviews_stale_and_attach_refuses(self):
         spec = self.reviewed_spec()
@@ -1141,7 +1172,7 @@ class HookDeadline(SpecFlowCase):
 
 
 class PlanGate(SpecFlowCase):
-    def repo(self, origin="https://github.com/ericmacdougall/agent-harness.git"):
+    def repo(self, origin="https://github.com/example-org/agent-harness.git"):
         repo = Path(tempfile.mkdtemp(dir=self.tmp))
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", origin], check=True)
@@ -1213,6 +1244,10 @@ class Install(unittest.TestCase):
         pre = [h for entry in settings["hooks"]["PreToolUse"] for h in entry["hooks"]
                if (h.get("args") or [""])[0].endswith("spec_flow.py")]
         stops = [h for entry in settings["hooks"]["SubagentStop"] for h in entry["hooks"]]
+        # The model ladder (tier_gate.py stop) is a second, separate SubagentStop hook; each must appear once.
+        ladder = [h for h in stops if (h.get("args") or [""])[0].endswith("tier_gate.py")]
+        stops = [h for h in stops if h not in ladder]
+        self.assertEqual(len(ladder), 1)
         self.assertEqual(len(pre), 1)
         self.assertEqual((pre[0]["timeout"], pre[0]["onFailure"]), (60, "block"))
         self.assertEqual(len(stops), 1)

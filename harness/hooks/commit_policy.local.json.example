@@ -1,0 +1,17 @@
+{
+  "_comment": "Copy to commit_policy.local.json beside commit_policy.json (untracked; never overwritten by the installer). Any key here replaces the shipped value; objects merge.",
+  "backstop_repos": [
+    "github\\.com[:/]your-org/"
+  ],
+  "ticket_systems": {
+    "goodqa": {
+      "repos": [
+        "github\\.com[:/]your-org/"
+      ],
+      "org_id": "00000000-0000-4000-8000-000000000000",
+      "key_file": "~/.claude/goodqa-hive/member.key",
+      "unreachable_projects": [],
+      "unreachable_reason": ""
+    }
+  }
+}

@@ -157,6 +157,9 @@ if a[:2]==['pr','list']:
 elif a[:2]==['pr','create']:
     s['creates']+=1;s['created']=not s.get('create_absent',False);p.write_text(json.dumps(s))
     if s.get('fail_list_after_create'):s['list_fail']=True;p.write_text(json.dumps(s))
+    sys.stderr.write(s.get('create_stderr',''));sys.stderr.flush()
+    if s.get('create_stderr_flood'):
+        for _ in range(int(s['create_stderr_flood'])):sys.stderr.write('x'*65536)
     print('https://github.com/fixture/project/pull/1');sys.exit(s.get('create_exit',0))
 elif a[:2]==['pr','view']:
     if s.get('view_fail'):sys.exit(1)
