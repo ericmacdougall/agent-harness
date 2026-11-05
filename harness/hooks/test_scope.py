@@ -42,6 +42,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -169,7 +170,7 @@ def baseline_get(store: Store, repo_id: str, main_sha: str):
 
 
 def baseline_record(store: Store, repo_id: str, main_sha: str, command: str, result: str, counts=None, failing=None,
-                    replace: bool = False, host: str = "") -> dict:
+                    replace: bool = False, host: str = "", suite: dict = None) -> dict:
     full_sha(main_sha, "main SHA")
     if result not in ("pass", "fail"):
         raise ValueError("result must be pass or fail")
@@ -180,6 +181,11 @@ def baseline_record(store: Store, repo_id: str, main_sha: str, command: str, res
         record = base_record(repo_id, kind="baseline", main_sha=main_sha, command=str(command)[:500], result=result,
                              counts=counts if isinstance(counts, dict) else {},
                              failing=[str(x)[:200] for x in (failing or [])][:200], host=host)
+        if suite is not None:
+            record["suite"] = suite  # exact ids, never truncated: baseline-compare matches them exactly
+            if len(json.dumps(record)) > MAX_RECORD - 2048:
+                raise Refused("baseline-too-large", f"the baseline has {len(suite.get('failing_ids', []))} failing ids, too many "
+                              "to record exactly: fix the failing tests first")
         store.write(repo_id, f"baseline-{main_sha}.json", record)
         return record
 
@@ -204,6 +210,105 @@ def reserve_control(store: Store, repo_id: str, main_sha: str, token: str) -> di
         record = base_record(repo_id, kind="control", main_sha=main_sha, token=token, state="reserved")
         store.write(repo_id, name, record)
         return {"allowed": True, "idempotent": False, "reservation": record}
+
+
+# ---- baseline-compare: an exact, complete suite baseline and the comparison against it ----------------------------
+
+SHA40 = re.compile(r"[0-9a-f]{40}")
+REPORT_KEYS = ("schema", "kind", "runner", "command", "whole_suite", "start", "head", "clean", "ran", "failing_ids", "complete")
+MAX_IDS = 300
+WHOLE_SUITE_CHECK = ["python3", "-m", "unittest", "discover", "-s", "tests"]
+
+
+def _report_problems(report, what: str) -> list:
+    """Why a suite report (or the suite block of a baseline) is not a real, complete, whole-suite run; [] when it is."""
+    if not isinstance(report, dict):
+        return [f"{what}: not an object"]
+    out = []
+    if report.get("schema") != 1 or report.get("runner") != "suite_report" or report.get("kind") not in ("suite-report", "baseline-suite"):
+        out.append(f"{what}: not produced by suite_report.py")
+    if report.get("complete") is not True:
+        out.append(f"{what}: the run did not complete")
+    if report.get("whole_suite") is not True or report.get("command") != "python3 -m unittest discover -s tests" \
+            or report.get("start") != "tests":
+        out.append(f"{what}: not the whole-suite command (a focused or partial run is not a baseline)")
+    if report.get("clean") is not True:
+        out.append(f"{what}: the tracked tree was not clean")
+    head = report.get("head")
+    if not isinstance(head, str) or not SHA40.fullmatch(head):
+        out.append(f"{what}: no full commit id")
+    ran = report.get("ran")
+    if type(ran) is not int or ran <= 0:
+        out.append(f"{what}: no tests ran")
+    ids = report.get("failing_ids")
+    if not isinstance(ids, list) or any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != len(ids):
+        out.append(f"{what}: failing_ids must be a list of distinct non-empty strings")
+    elif len(ids) > MAX_IDS:
+        out.append(f"{what}: more than {MAX_IDS} failing ids")
+    return out
+
+
+def suite_block(report: dict, report_sha256: str) -> dict:
+    return {"kind": "baseline-suite", "schema": 1, "runner": "suite_report", "command": report["command"], "whole_suite": True,
+            "start": report["start"], "head": report["head"], "clean": True, "complete": True, "ran": report["ran"],
+            "skipped": report.get("skipped", 0), "failing_ids": sorted(report["failing_ids"]), "python": report.get("python", ""),
+            "host": report.get("host", ""), "report_sha256": report_sha256}
+
+
+def record_suite_baseline(store: Store, repo_id: str, report: dict, report_sha256: str, replace: bool = False) -> dict:
+    """File a baseline from a real complete suite_report for exactly report['head']; anything else is refused."""
+    problems = _report_problems(report, "report")
+    if problems:
+        raise Refused("bad-suite-report", "; ".join(problems))
+    if not re.fullmatch(r"[0-9a-f]{64}", str(report_sha256)):
+        raise ValueError("report digest must be 64 lowercase hex characters")
+    ids = report["failing_ids"]
+    return baseline_record(store, repo_id, report["head"], report["command"], "fail" if ids else "pass",
+                           {"ran": report["ran"], "failing": len(ids), "skipped": report.get("skipped", 0)}, ids[:50],
+                           replace=replace, host=report.get("host", ""), suite=suite_block(report, report_sha256))
+
+
+def baseline_suite_for(record, sha: str):
+    """(suite block, problems): the recorded suite baseline for exactly this SHA, or why there is none."""
+    if not isinstance(record, dict):
+        return None, [f"no baseline is recorded for {sha}"]
+    if record.get("kind") != "baseline" or record.get("main_sha") != sha:
+        return None, [f"the recorded baseline is not for exactly {sha}"]
+    suite = record.get("suite")
+    if not isinstance(suite, dict):
+        return None, [f"the baseline for {sha} was not recorded from a complete suite run (no suite block): record it with "
+                      "test_scope.py run-baseline"]
+    problems = _report_problems(suite, "baseline")
+    if suite.get("head") != sha:
+        problems.append("baseline: its run was not at this commit")
+    return (None, problems) if problems else (suite, [])
+
+
+def compare_suite(report, baseline_record, expected_sha: str, checked_head: str) -> dict:
+    """Pass only when the checked tree's failing test ids are an EXACT-id subset of the failing ids of the complete suite
+    baseline recorded for exactly expected_sha, the run is complete and whole-suite, and it ran at least as many tests as
+    the baseline. Returns {'ok', 'problems', 'baseline_sha', 'baseline_ran', 'checked_ran', 'accepted_failing_ids',
+    'new_failing_ids'}."""
+    suite, problems = baseline_suite_for(baseline_record, expected_sha)
+    problems = list(problems)
+    problems += _report_problems(report, "checked run")
+    if isinstance(report, dict) and report.get("head") != checked_head:
+        problems.append("checked run: it ran at a different commit than the checked checkout")
+    result = {"ok": False, "baseline_sha": expected_sha, "baseline_ran": (suite or {}).get("ran"),
+              "checked_ran": report.get("ran") if isinstance(report, dict) else None, "accepted_failing_ids": [], "new_failing_ids": []}
+    if suite is not None and not problems:
+        base_ids = set(suite["failing_ids"])
+        new = sorted(i for i in report["failing_ids"] if i not in base_ids)  # exact string membership, nothing looser
+        if new:
+            problems.append(f"{len(new)} failing test(s) are not in the baseline: " + ", ".join(new[:10])
+                            + (" ..." if len(new) > 10 else ""))
+        if report["ran"] < suite["ran"]:
+            problems.append(f"the suite ran {report['ran']} tests, fewer than the baseline's {suite['ran']}")
+        result["new_failing_ids"] = new
+        result["accepted_failing_ids"] = sorted(i for i in report["failing_ids"] if i in base_ids)
+    result["problems"] = problems
+    result["ok"] = not problems
+    return result
 
 
 # ---- b. evidence ------------------------------------------------------------------------------------------------
@@ -897,6 +1002,13 @@ def cli(argv: list, capture: bool = False):
     p = sub.add_parser("run-full")
     p.add_argument("--repo", default=".")
     p.add_argument("command", nargs=argparse.REMAINDER)
+    p = sub.add_parser("baseline-from-report")
+    p.add_argument("--repo-id", required=True)
+    p.add_argument("--report", required=True)
+    p.add_argument("--replace", action="store_true")
+    p = sub.add_parser("run-baseline")
+    p.add_argument("--repo", default=".")
+    p.add_argument("--replace", action="store_true")
     sub.add_parser("hook")
     sub.add_parser("post")
     p = add("confirm", "--repo-id", "--kind", "--key", "--token")
@@ -941,6 +1053,27 @@ def cli(argv: list, capture: bool = False):
             return out(0, {"recorded": True, "record": rec})
         if args.cmd == "control":
             return out(0, reserve_control(store, args.repo_id, args.main_sha, args.token))
+        if args.cmd in ("baseline-from-report", "run-baseline"):
+            if remote:
+                return out(3, {"error": f"{args.cmd} records into the store: run it on the store host (dev2/T2)"})
+            if args.cmd == "run-baseline":
+                ctx = repo_context(args.repo)
+                report_path = Path(tempfile.mkdtemp(prefix="suite-report-")) / "report.json"
+                done = subprocess.run([sys.executable, str(HERE / "suite_report.py"), "--repo", ctx["top"], "--out", str(report_path)])
+                if done.returncode != 0 or not report_path.is_file():
+                    return out(4, {"error": "the suite runner did not complete; nothing recorded"})
+                repo_id = ctx["repo_id"]
+            else:
+                report_path, repo_id = Path(args.report), args.repo_id
+            sys.path.insert(0, str(HERE))
+            import safe_input
+            try:
+                raw = safe_input.read_bounded(report_path, MAX_REPORT)
+            except safe_input.InputRejected as exc:
+                return out(3, {"error": f"cannot read the report: {exc.message}"})
+            rec = record_suite_baseline(store, repo_id, json.loads(raw), hashlib.sha256(raw).hexdigest(), args.replace)
+            return out(0, {"recorded": True, "repo_id": repo_id, "sha": rec["main_sha"], "ran": rec["suite"]["ran"],
+                           "failing": len(rec["suite"]["failing_ids"])})
         if args.cmd == "full-get":
             rec = full_get(store, args.repo_id, args.head)
             return out(0 if rec else 1, {"found": bool(rec), "record": rec})

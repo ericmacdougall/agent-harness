@@ -357,8 +357,90 @@ def focused_recheck(flow, target):
                                 + " ".join(missing[:8]) + "; run a whole-suite check", code=2)
 
 
+# --baseline-compare (GoodQA #14582): the whole-suite check passes when its failing test ids are an exact-id subset of the
+# failing ids of the complete suite baseline recorded for exactly the pinned original HEAD. Active only for one finish.
+ACTIVE_COMPARE: dict = {}
+WHOLE_SUITE_ARGV = ["python3", "-m", "unittest", "discover", "-s", "tests"]
+MAX_SUITE_REPORT = 1_000_000
+
+
 def checks_digest(preparations, checks):
-    return hashlib.sha256(json.dumps([preparations, checks], separators=(",", ":")).encode()).hexdigest()
+    parts = [preparations, checks] + (["baseline-compare"] if ACTIVE_COMPARE else [])
+    return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+def compare_failure(problems, **facts):
+    return DeliveryError("DELIVERED_CHECK_FAILED", "Baseline comparison failed: " + "; ".join(problems[:6]),
+                         check_status="baseline-compare", baseline_compare_problems=problems[:20], **facts)
+
+
+def helper_source():
+    """Which code produced a baseline-compare receipt: this helper's tree and its git HEAD."""
+    tree = Path(__file__).resolve().parent.parent.parent
+    code, head = git(tree, "rev-parse", "HEAD")
+    return {"tree": str(tree), "head": head.strip() if not code else "unknown"}
+
+
+def baseline_record_for(repo, sha):
+    """The recorded baseline for exactly sha from the test-scope store (None when absent or unreachable)."""
+    import test_scope
+    ctx = test_scope.repo_context(str(repo))
+    got = test_scope.store_call(test_scope.load_policy(), ["baseline-get", f"--repo-id={ctx['repo_id']}", f"--main-sha={sha}"])
+    if got is None:
+        raise compare_failure(["the test-scope store is unreachable, so no baseline can be verified"])
+    _code, data = got
+    return data.get("record") if isinstance(data, dict) else None
+
+
+def run_suite_compare(repo, log, timeout, log_directory):
+    """Run the whole suite through suite_report.py (never trusting a report that was already there) and compare."""
+    import test_scope
+    plan = ACTIVE_COMPARE
+    sha = plan["expected_sha"]
+    report_path = Path(log_directory) / "suite-report.json"
+    try:
+        os.unlink(report_path)
+    except FileNotFoundError:
+        pass
+    nonce = secrets.token_hex(16)
+    command = ["python3", str(Path(__file__).with_name("suite_report.py")), "--repo", str(repo), "--out", str(report_path),
+               "--nonce", nonce]
+    log.header(command)
+    try:
+        result = run_check(repo, command, timeout=timeout, discard_output=True, sink=log)
+    except subprocess.TimeoutExpired:
+        raise compare_failure([f"the suite exceeded {timeout} seconds"], **log.facts()) from None
+    except (CheckInterpreterError, OSError) as error:
+        raise compare_failure([f"the suite runner could not start ({error.__class__.__name__})"], **log.facts()) from None
+    if result.returncode:
+        raise compare_failure([f"the suite runner exited {result.returncode}: the suite crashed or stopped early"], **log.facts())
+    try:
+        report = json.loads(regular_bytes(report_path, MAX_SUITE_REPORT))
+    except (DeliveryError, ValueError, OSError):
+        raise compare_failure(["no readable suite report was produced"], **log.facts()) from None
+    if not isinstance(report, dict) or report.get("nonce") != nonce:
+        raise compare_failure(["the suite report is not from this run"], **log.facts())
+    code, head = git(repo, "rev-parse", "HEAD")
+    if code:
+        raise compare_failure(["the checked checkout's HEAD could not be read"])
+    outcome = test_scope.compare_suite(report, baseline_record_for(repo, sha), sha, head.strip())
+    if not outcome["ok"]:
+        raise compare_failure(outcome["problems"], baseline_sha=sha, checked_ran=outcome["checked_ran"],
+                              baseline_ran=outcome["baseline_ran"], **log.facts())
+    plan["result"] = {key: outcome[key] for key in ("baseline_sha", "baseline_ran", "checked_ran", "accepted_failing_ids")}
+    plan["result"].update(source="run", checked_head=head.strip(), helper=helper_source())
+
+
+def accept_recorded_baseline(repo, sha):
+    """--use-recorded-baseline (resolve only): the already-recorded real suite run at exactly this HEAD is the evidence."""
+    import test_scope
+    record = baseline_record_for(repo, sha)
+    suite, problems = test_scope.baseline_suite_for(record, sha)
+    if suite is None:
+        raise compare_failure(problems)
+    ACTIVE_COMPARE["result"] = {"baseline_sha": sha, "baseline_ran": suite["ran"], "checked_ran": suite["ran"],
+                                "accepted_failing_ids": sorted(suite["failing_ids"]), "source": "recorded", "checked_head": sha,
+                                "helper": helper_source()}
 
 
 CHECK_FACTS = ("check_log", "check_tail", "check_log_truncated", "check_status")
@@ -378,7 +460,7 @@ def run_checks(repo, preparations, checks, timeout, log_directory):
     except OSError:
         raise DeliveryError("DELIVERED_CHECK_FAILED", "Check log could not be created", check_status="log") from None
     try:
-        for command in (*preparations, *checks):
+        for command in (*preparations, *([] if ACTIVE_COMPARE else checks)):
             log.header(command)
             try:
                 result = run_check(repo, command, timeout=timeout, discard_output=True, sink=log)
@@ -398,6 +480,10 @@ def run_checks(repo, preparations, checks, timeout, log_directory):
                 log.close()
                 raise DeliveryError("DELIVERED_CHECK_FAILED", "Delivered checkout check failed",
                                     check_status=f"exit {result.returncode}", **log.facts())
+        if ACTIVE_COMPARE and not ACTIVE_COMPARE.get("recorded_only"):
+            run_suite_compare(repo, log, timeout, log_directory)
+        elif ACTIVE_COMPARE:
+            accept_recorded_baseline(repo, ACTIVE_COMPARE["expected_sha"])
     finally:
         log.close()
 
@@ -599,6 +685,8 @@ class Workflow:
                  "checkout": str(self.original), "source_head": self.state["source_head"]}
         if getattr(self, "focused_checks", None):
             facts["focused_checks"] = self.focused_checks
+        if ACTIVE_COMPARE.get("result"):
+            facts["baseline_compare"] = ACTIVE_COMPARE["result"]
         overrides = self.target_overrides()
         if overrides:
             facts["target_policy_overrides"] = overrides
@@ -656,6 +744,8 @@ class Workflow:
                 "checks_digest": digest, "guard_key": self.state["guard_key"]}
         if getattr(self, "focused_checks", None):
             data["focused_checks"] = self.focused_checks  # the test_scope approval of each focused check
+        if ACTIVE_COMPARE.get("result"):
+            data["baseline_compare"] = ACTIVE_COMPARE["result"]  # baseline sha, both test counts, the accepted failing ids
         private_directory(self.receipt.parent)
         write_journal(self.receipt.parent, data, first=True)
         self.save(phase="DELIVERED" if mode == "remote" else "LOCAL_DELIVERED", target=head,
@@ -670,8 +760,9 @@ class Workflow:
         expected = {"schema", "kind", "scope", "task", "generation", "source_head", "head", "mode",
                     "repository", "pr_number", "checks_digest", "guard_key"}
         extra = value.get("focused_checks", [])
+        compare = value.get("baseline_compare", {})
         if (not isinstance(extra, list) or len(extra) > 20 or any(not isinstance(item, dict) for item in extra)
-                or set(value) - {"focused_checks"} != expected or type(value.get("schema")) is not int or value["schema"] != 1
+                or not isinstance(compare, dict) or set(value) - {"focused_checks", "baseline_compare"} != expected or type(value.get("schema")) is not int or value["schema"] != 1
                 or value.get("kind") != "delivery_receipt" or value.get("scope") != self.scope
                 or value.get("task") != self.task or value.get("generation") != self.generation
                 or value.get("source_head") != self.state["source_head"]
@@ -1749,9 +1840,37 @@ def local_finish(flow, preparations, checks):
     return getattr(flow, "ticket_exit", 0)
 
 
+def configure_compare(args, checks, state):
+    """Validate --baseline-compare (and --use-recorded-baseline) and arm ACTIVE_COMPARE; refuses everything it does not
+    fully understand. Without the flag nothing here runs and an exit-0 check stays required."""
+    ACTIVE_COMPARE.clear()
+    if getattr(args, "use_recorded_baseline", False) and not getattr(args, "baseline_compare", False):
+        raise DeliveryError("BLOCKED_POLICY", "--use-recorded-baseline needs --baseline-compare", code=2)
+    if not getattr(args, "baseline_compare", False):
+        return
+    if args.resolve_baseline is None and args.mode != "remote":
+        raise DeliveryError("BLOCKED_POLICY", "--baseline-compare supports remote delivery and --resolve-baseline, not local mode", code=2)
+    if getattr(args, "resume", False):
+        raise DeliveryError("BLOCKED_POLICY", "--baseline-compare does not apply to --resume", code=2)
+    if checks != [WHOLE_SUITE_ARGV]:
+        raise DeliveryError("BLOCKED_POLICY", "--baseline-compare needs exactly one check, the whole suite "
+                            "'python3 -m unittest discover -s tests'; a focused, partial or other check is refused", code=2)
+    if getattr(args, "use_recorded_baseline", False) and args.resolve_baseline is None:
+        raise DeliveryError("BLOCKED_POLICY", "--use-recorded-baseline applies only to --resolve-baseline", code=2)
+    expected = valid_oid(args.resolve_baseline) if args.resolve_baseline is not None else state["baseline"]
+    ACTIVE_COMPARE.update(expected_sha=expected, recorded_only=bool(getattr(args, "use_recorded_baseline", False)))
+
+
 def finish(args):
     preparations, checks = approved_commands(args.prepare, prepare=True), approved_commands(args.check, allow_focused=True)
     focused = [argv for argv in checks if not approved_check(argv)]  # accepted syntactically; proven below
+    try:
+        return _finish(args, preparations, checks, focused)
+    finally:
+        ACTIVE_COMPARE.clear()
+
+
+def _finish(args, preparations, checks, focused):
     try:
         # Before any checkout effect: a bare python3 that resolves to an
         # unsupported interpreter would only fail after the fast-forward.
@@ -1764,6 +1883,7 @@ def finish(args):
             raise DeliveryError("BLOCKED_POLICY", "Prepared generation is missing", code=2)
         if args.kit_file is not None and kit_digest(args.kit_file) != state["kit_digest"]:
             raise DeliveryError("BLOCKED_POLICY", "Run kit changed since prepare", code=2)
+        configure_compare(args, checks, state)
         if focused and args.resolve_baseline is not None:
             raise DeliveryError("BLOCKED_POLICY", "A recovery baseline needs a whole-suite check, not a focused one", code=2)
         flow.focused_checks = focused_proof(flow, focused) if focused else []
@@ -1923,6 +2043,11 @@ def parse_args():
     end.add_argument("--prepare", action="append", default=[])
     end.add_argument("--check-timeout", type=int, default=DEFAULT_CHECK_TIMEOUT,
                      help="Seconds allowed for each preparation and check command (default 1800)")
+    end.add_argument("--baseline-compare", action="store_true",
+                     help="Pass the whole-suite check when its failing test ids are an exact subset of the complete suite "
+                          "baseline recorded for exactly the pinned original HEAD (test_scope.py run-baseline); no waiver")
+    end.add_argument("--use-recorded-baseline", action="store_true",
+                     help="With --resolve-baseline --baseline-compare: accept the recorded real suite run at that HEAD without re-running")
     end.add_argument("--resume", action="store_true", help="Explicitly resume this pending remote delivery at its pinned target")
     end.add_argument("--resume-reason", help="Bounded private explanation for resuming an interrupted attempt")
     args = parser.parse_args()
