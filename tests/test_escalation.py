@@ -252,9 +252,10 @@ class RecordFromStore(LedgerFixture):
                                review={'stage': 'CODE_INSPECTION', 'verdict': 'BLOCK', 'findings': ['F1']},
                                usage={'provider_launches': 1, 'reported': []})
         result = subprocess.run([sys.executable, str(HOOKS / 'escalation.py'), 'record', '--task', 'rs1', '--run-id', run.run_id,
-                                 '--kind', 'review', '--source', 'test'], capture_output=True, text=True, timeout=30, env=env)
+                                 '--kind', 'review', '--source', 'test', '--head', 'f' * 40], capture_output=True, text=True, timeout=30, env=env)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads(result.stdout)['event']['class'], 'FAIL')
+        self.assertEqual(json.loads(result.stdout)['event']['head'], 'b' * 40)  # the receipt's HEAD, never --head
         bogus = subprocess.run([sys.executable, str(HOOKS / 'escalation.py'), 'record', '--task', 'rs1', '--run-id', 'f' * 32,
                                 '--kind', 'review', '--source', 'test'], capture_output=True, text=True, timeout=30, env=env)
         self.assertEqual(bogus.returncode, 2); self.assertIn('error', json.loads(bogus.stdout))
@@ -267,6 +268,28 @@ class RecordFromStore(LedgerFixture):
             self.ledger.record('ok', final(verdict='ACCEPT', salt=str(n)), kind='review', source='test')
         self.assertEqual(self.ledger.load('ok')['launches'], 0)
         self.assertEqual(self.ledger.status('ok')['blocked_by'], [])
+
+
+class EnvRoots(LedgerFixture):
+    def test_env_wals_root_is_ignored_for_the_installed_ledger(self):
+        wals = Path(self.temp.name) / 'wals'; (wals / 's').mkdir(parents=True)
+        wal = wals / 's' / 'main.jsonl'
+        wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'top for [task:k]', 'source': 'user:s/u "yes"'}) + '\n'
+                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'approved'}) + '\n')
+        os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
+        self.assertEqual(esc.verify_ask_pair(wal, 'w1', 'k', allow_env_root=True)['source'][:5], 'user:')
+        with self.assertRaises(esc.LedgerError):
+            esc.verify_ask_pair(wal, 'w1', 'k')  # the installed ledger never reads an env-selected WAL root
+        self.assertTrue(self.ledger._non_default_root())
+
+    def test_pending_resets_beyond_one_batch_survive_to_the_next_load(self):
+        pending = self.root / 'pb.pending-resets.jsonl'
+        rows = [json.dumps({'at': str(n), 'code': 'lock_timeout', 'detail': 'n%d' % n}) for n in range(esc.PENDING_BATCH + 40)]
+        pending.write_text('\n'.join(rows) + '\n')
+        first = self.ledger.load('pb')
+        self.assertEqual(len(first['resets']), esc.PENDING_BATCH); self.assertTrue(pending.exists())
+        second = self.ledger.load('pb')
+        self.assertEqual(len(second['resets']), esc.PENDING_BATCH + 40); self.assertFalse(pending.exists())
 
 
 class TopPermission(LedgerFixture):

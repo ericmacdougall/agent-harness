@@ -221,7 +221,10 @@ class BashAdvisory(GateFixture):
         self.assertEqual(self.bash('codex exec -c model=gpt-6-astra --task k9 -')[0], 'deny')
         self.assertEqual(self.bash('ANTHROPIC_MODEL=claude-fable-5-1 claude -p --task k9 x')[0], 'deny')
         self.assertEqual(self.bash('python3 rescue.py --repo r --packet p --output o --model opus --effort xhigh --task k9')[0], 'allow')
-        self.assertEqual(self.bash('claude -p --model opus "no task"')[0], 'allow')
+        # Without a task a Bash line cannot be rewritten: only the lowest writing rung runs.
+        self.assertEqual(self.bash('claude -p --model opus "no task"')[0], 'deny')
+        self.assertEqual(self.bash('claude -p --model sonnet "no task"')[0], 'allow')
+        self.assertEqual(self.bash('python3 rescue.py --repo r --packet p --output o --model opus --effort high')[0], 'allow')
 
 
 class ModesAndCap(GateFixture):

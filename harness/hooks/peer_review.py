@@ -1026,8 +1026,20 @@ def main() -> int:
         print('Review refused: no review harness is available for rung %s (codex and claude both unavailable)'
               % selection['rung'], file=sys.stderr)
         return 2
+    permission = None
+    if policy['rungs'][selection['rung']]['needs_user_permission']:
+        # --author-rung is a claim; the ledger permission is the only record of Fable-approved work.
+        if args.task:
+            try:
+                permission = ladder.Ledger(policy=policy).status(args.task).get('permission')
+            except (ladder.LedgerError, tiers.TierError):
+                permission = None
+        if not isinstance(permission, dict) or not permission.get('ask_id'):
+            print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
+                  '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
+            return 2
     options = {'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
-               'selection': selection, 'author_rung': author_rung,
+               'selection': selection, 'author_rung': author_rung, 'permission': permission,
                'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
                'claude_model': policy['rungs'][selection['rung']]['models']['claude']}
     try:
@@ -1107,6 +1119,7 @@ def main() -> int:
                           f"Author-Rung: {author_rung or 'unknown'}{' (author unknown: lowest writer rung reviewer)' if selection['author_unknown'] else ''}\n"
                           f"Reviewer-Rung: {selection['rung']}\nReviewer-Selection: {selection['harness']} {selection['model']} "
                           f"{selection['effort']}; {selection['why']}\n"
+                          f"{'Permission: ' + str(permission['ask_id']) + chr(10) if permission else ''}"
                           f"Review input: isolated committed snapshot (depth 1"
                           f"{', base ' + base if base and base != before[0] else ''})\n"
                           f"Worktree status: {'clean' if not before[1] else 'dirty'}\n{note}\n{report.strip()}\n",

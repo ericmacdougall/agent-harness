@@ -30,6 +30,9 @@ TASK_KEY = re.compile(r'\[task:([A-Za-z0-9][A-Za-z0-9._-]{0,63})\]')
 SAFE_KEY = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 MAX_STATE = 1 << 20
 MAX_EVENTS = 4096
+DEFAULT_ROOT = Path.home() / '.agent-harness' / 'escalation'
+DEFAULT_USAGE_ROOT = Path.home() / '.agent-harness' / 'usage'
+PENDING_BATCH = 256
 LOCK_SECONDS = 2.0
 # The fixed classifier table (user requirement, deterministic): what each receipt means for the ladder.
 NOT_COUNTED_REASONS = {'TRANSIENT_INFRA', 'LOW_DISK', 'QUOTA', 'AUTH', 'TIMEOUT', 'UNKNOWN', 'BUDGET_EXHAUSTED'}
@@ -283,19 +286,24 @@ class Ledger:
         if not path.exists():
             return False
         try:
-            lines = path.read_text(encoding='utf-8').splitlines()[:256]
+            lines = path.read_text(encoding='utf-8').splitlines()  # input-ok: own 0600 side file, batched below
         except OSError:
             return False
         absorbed = False
-        for line in lines:
+        for line in lines[:PENDING_BATCH]:
             try:
                 record = json.loads(line)
             except ValueError:
                 continue
             if record not in state['resets']:
                 state['resets'].append(record); absorbed = True
+        remainder = lines[PENDING_BATCH:]
         try:
-            os.unlink(path)
+            if remainder:  # never drop a durable reset: the rest is absorbed on the next load
+                tmp = path.with_suffix('.tmp')
+                tmp.write_text('\n'.join(remainder) + '\n', encoding='utf-8'); os.chmod(tmp, 0o600); os.replace(tmp, path)
+            else:
+                os.unlink(path)
         except OSError:
             pass
         return absorbed
@@ -423,7 +431,7 @@ class Ledger:
 
     def approve_top(self, task, ask_id, wal):
         """Record user permission for the top writing rung after verifying the ask pair in the WAL."""
-        proof = verify_ask_pair(Path(wal), ask_id, task)
+        proof = verify_ask_pair(Path(wal), ask_id, task, allow_env_root=self._non_default_root())
         fd = self._lock(task)
         try:
             state, _ = self._read(task)
@@ -435,6 +443,13 @@ class Ledger:
 
     def status(self, task):
         return ladder_status(self.load(task), self.policy)
+
+    def _non_default_root(self):
+        """Env-selected WAL and usage roots are honoured only for a test ledger, never for the installed one."""
+        try:
+            return self.root.resolve() != DEFAULT_ROOT.resolve()
+        except OSError:
+            return False
 
     def gate_digest(self, limit=200):
         """What the hook would have refused (warn mode) or refused (enforce): evidence for the flip."""
@@ -486,10 +501,12 @@ class Ledger:
                 pass
 
 
-def verified_final(run_id):
-    """The FINAL receipt bytes of a usage-guard run, verified against the store's completion reference."""
+def verified_final(run_id, allow_env_root=False):
+    """The FINAL receipt bytes of a usage-guard run, verified against the store's completion reference.
+
+    The installed ledger reads the installed usage store; AGENT_HARNESS_USAGE_DIR applies only to a test ledger."""
     import usage_guard
-    store = usage_guard.UsageStore()
+    store = usage_guard.UsageStore(None if allow_env_root else DEFAULT_USAGE_ROOT)
     directory = store._run_directory(run_id)
     completion = usage_guard.read_json(directory / 'completion.json')
     reference = completion.get('reference') if isinstance(completion, dict) else None
@@ -499,9 +516,13 @@ def verified_final(run_id):
     return (directory / 'final.json').read_bytes()  # input-ok: verified by load_ref, bounded by MAX_JSON
 
 
-def verify_ask_pair(wal, ask_id, task):
-    """A registered ask with a user: source naming the task, resolved by an ask_resolved that refs it."""
-    wals_root = Path(os.environ.get('AGENT_HARNESS_WALS_DIR') or Path.home() / '.claude' / 'wals').resolve()
+def verify_ask_pair(wal, ask_id, task, allow_env_root=False):
+    """A registered ask with a user: source naming the task, resolved by an ask_resolved that refs it.
+
+    The wals root is the installed one unless the caller's ledger is itself non-default (allow_env_root),
+    so an agent cannot point the installed ledger at a WAL of its own through the environment."""
+    override = os.environ.get('AGENT_HARNESS_WALS_DIR') if allow_env_root else None
+    wals_root = Path(override or Path.home() / '.claude' / 'wals').resolve()
     resolved_wal = Path(wal).resolve()
     if wals_root not in resolved_wal.parents or resolved_wal.name != 'main.jsonl':
         raise LedgerError('unclassifiable_evidence', 'permission must come from a session main WAL under ' + str(wals_root))
@@ -556,15 +577,16 @@ def main(argv=None):
             if args.kind in ('review', 'test'):
                 if not args.run_id:
                     raise LedgerError('unclassifiable_evidence', 'review and test receipts are read by --run-id from the usage store')
-                receipt_bytes = verified_final(args.run_id)
+                receipt_bytes = verified_final(args.run_id, allow_env_root=ledger._non_default_root())
             else:
                 if not args.receipt:
                     raise LedgerError('unclassifiable_evidence', 'spec_review needs --receipt')
                 receipt_bytes = args.receipt.read_bytes()  # input-ok: spec_flow record, bounded by MAX_STATE below
                 if len(receipt_bytes) > MAX_STATE:
                     raise LedgerError('unclassifiable_evidence', 'receipt oversized')
+            # Review and test events carry the receipt's own HEAD; --head applies to spec_review records only.
             value = ledger.record(args.task, receipt_bytes, kind=args.kind, source=args.source,
-                                  head=args.head, notify=args.notify_wal)
+                                  head=args.head if args.kind == 'spec_review' else None, notify=args.notify_wal)
         elif args.action == 'claim-fix':
             value = ledger.claim_fix(args.task, args.head)
         elif args.action == 'spend':

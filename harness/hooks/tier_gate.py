@@ -192,6 +192,12 @@ def decide_bash(data, policy, ledger):
     if not entry['writable'] and 'rescue.py' in basenames:
         return 'deny', 'rescue at %s is review-only' % requested['rung'], None, facts
     if task is None:
+        # A Bash line cannot be rewritten: without a task, above the lowest writing rung is denied
+        # (a rescue.py line names its rung by ticket and is checked by rescue.py itself).
+        lowest = tiers.writing_rungs(policy)[0]
+        order = tiers.rung_order(policy)
+        if order.index(requested['rung']) > order.index(lowest) and 'rescue.py' not in basenames:
+            return 'deny', 'launch at %s without --task: only the lowest rung %s runs without a task' % (requested['rung'], lowest), None, facts
         return 'allow', 'launch without --task: lowest rung applies', None, facts
     if status is None:
         return 'allow', 'ladder state unreadable (%s): lowest rung applies' % facts.get('ladder_error', 'error'), None, facts
@@ -312,6 +318,7 @@ def _main(action, data, tool, command, applies):
     record = {'at': esc.now(), 'tool': tool, 'decision': decision, 'reason': reason, 'mode': mode, 'facts': facts}
     try:
         log = esc.state_root() / 'gate.jsonl'
+        esc.rotate_log(log)
         with open(log, 'a', encoding='utf-8') as handle:
             handle.write(json.dumps(record, sort_keys=True, default=str) + '\n')
         os.chmod(log, 0o600)

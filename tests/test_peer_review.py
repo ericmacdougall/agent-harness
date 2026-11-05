@@ -1350,6 +1350,25 @@ else:
                          ('lad-1', 'code-inspection', 'R2', 'R3'))
         self.assertEqual(receipt['packet_sha256'], hashlib.sha256(self.packet.read_bytes()).hexdigest())
 
+    def test_permission_rung_reviewer_needs_a_recorded_permission(self):
+        import escalation as ladder
+        import model_tiers as tiers
+        refused = self.run_review('--author-rung', 'R5', '--author-harness', 'claude')
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn('needs user permission', refused.stderr)
+        self.assertFalse(self.argv_file.exists()); self.assertFalse((self.ladder / 'selections').exists())
+        wals = self.root / 'wals'; (wals / 's').mkdir(parents=True)
+        wal = wals / 's' / 'main.jsonl'
+        wal.write_text(json.dumps({'id': 'w9', 'event': 'ask', 'note': 'fable review for [task:lad-5]', 'source': 'user:s/u "yes"'}) + '\n'
+                       + json.dumps({'id': 'w10', 'event': 'ask_resolved', 'ref': 'w9', 'note': 'approved'}) + '\n')
+        os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
+        ladder.Ledger(self.ladder, tiers.load_policy()).approve_top('lad-5', 'w9', wal)
+        allowed = self.run_review('--task', 'lad-5', '--author-rung', 'R5', '--author-harness', 'claude')
+        self.assertEqual(allowed.returncode, 3, allowed.stderr)
+        argv = json.loads(self.argv_file.read_text())
+        # Claude author, Codex present: the cross-harness reviewer is Astra high, launched only with the record.
+        self.assertIn('gpt-6-astra', argv); self.assertIn('Permission: w9\n', self.output.read_text())
+
     def test_claude_fallback_carries_effort_and_budget_when_codex_is_absent(self):
         result = self.run_review('--task', 'lad-2', '--author-rung', 'R1', '--author-harness', 'claude', remove=('codex',))
         self.assertEqual(result.returncode, 3, result.stderr)
