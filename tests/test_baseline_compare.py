@@ -848,3 +848,52 @@ class Round5(unittest.TestCase):
             with self.assertRaises(sc.CompareFailure) as ctx:
                 sc.bound_by_pinned(".", ["t.a"], 10, 10, OTHER)
         self.assertIn("recorded on host", str(ctx.exception))
+
+
+class Round6(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name).resolve()
+
+    def test_a_waiver_is_inherited_by_the_next_commit(self):
+        import suite_compare as sc
+        repo = make_repo(self.dir, {"test_a.py": PASS})
+        store_dir = self.dir / "store"
+        env = {**os.environ, "HARNESS_TEST_SCOPE_ROOT": str(store_dir)}
+
+        def baseline(*extra):
+            return subprocess.run([sys.executable, str(HOOKS / "test_scope.py"), "--root", str(store_dir), "run-baseline", "--repo", str(repo), *extra],
+                                  capture_output=True, text=True, timeout=180, env=env)
+
+        def head():
+            return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+
+        first = baseline()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        (repo / "tests" / "test_n.py").write_text(NEWRED)
+        commit_all(repo, "regression")
+        self.assertEqual(baseline().returncode, 2)  # not accepted without the explicit flag
+        waived = baseline("--accept-new-failures", "--reason", "accepted for the test")
+        self.assertEqual(waived.returncode, 0, waived.stdout + waived.stderr)
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "next"], cwd=repo, check=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+        later = baseline()  # no flag, no reason: the regression is not new relative to the waived ancestor
+        self.assertEqual(later.returncode, 0, later.stdout + later.stderr)
+        sha = head()
+        record_path = next(store_dir.rglob(f"baseline-{sha}.json"))
+        note = json.loads(record_path.read_text())["suite"].get("note")
+        self.assertTrue(note and any("test_regression" in i for i in note["accepted_new_failures"]), note)
+        with mock.patch.dict(os.environ, env):
+            with self.assertRaises(sc.CompareFailure) as ctx:
+                sc.preflight(repo, sha, sha)
+        self.assertIn("test_regression", str(ctx.exception))
+
+    def test_a_waived_pinned_baseline_bounds_nothing(self):
+        import suite_compare as sc
+        pinned = {"failing_ids": ["t.a", "t.reg"], "ran": 10, "skipped": 0, "host": socket.gethostname().split(".")[0],
+                  "note": {"reason": "x", "accepted_new_failures": ["t.reg"]}}
+        with mock.patch.object(sc, "baseline_record_for", return_value="r"), mock.patch.object(ts, "baseline_suite_for", return_value=(pinned, [])):
+            with self.assertRaises(sc.CompareFailure) as ctx:
+                sc.bound_by_pinned(".", ["t.a"], 10, 10, OTHER)
+        self.assertIn("t.reg", str(ctx.exception))

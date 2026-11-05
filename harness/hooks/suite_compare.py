@@ -58,6 +58,8 @@ def bound_by_pinned(repo, failing_ids, ran: int, active: int, pinned_sha: str) -
         raise CompareFailure(["the pinned original HEAD has no complete suite baseline to bound the result with: " + "; ".join(why)])
     if host_problem(pinned):
         raise CompareFailure(["pinned HEAD baseline: " + host_problem(pinned)])
+    if waiver_problem(pinned):
+        raise CompareFailure(["pinned HEAD baseline: " + waiver_problem(pinned)])
     problems = []
     new = sorted(i for i in failing_ids if i not in set(pinned["failing_ids"]))
     if new:

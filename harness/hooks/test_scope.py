@@ -1118,9 +1118,18 @@ def cli(argv: list, capture: bool = False):
                                "message": f"{len(new)} failing test(s) are not in the nearest recorded ancestor baseline "
                                           f"({ancestor['head'][:12]}): {', '.join(new[:10])}. Fix them, or record with "
                                           "--accept-new-failures --reason <why>", "new_failing_ids": new[:50]})
+            # A waiver is inherited: a regression accepted at an ancestor stays accepted-with-a-note at every later commit
+            # that still fails the same test, so it can never turn into a plain known failure one commit later.
+            carried = sorted(i for i in ((ancestor or {}).get("note") or {}).get("accepted_new_failures", [])
+                             if i in set(report.get("failing_ids", [])))
+            accepted = sorted(set(new) | set(carried))
+            reason = args.reason.strip()[:300]
+            if not reason and ancestor:
+                reason = ("inherited from " + ancestor["head"][:12] + ": "
+                          + str((ancestor.get("note") or {}).get("reason", ""))[:200])
             rec = record_suite_baseline(store, repo_id, report, hashlib.sha256(raw).hexdigest(), args.replace,
-                                        note={"reason": args.reason.strip()[:300], "accepted_new_failures": new[:50],
-                                              "ancestor": ancestor["head"] if ancestor else ""} if (args.replace or new) else None)
+                                        note={"reason": reason, "accepted_new_failures": accepted[:50],
+                                              "ancestor": ancestor["head"] if ancestor else ""} if (args.replace or accepted) else None)
             return out(0, {"recorded": True, "repo_id": repo_id, "sha": rec["main_sha"], "ran": rec["suite"]["ran"],
                            "failing": len(rec["suite"]["failing_ids"]), "new_vs_ancestor": new[:50]})
         if args.cmd == "full-get":
