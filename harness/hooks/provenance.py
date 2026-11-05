@@ -567,10 +567,16 @@ def answer_text(record, ask_ids):
             or not isinstance(blocks[0], dict) or blocks[0].get("type") != "tool_result"
             or blocks[0].get("tool_use_id") not in ask_ids):
         return None
+    if blocks[0].get("is_error"):
+        return None
     content = blocks[0].get("content")
     if isinstance(content, list):
         content = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and isinstance(b.get("text"), str))
-    return content if isinstance(content, str) else None
+    if not isinstance(content, str):
+        return None
+    # Only the user's selections count: the question text in the result is the agent's own words.
+    answers = re.findall(r'"="(.*?)"(?:, "|\. You can now|\s*$)', content, re.S)
+    return "\n".join(answers) if answers else None
 
 
 def excerpt_in(text: str, excerpt: str):
@@ -633,10 +639,25 @@ def answer_turn(session: str, uid: str, home=None) -> dict:
     return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session}
 
 
+def _has_human_turn(path: Path) -> bool:
+    for line in _lines_containing(path, b'"human"'):  # spacing-agnostic; the parsed record decides
+        if line is None:
+            continue
+        try:
+            record = loads_line(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and user_authorship(record)[0] is not None:
+            return True
+    return False
+
+
 def queue_turn(session: str, ident, home=None) -> dict:
     import hashlib
     stamp, sha = ident
     path = find_transcript(session, home)
+    if not _has_human_turn(path):
+        raise Problem("message-not-found", "that transcript has no human-origin turn (a helper session): queue records are not user text")
     for line in _lines_containing(path, stamp.encode()):
         if line is None:
             continue
