@@ -536,6 +536,30 @@
    "rules": [
     "S19"
    ]
+  },
+  {
+   "id": "ledger-reminder:SessionStart",
+   "script": "ledger_reminder.py",
+   "arg": null,
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "ledger-reminder:UserPromptSubmit",
+   "script": "ledger_reminder.py",
+   "arg": null,
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
   }
  ]
 }

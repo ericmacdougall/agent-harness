@@ -31,7 +31,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py",
          "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
-         "commit_policy.local.json.example", "spec_policy.local.json.example",
+         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py",
          "work_assignments.py", "work_assignments_policy.json", "work_ledger.schema.json")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
@@ -50,7 +50,7 @@ class DirectoryPublicationError(OSError):
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
-                         "command_guard_hook.py", "tier_gate.py", "merge_gate.py", "work_assignments.py")}
+                         "command_guard_hook.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "work_assignments.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -182,6 +182,10 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             managed.setdefault(event, []).extend(groups)
     for event, groups in work_assignment_hook_groups(claude).items():
         managed.setdefault(event, []).extend(groups)
+    # Local-ledger reminder (docs/ledger.md): rate limited and dismissible; fails open, so no onFailure.
+    reminder = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "ledger_reminder.py")], "timeout": 3}
+    for event in ("SessionStart", "UserPromptSubmit"):
+        managed.setdefault(event, []).append({"hooks": [reminder]})
     return managed
 
 
