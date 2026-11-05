@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import fcntl
 import hashlib
 import json
@@ -718,22 +719,37 @@ POLICY_SELFCHECK_FIX = 'python3 harness/install.py --apply --role ROLE'
 
 
 WORD_BREAK = ' \t\n;&|(`'
+COMMENT_GLUE = '()<>'
+QUOTE_CHARS = '\'"'
 CASE_WORD = re.compile(r'case(?=[ \t\n])')
 
 
 def _walk_groups(text, i=0, stack=None):
-    """(index, certain). Walks shell text from i with the open contexts in stack: '(' for $(, <(, >( and a parenthesis
-    inside one, '`', '"' and '{' for ${. With a starting stack it stops just past the close of that group; from the top
-    level it reads to the end. `certain` is False when a shell may close the group elsewhere than this walk does: a
-    word-start # in a group (shells disagree on whether a comment there can hide the close), a \\` inside backticks, a
-    `case` in a group (its patterns hold unbalanced parentheses), a quote inside a double-quoted ${...}, or an
-    unterminated quote or group."""
+    """(index, certain). Walks shell text from i with the open contexts in stack: '(' for $(, <(, >(, (( and a parenthesis
+    inside one, '`', '[' for $[, '"' and '{' for ${. With a starting stack it stops just past the close of that group;
+    from the top level it reads to the end.
+
+    The certainty rule: shells disagree about quoting that nests inside a group, so any quote character (' " or $') in a
+    backtick group, $(...), <(...), >(...), ${...}, ((...)), $((...)) or $[...] makes the text uncertain, escaped or not;
+    certainty is claimed only for groups that hold no quote at all. Only the end of an uncertain group is a best effort,
+    and callers then check every physical line. Also uncertain: a word-start # in a group, a \\` inside backticks, a `case`
+    in a group (its patterns hold unbalanced parentheses), a # glued to ( ) < > or after an escaped blank, a $'...' holding
+    \\' (a shell without $'...', such as dash, ends the string there), and an unterminated quote or group."""
     stack = list(stack or [])
     grouped, certain, n = bool(stack), True, len(text)
     while i < n:
         top, ch = (stack[-1] if stack else None), text[i]
         at_word = i == 0 or text[i - 1] in WORD_BREAK
-        if top == '"':
+        if top == '`':  # raw up to the next unescaped backtick, whatever it holds: no shell nests or quotes in here
+            if ch == '\\':
+                certain = certain and text[i + 1:i + 2] not in ('`', "'", '"')
+                i += 2
+            elif ch == '`':
+                stack.pop(); i += 1
+            else:
+                certain = certain and ch not in QUOTE_CHARS and not (at_word and (ch == '#' or CASE_WORD.match(text, i)))
+                i += 1
+        elif top == '"':
             if ch == '\\':
                 i += 2
             elif ch == '"':
@@ -742,22 +758,25 @@ def _walk_groups(text, i=0, stack=None):
                 stack.append('`'); i += 1
             elif text.startswith('$(', i):
                 stack.append('('); i += 2
+            elif text.startswith('$[', i):
+                stack.append('['); i += 2
             elif text.startswith('${', i):
                 stack.append('{'); i += 2
             else:
                 i += 1
         elif ch == '\\':
-            certain = certain and not (text[i + 1:i + 2] == '`' and '`' in stack)
+            certain = certain and not (stack and text[i + 1:i + 2] in ('`', "'", '"'))
             i += 2
         elif text.startswith("$'", i):
             try:
-                i = _decode_ansi_c(text, i + 2)[1]
+                end = _decode_ansi_c(text, i + 2)[1]
             except ValueError:
                 return n, False
-        elif ch == "'" or ch == '"':
-            in_quoted_brace = top == '{' and len(stack) > 1 and stack[-2] == '"'
-            certain = certain and not in_quoted_brace
-            if in_quoted_brace:
+            certain = certain and not stack and "\\'" not in text[i:end]
+            i = end
+        elif ch in QUOTE_CHARS:
+            certain = certain and not stack
+            if top == '{' and len(stack) > 1 and stack[-2] == '"':
                 i += 1
             elif ch == '"':
                 stack.append('"'); i += 1
@@ -767,23 +786,27 @@ def _walk_groups(text, i=0, stack=None):
                     return n, False
                 i = end + 1
         elif ch == '`':
-            if top == '`':
-                stack.pop()
-            else:
-                stack.append('`')
-            i += 1
+            stack.append('`'); i += 1
         elif text.startswith(('$(', '<(', '>('), i):
             stack.append('('); i += 2
+        elif text.startswith('$[', i):
+            stack.append('['); i += 2
         elif text.startswith('${', i):
             stack.append('{'); i += 2
+        elif not stack and text.startswith('((', i):
+            stack.extend('(('); i += 2
         elif ch == '(' and stack and top != '{':
             stack.append('('); i += 1
         elif ch == ')' and top == '(':
             stack.pop(); i += 1
+        elif ch == '[' and top == '[':
+            stack.append('['); i += 1
+        elif ch == ']' and top == '[':
+            stack.pop(); i += 1
         elif ch == '}' and top == '{':
             stack.pop(); i += 1
-        elif ch == '#' and at_word and top != '{':
-            if stack:
+        elif ch == '#' and top != '{' and (at_word or text[i - 1] in COMMENT_GLUE):
+            if stack or not at_word or (i >= 1 and text[i - 1] == '(') or (i >= 2 and text[i - 2] == '\\'):
                 certain = False; i += 1
             else:
                 end = text.find('\n', i)
@@ -833,13 +856,25 @@ def join_continuations(text):
             out.append(text[i:end]); i = end
         elif ch in '\'"':
             quote = ch; out.append(ch); i += 1
-        elif ch == '#' and (not out or out[-1][-1] in ' \t\n;&|('):
+        elif ch == '#' and (not out or out[-1][-1] in ' \t\n;&|()'):
             end = text.find('\n', i)
             end = n if end < 0 else end
             out.append(text[i:end]); i = end
         else:
             out.append(ch); i += 1
     return ''.join(out)
+
+
+CONTINUED_LINE = re.compile(r'(?<!\\)\n')
+
+
+def _quoted_continuation(text):
+    """True when a quote character sits in a fragment joined by backslash-newline: the shell's reading of that join depends
+    on the quoting around it, and every model of it so far has been wrong somewhere. Any line ending in a backslash counts,
+    an even run of them included; a false answer here costs a prompt."""
+    if '\\\n' not in text:
+        return False
+    return any('\\\n' in fragment and ("'" in fragment or '"' in fragment) for fragment in CONTINUED_LINE.split(text))
 
 
 def inner_commands(text):
@@ -919,7 +954,7 @@ def _heredoc_bodies(command, i, pending, bodies):
     return position, True
 
 
-def heredoc_scan(command, openers=None):
+def heredoc_scan(command, openers=None, spans=None):
     """(status, text, bodies): the single rule for what may be hidden from the matcher and the escape classifier.
 
     Removing a body hides its lines, so a body is removed only when the shell cannot read the command another way.
@@ -932,13 +967,14 @@ def heredoc_scan(command, openers=None):
       ${...} other than ${NAME}, $[...], $'...', ((...)), [[...]], or a `(` attached to a word (<(, =(, @(, f().
     A command with no `<<` is `none`. Anything else is `uncertain`, with the text left whole: callers then check every
     physical line and never answer allow. A false uncertain costs a prompt; a false certain hides a command.
-    `openers`, when given, receives each opener's text in marker order."""
+    `openers`, when given, receives each opener's text in marker order; `spans`, on a certain scan, each (start, end) of the
+    typed command that holds bodies, terminators included, so a caller can keep those bytes exactly as typed."""
     if '<<' not in command:
         return HEREDOC_NONE, command, []
     uncertain = (HEREDOC_UNCERTAIN, command, [])
     if '\0' in command:
         return uncertain
-    out, bodies, pending, i, n, after_escape = [], [], [], 0, len(command), -1
+    out, bodies, pending, i, n, after_escape, found_spans = [], [], [], 0, len(command), -1, []
     while i < n:
         ch = command[i]
         at_break = i == 0 or (command[i - 1] in HEREDOC_BREAK and i != after_escape)
@@ -979,9 +1015,11 @@ def heredoc_scan(command, openers=None):
         elif ch == '\n':
             out.append(ch); i += 1
             if pending:
+                start = i
                 i, ok = _heredoc_bodies(command, i, pending, bodies)
                 if not ok:
                     return uncertain
+                found_spans.append((start, i))
                 pending = []
         elif ch == '`' or command.startswith(('$(', '$[', "$'", '[['), i):
             return uncertain
@@ -998,16 +1036,32 @@ def heredoc_scan(command, openers=None):
         return uncertain
     if not bodies:
         return HEREDOC_NONE, command, []
+    if spans is not None:
+        spans.extend(found_spans)
     return HEREDOC_CERTAIN, ''.join(out), bodies
+
+
+def _cut_bodies(command, spans):
+    """The typed text around the body spans, as a list: outside, outside, ..., one more item than spans."""
+    pieces, at = [], 0
+    for start, end in spans:
+        pieces.append(command[at:start]); at = end
+    pieces.append(command[at:])
+    return pieces
 
 
 def _prepare_text(command):
     """(text, heredoc bodies, uncertain). Bodies are removed only under heredoc_scan's rule; continuations are joined and
-    the rest normalized by deansi; _walk_groups then says whether every group ends where a shell ends it. An uncertain
-    result keeps every line in the text and is never allowed."""
-    status, text, bodies = heredoc_scan(command)
-    text, ok = deansi(join_continuations(text.strip()))
-    return text, bodies, status == HEREDOC_UNCERTAIN or not ok or not _walk_groups(text)[1]
+    the rest normalized by deansi. The command is uncertain when the scan is, when deansi cannot tokenize it, when a quote
+    sits in a continuation-joined fragment, or when _walk_groups' rule fails. An uncertain result keeps every line in the
+    text and is never allowed."""
+    spans = []
+    status, text, bodies = heredoc_scan(command, spans=spans)
+    joined = join_continuations(text).strip()  # join first: a trailing backslash-newline must not leave a lone backslash
+    normalized, ok = deansi(joined)
+    uncertain = (status == HEREDOC_UNCERTAIN or not ok or _quoted_continuation(''.join(_cut_bodies(command, spans)))
+                 or not _walk_groups(joined)[1])
+    return normalized, bodies, uncertain
 
 
 HEREDOC_HINT = ("Text in a heredoc inside $(...) is checked line by line as commands. Use a top-level quoted heredoc: "
@@ -1020,6 +1074,9 @@ LATER_WAIT = re.compile(r'(?:^|[\s;&|(])wait(?=[\s;&|)]|$)')
 
 SCRIPT_HOSTS = frozenset(('bash', 'sh', 'zsh', 'dash', 'ksh', 'source', '.', 'eval'))
 HEREDOC_MARKER = re.compile(r'<<__HD(\d+)__')
+OPENER_WITH_FD = re.compile(r'(?:(?<![^\s])\d+)?<<__HD\d+__')
+COMPOUND_CLOSE = frozenset(('}', ')', 'fi', 'done', 'esac'))
+FUNCTION_DEF = re.compile(r'(?:^|(?<=[\s;&|(]))(?:function\s+([^\s;&|()]+)|([^\s;&|()]+)\s*\(\s*\))')
 SSH_ON_LINE = re.compile(r'(?:^|[\s;&|(/])ssh\s')
 
 
@@ -1032,7 +1089,7 @@ def _reads_script(fragment):
         except ValueError:
             words = form.split()
         name = words[0].rsplit('/', 1)[-1] if words else ''
-        if name in SCRIPT_HOSTS:
+        if name in SCRIPT_HOSTS or (name == 'xargs' and any(word.rsplit('/', 1)[-1] in SCRIPT_HOSTS for word in words[1:])):
             return True
         if name == 'ssh':
             call = host_table.parse_ssh(words[1:])
@@ -1041,32 +1098,65 @@ def _reads_script(fragment):
     return False
 
 
+def _hidden_reader(fragment, functions):
+    """True when the heredoc on this fragment may reach a shell that the text does not name: on a compound command's close
+    (`{ bash; } <<E`, `done <<E`, a subshell's `)` already cut by the split), on `exec 3<<E`, or read by a variable or a
+    function defined in this command. A false answer only widens a deny or escape check on a shape that rarely holds prose."""
+    for form in match_candidates(fragment):
+        try:
+            words = [word[1] for word in raw_words(form)]
+        except ValueError:
+            continue  # the quote-blind split cut a quoted word (`python3 -c 'a;b' <<E`): not a command word
+        if not words or words == ['exec'] or words[0] in COMPOUND_CLOSE or words[0].startswith('$') or words[0] in functions:
+            return True
+    return False
+
+
+def _runs_a_saved_body(fragment):
+    """True for what can run a body read earlier: eval, or source or `.` of a /dev file (`exec 3<<E; . /dev/fd/3`)."""
+    for form in match_candidates(fragment):
+        words = form.split()
+        name = words[0].rsplit('/', 1)[-1] if words else ''
+        if name == 'eval' or (name in ('source', '.') and len(words) > 1 and words[1].startswith('/dev/')):
+            return True
+    return False
+
+
 def script_bodies(text, bodies):
-    """The heredoc bodies a shell will run: read by a shell directly, or from a pipeline that holds a shell. Any other
-    reader (cat, python3 -) keeps its body as data."""
+    """The heredoc bodies a shell will run: read by a shell directly or through xargs, from a pipeline that holds a shell,
+    on a compound command, a variable or a function, or saved and run by eval or source. Any other reader (cat, python3 -)
+    keeps its body as data."""
     if not bodies:
         return []
     fragments = SCRIPT_SPLIT.split(text)
+    if ('eval' in text or '/dev/' in text) and any(_runs_a_saved_body(fragment) for fragment in fragments):
+        return [body for body, _quoted in bodies]
     piped = '|' in text and any(_reads_script(fragment) for fragment in fragments)
+    functions = {left or right for left, right in FUNCTION_DEF.findall(text)}
     found = []
     for line in text.split('\n'):
         # the split ignores quotes, so a quoted remote command (`ssh h 'cd x && sh' <<E`) is judged on its whole line
         remote_shell = SSH_ON_LINE.search(line) and any(word.strip('\'"').rsplit('/', 1)[-1] in SCRIPT_HOSTS for word in line.split())
         for fragment in SCRIPT_SPLIT.split(line):
             numbers = [int(number) for number in HEREDOC_MARKER.findall(fragment)]
-            if numbers and (piped or remote_shell or _reads_script(fragment)):
+            if not numbers:
+                continue
+            command = OPENER_WITH_FD.sub('', fragment)  # without the numbered markers the same command hits the cache
+            if piped or remote_shell or _reads_script(command) or _hidden_reader(command, functions):
                 found.extend(bodies[number][0] for number in numbers if number < len(bodies))
     return found
 
 
 def physical_parts(command):
     """Every fragment of every physical line of a command the hook could not parse with certainty, cut at each operator
-    with quoting ignored, since the quoting is what is in doubt. Used only to widen a deny or an escape check; a fragment
-    that is really string text can give a false deny, never a missed one."""
+    with quoting ignored, since the quoting is what is in doubt, and the same again with every backslash-newline removed, so
+    a word split over a continuation is seen whole. Used only to widen a deny or an escape check; a fragment that is really
+    string text can give a false deny, never a missed one."""
     parts = []
-    for fragment in PHYSICAL_SPLIT.split(command):
+    text = command + '\n' + command.replace('\\\n', '') if '\\\n' in command else command
+    for fragment in PHYSICAL_SPLIT.split(text):
         fragment = fragment.strip()
-        bare = fragment.strip('\'" \t')
+        bare = fragment.strip('\'"$ \t')
         for form in (fragment, bare):
             if form and form not in parts[-2:]:
                 parts.append(form)
@@ -1405,11 +1495,28 @@ def peel_wrapper(text):
 
 
 BLANKS = re.compile(r'[ \t]+')
+REDIRECT_ANYWHERE = re.compile(r'(?:(?<![^\s])\d+)?(?:&>>|&>|<<<|<<-?|<>|>>|>&|<&|>\||>|<)[ \t]*[^\s<>&|;]*')
+VARIABLE = re.compile(r'\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\}')
+EMPTY_HEAD = re.compile(r'^(?:\$""|=)+|^(?:"?(?:X|\$\([^()]*\)|`[^`]*`)"?[ \t]+)+')
+BRACE_HEAD = re.compile(r'^\{[^{}\s]*,[^{}\s]*\}')
+THROUGH_HINT = re.compile(r'[<>$=X{`]')
 
 
-def match_candidates(segment):
-    """The segment as typed plus every form with env assignments, wrappers (exec, command, time, nohup, nice, sudo,
-    timeout, env) and the quoting of the program word removed. A deny or ask rule matching any form applies."""
+def _read_through(form):
+    """The form the shell may really run when the words around the program are redirects, or a word holds an expansion that
+    can be empty (`>f cmd`, `$x cmd`, `cmd$x`, `$(true) cmd`, which reads `X cmd` here, zsh's `=cmd`), a $"..." string, ${IFS}
+    as a separator, or a brace list (`{cmd,arg}`). Only the deny and ask checks use it, so it can widen them and never an
+    allow."""
+    if not THROUGH_HINT.search(form):
+        return form
+    text = REDIRECT_ANYWHERE.sub(' ', form).replace('${IFS}', ' ').replace('$IFS', ' ')
+    text = VARIABLE.sub('', text).strip()
+    if BRACE_HEAD.match(text):
+        return BRACE_HEAD.sub(lambda found: found.group()[1:-1].replace(',', ' '), text)
+    return EMPTY_HEAD.sub('', text).replace('$"', '"', 1).strip() if text.startswith(('$', '=', 'X', '"', '`')) else text
+
+
+def _peeled_forms(segment):
     forms, seen, current = [], set(), normalize_segment(segment)
     for _ in range(12):
         if current in seen:
@@ -1425,9 +1532,22 @@ def match_candidates(segment):
             if nxt == base:
                 nxt = WRAPPER_PREFIX.sub('', base, count=1)
         current = normalize_segment(nxt)
-    # a run of blanks is one separator to the shell. Only these forms get it, not allow, so it can only widen a deny or ask.
-    forms.extend(collapsed for collapsed in dict.fromkeys(BLANKS.sub(' ', form) for form in forms) if collapsed not in seen)
     return forms
+
+
+@functools.lru_cache(maxsize=4096)
+def match_candidates(segment):
+    """The segment as typed plus every form with env assignments, wrappers (exec, command, time, nohup, nice, sudo,
+    timeout, env) and the quoting of the program word removed, and those with _read_through's words gone, as a tuple. A deny
+    or ask rule matching any form applies. Cached because one command asks for the same segment up to four times."""
+    forms = _peeled_forms(segment)
+    for form in list(forms):
+        through = _read_through(form)
+        if through != form and through:
+            forms.extend(extra for extra in _peeled_forms(through) if extra not in forms)
+    # a run of blanks is one separator to the shell. Only these forms get it, not allow, so it can only widen a deny or ask.
+    forms.extend(collapsed for collapsed in dict.fromkeys(BLANKS.sub(' ', form) for form in forms) if collapsed not in forms)
+    return tuple(forms)
 
 
 class Rule:
@@ -1660,8 +1780,8 @@ def _classify_ssh(args, reasons, notes, depth):
     if 'f' in call.flags:
         reasons.append('ssh -f backgrounds the connection')
     for value in call.o_values:
-        key, _sep, setting = value.strip().partition('=') if '=' in value else value.strip().partition(' ')
-        key, setting = key.strip().lower(), setting.strip()
+        key, setting = (re.split(r'\s*=\s*|\s+', value.strip(), maxsplit=1) + [''])[:2]  # ssh takes =, blanks or tabs
+        key, setting = key.lower(), setting.strip()
         if key == 'forkafterauthentication' and setting.lower() != 'no':
             reasons.append('ssh -o ForkAfterAuthentication backgrounds the connection')
         elif key == 'controlpersist' and setting.lower() != 'no':
@@ -1699,6 +1819,9 @@ def _classify_command(command, reasons, notes, depth):
     last_wait = max((position for position, (words, _op) in enumerate(entries) if _command_word(words) == 'wait'), default=-1)
     for position, (words, operator) in enumerate(entries):
         _classify_words(words, reasons, notes, depth)
+        through = _read_through(' '.join(words)).split()
+        if through[:1] != words[:1]:  # only when another program runs: the words after it are quote-removed text
+            _classify_words(through, reasons, notes, depth)
         if operator == '&' and words and position >= last_wait:
             reasons.append('background & without a later wait')
     for body in inner:
@@ -1780,6 +1903,8 @@ def plain_recovery(segment, home):
         return False
     if words and INTERPRETER.fullmatch(words[0]):
         words = words[1:]
+        if words[:1] == ['-I']:  # the isolated form every installed hook line uses
+            words = words[1:]
     if not words or ASSIGNMENT.match(words[0]):
         return False
     path, rest = words[0], words[1:]
@@ -1836,6 +1961,8 @@ REVIEW_TYPES = frozenset(('red-team', 'click-tester', 'reviewer', 'Explore', 'Pl
 SSH_WORD = re.compile(r'^(?:\S*/)?ssh(?=\s)')
 REDIRECT = re.compile(r'^(?:\d*|&)(?:<<<|<<-?|<>|>>|>&|<&|>\||>|<)(.*)$', re.S)
 REMOTE_PATH = re.compile(r'^[A-Za-z0-9_./~-]+$')
+QUOTED_TEXT = re.compile(r'\\.|\'[^\']*\'|"(?:\\.|[^"\\])*"', re.S)
+ATTACHED_REDIRECT = re.compile(r'[<>]')
 REMOTE_ENV_KEY = re.compile(r'^AGENT_HARNESS_[A-Z_]{1,40}$')
 REMOTE_ENV_VALUE = re.compile(r'^[A-Za-z0-9_./~:-]{1,200}$')
 
@@ -1908,15 +2035,29 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
     """(command, remote): each `ssh HOST CMD` simple command whose resolved host has `ah_run: "<path>"` in the
     table becomes `ssh HOST python3 <path> run ... --token via-hook-ssh [--readonly] --cmd-b64 B64` (stdin stays
     inherited). `remote` is (command_class, host_digest) for the local ledger row when the host is external
-    (`remote-unattributed`) or has no remote ah-run (`remote-unwrapped`). Raises ValueError to deny."""
+    (`remote-unattributed`) or has no remote ah-run (`remote-unwrapped`). Raises ValueError to deny.
+
+    What runs must be what was checked. Heredoc bodies are never touched: the replacement works on the typed text with
+    each body swapped for a placeholder (which also keeps a body line from matching) and put back byte for byte. Text
+    outside bodies has its continuations joined only because the segments were cut from the joined text. A command with no
+    wrapped line comes back exactly as typed. An uncertain command is wrapped only when the whole command is the one ssh
+    line and every word is literal, since its text cannot be told apart from a body or a string; any other uncertain ssh
+    line is left unwrapped and recorded. The result is re-parsed: a replacement that changed any other command is undone."""
     segments = [s for s in dict.fromkeys(parsed.segments)]
     candidates = [(s, _ssh_form(s)) for s in segments]
     if not any(form for _s, form in candidates):
         return command, None
-    if not parsed.uncertain:
-        command = join_continuations(command)  # the segments were cut from the joined text
-    openers = []
-    heredoc_scan(command, openers)
+    typed_command, spans, openers = command, [], []
+    heredoc_scan(command, openers, spans)
+    pieces = _cut_bodies(command, spans)
+    bodies = [command[start:end] for start, end in spans]
+    work = []
+    for index, piece in enumerate(pieces):
+        work.append(piece if parsed.uncertain else join_continuations(piece))
+        if index < len(spans):
+            work.append('\0%d\0' % index)
+    command = ''.join(work)
+    rewritten = []
 
     def with_openers(text):
         return HEREDOC_MARKER.sub(lambda m: openers[int(m.group(1))] if int(m.group(1)) < len(openers) else m.group(), text)
@@ -1945,6 +2086,11 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
         if call is None or not call.remote:
             continue  # `ssh HOST` with no command, `ssh -N`, `-W`: nothing to wrap
         raws = [w[0] for w in args[1:]]
+        if '}' in raws or any(ATTACHED_REDIRECT.search(QUOTED_TEXT.sub('', raw)) for raw in raws):
+            # `cat>f` read as a word would carry a local redirect to the remote shell, or make a syntax error run; a bare }
+            # closes a zsh group or is a zsh parse error, and in the base64 it would be neither
+            remote = remote or ('remote-unwrapped', digest(call.target))
+            continue
         count = len(call.opts)
         before_remote = count + 1 + len(call.post_opts)  # ssh reads options after the host too, up to the first other word
         target_dynamic = args[1 + count][2]
@@ -2001,12 +2147,26 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
         tail += ['--cmd-b64', b64]
         new_form = with_openers(' '.join([args[0][0], *raws[:before_remote], *tail, *redirects]))
         typed = with_openers(segment)
-        if command.count(typed) != parsed.segments.count(segment):
+        lone_line = len(parsed.segments) == 1 and typed == command.strip() and not any(w[2] for w in remote_words)
+        if command.count(typed) != parsed.segments.count(segment) or (parsed.uncertain and not lone_line):
             remote = remote or ('remote-unwrapped', digest(who))
-            context.append('ah-run: an ssh line could not be rewritten safely (its text repeats inside another command); it runs unwrapped')
+            context.append('ah-run: an ssh line could not be rewritten safely (its text repeats inside another command, or the quoting around it is uncertain); it runs unwrapped')
             continue
         command = command.replace(typed, prefix + new_form)
+        rewritten.append((segment, who))
+    if not rewritten:
+        return typed_command, remote
+    if bodies:  # a command holding a NUL never gets here with bodies: heredoc_scan calls it uncertain and returns no spans
+        command = re.sub('\0(\\d+)\0', lambda found: bodies[int(found.group(1))], command)
+    if not _only_these_changed(parsed.segments, parse_command(command).segments, {segment for segment, _who in rewritten}):
+        context.append('ah-run: an ssh line could not be rewritten safely (the replacement changed another command); it runs unwrapped')
+        return typed_command, remote or ('remote-unwrapped', digest(rewritten[0][1]))
     return command, remote
+
+
+def _only_these_changed(before, after, replaced):
+    """True when the re-parse holds the same commands in the same order, apart from the replaced ones."""
+    return len(before) == len(after) and all(old in replaced or old == new for old, new in zip(before, after))
 
 
 # -- the hook -----------------------------------------------------------------------------------------------
@@ -2184,6 +2344,8 @@ def decide(payload, home=None, env=None, ancestors=None):
 
     if parsed.heredoc == HEREDOC_UNCERTAIN:
         context.append('heredoc: uncertain (every line was checked against the deny rules; this command is never auto-allowed)')
+    elif parsed.uncertain:
+        context.append('quoting: uncertain (every line was checked against the deny rules; this command is never auto-allowed)')
     reasons, notes = analyze_escapes(command)
     if reasons:
         text = 'command escapes tracking: %s. Run it through `ah-run` or keep it in the foreground (use `wait`).' % '; '.join(reasons)

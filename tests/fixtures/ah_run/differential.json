@@ -1,0 +1,3722 @@
+{
+"line": "echo HIDDEN-LINE",
+"pinned_on": {
+"platform": "darwin",
+"shells": {
+"bash3": "3.2.57(1)-release",
+"bash5": "5.3.20(1)-release",
+"dash": "",
+"ksh": "Version AJM 93u+ 2012-08-01",
+"sh": "3.2.57(1)-release",
+"zsh": "5.9"
+}
+},
+"rows": [
+{
+"deny": true,
+"group": "r1-B1",
+"kind": "hidden",
+"name": "ansi-quote",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo $'\\'' ; %s ; echo ''",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r2-B4",
+"kind": "hidden",
+"name": "ansi-opener",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo $'a\\' <<EOF'\n%s\nEOF",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "param-default",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo ${x:-<<EOF}\n%s\nEOF",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "param-arith",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo ${x:0:1<<EOF}\n%s\nEOF",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "delim-dot",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo <<E.F\nE.F\n%s\nE\n",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "delim-quote-tail",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo <<'E'OF\nEOF\n%s\nE\n",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "delim-escape",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo <<E\\OF\nEOF\n%s\nE\n",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "arith-cmd",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "((x=1<<EOF))\n%s\nEOF",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "undecodable-tail",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo $'a\\' <<EOF'\n%s\nEOF\necho $'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "prior-heredoc-desync",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "cat <<X\n'\nX\necho $'a\\' <<EOF'\n%s\nEOF\n#'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "old-arith",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh"
+],
+"rewritten": "none",
+"shape": "echo $[1<<EOF]\n%s\nEOF",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "partial-quote-head",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo <<E\"O\"F\nEOF\n%s\nE\n",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "backslash-terminator",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh"
+],
+"rewritten": "none",
+"shape": "echo <<EOF\nEOF\\\n\n%s\nEOF",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "escaped-space-comment",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo a\\ #'\ncat <<E\n'; %s\nE\n#'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "comment-after-paren",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "(true)#'\n' cat <<E\n'; %s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "case-in-substitution",
+"ran": [
+"bash5",
+"zsh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo \"$(case x in x) echo \" <<EOF\n\"; %s\nEOF\n;; esac)\" #\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "array-assignment",
+"ran": [
+"bash3",
+"bash5"
+],
+"rewritten": "none",
+"shape": "a=(1<<E)\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "unquoted-substitution",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "cat <<EOF\n$(%s)\nEOF",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-B6",
+"kind": "hidden",
+"name": "unterminated",
+"ran": [],
+"rewritten": "none",
+"shape": "echo <<EOF\n%s",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "r4-dbracket",
+"ran": [],
+"rewritten": "none",
+"shape": "[[ a << b ]]\n%s\nb",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "r4-cont-natural",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo a \\\n# don't do this\n%s\n# won't happen",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "r4-cont-single",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo a \\\n#'\n%s\n#'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "r4-cont-double",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo a \\\n#\"\n%s\n#\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "r4-cont-first-word",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "\\\n#'\n%s\n#'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "r4-comment-paren",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo $(echo # ) '\n); %s; echo \"'\" #\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "r4-comment-paren-dq",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "$(# ) \"\n); %s #\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "r4-backtick-escape",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo `echo \\` ' `; %s; echo \"'\" #\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "r4-shell-heredoc",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "bash <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "r4-sh-heredoc",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "sh -s <<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "r4-attached-opener",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "true `true <<'E'`\n%s<<-E\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "r4-attached-redirect",
+"ran": [],
+"rewritten": "none",
+"shape": "echo $'a\\' <<EOF'\n%s>/dev/null\nEOF",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "plain-line",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo a\n%s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "second-command",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo a; %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r3-r4-endstate",
+"kind": "hidden",
+"name": "comment-apostrophe-substitution",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "# it's\necho $(%s)\n# it's",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-B10",
+"kind": "hidden",
+"name": "indented",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo a \\\n  #'\n%s\n#'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r4-B11",
+"kind": "hidden",
+"name": "procsub-comment",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "cat <(echo # ) '\n); %s; echo \"'\" #\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r4-B11",
+"kind": "hidden",
+"name": "assign-comment",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "x=$(echo # ) '\n); %s; echo \"'\" #\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "zsh-glob-group",
+"ran": [],
+"rewritten": "same",
+"shape": "echo (a<<E)\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "zsh-glob-group2",
+"ran": [],
+"rewritten": "none",
+"shape": "echo (<<E)\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "zsh-glob-group-sp",
+"ran": [],
+"rewritten": "same",
+"shape": "echo ( a <<E )\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "glob-group-tail",
+"ran": [],
+"rewritten": "same",
+"shape": "echo a (b<<E)\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "bracket-word",
+"ran": [],
+"rewritten": "none",
+"shape": "echo a[<<E]\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "bracket-brace",
+"ran": [],
+"rewritten": "none",
+"shape": "echo ${x}[<<E]\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "bracket-dollar",
+"ran": [],
+"rewritten": "none",
+"shape": "echo $x[<<E]\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "bracket-assign",
+"ran": [],
+"rewritten": "none",
+"shape": "x[<<E]=1\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "bracket-space-assign",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "x[1 <<E]=1\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "numeric-glob",
+"ran": [],
+"rewritten": "same",
+"shape": "echo <1-2><<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "numeric-glob2",
+"ran": [],
+"rewritten": "same",
+"shape": "echo a<1<<E>\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "brace-word",
+"ran": [],
+"rewritten": "none",
+"shape": "echo {a,<<E}\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "quoted-tail-newline",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<E 'a\nb'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "dq-tail-newline",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<E \"a\nb\"\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "continuation",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<E \\\n\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "continuation2",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<E \\\n x\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "after-heredoc-quote",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "true <<E\n'\nE\n%s #'",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "body-quoted-terminator",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<'E'\n%s\nE\n",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "tab-term-nostrip",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<E\n\tE\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "space-terminator",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<E\n E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "crlf-term",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<E\nE\r\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "case-pattern",
+"ran": [],
+"rewritten": "same",
+"shape": "case x in x) true <<E;; esac\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "case-paren",
+"ran": [],
+"rewritten": "same",
+"shape": "case x in (x) true <<E\n%s\nE\n;; esac",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "time-prefix",
+"ran": [],
+"rewritten": "same",
+"shape": "time true <<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "function-word",
+"ran": [],
+"rewritten": "same",
+"shape": "function f { true <<E\n%s\nE\n}",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "function-paren",
+"ran": [],
+"rewritten": "same",
+"shape": "f () { true <<E\n%s\nE\n}\nf",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "hash-after-amp",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "true &#<<E\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "hash-pipe",
+"ran": [],
+"rewritten": "same",
+"shape": "true |#x\ntrue <<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "hash-dollar",
+"ran": [],
+"rewritten": "same",
+"shape": "echo $#<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "dollar-paren-like",
+"ran": [],
+"rewritten": "none",
+"shape": "echo $ (true)<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "dollar-dq",
+"ran": [],
+"rewritten": "same",
+"shape": "echo $\"a\"<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "dollar-single-space",
+"ran": [],
+"rewritten": "same",
+"shape": "echo $ 'a'<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "tilde",
+"ran": [],
+"rewritten": "same",
+"shape": "echo ~<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "equals-word",
+"ran": [],
+"rewritten": "same",
+"shape": "echo =<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "equals-echo",
+"ran": [],
+"rewritten": "same",
+"shape": "echo =echo<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "number-word",
+"ran": [],
+"rewritten": "same",
+"shape": "echo 2<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "amp-redirect",
+"ran": [],
+"rewritten": "none",
+"shape": "echo &<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "amp-gt",
+"ran": [],
+"rewritten": "same",
+"shape": "echo &><<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "gt-word",
+"ran": [],
+"rewritten": "same",
+"shape": "echo ><<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "lt-word",
+"ran": [],
+"rewritten": "none",
+"shape": "echo <<<<E\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "lt-gt",
+"ran": [],
+"rewritten": "same",
+"shape": "echo <><<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "heredoc-in-hrstr",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<<a<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "dq-with-dollar-name",
+"ran": [],
+"rewritten": "same",
+"shape": "echo \"$x\"<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "dq-backslash-end",
+"ran": [],
+"rewritten": "none",
+"shape": "echo \"a\\\"<<E\n%s\nE\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "dq-backslash-nl",
+"ran": [],
+"rewritten": "none",
+"shape": "echo \"a\\\n\"<<E\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "sq-then-word",
+"ran": [],
+"rewritten": "same",
+"shape": "echo 'a'b<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "escape-newline-word",
+"ran": [],
+"rewritten": "same",
+"shape": "echo a\\\n<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "escape-space",
+"ran": [],
+"rewritten": "same",
+"shape": "echo a\\ <<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "escape-hash",
+"ran": [],
+"rewritten": "same",
+"shape": "echo \\#<<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "brace-group",
+"ran": [],
+"rewritten": "same",
+"shape": "{ true <<E\n%s\nE\n}",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "subshell-close-attached",
+"ran": [],
+"rewritten": "same",
+"shape": "(true <<E)\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "and-newline",
+"ran": [],
+"rewritten": "same",
+"shape": "true &&\ntrue <<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "empty-delim-word",
+"ran": [],
+"rewritten": "none",
+"shape": "true << \nE\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "tab-after-op",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<\tE\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "two-ops",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<E <<E\n%s\nE\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "dash-delim",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<-E\n\t%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "dash-space",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<- E\n%s\n\tE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "dash-not-tab",
+"ran": [],
+"rewritten": "same",
+"shape": "true <<-E\n %s\n E\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "unicode-delim",
+"ran": [],
+"rewritten": "none",
+"shape": "true <<\u00c9\n%s\n\u00c9",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "nbsp",
+"ran": [],
+"rewritten": "none",
+"shape": "true <<E\u00a0\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "ff",
+"ran": [],
+"rewritten": "none",
+"shape": "true <<E\f\n%s\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-quote-in-subst",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo \"$(echo ')')\"; %s",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-case-in-subst",
+"ran": [
+"bash5",
+"zsh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo $(case x in x) echo y;; esac); %s",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-subst-prefix",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "$(true) %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-backtick-prefix",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "`true` %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-var-prefix",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "$x %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-ifs",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo${IFS}HIDDEN-LINE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-continuation",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "ec\\\nho HIDDEN-LINE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-dq-program",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "$\"echo\" HIDDEN-LINE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-brace",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "{echo,HIDDEN-LINE}",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-redirect-prefix",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": ">/dev/null true; 2>&1 %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-redirect-prefix2",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "</dev/null %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-assign-prefix",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "x=1 %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-group",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "{ %s; }",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-bang",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "! %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-if",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "if true; then %s; fi",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-case",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "case x in x) %s;; esac",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-for",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "for i in 1; do %s; done",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-function",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "f() { %s; }; f",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "none-time",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "time %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "limit",
+"name": "none-eval",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "same",
+"shape": "eval '%s'",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "limit",
+"name": "none-bash-c",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "same",
+"shape": "/bin/bash -c '%s'",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "limit",
+"name": "none-hrstr-shell",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"ksh"
+],
+"rewritten": "same",
+"shape": "/bin/bash <<< '%s'",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r4-shapes",
+"kind": "limit",
+"name": "none-pipe-shell",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "same",
+"shape": "echo '%s' | /bin/bash",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "cert-shell-stdin",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "/bin/bash <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "cert-shell-stdin2",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "/bin/sh -s <<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "cert-pipe-shell",
+"ran": [],
+"rewritten": "none",
+"shape": "true <<'E' | /bin/bash\n%s\nE\n",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "cert-source",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": ". /dev/stdin <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-shapes",
+"kind": "hidden",
+"name": "cert-eval-read",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "read -r x <<'E'\n%s\nE\neval \"$x\"",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-B12",
+"kind": "hidden",
+"name": "bt-single",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo `echo '`; %s; echo `echo '`",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B12",
+"kind": "hidden",
+"name": "bt-single-nl",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo `echo '`\n%s\necho `echo '`",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B12",
+"kind": "hidden",
+"name": "bt-double",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo `echo \"`; %s; echo `echo \"`",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B12",
+"kind": "hidden",
+"name": "bt-in-dq",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo \"`echo '`\"; %s; echo \"`echo '`\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B12",
+"kind": "hidden",
+"name": "bt-in-dq-dq",
+"ran": [
+"bash3",
+"bash5",
+"sh"
+],
+"rewritten": "none",
+"shape": "echo \"`echo \"`\"; %s; echo \"`echo \"`\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B12",
+"kind": "hidden",
+"name": "bt-subst-mix",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo `echo '$(`; %s; echo `echo ')'`",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B12",
+"kind": "hidden",
+"name": "bt-comment-nope",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo `echo a'`\n%s\necho `echo a'`",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "arith-subst",
+"ran": [],
+"rewritten": "none",
+"shape": "true $(( 1 ' ))\n%s\ntrue $(( 1 ' ))",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "arith-cmd",
+"ran": [
+"zsh"
+],
+"rewritten": "none",
+"shape": "((1 '))\n%s\n((1 '))",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "arith-old",
+"ran": [],
+"rewritten": "none",
+"shape": "true $[1 ']\n%s\ntrue $[1 ']",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "arith-dq",
+"ran": [],
+"rewritten": "none",
+"shape": "true \"$(( 1 ' ))\"\n%s\ntrue \"$(( 1 ' ))\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "arith-dbl",
+"ran": [
+"zsh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "true $(( 1 \" ))\n%s\ntrue $(( 1 \" ))",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "dbracket-sq",
+"ran": [],
+"rewritten": "same",
+"shape": "[[ a == ' ]]\n%s\n[[ a == ' ]]",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "brace-sq-in-dq-group",
+"ran": [
+"zsh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo \"$(echo \"${x-'}\")\"; %s; echo \"$(echo \"${x-'}\")\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "param-subst-pct",
+"ran": [],
+"rewritten": "none",
+"shape": "echo ${x%%'}\n%s\necho ${x%%'}",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-comment",
+"kind": "hidden",
+"name": "paren-hash",
+"ran": [],
+"rewritten": "none",
+"shape": "echo (#); %s",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-comment",
+"kind": "hidden",
+"name": "paren-hash2",
+"ran": [],
+"rewritten": "none",
+"shape": "echo a(#b); %s",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-comment",
+"kind": "hidden",
+"name": "paren-hash-nl",
+"ran": [],
+"rewritten": "none",
+"shape": "echo (#)\n%s",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-comment",
+"kind": "hidden",
+"name": "paren-after-close",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "(true)#'\n%s\n#'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-comment",
+"kind": "hidden",
+"name": "amp-hash",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "true &#'\n%s\n#'",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-comment",
+"kind": "hidden",
+"name": "pipe-hash",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "true |#'\ntrue\n%s\n#'",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-comment",
+"kind": "hidden",
+"name": "semi-hash",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "true ;#'\n%s\n#'",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-comment",
+"kind": "hidden",
+"name": "lparen-hash",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "(#'\n%s\n#'\n)",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "r5-comment",
+"kind": "hidden",
+"name": "dollar-hash",
+"ran": [],
+"rewritten": "same",
+"shape": "echo $#'\n%s\n'",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-comment",
+"kind": "hidden",
+"name": "brace-hash",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "{ #'\n%s\n#'\n}",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-comment",
+"kind": "hidden",
+"name": "bt-hash",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo `#'\n%s\n#'\n`",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-after-rparen",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "(true) \\\n#'\n%s\n#'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-split-word",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo \\\nHIDDEN-LINE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-in-uncertain-name",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo $'a\\' <<EOF'\nec\\\nho HIDDEN-LINE\nEOF\necho $'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-in-uncertain-arg",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo '<<'\necho \\\nHIDDEN-LINE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-after-sq-comment-paren",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "(true)#'\nec\\\nho HIDDEN-LINE\n#'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-in-comment",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "# a \\\n%s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-double-backslash",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo a\\\\\n%s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-triple-backslash",
+"ran": [],
+"rewritten": "same",
+"shape": "echo a\\\\\\\n%s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-dq-then-line",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo \"a\\\nb\"\n%s",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-sq-then-line",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo 'a\\\nb'\n%s",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-ansi-then-line",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo $'a\\\nb'\n%s",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-ansi-quote",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo $'a\\'\\\n'\n%s\n#'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-in-heredoc-opener",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "true <<E \\\n; %s\nb\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-eof",
+"ran": [
+"bash3",
+"sh"
+],
+"rewritten": "none",
+"shape": "%s \\",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-brace",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "{ /bin/bash; } <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-subshell",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "(/bin/bash) <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-if",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "if true; then /bin/bash; fi <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-while",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "while true; do /bin/bash; break; done <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-for",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "for i in 1; do /bin/bash; done <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-func",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "f () { /bin/bash; }\nf <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-var",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "x=/bin/bash; $x <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-brace-var",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "x=/bin/bash; ${x} <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-shell-var",
+"ran": [
+"bash3",
+"bash5",
+"sh"
+],
+"rewritten": "none",
+"shape": "$BASH <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-redirect-first",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "<<'E' /bin/bash\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-fd0",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "/bin/bash 0<<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-fd3",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "/bin/bash /dev/fd/3 3<<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-exec-fd",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "exec 3<<'E'\n%s\nE\n. /dev/fd/3",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-quoted-name",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "\"/bin/bash\" <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-escaped-name",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "ba\\sh <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-env",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "env /bin/bash <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-exec",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "exec /bin/bash <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-time",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "time /bin/bash <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-assign",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "A=1 /bin/bash <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-pipe-tail",
+"ran": [],
+"rewritten": "none",
+"shape": "true <<'E' | cat | /bin/bash\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-pipe-first",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "/bin/bash <<'E' | cat\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-cat-file",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "cat <<'E' | /bin/bash /dev/stdin\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-amp-pipe",
+"ran": [
+"bash5",
+"zsh"
+],
+"rewritten": "none",
+"shape": "cat <<'E' |& /bin/bash\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-xargs",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "cat <<'E' | xargs -I{} /bin/bash -c '{}'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-S23",
+"kind": "limit",
+"name": "host-python",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "same",
+"shape": "/usr/bin/python3 -I -S -c 'import os,sys;os.system(sys.stdin.read())' <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-S23",
+"kind": "hidden",
+"name": "host-sq-script",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "cat <<'E' | /bin/bash -c 'source /dev/stdin'\n%s\nE",
+"unstable": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-S15",
+"kind": "hidden",
+"name": "zsh <<-'E'",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "zsh <<-'E'\n\t%s\n\tE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-S15",
+"kind": "hidden",
+"name": "cat <<'E' | bash",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "cat <<'E' | bash\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-S15",
+"kind": "hidden",
+"name": "source /dev/stdin <<'E'",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "source /dev/stdin <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-S15",
+"kind": "hidden",
+"name": "sudo bash <<'E'",
+"ran": [],
+"rewritten": "none",
+"shape": "sudo bash <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-S15",
+"kind": "hidden",
+"name": "timeout 5 bash <<'E'",
+"ran": [],
+"rewritten": "none",
+"shape": "timeout 5 bash <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-S15",
+"kind": "hidden",
+"name": "ssh dev2 bash <<'E'",
+"ran": [],
+"rewritten": "none",
+"shape": "ssh dev2 bash <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-S15",
+"kind": "hidden",
+"name": "ssh dev2 <<'E'",
+"ran": [],
+"rewritten": "none",
+"shape": "ssh dev2 <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-S15",
+"kind": "hidden",
+"name": "ssh dev2 'cd /x && sh' <<'E'",
+"ran": [],
+"rewritten": "none",
+"shape": "ssh dev2 'cd /x && sh' <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-S15",
+"kind": "hidden",
+"name": "case x in x) /bin/bash;; esac <<'E'",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "case x in x) /bin/bash;; esac <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-S15",
+"kind": "hidden",
+"name": "function f { /bin/bash; }",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "function f { /bin/bash; }\nf <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r4-S15",
+"kind": "hidden",
+"name": "exec <<'E'",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "exec <<'E'\n%s\nE\n/bin/bash",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "cat <<'E'",
+"ran": [],
+"rewritten": "same",
+"shape": "cat <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "python3 - <<'E'",
+"ran": [],
+"rewritten": "same",
+"shape": "python3 - <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "cat > f.sh <<'E'",
+"ran": [],
+"rewritten": "same",
+"shape": "cat > f.sh <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "ssh dev2 'cat > f' <<'E'",
+"ran": [],
+"rewritten": "changed",
+"shape": "ssh dev2 'cat > f' <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "ssh dev2 python3 - <<'E'",
+"ran": [],
+"rewritten": "changed",
+"shape": "ssh dev2 python3 - <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "ssh dev2 'cd /x && cat > f' <<'E'",
+"ran": [],
+"rewritten": "changed",
+"shape": "ssh dev2 'cd /x && cat > f' <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "python3 -c 'a;b(c)' <<'E'",
+"ran": [],
+"rewritten": "same",
+"shape": "python3 -c 'a;b(c)' <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "cat <<'E' | xargs echo",
+"ran": [],
+"rewritten": "same",
+"shape": "cat <<'E' | xargs echo\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "cat 3<<'E'",
+"ran": [],
+"rewritten": "same",
+"shape": "cat 3<<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "source venv/bin/activate && python3 - <<'E'",
+"ran": [],
+"rewritten": "same",
+"shape": "source venv/bin/activate && python3 - <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "none-single-quoted",
+"ran": [],
+"rewritten": "same",
+"shape": "echo 'a\n%s\nb'",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "none-double-quoted",
+"ran": [],
+"rewritten": "same",
+"shape": "echo \"a\n%s\nb\"",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "none-comment",
+"ran": [],
+"rewritten": "same",
+"shape": "echo a # %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "certain-unquoted",
+"ran": [],
+"rewritten": "same",
+"shape": "cat <<E\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "quiet-data",
+"kind": "hidden",
+"name": "certain-tab",
+"ran": [],
+"rewritten": "same",
+"shape": "cat <<-E\n\t%s\n\tE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-B12",
+"kind": "hidden",
+"name": "dq-backtick-sq-open",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo \"`echo '`\"\n%s\necho \"`echo '`\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B12",
+"kind": "hidden",
+"name": "nested-bt-paren",
+"ran": [
+"bash3",
+"bash5",
+"sh"
+],
+"rewritten": "none",
+"shape": "echo `echo $(echo '`; %s; echo `echo ')'`",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B12",
+"kind": "hidden",
+"name": "bt-escaped-sq",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo `echo \\'`\n%s\necho `echo \\'`",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B12",
+"kind": "hidden",
+"name": "bt-dq-and-sq",
+"ran": [
+"bash3",
+"bash5",
+"sh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo `echo \"'`\n%s\necho `echo \"'`",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "arith-cmd-dq",
+"ran": [
+"zsh",
+"ksh"
+],
+"rewritten": "none",
+"shape": "((1 \"))\n%s\n((1 \"))",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "arith-ansi",
+"ran": [
+"zsh"
+],
+"rewritten": "none",
+"shape": "((1 $'))\n%s\n((1 $'))",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "arith-subst-ansi",
+"ran": [],
+"rewritten": "none",
+"shape": "true $((1 $'))\n%s\ntrue $((1 $'))",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "arith-old-dq",
+"ran": [
+"zsh"
+],
+"rewritten": "none",
+"shape": "true $[1 \"]\n%s\ntrue $[1 \"]",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "arith-in-for",
+"ran": [],
+"rewritten": "none",
+"shape": "for ((i=0; i<1 '; i++)); do true; done\n%s\nfor ((i=0; i<1 '; i++)); do true; done",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "subst-sq-open",
+"ran": [],
+"rewritten": "none",
+"shape": "echo $(echo ')\n%s\necho ')",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "subst-dq-open",
+"ran": [],
+"rewritten": "none",
+"shape": "echo $(echo \")\n%s\necho \")",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "procsub-sq-open",
+"ran": [],
+"rewritten": "none",
+"shape": "cat <(echo ')\n%s\necho ')",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-B14",
+"kind": "hidden",
+"name": "brace-dq-open",
+"ran": [],
+"rewritten": "none",
+"shape": "echo ${x:-\"}\n%s\necho ${x:-\"}",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-quote-in-word",
+"ran": [],
+"rewritten": "none",
+"shape": "echo a\\\n'\n%s\n'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-dq-open",
+"ran": [],
+"rewritten": "none",
+"shape": "echo a\\\n\"\n%s\n\"",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-ansi-open",
+"ran": [],
+"rewritten": "none",
+"shape": "echo a\\\n$'\n%s\n'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-after-sq",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo 'a' \\\n# it's\n%s\n# it's",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-even-backslash",
+"ran": [],
+"rewritten": "none",
+"shape": "echo a\\\\\n'\n%s\n'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "cont-sq-holds-newline",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo 'a\\\n'\n%s",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "esc-blank-hash",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "none",
+"shape": "echo a\\ #'\n'; %s #'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "ansi-escaped-quote",
+"ran": [
+"dash"
+],
+"rewritten": "none",
+"shape": "echo $'a\\'\n%s\n'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": true,
+"group": "r5-S22",
+"kind": "hidden",
+"name": "hash-glued-gt",
+"ran": [],
+"rewritten": "none",
+"shape": "true >#'\n%s\n#'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-terminator-appears-external",
+"ran": [],
+"rewritten": "same",
+"shape": "ssh ext cat <<'E'\nE\\\n\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-terminator-appears-table",
+"ran": [],
+"rewritten": "changed",
+"shape": "ssh dev2 cat <<'E'\nE\\\n\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-terminator-lost",
+"ran": [],
+"rewritten": "same",
+"shape": "ssh ext cat <<'E'\nb\\\nE\necho AFTER\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-terminator-lost-table",
+"ran": [],
+"rewritten": "changed",
+"shape": "ssh dev2 cat <<'E'\nb\\\nE\necho AFTER\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-other-heredoc",
+"ran": [],
+"rewritten": "same",
+"shape": "ssh ext ls\ncat <<'E'\nx\\\ny\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-other-heredoc-table",
+"ran": [],
+"rewritten": "changed",
+"shape": "ssh dev2 ls\ncat <<'E'\nx\\\ny\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-bare-close-brace",
+"ran": [],
+"rewritten": "same",
+"shape": "ssh dev2 cat } <<'E'\n%s\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-zsh-group",
+"ran": [
+"zsh"
+],
+"rewritten": "none",
+"shape": "{ ssh dev2 ls }\n%s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-body-continuation",
+"ran": [],
+"rewritten": "changed",
+"shape": "ssh dev2 'cat > f' <<'EOF'\nfoo \\\nbar\nEOF",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-body-continuation-external",
+"ran": [],
+"rewritten": "same",
+"shape": "ssh ext 'cat > f' <<'EOF'\nfoo \\\nbar\nEOF",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-body-holds-the-ssh-line",
+"ran": [],
+"rewritten": "changed",
+"shape": "ssh dev2 ls\ncat <<'E'\nssh dev2 ls\nE",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-string-holds-the-ssh-line",
+"ran": [],
+"rewritten": "same",
+"shape": "echo \"ssh dev2 'ls'\"; ssh dev2 $'ls'",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-string-holds-the-subst-form",
+"ran": [],
+"rewritten": "same",
+"shape": "echo \"a; ssh dev2 X; b\"; ssh dev2 $(echo ls)",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-continued-no-quote",
+"ran": [],
+"rewritten": "changed",
+"shape": "ssh dev2 \\\n  cat\necho AFTER",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-continued-quote",
+"ran": [],
+"rewritten": "same",
+"shape": "ssh dev2 \\\n  'cat'\necho AFTER",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-uncertain-with-a-body",
+"ran": [],
+"rewritten": "same",
+"shape": "ssh dev2 ls\necho $'a' <<E\nssh dev2 ls\nE",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "r5-B13",
+"kind": "hidden",
+"name": "b13-lone-remote-heredoc",
+"ran": [],
+"rewritten": "changed",
+"shape": "ssh dev2 'cat <<EOF\nfoo \\\nbar\nEOF'",
+"unstable": [],
+"verdict": "uncertain"
+},
+{
+"deny": false,
+"group": "limit",
+"kind": "limit",
+"name": "file-written-then-run",
+"ran": [
+"bash3",
+"bash5",
+"zsh",
+"sh",
+"dash",
+"ksh"
+],
+"rewritten": "same",
+"shape": "cat > s.sh <<'E'\n%s\nE\n/bin/bash s.sh",
+"unstable": [],
+"verdict": "certain"
+}
+]
+}

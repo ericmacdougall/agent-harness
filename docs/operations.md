@@ -229,7 +229,7 @@ Co-Authored-By: ...
      - `-m` (repeated) and `-am`;
      - `--message=`;
      - `-F <file>` and `-F -` with a quoted heredoc;
-     - `-m "$(cat <<'EOF' ... EOF)"` (accepted here, but prefer `-F - <<'EOF'`: the ah-run hook cannot read a heredoc inside `$(...)` with certainty, so it checks that message line by line as commands and can refuse it);
+     - `-m "$(cat <<'EOF' ... EOF)"` (accepted here, but prefer `-F - <<'EOF'`: the ah-run hook cannot read a heredoc inside `$(...)` with certainty, so it checks that message line by line as commands and can refuse it. The same goes for any quote character inside backticks, `$(...)`, `<(...)`, `${...}`, `((...))`, `$((...))` or `$[...]`, or on a line continued with a backslash: shells disagree about quoting there, so such a command is never auto-allowed and every line of it reaches the deny rules and the escape check);
      - `--amend --no-edit`, which checks HEAD's message;
      - `-C <commit>`;
      - `--fixup` and `--squash`;
