@@ -1152,8 +1152,10 @@ def write_compare_result(directory, result):
 
 
 def resolve_pin(args, record):
-    """(pinned HEAD, problem): the journal's own base is the generation's original HEAD, so the caller cannot choose a weaker
-    pin. Only a reservation-only journal (no base) needs --pinned-head."""
+    """(pinned HEAD, problem): the journal base is the checkout HEAD when the finish started, normally the generation's pinned
+    original HEAD, so the caller cannot choose a weaker pin. When the base already equals --expected-head (the checkout moved
+    before the finish) nothing is bounded and suite_compare refuses a baseline that accepted new failures. Only a
+    reservation-only journal (no base) needs --pinned-head."""
     base = (record or {}).get('base')
     explicit = getattr(args, 'pinned_head', None)
     if base:
@@ -1161,6 +1163,8 @@ def resolve_pin(args, record):
             return None, '--pinned-head does not match the journal base ' + base
         return base, None
     if explicit:
+        if explicit == getattr(args, 'expected_head', None):
+            return None, '--pinned-head equals --expected-head, which bounds nothing; it must be the generation\'s original HEAD'
         return explicit, None
     return None, 'the journal records no base commit; pass --pinned-head with the generation\'s pinned original HEAD'
 

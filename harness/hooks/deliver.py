@@ -1859,7 +1859,7 @@ def preflight_compare(flow):
         if ACTIVE_COMPARE.get("recorded_only"):
             suite_compare.accept_recorded(flow.original, ACTIVE_COMPARE["expected_sha"], ACTIVE_COMPARE.get("pinned_sha"))
         else:
-            suite_compare.preflight(flow.original, ACTIVE_COMPARE["expected_sha"])
+            suite_compare.preflight(flow.original, ACTIVE_COMPARE["expected_sha"], ACTIVE_COMPARE.get("pinned_sha"))
     except suite_compare.CompareFailure as failure:
         raise DeliveryError("BLOCKED_POLICY", "Baseline comparison cannot start: " + "; ".join(failure.problems[:4]), code=2,
                             baseline_compare_problems=failure.problems[:20]) from None

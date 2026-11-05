@@ -807,3 +807,44 @@ class Round4(unittest.TestCase):
                 out = base / "r.json"
                 self.assertEqual(run_runner(repo, out).returncode, 0)
                 self.assertFalse(json.loads(out.read_text())["clean"], name)
+
+
+class Round5(unittest.TestCase):
+    HOST = socket.gethostname().split(".")[0]
+
+    def test_a_baseline_that_accepted_new_failures_is_refused_when_nothing_bounds_it(self):
+        import suite_compare as sc
+        suite = {"failing_ids": ["t.a", "t.reg"], "ran": 10, "skipped": 0, "host": self.HOST,
+                 "note": {"reason": "accepted for now", "accepted_new_failures": ["t.reg"]}}
+        with mock.patch.object(sc, "baseline_record_for", return_value="r"), mock.patch.object(ts, "baseline_suite_for", return_value=(suite, [])):
+            for call in (lambda: sc.preflight(".", SHA), lambda: sc.preflight(".", SHA, SHA), lambda: sc.accept_recorded(".", SHA),
+                         lambda: sc.accept_recorded(".", SHA, SHA)):
+                with self.assertRaises(sc.CompareFailure) as ctx:
+                    call()
+                self.assertIn("t.reg", str(ctx.exception))
+            # bounded by a different pinned HEAD's baseline the waiver no longer decides anything
+            self.assertEqual(sc.preflight(".", SHA, OTHER), suite)
+
+    def test_run_compare_refuses_a_waived_baseline_before_running(self):
+        import suite_compare as sc
+        base = record(sha=SHA)
+        base["suite"]["note"] = {"reason": "accepted for now", "accepted_new_failures": ["t.reg"]}
+        ran = mock.Mock()
+        with mock.patch.object(sc, "baseline_record_for", return_value=base):
+            with self.assertRaises(sc.CompareFailure):
+                sc.run_compare(".", SHA, 60, tempfile.gettempdir(), ran, mock.Mock())
+        ran.assert_not_called()
+
+    def test_a_pin_equal_to_the_expected_head_is_not_a_pin(self):
+        import integrate_local as il
+        args = SimpleNamespace(expected_head=SHA, pinned_head=SHA)
+        self.assertIsNone(il.resolve_pin(args, {})[0])
+        self.assertIsNone(il.resolve_pin(args, None)[0])
+
+    def test_the_pinned_baseline_must_be_from_this_host_too(self):
+        import suite_compare as sc
+        pinned = {"failing_ids": ["t.a", "t.b"], "ran": 10, "skipped": 0, "host": "some-other-machine"}
+        with mock.patch.object(sc, "baseline_record_for", return_value="r"), mock.patch.object(ts, "baseline_suite_for", return_value=(pinned, [])):
+            with self.assertRaises(sc.CompareFailure) as ctx:
+                sc.bound_by_pinned(".", ["t.a"], 10, 10, OTHER)
+        self.assertIn("recorded on host", str(ctx.exception))

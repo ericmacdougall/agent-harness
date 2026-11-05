@@ -56,6 +56,8 @@ def bound_by_pinned(repo, failing_ids, ran: int, active: int, pinned_sha: str) -
     pinned, why = test_scope.baseline_suite_for(baseline_record_for(repo, pinned_sha), pinned_sha)
     if pinned is None:
         raise CompareFailure(["the pinned original HEAD has no complete suite baseline to bound the result with: " + "; ".join(why)])
+    if host_problem(pinned):
+        raise CompareFailure(["pinned HEAD baseline: " + host_problem(pinned)])
     problems = []
     new = sorted(i for i in failing_ids if i not in set(pinned["failing_ids"]))
     if new:
@@ -73,8 +75,18 @@ def host_problem(suite: dict):
     here = socket.gethostname().split(".")[0]
     recorded = suite.get("host")
     if recorded != here:
-        return (f"the baseline was recorded on host {recorded!r} but this run is on {here!r}: finish on the host that "
-                "recorded it (the delivery clone), or record a baseline here")
+        return (f"the baseline was recorded on host {recorded!r} but this run is on {here!r}: run the finish on the host "
+                "that recorded it (the dev2 delivery clone)")
+    return None
+
+
+def waiver_problem(suite: dict):
+    """A baseline recorded with --accept-new-failures turned a regression into a known failure. Nothing may be accepted
+    against it unless the result is also bounded by a different, pinned HEAD's baseline (there is no general waiver)."""
+    note = suite.get("note")
+    if isinstance(note, dict) and note.get("accepted_new_failures"):
+        return ("the baseline accepted new failures (" + ", ".join(map(str, note["accepted_new_failures"][:3]))
+                + "): a regression cannot become a known failure; fix them, or bound the result by the pinned HEAD's baseline")
     return None
 
 
@@ -101,7 +113,7 @@ def baseline_record_for(repo, sha: str):
     return data.get("record") if isinstance(data, dict) else None
 
 
-def preflight(repo, sha: str) -> dict:
+def preflight(repo, sha: str, pinned_sha=None) -> dict:
     """Before any effect: a complete suite baseline for exactly sha must exist. Returns its suite block."""
     import test_scope
     suite, problems = test_scope.baseline_suite_for(baseline_record_for(repo, sha), sha)
@@ -109,6 +121,8 @@ def preflight(repo, sha: str) -> dict:
         raise CompareFailure(problems)
     if host_problem(suite):
         raise CompareFailure([host_problem(suite)])
+    if not (pinned_sha and pinned_sha != sha) and waiver_problem(suite):
+        raise CompareFailure([waiver_problem(suite)])
     return suite
 
 
@@ -125,6 +139,8 @@ def run_compare(repo, expected_sha: str, timeout, report_dir, run_fn, log, pinne
         raise CompareFailure(base_problems)
     if host_problem(base_suite):
         raise CompareFailure([host_problem(base_suite)])
+    if not (pinned_sha and pinned_sha != expected_sha) and waiver_problem(base_suite):
+        raise CompareFailure([waiver_problem(base_suite)])
     try:
         os.unlink(report_path)
     except FileNotFoundError:
@@ -180,6 +196,8 @@ def accept_recorded(repo, sha: str, pinned_sha: str | None = None) -> dict:
         raise CompareFailure(problems)
     if host_problem(suite):
         raise CompareFailure([host_problem(suite)])
+    if not (pinned_sha and pinned_sha != sha) and waiver_problem(suite):
+        raise CompareFailure([waiver_problem(suite)])
     if pinned_sha and pinned_sha != sha:
         problems = bound_by_pinned(repo, suite["failing_ids"], suite["ran"], suite["ran"] - suite.get("skipped", 0), pinned_sha)
         if problems:
