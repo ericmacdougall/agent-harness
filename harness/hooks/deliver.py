@@ -361,7 +361,6 @@ def focused_recheck(flow, target):
 # failing ids of the complete suite baseline recorded for exactly the pinned original HEAD. Active only for one finish.
 ACTIVE_COMPARE: dict = {}
 WHOLE_SUITE_ARGV = ["python3", "-m", "unittest", "discover", "-s", "tests"]
-MAX_SUITE_REPORT = 1_000_000
 
 
 def checks_digest(preparations, checks):
@@ -381,69 +380,43 @@ def helper_source():
     return {"tree": str(tree), "head": head.strip() if not code else "unknown"}
 
 
-def baseline_record_for(repo, sha):
-    """The recorded baseline for exactly sha from the test-scope store (None when absent or unreachable)."""
-    import test_scope
-    ctx = test_scope.repo_context(str(repo))
-    got = test_scope.store_call(test_scope.load_policy(), ["baseline-get", f"--repo-id={ctx['repo_id']}", f"--main-sha={sha}"])
-    if got is None:
-        raise compare_failure(["the test-scope store is unreachable, so no baseline can be verified"])
-    _code, data = got
-    return data.get("record") if isinstance(data, dict) else None
-
-
 def run_suite_compare(repo, log, timeout, log_directory):
-    """Run the whole suite through suite_report.py (never trusting a report that was already there) and compare."""
-    import test_scope
-    plan = ACTIVE_COMPARE
-    sha = plan["expected_sha"]
-    report_path = Path(log_directory) / "suite-report.json"
+    """Run the whole suite through suite_report.py and compare it with the baseline recorded for the pinned HEAD."""
+    import suite_compare
     try:
-        os.unlink(report_path)
-    except FileNotFoundError:
-        pass
-    nonce = secrets.token_hex(16)
-    command = ["python3", str(Path(__file__).with_name("suite_report.py")), "--repo", str(repo), "--out", str(report_path),
-               "--nonce", nonce]
-    log.header(command)
-    try:
-        result = run_check(repo, command, timeout=timeout, discard_output=True, sink=log)
-    except subprocess.TimeoutExpired:
-        raise compare_failure([f"the suite exceeded {timeout} seconds"], **log.facts()) from None
-    except (CheckInterpreterError, OSError) as error:
-        raise compare_failure([f"the suite runner could not start ({error.__class__.__name__})"], **log.facts()) from None
-    if result.returncode:
-        raise compare_failure([f"the suite runner exited {result.returncode}: the suite crashed or stopped early"], **log.facts())
-    try:
-        report = json.loads(regular_bytes(report_path, MAX_SUITE_REPORT))
-    except (DeliveryError, ValueError, OSError):
-        raise compare_failure(["no readable suite report was produced"], **log.facts()) from None
-    if not isinstance(report, dict) or report.get("nonce") != nonce:
-        raise compare_failure(["the suite report is not from this run"], **log.facts())
-    code, head = git(repo, "rev-parse", "HEAD")
-    if code:
-        raise compare_failure(["the checked checkout's HEAD could not be read"])
-    outcome = test_scope.compare_suite(report, baseline_record_for(repo, sha), sha, head.strip())
-    if not outcome["ok"]:
-        raise compare_failure(outcome["problems"], baseline_sha=sha, checked_ran=outcome["checked_ran"],
-                              baseline_ran=outcome["baseline_ran"], **log.facts())
-    plan["result"] = {key: outcome[key] for key in ("baseline_sha", "baseline_ran", "checked_ran", "accepted_failing_ids")}
-    plan["result"].update(source="run", checked_head=head.strip(), helper=helper_source())
+        ACTIVE_COMPARE["result"] = suite_compare.run_compare(repo, ACTIVE_COMPARE["expected_sha"], timeout, log_directory, run_check, log)
+    except suite_compare.CompareFailure as failure:
+        raise compare_failure(failure.problems, **{k: v for k, v in failure.facts.items() if k != "baseline_compare_problems"}) from None
+    ACTIVE_COMPARE["result"]["helper"] = helper_source()
 
 
 def accept_recorded_baseline(repo, sha):
-    """--use-recorded-baseline (resolve only): the already-recorded real suite run at exactly this HEAD is the evidence."""
-    import test_scope
-    record = baseline_record_for(repo, sha)
-    suite, problems = test_scope.baseline_suite_for(record, sha)
-    if suite is None:
-        raise compare_failure(problems)
-    ACTIVE_COMPARE["result"] = {"baseline_sha": sha, "baseline_ran": suite["ran"], "checked_ran": suite["ran"],
-                                "accepted_failing_ids": sorted(suite["failing_ids"]), "source": "recorded", "checked_head": sha,
-                                "helper": helper_source()}
+    """--use-recorded-baseline (resolve only): the already-recorded real suite run at exactly this HEAD is the evidence, and
+    its failing ids must stay within the baseline of the generation's pinned original HEAD (no re-baselined regressions)."""
+    import suite_compare
+    try:
+        ACTIVE_COMPARE["result"] = suite_compare.accept_recorded(repo, sha, ACTIVE_COMPARE.get("pinned_sha"))
+    except suite_compare.CompareFailure as failure:
+        raise compare_failure(failure.problems) from None
+    ACTIVE_COMPARE["result"]["helper"] = helper_source()
 
 
-CHECK_FACTS = ("check_log", "check_tail", "check_log_truncated", "check_status")
+def write_compare_evidence(flow):
+    """Durable copy of the compare result next to the generation state (the resolve path writes no receipt)."""
+    result = ACTIVE_COMPARE.get("result")
+    if not result or getattr(flow, "directory", None) is None:
+        return
+    path = flow.directory / "baseline-compare.json"
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=1, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+CHECK_FACTS = ("check_log", "check_tail", "check_log_truncated", "check_status", "baseline_compare_problems")
 
 
 def check_facts(error):
@@ -746,6 +719,7 @@ class Workflow:
             data["focused_checks"] = self.focused_checks  # the test_scope approval of each focused check
         if ACTIVE_COMPARE.get("result"):
             data["baseline_compare"] = ACTIVE_COMPARE["result"]  # baseline sha, both test counts, the accepted failing ids
+            write_compare_evidence(self)
         private_directory(self.receipt.parent)
         write_journal(self.receipt.parent, data, first=True)
         self.save(phase="DELIVERED" if mode == "remote" else "LOCAL_DELIVERED", target=head,
@@ -1850,15 +1824,31 @@ def configure_compare(args, checks, state):
         return
     if args.resolve_baseline is None and args.mode != "remote":
         raise DeliveryError("BLOCKED_POLICY", "--baseline-compare supports remote delivery and --resolve-baseline, not local mode", code=2)
-    if getattr(args, "resume", False):
-        raise DeliveryError("BLOCKED_POLICY", "--baseline-compare does not apply to --resume", code=2)
     if checks != [WHOLE_SUITE_ARGV]:
         raise DeliveryError("BLOCKED_POLICY", "--baseline-compare needs exactly one check, the whole suite "
                             "'python3 -m unittest discover -s tests'; a focused, partial or other check is refused", code=2)
     if getattr(args, "use_recorded_baseline", False) and args.resolve_baseline is None:
         raise DeliveryError("BLOCKED_POLICY", "--use-recorded-baseline applies only to --resolve-baseline", code=2)
     expected = valid_oid(args.resolve_baseline) if args.resolve_baseline is not None else state["baseline"]
-    ACTIVE_COMPARE.update(expected_sha=expected, recorded_only=bool(getattr(args, "use_recorded_baseline", False)))
+    ACTIVE_COMPARE.update(expected_sha=expected, pinned_sha=state["baseline"],
+                          recorded_only=bool(getattr(args, "use_recorded_baseline", False)))
+
+
+def preflight_compare(flow):
+    """Before ANY checkout effect (the fast-forward happens long before a 30 minute suite ends): a complete suite baseline
+    for exactly the expected commit must already be recorded, and for --use-recorded-baseline its ids must stay within the
+    pinned HEAD's baseline. A missing baseline is a policy refusal here, never a recovery state."""
+    if not ACTIVE_COMPARE:
+        return
+    import suite_compare
+    try:
+        if ACTIVE_COMPARE.get("recorded_only"):
+            suite_compare.accept_recorded(flow.original, ACTIVE_COMPARE["expected_sha"], ACTIVE_COMPARE.get("pinned_sha"))
+        else:
+            suite_compare.preflight(flow.original, ACTIVE_COMPARE["expected_sha"])
+    except suite_compare.CompareFailure as failure:
+        raise DeliveryError("BLOCKED_POLICY", "Baseline comparison cannot start: " + "; ".join(failure.problems[:4]), code=2,
+                            baseline_compare_problems=failure.problems[:20]) from None
 
 
 def finish(args):
@@ -1884,6 +1874,7 @@ def _finish(args, preparations, checks, focused):
         if args.kit_file is not None and kit_digest(args.kit_file) != state["kit_digest"]:
             raise DeliveryError("BLOCKED_POLICY", "Run kit changed since prepare", code=2)
         configure_compare(args, checks, state)
+        preflight_compare(flow)
         if focused and args.resolve_baseline is not None:
             raise DeliveryError("BLOCKED_POLICY", "A recovery baseline needs a whole-suite check, not a focused one", code=2)
         flow.focused_checks = focused_proof(flow, focused) if focused else []
@@ -1932,6 +1923,7 @@ def resolve_baseline(flow, preparations, checks):
         if snapshot(flow.original, flow.branch) != confirmed:
             raise DeliveryError("RECOVERY_REQUIRED", "Baseline checks changed the confirmed checkout")
         # save rereads both the exact generation pointer and loaded state.
+        write_compare_evidence(flow)
         flow.save(phase="RESOLVED_BASELINE")
     report("RESOLVED_BASELINE", "Tested baseline accepted; review and prepare a new generation before delivery",
            head=confirmed, **flow.facts())

@@ -82,19 +82,32 @@ def write_report(path: Path, report: dict) -> None:
     os.replace(str(tmp), str(path))
 
 
+def _tree_state(repo: str) -> tuple:
+    """(HEAD, clean). Clean means no tracked change, no untracked file (ignored files excepted) and no assume-unchanged
+    or skip-worktree entry hiding a change."""
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    dirty = _git(repo, "status", "--porcelain", "--untracked-files=all").strip()
+    hidden = [line for line in _git(repo, "ls-files", "-v").splitlines() if line[:1].islower() or line[:1] == "S"]
+    return head, not dirty and not hidden
+
+
 def run_suite(repo: str, start: str = "tests") -> dict:
     """Discover and run; returns the report dict (complete only when the run reached its end)."""
     repo = str(Path(repo).resolve())
-    head = _git(repo, "rev-parse", "HEAD").strip()
-    clean = not _git(repo, "status", "--porcelain", "--untracked-files=no").strip()
+    sys.dont_write_bytecode = True
+    head, clean = _tree_state(repo)
     started = time.time()
     os.chdir(repo)
     start_dir = str(Path(repo) / start)
-    if start_dir not in sys.path:
-        sys.path.insert(0, start_dir)  # what `unittest discover -s tests` does (top-level dir = the start dir)
+    # Import environment of `python3 -m unittest discover -s tests` run in the repo: the repo (cwd) and the start
+    # directory come first, and THIS helper's own directory (sys.path[0] for a script) is not importable by the tests.
+    here = str(Path(__file__).resolve().parent)
+    sys.path[:] = [repo, start_dir] + [p for p in sys.path if p not in ("", here, repo, start_dir)]
     suite = unittest.TestLoader().discover(start_dir)
     runner = unittest.TextTestRunner(stream=sys.stderr, verbosity=1, resultclass=Collect)
     result = runner.run(suite)
+    head_after, _ = _tree_state(repo)
+    changed = head_after != head or bool(_git(repo, "status", "--porcelain", "--untracked-files=no").strip())
     return {
         "schema": SCHEMA, "kind": "suite-report", "runner": RUNNER, "runner_version": RUNNER_VERSION,
         "command": WHOLE_SUITE_COMMAND, "whole_suite": True, "start": start, "head": head, "clean": clean,
@@ -102,7 +115,9 @@ def run_suite(repo: str, start: str = "tests") -> dict:
         "ran": int(result.testsRun), "skipped": len(result.skipped), "failures": len(result.failures),
         "errors": len(result.errors), "unexpected_successes": len(result.unexpectedSuccesses),
         "failing_ids": sorted(set(result.bad_ids)), "failing_count": len(result.bad_ids),
-        "started_at": started, "ended_at": time.time(), "complete": True}
+        "started_at": started, "ended_at": time.time(),
+        # a run that moved HEAD or modified tracked files while it ran does not describe one commit
+        "complete": not changed, "changed_during_run": changed}
 
 
 def main(argv=None) -> int:

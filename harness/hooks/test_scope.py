@@ -237,9 +237,15 @@ def _report_problems(report, what: str) -> list:
     head = report.get("head")
     if not isinstance(head, str) or not SHA40.fullmatch(head):
         out.append(f"{what}: no full commit id")
-    ran = report.get("ran")
+    ran, skipped = report.get("ran"), report.get("skipped")
     if type(ran) is not int or ran <= 0:
         out.append(f"{what}: no tests ran")
+    elif type(skipped) is not int or not 0 <= skipped <= ran:
+        out.append(f"{what}: the skipped count is missing or impossible")
+    elif ran - skipped <= 0:
+        out.append(f"{what}: every test was skipped, so nothing was actually tested")
+    if report.get("changed_during_run") is True:
+        out.append(f"{what}: HEAD or tracked files changed while the suite ran")
     ids = report.get("failing_ids")
     if not isinstance(ids, list) or any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != len(ids):
         out.append(f"{what}: failing_ids must be a list of distinct non-empty strings")
@@ -255,7 +261,23 @@ def suite_block(report: dict, report_sha256: str) -> dict:
             "host": report.get("host", ""), "report_sha256": report_sha256}
 
 
-def record_suite_baseline(store: Store, repo_id: str, report: dict, report_sha256: str, replace: bool = False) -> dict:
+def nearest_ancestor_baseline(store: Store, repo_id: str, top: str, head: str, depth: int = 400):
+    """The suite block of the nearest first-parent ancestor of head (excluding head) that has a recorded suite baseline."""
+    if not SHA40.fullmatch(head or ""):
+        return None
+    try:
+        shas = git(top, "rev-list", "--first-parent", f"--max-count={depth}", head).split()[1:]
+    except OSError:
+        return None
+    for sha in shas:
+        suite, _ = baseline_suite_for(baseline_get(store, repo_id, sha), sha)
+        if suite is not None:
+            return suite
+    return None
+
+
+def record_suite_baseline(store: Store, repo_id: str, report: dict, report_sha256: str, replace: bool = False,
+                          note: dict = None) -> dict:
     """File a baseline from a real complete suite_report for exactly report['head']; anything else is refused."""
     problems = _report_problems(report, "report")
     if problems:
@@ -263,9 +285,17 @@ def record_suite_baseline(store: Store, repo_id: str, report: dict, report_sha25
     if not re.fullmatch(r"[0-9a-f]{64}", str(report_sha256)):
         raise ValueError("report digest must be 64 lowercase hex characters")
     ids = report["failing_ids"]
+    block = suite_block(report, report_sha256)
+    if note:
+        block["note"] = note  # why a baseline was replaced or new failures were accepted: visible in every receipt's source
+    if replace:
+        previous = baseline_get(store, repo_id, report["head"])
+        if previous and isinstance(previous.get("suite"), dict):
+            block["replaces"] = {"report_sha256": previous["suite"].get("report_sha256", ""),
+                                 "failing": len(previous["suite"].get("failing_ids", [])), "ran": previous["suite"].get("ran")}
     return baseline_record(store, repo_id, report["head"], report["command"], "fail" if ids else "pass",
                            {"ran": report["ran"], "failing": len(ids), "skipped": report.get("skipped", 0)}, ids[:50],
-                           replace=replace, host=report.get("host", ""), suite=suite_block(report, report_sha256))
+                           replace=replace, host=report.get("host", ""), suite=block)
 
 
 def baseline_suite_for(record, sha: str):
@@ -295,6 +325,9 @@ def compare_suite(report, baseline_record, expected_sha: str, checked_head: str)
     if isinstance(report, dict) and report.get("head") != checked_head:
         problems.append("checked run: it ran at a different commit than the checked checkout")
     result = {"ok": False, "baseline_sha": expected_sha, "baseline_ran": (suite or {}).get("ran"),
+              "baseline_active": ((suite or {}).get("ran") or 0) - (suite or {}).get("skipped", 0),
+              "checked_active": (report.get("ran", 0) - report.get("skipped", 0)) if isinstance(report, dict)
+              and type(report.get("ran")) is int and type(report.get("skipped")) is int else None,
               "checked_ran": report.get("ran") if isinstance(report, dict) else None, "accepted_failing_ids": [], "new_failing_ids": []}
     if suite is not None and not problems:
         base_ids = set(suite["failing_ids"])
@@ -304,6 +337,9 @@ def compare_suite(report, baseline_record, expected_sha: str, checked_head: str)
                             + (" ..." if len(new) > 10 else ""))
         if report["ran"] < suite["ran"]:
             problems.append(f"the suite ran {report['ran']} tests, fewer than the baseline's {suite['ran']}")
+        if report["ran"] - report["skipped"] < suite["ran"] - suite.get("skipped", 0):
+            problems.append(f"the suite ran {report['ran'] - report['skipped']} non-skipped tests, fewer than the baseline's "
+                            f"{suite['ran'] - suite.get('skipped', 0)} (skipping tests does not make a run pass)")
         result["new_failing_ids"] = new
         result["accepted_failing_ids"] = sorted(i for i in report["failing_ids"] if i in base_ids)
     result["problems"] = problems
@@ -1002,13 +1038,12 @@ def cli(argv: list, capture: bool = False):
     p = sub.add_parser("run-full")
     p.add_argument("--repo", default=".")
     p.add_argument("command", nargs=argparse.REMAINDER)
-    p = sub.add_parser("baseline-from-report")
-    p.add_argument("--repo-id", required=True)
-    p.add_argument("--report", required=True)
-    p.add_argument("--replace", action="store_true")
     p = sub.add_parser("run-baseline")
     p.add_argument("--repo", default=".")
     p.add_argument("--replace", action="store_true")
+    p.add_argument("--reason", default="", help="why a baseline is replaced or new failures are accepted (10+ characters)")
+    p.add_argument("--accept-new-failures", action="store_true",
+                   help="record a baseline whose failing ids are not all in the nearest recorded ancestor baseline")
     sub.add_parser("hook")
     sub.add_parser("post")
     p = add("confirm", "--repo-id", "--kind", "--key", "--token")
@@ -1053,27 +1088,41 @@ def cli(argv: list, capture: bool = False):
             return out(0, {"recorded": True, "record": rec})
         if args.cmd == "control":
             return out(0, reserve_control(store, args.repo_id, args.main_sha, args.token))
-        if args.cmd in ("baseline-from-report", "run-baseline"):
+        if args.cmd == "run-baseline":
             if remote:
-                return out(3, {"error": f"{args.cmd} records into the store: run it on the store host (dev2/T2)"})
-            if args.cmd == "run-baseline":
-                ctx = repo_context(args.repo)
-                report_path = Path(tempfile.mkdtemp(prefix="suite-report-")) / "report.json"
-                done = subprocess.run([sys.executable, str(HERE / "suite_report.py"), "--repo", ctx["top"], "--out", str(report_path)])
-                if done.returncode != 0 or not report_path.is_file():
-                    return out(4, {"error": "the suite runner did not complete; nothing recorded"})
-                repo_id = ctx["repo_id"]
-            else:
-                report_path, repo_id = Path(args.report), args.repo_id
+                return out(3, {"error": "run-baseline records into the store: run it on the store host (dev2/T2)"})
+            ctx = repo_context(args.repo)
+            if (args.replace or args.accept_new_failures) and len(args.reason.strip()) < 10:
+                return out(3, {"error": "--replace and --accept-new-failures need --reason of 10+ characters"})
+            work = Path(tempfile.mkdtemp(prefix="suite-report-"))
+            report_path, nonce = work / "report.json", uuid.uuid4().hex
+            env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+            done = subprocess.run([sys.executable, str(HERE / "suite_report.py"), "--repo", ctx["top"], "--out", str(report_path),
+                                   "--nonce", nonce], env=env)
+            if done.returncode != 0 or not report_path.is_file():
+                return out(4, {"error": "the suite runner did not complete; nothing recorded"})
             sys.path.insert(0, str(HERE))
             import safe_input
             try:
                 raw = safe_input.read_bounded(report_path, MAX_REPORT)
             except safe_input.InputRejected as exc:
                 return out(3, {"error": f"cannot read the report: {exc.message}"})
-            rec = record_suite_baseline(store, repo_id, json.loads(raw), hashlib.sha256(raw).hexdigest(), args.replace)
+            report = json.loads(raw)
+            if report.get("nonce") != nonce:
+                return out(4, {"error": "the report is not from this run; nothing recorded"})
+            repo_id = ctx["repo_id"]
+            ancestor = nearest_ancestor_baseline(store, repo_id, ctx["top"], report.get("head", ""))
+            new = sorted(i for i in report.get("failing_ids", []) if ancestor and i not in set(ancestor["failing_ids"]))
+            if new and not args.accept_new_failures:
+                return out(2, {"allowed": False, "code": "new-failures-vs-ancestor",
+                               "message": f"{len(new)} failing test(s) are not in the nearest recorded ancestor baseline "
+                                          f"({ancestor['head'][:12]}): {', '.join(new[:10])}. Fix them, or record with "
+                                          "--accept-new-failures --reason <why>", "new_failing_ids": new[:50]})
+            rec = record_suite_baseline(store, repo_id, report, hashlib.sha256(raw).hexdigest(), args.replace,
+                                        note={"reason": args.reason.strip()[:300], "accepted_new_failures": new[:50],
+                                              "ancestor": ancestor["head"] if ancestor else ""} if (args.replace or new) else None)
             return out(0, {"recorded": True, "repo_id": repo_id, "sha": rec["main_sha"], "ran": rec["suite"]["ran"],
-                           "failing": len(rec["suite"]["failing_ids"])})
+                           "failing": len(rec["suite"]["failing_ids"]), "new_vs_ancestor": new[:50]})
         if args.cmd == "full-get":
             rec = full_get(store, args.repo_id, args.head)
             return out(0 if rec else 1, {"found": bool(rec), "record": rec})

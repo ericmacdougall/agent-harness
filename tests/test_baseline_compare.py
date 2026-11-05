@@ -288,11 +288,15 @@ class Wiring(unittest.TestCase):
                 deliver.configure_compare(self.args(), checks, state)
             self.assertEqual(ctx.exception.status, "BLOCKED_POLICY")
             self.assertEqual(deliver.ACTIVE_COMPARE, {})
-        for kw, text in ((dict(mode="local"), "remote"), (dict(resume=True), "resume"),
+        for kw, text in ((dict(mode="local"), "remote"),
                          (dict(use_recorded_baseline=True), "resolve-baseline")):
             with self.assertRaises(deliver.DeliveryError, msg=str(kw)) as ctx:
                 deliver.configure_compare(self.args(**kw), self.WHOLE, state)
             self.assertIn(text, ctx.exception.message)
+
+    def test_resume_is_allowed_under_compare(self):
+        deliver.configure_compare(self.args(resume=True), self.WHOLE, {"baseline": SHA})
+        self.assertEqual(deliver.ACTIVE_COMPARE["expected_sha"], SHA)
 
     def test_expected_sha_is_the_pinned_original_head_or_the_confirmed_baseline(self):
         deliver.configure_compare(self.args(), self.WHOLE, {"baseline": SHA})
@@ -478,3 +482,50 @@ class Cli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Round2(unittest.TestCase):
+    def test_baseline_from_report_is_gone_and_helpers_are_installed(self):
+        self.assertFalse(hasattr(ts, "record_from_report"))
+        self.assertNotIn("baseline-from-report", (HOOKS / "test_scope.py").read_text())
+        import install
+        for name in ("suite_report.py", "suite_compare.py"):
+            self.assertIn(name, [str(h) for h in install.HOOKS], name)
+
+    def test_gate_refuses_non_whole_suite_check_for_resolve_journal(self):
+        import integrate_local as il
+        log = mock.Mock()
+        args = SimpleNamespace(expected_head=SHA, baseline_compare=True)
+        for checks in ([], [["python3", "-m", "unittest", "tests.test_a"]]):
+            with mock.patch.object(il, "report") as rep:
+                code = il.baseline_compare_gate(args, Path("."), Path("."), checks, log)
+            self.assertEqual(code, 2)
+            self.assertEqual(rep.call_args[0][0], "BLOCKED_POLICY")
+
+    def test_gate_keeps_journal_unresolved_when_compare_fails(self):
+        import integrate_local as il, suite_compare as sc
+        args = SimpleNamespace(expected_head=SHA, baseline_compare=True, check_timeout=None, timeout=60)
+        with mock.patch.object(sc, "run_compare", side_effect=sc.CompareFailure(["no baseline"])), \
+                mock.patch.object(il, "report") as rep, mock.patch.object(il, "observed_head", return_value=SHA):
+            code = il.baseline_compare_gate(args, Path("."), Path("/x"), [sc.WHOLE_SUITE_ARGV], mock.Mock())
+        self.assertEqual(code, 3)
+        self.assertEqual(rep.call_args[0][0], "RECOVERY_REQUIRED")
+
+    def test_gate_passes_when_compare_passes(self):
+        import integrate_local as il, suite_compare as sc
+        args = SimpleNamespace(expected_head=SHA, baseline_compare=True, check_timeout=None, timeout=60)
+        with mock.patch.object(sc, "run_compare", return_value={}):
+            self.assertEqual(il.baseline_compare_gate(args, Path("."), Path("/x"), [sc.WHOLE_SUITE_ARGV], mock.Mock()), 0)
+
+    def test_accept_recorded_rejects_ids_outside_pinned_baseline(self):
+        import suite_compare as sc
+        def suite(ids, ran=10):
+            return {"failing_ids": ids, "ran": ran, "skipped": 0}
+        recs = {"A": "ra", "B": "rb"}
+        def bs(rec, sha):
+            return ({"A": suite(["t.a"]), "B": suite(["t.a", "t.b"])}[sha], [])
+        with mock.patch.object(sc, "baseline_record_for", side_effect=lambda r, s: recs[s]), \
+                mock.patch.object(ts, "baseline_suite_for", side_effect=bs):
+            with self.assertRaises(sc.CompareFailure):
+                sc.accept_recorded(".", "B", "A")
+            self.assertEqual(sc.accept_recorded(".", "A", "B")["accepted_failing_ids"], ["t.a"])

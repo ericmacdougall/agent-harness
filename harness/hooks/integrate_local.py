@@ -425,6 +425,9 @@ def main():
     parser.add_argument("--source")
     parser.add_argument("--expected-source-head")
     parser.add_argument("--resolve-journal", help="Accept the tested current checkout as the recovery baseline; preserve artifacts")
+    parser.add_argument("--baseline-compare", action="store_true",
+                        help="With --resolve-journal: pass the whole-suite check when its failing ids are an exact subset of "
+                             "the baseline recorded for the confirmed HEAD (test_scope.py run-baseline)")
     parser.add_argument("--prepare", action="append", default=[], help="Lockfile install after merge, before checks")
     parser.add_argument("--check", action="append", required=True, help="One argv command, quoted as a single argument; no shell")
     parser.add_argument("--timeout", type=int, default=600, help="Seconds allowed for each Git command and abort")
@@ -1073,6 +1076,11 @@ def resolve_journal(args, repo, identity, root, common, common_info, root_info, 
         return 3
     log = CheckLog(directory / 'checks')
     try:
+        if getattr(args, 'baseline_compare', False):
+            code = baseline_compare_gate(args, repo, directory, checks, log)
+            if code:
+                return code
+            checks = []
         for command in checks:
             log.header(command)
             try:
@@ -1117,6 +1125,27 @@ def resolve_journal(args, repo, identity, root, common, common_info, root_info, 
            head=args.expected_head, journal=str(directory / 'journal.json'),
            scratch=record.get('scratch'), recovery_ref=record.get('ref'),
            artifacts_unknown=missing_record, **pin_details)
+    return 0
+
+
+def baseline_compare_gate(args, repo, directory, checks, log):
+    """--resolve-journal --baseline-compare (GoodQA #14582): the whole suite passes when its failing ids are an exact subset
+    of the complete suite baseline recorded for exactly the confirmed HEAD (args.expected_head); the rule deliver.py
+    --baseline-compare applies. Returns 0 when it passed, otherwise the exit code after reporting."""
+    import suite_compare
+    if list(checks) != [suite_compare.WHOLE_SUITE_ARGV]:
+        log.close()
+        report('BLOCKED_POLICY', "--baseline-compare needs exactly one check, the whole suite "
+               "'python3 -m unittest discover -s tests'")
+        return 2
+    try:
+        suite_compare.run_compare(repo, args.expected_head, check_timeout(args), directory / 'checks', run, log)
+    except suite_compare.CompareFailure as failure:
+        log.close()
+        report('RECOVERY_REQUIRED', 'Baseline comparison failed: ' + '; '.join(failure.problems[:4])
+               + '; journal remains unresolved', journal=str(directory / 'journal.json'),
+               head=observed_head(repo), phase='check', baseline_compare_problems=failure.problems[:20])
+        return 3
     return 0
 
 
