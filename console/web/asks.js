@@ -97,7 +97,8 @@ export function openAsksView({ api, el }) {
     const panel = el('div', 'asks-panel');
     panel.id = 'asks-panel';
     panel.setAttribute('role', 'tabpanel');
-    panel.tabIndex = -1;
+    panel.tabIndex = 0;
+    panel.setAttribute("aria-label", "Results");
     body.append(tablist, filters, el('div', 'asks-statusbar'), panel);
     body.querySelector('.asks-statusbar').append(status, refreshButton);
     syncTabs();

@@ -1714,7 +1714,7 @@ h1 {
     gap:0;
     margin:0
   }
-  .topbar-actions .quiet-button {
+  .topbar-actions .quiet-button:not(#asks-button) {
     display:none
   }
   .session-tab {
