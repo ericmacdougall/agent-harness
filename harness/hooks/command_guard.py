@@ -843,6 +843,19 @@ def _resolve_prefix(path):
         return None
 
 
+def _real_git_marker(marker):
+    """A .git directory holding HEAD, or a .git file starting with `gitdir:` (linked worktree)."""
+    try:
+        if os.path.isdir(marker) and not os.path.islink(marker):
+            return os.path.isfile(os.path.join(marker, 'HEAD'))
+        if os.path.isfile(marker) and not os.path.islink(marker):
+            with open(marker, 'rb') as handle:
+                return handle.read(8) == b'gitdir: '
+    except OSError:
+        return False
+    return False
+
+
 def classify_segs(c, segs):
     """'log' (Tier A), 'root' (Tier B), 'ancestor' (contains a protected root) or None, for case-folded segments."""
     for r in c.protected:
@@ -1087,6 +1100,9 @@ class Ctx:
         self.origin_cwd = cwd  # the payload's working directory, None when the host sent none
         self.cwd_known = bool(cwd)  # becomes True after an absolute or home `cd` in the command
         self.work_refusal = False
+        self.token_sink_ok = False
+        self.token_allowed = 0
+        self.top_commands = 0
         self.cwd_unknown = False
         self.cwd_protected_unknown = False  # cd to an unresolved path whose text names a protected location
         self.var_hints = {}  # raw text of dynamic assignments, for variables the guard cannot resolve
@@ -1125,6 +1141,9 @@ class Analyzer:
         if ctx.kill_seen:
             for finding in ctx.pending_kill:
                 ctx.findings.append(finding)
+        if ctx.token_allowed and ctx.top_commands > 1:
+            ctx.add(SECRET_DUMP, 'gh-secret', 'gh auth token is allowed only as VAR=$(gh auth token) gh <subcommand> '
+                    'on its own', 'run that gh command by itself')
         return ctx.findings
 
     def script(self, text, depth, tail_visible=None, ps=None):
@@ -1334,8 +1353,16 @@ class Analyzer:
             for w in (words if head_nonexec else []):
                 self.subs(w, depth, visible=False)
             return
+        if depth == 0:
+            ctx.top_commands += 1
+        token_ok = (depth == 0 and len(assigns) == 1 and len(pl.cmds) == 1 and not cmd.redirs and norm_name(rest[0].text) == 'gh'
+                    and not rest[0].dynamic and self._gh_sub_ok(rest[1:]))
         for a in assigns:
-            self.subs(a, depth, visible=False)
+            ctx.token_sink_ok = token_ok
+            try:
+                self.subs(a, depth, visible=False)
+            finally:
+                ctx.token_sink_ok = False
         # substitutions inside arguments run first; their output is visible only when the outer command prints it
         outer = norm_name(rest[0].text)
         printer = outer in ECHO_CMDS or outer in PRINT_FILE_CMDS or outer in PASS_FILTERS
@@ -2033,6 +2060,17 @@ class Analyzer:
             ctx.secret_seen += 1
             ctx.add(SECRET_DUMP, 'keychain-dump', 'security dump-keychain -d prints decrypted keychain items', 'security list-keychains')
 
+    GH_TOKEN_BANNED_SUBS = {'auth', 'config', 'extension', 'extensions', 'ext', 'alias', 'secret'}
+
+    def _gh_sub_ok(self, args):
+        for a in args:
+            if a.dynamic:
+                return False
+            if a.text.startswith('-'):
+                continue
+            return a.text.casefold() not in self.GH_TOKEN_BANNED_SUBS
+        return False
+
     def secret_clis(self, name, texts, visible=True):
         ctx = self.ctx
         nd = [t for t in texts if not t.startswith('-')]
@@ -2045,7 +2083,11 @@ class Analyzer:
             if extra and not re.search(extra, joined):
                 continue
             ctx.secret_seen += 1
-            if not visible and binary in ('gh', 'aws', 'gcloud', 'az', 'op', 'heroku', 'fly', 'flyctl'):
+            if binary == 'gh' and required == ('auth', 'token'):
+                if not visible and ctx.token_sink_ok:
+                    ctx.token_allowed += 1
+                    return  # VAR=$(gh auth token) gh <subcommand>: the value goes straight into gh's environment
+            elif not visible and binary in ('aws', 'gcloud', 'az', 'op', 'heroku', 'fly', 'flyctl'):
                 return  # the value goes into a variable or a --password-stdin sink, not the transcript
             ctx.add(SECRET_DUMP, '%s-secret' % binary, '%s %s prints a secret value into the transcript' % (binary, ' '.join(required) or 'decrypt'), alt)
             return
@@ -2356,12 +2398,15 @@ class Analyzer:
         segs = Compiled._segs(path)
         if '.git' in segs:
             return False
-        top = self._git_top(path, work_len + 2)
+        top = self._git_top(path, work_len + 3)  # strictly below work/<session>/<task>
         if not top:
             return False
         top_len = len(Compiled._segs(top))
-        if any(_has_glob(x) for x in segs[:top_len + 1]):
+        if any(_has_glob(x) for x in segs[:top_len]):
             return False  # a wildcard at or above the top level could reach the worktree itself or its siblings
+        first = segs[top_len] if len(segs) > top_len else ''
+        if _has_glob(first) and first[:1] in ('.', '?', '['):
+            return False  # could match .git directly below the top
         try:
             here = os.path.realpath(origin)
             top_real = os.path.realpath(top)
@@ -2413,7 +2458,7 @@ class Analyzer:
                 return None  # made by this same command
             try:
                 if os.path.lexists(marker):
-                    return top
+                    return top if _real_git_marker(marker) else None
             except (OSError, ValueError):
                 return None
         return None
