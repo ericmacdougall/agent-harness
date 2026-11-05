@@ -863,7 +863,7 @@ class TicketRefTests(GoodQABase):
         with contextlib.redirect_stdout(out):
             rc = ah.main(["ticket", "comment", "GoodQA goodqa#77", "--body", "good 2", "--key", "later-key-0002"])
         self.assertEqual(rc, 0, out.getvalue())
-        self.assertEqual(len(self.spool_files("dead")), 1)  # the stale job is dead, not a recurring error
+        self.assertEqual((len(self.spool_files("parked")), len(self.spool_files("dead"))), (1, 0))  # parked, not a recurring error
         self.assertEqual(self.spool_files(), [])
 
     def test_a_crashing_drain_cannot_fail_the_caller(self):
@@ -986,6 +986,58 @@ class TicketRefReview(WriteTests):
         self.assertEqual((r["dead"], len(self.spool_files("dead"))), (2, 2))
         self.assertEqual(ah.spool_drain(self.home)["drained"], 1)
         self.assertEqual(len(FakeGoodQA.state["posted"]), 1)
+
+
+class TicketRefRound2(WriteTests):
+    """Round 2 of goodqa#14658: nothing is lost on a bad policy file or an access change."""
+
+    def spool_files(self, sub=""):
+        d = self.home / ".agent-harness" / "state" / "ah" / "store" / "spool" / sub
+        return sorted(d.glob("*.json")) if d.exists() else []
+
+    def test_n1_a_value_error_while_posting_keeps_the_backlog(self):
+        for n in range(3):
+            ah._spool_comment(self.home, {"ticket": "GoodQA goodqa#77", "body": f"b{n}", "operation_id": f"ah:keep-{n}"})
+        with mock.patch.object(ah, "post_comment", side_effect=ValueError("truncated policy file")):
+            r = ah.spool_drain(self.home)
+        self.assertEqual((r["dead"], r["pending"], len(self.spool_files()), len(self.spool_files("dead"))), (0, 3, 3, 0))
+        self.assertEqual(ah.spool_drain(self.home)["drained"], 3)  # the next drain, with a good policy, delivers them
+
+    def test_n2_out_of_scope_is_parked_not_lost_and_retry_restores_it(self):
+        ah._spool_comment(self.home, {"ticket": "GoodQA nosuchproj#77", "body": "later", "operation_id": "ah:park-1"})
+        r = ah.spool_drain(self.home)
+        self.assertEqual((r["dead"], r["parked"], len(self.spool_files("parked"))), (0, 1, 1))
+        job = self.spool_files("parked")[0]
+        job.write_text(json.dumps({"ticket": "GoodQA goodqa#77", "body": "later", "operation_id": "ah:park-1"}))  # access fixed
+        self.assertEqual(ah.spool_retry(self.home)["requeued"], [job.name])
+        self.assertEqual((ah.spool_drain(self.home)["drained"], len(FakeGoodQA.state["posted"])), (1, 1))
+
+    def test_n2_comment_to_an_unreachable_project_is_queued_then_parked_not_dead(self):
+        r = ah.write(self.home, "ticket.comment", {"ticket": "GoodQA solve#5", "body": "x"}, SESSION, "park-key-00001")
+        self.assertEqual((r["result"], r["comment"]), ("applied", "parked"))
+        self.assertEqual((len(self.spool_files("parked")), len(self.spool_files("dead"))), (1, 0))
+
+    def test_n3_resuming_a_legacy_intent_keeps_its_operation_id(self):
+        args = {"ticket": "GoodQA #77", "body": "resume me"}
+        legacy_key = ah.derive_key("ticket.comment", args, SESSION)
+        body_sha = hashlib.sha256(ah.canonical(["ticket.comment", args]).encode()).hexdigest()
+        store = self.home / ".agent-harness" / "state" / "ah" / "store"
+        store.mkdir(parents=True, exist_ok=True)
+        ah._append_line(store / "ledger.jsonl", {"state": "intent", "key": legacy_key, "sha": body_sha, "seq": 1,
+                                                 "intent_op": "ticket.comment", "at": "x"})
+        r = ah.write(self.home, "ticket.comment", args, SESSION)
+        self.assertEqual((r["result"], r["key"]), ("applied", legacy_key))  # L1: the reply names the stored key
+        self.assertEqual(list(FakeGoodQA.state["posted"]), [ah.operation_id(legacy_key)])
+        self.assertEqual(ah.write(self.home, "ticket.comment", args, SESSION)["result"], "duplicate")
+
+    def test_l3_l4_drain_survives_an_unmovable_or_symlinked_job(self):
+        spool = self.home / ".agent-harness" / "state" / "ah" / "store" / "spool"
+        spool.mkdir(parents=True, exist_ok=True)
+        (spool / "dead").write_text("a file where the dead directory should be")
+        (spool / "1793866419170-eeeeeeeeeeeeeeee.json").write_text("{broken")
+        ah._spool_comment(self.home, {"ticket": "GoodQA goodqa#77", "body": "fine", "operation_id": "ah:fine-1"})
+        r = ah.spool_drain(self.home)
+        self.assertEqual((r["drained"], r["pending"]), (1, 1))  # the valid job still went out
 
 
 if __name__ == "__main__":

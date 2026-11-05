@@ -897,41 +897,76 @@ def spool_drain(home: Path, only_opid: str | None = None, limit: int | None = No
             fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return {"ok": True, "drained": 0, "pending": len(list(spool.glob("*.json"))), "busy": True}
-        done, failed, dead, dead_names = 0, 0, 0, []
+        done, failed, dead, parked, dead_names = 0, 0, 0, 0, []
         stop_at_ = time.monotonic() + budget_s if budget_s else None
         for n_, f in enumerate(sorted(spool.glob(f"*-{hashlib.sha256(only_opid.encode()).hexdigest()[:16]}.json" if only_opid else "*.json"))):
             if (limit is not None and n_ >= limit) or (stop_at_ and time.monotonic() > stop_at_):
                 break
-            try:
+            def move(kind):
+                (spool / kind).mkdir(parents=True, exist_ok=True, mode=0o700)
+                os.replace(f, spool / kind / f.name)
+
+            try:  # reading the job: only a malformed job (or a symlink) is dead; a read error keeps it
+                if f.is_symlink():
+                    raise ValueError("symlinked job")
                 job = json.loads(_bounded(f))
-                post_comment(job["ticket"], job["body"], job["operation_id"])
-            except AhError as e:
-                if e.code in ("not_found", "ticket_out_of_scope", "bad_request"):  # permanent: retrying cannot help
-                    (spool / "dead").mkdir(exist_ok=True, mode=0o700)
-                    os.replace(f, spool / "dead" / f.name)
+                ticket, body, opid = job["ticket"], job["body"], job["operation_id"]
+                if not all(isinstance(x, str) for x in (ticket, body, opid)):
+                    raise TypeError("job fields")
+            except (ValueError, KeyError, TypeError):
+                try:
+                    move("dead")
                     dead += 1
                     dead_names.append(f.name)
-                else:
+                except OSError:
                     failed += 1
                 continue
-            except (ValueError, KeyError, TypeError):  # an unreadable or malformed job can never succeed
-                (spool / "dead").mkdir(exist_ok=True, mode=0o700)
-                os.replace(f, spool / "dead" / f.name)
-                dead += 1
-                dead_names.append(f.name)
+            except Exception:
+                failed += 1
                 continue
-            except Exception:  # one bad job must never change another caller's result
+            try:
+                post_comment(ticket, body, opid)
+            except AhError as e:
+                try:
+                    if e.code in ("not_found", "bad_request"):  # a definite answer: this ticket does not exist
+                        move("dead")
+                        dead += 1
+                        dead_names.append(f.name)
+                    elif e.code == "ticket_out_of_scope":  # could change with access or credentials: park, never lose
+                        move("parked")
+                        parked += 1
+                    else:
+                        failed += 1
+                except OSError:
+                    failed += 1
+                continue
+            except Exception:  # one bad job (or a bad policy file) must never change another job or caller
                 failed += 1
                 continue
             f.unlink(missing_ok=True)
             done += 1
-        if done or dead:
+        if done or dead or parked:
             _append_line(store_dir(home) / "audit.jsonl", {"at": iso(time.time()), "op": "spool.drain",
-                                                           "result": "drained", "drained": done, "dead": dead,
+                                                           "result": "drained", "drained": done, "dead": dead, "parked": parked,
                                                            "dead_jobs": dead_names[:50]})
-        return {"ok": True, "drained": done, "pending": failed, "dead": dead}
+        return {"ok": True, "drained": done, "pending": failed, "dead": dead, "parked": parked}
     finally:
         os.close(lockfd)
+
+
+def spool_retry(home: Path) -> dict:
+    """Put parked jobs (out of scope when tried) back in the spool, e.g. after access or the credential was fixed."""
+    spool = store_dir(home) / "spool"
+    moved = []
+    parked = spool / "parked"
+    for f in sorted(parked.glob("*.json")) if parked.is_dir() else []:
+        if f.is_file() and not f.is_symlink():
+            os.replace(f, spool / f.name)
+            moved.append(f.name)
+    if moved:
+        _append_line(store_dir(home) / "audit.jsonl", {"at": iso(time.time()), "op": "spool.retry", "result": "requeued",
+                                                       "jobs": moved[:50]})
+    return {"ok": True, "requeued": moved}
 
 
 JOB_NAME = re.compile(r"\d{13}-[0-9a-f]{16}\.json")
@@ -1159,6 +1194,7 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
         intent = None
         for row in everything:
             if row.get("key") in keys:
+                key = row["key"]  # an intent or applied row from the previous build keeps its own key and operation id
                 if row.get("sha") not in shas:
                     _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who,
                                          "result": "key_conflict"})
@@ -1199,6 +1235,8 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
             reply["comment"] = "pending"
         elif list((spool / "dead").glob(f"*-{tag}.json")):
             reply["comment"] = "dead"  # the ticket does not exist; nothing was posted
+        elif list((spool / "parked").glob(f"*-{tag}.json")):
+            reply["comment"] = "parked"  # not visible to this credential yet; `ah spool retry` after access is fixed
         else:
             reply["comment"] = "posted"
         try:
@@ -1311,7 +1349,7 @@ def build_parser():
         x.add_argument("--key", help="idempotency key (default: derived from the request)")
     sub.add_parser("doctor", help="check the import chain and file hashes of this install")
     sp = sub.add_parser("spool")
-    sp.add_argument("action", choices=["drain", "ack"])
+    sp.add_argument("action", choices=["drain", "ack", "retry"])
     sp.add_argument("jobs", nargs="*", help="ack: spool job file names (<ms>-<hash>.json)")
     sp.add_argument("--evidence", help="ack: why these jobs are settled (the delivered comment, the ticket); 10+ characters")
     w = sub.add_parser("write")
@@ -1368,6 +1406,8 @@ def run(args, home: Path) -> dict:
     if cmd == "doctor":
         return doctor()
     if cmd == "spool":
+        if args.action == "retry":
+            return spool_retry(home)
         if args.action == "ack":
             return spool_ack(home, args.jobs, args.evidence)
         return spool_drain(home)
