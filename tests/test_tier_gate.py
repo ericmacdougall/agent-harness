@@ -1,0 +1,186 @@
+"""The ladder enforcement hook: spawn decisions, resets, TOP permission, Bash advisory, live cap (goodqa#14527)."""
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+HOOKS = Path(__file__).resolve().parents[1] / 'harness/hooks'
+sys.path.insert(0, str(HOOKS))
+import escalation as esc
+import model_tiers as tiers
+import tier_gate as gate
+
+
+def final(*, verdict='BLOCK', findings=('F1',), salt=''):
+    return json.dumps({'schema': 1, 'kind': 'final', 'run_id': 'b' * 32, 'evidence': 'EXECUTED', 'subject': {'head': 'a' * 40},
+                       'invocation': {}, 'execution': 'COMPLETED', 'result': 'NO_RESULT', 'reason': 'CODE_FINDINGS',
+                       'usage': {'provider_launches': 1, 'reported': []},
+                       'review': {'stage': 'CODE_INSPECTION', 'verdict': verdict, 'findings': list(findings)}, 'salt': salt}).encode()
+
+
+class GateFixture(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='gate-'); self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / 'state'; self.root.mkdir(mode=0o700)
+        self.policy = tiers.load_policy()
+        self.ledger = esc.Ledger(self.root, self.policy)
+        os.environ['AGENT_HARNESS_ESCALATION_DIR'] = str(self.root)
+        self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_ESCALATION_DIR', None))
+
+    def spawn(self, prompt, *, model=None, effort=None, subagent_type='task-owner', description='owner'):
+        tool_input = {'prompt': prompt, 'description': description, 'subagent_type': subagent_type}
+        if model is not None: tool_input['model'] = model
+        if effort is not None: tool_input['effort'] = effort
+        return gate.decide_spawn({'tool_name': 'Agent', 'tool_input': tool_input, 'session_id': 's1'}, self.policy, self.ledger, session_id='s1')
+
+    def escalate(self, task, times=2):
+        self.salt = getattr(self, 'salt', 0)
+        for n in range(times):
+            self.salt += 1
+            self.ledger.record(task, final(salt='%s-%d' % (task, self.salt)), kind='review', source='test')
+
+
+class SpawnDecisions(GateFixture):
+    def test_matching_rung_is_allowed_and_a_missing_model_is_filled_in(self):
+        decision, reason, updated, facts = self.spawn('do it [task:k1]', model='sonnet')
+        self.assertEqual((decision, updated), ('allow', None)); self.assertEqual(facts['required_rung'], 'R0')
+        decision, reason, updated, facts = self.spawn('do it [task:k1]')
+        self.assertEqual(decision, 'allow'); self.assertEqual((updated['model'], updated['effort']), ('sonnet', 'medium'))
+
+    def test_above_the_rung_is_downgraded_and_below_needs_a_reason(self):
+        decision, reason, updated, facts = self.spawn('do it [task:k2]', model='opus', effort='high')
+        self.assertEqual(decision, 'allow'); self.assertEqual((updated['model'], updated['effort']), ('sonnet', 'medium'))
+        self.assertIn('downgraded', reason)
+        self.escalate('k2')
+        decision, reason, updated, facts = self.spawn('do it [task:k2]', model='opus', effort='medium')
+        self.assertEqual((decision, updated), ('allow', None)); self.assertEqual(facts['required_rung'], 'R1')
+        decision, reason, updated, facts = self.spawn('do it [task:k2]', model='sonnet')
+        self.assertEqual(decision, 'deny'); self.assertIn('[rung-below:', reason)
+        decision, reason, updated, facts = self.spawn('do it [task:k2] [rung-below:cheap retry of a typo]', model='sonnet')
+        self.assertEqual(decision, 'allow'); self.assertEqual(facts['downgrade_reason'], 'cheap retry of a typo')
+
+    def test_review_only_rungs_never_write_and_reviewers_sit_one_rung_above(self):
+        decision, reason, updated, facts = self.spawn('do it [task:k3]', model='opus', effort='max')
+        self.assertEqual(decision, 'deny'); self.assertIn('review-only', reason)
+        decision, reason, updated, facts = self.spawn('review it [task:k3]', model='opus', effort='medium', subagent_type='red-team')
+        self.assertEqual(decision, 'allow'); self.assertEqual(facts['reviewer_rung'], 'R1')
+        decision, reason, updated, facts = self.spawn('review it [task:k3]', model='sonnet', subagent_type='red-team')
+        self.assertEqual(decision, 'deny')  # a reviewer below the reviewer rung without a reason
+        self.escalate('k3'); self.escalate('k3'); self.escalate('k3')  # R3
+        decision, reason, updated, facts = self.spawn('review it [task:k3]', model='opus', effort='max', subagent_type='red-team')
+        self.assertEqual(decision, 'allow'); self.assertEqual(facts['reviewer_rung'], 'R4')
+
+    def test_top_rung_is_blocked_without_user_permission_and_allowed_with_it(self):
+        # Reaching R5 takes four climbs, which the default ladder limits block first (that is the point of
+        # the limits); raise them here to exercise the permission gate itself.
+        self.policy = {**self.policy, 'ladder_limits': {'max_review_launches': 100, 'max_rung_climbs': 10, 'max_total_review_usd': 1000}}
+        self.ledger = esc.Ledger(self.root, self.policy)
+        for _ in range(4): self.escalate('k4')
+        self.assertEqual(self.ledger.status('k4')['rung'], 'R5')
+        decision, reason, updated, facts = self.spawn('do it [task:k4]', model='fable')
+        self.assertEqual(decision, 'deny'); self.assertIn('approve-top', reason)
+        decision, reason, updated, facts = self.spawn('do it [task:k4]', model='opus', effort='xhigh')
+        self.assertEqual(decision, 'deny')  # the computed rung needs permission; nothing is minted below it silently
+        wal = Path(self.temp.name) / 'main.jsonl'
+        wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'fable for task k4', 'source': 'user:s/u "yes use fable for k4"'}) + '\n'
+                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1'}) + '\n')
+        self.ledger.approve_top('k4', 'w1', wal)
+        decision, reason, updated, facts = self.spawn('do it [task:k4]', model='fable')
+        self.assertEqual(decision, 'allow')
+        decision, reason, updated, facts = self.spawn('do it [task:k4]', model='fable', effort='high')
+        self.assertEqual(decision, 'deny'); self.assertIn('review-only', reason)
+
+    def test_ladder_limits_deny_writers_but_not_reviewers(self):
+        self.ledger.add_spend('k5', 100)
+        decision, reason, updated, facts = self.spawn('do it [task:k5]', model='sonnet')
+        self.assertEqual(decision, 'deny'); self.assertIn('max_total_review_usd', reason)
+        decision, reason, updated, facts = self.spawn('review [task:k5]', model='opus', subagent_type='red-team')
+        self.assertEqual(decision, 'allow')
+
+
+class Resets(GateFixture):
+    def test_missing_task_key_resets_to_lowest_with_a_generated_key(self):
+        decision, reason, updated, facts = self.spawn('no key at all', model='opus', effort='high')
+        self.assertEqual(decision, 'allow'); self.assertEqual((updated['model'], updated['effort']), ('sonnet', 'medium'))
+        self.assertTrue(facts['task'].startswith('auto-')); self.assertEqual(facts['reset'], ['missing_task_key'])
+        state = self.ledger.load(facts['task'])
+        self.assertEqual(state['resets'][-1]['code'], 'missing_task_key')
+        again = self.spawn('no key at all', model='sonnet')
+        self.assertEqual(again[3]['task'], facts['task'])  # the generated key is stable, so later failures count
+
+    def test_corrupt_state_resets_and_never_reaches_top(self):
+        for _ in range(4): self.escalate('k6')
+        (self.root / 'k6.json').write_text('{"schema": 1, "task": "k6", "events": "x"}')
+        decision, reason, updated, facts = self.spawn('do it [task:k6]', model='fable')
+        self.assertEqual(decision, 'deny')  # fable needs permission regardless
+        decision, reason, updated, facts = self.spawn('do it [task:k6]', model='opus', effort='xhigh')
+        self.assertEqual(decision, 'allow'); self.assertEqual(updated['model'], 'sonnet')
+        self.assertEqual(facts['required_rung'], 'R0')
+        self.assertEqual(self.ledger.load('k6')['resets'][-1]['code'], 'state_corrupt')
+
+    def test_lock_timeout_resets_to_lowest(self):
+        with mock.patch.object(esc.Ledger, 'status', side_effect=esc.LedgerError('lock_timeout', 'busy')):
+            decision, reason, updated, facts = self.spawn('do it [task:k7]', model='opus', effort='high')
+        self.assertEqual(decision, 'allow'); self.assertEqual(updated['model'], 'sonnet')
+        self.assertIn('lock_timeout', facts['reset'])
+
+    def test_tier_table_error_fails_closed_at_the_hook_entry(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, {'AGENT_HARNESS_TIER_POLICY': str(Path(temp) / 'none.json')}):
+            result = subprocess.run([sys.executable, str(HOOKS / 'tier_gate.py'), 'hook'], input=json.dumps(
+                {'tool_name': 'Agent', 'tool_input': {'prompt': 'x [task:k8]', 'model': 'sonnet'}, 'session_id': 's'}),
+                capture_output=True, text=True, timeout=20, env={**os.environ, 'AGENT_HARNESS_TIER_POLICY': str(Path(temp) / 'none.json')})
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)['hookSpecificOutput']['permissionDecision'], 'deny')
+
+
+class BashAdvisory(GateFixture):
+    def bash(self, command):
+        return gate.decide_bash({'tool_name': 'Bash', 'tool_input': {'command': command}}, self.policy, self.ledger)
+
+    def test_launch_lines_are_checked_against_the_task_rung(self):
+        self.assertEqual(self.bash('ls -la')[0], 'allow')
+        self.assertEqual(self.bash('claude -p --model opus --effort high --task k9 "x"')[0], 'deny')
+        self.escalate('k9'); self.escalate('k9')
+        self.assertEqual(self.bash('claude -p --model opus --effort high --task k9 "x"')[0], 'allow')
+        self.assertEqual(self.bash('codex exec --model gpt-6.1-sol -c model_reasoning_effort=high --task k9 -')[0], 'allow')
+        self.assertEqual(self.bash('codex exec --model gpt-6-astra --task k9 -')[0], 'deny')
+        self.assertEqual(self.bash('claude -p --model gpt-4o --task k9 x')[0], 'deny')
+        self.assertEqual(self.bash('python3 rescue.py --repo r --packet p --output o --model opus --effort xhigh --task k9')[0], 'allow')
+        self.assertEqual(self.bash('claude -p --model opus "no task"')[0], 'allow')
+
+
+class ModesAndCap(GateFixture):
+    def run_hook(self, data, mode):
+        policy = dict(self.policy); policy['mode'] = mode
+        path = Path(self.temp.name) / 'tiers.json'; path.write_text(json.dumps(policy))
+        env = {**os.environ, 'AGENT_HARNESS_TIER_POLICY': str(path), 'AGENT_HARNESS_ESCALATION_DIR': str(self.root)}
+        result = subprocess.run([sys.executable, str(HOOKS / 'tier_gate.py'), 'hook'], input=json.dumps(data), capture_output=True, text=True, timeout=20, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr[-300:])
+        return json.loads(result.stdout)['hookSpecificOutput'] if result.stdout.strip() else None
+
+    def test_warn_mode_only_adds_context_and_enforce_mode_decides(self):
+        data = {'tool_name': 'Agent', 'tool_input': {'prompt': 'x [task:k10]', 'model': 'opus', 'effort': 'max'}, 'session_id': 's'}
+        warn = self.run_hook(data, 'warn')
+        self.assertEqual(warn['permissionDecision'], 'allow'); self.assertIn('would deny', warn['additionalContext'])
+        enforce = self.run_hook(data, 'enforce')
+        self.assertEqual(enforce['permissionDecision'], 'deny')
+        log = [json.loads(l) for l in (self.root / 'gate.jsonl').read_text().splitlines()]
+        self.assertEqual([entry['mode'] for entry in log], ['warn', 'enforce'])
+
+    def test_live_agent_cap_counts_starts_and_stops(self):
+        for n in range(gate.LIVE_CAP_DEFAULT):
+            gate.live_update('s2', 'agent-%d' % n, start=True)
+        self.assertEqual(gate.live_count('s2'), gate.LIVE_CAP_DEFAULT)
+        data = {'tool_name': 'Agent', 'tool_input': {'prompt': 'x [task:k11]', 'model': 'sonnet'}, 'session_id': 's2'}
+        self.assertEqual(self.run_hook(data, 'enforce')['permissionDecision'], 'deny')
+        gate.live_update('s2', 'agent-0', start=False)
+        self.assertIsNone(self.run_hook(data, 'enforce'))  # matching rung, nothing to say
+
+
+if __name__ == '__main__':
+    unittest.main()
