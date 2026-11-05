@@ -421,6 +421,49 @@ class Failure(Case):
             live = argv[-2].startswith(str(stage))
             self.assertEqual("--min-age" in argv, not live, argv)
 
+    def test_snapshot_temp_files_live_outside_every_uploaded_tree(self):
+        stage = self.home / ".agent-harness/backup-stage"
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertTrue((stage / ".rsync-tmp").is_dir())
+        for argv in self.copies():
+            self.assertFalse(argv[-2].startswith(str(stage / ".rsync-tmp")), argv)
+
+    def test_failed_snapshot_skips_upload_and_keeps_run_non_fresh(self):
+        fakebin = self.tmp / "fakebin"
+        fakebin.mkdir()
+        rsync = fakebin / "rsync"
+        rsync.write_text("#!/bin/sh\nexit 23\n")
+        rsync.chmod(0o755)
+        done = self.run_script(PATH=f"{fakebin}:/usr/bin:/bin")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.last_ok().exists())
+        staged_dirs = (".claude/projects", ".claude/wals", ".codex/sessions")  # rsync-staged; files use cp
+        self.assertFalse([c for c in self.copies() if ".agent-harness/backup-stage" in c[-2] and c[-2].endswith(staged_dirs)])
+
+    def test_rsync_vanished_files_exit_24_is_tolerated_but_other_codes_are_not(self):
+        fakebin = self.tmp / "fakebin"
+        fakebin.mkdir()
+        real = shutil.which("rsync")
+        wrapper = fakebin / "rsync"
+        wrapper.write_text(f"#!/bin/sh\n{real} \"$@\"\nexit 24\n")
+        wrapper.chmod(0o755)
+        done = self.run_script(PATH=f"{fakebin}:/usr/bin:/bin")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(self.last_ok().exists())
+
+    def test_symlink_inside_a_live_source_is_never_uploaded_or_followed(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("SECRET-MARKER")
+        os.symlink(outside, self.home / ".claude/projects/p1/dirlink")
+        os.symlink(outside / "secret.txt", self.home / ".claude/projects/p1/filelink")
+        done = self.local_run()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.remote_files(), set(ORDINARY))
+        for path in (self.remote / "testhost").rglob("*"):
+            if path.is_file():
+                self.assertNotIn(b"SECRET-MARKER", path.read_bytes())
+
     def test_persistent_failure_exhausts_retries_and_is_not_fresh(self):
         done = self.run_script(FAKE_FAIL_FIRST="1000", LOG_BACKUP_RETRIES="1")
         self.assertNotEqual(done.returncode, 0)

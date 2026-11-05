@@ -173,7 +173,11 @@ for src in "${LIVE[@]}"; do
   mkdir -p "$(dirname "$snap")" || { say "cannot stage $src"; ok=1; continue; }
   if [ -d "$HOME/$src" ]; then
     # rsync -a keeps symlinks as links; rclone never follows them. Exit 24 = a file vanished mid-copy (not an error).
-    rsync -a "$HOME/$src/" "$snap/" </dev/null; rc=$?
+    # --temp-dir sits outside every uploaded tree: a crash mid-copy leaves its partial files there, never beside data
+    # that rclone would upload as current. rsync renames within the stage volume, so a full disk fails the copy
+    # (exit 11 or 23, source skipped, run non-fresh) instead of leaving a truncated file in place.
+    mkdir -p "$STAGE/.rsync-tmp" || { say "cannot create the stage temp directory"; ok=1; continue; }
+    rsync -a --temp-dir="$STAGE/.rsync-tmp" "$HOME/$src/" "$snap/" </dev/null; rc=$?
     [ $rc -eq 0 ] || [ $rc -eq 24 ] || { say "snapshot failed (rsync exit $rc): $src"; ok=1; continue; }
   else
     cp -p "$HOME/$src" "$snap" || { say "snapshot failed: $src"; ok=1; continue; }
