@@ -147,7 +147,7 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
     return 'allow', 'requested %s %s is above rung %s; downgraded' % (requested['model'], requested['effort'], target_rung), updated, facts
 
 
-LAUNCH = re.compile(r'(^|[\s;&|(/`\'"=])(claude|codex|rescue\.py|peer_review\.py)(\s|$)', re.IGNORECASE)
+LAUNCH = re.compile(r'(^|[\s;&|(/`\'"=\\])(claude|codex|rescue\.py|peer_review\.py)(\s|$|[\'"`)])', re.IGNORECASE)
 SHELL_STRING_HOSTS = ('bash', 'sh', 'zsh', 'dash', 'ksh', 'su', 'sudo')
 ENV_MODEL = re.compile(r'(?:^|\s)(?:export\s+)?(?:ANTHROPIC_MODEL|CLAUDE_MODEL)=([^\s;&|]+)')
 MAX_NESTING = 2
@@ -228,6 +228,15 @@ def split_segments_with_seps(command):
     if kept:
         kept[0] = (kept[0][0], '')
     return [text for text, _ in kept], [sep for _, sep in kept]
+
+
+def program_name(word):
+    """The program a shlex word names, past `=`, quotes, backticks and `$(`; for a substitution such as
+    `$(which claude)` the last token is the candidate (the substitution yields that program's path)."""
+    pieces = [piece for piece in re.split(r'[=`$(\'"]', word) if piece.strip()]
+    if not pieces:
+        return ''
+    return pieces[-1].split()[-1].rsplit('/', 1)[-1].rstrip('`)\'"').lower()
 
 
 def nested_strings(segment):
@@ -325,7 +334,7 @@ def _decide_launch(command, policy, ledger, env_model=None):
         return 'deny', 'launch line cannot be parsed (unterminated quote)', None, {'unparsed': True}
     model = effort = task = author_rung = None
     author_harness = 'unknown'
-    programs = [re.split(r'[=`$(\'"]', w)[-1].rsplit('/', 1)[-1].rstrip('`)\'"').lower() for w in words]
+    programs = [program_name(w) for w in words]
     if not any(name in programs for name in ('claude', 'codex', 'rescue.py', 'peer_review.py')):
         # The launch name sits only inside quoted text (prose, or a shell string that nested_strings
         # checks on its own): the flags of this program are not launch flags (`git commit -m "..."`).

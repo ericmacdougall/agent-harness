@@ -306,6 +306,16 @@ class BashAdvisory(GateFixture):
         out = json.loads(bad.stdout)['hookSpecificOutput']
         self.assertIn('not JSON', out.get('additionalContext', '') + out.get('permissionDecisionReason', ''))
 
+    def test_substitution_or_quoted_program_words_are_launches(self):
+        self.escalate('k9'); self.escalate('k9')
+        for line in ('$(which claude) -p --model fable x', '"$(command -v claude)" -p --model fable x',
+                     '`which claude` -p --model fable x', '"claude" -p --model fable x', "'claude' -p --model fable x",
+                     '\\claude -p --model fable x'):
+            self.assertEqual(self.bash(line)[0], 'deny', line)
+        for line in ('$(which claude) -p --model sonnet --task k9 x', '"claude" -p --model opus --effort high --task k9 x',
+                     'which claude', 'echo "claude"'):
+            self.assertEqual(self.bash(line)[0], 'allow', line)
+
     def test_oversize_launch_lines_are_refused_quickly_not_parsed(self):
         import time
         filler = "echo 'x'; " * 7000  # about 70 KiB of harmless segments
