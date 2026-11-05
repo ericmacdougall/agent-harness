@@ -943,7 +943,11 @@ def spool_drain(home: Path, only_opid: str | None = None, limit: int | None = No
             except Exception:  # one bad job (or a bad policy file) must never change another job or caller
                 failed += 1
                 continue
-            f.unlink(missing_ok=True)
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:  # posted, but the file cannot be removed: the re-post is idempotent; keep draining the rest
+                failed += 1
+                continue
             done += 1
         if done or dead or parked:
             _append_line(store_dir(home) / "audit.jsonl", {"at": iso(time.time()), "op": "spool.drain",

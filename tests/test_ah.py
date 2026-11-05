@@ -1030,6 +1030,19 @@ class TicketRefRound2(WriteTests):
         self.assertEqual(list(FakeGoodQA.state["posted"]), [ah.operation_id(legacy_key)])
         self.assertEqual(ah.write(self.home, "ticket.comment", args, SESSION)["result"], "duplicate")
 
+    def test_r1_an_unremovable_job_does_not_stop_the_drain(self):
+        for n in (1, 2):
+            ah._spool_comment(self.home, {"ticket": "GoodQA goodqa#77", "body": f"u{n}", "operation_id": f"ah:unlink-{n}"})
+        real = Path.unlink
+
+        def stuck(self_, missing_ok=False):
+            if self_.name.endswith(".json") and "spool" in str(self_) and self_ == sorted(self_.parent.glob("*.json"))[0]:
+                raise PermissionError("immutable")
+            return real(self_, missing_ok=missing_ok)
+        with mock.patch.object(Path, "unlink", stuck):
+            r = ah.spool_drain(self.home)
+        self.assertEqual((r["drained"], r["pending"], len(FakeGoodQA.state["posted"])), (1, 1, 2))
+
     def test_l3_l4_drain_survives_an_unmovable_or_symlinked_job(self):
         spool = self.home / ".agent-harness" / "state" / "ah" / "store" / "spool"
         spool.mkdir(parents=True, exist_ok=True)
