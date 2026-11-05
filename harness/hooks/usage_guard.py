@@ -187,7 +187,7 @@ def boot_identity():
     """A boot identifier when the platform offers one cheaply; audit detail only."""
     # Tokens carry their scheme so an id from another build or platform is never compared.
     try:
-        value = Path('/proc/sys/kernel/random/boot_id').read_text().strip()[:64]
+        value = Path('/proc/sys/kernel/random/boot_id').read_text().strip()[:64]  # input-ok: 37-byte kernel file
         if value: return 'procboot:' + value
     except OSError:
         pass
@@ -208,7 +208,7 @@ def same_scheme(recorded, current):
 def process_start_token(pid):
     """A token naming one incarnation of `pid`, or None when the platform cannot say."""
     try:
-        after_comm = Path('/proc/%d/stat' % pid).read_text().rsplit(')', 1)[1].split()
+        after_comm = Path('/proc/%d/stat' % pid).read_text().rsplit(')', 1)[1].split()  # input-ok: one-line kernel file
         return 'proc:' + after_comm[19]  # field 22, starttime in clock ticks since boot
     except (OSError, IndexError, ValueError):
         pass
@@ -975,6 +975,34 @@ class UsageStore:
             self._publish_reconciliation(run_id, kind='manual_reconciliation', actor=actor,
                                          reason=reason, evidence=evidence)
 
+    def _repair_interrupted_publish(self, directory):
+        """A supervisor killed between link and unlink in _publish leaves a .stage-* twin, so the named
+        record has two links and file_bytes refuses it forever. Under the lock, in our private run
+        directory, drop such stage files; a dangling stage file is garbage from the same interruption."""
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            return 0
+        named = {}
+        for entry in entries:
+            if entry.name.startswith('.stage-'): continue
+            try:
+                info = os.stat(entry, follow_symlinks=False)
+            except OSError:
+                continue
+            named[(info.st_dev, info.st_ino)] = entry.name
+        removed = 0
+        for entry in entries:
+            if not entry.name.startswith('.stage-'): continue
+            try:
+                info = os.stat(entry, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid(): continue
+                os.unlink(entry)
+                removed += 1
+            except OSError:
+                continue
+        return removed
+
     def _auto_reconcile_locked(self, run_id):
         """Reconcile one reservation only when its owner is provably dead on this host past its deadline.
 
@@ -986,6 +1014,8 @@ class UsageStore:
         if not os.path.lexists(directory / 'start.json'):
             report['why'] = 'no start record'
             return report
+        repaired = self._repair_interrupted_publish(directory)
+        if repaired: report['repaired_stage_files'] = repaired
         start = self._owned_start(run_id)
         if os.path.lexists(directory / 'completion.json'):
             report['why'] = 'completed'

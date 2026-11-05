@@ -729,6 +729,21 @@ class OwnerLiveness(StoreFixture):
         with self.future(): reports = self.store.sweep()
         self.assertEqual(len(reports), 3); self.assertFalse(any(r['reconciled'] for r in reports))
 
+    def test_interrupted_child_record_publish_is_repaired(self):
+        # A SIGKILL between os.link and os.unlink in _publish leaves children.json with two links,
+        # which file_bytes refuses; the sweep must repair the private run directory and proceed.
+        supervisor = self.child(); reviewer = self.child()
+        run = self.begin_owned(self.facts_for(supervisor))
+        run.note_child(reviewer)
+        directory = self.store.root / 'runs' / run.run_id
+        os.link(directory / 'children.json', directory / '.stage-deadbeef')
+        self.assertEqual(os.stat(directory / 'children.json').st_nlink, 2)
+        supervisor.kill(); supervisor.wait(timeout=5); reviewer.kill(); reviewer.wait(timeout=5)
+        with self.future(): report = self.store.auto_reconcile(run.run_id)
+        self.assertTrue(report['reconciled']); self.assertEqual(report['repaired_stage_files'], 1)
+        self.assertEqual(os.stat(directory / 'children.json').st_nlink, 1)
+        self.assertFalse((directory / '.stage-deadbeef').exists())
+
     def test_finish_after_reconciliation_discards_the_late_result(self):
         child = self.child()
         run = self.begin_owned(self.facts_for(child))
