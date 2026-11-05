@@ -1104,6 +1104,8 @@ def main() -> int:
     try:
         policy = tiers.load_policy()
     except tiers.TierError as error:
+        target.close()
+        evidence.close()
         print(f'Review refused: tier table error: {error}', file=sys.stderr)
         return 2
     author_rung = args.author_rung
@@ -1148,6 +1150,8 @@ def main() -> int:
             except (ladder.LedgerError, tiers.TierError):
                 permission = None
         if not isinstance(permission, dict) or not permission.get('ask_id'):
+            target.close()
+            evidence.close()
             print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
                   '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
             return 2
