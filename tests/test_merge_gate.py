@@ -44,6 +44,16 @@ class FakeGh:
         self.pr_views = 0
         self.content_refs = []
 
+    @staticmethod
+    def served(f, ref):
+        if f.get("gone"):
+            return False
+        if f.get("head_only"):
+            return ref == HEAD
+        if f.get("base_only"):
+            return ref != HEAD
+        return True
+
     def workflow_files(self):
         sc = self.sc
         if "workflow_files" in sc:
@@ -165,12 +175,16 @@ class FakeGh:
                 if want == ".github/workflows":  # directory listing at a ref
                     if sc.get("dir_error"):
                         return 1, "", "HTTP 500"
-                    files = [f for f in self.workflow_files() if ref == HEAD or not f.get("head_only")]
+                    if sc.get("dir_error_404digits"):
+                        return 1, "", "gh: API rate limit exceeded for user ID 1404 (HTTP 403)"
+                    files = [f for f in self.workflow_files() if self.served(f, ref)]
                     if not files:
                         return 1, '{"message":"Not Found"}', "gh: Not Found (HTTP 404)"
                     return 0, json.dumps([{"name": f[".path"].split("/")[-1], "path": f[".path"], "type": "file"} for f in files]), ""
+                if sc.get("file_error_404digits"):
+                    return 1, "", "gh: Bad Gateway 5041404 (HTTP 502)"
                 for f in self.workflow_files():
-                    if f[".path"] == want and (ref == HEAD or not f.get("head_only")):
+                    if f[".path"] == want and self.served(f, ref):
                         body = f["content"] if ref == HEAD else f.get("base_content", f["content"])
                         return 0, json.dumps({"content": base64.b64encode(body.encode()).decode()}), ""
                 return 1, "", "gh: Not Found (HTTP 404)"
@@ -668,6 +682,11 @@ class ActiveWorkflows(Base):
             "brace-variant": "  name: {a: \"x\non: workflow_dispatch\n  y\"}\n  on:\n    pull_request:\n",
             "escaped-key": "on:\n  workflow_dispatch:\n  \"pull_\\x72equest\":\n",
             "multiline-scalar": "name: >\n  text\non: workflow_dispatch\n",
+            "tags-spaced-list": "on:\n  push:\n    tags: [ ]\n", "tags-spaced-map": "on:\n  push:\n    tags: { }\n",
+            "tags-NULL": "on:\n  push:\n    tags: NULL\n", "tags-Null": "on:\n  push:\n    tags: Null\n",
+            "tags-null-tag": "on:\n  push:\n    tags: !!null ''\n", "tags-empty-str": "on:\n  push:\n    tags: ''\n",
+            "tags-list-empty-str": "on:\n  push:\n    tags: [\"\"]\n", "tags-block-null": "on:\n  push:\n    tags:\n      null\n",
+            "tags-block-empty-list": "on:\n  push:\n    tags:\n      []\n", "tags-open-bracket": "on:\n  push:\n    tags: [\n      ]\n",
             "tab": "on:\n\tpull_request:\n", "push-list": "on:\n  push:\n    - tags\n",
             "dedent-garbage": "on:\n    workflow_dispatch:\n  pull_request:\n",
         }
@@ -742,10 +761,22 @@ class ActiveWorkflows(Base):
         self.assertEqual(self.merge(self.scenario([], dir_error=True))[0], 2)
 
     def test_unknown_workflow_state_fails_closed(self):
-        for state in ("Active", "future_state", 7):
+        for state in ("Active", "future_state", 7, None):
             with self.subTest(state):
                 self.assertEqual(self.merge(self.scenario([{"name": "x", "state": state, "content": ""}]))[0], 2)
-        self.assertEqual(self.merge(self.scenario([{"name": "x", "state": "deleted", "content": "on: pull_request\n"}]))[0], 0)
+        # `deleted` only records that the file was gone: if it exists at either ref it is classified
+        restored = {"name": "x", "state": "deleted", "content": "on: pull_request\n"}
+        self.assertEqual(self.merge(self.scenario([restored]))[0], 2)
+        self.assertEqual(self.merge(self.scenario([dict(restored, gone=True)]))[0], 0)
+
+    def test_error_text_containing_404_is_not_a_missing_file(self):
+        inert = [{"name": "Release", "file": "release", "state": "active", "content": self.RELEASE}]
+        self.assertEqual(self.merge(self.scenario(inert, dir_error_404digits=True))[0], 2)
+        self.assertEqual(self.merge(self.scenario(inert, file_error_404digits=True))[0], 2)
+
+    def test_workflow_only_on_the_base_branch_is_classified(self):
+        only_base = {"name": "B", "file": "b", "state": "active", "base_only": True, "content": "on: pull_request\n"}
+        self.assertEqual(self.merge(self.scenario([only_base]))[0], 2)
 
     def test_operations_doc_states_the_rule(self):
         text = (ROOT / "docs" / "operations.md").read_text().lower()

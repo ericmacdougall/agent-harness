@@ -742,6 +742,18 @@ _TRIGGER_LINE = re.compile(r"^([A-Za-z_]+)\s*:\s*$")
 _SUB_KEY = re.compile(r"^([A-Za-z_][\w-]*)\s*:")
 
 
+def _real_value(value):
+    """True for a one-line scalar or flow list that holds at least one non-empty, non-null item."""
+    v = value.strip()
+    if v.startswith("[") and v.endswith("]"):
+        items = [i.strip().strip("'\"").strip() for i in v[1:-1].split(",")]
+        return bool(items) and all(i and _real_value(i) for i in items)
+    if v[:1] in "{[!&*|>?" or not v:
+        return False
+    v = v.strip("'\"").strip()
+    return bool(v) and v.lower() not in ("null", "~")
+
+
 def _trigger_names(text):
     """Return {trigger: set(sub-keys)} from a workflow's top-level `on:`, or None unless every line was understood.
 
@@ -803,20 +815,23 @@ def _trigger_names(text):
                 m = _SUB_KEY.match(body)
                 if m:
                     value = body[m.end():].strip()
-                    # `tags:` with no value (null) or an empty list is not a tag filter
-                    empty = value in ("", "[]", "null", "~", "{}")
-                    found[current].add(m.group(1) if not empty else m.group(1) + ":empty")
-                    pending = None if not empty else (current, m.group(1))
+                    if value and not _real_value(value):
+                        return None  # `tags: null`, `[ ]`, `''`, `!!null ''` and friends: unknown
+                    found[current].add(m.group(1) if value else m.group(1) + ":empty")
+                    pending = None if value else (current, m.group(1))
                 elif body.startswith("- "):
                     found[current].add("-")  # a list directly under the trigger
                 else:
                     return None
             elif indent < sub:
                 return None
-            elif pending:  # a nested value under `key:` makes that key non-empty
+            elif pending:  # block value under `key:`: only `- item` lines with real scalars make it non-empty
+                if not (body.startswith("- ") and _real_value(body[2:].strip())):
+                    return None
                 found[pending[0]].discard(pending[1] + ":empty")
                 found[pending[0]].add(pending[1])
-                pending = None
+            elif not (body.startswith("- ") or body.startswith("[") or body.startswith("]")):
+                pass
     return found or None
 
 
@@ -833,14 +848,20 @@ def _can_run_on_pr_head(triggers):
     return False
 
 
-INACTIVE_STATES = {"disabled_manually", "disabled_inactivity", "disabled_fork", "deleted"}
+INACTIVE_STATES = {"disabled_manually", "disabled_inactivity", "disabled_fork"}
+DELETED_STATE = "deleted"  # the file may have been restored since: classified wherever it exists
+
+
+def _is_404(err, out):
+    """gh prints `(HTTP 404)` on stderr for a real not-found; a bare 404 inside other text (ids, 5xx bodies) is not."""
+    return bool(re.search(r"\(HTTP 404\)", err or "")) or bool(re.search(r'"status"\s*:\s*"404"', out or ""))
 
 
 def _get_file(client, slug, path, ref):
     """Text of a workflow file at a ref; None when the file does not exist there (404); GateError otherwise."""
     rc, out, err = client.raw(["api", f"repos/{slug}/contents/{path}?ref={urllib.parse.quote(ref, safe='')}"])
     if rc != 0:
-        if "404" in (err + out):
+        if _is_404(err, out):
             return None
         raise GateError("gh failed reading a workflow file: " + clean(err or out, 100))
     try:
@@ -854,7 +875,7 @@ def _workflow_dir(client, slug, ref):
     """Paths of workflow files at a ref; a missing directory is an empty list, any other failure is unreadable."""
     rc, out, err = client.raw(["api", f"repos/{slug}/contents/.github/workflows?ref={urllib.parse.quote(ref, safe='')}"])
     if rc != 0:
-        if "404" in (err + out):
+        if _is_404(err, out):
             return []
         raise GateError("gh failed reading the workflow directory: " + clean(err or out, 100))
     try:
@@ -876,18 +897,20 @@ def _ci_capable_workflows(client, slug, head, base):
     total, listed = int(wf.get("total_count", -1)), wf.get("workflows")
     if not isinstance(listed, list) or total < 0 or total > len(listed):
         raise GateError("the workflow list is incomplete")
-    paths, inactive = [], set()
+    paths, inactive, deleted = [], set(), set()
     for item in listed:
-        if not isinstance(item, dict) or item.get("state") not in INACTIVE_STATES | {"active"}:
+        if not isinstance(item, dict) or item.get("state") not in INACTIVE_STATES | {"active", DELETED_STATE}:
             raise GateError("the workflow list holds an entry with an unknown state")
         path = str(item.get("path") or "")
         if item["state"] in INACTIVE_STATES:
             inactive.add(path)
         else:
+            (deleted if item["state"] == DELETED_STATE else set()).add(path)
             paths.append(path)
-    for path in _workflow_dir(client, slug, head):  # added by the PR, or a listed path (already counted above)
-        if path not in inactive and path not in paths:
-            paths.append(path)
+    for ref in (head, base):  # added by the PR, or only on a non-default base: not in the API list until it runs
+        for path in _workflow_dir(client, slug, ref):
+            if path not in inactive and path not in paths:
+                paths.append(path)
     reasons = []
     for path in paths:
         if not re.match(r"^\.github/workflows/[\w./-]+$", path) or ".." in path:
@@ -895,6 +918,8 @@ def _ci_capable_workflows(client, slug, head, base):
             continue
         texts = [(label, _get_file(client, slug, path, ref)) for ref, label in ((base, "base"), (head, "head"))]
         if all(t is None for _, t in texts):
+            if path in deleted:
+                continue  # a deleted workflow whose file is still gone at both refs
             reasons.append("a workflow file listed by GitHub could not be found at the base or the head")
             continue
         for label, text in texts:
