@@ -110,7 +110,14 @@
     {"id": "ci-bash-o-pipefail", "command": "bash -o pipefail -c -- {SQ}gh pr merge 5{SQ}", "kinds": ["pr_merge"]},
     {"id": "ci-comment-flags", "command": "gh pr merge 5 # -R org/green --match-head-commit {HEAD}", "kinds": ["pr_merge"]},
     {"id": "ci-newline-flags", "command": "gh pr merge 5\necho --match-head-commit {HEAD}", "kinds": ["pr_merge"]},
-    {"id": "ci-fp-hash-in-word", "command": "echo a#b", "kinds": []},
+    {"id": "pr-backtick-subcommand", "command": "gh pr `echo merge` 5 -R o/r", "kinds": ["unverifiable"]},
+    {"id": "pr-backtick-group", "command": "gh `echo pr` merge 5", "kinds": ["unverifiable"]},
+    {"id": "pr-brace-subcommand", "command": "gh pr {merge,} 5", "kinds": ["unverifiable"]},
+    {"id": "pr-brace-partial", "command": "gh pr mer{ge,} 5", "kinds": ["unverifiable"]},
+    {"id": "pr-ifs-glued", "command": "gh${IFS}pr${IFS}merge${IFS}5", "kinds": ["unverifiable"]},
+    {"id": "pr-fp-api-path", "command": "gh api repos/o/r/pulls/5", "kinds": []},
+    {"id": "pr-fp-issue-list", "command": "gh issue list --label bug", "kinds": []},
+    {"id": "ci-fp-hash-in-word","command": "echo a#b", "kinds": []},
     {"id": "near-unbalanced-no-merge", "command": "echo \"unterminated", "kinds": []}
   ],
   "decisions": [
@@ -214,6 +221,8 @@
     {"id": "ci-heredoc-pipe-red", "command": "cat <<'EOF' | bash\ngh pr merge 5 -R o/r --admin --match-head-commit {HEAD}\nEOF", "scenario": "red_netwatch", "expect": "block", "text": "staticcheck"},
     {"id": "ci-dashdash-red", "command": "bash -c -- {SQ}gh pr merge 5 -R o/r --match-head-commit {HEAD}{SQ}", "scenario": "red_netwatch", "expect": "block", "text": "staticcheck"},
     {"id": "ci-hash-mid-word-red", "command": "echo x#; gh pr merge 5 -R o/r --match-head-commit {HEAD}", "scenario": "red_netwatch", "expect": "block", "text": "staticcheck"},
+    {"id": "pr-backtick-green", "command": "gh pr `echo merge` 5 -R o/r --match-head-commit {HEAD}", "scenario": "green", "expect": "block", "nowaiver": true},
+    {"id": "pr-ifs-green", "command": "gh${IFS}pr${IFS}merge${IFS}5${IFS}-R${IFS}o/r${IFS}--match-head-commit${IFS}{HEAD}", "scenario": "green", "expect": "block", "nowaiver": true},
     {"id": "near-view-allowed","command": "gh pr view 5", "scenario": "red_netwatch", "expect": "allow"},
     {"id": "near-git-merge-allowed", "command": "git merge main", "scenario": "red_netwatch", "expect": "allow"}
   ]

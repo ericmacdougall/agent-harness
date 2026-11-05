@@ -177,7 +177,7 @@ def _strip_comments(text):
 def tokenize(text):
     """(tokens, crude). shlex with punctuation splitting; unquoted newlines become ';'; a crude scan when quoting is
     unbalanced (heredocs)."""
-    text = _strip_comments(text.replace("`", " ( "))
+    text = _strip_comments(text.replace("`", " $( "))
     try:
         lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>\n")
         lex.whitespace = " \t\r"
@@ -311,7 +311,8 @@ def _gh_merge(args, in_xargs, ctx, cwd):
     pos, flags = _parse_gh_args(args)
     if not pos:
         return []
-    if any("$" in p or "`" in p for p in pos[:2]):
+    words = pos[:2] if pos[0] == "pr" else pos[:1]
+    if any(not re.match(r"^[a-z][a-z-]*$", p) for p in words):
         return [Merge("unverifiable", reason="gh subcommand is built at runtime")]
     names = {n for n, _ in flags}
     repo_ok = ctx["implicit_ok"]
@@ -430,6 +431,7 @@ def _http_scan(tokens):
 
 
 def _normalize_code(code):
+    code = re.sub(r"\$\{?IFS[^}\s]*\}?", " ", code)  # gh${IFS}pr${IFS}merge
     return re.sub(r"[\"'`\\,\[\]]", " ", code)
 
 
@@ -466,6 +468,10 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
             name = base[i]
             if name == "xargs":
                 seen_xargs = True
+            if name.startswith("gh") and name not in ("gh", "gh.exe") and re.search(r"[${}*?]", name) and \
+                    re.search(r"gh[${}*?\w]*(?:IFS|\$|\{)", name):
+                found.append(Merge("unverifiable", reason="a gh command glued together at run time"))
+                handled = True
             if name in ("gh", "gh.exe"):
                 found.extend(_gh_merge(tokens[i + 1:b], seen_xargs, ctx, cwd))
                 handled = True
