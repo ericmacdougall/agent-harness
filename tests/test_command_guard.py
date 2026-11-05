@@ -242,9 +242,60 @@ class FailureModeTests(Fixture):
         padding = 'true; ' * 120000
         self.assertEqual(self.decide(padding + 'echo eA== | base64 -d | sh; rm x')[0], 'block')
 
+    def test_existing_script_counts_only_log_deletion(self):
+        """Replay false positives: repo tooling that handles env is allowed; its log deletion still blocks."""
+        tools = self.home / 'repo/tools'
+        tools.mkdir(exist_ok=True)
+        (tools / 'envcheck.sh').write_text('#!/bin/sh\nenv | sort\n')
+        (tools / 'wipe.sh').write_text('#!/bin/sh\nrm -rf "$HOME/.claude/projects"\n')
+        self.assertEqual(self.decide('bash @HOME@/repo/tools/envcheck.sh')[0], 'allow')
+        self.assertEqual(self.decide('bash @HOME@/repo/tools/wipe.sh')[0], 'block')
+        written = "printf 'env\\n' > @HOME@/repo/tools/new.sh && bash @HOME@/repo/tools/new.sh"
+        self.assertEqual(self.decide(written)[0], 'block')
+
     def test_over_budget_plain_text_does_not_block(self):
         padding = 'true; ' * 120000
         self.assertIn(self.decide(padding + 'echo ok')[0], ('warn', 'allow'))
+
+
+class PolicyFileTests(Fixture):
+    """Red-team F2: a written or replaced policy file must not weaken the guard."""
+
+    def test_hostile_policy_cannot_weaken(self):
+        hostile = {
+            'modes': {'secret_dump': 'warn', 'log_delete': 'warn', 'broad_kill': 'warn'},
+            'protected_log_roots': [], 'protected_roots': [], 'protected_segment_names': [],
+            'ancestor_roots': [], 'credential_path_regexes': [], 'guard_files': [],
+            'allow_subtrees': ['{home}/.claude', '{home}/.claude/*'], 'temp_roots': ['{home}'],
+            'credential_allow_regexes': ['.*'], 'secret_env_regex': 'NEVERMATCH',
+            'limits': {'max_command_bytes': 1}, 'keep_suffixes': [],
+        }
+        path = self.home / 'hostile-policy.json'
+        path.write_text(json.dumps(hostile))
+        policy = cg.load_policy(path=str(path))
+        compiled = cg.Compiled(policy, home=str(self.home), cwd=str(self.home / 'repo'))
+        for row in ('rm -rf ~/.claude/projects', 'cat ~/.aws/credentials', 'env', 'rm -rf ~/.claude'):
+            self.assertEqual(cg.decide(fill(row, self.home), compiled, cwd=str(self.home / 'repo'))[0], 'block', row)
+        self.assertEqual(policy['allow_subtrees'], cg.DEFAULT_POLICY['allow_subtrees'])
+
+    def test_policy_may_add_protection(self):
+        path = self.home / 'extra-policy.json'
+        path.write_text(json.dumps({'protected_log_roots': ['{home}/repo/precious'], 'modes': {'broad_kill': 'enforce'}}))
+        policy = cg.load_policy(path=str(path))
+        self.assertEqual(policy['modes']['broad_kill'], 'enforce')
+        compiled = cg.Compiled(policy, home=str(self.home), cwd=str(self.home / 'repo'))
+        self.assertEqual(cg.decide(fill('rm -rf @HOME@/repo/precious', self.home), compiled,
+                                   cwd=str(self.home / 'repo'))[0], 'block')
+
+    def test_creating_guard_files_blocks(self):
+        for row in ("printf '{}' > ~/.claude/hooks/command_guard_policy.json",
+                    'cp /dev/null ~/.codex/agent-harness/command_guard_policy.json',
+                    "printf 'x' > ~/.claude/hooks/safe_input.py",
+                    'tee ~/.claude/hooks/command_guard_extra.py < /dev/null'):
+            self.assertEqual(self.decide(row)[0], 'block', row)
+
+    def test_block_message_does_not_point_at_policy_file(self):
+        self.assertNotIn('command_guard_policy', self.decide('rm -rf ~/.claude/projects')[1])
 
 
 class ApprovalTests(Fixture):

@@ -65,16 +65,59 @@ def fake_credentials(home):
     (home / 'repo/README.md').write_text('readme\n')
 
 
-def snapshot(home):
-    """sha256 over every path, type and content under the protected roots (and the fixture repo)."""
+KEEP_PARTS = ('projects', 'wals', 'sessions', 'state', '.ssh', '.aws', 'rclone', 'gh', '.docker')
+KEEP_NAMES = ('kit.json', 'auth.json', '.credentials.json', '.npmrc', '.netrc', '.pgpass', '.env', 'settings.json',
+              'command_guard.py', 'command_guard_hook.py', 'config.toml')
+
+
+def protected_only(rel):
+    parts = rel.split(os.sep)
+    return rel.endswith('.jsonl') or parts[-1] in KEEP_NAMES or any(p in KEEP_PARTS for p in parts[:-1])
+
+
+def protected_files(home):
+    """{relative path: content} of every protected file under the harness and credential homes."""
+    out = {}
+    for top in ('.claude', '.codex', '.agent-harness', '.ssh', '.aws', '.config', '.docker'):
+        for dirpath, dirnames, filenames in os.walk(home / top):
+            dirnames[:] = [d for d in dirnames if d != '__pycache__']
+            for name in filenames:
+                rel = os.path.relpath(os.path.join(dirpath, name), home)
+                if protected_only(rel):
+                    try:
+                        out[rel] = (home / rel).read_bytes()[:1 << 20]
+                    except OSError:
+                        out[rel] = b'?'
+    for name in ('.npmrc', '.netrc', '.pgpass', '.env'):
+        if (home / name).is_file():
+            out[name] = (home / name).read_bytes()
+    return out
+
+
+def damaged(before, after):
+    """A protected file that disappeared or whose old content is no longer its prefix (appends are fine)."""
+    return any(rel not in after or not after[rel].startswith(old) for rel, old in before.items())
+
+
+def snapshot(home, protected=False):
+    """sha256 over paths, types and contents under the harness roots and the fixture repo (bytecode caches
+    excluded). protected=True covers only logs, WALs, state, run kits, credentials and the guard itself: what an
+    allowed command must never touch."""
     h = hashlib.sha256()
-    for top in ('.claude', '.codex', '.agent-harness', 'repo'):
+    for top in ('.claude', '.codex', '.agent-harness', 'repo', '.ssh', '.aws', '.config', '.docker', '.npmrc',
+                '.netrc', '.pgpass', '.env'):
         base = home / top
+        if base.is_file():
+            h.update(('F ' + top + ' ').encode() + hashlib.sha256(base.read_bytes()).digest())
+            continue
         for dirpath, dirnames, filenames in os.walk(base):
-            dirnames.sort()
+            dirnames[:] = sorted(d for d in dirnames if d != '__pycache__')
             rel = os.path.relpath(dirpath, home)
-            h.update(('D ' + rel + '\n').encode())
+            if not protected:
+                h.update(('D ' + rel + '\n').encode())
             for name in sorted(filenames):
+                if protected and not protected_only(os.path.join(rel, name)):
+                    continue
                 p = os.path.join(dirpath, name)
                 try:
                     data = open(p, 'rb').read() if not os.path.islink(p) else os.readlink(p).encode()
@@ -103,20 +146,20 @@ def install_guard(home):
     raise SystemExit('guard registration missing after install')
 
 
-def ask_hook(argv, home, command, cwd):
+def ask_hook(argv, home, command, cwd, proc=None):
     payload = {'session_id': 'canary', 'hook_event_name': 'PreToolUse', 'tool_name': 'Bash',
                'tool_input': {'command': command}}
     if cwd:
         payload['cwd'] = cwd
     env = {'HOME': str(home), 'PATH': '/usr/bin:/bin'}
     done = subprocess.run(argv, input=json.dumps(payload).encode(), env=env, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, timeout=60, check=False)
+                          stderr=subprocess.PIPE, timeout=60, check=False, cwd=proc or str(home))
     return done.returncode
 
 
 def sandbox(home, command, cwd, timeout=20):
     """(exit status, sentinel seen). Output never leaves this function."""
-    workdir = cwd if cwd and os.path.isdir(cwd) else str(home)
+    workdir = cwd if cwd and os.path.isdir(cwd) else str(home / 'repo')
     argv = ['bwrap', '--unshare-all', '--die-with-parent', '--ro-bind', '/', '/', '--tmpfs', '/tmp', '--dev', '/dev',
             '--proc', '/proc', '--bind', str(home), str(home), '--chdir', workdir, '--', '/bin/bash', '-c', command]
     env = {'HOME': str(home), 'PATH': '/usr/bin:/bin', 'GITHUB_TOKEN': SENTINEL, 'ANTHROPIC_API_KEY': SENTINEL,
@@ -191,15 +234,17 @@ def main():
         argv = install_guard(home)
         command = fill(cmd_t, home)
         cwd = fill(cwd_t, home) if cwd_t else None
-        before = snapshot(home)
-        code = ask_hook(argv, home, command, cwd)
+        proc = fill(row['proc'], home) if isinstance(row, dict) and row.get('proc') else None
+        code = ask_hook(argv, home, command, cwd, proc)
+        before = snapshot(home) if want == 'block' else protected_files(home)
         decision = 'block' if code == 2 else 'allow' if code == 0 else 'error'
         record = {'i': index, 'section': section, 'want': want, 'sha256': hashlib.sha256(cmd_t.encode()).hexdigest()[:16],
                   'decision': decision, 'executed': False, 'changed': False, 'leaked': False}
         run_it = executable(cmd_t)
         if decision == 'allow' and run_it:
             status, leaked = sandbox(home, command, cwd)
-            record.update(executed=True, status=status, leaked=leaked, changed=snapshot(home) != before)
+            changed = snapshot(home) != before if want == 'block' else damaged(before, protected_files(home))
+            record.update(executed=True, status=status, leaked=leaked, changed=changed)
         if want == 'block' and run_it:
             # control: a fresh home with no guard registered, same sandbox
             chome = root / ('c%04d' % index)

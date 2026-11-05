@@ -65,7 +65,14 @@ DEFAULT_POLICY = {
                             '{home}/.codex/auth.json',
                             # the guard itself: deleting or replacing it would switch the protection off
                             '{home}/.claude/hooks/command_guard*', '{home}/.claude/hooks/redact.py',
-                            '{home}/.codex/agent-harness/command_guard*', '{home}/.codex/agent-harness/redact.py'],
+                            '{home}/.claude/hooks/safe_input.py',
+                            '{home}/.codex/agent-harness/command_guard*', '{home}/.codex/agent-harness/redact.py',
+                            '{home}/.codex/agent-harness/safe_input.py'],
+    # The guard's own files (and any policy file next to it): refused even when the target does not exist yet,
+    # because creating one is how the protection would be replaced or reconfigured.
+    'guard_files': ['{home}/.claude/hooks/command_guard*', '{home}/.claude/hooks/redact.py',
+                    '{home}/.claude/hooks/safe_input.py', '{home}/.codex/agent-harness/command_guard*',
+                    '{home}/.codex/agent-harness/redact.py', '{home}/.codex/agent-harness/safe_input.py'],
     'protected_work_wal_regex': r'^{home}/\.agent-harness/work/[^/]+/(?:.*/)?(?:wals?|wal[^/]*|[^/]*\.wal\.jsonl)(?:/.*)?$',
     # Tier A anywhere on disk: a `wals` directory segment, main.jsonl and *.wal.jsonl files.
     'protected_segment_names': ['wals'],
@@ -131,13 +138,36 @@ ALWAYS_ENFORCED = (SECRET_DUMP, LOG_DELETE)
 
 # --------------------------------------------------------------------------- policy
 
+# A policy file can only add protection: these lists are unioned with the defaults, broad_kill's mode may be set,
+# and every other key in the file is ignored. Allow-lists, regexes and limits are never taken from a file, so a
+# written or replaced policy cannot switch the guard off.
+ADDITIVE_LISTS = ('protected_log_roots', 'protected_segment_names', 'protected_file_names', 'protected_file_suffixes',
+                  'protected_roots', 'keep_names', 'keep_suffixes', 'keep_segments', 'generic_homes', 'ancestor_roots',
+                  'state_files', 'credential_path_regexes', 'credential_dirs', 'credential_samples',
+                  'rclone_blocked_config', 'guard_files')
+
+
 def _merge(base, override):
-    out = dict(base)
-    for key, value in (override or {}).items():
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            out[key] = _merge(base[key], value)
-        else:
-            out[key] = value
+    out = json.loads(json.dumps(base))
+    if not isinstance(override, dict):
+        return out
+    for key in ADDITIVE_LISTS:
+        extra = override.get(key)
+        if isinstance(extra, list):
+            for item in extra:
+                if isinstance(item, str) and item and item not in out[key]:
+                    if key == 'credential_path_regexes':
+                        try:
+                            re.compile(item)
+                        except re.error:
+                            continue
+                    out[key].append(item)
+    kill = override.get('kill')
+    if isinstance(kill, dict) and isinstance(kill.get('generic_names'), list):
+        out['kill']['generic_names'] += [n for n in kill['generic_names'] if isinstance(n, str) and n]
+    modes = override.get('modes')
+    if isinstance(modes, dict) and modes.get(BROAD_KILL) in ('warn', 'enforce'):
+        out['modes'][BROAD_KILL] = modes[BROAD_KILL]
     return out
 
 
@@ -206,6 +236,7 @@ class Compiled:
         self.keep_suffixes = tuple(s.casefold() for s in policy.get('keep_suffixes', []))
         self.keep_segments = {s.casefold() for s in policy.get('keep_segments', [])}
         self.ancestors = [self._segs(fmt(t, h)) for t in policy['ancestor_roots'] for h in homes]
+        self.guard_globs = [fmt(t, h).casefold() for t in policy.get('guard_files', []) for h in homes]
         self.state_files = [fmt(t, h).casefold() for t in policy['state_files'] for h in homes]
         self.wal_regexes = [re.compile(policy['protected_work_wal_regex'].replace('{home}', re.escape(h)), re.I)
                             for h in homes]
@@ -236,6 +267,11 @@ class Compiled:
             if _prefix_match(segs, r) and len(segs) >= len(r) + 2:
                 deep_enough = True
         return deep_enough
+
+    def is_guard_file(self, path):
+        folded = path.casefold()
+        real = (_realpath(path) or path).casefold()
+        return any(fnmatch.fnmatchcase(p, g) for g in self.guard_globs for p in (folded, real))
 
     def secret_name(self, name):
         upper = name.upper()
@@ -1710,7 +1746,12 @@ class Analyzer:
             if not (first.startswith('#!') and re.search(r'\b(?:ba|z|k|da|)sh\b', first)) \
                     and not path.endswith(('.sh', '.bash', '.zsh')):
                 return
+        # An existing script is the repository's own tooling: only its deletions of protected logs count. Its
+        # environment handling and secret lookups are routine there (replay false positives), and what it
+        # prints is not knowable from here. Scripts written earlier in this same command are judged in full.
+        before = len(ctx.findings)
         self.script(text, depth + 1, tail_visible=True)
+        ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
 
     def launcher(self, name, args, depth, pl, idx):
         """Commands that run another command given as text or as trailing words. True when handled."""
@@ -2562,7 +2603,8 @@ class Analyzer:
         if cls is None or cls not in tiers:
             return False
         if need_existing and literal and cls in ('log', 'root') and not _lexists(path) \
-                and path.casefold() not in ctx.created and not self._foreign_home(path):
+                and path.casefold() not in ctx.created and not self._foreign_home(path) \
+                and not self.c.is_guard_file(path):
             return False  # creating a new file is not destructive
         if literal and cls in ('log', 'root') and ctx.marker is not None and ctx.marker(path):
             return False
@@ -2988,7 +3030,7 @@ def format_block(f, more=0, warn=False):
     if more > 0:
         text += ' (%d more finding(s))' % more
     if not warn:
-        text += ' This policy lives in the installed command_guard_policy.json; there is no override variable.'
+        text += ' There is no override variable; ask the user if this command is really needed.'
     return text[:1500]
 
 
