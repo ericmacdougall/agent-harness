@@ -640,15 +640,33 @@ def cmd_scan(args):
     return 0
 
 
+STATE_MAX_BYTES = 64 * 1024 * 1024  # a dev2 scan is ~250 bytes per row; this allows ~250k rows
+
+
 def load_last():
+    """The saved scan, or None when it is missing, oversized or malformed. Every caller treats None as
+    "no usable scan" and exits 2, so a damaged file can never read as zero losses."""
+    path = os.path.join(state_dir(), "last-scan.json")
     try:
-        with open(os.path.join(state_dir(), "last-scan.json"), encoding="utf-8") as f:
-            d = json.load(f)
-    except (OSError, ValueError):
+        with open(path, "rb") as f:
+            raw = f.read(STATE_MAX_BYTES + 1)  # input-ok: the tool's own 0600 state file; oversize is rejected below
+    except OSError:
+        return None
+    if len(raw) > STATE_MAX_BYTES:
+        print("error: %s is larger than %d bytes; refusing to load it" % (path, STATE_MAX_BYTES), file=sys.stderr)
+        return None
+    try:
+        d = json.loads(raw.decode("utf-8"))  # input-ok: bounded by the read above
+    except ValueError:
+        print("error: %s is not valid JSON" % path, file=sys.stderr)
         return None
     if not isinstance(d, dict) or not isinstance(d.get("rows"), list):
+        print("error: %s does not hold a saved scan" % path, file=sys.stderr)
         return None
-    d["rows"] = [r for r in d["rows"] if isinstance(r, dict) and isinstance(r.get("path"), str) and r.get("class")]
+    # refuse rather than drop: dropping a damaged row would let report count it as nothing left to decide
+    if not all(isinstance(r, dict) and isinstance(r.get("path"), str) and r.get("class") for r in d["rows"]):
+        print("error: %s has malformed rows" % path, file=sys.stderr)
+        return None
     return d
 
 

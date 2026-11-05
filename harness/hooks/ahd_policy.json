@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "tick_seconds": 60,
+  "active_seconds": 600,
+  "registered_owners": [],
+  "unowned_seconds": 900,
+  "unowned_high_seconds": 7200,
+  "stale_ask_seconds": 86400,
+  "owner_window_seconds": 172800,
+  "clock_jump_seconds": 300,
+  "peek_list_window_seconds": 7200,
+  "peek_tail_max_bytes": 4194304,
+  "peek_line_max_bytes": 1048576,
+  "events_rotate_bytes": 33554432,
+  "exclude": {
+    "comment": "Interview material: never read, peeked or stored. A path, project dir, agent description, cwd or host whose token starts with one of these is excluded; liveness uses stat only. Fail closed: a path that cannot be classified is excluded.",
+    "token_prefixes": [
+      "solve",
+      "interview",
+      "interviewpilot"
+    ],
+    "path_substrings": [
+      "interview pilot",
+      "app.interviewpilot",
+      "solve capture"
+    ],
+    "hosts": [
+      "vm108",
+      "vm-108",
+      "108",
+      "interview-prep",
+      "interviewprep"
+    ]
+  },
+  "peers": [],
+  "jobs": [],
+  "writers": {},
+  "ledger_max_bytes": 67108864,
+  "wal_asks_max_bytes": 8388608,
+  "critical_seconds": 5400,
+  "tick_budget_seconds": 45,
+  "clock_hold_ticks": 1,
+  "no_evidence_window_seconds": 604800,
+  "memory_cap_bytes": 1073741824,
+  "owners_wal_max_bytes": 268435456
+}

@@ -336,7 +336,7 @@
   "source": "~/.claude/CLAUDE.md; OWNER-BRIEF-COMMON.md; matrix D11",
   "rule": "Do not merge to a protected main/deploy/spend/irreversible without main's go; PRs must not merge on red CI.",
   "enforcement": "ADVISORY",
-  "live_evidence": "commit_policy only validates gh pr merge message text. pr-e feat/merge-gate-14502 in flight.",
+  "live_evidence": "commit_policy only validates gh pr merge message text. merge_gate.py (GoodQA #14502) blocks gh pr merge, merge REST and GraphQL calls unless every check on the exact head is success; install.py and install_codex.py register it.",
   "checkable": "YES",
   "checkable_reason": "Required check status on exact head SHA is queryable.",
   "proposed_event": "PreToolUse Bash",
@@ -346,7 +346,10 @@
   "priority": "P1",
   "owner_overlap": "pr-e merge-gate #14502",
   "matrix_rows": "D11,D08",
-  "mechanisms": [],
+  "mechanisms": [
+   "merge_gate:hook"
+  ],
+  "partial_reason": "same-user honesty control: wrapper and runtime-built command shapes are disclosed residuals, and the waiver is not authentication of main",
   "planned_batch": "owner:pr-e"
  },
  {
@@ -471,7 +474,9 @@
   "owner_overlap": "OWNED a0e07708 (#14525-#14533)",
   "matrix_rows": "Z06",
   "mechanisms": [
-   "escalation:hook"
+   "tier_gate:hook",
+   "tier_gate:start",
+   "tier_gate:stop"
   ]
  },
  {

@@ -1,0 +1,21 @@
+{
+  "_doc": "Cases for tests/live_merge_gate.py: the installed hook is fed these payload commands as JSON on stdin (never executed). {HEAD} is replaced by a 40-hex SHA. expect is the hook exit code.",
+  "cases": [
+    {"id": "red-plain", "command": "gh pr merge 5 -R o/r --squash --match-head-commit {HEAD}", "scenario": "red_netwatch", "expect": 2},
+    {"id": "pending", "command": "gh pr merge 5 -R o/r --match-head-commit {HEAD}", "scenario": "pending_run", "expect": 2},
+    {"id": "zero-required", "command": "gh pr merge 5 -R o/r --match-head-commit {HEAD}", "scenario": "zero_required", "expect": 2},
+    {"id": "missing-required", "command": "gh pr merge 5 -R o/r --match-head-commit {HEAD}", "scenario": "required_missing", "expect": 2},
+    {"id": "gh-fails", "command": "gh pr merge 5 -R o/r --match-head-commit {HEAD}", "scenario": "pr_view_fails", "expect": 2},
+    {"id": "auto-pending", "command": "gh pr merge 5 -R o/r --auto --match-head-commit {HEAD}", "scenario": "pending_run", "expect": 2},
+    {"id": "bash-c-red", "command": "bash -c 'gh pr merge 5 -R o/r --match-head-commit {HEAD}'", "scenario": "red_netwatch", "expect": 2},
+    {"id": "ssh-red", "command": "ssh host 'gh pr merge 5 -R o/r --match-head-commit {HEAD}'", "scenario": "red_netwatch", "expect": 2},
+    {"id": "env-timeout-red", "command": "env X=1 timeout 60 gh pr merge 5 -R o/r --match-head-commit {HEAD}", "scenario": "red_netwatch", "expect": 2},
+    {"id": "rest-red", "command": "gh api -X PUT repos/o/r/pulls/5/merge -f sha={HEAD}", "scenario": "red_netwatch", "expect": 2},
+    {"id": "graphql-red", "command": "gh api graphql -f query='mutation { mergePullRequest(input:{pullRequestId:\"PR_kwDOabc\", expectedHeadOid:\"{HEAD}\"}) { clientMutationId } }'", "scenario": "red_netwatch", "expect": 2},
+    {"id": "green-unbound", "command": "gh pr merge 5 -R o/r --squash", "scenario": "green", "expect": 2},
+    {"id": "green-bound", "command": "gh pr merge 5 -R o/r --squash --match-head-commit {HEAD}", "scenario": "green", "expect": 0},
+    {"id": "green-rest-bound", "command": "gh api -X PUT repos/o/r/pulls/5/merge -f sha={HEAD}", "scenario": "green", "expect": 0},
+    {"id": "non-merge", "command": "ls -la", "scenario": "red_netwatch", "expect": 0},
+    {"id": "pr-view", "command": "gh pr view 5 -R o/r", "scenario": "red_netwatch", "expect": 0}
+  ]
+}

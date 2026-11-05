@@ -38,8 +38,9 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
                     'provenance_hooks.py', 'safe_input.py', 'domain_gates.py', 'domain_checklists.json',
                     'commit_policy.local.json.example', 'spec_policy.local.json.example',
+                    'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
-                    'command_guard.py', 'command_guard_hook.py', 'redact.py')
+                    'command_guard.py', 'command_guard_hook.py', 'redact.py', 'merge_gate.py')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
@@ -67,6 +68,11 @@ def policy_command(codex_home: Path) -> str:
     return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'commit_policy.py')) + ' hook'
 
 
+def gate_command(codex_home: Path) -> str:
+    """Merge gate; `|| exit 2` because a crash (exit 1) would otherwise count as allow."""
+    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'merge_gate.py')) + ' hook || exit 2'
+
+
 def guard_command(codex_home: Path, verb: str = ' hook') -> str:
     # The hook verb marks a fail-closed gate for the Go front door (cmd/harness/gates.json); the launcher ignores it.
     return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'command_guard_hook.py')) + verb
@@ -82,6 +88,7 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
     command = managed_command(codex_home)
     policy = policy_command(codex_home)
     guard = guard_command(codex_home)
+    gate = gate_command(codex_home)
     for event in HOOK_EVENTS:
         lifecycle = event in {'Stop', 'Interrupt'}
         managed = {'hooks': [{'type': 'command', 'command': command,
@@ -96,7 +103,7 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
                                 and handler.get('command') in (command, policy, guard,
-                                                               guard_command(codex_home, '')))]
+                                                               guard_command(codex_home, ''), gate))]
             if lifecycle and len(handlers) != len(group['hooks']) and group != managed:
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')
@@ -110,6 +117,7 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
         if event == 'PreToolUse':
             # Commit message policy for every tool (no matcher): shell argv, strings, stdin writes.
             preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 60}]})
+            preserved.append({'hooks': [{'type': 'command', 'command': gate, 'timeout': 60}]})
         hooks[event] = preserved
     return result
 
@@ -250,7 +258,8 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
     backup_root = harness_dir / 'backups'
     files = [(SOURCE / 'agents' / name, codex_home / 'agents' / name) for name in AGENTS]
     files += [(SOURCE / 'skills' / 'agent-harness' / name, skill_dir / name) for name in SKILL_FILES]
-    files += [(SOURCE / 'hooks' / 'wal.py', harness_dir / 'wal.py')]
+    files += [(SOURCE / 'hooks' / 'wal.py', harness_dir / 'wal.py'),
+              (SOURCE.parent / 'harness' / 'hooks' / 'ops_watch.py', harness_dir / 'ops_watch.py')]  # alert parity (goodqa#14613 M9)
     files += [(ROOT / 'harness' / 'hooks' / name, harness_dir / name)
               for name in DELIVERY_HELPERS]
     files += [(ROOT / 'harness' / 'tools' / 'watch-tests.py', harness_dir / 'watch-tests.py')]

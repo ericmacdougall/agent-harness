@@ -576,7 +576,7 @@ func propSeeds() int {
 }
 
 func TestRestoreMatchesLiveProjection(t *testing.T) {
-	t.Skip("known defect in the unreleased baseline; replaced by the event-log rebuild (K4+), GoodQA #35692, see console/README.md")
+	t.Skip("known defect in the unreleased baseline; replaced by the event-log rebuild (K5b and later), GoodQA #35692, see console/README.md")
 	var mu sync.Mutex
 	classes := map[string]string{}
 	counts := map[string]int{}
