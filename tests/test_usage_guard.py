@@ -65,10 +65,11 @@ class EvidenceStore(unittest.TestCase):
         other = self.root / 'other2'; other.mkdir()
         link = self.root / 'link2'; link.symlink_to(real)
         store = guard.UsageStore(link / 'state')
+        guard.UsageStore(other / 'state')  # a second, valid store at the same relative path
         link.unlink(); link.symlink_to(other)
         with self.assertRaises(guard.GuardError) as caught:
             store._current()
-        self.assertEqual(caught.exception.reason, 'UNKNOWN')
+        self.assertEqual(caught.exception.message, 'Usage directory identity changed')
 
     def test_symlinked_store_leaf_is_still_refused(self):
         real = self.root / 'real-leaf'; real.mkdir(mode=0o700)

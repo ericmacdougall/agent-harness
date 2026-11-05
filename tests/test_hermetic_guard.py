@@ -21,7 +21,7 @@ class HermeticSuite(unittest.TestCase):
     def test_usage_store_default_is_not_under_the_real_home(self):
         import usage_guard
         store = usage_guard.UsageStore()  # resolved from the pinned environment; creates a temp dir only
-        self.assertNotIn(hermetic.real_home(), Path(os.path.realpath(store.root)).parents)
+        self.assertFalse(hermetic.hits_protected(store.root), store.root)
 
     def test_guard_detects_a_real_home_resolution(self):
         real = hermetic.real_home()
@@ -54,8 +54,13 @@ class HermeticSuite(unittest.TestCase):
     def test_no_loaded_module_froze_a_real_state_path(self):
         # run_capped, heavy_job_guard and commit_policy compute their paths at import; with HOME pinned first
         # (gate wrapper) none may point at the real state. Under a bare `discover` they are reported, not hidden.
-        if os.environ.get('HARNESS_SUITE_PINNED') == '1':
-            self.assertEqual(hermetic.scan_frozen_paths(), [])
+        if os.environ.get('HARNESS_SUITE_PINNED') != '1':
+            self.skipTest('only meaningful when the gate wrapper pinned HOME before Python started')
+        self.assertEqual(hermetic.scan_frozen_paths(), [])
+
+    def test_home_inside_a_protected_dir_is_a_violation(self):
+        with mock.patch.dict(os.environ, {'HOME': str(hermetic.real_home() / '.claude')}):
+            self.assertTrue(any(item.startswith('HOME=') for item in hermetic.violations()))
 
 
 if __name__ == '__main__':

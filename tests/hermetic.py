@@ -62,6 +62,8 @@ def violations():
                         ('Path.home()', str(Path.home()))):
         if not value or os.path.realpath(value) == str(home):
             found.append(f'{name}={value!r} is the real home {home}')
+    if hits_protected(os.environ.get('HOME')):
+        found.append(f"HOME={os.environ.get('HOME')!r} is inside a real state directory")
     usage = os.environ.get('AGENT_HARNESS_USAGE_DIR')
     if not usage or hits_protected(usage):
         found.append(f'AGENT_HARNESS_USAGE_DIR={usage!r} is unset or inside a real state directory')
