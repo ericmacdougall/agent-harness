@@ -192,19 +192,24 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     if not main.is_file():
         raise AhError("session_unknown", f"no main WAL for session {session!r}")
     index_dir = state_dir(home, "ah-index")
-    spawned, stopped = {}, set()
+    spawned, stopped, named = {}, set(), []
     with open(main, "rb") as handle:
         for raw in handle:
             try:
                 rec = json.loads(raw)
             except ValueError:
                 continue
+            if isinstance(rec, dict) and rec.get("event") in ("scope", "intent", "decision") \
+                    and isinstance(rec.get("note"), str):
+                named.append(rec["note"])
             if not isinstance(rec, dict) or not isinstance(rec.get("agent_id"), str):
                 continue
             if rec.get("event") == "subagent":
                 spawned.setdefault(rec["agent_id"], {"type": rec.get("agent_type"), "at": parse_ts(rec.get("at"))})
             elif rec.get("event") == "subagent_stop":
                 stopped.add(rec["agent_id"])
+    registered = {r["args"].get("owner_agent") for r in _ledger(home) if r.get("op") == "task.register"}
+    named_text = "\n".join(named)
     rows = []
     for agent, info in spawned.items():
         path = wal / f"agent-{agent}.jsonl"
@@ -212,7 +217,10 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             "first": None, "last_at": 0.0, "outcome": None, "last_note": "", "tickets": []}
         last_wal = max(summary["last_at"], 0.0) or info["at"]
         verdict = liveness.classify(now, last_wal, transcript_mtime(home, session, agent), agent in stopped,
-                                    summary["outcome"], summary["last_note"], info["type"])
+                                    summary["outcome"], summary["last_note"], info["type"],
+                                    agent in registered,
+                                    owner=(agent in registered or info["type"] in liveness.OWNER_TYPES
+                                           or (info["type"] in liveness.NAMEABLE_TYPES and agent in named_text)))
         idle = verdict["idle_s"]
         row = {"agent_id": agent, "type": info["type"], "task": summary["first"],
                "state": verdict["state"], "severity": verdict["severity"],
@@ -304,33 +312,24 @@ def index_transcript(home: Path, session: str) -> dict:
         if not isinstance(rec, dict):
             continue
         kind = rec.get("type")
-        if kind == "assistant" and not rec.get("isSidechain"):
-            content = (rec.get("message") or {}).get("content")
-            for b in content if isinstance(content, list) else []:
-                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "AskUserQuestion" \
-                        and isinstance(b.get("id"), str):
-                    askq.add(b["id"])
+        if kind == "assistant":
+            askq |= prov.askuser_use_ids(rec)
         elif kind == "user":
             body, _ = prov.user_authorship(rec)
             if body and body.strip():
                 idx["msgs"].append(_msg("uuid", f"uuid:{session}/{rec.get('uuid')}", rec.get("timestamp"), body,
                                         "human-origin turn"))
                 continue
-            blocks = (rec.get("message") or {}).get("content")
-            if (not rec.get("isSidechain") and "toolUseResult" in rec and isinstance(blocks, list) and len(blocks) == 1
-                    and isinstance(blocks[0], dict) and blocks[0].get("type") == "tool_result"
-                    and blocks[0].get("tool_use_id") in askq):
+            answer = prov.answer_text(rec, askq)
+            if answer is not None:
                 idx["msgs"].append(_msg("answer", f"answer:{session}/{rec.get('uuid')}", rec.get("timestamp"),
-                                        _blocks_text(blocks[0].get("content")),
-                                        "AskUserQuestion tool result bound to an AskUserQuestion tool_use"))
-        elif kind == "queue-operation" and rec.get("operation") in ("enqueue", "popAll"):
-            content = rec.get("content")
-            # Harness wrappers (task notifications, agent messages, reminders) are never user text.
-            if isinstance(content, str) and content.strip() and not WRAPPER.match(content):
+                                        answer, prov.ANSWER_TRUST))
+        elif kind == "queue-operation":
+            content = prov.queue_user_text(rec)  # provenance.py owns the rule; wrappers are never user text
+            if content is not None:
                 digest = hashlib.sha256(content.encode()).hexdigest()[:12]
                 idx["msgs"].append(_msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
-                                        rec.get("timestamp"), content,
-                                        "transcript queue-operation record without an origin marker"))
+                                        rec.get("timestamp"), content, prov.QUEUE_TRUST))
     idx["askq"] = sorted(askq)
     atomic_json(cache, idx)
     return idx
