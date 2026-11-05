@@ -23,6 +23,24 @@ id_ecdsa*
 .git-credentials
 kit.json
 goodqa-hive/**
+# More credential stores (names are matched case-insensitively: the script passes --ignore-case).
+key
+token
+pem
+p12
+netrc
+_netrc
+.pgpass
+.pypirc
+*.jks
+*.gpg
+*.tfvars
+secrets.json
+service-account*.json
+id_dsa*
+.docker/config.json
+cookies.sqlite
+.git/config
 # VM dumps (vzdump images, e.g. under ~/vm-backups) are huge and must never ride the 15-minute log set.
 *.vma
 *.vma.zst

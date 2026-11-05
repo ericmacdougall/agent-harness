@@ -213,7 +213,7 @@ def validate_src(src: str) -> str:
 
 
 def validate_host(host: str) -> str:
-    if not re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._-]*", host) or ".." in host:
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", host) or ".." in host:
         raise RestoreError("--host may contain only letters, digits, '.', '_' and '-'")
     return host
 
@@ -244,8 +244,8 @@ def resolve_base(rclone: str, environ=os.environ) -> str:
     if base:
         if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*:[A-Za-z0-9_./-]*", base) or ".." in base:
             raise RestoreError("LOG_BACKUP_REMOTE is not a plain NAME:path")
-        if base.split(":", 1)[0] not in remotes:
-            raise RestoreError("LOG_BACKUP_REMOTE names a remote that is not configured")
+        if remotes.get(base.split(":", 1)[0]) not in ("dropbox", "crypt"):
+            raise RestoreError("LOG_BACKUP_REMOTE must name a configured dropbox or crypt remote")
         return base
     for name in REMOTE_CANDIDATES:
         if remotes.get(name) in ("dropbox", "crypt"):
