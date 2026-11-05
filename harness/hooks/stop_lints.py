@@ -26,7 +26,8 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -41,13 +42,16 @@ MAX_MESSAGE = 60_000
 TAIL_WINDOW = 400_000
 SESSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{7,63}$")
 AGENT_RE = re.compile(r"^[0-9A-Za-z]{6,64}$")
-ID_RE = r"([A-Za-z0-9_.\-]+)"
-PENDING_RE = re.compile(r"PENDING_REAL_TEST\s+" + ID_RE)
-REALLY_RE = re.compile(r"REALLY_TESTED\s+" + ID_RE)
+ID_BODY = r"([A-Za-z0-9_][A-Za-z0-9_.\-]*[A-Za-z0-9_]|[A-Za-z0-9_])"
+PENDING_RE = re.compile(r"PENDING_REAL_TEST\s+" + ID_BODY + r"(?=:)")  # the convention is `PENDING_REAL_TEST <id>:`
+REALLY_RE = re.compile(r"REALLY_TESTED\s+" + ID_BODY + r"(?=[:\s,;)]|\.(?:\s|$)|$)")
+DONE_WINDOW = 12_000  # the end of the message is where the claim is; also bounds every regex below
 DONE_RE = re.compile(
-    r"(?im)^\s*result:|\b(?:is|are|now|all|it's|its)\s+(?:done|complete|completed|finished|delivered|merged|shipped|deployed)\b"
-    r"|\b(?:i|we)(?:'ve| have)?\s+(?:finished|completed|shipped|merged|deployed|delivered)\b|^\s*done[.!:]")
-CITE_RE = re.compile(r"\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b|REALLY_TESTED|/pull/\d+|\bPR\s*#\d+", re.I)
+    r"(?im)\b(?:the (?:work|task|change|fix|feature|batch|pr|migration) (?:is|are)|it(?:'s| is)|all (?:is|are)|now|all)"
+    r"[ \t]+(?:done|complete|completed|finished|delivered|merged|shipped|deployed)\b"
+    r"|\b(?:i|we)(?:'ve| have)?[ \t]+(?:finished|completed|shipped|merged|deployed|delivered)\b|^[ \t]*done[.!:]")
+CITE_RE = re.compile(r"\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b|REALLY_TESTED[ \t]+(?=[A-Za-z0-9_.\-]*[0-9_\-])[A-Za-z0-9_][A-Za-z0-9_.\-]*"
+                     r"|/pull/\d+|\bPR[ \t]*#\d+", re.I)
 VERBS = r"(?:run|install|copy|paste|edit|restart|click|open|sign in|log ?in|download|approve|create|set up|configure|add)"
 CHORE_RES = [re.compile(p, re.I) for p in (
     r"\byou(?:'ll| will)? (?:(?:need|have) to|must|should) " + VERBS + r"\b",
@@ -56,7 +60,7 @@ CHORE_RES = [re.compile(p, re.I) for p in (
     r"\bcan you " + VERBS + r"\b")]
 NO_AGENT_PATH_RE = re.compile(r"no agent[- ]doable path|agent cannot|can(?:'|no)t be done by an agent|only you can", re.I)
 WORST_RE = re.compile(r"worst[- ]case", re.I)
-BOUND_RE = re.compile(r"\bbound\b", re.I)
+BOUND_RE = re.compile(r"\bbounds?\b[ \t]*[:=\-\u2013\u2014]|\bbounded (?:by|to)\b", re.I)
 
 
 def load_modes(path: Path = POLICY) -> dict[str, str]:
@@ -118,9 +122,10 @@ def read_wal(path: Path | None) -> list[dict]:
 
 def stamp(row: dict) -> datetime | None:
     try:
-        return datetime.fromisoformat(str(row.get("at")))
+        value = datetime.fromisoformat(str(row.get("at")))
     except ValueError:
         return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 def lint_wal_intent_result(rows: list[dict]) -> list[str]:
@@ -138,9 +143,11 @@ def lint_wal_intent_result(rows: list[dict]) -> list[str]:
     return out
 
 
-def lint_pending_tests(rows: list[dict]) -> list[str]:
-    """W06."""
+def lint_pending_tests(rows: list[dict], other_rows: list[dict] | None = None) -> list[str]:
+    """W06. other_rows are the same session's subagent WALs: owners record REALLY_TESTED in their own."""
     pending, done = {}, set()
+    for r in other_rows or []:
+        done.update(m.group(1) for m in REALLY_RE.finditer(str(r.get("note") or "")))
     for r in rows:
         note = str(r.get("note") or "")
         for m in PENDING_RE.finditer(note):
@@ -155,6 +162,7 @@ def lint_pending_tests(rows: list[dict]) -> list[str]:
 
 def lint_done_claim(message: str) -> list[str]:
     """W12."""
+    message = message[-DONE_WINDOW:]
     if DONE_RE.search(message) and not CITE_RE.search(message):
         return ["W12: the final message claims the work is done but cites no commit SHA, REALLY_TESTED id or PR"]
     return []
@@ -162,6 +170,7 @@ def lint_done_claim(message: str) -> list[str]:
 
 def lint_chore(message: str) -> list[str]:
     """W17."""
+    message = message.replace("\u2019", "'").replace("\u2018", "'")
     if NO_AGENT_PATH_RE.search(message):
         return []
     hits = sum(1 for rx in CHORE_RES for _ in rx.finditer(message))
@@ -180,12 +189,20 @@ def lint_red_team(message: str, agent_type: str) -> list[str]:
     return []
 
 
+RISKY_CONFIG = re.compile(r"^(filter\..*|core\.fsmonitor|core\.sshcommand|core\.hookspath|core\.pager|diff\.external|"
+                          r"diff\..*\.(command|textconv)|include\.path|includeif\..*)\b", re.I | re.M)
+DEADLINE = [0.0]
+
+
 def git(cwd: str, *args: str) -> str | None:
+    left = DEADLINE[0] - time.monotonic() if DEADLINE[0] else 5.0
+    if left <= 0.2:
+        return None
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path.home()), "GIT_TERMINAL_PROMPT": "0",
            "GIT_OPTIONAL_LOCKS": "0"}
     try:
         done = subprocess.run(["git", "-C", cwd, "-c", "core.fsmonitor=false", *args], capture_output=True, text=True,
-                              timeout=5, env=env)
+                              timeout=min(5.0, left), env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     return done.stdout if done.returncode == 0 else None
@@ -195,6 +212,12 @@ def lint_unpushed(cwd: str) -> list[str]:
     """S18."""
     if not cwd or not os.path.isdir(cwd) or git(cwd, "rev-parse", "--is-inside-work-tree") is None:
         return []
+    # git status runs clean filters, fsmonitor and similar commands named in the repo's own config; do not run it
+    # in a repo whose local config names any (a repo an agent or an archive wrote)
+    if RISKY_CONFIG.search(git(cwd, "config", "--local", "--name-only", "--list") or ""):
+        return []
+    if not (git(cwd, "remote") or "").strip():
+        return []  # nowhere to push: every commit would be "unpushed" on every turn
     out = []
     dirty = git(cwd, "status", "--porcelain=v1", "--untracked-files=no")
     if dirty and dirty.strip():
@@ -251,13 +274,26 @@ def tail_message(path: str) -> str:
 
 def run_lints(payload: dict, subagent: bool, modes: dict[str, str] | None = None, home: Path | None = None) -> list[str]:
     modes = modes or load_modes()
-    rows = read_wal(wal_path(payload, subagent, home))
+    DEADLINE[0] = time.monotonic() + 10.0
+    try:
+        return _run_lints(payload, subagent, modes, home)
+    finally:
+        DEADLINE[0] = 0.0  # no stale budget for a later direct call
+
+
+def _run_lints(payload: dict, subagent: bool, modes: dict[str, str], home: Path | None) -> list[str]:
+    path = wal_path(payload, subagent, home)
+    rows = read_wal(path)
+    siblings = []
+    if not subagent and path is not None:
+        for other in sorted(path.parent.glob("agent-*.jsonl"))[:60]:
+            siblings += read_wal(other)
     message = last_message(payload)
     found: list[str] = []
     if modes["W04"] == "warn":
         found += lint_wal_intent_result(rows)
     if modes["W06"] == "warn":
-        found += lint_pending_tests(rows)
+        found += lint_pending_tests(rows, siblings)
     if message:
         if modes["W12"] == "warn":
             found += lint_done_claim(message)

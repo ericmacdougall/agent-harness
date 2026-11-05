@@ -95,7 +95,7 @@ class PendingTests(WalFixture):  # W06
 
 class DoneClaims(WalFixture):  # W12
     def test_claim_without_a_cite_warns(self):
-        for msg in ("All the work is done.", "result: the migration shipped", "I've finished the change.",
+        for msg in ("All the work is done.", "The migration is shipped.", "I've finished the change.",
                     "done. nothing else to do"):
             self.assertEqual([w[:4] for w in self.lint(message=msg)], ["W12:"], msg)
 
@@ -281,6 +281,69 @@ class Wiring(unittest.TestCase):
         for rule in sl.RULES:
             self.assertTrue(by_id[rule]["mechanisms"], rule)
             self.assertTrue(set(by_id[rule]["mechanisms"]) <= manifest, rule)
+
+
+class ReviewRegressions(WalFixture):
+    """Findings of the independent review of fc32011."""
+
+    def test_blank_line_flood_is_linear_not_quadratic(self):  # F1
+        import time
+        for msg in ("\n" * 59990 + "all is done", " " * 59990 + "done.", "\n" * 59990 + "result:"):
+            start = time.monotonic()
+            sl.lint_done_claim(msg)
+            self.assertLess(time.monotonic() - start, 1.0, msg[-12:])
+
+    def test_result_header_and_negations_are_not_done_claims(self):  # F3
+        for msg in ("Result: BLOCK. Findings below.", "result: FAIL", "The tests are done running; 12 passed."):
+            self.assertEqual(self.lint(message=msg), [], msg)
+
+    def test_cite_must_name_an_id_not_just_the_word(self):  # F4
+        self.assertEqual([w[:4] for w in self.lint(message="It is all done, no REALLY_TESTED evidence exists")], ["W12:"])
+        self.assertEqual(self.lint(message="It is all done: REALLY_TESTED r1b recorded."), [])
+
+    def test_pending_ids_ignore_prose_and_trailing_periods(self):  # F5
+        self.wal([row("check", 1, note="a PENDING_REAL_TEST note; REALLY_TESTED T1."),
+                  row("check", 2, note="PENDING_REAL_TEST T1: x")])
+        self.assertEqual(self.lint(), [])
+
+    def test_main_stop_accepts_reallytested_recorded_in_an_owner_wal(self):  # F5
+        self.wal([row("check", 1, note="PENDING_REAL_TEST own-1: x")])
+        self.assertEqual(len(self.lint()), 1)
+        self.wal([row("check", 2, note="REALLY_TESTED own-1: ran it")], subagent=True)
+        self.assertEqual(self.lint(), [])
+
+    def test_naive_timestamps_do_not_abort_the_other_lints(self):  # F6
+        self.wal([{"at": "2026-11-05T03:01:00", "event": "intent"}, write_tool(5), row("result", 9),
+                  row("check", 2, note="PENDING_REAL_TEST z9: x")])
+        out = self.lint(message="All done.")
+        self.assertTrue(any(w.startswith("W06") for w in out) and any(w.startswith("W12") for w in out), out)
+        self.assertFalse(any(w.startswith("W04") for w in out), out)
+
+    def test_curly_apostrophes_and_bound_wording(self):  # F8
+        self.assertEqual([w[:4] for w in self.lint(message="You\u2019ll need to run the installer.")], ["W17:"])
+        rt = dict(subagent=True, agent_type="red-team")
+        self.assertIn("Bound", self.lint(message="Worst-case: x. We found an upper bound on nothing.", **rt)[0])
+        self.assertEqual(self.lint(message="Worst-case: x. Bound: 5 s.", **rt), [])
+        self.assertEqual(self.lint(message="Worst-case: x. Probes were bounded by 5 s.", **rt), [])
+
+
+class UnpushedNoise(Unpushed):
+    def test_repo_with_no_remote_is_skipped(self):  # F7
+        run_git(self.repo, "remote", "remove", "origin")
+        (self.repo / "a.txt").write_text("2")
+        run_git(self.repo, "commit", "-q", "-am", "two")
+        self.assertEqual(sl.lint_unpushed(str(self.repo)), [])
+
+    def test_repo_config_that_names_commands_is_never_run(self):  # F2
+        marker = Path(self.tmp.name) / "PWNED"
+        run_git(self.repo, "config", "filter.x.clean", f"sh -c 'touch {marker}; cat'")
+        (self.repo / ".gitattributes").write_text("a.txt filter=x\n")
+        run_git(self.repo, "add", ".gitattributes")
+        run_git(self.repo, "commit", "-q", "-m", "attrs")
+        (self.repo / "a.txt").write_text("changed")
+        marker.unlink(missing_ok=True)  # setup commands above may have run the filter themselves
+        self.assertEqual(sl.lint_unpushed(str(self.repo)), [])
+        self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":
