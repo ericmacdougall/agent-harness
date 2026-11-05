@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -34,6 +35,14 @@ MAX_JSON = 65536
 MAX_MANIFEST = 32768
 MAX_FILE = 2 * 1024 * 1024
 LOCK_SECONDS = 2
+# A dead owner is reconciled automatically only after its own timeout plus this grace (seconds).
+DEADLINE_GRACE = 60
+# Attempts that never launched a provider do not spend the two-launch repeat budget, but they are
+# bounded so an infrastructure refusal cannot turn into an unbounded retry loop.
+ZERO_LAUNCH_CAP = 6
+MAX_ATTEMPTS = 2 + ZERO_LAUNCH_CAP
+AUTO_ACTOR = 'usage_guard.auto'
+RECONCILIATION_KINDS = {'manual_reconciliation', 'automatic_reconciliation'}
 EXECUTIONS = {'NOT_STARTED', 'RUNNING', 'COMPLETED', 'INTERRUPTED', 'UNKNOWN'}
 RESULTS = {'CHECK_OK', 'CHECK_FAILED', 'NO_RESULT'}
 REASONS = {'NONE', 'CODE_FINDINGS', 'QUOTA', 'AUTH', 'TRANSIENT_INFRA', 'LOW_DISK',
@@ -131,6 +140,96 @@ def load_manifest(value=None):
                               'command_revision'}):
         raise GuardError('INVALID_OUTPUT', 'Input manifest is unsupported or oversized')
     return json.loads(encoded(value))
+
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def host_identity():
+    return socket.gethostname()[:255]
+
+
+def boot_identity():
+    """A boot identifier when the platform offers one cheaply; audit detail only."""
+    try:
+        return Path('/proc/sys/kernel/random/boot_id').read_text().strip()[:64] or None
+    except OSError:
+        pass
+    try:
+        probe = subprocess.run(['sysctl', '-n', 'kern.boottime'], capture_output=True, text=True, timeout=5)
+        if probe.returncode == 0 and probe.stdout.strip():
+            return ' '.join(probe.stdout.split())[:128]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return None
+
+
+def process_start_token(pid):
+    """A token naming one incarnation of `pid`, or None when the platform cannot say."""
+    try:
+        after_comm = Path('/proc/%d/stat' % pid).read_text().rsplit(')', 1)[1].split()
+        return 'proc:' + after_comm[19]  # field 22, starttime in clock ticks since boot
+    except (OSError, IndexError, ValueError):
+        pass
+    try:
+        probe = subprocess.run(['ps', '-p', str(pid), '-o', 'lstart='], capture_output=True, text=True, timeout=5)
+        if probe.returncode == 0 and probe.stdout.strip():
+            return 'ps:' + ' '.join(probe.stdout.split())[:64]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return None
+
+
+def owner_process_facts(pid=None):
+    """Who holds a reservation: enough to prove death on the same host, never to prove success."""
+    pid = os.getpid() if pid is None else pid
+    return {'pid': pid, 'host': host_identity(), 'boot_id': boot_identity(),
+            'process_started': process_start_token(pid)}
+
+
+def owner_liveness(start):
+    """DEAD only when provable on this host; ALIVE when the same incarnation answers; otherwise UNCERTAIN."""
+    owner = start.get('owner_process') if isinstance(start, dict) else None
+    facts = {'state': 'UNCERTAIN', 'past_deadline': False, 'why': 'owner facts missing or malformed'}
+    if (not isinstance(owner, dict) or type(owner.get('pid')) is not int or owner['pid'] <= 0
+            or not isinstance(owner.get('host'), str) or not isinstance(owner.get('deadline'), str)):
+        return facts
+    try:
+        deadline = datetime.fromisoformat(owner['deadline'])
+    except ValueError:
+        facts['why'] = 'deadline malformed'
+        return facts
+    if deadline.tzinfo is None:
+        facts['why'] = 'deadline has no time zone'
+        return facts
+    facts.update(pid=owner['pid'], host=owner['host'], deadline=owner['deadline'],
+                 past_deadline=now_utc() > deadline)
+    if owner['host'] != host_identity():
+        facts['why'] = 'other host'
+        return facts
+    try:
+        os.kill(owner['pid'], 0)
+        exists = True
+    except ProcessLookupError:
+        exists = False
+    except PermissionError:
+        exists = True
+    except OSError:
+        facts['why'] = 'pid probe failed'
+        return facts
+    if not exists:
+        facts.update(state='DEAD', why='pid gone')
+        return facts
+    recorded, current = owner.get('process_started'), process_start_token(owner['pid'])
+    if not isinstance(recorded, str) or current is None:
+        facts['why'] = 'process start time unavailable'
+        return facts
+    if current != recorded:
+        facts.update(state='DEAD', why='pid reused: start time differs', live_start=current)
+        return facts
+    facts.update(state='ALIVE', why='owner process alive')
+    return facts
 
 
 class Subject(dict):
@@ -544,7 +643,7 @@ class UsageStore:
         purpose = self.root / 'purposes' / identity
         self._directory(purpose, create=False)
         matches = []
-        for number in (1, 2):
+        for number in range(1, MAX_ATTEMPTS + 1):
             path = purpose / ('attempt-' + str(number) + '.json')
             if os.path.lexists(path):
                 entry = read_json(path)
@@ -559,10 +658,12 @@ class UsageStore:
         value = read_json(path)
         if (set(value) != {'schema', 'kind', 'run_id', 'actor', 'reason', 'evidence', 'at', 'execution', 'result'}
                 or type(value.get('schema')) is not int or value['schema'] != SCHEMA
-                or value.get('kind') != 'manual_reconciliation' or value.get('run_id') != run_id
+                or value.get('kind') not in RECONCILIATION_KINDS or value.get('run_id') != run_id
                 or value.get('execution') != 'UNKNOWN' or value.get('result') != 'NO_RESULT'):
             raise GuardError('UNKNOWN', 'Manual reconciliation is malformed or belongs to another run')
         for field in ('actor', 'reason', 'evidence', 'at'): safe_text(value[field])
+        if value['kind'] == 'automatic_reconciliation' and value['actor'] != AUTO_ACTOR:
+            raise GuardError('UNKNOWN', 'Automatic reconciliation has an unexpected actor')
         return True
 
     def begin(self, subject, invocation, *, owner, label, timeout, kind='review', repeat_reason=None,
@@ -594,8 +695,8 @@ class UsageStore:
                 resource_reason = 'UNKNOWN'
         with self._lock():
             purpose = self._directory(self.root / 'purposes' / invocation['fingerprint'])
-            previous, spent = [], 0
-            for number in (1, 2):
+            previous, counted, zero_launch, spent = [], [], [], 0
+            for number in range(1, MAX_ATTEMPTS + 1):
                 path = purpose / ('attempt-' + str(number) + '.json')
                 if not os.path.lexists(path): break
                 entry = read_json(path)
@@ -612,8 +713,11 @@ class UsageStore:
                 completion = directory / 'completion.json'
                 if not os.path.lexists(completion):
                     if not reconciled:
+                        reconciled = self._auto_reconcile_locked(entry['run_id'])['reconciled']
+                    if not reconciled:
                         raise GuardError('UNKNOWN', 'Prior reservation has no final receipt; reconcile before retry', entry['start'])
-                    spent += started['timeout']
+                    # Launches are unknown for a run without a final, so it counts as a launch.
+                    spent += started['timeout']; counted.append(entry)
                 else:
                     completed = read_json(completion)
                     if set(completed) != {'schema', 'reference'} or completed.get('schema') != SCHEMA:
@@ -629,19 +733,29 @@ class UsageStore:
                     if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
                         raise GuardError('UNKNOWN', 'Elapsed execution budget is invalid')
                     spent += elapsed
-            if previous and (repeat_reason is None or len(previous) >= 2):
-                raise GuardError('BUDGET_EXHAUSTED', 'Identical invocation already reserved; use evidence or one justified repeat', previous[-1]['start'])
+                    (zero_launch if zero_launch_attempt(record) else counted).append(entry)
+            if counted and (repeat_reason is None or len(counted) >= 2):
+                raise GuardError('BUDGET_EXHAUSTED', 'Identical invocation already reserved; use evidence or one justified repeat', counted[-1]['start'])
+            if len(zero_launch) >= ZERO_LAUNCH_CAP or len(previous) >= MAX_ATTEMPTS:
+                raise GuardError('BUDGET_EXHAUSTED', 'Repeated infrastructure refusals before any provider launch; '
+                                 'investigate the infrastructure before retrying', previous[-1]['start'])
             remaining = aggregate_timeout - spent
             if remaining <= 0:
                 raise GuardError('BUDGET_EXHAUSTED', 'Declared aggregate execution budget is exhausted')
             run_id = secrets.token_hex(16)
             directory = self._directory(self._run_directory(run_id))
+            started_at = now_utc()
+            owner_process = owner_process_facts()
+            if owner_process is not None:
+                owner_process = {**owner_process, 'deadline': (started_at + timedelta(
+                    seconds=min(timeout, remaining) + DEADLINE_GRACE)).isoformat()}
             started = {'schema': SCHEMA, 'kind': 'start', 'run_id': run_id, 'owner': owner, 'label': label,
                        'subject': dict(subject), 'invocation': invocation, 'command_kind': kind,
                        'timeout': min(timeout, remaining), 'aggregate_timeout': aggregate_timeout,
-                       'started_at': datetime.now(timezone.utc).isoformat(), 'resources': resources,
+                       'started_at': started_at.isoformat(), 'resources': resources,
                        'repeat_reason': repeat_reason, 'gate': gate,
-                       'ungated_reason': ungated_reason, 'execution': 'RUNNING'}
+                       'ungated_reason': ungated_reason, 'execution': 'RUNNING',
+                       'owner_process': owner_process}
             reference = {'run_id': run_id, 'record': 'start', 'sha256': hashlib.sha256(encoded(started)).hexdigest()}
             self._publish(purpose, 'attempt-' + str(len(previous) + 1) + '.json',
                           {'schema': SCHEMA, 'run_id': run_id, 'start': reference,
@@ -649,7 +763,8 @@ class UsageStore:
             self._publish(directory, 'start.json', started)
         run = Run(self, subject, started, reference)
         if resource_reason != 'NONE':
-            final = run.finish(execution='NOT_STARTED', result='NO_RESULT', reason=resource_reason)
+            final = run.finish(execution='NOT_STARTED', result='NO_RESULT', reason=resource_reason,
+                               usage={'provider_launches': 0, 'reported': []})
             raise GuardError(resource_reason, 'Resource preflight prevented command launch', final)
         return run
 
@@ -708,6 +823,8 @@ class UsageStore:
         with self._lock():
             self._owned_start(run_id)
             directory, state = self._pool(provider, pool)
+            if state['active'] is not None and self._auto_reconcile_locked(state['active'])['reconciled']:
+                directory, state = self._pool(provider, pool)
             if state['active'] is not None:
                 raise GuardError('UNKNOWN' if state['reason'] in {'UNKNOWN', 'TIMEOUT'} else 'TRANSIENT_INFRA',
                                  'Provider pool has an active or unreconciled owner; no provider was launched')
@@ -731,24 +848,84 @@ class UsageStore:
                      'reason': reason if cooldown or uncertain else 'NONE', 'reset_at': reset_at if cooldown else None}
             self._pool_event(directory, state, 'FINISHED')
 
+    def _affected_pools(self, run_id):
+        # Validate every referenced current pool before publishing any
+        # marker or deriving a replacement index from its state.
+        affected = []
+        for number, pool in enumerate((self.root / 'pools').iterdir()):
+            if number >= 4096: raise GuardError('UNKNOWN', 'Pool reconciliation scan exceeded limit')
+            state = self._read_pool_state(pool)
+            if state['active'] == run_id: affected.append((pool, state))
+        return affected
+
+    def _publish_reconciliation(self, run_id, *, kind, actor, reason, evidence):
+        directory = self._run_directory(run_id)
+        affected = self._affected_pools(run_id)
+        self._publish(directory, 'reconciled.json', {'schema': SCHEMA, 'kind': kind,
+                      'run_id': run_id, 'actor': actor, 'reason': reason, 'evidence': evidence,
+                      'at': now_utc().isoformat(), 'execution': 'UNKNOWN', 'result': 'NO_RESULT'})
+        for pool, state in affected:
+            self._pool_event(pool, {**state, 'active': None}, 'RECONCILED', actor=actor,
+                             reason=reason, evidence=evidence)
+        return len(affected)
+
     def reconcile(self, run_id, *, actor, reason, evidence):
         for value in (actor, reason, evidence): safe_text(value)
         with self._lock():
-            directory = self._run_directory(run_id)
             self._owned_start(run_id)
-            affected = []
-            # Validate every referenced current pool before publishing any
-            # manual marker or deriving a replacement index from its state.
-            for number, pool in enumerate((self.root / 'pools').iterdir()):
-                if number >= 4096: raise GuardError('UNKNOWN', 'Pool reconciliation scan exceeded limit')
-                state = self._read_pool_state(pool)
-                if state['active'] == run_id: affected.append((pool, state))
-            self._publish(directory, 'reconciled.json', {'schema': SCHEMA, 'kind': 'manual_reconciliation',
-                          'run_id': run_id, 'actor': actor, 'reason': reason, 'evidence': evidence,
-                          'at': datetime.now(timezone.utc).isoformat(), 'execution': 'UNKNOWN', 'result': 'NO_RESULT'})
-            for pool, state in affected:
-                self._pool_event(pool, {**state, 'active': None}, 'RECONCILED', actor=actor,
-                                 reason=reason, evidence=evidence)
+            self._publish_reconciliation(run_id, kind='manual_reconciliation', actor=actor,
+                                         reason=reason, evidence=evidence)
+
+    def _auto_reconcile_locked(self, run_id):
+        """Reconcile one reservation only when its owner is provably dead on this host past its deadline.
+
+        Never writes a FINAL or completion: the run stays UNKNOWN / NO_RESULT, exactly like a manual
+        reconciliation, with the liveness facts as evidence. Cross-host owners stay uncertain.
+        """
+        directory = self._run_directory(run_id)
+        report = {'run_id': run_id, 'reconciled': False, 'why': '', 'liveness': None}
+        if not os.path.lexists(directory / 'start.json'):
+            report['why'] = 'no start record'
+            return report
+        start = self._owned_start(run_id)
+        if os.path.lexists(directory / 'completion.json'):
+            report['why'] = 'completed'
+            return report
+        if self._reconciliation(directory, run_id):
+            report['why'] = 'already reconciled'
+            return report
+        liveness = owner_liveness(start)
+        report['liveness'] = liveness
+        if liveness['state'] != 'DEAD':
+            report['why'] = 'owner ' + liveness['state'].lower() + ': ' + liveness['why']
+            return report
+        if not liveness['past_deadline']:
+            report['why'] = 'dead owner before deadline'
+            return report
+        evidence = ('pid %d on host %s: %s; deadline %s; checked %s' % (
+            liveness['pid'], liveness['host'], liveness['why'], liveness['deadline'], now_utc().isoformat()))[:500]
+        reason = 'Owner process provably dead on this host past its deadline'
+        report['pools'] = self._publish_reconciliation(run_id, kind='automatic_reconciliation', actor=AUTO_ACTOR,
+                                                       reason=reason, evidence=evidence)
+        report.update(reconciled=True, why='owner dead past deadline')
+        return report
+
+    def auto_reconcile(self, run_id):
+        with self._lock():
+            return self._auto_reconcile_locked(run_id)
+
+    def sweep(self):
+        """Apply the automatic rule to every run; the report names each run and why it was or was not reconciled."""
+        reports = []
+        with self._lock():
+            for number, directory in enumerate(sorted((self.root / 'runs').iterdir())):
+                if number >= 65536: raise GuardError('UNKNOWN', 'Run sweep exceeded limit')
+                try:
+                    reports.append(self._auto_reconcile_locked(directory.name))
+                except GuardError as error:
+                    reports.append({'run_id': directory.name, 'reconciled': False,
+                                    'why': 'error: ' + error.message, 'liveness': None})
+        return reports
 
     def ack_pool(self, provider, pool, *, actor, reason, evidence):
         for value in (actor, reason, evidence): safe_text(value)
@@ -801,6 +978,14 @@ class Run:
             self.store._publish(self.store._run_directory(self.run_id), 'completion.json',
                                 {'schema': SCHEMA, 'reference': reference})
         return reference
+
+
+def zero_launch_attempt(final):
+    """True when the attempt provably launched no provider and failed on infrastructure, not on content."""
+    usage = final.get('usage') if isinstance(final.get('usage'), dict) else {}
+    if usage.get('provider_launches') != 0 or type(usage.get('provider_launches')) is not int:
+        return False
+    return final.get('execution') == 'NOT_STARTED' or final.get('reason') in {'TRANSIENT_INFRA', 'LOW_DISK'}
 
 
 def command_result(adapter, code, stdout, stderr='', success_exit=None):
@@ -930,18 +1115,31 @@ def main():
     check.add_argument('--gate', type=reference_argument)
     inspect = sub.add_parser('inspect'); inspect.add_argument('--reference', type=reference_argument, required=True)
     reconcile = sub.add_parser('reconcile'); reconcile.add_argument('--run', required=True)
+    reconcile.add_argument('--auto', action='store_true',
+                           help='reconcile only when the owner is provably dead on this host past its deadline')
     ack = sub.add_parser('ack-pool'); ack.add_argument('--provider', required=True); ack.add_argument('--pool', default='default')
     for part in (reconcile, ack):
-        for flag in ('actor', 'reason', 'evidence'): part.add_argument('--' + flag, required=True)
+        for flag in ('actor', 'reason', 'evidence'): part.add_argument('--' + flag)
+    sub.add_parser('sweep', help='apply the automatic dead-owner rule to every run and report each one')
     args = parser.parse_args()
     run = None
     try:
         store = UsageStore(args.state_dir)
         if args.action == 'inspect': value = store.inspect(args.reference)
+        elif args.action == 'reconcile' and args.auto:
+            value = {'execution': 'UNKNOWN', 'result': 'NO_RESULT', 'automatic_reconciliation': store.auto_reconcile(args.run)}
         elif args.action == 'reconcile':
+            if not all((args.actor, args.reason, args.evidence)):
+                parser.error('reconcile needs --actor, --reason and --evidence unless --auto is given')
             store.reconcile(args.run, actor=args.actor, reason=args.reason, evidence=args.evidence)
             value = {'execution': 'UNKNOWN', 'result': 'NO_RESULT', 'manual_reconciliation': args.run}
+        elif args.action == 'sweep':
+            reports = store.sweep()
+            value = {'result': 'NO_RESULT', 'runs': len(reports), 'reconciled': [r['run_id'] for r in reports if r['reconciled']],
+                     'reports': reports}
         elif args.action == 'ack-pool':
+            if not all((args.actor, args.reason, args.evidence)):
+                parser.error('ack-pool needs --actor, --reason and --evidence')
             store.ack_pool(args.provider, args.pool, actor=args.actor, reason=args.reason, evidence=args.evidence)
             value = {'availability_acknowledged': True, 'result': 'NO_RESULT'}
         else:
@@ -981,7 +1179,7 @@ def main():
                                                cleanup_incomplete=getattr(error, 'cleanup_incomplete', False))
                     value = {'reference': reference, **store.load_ref(reference)}
         print(json.dumps(value, sort_keys=True))
-        return 0 if value.get('result') == 'CHECK_OK' or args.action in {'inspect', 'reuse', 'reconcile', 'ack-pool', 'gate'} else 3
+        return 0 if value.get('result') == 'CHECK_OK' or args.action in {'inspect', 'reuse', 'reconcile', 'ack-pool', 'gate', 'sweep'} else 3
     except (GuardError, OSError, ValueError, TypeError, UnicodeError) as error:
         facts = {'reason': error.reason, 'reference': error.reference} if isinstance(error, GuardError) else {'reason': 'UNKNOWN'}
         if run is not None and facts.get('reference') is None:

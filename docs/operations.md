@@ -92,6 +92,17 @@ python3 ~/.codex/agent-harness/usage_guard.py reconcile --run RUN_ID --actor own
 python3 ~/.codex/agent-harness/usage_guard.py ack-pool --provider codex --pool default --actor owner-a --reason 'Availability change verified' --evidence 'private-evidence-reference'
 ```
 
+Every START also records who holds the reservation (`owner_process`: pid, host, boot id, a process start-time token and a deadline of the run's timeout plus 60 s of grace). A reservation without a FINAL is reconciled automatically, on the next `begin`, `acquire_pool`, `reconcile --auto` or `sweep`, only when all of these are proven on the same host: the pid is gone or its live start time differs from the recorded one, and the deadline has passed. The record is a `reconciled.json` of kind `automatic_reconciliation` with the liveness facts as evidence; it keeps the run UNKNOWN / NO_RESULT, releases the pools the run held with a `RECONCILED` event, and never writes a FINAL. A dead owner before its deadline, an owner on another host, a live owner, or a START without owner facts stays uncertain and still needs the manual command above.
+
+```sh
+python3 ~/.codex/agent-harness/usage_guard.py reconcile --run RUN_ID --auto
+python3 ~/.codex/agent-harness/usage_guard.py sweep
+```
+
+`sweep` prints one report per run (`reconciled`, `why`, `liveness`) and is safe to run on a schedule; the dead-man check uses it.
+
+Attempt budget: an attempt whose FINAL shows `provider_launches` 0 with execution `NOT_STARTED`, or reason `TRANSIENT_INFRA` or `LOW_DISK`, never launched a provider, so it does not spend the two-launch repeat budget and the next attempt needs no `--repeat-reason`. Launched attempts, uncertain results and reconciled runs without a FINAL still count. Zero-launch attempts are bounded to 6 per invocation (`ZERO_LAUNCH_CAP`); after that `begin` refuses with `BUDGET_EXHAUSTED` and names the infrastructure, not the packet. Every attempt's elapsed time still counts against the declared aggregate budget.
+
 These actions retain history and record actor/reason/evidence; they never manufacture successful execution. Acknowledging availability is separate from reconciling an active owner. Quota/auth cooldowns apply only to cooperating callers sharing this state directory and the configured opaque provider/auth-pool alias. Aliases do not derive from credentials. Trusted account errors can set a cooldown; vague credit messages, model-specific availability and tool content cannot disable the whole pool. A reliable reset hint can permit a later call after its reset; otherwise availability needs recorded evidence, with no polling, purchase or automatic model-switch loop.
 
 Before expensive commands, disk probes cover work/build, temp and receipt filesystems. Default floors are 2 GiB for compile/test work and 256 MiB otherwise, with `--minimum-free-bytes` for a declared override or known higher peak. Missing data or low space prevents launch. Floors are not predictions and are subject to concurrent consumption. No automatic cache deletion or broad process killing occurs. Process-group cleanup retains its existing detached-descendant limitations. Hashes/permissions catch accidental staleness or mutation; same-user receipts are cooperative evidence, not signed attestations.

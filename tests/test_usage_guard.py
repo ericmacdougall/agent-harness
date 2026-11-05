@@ -14,6 +14,7 @@ import shutil
 import signal
 import unittest
 from unittest import mock
+from datetime import datetime, timedelta, timezone
 
 
 HOOKS = Path(__file__).resolve().parents[1] / 'harness/hooks'
@@ -21,7 +22,7 @@ sys.path.insert(0, str(HOOKS))
 import usage_guard as guard
 
 
-class EvidenceStore(unittest.TestCase):
+class StoreFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='usage-guard-')
         self.addCleanup(self.temp.cleanup)
@@ -46,6 +47,8 @@ class EvidenceStore(unittest.TestCase):
     def finish(self, run):
         return run.finish(execution='COMPLETED', result='CHECK_OK', reason='NONE', exit_code=0, count=1)
 
+
+class EvidenceStore(StoreFixture):
     def test_private_start_final_and_reuse_preserve_original_reference(self):
         run = self.begin(); reference = self.finish(run)
         start = self.store.load_ref(run.start_ref); final = self.store.load_ref(reference)
@@ -458,3 +461,166 @@ class LiveReceipts(unittest.TestCase):
             if marker.exists():
                 try: os.killpg(json.loads(marker.read_text())['group'], signal.SIGKILL)
                 except ProcessLookupError: pass
+
+
+class OwnerLiveness(StoreFixture):
+    """GoodQA goodqa#14525: dead owners are reconciled automatically, auditable, never minted as success."""
+
+    def child(self, seconds=30):
+        process = subprocess.Popen([sys.executable, '-c', f'import time; time.sleep({seconds})'])
+        self.addCleanup(lambda: (process.kill(), process.wait(timeout=5)) if process.poll() is None else None)
+        return process
+
+    def facts_for(self, process, **overrides):
+        facts = guard.owner_process_facts(pid=process.pid)
+        facts.update(overrides)
+        return facts
+
+    def begin_owned(self, facts, **options):
+        with mock.patch.object(guard, 'owner_process_facts', return_value=facts):
+            return self.begin(**options)
+
+    def future(self):
+        return mock.patch.object(guard, 'now_utc', return_value=datetime.now(timezone.utc) + timedelta(days=1))
+
+    def test_start_records_owner_process_facts_and_deadline(self):
+        run = self.begin()
+        start = self.store.load_ref(run.start_ref)
+        owner = start['owner_process']
+        self.assertEqual(owner['pid'], os.getpid())
+        self.assertEqual(owner['host'], guard.host_identity())
+        self.assertIsInstance(owner['process_started'], str)
+        started = datetime.fromisoformat(start['started_at']); deadline = datetime.fromisoformat(owner['deadline'])
+        self.assertAlmostEqual((deadline - started).total_seconds(), start['timeout'] + guard.DEADLINE_GRACE, delta=1)
+
+    def test_auto_reconcile_dead_owner_past_deadline_is_audited_and_never_success(self):
+        child = self.child(); facts = self.facts_for(child)
+        run = self.begin_owned(facts, aggregate_timeout=30)
+        self.store.acquire_pool('codex', 'fixture-pool', run.run_id)
+        child.kill(); child.wait(timeout=5)
+        # Dead but not yet past the deadline: still uncertain, nothing written (NEG-1).
+        with self.assertRaises(guard.GuardError) as refused: self.begin(repeat_reason='retry', aggregate_timeout=30)
+        self.assertEqual(refused.exception.reason, 'UNKNOWN')
+        self.assertFalse((self.store.root / 'runs' / run.run_id / 'reconciled.json').exists())
+        with self.future():
+            report = self.store.auto_reconcile(run.run_id)
+        self.assertTrue(report['reconciled']); self.assertEqual(report['liveness']['state'], 'DEAD')
+        record = json.loads((self.store.root / 'runs' / run.run_id / 'reconciled.json').read_text())
+        self.assertEqual((record['kind'], record['actor'], record['execution'], record['result']),
+                         ('automatic_reconciliation', 'usage_guard.auto', 'UNKNOWN', 'NO_RESULT'))
+        self.assertIn(str(child.pid), record['evidence'])
+        self.assertFalse((self.store.root / 'runs' / run.run_id / 'final.json').exists())
+        self.assertFalse((self.store.root / 'runs' / run.run_id / 'completion.json').exists())
+        self.assertFalse(self.store.reuse(self.subject, self.identity, run.start_ref).get('eligible'))
+        # The pool was released by the reconciliation and the retry proceeds without manual work.
+        other = self.begin(repeat_reason='owner died', aggregate_timeout=30)
+        self.store.acquire_pool('codex', 'fixture-pool', other.run_id)
+        events = [json.loads(path.read_text())['action'] for path in (self.store.root / 'pools').glob('*/events/*.json')]
+        self.assertIn('RECONCILED', events)
+        # Idempotent: a second automatic pass reports nothing to do.
+        with self.future():
+            self.assertFalse(self.store.auto_reconcile(run.run_id)['reconciled'])
+
+    def test_begin_and_acquire_pool_auto_reconcile_inline(self):
+        child = self.child(); facts = self.facts_for(child)
+        run = self.begin_owned(facts, aggregate_timeout=30)
+        self.store.acquire_pool('codex', 'fixture-pool', run.run_id)
+        child.kill(); child.wait(timeout=5)
+        with self.future():
+            retry = self.begin(repeat_reason='owner died', aggregate_timeout=30)
+            self.store.acquire_pool('codex', 'fixture-pool', retry.run_id)
+        self.assertTrue((self.store.root / 'runs' / run.run_id / 'reconciled.json').exists())
+
+    def test_alive_owner_other_host_reused_pid_and_legacy_are_not_reconciled(self):
+        alive = self.child()
+        cases = {
+            'alive': (self.facts_for(alive), 'ALIVE'),
+            'other-host': (self.facts_for(alive, host='another-host.example'), 'UNCERTAIN'),
+            'legacy': (None, 'UNCERTAIN'),
+            'malformed': ({'pid': 'x', 'host': guard.host_identity(), 'process_started': None, 'deadline': 'soon'}, 'UNCERTAIN'),
+        }
+        for label, (facts, expected) in cases.items():
+            with self.subTest(label):
+                identity = guard.invocation_identity(self.subject, purpose=label, argv=[label], cwd=self.repo)
+                with mock.patch.object(guard, 'owner_process_facts', return_value=facts):
+                    run = self.store.begin(self.subject, identity, owner='fixture', label=label, timeout=10,
+                                           kind='focused', minimum_bytes=0, aggregate_timeout=30)
+                with self.future():
+                    report = self.store.auto_reconcile(run.run_id)
+                self.assertFalse(report['reconciled']); self.assertEqual(report['liveness']['state'], expected)
+                self.assertFalse((self.store.root / 'runs' / run.run_id / 'reconciled.json').exists())
+        reused = self.facts_for(alive, process_started='reused:0')
+        run = self.begin_owned(reused, aggregate_timeout=30)
+        with self.future():
+            self.assertTrue(self.store.auto_reconcile(run.run_id)['reconciled'])
+
+    def test_completed_run_is_not_auto_reconciled_and_sweep_reports_every_run(self):
+        done = self.begin(); self.finish(done)
+        child = self.child(); facts = self.facts_for(child)
+        identity = guard.invocation_identity(self.subject, purpose='dead', argv=['dead'], cwd=self.repo)
+        with mock.patch.object(guard, 'owner_process_facts', return_value=facts):
+            dead = self.store.begin(self.subject, identity, owner='fixture', label='dead', timeout=10,
+                                    kind='focused', minimum_bytes=0)
+        child.kill(); child.wait(timeout=5)
+        with self.future():
+            self.assertFalse(self.store.auto_reconcile(done.run_id)['reconciled'])
+            report = {item['run_id']: item for item in self.store.sweep()}
+        self.assertEqual(report[done.run_id]['why'], 'completed')
+        self.assertTrue(report[dead.run_id]['reconciled'])
+        self.assertEqual(json.loads((self.store.root / 'runs' / done.run_id / 'final.json').read_text())['result'], 'CHECK_OK')
+
+    def test_tampered_automatic_reconciliation_is_rejected(self):
+        child = self.child(); facts = self.facts_for(child)
+        run = self.begin_owned(facts, aggregate_timeout=30)
+        child.kill(); child.wait(timeout=5)
+        with self.future(): self.store.auto_reconcile(run.run_id)
+        path = self.store.root / 'runs' / run.run_id / 'reconciled.json'
+        record = json.loads(path.read_text()); record['run_id'] = 'f' * 32
+        path.write_text(json.dumps(record))
+        with self.assertRaises(guard.GuardError) as refused: self.begin(repeat_reason='retry', aggregate_timeout=30)
+        self.assertEqual(refused.exception.reason, 'UNKNOWN')
+
+
+class ZeroLaunchAttempts(StoreFixture):
+    """GoodQA goodqa#14526: infrastructure refusals before any provider ran do not spend the repeat budget."""
+
+    def refuse(self, run, *, launches=0, execution='NOT_STARTED', reason='TRANSIENT_INFRA'):
+        return run.finish(execution=execution, result='NO_RESULT', reason=reason,
+                          usage={'provider_launches': launches, 'reported': []})
+
+    def test_zero_launch_attempts_do_not_need_a_repeat_reason_or_spend_the_cap(self):
+        self.refuse(self.begin(aggregate_timeout=60))
+        self.refuse(self.begin(aggregate_timeout=60), reason='LOW_DISK')
+        self.refuse(self.begin(aggregate_timeout=60), execution='COMPLETED')
+        first = self.begin(aggregate_timeout=60); self.finish(first)
+        with self.assertRaises(guard.GuardError) as refused: self.begin(aggregate_timeout=60)
+        self.assertEqual(refused.exception.reason, 'BUDGET_EXHAUSTED')
+        second = self.begin(repeat_reason='new evidence', aggregate_timeout=60); self.finish(second)
+        with self.assertRaises(guard.GuardError) as refused: self.begin(repeat_reason='third', aggregate_timeout=60)
+        self.assertEqual(refused.exception.reason, 'BUDGET_EXHAUSTED')
+        self.assertEqual(len(list((self.store.root / 'purposes').glob('*/attempt-*.json'))), 5)
+
+    def test_launched_or_uncertain_attempts_still_count(self):
+        self.refuse(self.begin(aggregate_timeout=60), launches=1, execution='COMPLETED')
+        with self.assertRaises(guard.GuardError) as refused: self.begin(aggregate_timeout=60)
+        self.assertEqual(refused.exception.reason, 'BUDGET_EXHAUSTED')
+        second = self.begin(repeat_reason='provider ran', aggregate_timeout=60)
+        self.store.reconcile(second.run_id, actor='fixture', reason='owner ended', evidence='owned log')
+        with self.assertRaises(guard.GuardError) as refused: self.begin(repeat_reason='third', aggregate_timeout=60)
+        self.assertEqual(refused.exception.reason, 'BUDGET_EXHAUSTED')
+
+    def test_zero_launch_cap_bounds_the_retry_loop(self):
+        for _ in range(guard.ZERO_LAUNCH_CAP):
+            self.refuse(self.begin(aggregate_timeout=60))
+        with self.assertRaises(guard.GuardError) as refused: self.begin(aggregate_timeout=60)
+        self.assertEqual(refused.exception.reason, 'BUDGET_EXHAUSTED')
+        self.assertIn('infrastructure', refused.exception.message)
+
+    def test_zero_launch_budget_still_spends_elapsed_and_cannot_enlarge(self):
+        run = self.begin(aggregate_timeout=20)
+        run.began -= 15
+        self.refuse(run)
+        with self.assertRaises(guard.GuardError) as refused: self.begin(aggregate_timeout=40)
+        self.assertEqual(refused.exception.reason, 'BUDGET_EXHAUSTED')
+        retry = self.begin(aggregate_timeout=20)
+        self.assertLessEqual(retry.timeout, 5)
