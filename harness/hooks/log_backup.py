@@ -32,6 +32,9 @@ FUTURE_TOLERANCE_SECONDS = 300
 LAST_OK = "log-backup.last-ok"
 LAST_SKIP = "log-backup.last-skip"
 LAST_RUN = "log-backup.last-run"
+BULK_OK = "log-backup.bulk-last-ok"
+FIRST_RUN = "log-backup.first-run"
+BULK_MAX_AGE_SECONDS = 6 * 3600
 LOCK_DIR = "log-backup.lock.d"
 REMOTE_CANDIDATES = ("lessons-dropbox", "dropbox")
 MAX_STAMP_BYTES = 256
@@ -91,6 +94,29 @@ def printable(text: str) -> str:
     return "".join(c if c.isprintable() or c == " " else "?" for c in text.strip())
 
 
+def bulk_classify(home: Path, now: float | None = None, max_age: int = BULK_MAX_AGE_SECONDS) -> dict:
+    """State of the bulk tier (archived sessions, narrowed work tree). A bulk marker that never appeared is only a
+    problem once the backup has been installed for longer than max_age ('pending' before that)."""
+    now = time.time() if now is None else now
+    stamp = parse_stamp(read_small(logs_dir(home) / BULK_OK))
+    if stamp is None:
+        first = parse_stamp(read_small(logs_dir(home) / FIRST_RUN))
+        if first is not None and now - first <= max_age:
+            return {"state": "pending", "age": None}
+        return {"state": "missing", "age": None}
+    age = now - stamp
+    if age < -FUTURE_TOLERANCE_SECONDS:
+        return {"state": "invalid", "age": age}
+    return {"state": "fresh" if max(age, 0.0) <= max_age else "stale", "age": max(age, 0.0)}
+
+
+def bulk_alert_text(result: dict, max_age: int = BULK_MAX_AGE_SECONDS) -> str:
+    when = "has never completed" if result["state"] == "missing" else (
+        "has an unreadable marker" if result["state"] == "invalid" else f"last completed {human_age(result['age'])} ago")
+    return (f"LOG BACKUP NOTICE: transcripts are backed up, but the bulk tier (archived sessions and work files) {when} "
+            f"(limit {max_age // 3600} h). Check ~/.agent-harness/logs/log-backup.log.")
+
+
 def human_age(seconds: float | None) -> str:
     if seconds is None:
         return "unknown"
@@ -124,12 +150,21 @@ def run_note(home: Path) -> str:
 
 
 def cmd_check(args) -> int:
+    """0 transcripts and bulk fresh, 1 transcripts stale, 2 transcripts missing or invalid, 3 transcripts fresh
+    but the bulk tier stale, missing or invalid."""
     result = classify(args.home, max_age=args.max_age)
+    bulk = bulk_classify(args.home)
     if args.json:
-        print(json.dumps(result))
+        print(json.dumps({**result, "bulk": bulk["state"]}))
+    elif result["state"] != "fresh":
+        print(alert_text(result, args.max_age) + run_note(args.home))
+    elif bulk["state"] in ("stale", "missing", "invalid"):
+        print(bulk_alert_text(bulk) + run_note(args.home))
     else:
-        print("fresh" if result["state"] == "fresh" else alert_text(result, args.max_age) + run_note(args.home))
-    return {"fresh": 0, "stale": 1}.get(result["state"], 2)
+        print("fresh")
+    if result["state"] != "fresh":
+        return {"stale": 1}.get(result["state"], 2)
+    return 3 if bulk["state"] in ("stale", "missing", "invalid") else 0
 
 
 def cmd_session_start(args) -> int:
@@ -139,8 +174,13 @@ def cmd_session_start(args) -> int:
         except (OSError, ValueError):
             pass
         result = classify(args.home, max_age=args.max_age)
+        bulk = bulk_classify(args.home)
+        text = ""
         if result["state"] != "fresh":
             text = alert_text(result, args.max_age) + run_note(args.home)
+        elif bulk["state"] in ("stale", "missing", "invalid"):
+            text = bulk_alert_text(bulk) + run_note(args.home)
+        if text:
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text},
                               "systemMessage": text}))
     except Exception:  # noqa: BLE001 - a status hook must never break a session
@@ -168,6 +208,8 @@ def cmd_status(args) -> int:
     result = classify(args.home, max_age=args.max_age)
     logs = logs_dir(args.home)
     print(f"last success : {printable(read_small(logs / LAST_OK) or 'never')} (age {human_age(result['age'])}, {result['state']})")
+    bulk = bulk_classify(args.home)
+    print(f"bulk success : {printable(read_small(logs / BULK_OK) or 'never')} (age {human_age(bulk['age'])}, {bulk['state']}; limit {BULK_MAX_AGE_SECONDS // 3600} h)")
     print(f"last run     : {printable(read_small(logs / LAST_RUN) or 'never')}")
     print(f"last skipped : {printable(read_small(logs / LAST_SKIP) or 'never')} (a skipped run is not a backup)")
     print(f"lock         : {lock_holder(args.home)}")
