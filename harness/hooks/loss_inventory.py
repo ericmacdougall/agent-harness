@@ -34,7 +34,8 @@ Subcommands
          scan, else 0. Excluded and built-in pruned directory names are listed in the output.
 
 NOT covered (known limits): system units (/etc/systemd/system), other users' crontabs and homes,
-anything outside the --root dirs, git objects outside refs (reflog-only commits), rewritten
+anything outside the --root dirs, gitignored files and plain (non-git) files, linked worktrees
+whose main repo is outside the roots, refs/notes and other custom refs, git objects outside refs (reflog-only commits), rewritten
 remotes (url.insteadOf), and remote-side state (we never contact a remote).
 
 Safety: symlinks are never followed; the walk does not cross filesystems unless --cross-devices;
@@ -45,6 +46,7 @@ runs with optional locks off and fsmonitor disabled, and a failing repo becomes 
 import argparse
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -60,7 +62,7 @@ SCHEMA = 2
 CLASSES = ("unpushed_branch", "no_remote_repo", "systemd_user_unit", "timer", "state_db_outside_git",
            "git_stash", "local_tag", "dirty_worktree", "crontab")
 UNIT_EXTS = (".service", ".socket", ".path", ".mount", ".automount")
-REQUIRED_KEYS = ("schema", "host", "scanned_at", "roots", "classes", "rows", "partial", "errors_total",
+REQUIRED_KEYS = ("schema", "min_db_bytes", "host", "scanned_at", "roots", "classes", "rows", "partial", "errors_total",
                  "skipped_mounts_total", "skipped_symlinks_total", "excludes", "prune")
 DECISIONS = ("moved", "rebuildable", "accepted-loss")
 DB_EXTS = (".sqlite", ".sqlite3", ".db")
@@ -72,6 +74,8 @@ PRUNE = {
 }
 MAX_ERRORS = 200
 GIT_TIMEOUT = 30
+DIRTY_STAT_CAP = 5000
+DEFAULT_MIN_DB = 1000000
 
 
 def state_dir():
@@ -103,6 +107,7 @@ class Scan:
         self.extra_prune = set(args.exclude or [])
         self.prune = PRUNE | self.extra_prune
         self.cross = args.cross_devices
+        self.no_crontab = args.no_crontab
         self.symlink_allow = [os.path.abspath(os.path.expanduser(x)) for x in (args.allow_symlink_target or [])]
         self.roots_real = []
         self.rows = []
@@ -137,7 +142,7 @@ class Scan:
         env = os.environ.copy()
         for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
             env.pop(k, None)
-        env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")  # optional locks off: status never writes the index
+        env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_LITERAL_PATHSPECS="1")  # optional locks off: status never writes the index
         # fsmonitor=false: a scanned repo's config must not be able to run a command
         cmd = ["git", "-C", repo, "-c", "core.fsmonitor=false"] + list(argv)
         try:
@@ -260,13 +265,20 @@ class Scan:
 
     def check_dirty(self, repo):
         """Count of changed/untracked entries only (git status --porcelain, no index write)."""
-        rc, out, er = self.git(repo, "status", "--porcelain")
+        # explicit flags: user/repo config (status.showUntrackedFiles=no) must not hide files
+        rc, out, er = self.git(repo, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
         if rc != 0:
             raise RuntimeError("git status failed: %s" % er.strip()[:120])
-        n = len([l for l in out.split("\n") if l.strip()])
-        if n:
-            self.row("dirty_worktree", "%s::dirty" % repo, self.now, None,
-                     hashlib.sha256(out.encode("utf-8", "replace")).hexdigest()[:16], n)
+        lines = [l for l in out.split("\n") if l.strip()]
+        if lines:
+            h = hashlib.sha256(out.encode("utf-8", "replace"))
+            for l in lines[:DIRTY_STAT_CAP]:  # content changes under the same path change size:mtime
+                try:
+                    st = os.lstat(os.path.join(repo, l[3:].split(" -> ")[-1].strip('"')))
+                    h.update(("%d:%d" % (st.st_size, st.st_mtime_ns)).encode())
+                except OSError:
+                    h.update(b"-")
+            self.row("dirty_worktree", "%s::dirty" % repo, self.now, None, h.hexdigest()[:16], len(lines))
 
     def tracked(self, repo_root, path):
         """True if path is tracked by git (so it lives in the repo, not only on this disk)."""
@@ -317,16 +329,21 @@ class Scan:
 
     def scan_crontab(self):
         """User crontab: count of active lines only; contents are hashed and discarded."""
+        if self.no_crontab:
+            return
         try:
-            p = subprocess.run(["crontab", "-l"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            p = subprocess.run(["crontab", "-l"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                timeout=10, stdin=subprocess.DEVNULL)
         except FileNotFoundError:
+            self.err("crontab", "crontab binary not found (use --no-crontab if this host has no cron)")
             return
         except (OSError, subprocess.TimeoutExpired) as e:
             self.err("crontab", e)
             return
         if p.returncode != 0:
-            return  # "no crontab for user"
+            if b"no crontab" not in p.stderr.lower():  # only this message means "empty"
+                self.err("crontab", "crontab -l failed: %s" % p.stderr.decode("utf-8", "replace").strip()[:100])
+            return
         text = p.stdout.decode("utf-8", "replace")
         n = len([l for l in text.split("\n") if l.strip() and not l.strip().startswith("#")])
         if n:
@@ -353,11 +370,20 @@ class Scan:
     def inside(self, target, prefixes):
         return any(target == r or target.startswith(r.rstrip("/") + "/") for r in prefixes)
 
+    def walked(self, target):
+        """target is inside a scanned root AND no pruned directory name lies on the way to it."""
+        for r in self.roots_real:
+            if target == r or target.startswith(r.rstrip("/") + "/"):
+                rel = os.path.relpath(target, r)
+                if not any(part in self.prune for part in rel.split(os.sep)):
+                    return True
+        return False
+
     def note_symlink(self, path, force=False):
         """A symlink we did not follow. Blocks report unless its target is inside a scanned root
         (it is then inventoried through the real path) or under --allow-symlink-target."""
         target = os.path.realpath(path)
-        if not force and (self.inside(target, self.roots_real) or self.inside(target, self.symlink_allow)):
+        if not force and (self.walked(target) or self.inside(target, self.symlink_allow)):
             return
         self.skipped_symlinks_total += 1
         if len(self.skipped_symlinks) < MAX_ERRORS:
@@ -424,17 +450,24 @@ class Scan:
 
 
 def local_host_names():
-    names = {"localhost", "127.0.0.1", "::1"}
+    names = {"localhost", "::1"}
     for n in (socket.gethostname(), socket.getfqdn()):
         if n:
             names.add(n.lower())
             names.add(n.lower().split(".")[0])
+    try:  # this machine's own addresses
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            names.add(info[4][0].lower())
+    except OSError:
+        pass
     return names
 
 
 def url_is_local(url, local_names):
     """True if a remote URL points at this machine (a path, file://, localhost or our own hostname)."""
-    u = url.strip()
+    u = re.sub(r"^[A-Za-z0-9_+.-]+::", "", url.strip())  # remote helpers: gcrypt::/path, ext::...
+    if url.strip() != u and not u.startswith(("http://", "https://", "ssh://", "git://")):
+        return True  # helper with a bare address: cannot prove it is off-host, so count as local
     if not u or u == "." or u.startswith(("/", "./", "../", "~", "file:")):
         return True
     m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]*@)?(\[[^\]]+\]|[^:/]+)", u)
@@ -443,6 +476,12 @@ def url_is_local(url, local_names):
     if not m:
         return True  # plain relative path
     host = m.group(1).strip("[]").lower()
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_loopback or ip.is_unspecified or ip.is_link_local:
+            return True
+    except ValueError:
+        pass
     return host in local_names or host.split(".")[0] in local_names
 
 
@@ -535,6 +574,7 @@ def cmd_scan(args):
         "skipped_symlinks": s.skipped_symlinks, "skipped_symlinks_total": s.skipped_symlinks_total,
         "symlink_allow": s.symlink_allow,
         "excludes": sorted(s.extra_prune), "prune": sorted(PRUNE),
+        "min_db_bytes": s.min_db, "no_crontab": bool(s.no_crontab),
         "note": "git state comes from local refs only (never fetched); remote-tracking refs may be stale",
     }
     if not args.no_save:
@@ -622,6 +662,12 @@ def cmd_report(args):
     roots = last.get("roots") or []
     if not args.allow_partial_roots and not roots_cover_home(roots):
         problems.append("ROOTS\tscanned roots do not include $HOME; rescan with --root ~ (or --allow-partial-roots)")
+    if args.expect_host and last.get("host") != args.expect_host:
+        problems.append("HOST\tscan was taken on %r, expected %r" % (last.get("host"), args.expect_host))
+    if last.get("min_db_bytes") is None or last.get("min_db_bytes") > DEFAULT_MIN_DB:
+        problems.append("DB_THRESHOLD\tscan skipped databases below %s bytes (default %d); rescan with the default" % (last.get("min_db_bytes"), DEFAULT_MIN_DB))
+    if last.get("no_crontab"):
+        problems.append("NO_CRONTAB\tcrontab was not checked (--no-crontab)")
     undecided = [r for r in merge_decisions(last["rows"]) if r.get("decision") is None]
     if last.get("partial"):
         problems.append("PARTIAL\tscan hit its --max-seconds budget; some of the tree was not scanned")
@@ -640,6 +686,7 @@ def cmd_report(args):
                           "prune": last.get("prune", []), "undecided": undecided}, indent=1))
     else:
         print("last scan %s (incomplete)" % last.get("scanned_at") if problems else "last scan %s" % last.get("scanned_at"))
+        print("HOST\t%s\tMIN_DB_BYTES\t%s" % (last.get("host"), last.get("min_db_bytes")))
         print("ROOTS\t%s" % ",".join(roots))
         for r in undecided:
             print("%s\t%s\tage_days=%s\tbytes=%s%s" % (r["class"], r["path"], r.get("age_days"), r.get("bytes"),
@@ -666,10 +713,11 @@ def main(argv=None):
     s.add_argument("--root", action="append", required=True)
     s.add_argument("--json", action="store_true")
     s.add_argument("--max-seconds", type=float, default=900, help="time budget, 0 = unlimited (default 900)")
-    s.add_argument("--min-db-bytes", type=int, default=1000000)
+    s.add_argument("--min-db-bytes", type=int, default=DEFAULT_MIN_DB)
     s.add_argument("--exclude", action="append", help="extra directory name to skip (reported)")
     s.add_argument("--cross-devices", action="store_true")
     s.add_argument("--allow-symlink-target", action="append", help="acknowledge symlinks whose target is under this path (reported)")
+    s.add_argument("--no-crontab", action="store_true", help="host has no cron (reported)")
     s.add_argument("--no-save", action="store_true")
     d = sub.add_parser("decide")
     d.add_argument("--row", required=True)
@@ -679,6 +727,7 @@ def main(argv=None):
     r = sub.add_parser("report")
     r.add_argument("--json", action="store_true")
     r.add_argument("--max-age", type=float, default=24, help="max scan age in hours (default 24)")
+    r.add_argument("--expect-host", help="fail unless the saved scan was taken on this host")
     r.add_argument("--allow-partial-roots", action="store_true", help="do not require $HOME under the scanned roots")
     args = p.parse_args(argv)
     return {"scan": cmd_scan, "decide": cmd_decide, "report": cmd_report}[args.cmd](args)
