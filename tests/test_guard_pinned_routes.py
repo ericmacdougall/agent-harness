@@ -76,21 +76,21 @@ class Base(unittest.TestCase):
 
 class PinnedRouteTests(Base):
     def test_exact_invocations_are_allowed(self):
-        self.assertAllowed('/bin/bash %s' % self.sh)
+        self.assertAllowed('/bin/bash -p %s' % self.sh)
         for args in PY_ARGS:
             self.assertAllowed('/usr/bin/python3 -I %s %s' % (self.py, args))
 
     def test_changed_invocations_are_refused(self):
         sh, py = self.sh, self.py
         rows = [
-            '/bin/bash %s extra' % sh,
-            '/bin/bash %s | tee %s/out' % (sh, self.home),
-            '/bin/bash %s > %s/out' % (sh, self.home),
-            '/bin/bash %s; true' % sh,
+            '/bin/bash -p %s extra' % sh,
+            '/bin/bash -p %s | tee %s/out' % (sh, self.home),
+            '/bin/bash -p %s > %s/out' % (sh, self.home),
+            '/bin/bash -p %s; true' % sh,
             'true && /bin/bash %s' % sh,
-            '/bin/bash  %s' % sh,
-            '/bin/bash %s\n' % sh,
-            '/bin/bash -x %s' % sh,
+            '/bin/bash -p  %s' % sh,
+            '/bin/bash -p %s\n' % sh,
+            '/bin/bash -p -x %s' % sh,
             'bash %s' % sh,
             'sh %s' % sh,
             'source %s' % sh,
@@ -115,8 +115,17 @@ class PinnedRouteTests(Base):
             '/bin/sh %s' % sh,
             '/usr/local/bin/bash %s' % sh,
             '/usr/local/bin/python3 -I %s list' % py,
-            '/bin/bash %s' % py,
+            '/bin/bash -p %s' % py,
             '/usr/bin/python3 -I %s list' % sh,
+            # the route's bash must be in privileged mode, so no BASH_ENV, ENV or exported function runs first
+            '/bin/bash %s' % sh,
+            '/bin/bash -p -p %s' % sh,
+            '/bin/bash --norc -p %s' % sh,
+            'BASH_ENV=%s/e /bin/bash -p %s' % (self.home, sh),
+            'ENV=%s/e /bin/bash -p %s' % (self.home, sh),
+            'env BASH_ENV=%s/e /bin/bash -p %s' % (self.home, sh),
+            'PATH=%s:/usr/bin /bin/bash -p %s' % (self.home, sh),
+            'export BASH_ENV=%s/e; /bin/bash -p %s' % (self.home, sh),
         ]
         for command in rows:
             with self.subTest(command=command):
@@ -125,27 +134,27 @@ class PinnedRouteTests(Base):
     def test_modified_script_at_the_pinned_path_is_refused(self):
         self.sh.write_bytes(SH_TEXT + b'# changed\n')
         self.py.write_bytes(PY_TEXT + b'# changed\n')
-        self.assertRefused('/bin/bash %s' % self.sh)
+        self.assertRefused('/bin/bash -p %s' % self.sh)
         self.assertRefused('/usr/bin/python3 -I %s list' % self.py)
 
     def test_copy_at_another_path_is_refused(self):
         sh = self.write('elsewhere/copy.sh', SH_TEXT)
         py = self.write('elsewhere/copy.py', PY_TEXT)
-        self.assertRefused('/bin/bash %s' % sh)
+        self.assertRefused('/bin/bash -p %s' % sh)
         self.assertRefused('/usr/bin/python3 -I %s list' % py)
 
     def test_symlink_at_the_pinned_path_is_refused(self):
         target = self.write('elsewhere/target.sh', SH_TEXT)
         self.sh.unlink()
         self.sh.symlink_to(target)
-        self.assertRefused('/bin/bash %s' % self.sh)
+        self.assertRefused('/bin/bash -p %s' % self.sh)
 
     def test_missing_file_gives_no_route(self):
         self.sh.unlink()
-        self.assertFalse(cg.pinned_route('/bin/bash %s' % self.sh))
+        self.assertFalse(cg.pinned_route('/bin/bash -p %s' % self.sh))
 
     def test_routes_end_at_expiry(self):
-        command = '/bin/bash %s' % self.sh
+        command = '/bin/bash -p %s' % self.sh
         self.assertTrue(cg.pinned_route(command, now=cg.PINNED_ROUTE_EXPIRES - 1))
         self.assertFalse(cg.pinned_route(command, now=cg.PINNED_ROUTE_EXPIRES))
         with mock.patch.object(cg.time, 'time', return_value=cg.PINNED_ROUTE_EXPIRES):
@@ -153,16 +162,16 @@ class PinnedRouteTests(Base):
 
     def test_read_failure_gives_no_route(self):
         with mock.patch.object(cg, '_read_prefix', side_effect=OSError):
-            self.assertFalse(cg.pinned_route('/bin/bash %s' % self.sh))
+            self.assertFalse(cg.pinned_route('/bin/bash -p %s' % self.sh))
 
     def test_only_a_plain_home_gives_a_route(self):
-        command = '/bin/bash %s' % self.sh
+        command = '/bin/bash -p %s' % self.sh
         self.assertTrue(cg.pinned_route(command))
         for home in ('', 'relative/home', str(self.home) + ';id', str(self.home) + ' x', '$(id)'):
             with self.subTest(home=home), mock.patch.dict(os.environ, {'HOME': home}):
                 self.assertFalse(cg.pinned_route(command))
                 path = '%s/%s%s' % (home, BASE, SH_REL)
-                self.assertFalse(cg.pinned_route('/bin/bash %s' % path))
+                self.assertFalse(cg.pinned_route('/bin/bash -p %s' % path))
         with mock.patch.dict(os.environ):
             del os.environ['HOME']
             self.assertFalse(cg.pinned_route(command))
@@ -173,7 +182,7 @@ class PinnedRouteTests(Base):
         target.parent.mkdir(parents=True)
         target.write_bytes(SH_TEXT)
         with mock.patch.dict(os.environ, {'HOME': home}):
-            self.assertFalse(cg.pinned_route('/bin/bash %s' % target))
+            self.assertFalse(cg.pinned_route('/bin/bash -p %s' % target))
 
     def test_a_command_list_gets_no_route(self):
         self.assertFalse(cg.pinned_route(['/bin/bash', str(self.sh)]))
@@ -183,13 +192,13 @@ class PinnedRouteTests(Base):
         text = b'#!/bin/bash\ncat ~/.config/rclone/rclone.conf\n'
         # Under the routes' own base with its true hash, so only the table can be what refuses it.
         rogue = self.write(BASE + 'rogue.sh', text)
-        row = ['rogue.sh', sha(text), '/bin/bash {path}']
+        row = ['rogue.sh', sha(text), '/bin/bash -p {path}']
         policy.write_text(json.dumps({'PINNED_ROUTES': [row], 'pinned_routes': [row]}))
         compiled = cg.Compiled(cg.load_policy(path=str(policy)), cwd=str(self.home))
-        self.assertEqual(cg.decide('/bin/bash %s' % rogue, compiled, cwd=str(self.home))[0], 'block')
+        self.assertEqual(cg.decide('/bin/bash -p %s' % rogue, compiled, cwd=str(self.home))[0], 'block')
 
     def test_the_path_in_the_shape_is_literal(self):
-        command = '/bin/bash %s' % self.sh
+        command = '/bin/bash -p %s' % self.sh
         self.assertIn('.agent-harness', command)
         self.assertFalse(cg.pinned_route(command.replace('.agent-harness', 'xagent-harness')))
 
@@ -198,7 +207,7 @@ class PinnedRouteTests(Base):
         self.sh.write_bytes(big)
         table = ((SH_REL, sha(big), cg.PINNED_ROUTES[0][2]), cg.PINNED_ROUTES[1])
         with mock.patch.object(cg, 'PINNED_ROUTES', table):
-            self.assertFalse(cg.pinned_route('/bin/bash %s' % self.sh))
+            self.assertFalse(cg.pinned_route('/bin/bash -p %s' % self.sh))
 
     def test_a_home_with_a_space_and_a_true_copy_gets_no_route(self):
         home = str(self.home) + '/a b'
@@ -206,7 +215,7 @@ class PinnedRouteTests(Base):
         target.parent.mkdir(parents=True)
         target.write_bytes(SH_TEXT)
         with mock.patch.dict(os.environ, {'HOME': home}):
-            self.assertFalse(cg.pinned_route('/bin/bash %s' % target))
+            self.assertFalse(cg.pinned_route('/bin/bash -p %s' % target))
 
 
 class CredentialScriptTests(Base):
@@ -362,7 +371,7 @@ class CredentialScriptTests(Base):
                 with self.subTest(count=count, last=last):
                     if len(pad) < 262144 or last is read:  # past 256 KiB the log rule does not read the file, on main too
                         self.assertRefused('bash %s' % path)
-                    self.assertLess(time.monotonic() - started, cg.CREDENTIAL_SCRIPT_SECONDS + 2)
+                    self.assertLess(time.monotonic() - started, cg.CREDENTIAL_PASS_SECONDS + 2)
 
     def test_many_padded_scripts_cannot_use_up_the_time_limit(self):
         pad = b'#!/bin/bash\n' + b'rclone -a ' * 100000 + b'\n'
@@ -371,7 +380,7 @@ class CredentialScriptTests(Base):
         clean = self.write('x/clean.sh', b'#!/bin/bash\nrm -rf ~/.claude/projects\n')
         started = time.monotonic()
         self.assertRefused('; '.join('bash %s' % p for p in scripts + [clean]))
-        self.assertLess(time.monotonic() - started, cg.CREDENTIAL_SCRIPT_SECONDS + 2)
+        self.assertLess(time.monotonic() - started, cg.CREDENTIAL_PASS_SECONDS + 2)
 
     def test_the_check_failing_changes_nothing_else(self):
         clean = self.write('x/clean.sh', b'#!/bin/bash\nrm -rf ~/.claude/projects\n')
@@ -465,7 +474,7 @@ class CredentialScriptTests(Base):
         compiled = cg.Compiled(cg.load_policy(), cwd=str(self.home))
         self.assertEqual(cg.decide(command, compiled, cwd=str(self.home))[0], 'block')
         real = cg._read_prefix
-        for delay in (1.6, 2.0, 2.4):
+        for delay in (0.6, 1.0, 1.6, 2.4, 4.0):
             def slow(path, limit, delay=delay):
                 if str(path).endswith('slow.py'):
                     time.sleep(delay)
@@ -474,6 +483,96 @@ class CredentialScriptTests(Base):
             with mock.patch.object(cg, '_read_prefix', side_effect=slow):
                 verdict, message = cg.decide(command, compiled, cwd=str(self.home))[:2]
             self.assertEqual(verdict, 'block', '%s: %s' % (delay, message))
+
+    def slowed_reads(self, delays):
+        """Patch _read_prefix so files named slow<N>.py take delays[N] seconds."""
+        real = cg._read_prefix
+
+        def read(path, limit):
+            name = os.path.basename(str(path))
+            if name.startswith('slow') and name.endswith('.py') and name[4:-3].isdigit():
+                time.sleep(delays[int(name[4:-3])])
+            return real(path, limit)
+        return mock.patch.object(cg, '_read_prefix', side_effect=read)
+
+    def main_verdict(self, command, compiled):
+        """The verdict with the credential check taken out, which is main's analysis."""
+        with mock.patch.object(cg.Analyzer, 'credential_entry', lambda *a, **k: None):
+            return cg.decide(command, compiled, cwd=str(self.home))[0]
+
+    def test_short_reads_then_a_longer_one_do_not_weaken_a_block(self):
+        """A first read under 1 s used to be repeated by the second shell reading, and the repeat ate the 3 s limit."""
+        slow = [self.write('x/slow%d.py' % i, b'print("hello")\n') for i in range(2)]
+        ondisk = self.write('x/ondisk.sh', b'#!/bin/bash\nrm -rf ~/.claude/projects\n')
+        command = 'python3 %s; python3 %s; echo hi >! %s; bash %s' % (slow[0], slow[1], ondisk, ondisk)
+        compiled = cg.Compiled(cg.load_policy(), cwd=str(self.home))
+        self.assertEqual(self.main_verdict(command, compiled), 'block')
+        for delays in ((0.6, 1.4), (0.9, 1.4), (1.0, 1.4), (0.6, 0.6), (0.9, 0.9), (1.0, 1.0)):
+            with self.slowed_reads(delays):
+                verdict, message = cg.decide(command, compiled, cwd=str(self.home))[:2]
+            self.assertEqual(verdict, 'block', '%s: %s' % (delays, message))
+
+    def test_slow_reads_with_analysis_near_its_limit_do_not_weaken_a_block(self):
+        """Main's analysis is held at 2.2 s of its 3 s; the credential reads must not take any of what is left."""
+        slow = [self.write('x/slow%d.py' % i, b'print("hello")\n') for i in range(2)]
+        clean = self.write('x/clean.sh', b'#!/bin/bash\nrm -rf ~/.claude/projects\n')
+        command = 'python3 %s; python3 %s; bash %s' % (slow[0], slow[1], clean)
+        compiled = cg.Compiled(cg.load_policy(), cwd=str(self.home))
+        real_script = cg.Analyzer.script_file
+
+        def slow_script(analyzer, *args, **kwargs):
+            time.sleep(2.2)
+            return real_script(analyzer, *args, **kwargs)
+
+        with mock.patch.object(cg.Analyzer, 'script_file', slow_script):
+            self.assertEqual(self.main_verdict(command, compiled), 'block')
+            for delays in ((1.0, 1.4), (0.9, 0.9), (0.4, 2.0)):
+                with self.slowed_reads(delays):
+                    verdict, message = cg.decide(command, compiled, cwd=str(self.home))[:2]
+                self.assertEqual(verdict, 'block', '%s: %s' % (delays, message))
+
+    def test_a_padded_script_on_disk_cannot_hide_a_later_credential_script(self):
+        """Commands inside a script already on disk are judged only for log deletion, so they must not use up the credential
+        check's time either: the credential script after it is still refused."""
+        slow = [self.write('x/slow%d.py' % i, b'print("hello")\n') for i in range(5)]
+        padded = self.write('x/padded.sh', b'#!/bin/bash\n' + b''.join(b'python3 %s\n' % str(p).encode() for p in slow))
+        cred = self.write('x/cred.sh', SH_TEXT)
+        command = 'bash %s; bash %s' % (padded, cred)
+        compiled = cg.Compiled(cg.load_policy(), cwd=str(self.home))
+        with self.slowed_reads((0.4,) * 5):
+            verdict, message = cg.decide(command, compiled, cwd=str(self.home))[:2]
+        self.assertEqual(verdict, 'block', message)
+        self.assertIn('credential-script', message)
+
+    def test_the_check_stops_at_its_own_cap(self):
+        """Six slow files and nothing else to refuse: the check gives up at its cap and main's allow stands."""
+        slow = [self.write('x/slow%d.py' % i, b'print("hello")\n') for i in range(6)]
+        command = '; '.join('python3 %s' % p for p in slow)
+        compiled = cg.Compiled(cg.load_policy(), cwd=str(self.home))
+        started = time.monotonic()
+        with self.slowed_reads((0.5,) * 6):
+            verdict = cg.decide(command, compiled, cwd=str(self.home))[0]
+        self.assertEqual(verdict, 'allow')
+        self.assertLess(time.monotonic() - started, cg.CREDENTIAL_PASS_SECONDS + 1.0)
+
+    def test_a_read_that_stalls_past_the_alarm_leaves_mains_verdict(self):
+        """Through the hook with its real 7 s alarm: the alarm lands in the credential check, which then adds nothing, so the
+        result is main's (an allow here) rather than the time-limit warning, and the hook still ends at the alarm."""
+        slow = self.write('x/slow0.py', b'print("hello")\n')
+        cred = self.write('x/cred.sh', SH_TEXT)
+        compiled = cg.Compiled(cg.load_policy(), cwd=str(self.home))
+        for command, want_rc in (('python3 %s' % slow, 0), ('python3 %s; bash %s' % (slow, cred), 0)):
+            payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command},
+                                  'cwd': str(self.home)}).encode()
+            err, out = io.StringIO(), io.StringIO()
+            started = time.monotonic()
+            with self.slowed_reads((9.0,)), contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                rc = cg.hook_main('exit2', stdin_bytes=payload, compiled=compiled, marker=False)
+            took = time.monotonic() - started
+            said = err.getvalue() + out.getvalue()
+            self.assertEqual(rc, want_rc, said[:200])
+            self.assertNotIn('internal error', said)
+            self.assertLess(took, 9.0)
 
     def test_a_fifo_is_never_read(self):
         """A file swapped for a FIFO after the existence check must not hang the guard until its alarm."""

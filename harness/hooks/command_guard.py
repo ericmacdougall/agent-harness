@@ -320,7 +320,9 @@ PINNED_ROUTE_EXPIRES = 1794182400  # 2026-11-09T00:00:00Z, the day the host thes
 PINNED_ROUTES = (
     ('unit-mig/t2-rclone/user-run-store-dropbox-secret.sh',
      '92438a47d6b8083266e42922a2d151d0d0d65475fcc20744ea54359f2af501f3',
-     r'/bin/bash {path}'),
+     # -p (privileged mode): bash then runs no $BASH_ENV or $ENV file and imports no exported function before the script,
+     # which sets its own PATH and calls tools by absolute path
+     r'/bin/bash -p {path}'),
     ('unit-mig/cf-dns/cf_dns_prod_move.py',
      '30c688923554c09f93128a7d9b89831557acd06d1f04949c235b09ea05cf89a6',
      r'/usr/bin/python3 -I {path} (?:list'
@@ -329,9 +331,9 @@ PINNED_ROUTES = (
 )
 # Existing scripts are otherwise judged only for log deletion, so a credential read inside one would pass. This refuses
 # scripts whose own text, outside comment lines, names the rclone config or the token secret or dumps the config. Text only.
-# Python prose does not count as a dump: there the command must open a string or be an argument list. It only ever adds a
-# finding. It starts no new read after CREDENTIAL_SCRIPT_SECONDS, and its time extends the analysis deadline by at most
-# CREDENTIAL_EXTENSION_CAP, so normal reads cannot turn a refusal into the time-limit warning. It does not catch a
+# Python prose does not count as a dump: there the command must open a string or be an argument list. It runs as its own
+# pass after main's analysis (credential_findings), so it only ever adds a finding and cannot use main's time. It does
+# not run inside scripts on disk, whose own commands are judged only for log deletion. It does not catch a
 # script that builds the name at runtime or calls another script, a name past the read limit, a path the guard cannot
 # resolve, a runner it does not unwrap (`uv run`, `tmux`, `python3 -m cProfile`), a test in a folder named tests, or one of
 # the guard's own files.
@@ -345,10 +347,9 @@ CREDENTIAL_SHELL_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|\b' + _RCLONE_DUMP)
 CREDENTIAL_PYTHON_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|[f]?["\'](?:[^"\'\s]*/)?' + _RCLONE_DUMP
                                     + rb'|["\']rclone["\']\s*,\s*["\']config["\']\s*,\s*["\'](?:show|dump)["\']')
 CREDENTIAL_SCRIPT_READ = 1048576
-CREDENTIAL_SCRIPT_SECONDS = 1.0
-# The most the check may move the analysis deadline in one command. The 3 s limit plus this stays well under the hook's
-# 7 s alarm, whose TimeoutError would otherwise end in an allow. A slower read ends in the time-limit warning, as on main.
-CREDENTIAL_EXTENSION_CAP = 1.5
+# The check's own pass starts no new read after this long. Main's analysis (at most its 3 s limit) plus this stays under
+# the hook's 7 s alarm; a single read that stalls past the alarm ends the pass, and main's verdict stands.
+CREDENTIAL_PASS_SECONDS = 1.5
 CREDENTIAL_SCRIPT_SUFFIXES = ('.sh', '.bash', '.zsh', '.py')
 CREDENTIAL_DATA_SUFFIXES = ('.json', '.jsonl', '.md')
 CREDENTIAL_SCRIPT_SHEBANG = re.compile(rb'#![^\n]*\b(?:ba|z|k|da|)sh\b|#![^\n]*\bpython')
@@ -1553,6 +1554,13 @@ MAX_READING_FORKS = 3
 
 
 class Analyzer:
+    # The credential-script check (goodqa#14518) runs only in its own second pass, credential_findings(), so the analysis
+    # that decides everything else is exactly main's. disk_depth counts scripts on disk being analysed: their own
+    # commands are judged only for log deletion, so the check skips them rather than spend its time there.
+    credential_pass = False
+    credential_candidate = False
+    disk_depth = 0
+
     def __init__(self, compiled, cwd=None, ps=False, marker=None):
         self.ctx = Ctx(compiled, cwd, ps, marker)
         self.c = compiled
@@ -1612,13 +1620,10 @@ class Analyzer:
         start = ctx.state()
         mark = len(ctx.findings)
         count, began = ctx.budget.count, time.monotonic()
-        read_before = getattr(self, 'credential_seconds', 0.0)
         self._run_tokens(zsh_tokens, depth)
         # a second reading that cannot finish would stop the analysis and lose every later command, so skip it instead;
-        # analyze() then treats the command as unanalysable. The credential check's reads are left out of the estimate:
-        # they extend the deadline themselves, and counting them here would let a slow file skip the reading main judges.
-        spent = time.monotonic() - began - (getattr(self, 'credential_seconds', 0.0) - read_before)
-        if not ctx.budget.has_room(2 * (ctx.budget.count - count) + len(text), 2 * max(0.0, spent)):
+        # analyze() then treats the command as unanalysable
+        if not ctx.budget.has_room(2 * (ctx.budget.count - count) + len(text), 2 * (time.monotonic() - began)):
             ctx.readings_capped = True
             return
         after_zsh = ctx.state()
@@ -2277,6 +2282,18 @@ class Analyzer:
     def credential_entry(self, cmd, name, words, args, texts):
         """Add a refusal when this command runs an existing script that names a credential (goodqa#14518). Only ever adds a
         finding, and any failure here means no finding, so no other rule's verdict changes."""
+        if self.disk_depth:
+            return
+        if not self.credential_pass:
+            # main's pass only notes that a script is run, so the check's pass is skipped for commands that run none.
+            # Nothing here reads a file or adds a finding, and the alarm's TimeoutError is not caught.
+            if not self.credential_candidate:
+                try:
+                    self.credential_candidate = any(w is not None and not w.dynamic and w.text
+                                                    for w, _ in self._credential_words(cmd, name, words, args, texts))
+                except (IndexError, AttributeError, TypeError, ValueError):
+                    self.credential_candidate = True
+            return
         try:
             for word, runner in self._credential_words(cmd, name, words, args, texts):
                 if word is not None and not word.dynamic and word.text:
@@ -2311,10 +2328,15 @@ class Analyzer:
         in_tests = os.path.basename(os.path.dirname(path)) == 'tests' and base.startswith('test_') and base.endswith('.py')
         if base in GUARD_OWN_FILES or in_tests or lower.endswith(CREDENTIAL_DATA_SUFFIXES):
             return  # these hold the names as data
-        spent = getattr(self, 'credential_seconds', 0.0)
-        if spent > CREDENTIAL_SCRIPT_SECONDS:
+        # Each (path, runner) is read once per pass, so the second shell reading of `>!` repeats no read.
+        seen = self.__dict__.setdefault('credential_seen', {})
+        if (path, runner) in seen:
+            if seen[(path, runner)]:
+                self._credential_finding()
             return
-        started = time.monotonic()
+        seen[(path, runner)] = False
+        if time.monotonic() > self.ctx.budget.deadline:
+            return  # the pass is out of time: start no new read
         try:
             if not os.path.isfile(path):
                 return
@@ -2325,23 +2347,14 @@ class Analyzer:
             python = runner == 'python' or (runner is None and (lower.endswith('.py') or (shebang and b'python' in shebang.group())))
             code = b'\n'.join(line for line in data.split(b'\n') if not line.lstrip().startswith(b'#'))
             if (CREDENTIAL_PYTHON_TEXT if python else CREDENTIAL_SHELL_TEXT).search(code):
-                self.ctx.add(SECRET_DUMP, 'credential-script', 'this script names a credential file or secret, and only a '
-                             'pinned route may run one', 'read the task for a pinned route, or take a path that does not need this credential')
+                seen[(path, runner)] = True
+                self._credential_finding()
         except (OSError, ValueError):
             return
-        finally:
-            # This time is the check's own, not the analysis's: it moves the deadline, so it can never turn into the
-            # time-limit warning that a command main blocks would otherwise get.
-            elapsed = time.monotonic() - started
-            self.credential_seconds = spent + elapsed
-            extended = getattr(self, 'credential_extended', 0.0)
-            extra = min(elapsed, max(0.0, CREDENTIAL_EXTENSION_CAP - extended))
-            self.credential_extended = extended + extra
-            self.ctx.budget.deadline += extra
-            if self.credential_seconds > CREDENTIAL_SCRIPT_SECONDS + CREDENTIAL_EXTENSION_CAP:
-                # A read slow enough to pass the cap ends here with the time-limit result. Going on could let the hook's
-                # alarm fire during later analysis, and that path allows.
-                raise Blocked('analysis exceeded its time budget')
+
+    def _credential_finding(self):
+        self.ctx.add(SECRET_DUMP, 'credential-script', 'this script names a credential file or secret, and only a '
+                     'pinned route may run one', 'read the task for a pinned route, or take a path that does not need this credential')
 
     def script_file(self, word, depth, require_shell=False):
         """Analyse a shell script named on the command line (or written earlier in this command)."""
@@ -2384,9 +2397,11 @@ class Analyzer:
         before = len(ctx.findings)
         keep = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
                 if k not in ('findings', 'budget', 'c', 'marker', 'files_read', 'unterminated', 'readings_capped')}
+        self.disk_depth += 1
         try:
             self.script(text, depth + 1, tail_visible=True)
         finally:
+            self.disk_depth -= 1
             for k, v in keep.items():
                 setattr(ctx, k, v)
             ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
@@ -4165,7 +4180,27 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
             findings.append(Finding(PARSE, 'readings-capped', '`>!` cannot be judged under both shell readings (too large, too '
                                     'deeply nested, or they disagree on what a later command uses)',
                                     'split the command, or use `>|`'))
+    modes = compiled.policy['modes']
+    if analyzer.credential_candidate and not any(modes.get(f.category) == 'enforce' for f in findings):
+        findings = findings + credential_findings(command, compiled, cwd=cwd, ps=ps)
     return findings
+
+
+def credential_findings(command, compiled, cwd=None, ps=False):
+    """The credential-script check (goodqa#14518) as a separate pass, run after main's analysis has finished with its own
+    budget untouched. It has its own time cap and adds only credential-script findings. Any stop here, including the
+    hook's alarm, keeps what it found before the stop and adds nothing more, so the verdict is never looser than main's.
+    The pass is skipped when main already blocks, since a further finding changes nothing, and when main's pass saw no
+    script being run."""
+    analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=None)
+    analyzer.credential_pass = True
+    budget = analyzer.ctx.budget
+    budget.deadline = time.monotonic() + min(CREDENTIAL_PASS_SECONDS, float(compiled.limits['max_seconds']))
+    try:
+        analyzer.run(command)
+    except Exception:  # noqa: BLE001 - a budget stop, the alarm's TimeoutError or a bug: main's verdict stands
+        pass
+    return [f for f in analyzer.ctx.findings if f.rule == 'credential-script']
 
 
 SECRET_TEXT = re.compile(r'(?i)\brclone\b|\bauth\s+token\b|--show-token|\bprintenv\b|(?:^|[;&|(\s])(?:env|set|export'
