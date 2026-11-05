@@ -7418,6 +7418,110 @@
    ]
   },
   {
+   "cmd": "kill -s $(printf 'KILL -1')",
+   "expect": "block",
+   "id": "P-rt6-s-subst-split",
+   "tags": [
+    "ownership",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "S='KILL -1'; kill -s $S",
+   "expect": "block",
+   "id": "P-rt6-s-var-split",
+   "tags": [
+    "ownership",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "S='KILL -1'; kill --signal=$S",
+   "expect": "block",
+   "id": "P-rt6-signal-eq-var",
+   "tags": [
+    "ownership",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "S='KILL -1'; kill --signal $S",
+   "expect": "block",
+   "id": "P-rt6-signal-var-split",
+   "tags": [
+    "ownership",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -n $X 4001",
+   "expect": "block",
+   "id": "P-rt6-n-var-pid",
+   "tags": [
+    "ownership",
+    "bash"
+   ]
+  },
+  {
+   "cmd": "kill -s K* 4001",
+   "expect": "block",
+   "id": "P-rt6-s-glob-pid",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill -s 'KILL -1' 4001",
+   "expect": "block",
+   "id": "P-rt6-s-quoted-space",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill -s {KILL,TERM} 4001",
+   "expect": "block",
+   "id": "P-rt6-s-brace",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "sudo kill -s $(printf 'KILL -1')",
+   "expect": "block",
+   "id": "P-rt6-sudo-s-subst",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "pgrep x | xargs kill -s $(printf 'KILL -1')",
+   "expect": "block",
+   "id": "P-rt6-xargs-s-subst",
+   "tags": [
+    "ownership",
+    "pidfeed"
+   ]
+  },
+  {
+   "cmd": "bash -c \"S='KILL -1'; kill -s \\$S\"",
+   "expect": "block",
+   "id": "P-rt6-bash-c-s-var",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "ssh host kill -s $(printf 'KILL -1')",
+   "expect": "block",
+   "id": "P-rt6-ssh-s-subst",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
    "cmd": "grep -n \"pkill -f pytest\" notes.md",
    "expect": "allow",
    "id": "N-text00-grep",
@@ -9853,6 +9957,54 @@
    "cmd": "kill -s 0 \"$PID\"",
    "expect": "allow",
    "id": "N-rt5-ok-s0-lone-var",
+   "tags": [
+    "signal0"
+   ]
+  },
+  {
+   "cmd": "kill -s KILL 4001",
+   "expect": "allow",
+   "id": "N-rt6-ok-s-name",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill -n 9 4001",
+   "expect": "allow",
+   "id": "N-rt6-ok-n-num",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill --signal=TERM 4001",
+   "expect": "allow",
+   "id": "N-rt6-ok-signal-eq",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill --signal TERM 4001",
+   "expect": "allow",
+   "id": "N-rt6-ok-signal-sep",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill -s SIGTERM 4001",
+   "expect": "allow",
+   "id": "N-rt6-ok-s-sigterm",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill -s 0 4004",
+   "expect": "allow",
+   "id": "N-rt6-ok-s0",
    "tags": [
     "signal0"
    ]

@@ -86,6 +86,7 @@ INDIRECT = re.compile(r"\$'|\\x[0-9a-fA-F]{2}|\\[0-7]{3}|\beval\b|base64|\bxxd\b
 JOB_SPEC = re.compile(r'%(?:[0-9]+|[%+\-]|\?\S+|[A-Za-z_]\S*)?')
 LIST_FLAGS = {'-l', '-L', '--list', '-t', '--table', '-Ll', '-lL'}
 SIGNAL_NAME = re.compile(r'-(?:sig)?([A-Za-z0-9+]+)', re.I)
+SIGNAL_VALUE = re.compile(r'[A-Za-z0-9+]{0,32}')
 FUNCTION_KW = re.compile(r'\bfunction\s+([A-Za-z_][\w.:-]*)\s*(?:\(\s*\))?\s*\{')
 COPROC_KW = re.compile(r'\bcoproc\s+(?:[A-Za-z_]\w*\s*)?\{')
 INTERPRETER_NAME = re.compile(r'(?:python|pypy)[0-9.]*|node(?:js)?[0-9]*|ruby[0-9.]*|perl[0-9.]*|php[0-9.]*|deno|bun|lua[0-9.]*')
@@ -863,9 +864,9 @@ def make_analyzer_class(cg):
                 t, w = texts[i], args[i]
                 if not targets and not w.dynamic:
                     if signal_seen and t != '--':
-                        # After the first signal option bash and zsh read every later dash word as a target (-0 is
-                        # process group 0, -s / -t an illegal pid), so none of them may be read as a signal or a list
-                        # flag: the judge below finds it is not a plain positive PID and blocks.
+                        # After the first signal option no later dash word may count as a signal or list flag: zsh reads
+                        # them as targets (-0 is process group 0, -s an illegal pid) and bash still honours -s/-n/-l, so
+                        # either reading can add a real target. The judge below finds it is not a plain PID and blocks.
                         targets.append(w)
                         i += 1
                         continue
@@ -878,11 +879,19 @@ def make_analyzer_class(cg):
                     if t in LIST_FLAGS:
                         return
                     if t in ('-s', '-n', '--signal'):
+                        value = args[i + 1] if i + 1 < n else None
+                        if value is not None and bad_signal_value(value):
+                            self.block('unprovable-target', 'the signal value is an expansion, a glob or several '
+                                       'words, and the shell may split it into more kill options or targets')
+                            return
                         last_sig = texts[i + 1] if i + 1 < n else ''
                         signal_seen = True
                         i += 2
                         continue
                     if t.startswith('--signal='):
+                        if not SIGNAL_VALUE.fullmatch(t.split('=', 1)[1]):
+                            self.block('unprovable-target', 'the signal value is not one plain signal name or number')
+                            return
                         last_sig = t.split('=', 1)[1]
                         signal_seen = True
                         i += 1
@@ -943,6 +952,12 @@ def make_analyzer_class(cg):
 
     return KillAnalyzer
 
+
+
+def bad_signal_value(word):
+    """The word after -s/-n/--signal must be one plain name or number: bash splits an expanded value, so `-s $S`
+    with S='KILL -1' becomes `kill -s KILL -1` (every process)."""
+    return bool(word.dynamic or word.subs or word.glob or len(word.alts) > 1 or not SIGNAL_VALUE.fullmatch(word.text))
 
 
 def liveness_only(targets):
