@@ -63,9 +63,11 @@ func trackedPatterns() ([]*regexp.Regexp, bool) {
 			continue
 		}
 		for _, pat := range s.Repos {
-			if re, err := regexp.Compile("(?i)" + pat); err == nil {
-				out = append(out, re)
+			re, err := regexp.Compile("(?i)" + pat)
+			if err != nil {
+				return nil, false // a pattern RE2 cannot read (Python accepts more): unknown, never "tracked"
 			}
+			out = append(out, re)
 		}
 	}
 	return out, true

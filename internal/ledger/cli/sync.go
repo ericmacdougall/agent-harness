@@ -99,6 +99,7 @@ type receipt struct {
 	LedgerProject string            `json:"ledger_project"`
 	ExportDigest  string            `json:"export_digest"`
 	BaseDigest    string            `json:"base_digest"`
+	Redacted      *bool             `json:"redacted"`
 	Frontier      []receiptFrontier `json:"frontier"`
 	Tickets       []receiptTicket   `json:"tickets"`
 	ImportedMs    int64             `json:"imported_at_ms"`
@@ -127,6 +128,8 @@ func readReceipt(path string, env Env) (*receipt, error) {
 		return nil, refusedf("receipt lists more than %d tickets", maxReceiptTickets)
 	}
 	switch {
+	case r.Redacted == nil:
+		return nil, refusedf("receipt must say whether the export was redacted (redacted: true or false)")
 	case r.Format != ledger.ReceiptFormat:
 		return nil, refusedf("receipt format is not %s", ledger.ReceiptFormat)
 	case !uuidRe.MatchString(r.GoodQAProject):
@@ -196,24 +199,18 @@ func cmdBind(args []string, env Env) error {
 		for i, f := range rc.Frontier {
 			to[i] = ledger.Frontier{Writer: f.Writer, Ops: f.Ops, WallMs: f.WallMs, Ctr: f.Ctr, LastOp: f.LastOp}
 		}
-		ok := false
+		// Rebuild in the receipt's own mode: a redacted receipt is never matched against a plain document.
 		var firstErr error
-		for _, redact := range []bool{false, true} {
-			doc, err := ledger.BuildImport(in, from, to, base, redact)
-			if err != nil {
-				var se *ledger.SecretError
-				if !errors.As(err, &se) && firstErr == nil {
-					firstErr = err
-				}
-				continue
-			}
-			if doc.Digest == rc.ExportDigest {
-				ok = true
-				break
-			}
+		doc, berr := ledger.BuildImport(in, from, to, base, *rc.Redacted)
+		if berr != nil {
+			firstErr = berr
 		}
-		if !ok {
+		if berr != nil || doc.Digest != rc.ExportDigest {
 			if firstErr != nil {
+				var se *ledger.SecretError
+				if errors.As(firstErr, &se) {
+					return refusedf("this ledger holds secret-shaped text; the receipt must be for a redacted export")
+				}
 				return refusedf("the receipt's frontier is not a prefix of this ledger: %s", term.Line(firstErr.Error()))
 			}
 			return refusedf("the receipt's export_digest does not match this ledger at its frontier")

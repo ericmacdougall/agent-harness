@@ -1969,3 +1969,41 @@ h1 {
 
 #pr-open-map[aria-busy=true]::after{content:' (can take up to a minute)'}
 .review-map-attach label{display:flex;gap:6px;align-items:center}
+
+/* Local-ledger sync icon: a glyph that differs per state plus a text label on hover and focus. */
+.ledger-icon {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  margin: 0 2px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1;
+  color: var(--muted);
+  background: var(--surface);
+  cursor: default
+}
+.ledger-icon.ledger-pending { color: var(--amber); border-color: var(--amber) }
+.ledger-icon.ledger-local-only { color: var(--text); border-color: var(--muted) }
+.ledger-icon.ledger-diverged { color: var(--danger); border-color: var(--danger) }
+.ledger-icon.ledger-synced, .ledger-icon.ledger-tracked { color: var(--accent); border-color: var(--border) }
+.ledger-icon:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px }
+.ledger-icon:hover::after, .ledger-icon:focus-visible::after {
+  content: attr(aria-label);
+  position: absolute;
+  top: 22px;
+  left: 0;
+  z-index: 20;
+  padding: 3px 7px;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  pointer-events: none
+}

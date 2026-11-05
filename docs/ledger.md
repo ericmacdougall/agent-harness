@@ -3,13 +3,14 @@
 `harness tickets` keeps GoodQA-shaped tickets in the git repository you are working in, with no
 network, account or server. It is for repositories that have no GoodQA project yet. When the
 repository is later imported into GoodQA, the ledger freezes and work continues in GoodQA.
-Phase 0a ships the local ledger only. Sharing between machines (`travel`, `trust-writer`) and
-import are later phases.
+Phase 0a ships the local ledger. Phase 0b (see "Phase 0b" below) adds the sync state, the GoodQA import
+document, explicit git transport (`travel`) with reviewed trust (`trust-writer`), a reminder hook and a console
+icon. The GoodQA server-side import is a proposal (`docs/ledger-goodqa-import-api.md`), not built.
 
-**This ledger travels with this machine only.** Its refs live under `refs/goodqa/` in this
+**A ledger stays on this machine unless you run `travel`.** Its refs live under `refs/goodqa/` in this
 clone's git directory, and their store of record lives under `~/.agent-harness`. Nothing pushes them
-anywhere, and `git push` of your branches does not include them. The ledger is never meant to
-travel in public repositories.
+anywhere, and `git push` of your branches does not include them. `travel push` publishes the whole ledger,
+history included, to everyone who can read the remote (see "Phase 0b: git transport").
 
 ## Quick start
 
@@ -181,3 +182,84 @@ The black-box tests build `harness` with `-tags ledgertest`, which honors the te
 `HARNESS_LEDGER_TEST_CRASH_AFTER_CAS` and `HARNESS_LEDGER_TEST_LOCK_WAIT_MS`. Any other build,
 including a plain `go build` or `go install`, refuses to run while one of them is set. The commit
 policy also strips them from the environment it passes to `harness`.
+
+## Phase 0b: sync state, import, travel, reminders
+
+### Sync state and the GoodQA import document
+
+`harness tickets sync-state [--json]` reports one state, from local files only:
+
+| State | Meaning |
+|---|---|
+| `none` | no usable ledger (also outside a repository, or a ledger this HOME refuses to open) |
+| `local-only` | a ledger exists and was never bound to GoodQA |
+| `pending` | bound; N ops lie beyond what the last receipt covers |
+| `synced` | bound; nothing beyond the receipt |
+| `diverged` | bound, but the receipt names a writer or ops the ledger no longer folds (a writer lost trust, history was replaced) |
+| `tracked` | no binding, and a remote matches a GoodQA `repos` pattern in `commit_policy.json` (best effort; `commit_policy.py` is the authority) |
+
+A usable binding decides first, then `tracked`, then `local-only`, then `none`. The **frontier** is, per folded writer,
+the op count, the last op id and the last clock, never a commit id.
+
+`harness tickets export --format goodqa-import [--since-bound] [--redact-secrets] [--out PATH]` writes the import
+document (`docs/ledger-goodqa-import-api.md` defines it): the full ordered history of every ticket, the folded ops,
+the frontier and a digest. The same state always gives the same bytes. Secret-shaped text refuses the export (field
+and offset only) unless `--redact-secrets` masks it and drops the raw ops.
+
+`harness tickets bind --project UUID --receipt FILE` records a GoodQA receipt in this HOME's state
+(`~/.agent-harness/ledgers/<proj>/sync.json`, never in the git dir, so a copied repository is never `synced`). `bind`
+rebuilds the document for the receipt's frontier and accepts the receipt only if the digests match. The receipt is
+advisory: its digest is public.
+
+### Git transport (`travel`)
+
+`harness tickets travel enable --remote NAME [--yes-share TOKEN]`, then `travel status`, `travel push`, `travel fetch`.
+
+- **Privacy.** Pushing publishes every ticket, comment and the full history to everyone who can read the remote, and it
+  cannot be undone; ops also carry writer ids, claimed actor labels and wall times. The harness cannot tell whether a
+  remote is public. `enable` refuses until you pass the token it prints, which is bound to the exact fetch and push
+  URLs; if a URL later changes, push and fetch refuse. `travel`, `bind`, `trust-writer` and `block-writer` are not
+  ledger-mcp tools, but an agent with a shell can still run them.
+- **What travels.** Only this HOME's own writer refs, from the mirror, as plain fast-forward pushes (never forced),
+  after a size check (16 MiB and 4096 commits per writer, 64 MiB total, the limits a peer reads with) and a secret
+  re-scan of every op. Nothing is added to `remote.<name>.push` or `.fetch`, so ordinary `git push` and `git fetch`
+  never move the ledger, and a plain `git clone` does not carry it.
+- **Transport environment.** ssh, https and file only (`GIT_ALLOW_PROTOCOL`), no `ext::`, `fd::` or helper URLs, no
+  credential helper (use an ssh remote for private repositories), hooks off, fsck on every object, a URL validated
+  before git sees it.
+- **Fetch.** `travel fetch` lists the remote's ledger refs (more than 128 is refused), fetches them into a disposable
+  directory under `~/.agent-harness/ledgers/<proj>/` (stopped past 64 MiB or 120 s; stale ones are removed), validates
+  each with the bounded reader, and only then pushes it into the repository as a plain fast-forward, never over an own
+  ref. A rewritten history stays rejected. `travel fetch --adopt --remote NAME` lets a second machine create its ledger
+  from a remote's (exactly one project).
+- **Trust.** Fetched writers are `unverified`: excluded from every view, export and the commit policy.
+  `writers --show w_...` prints the ops and a review digest; `trust-writer w_... --reviewed DIGEST` folds exactly the
+  reviewed ops (`~/.agent-harness/ledgers/<proj>/trust.json`, never read from the git dir). Ops the writer appends later
+  are held back (counted as `held_ops` in the export) until you review again. `block-writer` excludes a writer; neither
+  command accepts your own writer.
+- **Git behaviours.** Squash, rebase and branch deletion do not touch the refs; `git gc --prune=now` and
+  `git push --mirror` keep them; a remote that refuses the push gives an error and records nothing. A HOME copied
+  together with its repository defeats the HOME trust anchor.
+
+### Reminder hook and console icon
+
+`harness/hooks/ledger_reminder.py` (installed on SessionStart and UserPromptSubmit for Claude Code only) adds one fixed
+line when the state is `local-only`, `pending` or `diverged` (or `none` in an untracked repository with at least 3
+commits: an assumption, not something the request spelled out). It runs inside 2.5 s, reads its state before starting
+`harness`, reminds at most once per repository per 24 hours and once per session, and never blocks. Silence one
+repository with `python3 ~/.claude/hooks/ledger_reminder.py dismiss --repo PATH [--days N | --forever]`, everything
+with `HARNESS_LEDGER_REMINDERS=0`.
+
+The console shows a small icon beside each session and in the repository summary (`✓` synced or tracked, `↑` pending,
+`◐` local only, `⚠` diverged, `?` unknown; text label on hover and focus, never colour alone). It asks
+`POST /api/ledger/sync-state` for up to 32 directories, refreshes every 60 seconds, and caches an answer for 10.
+
+### Phase 0b tests
+
+```sh
+go test ./internal/ledger/...                      # includes the travel, bind, trust and contract tests
+python3 -m unittest tests.test_ledger_reminder tests.test_ledger_docs tests.test_ledger_tracked_parity
+(cd console && go test ./... -run LedgerSync) && node console/web/ledger-icon.test.mjs
+HARNESS_LEDGER_PERF=1 go test ./internal/ledger -run Performance    # wall-clock bound, dev2
+python3 testdata/mutants/run_mutants.py            # every mutant, 0a and 0b, must be killed
+```
