@@ -93,7 +93,7 @@ def defaults(host: str) -> dict:
         "codex_dir": "~/.codex",
         # thresholds shared with ahd's liveness.py (DESIGN.md section 5): SILENT 30 min warning, 60 min high
         "liveness": {"enabled": True, "wal_root": "~/.claude/wals", "silent_min": 30, "silent_high_min": 60,
-                     "lookback_h": 24, "lookback_active_h": 168, "ticket_quiet_h": 3, "max_ticket_lookups": 10,
+                     "lookback_h": 24, "lookback_active_h": 168, "retire_h": 6, "ticket_quiet_h": 3, "max_ticket_lookups": 10,
                      "ticket_budget_s": 90, "gq": "~/.claude/goodqa-p0p1/gq.py",
                      "projects": {"goodqa": "1ae27b6b-f8f2-4e61-ab2d-c9c43fd162c3"}},
         "peers": [],
@@ -1087,9 +1087,8 @@ def check_peers(cfg, state, runner, now):
 TERMINAL_EVENTS = ("handoff", "result", "done", "delivered")
 TERMINAL_NOTE = re.compile(r"^\s*(WORKDIR_DONE|DELIVERED)\s*:")  # anchored: "not DONE yet" is not terminal
 HOOK_EVENTS = ("pretool", "subagent", "subagent_stop", "prompt", "session")  # metadata, not an owner's note
-OWNER_TYPES = ("task-owner", "fixer", "general-purpose", "claude")
-OWNER_NOTE_EVENTS = ("scope", "intent", "decision")
-AGENT_ID_RE = re.compile(r"\ba[0-9a-f]{16}\b")
+OWNER_ALERT_STATES = {"DROPPED": "owner dropped", "SILENT": "owner silent", "SILENT-HIGH": "owner silent"}
+OWNER_RUNNING_STATES = ("live", "quiet", "finishing")
 WAITING_NOTE = re.compile(r"\b(waiting|blocked|wait)\s+(on|for)\s+\S+", re.I)
 TICKET_RE = re.compile(r"GoodQA\s+(?:([a-z0-9][a-z0-9-]*)#|#)(\d+)")
 CLOSED_STATUS = ("done", "closed", "wont_fix", "won't fix", "archived", "canceled", "cancelled", "resolved")
@@ -1113,9 +1112,11 @@ def _tail(path: Path, limit: int) -> bytes:
         os.close(fd)
 
 
-def last_events(path: Path):
-    """(last event of any kind, last owner-written event) from the WAL tail."""
+def task_wal_tail(path: Path):
+    """(last event of any kind, last owner-written event, ended) from a task WAL's tail. Any handoff, result or
+    WORKDIR_DONE ends the task, even with later notes: a resumed owner is tracked through its agent row."""
     last_any = last_note = None
+    ended = False
     for line in reversed(_tail(path, 262144).decode("utf-8", "replace").splitlines()):
         try:
             obj = json.loads(line)
@@ -1125,46 +1126,12 @@ def last_events(path: Path):
             continue
         last_any = last_any or obj
         if obj.get("event") not in HOOK_EVENTS:
-            last_note = obj
+            last_note = last_note or obj
+            if not is_terminal_kind(obj):
+                continue
+            ended = True
             break
-    return last_any, last_note
-
-
-def last_event(path: Path):
-    return last_events(path)[0]
-
-
-def subagent_lifecycle(main_wal: Path) -> dict:
-    """agent_id -> (agent_type, last lifecycle event, at) from the session's main WAL (SubagentStart/Stop).
-    The key "" holds the text of main's scope/intent/decision notes, which name owners of any agent type."""
-    out = {"": ("", "", None, "")}
-    notes = []
-    try:
-        data = _tail(main_wal, 8 * 1024 * 1024)
-    except OSError:
-        return out
-    for line in data.decode("utf-8", "replace").splitlines():
-        if '"subagent' not in line and not any(f'"{k}"' in line for k in OWNER_NOTE_EVENTS):
-            continue
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(obj, dict) and obj.get("event") in OWNER_NOTE_EVENTS:
-            notes.append(str(obj.get("note", ""))[:4000])
-        elif isinstance(obj, dict) and obj.get("event") in ("subagent", "subagent_stop") and obj.get("agent_id"):
-            prev = out.get(obj["agent_id"], ("", "", None))
-            out[obj["agent_id"]] = (obj.get("agent_type") or prev[0], obj["event"], parse_ts(obj.get("at")))
-    out[""] = ("", "", None, "\n".join(notes))
-    return out
-
-
-def is_owner(life: dict, agent: str) -> bool:
-    """Owner if its SubagentStart type is an owner type, or main named its id in a scope/intent/decision note
-    (the type alone is not enough: most real owners are general-purpose, and a matcher can hide the record)."""
-    if life.get(agent, ("",))[0] in OWNER_TYPES:
-        return True
-    return bool(agent) and re.search(rf"(?<![A-Za-z0-9]){re.escape(agent)}(?![A-Za-z0-9])", life[""][3]) is not None
+    return last_any, last_note, ended
 
 
 def wal_ticket(path: Path):
@@ -1176,15 +1143,13 @@ def wal_ticket(path: Path):
     return max(sorted(counts), key=lambda r: counts[r]) if counts else None
 
 
-def is_terminal(ev) -> bool:
-    if not ev:
-        return False
+def is_terminal_kind(ev: dict) -> bool:
     kind, note = str(ev.get("event", "")), str(ev.get("note", ""))
-    if kind in TERMINAL_EVENTS:
-        return True
-    if kind == "status" and TERMINAL_NOTE.search(note):
-        return True
-    return kind == "blocker" and bool(WAITING_NOTE.search(note))
+    return kind in TERMINAL_EVENTS or (kind == "status" and bool(TERMINAL_NOTE.search(note)))
+
+
+def is_waiting(ev) -> bool:
+    return bool(ev) and ev.get("event") == "blocker" and bool(WAITING_NOTE.search(str(ev.get("note", ""))))
 
 
 def gq_call(runner, gq: str, tool: str, args: dict):
@@ -1219,99 +1184,150 @@ def ticket_info(lc: dict, runner, gq: str, ref: str, now: float):
     return {"at": now, "open": is_open, "last_comment": last}
 
 
-def check_liveness(cfg, state, runner, now):
-    """Owner liveness, one alert per owner (key liveness:<session8>/<task>):
+def _ticket_ref(text):
+    m = TICKET_RE.search(str(text or ""))
+    return f"{m.group(1) or 'goodqa'}#{m.group(2)}" if m else None
 
-    owners   task WALs ~/.claude/wals/<session>/<task>.jsonl (not main), and subagent WALs agent-<id>.jsonl whose
-             SubagentStart in that session's main.jsonl has an owner type (task-owner, fixer)
-    SILENT   last event older than silent_min (30, warning) or silent_high_min (60, high), and the last owner
-             note is not terminal (handoff/result/done/delivered, a status "WORKDIR_DONE:"/"DELIVERED:", or a
-             blocker that names what it waits on)
-    DROPPED  a subagent owner whose last lifecycle event is SubagentStop and whose last note is not terminal (high)
-    QUIET    the task's open GoodQA ticket has had no comment for ticket_quiet_h (high; Mac, via gq.py)
-    Clears on new activity or a terminal note. WALs untouched for lookback_h are history, except that an owner
-    already alerting is followed for lookback_active_h so age alone never clears it."""
-    lc = cfg["liveness"]
-    home = home_of(cfg)
-    root = Path(expand(home, lc["wal_root"]))
-    gq = expand(home, lc.get("gq") or "")
-    use_gq = bool(gq) and os.path.isfile(gq)
-    cache = state.setdefault("ticket_cache", {})
-    alerting = {k for k in (state.get("active") or {}) if k.startswith("liveness:")}
-    lookups = 0
-    ticket_deadline = time.monotonic() + lc.get("ticket_budget_s", 90)
+
+class TicketLookup:
+    """Cached, bounded ticket state: at most max_ticket_lookups and ticket_budget_s per run."""
+
+    def __init__(self, lc, state, runner, gq, now):
+        self.lc, self.runner, self.gq, self.now = lc, runner, gq, now
+        self.cache = state.setdefault("ticket_cache", {})
+        self.left = lc["max_ticket_lookups"]
+        self.deadline = time.monotonic() + lc.get("ticket_budget_s", 90)
+
+    def get(self, ref):
+        if not ref or not self.gq:
+            return None
+        info = self.cache.get(ref)
+        if (not info or self.now - info.get("at", 0) > 1800) and self.left > 0 and time.monotonic() < self.deadline:
+            self.left -= 1
+            info = ticket_info(self.lc, self.runner, self.gq, ref, self.now) or info
+            if info:
+                self.cache[ref] = info
+        return info
+
+    def quiet_h(self, ref):
+        info = self.get(ref)
+        if info and info.get("open") and info.get("last_comment"):
+            quiet = (self.now - info["last_comment"]) / 3600
+            if quiet >= self.lc["ticket_quiet_h"]:
+                return round(quiet, 1)
+        return None
+
+    def prune(self):
+        for ref in [r for r, v in self.cache.items() if self.now - v.get("at", 0) > 86400]:
+            self.cache.pop(ref, None)
+
+
+def _owner_alerts(home, session, tickets, now):
+    """Sub-agent owners, through the one shared rule (ah.owners and liveness.classify). A stop followed by later
+    WAL or transcript activity is not a stop, a just-stopped owner gets liveness.FINISH_GRACE_S, and helpers
+    that return their result to the parent are not owners. Task text never leaves here, only ids and tickets."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import ah  # noqa: PLC0415 - absent on hosts without WALs, which return before reaching this
+    try:
+        rows = ah.owners(home, session, now=now)["owners"]
+    except ah.AhError:
+        return []
     out = []
+    for row in rows:
+        state = row.get("state", "")
+        if not row.get("owner") or not (state in OWNER_ALERT_STATES or state in OWNER_RUNNING_STATES):
+            continue
+        task = f"agent-{row['agent_id']}"
+        ref = _ticket_ref(row.get("ticket"))
+        quiet = tickets.quiet_h(ref)
+        idle = round((row.get("idle_s") or 0) / 60)
+        if state in OWNER_ALERT_STATES:
+            sev, label = row["severity"], OWNER_ALERT_STATES[state]
+            reason = "stopped without handoff, result or a named wait" if state == "DROPPED" else f"silent {idle}m"
+            reason += f"; ticket quiet {quiet}h" if quiet else ""
+            if quiet:
+                sev = "high"
+        elif quiet:
+            sev, label, reason = "warning", "owner ticket quiet", f"ticket quiet {quiet}h, owner {state}"
+        else:
+            continue
+        out.append(alert("liveness", f"liveness:{session[:8]}/{task}", sev,
+                         f"{label}: {task} {('GoodQA ' + ref) if ref else 'no-ticket'} {idle}m ({reason})",
+                         {"session": session[:8], "agent": row["agent_id"], "kind": "subagent", "state": state,
+                          "ticket": ref, "idle_min": idle, "ticket_quiet_h": quiet}))
+    return out
+
+
+def _task_wal_alert(f, session, lc, tickets, now):
+    """A named task WAL has no process behind it, so silence alone is a warning, and it retires: on a handoff,
+    result or WORKDIR_DONE, a closed ticket, a named wait, or retire_h of silence without an open quiet ticket."""
+    mtime = f.stat().st_mtime
+    if mtime < now - lc["lookback_h"] * 3600:
+        return None
+    path = Path(f.path)
+    last_any, note, ended = task_wal_tail(path)
+    if last_any is None or ended or is_waiting(note):
+        return None
+    ref = wal_ticket(path)
+    info = tickets.get(ref)
+    if info and not info.get("open"):
+        return None
+    silent = max(0.0, (now - (parse_ts(last_any.get("at")) or mtime)) / 60)
+    quiet = tickets.quiet_h(ref)
+    reasons, sev = [], None
+    if lc["silent_high_min"] <= silent < lc["retire_h"] * 60:
+        reasons.append(f"WAL silent {round(silent)}m")
+        sev = "warning"
+    if quiet:
+        reasons.append(f"ticket quiet {quiet}h")
+        sev = "high"
+    if not reasons:
+        return None
+    task = f.name[:-6]
+    return alert("liveness", f"liveness:{session[:8]}/{task}", sev,
+                 f"owner silent: {task} {('GoodQA ' + ref) if ref else 'no-ticket'} {round(silent)}m "
+                 f"({'; '.join(reasons)})",
+                 {"session": session[:8], "task": task, "kind": "task", "ticket": ref, "silent_min": round(silent),
+                  "ticket_quiet_h": quiet})
+
+
+def check_liveness(cfg, state, runner, now):
+    """One alert per owner that needs a decision (key liveness:<session8>/<task>). Sub-agents follow the shared
+    rule in liveness.py through ah.owners; named task WALs follow _task_wal_alert. A session idle past lookback_h
+    is history, or past lookback_active_h when it still has an active alert. A clear means the owner moved, ended
+    or retired, not that anyone resumed the work."""
+    lc = cfg["liveness"]
+    home = Path(home_of(cfg))
+    root = Path(expand(home, lc["wal_root"]))
     try:
         sessions = [e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)]
     except OSError:
         return []
+    gq = expand(home, lc.get("gq") or "")
+    tickets = TicketLookup(lc, state, runner, gq if gq and os.path.isfile(gq) else None, now)
+    alerting = {k.split(":", 1)[1].split("/", 1)[0] for k in (state.get("active") or {}) if k.startswith("liveness:")}
+    out = []
     for sess in sorted(sessions, key=lambda e: e.name):
         try:
-            files = [f for f in os.scandir(sess.path) if f.is_file(follow_symlinks=False)]
+            files = [f for f in os.scandir(sess.path) if f.is_file(follow_symlinks=False) and f.name.endswith(".jsonl")]
+            newest = max((f.stat().st_mtime for f in files), default=0)
         except OSError:
             continue
-        life = None
+        horizon = lc["lookback_active_h"] if sess.name[:8] in alerting else lc["lookback_h"]
+        if newest < now - horizon * 3600:
+            continue
+        if root == home / ".claude" / "wals" and any(f.name == "main.jsonl" for f in files):
+            out += _owner_alerts(home, sess.name, tickets, now)
         for f in sorted(files, key=lambda e: e.name):
-            if not f.name.endswith(".jsonl") or f.name == "main.jsonl":
+            if f.name == "main.jsonl" or f.name.startswith("agent-"):
                 continue
-            task = f.name[:-6]
-            key = f"liveness:{sess.name[:8]}/{task}"
             try:
-                mtime = f.stat().st_mtime
-                horizon = lc["lookback_active_h"] if key in alerting else lc["lookback_h"]
-                if mtime < now - horizon * 3600:
-                    continue
-                kind, agent = "task", None
-                if f.name.startswith("agent-"):
-                    if life is None:
-                        life = subagent_lifecycle(Path(sess.path) / "main.jsonl")
-                    agent = task[len("agent-"):]
-                    if not is_owner(life, agent):
-                        continue
-                    kind = "subagent"
-                last_any, note = last_events(Path(f.path))
-                if last_any is None or is_terminal(note):
-                    continue
-                ticket = wal_ticket(Path(f.path))
+                found = _task_wal_alert(f, sess.name, lc, tickets, now)
             except OSError:
                 continue
-            last_at = parse_ts(last_any.get("at")) or mtime
-            silent = max(0.0, (now - last_at) / 60)
-            reasons, sev = [], None
-            if agent and life.get(agent, ("", ""))[1] == "subagent_stop":
-                reasons.append("DROPPED: stopped without handoff, result or a named wait")
-                sev = "high"
-            if silent >= lc["silent_high_min"]:
-                reasons.append(f"WAL silent {round(silent)}m")
-                sev = "high"
-            elif silent >= lc["silent_min"]:
-                reasons.append(f"WAL silent {round(silent)}m")
-                sev = sev or "warning"
-            quiet_h = None
-            if ticket and use_gq:
-                info = cache.get(ticket)
-                if ((not info or now - info.get("at", 0) > 1800) and lookups < lc["max_ticket_lookups"]
-                        and time.monotonic() < ticket_deadline):
-                    lookups += 1
-                    info = ticket_info(lc, runner, gq, ticket, now) or info
-                    if info:
-                        cache[ticket] = info
-                if info and info.get("open") and info.get("last_comment"):
-                    quiet = (now - info["last_comment"]) / 3600
-                    if quiet >= lc["ticket_quiet_h"]:
-                        quiet_h = round(quiet, 1)
-                        reasons.append(f"ticket quiet {quiet_h}h")
-                        sev = "high"
-            if reasons:
-                label = "owner dropped" if reasons[0].startswith("DROPPED") else "owner silent"
-                out.append(alert("liveness", key, sev,
-                                 f"{label}: {task} {('GoodQA ' + ticket) if ticket else 'no-ticket'} "
-                                 f"{round(silent)}m ({'; '.join(reasons)})",
-                                 {"session": sess.name[:8], "task": task, "kind": kind, "agent": agent,
-                                  "ticket": ticket, "silent_min": round(silent),
-                                  "last_event": str((note or last_any).get("event"))[:20], "ticket_quiet_h": quiet_h}))
-    for ref in [r for r, v in cache.items() if now - v.get("at", 0) > 86400]:
-        cache.pop(ref, None)
+            if found:
+                out.append(found)
+    tickets.prune()
     return out
 
 
