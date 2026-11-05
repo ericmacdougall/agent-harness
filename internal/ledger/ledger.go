@@ -45,6 +45,7 @@ const (
 	ViewBudgetEnv     = "HARNESS_LEDGER_TEST_VIEW_BUDGET"
 	FailFirstFoldEnv  = "HARNESS_LEDGER_TEST_FAIL_FIRST_FOLD"
 	FailPublishEnv    = "HARNESS_LEDGER_TEST_FAIL_BEFORE_PUBLISH"
+	FailViewAfterEnv  = "HARNESS_LEDGER_TEST_FAIL_VIEW_AFTER_COMMIT"
 	DirName           = "goodqa"
 	projectsFile      = "projects.json"
 	cacheFile         = "view.cache.json"
@@ -75,7 +76,7 @@ func CheckTestEnv() error {
 	if writer.TestHooksAllowed {
 		return nil
 	}
-	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, ViewBudgetEnv, FailFirstFoldEnv, FailPublishEnv, writer.FakeMachineIDEnv} {
+	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, ViewBudgetEnv, FailFirstFoldEnv, FailPublishEnv, FailViewAfterEnv, writer.FakeMachineIDEnv} {
 		if _, ok := os.LookupEnv(k); ok {
 			return wrap(ErrUsage, "%s is a test-only variable, refused by builds without -tags ledgertest", k)
 		}
@@ -948,6 +949,9 @@ func (l *Ledger) appendLocked(drafts []op.Draft, opts AppendOptions, check func(
 			l.syncRepo(mirror, ref, tip, commit)
 		}
 		nv, err := l.View()
+		if os.Getenv(FailViewAfterEnv) == "1" && writer.TestHooksAllowed {
+			err = errors.New("test hook: view refresh failed")
+		}
 		if err != nil {
 			// The ops are already committed: say so, because a retry would append them twice.
 			return nil, wrap(ErrRefused, "the change was committed (%s) but the view could not be refreshed; do not retry: %v", ops[0].ID, err)

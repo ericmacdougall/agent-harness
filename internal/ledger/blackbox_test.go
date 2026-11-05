@@ -863,7 +863,7 @@ func TestReleaseBuildRefusesTestHooks(t *testing.T) {
 		if out, err := exec.Command("go", args...).CombinedOutput(); err != nil {
 			t.Fatalf("%s: %v %s", name, err, out)
 		}
-		for _, v := range []string{"HARNESS_LEDGER_FAKE_NOW_MS=1", "HARNESS_LEDGER_FAKE_MACHINE_ID=x", "HARNESS_LEDGER_TEST_CRASH_AFTER_CAS=1", "HARNESS_LEDGER_TEST_LOCK_WAIT_MS=5"} {
+		for _, v := range []string{"HARNESS_LEDGER_FAKE_NOW_MS=1", "HARNESS_LEDGER_FAKE_MACHINE_ID=x", "HARNESS_LEDGER_TEST_CRASH_AFTER_CAS=1", "HARNESS_LEDGER_TEST_LOCK_WAIT_MS=5", "HARNESS_LEDGER_TEST_FAIL_VIEW_AFTER_COMMIT=1"} {
 			cmd := exec.Command(bin, "tickets", "init", "--slug", "rel")
 			cmd.Dir = w.repo
 			cmd.Env = append([]string{"HOME=" + w.home, "PATH=" + os.Getenv("PATH")}, v)
@@ -1257,5 +1257,23 @@ func TestInsteadOfCannotRedirectMirror(t *testing.T) {
 	}
 	if out, _ := exec.Command("git", "--git-dir="+decoy, "for-each-ref").Output(); len(out) != 0 {
 		t.Fatalf("decoy received refs: %s", out)
+	}
+}
+
+// Red-team M1: when the view refresh fails after the write is committed, the error must say the change is
+// stored and must not be retried, and the ticket must really be there.
+func TestViewRefreshFailureAfterCommitSaysCommitted(t *testing.T) {
+	w := newWorld(t)
+	w.ok(w.repo, nil, "init", "--slug", "m1")
+	r := w.run(w.repo, []string{ledger.FailViewAfterEnv + "=1"}, "tickets", "new", "--title", "stored anyway", "--json")
+	if r.code == 0 {
+		t.Fatalf("the hook did not fail the refresh: %s", r.stdout)
+	}
+	if !strings.Contains(r.stderr, "was committed") || !strings.Contains(r.stderr, "do not retry") {
+		t.Fatalf("error does not say the change is committed: %q", r.stderr)
+	}
+	list := w.jsonOK(w.repo, nil, "list")
+	if n := len(list["tickets"].([]any)); n != 1 {
+		t.Fatalf("expected the committed ticket to be listed once, got %d: %v", n, list)
 	}
 }
