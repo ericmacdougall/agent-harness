@@ -153,7 +153,7 @@ class ReportFinalizationTests(unittest.TestCase):
                         raise OSError('fixture WAL failure')
                     mutate()
 
-            def model(*args):
+            def model(*args, **kwargs):
                 if helper == 'rescue':
                     (repo / 'app.txt').write_text('after')
                 return 0, 'VERDICT: PASS\nFixture handoff', ''

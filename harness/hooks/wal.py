@@ -153,6 +153,15 @@ def work_dir_context(session_id: str, event: str, data: dict) -> str:
     return text
 
 
+def ops_alert_context(event: str) -> str:
+    """Active ops-watch alerts from ~/.agent-harness/state/alerts.jsonl (docs/ops-watch.md). Never raises."""
+    try:
+        import ops_watch
+        return ops_watch.injection_text(Path.home(), max_chars=400 if event == "prompt" else 700)
+    except Exception:  # the prompt hook blocks on failure; a missing alert line must never block a prompt
+        return ""
+
+
 def tmp_advisory_output(data: dict) -> tuple:
     """Advisory only: count and message for durable state written under /tmp; never raises."""
     try:
@@ -185,12 +194,12 @@ def main() -> None:
     if event == "session":
         record["source"] = data.get("source", "")
         append(main_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": f"Session WAL: {main_wal}. Record task ownership, decisions, changes, checks, commits and handoffs; omit secrets and PII." + work_dir_context(session_id, event, data)}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": f"Session WAL: {main_wal}. Record task ownership, decisions, changes, checks, commits and handoffs; omit secrets and PII." + work_dir_context(session_id, event, data) + ops_alert_context(event)}}))
     elif event == "prompt":
         prompt = str(data.get("prompt", ""))
         record["prompt_chars"] = len(prompt)
         append(main_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": f"Session WAL: {main_wal}. Follow Agent Harness triage. Record a human-readable intent before edits; the hook metadata alone is insufficient. Use the fast path for small fixes. For substantive work, brief and reuse a background owner, then review, test, publish the feature branch and integrate locally. Ask about material ambiguity and keep the user updated. Never log secrets or PII." + work_dir_context(session_id, event, data)}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": f"Session WAL: {main_wal}. Follow Agent Harness triage. Record a human-readable intent before edits; the hook metadata alone is insufficient. Use the fast path for small fixes. For substantive work, brief and reuse a background owner, then review, test, publish the feature branch and integrate locally. Ask about material ambiguity and keep the user updated. Never log secrets or PII." + work_dir_context(session_id, event, data) + ops_alert_context(event)}}))
     elif event == "subagent":
         agent_id = safe_id(data.get("agent_id"))
         agent_type = safe_id(data.get("agent_type"))
@@ -198,7 +207,7 @@ def main() -> None:
         record.update({"agent_id": agent_id, "agent_type": agent_type})
         append(main_wal, record)
         append(agent_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": f"Your private WAL: {agent_wal}. Read the main scope brief and decision log in {main_wal}; challenge omissions and harmful shortcuts. Before editing, record intent, assumptions, domain invariants, a risk table and negative acceptance cases. Then log decisions, tests, commits, blockers and handoff. Do not log secrets or PII." + work_dir_context(session_id, event, data)}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": f"Your private WAL: {agent_wal}. Read the main scope brief and decision log in {main_wal}; challenge omissions and harmful shortcuts. Before editing, record intent, assumptions, domain invariants, a risk table and negative acceptance cases. Then log decisions, tests, commits, blockers and handoff. Do not log secrets or PII." + work_dir_context(session_id, event, data) + ops_alert_context(event)}}))
     elif event == "subagent_stop":
         # SubagentStop: lets spec_flow.py record when a click-test agent finished. Only ids that
         # SubagentStart logged are recorded, so spurious stops (empty agent_type) leave no trace.

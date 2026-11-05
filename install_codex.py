@@ -36,7 +36,9 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'ticket_adapters.py', 'commit_policy.py', 'commit_policy.json',
                     # Spec flow commands work by hand in Codex; its done hook is Claude Code only.
                     'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
-                    'provenance_hooks.py', 'safe_input.py')
+                    'provenance_hooks.py', 'safe_input.py', 'domain_gates.py', 'domain_checklists.json',
+                    # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
+                    'command_guard.py', 'command_guard_hook.py', 'redact.py')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
@@ -64,7 +66,12 @@ def policy_command(codex_home: Path) -> str:
     return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'commit_policy.py')) + ' hook'
 
 
-def merge_hooks(existing: dict, codex_home: Path) -> dict:
+def guard_command(codex_home: Path, verb: str = ' hook') -> str:
+    # The hook verb marks a fail-closed gate for the Go front door (cmd/harness/gates.json); the launcher ignores it.
+    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'command_guard_hook.py')) + verb
+
+
+def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) -> dict:
     if not isinstance(existing, dict):
         raise ValueError('hooks.json must contain an object')
     result = json.loads(json.dumps(existing))
@@ -73,6 +80,7 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
         raise ValueError('hooks.json hooks must be an object')
     command = managed_command(codex_home)
     policy = policy_command(codex_home)
+    guard = guard_command(codex_home)
     for event in HOOK_EVENTS:
         lifecycle = event in {'Stop', 'Interrupt'}
         managed = {'hooks': [{'type': 'command', 'command': command,
@@ -86,13 +94,18 @@ def merge_hooks(existing: dict, codex_home: Path) -> dict:
                 raise ValueError(f'hooks.json {event} has an invalid hook group')
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
-                                and handler.get('command') in (command, policy))]
+                                and handler.get('command') in (command, policy, guard,
+                                                               guard_command(codex_home, '')))]
             if lifecycle and len(handlers) != len(group['hooks']) and group != managed:
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')
             if handlers:
                 preserved.append({**group, 'hooks': handlers})
         preserved.append(managed)
+        if event == 'PreToolUse' and command_guard:
+            # Command guard for every tool (no matcher): Codex fails open, so the launcher blocks by itself, and
+            # write_stdin text typed into a running shell is never checked again by the host.
+            preserved.insert(0, {'hooks': [{'type': 'command', 'command': guard, 'timeout': 30}]})
         if event == 'PreToolUse':
             # Commit message policy for every tool (no matcher): shell argv, strings, stdin writes.
             preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 60}]})
@@ -226,7 +239,7 @@ def merge_config(existing: str, wal_dir: Path, *, default_full_access: bool = Fa
     return result
 
 
-def install(home: Path, apply: bool, *, default_full_access: bool = False) -> list[str]:
+def install(home: Path, apply: bool, *, default_full_access: bool = False, command_guard: bool = True) -> list[str]:
     home = home.expanduser().resolve()
     codex_home = home / '.codex'
     skill_dir = codex_home / 'skills' / 'agent-harness'
@@ -262,7 +275,7 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False) -> li
         existing_hooks = json.loads(originals[hooks_path][0].decode()) if originals[hooks_path] else {}
         existing_config = originals[config_path][0].decode() if originals[config_path] else ''
         instructions = merge_marked(existing_instructions, (SOURCE / 'AGENTS.md').read_text())
-        hooks = merge_hooks(existing_hooks, codex_home)
+        hooks = merge_hooks(existing_hooks, codex_home, command_guard)
         config = merge_config(existing_config, wal_dir, default_full_access=default_full_access)
         payloads = [(destination, source.read_bytes()) for source, destination in files]
         payloads += [(instructions_path, instructions.encode()),
@@ -344,9 +357,13 @@ def main() -> None:
                           help='do not install or upgrade the netwatch monitor (remembered)')
     netwatch.add_argument('--netwatch', dest='netwatch', action='store_true',
                           help='install or upgrade the pinned netwatch monitor (the default; remembered)')
+    parser.add_argument('--no-command-guard', dest='command_guard', action='store_false',
+                        help='do not register the command guard and remove an earlier registration (rollback); '
+                             'the files stay installed; not remembered')
     args = parser.parse_args()
     try:
-        changes = install(args.home, args.apply, default_full_access=args.default_full_access)
+        changes = install(args.home, args.apply, default_full_access=args.default_full_access,
+                          command_guard=args.command_guard)
     except (ValueError, RuntimeError) as error:
         parser.exit(2, f'error: {error}\n')
     print(('Installed' if args.apply else 'Would install') + f' Codex Agent Harness in {args.home / ".codex"}')
