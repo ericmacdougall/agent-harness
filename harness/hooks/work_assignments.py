@@ -57,6 +57,8 @@ BLOCK_MEMORY_SECONDS = 6 * 3600
 MAX_STORE_BYTES = 128 * 1024 * 1024
 MAX_PAYLOAD = 8 * 1024 * 1024
 SYNC_WINDOW = 64 * 1024
+DISCOVER_READS = 40          # new Codex rollout headers read per hook call
+SESSION_IDLE_DAYS = 14       # session caches idle longer than this are dropped (headless ones after 2 days)
 SYNC_MAX_BYTES = 64 * 1024 * 1024
 LOCK_SECONDS = 3.0
 HOOK_SECONDS = 6.0
@@ -514,11 +516,17 @@ def read_snapshot():
 
 
 def read_events(limit_tail=None) -> list:
+    """All events, or the tail window. An absent log is empty; an unreadable or oversized one fails loudly, because
+    folding it as empty would replace the ledger with nothing."""
     path = files()["events"]
     try:
         raw = prov.read_tail(path, limit_tail) if limit_tail else prov.read_small(path, MAX_STORE_BYTES)
-    except prov.Problem:
-        return []
+    except prov.Problem as error:
+        if not path.exists():
+            return []
+        raise StoreCorrupt(f"cannot read {path.name} ({error.message}); nothing was folded or overwritten. "
+                           f"The event log is read whole up to {MAX_STORE_BYTES >> 20} MiB: archive it with "
+                           "`work_assignments.py verify` evidence and ask main")
     lines = raw.split(b"\n")
     if limit_tail:
         lines = lines[1:]  # first line of a tail window may be partial
@@ -801,7 +809,21 @@ def commit(data: dict) -> None:
     data["rev"] = int(data.get("rev", 0)) + (1 if queued else 0)
     data["generatedAt"] = iso(now())
     data["index"] = build_index(data)
+    trim_sessions(data)
     write_private(files()["snap"], json.dumps(data, ensure_ascii=False, indent=None, sort_keys=True, separators=(",", ":")).encode())
+
+
+def trim_sessions(data: dict) -> None:
+    """Session records are caches outside the fold. Drop idle ones so a busy Codex host (about 200 subagent rollouts a
+    day) does not grow the snapshot; keep any session with an ask or an untriaged message."""
+    ts = now()
+    keep = set(data["index"]["bySession"]) | {data["messages"][m]["sessionId"] for m in data["index"]["untriagedMessages"]
+                                              if m in data["messages"]}
+    for sid in list(data["sessions"]):
+        rec = data["sessions"][sid]
+        idle = ts - parse_ts(rec.get("lastSeenAt") or rec.get("firstSeenAt"))
+        if sid not in keep and idle > (2 if rec.get("headless") else SESSION_IDLE_DAYS) * 86400:
+            del data["sessions"][sid]
 
 
 @contextmanager
@@ -1244,11 +1266,12 @@ def discover_codex(data: dict) -> None:
     root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
     created = parse_ts(hive_identity().get("createdAt"))
     tracked = {rec.get("transcript") for rec in data["sessions"].values()}
+    budget = [DISCOVER_READS]
     today = datetime.fromtimestamp(now(), timezone.utc)
     for back in (0, 1):
         day = root / (today - timedelta(days=back)).strftime("%Y/%m/%d")
         try:
-            names = sorted(os.listdir(day))[-40:]
+            names = sorted(os.listdir(day), reverse=True)[:5000]  # newest first; a busy host writes ~200 a day
         except OSError:
             continue
         for name in names:
@@ -1256,9 +1279,12 @@ def discover_codex(data: dict) -> None:
             match = re.match(r"rollout-.*-([0-9a-f-]{36})\.jsonl$", name)
             if not match or path in tracked:
                 continue
+            if budget[0] <= 0:
+                return  # the rest are read by the next hook: each new rollout is read once, then tracked
             try:
                 if os.stat(path).st_mtime < created:
                     continue
+                budget[0] -= 1
                 first = prov.read_small(path, 1 << 16).split(b"\n")[0]
                 started = parse_ts(json.loads(first).get("timestamp"))
             except (OSError, prov.Problem, ValueError):
@@ -1270,11 +1296,16 @@ def discover_codex(data: dict) -> None:
 
 def sync_all(data: dict, session=None) -> int:
     discover_codex(data)
-    recent = sorted(data["sessions"], key=lambda s: data["sessions"][s].get("firstSeenAt", ""))[-40:]
-    if session:  # this session plus the Codex rollouts the watcher tracks, so a hook-less Codex session is caught up
-        wanted = [session] + [sid for sid in recent[-10:] if sid != session and data["sessions"][sid].get("provider") == "codex"]
+    def seen(sid):
+        rec = data["sessions"][sid]
+        return rec.get("lastSeenAt") or rec.get("firstSeenAt", "")
+
+    live = sorted((sid for sid, rec in data["sessions"].items() if not rec.get("headless")), key=seen)
+    if session:  # this session plus the interactive Codex rollouts the watcher tracks (hook-less Codex sessions)
+        codex = [sid for sid in live if sid != session and data["sessions"][sid].get("provider") == "codex"]
+        wanted = [session] + codex[-10:]
     else:
-        wanted = recent
+        wanted = live[-40:]
     return sum(sync_session(data, sid) for sid in wanted if sid in data["sessions"])
 
 
@@ -1406,6 +1437,13 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
                      f"{prov.clip(ask['request']['compressed'], 60)} (shown until the user cancels it)")
     if len(pending) > 8:
         lines.append(f"  ... {len(pending) - 8} more superseded ask(s) awaiting a user cancel: `work_assignments.py status --json`")
+    closed = sorted((a for a in data["asks"].values() if a["state"] in CLOSED and a.get("removableAfter")
+                     and parse_ts(a["removableAfter"]) > ts), key=lambda a: a["removableAfter"])
+    for ask in closed[:5]:
+        lines.append(f"  CLOSED {ask['id']} [{ask['state']}] removable after {ask['removableAfter']}: "
+                     f"{prov.clip(ask['request']['compressed'], 60)}")
+    if len(closed) > 5:
+        lines.append(f"  ... {len(closed) - 5} more closed in the last 24h: `work_assignments.py status --json`")
     shown = min(8, limit)
     lines.extend(no_ask_line(row) for row in no_asks[:shown])
     if len(no_asks) > shown:

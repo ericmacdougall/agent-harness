@@ -126,6 +126,11 @@ Headless runs are not human. A `claude -p` prompt (`CLAUDE_CODE_ENTRYPOINT=sdk-c
 `source: {"subagent": ...}` are never captured, caught up or accepted as cancel proof. Their prompts come from a
 program. A Codex rollout with no readable `session_meta` counts as interactive.
 
+Long-lived data. The event log is read whole up to 128 MiB; an absent log is empty, but an unreadable or larger
+one fails loudly and is never folded as empty (the hook records a failure and exits 0). Session records are caches
+outside the fold: idle ones are dropped after 14 days (headless Codex rollouts after 2), unless the session holds an
+ask or an untriaged message. Rollout discovery reads at most 40 new rollout headers per hook call, newest first.
+
 ## Known limits
 
 A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt and no request cues, and an excerpt whose first 15 words look secret-adjacent

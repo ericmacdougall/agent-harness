@@ -325,6 +325,40 @@ class CaptureTest(Base):
         self.assertEqual(len(self.data()["messages"]), 1)
         self.assertFalse(self.data()["sessions"]["codex-ide-1"].get("headless"))
 
+    def test_interactive_rollout_among_many_subagent_rollouts_is_caught_up(self):
+        """Spec review v5 F3: discovery read only the last 40 names a day, so subagent rollouts crowded out a session."""
+        wa.hive_identity()
+        CLOCK[0] += 10
+        day = Path(self.tmp.name) / "codex" / "sessions" / wa.iso(CLOCK[0])[:10].replace("-", "/")
+        day.mkdir(parents=True)
+
+        def write(n, meta, text):
+            path = day / f"rollout-2027-01-15T08-{n:05d}-01a16a08-4480-78d3-83f9-{n:012x}.jsonl"
+            item = {"type": "UserMessage", "id": f"01a16512-0d07-78f3-b199-{n:012x}", "content": [{"type": "text", "text": text}]}
+            path.write_text(json.dumps({"timestamp": wa.iso(CLOCK[0]), "type": "session_meta", "payload": meta}) + "\n"
+                            + json.dumps({"timestamp": wa.iso(CLOCK[0] + 1), "type": "event_msg",
+                                          "payload": {"type": "item_completed", "item": item}}) + "\n")
+            os.utime(path, (CLOCK[0], CLOCK[0]))
+
+        write(1, {"source": "vscode"}, "the one real request in the pile")
+        for n in range(2, 47):
+            write(n, {"source": {"subagent": {"thread_spawn": {"parent_thread_id": "p"}}}}, f"subagent task {n}")
+        for _ in range(3):
+            self.hook("session", {"session_id": SID, "transcript_path": str(self.transcript)})
+        texts = [m["text"].get("excerpt") for m in self.data()["messages"].values()]
+        self.assertEqual(texts, ["the one real request in the pile"])
+
+    def test_codex_hook_and_rollout_sync_yield_one_message(self):
+        """Spec review v5 F12 (NEG-15 on Codex): the same UserMessage via the prompt hook and rollout sync."""
+        rollout = self.codex_rollout("rollout-dup.jsonl", {"source": "cli"}, "one codex request only once",
+                                     "01a16512-0d07-78f3-b199-70f1db8736d0")
+        base = {"session_id": "codex-dup-1", "transcript_path": str(rollout)}
+        self.hook("prompt", {**base, "prompt": "one codex request only once"}, runtime="codex")
+        with wa.transaction() as data:
+            wa.sync_all(data, "codex-dup-1")
+        self.hook("session", base, runtime="codex")
+        self.assertEqual(len(self.data()["messages"]), 1)
+
     def test_codex_injected_agents_item_is_not_human(self):
         rollout = Path(self.tmp.name) / "codex" / "sessions" / "2027" / "01" / "01" / "rollout-y.jsonl"
         rollout.parent.mkdir(parents=True)
@@ -502,13 +536,13 @@ class TriageTest(Base):
         self.assertNotIn("removableAfter", ask)  # reopening drops the clock until the ask is done again
         self.assertEqual(ask["state"], "in_progress")
         self.assertEqual({e["verification"]["status"] for e in ask["evidence"]}, {"stale"})
-        self.check_schema()
         self.cli("update", aid, "--state", "ready")
         self.assertEqual(self.cli("update", aid, "--state", "done")[0], 2)  # stale evidence cannot carry it to done again
         self.assertEqual(self.cli("update", aid, "--evidence", "abc9999aaa")[0], 0)
         CLOCK[0] += 3600
         self.assertEqual(self.cli("update", aid, "--state", "done")[0], 0)
         self.assertGreater(wa.parse_ts(self.asks()[aid]["removableAfter"]), CLOCK[0] + 23 * 3600)  # a fresh 24h clock
+        self.check_schema()  # last: it skips without jsonschema, and nothing after it may be skipped
 
     def test_relate_stores_both_directions_and_prereq_status(self):
         _, a = self.split("one", "first thing here")
@@ -759,7 +793,9 @@ class RemovalTest(Base):
         CLOCK[0] += 31 * 86400
         self.cli("prune", "--apply")
         self.assertNotIn(thanks["id"], self.data()["messages"])
+        self.assertNotIn(SID, self.data()["sessions"])  # an idle session cache is trimmed after 14 days
         with wa.transaction() as d:
+            wa.session_record(d, SID, "claude", str(self.transcript))  # the session resumes: a full rescan
             d["sessions"][SID]["syncOffset"] = None
             wa.sync_all(d, SID)
         self.assertNotIn(msg["id"], self.data()["messages"])
@@ -871,7 +907,7 @@ class RemovalTest(Base):
         self.advance(new)
         CLOCK[0] += 25 * 3600
         self.assertEqual(self.cli("remove", old)[0], 2)
-        self.assertEqual(self.cli("prune")[0], 0)
+        self.assertEqual(self.cli("prune", "--apply")[0], 0)
         self.assertIn(old, self.asks())
         # PR review 7d0fb89 #1: it also must not vanish from status and Stop once the replacement is done.
         self.assertIn(f"SUPERSEDED {old}", self.cli("status")[1])
@@ -1168,9 +1204,35 @@ class StoreTest(Base):
         with mock.patch.object(wa, "write_private", boom):
             self.hook("prompt", self.payload("two"))  # snapshot write fails; event is already durable
         self.assertEqual(self.cli("sync")[0], 0)
-        self.assertEqual(len(self.data()["messages"]), 3 if False else len(self.data()["messages"]))
-        self.assertGreaterEqual(len(self.data()["messages"]), 2)
+        self.assertEqual(len(self.data()["messages"]), 2)  # "one" and "two": the durable event was folded back in
         self.assertEqual(wa.verify_events(), [])
+
+    def test_oversized_event_log_fails_loudly_and_never_folds_empty(self):
+        """Spec review v5 F8: an event log over the read bound read as [] and could fold to an empty ledger."""
+        _, aid = self.split("keep", "a request that must survive")
+        with mock.patch.object(wa, "MAX_STORE_BYTES", 64):
+            with self.assertRaises(wa.StoreCorrupt):
+                wa.read_events()
+            wa.files()["snap"].unlink()
+            with self.assertRaises(wa.StoreCorrupt):
+                with wa.transaction() as data:
+                    pass
+        self.assertTrue(wa.files()["events"].stat().st_size > 64)
+        self.assertEqual(self.cli("recover")[0], 0)
+        self.assertIn(aid, self.asks())
+
+    def test_no_cli_option_sets_a_time(self):
+        """NEG-33 (spec review v5 F12): timestamps are harness-minted; no subcommand may accept a time or date."""
+        import argparse
+        parser, seen = wa.build_parser(), []
+        subs = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+        self.assertTrue(subs)
+        for name, sub in subs[0].choices.items():
+            for action in sub._actions:
+                for opt in action.option_strings:
+                    seen.append(opt)
+                    self.assertNotRegex(opt, r"(?i)^--(at|time|times?tamp|date|when|now|since-epoch)$", f"{name} {opt}")
+        self.assertGreater(len(seen), 20)  # the walk reached the real options
 
     def test_clock_rollback_is_reported_by_verify(self):
         self.capture("one")
@@ -1236,6 +1298,32 @@ class StoreTest(Base):
         self.hook("compact", {"session_id": SID})
         reply = self.hook("prompt", self.payload("<system-reminder>x</system-reminder>"))
         self.assertIn("visible after compaction", reply["hookSpecificOutput"]["additionalContext"])
+
+    def test_codex_session_and_compact_inject_open_items(self):
+        """Spec review v5 F4: AC-6 on the Codex runtime (SessionStart and PostCompact, then the next prompt)."""
+        self.split("a request", "visible to codex after compaction")
+        rollout = Path(self.tmp.name) / "codex" / "sessions" / "2027" / "01" / "04" / "rollout-c.jsonl"
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text(json.dumps({"timestamp": wa.iso(CLOCK[0]), "type": "session_meta",
+                                       "payload": {"source": "cli", "originator": "codex_cli_rs"}}) + "\n")
+        base = {"session_id": "codex-digest-1", "transcript_path": str(rollout)}
+        text = self.hook("session", base, runtime="codex")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("visible to codex after compaction", text)
+        self.assertEqual(self.hook("compact", base, runtime="codex"), {})
+        reply = self.hook("prompt", {**base, "prompt": "<system-reminder>x</system-reminder>"}, runtime="codex")
+        self.assertIn("visible to codex after compaction", reply["hookSpecificOutput"]["additionalContext"])
+
+    def test_digest_shows_other_sessions_flagged_and_recently_closed_asks(self):
+        """Spec review v5 F5: an ended session's stale ask and a just-closed ask are visible in a new session."""
+        _, stale = self.split("old work", "stale request from an ended session")
+        CLOCK[0] += 13 * 3600
+        _, closed = self.split("ship it", "ship the release")
+        self.advance(closed)
+        text = self.hook("session", {"session_id": "other-session-0001", "transcript_path": str(self.transcript)})
+        text = text["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"{stale} [", text)
+        self.assertRegex(text, rf"{stale} \[[a-z_]+\] owner=none !")
+        self.assertIn(f"CLOSED {closed} [done] removable after", text)
 
     def test_huge_failures_file_still_surfaces_newest(self):
         """Red-team MAJOR: a failures file over 1 MiB used to read as empty."""
@@ -1604,18 +1692,27 @@ class LatencyTest(Base):
                 wa.new_ask(data, description=f"synthetic ask number {i}", owner="main", who=who,
                            origin_actor=wa.actor("harness", "other", label="x"), source={"kind": "file", "ref": "t", "why": "latency"})
         env = {**os.environ, "PYTHONPATH": str(HOOKS)}
-        payload = json.dumps(self.payload("latency probe")).encode()
-        timings = []
-        for _ in range(5):
-            started = time.monotonic()
-            run = subprocess.run([sys.executable, str(HOOKS / "work_assignments.py"), "hook", "prompt"], input=payload,
-                                 capture_output=True, env=env, timeout=20)
-            timings.append(time.monotonic() - started)
-            self.assertEqual(run.returncode, 0, run.stderr)
-        timings.sort()
+        payloads = {"prompt": self.payload("latency probe"),
+                    "stop": {"session_id": SID, "transcript_path": str(self.transcript)},
+                    "session": {"session_id": SID, "transcript_path": str(self.transcript)},
+                    "guard": {"session_id": SID, "tool_name": "Read", "tool_input": {"file_path": str(self.transcript)},
+                              "cwd": self.tmp.name}}
         size = wa.files()["snap"].stat().st_size
-        print(f"\n[latency] 600 asks ({size // 1024} KiB snapshot), prompt hook median {timings[2] * 1000:.0f} ms, max {timings[-1] * 1000:.0f} ms")
-        self.assertLess(timings[2], 0.25)
+        medians = {}
+        for name, payload in payloads.items():
+            timings = []
+            for _ in range(5):
+                started = time.monotonic()
+                run = subprocess.run([sys.executable, str(HOOKS / "work_assignments.py"), "hook", name],
+                                     input=json.dumps(payload).encode(), capture_output=True, env=env, timeout=20)
+                timings.append(time.monotonic() - started)
+                self.assertEqual(run.returncode, 0, run.stderr)
+            timings.sort()
+            medians[name] = timings[2]
+            print(f"\n[latency] 600 asks ({size // 1024} KiB snapshot), {name} hook median {timings[2] * 1000:.0f} ms, "
+                  f"max {timings[-1] * 1000:.0f} ms")
+        for name, median in medians.items():
+            self.assertLess(median, 0.25, name)  # AC-15: median of 5 subprocess runs per hook; the max is reported
 
 
 @unittest.skipIf(jsonschema is None, "jsonschema not installed")
