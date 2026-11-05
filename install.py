@@ -31,7 +31,8 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py",
          "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
-         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py")
+         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py",
+         "stop_lints.py", "stop_lints_policy.json")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -49,7 +50,8 @@ class DirectoryPublicationError(OSError):
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
-                         "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py")}
+                         "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py",
+                         "stop_lints.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -176,6 +178,12 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     if provenance:
         for event, groups in provenance_hook_groups(claude).items():
             managed.setdefault(event, []).extend(groups)
+    # Completion-hygiene lints (rules W04, W06, W12, W17, S18, S26): standalone groups, warn-only.
+    lints = str(claude / "hooks" / "stop_lints.py")
+    managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3", "args": [lints, "stop"], "timeout": 15}]})
+    managed.setdefault("SubagentStop", []).append({
+        "matcher": SUBAGENT_MATCHER,
+        "hooks": [{"type": "command", "command": "python3", "args": [lints, "subagent-stop"], "timeout": 15}]})
     # Local-ledger reminder (docs/ledger.md): rate limited and dismissible; fails open, so no onFailure.
     reminder = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "ledger_reminder.py")], "timeout": 3}
     for event in ("SessionStart", "UserPromptSubmit"):

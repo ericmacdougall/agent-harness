@@ -498,6 +498,48 @@
    ],
    "status": "installed",
    "rules": []
+  },
+  {
+   "id": "stop_lints:stop",
+   "script": "stop_lints.py",
+   "arg": "stop",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04",
+    "W06",
+    "W12",
+    "W17",
+    "S18"
+   ]
+  },
+  {
+   "id": "stop_lints:subagent-stop",
+   "script": "stop_lints.py",
+   "arg": "subagent-stop",
+   "event": "SubagentStop",
+   "tools": [
+    "task-owner",
+    "click-tester",
+    "fixer",
+    "red-team"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04",
+    "W06",
+    "W12",
+    "W17",
+    "S18",
+    "S26"
+   ]
   }
  ]
 }
