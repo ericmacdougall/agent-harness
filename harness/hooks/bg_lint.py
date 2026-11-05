@@ -201,7 +201,7 @@ def lint(command, _depth=0):
     if hit:
         out.append(("pipestatus", "PIPESTATUS is read after a command-substitution assignment (`%s`); it holds only "
                                   "the assignment's status. Run the pipeline directly and read PIPESTATUS at once, "
-                                  "use `set -o pipefail`, or write each stage's status to its own file." % hit))
+                                  "use `set -o pipefail`, or write each stage's status to its own file (see bg_job.py docs)." % hit))
     return out
 
 

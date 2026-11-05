@@ -181,6 +181,60 @@ class RedTeamRegressions(Base):
         self.assertEqual(run_bg("wait", "--name", "x", "--timeout", "nan", "--dir", str(self.jobs)).returncode, 64)
 
 
+class Round2(Base):
+    """Adversarial spec review findings B3, B4, N1, N3."""
+
+    def test_stop_group_never_signals_a_stranger(self):
+        import bg_job
+        stranger = subprocess.Popen(["sleep", "300"], start_new_session=True)  # started here, so we may stop it
+        try:
+            bg_job.stop_group(stranger.pid, "0" * 32)  # own=False: identity is not proven, nothing is signalled
+            time.sleep(0.3)
+            self.assertIsNone(stranger.poll(), "stop_group signalled a process that is not the job")
+            bg_job.stop_group(stranger.pid, "")
+            time.sleep(0.2)
+            self.assertIsNone(stranger.poll())
+        finally:
+            stranger.terminate()
+            stranger.wait()
+
+    def test_status_exit_codes_are_not_false_success(self):
+        for name, body, want, word in (("sok", "echo go\nsleep 1\nexit 0\n", 0, "EXIT_STATUS=0"),
+                                       ("sbad", "echo go\nsleep 1\nexit 3\n", 1, "EXIT_STATUS=3")):
+            res = self.launch(name, self.tmp / (name + ".log"), 10, "sh", self.script(name + ".sh", body))
+            self.assertEqual(res.returncode, 0, res.stdout)
+            run_bg("wait", "--name", name, "--timeout", "20", "--dir", str(self.jobs))
+            st = run_bg("status", "--name", name, "--dir", str(self.jobs))
+            self.assertEqual(st.returncode, want, st.stdout)
+            self.assertIn(word, st.stdout)
+        res = self.launch("slost", self.tmp / "slost.log", 10, "sh", self.script("slost.sh", "echo go\nsleep 300\n"))
+        rec = json.loads((self.jobs / "slost.json").read_text())
+        os.killpg(rec["pid"], 9)
+        time.sleep(0.5)
+        st = run_bg("status", "--name", "slost", "--dir", str(self.jobs))
+        self.assertEqual(st.returncode, 2, st.stdout)
+        self.assertIn("LOST", st.stdout)
+
+    def test_wait_after_failed_to_start_is_unproven_even_if_job_exited_zero(self):
+        res = self.launch("f0", self.tmp / "f0.log", 5, sys.executable, "-c", "raise SystemExit(0)")
+        self.assertEqual(res.returncode, 3, res.stdout)
+        w = run_bg("wait", "--name", "f0", "--timeout", "3", "--dir", str(self.jobs))
+        self.assertEqual(w.returncode, 2, w.stdout)
+        self.assertIn("failed to start", w.stdout)
+
+    def test_concurrent_launch_of_same_name_is_serialised(self):
+        path = self.script("conc.sh", "echo hi\nsleep 30\n")
+        self.started.append("conc")
+        cmd = [sys.executable, str(BG_JOB), "launch", "--name", "conc", "--log", str(self.tmp / "conc.log"),
+               "--deadline", "10", "--dir", str(self.jobs), "--", "sh", path]
+        procs = [subprocess.Popen(cmd, stdout=subprocess.PIPE, universal_newlines=True) for _ in range(2)]
+        outs = [p.communicate(timeout=60)[0] for p in procs]
+        started = [o for o in outs if o.startswith("STARTED")]
+        self.assertEqual(len(started), 1, outs)
+        rec = json.loads((self.jobs / "conc.json").read_text())
+        self.assertIn("pid=%d" % rec["pid"], started[0])  # the one recorded job is the one reported
+
+
 class WaitFailsClosed(Base):
     def start(self, name, body):
         res = self.launch(name, self.tmp / (name + ".log"), 10, "sh", self.script(name + ".sh", body))
@@ -288,7 +342,7 @@ class LintCorpora(unittest.TestCase):
             codes = [c for c, _ in bg_lint.lint(case["command"])]
             self.assertIn(case["expect"], codes, case["id"])
             for _, message in bg_lint.lint(case["command"]):
-                self.assertIn("bg_job.py", message if case["expect"] != "pipestatus" else "bg_job.py")
+                self.assertIn("bg_job.py", message, case["id"])
 
     def test_negative_corpus(self):
         import bg_lint
@@ -301,7 +355,7 @@ class LintCorpora(unittest.TestCase):
         import bg_lint
         for case in json.loads((DATA / "bg_lint_positive.json").read_text()):
             for code, message in bg_lint.lint(case["command"]):
-                self.assertIn("bg_job", message + (" bg_job" if code == "pipestatus" else ""), case["id"])
+                self.assertIn("bg_job.py", message, case["id"])
 
 
 class LintBounded(unittest.TestCase):

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import fcntl
 import json
 import math
 import os
@@ -175,6 +176,8 @@ def load_record(directory, name):
     for key in ("pid", "nonce", "status", "log", "argv_sha256"):
         if key not in obj:
             return None, "job record incomplete"
+    if obj.get("failed"):
+        return None, "job failed to start (%s)" % str(obj["failed"])[:120]
     pid = obj["pid"]
     if (isinstance(pid, bool) or not isinstance(pid, int) or not 1 < pid < 2 ** 31
             or not isinstance(obj["nonce"], str) or not re.match(r"^[0-9a-f]{32}$", obj["nonce"])
@@ -223,6 +226,16 @@ def cmd_launch(args):
         return EXIT_USAGE
     directory = job_dir(args.dir)
     os.makedirs(directory, mode=0o700, exist_ok=True)
+    lock = open(os.path.join(directory, args.name + ".lock"), "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("FAILED_TO_START reason=another launch of %s is in progress" % args.name)
+        return EXIT_FAILED_TO_START
+    return _launch_locked(args, argv, directory)  # the lock lives as long as this process holds `lock`
+
+
+def _launch_locked(args, argv, directory):
     old, _ = load_record(directory, args.name)
     if old and pid_is_job(old.get("pid"), old.get("nonce", "")):
         print("FAILED_TO_START reason=job %s is already running (pid %s)" % (args.name, old["pid"]))
@@ -262,6 +275,12 @@ def supervise(args, proc, nonce, log, status, argv, before):
     def fail(reason):
         proc.poll()
         stop_group(proc.pid, nonce, own=True)
+        try:  # a later `wait` must not read an immediate exit 0 as success of a launch reported as failed
+            atomic_write_json(os.path.join(os.path.dirname(status), args.name + ".json"),
+                              {"name": args.name, "pid": proc.pid, "nonce": nonce, "log": log, "status": status,
+                               "argv_sha256": argv_hash(argv), "failed": reason})
+        except OSError:
+            pass
         print("FAILED_TO_START name=%s reason=%s log=%s" % (args.name, reason, log))
         return EXIT_FAILED_TO_START
 
@@ -333,10 +352,12 @@ def cmd_status(args):
     code, swhy = read_status(record)
     if code is not None:
         print("EXITED name=%s EXIT_STATUS=%d pid=%s log=%s" % (args.name, code, record["pid"], record["log"]))
+        return EXIT_OK if code == 0 else EXIT_JOB_FAILED
     elif swhy == "missing" and pid_is_job(record["pid"], record["nonce"]):
         print("RUNNING name=%s pid=%s log=%s" % (args.name, record["pid"], record["log"]))
     elif swhy == "missing":
         print("LOST name=%s pid=%s reason=process gone, no status" % (args.name, record["pid"]))
+        return EXIT_UNPROVEN
     else:
         print("UNPROVEN name=%s reason=status file %s" % (args.name, swhy))
         return EXIT_UNPROVEN
