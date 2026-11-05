@@ -1035,6 +1035,7 @@ class ScriptArgumentTextIsData(WorldCase):
         # a script that runs its own arguments as a command
         "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 -- kill -9 4242",
         "python3 ./runner.py pkill -f node",
+        "python3 ./unlisted_tool.py --note 'will kill the job'",  # not on the named list: scanned in full
         # delta review: runners that take a command without `--`, absolute-path verbs, shell and -c strings
         "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 /bin/kill -9 4242",
         "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 /usr/bin/pkill -f node",
