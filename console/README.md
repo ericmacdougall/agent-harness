@@ -63,10 +63,15 @@ Implementation plans and scenario registrations live in `../plans/CONSOLE-*.md`.
 
 ### Known defects skipped in this baseline
 
-These three tests fail on this code. The event-log rebuild replaces the code they cover, so they are skipped by name until then (GoodQA #35692). The skips are removed, and the tests must pass, once K5b and later land. A third, `TestClaudeSurvivesRevisionOnlyToolConfigChange`, was un-skipped by K4: its fixture made a tool config appear from nothing, which is a real tool change, so the fixture was corrected and the test passes.
+These three tests fail on this code. The event-log rebuild replaces the code they cover, so they are skipped by name until then (GoodQA #35692). The skips are removed, and the tests must pass, once K5b and later land. `TestClaudeSurvivesRevisionOnlyToolConfigChange` was skipped here earlier and K4 un-skipped it: its fixture made a tool config appear from nothing, which is a real tool change, so the fixture was corrected (a real identity-to-identity change still has no test of its own).
 
 - `TestClaudeResultBeforeWriteAckRemainsFinalAcrossRestart`: a completed Claude request can be replayed after restore.
 - `TestStalledJournalSyncDoesNotBlockReads`: receipts are journalled under the app lock, so a stalled fsync blocks state reads.
 - `TestRestoreMatchesLiveProjection`: a restored session can show `disconnected` where the live one shows `unknown`.
 
-On Windows the full suite has never passed for this code (discard, torn-record and attachment tests fail, then a test hangs), so Windows CI runs vet, the build and the data-directory guard tests only. K4+ restores the full Windows suite, and it must pass.
+On Windows the full suite has never passed for this code (discard, torn-record and attachment tests fail, then a test hangs), so Windows CI runs vet, the build and the data-directory guard tests only. The full Windows suite is not restored by K4: the process tree's Windows path (a Job Object, and a timer-based drain bound because Windows pipes are not pollable, which drops unread bytes at the bound) is compile-checked only. A later slice with a Windows runner owns it.
+
+### Deferred by K4
+
+- Codex conversation identity (separating the client cache key from conversation identity) and Codex A8 belong to K6.
+- `cancel()` and a stop verdict discard output the console has not read yet; an explicit stop is not a drain.

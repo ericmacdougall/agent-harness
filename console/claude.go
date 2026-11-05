@@ -37,9 +37,11 @@ func (r *claudeRun) cancel() {
 		r.writer.close()
 		if r.tree != nil {
 			// Callers hold the app lock. The polite signal goes out before cancel
-			// returns, so shutdown cannot skip it; only the grace wait and the kill
-			// run on their own goroutine. An explicit cancel overrides a leave
-			// verdict that was not yet recorded, and stops the group.
+			// returns; the grace wait and the kill run on their own goroutine, so
+			// a caller that must see the group gone (app.close) uses waitStopped
+			// after releasing the lock. An explicit cancel stops the group even
+			// after a leave verdict while the leader is still alive, and drops
+			// output not yet read.
 			r.tree.Release(true)
 			if r.tree.BeginStop() {
 				go r.tree.FinishStop(100 * time.Millisecond)
@@ -48,6 +50,14 @@ func (r *claudeRun) cancel() {
 			terminateProcess(r.command)
 		}
 	})
+}
+
+// waitStopped waits up to grace for a cancelled run's group to end and kills it
+// if it ignores the polite signal. Call it without holding the app lock.
+func (r *claudeRun) waitStopped(grace time.Duration) {
+	if r.tree != nil {
+		r.tree.FinishStop(grace)
+	}
 }
 func (r *claudeRun) write(value any) error { return r.writeContext(context.Background(), value) }
 func (r *claudeRun) writeContext(ctx context.Context, value any) error {
@@ -530,6 +540,11 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 			}
 			a.transitionRequestLocked(current, requestID, "final")
 			current.providerFinal = true
+			if run.tree != nil {
+				// A recorded final: the tool's background work is its own, whatever
+				// the leader and its descendants do with stdout from here on.
+				run.tree.Settle(false)
+			}
 			a.inputOutcomeLocked(current, requestID, "retained", "Main turn final; files retained for possible owner/tool readers until explicit discard")
 			if current.queueUncertain {
 				current.Status = "unknown"
@@ -582,7 +597,7 @@ func (a *app) readClaude(current *session, run *claudeRun, reader io.Reader) {
 	// errStreamDrainBound means the leader is gone and a descendant merely holds
 	// the pipe: the caller's goroutine decides the tree's fate after the final
 	// check, so it is not a stream failure and must not cancel the run here.
-	if err := scanner.Err(); err != nil && !errors.Is(err, errStreamDrainBound) {
+	if err := scanner.Err(); err != nil && !errors.Is(err, errStreamDrainBound) && !errors.Is(err, io.ErrClosedPipe) {
 		a.mu.Lock()
 		a.claudeUnfinishedLocked(current, run, "Claude output stream exceeded its bound or failed before a final result. No request was replayed.")
 		a.changedLocked()

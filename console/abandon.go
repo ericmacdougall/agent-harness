@@ -117,7 +117,7 @@ func (a *app) abandonTurn(id, expectedRequest, reason string) error {
 	run, client, binding, turn := current.claude, current.codex, current.codexTurn, current.turnID
 	current.claude, current.codex = nil, nil
 	if run != nil {
-		go run.cancel()
+		run.cancel() // signals inline and never waits
 	}
 	if client != nil {
 		if turn != "" {

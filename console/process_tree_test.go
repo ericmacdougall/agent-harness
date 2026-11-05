@@ -413,3 +413,23 @@ func TestTreeReleaseVerdictDecidesWithoutPolicy(t *testing.T) {
 		}
 	}
 }
+
+// F2: the polite signal is on its way before a cancel-style stop returns. A
+// regression that moves BeginStop onto a goroutine fails this.
+func TestTreeBeginStopSignalsBeforeReturn(t *testing.T) {
+	rec := &signalRecorder{}
+	tree := shellTree(t, "echo ready; while :; do sleep 1; done", nil, rec, 100*time.Millisecond)
+	ready := bufio.NewScanner(tree.Stdout())
+	if !ready.Scan() {
+		t.Fatal("child never became ready")
+	}
+	discardStream(tree)
+	if !tree.BeginStop() {
+		t.Fatal("BeginStop refused a running tree")
+	}
+	if rec.count() != 1 {
+		t.Fatalf("signals at return = %d, want exactly the polite one", rec.count())
+	}
+	tree.FinishStop(2 * time.Second)
+	<-tree.Done()
+}

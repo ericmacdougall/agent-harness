@@ -23,10 +23,12 @@ var errStreamDrainBound = errors.New("provider output ended by the drain bound w
 //     kqueue NOTE_EXIT), so the zombie pins the pid and the group ID until the
 //     tree has decided the group's fate. Elsewhere the exit is observed by
 //     Wait and the old narrow window remains (documented, not hidden).
-//   - The stop-on-exit decision happens only after the consumer has taken the
-//     whole stream (or the consume bound passed, or a stop was requested), so a
-//     leader that prints its final and exits cannot lose background work to a
-//     decision made before the final was read.
+//   - The stop-or-leave decision waits for the caller's verdict (Settle or
+//     Release), a requested stop, or the consume bound; with no verdict the
+//     tree stops. A leader that prints its final and exits therefore cannot
+//     lose background work to a decision made before the final was read, and
+//     a verdict of leave also ends the consumer's stream, because a descendant
+//     that keeps writing would otherwise hold it open forever.
 //   - Output is pumped continuously, so a slow consumer never loses bytes that
 //     are already in the pipe. The drain bound applies to idleness of the pipe,
 //     not to the consumer.
@@ -58,14 +60,16 @@ type processTree struct {
 	stopCh     chan struct{}
 	stopOnExit func() bool
 
-	settled  chan struct{}
-	setOnce  sync.Once
-	verdict  atomic.Int32 // 0 none, 1 stop, 2 leave
-	legacy   bool
-	exitSeen atomic.Bool
-	exited   chan struct{} // leader exit observed
-	done     chan struct{} // leader reaped, Err valid
-	waitErr  error
+	settled    chan struct{}
+	setOnce    sync.Once
+	verdict    atomic.Int32 // 0 none, 1 stop, 2 leave
+	legacy     bool
+	exitSeen   atomic.Bool
+	boundHit   atomic.Bool
+	noDeadline sync.Once
+	exited     chan struct{} // leader exit observed
+	done       chan struct{} // leader reaped, Err valid
+	waitErr    error
 }
 
 type processTreeOptions struct {
@@ -82,6 +86,10 @@ const (
 	defaultTreeDrain     = 2 * time.Second
 	defaultTreeConsume   = 7 * time.Second
 )
+
+// treeConsumeGrace is how long a tree waits for a verdict after its leader
+// exits; a variable so tests can shorten it.
+var treeConsumeGrace = defaultTreeConsume
 
 // startProcessTree starts cmd and returns its tree. The caller must already have
 // called configureProcess and may set cmd.Stderr; Stdout is delivered through
@@ -101,7 +109,7 @@ func startProcessTreeWith(cmd *exec.Cmd, stopOnExit func() bool, opt processTree
 		opt.Drain = defaultTreeDrain
 	}
 	if opt.ConsumeGrace == 0 {
-		opt.ConsumeGrace = defaultTreeConsume
+		opt.ConsumeGrace = treeConsumeGrace
 	}
 	reader, writer, err := os.Pipe()
 	if err != nil {
@@ -146,19 +154,29 @@ func (t *processTree) pump() {
 	discard := false
 	var endErr error
 	for {
-		if t.exitSeen.Load() {
+		if t.exitSeen.Load() && !discard {
 			// Idle bound, re-armed before every read so a slow consumer never
-			// spends it.
-			_ = t.stdout.SetReadDeadline(time.Now().Add(t.drain))
+			// spends it. Where the pipe is not pollable (Windows) the bound is a
+			// timer that closes the read end once, dropping unread bytes.
+			if err := t.stdout.SetReadDeadline(time.Now().Add(t.drain)); err != nil {
+				t.noDeadline.Do(func() { time.AfterFunc(t.drain, func() { t.boundHit.Store(true); _ = t.stdout.Close() }) })
+			}
 		}
 		n, err := t.stdout.Read(buf)
 		if n > 0 && !discard {
 			if _, werr := t.pw.Write(buf[:n]); werr != nil {
-				discard = true // consumer left; keep emptying so the child never blocks
+				// The consumer left. Keep emptying the pipe with no idle bound so
+				// the child never blocks and never receives SIGPIPE.
+				discard = true
+				_ = t.stdout.SetReadDeadline(time.Time{})
 			}
 		}
 		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
+			if discard && errors.Is(err, os.ErrDeadlineExceeded) {
+				_ = t.stdout.SetReadDeadline(time.Time{})
+				continue
+			}
+			if errors.Is(err, os.ErrDeadlineExceeded) || t.boundHit.Load() {
 				endErr = errStreamDrainBound
 			} else if err != io.EOF {
 				endErr = err
@@ -182,7 +200,9 @@ func (t *processTree) wait() {
 		legacyErr = t.cmd.Wait() // old behaviour: Wait is the observation
 	}
 	t.exitSeen.Store(true)
-	_ = t.stdout.SetReadDeadline(time.Now().Add(t.drain)) // unblock a pending read
+	if err := t.stdout.SetReadDeadline(time.Now().Add(t.drain)); err != nil { // unblock a pending read
+		t.noDeadline.Do(func() { time.AfterFunc(t.drain, func() { t.boundHit.Store(true); _ = t.stdout.Close() }) })
+	}
 	close(t.exited)
 	{
 		// With a stopOnExit policy the stream being consumed triggers the
@@ -203,8 +223,8 @@ func (t *processTree) wait() {
 		}
 		timer.Stop()
 		// Expiry with no verdict means nobody decided: the default below stops the
-		// tree. A consumer stalled past ConsumeGrace after the leader's exit can
-		// therefore lose background work; the bound is deliberate and documented.
+		// tree, so a caller that never settles loses background work after
+		// ConsumeGrace. Production callers settle at the recorded final.
 		_ = expired
 	}
 	var stop bool
@@ -221,7 +241,7 @@ func (t *processTree) wait() {
 	if t.stopped || stop {
 		_ = t.signal(pid, true)
 	}
-	t.reaped = true // conservative: set before the real reap
+	t.reaped = true // signals stop being allowed here; on the pinned path the real reap follows
 	t.mu.Unlock()
 	err := legacyErr
 	if pinned {
@@ -233,8 +253,10 @@ func (t *processTree) wait() {
 	t.mu.Lock()
 	t.waitErr = err
 	t.mu.Unlock()
-	if stop || t.stopped {
-		// Nothing will read the stream any more: unblock a pump stuck on a write.
+	if stop || t.stopped || t.verdict.Load() == 2 {
+		// Decided: nothing needs the stream any more. Closing the consumer end
+		// switches the pump to discarding, so it cannot stick on a write and a
+		// descendant that keeps writing is neither blocked nor sent SIGPIPE.
 		_ = t.pr.CloseWithError(io.ErrClosedPipe)
 	}
 	if t.release != nil {
@@ -275,6 +297,16 @@ func (t *processTree) Err() error {
 // true final was recorded). The pump keeps emptying the pipe so the child never
 // blocks. The first verdict wins.
 func (t *processTree) Release(stop bool) {
+	t.Settle(stop)
+	_ = t.pr.CloseWithError(io.ErrClosedPipe)
+	t.consOnce.Do(func() { close(t.consumed) })
+}
+
+// Settle records the verdict without closing the stream, so a caller that is
+// still reading (for example right after it recorded a final) can let the tree
+// decide at the leader's exit without waiting for the stream to end. The first
+// verdict wins. It never blocks and is safe to call under a lock.
+func (t *processTree) Settle(stop bool) {
 	t.setOnce.Do(func() {
 		if stop {
 			t.verdict.Store(1)
@@ -283,8 +315,6 @@ func (t *processTree) Release(stop bool) {
 		}
 		close(t.settled)
 	})
-	_ = t.pr.CloseWithError(io.ErrClosedPipe)
-	t.consOnce.Do(func() { close(t.consumed) })
 }
 
 // Reaped reports whether signals are no longer permitted.

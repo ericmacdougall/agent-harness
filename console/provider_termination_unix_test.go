@@ -255,3 +255,70 @@ exit 0
 	}
 	t.Fatal("final turn did not finish while a descendant held stdout")
 }
+
+// F3: a descendant that keeps writing to the inherited stdout more often than the
+// idle drain bound must not cost a recorded final its background work. The final
+// settles the tree, so the decision does not wait for the stream to go idle.
+func TestClaudeFinalWithChattyDescendantKeepsBackgroundWork(t *testing.T) {
+	old := treeConsumeGrace
+	treeConsumeGrace = time.Second
+	t.Cleanup(func() { treeConsumeGrace = old })
+	childFile := filepath.Join(t.TempDir(), "child")
+	a, s := claudeProcessFixture(t, `sh -c 'echo $$ > "`+childFile+`"; while :; do echo tick; sleep 0.1; done' &
+until [ -s "`+childFile+`" ]; do sleep 0.01; done
+read line
+printf '{"type":"result","result":"done"}\n'
+exit 0
+`)
+	if err := a.sendClaude(s, "A", "bounded", s.CWD, ""); err != nil {
+		t.Fatal(err)
+	}
+	childPID := recordedPID(t, childFile)
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		claude, state := s.claude, s.requests["A"]
+		a.mu.Unlock()
+		if claude == nil && state == "final" {
+			time.Sleep(2500 * time.Millisecond) // past the consume bound and the drain bound
+			if processGone(childPID) {
+				t.Fatal("a recorded final lost the tool's background work behind a chatty descendant")
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("final turn did not finish while a descendant kept writing")
+}
+
+// F1: closing the app must leave no group alive, even one that ignores the polite
+// signal; the process exits right after close, so the kill cannot be left to a
+// goroutine.
+func TestAppCloseKillsTermIgnoringClaudeGroup(t *testing.T) {
+	dir := t.TempDir()
+	leaderFile, childFile := filepath.Join(dir, "leader"), filepath.Join(dir, "child")
+	a, s := claudeProcessFixture(t, `trap '' TERM
+echo $$ > "`+leaderFile+`"
+sh -c 'trap "" TERM; echo $$ > "`+childFile+`"; while :; do sleep 1; done' &
+until [ -s "`+childFile+`" ]; do sleep 0.01; done
+read line
+while :; do sleep 1; done
+`)
+	if err := a.sendClaude(s, "A", "bounded", s.CWD, ""); err != nil {
+		t.Fatal(err)
+	}
+	leader, child := recordedPID(t, leaderFile), recordedPID(t, childFile)
+	t.Cleanup(func() { _ = syscall.Kill(-leader, syscall.SIGKILL); _ = syscall.Kill(child, syscall.SIGKILL) })
+	start := time.Now()
+	a.close()
+	if time.Since(start) > 3*time.Second {
+		t.Fatalf("close took %v", time.Since(start))
+	}
+	// No grace for a goroutine: both must already be gone, not merely signalled.
+	for _, pid := range []int{leader, child} {
+		if !processGone(pid) {
+			t.Fatalf("pid %d survived app.close", pid)
+		}
+	}
+}
