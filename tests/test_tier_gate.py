@@ -224,6 +224,10 @@ class BashAdvisory(GateFixture):
         # Without a task a Bash line cannot be rewritten: only the lowest writing rung runs.
         self.assertEqual(self.bash('claude -p --model opus "no task"')[0], 'deny')
         self.assertEqual(self.bash('claude -p --model sonnet "no task"')[0], 'allow')
+        # A peer_review launch at a permission rung is checked here, against the installed ledger, not in the helper's env.
+        self.assertEqual(self.bash('python3 ~/.claude/hooks/peer_review.py code-inspection --repo r --packet p --output o --author-rung R5 --author-harness claude')[0], 'deny')
+        self.assertEqual(self.bash('python3 ~/.claude/hooks/peer_review.py code-inspection --repo r --packet p --output o --task k9 --author-rung R2')[0], 'allow')
+        self.assertEqual(self.bash('python3 ~/.claude/hooks/peer_review.py pr --repo r --packet p --output o --task k9 --author-rung R5')[0], 'deny')
         self.assertEqual(self.bash('python3 rescue.py --repo r --packet p --output o --model opus --effort high')[0], 'allow')
 
 

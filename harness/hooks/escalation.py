@@ -30,8 +30,19 @@ TASK_KEY = re.compile(r'\[task:([A-Za-z0-9][A-Za-z0-9._-]{0,63})\]')
 SAFE_KEY = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 MAX_STATE = 1 << 20
 MAX_EVENTS = 4096
-DEFAULT_ROOT = Path.home() / '.agent-harness' / 'escalation'
-DEFAULT_USAGE_ROOT = Path.home() / '.agent-harness' / 'usage'
+
+
+def installed_home():
+    """The account's home from the passwd database, so a caller's HOME cannot relabel the installed roots."""
+    try:
+        import pwd
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        return Path.home()
+
+
+DEFAULT_ROOT = installed_home() / '.agent-harness' / 'escalation'
+DEFAULT_USAGE_ROOT = installed_home() / '.agent-harness' / 'usage'
 PENDING_BATCH = 256
 LOCK_SECONDS = 2.0
 # The fixed classifier table (user requirement, deterministic): what each receipt means for the ladder.

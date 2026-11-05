@@ -146,7 +146,7 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
     return 'allow', 'requested %s %s is above rung %s; downgraded' % (requested['model'], requested['effort'], target_rung), updated, facts
 
 
-LAUNCH = re.compile(r'(^|[\s;&|(/])(claude|codex|rescue\.py)(\s|$)')
+LAUNCH = re.compile(r'(^|[\s;&|(/])(claude|codex|rescue\.py|peer_review\.py)(\s|$)')
 
 
 def decide_bash(data, policy, ledger):
@@ -159,7 +159,8 @@ def decide_bash(data, policy, ledger):
         words = shlex.split(command)
     except ValueError:
         return 'allow', None, None, {'unparsed': True}
-    model = effort = task = None
+    model = effort = task = author_rung = None
+    author_harness = 'unknown'
     for index, word in enumerate(words):
         if word in ('--model', '-m') and index + 1 < len(words): model = words[index + 1]
         if word.startswith('--model='): model = word.split('=', 1)[1]
@@ -171,8 +172,26 @@ def decide_bash(data, policy, ledger):
         if word.startswith('ANTHROPIC_MODEL=') or word.startswith('CLAUDE_MODEL='): model = word.split('=', 1)[1]
         if word == '--task' and index + 1 < len(words): task = words[index + 1]
         if word.startswith('--task='): task = word.split('=', 1)[1]
+        if word == '--author-rung' and index + 1 < len(words): author_rung = words[index + 1]
+        if word.startswith('--author-rung='): author_rung = word.split('=', 1)[1]
+        if word == '--author-harness' and index + 1 < len(words): author_harness = words[index + 1]
     task = task or esc.task_key_from(command)
     facts = {'model': model, 'effort': effort, 'task': task}
+    basenames = [w.rsplit('/', 1)[-1] for w in words]
+    if 'peer_review.py' in basenames:
+        # A review launch: the reviewer rung follows from the author rung; a permission rung needs the
+        # installed ledger's record, checked here so a forged state dir in the helper's env cannot stand in.
+        selection = tiers.reviewer_for(policy, author_rung, author_harness, {'openai': True, 'claude': True})
+        if selection.get('rung') and policy['rungs'][selection['rung']]['needs_user_permission']:
+            permission = None
+            if task is not None:
+                try:
+                    permission = ledger.status(task).get('permission')
+                except (esc.LedgerError, tiers.TierError) as error:
+                    facts['ladder_error'] = getattr(error, 'code', 'error')
+            if not permission:
+                return 'deny', 'review at %s needs recorded user permission for task %s' % (selection['rung'], task or '(none)'), None, facts
+        return 'allow', None, None, facts
     if model is None:
         return 'allow', None, None, facts
     requested = tiers.classify(model, effort, policy)
@@ -188,7 +207,6 @@ def decide_bash(data, policy, ledger):
     # Permission and review-only checks come first: no task means no recorded permission.
     if entry['needs_user_permission'] and not (status or {}).get('permission'):
         return 'deny', 'launch at %s needs recorded user permission for task %s' % (requested['rung'], task or '(none)'), None, facts
-    basenames = [w.rsplit('/', 1)[-1] for w in words]
     if not entry['writable'] and 'rescue.py' in basenames:
         return 'deny', 'rescue at %s is review-only' % requested['rung'], None, facts
     if task is None:

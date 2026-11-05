@@ -282,6 +282,13 @@ class EnvRoots(LedgerFixture):
             esc.verify_ask_pair(wal, 'w1', 'k')  # the installed ledger never reads an env-selected WAL root
         self.assertTrue(self.ledger._non_default_root())
 
+    def test_installed_home_ignores_a_relabelled_HOME(self):
+        import pwd
+        real = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        os.environ['HOME'] = self.temp.name; self.addCleanup(lambda: os.environ.__setitem__('HOME', str(real)))
+        self.assertEqual(esc.installed_home(), real)
+        self.assertEqual(esc.DEFAULT_ROOT, real / '.agent-harness' / 'escalation')
+
     def test_pending_resets_beyond_one_batch_survive_to_the_next_load(self):
         pending = self.root / 'pb.pending-resets.jsonl'
         rows = [json.dumps({'at': str(n), 'code': 'lock_timeout', 'detail': 'n%d' % n}) for n in range(esc.PENDING_BATCH + 40)]
