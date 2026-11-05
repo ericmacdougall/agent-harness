@@ -223,26 +223,61 @@ def ring_state(events: list, src: str, hostname: str) -> dict:
     return latest
 
 
-def active_sessions(policy: dict, ts: float) -> list:
+def wal_problem(path: str, limit: int):
+    """Why `ah owners` must not be given this WAL: not a regular file (a symlink could be /dev/zero), or too big."""
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode):
+        return "not a regular file"
+    return f"{st.st_size} bytes" if st.st_size > limit else None
+
+
+def scan_sessions(policy: dict, ts: float) -> tuple:
+    """(usable sessions, {session: "<wal name>: <problem>"}). `ah owners` reads a session's main and task WALs, so a
+    session with an unsafe one is left out. Its liveness alerts are held and a wal:unsafe alert says why."""
     base = home() / ".claude" / "wals"
     look = policy.get("owner_window_seconds", 172800)
-    out = []
+    limit = policy.get("owners_wal_max_bytes", 256 << 20)
+    usable, blocked = [], {}
     try:
         entries = list(os.scandir(base))
     except FileNotFoundError:
-        return []  # no WALs at all on this host; any other error propagates so the step counts as failed
+        return [], {}  # no WALs at all on this host; any other error propagates so the step counts as failed
     for d in entries:
         if not SESSION_RE.match(d.name) or not d.is_dir(follow_symlinks=False):
             continue
+        main = os.path.join(d.path, "main.jsonl")
         try:
-            st = os.lstat(os.path.join(d.path, "main.jsonl"))
+            st = os.lstat(main)
         except OSError:
             continue
-        # `ah owners` reads main.jsonl whole, so an oversized one is left out (its alerts are held, not cleared)
-        if stat.S_ISREG(st.st_mode) and ts - st.st_mtime <= look \
-                and st.st_size <= policy.get("owners_wal_max_bytes", 256 << 20):
-            out.append(d.name)
-    return sorted(out)
+        if ts - st.st_mtime > look:
+            continue
+        problem = None
+        try:
+            names = ["main.jsonl"] + sorted(n for n in os.listdir(d.path) if n.startswith("agent-") and n.endswith(".jsonl"))
+            for name in names:
+                why = wal_problem(os.path.join(d.path, name), limit)
+                if why:
+                    problem = f"{name}: {why}"
+                    break
+        except OSError:
+            problem = "unreadable"
+        if problem:
+            blocked[d.name] = problem
+        else:
+            usable.append(d.name)
+    return sorted(usable), blocked
+
+
+def active_sessions(policy: dict, ts: float) -> list:
+    return scan_sessions(policy, ts)[0]
+
+
+def wal_unsafe_alerts(blocked: dict, ts: float) -> dict:
+    return {f"wal:unsafe:{sess[:8]}": {
+        "severity": "warning", "class": "self", "kind": "wal", "subject": sess[:8], "since": int(ts // 86400 * 86400),
+        "message": f"session {sess[:8]} not monitored for liveness: {why}"[:200], "detail": {}}
+        for sess, why in blocked.items()}
 
 
 def v1_asks(policy: dict) -> list:
@@ -512,7 +547,7 @@ class Daemon:
         step("heartbeat", lambda: self.call("heartbeat beat", [
             "--service", SOURCE, "--key", write_key(self.host, "beat", SOURCE, f"t{self.tick_no}", ts)], deadline))
         step("checks", lambda: self.run_checks(deadline))
-        sessions = step("sessions", lambda: active_sessions(self.policy, ts)) or []
+        sessions, blocked = step("sessions", lambda: scan_sessions(self.policy, ts)) or ([], {})
         docs = step("owners", lambda: self.owner_docs(sessions, deadline)) or {}
         asks = step("asks", lambda: v1_asks(self.policy)) or []
         pending = step("wal_asks", lambda: wal_asks(self.policy, sessions)) or []
@@ -521,12 +556,14 @@ class Daemon:
         desired.update(liveness_alerts(docs, self.policy))
         desired.update(ask_alerts(asks, self.policy, ts))
         desired.update(ring_wrap_alert(events, ts, self.host))
+        desired.update(wal_unsafe_alerts(blocked, ts))
         ring = ring_state(events, SOURCE, self.host)
         hold = set()
         if self.hold_ticks > 0:
             hold |= {k for k in list(desired) + list(ring) if k.startswith("liveness:")}
             self.hold_ticks -= 1
-        missing = {s[:8] for s in sessions if s not in docs}  # owners unreadable: never clear on missing data
+        # owners unreadable or session blocked: never clear on missing data
+        missing = {s[:8] for s in sessions if s not in docs} | {s[:8] for s in blocked}
         hold |= {k for k in ring if k.startswith("liveness:") and k[9:17] in missing and k not in desired}
         bad = set(summary["skipped"]) | {e.split(":", 1)[0] for e in summary.get("errors", [])}
         if bad & {"sessions", "owners"}:

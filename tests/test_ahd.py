@@ -698,6 +698,34 @@ class MemoryBounds(Scratch):
         ahd.memory_guard(100, stop, period=0, die=died.append, peak=low)
         self.assertEqual(died, [70])
 
+    def blocked_tick(self, make_unsafe):
+        self.owners([owner("a1111111111111111", "SILENT")])
+        d = self.daemon()
+        d.tick()
+        self.policy["owners_wal_max_bytes"] = 1 << 20
+        d.policy["owners_wal_max_bytes"] = 1 << 20
+        make_unsafe(self.main_wal.parent / "agent-a2222222222222222.jsonl")
+        d.tick()
+        return d
+
+    def test_oversized_task_wal_holds_alerts_and_says_so(self):
+        def big(path):
+            self.sparse(path, 2 << 20)
+        d = self.blocked_tick(big)
+        self.assertEqual(ahd.scan_sessions(self.policy, NOW)[0], [])
+        self.assertEqual(self.alert_calls("clear"), [])  # the session's liveness alert stays up
+        self.assertIn(f"wal:unsafe:{SESSION[:8]}", d.last["desired"])
+
+    def test_symlinked_task_wal_is_never_handed_to_ah(self):
+        def link(path):
+            target = self.home / "sparse.bin"  # never real /dev/zero here: a regression must not eat the host
+            self.sparse(target, 1024)
+            os.symlink(target, path)
+        d = self.blocked_tick(link)
+        self.assertEqual(self.alert_calls("clear"), [])
+        self.assertIn(f"wal:unsafe:{SESSION[:8]}", d.last["desired"])
+        self.assertIn("not a regular file", d.last["desired"][f"wal:unsafe:{SESSION[:8]}"]["message"])
+
     def test_oversized_main_wal_is_not_handed_to_ah(self):
         self.sparse(self.main_wal, 2 << 20)
         os.utime(self.main_wal, (NOW - 60, NOW - 60))
