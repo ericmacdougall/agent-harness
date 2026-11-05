@@ -23,7 +23,9 @@ def _config():
             continue
         try:
             with open(path) as handle:
-                return json.load(handle)
+                loaded = json.load(handle)
+            if loaded.get('log'):  # a file without a log path would silently disable auditing: fall through
+                return loaded
         except Exception:
             continue
     return None
