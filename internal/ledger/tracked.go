@@ -6,6 +6,7 @@ package ledger
 
 import (
 	"encoding/json"
+	"io"
 	"net/url"
 	"os"
 	"path"
@@ -44,7 +45,15 @@ func trackedPatterns() ([]*regexp.Regexp, bool) {
 	if p == "" {
 		return nil, false
 	}
-	b, err := os.ReadFile(p)
+	fh, err := os.Open(p)
+	if err != nil {
+		return nil, false
+	}
+	defer fh.Close()
+	if fi, serr := fh.Stat(); serr != nil || !fi.Mode().IsRegular() || fi.Size() > 1<<20 {
+		return nil, false
+	}
+	b, err := io.ReadAll(io.LimitReader(fh, 1<<20+1))
 	if err != nil || len(b) > 1<<20 {
 		return nil, false
 	}

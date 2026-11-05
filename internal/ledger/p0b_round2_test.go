@@ -219,12 +219,16 @@ func TestUpdateTravelKeepsNewerConsent(t *testing.T) {
 		t.Fatalf("setup: %+v", stale)
 	}
 	a.ok(a.repo, nil, "travel", "enable", "--remote", "second", "--yes-share", tokenFor(t, a, "second"))
-	if err := l.UpdateTravel(func(c *ledger.TravelConfig) { c.PushedMs = 42 }); err == nil {
-		// the update applies to whatever consent is current, not to the stale struct
+	// A push that started against origin must not write its numbers onto the newer consent for "second".
+	if err := l.UpdateTravel(stale.Endpoint, func(c *ledger.TravelConfig) { c.PushedMs = 42 }); err != nil {
+		t.Fatal(err)
 	}
 	now := l.ReadTravel()
-	if now.Remote != "second" || now.PushedMs != 42 {
-		t.Fatalf("a stale write reverted the consent: %+v", now)
+	if now.Remote != "second" || now.PushedMs == 42 {
+		t.Fatalf("a stale update reached the newer consent: %+v", now)
+	}
+	if err := l.UpdateTravel(now.Endpoint, func(c *ledger.TravelConfig) { c.PushedMs = 43 }); err != nil || l.ReadTravel().PushedMs != 43 {
+		t.Fatalf("an update for the current consent was not applied")
 	}
 }
 
@@ -626,5 +630,83 @@ func TestUnbindReleasesAPinnedKey(t *testing.T) {
 	os.WriteFile(key2, []byte(hex.EncodeToString(rot.Public().(ed25519.PublicKey))), 0o600)
 	if r := bindSigned(doc, rot, key2); r.code != 0 {
 		t.Fatalf("a rotated key could not be pinned after unbind: %s", r.stderr)
+	}
+}
+
+// Plain `travel fetch` (not adopt) keeps the unverified-writer budget too.
+func TestPlainFetchCapsNewWriters(t *testing.T) {
+	p := newPair(t)
+	a, b := p.a, p.b
+	a.ok(a.repo, nil, "init", "--slug", "plain")
+	a.newTicket(a.repo, nil, "alpha")
+	a.enable(a.repo)
+	a.ok(a.repo, nil, "travel", "push")
+	proj := p.projectOf(t)
+	b.ok(b.repo, nil, "travel", "fetch", "--adopt", "--remote", "origin", "--yes-share", b.adoptToken(b.repo))
+	for i := 1; i <= 70; i++ {
+		junkWriter(t, p.remote, proj, writerID(i), 1_800_000_000_000+int64(i))
+	}
+	out := b.jsonOK(b.repo, nil, "travel", "fetch")
+	total := 0
+	for _, w := range b.jsonOK(b.repo, nil, "writers")["writers"].([]any) {
+		if w.(map[string]any)["class"] == "unverified" {
+			total++
+		}
+	}
+	if total > 64 || len(out["rejected"].([]any)) < 7 {
+		t.Fatalf("unverified writers kept: %d (cap 64); rejected %d", total, len(out["rejected"].([]any)))
+	}
+}
+
+// A pinned key that cannot be read must refuse, not silently unpin.
+func TestUnreadablePinnedKeyRefusesBind(t *testing.T) {
+	seed := make([]byte, ed25519.SeedSize)
+	for i := range seed {
+		seed[i] = byte(i + 3)
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	w := newWorld(t)
+	w.ok(w.repo, nil, "init", "--slug", "pinbad")
+	w.newTicket(w.repo, nil, "alpha")
+	key := filepath.Join(w.home, "k.pub")
+	os.WriteFile(key, []byte(hex.EncodeToString(priv.Public().(ed25519.PublicKey))), 0o600)
+	_, doc := w.exportDoc(w.repo, nil)
+	p := receiptFor(t, doc, nil)
+	raw, _ := os.ReadFile(p)
+	var rd ledger.ReceiptDoc
+	json.Unmarshal(raw, &rd)
+	env, _ := rd.Sign(priv)
+	b, _ := json.Marshal(env)
+	os.WriteFile(p, b, 0o600)
+	if r := w.run(w.repo, nil, "tickets", "bind", "--project", goodqaUUID, "--receipt", p, "--goodqa-key", key); r.code != 0 {
+		t.Fatalf("%s", r.stderr)
+	}
+	// Damage the stored pin, then offer a bare delta receipt.
+	proj := w.jsonOK(w.repo, nil, "status")["project"].(string)
+	sync := filepath.Join(w.home, ".agent-harness", "ledgers", proj, "sync.json")
+	sb, _ := os.ReadFile(sync)
+	var sd map[string]any
+	json.Unmarshal(sb, &sd)
+	sd["goodqa_key"] = "not-a-key"
+	nb, _ := json.Marshal(sd)
+	os.WriteFile(sync, nb, 0o600)
+	w.ok(w.repo, nil, "comment", w.jsonOK(w.repo, nil, "list")["tickets"].([]any)[0].(map[string]any)["handle"].(string), "--body", "x")
+	_, d2 := w.exportDoc(w.repo, nil, "--since-bound")
+	if r := w.run(w.repo, nil, "tickets", "bind", "--project", goodqaUUID, "--receipt", receiptFor(t, d2, nil)); r.code == 0 {
+		t.Fatalf("a bare receipt bound after the stored pin became unreadable")
+	}
+}
+
+// Receipt ticket entries are validated (handle hex, positive number).
+func TestReceiptTicketEntriesAreValidated(t *testing.T) {
+	w := newWorld(t)
+	w.ok(w.repo, nil, "init", "--slug", "tkv")
+	w.newTicket(w.repo, nil, "alpha")
+	_, doc := w.exportDoc(w.repo, nil)
+	for _, bad := range []map[string]any{{"handle": "zz\u0001zz", "number": 1}, {"handle": "d974ebba", "number": 0}} {
+		p := receiptFor(t, deepCopy(doc), func(r map[string]any) { r["tickets"] = []any{bad} })
+		if r := w.bind(w.repo, p); r.code == 0 {
+			t.Fatalf("bad ticket entry %v accepted", bad)
+		}
 	}
 }

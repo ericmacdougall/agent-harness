@@ -276,13 +276,13 @@ func (l *Ledger) TravelPush() (*PushResult, error) {
 		return nil, wrap(ErrRefused, "the remote refused or could not take the ledger refs (not a fast-forward, a host that refuses non-branch refs, or unreachable): %v", err)
 	}
 	now, _ := Now()
-	if err := l.UpdateTravel(func(c *TravelConfig) {
+	if err := l.UpdateTravel(tc.Endpoint, func(c *TravelConfig) {
 		c.PushedMs = now
 		for w, n := range counts {
 			c.PushedOps[w] = n
 		}
 	}); err != nil {
-		return nil, err
+		l.warn = append(l.warn, "the push succeeded but its bookkeeping could not be saved: "+err.Error())
 	}
 	return &PushResult{Refs: refs}, nil
 }
@@ -411,7 +411,7 @@ func (l *Ledger) TravelFetch() (*FetchResult, error) {
 		}
 	}
 	now, _ := Now()
-	if err := l.UpdateTravel(func(c *TravelConfig) {
+	if err := l.UpdateTravel(fc.Endpoint, func(c *TravelConfig) {
 		c.FetchedMs = now
 		for w, n := range fetchedOps {
 			c.FetchedOps[w] = n
@@ -644,11 +644,14 @@ func shownURL(u string) string {
 
 // UpdateTravel applies fn to the consent as it is now (re-read under the writer lock), so a push or fetch
 // that started earlier cannot write back a stale consent over a newer `travel enable`.
-func (l *Ledger) UpdateTravel(fn func(*TravelConfig)) error {
+func (l *Ledger) UpdateTravel(endpoint string, fn func(*TravelConfig)) error {
 	return l.Locked(func() error {
 		c := l.ReadTravel()
 		if c == nil {
 			return wrap(ErrRefused, "travel is no longer enabled for this ledger")
+		}
+		if endpoint != "" && c.Endpoint != endpoint {
+			return nil // consent was re-pointed while this ran: its numbers belong to another remote
 		}
 		fn(c)
 		return l.writeTravel(c)
@@ -698,7 +701,10 @@ func (l *Ledger) Unbind() error {
 	return l.Locked(func() error {
 		d, err := l.homeDir(false)
 		if err != nil {
-			return nil
+			if IsNotExist(err) {
+				return nil
+			}
+			return err
 		}
 		defer d.Close()
 		return d.Remove(syncFile)

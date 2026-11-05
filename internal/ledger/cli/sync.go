@@ -30,6 +30,7 @@ const (
 var (
 	uuidRe     = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 	importIDRe = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
+	handleRe   = regexp.MustCompile(`^[0-9a-f]{8,64}$`)
 	digestRe   = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
@@ -138,6 +139,11 @@ func readReceipt(path string, env Env) (*ledger.ReceiptDoc, *ledger.SignedReceip
 	case len(r.Frontier) == 0 || len(r.Frontier) > 4096:
 		return nil, nil, refusedf("receipt frontier is empty or too large")
 	}
+	for _, t := range r.Tickets {
+		if !handleRe.MatchString(t.Handle) || t.Number < 1 {
+			return nil, nil, refusedf("receipt ticket entry is malformed")
+		}
+	}
 	seenW := map[string]bool{}
 	for _, f := range r.Frontier {
 		if seenW[f.Writer] {
@@ -215,7 +221,10 @@ func cmdBind(args []string, env Env) error {
 			return refusedf("a different GoodQA key is already pinned for this ledger")
 		}
 		if key == nil && pinned != "" {
-			key, _ = ledger.ParseKey([]byte(pinned))
+			var perr error
+			if key, perr = ledger.ParseKey([]byte(pinned)); perr != nil {
+				return refusedf("the pinned GoodQA key in this HOME's state is unreadable; run unbind and bind again")
+			}
 		}
 		if key != nil {
 			if signed == nil {
