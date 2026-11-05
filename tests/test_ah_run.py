@@ -81,15 +81,6 @@ class Launcher(Fixture):
         refused = subprocess.run([sys.executable, AH, 'run', '--readonly', '--no-unit', '--', 'true'], env=self.env, capture_output=True, text=True, timeout=30)
         self.assertEqual(refused.returncode, 126)
 
-    def test_payload_file_is_read_once_and_unlinked(self):
-        payload = self.reserve / 'ledger' / 'pending' / 'tok.cmd'
-        payload.parent.mkdir(parents=True, exist_ok=True)
-        payload.write_text('echo from-file'); payload.chmod(0o600)
-        result = subprocess.run([sys.executable, AH, 'run', '--task', 't1', '--token', 'tok', '--no-unit', '--cmd-file', str(payload)],
-                                env=self.env, capture_output=True, text=True, timeout=30)
-        self.assertEqual((result.returncode, result.stdout.strip()), (0, 'from-file'))
-        self.assertFalse(payload.exists())
-
     def test_base64_transport(self):
         import base64
         encoded = base64.b64encode(b"printf '%s\\n' \"it's $HOME-free\"").decode()
@@ -395,16 +386,6 @@ class RewriteHook(HookFixture):
         self.assertIn('settings.json line 5', out['additionalContext'])
         self.assertEqual(self.decide('echo ok')['permissionDecision'], 'ask')  # a committed rule degrades every command to ask
 
-    def test_recovery_passthrough(self):
-        for command in ('python3 harness/reserve.py status', 'python3 /x/reclaim.py plan', 'ah-run kill --task t1',
-                        'python3 /x/ah_run.py kill --agent a', 'harness doctor', 'python3 harness/install.py --apply --role dev',
-                        'harness doctor && python3 harness/reserve.py status'):
-            out = self.decide(command)
-            self.assertEqual(out['permissionDecision'], 'allow', command); self.assertNotIn('updatedInput', out, command)
-        self.assertIn('updatedInput', self.decide('python3 harness/install.py --dry-run'))
-        self.assertIn('updatedInput', self.decide('harness doctor; echo hi'))
-        self.assertIn('updatedInput', self.decide('harness doctor $(echo x)'))
-
     def test_token_missing(self):
         result = subprocess.run([sys.executable, AH, 'run', '--task', 't1', '--agent', 'a1', '--token', 'N' * 24, '--no-unit', '--', 'echo hi'],
                                 env=self.env, capture_output=True, text=True, timeout=30)
@@ -622,6 +603,300 @@ class Equivalence(Fixture):
 
     def test_cwd_is_inherited(self):
         self.assertEqual(Path(self.both('pwd').stdout.strip()).resolve(), Path(self.temp.name).resolve())
+
+
+class JobTable(Fixture):
+    """B3: the watchdog is not a job of the user's shell, so wait, jobs and $! behave as without ah-run."""
+    SHELLS = [s for s in ('/bin/bash', '/bin/zsh') if os.access(s, os.X_OK)]
+
+    def run_in(self, shell, command):
+        started = time.monotonic()
+        env = {**self.env, 'CLAUDE_CODE_SHELL': shell}
+        token = ah_run.mint_pending(self.reserve, command, 't1', 'a1')
+        result = subprocess.run([sys.executable, AH, 'run', '--task', 't1', '--agent', 'a1', '--token', token, '--no-unit', '--', command],
+                                env=env, capture_output=True, text=True, timeout=20)
+        return result, time.monotonic() - started
+
+    def test_bare_wait_returns_after_a_subshell_background_job(self):
+        for shell in self.SHELLS:
+            result, elapsed = self.run_in(shell, '(sleep 1 &); wait')
+            self.assertEqual(result.returncode, 0, shell); self.assertLess(elapsed, 3.5, shell)
+
+    def test_dollar_bang_is_one_pid_and_wait_returns(self):
+        for shell in self.SHELLS:
+            result, elapsed = self.run_in(shell, 'sleep 1 & echo $!; wait')
+            self.assertEqual(result.returncode, 0, shell); self.assertLess(elapsed, 3.5, shell)
+            lines = result.stdout.split()
+            self.assertEqual(len(lines), 1, (shell, result.stdout)); self.assertTrue(lines[0].isdigit())
+
+    def test_jobs_prints_nothing_extra(self):
+        for shell in self.SHELLS:
+            result, _ = self.run_in(shell, 'jobs')
+            self.assertEqual((result.returncode, result.stdout), (0, ''), shell)
+
+    def test_row_names_the_watchdog_pid_and_it_is_gone_after_the_run(self):
+        self.run_in('/bin/bash', 'true')
+        pid = self.rows()[0]['watchdog']
+        self.assertIsInstance(pid, int); self.assertTrue(self.wait_gone(pid))
+
+    def test_watchdog_joins_the_child_group_or_is_recorded_null(self):
+        with mock.patch.object(ah_run.os, 'setpgid', side_effect=OSError('denied')):
+            self.assertIsNone(ah_run.start_watchdog(os.getpgid(0)))
+        child = subprocess.Popen(['sleep', '30'], preexec_fn=os.setpgrp)
+        self.addCleanup(child.wait); self.addCleanup(child.kill)
+        watchdog = ah_run.start_watchdog(child.pid)
+        self.addCleanup(watchdog.wait); self.addCleanup(watchdog.kill)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and os.getpgid(watchdog.pid) != child.pid:
+            time.sleep(0.05)
+        self.assertEqual(os.getpgid(watchdog.pid), child.pid)
+
+
+class Recovery(HookFixture):
+    """B2: recovery commands skip the rewrite but still need an allow rule, and only in the plain form."""
+    HOOKS_DIR = str(HOOKS)
+
+    def rule(self, text):
+        self.settings('user', allow=['Bash(%s:*)' % text])
+
+    def test_plain_with_a_rule_is_allowed_unwrapped(self):
+        self.rule('python3 %s/reserve.py' % self.HOOKS_DIR)
+        out = self.decide('python3 %s/reserve.py status' % self.HOOKS_DIR)
+        self.assertEqual(out['permissionDecision'], 'allow'); self.assertNotIn('updatedInput', out)
+        self.assertEqual(self.pending(), [])
+
+    def test_without_a_rule_it_asks_and_is_not_rewritten(self):
+        out = self.decide('python3 %s/reserve.py status' % self.HOOKS_DIR)
+        self.assertEqual(out['permissionDecision'], 'ask'); self.assertNotIn('updatedInput', out)
+        self.assertEqual(self.decide('python3 %s/reclaim.py plan' % self.HOOKS_DIR, permission_mode='dontAsk')['permissionDecision'], 'deny')
+
+    def test_installer_needs_apply_and_a_role(self):
+        self.rule('python3 harness/install.py')
+        out = self.decide('python3 harness/install.py --apply --role dev')
+        self.assertEqual(out['permissionDecision'], 'allow'); self.assertNotIn('updatedInput', out)
+        out = self.decide('python3 harness/install.py --apply')
+        self.assertIn('updatedInput', out); self.assertEqual(out['permissionDecision'], 'allow')  # ordinary: the rule admits it, wrapped
+
+    def test_sudo_redirection_pipeline_env_and_other_paths_are_ordinary(self):
+        self.settings('user', allow=['Bash(sudo:*)', 'Bash(python3:*)', 'Bash(reserve.py:*)', 'Bash(BASH_ENV=/x/y.sh:*)'])
+        base = 'python3 %s/reserve.py status' % self.HOOKS_DIR
+        for command in ('sudo ' + base, base + ' > out.txt', base + ' | cat', base + ' &', 'python3 /tmp/evil/reserve.py',
+                        'reserve.py', 'BASH_ENV=/x/y.sh ' + base, 'sudo harness doctor'):
+            out = self.decide(command)
+            self.assertIn('updatedInput', out, command)
+
+    def test_other_recovery_forms_with_rules(self):
+        self.settings('user', allow=['Bash(ah-run kill:*)', 'Bash(harness doctor)', 'Bash(harness doctor:*)'])
+        for command in ('ah-run kill --task t1', 'harness doctor'):
+            out = self.decide(command)
+            self.assertEqual(out['permissionDecision'], 'allow', command); self.assertNotIn('updatedInput', out, command)
+
+
+class ParserSync(HookFixture):
+    """B1: the hook splits commands the way the shell does, ANSI-C and locale quoting included."""
+    HIDDEN = "echo $'\\'' ; rm -rf x ; echo ''"
+
+    def test_ansi_c_quote_does_not_hide_a_command_from_deny(self):
+        self.settings('user', allow=['Bash(echo:*)'], deny=['Bash(rm:*)'])
+        self.assertEqual(self.decide(self.HIDDEN)['permissionDecision'], 'deny')
+
+    def test_ansi_c_quote_hiding_a_command_is_never_allowed(self):
+        self.settings('user', allow=['Bash(echo:*)'])
+        out = self.decide(self.HIDDEN)
+        self.assertEqual(out['permissionDecision'], 'ask')
+
+    def test_hidden_command_in_a_substitution_and_double_quote_forms(self):
+        self.settings('user', allow=['Bash(echo:*)'], deny=['Bash(rm:*)'])
+        for command in ("echo $(echo $'\\'' ; rm -rf x ; echo '')", "echo $'a\\'b' ; rm x", 'echo $"a" ; rm x'):
+            self.assertEqual(self.decide(command)['permissionDecision'], 'deny', command)
+
+    def test_benign_ansi_c_strings_are_allowed(self):
+        self.settings('user', allow=['Bash(echo:*)'])
+        for command in ("echo $'\\n'", "echo $'tab\\there' done", "echo $'it\\'s'", 'echo $"x y"', "echo $'\\x41\\101\\u00e9'"):
+            self.assertEqual(self.decide(command)['permissionDecision'], 'allow', command)
+
+    def test_unterminated_quotes_are_never_allowed(self):
+        self.settings('user', allow=['Bash(echo:*)'])
+        for command in ("echo 'abc", 'echo "abc', "echo $'abc", "echo $'\\'", "echo $'a\\x00b'"):
+            self.assertEqual(self.decide(command)['permissionDecision'], 'ask', command)
+
+    def test_escape_classifier_sees_through_ansi_c(self):
+        self.assertTrue(ah_run.classify_escapes("echo $'\\'' ; nohup x ; echo ''"))
+        self.assertEqual(ah_run.classify_escapes("echo $'nohup \\n' ; true"), [])
+
+
+class PermissionRules(HookFixture):
+    def test_ask_rules_see_through_wrappers_and_env_prefixes(self):
+        self.settings('user', allow=['Bash'], ask=['Bash(git push:*)'])
+        for command in ('git push origin main', 'FOO=1 git push origin main', 'timeout 60 git push', 'command git push',
+                        'env git push', 'sudo git push', 'exec git push'):
+            out = self.decide(command)
+            self.assertEqual(out['permissionDecision'], 'ask', command); self.assertIn('updatedInput', out, command)
+        self.assertEqual(self.decide('git status')['permissionDecision'], 'allow')
+
+    def test_deny_sees_through_wrappers_and_quoting(self):
+        self.settings('user', allow=['Bash'], deny=['Bash(rm:*)'])
+        for command in ('timeout -s KILL 5 rm -rf x', 'timeout --kill-after=2 5 rm x', 'sudo rm -rf x', 'sudo -u root rm x', 'exec rm x',
+                        '"rm" -rf x', "'rm' x", '\\rm x', 'env FOO=1 rm x', 'env -i rm x', 'nohup rm x', 'command -p rm x',
+                        'time rm x', 'nice -n 5 rm x', 'sudo -n timeout 5 rm x', 'FOO=1 sudo rm x'):
+            self.assertEqual(self.decide(command)['permissionDecision'], 'deny', command)
+        for command in ('echo rm', 'ls', 'sudo ls', 'timeout 5 sleep 1', '"echo" rm'):
+            self.assertNotEqual(self.decide(command).get('permissionDecision'), 'deny', command)
+
+
+class PendingHygiene(HookFixture):
+    """S2: pending rows and payloads exist only for a command that will run, and expire."""
+    BIG = 'echo ' + 'A' * (70 * 1024) + ' --password hunter2'
+
+    def files(self):
+        return sorted(p.name for p in (self.reserve / 'ledger' / 'pending').glob('*'))
+
+    def test_deny_leaves_nothing_behind(self):
+        self.settings('user', deny=['Bash(rm:*)'])
+        self.assertEqual(self.decide(self.BIG + '; rm x')['permissionDecision'], 'deny')
+        self.assertEqual(self.files(), [])
+
+    def test_dont_ask_refusal_leaves_nothing_behind(self):
+        out = self.decide(self.BIG, permission_mode='dontAsk')
+        self.assertEqual(out['permissionDecision'], 'deny'); self.assertEqual(self.files(), [])
+
+    def test_ask_writes_a_row_and_a_payload(self):
+        out = self.decide(self.BIG)
+        self.assertEqual(out['permissionDecision'], 'ask'); self.assertEqual(len(self.files()), 2)
+
+    def age(self, path, seconds):
+        old = time.time() - seconds
+        os.utime(path, (old, old))
+
+    def test_prune_removes_expired_rows_and_payloads_only(self):
+        fresh = ah_run.mint_pending(self.reserve, 'echo a', 't', 'a')
+        stale = ah_run.mint_pending(self.reserve, 'echo b', 't', 'a')
+        pend = self.reserve / 'ledger' / 'pending'
+        (pend / (stale + '.cmd')).write_text('secret'); self.age(pend / (stale + '.cmd'), 2 * ah_run.PENDING_TTL)
+        self.age(pend / (stale + '.json'), 2 * ah_run.PENDING_TTL)
+        self.assertEqual(ah_run.prune_pending(self.reserve), 2)
+        self.assertEqual(self.files(), [fresh + '.json'])
+
+    def test_ledger_prune_command_and_run_start_prune(self):
+        pend = self.reserve / 'ledger' / 'pending'; pend.mkdir(parents=True, exist_ok=True)
+        for name in ('old1.cmd', 'old2.json'):
+            (pend / name).write_text('x'); self.age(pend / name, 2 * ah_run.PENDING_TTL)
+        result = subprocess.run([sys.executable, AH, 'ledger', '--prune'], env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(json.loads(result.stdout), {'pruned': 2})
+        (pend / 'old3.cmd').write_text('x'); self.age(pend / 'old3.cmd', 2 * ah_run.PENDING_TTL)
+        subprocess.run([sys.executable, AH, 'run', '--no-unit', '--', 'true'], env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(self.files(), [])
+
+
+class LedgerFailure(Fixture):
+    """S5: a reserve that cannot be written never stops the command or changes its exit code."""
+
+    def run_plain(self, command, env=None):
+        return subprocess.run([sys.executable, AH, 'run', '--task', 't1', '--no-unit', '--', command], env=env or self.env,
+                              capture_output=True, text=True, timeout=30)
+
+    def test_read_only_ledger_dir_passes_the_exit_code_through(self):
+        (self.reserve / 'ledger' / 'pending').mkdir(parents=True)
+        os.chmod(self.reserve / 'ledger', 0o500); self.addCleanup(os.chmod, self.reserve / 'ledger', 0o700)
+        result = self.run_plain('echo ran; exit 3')
+        self.assertEqual((result.returncode, result.stdout), (3, 'ran\n')); self.assertNotIn('Traceback', result.stderr)
+
+    def test_symlinked_reserve_still_runs_the_command(self):
+        link = Path(self.temp.name) / 'link'; link.symlink_to(self.reserve)
+        result = self.run_plain('echo ran; exit 4', env={**self.env, 'AGENT_HARNESS_RESERVE_DIR': str(link)})
+        self.assertEqual((result.returncode, result.stdout), (4, 'ran\n')); self.assertNotIn('Traceback', result.stderr)
+
+    def test_a_row_that_lands_late_is_retried_at_the_end(self):
+        real = ah_run.Ledger.write
+        calls = []
+        def flaky(self_, run_id, row):
+            calls.append(row.get('end'))
+            if len(calls) == 1:
+                raise OSError(28, 'no space')
+            return real(self_, run_id, row)
+        with mock.patch.object(ah_run.Ledger, 'write', flaky):
+            with mock.patch.dict(os.environ, {'AGENT_HARNESS_RESERVE_DIR': str(self.reserve)}):
+                args = ah_run.argparse.Namespace(task='t1', agent=None, ticket=None, session=None, token=None, cmd_file=None, cmd_b64=None,
+                                                 command_class=None, remote_host_sha256=None, task_source=None, readonly=False,
+                                                 no_unit=True, command=['exit 5'])
+                self.assertEqual(ah_run.launch(args), 5)
+        self.assertEqual(len(calls), 2); self.assertEqual(self.rows()[0]['exit_code'], 5)
+
+
+class TaskSource(HookFixture):
+    """S6: the model cannot pick its own task key per call."""
+
+    def with_description(self, text, env=None, **extra):
+        payload = self.payload('echo hi', **extra)
+        payload['tool_input']['description'] = text
+        return ah_run.decide(payload, home=str(self.home), env=env or {}, ancestors=lambda: [])['hookSpecificOutput']
+
+    def test_environment_task_wins_over_the_description(self):
+        out = self.with_description('x [task:evil]', env={'AGENT_HARNESS_TASK': 'envtask'})
+        self.assertIn('--task envtask', out['updatedInput']['command']); self.assertNotIn('task-source', out['updatedInput']['command'])
+
+    def test_subagent_record_wins_and_a_recordless_subagent_gets_a_generated_key(self):
+        record = self.reserve / 'subagents'; record.mkdir()
+        (record / 'ag-1.json').write_text(json.dumps({'task': 'rec-task'}))
+        out = self.with_description('x [task:evil]', agent_id='ag-1')
+        self.assertIn('--task rec-task', out['updatedInput']['command'])
+        out = self.with_description('x [task:evil]', agent_id='ag-2')
+        self.assertNotIn('evil', out['updatedInput']['command']); self.assertIn('--task auto-', out['updatedInput']['command'])
+
+    def test_main_session_input_token_is_used_and_marked(self):
+        out = self.with_description('x [task:from-input]')
+        wrapped = out['updatedInput']['command']
+        self.assertIn('--task from-input', wrapped); self.assertIn('--task-source input', wrapped)
+        subprocess.run(['/bin/sh', '-c', wrapped], env={**self.env, 'AGENT_HARNESS_RESERVE_DIR': str(self.reserve)}, capture_output=True, timeout=30)
+        self.assertEqual(self.rows()[0]['task_source'], 'input')
+
+
+class PayloadFile(Fixture):
+    """S7: --cmd-file is only <reserve>/ledger/pending/<token>.cmd, opened without following links."""
+
+    def setUp(self):
+        super().setUp()
+        self.token = ah_run.mint_pending(self.reserve, 'echo from-file', 't1', 'a1')
+        self.payload = self.reserve / 'ledger' / 'pending' / (self.token + '.cmd')
+
+    def run_file(self, path, token=None):
+        return subprocess.run([sys.executable, AH, 'run', '--task', 't1', '--agent', 'a1', '--token', token or self.token, '--no-unit',
+                               '--cmd-file', str(path)], env=self.env, capture_output=True, text=True, timeout=30)
+
+    def write(self, text='echo from-file'):
+        self.payload.write_text(text); self.payload.chmod(0o600)
+
+    def test_verified_payload_runs_and_is_unlinked(self):
+        self.write()
+        result = self.run_file(self.payload)
+        self.assertEqual((result.returncode, result.stdout), (0, 'from-file\n')); self.assertFalse(self.payload.exists())
+        self.assertEqual(self.rows()[0]['attribution'], 'verified')
+
+    def test_digest_mismatch_runs_unverified_and_keeps_the_file_for_pruning(self):
+        self.write('echo swapped')
+        result = self.run_file(self.payload)
+        self.assertEqual(self.rows()[0]['attribution_reason'], 'token-command-mismatch'); self.assertTrue(self.payload.exists())
+
+    def test_a_path_outside_pending_is_refused_and_survives(self):
+        other = Path(self.temp.name) / 'victim.txt'; other.write_text('echo owned')
+        result = self.run_file(other)
+        self.assertEqual(result.returncode, 126); self.assertTrue(other.exists()); self.assertNotIn('owned', result.stdout)
+        elsewhere = self.reserve / 'ledger' / 'pending' / 'other.cmd'; elsewhere.write_text('echo x')
+        self.assertEqual(self.run_file(elsewhere).returncode, 126); self.assertTrue(elsewhere.exists())
+
+    def test_a_symlink_payload_is_refused(self):
+        target = Path(self.temp.name) / 'target.txt'; target.write_text('echo from-file')
+        self.payload.symlink_to(target)
+        result = self.run_file(self.payload)
+        self.assertEqual(result.returncode, 126); self.assertTrue(target.exists()); self.assertEqual(result.stdout, '')
+
+    def test_a_hard_linked_payload_is_refused(self):
+        self.write(); os.link(self.payload, Path(self.temp.name) / 'second-name')
+        self.assertEqual(self.run_file(self.payload).returncode, 126)
+
+    def test_a_token_that_is_not_a_token_is_refused(self):
+        self.write()
+        self.assertEqual(self.run_file(self.payload, token='tok').returncode, 126)
 
 
 # ---------------------------------------------------------------------------------------------------------

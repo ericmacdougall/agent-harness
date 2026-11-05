@@ -36,7 +36,12 @@
     {"id": "env-u-glued", "cmd": "env -uAGENT_HARNESS_SESSION ./serve"},
     {"id": "bash-c-nohup", "cmd": "bash -c 'nohup ./serve'"},
     {"id": "substitution-nohup", "cmd": "echo $(nohup ./serve)"},
-    {"id": "unterminated-quote-is-parse-failure", "cmd": "echo 'unterminated"}
+    {"id": "unterminated-quote-is-parse-failure", "cmd": "echo 'unterminated"},
+    {"id": "env-iu-combined", "cmd": "env -iu FOO sleep 9"},
+    {"id": "env-split-string", "cmd": "env -S 'nohup sleep 9'"},
+    {"id": "unset-task", "cmd": "unset AGENT_HARNESS_TASK; sleep 9"},
+    {"id": "export-task", "cmd": "export AGENT_HARNESS_TASK=other"},
+    {"id": "sudo-user-nohup", "cmd": "sudo -u root nohup sleep 9"}
   ],
   "allowed": [
     {"id": "subshell-amp-then-wait", "cmd": "(sleep 5 &) ; wait"},

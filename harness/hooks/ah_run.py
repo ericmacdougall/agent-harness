@@ -24,6 +24,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -215,22 +216,60 @@ def shell_quote(value):
     return "'" + str(value).replace("'", "'\\''") + "'"
 
 
-def read_command(args):
-    """The command text, from argv, a base64 argument or the pending payload file (unlinked after reading)."""
+WATCHDOG_CODE = (
+    'import os, signal, sys, time\n'
+    'sup, pgid, grace = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])\n'
+    'while os.getppid() == sup:\n'
+    '    time.sleep(0.5)\n'
+    'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+    'try:\n'
+    '    os.killpg(pgid, signal.SIGTERM)\n'
+    'except OSError:\n'
+    '    pass\n'
+    'time.sleep(grace)\n'
+    'try:\n'
+    '    os.killpg(pgid, signal.SIGKILL)\n'
+    'except OSError:\n'
+    '    pass\n')
+
+
+def start_watchdog(pgid):
+    """A sibling process in the child's group (not a job of the user's shell, so `wait`, `jobs` and `$!` are untouched):
+    when the supervisor disappears, even by SIGKILL, it ends the group (SIGTERM, then SIGKILL after KILL_GRACE).
+    The supervisor stops it on a normal end. Returns the Popen, or None when the group cannot be joined."""
+    def join_group():
+        os.setpgid(0, pgid)
+    try:
+        return subprocess.Popen([sys.executable, '-S', '-c', WATCHDOG_CODE, str(os.getpid()), str(pgid), str(KILL_GRACE)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                preexec_fn=join_group)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def read_command(args, root=None):
+    """(command text, payload path or None). A payload file is accepted only as <reserve>/ledger/pending/<token>.cmd,
+    opened with O_NOFOLLOW and checked on the descriptor (regular file, our uid, one link); it is read once and the
+    caller unlinks it only after the token's digest matches."""
     if args.cmd_b64:
-        return base64.b64decode(args.cmd_b64.encode('ascii')).decode('utf-8', 'replace')
+        return base64.b64decode(args.cmd_b64.encode('ascii')).decode('utf-8', 'replace'), None
     if args.cmd_file:
-        path = Path(args.cmd_file)
-        info = os.stat(path, follow_symlinks=False)
-        if os.path.islink(path) or info.st_size > (1 << 20):
-            raise RuntimeError('command payload unsafe or oversized')
-        text = path.read_bytes().decode('utf-8', 'replace')  # input-ok: size checked above
+        if not TOKEN_RE.fullmatch(args.token or '') or root is None:
+            raise RuntimeError('a command payload needs a hook token')
+        expected = os.path.abspath(pending_dir(root) / (args.token + '.cmd'))
+        if os.path.abspath(args.cmd_file) != expected:
+            raise RuntimeError('command payload is not a pending payload of this token')
         try:
-            os.unlink(path)
+            fd = os.open(expected, os.O_RDONLY | os.O_NOFOLLOW)
         except OSError:
-            pass
-        return text
-    return ' '.join(args.command)
+            raise RuntimeError('command payload cannot be opened')
+        with os.fdopen(fd, 'rb') as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_size > (1 << 20):
+                raise RuntimeError('command payload unsafe or oversized')
+            text = handle.read(info.st_size + 1).decode('utf-8', 'replace')  # input-ok: size checked above
+        return text, expected
+    return ' '.join(args.command), None
 
 
 PENDING_TTL = 600
@@ -241,9 +280,27 @@ def pending_dir(root):
     return Path(root) / 'ledger' / 'pending'
 
 
+def prune_pending(root, ttl=None):
+    """Remove pending token rows, payloads and leftovers older than the TTL; returns the count removed."""
+    ttl = PENDING_TTL if ttl is None else ttl
+    removed, cutoff = 0, time.time() - ttl
+    try:
+        entries = list(os.scandir(pending_dir(root)))
+    except OSError:
+        return 0
+    for entry in entries[:20000]:
+        try:
+            if entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                os.unlink(entry.path); removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def mint_pending(root, command, task, agent, session='none'):
     """Write a single-use pending row for a hook-wrapped command; return the token."""
-    token = secrets.token_urlsafe(18)
+    token = secrets.token_urlsafe(18).lstrip('-') or 'x'  # a leading '-' would be read as an option by `--token VALUE`
+    token = token + 'x' * (16 - len(token)) if len(token) < 16 else token
     row = {'schema': SCHEMA, 'command_sha256': digest(command), 'task': task, 'agent': agent, 'session': session,
            'created': time.time(), 'expires': time.time() + PENDING_TTL}
     directory = pending_dir(root)
@@ -284,10 +341,30 @@ def consume_pending(root, token, command, task, agent):
     return 'verified', None
 
 
+def _ledger_write(ledger, run_id, row):
+    """False when the row could not be written (full disk, read-only or symlinked reserve): the command still runs."""
+    if ledger is None:
+        return False
+    try:
+        ledger.write(run_id, row)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def launch(args):
-    ledger = Ledger()
+    try:
+        ledger = Ledger()
+    except (OSError, RuntimeError):
+        ledger = None  # a symlinked or unwritable reserve must not stop the command (S5)
+    if ledger is not None:
+        prune_pending(ledger.root)
     run_id = secrets.token_hex(16)
-    command = read_command(args)
+    try:
+        command, payload_path = read_command(args, ledger.root if ledger else None)
+    except (RuntimeError, OSError, ValueError) as error:
+        print('ah-run: refused: %s' % (error if isinstance(error, RuntimeError) else type(error).__name__), file=sys.stderr)
+        return 126
     task = safe_key(args.task, 'auto-' + digest(command)[:16])
     agent = safe_key(args.agent, 'main')
     ticket = safe_key(args.ticket, 'none')
@@ -298,11 +375,7 @@ def launch(args):
     if args.readonly:
         env['AGENT_HARNESS_READONLY'] = '1'
     env['AH_SUPERVISOR'] = str(os.getpid())
-    # A watchdog inside the child's own group: when the supervisor (this process) disappears, even by
-    # SIGKILL, the group terminates itself; it exits on its own once the group is gone.
-    watchdog = ('( while kill -0 "$AH_SUPERVISOR" 2>/dev/null; do sleep 1; done; '
-                'kill -TERM -- -$$ 2>/dev/null; sleep %d; kill -KILL -- -$$ 2>/dev/null ) &\n' % int(KILL_GRACE))
-    script = prelude + watchdog + command
+    script = prelude + command
     use_unit = user_bus_answers() and not args.no_unit
     unit = 'ah-run-' + run_id if use_unit else None
     argv = [shell, '-c', script]
@@ -310,29 +383,40 @@ def launch(args):
         argv = ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--unit', unit, *argv]
     if args.token == 'via-hook-ssh':
         attribution, why = 'hook-ssh', None
-    elif args.token:
+    elif args.token and ledger is not None:
         attribution, why = consume_pending(ledger.root, args.token, command, task, agent)
+    elif args.token:
+        attribution, why = 'unverified', 'ledger-unavailable'
     else:
         attribution, why = 'unverified', 'no-token'
+    if payload_path and attribution == 'verified':
+        try:
+            os.unlink(payload_path)  # only after the digest matched the pending row
+        except OSError:
+            pass
     if args.readonly and attribution == 'unverified':
         print('ah-run: a read-only agent run needs a hook token; refused', file=sys.stderr)
         return 126
     row = {'schema': SCHEMA, 'run_id': run_id, 'task': task, 'agent': agent, 'ticket': ticket, 'session': session,
+           'task_source': args.task_source if args.task_source in ('input', 'record') else None,
            'attribution': attribution, 'attribution_reason': why, 'readonly': bool(args.readonly), 'host': host_identity(),
            'command_sha256': digest(command), 'command_class': args.command_class or 'unclassified',
            'remote_host_sha256': safe_hex(args.remote_host_sha256),
            'cwd_sha256': digest(os.getcwd()), 'started_at': now(), 'supervisor_pid': os.getpid(),
            'supervisor_start': process_start_token(os.getpid()), 'unit': unit, 'end': None}
     try:
-        child = subprocess.Popen(argv, env=env, start_new_session=True)
+        # own process group, same session, so the watchdog (a sibling) can join it with setpgid
+        child = subprocess.Popen(argv, env=env, preexec_fn=os.setpgrp)
     except OSError as error:
         row.update(end=now(), exit_code=127, error=type(error).__name__)
-        ledger.write(run_id, row)
+        _ledger_write(ledger, run_id, row)
         print('ah-run: cannot start the shell: %s' % type(error).__name__, file=sys.stderr)
         return 127
-    pgid = child.pid  # a new session makes the child its own group leader
-    row.update(pid=child.pid, pgid=pgid, start_token=process_start_token(child.pid))
-    ledger.write(run_id, row)
+    pgid = child.pid  # setpgrp made the child its own group leader
+    watchdog = start_watchdog(pgid)
+    row.update(pid=child.pid, pgid=pgid, start_token=process_start_token(child.pid),
+               watchdog=watchdog.pid if watchdog else None)
+    written = _ledger_write(ledger, run_id, row)
     state = {'signal': None, 'parent_died': False}
 
     def forward(signum, frame):
@@ -360,12 +444,18 @@ def launch(args):
         kill_group(pgid, signal.SIGTERM); code = child.wait()
     if state['signal'] is not None and child.poll() is None:
         time.sleep(KILL_GRACE); kill_group(pgid, signal.SIGKILL)
-    tree = pid_tree(pgid)
+    if watchdog is not None:  # normal end: the watchdog's job is done
+        try:
+            watchdog.kill(); watchdog.wait(timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    tree = [entry for entry in pid_tree(pgid) if not (watchdog and entry['pid'] == watchdog.pid)]
     kill_group(pgid, signal.SIGTERM)  # leftovers of a finished leader are not part of the result
     usage = resource_usage()
     row.update(end=now(), exit_code=code, signal=state['signal'], parent_died=state['parent_died'],
                rusage=usage, pid_tree=tree)
-    ledger.write(run_id, row)
+    if not _ledger_write(ledger, run_id, row):  # retry once; a row that never lands is noted, never fatal
+        _warn_row('ledger-unwritable', run_id, guard='ledger')
     if code < 0:
         return 128 + (-code)
     return code
@@ -512,6 +602,9 @@ def kill(args):
 
 def ledger_cmd(args):
     ledger = Ledger()
+    if args.prune:
+        print(json.dumps({'pruned': prune_pending(ledger.root)}))
+        return 0
     rows = [row for row in ledger.rows() if (not args.task or row.get('task') == args.task)]
     if args.live:
         rows = [row for row in rows if row.get('end') is None]
@@ -613,15 +706,118 @@ def _mask_redirect_amps(text):
     return ''.join(out)
 
 
+ANSI_SIMPLE = {'a': '\a', 'b': '\b', 'e': '\x1b', 'E': '\x1b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t', 'v': '\v',
+               '\\': '\\', "'": "'", '"': '"', '?': '?'}
+
+
+def _decode_ansi_c(text, i):
+    """(value, index after the closing quote) for the $'...' string whose body starts at text[i]; ValueError when it is
+    unterminated or its value cannot be modelled (NUL ends a shell string early)."""
+    out, n = [], len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "'":
+            return ''.join(out), i + 1
+        if ch != '\\' or i + 1 >= n:
+            out.append(ch); i += 1
+            continue
+        nxt = text[i + 1]
+        if nxt in ANSI_SIMPLE:
+            out.append(ANSI_SIMPLE[nxt]); i += 2
+        elif nxt in '01234567':
+            digits = re.match(r'[0-7]{1,3}', text[i + 1:]).group()
+            value = int(digits, 8) & 0xFF
+            if value == 0:
+                raise ValueError('NUL in an ANSI-C string')
+            out.append(chr(value)); i += 1 + len(digits)
+        elif nxt in 'xuU':
+            digits = re.match(r'[0-9a-fA-F]{1,%d}' % {'x': 2, 'u': 4, 'U': 8}[nxt], text[i + 2:])
+            if not digits:
+                out.append('\\' + nxt); i += 2
+                continue
+            value = int(digits.group(), 16)
+            if value == 0:
+                raise ValueError('NUL in an ANSI-C string')
+            out.append(chr(value)); i += 2 + len(digits.group())
+        elif nxt == 'c' and i + 2 < n:
+            if ord(text[i + 2]) & 0x1f == 0:
+                raise ValueError('NUL in an ANSI-C string')
+            out.append(chr(ord(text[i + 2]) & 0x1f)); i += 3
+        else:
+            out.append('\\' + nxt); i += 2
+    raise ValueError('unterminated $\'')
+
+
+def _deansi_group(text, i, out):
+    """Copy the substitution or process substitution at text[i] into out, normalizing its body; return the next index."""
+    if text[i] == '`':
+        end = text.find('`', i + 1)
+        if end < 0:
+            raise ValueError('unterminated backtick')
+        body, ok = deansi(text[i + 1:end])
+        if not ok:
+            raise ValueError('inner quoting')
+        out.append('`' + body + '`')
+        return end + 1
+    end = _skip_group(text, i + 1)
+    if end > len(text) or text[end - 1] != ')':
+        raise ValueError('unterminated substitution')
+    body, ok = deansi(text[i + 2:end - 1])
+    if not ok:
+        raise ValueError('inner quoting')
+    out.append(text[i:i + 2] + body + ')')
+    return end
+
+
+def deansi(text):
+    """(text, ok): every $'...' word rewritten as an equivalent single-quoted word, so the splitter, the matcher and
+    the classifier all read what the shell reads. ok is False for any quoting that cannot be tokenized with certainty
+    (unterminated quotes, substitutions or ANSI-C strings, NUL escapes); callers then never answer allow."""
+    out, i, n, quote = [], 0, len(text), None
+    try:
+        while i < n:
+            ch = text[i]
+            if quote == "'":
+                out.append(ch); i += 1
+                quote = None if ch == "'" else quote
+            elif ch == '\\':
+                out.append(text[i:i + 2]); i += 2
+            elif quote == '"':
+                if ch == '"':
+                    quote = None; out.append(ch); i += 1
+                elif ch == '`' or text.startswith('$(', i):
+                    i = _deansi_group(text, i, out)
+                else:
+                    out.append(ch); i += 1
+            elif ch in '\'"':
+                quote = ch; out.append(ch); i += 1
+            elif text.startswith("$'", i):
+                value, i = _decode_ansi_c(text, i + 2)
+                out.append(shell_quote(value))
+            elif ch == '#' and (i == 0 or text[i - 1] in ' \t\n'):
+                end = text.find('\n', i)
+                end = n if end < 0 else end
+                out.append(text[i:end]); i = end
+            elif ch == '`' or text.startswith('$(', i) or text[i:i + 2] in ('<(', '>('):
+                i = _deansi_group(text, i, out)
+            else:
+                out.append(ch); i += 1
+    except ValueError:
+        return text, False
+    return ''.join(out), quote is None
+
+
 class Parsed:
     def __init__(self):
         self.segments, self.inner, self.substitution, self.newline = [], [], False, False
+        self.uncertain, self.pipeline = False, False  # quoting not modelled with certainty; a `|` or `&` joins commands
 
 
 def parse_command(command, depth=0):
     """Split into simple-command strings (quote, heredoc and comment aware) and flag substitutions and newlines."""
     parsed = Parsed()
     text, bodies = _strip_heredocs(command.strip())
+    text, parsed.uncertain = deansi(text)[0], not deansi(text)[1]
     parsed.substitution = any(not quoted and re.search(r'\$\(|`', body) for body, quoted in bodies)
     cur, i, n, quote = [], 0, len(text), None
 
@@ -668,14 +864,19 @@ def parse_command(command, depth=0):
         elif ch == '&' and ((i > 0 and text[i - 1] in '<>') or text[i + 1:i + 2] == '>'):
             cur.append(ch); i += 1
         elif ch in '&|':
+            if text[i:i + 2] not in ('&&', '||'):
+                parsed.pipeline = True
             cut(); i += 2 if text[i + 1:i + 2] in ('&', '|') else 1
         else:
             cur.append(ch); i += 1
     cut()
+    if quote:
+        parsed.uncertain = True
     if depth < 4:
         for body in inner_commands(text):
             sub = parse_command(body, depth + 1)
             parsed.inner.extend(sub.segments + sub.inner)
+            parsed.uncertain = parsed.uncertain or sub.uncertain
     return parsed
 
 
@@ -687,16 +888,121 @@ def normalize_segment(segment):
         segment = stripped
 
 
+def _spans(text):
+    """[(start, end)] of the words of text, quote aware; ValueError on an unbalanced quote."""
+    spans, i, n = [], 0, len(text)
+    while i < n:
+        while i < n and text[i] in ' \t':
+            i += 1
+        if i >= n:
+            break
+        start, quote = i, None
+        while i < n and (quote or text[i] not in ' \t'):
+            ch = text[i]
+            if quote:
+                if ch == '\\' and quote == '"' and i + 1 < n:
+                    i += 1
+                elif ch == quote:
+                    quote = None
+            elif ch == '\\' and i + 1 < n:
+                i += 1
+            elif ch in '\'"':
+                quote = ch
+            i += 1
+        if quote:
+            raise ValueError('unbalanced quote')
+        spans.append((start, i))
+    return spans
+
+
+SUDO_ARG_OPTS = frozenset(('-u', '-g', '-h', '-p', '-C', '-D', '-R', '-T', '-U', '-r', '-t'))
+
+
+def _unquote_program(text):
+    """text with its first word unquoted (`"rm" -rf` -> `rm -rf`, `\\rm` -> `rm`), or None when nothing changes."""
+    try:
+        spans = _spans(text)
+        if not spans:
+            return None
+        raw = text[spans[0][0]:spans[0][1]]
+        _raw, value, dynamic = raw_words(raw)[0]
+    except (ValueError, IndexError):
+        return None
+    if dynamic or value == raw or not value or re.search(r'\s', value):
+        return None
+    return value + text[spans[0][1]:]
+
+
+def peel_wrapper(text):
+    """The command with its first wrapper removed (an env assignment, exec/command/builtin/time/nohup, nice, sudo with
+    options, timeout with options and duration, env with options), or None when it starts with no wrapper."""
+    try:
+        spans = _spans(text)
+        if not spans:
+            return None
+
+        def val(k):
+            return raw_words(text[spans[k][0]:spans[k][1]])[0][1]
+        first = text[spans[0][0]:spans[0][1]]
+        base, k, count = val(0).rsplit('/', 1)[-1], 1, len(spans)
+        if ASSIGNMENT.match(first):
+            pass
+        elif base in ('exec', 'command', 'builtin', 'time', 'nohup'):
+            while k < count and val(k).startswith('-'):
+                k += 2 if val(k) == '-a' else 1
+        elif base == 'nice':
+            if k < count and val(k) == '-n':
+                k += 2
+            elif k < count and (re.fullmatch(r'-\d+', val(k)) or val(k).startswith('--adjustment')):
+                k += 1
+        elif base == 'sudo':
+            while k < count and val(k).startswith('-'):
+                option = val(k)
+                k += 2 if option in SUDO_ARG_OPTS else 1
+                if option == '--':
+                    break
+        elif base == 'timeout':
+            while k < count and val(k).startswith('-'):
+                k += 2 if val(k) in ('-s', '-k') else 1
+            k += 1
+        elif base == 'env':
+            while k < count:
+                word = val(k)
+                if word in ('-S', '--split-string') and k + 1 < count:
+                    rest = text[spans[k + 2][0]:] if k + 2 < count else ''
+                    return (val(k + 1) + ' ' + rest).strip()
+                if ASSIGNMENT.match(text[spans[k][0]:spans[k][1]]):
+                    k += 1
+                elif word in ('-u', '-C', '--unset', '--chdir'):
+                    k += 2
+                elif word.startswith('-') and len(word) > 1:
+                    k += 1
+                else:
+                    break
+        else:
+            return None
+        return text[spans[k][0]:] if k < count else None
+    except (ValueError, IndexError):
+        return None
+
+
 def match_candidates(segment):
-    """The segment as typed plus forms with leading env assignments and wrappers (timeout, nice...) removed."""
+    """The segment as typed plus every form with env assignments, wrappers (exec, command, time, nohup, nice, sudo,
+    timeout, env) and the quoting of the program word removed. A deny or ask rule matching any form applies."""
     forms, seen, current = [], set(), normalize_segment(segment)
-    for _ in range(6):
+    for _ in range(12):
         if current in seen:
             break
         seen.add(current); forms.append(current)
-        nxt = ENV_PREFIX.sub('', current, count=1)
-        if nxt == current:
-            nxt = WRAPPER_PREFIX.sub('', current, count=1)
+        bare = _unquote_program(current)
+        if bare and bare not in seen:
+            seen.add(bare); forms.append(bare)
+        base = bare or current
+        nxt = peel_wrapper(base)
+        if nxt is None:
+            nxt = ENV_PREFIX.sub('', base, count=1)
+            if nxt == base:
+                nxt = WRAPPER_PREFIX.sub('', base, count=1)
         current = normalize_segment(nxt)
     return forms
 
@@ -825,6 +1131,10 @@ def rule_line(rule):
 
 # -- escape classification -------------------------------------------------------------------------------
 
+def _is_attribution_key(key):
+    return key.startswith('AGENT_HARNESS_') or key == 'AGENT_ID'
+
+
 def _classify_words(words, reasons, notes, depth):
     """Name the escape (if any) in one simple command; wrappers (env, timeout, sudo...) are looked through."""
     index = 0
@@ -838,7 +1148,7 @@ def _classify_words(words, reasons, notes, depth):
         if name in ('command', 'exec', 'builtin', 'time', 'sudo', 'then', 'do', 'else', 'if', 'while', '!', '{'):
             index += 1
             while index < len(words) and words[index].startswith('-') and name in ('command', 'exec', 'time', 'sudo'):
-                index += 1
+                index += 2 if name == 'sudo' and words[index] in SUDO_ARG_OPTS else 1
             continue
         if name == 'nice':
             index += 1
@@ -860,16 +1170,33 @@ def _classify_words(words, reasons, notes, depth):
                 word = words[index]
                 if ASSIGNMENT.match(word):
                     index += 1
-                elif word in ('-i', '--ignore-environment') or (word.startswith('-') and not word.startswith('--') and 'i' in word[1:]
-                                                               and 'u' not in word[1:]):
-                    reasons.append('env -i clears the attribution environment'); index += 1
-                elif word in ('-u', '--unset') or (word.startswith('-u') and len(word) > 2) or word.startswith('--unset='):
-                    target = words[index + 1] if word in ('-u', '--unset') and index + 1 < len(words) else word.split('=', 1)[-1].lstrip('-u')
-                    if target.startswith('AGENT_HARNESS_') or target == 'AGENT_ID':
-                        reasons.append('env -u %s removes attribution' % target)
-                    index += 2 if word in ('-u', '--unset') else 1
-                elif word.startswith('-'):
-                    index += 1
+                elif word.startswith('--'):
+                    option, _eq, inline = word.partition('=')
+                    takes_next = option in ('--unset', '--split-string') and not _eq
+                    arg = inline if _eq else (words[index + 1] if takes_next and index + 1 < len(words) else '')
+                    if option == '--ignore-environment':
+                        reasons.append('env -i clears the attribution environment')
+                    elif option == '--unset' and _is_attribution_key(arg):
+                        reasons.append('env -u %s removes attribution' % arg)
+                    elif option == '--split-string':
+                        _classify_text(arg, reasons, notes, depth + 1, 'env -S: ')
+                    index += 2 if takes_next else 1
+                elif word.startswith('-') and len(word) > 1:
+                    letters, position, takes_next = word[1:], 0, False
+                    while position < len(letters):
+                        letter = letters[position]
+                        if letter == 'i':
+                            reasons.append('env -i clears the attribution environment')
+                        elif letter in 'uSC':
+                            takes_next = position + 1 == len(letters)
+                            arg = letters[position + 1:] if not takes_next else (words[index + 1] if index + 1 < len(words) else '')
+                            if letter == 'u' and _is_attribution_key(arg):
+                                reasons.append('env -u %s removes attribution' % arg)
+                            elif letter == 'S':
+                                _classify_text(arg, reasons, notes, depth + 1, 'env -S: ')
+                            break
+                        position += 1
+                    index += 2 if takes_next else 1
                 else:
                     break
             continue
@@ -878,6 +1205,10 @@ def _classify_words(words, reasons, notes, depth):
         return
     if name in ESCAPE_NAMES:
         reasons.append('%s detaches a process from tracking' % name)
+    elif name in ('unset', 'export', 'declare', 'typeset', 'readonly'):
+        for word in rest:
+            if _is_attribution_key(word.split('=', 1)[0]):
+                reasons.append('%s %s changes the attribution environment' % (name, word.split('=', 1)[0]))
     elif name == 'launchctl':
         sub = next((word for word in rest if not word.startswith('-')), '')
         if sub in LAUNCHCTL_ESCAPES:
@@ -938,6 +1269,7 @@ def _classify_text(command, reasons, notes, depth, prefix=''):
 def _classify_command(command, reasons, notes, depth):
     try:
         text, _bodies = _strip_heredocs(command.strip())
+        text = deansi(text)[0]
         entries = []
         for words, operator in _simple(_tokens(_mask_redirect_amps(text))):
             entries.append(([w[1].replace('\x01', '&') for w in words if w[0] == 'word'], operator))
@@ -998,27 +1330,52 @@ def escape_mode(home, env):
 
 # -- recovery commands and prefix stripping ----------------------------------------------------------------
 
-def is_recovery(segment):
-    """reserve.py, reclaim.py, `ah-run kill`, `harness doctor`, `install.py --apply`: never routed through the launcher."""
+ROLE_WORD = re.compile(r'^[A-Za-z0-9_-]+$')
+INTERPRETER = re.compile(r'^(?:(?:/usr/bin/|/usr/local/bin/|/opt/homebrew/bin/)?python3?(?:\.\d+)?)$')
+
+
+def _recovery_path_ok(path, home, repo_forms):
+    """The installed hooks directory (this file's, ~/.claude/hooks, ~/.codex/agent-harness) or an in-repo relative path."""
+    if path.startswith('~/'):
+        path = os.path.join(home, path[2:])
+    if '..' in path.split('/'):
+        return False
+    if os.path.isabs(path):
+        directory = os.path.dirname(os.path.normpath(path))
+        allowed = {str(Path(__file__).resolve().parent), os.path.join(home, '.claude', 'hooks'),
+                   os.path.join(home, '.codex', 'agent-harness')}
+        return directory in allowed
+    return path in repo_forms or ('./' + path) in repo_forms or path.startswith('./') and path[2:] in repo_forms
+
+
+def plain_recovery(segment, home):
+    """True only for the plain form of a recovery command: reserve.py, reclaim.py, `ah-run kill`, `harness doctor`,
+    `install.py --apply --role ROLE`, run as the user, at the installed or repo path, with no sudo, env assignment,
+    redirection or expansion. Any other shape is an ordinary command."""
+    if re.search(r'[<>$`*?\[\]{}|&;()!]', segment):
+        return False
     try:
         words = shlex.split(segment)
     except ValueError:
         return False
-    while words and (ASSIGNMENT.match(words[0]) or words[0] in ('sudo', 'command')):
+    if words and INTERPRETER.fullmatch(words[0]):
         words = words[1:]
-    if words and re.fullmatch(r'(?:\S*/)?python3?(?:\.\d+)?', words[0]):
-        words = words[1:]
-    if not words:
+    if not words or ASSIGNMENT.match(words[0]):
         return False
-    name, rest = words[0].rsplit('/', 1)[-1], words[1:]
+    path, rest = words[0], words[1:]
+    name = path.rsplit('/', 1)[-1]
     if name in RECOVERY_SCRIPTS:
-        return True
-    if name in ('ah_run.py', 'ah-run'):
-        return rest[:1] == ['kill']
+        return _recovery_path_ok(path, home, ('harness/%s' % name, 'harness/hooks/%s' % name, 'hooks/%s' % name))
+    if name == 'ah-run':
+        return path == 'ah-run' and rest[:1] == ['kill']
+    if name == 'ah_run.py':
+        return rest[:1] == ['kill'] and _recovery_path_ok(path, home, ('harness/hooks/ah_run.py',))
     if name == 'harness':
-        return rest[:1] == ['doctor']
+        return path == 'harness' and rest[:1] == ['doctor']
     if name == 'install.py':
-        return '--apply' in rest
+        if '--apply' not in rest or '--role' not in rest or rest.index('--role') + 1 >= len(rest):
+            return False
+        return bool(ROLE_WORD.match(rest[rest.index('--role') + 1])) and _recovery_path_ok(path, home, ('harness/install.py',))
     return False
 
 
@@ -1108,11 +1465,11 @@ def raw_words(text):
     return words
 
 
-def _warn_row(reason, target):
+def _warn_row(reason, target, guard='ssh-resolve'):
     """Append to <reserve>/warn.jsonl (AC-18 triage); a digest of the target, never the name."""
     try:
         root = reserve_root()
-        row = json.dumps({'at': now(), 'guard': 'ssh-resolve', 'reason': reason, 'target_sha256': digest(target)}, sort_keys=True)
+        row = json.dumps({'at': now(), 'guard': guard, 'reason': reason, 'target_sha256': digest(target)}, sort_keys=True)
         fd = os.open(root / 'warn.jsonl', os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'a') as handle:
             handle.write(row + '\n')
@@ -1247,36 +1604,70 @@ def _strings(value, skip_command=False, depth=0):
             yield from _strings(item, skip_command, depth + 1)
 
 
-def task_key(payload, env):
-    """AGENT_HARNESS_TASK, else a [task:KEY] token outside the command text, else a stable generated key."""
+def subagent_task(agent_id):
+    """The task the spawn recorded for this agent (<reserve>/subagents/<agent_id>.json), or None. Written when a subagent
+    starts (slice 7); a model cannot choose it per call."""
+    key = safe_key(agent_id, None)
+    if key is None or '/' in key:
+        return None
+    base = Path(os.environ.get('AGENT_HARNESS_RESERVE_DIR') or Path.home() / '.agent-harness' / 'reserve')
+    try:
+        fd = os.open(base / 'subagents' / (key + '.json'), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'rb') as handle:
+            row = json.loads(handle.read(4097)[:4096])
+    except (OSError, ValueError):
+        return None
+    task = row.get('task') if isinstance(row, dict) else None
+    return task if isinstance(task, str) and SAFE_KEY.fullmatch(task) else None
+
+
+def task_key_source(payload, env):
+    """(key, source). AGENT_HARNESS_TASK in the hook environment wins, then the spawn record for this agent_id, then a
+    [task:KEY] outside tool_input; a [task:KEY] in the tool input counts only for the main session (no agent_id) and is
+    marked `input`; else a stable generated key."""
     given = env.get('AGENT_HARNESS_TASK')
     if given and SAFE_KEY.fullmatch(given):
-        return given
+        return given, 'env'
+    agent_id = payload.get('agent_id')
+    recorded = subagent_task(agent_id) if agent_id else None
+    if recorded:
+        return recorded, 'record'
     for text in _strings({k: v for k, v in payload.items() if k != 'tool_input'}):
         found = TASK_TOKEN.search(text)
         if found:
-            return found.group(1)
-    for text in _strings(payload.get('tool_input'), skip_command=True):
-        found = TASK_TOKEN.search(text)
-        if found:
-            return found.group(1)
-    seed = '%s%s' % (payload.get('session_id') or '', payload.get('agent_id') or '')
-    return 'auto-' + digest(seed)[:12]
+            return found.group(1), 'payload'
+    if not agent_id:
+        for text in _strings(payload.get('tool_input'), skip_command=True):
+            found = TASK_TOKEN.search(text)
+            if found:
+                return found.group(1), 'input'
+    seed = '%s%s' % (payload.get('session_id') or '', agent_id or '')
+    return 'auto-' + digest(seed)[:12], 'generated'
+
+
+def task_key(payload, env):
+    return task_key_source(payload, env)[0]
+
+
+def check_payload_cap(command):
+    size = len(command.encode('utf-8'))
+    if size > PAYLOAD_CAP:
+        raise ValueError('command is %d bytes; the ah-run payload cap is %d bytes (1 MiB). Write it to a file and run the file.'
+                         % (size, PAYLOAD_CAP))
 
 
 def build_rewrite(command, payload, env, notes, context, remote=None):
     """The wrapped command and, when the pending row could be written, its token. Raises ValueError to deny."""
     raw = command.encode('utf-8')
-    if len(raw) > PAYLOAD_CAP:
-        raise ValueError('command is %d bytes; the ah-run payload cap is %d bytes (1 MiB). Write it to a file and run the file.'
-                         % (len(raw), PAYLOAD_CAP))
-    task = task_key(payload, env)
+    check_payload_cap(command)
+    task, task_source = task_key_source(payload, env)
     agent = safe_key(payload.get('agent_id'), 'main')
     session = safe_key(payload.get('session_id'), 'none')
     ticket = env.get('AGENT_HARNESS_TICKET')
     token, root = None, None
     try:
         root = reserve_root()
+        prune_pending(root)
         token = mint_pending(root, command, task, agent, session)
     except (OSError, RuntimeError):
         context.append('ah-run: the pending token row could not be written; attribution will be unverified')
@@ -1286,6 +1677,8 @@ def build_rewrite(command, payload, env, notes, context, remote=None):
     parts += ['--session', session]
     if token:
         parts += ['--token', token]
+    if task_source in ('input', 'record'):
+        parts += ['--task-source', task_source]
     if remote:
         parts += ['--command-class', remote[0], '--remote-host-sha256', remote[1]]
     elif 'pgid-split' in notes:
@@ -1330,8 +1723,18 @@ def decide(payload, home=None, env=None, ancestors=None):
             if any(rule.matches(form) for form in forms):
                 return _out('deny', 'denied by permission rule %s' % rule.label())
 
-    if parsed.segments and not parsed.substitution and not parsed.newline and all(is_recovery(s) for s in parsed.segments):
-        return _out('allow', 'recovery command runs unwrapped')
+    asked = any(rule.matches(form) for part in parsed.segments + parsed.inner for rule in rules['ask'] for form in match_candidates(part))
+    if (parsed.segments and not parsed.substitution and not parsed.newline and not parsed.uncertain and not parsed.pipeline
+            and all(plain_recovery(segment, home) for segment in parsed.segments)):
+        # exempt from the rewrite (and from the floor and heavy-command guards elsewhere), never from the allow rules
+        recovery_allows = rules['allow']  # a rule naming ah-run is meaningful here: `ah-run kill` is recovery
+        if not asked and all(any(rule.matches(normalize_segment(part)) for rule in recovery_allows) for part in parsed.segments):
+            return _out('allow', 'recovery command with a matching allow rule runs unwrapped')
+        if mode == 'bypassPermissions':
+            return _out(None, 'recovery command runs unwrapped')
+        if mode == 'dontAsk':
+            return _out('deny', 'no allow rule matches this recovery command and permission mode dontAsk refuses to ask')
+        return _out('ask', 'recovery command: no allow rule matches (run through its installed path or add a narrow rule)')
 
     reasons, notes = analyze_escapes(command)
     if reasons:
@@ -1348,26 +1751,41 @@ def decide(payload, home=None, env=None, ancestors=None):
 
     try:
         command, remote = rewrite_ssh(command, parsed, payload, env, home, context)
-        wrapped = build_rewrite(command, payload, env, notes, context, remote)
+        check_payload_cap(command)
+    except ValueError as error:
+        return _out('deny', 'ah-run: %s' % error)
+
+    committed = any(rule.source == 'project' for rule in ignored)  # F75: a committed ah-run rule degrades to ask
+    eligible = (bool(parsed.segments) and not committed and not parsed.substitution and not parsed.newline and not asked
+                and not parsed.uncertain and all(part.split(None, 1)[0] != 'eval' for part in parsed.segments)
+                and all(any(rule.matches(normalize_segment(part)) for rule in allows) for part in parsed.segments))
+    if mode == 'bypassPermissions':
+        decision = None
+    elif eligible:
+        decision = 'allow'
+    elif mode == 'dontAsk':
+        return _out('deny', 'no allow rule matches and permission mode dontAsk refuses to ask')  # nothing written for a refusal
+    else:
+        decision = 'ask'
+    try:
+        wrapped = build_rewrite(command, payload, env, notes, context, remote)  # the pending row and payload exist only now
     except ValueError as error:
         return _out('deny', 'ah-run: %s' % error)
     updated = {**(payload.get('tool_input') or {}), 'command': wrapped}
-
-    if mode == 'bypassPermissions':
-        return _out(None, None, updated, '\n'.join(context) or None)
-
-    asked = any(rule.matches(form) for part in parsed.segments for rule in rules['ask'] for form in [normalize_segment(part)])
-    committed = any(rule.source == 'project' for rule in ignored)  # F75: a committed ah-run rule degrades to ask
-    eligible = (bool(parsed.segments) and not committed and not parsed.substitution and not parsed.newline and not asked
-                and all(part.split(None, 1)[0] != 'eval' for part in parsed.segments)
-                and all(any(rule.matches(normalize_segment(part)) for rule in allows) for part in parsed.segments))
-    if eligible:
-        return _out('allow', 'every command matches an allow rule; wrapped in ah-run', updated, '\n'.join(context) or None)
-    if mode == 'dontAsk':
-        return _out('deny', 'no allow rule matches and permission mode dontAsk refuses to ask')
-    why = 'ask rule matched' if asked else ('contains substitution, eval or a newline' if (parsed.substitution or parsed.newline)
-                                           else 'no allow rule matches every command')
-    return _out('ask', why, updated, '\n'.join(context) or None)
+    extra = '\n'.join(context) or None
+    if decision is None:
+        return _out(None, None, updated, extra)
+    if decision == 'allow':
+        return _out('allow', 'every command matches an allow rule; wrapped in ah-run', updated, extra)
+    if asked:
+        why = 'ask rule matched'
+    elif parsed.uncertain:
+        why = 'quoting the hook cannot tokenize with certainty'
+    elif parsed.substitution or parsed.newline:
+        why = 'contains substitution, eval or a newline'
+    else:
+        why = 'no allow rule matches every command'
+    return _out('ask', why, updated, extra)
 
 
 def hook_main(stdin=None, stdout=None):
@@ -1392,13 +1810,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action')
     run = sub.add_parser('run')
-    for name in ('--task', '--agent', '--ticket', '--session', '--token', '--cmd-file', '--cmd-b64', '--command-class', '--remote-host-sha256'):
+    for name in ('--task', '--agent', '--ticket', '--session', '--token', '--cmd-file', '--cmd-b64', '--command-class', '--remote-host-sha256', '--task-source'):
         run.add_argument(name)
     run.add_argument('--readonly', action='store_true'); run.add_argument('--no-unit', action='store_true')
     run.add_argument('command', nargs=argparse.REMAINDER)
     kill_p = sub.add_parser('kill'); kill_p.add_argument('--task'); kill_p.add_argument('--agent')
     kill_p.add_argument('--pause', action='store_true'); kill_p.add_argument('--resume', action='store_true')
     led = sub.add_parser('ledger'); led.add_argument('--task'); led.add_argument('--live', action='store_true'); led.add_argument('--limit', type=int, default=50)
+    led.add_argument('--prune', action='store_true')
     mask = sub.add_parser('mask'); mask.add_argument('text', nargs=argparse.REMAINDER)
     sub.add_parser('hook')
     args = parser.parse_args(argv)
