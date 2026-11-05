@@ -56,7 +56,7 @@ relation, to an ask split from the same human message. Superseding only marks th
 makes an ask removable, because which asks a message holds is the agent's own split. The older ask leaves only
 when the user cancels it. A request the user replaced is cancelled with their words as proof. The guard runs on Write, Edit, MultiEdit, NotebookEdit, Bash, Read, Grep, Glob and LS on Claude Code, and on every
 tool on Codex. It looks at paths and shell commands, not file contents, and refuses a Grep rooted at the store or any folder
-above it (such as the home directory) unless a `glob` or `type` filter cannot match the key's name, because Claude
+above it (such as the home directory) unless a plain `glob` (letters, digits and `._/*-` only, at most 32) or a `type` filter cannot match the key's name, because Claude
 Code's Grep and Glob search hidden directories (checked headless on 2.1.318). Glob and LS list names only and are
 refused only at the store itself; reading the key stays refused. Paths resolve against the session cwd, and a Glob
 pattern against its path. It refuses a path or shell word that names the key or a glob that
@@ -98,17 +98,12 @@ contain a cue stays flagged until it is split.
 
 `remove` and `prune` refuse unless the ask has been `done` with re-verifying verified evidence, or `cancelled` with a
 user proof, for more than 24 hours (clock `stateSince`, cached as `removableAfter`). A `superseded` ask is not removable; it can be cancelled with user proof.
-A cancel proof names `targets` and a `binding`: `same_message_retraction` (the ask's own message),
-`explicit_reference` (the quote names the ask id or shares 3 or more words with its request),
-`answer_to_decision` or `answer_to_cancel_question` (the human answer to a decision tied to the ask). It must also
-be a human message this ledger captured from a transcript it tracks, not older than the ask, and the transcript
-line is re-read at removal. Every binding also needs retraction words in the quote (cancel, drop, stop, never mind,
-no longer, skip and similar); an answer binding may instead be a plain yes to a decision whose question is about
-cancelling. Sharing words with the ask is not enough on its own. A superseded ask stays in the digest as
-`SUPERSEDED A -> B` until the user cancels it, and once B is closed, Stop asks the agent to put that question to
-the user, because superseding is the agent's call. If the user wants A kept, `update A --state open` reinstates it.
-A cancel is judged on the user's whole message: a refusal such as "don't cancel A" or "keep it" never counts. Removal appends
-the full record to the archive and leaves a tombstone.
+A cancel proof names `targets` and a `binding`: `explicit_reference` (a later typed message) or
+`answer_to_decision` / `answer_to_cancel_question` (the typed reply to a recorded decision about this ask). In every
+case the user's whole message must be the command `cancel <ask-id>` (or `drop` / `withdraw`), optionally followed by
+`: reason`; to cancel, the agent asks the user to send exactly that. A sentence that only sounds like a retraction,
+a refusal, or a message naming another ask never counts, and an AskUserQuestion answer is a tool result, not a typed
+turn, so it cannot be cancel proof. `same_message_retraction` is no longer accepted.
 
 ## Backup
 

@@ -594,14 +594,15 @@ class RemovalTest(Base):
         self.cli("update", aid, "--state", "ready", "--evidence", "https://example.invalid/fake")
         self.assertEqual(self.cli("update", aid, "--state", "done")[0], 2)
 
-    def cancel_args(self, aid, uid, line, quote="cancel that whole thing please", binding="explicit_reference", *extra):
+    def cancel_args(self, aid, uid, line, quote=None, binding="explicit_reference", *extra):
+        quote = quote or f"cancel {aid}"
         return ("cancel", aid, "--uuid", uid, "--file", str(self.transcript), "--line", str(line), "--quote", quote,
                 "--binding", binding, *extra)
 
-    def setup_cancel(self, ask_text="finish the whole thing please"):
+    def setup_cancel(self, ask_text="finish the whole thing please", say=None):
         """The cancelling turn arrives through the prompt hook (verified), then sync binds it to its transcript line."""
         _, aid = self.split("start something", ask_text)
-        msg = self.capture("cancel that whole thing please, I changed my mind")
+        msg = self.capture(say or f"cancel {aid}: I changed my mind")
         uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
         return aid, uid, 2
 
@@ -819,10 +820,10 @@ class RemovalTest(Base):
         # PR review 7d0fb89 #1: it also must not vanish from status and Stop once the replacement is done.
         self.assertIn(f"SUPERSEDED {old}", self.cli("status")[1])
         self.assertEqual(self.hook("stop", {"session_id": SID, "transcript_path": str(self.transcript)}).get("decision"), "block")
-        msg = self.capture("cancel: do not rotate the staging credentials")
+        msg = self.capture(f"cancel {old}: the rotation is not needed")
         uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
         line = len(self.transcript.read_text().splitlines())
-        self.assertEqual(self.cli(*self.cancel_args(old, uid, line, "cancel: do not rotate the staging credentials"))[0], 0)
+        self.assertEqual(self.cli(*self.cancel_args(old, uid, line))[0], 0)
         CLOCK[0] += 25 * 3600
         self.assertEqual(self.cli("remove", old)[0], 0)
         self.assertEqual(self.data()["tombstones"][old]["proofKind"], "user_proof")
@@ -855,18 +856,20 @@ class RemovalTest(Base):
 
     def test_unrelated_human_message_cannot_cancel_an_ask(self):
         """Review blocker 1: any later human message used to cancel any ask."""
-        aid, uid, line = self.setup_cancel(ask_text="refactor the billing exporter module")
-        code, _ = self.cli(*self.cancel_args(aid, uid, line))
+        aid, uid, line = self.setup_cancel(ask_text="refactor the billing exporter module",
+                                           say="cancel that whole thing please, I changed my mind")
+        code, _ = self.cli(*self.cancel_args(aid, uid, line, "cancel that whole thing please"))
         self.assertEqual(code, 2)
         self.assertEqual(self.asks()[aid]["state"], "open")
 
-    def test_same_message_retraction_binding(self):
+    def test_same_message_retraction_is_no_longer_accepted(self):
+        """PR review 39c949d #2: "never mind the signup email" cancelled the sibling login ask split from that message."""
         msg = self.capture("please add a dark mode toggle, no wait, cancel that, forget dark mode")
         self.cli("split", "--msg", msg["id"], "--item", "add dark mode toggle")
         aid = sorted(self.asks())[-1]
         uid = msg["origin"]["log"]["messageUuid"]
         args = self.cancel_args(aid, uid, 1, "cancel that, forget dark mode", "same_message_retraction")
-        self.assertEqual(self.cli(*args)[0], 0)
+        self.assertEqual(self.cli(*args)[0], 2)
 
     def test_retraction_binding_needs_retracting_words(self):
         msg = self.capture("please add a dark mode toggle to the settings page")
@@ -883,31 +886,37 @@ class RemovalTest(Base):
 
     def test_decision_answer_binding(self):
         _, aid = self.split("start something", "refactor the billing exporter module")
-        did = self.ask_decision(aid, "Cancel the billing exporter refactor?")
-        msg = self.capture("yes, cancel the billing exporter refactor")
+        did = self.ask_decision(aid, f"Cancel the billing exporter refactor? Reply `cancel {aid}` to cancel it.")
+        msg = self.capture(f"cancel {aid}")
         self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", msg["id"])[0], 0)
         uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
-        args = self.cancel_args(aid, uid, 2, "yes, cancel the billing exporter refactor", "answer_to_decision", "--decision", did)
+        args = self.cancel_args(aid, uid, 2, None, "answer_to_decision", "--decision", did)
         self.assertEqual(self.cli(*args)[0], 0)
         self.check_schema()
 
     def test_refusal_is_not_cancel_proof(self):
-        """PR review 62e5e5f #1: "no, don't cancel A, I still want it" cancelled A with the quote "don't cancel A";
-        a retraction cut out of a refusal ("do not cancel ...") passed too."""
-        for said, quote in (("no, don't cancel the billing exporter refactor, I still want it", "don't cancel the billing exporter refactor"),
-                            ("please do not cancel the billing exporter refactor", "cancel the billing exporter refactor"),
-                            ("keep the billing exporter refactor, cancel nothing", "cancel nothing")):
+        """PR review 62e5e5f #1 and 39c949d #1/#2: refusals, a "reinstate" reply, curly quotes, and a retraction of a
+        different ask were all accepted, because proof was judged by word lists."""
+        _, other = self.split("other", "update the release changelog notes")
+        for said in ("no, don't cancel {a}, I still want it", "please do not cancel {a}", "keep {a}, cancel nothing",
+                     "please reinstate {a} instead", "don\u2019t cancel {a}", "cancel {a}? no, it's still needed",
+                     "instead of cancelling {a}, finish it", "cancelling {a} would be a mistake",
+                     "don't do anything that would cancel {a}", "drop {o}, but {a} stays", "cancel {a} and {o}",
+                     "cancel {o}"):
             _, aid = self.split("start something", "refactor the billing exporter module")
-            msg = self.capture(said)
+            text = said.format(a=aid, o=other)
+            msg = self.capture(text)
             uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
             line = len(self.transcript.read_text().splitlines())
-            args = self.cancel_args(aid, uid, line, quote, "explicit_reference")
-            self.assertEqual(self.cli(*args)[0], 2, said)
-            self.assertEqual(self.asks()[aid]["state"], "open", said)
-        msg = self.capture("cancel the billing exporter refactor, not needed")
-        uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
-        line = len(self.transcript.read_text().splitlines())
-        self.assertEqual(self.cli(*self.cancel_args(aid, uid, line, "cancel the billing exporter refactor"))[0], 0)
+            self.assertEqual(self.cli(*self.cancel_args(aid, uid, line, text[:120], "explicit_reference"))[0], 2, text)
+            self.assertEqual(self.asks()[aid]["state"], "open", text)
+        for said in ("cancel {a}", "Please cancel {a}.", "drop {a}: not needed any more", "withdraw {a} \u2014 done elsewhere"):
+            _, aid = self.split("start something", "refactor the billing exporter module")
+            text = said.format(a=aid)
+            msg = self.capture(text)
+            uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
+            line = len(self.transcript.read_text().splitlines())
+            self.assertEqual(self.cli(*self.cancel_args(aid, uid, line, text))[0], 0, text)
 
     def test_silent_cancel_question_does_not_let_an_unrelated_reply_cancel(self):
         """PR review R2: the agent wrote "Cancel the billing exporter refactor?" without asking the user; the next
@@ -1256,6 +1265,9 @@ class AttestGuardTest(Base):
                                    ("Grep", {"pattern": "x", "glob": ".agent-harness/**"}, user_home),
                                    ("Grep", {"pattern": "x"}, user_home), ("Grep", {"pattern": "x", "path": "~"}, "/repo"),
                                    ("Grep", {"pattern": "x", "glob": "*.key"}, user_home),
+                                   *[("Grep", {"pattern": "x", "glob": g}, user_home) for g in
+                                     ("*.{md,key}", "*.{key}", "**/*.{pem,key}", "*.[^m]ey", "work-ledger\\.key", "*.k\\ey",
+                                      ",".join(["*.md"] * 40))],
                                    ("Grep", {"pattern": "x"}, str(hidden))):
                 self.assertEqual(call(tool, inp, cwd), "deny", (tool, inp, cwd))
             for tool, inp, cwd in (("Grep", {"pattern": "x", "glob": "*.md"}, user_home), ("Grep", {"pattern": "x", "type": "py"}, user_home),

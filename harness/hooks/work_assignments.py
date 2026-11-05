@@ -68,7 +68,7 @@ DEFAULT_POLICY = {"schema": 1, "capture": "enforce", "stop": "enforce", "guard":
 PROTECTED = re.compile(r"work-(?:assign|ledger)[A-Za-z0-9._*?-]*|work_assignments_policy[A-Za-z0-9._*?-]*|"
                        r"work_assign[a-z]*[*?]|work-[a-z]+[*?]|\bhive\.json\b")
 SAFE_CLI = re.compile(r"^\s*python3\s+(?:~|\$HOME|/[^\s;&|<>`$]*)?[^\s;&|<>`$]*/work_assignments\.py\s+[A-Za-z-]+(?:\s+[^;&|<>`$\n]*)?$")
-KEY_FILE = re.compile(r"work-ledger\.key")
+KEY_FILE = re.compile(r"(?i)work-ledger\.key")
 GLOB_TOKEN = re.compile(r"[^\s'\"=;&|<>()`]*[*?\[][^\s'\"=;&|<>()`]*")
 HOOK_CALL = re.compile(r"\bhook\s+(?:prompt|stop|session|compact|ask-answer|guard|subagent-start)\b")
 INPROCESS = re.compile(r"\b(?:import|from)\s+work_assignments\b|__import__\(\s*['\"]work_assignments|\bcapture_key\b|"
@@ -143,15 +143,16 @@ def searches_store(tool: str, tool_input, cwd=None) -> bool:
         return False
     if any(isinstance(v, str) and "\x00" in v for v in tool_input.values()):
         return True
-    home = os.path.realpath(str(base()))
+    fold = (lambda x: x.lower()) if sys.platform == "darwin" else (lambda x: x)  # APFS/HFS+ default: case-insensitive
+    home = fold(os.path.realpath(str(base())))
     here = cwd or os.getcwd()
     name = tool.lower()
 
     def resolve(value: str, against: str) -> str:
-        return os.path.realpath(os.path.join(against, os.path.expanduser(os.path.expandvars(value))))
+        return fold(os.path.realpath(os.path.join(against, os.path.expanduser(os.path.expandvars(value)))))
 
     path = tool_input.get("path") if isinstance(tool_input.get("path"), str) and tool_input["path"].strip() else None
-    root = resolve(path, here) if path else os.path.realpath(here)
+    root = resolve(path, here) if path else fold(os.path.realpath(here))
     if name == "glob" and isinstance(tool_input.get("pattern"), str):
         pattern = tool_input["pattern"]
         literal = re.split(r"[*?\[{]", pattern, 1)[0]
@@ -162,11 +163,14 @@ def searches_store(tool: str, tool_input, cwd=None) -> bool:
     if root != home and not home.startswith(root.rstrip("/") + "/"):
         return False
     filt = tool_input.get("glob")
-    if isinstance(tool_input.get("type"), str) and tool_input["type"].strip() and not filt:
-        return False  # a file-type filter (py, js, ...) never matches work-ledger.key
+    if isinstance(tool_input.get("type"), str) and re.fullmatch(r"[a-z0-9]{1,20}", tool_input["type"]) and not filt:
+        return False  # a ripgrep file type (py, js, ...): no built-in type includes *.key
     if isinstance(filt, str) and filt.strip():
-        globs = [g.strip() for g in re.split(r"[,\s]+", filt.strip("{}")) if g.strip()]
-        return any(fnmatch.fnmatchcase("work-ledger.key", g.rsplit("/", 1)[-1]) or g.startswith("!") for g in globs)
+        # ripgrep globs have braces, escapes, classes and negation that fnmatch does not; exempt only plain globs.
+        globs = [g for g in re.split(r"[,\s]+", filt.strip()) if g]
+        if not globs or len(globs) > 32 or any(not re.fullmatch(r"[A-Za-z0-9_./*-]+", g) for g in globs):
+            return True
+        return any(fnmatch.fnmatchcase("work-ledger.key", g.rsplit("/", 1)[-1].lower()) for g in globs)
     return True
 
 
@@ -174,7 +178,7 @@ def reads_store_recursively(command: str) -> bool:
     """A recursive reader pointed at the store directory itself (not a subdirectory such as work/)."""
     if not RECURSIVE.search(command):
         return False
-    targets = store_dir_forms()
+    targets = store_dir_forms() | {"~", "$HOME", "${HOME}", str(Path.home()).rstrip("/")}
     for token in re.split(r"[\s'\"=;&|<>()]+", command):
         if token.rstrip("/") in targets or token.rstrip("/*") in targets and token.endswith("*"):
             return True
@@ -1245,7 +1249,7 @@ def problems_for(data: dict, session: str, policy: dict, ts=None) -> list:
                 if repl is None or repl["state"] in CLOSED:  # the replacement is closed: only the user can drop this one
                     found.append(("superseded", rid, f"{rid} superseded by {repl['id'] if repl else '?'} "
                                   f"({repl['state'] if repl else 'missing'}): ask the user whether to cancel it "
-                                  f"(`cancel` with their words) or reinstate it (`update {rid} --state open`) - "
+                                  f"(they reply `cancel {rid}`) or reinstate it (`update {rid} --state open`) - "
                                   f"{prov.clip(ask['request']['compressed'], 60)}"))
     return found
 
@@ -1740,14 +1744,22 @@ def words_of(text: str) -> set:
 
 RETRACTION = re.compile(r"(?i)cancel|never ?mind|forget|scrap|\bdrop|\bstop|no wait|instead|retract|ignore|"
                         r"don'?t (?:do|bother|need|want)|no longer|not needed|skip|abandon|withdraw|call (?:it|that) off")
-# "don't cancel A", "do not drop it", "keep it", "I still want it": a refusal mentions the same verbs.
-NEGATED = re.compile(r"(?i)\b(?:don'?t|do not|doesn'?t|never|not|no need to|without|won'?t)\s+(?:\w+\s+){0,3}?"
-                     r"(?:cancel|drop|stop|scrap|forget|abandon|skip|remove|withdraw|ignore|retract)|\bkeep\b|"
-                     r"\bstill (?:want|need)\b")
+# Cancel proof is a command, not a sentiment: the user's whole message must be `cancel <ask-id>` (or drop/withdraw),
+# optionally followed by `:` or a dash and a reason. Word lists lost every round ("don't cancel", "instead of
+# cancelling", "cancel A? no", curly quotes), and a sentence could retract one ask while naming another.
+CANCEL_COMMAND = re.compile(r"(?is)\s*(?:please\s+)?(?:cancel|drop|withdraw)\s+([a-z]-[a-z0-9-]+?)\s*(?:[.!]\s*|[:\u2013\u2014-]\s+\S.*)?")
 
 
-def retracts(text: str) -> bool:
-    return bool(RETRACTION.search(text)) and not NEGATED.search(text)
+def cancel_target(text: str):
+    """The ask id an explicit cancel command names, or None."""
+    m = CANCEL_COMMAND.fullmatch(text or "")
+    return m.group(1).lower() if m else None
+
+
+def commands_cancel(ask: dict, text: str) -> bool:
+    target = cancel_target(text)
+    ids = {ask["id"].lower(), (ask.get("migratedFrom", {}).get("id") or "").lower()} - {""}
+    return target is not None and target in ids
 
 
 def captured_after(mid: str, did: str, asked_at: float) -> bool:
@@ -1788,16 +1800,15 @@ def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, de
     decision tied to it. A stranger's human message cannot cancel an unrelated ask. Whether it retracts is judged on
     the user's whole message (`full`), so a quote cut out of "don't cancel A" cannot pass."""
     whole = full or quote
+    if full and quote not in full:
+        raise WAError("the quote must come from the user's message")
+    explicit = f"the user's message must be exactly `cancel {ask['id']}` (or drop/withdraw), optionally followed by `: reason`"
     if binding == "same_message_retraction":
-        if ask["origin"].get("messageId") != msg["id"]:
-            raise WAError("same_message_retraction needs the ask's own origin message")
-        if not RETRACTION.search(quote) or not retracts(whole):
-            raise WAError("same_message_retraction: the quote must be the retracting words, in a message that retracts")
+        raise WAError("same_message_retraction is no longer accepted: a message cannot both ask and retract; record it as a "
+                      "no-ask instead, or have the user send `cancel <ask-id>`")
     elif binding == "explicit_reference":
-        if not names_ask(ask, quote):
-            raise WAError("explicit_reference: the quote must name the ask id or share 3+ words with its request")
-        if not RETRACTION.search(quote) or not retracts(whole):
-            raise WAError("explicit_reference: the message must say to cancel, drop or stop it, not keep or just mention it")
+        if not commands_cancel(ask, whole):
+            raise WAError("explicit_reference: " + explicit)
     elif binding in ("answer_to_decision", "answer_to_cancel_question"):
         dec = data["decisions"].get(decision_id or "")
         if not dec or dec["state"] != "answered" or dec["answer"]["messageId"] != msg["id"]:
@@ -1812,8 +1823,8 @@ def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, de
         if why:
             raise WAError(f"{binding}: {why}")
         # The question text is the agent's; nothing proves the user saw it. Only the user's own words count.
-        if not (RETRACTION.search(quote) and retracts(whole) and names_ask(ask, quote)):
-            raise WAError(f"{binding}: the answer must itself retract this ask, naming it (id or 3+ of its words)")
+        if not commands_cancel(ask, whole):
+            raise WAError(f"{binding}: the answer is not a cancel command; " + explicit)
     else:
         raise WAError("unknown binding " + str(binding))
 
