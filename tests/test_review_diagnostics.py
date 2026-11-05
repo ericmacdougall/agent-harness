@@ -654,6 +654,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_deleted_working_directory_refuses_with_a_diagnostic(self):
+        launches = self.root / 'launches.log'
         gone = self.root / 'gone'
         gone.mkdir()
         script = (
@@ -667,10 +668,14 @@ class EndToEndTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, '-c', script, str(gone), str(HOOKS / 'peer_review.py'), 'pr', '--repo', str(self.repo),
              '--packet', str(self.packet), '--output', str(self.output), '--expected-head', self.head()],
-            capture_output=True, text=True, env={**os.environ, 'PATH': os.pathsep.join([str(self.bin), tpr.system_path()])})
+            capture_output=True, text=True, env={**os.environ, 'PROVIDER_LAUNCH_LOG': str(launches),
+                                                  'PATH': os.pathsep.join([str(self.bin), tpr.system_path()])})
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn('REVIEW_DIAGNOSTIC', result.stderr)
         self.assertNotIn('Traceback', result.stderr)
+        self.assertFalse(self.output.exists())
+        self.assertFalse(launches.exists())
+        self.assertEqual(self.finals(), [])
 
     def test_both_absent_prints_exec_not_found_with_searched_locations(self):
         (self.bin / 'codex').unlink()
