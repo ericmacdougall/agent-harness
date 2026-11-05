@@ -8,7 +8,7 @@
 # PYTHONPATH, grandchildren) and records each write, mkdir, rename, remove (including dir_fd forms) inside the real
 # state dirs, swallowed or not. Every disposable file lives in a fresh mktemp dir outside ~/.agent-harness; the dir is
 # printed as REPORT_DIR.
-# PASS = suite rc 0 with "Ran N" (N>0) and a final OK line, 0 ssh calls, an empty audit log (opendir records count), the hook
+# PASS = suite rc 0 with "Ran N" (N>0) and a final OK line, 0 non-loopback ssh calls, an empty audit log (opendir records count), the hook
 # loaded at least twice, and two canaries: a write into a temp "protected" dir is recorded,
 # and the suite's own configuration loads with protected=9. Every FAIL path exits non-zero.
 # Limits: ssh is recorded only when found through PATH (bwrap runs in a network namespace with a working loopback, so
@@ -84,7 +84,13 @@ ${wrap[@]+"${wrap[@]}"} env -i "${pin[@]}" ${envtmp[@]+"${envtmp[@]}"} \
   "$vpy" -m unittest "${args[@]}" > "$LOGS_REAL/suite.log" 2>&1
 rc=$?
 snap > "$LOGS_REAL/after.snap"; diff "$LOGS_REAL/before.snap" "$LOGS_REAL/after.snap" > "$LOGS_REAL/snap.diff"; d=$(wc -l < "$LOGS_REAL/snap.diff" | tr -d ' ')
-ssh=0; [ -f "$LOGS_REAL/ssh.calls" ] && ssh=$(wc -l < "$LOGS_REAL/ssh.calls" | tr -d ' ')
+# ssh to a loopback address is how tests/test_delivery_helpers.py fakes an unreachable git remote (ssh://127.0.0.1/missing.git);
+# it never leaves the machine, so it is counted separately and does not fail the gate. Any other host does.
+ssh=0; sshlo=0
+if [ -f "$LOGS_REAL/ssh.calls" ]; then
+  ssh=$(grep -Evc "(^| )(127\.0\.0\.1|localhost|::1)( |$)" "$LOGS_REAL/ssh.calls")
+  sshlo=$(grep -Ec "(^| )(127\.0\.0\.1|localhost|::1)( |$)" "$LOGS_REAL/ssh.calls")
+fi
 audited=0; [ -f "$LOGS_REAL/audit.log" ] && audited=$(wc -l < "$LOGS_REAL/audit.log" | tr -d ' ')
 errors=0; [ -f "$LOGS_REAL/audit.log.error" ] && errors=$(wc -l < "$LOGS_REAL/audit.log.error" | tr -d ' ')
 opendirs=0; [ -f "$LOGS_REAL/audit.log" ] && opendirs=$(grep -c " opendir " "$LOGS_REAL/audit.log")
@@ -92,5 +98,5 @@ ran=$(sed -n 's/^Ran \([0-9][0-9]*\) tests\{0,1\} in .*/\1/p' "$LOGS_REAL/suite.
 finalok=0; tail -n 3 "$LOGS_REAL/suite.log" | grep -Eq '^OK( \(.*\))?$' && finalok=1
 loaded=$(wc -l < "$LOGS_REAL/loaded.log" | tr -d ' ')
 if command -v shasum >/dev/null; then sha=$(shasum -a 256 "$self" | cut -c1-16); else sha=$(sha256sum "$self" | cut -c1-16); fi
-echo "suite_rc=$rc tests_ran=$ran final_ok=$finalok audit_writes=$audited audit_opendir_records=$opendirs audit_log_errors=$errors ssh_calls=$ssh hook_loaded_in=$loaded snapshot_diff_lines=$d sandbox=${HC_SANDBOX:-no} bwrap=${HC_BWRAP:-no} pinned=$([ -n "${HC_UNPINNED:-}" ] && echo no || echo yes) tmpdir=${HC_TMPDIR:-unset} pattern=${pattern:-full} script_sha256=$sha $(grep -E '^Ran ' "$LOGS_REAL/suite.log")" | tee "$LOGS_REAL/result.txt"
+echo "suite_rc=$rc tests_ran=$ran final_ok=$finalok audit_writes=$audited audit_opendir_records=$opendirs audit_log_errors=$errors ssh_calls=$ssh ssh_loopback_calls=$sshlohook_loaded_in=$loaded snapshot_diff_lines=$d sandbox=${HC_SANDBOX:-no} bwrap=${HC_BWRAP:-no} pinned=$([ -n "${HC_UNPINNED:-}" ] && echo no || echo yes) tmpdir=${HC_TMPDIR:-unset} pattern=${pattern:-full} script_sha256=$sha $(grep -E '^Ran ' "$LOGS_REAL/suite.log")" | tee "$LOGS_REAL/result.txt"
 if [ "$rc" = 0 ] && [ "$audited" -eq 0 ] && [ "$errors" -eq 0 ] && [ "$ssh" -eq 0 ] && [ "$loaded" -ge 2 ] && [ "$ran" -gt 0 ] && [ "$finalok" -eq 1 ]; then echo HERMETIC_PASS | tee -a "$LOGS_REAL/result.txt"; echo "REPORT_DIR=$LOGS_REAL"; else echo HERMETIC_FAIL | tee -a "$LOGS_REAL/result.txt"; echo "REPORT_DIR=$LOGS_REAL (audit.log, suite.log, ssh.calls)"; exit 1; fi
