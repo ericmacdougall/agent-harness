@@ -849,10 +849,14 @@ def resolve_commit(args, cwd, stdin_body, facts):
                                    f"{opts['file']} cannot be located; use an absolute -F path")
             path = path if path.is_absolute() else Path(cwd) / path
             try:
-                info = path.stat()
-                if info.st_size > 65536:
-                    raise Unresolvable("message file exceeds 64 KiB")
-                parts.append(path.read_text(encoding="utf-8", errors="replace"))
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)  # never wait on a FIFO
+                with os.fdopen(fd, "rb") as handle:
+                    info = os.fstat(handle.fileno())
+                    if not stat.S_ISREG(info.st_mode):
+                        raise Unresolvable(f"message file {opts['file']} is not a regular file")
+                    if info.st_size > 65536:
+                        raise Unresolvable("message file exceeds 64 KiB")
+                    parts.append(handle.read(65537).decode("utf-8", errors="replace"))
             except FileNotFoundError:
                 raise Unresolvable(f"message file {opts['file']} does not exist yet; write it in a separate "
                                    "step, then run git commit -F <file>") from None
