@@ -137,6 +137,105 @@ class CheckInterpreter(unittest.TestCase):
         self.assertEqual(self.integrate.resolve_check_interpreter('python3', {'PATH': str(supported.parent)}),
                          str(supported))
 
+    # GoodQA #14789: the first python3 on PATH that is 3.10 or newer wins; stubs only, never the real interpreters.
+    def stub(self, directory, body, name='python3'):
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        path.write_text('#!/bin/sh\n' + body)
+        path.chmod(0o700)
+        return path
+
+    def resolve(self, *dirs, timeout=30, name='python3'):
+        return self.integrate.resolve_check_interpreter(name, {'PATH': os.pathsep.join(str(d) for d in dirs)},
+                                                        timeout=timeout)
+
+    def test_ac1_older_first_entry_does_not_hide_a_supported_later_one(self):
+        old = fake_python(self.root / 'old-bin', '3.9')
+        new = fake_python(self.root / 'new-bin', '3.11')
+        self.assertEqual(self.resolve(old.parent, new.parent), str(new))
+
+    def test_ac2_supported_first_entry_is_still_the_one_chosen(self):
+        first = fake_python(self.root / 'first-bin', '3.10')
+        second = fake_python(self.root / 'second-bin', '3.13')
+        old = fake_python(self.root / 'old-bin', '3.9')
+        self.assertEqual(self.resolve(first.parent, second.parent, old.parent), str(first))
+
+    def test_ac3_result_is_an_absolute_path_and_refusal_names_every_skipped_candidate(self):
+        new = fake_python(self.root / 'new-bin', '3.12')
+        self.assertTrue(os.path.isabs(self.resolve(new.parent)))
+        old1 = fake_python(self.root / 'old1', '3.9')
+        old2 = fake_python(self.root / 'old2', '3.8')
+        with self.assertRaises(self.integrate.CheckInterpreterError) as raised:
+            self.resolve(old1.parent, old2.parent)
+        message = str(raised.exception)
+        for needed in (str(old1), str(old2), 'Python 3.9', 'Python 3.8', '3.10 or newer', 'first on PATH'):
+            self.assertIn(needed, message)
+
+    def test_neg2_relative_and_empty_path_entries_are_ignored(self):
+        previous = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        fake_python(self.root / 'rel', '3.12')
+        old = fake_python(self.root / 'old-bin', '3.9')
+        with self.assertRaises(self.integrate.CheckInterpreterError):
+            self.resolve('rel', '', '.', old.parent)
+
+    def test_neg3_hanging_erroring_or_malformed_probe_is_skipped_never_chosen(self):
+        hang = self.stub(self.root / 'hang', 'sleep 20\n')
+        err = self.stub(self.root / 'err', 'echo 3.12\nexit 1\n')
+        junk = self.stub(self.root / 'junk', 'echo banana\n')
+        good = fake_python(self.root / 'good', '3.11')
+        self.assertEqual(self.resolve(hang.parent, err.parent, junk.parent, good.parent, timeout=1), str(good))
+        with self.assertRaises(self.integrate.CheckInterpreterError) as raised:
+            self.resolve(hang.parent, err.parent, junk.parent, timeout=1)
+        self.assertIn('could not report its version', str(raised.exception))
+
+    def test_neg4_unusable_earlier_candidate_refuses_and_is_named_not_skipped(self):
+        new = fake_python(self.root / 'new-bin', '3.12')
+        noexec = self.stub(self.root / 'noexec', 'echo 3.12\n')
+        noexec.chmod(0o600)
+        with self.assertRaises(self.integrate.CheckInterpreterError) as raised:
+            self.resolve(noexec.parent, new.parent)
+        self.assertIn(str(noexec), str(raised.exception))
+        dangling = self.root / 'dangling'
+        dangling.mkdir()
+        os.symlink(self.root / 'nowhere', dangling / 'python3')
+        with self.assertRaises(self.integrate.CheckInterpreterError) as raised:
+            self.resolve(dangling, new.parent)
+        self.assertIn(str(dangling / 'python3'), str(raised.exception))
+        locked = self.root / 'locked'
+        locked.mkdir()
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        if os.access(locked, os.X_OK):
+            self.skipTest('running as a user that can read a mode 0 directory')
+        with self.assertRaises(self.integrate.CheckInterpreterError) as raised:
+            self.resolve(locked, new.parent)
+        self.assertIn(str(locked), str(raised.exception))
+
+    def test_a_directory_without_the_candidate_is_simply_passed_over(self):
+        empty = self.root / 'empty-bin'
+        empty.mkdir()
+        new = fake_python(self.root / 'new-bin', '3.12')
+        self.assertEqual(self.resolve(empty, self.root / 'absent', new.parent), str(new))
+
+    def test_ac4_finish_run_checks_passes_the_interpreter_step_with_an_old_python_first(self):
+        if sys.version_info < (3, 10):
+            self.skipTest('the suite interpreter is older than the supported check Python (3.10)')
+        old = fake_python(self.root / 'old-first', '3.9')
+        bindir = self.root / 'new-second'
+        bindir.mkdir()
+        os.symlink(sys.executable, bindir / 'python3')
+        repo = self.root / 'repo-ac4'
+        (repo / 'tests').mkdir(parents=True)
+        (repo / 'tests' / 'test_a.py').write_text(
+            'import unittest\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n')
+        command = ['python3', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_a.py']
+        self.assertTrue(self.integrate.approved_check(command))
+        path = os.pathsep.join([str(old.parent), str(bindir), os.environ['PATH']])
+        with patch.dict(os.environ, {'PATH': path}):
+            self.delivery.run_checks(repo, [], [command], 60, self.root / 'logs-ac4')
+
     def test_missing_or_silent_interpreter_is_refused(self):
         with self.assertRaises(self.integrate.CheckInterpreterError):
             self.integrate.resolve_check_interpreter('python3', {'PATH': str(self.root / 'empty')})

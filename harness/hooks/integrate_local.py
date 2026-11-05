@@ -185,27 +185,52 @@ def resolve_check_interpreter(name, env=None, timeout=30):
     """Pin a check's `python`/`python3` to one absolute, supported executable.
 
     Bare names resolve through PATH at run time, so a system Python 3.9 could
-    silently run a 3.10+ suite. Refuse that with a reason that names the fix.
+    silently run a 3.10+ suite. Scan the absolute PATH entries in order and take
+    the first candidate that reports 3.10 or newer. A candidate is skipped only
+    for its version or a failed probe (hang, error, malformed output). One that
+    exists but cannot be used for another reason (not executable, unreadable
+    directory, dangling link) refuses and is named: a later, less trusted entry
+    must not win silently. Relative and empty entries are never used.
     """
     search = (os.environ if env is None else env).get('PATH', os.defpath)
-    found = shutil.which(name, path=search)
-    if found is None:
+    skipped = []
+    for directory in search.split(os.pathsep):
+        if not directory or not os.path.isabs(directory):
+            continue
+        candidate = os.path.join(directory, name)
+        try:
+            os.lstat(candidate)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as error:
+            raise CheckInterpreterError(
+                f'{name} candidate {candidate} cannot be inspected ({type(error).__name__}); refusing to '
+                'fall through to a later PATH entry. Python checks need 3.10 or newer') from None
+        if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+            raise CheckInterpreterError(
+                f'{name} candidate {candidate} exists but is not an executable file; refusing to fall through '
+                'to a later PATH entry. Python checks need 3.10 or newer')
+        found = os.path.abspath(candidate)
+        try:
+            probe = run_process([found, '-I', '-c', 'import sys; print("%d.%d" % sys.version_info[:2])'],
+                                timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            skipped.append(f'{found} could not report its version')
+            continue
+        match = re.fullmatch(r'(\d+)\.(\d+)\s*', probe.stdout or '')
+        if probe.returncode or match is None:
+            skipped.append(f'{found} could not report its version')
+            continue
+        version = (int(match.group(1)), int(match.group(2)))
+        if version < MIN_CHECK_PYTHON:
+            skipped.append(f'{found} is Python {version[0]}.{version[1]}')
+            continue
+        return found
+    if not skipped:
         raise CheckInterpreterError(f'{name} is not on PATH; Python checks need Python 3.10 or newer')
-    found = os.path.abspath(found)
-    try:
-        probe = run_process([found, '-I', '-c', 'import sys; print("%d.%d" % sys.version_info[:2])'],
-                            timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired):
-        raise CheckInterpreterError(f'{name} at {found} could not report its version') from None
-    match = re.fullmatch(r'(\d+)\.(\d+)\s*', probe.stdout or '')
-    if probe.returncode or match is None:
-        raise CheckInterpreterError(f'{name} at {found} could not report its version')
-    version = (int(match.group(1)), int(match.group(2)))
-    if version < MIN_CHECK_PYTHON:
-        raise CheckInterpreterError(
-            f'{name} on PATH is Python {version[0]}.{version[1]} ({found}); Python checks need 3.10 or newer. '
-            'Put a supported python3 first on PATH')
-    return found
+    raise CheckInterpreterError(
+        f'no {name} on PATH is Python 3.10 or newer (skipped: {"; ".join(skipped)}); Python checks need '
+        '3.10 or newer. Put a supported python3 first on PATH')
 
 
 # The lookbehind anchors each key at a word start, keeping matching linear per line.
