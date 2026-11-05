@@ -12,6 +12,8 @@ self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 py=$1; tree=$2; logs=$3; pattern=${4:-}
 R=$(/usr/bin/python3 -c 'import os,pwd;print(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))')
 mkdir -p "$logs"; TREE=$(cd "$tree" && pwd -P); LOGS=$(cd "$logs" && pwd -P)
+GITCOMMON=$(cd "$TREE" && cd "$(git rev-parse --git-common-dir 2>/dev/null || echo .)" && pwd -P)
+case "$LOGS/" in "$R/.claude/"*|"$R/.codex/"*|"$R/.ssh/"*|"$R/.agent-harness/usage/"*|"$R/.agent-harness/state/"*|"$R/.agent-harness/logs/"*|"$R/.agent-harness/commit-policy/"*|"$R/.agent-harness/wals/"*) echo "LOGDIR is inside a protected real state dir"; exit 6;; esac
 scratch=$(mktemp -d "$logs/home.XXXXXX"); shim="$logs/shim"; mkdir -p "$shim" "$logs/pybin"
 printf '#!/bin/sh\necho "$@" >> %s/ssh.calls\nexit 255\n' "$logs" > "$shim/ssh"; chmod +x "$shim/ssh"
 ln -sf "$py" "$logs/pybin/python3"; ln -sf "$py" "$logs/pybin/$(basename "$py")"
@@ -22,7 +24,7 @@ cat > "$logs/deny.sb" <<S
 (version 1)
 (allow default)
 (deny file-write* (subpath "$R"))
-(allow file-write* (subpath "$TREE") (subpath "$LOGS"))
+(allow file-write* (subpath "$TREE") (subpath "$LOGS") (subpath "$GITCOMMON"))
 (deny process-exec (literal "/usr/bin/ssh"))
 S
 snap() { for d in "$R/.agent-harness/state" "$R/.agent-harness/usage" "$R/.agent-harness/logs" "$R/.agent-harness/commit-policy" "$R/.claude/hooks" "$R/.codex"; do find "$d" -path '*__pycache__*' -prune -o -type f -exec stat -f '%N %z %m' {} + 2>/dev/null; done | sort; }
@@ -45,8 +47,9 @@ snap > "$logs/after.snap"
 sleep 3
 /usr/bin/log show --start "$start" --predicate 'eventMessage CONTAINS "deny(1)"' > "$logs/denials.log" 2>&1; logrc=$?
 canaries=$(grep -c "hermetic-canary-$$" "$logs/denials.log")
-others=$(grep -E "($R/|/usr/bin/ssh)" "$logs/denials.log" | grep -vc "hermetic-canary-$$")
+grep -E "($R/|/usr/bin/ssh)" "$logs/denials.log" | grep -v "hermetic-canary-$$" > "$logs/other_denials.log"
+others=$(wc -l < "$logs/other_denials.log" | tr -d " ")
 ssh=0; [ -f "$logs/ssh.calls" ] && ssh=$(wc -l < "$logs/ssh.calls" | tr -d " ")
 diff "$logs/before.snap" "$logs/after.snap" > "$logs/snap.diff"; d=$(wc -l < "$logs/snap.diff")
 echo "suite_rc=$rc log_rc=$logrc canary_denials=$canaries other_denials=$others ssh_calls=$ssh snapshot_diff_lines=$d tmpdir=${HC_TMPDIR:-unset} pattern=${pattern:-full} script_sha256=$(shasum -a 256 "$self" | cut -c1-16) $(grep -E '^Ran ' "$logs/suite.log")" | tee "$logs/result.txt"
-if [ "$rc" = 0 ] && [ "$logrc" = 0 ] && [ "$canaries" -eq 1 ] && [ "$others" -eq 0 ] && [ "$ssh" -eq 0 ]; then echo HERMETIC_PASS | tee -a "$logs/result.txt"; else echo HERMETIC_FAIL | tee -a "$logs/result.txt"; fi
+if [ "$rc" = 0 ] && [ "$logrc" = 0 ] && [ "$canaries" -eq 1 ] && [ "$others" -eq 0 ] && [ "$ssh" -eq 0 ]; then echo HERMETIC_PASS | tee -a "$logs/result.txt"; else echo HERMETIC_FAIL | tee -a "$logs/result.txt"; echo "see $logs/other_denials.log, suite.log, ssh.calls; an unrelated process denial elsewhere on the host means rerun" >&2; exit 1; fi
