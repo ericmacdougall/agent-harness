@@ -929,6 +929,18 @@ OVERWRITE_EXISTING = [
     ('echo x > /home/other/.claude/projects/p/s.jsonl', 'block'),
     ('echo x > /home/other/.codex/sessions/2026/r.jsonl', 'block'),
     ('echo x > /root/.agent-harness/work/S/T/x.log', 'block'),
+    # code inspection of fab0cad. WAL-shaped names are tier A on every home form; a bare `>! f` empties the file like
+    # `> f`; a reversed glob range must not raise and lose the rest of the command (Python 3.9)
+    ('echo x > /home/other/.agent-harness/work/S/T/wal/x.log', 'block'),
+    ('echo x > /home/other/.agent-harness/work/S/T/wal-1/x.out', 'block'),
+    ('echo x > /home/other/.agent-harness/work/S/T/wal_a.log', 'block'),
+    ('echo x > /home/other/.agent-harness/work/S/T/wal.1', 'block'),
+    ('echo x > /home/other/.agent-harness/work/S/T/walker/x.log', 'allow'),
+    ('>! @TASK@/existing.log', 'block'),
+    ('&>! @TASK@/existing.log', 'block'),
+    ('>&! @TASK@/existing.log', 'block'),
+    ('echo x > @HOME@/.claude/[z-a]', 'allow'),
+    ('echo x > /tmp/[z-a]; rm -rf @HOME@/.claude', 'block'),
 ]
 # (target row, words the refusal must carry so the owner knows what to do instead)
 OVERWRITE_HINTS = [

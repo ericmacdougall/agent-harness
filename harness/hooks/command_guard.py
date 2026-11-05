@@ -239,8 +239,10 @@ class Compiled:
         self.ancestors = [self._segs(fmt(t, h)) for t in policy['ancestor_roots'] for h in homes]
         self.guard_globs = [fmt(t, h).casefold() for t in policy.get('guard_files', []) for h in homes]
         self.state_files = [fmt(t, h).casefold() for t in policy['state_files'] for h in homes]
-        self.wal_regexes = [re.compile(policy['protected_work_wal_regex'].replace('{home}', re.escape(h)), re.I)
-                            for h in homes]
+        # every home form, not only this machine's: a WAL under another host's work dir is still a WAL
+        self.wal_regexes = [re.compile(policy['protected_work_wal_regex'].replace(
+            '{home}', re.escape(h).replace(r'\*', '[^/]+')), re.I)
+            for h in homes + [g for g in policy.get('generic_homes', []) if isinstance(g, str)]]
         self.cred = [re.compile(r, re.I) for r in policy['credential_path_regexes']]
         self.cred_allow = [re.compile(r, re.I) for r in policy['credential_allow_regexes']]
         self.cred_dirs = [self._segs(fmt(t, h)) for t in policy['credential_dirs'] for h in homes]
@@ -272,7 +274,7 @@ class Compiled:
     def is_guard_file(self, path):
         folded = path.casefold()
         real = (_realpath(path) or path).casefold()
-        return any(fnmatch.fnmatchcase(p, g) for g in self.guard_globs for p in (folded, real))
+        return any(_fnmatchcase(p, g) for g in self.guard_globs for p in (folded, real))
 
     def secret_name(self, name):
         upper = name.upper()
@@ -942,6 +944,15 @@ def _has_glob(seg):
     return any(ch in seg for ch in GLOB_CHARS)
 
 
+def _fnmatchcase(name, pattern):
+    """fnmatch that cannot raise: Python 3.9 raises re.error on a reversed range such as [z-a], which a shell treats
+    as matching nothing. An exception here would cost the whole command its findings."""
+    try:
+        return fnmatch.fnmatchcase(name, pattern)
+    except re.error:
+        return False
+
+
 def _seg_eq(p, r):
     """One path segment against one pattern segment; either side may be a glob."""
     if p == r:
@@ -950,9 +961,9 @@ def _seg_eq(p, r):
     if gp and gr:
         return True  # two patterns may overlap: assume they do
     if gp:
-        return fnmatch.fnmatchcase(r, p)
+        return _fnmatchcase(r, p)
     if gr:
-        return fnmatch.fnmatchcase(p, r)
+        return _fnmatchcase(p, r)
     return False
 
 
@@ -1017,9 +1028,9 @@ def classify_segs(c, segs):
     if in_root == 'root':
         # inside a harness tree a glob that can reach a WAL name counts as a WAL path
         for s in segs:
-            if _has_glob(s) and any(fnmatch.fnmatchcase(n, s) for n in c.seg_names | c.file_names):
+            if _has_glob(s) and any(_fnmatchcase(n, s) for n in c.seg_names | c.file_names):
                 return 'log'
-        if _has_glob(leaf) and any(fnmatch.fnmatchcase('x' + suf, leaf) for suf in c.file_suffixes):
+        if _has_glob(leaf) and any(_fnmatchcase('x' + suf, leaf) for suf in c.file_suffixes):
             return 'log'
         if leaf in c.keep_names or leaf.endswith(c.keep_suffixes) or any(x in c.keep_segments for x in segs):
             return 'root'
@@ -1049,7 +1060,7 @@ def seg_match(pattern_segs, concrete_segs):
     """Pattern (may have globs) vs concrete path segments, over the shorter length: True if one reaches the other."""
     n = min(len(pattern_segs), len(concrete_segs))
     for k in range(n):
-        if not fnmatch.fnmatchcase(concrete_segs[k], pattern_segs[k]):
+        if not _fnmatchcase(concrete_segs[k], pattern_segs[k]):
             return False
     return True
 
@@ -1635,10 +1646,11 @@ class Analyzer:
     def redirects(self, cmd, pl, idx, has_command, depth):
         ctx = self.ctx
         words = self._skip_assigns(strip_reserved(cmd.words))[1]
+        # the lexer adds a `>! word` target to the words for bash's reading; for zsh it is not a word at all, so it must
+        # not turn `cat >! f` or a bare `>! f` into a content write. The bash reading is judged by dispatch
+        words = [w for w in words if not any(w is r.target for r in cmd.redirs)]
         name = norm_name(words[0].text) if words else ''
-        # the lexer adds a `>! word` target to the words for bash's reading; for zsh it is not an argument, so it must
-        # not turn `cat >! f` into a content write
-        arg_texts = [w.text for w in words[1:] if not any(w is r.target for r in cmd.redirs)]
+        arg_texts = [w.text for w in words[1:]]
         # pure truncation: nothing (or nothing meaningful) is written, so the redirect only empties the file
         # `cat > f <<EOF` writes content; an empty heredoc writes nothing, so that stays a pure truncation
         has_body = any(r.op == '<<<' or r.op in ('<<', '<<-') and r.body.strip('\n') for r in cmd.redirs)
@@ -1818,7 +1830,7 @@ class Analyzer:
             name = norm_name(alt)
             if head.glob or any(ch in name for ch in '*?['):
                 for known in KNOWN_NAMES:
-                    if fnmatch.fnmatchcase(known, name):
+                    if _fnmatchcase(known, name):
                         out.append(known)
             if name:
                 out.append(name)
@@ -2777,7 +2789,7 @@ class Analyzer:
                 return True
         if any(ch in text for ch in '*?['):
             for sample in c.cred_samples:
-                if fnmatch.fnmatchcase(norm_path(sample, ctx, ctx.cwd).casefold(), path.casefold()):
+                if _fnmatchcase(norm_path(sample, ctx, ctx.cwd).casefold(), path.casefold()):
                     return True
         if is_dynamic_path(text):
             tail = path.split('$')[-1] if '$' in path else ''
@@ -2977,7 +2989,7 @@ class Analyzer:
                 except OSError:
                     return None
                 for name in names:
-                    if not fnmatch.fnmatchcase(name, seg):
+                    if not _fnmatchcase(name, seg):
                         continue
                     cand = os.path.join(base, name)
                     if last or os.path.isdir(cand):
@@ -3391,8 +3403,11 @@ class Analyzer:
             real = os.path.realpath(path)
         except (OSError, ValueError):
             return False
-        # another host's path says nothing about this machine's links (macOS even makes /home itself a symlink)
-        for cand in (path,) if self._foreign_home(path) else (path, real):
+        # macOS makes /home itself a symlink, so that prefix alone must not fail the check. A /home/<user> path that
+        # does exist here (another user on this machine) is still followed, so a link out of the tree is refused
+        if real.startswith('/System/Volumes/Data/home/') and self._foreign_home(path):
+            real = real[len('/System/Volumes/Data'):]
+        for cand in (path, real):
             if self._kept(cand):
                 return False
             segs = Compiled._segs(cand)
