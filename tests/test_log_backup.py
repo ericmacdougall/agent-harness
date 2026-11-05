@@ -107,6 +107,10 @@ class Freshness(Base):
         self.assertIn(b"bulk tier", done.stdout)
         self.assertIn(b"never completed", self.run_cli("session-start").stdout)
         # stale, invalid, future
+        first.write_text(stamp(time.time() - 60) + "\n")
+        bulk.write_text("garbage")  # present but unreadable is invalid even right after install
+        self.assertEqual(self.run_cli("check").returncode, 3)
+        first.write_text(stamp(time.time() - 7 * 3600) + "\n")
         for text, code in ((stamp(time.time() - 7 * 3600), 3), ("garbage", 3), (stamp(time.time() + 3600), 3),
                            (stamp(time.time() - 60), 0)):
             bulk.write_text(text)
