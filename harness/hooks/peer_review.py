@@ -841,6 +841,21 @@ def plan_ticket_gate(repo, content):
         return 0, f'spec-flow: plan ticket gate could not run ({error}); continuing'
 
 
+def plan_resource_gate(content):
+    """Plan review also needs a `## Resource budget` that fits the target host's live headroom."""
+    try:
+        import resource_budget
+        import spec_flow
+        text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+        try:
+            mode = spec_flow.load_spec_policy().get('resource_budget_gate', 'enforce')
+        except (OSError, ValueError):
+            mode = 'enforce'
+        return resource_budget.plan_gate(text, mode)
+    except ImportError:
+        return 0, ''  # older install without the resource gate
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("plan", "code-inspection", "pr"))
@@ -935,6 +950,15 @@ def main() -> int:
             target.close()
             evidence.close()
             print('Plan review not started: name the ticket this work belongs to first.', file=sys.stderr)
+            return code
+        code, text = plan_resource_gate(evidence.content)
+        if text:
+            print(text, file=sys.stderr)
+        if code:
+            target.close()
+            evidence.close()
+            print('Plan review not started: add a `## Resource budget` that fits the target host (resource_budget.py check).',
+                  file=sys.stderr)
             return code
     if args.stage == 'pr':
         code, text = commit_policy_gate(repo, args.base)

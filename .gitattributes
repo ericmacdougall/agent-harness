@@ -1,0 +1,5 @@
+# Go sources must stay LF on every checkout: gofmt -l flags CRLF, and Windows runners default to
+# core.autocrlf=true (the windows-latest CI go job failed on that).
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
