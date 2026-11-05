@@ -6976,6 +6976,96 @@
    ]
   },
   {
+   "cmd": "sshpass -p x ssh host pkill foo",
+   "expect": "block",
+   "id": "P-rt3-1-sshpass",
+   "tags": [
+    "ssh",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "sshpass -p x ssh host kill 4004",
+   "expect": "block",
+   "id": "P-rt3-1-sshpass-kill",
+   "tags": [
+    "ssh",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "pnpm exec pkill foo",
+   "expect": "block",
+   "id": "P-rt3-1-pnpm-exec",
+   "tags": [
+    "verb",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "npm exec -- pkill foo",
+   "expect": "block",
+   "id": "P-rt3-1-npm-exec",
+   "tags": [
+    "verb",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "bundle exec pkill foo",
+   "expect": "block",
+   "id": "P-rt3-1-bundle",
+   "tags": [
+    "verb",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "fakeroot kill 4004",
+   "expect": "block",
+   "id": "P-rt3-1-fakeroot",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "entr -r pkill foo",
+   "expect": "block",
+   "id": "P-rt3-1-entr",
+   "tags": [
+    "verb",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "uv run python - <<EOF\nimport os\nos.kill(4004, 9)\nEOF",
+   "expect": "block",
+   "id": "P-rt3-2-uv-heredoc",
+   "tags": [
+    "interpreter",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "script -qc 'pkill foo'",
+   "expect": "block",
+   "id": "P-rt3-3-script-qc",
+   "tags": [
+    "verb",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "su -qc 'kill 4004'",
+   "expect": "block",
+   "id": "P-rt3-3-su-qc",
+   "tags": [
+    "ownership",
+    "wrapper"
+   ]
+  },
+  {
    "cmd": "grep -n \"pkill -f pytest\" notes.md",
    "expect": "allow",
    "id": "N-text00-grep",
@@ -9237,6 +9327,46 @@
    "id": "N-rt2-10-brace-sig-ok",
    "tags": [
     "signal0"
+   ]
+  },
+  {
+   "cmd": "man pkill",
+   "expect": "allow",
+   "id": "N-rt3-man-pkill",
+   "tags": [
+    "text"
+   ]
+  },
+  {
+   "cmd": "npm run kill-port",
+   "expect": "allow",
+   "id": "N-rt3-npm-kill-port",
+   "tags": [
+    "text"
+   ]
+  },
+  {
+   "cmd": "pnpm test",
+   "expect": "allow",
+   "id": "N-rt3-pnpm-test",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "bundle exec rspec",
+   "expect": "allow",
+   "id": "N-rt3-bundle-rspec",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "uv run python - <<EOF\nprint(1)\nEOF",
+   "expect": "allow",
+   "id": "N-rt3-uv-heredoc-ok",
+   "tags": [
+    "plain"
    ]
   },
   {

@@ -57,7 +57,7 @@ WRAPPER_NAMES = {'sudo', 'doas', 'env', 'nohup', 'timeout', 'nice', 'ionice', 't
                  'setsid', 'stdbuf', 'chrt', 'taskset', 'unbuffer', 'strace', 'ltrace', 'runuser', 'su', 'sg', 'chroot',
                  'nsenter', 'flock', 'unshare', 'watch', 'xargs', 'parallel', 'systemd-run', 'caffeinate', 'gosu',
                  'firejail', 'tmux', 'screen', 'at', 'batch', 'uv', 'uvx', 'pipx', 'npx', 'bunx', 'pnpx', 'dtruss', 'script',
-                 'arch', 'start', 'call', 'busybox', 'toybox', 'poetry', 'pipenv', 'conda', 'pdm', 'rye', 'hatch'}
+                 'arch', 'start', 'call', 'busybox', 'toybox', 'poetry', 'pipenv', 'conda', 'pdm', 'rye', 'hatch', 'sshpass', 'fakeroot', 'entr', 'bundle'}
 REMOTE_WRAPPERS = {'docker-compose', 'oc', 'wsl', 'limactl', 'multipass', 'vagrant', 'colima', 'orb', 'adb', 'gcloud',
                    'aws', 'podman-compose', 'lxc', 'incus', 'ctr', 'crictl'}
 REMOTE_EXEC = {'ssh', 'mosh', 'docker', 'podman', 'kubectl', 'nerdctl', 'oc'}
@@ -91,6 +91,7 @@ COPROC_KW = re.compile(r'\bcoproc\s+(?:[A-Za-z_]\w*\s*)?\{')
 INTERPRETER_NAME = re.compile(r'(?:python|pypy)[0-9.]*|node(?:js)?[0-9]*|ruby[0-9.]*|perl[0-9.]*|php[0-9.]*|deno|bun|lua[0-9.]*')
 RUN_OPTS = {'-c', '-s', '-i', '-e', '-lc', '-ic', '--command', '-l', '-S'}  # options that take a command to run
 LAUNCHERS = {'tmux', 'screen', 'at', 'batch', 'watch'}
+CLASSIC_VERBS = {'pkill', 'killall', 'killall5', 'skill', 'slay', 'taskkill', 'stop-process', 'spps'}
 PID_OPT_VALUE = re.compile(r'[0-9]+(?:,[0-9]+)*')
 
 
@@ -617,6 +618,10 @@ def make_analyzer_class(cg):
             self.inspect(name, words, cmd, pl, idx, depth)
             if name in WRAPPER_NAMES or name.startswith('-') or name in REMOTE_WRAPPERS:
                 self.scan_tail(name, args, pl, idx, depth)
+            elif name not in STOP_COMMANDS and name not in cg.SHELLS and name not in self.broad \
+                    and name not in self.windows and name != 'netwatch':
+                if any(cg.norm_name(a.text) in CLASSIC_VERBS for a in args):  # pnpm exec pkill x, bundle exec ..., entr -r ...
+                    self.block('indirect-kill', '`%s` runs a process-killing command by name' % one_line(name, 30))
             return super().apply(name, words, cmd, pl, idx, depth)
 
         def scan_tail(self, name, args, pl, idx, depth):
@@ -643,6 +648,9 @@ def make_analyzer_class(cg):
                         if remote:
                             self.remote -= 1
                     return
+                if n in ('ssh', 'mosh') and name == 'sshpass':
+                    self.inner_words(args[i:], depth, pl, idx)  # sshpass -p x ssh host ...
+                    return
                 if INTERPRETER_NAME.fullmatch(n) or n in cg.SHELLS:
                     self.inner_words(args[i:], depth, pl, idx, via_xargs=via_xargs)  # uv run python -c ..., tmux new sh -c ...
                     return
@@ -651,7 +659,8 @@ def make_analyzer_class(cg):
                 if w.text.startswith(('--split-string=', '-S')) and len(w.text) > 2 and name == 'env':
                     self.script(w.text.split('=', 1)[1] if '=' in w.text else w.text[2:], depth + 1)
                 prev = args[i - 1].text if i else ''
-                value_of_other_option = prev.startswith('-') and prev not in RUN_OPTS and name not in LAUNCHERS
+                value_of_other_option = prev.startswith('-') and prev not in RUN_OPTS and name not in LAUNCHERS \
+                    and not re.fullmatch(r'-[A-Za-z]*c', prev)
                 if (' ' in w.text.strip() or ';' in w.text) and not w.text.startswith('-') \
                         and name not in ('xargs', 'parallel') and not value_of_other_option:
                     if remote:
@@ -747,6 +756,8 @@ def make_analyzer_class(cg):
                             self.script(redir.body, depth + 1)
                 finally:
                     self.remote -= 1 if remote else 0
+            if (name in WRAPPER_NAMES) and any(INTERPRETER_NAME.fullmatch(cg.norm_name(a.text)) for a in args):
+                self.check_interpreter(name, texts, cmd)  # uv run python - <<EOF
             if name in ('at', 'batch'):
                 for i, t in enumerate(texts):
                     if t == '-f' and i + 1 < len(args):
