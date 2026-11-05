@@ -14,9 +14,11 @@
 #   LOG_BACKUP_RETRIES      extra attempts per source (default 2) and LOG_BACKUP_RETRY_SLEEP seconds between them (30)
 #   LOG_BACKUP_STAGE        local snapshot directory for live sources (default ~/.agent-harness/backup-stage)
 #   LOG_BACKUP_VERSIONS     exactly 0 turns off versions/STAMP (loud warning); anything else keeps them
-# Freshness contract: log-backup.last-ok is written (atomically, with the run START time) only after every source
-# copied cleanly and at least one primary source (.claude/projects or .codex/sessions) was copied. A run skipped
-# because another run holds the lock writes log-backup.last-skip and leaves last-ok alone.
+# Freshness contract, two tiers with their own markers. log-backup.last-ok (transcripts, WALs, ledgers) is written
+# atomically with the run START time only after every tier-1 source copied cleanly and a primary source
+# (.claude/projects or .codex/sessions) held files. log-backup.bulk-last-ok (archived sessions, narrowed work tree)
+# is written only after every tier-2 source copied cleanly. A run skipped because another run holds the lock writes
+# log-backup.last-skip and touches neither marker.
 set -u
 SELF_DIR=$(cd "$(dirname "$0")" && pwd)
 cd / || exit 1
@@ -33,8 +35,10 @@ WORK_EXCLUDES=${LOG_BACKUP_WORK_EXCLUDES:-$SELF_DIR/log-backup.work-excludes}
 BUDGET_SECONDS=${LOG_BACKUP_BUDGET_SECONDS:-780}   # one run must end inside the 15 minute period
 RUN_START=$(date +%s)
 
+umask 077
 mkdir -p "$LOGDIR" || { echo "log-backup: cannot create $LOGDIR" >&2; exit 1; }
 chmod 700 "$LOGDIR" 2>/dev/null
+[ -e "$LOGDIR/log-backup.first-run" ] || date -u +%FT%TZ > "$LOGDIR/log-backup.first-run"
 # Never let an inherited rclone option redirect or reconfigure a run; only the config file location passes through.
 for v in $(env | sed -n 's/^\(RCLONE_[A-Za-z0-9_]*\)=.*/\1/p'); do
   [ "$v" = RCLONE_CONFIG ] || unset "$v"
@@ -159,7 +163,7 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   shift 2
   if [ -d "$p" ]; then dst="$R/$rel"; else dst="$R/$(dirname "$rel")"; fi
   args=(copy --dropbox-batch-mode sync --dropbox-batch-size 100 --tpslimit 2 --transfers 2 --checkers 4
-    --retries 10 --retries-sleep 30s --low-level-retries 20 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE --exclude-from "$EXCLUDES" --ignore-case "$@")
+    --checksum --retries 10 --retries-sleep 30s --low-level-retries 20 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE --exclude-from "$EXCLUDES" --ignore-case "$@")
   if [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ]; then args+=(--backup-dir "$R/versions/$STAMP/$rel"); fi
   local remaining
   # Dropbox can rate-limit (too_many_write_operations): retry the source with a pause before calling it a failure.
@@ -217,6 +221,15 @@ for src in "${LIVE[@]}"; do
   fi
   upload "$snap" "$src"
 done
+# Tier 1 (transcripts, WALs, ledgers) is done: mark it on its own, so a slow bulk pass can never hide a gap here.
+[ $primary -gt 0 ] || { say "no primary source (.claude/projects or .codex/sessions) was copied"; ok=1; }
+say "transcripts exit=$ok sources=$found remote=${R%%:*}"
+transcripts_ok=$ok
+if [ $ok -eq 0 ]; then
+  echo "$STARTED sources=$found remote=${R%%:*}" > "$LOGDIR/log-backup.last-ok.tmp.$$" \
+    && mv "$LOGDIR/log-backup.last-ok.tmp.$$" "$LOGDIR/log-backup.last-ok"
+fi
+ok=0
 for src in "${DIRECT[@]}"; do
   [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
   if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
@@ -237,12 +250,14 @@ for src in "${DIRECT[@]}"; do
   fi
   upload "$HOME/$src" "$src" "${extra[@]}"
 done
-[ $primary -gt 0 ] || { say "no primary source (.claude/projects or .codex/sessions) was copied"; ok=1; }
-
-say "run exit=$ok sources=$found remote=${R%%:*}"
-echo "$STARTED exit=$ok" > "$LOGDIR/log-backup.last-run"
-if [ $ok -eq 0 ]; then
-  echo "$STARTED sources=$found remote=${R%%:*}" > "$LOGDIR/log-backup.last-ok.tmp.$$" \
-    && mv "$LOGDIR/log-backup.last-ok.tmp.$$" "$LOGDIR/log-backup.last-ok"
+# Tier 2 (bulk: archived sessions and the narrowed work tree) has its own marker.
+bulk_ok=$ok
+say "bulk exit=$bulk_ok"
+if [ $bulk_ok -eq 0 ]; then
+  echo "$STARTED" > "$LOGDIR/log-backup.bulk-last-ok.tmp.$$" \
+    && mv "$LOGDIR/log-backup.bulk-last-ok.tmp.$$" "$LOGDIR/log-backup.bulk-last-ok"
 fi
-exit $ok
+rc=0
+{ [ $transcripts_ok -eq 0 ] && [ $bulk_ok -eq 0 ]; } || rc=1
+echo "$STARTED exit=$rc transcripts=$transcripts_ok bulk=$bulk_ok" > "$LOGDIR/log-backup.last-run"
+exit $rc

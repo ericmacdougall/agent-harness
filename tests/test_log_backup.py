@@ -36,8 +36,10 @@ class Base(unittest.TestCase):
         self.logs = self.home / ".agent-harness" / "logs"
         self.logs.mkdir(parents=True)
 
-    def last_ok(self, text):
+    def last_ok(self, text, bulk=True):
         (self.logs / "log-backup.last-ok").write_text(text)
+        if bulk is True:
+            (self.logs / "log-backup.bulk-last-ok").write_text(stamp(time.time()) + "\n")
 
 
 class Freshness(Base):
@@ -89,6 +91,32 @@ class Freshness(Base):
         self.assertIn(b"has held the lock", self.run_cli("session-start").stdout)
         (lock / "pid").write_text("999999999")
         self.assertNotIn(b"has held the lock", self.run_cli("check").stdout)
+
+    def test_bulk_tier_states(self):
+        self.last_ok(stamp(time.time()), bulk=False)
+        bulk = self.logs / "log-backup.bulk-last-ok"
+        first = self.logs / "log-backup.first-run"
+        # never completed, backup installed a moment ago: pending, not an alert
+        first.write_text(stamp(time.time() - 60) + "\n")
+        self.assertEqual(self.run_cli("check").returncode, 0)
+        self.assertEqual(self.run_cli("session-start").stdout, b"")
+        # never completed and installed long ago: a visible notice and exit 3, transcripts stay fresh
+        first.write_text(stamp(time.time() - 7 * 3600) + "\n")
+        done = self.run_cli("check")
+        self.assertEqual(done.returncode, 3)
+        self.assertIn(b"bulk tier", done.stdout)
+        self.assertIn(b"never completed", self.run_cli("session-start").stdout)
+        # stale, invalid, future
+        for text, code in ((stamp(time.time() - 7 * 3600), 3), ("garbage", 3), (stamp(time.time() + 3600), 3),
+                           (stamp(time.time() - 60), 0)):
+            bulk.write_text(text)
+            self.assertEqual(self.run_cli("check").returncode, code, text)
+
+    def test_stale_transcripts_outrank_a_bulk_notice(self):
+        self.last_ok(stamp(time.time() - 7200), bulk=False)
+        done = self.run_cli("check")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(b"LOG BACKUP ALERT", done.stdout)
 
     def test_check_exit_codes(self):
         self.assertEqual(self.run_cli("check").returncode, 2)  # missing

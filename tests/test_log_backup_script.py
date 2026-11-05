@@ -128,10 +128,13 @@ class Case(unittest.TestCase):
     def last_ok(self):
         return self.logs / "log-backup.last-ok"
 
+    def bulk_ok(self):
+        return self.logs / "log-backup.bulk-last-ok"
+
 
 ALLOWED_FLAGS = {"--tpslimit", "--transfers", "--contimeout", "--timeout", "--log-file", "--log-level", "--exclude-from", "--backup-dir", "--ignore-case",
                  "--dropbox-batch-mode", "--dropbox-batch-size", "--checkers", "--retries", "--retries-sleep",
-                 "--low-level-retries", "--min-age", "--max-duration", "--max-size", "--max-transfer"}
+                 "--low-level-retries", "--min-age", "--checksum", "--max-duration", "--max-size", "--max-transfer"}
 
 
 def assert_copy_only(test, calls):
@@ -597,6 +600,26 @@ class Failure(Case):
         done = self.run_script()
         self.assertNotEqual(done.returncode, 0)
         self.assertFalse(self.last_ok().exists())
+
+    def test_two_tiers_have_separate_markers(self):
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(self.last_ok().exists() and self.bulk_ok().exists())
+        self.assertRegex(self.bulk_ok().read_text(), r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\n$")
+        for p in (self.last_ok(), self.bulk_ok()):
+            os.unlink(p)
+        done = self.run_script(FAKE_FAIL_MATCH="--min-age", LOG_BACKUP_RETRIES="0")  # only bulk sources carry --min-age
+        self.assertNotEqual(done.returncode, 0)
+        self.assertTrue(self.last_ok().exists())            # transcripts are safe and say so
+        self.assertFalse(self.bulk_ok().exists())           # the gap in the bulk tier is not hidden
+        for p in (self.last_ok(), self.bulk_ok()):
+            if p.exists():
+                os.unlink(p)
+        done = self.run_script(FAKE_FAIL_MATCH=".claude/wals", LOG_BACKUP_RETRIES="0")  # transcripts tier fails
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.last_ok().exists())
+        self.assertTrue(self.bulk_ok().exists())
+        self.assertTrue((self.logs / "log-backup.first-run").exists())
 
     def test_success_writes_last_ok_with_start_time_atomically(self):
         done = self.run_script()
