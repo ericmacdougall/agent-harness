@@ -34,7 +34,8 @@ Subcommands
          scan, else 0. Excluded and built-in pruned directory names are listed in the output.
 
 NOT covered (known limits): system units (/etc/systemd/system), other users' crontabs and homes,
-anything outside the --root dirs, gitignored files and plain (non-git) files, linked worktrees
+anything outside the --root dirs, remotes addressed by this host's LAN IP (only loopback, hostname and
+resolved own addresses are recognised), gitignored files and plain (non-git) files, linked worktrees
 whose main repo is outside the roots, refs/notes and other custom refs, git objects outside refs (reflog-only commits), rewritten
 remotes (url.insteadOf), and remote-side state (we never contact a remote).
 
@@ -152,7 +153,7 @@ class Scan:
             raise RuntimeError("git %s timed out" % argv[0])
         except OSError as e:
             raise RuntimeError("git not runnable: %s" % e)
-        return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+        return p.returncode, p.stdout.decode("utf-8", "surrogateescape"), p.stderr.decode("utf-8", "replace")
 
     def contained_in(self, repo, sha, *namespaces):
         """True if some ref under the namespaces contains commit sha (for-each-ref --contains)."""
@@ -266,19 +267,28 @@ class Scan:
     def check_dirty(self, repo):
         """Count of changed/untracked entries only (git status --porcelain, no index write)."""
         # explicit flags: user/repo config (status.showUntrackedFiles=no) must not hide files
-        rc, out, er = self.git(repo, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
+        rc, out, er = self.git(repo, "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none")
         if rc != 0:
             raise RuntimeError("git status failed: %s" % er.strip()[:120])
-        lines = [l for l in out.split("\n") if l.strip()]
-        if lines:
+        fields = out.split("\0")  # -z: no path quoting; a rename/copy record is followed by its source path
+        paths, i = [], 0
+        while i < len(fields):
+            f = fields[i]
+            i += 1
+            if len(f) < 4:
+                continue
+            if f[0] in "RC" or f[1] in "RC":
+                i += 1
+            paths.append(f[3:])
+        if paths:
             h = hashlib.sha256(out.encode("utf-8", "replace"))
-            for l in lines[:DIRTY_STAT_CAP]:  # content changes under the same path change size:mtime
+            for pth in paths[:DIRTY_STAT_CAP]:  # content changes under the same path change size:mtime
                 try:
-                    st = os.lstat(os.path.join(repo, l[3:].split(" -> ")[-1].strip('"')))
+                    st = os.lstat(os.path.join(repo, pth))
                     h.update(("%d:%d" % (st.st_size, st.st_mtime_ns)).encode())
                 except OSError:
                     h.update(b"-")
-            self.row("dirty_worktree", "%s::dirty" % repo, self.now, None, h.hexdigest()[:16], len(lines))
+            self.row("dirty_worktree", "%s::dirty" % repo, self.now, None, h.hexdigest()[:16], len(paths))
 
     def tracked(self, repo_root, path):
         """True if path is tracked by git (so it lives in the repo, not only on this disk)."""
@@ -664,7 +674,8 @@ def cmd_report(args):
         problems.append("ROOTS\tscanned roots do not include $HOME; rescan with --root ~ (or --allow-partial-roots)")
     if args.expect_host and last.get("host") != args.expect_host:
         problems.append("HOST\tscan was taken on %r, expected %r" % (last.get("host"), args.expect_host))
-    if last.get("min_db_bytes") is None or last.get("min_db_bytes") > DEFAULT_MIN_DB:
+    mdb = last.get("min_db_bytes")
+    if not isinstance(mdb, int) or isinstance(mdb, bool) or mdb > DEFAULT_MIN_DB:
         problems.append("DB_THRESHOLD\tscan skipped databases below %s bytes (default %d); rescan with the default" % (last.get("min_db_bytes"), DEFAULT_MIN_DB))
     if last.get("no_crontab"):
         problems.append("NO_CRONTAB\tcrontab was not checked (--no-crontab)")
@@ -707,6 +718,10 @@ def cmd_report(args):
 
 
 def main(argv=None):
+    try:  # non-UTF-8 file names must not crash text output
+        sys.stdout.reconfigure(errors="backslashreplace")
+    except (AttributeError, ValueError):
+        pass
     p = argparse.ArgumentParser(prog="loss_inventory.py", description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("scan")
