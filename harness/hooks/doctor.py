@@ -181,12 +181,18 @@ def remote_path(ssh: str, path: str) -> str:
 
 def read_live(path: str, ssh: str | None) -> dict:
     if ssh:
+        # `head -c cap+1` keeps the remote read bounded (a remote /dev/zero or huge file cannot fill local memory);
+        # one byte over the cap is refused, and parsing goes through the same depth/size checks as a local read.
         r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", check_host(ssh),
-                            "cat", shlex.quote(path)],
-                           capture_output=True, text=True, timeout=30)
+                            "head", "-c", str(MAX_JSON_BYTES + 1), "--", shlex.quote(path)],
+                           capture_output=True, timeout=30)
         if r.returncode != 0:
-            raise OSError(f"ssh {ssh} cat failed rc={r.returncode}")
-        return json.loads(r.stdout)
+            raise OSError(f"ssh {ssh} read failed rc={r.returncode}")
+        if len(r.stdout) > MAX_JSON_BYTES:
+            raise ValueError(f"{path}: remote file is larger than {MAX_JSON_BYTES} bytes")
+        sys.path.insert(0, str(HERE))
+        import safe_input
+        return safe_input.safe_json_loads(r.stdout)
     return load_json(Path(path).expanduser())
 
 
@@ -256,14 +262,18 @@ def main(argv=None) -> int:
     r.add_argument("--canary", action="store_true", help="also run canaries (default: wiring only)")
     r.add_argument("--fail-on-p0", action="store_true", help="exit 1 when any P0 rule is not ENFORCED/PARTIAL")
     a = ap.parse_args(argv)
-    manifest = load_json(MANIFEST)
+    try:
+        manifest = load_json(MANIFEST)
+    except (OSError, ValueError) as exc:
+        print(f"doctor: cannot read {MANIFEST}: {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+        return 2
     ssh = getattr(a, "ssh", None)
     try:
         if ssh:
             a.settings, a.hooks_dir = remote_path(ssh, a.settings), remote_path(ssh, a.hooks_dir)
         live = read_live(a.settings, ssh)
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-        print(f"doctor: cannot read {a.settings}: {type(exc).__name__}", file=sys.stderr)
+        print(f"doctor: cannot read {a.settings}: {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
         return 2
     hooks_dir = Path(a.hooks_dir).expanduser()
     if a.cmd == "check":
@@ -283,7 +293,11 @@ def main(argv=None) -> int:
                 print(f"{f['state']:14} {f['id']:34} {f['detail']}")
         return verdict(findings)
     findings = check_hooks(manifest, "claude", live, hooks_dir, canary=a.canary)
-    rules = load_json(RULES)
+    try:
+        rules = load_json(RULES)
+    except (OSError, ValueError) as exc:
+        print(f"doctor: cannot read {RULES}: {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+        return 2
     rows = rules_report(rules, findings, hooks_dir)
     for row in rows:
         print(f"{row['state']:13} {row['priority']} {row['id']} {row['planned']}")
