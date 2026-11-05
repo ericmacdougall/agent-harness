@@ -225,14 +225,28 @@ class RemoteBase(workflow.DeliveryWorkflow):
 
 @own_tests_only
 class TargetSanity(workflow.DeliveryWorkflow):
-    def run_prepare(self, **policy):
+    def run_prepare(self, *extra, **policy):
         module = load_deliver()
         out = io.StringIO()
         with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(out), \
                 mock.patch.dict(module.TARGET_POLICY, policy), \
-                mock.patch.object(sys, 'argv', [str(workflow.DELIVER), *self.prepare_args(), '--local-only']):
+                mock.patch.object(sys, 'path', [str(workflow.DELIVER.parent), *sys.path]), \
+                mock.patch.object(sys, 'argv', [str(workflow.DELIVER), *self.prepare_args(), '--local-only', *extra]):
             code = module.main()
         return code, json.loads(out.getvalue())
+
+    def wal_path(self):
+        return self.home / '.claude' / 'wals' / 'session-1' / 'main.jsonl'
+
+    def make_behind(self, commits=4):
+        clone = self.root / 'clone'
+        command('git', 'clone', '-q', str(self.remote), str(clone), env=self.env)
+        command('git', 'config', 'user.name', 'T', cwd=clone, env=self.env)
+        command('git', 'config', 'user.email', 't@example.invalid', cwd=clone, env=self.env)
+        for index in range(commits):
+            command('git', 'commit', '-q', '--allow-empty', '-m', f'chore: upstream {index}', cwd=clone, env=self.env)
+        command('git', 'push', '-q', 'origin', 'main', cwd=clone, env=self.env)
+        command('git', 'fetch', '-q', 'origin', cwd=self.original, env=self.env)
 
     def test_huge_staged_set_gets_a_specific_refusal(self):
         for index in range(6):
@@ -264,9 +278,46 @@ class TargetSanity(workflow.DeliveryWorkflow):
     def test_warn_mode_continues(self):
         for index in range(6):
             (self.original / f'loose{index}.txt').write_text('x')
-        code, data = self.run_prepare(max_untracked=3, mode='warn')
+        code, data = self.run_prepare('--wal', str(self.wal_path()), max_untracked=3, mode='warn')
+        self.assertNotEqual(data.get('reason'), 'TARGET_OVERRIDE_UNRECORDED', data)
         # Warn mode proceeds to the strict clean check, which still refuses a dirty target.
         self.assertNotEqual(data.get('reason'), 'HUGE_UNTRACKED', data)
+
+    def test_warn_override_is_recorded_in_output_generation_and_wal(self):
+        # The coordinator's requirement: a per-run warn and the checks it bypassed are never silent.
+        self.make_behind()
+        code, data = self.run_prepare('--target-policy', 'warn', '--wal', str(self.wal_path()), max_behind=2)
+        self.assertEqual((code, data['status']), (0, 'LOCAL_READY'), data)
+        [override] = data['target_policy_overrides']
+        self.assertEqual((override['mode'], [item['reason'] for item in override['bypassed']]),
+                         ('warn', ['ORIGINAL_BEHIND']))
+        record = Path(data['state']).parent / 'target-policy-overrides.json'
+        self.assertEqual(json.loads(record.read_text())['overrides'], [override])
+        self.assertEqual(oct(record.stat().st_mode & 0o777), '0o600')
+        lines = [json.loads(line) for line in self.wal_path().read_text().splitlines()]
+        self.assertEqual([line['target_policy_override']['bypassed'] for line in lines], [override['bypassed']])
+        self.assertIn('ORIGINAL_BEHIND', lines[0]['note'])
+        # A second warn run of the same generation appends; the history is kept, not overwritten.
+        code, again = self.run_prepare('--target-policy', 'warn', '--wal', str(self.wal_path()), max_behind=2)
+        self.assertEqual(len(again['target_policy_overrides']), 2, again)
+
+    def test_warn_without_wal_is_refused_before_anything(self):
+        self.make_behind()
+        code, data = self.run_prepare('--target-policy', 'warn', max_behind=2)
+        self.assertEqual((code, data['status'], data.get('reason')), (2, 'BLOCKED_POLICY', 'TARGET_OVERRIDE_UNRECORDED'),
+                         data)
+        self.assertFalse(any(self.original.glob('.git/agent-harness/delivery-workflows/*/*/journal.json')))
+
+    def test_warn_with_unusable_wal_is_refused(self):
+        self.make_behind()
+        code, data = self.run_prepare('--target-policy', 'warn', '--wal', str(self.root / 'elsewhere.jsonl'),
+                                      max_behind=2)
+        self.assertEqual((code, data.get('reason')), (2, 'TARGET_OVERRIDE_UNRECORDED'), data)
+
+    def test_source_default_warn_also_needs_a_wal(self):
+        self.make_behind()
+        code, data = self.run_prepare(max_behind=2, mode='warn')
+        self.assertEqual((code, data.get('reason')), (2, 'TARGET_OVERRIDE_UNRECORDED'), data)
 
     def test_operator_can_choose_warn_on_the_command_line(self):
         for index in range(6):
@@ -277,7 +328,7 @@ class TargetSanity(workflow.DeliveryWorkflow):
         with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err), mock.patch.dict(module.TARGET_POLICY, {'max_staged': 3}), \
                 mock.patch.object(sys, 'argv', [str(workflow.DELIVER), *self.prepare_args(), '--local-only',
-                                                '--target-policy', 'warn']):
+                                                '--target-policy', 'warn', '--wal', str(self.wal_path())]):
             module.main()
         data = json.loads(out.getvalue())
         self.assertIn('6 staged paths', err.getvalue())

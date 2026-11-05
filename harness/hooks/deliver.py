@@ -33,6 +33,7 @@ from integrate_local import (ALLOWED_GIT_ENV, CheckInterpreterError, CheckLog, E
                              fsync_directory, private_directory, read_journal, run as run_check,
                              scope_key, valid_identity_text, write_journal)
 from process import cleanup_discarded
+import wal as wal_log
 
 
 OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -224,11 +225,12 @@ def target_preflight(original, branch, mode=None):
                          f"feature onto origin/{branch}; to resume an in-flight generation, do not move the original: "
                          f"use --reconcile-only or --target-policy warn"))
     if not problems:
-        return
+        return []
     message = "; ".join(item[0] for item in problems)
     if mode == "warn":
         print("WARNING: " + message, file=sys.stderr)
-        return
+        # The caller records these bypassed checks in the WAL, the generation and the output.
+        return [{"reason": item[1], "message": item[0][:300]} for item in problems]
     raise DeliveryError("BLOCKED_POLICY", "Original checkout is not a sane delivery target: " + message, code=2,
                         reason=problems[0][1], hint="; ".join(item[2] for item in problems))
 
@@ -548,6 +550,9 @@ class Workflow:
     def facts(self):
         facts = {"generation": self.generation, "state": str(self.directory / "journal.json"),
                  "checkout": str(self.original), "source_head": self.state["source_head"]}
+        overrides = self.target_overrides()
+        if overrides:
+            facts["target_policy_overrides"] = overrides
         waivers, total = self.policy_waivers()
         if waivers is None:
             # A record that exists but cannot be read must not look like "no waivers".
@@ -557,6 +562,17 @@ class Workflow:
             if total > len(waivers):
                 facts["commit_policy_waivers_total"] = total
         return facts
+
+    def target_overrides(self):
+        """Every --target-policy warn run recorded for this generation (see record_target_override)."""
+        path = self.directory / TARGET_OVERRIDE_RECORD
+        if not os.path.lexists(path):
+            return []
+        try:
+            items = json.loads(regular_bytes(path, WAIVER_RECORD_LIMIT)).get("overrides", [])
+            return items if isinstance(items, list) else [{"mode": "unreadable"}]
+        except (OSError, ValueError, DeliveryError, AttributeError):
+            return [{"mode": "unreadable"}]
 
     def policy_waivers(self):
         """Waivers the checked range used, so a reviewer of the prepare output sees every bypass.
@@ -991,6 +1007,38 @@ def prepare_pr(flow, title, body):
 
 
 COMMIT_POLICY_RECORD = "commit-policy.json"
+TARGET_OVERRIDE_RECORD = "target-policy-overrides.json"
+TARGET_OVERRIDE_LIMIT = 20
+
+
+def record_target_override_in_wal(args, bypassed):
+    """Append the operator's --target-policy warn and what it bypassed to the WAL, or refuse to run."""
+    override = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "mode": "warn",
+                "task": str(getattr(args, "task", ""))[:120], "bypassed": bypassed}
+    names = ", ".join(item["reason"] for item in bypassed) or "none (no check was exceeded)"
+    record = {"at": override["at"], "event": "risk", "id": "w" + secrets.token_hex(6),
+              "note": f"deliver.py prepare --target-policy warn for task {override['task']}: bypassed {names}",
+              "target_policy_override": override}
+    try:
+        wal_log.append(args.wal.expanduser().absolute(), record)
+    except (OSError, ValueError):
+        raise DeliveryError("BLOCKED_POLICY", "--target-policy warn could not be recorded in the WAL; nothing was done",
+                            code=2, reason="TARGET_OVERRIDE_UNRECORDED",
+                            hint="pass a per-session WAL path under ~/.claude/wals") from None
+    return override
+
+
+def record_target_override(flow, override):
+    """Keep every warn-mode run of this generation beside its journal (the journal schema is fixed)."""
+    path = flow.directory / TARGET_OVERRIDE_RECORD
+    history = []
+    if os.path.lexists(path):
+        try:
+            history = json.loads(regular_bytes(path, WAIVER_RECORD_LIMIT)).get("overrides", [])
+        except (OSError, ValueError, DeliveryError, AttributeError):
+            history = [{"mode": "unreadable-previous-record"}]
+    history = (history if isinstance(history, list) else [])[-(TARGET_OVERRIDE_LIMIT - 1):] + [override]
+    _write_private_json(path, {"schema": 1, "generation": flow.generation, "overrides": history})
 WAIVER_RECORD_LIMIT = 1_048_576
 
 
@@ -1121,10 +1169,18 @@ def _ticket_updates(flow, stage, head, pr_url):
 def prepare(args):
     if getattr(args, "reconcile_only", False):
         return reconcile(args)
+    override = None
     if args.original is not None and isinstance(args.original_branch, str):
+        # Effective mode: the per-run flag, else the source default; either way warn must be recorded.
+        mode = getattr(args, "target_policy", None) or TARGET_POLICY["mode"]
+        if mode == "warn" and getattr(args, "wal", None) is None:
+            raise DeliveryError("BLOCKED_POLICY", "--target-policy warn requires --wal so the override is recorded",
+                                code=2, reason="TARGET_OVERRIDE_UNRECORDED",
+                                hint="pass --wal <your session WAL under ~/.claude/wals>, or drop --target-policy warn")
         # Before any strict snapshot, so a huge dirty set gets a specific message, not a status timeout.
-        target_preflight(args.original.expanduser().absolute(), args.original_branch,
-                         getattr(args, "target_policy", None))
+        bypassed = target_preflight(args.original.expanduser().absolute(), args.original_branch, mode)
+        if mode == "warn":
+            override = record_target_override_in_wal(args, bypassed)
     source, branch, head, baseline, kit = source_inputs(args)
     local_only = getattr(args, "local_only", False)
     title, body = "", b""
@@ -1158,6 +1214,8 @@ def prepare(args):
             flow.create(source, branch, head, baseline, kit, repository, phase)
             write_policy_record(flow, policy_record)
             state = flow.state
+        if override is not None:
+            record_target_override(flow, override)
         if state["phase"] == "LOCAL_READY":
             report("LOCAL_READY", "Explicit local-only generation prepared", **flow.facts())
             return 0
@@ -1791,7 +1849,10 @@ def parse_args():
     prep.add_argument("--reconcile-only", action="store_true", help="Query a pending remote outcome without publishing or changing checkout")
     prep.add_argument("--local-only", action="store_true", help="Explicitly choose guarded local delivery")
     prep.add_argument("--target-policy", choices=("refuse", "warn"), default=None,
-                      help="Original-checkout sanity preflight: refuse (default) or warn and continue")
+                      help="Original-checkout sanity preflight: refuse (default) or warn and continue; "
+                           "warn is per run, needs --wal, and is recorded in the WAL, the generation and the output")
+    prep.add_argument("--wal", type=Path, default=None,
+                      help="Session WAL (~/.claude/wals/<session>/<name>.jsonl) that records a --target-policy warn run")
     prep.add_argument("--new-generation", action="store_true", help="Supersede only a settled generation")
     end = sub.choices["finish"]
     finish_mode = end.add_mutually_exclusive_group(required=True)
