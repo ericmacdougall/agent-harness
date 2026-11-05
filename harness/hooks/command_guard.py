@@ -182,6 +182,7 @@ class Compiled:
         fmt = lambda template, h: template.replace('{home}', h).replace('{cwd}', self.cwd)  # noqa: E731
         # Matching homes: the local ones (exact) plus glob patterns for other machines' homes.
         match_homes = homes + [g for g in policy.get('generic_homes', []) if isinstance(g, str)]
+        self.match_homes = [self._segs(g.casefold()) for g in policy.get('generic_homes', []) if isinstance(g, str)]
         self.protected = [self._segs(fmt(t, h)) for t in policy['protected_log_roots'] for h in match_homes]
         self.roots = [self._segs(fmt(t, h)) for t in policy.get('protected_roots', []) for h in match_homes]
         self.allow = []
@@ -938,6 +939,12 @@ SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'bus
 PS_SHELLS = {'pwsh', 'powershell'}
 INTERPRETERS = {'python', 'python3', 'python2', 'node', 'nodejs', 'perl', 'ruby', 'php', 'deno', 'bun', 'lua', 'rscript',
                 'osascript', 'pypy', 'pypy3', 'tclsh', 'awk-script'}
+WRAPPER_VALUE_OPTS = {'nice': ('-n', '--adjustment'), 'ionice': ('-c', '-n', '-p', '-t'), 'chrt': ('-p',),
+                      'stdbuf': ('-i', '-o', '-e'), 'caffeinate': ('-t', '-w'), 'watch': ('-n', '-d', '--interval'),
+                      'strace': ('-o', '-e', '-p', '-s', '-u'), 'ltrace': ('-o', '-e', '-p', '-s', '-u'),
+                      'runuser': ('-u', '-g', '-G'), 'su': ('-s', '-g', '-G'), 'sg': (), 'setsid': (),
+                      'nsenter': ('-t', '--target'), 'firejail': ('--profile',), 'sandbox-exec': ('-f', '-p', '-n'),
+                      'start-process': ('-FilePath', '-ArgumentList'), 'unbuffer': (), 'time': ('-o', '-f')}
 WRAPPERS_SIMPLE = {'command', 'builtin', 'exec', 'nohup', 'time', 'nice', 'ionice', 'setsid', 'stdbuf', 'caffeinate',
                    'noglob', 'unbuffer', 'chrt', 'taskset', 'doas', 'sudo', 'env', 'xargs', 'timeout', 'watch', 'gosu',
                    'chroot', 'runuser', 'strace', 'ltrace', 'script', 'dtruss', 'arch', 'nsenter', 'firejail', 'sandbox-exec',
@@ -1224,7 +1231,8 @@ class Analyzer:
             if not words or idx == 0:
                 continue
             name = norm_name(words[0].text)
-            if name in SHELLS | PS_SHELLS and not any(a.text in ('-c', '-command', '-Command', '/c') or re.fullmatch(r'-[a-z]*c[a-z]*', a.text) for a in words[1:]) \
+            job_queue = name in ('at', 'batch') and not any(a.text == '-f' for a in words[1:])
+            if job_queue or name in SHELLS | PS_SHELLS and not any(a.text in ('-c', '-command', '-Command', '/c') or re.fullmatch(r'-[a-z]*c[a-z]*', a.text) for a in words[1:]) \
                     and not [a for a in words[1:] if not a.text.startswith('-')]:
                 for prev in pl.cmds[:idx]:
                     pw = self._skip_assigns(strip_reserved(prev.words))[1]
@@ -1368,8 +1376,19 @@ class Analyzer:
         printer = outer in ECHO_CMDS or outer in PRINT_FILE_CMDS or outer in PASS_FILTERS
         for w in rest:
             self.subs(w, depth, visible=printer and self.out_visible(pl, idx, False))
+        if printer and any(v.startswith('!') for w in rest[1:] for v in w.vars) and self.out_visible(pl, idx, False):
+            ctx.secret_seen += 1
+            ctx.add(SECRET_DUMP, 'indirect-var', 'printing ${!name} prints the value of whatever variable name holds',
+                    'print variable names only (compgen -v), never their values')
         before = ctx.secret_seen
         self.dispatch(rest, cmd, pl, idx, depth)
+        if outer in ('cp', 'install', 'ditto', 'ln', 'rsync', 'mv') and len(rest) >= 3:
+            ops = _nondash(rest[1:])
+            if len(ops) >= 2 and any(self._cred_one(norm_path(o.text, ctx)) for o in ops[:-1]):
+                ctx.secret_files.add(norm_path(ops[-1].text, ctx).casefold())
+                dest = norm_path(ops[-1].text, ctx)
+                for o in ops[:-1]:
+                    ctx.secret_files.add((dest.rstrip('/') + '/' + posixpath.basename(o.text)).casefold())
         if ctx.secret_seen > before:
             for r in cmd.redirs:
                 if r.op in ('>', '>>', '>|', '&>', '&>>') and r.target is not None:
@@ -1542,6 +1561,9 @@ class Analyzer:
             raise Blocked('command nesting is deeper than %d levels' % ctx.budget.max_depth)
         head = words[0]
         names = self.names_for(head)
+        which = self._which_name(head)
+        if which:
+            names = [which]
         if head.dynamic and not head.text.strip('') or (head.dynamic and any(v not in ctx.vars for v in head.vars) or SUB_MARK in head.text):
             # unresolved command word: judge the whole line as text
             joined = ' '.join(w.text for w in words)
@@ -1778,8 +1800,9 @@ class Analyzer:
                 i += 2 if texts[i] in ('-s', '-k', '--signal', '--kill-after') else 1
             i += 1  # duration
         elif name in ('nice', 'ionice', 'chrt', 'taskset', 'stdbuf', 'caffeinate', 'watch', 'strace', 'ltrace', 'setsid', 'arch', 'nohup', 'unbuffer', 'dtruss', 'chroot', 'nsenter', 'firejail', 'sandbox-exec', 'script', 'gosu', 'runuser', 'su', 'sg', 'time', 'noglob', 'command', 'builtin', 'exec', 'start-process', 'start', 'call', 'invoke-command', 'icm'):
+            valued = WRAPPER_VALUE_OPTS.get(name, ())
             while i < len(args) and texts[i].startswith('-'):
-                i += 2 if texts[i] in ('-n', '-c', '-p', '-o', '-u', '-g', '-s', '-i', '-d', '-t', '-f', '-FilePath', '-ArgumentList') and False else 1
+                i += 2 if texts[i] in valued else 1
             if name in ('chroot', 'gosu', 'runuser', 'sg', 'taskset', 'chrt'):
                 i += 1
             if name == 'su':
@@ -1993,6 +2016,9 @@ class Analyzer:
         rest = texts[i + 1:]
         if sub == 'clean':
             self.git_clean(args[i + 1:], rest, cwd_word)
+        if sub == 'worktree' and rest[:1] in (['remove'], ['prune']):
+            for w in _nondash(args[i + 2:]):
+                self.refuse('git worktree remove', w)
         if sub == 'init' and rest:
             for w in _nondash(args[i + 1:])[-1:]:
                 self.note_created(_join_word(w, '.git'))
@@ -2036,7 +2062,10 @@ class Analyzer:
         nd = [t for t in low if not t.startswith('-')]
         if 'config' in nd:
             after = nd[nd.index('config') + 1:]
-            if any(a in ctx.c.rclone_blocked for a in after[:2]):
+            sub = after[0] if after else ''
+            secret_args = (not after or sub == 'password' or sub == 'create' and len(after) > 3
+                           or sub == 'update' and len(after) > 2)
+            if secret_args or any(a in ctx.c.rclone_blocked for a in after[:2]):
                 ctx.secret_seen += 1
                 ctx.add(SECRET_DUMP, 'rclone-config-dump',
                         'rclone config show/dump/reconnect prints OAuth access and refresh tokens into the transcript',
@@ -2236,10 +2265,12 @@ class Analyzer:
                 return True
         return False
 
-    def under_cred_dir(self, path):
+    def under_cred_dir(self, path, or_above=False):
         segs = Compiled._segs(path)
         for d in self.c.cred_dirs:
             if len(segs) >= len(d) and segs[:len(d)] == d:
+                return True
+            if or_above and len(segs) < len(d) and d[:len(segs)] == segs:
                 return True
         return False
 
@@ -2288,7 +2319,7 @@ class Analyzer:
                 if ':' in t and not t.startswith('/') and name in ('scp', 'rsync', 'sftp'):
                     continue
             hit = self.is_cred_path(t, w) if t == w.text else self._cred_one(t)
-            dir_hit = recursive and self.under_cred_dir(norm_path(t, ctx))
+            dir_hit = recursive and self.under_cred_dir(norm_path(t, ctx), or_above=True)
             if hit or dir_hit:
                 ctx.secret_seen += 1
                 if count_only:
@@ -2404,9 +2435,8 @@ class Analyzer:
         top_len = len(Compiled._segs(top))
         if any(_has_glob(x) for x in segs[:top_len]):
             return False  # a wildcard at or above the top level could reach the worktree itself or its siblings
-        first = segs[top_len] if len(segs) > top_len else ''
-        if _has_glob(first) and first[:1] in ('.', '?', '['):
-            return False  # could match .git directly below the top
+        if any(_has_glob(x) and x[:1] in ('.', '?', '[') for x in segs[top_len:]):
+            return False  # could match .git, . or .. (and so reach the top or a parent)
         try:
             here = os.path.realpath(origin)
             top_real = os.path.realpath(top)
@@ -2527,7 +2557,7 @@ class Analyzer:
         if cls is None or cls not in tiers:
             return False
         if need_existing and literal and cls in ('log', 'root') and not _lexists(path) \
-                and path.casefold() not in ctx.created:
+                and path.casefold() not in ctx.created and not self._foreign_home(path):
             return False  # creating a new file is not destructive
         if literal and cls in ('log', 'root') and ctx.marker is not None and ctx.marker(path):
             return False
@@ -2542,6 +2572,13 @@ class Analyzer:
                 'then delete the literal path' + ('' if literal else '; spell out the literal path, globs and '
                                                   'variables cannot be approved'))
         return True
+
+    def _foreign_home(self, path):
+        """A /home/x or /Users/x path that is not one of this machine's homes (an ssh or container target)."""
+        folded = path.casefold()
+        if any(folded == h.casefold() or folded.startswith(h.casefold().rstrip('/') + '/') for h in self.c.homes):
+            return False
+        return any(_prefix_match(Compiled._segs(folded), g) for g in self.c.match_homes)
 
     def protected_target(self, what, word):
         self.refuse(what, word)
@@ -2722,12 +2759,18 @@ class Analyzer:
         letters = _flag_letters(args)
         if not ('f' in letters or '--force' in texts) or 'n' in letters or '--dry-run' in texts:
             return
-        target = cwd_word
-        if target is None:
+        base = norm_path(cwd_word.text, self.ctx) if cwd_word is not None and not cwd_word.dynamic else (
+            None if cwd_word is not None else self.ctx.cwd)
+        if base is None:
+            self.refuse('git clean', cwd_word)
+            return
+        specs = [a for a in _nondash(args) if a.text not in ('--',)]
+        targets = [norm_path(a.text, self.ctx, base) for a in specs] or [base]
+        for t in targets:
+            # git clean removes untracked files below t, so judge a path inside it, not t itself
             fake = Word()
-            fake.alts = [self.ctx.cwd]
-            target = fake
-        self.refuse('git clean', target)
+            fake.alts = [t.rstrip('/') + '/.git-clean-interior']
+            self.refuse('git clean', fake)
 
     # ---- kills
     def kill_cmd(self, name, args, texts):
@@ -2932,6 +2975,11 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
 def format_block(f, more=0, warn=False):
     head = 'command_guard WARNING' if warn else 'command_guard BLOCKED'
     text = '%s [%s/%s]: %s. Safe alternative: %s.' % (head, f.category, f.rule, f.reason, f.alternative)
+    try:  # names taken from the command (basenames) must never carry a secret into the transcript
+        import redact
+        text = redact.redact(text)
+    except Exception:  # noqa: BLE001 - without the redactor, drop everything after the rule label
+        text = '%s [%s/%s]: blocked; see the command_guard docs.' % (head, f.category, f.rule)
     if more > 0:
         text += ' (%d more finding(s))' % more
     if not warn:
