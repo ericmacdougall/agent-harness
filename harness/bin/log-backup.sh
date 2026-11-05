@@ -34,6 +34,9 @@ STALE_LOCK_SECONDS=86400
 WORK_EXCLUDES=${LOG_BACKUP_WORK_EXCLUDES:-$SELF_DIR/log-backup.work-excludes}
 BUDGET_SECONDS=${LOG_BACKUP_BUDGET_SECONDS:-780}   # one run must end inside the 15 minute period
 RUN_START=$(date +%s)
+for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP; do
+  case "${!numeric:-0}" in *[!0-9]*|??????*) echo "log-backup: $numeric must be a whole number of at most 5 digits" >&2; exit 2 ;; esac
+done
 
 umask 077
 mkdir -p "$LOGDIR" || { echo "log-backup: cannot create $LOGDIR" >&2; exit 1; }
@@ -148,7 +151,8 @@ DIRECT=(.codex/archived_sessions .agent-harness/work)
 command -v rsync >/dev/null 2>&1 || fail "rsync not found (needed to snapshot live files)" 127
 # The stage must be a private directory of its own: absolute, no `..`, not a symlink, not HOME or any ancestor of a
 # source, and not inside a source (it would nest into itself or be uploaded as data).
-case "$STAGE" in /*) ;; *) fail "LOG_BACKUP_STAGE must be an absolute path" 2 ;; esac
+STAGE=$(printf '%s' "$STAGE" | sed 's#//*#/#g; s#/$##')   # collapse repeated and trailing slashes
+case "$STAGE" in "$HOME"/?*) ;; *) fail "LOG_BACKUP_STAGE must be an absolute path below $HOME" 2 ;; esac
 case "$STAGE" in *..*|*[[:cntrl:]]*) fail "LOG_BACKUP_STAGE is not a plain path" 2 ;; esac
 for guarded in "$HOME" "$HOME/.claude" "$HOME/.codex" "$HOME/.agent-harness/work"; do
   case "$STAGE/" in "$guarded/"*) [ "$guarded" = "$HOME" ] && continue; fail "LOG_BACKUP_STAGE must not sit inside $guarded" 2 ;; esac
@@ -241,12 +245,16 @@ for src in "${DIRECT[@]}"; do
     # the small durable state: skip every directory that has a .git entry, media files, and files over the size cap.
     gen="$LOGDIR/log-backup.worktrees.excludes"
     : > "$gen"
-    find "$HOME/$src" -maxdepth 8 -name .git -prune -print 2>/dev/null | while IFS= read -r g; do
+    unsafe=0
+    while IFS= read -r -d '' g; do
       d=${g%/.git}; rel=${d#"$HOME/$src"}
-      case "$rel" in ''|*[\*?\[\]{}]*) continue ;; esac   # root itself or glob characters: cannot express safely
+      if [ -z "$rel" ]; then printf '/.git/**\n' >> "$gen"; continue; fi   # the work root is itself a checkout
+      case "$rel" in
+        *[\\*?\[\]{}]*|*$'\n'*|*$'\r'*) unsafe=$((unsafe + 1)); continue ;;   # cannot be written as a safe pattern
+      esac
       printf '%s/**\n' "$rel" >> "$gen"
-    done
-    say "work: $(wc -l < "$gen" | tr -d ' ') git trees excluded"
+    done < <(find "$HOME/$src" -xdev -maxdepth 12 -name .git -prune -print0 2>/dev/null)
+    say "work: $(wc -l < "$gen" | tr -d ' ') git trees excluded, $unsafe with unsafe names left in (uploaded)"
     extra+=(--exclude-from "$WORK_EXCLUDES" --exclude-from "$gen" --max-size "${LOG_BACKUP_WORK_MAX_SIZE:-25M}"
             --max-transfer "${LOG_BACKUP_WORK_MAX_TRANSFER:-5G}")
   fi
