@@ -1,4 +1,5 @@
 import json
+import re
 import os
 import stat
 import subprocess
@@ -24,6 +25,32 @@ class InstallerTests(unittest.TestCase):
         self.home = Path(self.temp.name).resolve()
         self.claude = self.home / ".claude"
         self.claude.mkdir()
+
+    def test_subagent_hooks_fire_for_every_agent_type(self):
+        # goodqa#14613: the matcher covered four agent types, so a general-purpose owner never got a
+        # SubagentStart/Stop WAL record and no liveness check could see it stop.
+        install(self.home, apply=True)
+        hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+        for event, action in (("SubagentStart", "subagent"), ("SubagentStop", "subagent_stop")):
+            groups = [g for g in hooks[event]
+                      if any(os.path.basename(str((h.get("args") or [""])[0])) == "wal.py" for h in g.get("hooks", []))]
+            self.assertEqual(len(groups), 1, event)
+            matcher = groups[0].get("matcher")
+            self.assertIn(matcher, (None, ".*", "*"), (event, matcher))  # every type, not a list of named types
+            matcher = matcher or ".*"
+            for agent_type in ("general-purpose", "claude", "Explore", "Plan", "task-owner", "red-team", "fixer",
+                               "click-tester", "statusline-setup", "any-new-type-123"):
+                self.assertTrue(re.fullmatch(matcher if matcher != "*" else ".*", agent_type), (event, matcher, agent_type))
+            hook = [h for h in groups[0]["hooks"] if os.path.basename(str(h["args"][0])) == "wal.py"][0]
+            self.assertEqual(hook["args"][1], action)
+            result = subprocess.run([sys.executable, *[str(a) for a in hook["args"]]],
+                                    input=json.dumps({"session_id": "s-gp", "agent_id": "owner-gp", "agent_type": "general-purpose"}),
+                                    text=True, capture_output=True, timeout=30, env={**os.environ, "HOME": str(self.home)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+        wal = self.claude / "wals" / "s-gp" / "main.jsonl"
+        self.assertTrue(wal.exists(), list((self.claude / "wals").rglob("*")))
+        events = [json.loads(line).get("event") for line in wal.read_text().splitlines() if line.strip()]
+        self.assertIn("subagent", events); self.assertIn("subagent_stop", events)
 
     def test_preview_does_not_write(self):
         paths = install(self.home, apply=False)
@@ -109,7 +136,7 @@ class InstallerTests(unittest.TestCase):
         first = json.loads((self.claude / "settings.json").read_text())
         self.assertEqual(first["model"], "sonnet")
         self.assertEqual(first["permissions"]["deny"], ["Read(**/.env)"])
-        self.assertEqual(len(first["hooks"]["PreToolUse"]), 8)  # user + command guard + WAL + commit policy + heavy-job guard + agent gate + spec gate + ask gate
+        self.assertEqual(len(first["hooks"]["PreToolUse"]), 9)  # user + command guard + WAL + ladder + commit policy + heavy-job guard + agent gate + spec gate + ask gate
         self.assertNotIn("skipDangerousModePermissionPrompt", first)
         self.assertIn("My existing instructions.", (self.claude / "CLAUDE.md").read_text())
         self.assertEqual((self.claude / "CLAUDE.md").read_text().count(START), 1)
@@ -230,7 +257,7 @@ class InstallerTests(unittest.TestCase):
         ))
         install(self.home, apply=True)
         settings = json.loads((self.claude / "settings.json").read_text())
-        self.assertEqual(len(settings["hooks"]["PreToolUse"]), 8)  # + command guard + heavy-job guard + agent gate + spec gate + ask gate
+        self.assertEqual(len(settings["hooks"]["PreToolUse"]), 9)  # + command guard + ladder + heavy-job guard + agent gate + spec gate + ask gate
         self.assertEqual(settings["hooks"]["PreToolUse"][0]["hooks"][0]["args"], [])
 
     def test_backups_are_private(self):
@@ -259,7 +286,7 @@ class InstallerTests(unittest.TestCase):
         install(self.home, apply=True)
         groups = json.loads((self.claude / "settings.json").read_text())["hooks"]["PreToolUse"]
         self.assertEqual(groups[0], {**group, "hooks": [foreign]})
-        self.assertEqual(len(groups), 8)  # foreign + command guard + WAL + commit policy + heavy-job guard + agent gate + spec gate + ask gate
+        self.assertEqual(len(groups), 9)  # foreign + command guard + WAL + ladder + commit policy + heavy-job guard + agent gate + spec gate + ask gate
 
     def test_refuses_symlinked_parent_directories_before_writing(self):
         for name in ("agents", "hooks", "tools", "agent-harness-backups", ".claude"):
