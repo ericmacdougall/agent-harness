@@ -2,17 +2,24 @@
 
 Files written (each atomically, only when the bytes differ; a differing hand-installed file is first saved as
 NAME.bak-STAMP):
-  ~/.agent-harness/bin/log-backup.sh and log-backup.excludes
+  ~/.agent-harness/bin/log-backup.sh, log-backup.excludes and log-backup.work-excludes
   macOS: ~/Library/LaunchAgents/com.ericmacdougall.log-backup.plist (label unchanged, so no second job appears)
   Linux: ~/.config/systemd/user/log-backup.service and log-backup.timer
 
 The scheduler is (re)loaded only when a unit file changed, never while a backup run holds the lock, and never
 when the installer targets a non-default --home (the job belongs to the real user). A failure here is returned as
 one status line and never fails the harness install. A symlinked destination or parent directory is refused.
+
+Opt-in: encryption at rest is not part of this component (GoodQA #14522), so a host that does not have it yet does
+not get it from a routine install. `--log-backup` installs it and remembers the choice; `--no-log-backup` remembers
+the opposite and, when the component is installed, stops its scheduler job (files and remote copies stay). With no
+flag, the remembered choice wins; with none, the component is kept up to date only where it is already installed
+(log-backup.excludes next to the script is the marker, so a hand-installed copy alone does not count).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import subprocess
@@ -35,6 +42,46 @@ def real_home() -> Path:
         return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
     except (ImportError, KeyError):
         return Path.home().resolve()
+
+
+CHOICE_FILE = "log-backup-choice.json"
+
+
+def component_installed(home: Path) -> bool:
+    return (home / ".agent-harness" / "bin" / "log-backup.excludes").is_file()
+
+
+def read_choice(home: Path):
+    """True or False when a choice was remembered, else None. Never follows a link, never raises."""
+    path = home / ".agent-harness" / CHOICE_FILE
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        data = json.loads(os.read(fd, 4096).decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
+    value = data.get("enabled") if isinstance(data, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+def choice(home: Path, flag) -> bool:
+    """--log-backup/--no-log-backup win; else the remembered choice; else on only where the component already is."""
+    if flag is not None:
+        return flag
+    remembered = read_choice(home.expanduser().resolve())
+    return remembered if remembered is not None else component_installed(home.expanduser().resolve())
+
+
+def save_choice(home: Path, enabled: bool) -> None:
+    directory = home / ".agent-harness"
+    if directory.is_symlink():
+        raise InstallRefused(f"refusing a symlinked directory: {directory}")
+    directory.mkdir(parents=True, exist_ok=True)
+    write_atomic(directory / CHOICE_FILE, (json.dumps({"schema": 1, "enabled": enabled}) + "\n").encode(), 0o600)
 
 
 def desired_files(home: Path, system: str) -> list[tuple[Path, bytes, int, bool]]:
@@ -132,7 +179,24 @@ def default_runner(argv: list[str]) -> int:
     return subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False).returncode
 
 
+def safe_run(run, argv: list[str]) -> int:
+    """A runner that raises (timeout, missing launchctl or systemctl) counts as a failed command, never as success."""
+    try:
+        return run(argv)
+    except (OSError, subprocess.SubprocessError):
+        return 127
+
+
+def disable_scheduler(system: str, home: Path, uid: int, run) -> str:
+    if system == "Darwin":
+        code = safe_run(run, ["launchctl", "bootout", f"gui/{uid}/{LABEL}"])
+        return "stopped" if code in (0, 3, 113) else f"launchctl bootout failed (exit {code})"  # 3/113: not loaded
+    code = safe_run(run, ["systemctl", "--user", "disable", "--now", "log-backup.timer"])
+    return "stopped" if code == 0 else f"systemctl disable failed (exit {code})"
+
+
 def reload_scheduler(system: str, home: Path, uid: int, run) -> str:
+    run = lambda argv, _run=run: safe_run(_run, argv)  # noqa: E731
     if system == "Darwin":
         domain = f"gui/{uid}"
         plist = str(home / "Library" / "LaunchAgents" / f"{LABEL}.plist")
@@ -147,12 +211,27 @@ def reload_scheduler(system: str, home: Path, uid: int, run) -> str:
 
 
 def status(home: Path, apply: bool, system: str | None = None, run=None, uid: int | None = None,
-           activate: bool | None = None) -> str:
+           activate: bool | None = None, enabled: bool | None = None) -> str:
     try:
         home = home.expanduser().resolve()
         system = system or platform.system()
         if system not in ("Darwin", "Linux"):
             return f"log backup: skipped (unsupported platform {system})"
+        if enabled is None:
+            enabled = choice(home, None)
+        if not enabled:
+            if not component_installed(home):
+                return "log backup: not installed on this host (pass --log-backup to install it); nothing changed"
+            if not apply:
+                return "log backup: disabled by choice; would stop the scheduler job (files stay)"
+            if activate is None:
+                activate = home == real_home()
+            if not activate:
+                return "log backup: disabled by choice (non-default --home); scheduler not touched"
+            if backup_run_active(home):
+                return "log backup: disabled by choice; scheduler stop deferred while a backup runs; re-run install"
+            result = disable_scheduler(system, home, os.getuid() if uid is None else uid, run or default_runner)
+            return f"log backup: disabled by choice, scheduler {result}; files and remote copies stay"
         files = desired_files(home, system)
         changed, units_changed = [], False
         for path, data, _mode, is_unit in files:
@@ -183,14 +262,13 @@ def status(home: Path, apply: bool, system: str | None = None, run=None, uid: in
         if backup_run_active(home):
             pending.write_text("reload deferred\n")
             return "log backup: units written; scheduler reload deferred while a backup runs; re-run install to finish it"
+        pending.write_text("reload started\n")  # stays if the reload fails or raises; the next install finishes it
         result = reload_scheduler(system, home, os.getuid() if uid is None else uid, run or default_runner)
         if result in ("loaded", "enabled"):
             try:
                 pending.unlink()
             except OSError:
                 pass
-        else:
-            pending.write_text("reload failed\n")
         return f"log backup: installed, scheduler {result}"
     except (InstallRefused, OSError, subprocess.SubprocessError) as error:
         return f"log backup: skipped ({error.__class__.__name__}: {error})"

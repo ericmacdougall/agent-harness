@@ -5,7 +5,8 @@ The backup itself is harness/bin/log-backup.sh (copy only, scheduled by launchd 
 ~/.agent-harness/logs/log-backup.last-ok only after every source copied cleanly. A run skipped because of a held
 lock writes log-backup.last-skip instead, which this tool never treats as success.
 
-  check          exit 0 fresh, 1 stale, 2 missing or invalid (a future timestamp is invalid)
+  check          exit 0 fresh, 1 stale, 2 missing or invalid (a future timestamp is invalid), 3 transcripts fresh but
+                 the bulk marker is stale, missing or invalid
   session-start  SessionStart hook: prints an alert only when the backup is not fresh; always exits 0
   status         last success, last run, last skip and lock holder
   restore        copy one backed-up source from the remote into an empty scratch directory and compare it
@@ -196,7 +197,7 @@ def lock_holder(home: Path) -> str:
     if not lock.is_dir():
         return "none"
     pid = (read_small(lock / "pid") or "").strip()
-    if not pid.isdigit():
+    if not re.fullmatch(r"[0-9]{1,9}", pid):  # no unicode digits, no absurd lengths
         return "held (pid unknown)"
     try:
         os.kill(int(pid), 0)
@@ -205,6 +206,8 @@ def lock_holder(home: Path) -> str:
         return f"stale (pid {pid} is gone)"
     except PermissionError:
         return f"held by pid {pid}"
+    except (OverflowError, ValueError, OSError):
+        return "held (pid unknown)"
 
 
 def status_json(home: Path, max_age: int = MAX_AGE_SECONDS) -> dict:

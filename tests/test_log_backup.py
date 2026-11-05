@@ -156,7 +156,7 @@ class Freshness(Base):
 
     def test_installed_settings_hook_command_prints_the_alert(self):
         (self.tmp / "inst").mkdir()
-        install.install(self.tmp / "inst", apply=True, durable_tmp=False)
+        install.install(self.tmp / "inst", apply=True, durable_tmp=False, log_backup=True)
         settings = json.loads((self.tmp / "inst" / ".claude" / "settings.json").read_text())
         hooks = [h for group in settings["hooks"]["SessionStart"] for h in group["hooks"]
                  if "log_backup.py" in " ".join(h.get("args", []))]
@@ -200,6 +200,18 @@ class Status(Base):
             code = lb.main(["--home", str(self.home), "status", "--json"])
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(out.getvalue())["transcripts"]["state"], "stale")
+
+    def test_malformed_pid_values_do_not_crash_status_or_check(self):
+        self.last_ok(stamp(time.time()))
+        lock = self.logs / "log-backup.lock.d"
+        lock.mkdir()
+        for value in ("9" * 40, "²³", "-5", "12 34", ""):
+            (lock / "pid").write_text(value)
+            self.assertEqual(lb.lock_holder(self.home), "held (pid unknown)", repr(value))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lb.main(["--home", str(self.home), "status"]), 0)
+                self.assertEqual(lb.main(["--home", str(self.home), "status", "--json"]), 0)
 
     def test_status_reports_success_run_skip_and_lock(self):
         self.last_ok(stamp(time.time() - 60) + " sources=6\n")
