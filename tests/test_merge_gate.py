@@ -42,6 +42,16 @@ class FakeGh:
         self.calls = []
         self.timeouts = []
         self.pr_views = 0
+        self.content_refs = []
+
+    def workflow_files(self):
+        sc = self.sc
+        if "workflow_files" in sc:
+            files = sc["workflow_files"]
+        else:  # legacy shape: N active workflows triggered by pull_request
+            files = [{"name": "ci%d" % i, "state": "active", "content": "on:\n  pull_request:\n  push:\n"}
+                     for i in range(sc.get("workflows", 1))]
+        return [dict(f, **{".path": ".github/workflows/%s.yml" % f.get("file", f["name"].replace(" ", "-"))}) for f in files]
 
     def _fail(self, key, args, timeout):
         if self.sc.get("timeout") == key:
@@ -138,7 +148,23 @@ class FakeGh:
                           "parameters": {"required_status_checks": [{"context": n} for n in sc.get("rules", [])]}}] if sc.get("rules") else []
                 return 0, json.dumps(rules), ""
             if "/actions/workflows" in path:
-                return 0, json.dumps({"total_count": sc.get("workflows", 1), "workflows": []}), ""
+                hit = self._fail("workflows", args, timeout)
+                if hit:
+                    return hit
+                files = self.workflow_files()
+                return 0, json.dumps({"total_count": sc.get("workflow_total", len(files)), "workflows": [
+                    {"name": f["name"], "path": f[".path"], "state": f["state"]} for f in files]}), ""
+            if "/contents/" in path:
+                import base64
+                hit = self._fail("contents", args, timeout)
+                if hit:
+                    return hit
+                want = path.split("/contents/", 1)[1].split("?", 1)[0]
+                self.content_refs.append(path.split("ref=", 1)[-1])
+                for f in self.workflow_files():
+                    if f[".path"] == want:
+                        return 0, json.dumps({"content": base64.b64encode(f["content"].encode()).decode()}), ""
+                return 1, "", "HTTP 404"
         raise AssertionError("unexpected gh call: " + joined)
 
 
@@ -578,6 +604,94 @@ class Wiring(unittest.TestCase):
         text = (ROOT / "docs" / "operations.md").read_text().lower()
         for needle in ("merge gate", "skipped", "neutral", "--match-head-commit", "waive"):
             self.assertIn(needle, text)
+
+
+class ActiveWorkflows(Base):
+    """GoodQA #14669: with GitHub CI switched off (no ACTIVE workflow that can run on a PR head) zero checks pass."""
+
+    CMD = "gh pr merge 5 --match-head-commit {HEAD}"
+    RELEASE = "name: Release\non:\n  push:\n    tags: [\"v*\"]\npermissions:\n  contents: read\n"
+
+    def scenario(self, files, **extra):
+        return dict({"checks": [], "protection": "none", "workflow_files": files}, **extra)
+
+    def merge(self, sc, command=None):
+        gh = FakeGh(sc)
+        code, text = mg.decide(bash(expand(command or self.CMD)), gh, self.state)
+        return code, text, gh
+
+    def test_real_agent_harness_shape_is_allowed(self):
+        files = [{"name": "CI", "state": "disabled_manually", "content": "on: [push, pull_request]\n"},
+                 {"name": "Console", "state": "disabled_manually", "content": "on:\n  pull_request:\n"},
+                 {"name": "Release harness binary", "file": "release", "state": "active", "content": self.RELEASE}]
+        code, text, gh = self.merge(self.scenario(files))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(gh.content_refs, [HEAD])  # the file is read at the verified head
+
+    def test_all_disabled_and_no_workflows_allowed(self):
+        for state in ("disabled_manually", "disabled_inactivity", "disabled_fork"):
+            with self.subTest(state):
+                code, text, _ = self.merge(self.scenario([{"name": "CI", "state": state, "content": "on: pull_request\n"}]))
+                self.assertEqual(code, 0, text)
+        self.assertEqual(self.merge(self.scenario([]))[0], 0)
+
+    def test_active_workflow_that_can_run_on_a_pr_head_blocks(self):
+        triggers = {
+            "pull_request": "on:\n  pull_request:\n", "inline": "on: [push, pull_request]\n", "scalar": "on: push\n",
+            "push-branches": "on:\n  push:\n    branches: [main]\n    tags: [v*]\n", "push-bare": "on:\n  push:\n",
+            "pr-target": "on:\n  pull_request_target:\n", "merge-group": "on:\n  merge_group:\n",
+            "workflow-run": "on:\n  workflow_run:\n    workflows: [x]\n", "list-form": "on:\n  - push\n",
+            "flow-map": "on: {push: {tags: ['v*']}}\n", "no-on": "name: x\njobs: {}\n", "empty": "",
+            "quoted-on": "\"on\":\n  pull_request:\n",
+        }
+        for name, content in triggers.items():
+            with self.subTest(name):
+                code, text, _ = self.merge(self.scenario([{"name": "CI", "state": "active", "content": content}]))
+                self.assertEqual(code, 2, name + ": " + text)
+                self.assertIn("active workflow", text)
+
+    def test_inert_triggers_alone_are_allowed(self):
+        for name, content in {"dispatch": "on: workflow_dispatch\n", "schedule": "on:\n  schedule:\n    - cron: '0 0 * * *'\n",
+                              "release": "on:\n  release:\n    types: [published]\n", "tags-only": self.RELEASE}.items():
+            with self.subTest(name):
+                code, text, _ = self.merge(self.scenario([{"name": "W", "state": "active", "content": content}]))
+                self.assertEqual(code, 0, text)
+
+    def test_one_capable_workflow_among_inert_ones_blocks(self):
+        files = [{"name": "Release", "file": "release", "state": "active", "content": self.RELEASE},
+                 {"name": "CI", "state": "active", "content": "on:\n  pull_request:\n"}]
+        self.assertEqual(self.merge(self.scenario(files))[0], 2)
+
+    def test_unreadable_listing_or_file_fails_closed(self):
+        active = [{"name": "Release", "file": "release", "state": "active", "content": self.RELEASE}]
+        for label, sc in {
+                "list-timeout": self.scenario(active, timeout="workflows"), "list-bad-json": self.scenario(active, bad_json="workflows"),
+                "file-timeout": self.scenario(active, timeout="contents"), "file-bad-json": self.scenario(active, bad_json="contents"),
+                "truncated": self.scenario(active, workflow_total=5),
+                "no-state": self.scenario([{"name": "x", "state": None, "content": ""}])}.items():
+            with self.subTest(label):
+                code, text, _ = self.merge(sc)
+                self.assertEqual(code, 2, text)
+
+    def test_head_binding_and_short_sha_still_required(self):
+        sc = self.scenario([])
+        for command in ("gh pr merge 5", "gh pr merge 5 --match-head-commit aaaaaaa"):
+            with self.subTest(command):
+                self.assertEqual(self.merge(sc, command)[0], 2)
+
+    def test_red_or_pending_checks_still_block_without_active_workflows(self):
+        for name in ("red_netwatch", "status_pending"):
+            with self.subTest(name):
+                sc = dict(SCENARIOS[name], workflow_files=[])
+                self.assertEqual(self.merge(sc)[0], 2)
+
+    def test_required_check_that_has_not_reported_still_blocks(self):
+        self.assertEqual(self.merge(dict(SCENARIOS["zero_required"], workflow_files=[]))[0], 2)
+
+    def test_operations_doc_states_the_rule(self):
+        text = (ROOT / "docs" / "operations.md").read_text().lower()
+        self.assertIn("no active workflow", text)
+        self.assertNotIn("has no workflows at all", text)
 
 
 if __name__ == "__main__":

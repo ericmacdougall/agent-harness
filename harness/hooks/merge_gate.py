@@ -732,6 +732,82 @@ def _pr_required(client, slug, number):
         return "error", None
 
 
+INERT_TRIGGERS = {"workflow_dispatch", "schedule", "release", "workflow_call", "repository_dispatch"}
+_ON_KEY = re.compile(r"^(?:on|\"on\"|'on')\s*:\s*(.*)$")
+
+
+def _trigger_names(text):
+    """Return {trigger: set(sub-keys)} from a workflow's top-level `on:`; None when it cannot be read with confidence."""
+    lines = [re.sub(r"\s+#.*$", "", ln.rstrip()) for ln in text.splitlines()]
+    for i, line in enumerate(lines):
+        m = _ON_KEY.match(line)
+        if not m:
+            continue
+        rest = m.group(1).strip()
+        if rest:  # on: push   |   on: [push, pull_request]
+            names = re.findall(r"[A-Za-z_]+", rest)
+            return {n: set() for n in names} if names and "{" not in rest else None
+        found, current, base = {}, None, None
+        for ln in lines[i + 1:]:
+            if not ln.strip():
+                continue
+            indent = len(ln) - len(ln.lstrip())
+            if indent == 0:
+                break
+            base = indent if base is None else base
+            key = re.match(r"^\s*([A-Za-z_]+)\s*:", ln)
+            if indent == base and key:
+                current = key.group(1)
+                found[current] = set()
+            elif indent == base and ln.strip().startswith("- "):
+                return None
+            elif current and key:
+                found[current].add(key.group(1))
+        return found or None
+    return None
+
+
+def _can_run_on_pr_head(triggers):
+    """True when any trigger could create a check run on a pull request head (unknown means yes: fail closed)."""
+    if triggers is None:
+        return True
+    for name, keys in triggers.items():
+        if name in INERT_TRIGGERS:
+            continue
+        if name == "push" and "tags" in keys and not (keys & {"branches", "branches-ignore", "paths", "paths-ignore"}):
+            continue  # runs only for tag pushes, never for a pull request head
+        return True
+    return False
+
+
+def _ci_capable_workflows(client, slug, head):
+    """Reasons to block when an active workflow may report on this head. Raises GateError when it cannot tell."""
+    wf = client.json(["api", f"repos/{slug}/actions/workflows?per_page=100"], "workflows")
+    total, listed = int(wf.get("total_count", -1)), wf.get("workflows")
+    if not isinstance(listed, list) or total < 0 or total > len(listed):
+        raise GateError("the workflow list is incomplete")
+    reasons = []
+    for item in listed:
+        if not isinstance(item, dict) or item.get("state") is None:
+            raise GateError("the workflow list holds an unreadable entry")
+        if item["state"] != "active":  # disabled_manually, disabled_inactivity, disabled_fork
+            continue
+        path = str(item.get("path") or "")
+        if not re.match(r"^\.github/workflows/[\w./-]+$", path) or ".." in path:
+            reasons.append("an active workflow has an unreadable path")
+            continue
+        data = client.json(["api", f"repos/{slug}/contents/{path}?ref={head}"], "a workflow file")
+        try:
+            import base64
+            text = base64.b64decode(data["content"]).decode("utf-8")
+        except (KeyError, TypeError, ValueError):
+            raise GateError("a workflow file is unreadable")
+        if _can_run_on_pr_head(_trigger_names(text)):
+            reasons.append("no checks have reported yet but active workflow " + clean(path, 60)
+                           + " can run on this head")
+    return reasons
+
+
 def evaluate_pr(client, slug, number, target=None):
     """Return (info, reasons) where info has slug, number, head and reasons list the (waivable) check problems."""
     ref = [str(number)] if number else ([target] if target else [])
@@ -800,10 +876,9 @@ def evaluate_pr(client, slug, number, target=None):
         elif name in apps and not any(e["src"] == "api" and e["app"] in apps[name] and e["v"] == "ok" for e in mine):
             reasons.append(f"required check '{clean(name)}' has no success from the required app")
     if not entries and known and not required:
+        # Zero reports: fine only when no ACTIVE workflow could have run on this head (GitHub CI switched off).
         try:
-            wf = client.json(["api", f"repos/{slug}/actions/workflows?per_page=1"], "workflows")
-            if int(wf.get("total_count", 1)) > 0:
-                reasons.append("no checks have reported yet but the repository has workflows")
+            reasons.extend(_ci_capable_workflows(client, slug, head))
         except (GateError, ValueError, TypeError, AttributeError):
             reasons.append("no checks reported and the workflow list could not be read")
     again = client.json(["pr", "view", str(number), "-R", slug, "--json", "headRefOid"], "the pull request head")
