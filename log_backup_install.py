@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import platform
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -81,7 +82,15 @@ def write_atomic(path: Path, data: bytes, mode: int) -> None:
 
 
 def backup_run_active(home: Path) -> bool:
-    pid_file = home / ".agent-harness" / "logs" / "log-backup.lock.d" / "pid"
+    lock = home / ".agent-harness" / "logs" / "log-backup.lock.d"
+    pid_file = lock / "pid"
+    if lock.is_dir() and not pid_file.exists():
+        # The older hand-installed script uses the same lock directory without a pid: treat a young one as a run in
+        # progress, so a scheduler reload never kills it.
+        try:
+            return time.time() - lock.stat().st_mtime < 86400
+        except OSError:
+            return False
     try:
         pid = int(pid_file.read_text().strip())
         if pid <= 1:
