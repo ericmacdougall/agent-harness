@@ -5,7 +5,9 @@ a real credential. Files are synthetic and live in a temporary HOME. CG_HOOKS_DI
 show them failing first.
 """
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import sys
@@ -403,6 +405,54 @@ class CredentialScriptTests(Base):
             verdict, message = cg.decide(command, compiled, cwd=str(self.home))[:2]
         self.assertEqual(verdict, 'block', message)
         self.assertIn('log_delete', str(message))
+
+    def test_a_very_slow_read_ends_no_looser_than_without_the_check(self):
+        """Through the hook entry point with its real 7 s alarm: a read slower than the cap must end in a warning or a block,
+        never an allow. Later analysis is slowed by a fixed 2.5 s, which alone stays under the 3 s limit, so the result does
+        not depend on the machine's load. Without the cap the deadline passes the alarm, the alarm lands in that later
+        analysis, and the command is allowed."""
+        slow_py = self.write('x/slow.py', b'print("hello")\n')
+        clean = self.write('x/clean.sh', b'#!/bin/bash\nrm -rf ~/.claude/projects\n')
+        command = 'python3 %s; bash %s' % (slow_py, clean)
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': str(self.home)}).encode()
+        compiled = cg.Compiled(cg.load_policy(), cwd=str(self.home))
+        real_read = cg._read_prefix
+        real_script = cg.Analyzer.script_file
+
+        def slow_read(path, limit):
+            if str(path).endswith('slow.py'):
+                time.sleep(5)
+            return real_read(path, limit)
+
+        def slow_script(analyzer, *args, **kwargs):
+            time.sleep(2.5)
+            return real_script(analyzer, *args, **kwargs)
+
+        err, out = io.StringIO(), io.StringIO()
+        with mock.patch.object(cg, '_read_prefix', side_effect=slow_read), \
+                mock.patch.object(cg.Analyzer, 'script_file', slow_script), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            rc = cg.hook_main('exit2', stdin_bytes=payload, compiled=compiled, marker=False)
+        said = err.getvalue() + out.getvalue()
+        self.assertNotIn('allowed', said)
+        self.assertTrue(rc == 2 or 'WARNING' in said, (rc, said[:200]))
+
+    def test_the_slowed_later_analysis_alone_still_blocks(self):
+        """Control for the test above: with no slow read, the same 2.5 s of later analysis ends in a block."""
+        clean = self.write('x/clean.sh', b'#!/bin/bash\nrm -rf ~/.claude/projects\n')
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'bash %s' % clean}, 'cwd': str(self.home)}).encode()
+        compiled = cg.Compiled(cg.load_policy(), cwd=str(self.home))
+        real_script = cg.Analyzer.script_file
+
+        def slow_script(analyzer, *args, **kwargs):
+            time.sleep(2.5)
+            return real_script(analyzer, *args, **kwargs)
+
+        err, out = io.StringIO(), io.StringIO()
+        with mock.patch.object(cg.Analyzer, 'script_file', slow_script), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            rc = cg.hook_main('exit2', stdin_bytes=payload, compiled=compiled, marker=False)
+        self.assertEqual(rc, 2, (err.getvalue() + out.getvalue())[:200])
 
     def test_a_fifo_is_never_read(self):
         """A file swapped for a FIFO after the existence check must not hang the guard until its alarm."""

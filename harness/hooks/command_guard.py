@@ -330,8 +330,8 @@ PINNED_ROUTES = (
 # Existing scripts are otherwise judged only for log deletion, so a credential read inside one would pass. This refuses
 # scripts whose own text, outside comment lines, names the rclone config or the token secret or dumps the config. Text only.
 # Python prose does not count as a dump: there the command must open a string or be an argument list. It only ever adds a
-# finding. It starts no new read after CREDENTIAL_SCRIPT_SECONDS, and its time extends the analysis deadline rather than
-# using it, so it cannot turn a refusal into the time-limit warning. It does not catch a
+# finding. It starts no new read after CREDENTIAL_SCRIPT_SECONDS, and its time extends the analysis deadline by at most
+# CREDENTIAL_EXTENSION_CAP, so normal reads cannot turn a refusal into the time-limit warning. It does not catch a
 # script that builds the name at runtime or calls another script, a name past the read limit, a path the guard cannot
 # resolve, a runner it does not unwrap (`uv run`, `tmux`, `python3 -m cProfile`), a test in a folder named tests, or one of
 # the guard's own files.
@@ -346,6 +346,9 @@ CREDENTIAL_PYTHON_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|[f]?["\'](?:[^"\'\s]
                                     + rb'|["\']rclone["\']\s*,\s*["\']config["\']\s*,\s*["\'](?:show|dump)["\']')
 CREDENTIAL_SCRIPT_READ = 1048576
 CREDENTIAL_SCRIPT_SECONDS = 1.0
+# The most the check may move the analysis deadline in one command. The 3 s limit plus this stays well under the hook's
+# 7 s alarm, whose TimeoutError would otherwise end in an allow. A slower read ends in the time-limit warning, as on main.
+CREDENTIAL_EXTENSION_CAP = 1.5
 CREDENTIAL_SCRIPT_SUFFIXES = ('.sh', '.bash', '.zsh', '.py')
 CREDENTIAL_DATA_SUFFIXES = ('.json', '.jsonl', '.md')
 CREDENTIAL_SCRIPT_SHEBANG = re.compile(rb'#![^\n]*\b(?:ba|z|k|da|)sh\b|#![^\n]*\bpython')
@@ -2275,6 +2278,8 @@ class Analyzer:
             for word, runner in self._credential_words(cmd, name, words, args, texts):
                 if word is not None and not word.dynamic and word.text:
                     self.credential_script(norm_path(word.text, self.ctx), runner)
+        except Blocked:
+            raise
         except Exception:  # noqa: BLE001
             return
 
@@ -2326,7 +2331,14 @@ class Analyzer:
             # time-limit warning that a command main blocks would otherwise get.
             elapsed = time.monotonic() - started
             self.credential_seconds = spent + elapsed
-            self.ctx.budget.deadline += elapsed
+            extended = getattr(self, 'credential_extended', 0.0)
+            extra = min(elapsed, max(0.0, CREDENTIAL_EXTENSION_CAP - extended))
+            self.credential_extended = extended + extra
+            self.ctx.budget.deadline += extra
+            if self.credential_seconds > CREDENTIAL_SCRIPT_SECONDS + CREDENTIAL_EXTENSION_CAP:
+                # A read slow enough to pass the cap ends here with the time-limit result. Going on could let the hook's
+                # alarm fire during later analysis, and that path allows.
+                raise Blocked('analysis exceeded its time budget')
 
     def script_file(self, word, depth, require_shell=False):
         """Analyse a shell script named on the command line (or written earlier in this command)."""
