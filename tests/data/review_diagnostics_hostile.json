@@ -10,5 +10,7 @@
     "line\nforged: [ok] PASSED",
     "tab\there\u0000nul",
     "‮pwn‬"
-  ]
+  ],
+  "private_key_block": "error: -----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ\nQyNTUxOQAAACBfakefakefakefakefakefake\n-----END OPENSSH PRIVATE KEY----- trailing context",
+  "fake_token_tail": "sk-ant-api03-FAKEFAKEFAKEFAKEFAKEFAKEFAKE"
 }

@@ -52,8 +52,9 @@ NATIVE_EVIDENCE = ('Native evidence: if you continue without a helper receipt, r
 CONTRACT = {
     'EXEC_NOT_FOUND': ('TRANSIENT_INFRA', 'The reviewer CLI was not found on PATH or in the policy install locations.',
                        ['Run `command -v codex claude` in a normal shell and note the absolute path.',
-                        'Add that absolute path to known_install_locations in review_policy.json (or set '
-                        'AGENT_HARNESS_REVIEW_POLICY to a private copy you own), then rerun the same command once.']),
+                        'Add that absolute path to known_install_locations in review_policy.json, or set '
+                        'AGENT_HARNESS_REVIEW_POLICY to a private copy you own (its list for a provider replaces the '
+                        'default list, so copy the defaults you still want), then rerun the same command once.']),
     'EXEC_UNTRUSTED': ('TRANSIENT_INFRA', 'A reviewer CLI was found but refused: it sits inside the repo or cwd, '
                        'is writable by others, or has an unsafe parent directory.',
                        ['Install the CLI in a directory only you or root can write (for example ~/.local/bin).',
@@ -110,7 +111,12 @@ _ANSI = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\
 # credential, including AWS_SECRET_ACCESS_KEY-style names), a bearer/basic token, or a known token prefix.
 # Each alternative starts at a fixed literal, so matching stays linear on the bounded input.
 _SECRET = re.compile(
-    r'(?:ghp_|github_pat_|sk-ant-|sk-|xox[a-z]-|AKIA)[A-Za-z0-9_-]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|'
+    # A known token prefix is redacted with 12 or more following characters, or with any length at the end of
+    # the (possibly truncated) text, so a cut cannot expose a token's start. A private key is redacted from its
+    # BEGIN line through its END line, or to the end of the text.
+    r'(?:ghp_|github_pat_|sk-ant-|sk-|xox[a-z]-|AKIA)[A-Za-z0-9_-]{12,}|'
+    r'\b(?:ghp_|github_pat_|sk-ant-|sk-|xox[a-z]-|AKIA)[A-Za-z0-9_-]+$|'
+    r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)|'
     r'(?i:(?:api[_-]?key|password|passwd|secret|access[_-]?token|auth[_-]?token|token|authorization|credential)'
     r'[A-Za-z0-9_]*["\']?[ ]?[:=][ ]?(?:(?:bearer|basic)[ ])?(?:"[^"]*"|\'[^\']*\'|[^ ]+))|'
     r'(?i:\b(?:bearer|basic)[ ][A-Za-z0-9._~+/=-]{8,})')
@@ -119,14 +125,14 @@ _SECRET = re.compile(
 def sanitize(value, limit=300):
     """Printable, single-line, secret-free, bounded text from any external value."""
     if isinstance(value, bytes):
-        value = value[: limit * 8].decode('utf-8', errors='replace')
+        value = value[: limit * 32].decode('utf-8', errors='replace')
     elif not isinstance(value, str):
         value = str(value)
-    value = value[: limit * 8]
+    # Format characters (bidi overrides, zero-width and tag characters) are dropped before the length cut, so
+    # padding with invisible characters cannot move the cut into a secret.
+    value = ''.join(c for c in value[: limit * 32] if unicodedata.category(c) != 'Cf')[: limit * 8]
     value = _ANSI.sub(' ', value)
-    # Format characters (bidi overrides, zero-width and tag characters) are dropped: they can hide or reorder text.
-    value = ''.join('' if unicodedata.category(c) == 'Cf' else
-                    ' ' if (ord(c) < 32 or 0x7F <= ord(c) < 0xA0 or unicodedata.category(c) in ('Cc', 'Cs', 'Co'))
+    value = ''.join(' ' if (ord(c) < 32 or 0x7F <= ord(c) < 0xA0 or unicodedata.category(c) in ('Cc', 'Cs', 'Co'))
                     else c for c in value)
     value = _SECRET.sub('[redacted]', re.sub(r'\s+', ' ', value)).strip()
     return value[:limit]
@@ -254,6 +260,26 @@ def untrusted_roots(repo=None, snapshot=None, cwd=None):
     if here != os.sep and here != home and not (home + os.sep).startswith(here + os.sep):
         roots.append(here)
     return roots
+
+
+def child_path(path_value, roots):
+    """PATH for a reviewer child process: absolute entries outside the reviewed roots only.
+
+    A trusted reviewer can still be a `#!/usr/bin/env node` script; its interpreter is looked up on this
+    PATH, so an empty, relative or repo/snapshot/cwd entry would let committed files act as the interpreter.
+    """
+    kept = []
+    for entry in (path_value or '').split(os.pathsep):
+        if not entry or not os.path.isabs(entry):
+            continue
+        try:
+            real = os.path.realpath(entry)
+        except (OSError, ValueError):
+            continue
+        if _inside(real, roots) or entry in kept:
+            continue
+        kept.append(entry)
+    return os.pathsep.join(kept)
 
 
 def check_executable(path, roots):
@@ -498,11 +524,16 @@ def lint_packet(stage, content, expected_head, *, clock=time.monotonic):
             r'(?<![0-9a-fA-F])' + re.escape(head) + r'(?![0-9a-fA-F])', content, re.IGNORECASE):
         problems.append('The packet must contain the full expected HEAD commit SHA (not an abbreviation): ' + head[:64])
     lines = [line[:LINT_LINE_CHARS] for line in content.replace('\0', ' ').splitlines()]
-    fenced, open_before = False, []
-    for line in lines:  # fence state before each line
-        open_before.append(fenced)
-        if _FENCE.match(line):
-            fenced = not fenced
+    fence, open_before = None, []
+    for line in lines:  # fence state before each line; a fence closes only with its own character
+        open_before.append(fence)
+        marker = _FENCE.match(line)
+        if marker:
+            char = marker.group(0).strip()[0]
+            if fence is None:
+                fence = char
+            elif fence == char:
+                fence = None
     passing, failing = False, False
     for index, line in enumerate(lines):
         if index % 256 == 0 and clock() > deadline:
@@ -512,12 +543,19 @@ def lint_packet(stage, content, expected_head, *, clock=time.monotonic):
             continue
         # Evidence belongs to the command's own fenced block. A command written just above a fence may have
         # its output in that fence; any other fence boundary ends the block.
-        block, inside, opened = [line], open_before[index], False
+        # `fence` is the character of the block holding the command (None when it is outside any fence).
+        block, fence, opened = [line], open_before[index], False
         for follower in lines[index + 1:index + EVIDENCE_WINDOW + 1]:
-            if _FENCE.match(follower):
-                if inside or opened or any(item.strip() for item in block[1:]):
+            marker = _FENCE.match(follower)
+            if marker:
+                char = marker.group(0).strip()[0]
+                if fence is not None:
+                    if char == fence:
+                        break      # the command's own block closes
+                    continue       # a different fence character is content of this block
+                if opened or any(item.strip() for item in block[1:]):
                     break
-                opened = True
+                fence, opened = char, True
                 continue
             block.append(follower)
         window = '\n'.join(block)

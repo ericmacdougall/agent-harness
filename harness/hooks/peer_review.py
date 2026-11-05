@@ -424,9 +424,16 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
     return base
 
 
+_CHILD_PATH_ROOTS: list[str] = []  # reviewed repo roots, set where discovery computes them
+
+
 def run(cmd: list[str], prompt: str, cwd: Path, timeout=720) -> tuple[int, str, str]:
+    environment = git_environment(snapshot=True)
+    # The reviewer's own interpreter lookup (`#!/usr/bin/env node`) must not reach reviewed files.
+    environment['PATH'] = diagnostics.child_path(
+        environment.get('PATH', ''), [*_CHILD_PATH_ROOTS, *diagnostics.untrusted_roots(snapshot=cwd)])
     try:
-        result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=git_environment(snapshot=True),
+        result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=environment,
                              timeout=timeout)
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
@@ -674,8 +681,10 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         resolution, code, stdout, stderr = None, None, '', ''
         try:
             # Resolve before the lease, so a lease refusal is reported with its own reason, not as a missing CLI.
+            roots = diagnostics.untrusted_roots(repo=options.get('repo'), snapshot=snapshot)
+            _CHILD_PATH_ROOTS[:] = sorted(set(_CHILD_PATH_ROOTS) | set(roots))
             resolution = (options.get('resolutions') or {}).get(provider) or diagnostics.discover_executable(
-                provider, policy=review_policy(), roots=diagnostics.untrusted_roots(repo=options.get('repo'), snapshot=snapshot))
+                provider, policy=review_policy(), roots=roots)
             if store is not None:
                 store.acquire_pool(provider, pool, run_record.run_id)
                 leased = True
@@ -959,8 +968,9 @@ def main() -> int:
             base = make_snapshot(repo, snapshot, before[0], base=base, timeout=args.snapshot_timeout)
             options['base'] = base
             options['repo'] = repo
+            _CHILD_PATH_ROOTS[:] = diagnostics.untrusted_roots(repo=repo, snapshot=snapshot)
             resolutions = {name: diagnostics.discover_executable(
-                name, policy=review_policy(), roots=diagnostics.untrusted_roots(repo=repo, snapshot=snapshot))
+                name, policy=review_policy(), roots=list(_CHILD_PATH_ROOTS))
                 for name in diagnostics.PROVIDERS}
             options['resolutions'] = resolutions
             if repo_state(repo) != before:
@@ -968,7 +978,10 @@ def main() -> int:
             subject = capture_subject(repo, args.input_manifest)
             invocation = invocation_identity(subject, purpose='peer-review-' + args.stage,
                 argv=['peer_review', args.stage, options['model'], 'opus', args.pool, args.fallback_pool,
-                      '--snapshot-base', base or 'none'], cwd=repo,
+                      '--snapshot-base', base or 'none',
+                      # The effective review policy (shipped or override) changes discovery and quota classification.
+                      '--review-policy', hashlib.sha256(json.dumps(review_policy(), sort_keys=True).encode()).hexdigest()],
+                cwd=repo,
                 stage=args.stage.upper().replace('-', '_'), packet_digest=evidence.sha256,
                 provider='codex', model=options['model'], pool=args.pool, toolchain=provider_toolchains(resolutions),
                 environment={name: os.environ[name] for name in ('CI', 'LANG', 'LC_ALL', 'TZ', 'PYTHONHASHSEED', 'NODE_ENV')

@@ -880,5 +880,97 @@ class RedTeamRound1Tests(unittest.TestCase):
         self.assertNotIn(' <hook', record)
 
 
+class CodeInspectionRound1Tests(unittest.TestCase):
+    """Regressions for the code-inspection findings on f119894 (F1, F3, F4, F5, F6, F7, mixed fences)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_peer_review()
+        cls.hostile = json.loads((HERE / 'data/review_diagnostics_hostile.json').read_text())
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(os.path.realpath(self.temp.name))
+        self.repo = self.root / 'Repo'
+        self.snapshot = self.root / 'snap'
+        for path in (self.repo / 'bin', self.snapshot / 'node_modules/.bin', self.root / 'tools'):
+            path.mkdir(parents=True)
+
+    # F1: the reviewer child never gets a PATH entry inside the reviewed roots.
+    def test_child_path_drops_relative_and_reviewed_entries(self):
+        roots = rd.untrusted_roots(repo=str(self.repo), snapshot=str(self.snapshot), cwd=str(self.root / 'tools'))
+        value = os.pathsep.join(['', '.', 'bin', 'node_modules/.bin', str(self.root / 'repo' / 'bin'),
+                                 str(self.snapshot / 'node_modules/.bin'), '/usr/bin', '/usr/bin', '/bin'])
+        self.assertEqual(rd.child_path(value, roots), os.pathsep.join(['/usr/bin', '/bin']))
+
+    def test_run_gives_the_provider_a_cleaned_path(self):
+        seen = {}
+
+        def fake(cmd, **kw):
+            seen['env'] = kw['env']
+            return subprocess.CompletedProcess(cmd, 0, '', '')
+        dirty = os.pathsep.join(['.', '', str(self.snapshot / 'node_modules/.bin'), str(self.repo / 'bin'), '/usr/bin'])
+        with patch.dict(os.environ, {'PATH': dirty}), patch.object(self.module, 'run_process', side_effect=fake), \
+                patch.object(self.module, '_CHILD_PATH_ROOTS', [str(self.repo)]):
+            self.module.run(['/usr/bin/true'], '', self.snapshot, 5)
+        entries = seen['env']['PATH'].split(os.pathsep)
+        self.assertEqual(entries, ['/usr/bin'], entries)
+
+    # F3, F6 and AC-10: the docs carry each code's cause and next steps, with table pipes escaped.
+    def test_documentation_carries_cause_and_steps(self):
+        docs = DOCS.read_text()
+        for code, (_reason, cause, steps) in rd.CONTRACT.items():
+            with self.subTest(code=code):
+                self.assertIn(cause.replace('|', '\\|'), docs)
+                for step in steps:
+                    self.assertIn(step.replace('|', '\\|'), docs)
+        self.assertIn('replaces the default list', docs)
+
+    # F4: the record command flags parse with the repository copy of wal_note.py, so this never skips.
+    def test_record_command_flags_exist_in_repo_wal_note(self):
+        source = (HOOKS / 'wal_note.py').read_text()
+        text = rd.render(rd.diagnostic('EXEC_NOT_FOUND'), stage='pr', head=HEAD)
+        record = next(line for line in text.splitlines() if line.startswith('Record: '))
+        flags = [w for w in shlex.split(record[len('Record: '):]) if w.startswith('--')]
+        self.assertEqual(flags, ['--wal', '--event', '--note'])
+        for flag in flags:
+            self.assertIn("'%s'" % flag, source)
+        self.assertIn("'blocker'", source)
+
+    # F5: a private key body is redacted, and invisible padding cannot move the cut into a token.
+    def test_private_key_body_is_redacted(self):
+        text = rd.sanitize(self.hostile['private_key_block'])
+        self.assertNotIn('b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ', text)
+        self.assertNotIn('fakefakefake', text)
+        self.assertIn('trailing context', text)
+
+    def test_invisible_padding_cannot_expose_a_token_start(self):
+        token = self.hostile['fake_token_tail']
+        for pad in range(0, 2400, 97):
+            with self.subTest(pad=pad):
+                text = rd.sanitize('x' * pad + '​' * 3000 + token)
+                self.assertNotIn('sk-ant-api03-FAKE', text)
+        # Spaces collapse after the length cut, pulling a cut-off token start into the visible 300 characters.
+        cut = 'x' + ' ' * (300 * 8 - 1 - 10) + token
+        text = rd.sanitize(cut)
+        self.assertTrue(text.startswith('x'), text)
+        self.assertNotIn('sk-ant', text)
+
+    # Mixed fences: a backtick fence inside a tilde fence does not flip the fence state.
+    def test_tilde_fence_holds_backtick_lines(self):
+        packet = 'HEAD %s\n~~~\n$ python3 -m unittest\n```\nRan 4 tests\nOK\nexit 0\n~~~\n' % HEAD
+        self.assertEqual(rd.lint_packet('pr', packet, HEAD), [])
+        # control: the block's own closing fence still ends the evidence window
+        packet = 'HEAD %s\n~~~\n$ python3 -m unittest\n~~~\nRan 4 tests\nOK\nexit 0\n' % HEAD
+        self.assertTrue(rd.lint_packet('pr', packet, HEAD))
+
+    # F7: the effective policy and the shipped policy file are part of the run identity.
+    def test_policy_is_part_of_the_identity(self):
+        source = (HOOKS / 'peer_review.py').read_text()
+        self.assertIn("'--review-policy', hashlib.sha256(json.dumps(review_policy(), sort_keys=True)", source)
+        self.assertIn("'review_policy.json'", (HOOKS / 'usage_guard.py').read_text())
+
+
 if __name__ == '__main__':
     unittest.main()
