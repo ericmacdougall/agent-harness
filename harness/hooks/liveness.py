@@ -7,7 +7,7 @@ transcript, and whether the harness recorded it as stopped.
   quiet     no activity for more than the live window but under SILENT_S
   SILENT    running (never stopped) and no activity for SILENT_S or more
   SILENT-HIGH  same, past HIGH_S (alert severity high)
-  done / handoff / waiting-on-<x> / DROPPED  stopped owners, by their last recorded outcome
+  done / handoff / waiting-on-<x> / DROPPED / returned  stopped owners, by their last recorded outcome
 """
 from __future__ import annotations
 
@@ -21,18 +21,24 @@ HIGH_S = 60 * 60
 _WAITING = re.compile(r"\bwaiting\s+(?:on|for)\s+([A-Za-z0-9_.:#\-]{1,60})", re.I)
 
 
+# Types that are owners only when main names them as one (a WAL scope/intent/decision note carrying the id).
+NAMEABLE_TYPES = ("general-purpose", "claude")
+
+
 def waiting_on(note: str):
     match = _WAITING.search(note or "")
     return match.group(1) if match else None
 
 
-# Agent types that must leave a handoff/result in their WAL; reviewers and explorers return their report
-# as the final message, so stopping without a WAL outcome is normal for them ("stopped", not DROPPED).
-OWNER_TYPES = ("task-owner", "fixer", "click-tester", "general-purpose", "claude")
+# Only owner tasks must leave a handoff/result in their WAL. Helpers (fixer, click-tester, red-team, reviewer,
+# Explore, Plan) return their result to the parent as the final message, so stopping without a WAL outcome
+# is "returned", not DROPPED. A helper explicitly registered as a task owner (ah task register) is an owner.
+OWNER_TYPES = ("task-owner",)
 
 
 def classify(now: float, last_wal: float, transcript_mtime: float, stopped: bool, outcome: str | None,
-             last_note: str = "", agent_type: str | None = None) -> dict:
+             last_note: str = "", agent_type: str | None = None, registered: bool = False,
+             owner: bool | None = None) -> dict:
     """Return {"state", "idle_s", "severity"}; `outcome` is the last done/handoff/result kind or None."""
     last = max(last_wal or 0.0, transcript_mtime or 0.0)
     idle = max(0.0, now - last) if last else float("inf")
@@ -46,7 +52,8 @@ def classify(now: float, last_wal: float, transcript_mtime: float, stopped: bool
             if wait:
                 state = f"waiting-on-{wait}"
             else:
-                state = "DROPPED" if (agent_type or "task-owner") in OWNER_TYPES else "stopped"
+                is_owner = owner if owner is not None else (registered or (agent_type or "task-owner") in OWNER_TYPES)
+                state = "DROPPED" if is_owner else "returned"
         return {"state": state, "idle_s": idle, "severity": "high" if state == "DROPPED" else "info"}
     wal_idle = now - last_wal if last_wal else float("inf")
     tr_idle = now - transcript_mtime if transcript_mtime else float("inf")
