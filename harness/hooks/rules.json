@@ -16,7 +16,8 @@
   "matrix_rows": "X01,X07",
   "mechanisms": [
    "command_guard:hook"
-  ]
+  ],
+  "partial_reason": "wrapper and encoded-string evasion are disclosed residuals"
  },
  {
   "id": "S02",
@@ -35,7 +36,8 @@
   "matrix_rows": "X01,X02,X03",
   "mechanisms": [
    "command_guard:hook"
-  ]
+  ],
+  "partial_reason": "output-side secret scan is not part of the command guard"
  },
  {
   "id": "S03",
@@ -72,7 +74,8 @@
   "matrix_rows": "X04,X08",
   "mechanisms": [
    "command_guard:hook"
-  ]
+  ],
+  "partial_reason": "a command guard cannot verify the backup itself; freshness is B3"
  },
  {
   "id": "S05",
@@ -91,7 +94,8 @@
   "matrix_rows": "X04,X07",
   "mechanisms": [
    "command_guard:hook"
-  ]
+  ],
+  "partial_reason": "the guard checks literal paths, not that a reviewed list or backup exists"
  },
  {
   "id": "S06",
@@ -127,7 +131,7 @@
   "owner_overlap": "pr-d feat/log-backup",
   "matrix_rows": "X08",
   "mechanisms": [],
-  "planned_batch": "B3"
+  "planned_batch": "backlog"
  },
  {
   "id": "S08",
@@ -307,7 +311,7 @@
   "owner_overlap": "new",
   "matrix_rows": "X06",
   "mechanisms": [],
-  "planned_batch": "B3"
+  "planned_batch": "B1"
  },
  {
   "id": "S18",
@@ -381,7 +385,12 @@
   "matrix_rows": "D07",
   "mechanisms": [
    "commit_policy:hook"
-  ]
+  ],
+  "mode": {
+   "file": "commit_policy.json",
+   "key": "enforcement"
+  },
+  "partial_reason": "hook is Bash-only; git commit inside ssh stdin scripts relies on the git commit-msg backstop (D07)"
  },
  {
   "id": "S22",
@@ -423,7 +432,8 @@
   "matrix_rows": "C06,C07",
   "mechanisms": [
    "provenance:ask-gate"
-  ]
+  ],
+  "partial_reason": "ask-gate enforces; stop-lint, plan_packet and wal blocker/scope/decision are warn mode"
  },
  {
   "id": "S24",
@@ -442,7 +452,8 @@
   "matrix_rows": "G09,C08,C12",
   "mechanisms": [
    "work_assignments:guard"
-  ]
+  ],
+  "partial_reason": "work_assignments guard does not verify ticket status comments"
  },
  {
   "id": "S25",
@@ -571,7 +582,8 @@
   "matrix_rows": "Z08",
   "mechanisms": [
    "wal:pretool"
-  ]
+  ],
+  "partial_reason": "wal.py pretool only warns about durable-state drift"
  },
  {
   "id": "W06",

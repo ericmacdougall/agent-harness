@@ -45,6 +45,12 @@ class ManifestCoversInstallers(unittest.TestCase):
         self.assertTrue(written)
         self.assertEqual(written - listed, set())
 
+    def test_installed_rows_exist_in_installer_output_with_matching_matcher(self):
+        hooks = install.managed_hooks(Path("/h/.claude"), True)
+        for r in (x for x in MANIFEST["hooks"] if x["status"] == "installed" and "claude" in x["flavors"]):
+            found = doctor.find_hook(hooks, r["event"], r["script"], r["arg"], r["tools"], Path("/h/.claude/hooks"))
+            self.assertIsNotNone(found, f"manifest row {r['id']} is not what install.py writes")
+
     def test_pending_rows_do_not_hide_shipped_scripts(self):
         shipped = {p.name for p in (ROOT / "harness" / "hooks").iterdir()}
         hidden = [r["id"] for r in MANIFEST["hooks"] if r["status"] == "pending" and r["script"] in shipped and not r.get("known_gap")]
@@ -110,8 +116,54 @@ class Check(unittest.TestCase):
         live = {"hooks": {"PreToolUse": [{"hooks": [{"type": "command",
                 "command": "python3 /h/.codex/agent-harness/commit_policy.py hook"}]}]}}
         hooks = live["hooks"]
-        self.assertIsNotNone(doctor.find_hook(hooks, "PreToolUse", "commit_policy.py", "hook", ["Bash"]))
-        self.assertIsNone(doctor.find_hook(hooks, "PreToolUse", "commit_policy.py", "other", ["Bash"]))
+        hd = Path("/h/.codex/agent-harness")
+        self.assertIsNotNone(doctor.find_hook(hooks, "PreToolUse", "commit_policy.py", "hook", ["Bash"], hd))
+        self.assertIsNone(doctor.find_hook(hooks, "PreToolUse", "commit_policy.py", "other", ["Bash"], hd))
+
+
+class WiringIsReal(Check):
+    """Review B2 findings 1-3: a hook only counts when it really runs the installed script."""
+
+    def _state(self, live, rid="commit_policy:hook"):
+        return {x["id"]: x["state"] for x in self.run_check(live)}[rid]
+
+    def _mut(self, fn):
+        live = json.loads(json.dumps(self.live))
+        for g in live["hooks"]["PreToolUse"]:
+            if g.get("matcher") == "Bash":
+                fn(g["hooks"][0])
+        return live
+
+    def test_wrong_path_is_not_wired(self):
+        live = self._mut(lambda h: h.update(args=["/nonexistent/commit_policy.py", "hook"]))
+        self.assertEqual(self._state(live), doctor.MISSING)
+
+    def test_echo_is_not_wired(self):
+        live = self._mut(lambda h: h.update(command="echo", args=["commit_policy.py", "hook"]))
+        self.assertEqual(self._state(live), doctor.MISSING)
+
+    def test_non_command_type_is_not_wired(self):
+        live = self._mut(lambda h: h.update(type="prompt"))
+        self.assertEqual(self._state(live), doctor.MISSING)
+
+    def test_disable_all_hooks_means_nothing_is_wired(self):
+        live = dict(self.live, disableAllHooks=True)
+        f = self.run_check(live)
+        self.assertTrue(all(x["state"] != doctor.WIRED for x in f))
+        self.assertEqual(doctor.verdict(f), 1)
+
+    def test_matcher_semantics(self):
+        self.assertFalse(doctor.matcher_covers("Ba", ["Bash"]))
+        self.assertTrue(doctor.matcher_covers("*", ["Bash"]))
+        self.assertTrue(doctor.matcher_covers("", ["Bash"]))
+        self.assertTrue(doctor.matcher_covers("Edit|Bash", ["Bash"]))
+        self.assertFalse(doctor.matcher_covers("Edit|Write", ["Bash"]))
+
+    def test_ssh_host_cannot_be_an_option(self):
+        for bad in ("-oProxyCommand=x", "a b", "", "x;y"):
+            with self.assertRaises(OSError):
+                doctor.check_host(bad)
+        self.assertEqual(doctor.check_host("dev2"), "dev2")
 
 
 class Canary(unittest.TestCase):
@@ -123,18 +175,39 @@ class Canary(unittest.TestCase):
         return p
 
     def test_guard_that_allows_a_denied_payload_fails_canary(self):
-        row = {"canary": {"payload": {"tool_input": {"command": "x"}}, "expect": "deny"}}
+        row = {"canaries": [{"payload": {"tool_input": {"command": "x"}}, "expect": "deny"}]}
         allow = self.script("import sys; sys.stdin.read()\n")
         deny = self.script("import sys; sys.stdin.read(); print('{\"permissionDecision\": \"deny\"}')\n")
         self.assertFalse(doctor.run_canary(row, allow)[0])
         self.assertTrue(doctor.run_canary(row, deny)[0])
 
     def test_crashing_hook_fails_an_allow_canary(self):
-        row = {"canary": {"payload": {}, "expect": "allow"}}
+        row = {"canaries": [{"payload": {}, "expect": "allow"}]}
         self.assertFalse(doctor.run_canary(row, self.script("raise SystemExit(7)\n"))[0])
+
+    def test_exit_two_crash_does_not_satisfy_a_deny_canary(self):
+        row = {"canaries": [{"payload": {}, "expect": "deny"}]}
+        crash = self.script("import sys; sys.stderr.write('usage: g.py [-h]'); sys.exit(2)\n")
+        self.assertFalse(doctor.run_canary(row, crash)[0])
+        clean_deny = self.script("import sys; sys.stdin.read(); sys.stderr.write('blocked by policy'); sys.exit(2)\n")
+        self.assertTrue(doctor.run_canary(row, clean_deny)[0])
+
+    def test_empty_script_passes_allow_but_manifest_also_has_a_deny_canary(self):
+        row = next(r for r in MANIFEST["hooks"] if r["id"] == "commit_policy:hook")
+        self.assertEqual([c["expect"] for c in row["canaries"]], ["allow", "deny"])
 
 
 class RulesRegistry(unittest.TestCase):
+    def test_partial_rule_never_reports_enforced(self):
+        rule = {"id": "R", "mechanisms": ["a"], "partial_reason": "only part"}
+        self.assertEqual(doctor.rules_report([rule], [{"id": "a", "state": doctor.WIRED}], ROOT)[0]["state"], "PARTIAL")
+
+    def test_known_overclaims_are_flagged_partial(self):
+        by_id = {r["id"]: r for r in RULES}
+        for rid in ("W05", "S21", "S23", "S04", "S05", "S24"):
+            self.assertTrue(by_id[rid].get("partial_reason"), rid)
+        self.assertEqual(by_id["S21"]["mode"], {"file": "commit_policy.json", "key": "enforcement"})
+
     def test_no_unmapped_rules_and_batches_valid(self):
         rows = doctor.rules_report(RULES, [], ROOT / "harness" / "hooks")
         self.assertTrue(rows)

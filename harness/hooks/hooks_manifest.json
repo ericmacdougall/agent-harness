@@ -98,16 +98,28 @@
    "rules": [
     "S21"
    ],
-   "canary": {
-    "payload": {
-     "hook_event_name": "PreToolUse",
-     "tool_name": "Bash",
-     "tool_input": {
-      "command": "ls"
-     }
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "ls"
+      }
+     },
+     "expect": "allow"
     },
-    "expect": "allow"
-   }
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "git commit -m \"added stuff\""
+      }
+     },
+     "expect": "deny"
+    }
+   ]
   },
   {
    "id": "spec_flow:hook",

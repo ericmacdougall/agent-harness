@@ -48,25 +48,42 @@ def flatten(handler: dict) -> list[str]:
 
 
 def matcher_covers(matcher, tools: list[str]) -> bool:
-    if not matcher:
+    """Claude Code semantics: empty or * matches every tool; otherwise the matcher is a regex that must match the
+    whole tool name (so a plain name is an exact match and 'Ba' does not cover 'Bash')."""
+    if matcher in (None, "", "*"):
         return True
     try:
         rx = re.compile(matcher)
     except re.error:
         return False
-    return all(rx.search(t) for t in tools)
+    return all(rx.fullmatch(t) for t in tools)
 
 
-def find_hook(hooks: dict, event: str, script: str, arg: str | None, tools: list[str]):
-    """Return the matching handler or None. The script is matched by file name so ~ and absolute paths agree."""
+def is_interpreter(tok: str) -> bool:
+    return re.fullmatch(r"python[0-9.]*", Path(tok).name) is not None
+
+
+def wired_path_ok(toks: list[str], script: str, arg, hooks_dir: Path) -> bool:
+    """The handler must run an interpreter on exactly hooks_dir/script (then arg), not merely mention its name."""
+    want = os.path.normpath(str(hooks_dir / script))
+    if not toks or not is_interpreter(toks[0]):
+        return False
+    i = 1
+    while i < len(toks) and toks[i].startswith("-"):
+        i += 1
+    if i >= len(toks) or os.path.normpath(os.path.expanduser(toks[i])) != want:
+        return False
+    rest = toks[i + 1:]
+    return rest == [] if arg is None else rest[:1] == [arg]
+
+
+def find_hook(hooks: dict, event: str, script: str, arg, tools: list[str], hooks_dir: Path):
     for group in hooks.get(event, []) or []:
         if not isinstance(group, dict) or not matcher_covers(group.get("matcher"), tools):
             continue
         for handler in group.get("hooks", []) or []:
-            if not isinstance(handler, dict):
-                continue
-            toks = flatten(handler)
-            if any(Path(t).name == script for t in toks) and (arg is None or arg in toks):
+            if (isinstance(handler, dict) and handler.get("type", "command") == "command"
+                    and wired_path_ok(flatten(handler), script, arg, hooks_dir)):
                 return handler
     return None
 
@@ -78,32 +95,43 @@ def expected(manifest: dict, flavor: str, claude_dir: Path) -> list[dict]:
 
 
 def run_canary(row: dict, script_path: Path) -> tuple[bool, str]:
-    canary = row.get("canary")
-    if not canary:
+    """Every canary payload goes to the hook on stdin under a scratch HOME. A deny is a deny decision in stdout or
+    exit 2; a crash (Traceback, usage error, any other exit code) satisfies neither an allow nor a deny canary."""
+    canaries = row.get("canaries") or []
+    if not canaries:
         return True, "no canary"
-    with tempfile.TemporaryDirectory(prefix="doctor-home-") as home:
-        env = {"HOME": home, "PATH": "/usr/bin:/bin:/usr/local/bin", "LANG": "C.UTF-8"}
-        argv = ["python3", "-I", str(script_path)] + ([row["arg"]] if row.get("arg") else [])
-        try:
-            r = subprocess.run(argv, input=json.dumps(canary["payload"]), capture_output=True, text=True,
-                               timeout=30, env=env, cwd=home)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return False, f"canary could not run: {type(exc).__name__}"
-        denied = '"deny"' in r.stdout or r.returncode == 2
+    notes = []
+    for canary in canaries:
+        with tempfile.TemporaryDirectory(prefix="doctor-home-") as home:
+            env = {"HOME": home, "PATH": "/usr/bin:/bin:/usr/local/bin", "LANG": "C.UTF-8"}
+            argv = ["python3", "-I", str(script_path)] + ([row["arg"]] if row.get("arg") else [])
+            try:
+                r = subprocess.run(argv, input=json.dumps(canary["payload"]), capture_output=True, text=True,
+                                   timeout=30, env=env, cwd=home)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return False, f"canary could not run: {type(exc).__name__}"
+        out = r.stdout + r.stderr
+        crashed = "Traceback" in out or "usage:" in out.lower() or r.returncode not in (0, 2)
+        denied = ('"permissionDecision": "deny"' in r.stdout.replace('":"', '": "')) or r.returncode == 2
         want_deny = canary.get("expect") == "deny"
-        ok = denied == want_deny and r.returncode in (0, 2)
-        return ok, f"rc={r.returncode} denied={denied} expected={'deny' if want_deny else 'allow'}"
+        ok = not crashed and denied == want_deny
+        notes.append(f"rc={r.returncode} denied={denied} want={'deny' if want_deny else 'allow'}")
+        if not ok:
+            return False, "; ".join(notes) + (" (crashed)" if crashed else "")
+    return True, "; ".join(notes)
 
 
 def check_hooks(manifest: dict, flavor: str, live: dict, hooks_dir: Path, canary: bool = True, exists=None) -> list[dict]:
     hooks = live.get("hooks", {}) if isinstance(live, dict) else {}
+    disabled = isinstance(live, dict) and live.get("disableAllHooks") is True
     out = []
     for row in expected(manifest, flavor, hooks_dir.parent):
-        found = find_hook(hooks, row["event"], row["script"], row.get("arg"), row.get("tools", []))
+        found = None if disabled else find_hook(hooks, row["event"], row["script"], row.get("arg"),
+                                                row.get("tools", []), hooks_dir)
         script = hooks_dir / row["script"]
         if found is None:
             state = PENDING if row["status"] == "pending" else MISSING
-            detail = "not in live hooks"
+            detail = "disableAllHooks is true in this settings file" if disabled else "not in live hooks (or wired to another path/interpreter)"
         elif not (exists(row["script"]) if exists else script.exists()):
             state, detail = SCRIPT_MISSING, f"wired but {script} does not exist (hook would exit 0 silently)"
         else:
@@ -117,9 +145,19 @@ def check_hooks(manifest: dict, flavor: str, live: dict, hooks_dir: Path, canary
     return out
 
 
+HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def check_host(host: str) -> str:
+    if not HOST_RE.match(host):
+        raise OSError("invalid ssh host name")
+    return host
+
+
 def read_live(path: str, ssh: str | None) -> dict:
     if ssh:
-        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", ssh, "cat", path],
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", check_host(ssh),
+                            "cat", shlex.quote(path)],
                            capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             raise OSError(f"ssh {ssh} cat failed rc={r.returncode}")
@@ -128,7 +166,8 @@ def read_live(path: str, ssh: str | None) -> dict:
 
 
 def remote_names(ssh: str, path: str) -> set[str]:
-    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", ssh, "ls", path],
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", check_host(ssh),
+                        "ls", shlex.quote(path)],
                        capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         raise OSError(f"ssh {ssh} ls failed rc={r.returncode}")
@@ -157,7 +196,12 @@ def rules_report(rules: list[dict], findings: list[dict], hooks_dir: Path) -> li
         if mech:
             wired = all(by_id.get(m, {"state": MISSING})["state"] == WIRED for m in mech)
             mode = policy_mode(hooks_dir, rule.get("mode"))
-            state = "NOT-ENFORCED" if not wired else ("ENFORCED" if mode == "enforce" else "ALERT-ONLY")
+            if not wired:
+                state = "NOT-ENFORCED"
+            elif mode != "enforce":
+                state = "ALERT-ONLY"
+            else:
+                state = "PARTIAL" if rule.get("partial_reason") else "ENFORCED"
         elif rule.get("advisory_reason"):
             state = "ADVISORY"
         elif rule.get("planned_batch"):
@@ -182,6 +226,8 @@ def main(argv=None) -> int:
     r = sub.add_parser("rules-report")
     r.add_argument("--settings", default="~/.claude/settings.json")
     r.add_argument("--hooks-dir", default="~/.claude/hooks")
+    r.add_argument("--canary", action="store_true", help="also run canaries (default: wiring only)")
+    r.add_argument("--fail-on-p0", action="store_true", help="exit 1 when any P0 rule is not ENFORCED/PARTIAL")
     a = ap.parse_args(argv)
     manifest = load_json(MANIFEST)
     try:
@@ -206,12 +252,16 @@ def main(argv=None) -> int:
             for f in findings:
                 print(f"{f['state']:14} {f['id']:34} {f['detail']}")
         return verdict(findings)
-    findings = check_hooks(manifest, "claude", live, hooks_dir)
+    findings = check_hooks(manifest, "claude", live, hooks_dir, canary=a.canary)
     rules = load_json(RULES)
     rows = rules_report(rules, findings, hooks_dir)
     for row in rows:
         print(f"{row['state']:13} {row['priority']} {row['id']} {row['planned']}")
-    return 1 if any(x["state"] == "UNMAPPED" for x in rows) else 0
+    p0_gaps = [x["id"] for x in rows if x["priority"] == "P0" and x["state"] in ("NOT-ENFORCED", "PLANNED", "UNMAPPED")]
+    print(f"P0 gaps: {', '.join(p0_gaps) or 'none'}")
+    if any(x["state"] == "UNMAPPED" for x in rows):
+        return 1
+    return 1 if (a.fail_on_p0 and p0_gaps) else 0
 
 
 if __name__ == "__main__":
