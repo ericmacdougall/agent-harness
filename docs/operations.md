@@ -448,13 +448,13 @@ Process ancestry is deliberately not a proof: subagents share the CLI process, s
 
 ### Kill grammar
 
-Once the shared command parser has handed the guard a `kill` command, the guard accepts it only if every word fits a closed grammar, checked against the word's exact source text so a form the lexer does not understand cannot pass as a literal (`kill_guard.py`, `parse_kill_words`). This covers the kill words only. A kill the parser never presents to the guard is not judged at all; those gaps are listed under Known limits below and tracked in goodqa#14654 (items 1-14) and goodqa#14677 (item 16):
+Once the shared command parser has handed the guard a `kill` command, the guard accepts it only if every word fits a closed grammar, checked against the word's exact source text so a form the lexer does not understand cannot pass as a literal (`kill_guard.py`, `parse_kill_words`). This covers the kill words only. A kill the parser never presents to the guard is not judged at all; those gaps are listed under Known limits below and tracked in goodqa#14654 (items 1-14), goodqa#14677 (item 16), goodqa#14683 (item 17), goodqa#14684 (item 18) and goodqa#14685 (item 19):
 
 - option, first word only and unquoted: `-SIG`, `-s SIG`, `-n SIG`, `--signal SIG`, `--signal=SIG`, then an optional `--`; or `-l`, `-L`, `--list`, `-t`, `--table` with plain signal values;
 - target: a literal integer, a job spec `%N`, `%%`, `%+`, `%-` or `%name` matching `[A-Za-z_][A-Za-z0-9_.-]*`, unquoted or wholly inside one pair of quotes;
 - `kill -0` only: one target that is exactly `"$NAME"` or `"${NAME}"`.
 
-Everything else fails closed, whatever it would expand to: `$!`, `PID=4001; kill $PID`, `{4001,4016}`, `\\4001`, `$'4001'`, `$x""`, `%a$=x`, `%?str`, and a parenthesis after a kill word (`kill 4001(N) 4004`, where zsh drops the first word). The parenthesis rule follows the command the analyser resolves, so `gkill`, `K=kil; ${K}l`, `$(...)` and `eval` forms count. A parenthesis in another command does not (`[[ "$s" =~ ^(a|b)$ ]] && kill 4001`, `case "$x" in (a) kill 4001;; esac`), and neither does the definition `kill() { ...; }`. A command whose name holds an expansion is also refused at a parenthesis when the input mentions kill anywhere, because its value may never be visible. After a background job use `kill %1`, or start it with `kill_guard.py spawn` and use the printed PID.
+Everything else fails closed, whatever it would expand to: `$!`, `PID=4001; kill $PID`, `{4001,4016}`, `\\4001`, `$'4001'`, `$x""`, `%a$=x`, `%?str`, and a parenthesis after a kill word (`kill 4001(N) 4004`, where zsh drops the first word). The parser ends a command at `(`, so for each statement with a word before a parenthesis the analyser also reads the statement with the parentheses taken out, and it refuses any kill judged inside that pipeline, including text that `eval`, `env -S`, `watch`, `sh -c`, `sudo -i`, `ssh`, or a printer piped to a shell re-reads. So `gkill 4001(N) 4004`, `K=kil; ${K}l 4001(N) 4004`, `K=kill; eval $K 4001(N) 4004`, `eval "kill 4001" 4001(N) 4004`, `env -S "kill 4001" 4001(N) 4004`, `echo "kill 4001" 4001(N) 4004 | sh` and `sh -c "$(print -r -- "kill 4001" x(N) 4004)"` are all refused. So is a re-read command whose name holds an expansion when the input mentions kill (`K=kill; read x; eval $x 4001(N) 4004`). A parenthesis in another pipeline does not count (`[[ "$s" =~ ^(a|b)$ ]] && kill 4001`, `case "$x" in (a) kill 4001;; esac`, `ls *(N); kill 4001`), nor does printed text that nothing re-reads (`echo "kill 4001" x(N)`), nor the definition `kill() { ...; }`. A command whose name holds an expansion is also refused at a parenthesis when the input mentions kill anywhere, because its value may never be visible. After a background job use `kill %1`, or start it with `kill_guard.py spawn` and use the printed PID.
 
 ### Starting processes you will need to stop
 
@@ -490,10 +490,12 @@ The registered command is `kill_guard.py hook`, a launcher that runs the analysi
 | 12 | local stdin shells | `source /dev/stdin <<< 'kill ...'` |
 | 13 | a literal PID rewritten at parse time | `alias -g 4001=4004; eval "kill -9 4001"` |
 | 14 | wrappers and remote tools the guard does not list | `xcrun kill`, `tailscale ssh`, `pdsh`, `ansible -a`, `fd -x` |
-| 15 | `alias` is not followed, so a name aliased to kill is not judged | `alias K=kill` then `K -9 4004` on a new line |
-| 16 | interpreter code in a remote heredoc is read as shell (goodqa#14677, the goodqa#14617 route) | `ssh dev2 python3 - <<PY` with `os.kill(4004, 9)` in the body |
 | 15 | an alias of the kill verb, because `_alias()` in `command_guard.py` does nothing | `alias K=kill` then `K -9 4004` on the next line |
-| 16 | interpreter code in a heredoc given to a remote command; the body is read as shell, not as interpreter code (a local `python3 - <<PY` is blocked) | `ssh dev2 python3 - <<'PY'` with `os.kill(4004, 9)` in the body |
+| 16 | interpreter code in a heredoc given to a remote command; the body is read as shell, not as interpreter code, so this is the goodqa#14617 route (goodqa#14677; a local `python3 - <<PY` is blocked) | `ssh dev2 python3 - <<'PY'` with `os.kill(4004, 9)` in the body |
+| 17 | an array-valued command name (goodqa#14683, high; both bash and zsh run the kill) | `K=(kill); $K 4004`, `a=(kill 4001); $a 4004` |
+| 18 | a command name assembled from variables and split with `${=R}` (goodqa#14684, medium) | `A=ki; B=ll; R="$A$B -15"; ${=R} 4004` |
+| 19 | `find -exec` with the Homebrew-prefixed verb (goodqa#14685, low; `find -exec kill` is blocked) | `find . -exec gkill 4004 \;` |
+| 20 | a printer piped to a shell when the shell is behind a wrapper or `printf` has a format; no parenthesis involved, no ticket yet | `echo "kill 4004" \| sudo sh`, `printf '%s ' "kill 4004" \| bash` |
 
 The guard therefore does not close the incident class. It closes the kill words it is shown.
 

@@ -1,5 +1,5 @@
 {
- "_doc": "Data only (rule S1): judged by decide() in the fake world of kill_guard_corpus.json, never executed or fed to a shell. shape names the BLOCK that found it: a commit hash for the six earlier fixes, with only rows that fix's parent let through, F6-F9 for the closed grammar, PKILL for goodqa#14617, OK for commands that must keep working.",
+ "_doc": "Data only (rule S1): judged by decide() in the fake world of kill_guard_corpus.json, never executed or fed to a shell. shape names the BLOCK that found it: a commit hash for the six earlier fixes, with only rows that fix's parent let through, F6-F9 for the closed grammar, R2-R5 for later reviews, PKILL for goodqa#14617, OK for commands that must keep working.",
  "rows": [
   {
    "cmd": "kill -9 -0 4004",
@@ -1883,6 +1883,720 @@
    "id": "R3-22",
    "shape": "R3",
    "why": "the analyser resolves the command to kill, but the words after a parenthesis never reached it"
+  },
+  {
+   "cmd": "K=kill; eval $K 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-1",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kill; eval $K -0 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-2",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kill; eval $K -9 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-3",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kil; eval ${K}l 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-4",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=ki; eval ${K}ll -0 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-5",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=gkill; eval $K 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-6",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "eval gkill 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-7",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kill; env -S $K 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-8",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kil; env -S ${K}l 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-9",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=gkill; env -S $K 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-10",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=\"kill 4001\"; eval $K 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-11",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=\"kill -0 4001\"; eval $K 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-12",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kill; read x; eval $x 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-13",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kill; read x; eval $x -0 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-14",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "read x <<< kill; eval $x 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-15",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kill; read x; env -S $x 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-16",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kill; eval $K 4001(|N) 4004",
+   "expect": "block",
+   "id": "R4-17",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kill; eval $K 4001(N)(N) 4004",
+   "expect": "block",
+   "id": "R4-18",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kill; if eval $K 4001(N) 4004; then :; fi",
+   "expect": "block",
+   "id": "R4-19",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kill; time eval $K 4001(N) 4004",
+   "expect": "block",
+   "id": "R4-20",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kill; eval $K (N) 4004",
+   "expect": "block",
+   "id": "R4-21",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "K=kill; f() { eval $K 4001(N) 4004; }",
+   "expect": "block",
+   "id": "R4-22",
+   "shape": "R4",
+   "why": "the words were joined and re-read by eval or env -S, so the mark on the word before the parenthesis was lost"
+  },
+  {
+   "cmd": "eval \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-1",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "eval 'kill 4001' 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-2",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "eval \"kill -0 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-3",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "eval \"kill -9 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-4",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "eval \"gkill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-5",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "eval \"kill 4001\" (N) 4004",
+   "expect": "block",
+   "id": "R5-6",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "eval \"kill 4001\" (|N)(N) 4004",
+   "expect": "block",
+   "id": "R5-7",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "eval kill\\ 4001 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-8",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "eval eval \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-9",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "eval 'eval \"kill 4001\"' 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-10",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "builtin eval \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-11",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "command eval \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-12",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "time eval \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-13",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "sudo eval \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-14",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "if eval \"kill 4001\" 4001(N) 4004; then :; fi",
+   "expect": "block",
+   "id": "R5-15",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "env -S \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-16",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "env -S \"kill -0 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-17",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "env -S \"gkill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-18",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "timeout 5 env -S \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-19",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "watch \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-20",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "K=ki;L=ll; eval $K$L 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-21",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "K=ki;L=ll; eval $K$L -0 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-22",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "K=ki; eval ${K}ll 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-23",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "echo \"kill 4001\" 4001(N) 4004 | sh",
+   "expect": "block",
+   "id": "R5-24",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "echo \"kill -0 4001\" 4001(N) 4004 | sh",
+   "expect": "block",
+   "id": "R5-25",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "echo \"kill 4001\" 4001(N) 4004 | bash",
+   "expect": "block",
+   "id": "R5-26",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "echo \"gkill 4001\" 4001(N) 4004 | sh",
+   "expect": "block",
+   "id": "R5-27",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "echo \"kill 4001\" 4001(N) 4004 | sudo sh",
+   "expect": "block",
+   "id": "R5-28",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "print -r -- \"kill 4001\" x(N) 4004 | zsh",
+   "expect": "block",
+   "id": "R5-29",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "printf '%s\\n' \"kill 4001\" 4001(N) 4004 | sh",
+   "expect": "block",
+   "id": "R5-30",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "printf '%s ' \"kill 4001\" 4001(N) 4004 | bash",
+   "expect": "block",
+   "id": "R5-31",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "printf \"%s \" \"kill 4001\" x(N) 4004 | bash",
+   "expect": "block",
+   "id": "R5-32",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "sh -c \"$(print -r -- \"kill 4001\" x(N) 4004)\"",
+   "expect": "block",
+   "id": "R5-33",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "sh -c \"$(print -r -- \"kill -0 4001\" x(N) 4004)\"",
+   "expect": "block",
+   "id": "R5-34",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "ssh host \"kill -0 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-35",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "sudo -i \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-36",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "su -c \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-37",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "tmux new \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-38",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "uv run \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-39",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "bash -c \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-40",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "nohup sh -c \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-41",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "timeout 5 sh -c \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-42",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "trap \"kill 4001\" 4001(N) EXIT",
+   "expect": "block",
+   "id": "R5-43",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "cmd /c \"kill 4001\" 4001(N) 4004",
+   "expect": "block",
+   "id": "R5-44",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "sh -c \"`print -r -- \"kill 4001\" x(N) 4004`\"",
+   "expect": "block",
+   "id": "R5-45",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "print -r -- \"kill 4001\" x(N) 4004 | tee /dev/null | zsh",
+   "expect": "block",
+   "id": "R5-46",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "echo \"kill 4001\" 4001(N) 4004 > /dev/null | sh",
+   "expect": "block",
+   "id": "R5-49",
+   "shape": "R5",
+   "why": "parse() ended the command at the parenthesis, so the re-read text or printed program held only the words before it"
+  },
+  {
+   "cmd": "[[ \"$s\" =~ ^(a|b)$ ]] && kill 4001",
+   "expect": "allow",
+   "id": "R4OK-1",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "[[ \"$s\" =~ ^(kill)$ ]] && echo ok",
+   "expect": "allow",
+   "id": "R4OK-2",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "if [[ $x == (a|b) ]]; then kill 4001; fi",
+   "expect": "allow",
+   "id": "R4OK-3",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "case \"$x\" in (a) kill 4001;; esac",
+   "expect": "allow",
+   "id": "R4OK-4",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "case $x in (a) kill -0 4004;; (b) kill 4001;; esac",
+   "expect": "allow",
+   "id": "R4OK-5",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "case $x in (kill) echo x;; esac",
+   "expect": "allow",
+   "id": "R4OK-6",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "kill() { :; }",
+   "expect": "allow",
+   "id": "R4OK-7",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "function kill() { :; }",
+   "expect": "allow",
+   "id": "R4OK-8",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "kill() { kill 4001; }",
+   "expect": "allow",
+   "id": "R4OK-9",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "f() { kill 4001; }; f",
+   "expect": "allow",
+   "id": "R4OK-10",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "arr=($y); kill 4001",
+   "expect": "allow",
+   "id": "R4OK-11",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "x=(1 2); y=${x[1]}; kill 4001",
+   "expect": "allow",
+   "id": "R4OK-12",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "(sleep 1); kill 4001",
+   "expect": "allow",
+   "id": "R4OK-13",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "(kill 4001); (kill 4001)",
+   "expect": "allow",
+   "id": "R4OK-14",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "if [ -n \"$x\" ]; then (cd a && make); fi; kill 4001",
+   "expect": "allow",
+   "id": "R4OK-15",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "then_ok=1; if true; then (kill 4001); fi",
+   "expect": "allow",
+   "id": "R4OK-16",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "echo a(N) ; kill 4001",
+   "expect": "allow",
+   "id": "R4OK-17",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "ls *(N); kill 4001",
+   "expect": "allow",
+   "id": "R4OK-18",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "for f in *(N); do echo $f; done; kill 4001",
+   "expect": "allow",
+   "id": "R4OK-19",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "print -l *.log(N) ; kill 4001",
+   "expect": "allow",
+   "id": "R4OK-20",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "python3 -c \"print(1)\"; kill 4001",
+   "expect": "allow",
+   "id": "R4OK-21",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "git log --format='%h(%s)'; kill 4001",
+   "expect": "allow",
+   "id": "R4OK-22",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "eval \"echo hi\" x(N); kill 4001",
+   "expect": "allow",
+   "id": "R4OK-23",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "eval \"ls\" *(N)",
+   "expect": "allow",
+   "id": "R4OK-24",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "env -S \"ls\" *(N)",
+   "expect": "allow",
+   "id": "R4OK-25",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "echo \"kill 4001\" x(N)",
+   "expect": "allow",
+   "id": "R4OK-26",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "ls kill*(N)",
+   "expect": "allow",
+   "id": "R4OK-27",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "rg \"kill 4004\" src/*(N)",
+   "expect": "allow",
+   "id": "R4OK-28",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "echo \"kill 4001\" x(N) | cat",
+   "expect": "allow",
+   "id": "R4OK-29",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "K=kill; echo $K x(N)",
+   "expect": "allow",
+   "id": "R4OK-30",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "eval \"kill 4001\"",
+   "expect": "allow",
+   "id": "R4OK-31",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "env -S \"kill 4001\"",
+   "expect": "allow",
+   "id": "R4OK-32",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
+  },
+  {
+   "cmd": "K=kill; eval $K 4001",
+   "expect": "allow",
+   "id": "R4OK-33",
+   "shape": "R4OK",
+   "why": "a parenthesis that is not a qualifier on this command, or a qualifier whose text no shell re-reads, must keep working"
   }
  ]
 }
