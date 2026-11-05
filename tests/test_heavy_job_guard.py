@@ -542,7 +542,8 @@ class PathologicalInput(unittest.TestCase):
     def fast(self, expression, action, rule="oversize", **kwargs):
         elapsed, got_action, got_rule = self.timed(expression, **kwargs)
         self.assertLess(elapsed, 1.0, expression)
-        self.assertEqual(got_action, action, expression)
+        if action is not None:  # None: only the bounded time matters, allow or deny are both safe answers
+            self.assertEqual(got_action, action, expression)
         if action == "deny" and rule:
             self.assertEqual(got_rule, rule, expression)
 
@@ -603,6 +604,17 @@ class PathologicalInput(unittest.TestCase):
     def test_g2_nested_uncertain_wrappers_are_not_exponential(self):
         self.fast("'env -Z ' + ('eval env -Z ' + 'a ' * 20) * 12", "deny", rule=None)
         self.fast("'env -Z ' + ('eval env -Z ' + 'a ' * 20) * 16", "deny", rule=None)
+
+    def test_h1_work_is_budgeted_by_size_not_by_probe_count(self):
+        for expression in ("'env -Z ' + 'gradle ' * 8000", "'nice -19 ' + 'gradle ' * 8000",
+                           "'env -Z ' + 'make ' * 8000", "'env -Z ' + 'xcodebuild ' * 8000",
+                           "'env -Z ' + ('eval ' + 'a' * 120 + ' ') * 500",
+                           "'env -Z ' + ('eval ' + 'a' * 120 + ' ') * 2000"):
+            self.fast(expression, "deny")  # past the budget the guard fails closed; it never allows an unscanned job
+
+    def test_h2_ordinary_long_scripts_are_not_denied_by_the_budget(self):
+        self.fast("'\\n'.join('nice -5 cp f%d /tmp/x' % i for i in range(4000))", "allow")
+        self.fast("'\\n'.join('bash -c \"echo %d\"' % i for i in range(11000))", "allow")
 
     def test_g3_nested_commands_share_the_script_cache(self):
         with tempfile.TemporaryDirectory() as cwd:

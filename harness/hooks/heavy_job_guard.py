@@ -59,7 +59,7 @@ import sys
 MAX_COMMAND_CHARS = 1_000_000
 MAX_SCAN_CHARS = 256 * 1024  # command text left after heredoc bodies are removed; ~0.3 s worst case, linear
 MAX_SEGMENT_WORDS = 8192  # words in one shell command; bounds the quadratic wrapper-slicing paths
-MAX_NESTED_WORK = 10000  # nested re-scans plus uncertain-wrapper word probes allowed per decision
+MAX_NESTED_WORK = 400_000  # work units per decision (about 0.3 s): words re-sliced per probe, text re-scanned per nested scan
 MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enforce",
                  "build": "enforce", "media": "warn", "fan-out": "warn", "oversize": "enforce"}
@@ -352,8 +352,8 @@ class Ctx:
         self._hits = parent._hits if parent else {}
         self.budget = parent.budget if parent else [MAX_NESTED_WORK]
 
-    def spend(self):
-        self.budget[0] -= 1
+    def spend(self, units=1):
+        self.budget[0] -= units
         if self.budget[0] < 0:
             raise WorkBudgetExceeded()
 
@@ -542,7 +542,7 @@ def classify_build_tool(low, args):
 def scan_words(words, ctx, depth):
     """Uncertain wrapper parse: judge every remaining word as if it started the command; first heavy finding wins."""
     for j, word in enumerate(words):
-        ctx.spend()
+        ctx.spend(1 + len(words) - j)  # each probe slices and re-classifies the remaining words
         if word.startswith("-") or ASSIGN.match(word):
             continue
         result = classify_text(word, ctx, depth + 1) if re.search(r"\s", word) else None
@@ -888,7 +888,7 @@ def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
 
 def classify_text(text, ctx, depth):
     """Classify a nested `bash -c` string with the parent's cwd."""
-    ctx.spend()
+    ctx.spend(1 + len(text) // 4)  # a nested scan re-tokenises and re-classifies the whole text
     _hatch, findings = scan_state(text, ctx.cwd, depth, ctx)
     if findings:
         rule, detail, capped, _segment = findings[0]
