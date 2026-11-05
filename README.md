@@ -65,7 +65,7 @@ Claude Code's `--safe-mode` disables `CLAUDE.md` and hooks, including the WAL ga
 To uninstall, follow these steps:
 
 1. Remove the marked block from `CLAUDE.md`.
-2. Remove the harness entries from `settings.json`: the hook entries pointing at `~/.claude/hooks/wal.py`, `~/.claude/hooks/commit_policy.py` or `~/.claude/hooks/spec_flow.py`, and the harness permission rules.
+2. Remove the harness entries from `settings.json`: the hook entries pointing at `~/.claude/hooks/wal.py`, `~/.claude/hooks/commit_policy.py`, `~/.claude/hooks/spec_flow.py`, `~/.claude/hooks/merge_gate.py`, `~/.claude/hooks/command_guard_hook.py` or `~/.claude/hooks/kill_guard.py`, and the harness permission rules.
 3. Run `python3 ~/.claude/hooks/commit_policy.py uninstall-git-hook`.
 4. If installed, run `~/.agent-harness/bin/netwatch uninstall`, delete the binary, and pass `--no-netwatch` to any later install.
 5. Remove the copied agents and helper scripts. Restore a backup if you want the exact earlier state.
@@ -87,6 +87,16 @@ Both editions install `deliver.py`. Its prepare phase verifies reviewed commits 
 
 Both editions enforce one commit message format for agent commits: `<type>(<scope>): <summary>` followed by `Why:`, `What:`, `Testing:` and `Refs:` sections. In ticket-tracked repositories, each commit must name a GoodQA ticket, and that ticket must have been updated about the commit before publication. A PreToolUse hook checks each `git commit` before it runs, including commits made over `ssh` on dev2/T2. It also checks `gh pr create`. A git `commit-msg` config hook (Git 2.54+) runs alongside each repository's own hooks. `deliver.py prepare` and `peer_review.py pr` refuse non-compliant ranges, and `deliver.py finish` comments the delivered SHA on each ticket. Rules live in one file, `commit_policy.json`. The only exception path is a reasoned waiver recorded in the WAL. See [commit message policy](docs/operations.md#commit-message-policy).
 
+Untracked repos may reference local ledger tickets. `harness tickets` keeps tickets in hidden git refs of the repository, offline and on this machine only. In a repository that no ticket system tracks (no remote URL or push URL matches), or a remote-less one listed in `ledger.allowed_repos`, a commit may cite `Refs: Ledger <slug>#<8+ hex>`. The policy resolves the ref with the local `harness` binary and fails closed if it cannot. Tracked repositories still need GoodQA tickets. See [the local ledger](docs/ledger.md).
+
+When `peer_review.py` cannot produce a reviewed result it prints a stable reason code, an exact next step and a reminder that native evidence is not a helper receipt; it also finds the reviewer CLIs in documented install locations and lints review packets for run evidence and the exact HEAD. See [review helper reliability](docs/operations.md#review-helper-reliability).
+
+A command guard (`command_guard.py`, behind the fail-closed launcher `command_guard_hook.py`) blocks shell commands that delete, move or empty Claude, Codex and harness logs and state, or that print secrets and configuration (for example `rclone config show`), in both editions; deletes of logs need a verified Dropbox backup and a single-use `approve-delete`. See [command guard](docs/operations.md#command-guard).
+
+A kill guard (`kill_guard.py`, GoodQA #14506) blocks `pkill`, `killall`, `pgrep`-fed kills and kills of processes the caller cannot prove it owns (cwd or program inside its own worktree, or a `kill_guard.py spawn` ledger entry), including inside `ssh`, except `netwatch orphans --kill --pid N`; see [kill guard](docs/operations.md#kill-guard).
+
+Both editions also gate PR merges: a PreToolUse hook (`merge_gate.py`) blocks `gh pr merge`, `gh api` merge calls (REST and GraphQL) and wrapped forms unless every required and reported check on the exact head SHA is green, the merge command carries that head SHA, and the check state could be read; the only override is a recorded single-use waiver. See [merge gate](docs/operations.md#merge-gate).
+
 Work is spec-driven. Each ticket gets a spec with `AC-n` acceptance criteria and negative cases, reviewed adversarially and for acceptance by two different models, agents or people. The spec and its reviews are attached to the ticket. Proof for each criterion (a `REALLY_TESTED` WAL entry, commits and redacted logs) and the click-tester's identity, time window and logs are attached as the work proceeds. `spec_flow.py done` marks a ticket done only when every criterion has evidence, both reviews accepted the current spec, the click-test passed and someone independent signed off. Otherwise it lists what is missing. A Claude Code PreToolUse hook applies the same gate to GoodQA status changes; on Codex and Cursor the check is run by hand. It ships in warn mode. See [spec-driven tickets](docs/operations.md#spec-driven-tickets).
 
 When a repo shows blockchain work (Solidity, Foundry, Hardhat, Anchor, Substrate, XRPL, ledger over NATS), specs and review prompts also carry a risk checklist, test scaffolds and follow-up prompts; see [blockchain domain gates](docs/operations.md#blockchain-domain-gates).
@@ -104,3 +114,13 @@ This repository contains no account credentials, session logs, app fixtures, or 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs should include a reproducible failure, the affected agent edition and version, and evidence that a fix works without breaking the fast path or local delivery.
+
+## Local gates (no CI)
+
+Run before pushing, from a clean tree: `python3 scripts/leak_gate.py --range origin/main..HEAD`.
+It runs `scripts/leak_scan.py` on the tree and the pushed commits, and gitleaks
+if installed and pinned by SHA-256 (`--gitleaks-sha256`). It needs your personal denylist
+(`~/.agent-harness/leak-denylist.txt`, one regex per line, mode 0600, never committed) and
+refuses to pass without one unless you pass `--no-denylist`. Matched values are
+never printed. Personal identifiers live in the untracked
+`commit_policy.local.json`, not in the repo.

@@ -160,7 +160,8 @@ class Dispatch(unittest.TestCase):
 
 
 GATES = json.loads((ROOT / "cmd" / "harness" / "gates.json").read_text(encoding="utf-8"))["gates"]
-SUBCOMMAND = {"wal.py": "wal", "commit_policy.py": "commit-policy", "spec_flow.py": "spec-flow"}
+SUBCOMMAND = {"wal.py": "wal", "commit_policy.py": "commit-policy", "spec_flow.py": "spec-flow",
+              "command_guard_hook.py": "command-guard", "kill_guard.py": "kill-guard", "tier_gate.py": "tier-gate", "merge_gate.py": "merge-gate"}
 
 
 class GateTable(unittest.TestCase):

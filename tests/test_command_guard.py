@@ -1,0 +1,1256 @@
+"""Tests for harness/hooks/command_guard.py (GoodQA #14471).
+
+Every command string here is DATA handed to command_guard.decide(); nothing in this file executes a corpus row
+(safety rule S1/S3). The live, executing harness is tests/live_guard_canary.py and runs only on dev2 (rule S2).
+
+CG_HOOKS_DIR overrides the module directory so the same tests can be pointed at an older implementation to show
+them failing first.
+"""
+
+import ast
+import inspect
+import json
+import os
+import random
+import re
+import shlex
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+HOOKS = Path(os.environ.get('CG_HOOKS_DIR') or ROOT / 'harness/hooks')
+sys.path.insert(0, str(HOOKS))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import command_guard as cg  # noqa: E402
+import command_guard_corpus as corpus  # noqa: E402
+
+POSITIVE_FLOOR = 400
+NEGATIVE_FLOOR = 200
+
+
+def make_fixture(home):
+    """The tree the corpus rows refer to: harness roots, a real worktree, a fake one, a plain task folder."""
+    h = Path(home)
+    files = [
+        '.claude/projects/p/a.jsonl', '.claude/history.jsonl', '.claude/settings.json', '.claude/wals/s/main.jsonl',
+        '.claude/hooks/command_guard.py', '.codex/sessions/2026/x.jsonl', '.codex/history.jsonl',
+        '.codex/config.toml', '.agent-harness/state/log-delete-ok.json',
+        '.agent-harness/work/S/notes.md', '.agent-harness/work/S/T/kit.json', '.agent-harness/work/S/T/notes.md',
+        '.agent-harness/work/S/T/main.jsonl', '.agent-harness/work/S/T/tmp/packet.md',
+        '.agent-harness/work/S/T/tmp/scripts/a.py', '.agent-harness/work/S/T/tmp/main.jsonl',
+        '.agent-harness/work/S/T/tmp/kit.json', '.agent-harness/work/S/T/wt/.git/HEAD',
+        '.agent-harness/work/S/T/wt/build/a.o', '.agent-harness/work/S/T/wt/out/x.o',
+        '.agent-harness/work/S/T/wt/out/results.jsonl', '.agent-harness/work/S/T/fake/.git/config',
+        '.agent-harness/work/S/T/fake/x/y', '.agent-harness/work/S/T/plain/x/y',
+        '.agent-harness/work/S/T2/notes.md', '.agent-harness/scratch/a/b/c/d/tmp.txt',
+        '.agent-harness/scratch/a/b/c/tasks/x.output', '.agent-harness/scratch/a/b/c/run.log',
+        '.agent-harness/scratch/a/b/c/tasks/d/session.txt',
+        'repo/.git/HEAD', 'repo/tests/fixtures/wals/main.jsonl',
+    ]
+    for rel in files:
+        p = h / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('ref: refs/heads/main\n' if rel.endswith('/HEAD') else '{}\n' if rel.endswith('.json') else 'x\n')
+    (h / '.agent-harness/work/S/T/state').mkdir(parents=True, exist_ok=True)
+    return h
+
+
+def fill(text, home):
+    h = str(home)
+    return (text.replace('@WT@', h + '/.agent-harness/work/S/T/wt')
+            .replace('@TASK@', h + '/.agent-harness/work/S/T').replace('@HOME@', h))
+
+
+class Fixture(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix='cg-home-')
+        cls.home = Path(os.path.realpath(cls._tmp.name))
+        make_fixture(cls.home)
+        cls.policy = cg.load_policy(path=str(cls.home / 'no-such-policy.json'))
+        cls._old_home = os.environ.get('HOME')
+        os.environ['HOME'] = str(cls.home)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._old_home is not None:
+            os.environ['HOME'] = cls._old_home
+        cls._tmp.cleanup()
+
+    def decide(self, command, cwd='@HOME@/repo', ps=False, proc=None):
+        """`cwd` is the payload cwd (None: the host sent none); `proc` is the hook process's own directory."""
+        cwd = fill(cwd, self.home) if cwd else None
+        proc = fill(proc, self.home) if proc else None
+        compiled = cg.Compiled(self.policy, home=str(self.home), cwd=proc or cwd or str(self.home / 'repo'))
+        return cg.decide(fill(command, self.home), compiled, cwd=cwd, ps=ps)
+
+    def expect(self, rows, want, ps=False, label=''):
+        failures = []
+        for row in rows:
+            cmd, cwd = (row['cmd'], row['cwd']) if isinstance(row, dict) else (row, '@HOME@/repo')
+            proc = row.get('proc') if isinstance(row, dict) else None
+            verdict, message = self.decide(cmd, cwd=cwd, ps=ps, proc=proc)
+            ok = verdict in want if isinstance(want, tuple) else verdict == want
+            if not ok:
+                failures.append('%r (cwd=%s) -> %s %s' % (cmd, cwd, verdict, message.splitlines()[:1]))
+        self.assertGreater(len(rows), 0, 'empty corpus section ' + label)
+        self.assertEqual(failures, [], '%s: %d of %d rows wrong:\n%s' % (label, len(failures), len(rows),
+                                                                         '\n'.join(failures[:40])))
+
+
+class CorpusTests(Fixture):
+    def test_secret_positive_blocks(self):
+        self.expect(corpus.SECRET_POSITIVE, 'block', label='SECRET_POSITIVE')
+
+    def test_secret_positive_powershell_blocks(self):
+        self.expect(corpus.SECRET_POSITIVE_PS, 'block', ps=True, label='SECRET_POSITIVE_PS')
+
+    def test_gh_token_shapes_block(self):
+        self.expect(corpus.NEG13_GH_TOKEN, 'block', label='NEG13_GH_TOKEN')
+
+    def test_log_positive_blocks(self):
+        self.expect(corpus.LOG_POSITIVE, 'block', label='LOG_POSITIVE')
+
+    def test_log_positive_powershell_blocks(self):
+        self.expect(corpus.LOG_POSITIVE_PS, 'block', ps=True, label='LOG_POSITIVE_PS')
+
+    def test_work_tree_blocks(self):
+        self.expect(corpus.NEG15_WORK_BLOCK, 'block', label='NEG15_WORK_BLOCK')
+
+    def test_work_tree_allows(self):
+        self.expect(corpus.NEG15_WORK_ALLOW, 'allow', label='NEG15_WORK_ALLOW')
+
+    def test_heredoc_with_destructive_text_is_never_silent(self):
+        # warn, never block: writing or printing the text is not a deletion, but it must not pass silently
+        self.expect(corpus.HEREDOC_DESTRUCTIVE_WARN, 'warn', label='HEREDOC_DESTRUCTIVE_WARN')
+        for cmd in corpus.HEREDOC_DESTRUCTIVE_WARN:
+            self.assertIn('heredoc-destructive-text', self.decide(cmd)[1], cmd)
+        self.expect(corpus.HEREDOC_DESTRUCTIVE_BLOCK, 'block', label='HEREDOC_DESTRUCTIVE_BLOCK')
+        self.expect(corpus.HEREDOC_PLAIN_ALLOW, 'allow', label='HEREDOC_PLAIN_ALLOW')
+
+    def test_kill_positive_warns_or_blocks(self):
+        self.expect(corpus.KILL_POSITIVE, ('warn', 'block'), label='KILL_POSITIVE')
+
+    def test_negative_allows(self):
+        self.expect(corpus.NEGATIVE, 'allow', label='NEGATIVE')
+
+    def test_negative_powershell_allows(self):
+        self.expect(corpus.NEGATIVE_PS, 'allow', ps=True, label='NEGATIVE_PS')
+
+    def test_block_messages_never_carry_secrets_or_suggest_file_tools(self):
+        sentinel = 'sk-ant-api03-' + 'Q' * 40  # fake key shape, not a real credential
+        rows = ['rm -rf ~/.claude/projects/' + sentinel, 'gh auth status --show-token ' + sentinel, 'echo $GITHUB_TOKEN ' + sentinel,
+                'rm ~/.agent-harness/state/' + sentinel]
+        for cmd in rows + corpus.SECRET_POSITIVE[:40] + corpus.LOG_POSITIVE[:40]:
+            verdict, message = self.decide(cmd)
+            self.assertEqual(verdict, 'block', cmd)
+            self.assertNotIn(sentinel, message)
+            for word in ('Write tool', 'Edit tool', 'apply_patch'):
+                self.assertNotIn(word, message, cmd)
+
+
+class CrossProductTests(Fixture):
+    """Seeded wrapper x base products; the seed is printed in every failure."""
+
+    def product(self, bases, wrappers, n):
+        rng = random.Random(corpus.SEED)
+        rows = []
+        compound = (';', '&&', '||', '|', 'for ', 'if ', 'while ', '\n')
+        for base in bases:
+            simple = not any(x in base for x in compound) and not base.startswith(('{', '(', '>', ':', '`')) \
+                and not re.match(r'[A-Za-z_][A-Za-z0-9_]*=', base) and not base.endswith('&')
+            for w in wrappers:
+                prefix = w.endswith('{}') or w.endswith('{} &') or w.startswith('eval')
+                if "'" in base and "'{}'" in w:
+                    continue
+                if prefix and not w.startswith(('true &&', 'false ||', 'echo pre;')) and not simple:
+                    continue  # a prefix command applies to the first simple command only: not a real wrapping
+                if w.startswith('eval') and ('"' in base or '$' in base or '\\' in base):
+                    continue
+                if '\n' in base:
+                    continue
+                rows.append(w.format(base))
+        rng.shuffle(rows)
+        return rows[:n]
+
+    def test_wrapped_positives_block(self):
+        bases = [r for r in corpus.SECRET_POSITIVE + corpus.LOG_POSITIVE if r.count('$(') == 0 and '`' not in r]
+        rows = self.product(bases, corpus.WRAPPERS_POSITIVE, 1200)
+        self.assertGreaterEqual(len(rows), POSITIVE_FLOOR, 'seed %d' % corpus.SEED)
+        self.expect(rows, 'block', label='wrapped positives seed=%d' % corpus.SEED)
+
+    def test_wrapped_negatives_allow(self):
+        bases = [r for r in corpus.NEGATIVE if '\n' not in r and '$(' not in r and 'cd ' not in r
+                 and not r.startswith(('export', 'x=', 'set ', 'if ', 'for ', '[', 'source', '. '))]
+        rows = self.product(bases, corpus.WRAPPERS_NEGATIVE, 800)
+        self.assertGreaterEqual(len(rows), NEGATIVE_FLOOR, 'seed %d' % corpus.SEED)
+        self.expect(rows, 'allow', label='wrapped negatives seed=%d' % corpus.SEED)
+
+
+class CorpusManifestTests(unittest.TestCase):
+    def test_floors_and_no_overlap(self):
+        positives = corpus.SECRET_POSITIVE + corpus.LOG_POSITIVE + corpus.NEG13_GH_TOKEN
+        self.assertGreaterEqual(len(positives), 250)
+        self.assertGreaterEqual(len(corpus.NEGATIVE), 150)
+        self.assertEqual(set(positives) & set(corpus.NEGATIVE), set())
+        block = {r['cmd'] for r in corpus.NEG15_WORK_BLOCK}
+        allow = {r['cmd'] for r in corpus.NEG15_WORK_ALLOW}
+        for cmd in block & allow:  # the same text may differ only by cwd
+            cwds_b = {r['cwd'] for r in corpus.NEG15_WORK_BLOCK if r['cmd'] == cmd}
+            cwds_a = {r['cwd'] for r in corpus.NEG15_WORK_ALLOW if r['cmd'] == cmd}
+            self.assertEqual(cwds_b & cwds_a, set(), cmd)
+
+    def test_incident_rows_present(self):
+        incident = "cat <<'EOF'\nhello\nEOF\nrm -rf ~/.claude/projects"
+        self.assertIn(incident, corpus.LOG_POSITIVE)
+        self.assertIn('rclone config file', corpus.SECRET_POSITIVE)
+        self.assertIn('rm ~/.claude/settings.json', corpus.LOG_POSITIVE)
+
+
+class PayloadTests(Fixture):
+    def test_codex_and_claude_payload_shapes(self):
+        cmd = 'rm -rf ' + str(self.home) + '/.claude/projects'
+        shapes = [
+            {'tool_name': 'Bash', 'tool_input': {'command': cmd}},
+            {'tool_name': 'exec_command', 'tool_input': {'cmd': cmd}},
+            {'tool_name': 'shell', 'tool_input': {'command': ['bash', '-lc', cmd]}},
+            {'tool_name': 'write_stdin', 'tool_input': {'chars': cmd + '\n'}},
+            {'tool_name': 'unified_exec', 'tool_input': {'input': cmd}},
+            {'tool_name': 'local_shell', 'tool_input': {'command': ['rm', '-rf', str(self.home) + '/.claude/projects']}},
+        ]
+        for payload in shapes:
+            command, _ = cg.extract_command(payload)
+            self.assertTrue(command, payload['tool_name'])
+            text = command if isinstance(command, str) else ' '.join(command)
+            self.assertEqual(self.decide(text)[0], 'block', payload['tool_name'])
+
+    def test_non_shell_tools_are_ignored(self):
+        self.assertEqual(cg.extract_command({'tool_name': 'Read', 'tool_input': {'file_path': '/x'}}), (None, False))
+
+    def test_codex_workdir_is_the_cwd(self):
+        wt = str(self.home) + '/.agent-harness/work/S/T/wt'
+        self.assertEqual(cg.payload_cwd({'cwd': '/elsewhere', 'tool_input': {'workdir': wt}}), wt)
+        self.assertEqual(cg.payload_cwd({'cwd': '/elsewhere', 'tool_input': {}}), '/elsewhere')
+        self.assertIsNone(cg.payload_cwd({'tool_input': {}}))
+
+    def test_write_stdin_has_no_trusted_cwd(self):
+        """Red-team F5: typed shell input may run after a cd in an earlier call."""
+        self.assertIsNone(cg.payload_cwd({'tool_name': 'write_stdin', 'cwd': '/elsewhere', 'tool_input': {'chars': 'x'}}))
+
+    def test_blank_command_key_does_not_hide_another(self):
+        """Red-team F8: every non-blank command field is judged; a JSON-string tool_input is decoded."""
+        cmd = 'rm -rf ' + str(self.home) + '/.claude/projects'
+        command, _ = cg.extract_command({'tool_name': 'exec_command', 'tool_input': {'command': '   ', 'cmd': cmd}})
+        self.assertEqual(self.decide(command)[0], 'block')
+        command, _ = cg.extract_command({'tool_name': 'exec_command', 'tool_input': {'command': 'ls', 'cmd': cmd}})
+        self.assertEqual(self.decide(command)[0], 'block')
+        command, _ = cg.extract_command({'tool_name': 'Bash', 'tool_input': json.dumps({'command': cmd})})
+        self.assertEqual(command, cmd)
+        # fresh red-team #11: a list command next to a string field
+        command, _ = cg.extract_command({'tool_name': 'shell', 'tool_input': {
+            'command': ['rm', '-rf', str(self.home) + '/.claude/projects'], 'cmd': 'ls'}})
+        self.assertEqual(self.decide(command)[0], 'block')
+
+
+class FailureModeTests(Fixture):
+    def test_unterminated_quote_with_protected_text_blocks(self):
+        self.assertEqual(self.decide("rm -rf ~/.claude/projects '")[0], 'block')
+        self.assertEqual(self.decide('echo "rclone config show')[0], 'block')
+
+    def test_unterminated_quote_without_protected_text_warns(self):
+        self.assertEqual(self.decide("echo 'hello")[0], 'warn')
+
+    def test_over_budget_with_exec_step_blocks(self):
+        padding = 'true; ' * 120000
+        self.assertEqual(self.decide(padding + 'echo eA== | base64 -d | sh; rm x')[0], 'block')
+
+    def test_existing_script_counts_only_log_deletion(self):
+        """Replay false positives: repo tooling that handles env is allowed; its log deletion still blocks."""
+        tools = self.home / 'repo/tools'
+        tools.mkdir(exist_ok=True)
+        (tools / 'envcheck.sh').write_text('#!/bin/sh\nenv | sort\n')
+        (tools / 'wipe.sh').write_text('#!/bin/sh\nrm -rf "$HOME/.claude/projects"\n')
+        self.assertEqual(self.decide('bash @HOME@/repo/tools/envcheck.sh')[0], 'allow')
+        self.assertEqual(self.decide('bash @HOME@/repo/tools/wipe.sh')[0], 'block')
+        written = "printf 'env\\n' > @HOME@/repo/tools/new.sh && bash @HOME@/repo/tools/new.sh"
+        self.assertEqual(self.decide(written)[0], 'block')
+
+    def test_symlink_in_own_worktree_does_not_reach_protected(self):
+        """Red-team F3: the own-worktree exception must hold for the path a symlink really leads to."""
+        wt = self.home / '.agent-harness/work/S/T/wt'
+        for name, target in (('lnk_claude', self.home / '.claude'), ('lnk_task', self.home / '.agent-harness/work/S/T'),
+                             ('lnk_build', wt / 'build')):
+            if not os.path.lexists(wt / name):
+                os.symlink(str(target), str(wt / name))
+        self.assertEqual(self.decide('rm -f lnk_claude/settings.json', cwd='@WT@')[0], 'block')
+        self.assertEqual(self.decide('rm -f lnk_task/notes.md', cwd='@WT@')[0], 'block')
+        self.assertEqual(self.decide('rm -f lnk_build/a.o', cwd='@WT@')[0], 'allow')
+
+    def test_globs_and_dotdot_follow_links_like_the_shell(self):
+        """Native code-inspection of b5daca9 (findings 3 and 4): `..` after a symlink and a hidden symlink under a
+        wildcard are judged where the shell really goes."""
+        wt = self.home / '.agent-harness/work/S/T/wt'
+        (wt / 'linkfx/b').mkdir(parents=True, exist_ok=True)
+        (wt / 'linkfx/d/e').mkdir(parents=True, exist_ok=True)
+        (self.home / '.claude/projects/p').mkdir(parents=True, exist_ok=True)
+        for link, target in ((wt / 'linkfx/b/c', self.home / '.claude/projects/p'),
+                             (wt / 'linkfx/d/.hid', self.home / '.claude')):
+            if not os.path.lexists(link):
+                os.symlink(str(target), str(link))
+        for cmd, want in corpus.LINK_GLOB_ROWS:
+            self.assertEqual(self.decide(cmd, cwd='@WT@')[0], want, cmd)
+
+    def test_brace_overflow_is_not_dropped(self):
+        """Red-team F4: alternatives past the expansion cap are unknown, not absent."""
+        alts = ','.join('d%d' % k for k in range(40)) + ',.claude'
+        verdict, message = self.decide('rm -rf ~/{' + alts + '}/projects')
+        self.assertEqual(verdict, 'block')
+        self.assertIn('[log_delete/log-delete]', message)  # judged by the analyser, not its error fallback
+        self.assertEqual(self.decide('rm -rf ~/{d1,.claude}/projects')[0], 'block')
+        creds = ','.join('c%d' % k for k in range(40)) + ',.aws'
+        self.assertEqual(self.decide('cat ~/{' + creds + '}/credentials')[0], 'block')
+        self.assertEqual(self.decide('touch {' + ','.join('f%d' % k for k in range(40)) + '}')[0], 'allow')
+
+    def test_internal_error_uses_raw_sensitive(self):
+        """Red-team F6: an analyser bug must fail closed for commands that name protected locations."""
+        original = cg.Analyzer.run
+        def boom(self, *a, **k):
+            raise ValueError('seeded analyser bug')
+        cg.Analyzer.run = boom
+        try:
+            self.assertEqual(self.decide('rm -rf ~/.agent-harness/state')[0], 'block')
+            self.assertEqual(self.decide('rm -rf ~/.claude')[0], 'block')
+            self.assertEqual(self.decide('ls -la')[0], 'allow')
+        finally:
+            cg.Analyzer.run = original
+
+    def test_remote_home_is_not_resolved_through_local_links(self):
+        """Fresh red-team #1: on macOS /home is a symlink; ssh targets' Tier B paths must stay protected. The
+        remote user is one that is not local on any test machine (on dev2 /home/someone is the local home, which
+        is rightly resolved as local)."""
+        original = cg._resolve_prefix
+        cg._resolve_prefix = lambda p: ('/System/Volumes/Data' + p) if p and p.startswith('/home/') else original(p)
+        try:
+            for row in ('ssh dev2 "rm -rf /home/cgremote/.agent-harness/work"',
+                        'ssh dev2 rm /home/cgremote/.claude/settings.json',
+                        'ssh dev2 rm -rf /home/cgremote/.agent-harness/scratch'):
+                self.assertEqual(self.decide(row)[0], 'block', row)
+        finally:
+            cg._resolve_prefix = original
+
+    def test_over_budget_from_protected_cwd_blocks(self):
+        """Fresh red-team #2: the unanalysable fallback must consider a protected working directory."""
+        padding = "cat <<'EOF'\n" + ('x' * 280000) + "\nEOF\n"
+        self.assertEqual(self.decide(padding + 'rm -rf projects', cwd='@HOME@/.claude')[0], 'block')
+        nested = '$(' * 12 + 'true' + ')' * 12
+        self.assertEqual(self.decide('echo ' + nested + '; rm -rf sessions', cwd='@HOME@/.codex')[0], 'block')
+        self.assertIn(self.decide(padding + 'ls', cwd='@HOME@/repo')[0], ('warn', 'allow'))
+
+    def test_powershell_overwrite_is_not_an_append(self):
+        """Fresh red-team #3: -Value/-FilePath are not short-flag bundles containing a."""
+        for row in ('Set-Content -Path ~/.claude/wals/s/main.jsonl -Value ""',
+                    'Out-File -FilePath ~/.claude/history.jsonl'):
+            self.assertEqual(self.decide(row, ps=True)[0], 'block', row)
+        self.assertEqual(self.decide('Add-Content -Path ~/.claude/history.jsonl -Value x', ps=True)[0], 'allow')
+
+    def test_dotnet_environment_dump_blocks(self):
+        """Fresh red-team #9."""
+        self.assertEqual(self.decide('[Environment]::GetEnvironmentVariables()', ps=True)[0], 'block')
+        self.assertEqual(self.decide('[System.Environment]::GetEnvironmentVariable("GITHUB_TOKEN")', ps=True)[0], 'block')
+        self.assertEqual(self.decide('[Environment]::GetEnvironmentVariable("PATH")', ps=True)[0], 'allow')
+
+    def test_over_budget_plain_text_does_not_block(self):
+        padding = 'true; ' * 120000
+        self.assertIn(self.decide(padding + 'echo ok')[0], ('warn', 'allow'))
+
+
+class PolicyFileTests(Fixture):
+    """Red-team F2: a written or replaced policy file must not weaken the guard."""
+
+    def test_hostile_policy_cannot_weaken(self):
+        hostile = {
+            'modes': {'secret_dump': 'warn', 'log_delete': 'warn', 'broad_kill': 'warn'},
+            'protected_log_roots': [], 'protected_roots': [], 'protected_segment_names': [],
+            'ancestor_roots': [], 'credential_path_regexes': [], 'guard_files': [],
+            'allow_subtrees': ['{home}/.claude', '{home}/.claude/*'], 'temp_roots': ['{home}'],
+            'credential_allow_regexes': ['.*'], 'secret_env_regex': 'NEVERMATCH',
+            'limits': {'max_command_bytes': 1}, 'keep_suffixes': [],
+        }
+        path = self.home / 'hostile-policy.json'
+        path.write_text(json.dumps(hostile))
+        policy = cg.load_policy(path=str(path))
+        compiled = cg.Compiled(policy, home=str(self.home), cwd=str(self.home / 'repo'))
+        for row in ('rm -rf ~/.claude/projects', 'cat ~/.aws/credentials', 'env', 'rm -rf ~/.claude'):
+            self.assertEqual(cg.decide(fill(row, self.home), compiled, cwd=str(self.home / 'repo'))[0], 'block', row)
+        self.assertEqual(policy['allow_subtrees'], cg.DEFAULT_POLICY['allow_subtrees'])
+
+    def test_policy_may_add_protection(self):
+        path = self.home / 'extra-policy.json'
+        path.write_text(json.dumps({'protected_log_roots': ['{home}/repo/precious'], 'modes': {'broad_kill': 'enforce'}}))
+        policy = cg.load_policy(path=str(path))
+        self.assertEqual(policy['modes']['broad_kill'], 'enforce')
+        compiled = cg.Compiled(policy, home=str(self.home), cwd=str(self.home / 'repo'))
+        self.assertEqual(cg.decide(fill('rm -rf @HOME@/repo/precious', self.home), compiled,
+                                   cwd=str(self.home / 'repo'))[0], 'block')
+
+    def test_creating_guard_files_blocks(self):
+        for row in ("printf '{}' > ~/.claude/hooks/command_guard_policy.json",
+                    'cp /dev/null ~/.codex/agent-harness/command_guard_policy.json',
+                    "printf 'x' > ~/.claude/hooks/safe_input.py",
+                    'tee ~/.claude/hooks/command_guard_extra.py < /dev/null'):
+            self.assertEqual(self.decide(row)[0], 'block', row)
+
+    def test_block_message_does_not_point_at_policy_file(self):
+        self.assertNotIn('command_guard_policy', self.decide('rm -rf ~/.claude/projects')[1])
+
+
+class ApprovalTests(Fixture):
+    class Verifier:
+        def __init__(self, ok=True, kinds=None):
+            self.ok, self.kinds, self.calls = ok, kinds or {'dropbox': 'dropbox'}, 0
+
+        def remote_types(self):
+            return dict(self.kinds)
+
+        def verify(self, local_root, manifest, remote):
+            self.calls += 1
+            return cg.VerifyResult(self.ok, checked=len(manifest))
+
+    def setUp(self):
+        self.target = self.home / '.claude/projects' / ('old-%d' % time.monotonic_ns())
+        (self.target / 'sub').mkdir(parents=True)
+        (self.target / 'sub/a.jsonl').write_text('x\n')
+        past = time.time() - 3600
+        for p in (self.target / 'sub/a.jsonl', self.target / 'sub', self.target):
+            os.utime(p, (past, past))
+
+    def approve(self, path=None, remote='dropbox:backups/x', **kw):
+        return cg.approve_delete(str(path or self.target), remote, verifier=kw.pop('verifier', self.Verifier()),
+                                 home=str(self.home), policy=self.policy, **kw)
+
+    def test_whole_roots_and_log_dirs_are_never_approvable(self):
+        for rel in ('.claude', '.codex', '.agent-harness', '.claude/projects', '.claude/wals', '.codex/sessions', ''):
+            with self.assertRaises(ValueError, msg=rel):
+                self.approve(self.home / rel if rel else self.home)
+
+    def test_failed_backup_check_refuses(self):
+        with self.assertRaises(ValueError):
+            self.approve(verifier=self.Verifier(ok=False))
+
+    def test_non_dropbox_and_local_remotes_refused(self):
+        with self.assertRaises(ValueError):
+            self.approve(verifier=self.Verifier(kinds={'dropbox': 'local'}))
+        for remote in ('/tmp/x', ':local:/tmp', 'nosuch:x', 'dropbox'):
+            with self.assertRaises(ValueError, msg=remote):
+                self.approve(remote=remote)
+
+    def test_recent_change_refused(self):
+        (self.target / 'sub/a.jsonl').write_text('y\n')
+        with self.assertRaises(ValueError):
+            self.approve()
+
+    def test_single_use_and_bound_to_the_tree(self):
+        self.approve()
+        approvals = cg.Approvals(home=str(self.home), compiled=cg.Compiled(self.policy, home=str(self.home)))
+        self.assertTrue(approvals.covers(str(self.target)))
+        self.assertFalse(approvals.covers(str(self.target / 'sub')))  # exact path only
+        self.assertTrue(approvals.consume())
+        again = cg.Approvals(home=str(self.home), compiled=cg.Compiled(self.policy, home=str(self.home)))
+        self.assertFalse(again.covers(str(self.target)))
+
+    def test_changed_tree_voids_the_approval(self):
+        self.approve()
+        (self.target / 'sub/new.jsonl').write_text('z\n')
+        approvals = cg.Approvals(home=str(self.home), compiled=cg.Compiled(self.policy, home=str(self.home)))
+        self.assertFalse(approvals.covers(str(self.target)))
+
+    def test_forged_mac_refused(self):
+        self.approve()
+        marker = self.home / '.agent-harness/state/log-delete-ok.json'
+        data = json.loads(marker.read_text())
+        data['entries'][-1]['expires_at'] += 10 ** 6
+        marker.write_text(json.dumps(data))
+        approvals = cg.Approvals(home=str(self.home), compiled=cg.Compiled(self.policy, home=str(self.home)))
+        self.assertFalse(approvals.covers(str(self.target)))
+
+    def test_concurrent_consumers_exactly_one_wins(self):
+        self.approve()
+        compiled = cg.Compiled(self.policy, home=str(self.home))
+        racers = [cg.Approvals(home=str(self.home), compiled=compiled) for _ in range(6)]
+        for r in racers:
+            self.assertTrue(r.covers(str(self.target)))
+        results = []
+        threads = [threading.Thread(target=lambda r=r: results.append(r.consume())) for r in racers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results.count(True), 1, results)
+
+    def test_every_decision_is_audited(self):
+        self.approve()
+        with self.assertRaises(ValueError):
+            self.approve(self.home / '.claude')
+        lines = (self.home / '.agent-harness/state/log-delete-audit.jsonl').read_text().splitlines()
+        events = [json.loads(line)['event'] for line in lines]
+        self.assertIn('approved', events)
+        self.assertIn('refused', events)
+
+
+class InterfaceTests(unittest.TestCase):
+    def test_rclone_verifier_signature_is_stable(self):
+        # the log-backup owner (feat/log-backup) imports this; changing it breaks their branch
+        params = list(inspect.signature(cg.RcloneVerifier.verify).parameters)
+        self.assertEqual(params, ['self', 'local_root', 'manifest', 'remote'])
+
+
+LAUNCHER_SRC = HOOKS / 'command_guard_hook.py'
+PROTECTED_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'rm -rf /home/x/.claude/projects'}}
+HARMLESS_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'ls -la'}}
+READ_PAYLOAD = {'tool_name': 'Read', 'tool_input': {'file_path': '/home/x/.claude/projects/a.jsonl'}}
+EXEC_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'echo eA== | base64 -d | sh; rm -f x'}}
+
+
+class LauncherTests(unittest.TestCase):
+    """command_guard_hook.py turns an analyser crash, hang or garbage into a raw-text decision (AC-6)."""
+
+    def launcher_dir(self, guard_source=None, child_timeout=None):
+        tmp = tempfile.TemporaryDirectory(prefix='cg-launcher-')
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        text = LAUNCHER_SRC.read_text()
+        if child_timeout is not None:
+            text = text.replace('CHILD_TIMEOUT = 10.0', 'CHILD_TIMEOUT = %r' % child_timeout)
+        (d / 'command_guard_hook.py').write_text(text)
+        if guard_source is None:
+            for name in ('command_guard.py', 'redact.py', 'safe_input.py'):
+                (d / name).write_text((HOOKS / name).read_text())
+        else:
+            (d / 'command_guard.py').write_text(guard_source)
+        return d
+
+    def run_launcher(self, d, payload):
+        import subprocess
+        data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        env = {'PATH': '/usr/bin:/bin', 'HOME': str(d)}
+        done = subprocess.run([sys.executable, str(d / 'command_guard_hook.py')], input=data, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
+        return done.returncode, done.stderr.decode()
+
+    def test_real_analyser_blocks_and_allows(self):
+        d = self.launcher_dir()
+        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
+        self.assertEqual(self.run_launcher(d, HARMLESS_PAYLOAD)[0], 0)
+        self.assertEqual(self.run_launcher(d, READ_PAYLOAD)[0], 0)
+
+    def test_crashing_analyser_fails_closed_for_sensitive_text(self):
+        d = self.launcher_dir('import sys\nraise SystemExit(7)\n')
+        code, err = self.run_launcher(d, PROTECTED_PAYLOAD)
+        self.assertEqual(code, 2, err)
+        self.assertEqual(self.run_launcher(d, EXEC_PAYLOAD)[0], 2)
+        self.assertEqual(self.run_launcher(d, HARMLESS_PAYLOAD)[0], 0)
+        self.assertEqual(self.run_launcher(d, READ_PAYLOAD)[0], 0)
+
+    def test_missing_analyser_fails_closed(self):
+        d = self.launcher_dir('')
+        (d / 'command_guard.py').unlink()  # this test's own temp copy
+        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
+
+    def test_hanging_analyser_times_out_closed(self):
+        d = self.launcher_dir('import time\ntime.sleep(30)\n', child_timeout=1.0)
+        started = time.monotonic()
+        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
+        self.assertLess(time.monotonic() - started, 20)
+
+    def test_garbage_output_fails_closed(self):
+        d = self.launcher_dir('print("not json")\n')
+        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
+
+    def test_unparsable_payload_is_probed(self):
+        d = self.launcher_dir('import sys\nraise SystemExit(7)\n')
+        self.assertEqual(self.run_launcher(d, b'{not json rm -rf ~/.claude/wals')[0], 2)
+
+    def test_large_non_shell_payload_is_fast(self):
+        d = self.launcher_dir()
+        big = {'tool_name': 'Write', 'tool_input': {'file_path': '/tmp/x', 'content': 'y' * (4 << 20)}}
+        started = time.monotonic()
+        self.assertEqual(self.run_launcher(d, big)[0], 0)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_launcher_is_stdlib_only(self):
+        tree = ast.parse(LAUNCHER_SRC.read_text())
+        mods = {a.name.split('.')[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        mods |= {n.module.split('.')[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
+        self.assertLessEqual(mods, {'json', 'os', 're', 'subprocess', 'sys'})
+
+
+class OverwriteExistingTests(Fixture):
+    """`>`, `>|`, `&>` onto an existing protected file replace its content; new files and appends stay allowed."""
+
+    def test_overwrite_rows(self):
+        for rel in ('.claude/wals/s/main.jsonl', '.claude/projects/p/s.jsonl', '.codex/sessions/2026/r.jsonl',
+                    '.claude/settings.json', 'repo/existing.txt', '.agent-harness/work/S/T/receipt.json',
+                    '.agent-harness/work/S/T/kept/.keep', '.agent-harness/work/S/T/kept/evidence.log',
+                    '.agent-harness/bin/tool', '.claude/hooks/hook.py', '.agent-harness/work/S/top.log',
+                    '.agent-harness/work/top.log', '.agent-harness/work/S/T/existing.log',
+                    '.agent-harness/work/S/T/journal.jsonl', '.agent-harness/work/S/T/state/run.txt',
+                    '.agent-harness/scratch/c/u/s/scratchpad/run.log',
+                    '.agent-harness/scratch/c/u/s/scratchpad/out.jsonl', '.agent-harness/scratch/top.txt'):
+            p = self.home / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('keep\n')
+        (self.home / '.agent-harness/work/S/T/hooklink').symlink_to(self.home / '.claude/hooks')
+        failures = [(cmd, want, got) for cmd, want in corpus.OVERWRITE_EXISTING
+                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
+        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 122)
+        self.assertEqual(failures, [])
+
+    def _seed_bang_rows(self):
+        for rel in ('.claude/wals/s/main.jsonl', '.claude/projects/p/s.jsonl', '.claude/hooks/hook.py',
+                    '.agent-harness/work/S/T/existing.log', '.agent-harness/work/S/T/kept/.keep'):
+            p = self.home / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('keep\n')
+        (self.home / 'proj').mkdir(exist_ok=True)
+
+    def test_bang_clobber_is_judged_under_both_readings(self):
+        self._seed_bang_rows()
+        self.assertGreaterEqual(len(corpus.BANG_READINGS), 120)
+        failures = [(cmd, want, got) for cmd, want in corpus.BANG_READINGS
+                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
+        self.assertEqual(failures, [])
+        self.assertGreaterEqual(len(corpus.BANG_READINGS_CWD), 9)
+        failures = [(cmd, want, got) for cmd, want, where in corpus.BANG_READINGS_CWD
+                    for got in [self.decide(cmd, cwd=where)[0]] if got != want]
+        self.assertEqual(failures, [])
+
+    def test_bash_reading_stops_the_operator_before_the_bang(self):
+        # the spellings and results observed from bash 5.2 and dash on dev2 (shell_probe rows C1-C8, N1, S1)
+        def lexed(text, bang):
+            lexer = cg.Lexer(cg.Ctx(cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))),
+                             bang_operators=bang)
+            tokens = lexer.lex(text)
+            words = [v.text for k, v in tokens if k == 'w']
+            redirs = [(v.fd, v.op, v.target.text if v.target else None) for k, v in tokens if k == 'redir']
+            return words, redirs, lexer.saw_bang
+        self.assertEqual(lexed('echo hi >! f1', False), (['echo', 'hi', 'f1'], [(None, '>', '!')], True))
+        self.assertEqual(lexed('echo hi >>! f1', False), (['echo', 'hi', 'f1'], [(None, '>>', '!')], True))
+        self.assertEqual(lexed('echo hi &>! f1', False), (['echo', 'hi', 'f1'], [(None, '&>', '!')], True))
+        self.assertEqual(lexed('echo hi >&! f1', False), (['echo', 'hi', 'f1'], [(None, '>&', '!')], True))
+        self.assertEqual(lexed('echo hi 2>! f1', False), (['echo', 'hi', 'f1'], [('2', '>', '!')], True))
+        self.assertEqual(lexed('echo hi >!f1', False), (['echo', 'hi'], [(None, '>', '!f1')], True))
+        self.assertEqual(lexed('echo hi >! ; true', False)[:2], (['echo', 'hi', 'true'], [(None, '>', '!')]))
+        self.assertEqual(lexed('echo hi >! f1', True), (['echo', 'hi'], [(None, '>|', 'f1')], True))
+        self.assertEqual(lexed('echo hi >>&! f1', True), (['echo', 'hi'], [(None, '&>>', 'f1')], True))
+        # only an unquoted operator is one, so nothing else starts a second reading
+        for text in ("echo '>!' f1", 'echo x \\>! f1', "echo x >'!' f1", 'echo x >\\! f1', 'echo x > ! f1', 'echo x >| f1',
+                     'echo x >> f1', 'echo x &> f1', 'echo "a >! b"', "cat <<'E'\n>! f1\nE"):
+            self.assertFalse(lexed(text, True)[2], text)
+
+    def test_a_finding_in_both_readings_is_reported_once(self):
+        self._seed_bang_rows()
+        plain = self.decide('rm -rf @HOME@/.claude/hooks', cwd='@TASK@')[1]
+        both = self.decide('rm -rf @HOME@/.claude/hooks >! /dev/null', cwd='@TASK@')[1]
+        self.assertEqual(both, plain)
+
+    def test_many_bang_operators_stay_two_parses(self):
+        # one shell reads every `>!` in a script alike: the count of parses must not grow with the operators
+        count = []
+        real = cg.Lexer.lex
+
+        def counted(lexer, text):
+            count.append(1)
+            return real(lexer, text)
+        cg.Lexer.lex = counted
+        try:
+            self.decide('; '.join('echo x >! @TASK@/f%d' % i for i in range(40)), cwd='@TASK@')
+        finally:
+            cg.Lexer.lex = real
+        self.assertEqual(len(count), 2)
+
+    def test_bang_forms_stay_fast_on_long_commands(self):
+        self._seed_bang_rows()
+        token = 'a' * 65536
+        forms = ('>! ' + token, 'echo x >! ' + token, token + ' >! x', '>! x ' + token, 'cat >! @TASK@/' + token,
+                 'echo ' + token + ' >! x; >! y', "bash -c '>! x " + token + "'", '>!' + token)
+        for text in forms:
+            started = time.monotonic()
+            self.decide(text, cwd='@TASK@')
+            self.assertLess(time.monotonic() - started, 3.0, text[:12])
+
+    def _nested(self, levels, leaf):
+        for _ in range(levels):
+            leaf = 'echo $(>! a %s)' % leaf
+        return leaf
+
+    def test_nested_bang_forks_are_capped_and_stay_cheap(self):
+        # 8 levels is the depth limit, and the worst case: every level would double the parses
+        count = []
+        real = cg.Lexer.lex
+
+        def counted(lexer, text):
+            count.append(1)
+            return real(lexer, text)
+        cg.Lexer.lex = counted
+        try:
+            verdict = self.decide(self._nested(8, 'word'), cwd='@HOME@/proj')[0]
+        finally:
+            cg.Lexer.lex = real
+        self.assertEqual(verdict, 'warn')  # past the cap the command is unanalysable, not clean
+        self.assertLessEqual(len(count), 60)
+        self.assertGreater(len(count), 8)  # it did fork: the row is not stopped at the first descent
+        self.assertEqual(self.decide(self._nested(8, 'word @HOME@/.claude'), cwd='@HOME@/proj')[0], 'block')
+
+    def test_a_budget_stop_keeps_what_was_already_refused(self):
+        self._seed_bang_rows()
+        hide = 'rm -rf ~/.c*/projects'  # a glob the parse resolves and the raw-text check does not see
+        self.assertFalse(cg.raw_sensitive(hide))
+        big = 'word ' * 50000
+        for name, text in (('before a large >!', hide + "; ssh host 'echo x >! y; " + big + "'"),
+                           ('after a large >!', "ssh host 'echo x >! y; " + big + "'; " + hide),
+                           ('before nested >!', hide + '; ' + self._nested(8, 'word ' * 500)),
+                           ('after nested >!', self._nested(8, 'word ' * 500) + '; ' + hide),
+                           ('control with >', hide + "; ssh host 'echo x > y; " + big + "'")):
+            self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'block', name)
+        # a stop with nothing refused yet is still not a pass
+        big = 'word ' * 150000
+        self.assertEqual(self.decide('echo ' + big, cwd='@HOME@/proj')[0], 'warn')
+
+    def test_budget_stop_keeps_an_enforced_finding(self):
+        # the stop itself, with nothing to avoid it: a finding raised before the budget runs out still blocks
+        hide = 'rm -rf ~/.c*/projects'
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home), cwd=str(self.home / 'proj'))
+        # the outer lex skips over $(..) cheaply and the nested script's does not fit, so the stop comes after the first
+        # command was judged. The second assertion proves the stop happens
+        comp.limits = dict(comp.limits, max_nodes=5000)
+        nested = 'echo $(echo ' + 'word ' * 2000 + ')'
+        self.assertEqual(cg.decide(hide + '; ' + nested, comp, cwd=str(self.home / 'proj'))[0], 'block')
+        self.assertEqual(cg.decide(nested, comp, cwd=str(self.home / 'proj'))[0], 'warn')
+
+    def test_second_reading_is_skipped_rather_than_run_out_of_budget(self):
+        self._seed_bang_rows()
+        text = "ssh host 'echo x >! /tmp/y; " + 'word ' * 50000 + "'"
+        self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'warn')
+        # the skip is what lets the command after it be read: a stop here would never reach it
+        hide = 'rm -rf ~/.c*/projects'
+        self.assertFalse(cg.raw_sensitive(hide))
+        self.assertEqual(self.decide(text + '; ' + hide, cwd='@HOME@/proj')[0], 'block')
+        # text that names a protected location fails closed when both readings cannot be judged
+        self.assertEqual(self.decide(text + '; ls @HOME@/.claude', cwd='@HOME@/proj')[0], 'block')
+
+    def test_nesting_too_deep_for_python_keeps_what_was_already_refused(self):
+        self._seed_bang_rows()
+        hide = 'rm -rf ~/.c*/projects'
+        # just past the interpreter's limit: a recursion error's frames stay in this process's peak memory, and the
+        # hostile input tests later in a full run measure their children against 100 MiB, which starts from that peak
+        deep = 'sudo ' * (sys.getrecursionlimit() + 100) + 'ls'
+        self.assertEqual(self.decide(deep, cwd='@HOME@/proj')[0], 'warn')  # it does stop
+        self.assertEqual(self.decide(hide + '; ' + deep, cwd='@HOME@/proj')[0], 'block')
+
+    def test_any_exception_keeps_what_was_already_refused(self):
+        # the hook's alarm raises TimeoutError part way through, and raw text cannot see every finding
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))
+
+        def run(analyzer, command):
+            analyzer.ctx.add(cg.LOG_DELETE, 'r', 'seen before the alarm', 'a')
+            raise TimeoutError('alarm')
+        real = cg.Analyzer.run
+        cg.Analyzer.run = run
+        try:
+            verdict = cg.decide('echo plain', comp)
+        finally:
+            cg.Analyzer.run = real
+        self.assertEqual(verdict[0], 'block')
+        self.assertIn('seen before the alarm', verdict[1])
+        self.assertEqual(cg.decide('echo plain', comp)[0], 'allow')
+
+    def _existing_script(self, name, *lines):
+        self._seed_bang_rows()
+        (self.home / 'proj' / name).write_text('#!/bin/bash\n' + '\n'.join(lines) + '\n')
+        return self.decide('bash ' + name, cwd='@HOME@/proj')[0]
+
+    def test_an_existing_script_past_the_cap_is_not_clean(self):
+        nest = 'plain'
+        for name in 'dcba':
+            nest = 'echo $(>! %s %s)' % (name, nest)
+        self.assertEqual(self._existing_script('deep.sh', nest), 'warn')
+
+    def test_a_stop_in_an_existing_script_keeps_only_what_its_filter_keeps(self):
+        nest = 'plain'
+        for _ in range(10):
+            nest = 'echo $(%s)' % nest
+        # a secret lookup is routine in a repository's own script, so it does not turn the stop into a refusal
+        self.assertEqual(self._existing_script('nest.sh', nest), 'warn')
+        self.assertEqual(self._existing_script('lookup.sh', 'printenv', nest), 'warn')
+        self.assertEqual(self._existing_script('ok.sh', 'printenv', 'echo plain'), 'allow')
+
+    def test_disputes_lists_only_what_a_merge_cannot_keep(self):
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))
+        ctx = cg.Ctx(comp, '/tmp/start')
+        ctx.written['/same'] = 'text'
+        self.assertFalse(ctx.disputes(ctx.state()))
+        changes = (('vars', {'A': '1'}), ('var_hints', {'A': '1'}), ('aliases', {'a': 'b'}), ('links', {'/l': '/t'}),
+                   ('cwd', '/tmp/other'), ('cwd_unknown', True), ('written', {'/same': 'other text'}))
+        for name, value in changes:
+            other = ctx.state()
+            other[name] = value
+            self.assertTrue(ctx.disputes(other), name)
+        # one reading alone wrote a file, or added to a set: a merge keeps both
+        other = ctx.state()
+        other['written'] = {'/same': 'text', '/new': 'x'}
+        other['created'] = {'/new'}
+        other['secret_seen'] = 3
+        self.assertFalse(ctx.disputes(other))
+        # bash's file named `!` is rewritten by every nested `>!`, and a file only needs the name to end that way to count
+        ctx.written['/p/!'] = 'one'
+        other = ctx.state()
+        other['written']['/p/!'] = 'two'
+        self.assertFalse(ctx.disputes(other))
+        ctx.written['/p/x!'] = 'one'
+        other = ctx.state()
+        other['written']['/p/x!'] = 'two'
+        self.assertTrue(ctx.disputes(other))
+
+    def test_a_file_one_reading_wrote_is_also_judged_on_disk(self):
+        # bash leaves the file as it was, or zsh appends to it, so what is on disk can still be what runs
+        self._seed_bang_rows()
+        proj = self.home / 'proj'
+        (proj / 'ondisk.sh').write_text('rm -rf ' + str(self.home / '.claude/projects') + '\n')
+        (proj / 'plain.sh').write_text('echo plain\n')
+        for form in ("eval '%s echo hi'; bash %s", "bash -c '%s echo hi'; bash %s", 'x=$(%s echo hi); bash %s',
+                     "ssh h '%s echo hi'; bash %s"):
+            for op in ('>!', '>>!'):
+                text = form % (op + ' ondisk.sh', 'ondisk.sh')
+                self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'block', text)
+                text = form % (op + ' plain.sh', 'plain.sh')
+                self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'allow', text)
+                text = form % (op + ' absent.sh', 'absent.sh')
+                self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'allow', text)
+        # the other direction: only bash's reading wrote this one, and zsh would leave what is on disk
+        (proj / '!').write_text('rm -rf ' + str(self.home / '.claude/projects') + '\n')
+        self.assertEqual(self.decide("eval 'echo hi >! x'; bash '!'", cwd='@HOME@/proj')[0], 'block')
+        # both readings replaced the file, so what was on disk is gone and is not what runs
+        for text in ('echo hi > ondisk.sh; bash ondisk.sh', "eval 'echo hi > ondisk.sh'; bash ondisk.sh"):
+            self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'allow', text)
+
+    def test_the_disk_is_judged_before_the_recorded_text(self):
+        # in the reading where the disk is what runs, the recorded text never ran: its cd or alias must not colour the disk
+        self._seed_bang_rows()
+        proj, other = self.home / 'proj', self.home / 'other'
+        other.mkdir()
+        (other / 'rel.sh').write_text('rm -rf .claude/projects\n')
+        (other / 'cdonly.sh').write_text('cd /tmp\n')
+        (proj / 'ondisk.sh').write_text('rm -rf ' + str(self.home / '.claude/projects') + '\n')
+        rel = "cd @HOME@/other; %s; cd @HOME@; bash @HOME@/other/rel.sh"
+        for nested in ("eval '>! rel.sh echo cd /tmp'", "eval '>! rel.sh echo cd /tmp; true'", "eval '>>! rel.sh echo cd /tmp'",
+                       "bash -c '>! rel.sh echo cd /tmp'", 'x=$(>! rel.sh echo cd /tmp)'):
+            self.assertEqual(self.decide(rel % nested, cwd='@HOME@/proj')[0], 'block', nested)
+        self.assertEqual(self.decide("eval '>! ondisk.sh echo alias rm=true'; bash ondisk.sh", cwd='@HOME@/proj')[0], 'block')
+        # the disk text's own cd stays inside its own process
+        text = "cd @HOME@/other; eval '>! cdonly.sh echo hi'; cd @HOME@; bash @HOME@/other/cdonly.sh; rm -rf .claude/projects"
+        self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'block')
+        # and the recorded text is still read after a disk read that finishes: the rule label shows a reading refused it
+        (proj / 'plain.sh').write_text('echo plain\n')
+        for name in ('plain.sh', 'absent.sh'):
+            text = "eval '>! %s echo rm -rf ~/.c*/projects'; bash %s" % (name, name)
+            verdict, message = self.decide(text, cwd='@HOME@/proj')
+            self.assertEqual(verdict, 'block', text)
+            self.assertIn('[log_delete/log-delete]', message, text)
+        self.assertEqual(self.decide("eval '>! plain.sh echo hi'; bash plain.sh", cwd='@HOME@/proj')[0], 'allow')
+        # Known limit: a disk read that stops the analysis costs the recorded text its reading, so that text goes only to
+        # the raw-text check, which sees no protected location in this glob inside $(..). This warns; 60cf346 blocked it.
+        # In a child: parsing this file adds about 70 MiB, and tests that bound their own children's peak inherit this
+        # process's high-water mark on Linux.
+        import subprocess
+        (proj / 'big.sh').write_text(':\n' * 128000)
+        text = 'x=$(>! big.sh echo rm -rf ~/.c*/projects); bash big.sh'
+        code = ('import sys\nsys.path.insert(0, sys.argv[1])\nimport command_guard as cg\n'
+                "comp = cg.Compiled(cg.load_policy(sys.argv[2] + '/none.json'), home=sys.argv[2], cwd=sys.argv[3])\n"
+                'print(cg.decide(sys.argv[4], comp, cwd=sys.argv[3])[0])\n')
+        child = subprocess.run([sys.executable, '-c', code, os.path.dirname(cg.__file__), str(self.home), str(proj), text],
+                               env=dict(os.environ, HOME=str(self.home)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=60, check=False)
+        self.assertEqual(child.returncode, 0, child.stderr.decode('utf-8', 'replace')[-400:])
+        self.assertEqual(child.stdout.decode().strip(), 'warn', text)
+        # a small file does it too: this one stops on the nesting limit, with budget left to read the recorded text
+        (proj / 'self.sh').write_text('bash self.sh\n')
+        text = 'x=$(>! self.sh echo rm -rf ~/.c*/projects); bash self.sh'
+        self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'warn', text)
+
+    def test_known_limits_worse_than_the_base_are_pinned(self):
+        # Each of these blocks at cbfc4da and runs with no refusal here, so each is a regression accepted for now, listed in
+        # the PR: goodqa#14722 (the disk read) and goodqa#14723 (a script's state carrying past its process). The allows reach
+        # a deletion with no warning. These rows are not wanted behaviour: a repair should change them on purpose.
+        self._seed_bang_rows()
+        fx = self.home / 'fx'
+        fx.mkdir()
+        (fx / 'del.sh').write_text('rm -rf ' + str(self.home / '.claude/projects') + '\n')
+        (fx / 'a1.sh').write_text('echo plain\n')
+        (fx / 'a8.sh').write_text(''.join('bash %s/c%d.sh\n' % (fx, n) for n in range(1, 9)))
+        (fx / 'self.sh').write_text('bash %s/self.sh\n' % fx)
+        for n in range(1, 9):
+            (fx / ('c%d.sh' % n)).write_text('echo plain\n')
+        allows = (
+            ('P1', 'x=$(echo bash del.sh >! a8.sh); bash a8.sh', str(fx)),
+            ('P2', "eval 'echo bash del.sh >! a8.sh'; bash a8.sh", str(fx)),
+            ('P3', "bash -c 'echo bash del.sh >! a8.sh'; bash a8.sh", str(fx)),
+            ('R3', 'x=$(echo hi >! a8.sh); echo bash del.sh > a8.sh; bash a8.sh', str(fx)),
+            ('T1', 'T=@HOME@/.claude/projects; x=$(echo T=/tmp/plain >! a1.sh); bash a1.sh; rm -rf $T', str(fx)),
+            ('D5', "eval '>! a1.sh echo cd /tmp'; bash a1.sh; rm -rf .claude/projects", '@HOME@'),
+        )
+        warns = (
+            ('U1', 'x=$(echo hi >! self.sh); bash self.sh; rm -rf ~/.c*/projects', str(fx)),
+            ('R1', 'x=$(echo hi >! self.sh); echo rm -rf ~/.c*/projects > self.sh; bash self.sh', str(fx)),
+        )
+        for want, rows in (('allow', allows), ('warn', warns)):
+            for name, text, cwd in rows:
+                with self.subTest(name):
+                    self.assertEqual(self.decide(text, cwd=cwd)[0], want)
+
+    def test_only_enforced_findings_survive_a_stop(self):
+        # broad_kill warns by default, so a warning raised before the stop must not turn into a refusal
+        self._seed_bang_rows()
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home), cwd=str(self.home / 'proj'))
+        self.assertNotEqual(comp.policy['modes'].get(cg.PARSE), 'enforce')
+
+        def run(analyzer, command):
+            analyzer.ctx.add(cg.PARSE, 'r', 'only a warning', 'a')
+            raise self.stop
+        real = cg.Analyzer.run
+        cg.Analyzer.run = run
+        try:
+            for self.stop in (TimeoutError('alarm'), cg.Blocked('budget')):
+                self.assertNotEqual(cg.decide('echo plain', comp)[0], 'block', repr(self.stop))
+        finally:
+            cg.Analyzer.run = real
+
+    def test_the_fork_cap_is_three(self):
+        self._seed_bang_rows()
+        self.assertEqual(self.decide(self._nested(3, 'word'), cwd='@HOME@/proj')[0], 'allow')
+        self.assertEqual(self.decide(self._nested(4, 'word'), cwd='@HOME@/proj')[0], 'warn')
+
+    def test_written_rule_reads_the_real_home_not_a_variable_named_home(self):
+        code = "%s\nshutil.rmtree(%s)\n"
+        for target in ("home / '.claude'", "os.path.join(home, '.claude')"):
+            self.assertFalse(cg.written_code_destroys_root(code % ('home = tmp', target), str(self.home)), target)
+        for target in ("Path.home() / '.claude'", "os.environ['HOME'] + '/.claude'", "os.environ.get('HOME') + '/.claude'",
+                       "os.getenv('HOME') + '/.claude'", "'$HOME/.claude'", "'${HOME}/.claude'", "'~/.claude'",
+                       "'/users/x/.claude'", "'/home/x/.claude'", "'/root/.claude'"):
+            self.assertTrue(cg.written_code_destroys_root(code % ('', target), str(self.home)), target)
+
+    def test_readings_merge_keeps_what_either_one_knows(self):
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))
+        ctx = cg.Ctx(comp, '/tmp/start')
+        start = ctx.state()
+        # one reading
+        ctx.vars.update({'SAME': 'a', 'DIFF': '/x/one', 'ONLY_A': '/x/a'})
+        ctx.var_hints.update({'HINT': 'first'})
+        ctx.written.update({'/f': 'text one', '/g': 'kept'})
+        ctx.created.add('/c1')
+        ctx.tainted.add('T1')
+        ctx.aliases['a1'] = 'x'
+        ctx.links['/l1'] = '/t1'
+        ctx.secret_seen = 1
+        ctx.kill_seen = True
+        ctx.cwd = '/tmp/one'
+        ctx.pending_kill.append('k1')
+        ctx.flow_vars = {'F1'}
+        one = ctx.state()
+        ctx.restore(start)
+        self.assertEqual((ctx.vars, ctx.cwd, ctx.secret_seen, ctx.kill_seen), ({}, '/tmp/start', 0, False))
+        self.assertFalse(hasattr(ctx, 'flow_vars'))  # an attribute added by one reading does not reach the other
+        # the other
+        ctx.vars.update({'SAME': 'a', 'DIFF': '/x/two', 'ONLY_B': '/x/b'})
+        ctx.var_hints.update({'HINT': 'second'})
+        ctx.written.update({'/f': 'text two', '/h': 'also kept'})
+        ctx.created.add('/c2')
+        ctx.tainted.add('T2')
+        ctx.aliases['a2'] = 'y'
+        ctx.links['/l2'] = '/t2'
+        ctx.secret_seen = 2
+        ctx.unterminated = True
+        ctx.cwd = '/home/x/.claude'
+        ctx.pending_kill.append('k2')
+        ctx.merge(one)
+        self.assertEqual(ctx.vars, {'SAME': 'a'})
+        for name, value in (('DIFF', '/x/one'), ('DIFF', '/x/two'), ('ONLY_A', '/x/a'), ('ONLY_B', '/x/b'),
+                            ('HINT', 'first'), ('HINT', 'second')):
+            self.assertIn(value, ctx.var_hints[name])
+        self.assertIn('text one', ctx.written['/f'])
+        self.assertIn('text two', ctx.written['/f'])
+        self.assertEqual((ctx.written['/g'], ctx.written['/h']), ('kept', 'also kept'))
+        self.assertEqual(ctx.created, {'/c1', '/c2'})
+        self.assertEqual(ctx.tainted, {'T1', 'T2'})
+        self.assertEqual((ctx.aliases, ctx.links), ({'a1': 'x', 'a2': 'y'}, {'/l1': '/t1', '/l2': '/t2'}))
+        self.assertEqual(ctx.secret_seen, 2)
+        self.assertTrue(ctx.kill_seen)  # set by the other reading
+        self.assertTrue(ctx.unterminated)  # set by this one
+        self.assertEqual(sorted(ctx.pending_kill), ['k1', 'k2'])
+        self.assertEqual(ctx.flow_vars, {'F1'})
+        self.assertTrue(ctx.cwd_unknown)
+        self.assertTrue(ctx.cwd_protected_unknown)
+
+    def test_merge_keeps_a_protected_cwd_flag_set_by_either_reading(self):
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))
+        ctx = cg.Ctx(comp, '/tmp/start')
+        ctx.cwd = '/tmp/one'
+        one = ctx.state()
+        ctx.cwd, ctx.cwd_unknown, ctx.cwd_protected_unknown = '/tmp/two', True, True
+        ctx.merge(one)
+        self.assertTrue(ctx.cwd_protected_unknown)
+
+    def test_root_text_stays_linear(self):
+        # _scan_text collapses runs of spaces and commas, so these tails are the ones that reach the regex as written.
+        # The short run comes first: a backtracking regex then fails here instead of hanging on the long one
+        for size in (16, 50000):
+            for tail in ('/ ', ' + ', '\\\\ ', ' / '):
+                text = 'x = ~' + tail * size + 'y'
+                started = time.monotonic()
+                self.assertFalse(cg.written_code_destroys_root(text, str(self.home)))
+                self.assertLess(time.monotonic() - started, 1.0, repr((tail, size)))
+        # a run the name class of /users/ and /home/ could also match, which made this quadratic: 3.5 s at 64 KB
+        for text in ('/users/x' + '+' * 50000 + 'y', '/home/x' + '+' * 50000 + 'y', '/users/x' + '\\' * 50000 + 'y'):
+            started = time.monotonic()
+            self.assertFalse(cg.written_code_destroys_root(text, str(self.home)))
+            self.assertLess(time.monotonic() - started, 1.0, text[:9])
+
+    def test_other_user_home_link_out_of_the_tree_is_refused(self):
+        # a real /home/<user> on this machine cannot be made in a test, so its realpath is what is simulated
+        target = '/home/alice/.agent-harness/work/a/b/lnk'
+        settings = str(self.home / '.claude/settings.json')
+        real = os.path.realpath
+        cmd = 'echo x > ' + target
+        self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], 'allow')
+        try:
+            os.path.realpath = lambda p, **k: settings if p == target else real(p, **k)
+            self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], 'block')
+            os.path.realpath = lambda p, **k: '/home/alice/.agent-harness/work/a/b/wal-1' if p == target else real(p, **k)
+            self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], 'block')
+            os.path.realpath = lambda p, **k: '/System/Volumes/Data' + target if p == target else real(p, **k)
+            self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], 'allow')
+        finally:
+            os.path.realpath = real
+
+    def test_layout_refusals_say_what_to_do_instead(self):
+        for rel in ('.agent-harness/work/S/T/state/run.txt', '.agent-harness/scratch/top.txt',
+                    '.agent-harness/work/top.log'):
+            p = self.home / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('keep\n')
+        self.assertGreaterEqual(len(corpus.OVERWRITE_HINTS), 4)
+        for cmd, words in corpus.OVERWRITE_HINTS:
+            verdict, message = self.decide(cmd, cwd='@TASK@')[:2]
+            self.assertEqual(verdict, 'block', cmd)
+            self.assertIn(words, message, cmd)
+            self.assertNotIn('approve-delete', message, cmd)
+
+    def test_redirect_glob_with_too_many_matches_is_refused_without_a_full_walk(self):
+        many = self.home / '.claude/many'
+        many.mkdir(parents=True)
+        for i in range(300):
+            (many / ('f%d' % i)).write_text('keep\n')
+        self.assertEqual(self.decide('echo x > @HOME@/.claude/many/*', cwd='@TASK@')[0], 'block')
+        self.assertEqual(self.decide('echo x > @HOME@/.claude/many/nomatch-*', cwd='@TASK@')[0], 'allow')
+
+
+class GuardCompositionTests(unittest.TestCase):
+    """The command guard and the heavy-job guard (#53) both classify Bash commands. They are separate hook groups
+    and decide independently: neither one's allow, hatch or crash policy can override the other's block."""
+
+    def run_both(self, command):
+        import subprocess
+        home = tempfile.TemporaryDirectory(prefix='cg-compose-')
+        self.addCleanup(home.cleanup)
+        data = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'session_id': 's'}).encode()
+        env = {'PATH': '/usr/bin:/bin', 'HOME': home.name, 'HARNESS_HEAVY_GUARD_FORCE': '1'}
+        codes = {}
+        for name, argv in (('command', [str(HOOKS / 'command_guard_hook.py'), 'hook']),
+                           ('heavy', [str(HOOKS / 'heavy_job_guard.py')])):
+            done = subprocess.run([sys.executable] + argv, input=data, env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=60, check=False)
+            codes[name] = done.returncode
+        return codes
+
+    def test_each_guard_blocks_its_own_class_and_allows_the_other(self):
+        protected = PROTECTED_PAYLOAD['tool_input']['command']
+        self.assertEqual(self.run_both('ls -la'), {'command': 0, 'heavy': 0})
+        self.assertEqual(self.run_both('pytest'), {'command': 0, 'heavy': 2})
+        self.assertEqual(self.run_both(protected), {'command': 2, 'heavy': 0})
+        self.assertEqual(self.run_both('pytest; ' + protected), {'command': 2, 'heavy': 2})
+
+    def test_heavy_job_hatch_does_not_bypass_the_command_guard(self):
+        protected = PROTECTED_PAYLOAD['tool_input']['command']
+        hatch = 'HARNESS_LOCAL_OK=needs-the-local-mac-gpu '
+        self.assertEqual(self.run_both(hatch + 'pytest')['heavy'], 0)
+        self.assertEqual(self.run_both(hatch + protected)['command'], 2)
+
+    def test_install_keeps_the_guards_in_separate_groups(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        groups = install.managed_hooks(Path('/home/u/.claude'))['PreToolUse']
+        scripts = [[Path((h.get('args') or [''])[0]).name for h in g['hooks']] for g in groups]
+        self.assertEqual(scripts[0], ['command_guard_hook.py'])
+        self.assertEqual(groups[0]['hooks'][0]['onFailure'], 'block')
+        heavy = [g for g, s in zip(groups, scripts) if 'heavy_job_guard.py' in s]
+        self.assertEqual(len(heavy), 1)
+        self.assertEqual([Path(h['args'][0]).name for h in heavy[0]['hooks']], ['heavy_job_guard.py'])
+        self.assertNotIn('onFailure', heavy[0]['hooks'][0])  # fail-open by design (#53); the guard stays fail-closed
+
+
+class InstallTests(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        import install_codex
+        self.install, self.install_codex = install, install_codex
+        tmp = tempfile.TemporaryDirectory(prefix='cg-install-')
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+
+    def guard_groups(self, settings):
+        return [g for g in settings['hooks'].get('PreToolUse', [])
+                if any('command_guard_hook.py' in ' '.join(h.get('args') or [h.get('command', '')])
+                       for h in g.get('hooks', []))]
+
+    def test_claude_registration_and_rollback(self):
+        claude = self.home / '.claude'
+        settings = self.install.merged_settings({}, claude)
+        groups = self.guard_groups(settings)
+        self.assertEqual(len(groups), 1)
+        hook = groups[0]['hooks'][0]
+        self.assertEqual(hook['onFailure'], 'block')
+        self.assertEqual(hook['timeout'], 30)
+        self.assertIn('Bash', groups[0]['matcher'])
+        again = self.install.merged_settings(settings, claude)
+        self.assertEqual(len(self.guard_groups(again)), 1)  # idempotent
+        rolled_back = self.install.merged_settings(settings, claude, command_guard=False)
+        self.assertEqual(self.guard_groups(rolled_back), [])
+        for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py'):
+            self.assertIn(name, self.install.HOOKS)
+
+    def test_codex_registration_has_no_matcher_and_rolls_back(self):
+        codex = self.home / '.codex'
+        hooks = self.install_codex.merge_hooks({}, codex)
+        guard = self.install_codex.guard_command(codex)
+        groups = [g for g in hooks['hooks']['PreToolUse'] if g['hooks'][0]['command'] == guard]
+        self.assertEqual(len(groups), 1)
+        self.assertNotIn('matcher', groups[0])
+        self.assertEqual(len([g for g in self.install_codex.merge_hooks(hooks, codex)['hooks']['PreToolUse']
+                              if g['hooks'][0]['command'] == guard]), 1)
+        off = self.install_codex.merge_hooks(hooks, codex, command_guard=False)
+        self.assertFalse([g for g in off['hooks']['PreToolUse'] if g['hooks'][0]['command'] == guard])
+        for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py'):
+            self.assertIn(name, self.install_codex.DELIVERY_HELPERS)
+
+    def test_guard_carries_the_gate_verb_and_replaces_a_verbless_entry(self):
+        # cmd/harness/gates.json lists command-guard as a fail-closed gate only when the hook verb is present.
+        claude, codex = self.home / '.claude', self.home / '.codex'
+        hook = self.guard_groups(self.install.merged_settings({}, claude))[0]['hooks'][0]
+        self.assertEqual(hook['args'][1:], ['hook'])
+        guard = self.install_codex.guard_command(codex)
+        self.assertTrue(guard.endswith(' hook'))
+        legacy = {'hooks': {'PreToolUse': [{'hooks': [{'type': 'command', 'timeout': 30,
+                                                       'command': self.install_codex.guard_command(codex, '')}]}]}}
+        merged = self.install_codex.merge_hooks(legacy, codex)
+        commands = [h['command'] for g in merged['hooks']['PreToolUse'] for h in g['hooks']]
+        self.assertEqual([c for c in commands if 'command_guard_hook.py' in c], [guard])
+
+    def test_codex_guard_is_last_so_existing_trust_keys_keep_their_hooks(self):
+        # Codex trust is keyed by "<hooks.json>:pre_tool_use:<group>:<handler>" (GoodQA #14590)
+        codex = self.home / '.codex'
+        user = {'hooks': {'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': 'my-hook'}]}]}}
+        without = self.install_codex.merge_hooks(user, codex, command_guard=False)['hooks']['PreToolUse']
+        with_guard = self.install_codex.merge_hooks(user, codex)['hooks']['PreToolUse']
+        self.assertEqual(with_guard[:len(without)], without)
+        self.assertEqual(len(with_guard), len(without) + 2)  # the command guard, then the kill guard (GoodQA #14506)
+        self.assertEqual(with_guard[-2]['hooks'][0]['command'], self.install_codex.guard_command(codex))
+        self.assertEqual(with_guard[-1]['hooks'][0]['command'], self.install_codex.kill_guard_command(codex))
+        self.assertNotIn('matcher', with_guard[-2])
+        self.assertNotIn('matcher', with_guard[-1])
+        again = self.install_codex.merge_hooks({'hooks': {'PreToolUse': with_guard}}, codex)['hooks']['PreToolUse']
+        self.assertEqual(again, with_guard)  # idempotent: a reinstall keeps every index
+        # upgrade from the 220c37e layout (guard first): one guard group, moved back to its place
+        old = [with_guard[-2]] + with_guard[:-2] + with_guard[-1:]
+        upgraded = self.install_codex.merge_hooks({'hooks': {'PreToolUse': old}}, codex)['hooks']['PreToolUse']
+        self.assertEqual(upgraded, with_guard)
+
+    def test_old_claude_version_warns(self):
+        self.assertIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.200 (Claude Code)'))
+        self.assertNotIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.295 (Claude Code)'))
+        self.assertIn('not registered', self.install.command_guard_status(False))
+
+
+class DoctorTests(unittest.TestCase):
+    def test_doctor_reports_unregistered_and_old_version(self):
+        with tempfile.TemporaryDirectory(prefix='cg-doctor-') as d:
+            home = Path(d)
+            (home / '.claude' / 'hooks').mkdir(parents=True)
+            checks = {name: ok for name, ok, _ in cg.doctor(home=home, version_runner=lambda: '2.1.100')}
+            self.assertFalse(checks['claude files'])
+            self.assertFalse(checks['claude registered'])
+            self.assertTrue(checks['self-test probes'])
+
+    def test_doctor_healthy_install(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        with tempfile.TemporaryDirectory(prefix='cg-doctor-') as d:
+            home = Path(d)
+            hooks = home / '.claude' / 'hooks'
+            hooks.mkdir(parents=True)
+            for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py'):
+                (hooks / name).write_text('#\n')
+            (home / '.claude' / 'settings.json').write_text(json.dumps(install.merged_settings({}, home / '.claude')))
+            checks = cg.doctor(home=home, version_runner=lambda: '2.1.300')
+            self.assertTrue(all(ok for _n, ok, _d in checks), checks)
+
+
+class DocsTests(unittest.TestCase):
+    def test_operations_section_and_readme_line(self):
+        ops = (ROOT / 'docs' / 'operations.md').read_text()
+        self.assertIn('## Command guard', ops)
+        for needle in ('approve-delete', 'doctor', '--no-command-guard', '#14500', 'not an ownership boundary',
+                       'git clean'):
+            self.assertIn(needle, ops)
+        self.assertIn('command_guard', (ROOT / 'README.md').read_text())
+
+
+class SafetyRuleTests(unittest.TestCase):
+    """NEG-8 / S1: no test module passes corpus text to a shell."""
+
+    BANNED = {('subprocess', 'run'), ('subprocess', 'Popen'), ('subprocess', 'call'), ('subprocess', 'check_call'),
+              ('subprocess', 'check_output'), ('os', 'system'), ('os', 'popen')}
+
+    def offenders(self, source):
+        bad = []
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            name = (getattr(f.value, 'id', None), f.attr) if isinstance(f, ast.Attribute) else (None, None)
+            if name in {('os', 'system'), ('os', 'popen')}:
+                bad.append(node.lineno)
+            elif name in self.BANNED:
+                if any(k.arg == 'shell' and getattr(k.value, 'value', False) for k in node.keywords):
+                    bad.append(node.lineno)
+                text = ast.dump(node)
+                if 'corpus' in text or 'POSITIVE' in text or 'NEGATIVE' in text:
+                    bad.append(node.lineno)
+        return bad
+
+    def test_this_suite_never_shells_out_corpus_text(self):
+        for name in ('test_command_guard.py', 'command_guard_corpus.py'):
+            source = (Path(__file__).resolve().parent / name).read_text()
+            self.assertEqual(self.offenders(source), [], name)
+
+    def test_scan_catches_a_seeded_violation(self):
+        seeded = 'import subprocess, corpus\nsubprocess.run(corpus.LOG_POSITIVE[0], shell=True)\n'
+        self.assertTrue(self.offenders(seeded))
+
+
+if __name__ == '__main__':
+    unittest.main()
