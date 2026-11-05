@@ -15,7 +15,8 @@ Policy decisions (docs/operations.md, "Merge gate"):
   * the required set is the union of branch protection (base branch), rulesets and `gh pr checks --required`, and it
     must be known. When `gh pr checks --required` is the only readable source the PR must also report
     mergeStateStatus CLEAN or HAS_HOOKS, because that source only lists checks that already reported.
-  * zero reported checks block unless the repository has no workflows at all.
+  * zero reported checks block unless no ACTIVE workflow can run on the head (GitHub CI switched off): workflow files
+    are read at the PR base and the verified head, new files at the head are classified too, unknown means capable.
   * the merge command must carry the verified full head SHA (--match-head-commit, REST sha, GraphQL expectedHeadOid),
     so GitHub itself refuses a head that moved after the check.
   * waiver: `waive` records repo, PR, head, ticket, reason and approver; it is single use, expires in 24 hours and is
@@ -29,6 +30,7 @@ Stdlib only, Python 3.9.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -39,6 +41,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -748,6 +751,9 @@ def _trigger_names(text):
     if "\t" in text or re.search(r"(?m)^(?:---|\.\.\.)", text) or re.search(r"(?m)(?:^|\s)[&*][\w-]+|<<\s*:", text):
         return None
     lines = [re.sub(r"\s+#.*$", "", ln.rstrip()) for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    for ln in lines:  # every top-level line must be a plain `key:`; flow maps, `? key`, `}` and quoted keys are unknown
+        if ln.strip() and not ln[0].isspace() and not _TOP_KEY.match(ln) and not _ON_KEY.match(ln):
+            return None
     starts = [i for i, ln in enumerate(lines) if _ON_KEY.match(ln)]
     if len(starts) != 1:
         return None
@@ -759,7 +765,7 @@ def _trigger_names(text):
         if re.fullmatch(r"\[\s*[A-Za-z_]+(?:\s*,\s*[A-Za-z_]+)*\s*\]", rest):
             return {n: set() for n in re.findall(r"[A-Za-z_]+", rest)}
         return None
-    found, current, base, sub = {}, None, None, None
+    found, current, base, sub, pending = {}, None, None, None, None
     for ln in lines[i + 1:]:
         if not ln.strip():
             continue
@@ -776,7 +782,7 @@ def _trigger_names(text):
             m = _TRIGGER_LINE.match(body)
             if not m:
                 return None
-            current, sub = m.group(1), None
+            current, sub, pending = m.group(1), None, None
             found[current] = set()
         elif current is None:
             return None
@@ -785,13 +791,21 @@ def _trigger_names(text):
             if indent == sub:
                 m = _SUB_KEY.match(body)
                 if m:
-                    found[current].add(m.group(1))
+                    value = body[m.end():].strip()
+                    # `tags:` with no value (null) or an empty list is not a tag filter
+                    empty = value in ("", "[]", "null", "~", "{}")
+                    found[current].add(m.group(1) if not empty else m.group(1) + ":empty")
+                    pending = None if not empty else (current, m.group(1))
                 elif body.startswith("- "):
                     found[current].add("-")  # a list directly under the trigger
                 else:
                     return None
             elif indent < sub:
                 return None
+            elif pending:  # a nested value under `key:` makes that key non-empty
+                found[pending[0]].discard(pending[1] + ":empty")
+                found[pending[0]].add(pending[1])
+                pending = None
     return found or None
 
 
@@ -808,31 +822,75 @@ def _can_run_on_pr_head(triggers):
     return False
 
 
-def _ci_capable_workflows(client, slug, head):
-    """Reasons to block when an active workflow may report on this head. Raises GateError when it cannot tell."""
+INACTIVE_STATES = {"disabled_manually", "disabled_inactivity", "disabled_fork", "deleted"}
+
+
+def _get_file(client, slug, path, ref):
+    """Text of a workflow file at a ref; None when the file does not exist there (404); GateError otherwise."""
+    rc, out, err = client.raw(["api", f"repos/{slug}/contents/{path}?ref={urllib.parse.quote(ref, safe='')}"])
+    if rc != 0:
+        if "404" in (err + out):
+            return None
+        raise GateError("gh failed reading a workflow file: " + clean(err or out, 100))
+    try:
+        data = safe_input.safe_json_loads(out, max_depth=40, max_bytes=MAX_GH_OUTPUT)
+        return base64.b64decode(data["content"]).decode("utf-8")
+    except (KeyError, TypeError, ValueError):
+        raise GateError("a workflow file is unreadable")
+
+
+def _workflow_dir(client, slug, ref):
+    """Paths of workflow files at a ref; a missing directory is an empty list, any other failure is unreadable."""
+    rc, out, err = client.raw(["api", f"repos/{slug}/contents/.github/workflows?ref={urllib.parse.quote(ref, safe='')}"])
+    if rc != 0:
+        if "404" in (err + out):
+            return []
+        raise GateError("gh failed reading the workflow directory: " + clean(err or out, 100))
+    try:
+        listing = safe_input.safe_json_loads(out, max_depth=40, max_bytes=MAX_GH_OUTPUT)
+    except ValueError:
+        raise GateError("the workflow directory is unreadable")
+    if not isinstance(listing, list):
+        raise GateError("the workflow directory is unreadable")
+    return [str(i.get("path") or "") for i in listing if isinstance(i, dict) and re.search(r"\.ya?ml$", str(i.get("name") or ""), re.I)]
+
+
+def _ci_capable_workflows(client, slug, head, base):
+    """Reasons to block when a workflow may report on this head. Raises GateError when it cannot tell.
+
+    A PR can edit the workflow that decides whether its own CI runs, so every active workflow is read at the PR base
+    AND the verified head and counts as inert only if both versions are; files that exist only at the head (added by
+    the PR, not yet listed by the API) are classified too."""
     wf = client.json(["api", f"repos/{slug}/actions/workflows?per_page=100"], "workflows")
     total, listed = int(wf.get("total_count", -1)), wf.get("workflows")
     if not isinstance(listed, list) or total < 0 or total > len(listed):
         raise GateError("the workflow list is incomplete")
-    reasons = []
+    paths, inactive = [], set()
     for item in listed:
-        if not isinstance(item, dict) or item.get("state") is None:
-            raise GateError("the workflow list holds an unreadable entry")
-        if item["state"] != "active":  # disabled_manually, disabled_inactivity, disabled_fork
-            continue
+        if not isinstance(item, dict) or item.get("state") not in INACTIVE_STATES | {"active"}:
+            raise GateError("the workflow list holds an entry with an unknown state")
         path = str(item.get("path") or "")
+        if item["state"] in INACTIVE_STATES:
+            inactive.add(path)
+        else:
+            paths.append(path)
+    for path in _workflow_dir(client, slug, head):  # added by the PR, or a listed path (already counted above)
+        if path not in inactive and path not in paths:
+            paths.append(path)
+    reasons = []
+    for path in paths:
         if not re.match(r"^\.github/workflows/[\w./-]+$", path) or ".." in path:
-            reasons.append("an active workflow has an unreadable path")
+            reasons.append("a workflow has an unreadable path")
             continue
-        data = client.json(["api", f"repos/{slug}/contents/{path}?ref={head}"], "a workflow file")
-        try:
-            import base64
-            text = base64.b64decode(data["content"]).decode("utf-8")
-        except (KeyError, TypeError, ValueError):
-            raise GateError("a workflow file is unreadable")
-        if _can_run_on_pr_head(_trigger_names(text)):
-            reasons.append("no checks have reported yet but active workflow " + clean(path, 60)
-                           + " can run on this head")
+        texts = [(label, _get_file(client, slug, path, ref)) for ref, label in ((base, "base"), (head, "head"))]
+        if all(t is None for _, t in texts):
+            reasons.append("a workflow file listed by GitHub could not be found at the base or the head")
+            continue
+        for label, text in texts:
+            if text is not None and _can_run_on_pr_head(_trigger_names(text)):
+                reasons.append("no checks have reported yet but workflow " + clean(path, 60)
+                               + " can run (at the PR " + label + ")")
+                break
     return reasons
 
 
@@ -906,7 +964,7 @@ def evaluate_pr(client, slug, number, target=None):
     if not entries and known and not required:
         # Zero reports: fine only when no ACTIVE workflow could have run on this head (GitHub CI switched off).
         try:
-            reasons.extend(_ci_capable_workflows(client, slug, head))
+            reasons.extend(_ci_capable_workflows(client, slug, head, base))
         except (GateError, ValueError, TypeError, AttributeError):
             reasons.append("no checks reported and the workflow list could not be read")
     again = client.json(["pr", "view", str(number), "-R", slug, "--json", "headRefOid"], "the pull request head")
