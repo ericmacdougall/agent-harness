@@ -145,6 +145,13 @@ class AlertParityAndDegrade(unittest.TestCase):
                               capture_output=True, env=self.env, timeout=30)
 
     def test_active_alert_reaches_prompt_session_and_subagent_context(self):
+        # Run an installed-style copy (hook + ops_watch.py beside it, as install_codex ships them) so the positive
+        # path is proven without the checkout-relative candidate; the test then passes from an archive without .git.
+        import shutil
+        install_dir = Path(self.home.name) / '.codex' / 'agent-harness'; install_dir.mkdir(parents=True)
+        shutil.copy(self.hook, install_dir / 'wal.py')
+        shutil.copy(Path(__file__).resolve().parents[1] / 'harness' / 'hooks' / 'ops_watch.py', install_dir / 'ops_watch.py')
+        self.hook = install_dir / 'wal.py'
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'harness' / 'hooks'))
         import ops_watch
         ops_watch.emit({'schema': 1, 'at': '2026-11-05T08:00:00+00:00', 'host': 'testhost', 'source': 'test-alert',
