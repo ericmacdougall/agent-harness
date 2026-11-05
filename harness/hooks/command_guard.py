@@ -320,6 +320,10 @@ class Budget:
         self.max_depth = int(limits['max_depth'])
         self.count = 0
 
+    def has_room(self, ticks, seconds):
+        """Could about this much more work finish inside the budget?"""
+        return self.count + ticks <= self.nodes and time.monotonic() + seconds <= self.deadline
+
     def tick(self, weight=1):
         self.count += weight
         if self.count > self.nodes:
@@ -329,7 +333,7 @@ class Budget:
 
 
 class Word:
-    __slots__ = ('alts', 'subs', 'vars', 'glob', 'quoted', 'dynamic', 'single_only', 'overflow')
+    __slots__ = ('alts', 'subs', 'vars', 'glob', 'quoted', 'dynamic', 'single_only', 'overflow', 'raw')
 
     def __init__(self):
         self.alts = ['']
@@ -340,6 +344,7 @@ class Word:
         self.dynamic = False  # contains an unresolved expansion
         self.single_only = False
         self.overflow = None  # raw text of a brace expansion that exceeded the 32-alternative cap
+        self.raw = None       # the word's exact source text; None for a word the lexer did not read from the input
 
     @property
     def text(self):
@@ -521,14 +526,21 @@ def _find_brace(text):
 
 # zsh clobber forms (the Bash tool may run zsh): judged as the bash operator with the same effect
 ZSH_CLOBBER = {'>!': '>|', '>>!': '>>', '>>|': '>>', '&>!': '&>', '&>|': '&>', '>&!': '&>', '>&|': '&>',
-               '&>>!': '&>>', '&>>|': '&>>'}
+               '&>>!': '&>>', '&>>|': '&>>', '>>&': '&>>', '>>&!': '&>>', '>>&|': '&>>'}
 
 
 class Lexer:
-    def __init__(self, ctx, ps=False):
+    """`bang_operators` picks how `>!` and its relatives read. zsh takes them as one clobber operator. bash and sh do
+    not have them: they stop the operator before the `!`, which starts the next word, so `>! w` writes a file named
+    `!` and w is a command word. `saw_bang` reports whether the text had such an operator, so that a caller knows a
+    second reading exists (Analyzer.script)."""
+
+    def __init__(self, ctx, ps=False, bang_operators=True):
         self.ctx = ctx
         self.ps = ps
         self.budget = ctx.budget
+        self.bang_operators = bang_operators
+        self.saw_bang = False
 
     # ---- words
     def read_word(self, s, i, at_start=True):
@@ -734,7 +746,6 @@ class Lexer:
         tokens, pending = [], []
         prev_end = -1
         wait_target = None
-        also_arg = False
         while i < n:
             self.budget.tick()
             c = s[i]
@@ -762,9 +773,6 @@ class Lexer:
                     rd = Redir(fd, ZSH_CLOBBER.get(op, op))
                     tokens.append(('redir', rd))
                     wait_target = rd
-                    # bash has no `>!`: it reads `>` onto a file named `!`, so the next word is an argument of the
-                    # command. Judge both shells: zsh's redirect target and bash's argument (delta review F1)
-                    also_arg = op.endswith('!') and s[i + len(op):i + len(op) + 1] in WS
                     if op in ('<<', '<<-'):
                         rd.strip = op == '<<-'
                         pending.append(rd)
@@ -777,26 +785,27 @@ class Lexer:
             if w is None:
                 i += 1
                 continue
+            w.raw = s[i:j]
             if wait_target is not None:
                 wait_target.target = w
                 if wait_target.op in ('<<', '<<-'):
                     wait_target.delim = w.text
                     wait_target.quoted = w.quoted
                 wait_target = None
-                if also_arg:
-                    tokens.append(('w', w))
-                    also_arg = False
             else:
                 tokens.append(('w', w))
             prev_end = j
             i = j
         return tokens
 
-    @staticmethod
-    def _operator(s, i):
-        for op in ('&>>!', '&>>|', '<<<', '<<-', '&>>', '>>!', '>>|', '&>!', '&>|', '>&!', '>&|', '&&', '||', '|&', '>>', '>&',
-                   '<&', '<>', '<<', '&>', '>|', '>!', ';', '&', '|', '(', ')', '<', '>'):
+    def _operator(self, s, i):
+        for op in ('>>&!', '>>&|', '&>>!', '&>>|', '<<<', '<<-', '>>&', '&>>', '>>!', '>>|', '&>!', '&>|', '>&!', '>&|', '&&',
+                   '||', '|&', '>>', '>&', '<&', '<>', '<<', '&>', '>|', '>!', ';', '&', '|', '(', ')', '<', '>'):
             if s.startswith(op, i):
+                if op.endswith('!'):
+                    self.saw_bang = True
+                    if not self.bang_operators:
+                        return op[:-1]
                 return op
         return s[i]
 
@@ -1242,13 +1251,45 @@ def _build_fallback(c):
     return rules
 
 
-def fallback_scan(text, ctx):
-    """Raw-text rules for unresolved indirection, interpreter code, oversized input and internal errors."""
-    findings = []
+def _scan_text(text):
+    """The form the raw-text rules read: no confusables or format characters, quotes as spaces, casefolded."""
     t = unicodedata.normalize('NFKC', text[:2_000_000])
     t = ''.join(ch for ch in t if unicodedata.category(ch) != 'Cf').translate(CONFUSABLE).replace('\x00', '')
     t = re.sub(r'[\'",\[\](){}]', ' ', t)
-    t = re.sub(r'\s+', ' ', t).casefold()
+    return re.sub(r'\s+', ' ', t).casefold()
+
+
+# a line of a script that names a harness root under a home, outside the work and scratch dirs owners clean up routinely,
+# and calls something that destroys or replaces a file (quotes are spaces by now, see _scan_text). One character class
+# for the separator, so a long run of spaces cannot make the regex backtrack
+_ROOT_SEP = r'[\s/,+\\]+'
+ROOT_DELETE_VERB = re.compile(r'\b(?:rm|rmdir|unlink|shred|truncate|rmtree|remove|rimraf|trash|rm_rf|rm_r|remove_tree|removedirs|'
+                              r'rmdirsync|unlinksync|rmsync|write_text|write_bytes|writefilesync|sponge)\b|'
+                              r'\bopen\b[^\n]{0,200}?\s(?:w|wb|wt|w\+)(?:\s|$)|\bfs\.(?:rm|rmdir|unlink)\b')
+
+
+def _root_text(home):
+    start = r'(?<![\w./-])'  # the start of a path or a name: /tmp/fake/home/.claude and /tmp/root/.claude are not homes
+    # the real home's spellings. A bare `home` is a variable, often a test's temp dir, and variables are not followed
+    anchor = (r'(?:' + start + r'(?:~|/users/[^/\s+\\]+|/home/[^/\s+\\]+|/root\b|' + re.escape(home.casefold().rstrip('/'))
+              + r')|\.home\b|(?:\$\s*|\benviron(?:\.get)?\s+|\bgetenv\s+)home\b)')
+    return re.compile(anchor + _ROOT_SEP + r'\.(?:(?:claude|codex)(?![\w-])|agent-harness(?![\w-])(?!' + _ROOT_SEP
+                      + r'(?:work|scratch)(?![\w.-])))')
+
+
+def written_code_destroys_root(code, home):
+    """A path and the call that destroys it on one line. Anywhere in the script would refuse every script that reads a
+    harness file and writes its own output (replay: 13 of 13 false). A path held in a variable is not followed."""
+    root = _root_text(home)
+    if not root.search(_scan_text(code)):
+        return False
+    return any(root.search(line) and ROOT_DELETE_VERB.search(line) for line in map(_scan_text, code.splitlines()))
+
+
+def fallback_scan(text, ctx):
+    """Raw-text rules for unresolved indirection, interpreter code, oversized input and internal errors."""
+    findings = []
+    t = _scan_text(text)
     for category, rule, pattern, reason, alt in ctx.fallback:
         if isinstance(pattern, tuple):
             hit = pattern[1].search(t) and pattern[2].search(t)
@@ -1282,6 +1323,7 @@ class Ctx:
         self.created = set()  # case-folded paths written earlier in this command (count as existing)
         self.links = {}  # symlinks created earlier in this command: link path -> target path
         self.written = {}  # case-folded path -> text written to it earlier in this command (echo/printf/heredoc)
+        self.one_sided = set()  # files only one reading of `>!` wrote: what is on disk may still be what runs
         self.secret_files = set()  # files that received a secret value earlier in this command
         self.unterminated = False
         self.vars = {}
@@ -1294,12 +1336,81 @@ class Ctx:
         self.pending_kill = []
         self.marker = marker  # callable(path) -> bool, injectable for tests
         self.fixed_cwd = None
+        self.fork_depth = 0  # readings of `>!` being analysed around the current script (Analyzer._both_readings)
+        self.readings_capped = False  # `>!` could not be judged both ways: too deep, no budget, or the readings disagree
 
     def cwd_value(self):
         return self.cwd
 
+    # what one reading of a script can change; findings accumulate across readings and the rest is not analysis state
+    NOT_STATE = ('findings', 'budget', 'c', 'marker', 'raw_top', 'ps', 'tail_visible', 'fork_depth', 'readings_capped')
+
+    def state(self):
+        return {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(self).items()
+                if k not in self.NOT_STATE}
+
+    def restore(self, saved):
+        for k in [k for k in vars(self) if k not in self.NOT_STATE and k not in saved]:
+            delattr(self, k)
+        for k, v in saved.items():
+            setattr(self, k, v.copy() if isinstance(v, (set, dict, list)) else v)
+
+    def disputes(self, other):
+        """Can a later command depend on which reading was right? Sets and flags combine without loss. These values do
+        not: a merged variable is only a hint on a path operand, and is lost as a command name, an option or a script."""
+        return (any(getattr(self, k) != other[k] for k in ('vars', 'var_hints', 'aliases', 'links', 'cwd', 'cwd_unknown'))
+                # not bash's file named `!`: every nested `>!` rewrites it, so it would always differ. merge keeps
+                # both texts, so running it is still judged
+                or any(other['written'].get(path, text) != text for path, text in self.written.items()
+                       if os.path.basename(path) != '!'))
+
+    def merge(self, other):
+        """Combine another reading's end state into this one for the commands that follow. Either reading may be the
+        real one, so nothing it knows can be lost: a variable they disagree on is no longer known and both values
+        become hints, a file keeps both texts, and if they end in different directories the current one is unknown,
+        judged as protected if either names a protected location."""
+        hints = dict(self.var_hints)
+        for name, value in other['var_hints'].items():
+            hints[name] = value if hints.get(name) in (None, value) else hints[name] + ' ' + value
+        known = {name: value for name, value in self.vars.items() if name in other['vars'] and other['vars'][name] == value}
+        for name in (set(self.vars) | set(other['vars'])) - set(known):
+            values = [hints.get(name), self.vars.get(name), other['vars'].get(name)]
+            hints[name] = ' '.join(v for v in values if isinstance(v, str))[:4096]
+        self.vars, self.var_hints = known, hints
+        for k, theirs in other.items():
+            if k in self.NOT_STATE or k in ('vars', 'var_hints'):
+                continue
+            mine = getattr(self, k, None)
+            if k == 'written':
+                both = dict(theirs)
+                for path, text in (mine or {}).items():
+                    both[path] = text if both.get(path) in (None, text) else (both[path] + '\n' + text)[:524288]
+                self.written = both
+                self.one_sided = self.one_sided | (set(theirs) ^ set(mine or {}))
+            elif isinstance(theirs, set):
+                setattr(self, k, (mine or set()) | theirs)
+            elif isinstance(theirs, dict):
+                setattr(self, k, {**(mine or {}), **theirs})
+            elif isinstance(theirs, list):
+                setattr(self, k, (mine or []) + [x for x in theirs if x not in (mine or [])])
+            elif isinstance(theirs, int):  # counters only rise, and a flag set by either reading stays set
+                setattr(self, k, max(mine or 0, theirs))
+            elif k == 'cwd' and mine != theirs:
+                self.cwd_protected_unknown = self.cwd_protected_unknown or bool(
+                    PROTECTED_TEXT.search((mine or '') + ' ' + (theirs or '') + '/'))
+                self.cwd = theirs
+                self.cwd_unknown = True
+            else:
+                setattr(self, k, theirs)
+
     def add(self, category, rule, reason, alternative):
         self.findings.append(Finding(category, rule, reason, alternative))
+
+
+# Each nesting level with a `>!` doubles the parses. This keeps a small command inside the budget, which matters because
+# a budget stop loses whatever the guard has not reached yet. Past it a script gets one reading, and analyze() treats
+# the command as unanalysable.
+MAX_READING_FORKS = 3
 
 
 class Analyzer:
@@ -1320,6 +1431,9 @@ class Analyzer:
                     'on its own', 'run that gh command by itself')
         return ctx.findings
 
+    def check_tokens(self, tokens):
+        """Seam for a subclass that must see the token stream before parse() ends a command at an operator."""
+
     def script(self, text, depth, tail_visible=None, ps=None):
         ctx = self.ctx
         if depth > ctx.budget.max_depth:
@@ -1330,11 +1444,51 @@ class Analyzer:
         if tail_visible is not None:
             ctx.tail_visible = tail_visible
         try:
-            tokens = Lexer(ctx, ctx.ps).lex(text)
-            for pipeline in parse(tokens):
-                self.pipeline(pipeline, depth)
+            lexer = Lexer(ctx, ctx.ps)
+            tokens = lexer.lex(text)
+            if lexer.saw_bang and ctx.fork_depth < MAX_READING_FORKS:
+                ctx.fork_depth += 1
+                try:
+                    self._both_readings(tokens, text, depth)
+                finally:
+                    ctx.fork_depth -= 1
+            else:
+                ctx.readings_capped = ctx.readings_capped or lexer.saw_bang
+                self._run_tokens(tokens, depth)
         finally:
             ctx.ps, ctx.tail_visible = saved_ps, saved_tail
+
+    def _run_tokens(self, tokens, depth):
+        self.check_tokens(tokens)
+        for pipeline in parse(tokens):
+            self.pipeline(pipeline, depth)
+
+    def _both_readings(self, zsh_tokens, text, depth):
+        """zsh and bash read `>! w` differently and the guard cannot know which shell runs the text, so judge the text
+        once per reading: anything either one refuses is refused. One shell reads every `>!` in a script the same way,
+        so two parses cover a script however many it has. This runs per script rather than per command line because a
+        nested shell can read the operator differently from its parent (`>! f bash -c '...'`). Each reading starts from
+        the same state: a `cd` or an assignment made in one did not happen in the other (GoodQA #14657)."""
+        ctx = self.ctx
+        start = ctx.state()
+        mark = len(ctx.findings)
+        count, began = ctx.budget.count, time.monotonic()
+        self._run_tokens(zsh_tokens, depth)
+        # a second reading that cannot finish would stop the analysis and lose every later command, so skip it instead;
+        # analyze() then treats the command as unanalysable
+        if not ctx.budget.has_room(2 * (ctx.budget.count - count) + len(text), 2 * (time.monotonic() - began)):
+            ctx.readings_capped = True
+            return
+        after_zsh = ctx.state()
+        ctx.restore(start)
+        mid = len(ctx.findings)
+        self._run_tokens(Lexer(ctx, ctx.ps, bang_operators=False).lex(text), depth)
+        seen = {(f.category, f.rule, f.reason) for f in ctx.findings[mark:mid]}
+        ctx.findings[mid:] = [f for f in ctx.findings[mid:] if (f.category, f.rule, f.reason) not in seen]
+        # at the top level each reading has already seen its own later commands; nested text has more to come
+        if depth > 0 and ctx.disputes(after_zsh):
+            ctx.readings_capped = True
+        ctx.merge(after_zsh)
 
     # ---- visibility of a stage's stdout
     def consumer_class(self, cmd):
@@ -1520,6 +1674,7 @@ class Analyzer:
         out.alts = [VAR_MARKER.sub(sub, a) for a in word.alts]
         out.subs, out.vars, out.glob, out.quoted = word.subs, word.vars, word.glob, word.quoted
         out.dynamic = word.dynamic or unresolved
+        out.raw = word.raw
         return out
 
     # ---- single command
@@ -1647,8 +1802,6 @@ class Analyzer:
     def redirects(self, cmd, pl, idx, has_command, depth):
         ctx = self.ctx
         words = self._skip_assigns(strip_reserved(cmd.words))[1]
-        # a `>! word` target is also in `words` for bash's reading, and heredoc and exec checks below must see it. So
-        # `cat >! f` and a bare `>! f` count as content writes here: on a plain work file they are allowed
         name = norm_name(words[0].text) if words else ''
         arg_texts = [w.text for w in words[1:]]
         # pure truncation: nothing (or nothing meaningful) is written, so the redirect only empties the file
@@ -1985,8 +2138,16 @@ class Analyzer:
         path = norm_path(word.text, ctx)
         key = path.casefold()
         if key in ctx.written:
+            # the disk first: in the reading where the disk is what runs, the recorded text never ran, so its cd or
+            # alias must not colour this read
+            if key in ctx.one_sided:
+                self._script_on_disk(path, depth, require_shell)
             self.script(ctx.written[key], depth + 1, tail_visible=True)
             return
+        self._script_on_disk(path, depth, require_shell)
+
+    def _script_on_disk(self, path, depth, require_shell):
+        ctx = self.ctx
         ctx.files_read = getattr(ctx, 'files_read', 0) + 1
         if ctx.files_read > 8:
             return
@@ -2009,13 +2170,13 @@ class Analyzer:
         # It also runs as its own process, so its cd, variables and recorded files do not carry into this command.
         before = len(ctx.findings)
         keep = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
-                if k not in ('findings', 'budget', 'c', 'marker', 'files_read', 'unterminated')}
+                if k not in ('findings', 'budget', 'c', 'marker', 'files_read', 'unterminated', 'readings_capped')}
         try:
             self.script(text, depth + 1, tail_visible=True)
         finally:
             for k, v in keep.items():
                 setattr(ctx, k, v)
-        ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
+            ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
 
     def launcher(self, name, args, depth, pl, idx):
         """Commands that run another command given as text or as trailing words. True when handled."""
@@ -2399,7 +2560,9 @@ class Analyzer:
             ctx.cwd_protected_unknown = bool(PROTECTED_TEXT.search(target) or self._hint_points_at_protected(word))
             return
         if ctx.cwd_unknown and not target.startswith(('/', '~')):
-            return  # relative to a directory the guard could not resolve: still unknown
+            # relative to a directory the guard could not resolve: still unknown, and a protected name stays visible
+            ctx.cwd_protected_unknown = ctx.cwd_protected_unknown or bool(PROTECTED_TEXT.search(target))
+            return
         if target.startswith(('/', '~')):
             ctx.cwd_known = True
         ctx.cwd = norm_path(target, ctx, ctx.cwd)
@@ -2892,6 +3055,14 @@ class Analyzer:
                 text = self.ctx.written.get(norm_path(nd[0].text, self.ctx).casefold())
                 if text:
                     self.code(text, depth)
+                    # a script this same command wrote and now runs is the incident's shape, so a deletion under a
+                    # harness root counts here, not only logs (GoodQA #14657). Existing scripts and one-liners keep
+                    # the log-only rule: harness tooling reads and edits these files routinely
+                    if written_code_destroys_root(text, self.ctx.home):
+                        self.ctx.add(LOG_DELETE, 'written-script-root',
+                                     'a line of a script written in this command names a harness root and a call that '
+                                     'can destroy or replace a file',
+                                     'edit the file with the editor tool, or keep the change out of the harness roots')
 
     def code(self, code, depth):
         ctx = self.ctx
@@ -3372,7 +3543,7 @@ class Analyzer:
 
     def _work_base(self, segs):
         """Segment count of the ~/.agent-harness/work or /scratch prefix of `segs`, for this machine's homes and for
-        /home/<user> on another host (`ssh dev2 'cmd > /home/eric/...'`), else None."""
+        /home/<user> on another host (`ssh dev2 'cmd > /home/someone/...'`), else None."""
         other = ['/'.join(segs[:2])] if len(segs) > 2 and segs[0] == 'home' else []
         for h in list(self.c.homes) + other:
             for top in ('work', 'scratch'):
@@ -3756,7 +3927,11 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
     if len(command.encode('utf-8', 'replace')) > int(compiled.limits['max_command_bytes']):
         raise Blocked('command is larger than %d bytes' % int(compiled.limits['max_command_bytes']))
     analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=marker)
-    findings = analyzer.run(command)
+    try:
+        findings = analyzer.run(command)
+    except Exception as stop:  # noqa: BLE001 - re-raised: a budget stop, the hook's alarm or a bug
+        stop.findings = list(analyzer.ctx.findings)  # what the guard already refused still counts (decide)
+        raise
     if analyzer.ctx.unterminated and not any(f.category in ALWAYS_ENFORCED for f in findings):
         if raw_sensitive(command, compiled, cwd=cwd):
             findings.append(Finding(LOG_DELETE if PROTECTED_TEXT.search(command) else SECRET_DUMP, 'unanalysable',
@@ -3765,6 +3940,16 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
         else:
             findings.append(Finding(PARSE, 'unterminated', 'the command has an unterminated quote or substitution',
                                     'check the quoting'))
+    if analyzer.ctx.readings_capped and not any(f.category in ALWAYS_ENFORCED for f in findings):
+        if raw_sensitive(command, compiled, cwd=cwd):
+            findings.append(Finding(LOG_DELETE if PROTECTED_TEXT.search(command) else SECRET_DUMP, 'unanalysable',
+                                    '`>!` cannot be judged under both shell readings (too large, too deeply nested, or '
+                                    'they disagree on what a later command uses) and the command names a protected '
+                                    'location or secret', 'split the command, or use `>|`'))
+        else:
+            findings.append(Finding(PARSE, 'readings-capped', '`>!` cannot be judged under both shell readings (too large, too '
+                                    'deeply nested, or they disagree on what a later command uses)',
+                                    'split the command, or use `>|`'))
     return findings
 
 
@@ -3803,6 +3988,9 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
         findings = analyze(command, compiled, cwd=cwd, ps=ps, marker=marker)
     except (Blocked, RecursionError) as stop:
         reason = str(stop) if isinstance(stop, Blocked) else 'command nesting is too deep'
+        already = [f for f in getattr(stop, 'findings', []) if modes.get(f.category) == 'enforce']
+        if already:
+            return 'block', format_block(already[0], more=len(already) - 1)
         if raw_sensitive(command, compiled, cwd=cwd):
             category = LOG_DELETE if PROTECTED_TEXT.search(command if isinstance(command, str) else ' '.join(command)) \
                 else SECRET_DUMP
@@ -3810,6 +3998,9 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
                                                  'or secret', 'split it into smaller commands or put it in a script file'))
         return 'warn', format_block(Finding(PARSE, 'unanalysable', reason, 'split it into smaller commands'), warn=True)
     except Exception as error:  # noqa: BLE001 - fail closed for sensitive-looking text, open for the rest
+        already = [f for f in getattr(error, 'findings', []) if modes.get(f.category) == 'enforce']
+        if already:
+            return 'block', format_block(already[0], more=len(already) - 1)
         try:
             text = command if isinstance(command, str) else ' '.join(map(str, command))
             raw = [f for f in fallback_scan(text, compiled) if modes.get(f.category) == 'enforce']

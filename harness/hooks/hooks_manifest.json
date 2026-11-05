@@ -17,6 +17,20 @@
    ]
   },
   {
+   "id": "log_backup:session-start",
+   "script": "log_backup.py",
+   "arg": "session-start",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "pending",
+   "owner": "log backup (GoodQA #14471)",
+   "rules": [],
+   "known_gap": "opt-in: wired only where the log backup is installed (install.py --log-backup), so doctor reports it NOT-ENFORCED elsewhere"
+  },
+  {
    "id": "wal:prompt",
    "script": "wal.py",
    "arg": "prompt",
@@ -398,17 +412,19 @@
   {
    "id": "kill_guard:hook",
    "script": "kill_guard.py",
-   "arg": null,
+   "arg": "hook",
    "event": "PreToolUse",
    "tools": [
     "Bash"
    ],
    "flavors": [
-    "claude"
+    "claude",
+    "codex"
    ],
-   "status": "pending",
-   "owner": "feat/kill-guard-14506",
-   "rules": []
+   "status": "installed",
+   "rules": [
+    "S27"
+   ]
   },
   {
    "id": "heavy_job_guard:hook",
