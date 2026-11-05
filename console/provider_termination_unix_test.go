@@ -191,3 +191,34 @@ exit 0
 	}
 	t.Fatal("console kept the run attached for 8 s behind a descendant holding stdout")
 }
+
+// A6 for Codex: the leader exits after the handshake while a descendant keeps
+// stdout open. The disconnect must be seen within the drain bound and the
+// descendant stopped, not when the descendant eventually ends.
+func TestCodexLeaderExitSeenWhileDescendantHoldsStdout(t *testing.T) {
+	dir := t.TempDir()
+	child := filepath.Join(dir, "child")
+	script := providerScript(t, `sh -c 'echo $$ > "`+child+`"; exec sleep 60' &
+until [ -s "`+child+`" ]; do sleep 0.01; done
+read line
+printf '{"id":1,"result":{}}\n'
+read line
+exit 0
+`)
+	closed := make(chan struct{})
+	client, err := startRPC(script, os.Environ(), nil, nil, func(*rpcClient, error) { close(closed) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID := recordedPID(t, child)
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+	select {
+	case <-closed:
+	case <-time.After(8 * time.Second):
+		t.Fatal("leader exit was hidden behind a descendant holding stdout")
+	}
+	client.close()
+	if !waitForExit(childPID) {
+		t.Fatalf("descendant %d survived the provider disconnect", childPID)
+	}
+}
