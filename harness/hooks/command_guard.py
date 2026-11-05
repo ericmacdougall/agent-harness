@@ -50,13 +50,34 @@ DEFAULT_POLICY = {
     'modes': {'secret_dump': 'enforce', 'log_delete': 'enforce', 'broad_kill': 'warn'},
     'limits': {'max_command_bytes': 262144, 'max_depth': 8, 'max_nodes': 600000, 'max_seconds': 3.0,
                'max_stdin_bytes': 4194304},
+    # Tier A: logs, WALs and approval state. Every destructive form is refused, including overwrites.
     'protected_log_roots': ['{home}/.claude/projects', '{home}/.claude/wals', '{home}/.claude/sessions',
                             '{home}/.claude/transcripts', '{home}/.claude/history.jsonl',
+                            '{home}/.claude/file-history',
                             '{home}/.codex/sessions', '{home}/.codex/archived_sessions',
-                            '{home}/.codex/history*'],
+                            '{home}/.codex/history*', '{home}/.agent-harness/state',
+                            '{home}/.agent-harness/codex-wals', '{home}/.claude/.credentials.json',
+                            '{home}/.codex/auth.json',
+                            # the guard itself: deleting or replacing it would switch the protection off
+                            '{home}/.claude/hooks/command_guard*', '{home}/.claude/hooks/redact.py',
+                            '{home}/.codex/agent-harness/command_guard*', '{home}/.codex/agent-harness/redact.py'],
     'protected_work_wal_regex': r'^{home}/\.agent-harness/work/[^/]+/(?:.*/)?(?:wals?|wal[^/]*|[^/]*\.wal\.jsonl)(?:/.*)?$',
+    # Tier A anywhere on disk: a `wals` directory segment, main.jsonl and *.wal.jsonl files.
+    'protected_segment_names': ['wals'],
+    'protected_file_names': ['main.jsonl'],
+    'protected_file_suffixes': ['.wal.jsonl'],
+    # Tier B: whole harness trees. Deletes, moves out and truncation are refused; edits and new files are not.
+    'protected_roots': ['{home}/.claude', '{home}/.codex', '{home}/.agent-harness'],
+    # Literal paths inside these stay deletable (agent task folders and worktrees, disposable scratch).
+    # A wildcard position must be filled by a literal name: a glob there could reach other tasks.
+    'allow_subtrees': ['{home}/.agent-harness/work/*/*/*', '{home}/.agent-harness/scratch/*/*/*/*'],
+    # Homes on other machines (ssh targets) are matched with these patterns as well as the local homes.
+    'generic_homes': ['/users/*', '/home/*', '/root', '/var/root'],
     'ancestor_roots': ['{home}', '{home}/.claude', '{home}/.codex', '{home}/.agent-harness',
                        '{home}/.agent-harness/work'],
+    'rclone_allow_redacted': False,
+    # Temp trees where the anywhere-on-disk WAL names (wals/, main.jsonl) are test data, not real WALs.
+    'temp_roots': ['/tmp', '/private/tmp', '/var/tmp', '/var/folders', '/private/var/folders'],
     'state_files': ['{home}/.agent-harness/state/log-delete-ok.json', '{home}/.agent-harness/state/log-delete.key'],
     'credential_path_regexes': [
         r'(^|/)\.config/rclone/rclone\.conf$', r'(^|/)rclone\.conf$',
@@ -82,14 +103,15 @@ DEFAULT_POLICY = {
                            '{home}/.codex/auth.json', '{home}/.pgpass', '{home}/.git-credentials', '{cwd}/.env'],
     'secret_env_regex': r'(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|APIKEY|ACCESSKEY|PRIVATEKEY)|(?:^|_)(?:KEY|PAT)(?:_|$)',
     'secret_env_exclude_regex': r'(?:_FILE|_PATH|_DIR|_NAME|_COUNT|_LIMIT|_BUDGET|_URL|_ID|_TTL|_EXPIRY|_TIMEOUT)$|^(?:KEYCHAIN|SSH_AUTH_SOCK)',
-    'rclone_blocked_config': ['show', 'dump', 'reconnect'],
+    'rclone_blocked_config': ['show', 'dump', 'reconnect', 'file', 'redacted', 'paste'],
     'kill': {'min_pattern_length': 12,
              'generic_names': ['python', 'python3', 'node', 'nodejs', 'claude', 'codex', 'unittest', 'pytest', 'chrome',
                                'chromium', 'ssh', 'sshd', 'bash', 'sh', 'zsh', 'java', 'ruby', 'go', 'npm', 'pnpm',
                                'yarn', 'tmux', 'git', 'rclone', 'docker', 'electron', 'code', 'safari', 'firefox',
                                'tests', 'test', 'server', 'worker', 'agent', 'harness', 'deliver', 'peer_review']},
     'marker': {'default_ttl_seconds': 900, 'max_ttl_seconds': 86400, 'max_walk_entries': 200000,
-               'max_walk_seconds': 2.0, 'max_hash_bytes': 21474836480},
+               'max_walk_seconds': 2.0, 'max_hash_bytes': 21474836480, 'recent_change_seconds': 600,
+               'approve_remote_types': ['dropbox']},
 }
 
 SECRET_DUMP, LOG_DELETE, BROAD_KILL = 'secret_dump', 'log_delete', 'broad_kill'
@@ -139,14 +161,35 @@ class Compiled:
         self.policy = policy
         homes = []
         for candidate in (home, os.path.expanduser('~'), _pw_home()):
-            if candidate and candidate not in homes:
-                homes.append(os.path.normpath(candidate))
+            if not candidate:
+                continue
+            for variant in (os.path.normpath(candidate), _realpath(candidate)):
+                if variant and variant not in homes:
+                    homes.append(variant)
         self.homes = homes
         self.home = homes[0]
-        self.cwd = cwd or os.getcwd()
+        try:
+            self.cwd = cwd or os.getcwd()
+        except OSError:
+            self.cwd = self.home
         self.limits = policy['limits']
         fmt = lambda template, h: template.replace('{home}', h).replace('{cwd}', self.cwd)  # noqa: E731
-        self.protected = [self._segs(fmt(t, h)) for t in policy['protected_log_roots'] for h in homes]
+        # Matching homes: the local ones (exact) plus glob patterns for other machines' homes.
+        match_homes = homes + [g for g in policy.get('generic_homes', []) if isinstance(g, str)]
+        self.protected = [self._segs(fmt(t, h)) for t in policy['protected_log_roots'] for h in match_homes]
+        self.roots = [self._segs(fmt(t, h)) for t in policy.get('protected_roots', []) for h in match_homes]
+        self.allow = []
+        for t in policy.get('allow_subtrees', []):
+            if not isinstance(t, str):
+                continue
+            for h in match_homes:
+                segs = self._segs(fmt(t, h))
+                if self._safe_allow(segs, h):
+                    self.allow.append(segs)
+        self.temp_roots = [self._segs(t) for t in policy.get('temp_roots', []) if isinstance(t, str)]
+        self.seg_names = {s.casefold() for s in policy.get('protected_segment_names', [])}
+        self.file_names = {s.casefold() for s in policy.get('protected_file_names', [])}
+        self.file_suffixes = tuple(s.casefold() for s in policy.get('protected_file_suffixes', []))
         self.ancestors = [self._segs(fmt(t, h)) for t in policy['ancestor_roots'] for h in homes]
         self.state_files = [fmt(t, h).casefold() for t in policy['state_files'] for h in homes]
         self.wal_regexes = [re.compile(policy['protected_work_wal_regex'].replace('{home}', re.escape(h)), re.I)
@@ -166,9 +209,29 @@ class Compiled:
     def _segs(path):
         return [s for s in path.casefold().replace('\\', '/').split('/') if s]
 
+    def _safe_allow(self, segs, home):
+        """An allow_subtrees entry must sit at least two levels below a protected root and not cover Tier A."""
+        if any(s in ('..', '.', '**') for s in segs):
+            return False
+        for r in self.protected:
+            if _prefix_match(segs, r):
+                return False
+        deep_enough = False
+        for r in self.roots:
+            if _prefix_match(segs, r) and len(segs) >= len(r) + 2:
+                deep_enough = True
+        return deep_enough
+
     def secret_name(self, name):
         upper = name.upper()
         return bool(self.secret_env.search(upper)) and not self.secret_env_excl.search(upper)
+
+
+def _realpath(path):
+    try:
+        return os.path.realpath(path) if path and len(path) < 4096 else None
+    except (OSError, ValueError):
+        return None
 
 
 def _pw_home():
@@ -703,15 +766,100 @@ def norm_name(text):
 
 
 def norm_path(text, ctx, cwd=None):
-    """Absolute, normalised, case-folded path with / separators. Unresolved variables stay as $NAME."""
+    """Absolute, normalised path with / separators (case kept; match with casefold). Unresolved vars stay $NAME."""
     text = unicodedata.normalize('NFKC', text.replace('\\', '/') if ctx.ps else text)
     text = ''.join(ch for ch in text if unicodedata.category(ch) != 'Cf')
-    if text.startswith('~'):
+    if text == '~' or text.startswith('~/'):
         text = ctx.home + text[1:]
-    text = re.sub(r'^(?:\$env:USERPROFILE|%USERPROFILE%)', ctx.home, text, flags=re.I)
+    text = re.sub(r'^(?:\$env:USERPROFILE|%USERPROFILE%)', lambda _m: ctx.home, text, flags=re.I)
     if not text.startswith('/') and not re.match(r'^[A-Za-z]:/', text):
         text = posixpath.join(cwd if cwd is not None else ctx.cwd_value(), text)
-    return posixpath.normpath(text).casefold() if text else ''
+    return posixpath.normpath(text) if text else ''
+
+
+GLOB_CHARS = '*?['
+
+
+def _has_glob(seg):
+    return any(ch in seg for ch in GLOB_CHARS)
+
+
+def _seg_eq(p, r):
+    """One path segment against one pattern segment; either side may be a glob."""
+    if p == r:
+        return True
+    gp, gr = _has_glob(p), _has_glob(r)
+    if gp and gr:
+        return True  # two patterns may overlap: assume they do
+    if gp:
+        return fnmatch.fnmatchcase(r, p)
+    if gr:
+        return fnmatch.fnmatchcase(p, r)
+    return False
+
+
+def _prefix_match(path_segs, root_segs):
+    n = min(len(path_segs), len(root_segs))
+    return all(_seg_eq(path_segs[k], root_segs[k]) for k in range(n))
+
+
+# Raw text that names a protected location: used for unresolved variables, substitutions and fallbacks.
+PROTECTED_TEXT = re.compile(r'(?i)\.(?:claude|codex|agent-harness)(?![\w-])|(?:^|[/\s\'"])wals?(?:/|$|[\s\'"])|'
+                            r'main\.jsonl|\.wal\.jsonl')
+PROTECTED_VAR_NAME = re.compile(r'(?i)claude|codex|harness|(?:^|_)wals?(?:_|$)')
+RELATIVE_PROTECTED_NAMES = {'projects', 'wals', 'sessions', 'history.jsonl', 'transcripts', 'archived_sessions',
+                            '.claude', '.codex', '.agent-harness', 'file-history', 'main.jsonl'}
+
+
+def _lexists(path):
+    try:
+        return len(path) < 4096 and os.path.lexists(path)
+    except (OSError, ValueError):
+        return False
+
+
+def _resolve_prefix(path):
+    """realpath of the longest existing prefix (symlinks resolved), with the unresolved rest appended."""
+    if not path or len(path) > 4096 or '\x00' in path:
+        return None
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def classify_segs(c, segs):
+    """'log' (Tier A), 'root' (Tier B), 'ancestor' (contains a protected root) or None, for case-folded segments."""
+    for r in c.protected:
+        if _prefix_match(segs, r):
+            return 'log' if len(segs) >= len(r) else 'ancestor'
+    leaf = segs[-1] if segs else ''
+    in_root = None
+    for r in c.roots:
+        if _prefix_match(segs, r):
+            in_root = 'root' if len(segs) >= len(r) else 'ancestor'
+            break
+    in_temp = not in_root and any(len(segs) > len(t) and segs[:len(t)] == t for t in c.temp_roots)
+    if not in_temp and (any(s in c.seg_names for s in segs)
+                        or (leaf and (leaf in c.file_names or leaf.endswith(c.file_suffixes)))):
+        return 'log' if in_root else 'log-name'
+    if in_root == 'root':
+        # inside a harness tree a glob that can reach a WAL name counts as a WAL path
+        for s in segs:
+            if _has_glob(s) and any(fnmatch.fnmatchcase(n, s) for n in c.seg_names | c.file_names):
+                return 'log'
+        if _has_glob(leaf) and any(fnmatch.fnmatchcase('x' + suf, leaf) for suf in c.file_suffixes):
+            return 'log'
+        for a in c.allow:
+            if len(segs) >= len(a) and all(
+                    (segs[k] == a[k]) or (a[k] == '*' and not _has_glob(segs[k])) for k in range(len(a))):
+                return None
+    if in_root:
+        return in_root
+    for a in c.ancestors:
+        if _prefix_match(segs, a) and len(segs) <= len(a):
+            return 'ancestor'
+    return None
 
 
 def is_dynamic_path(text):
@@ -918,6 +1066,12 @@ class Ctx:
         self.home = compiled.home
         self.cwd = cwd or compiled.cwd
         self.cwd_unknown = False
+        self.cwd_protected_unknown = False  # cd to an unresolved path whose text names a protected location
+        self.var_hints = {}  # raw text of dynamic assignments, for variables the guard cannot resolve
+        self.created = set()  # case-folded paths written earlier in this command (count as existing)
+        self.links = {}  # symlinks created earlier in this command: link path -> target path
+        self.written = {}  # case-folded path -> text written to it earlier in this command (echo/printf/heredoc)
+        self.unterminated = False
         self.vars = {}
         self.tainted = set()
         self.aliases = {}
@@ -1170,22 +1324,46 @@ class Analyzer:
             if not a.dynamic and not tainted:
                 ctx.vars[name] = value
                 ctx.tainted.discard(name)
+                ctx.var_hints.pop(name, None)
             elif a.dynamic:
                 ctx.vars.pop(name, None)
+                ctx.var_hints[name] = (value + ' ' + ' '.join(a.subs) + ' ' + ' '.join(
+                    ctx.var_hints.get(v, '') for v in a.vars))[:4096]
 
     # ---- redirections and heredocs
     def redirects(self, cmd, pl, idx, has_command, depth):
         ctx = self.ctx
         words = self._skip_assigns(strip_reserved(cmd.words))[1]
         name = norm_name(words[0].text) if words else ''
+        arg_texts = [w.text for w in words[1:]]
+        # pure truncation: nothing (or nothing meaningful) is written, so the redirect only empties the file
+        pure = (not words or name in (':', 'true', 'false')
+                or (name == 'cat' and all(t == '/dev/null' for t in arg_texts))
+                or (name in ('echo', 'printf') and all(t in ('', '-n', '-e', '-ne', '-en') for t in arg_texts)))
+        written = None
+        if name in ('echo', 'printf'):
+            written = ' '.join(t for t in arg_texts if t not in ('-n', '-e', '-ne', '-en'))
+            if name == 'printf' or '-e' in arg_texts:
+                written = decode_ansi(written)
+        bodies = [r.body for r in cmd.redirs if r.op in ('<<', '<<-')]
+        if bodies and name in ('cat', 'tee', ''):
+            written = '\n'.join(bodies)
         for r in cmd.redirs:
             r.target = self.resolve(r.target)
             target = r.target.text if r.target is not None else ''
             if r.target is not None:
                 self.subs(r.target, depth, visible=False)
+            is_write = False
             if r.op in ('>', '>|', '&>', '>&') and r.fd in (None, '1', '2') or r.op in ('>>', '&>>'):
                 if target and r.op != '>&' or (r.op == '>&' and target and not re.fullmatch(r'[0-9-]+', target)):
-                    self.write_target(target, truncating=r.op not in ('>>', '&>>'), via='redirect')
+                    self.write_target(r.target, truncating=r.op not in ('>>', '&>>'), via='redirect', pure=pure)
+                    is_write = True
+            elif r.op in ('>>', '&>>') or r.op in ('>', '>|') and r.fd not in (None, '1', '2'):
+                if target:
+                    self.write_target(r.target, truncating=r.op in ('>', '>|'), via='redirect', pure=pure)
+                    is_write = True
+            if is_write and written is not None and r.target is not None:
+                self.note_created(r.target, written)
             if r.op in ('<', '<>') and target:
                 if self.is_cred_path(target, r.target):
                     ctx.secret_seen += 1
@@ -1271,6 +1449,13 @@ class Analyzer:
                 pass
         for name in names:
             self.apply(name, words, cmd, pl, idx, depth)
+
+    def _which_name(self, head):
+        """`$(which rm)`, `$(command -v rm)`, `` `type -p rm` ``: the named command."""
+        if len(head.subs) != 1 or head.text.replace(SUB_MARK, '').strip():
+            return None
+        m = re.fullmatch(r'\s*(?:which|command\s+-[vV]|type\s+-[pP]|whence\s+-p)\s+([^\s;|&]+)\s*', head.subs[0])
+        return norm_name(m.group(1)) if m else None
 
     def names_for(self, head):
         out = []
@@ -1523,13 +1708,18 @@ class Analyzer:
         pos = _nondash(args)
         if not pos:
             ctx.cwd = ctx.home
+            ctx.cwd_unknown = ctx.cwd_protected_unknown = False
             return
-        target = pos[0].text
-        if target == '-' or is_dynamic_path(target):
+        word = pos[0]
+        target = word.text
+        if target == '-' or is_dynamic_path(target) or word.dynamic:
             ctx.cwd_unknown = True
+            ctx.cwd_protected_unknown = bool(PROTECTED_TEXT.search(target) or self._hint_points_at_protected(word))
             return
+        if ctx.cwd_unknown and not target.startswith(('/', '~')):
+            return  # relative to a directory the guard could not resolve: still unknown
         ctx.cwd = norm_path(target, ctx, ctx.cwd)
-        ctx.cwd_unknown = False
+        ctx.cwd_unknown = ctx.cwd_protected_unknown = False
 
     # ---- find
     def find(self, args, depth, pl, idx):
@@ -1581,9 +1771,12 @@ class Analyzer:
         ctx = self.ctx
         texts = [a.text for a in args]
         i = 0
+        cwd_word = None
         while i < len(texts):
             t = texts[i]
             if t in ('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env'):
+                if t in ('-C', '--work-tree') and i + 1 < len(args):
+                    cwd_word = args[i + 1]
                 i += 2
             elif t.startswith('-'):
                 i += 1
@@ -1591,6 +1784,13 @@ class Analyzer:
                 break
         sub = texts[i] if i < len(texts) else ''
         rest = texts[i + 1:]
+        if sub == 'clean':
+            self.git_clean(args[i + 1:], rest, cwd_word)
+        if sub == 'init' and rest:
+            for w in _nondash(args[i + 1:])[-1:]:
+                self.note_created(_join_word(w, '.git'))
+        elif sub == 'init':
+            self.note_created(_literal_word(posixpath.join(ctx.cwd, '.git')))
         if sub == 'config':
             letters = _flag_letters(args[i + 1:])
             longs = {t.split('=')[0] for t in rest if t.startswith('--')}
@@ -1746,7 +1946,7 @@ class Analyzer:
         candidates = {path}
         try:
             if os.path.lexists(path) and len(path) < 1024:
-                candidates.add(os.path.realpath(path).casefold())
+                candidates.add(os.path.realpath(path))
         except (OSError, ValueError):
             pass
         for p in candidates:
@@ -1754,7 +1954,7 @@ class Analyzer:
                 return True
         if any(ch in text for ch in '*?['):
             for sample in c.cred_samples:
-                if fnmatch.fnmatchcase(norm_path(sample, ctx, ctx.cwd), path):
+                if fnmatch.fnmatchcase(norm_path(sample, ctx, ctx.cwd).casefold(), path.casefold()):
                     return True
         if is_dynamic_path(text):
             tail = path.split('$')[-1] if '$' in path else ''
@@ -1856,97 +2056,208 @@ class Analyzer:
                 ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or key directly', 'use command_guard.py approve-delete')
 
     # ---- destructive
-    def write_target(self, target, truncating, via):
+    #
+    # Every target goes through target_class(): it expands the word's alternatives (brace expansion), resolves
+    # ~, $HOME, cd and symlinks, and returns the strongest protection that applies:
+    #   'log'      Tier A: logs, WALs, approval state. Every destructive form is refused.
+    #   'root'     Tier B: anything else in ~/.claude, ~/.codex, ~/.agent-harness (minus allow_subtrees).
+    #   'ancestor' a directory that contains a protected root (/, /Users, ~, ~/.claude, a glob reaching one).
+    #   'unknown'  an unresolved variable or substitution whose text points at a protected location.
+    # A literal, existing target covered by a single-use approval (approve-delete) is let through.
+
+    RANK = {None: 0, 'root': 1, 'unknown': 2, 'log': 3, 'ancestor': 3}
+
+    def _path_class(self, path):
+        c = self.c
+        folded = path.casefold()
+        best = classify_segs(c, Compiled._segs(folded))
+        if best == 'log-name':
+            # a WAL-shaped name outside the harness trees: test data inside a git working tree is not a WAL
+            best = None if self._git_top(path, 0) else 'log'
+        if folded in c.state_files:
+            return 'log'
+        if best != 'log' and any(rx.search(folded) for rx in c.wal_regexes):
+            best = 'log'
+        if best is None or best == 'root':
+            real = _resolve_prefix(self._through_links(path))
+            if real and real.casefold() != folded:
+                other = classify_segs(c, Compiled._segs(real.casefold()))
+                other = 'log' if other == 'log-name' else other
+                if self.RANK[other] > self.RANK[best]:
+                    best = other
+        if best == 'root' and not any(ch in path for ch in GLOB_CHARS) and not is_dynamic_path(path):
+            if self._session_file(path) or self._inside_repo(path):
+                return None
+        return best
+
+    def _through_links(self, path):
+        """Rewrite a prefix that is a symlink created earlier in this command to the link's target."""
+        folded = path.casefold()
+        for link, target in self.ctx.links.items():
+            lf = link.casefold()
+            if folded == lf or folded.startswith(lf + '/'):
+                return target + path[len(link):]
+        return path
+
+    def _session_file(self, path):
+        """A regular file directly in ~/.agent-harness/work/<session>/ (kits, packets, notes)."""
+        segs = Compiled._segs(path)
+        for h in self.c.homes:
+            base = Compiled._segs(h) + ['.agent-harness', 'work']
+            if len(segs) == len(base) + 2 and segs[:len(base)] == base:
+                return not os.path.isdir(path) and not os.path.islink(path)
+        return False
+
+    def _inside_repo(self, path):
+        """Inside a git working tree whose top level is strictly below a Tier B root (never the root itself)."""
+        segs = Compiled._segs(path)
+        root_len = None
+        for r in self.c.roots:
+            if len(segs) > len(r) and _prefix_match(segs, r):
+                root_len = len(r)
+                break
+        if root_len is None:
+            return False
+        # the top must sit two or more levels below the root, so ~/.claude/hooks or ~/.agent-harness/work being
+        # a repository never exempts the harness's own infrastructure
+        return self._git_top(path, root_len + 2)
+
+    def _git_top(self, path, min_len):
+        """True when an ancestor of `path` (not path itself) with at least min_len segments holds a `.git` that
+        existed before this command."""
+        parts = [s for s in path.split('/') if s]
+        for k in range(len(parts) - 1, max(min_len, 1) - 1, -1):
+            top = '/' + '/'.join(parts[:k])
+            marker = top + '/.git'
+            if marker.casefold() in self.ctx.created:
+                return False  # made by this same command
+            try:
+                if os.path.lexists(marker):
+                    return True
+            except (OSError, ValueError):
+                return False
+        return False
+
+    def _hint_points_at_protected(self, word):
+        texts = list(word.subs)
+        for v in word.vars:
+            name = v.lstrip('!')
+            if name not in self.ctx.vars and PROTECTED_VAR_NAME.search(name):
+                return True
+            hint = self.ctx.var_hints.get(name)
+            if hint:
+                texts.append(hint)
+        return any(PROTECTED_TEXT.search(t) for t in texts)
+
+    def target_class(self, word):
+        """(class, shown path, literal) for the strongest protection any expansion of `word` hits."""
         ctx = self.ctx
-        if not target or target in ('/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty') or target.startswith('&'):
-            return
-        path = norm_path(target, ctx)
-        if path in ctx.c.state_files or any(path == s for s in ctx.c.state_files):
-            ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or its key directly',
-                    'use command_guard.py approve-delete after the Dropbox backup is verified')
-            return
-        if truncating:
-            self.protected_path(path, target, 'truncates via redirect', exact_only=False, allow_ancestor=False)
+        best, shown, literal = None, '', True
+        if ctx.cwd_protected_unknown and word.alts and not word.alts[0].startswith(('/', '~')):
+            return 'unknown', word.alts[0], False
+        for alt in word.alts[:32]:
+            path = norm_path(alt, ctx)
+            dynamic = is_dynamic_path(alt) or word.dynamic
+            cls = self._path_class(path)
+            if dynamic:
+                literal = False
+                if cls is None and self._dynamic_suffix_protected(path):
+                    cls = 'unknown'
+                if cls is None and self._hint_points_at_protected(word):
+                    cls = 'unknown'
+            if any(ch in alt for ch in GLOB_CHARS):
+                literal = False
+            if ctx.cwd_unknown and not alt.startswith(('/', '~')) and cls is None:
+                head = posixpath.normpath(alt).split('/')[0].casefold()
+                if head in RELATIVE_PROTECTED_NAMES or head.startswith('history'):
+                    cls = 'unknown'
+            if self.RANK[cls] > self.RANK[best]:
+                best, shown = cls, path
+        return best, shown, literal
+
+    def _dynamic_suffix_protected(self, path):
+        """`$X/projects`, `$DIR/.claude`, `$(..)/wals`: an unresolved prefix followed by a protected tail."""
+        folded = path.casefold()
+        marker = folded.rfind('$')
+        for m in (SUB_MARK, ARITH_MARK):
+            marker = max(marker, folded.rfind(m))
+        tail = folded[marker + 1:]
+        tail = tail.split('/', 1)[1] if '/' in tail else ''
+        tail_segs = Compiled._segs(tail)
+        if not tail_segs:
+            return False
+        if any(s in self.c.seg_names for s in tail_segs) or tail_segs[-1] in self.c.file_names:
+            return True
+        for r in self.c.protected + self.c.roots:
+            for k in range(1, len(r) + 1):
+                if all(_seg_eq(tail_segs[i], r[len(r) - k + i]) for i in range(min(k, len(tail_segs)))) \
+                        and r[len(r) - k].startswith('.'):
+                    return True
+        return False
+
+    def refuse(self, what, word, tiers=('log', 'root', 'ancestor', 'unknown'), need_existing=False):
+        """Add a log_delete finding when `word` resolves into one of `tiers`. Returns True when it did."""
+        ctx = self.ctx
+        cls, path, literal = self.target_class(word)
+        if cls is None or cls not in tiers:
+            return False
+        if need_existing and literal and cls in ('log', 'root') and not _lexists(path) \
+                and path.casefold() not in ctx.created:
+            return False  # creating a new file is not destructive
+        if literal and cls in ('log', 'root') and ctx.marker is not None and ctx.marker(path):
+            return False
+        label = {'log': 'a protected log, WAL or approval-state location', 'root': 'a protected harness directory',
+                 'ancestor': 'a directory that contains protected logs', 'unknown':
+                 'a path the guard cannot resolve that points at protected logs'}[cls]
+        name = posixpath.basename(path.rstrip('/')) or path
+        ctx.add(LOG_DELETE, 'log-delete',
+                ('%s targets %s (%s). Claude/Codex/harness logs and state are never deleted, moved or truncated '
+                 'without a verified backup' % (what, label, name[:60]))[:300],
+                'back up to Dropbox (rclone copy), then `command_guard.py approve-delete --path P --remote REMOTE`, '
+                'then delete the literal path' + ('' if literal else '; spell out the literal path, globs and '
+                                                  'variables cannot be approved'))
+        return True
 
     def protected_target(self, what, word):
-        for alt in word.alts[:32]:
-            self.protected_path(norm_path(alt, self.ctx), alt, what)
+        self.refuse(what, word)
 
-    def protected_path(self, path, shown, what, exact_only=False, allow_ancestor=True):
+    def write_target(self, target_word, truncating, via, pure=True):
+        if target_word is None:
+            return
+        target = target_word.text
+        if not target or target in ('/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty') or target.startswith('&'):
+            return
+        if self.state_dest(target_word):
+            return
+        if truncating:
+            tiers = ('log', 'root', 'unknown') if pure else ('log', 'unknown')
+            self.refuse('truncation by redirect', target_word, tiers=tiers, need_existing=True)
+        self.note_created(target_word)
+
+    def note_created(self, word, text=None):
+        for alt in word.alts[:32]:
+            path = norm_path(alt, self.ctx).casefold()
+            self.ctx.created.add(path)
+            if text is not None:
+                self.ctx.written[path] = text[:262144]
+
+    def state_dest(self, word):
         ctx = self.ctx
-        c = ctx.c
-        hit = None
-        segs = Compiled._segs(path)
-        dynamic = '$' in path or SUB_MARK.casefold() in path
-        if dynamic:
-            pieces = path.split('$')
-            tail_part = pieces[-1]
-            tail_segs = Compiled._segs(tail_part.split('/', 1)[1]) if '/' in tail_part else []
-            for r in c.protected:
-                for k in range(1, len(r) + 1):
-                    if tail_segs and r[-k:] == tail_segs[:k]:
-                        hit = 'a path with an unresolved variable ending in a protected log location'
-                        break
-                if hit:
-                    break
-            if not hit and ctx.cwd_unknown and not path.startswith('/'):
-                hit = None
-        else:
-            if ctx.cwd_unknown and not shown.startswith(('/', '~')) and not os.path.isabs(shown):
-                leaf = Compiled._segs(path)[:1]
-                names = {'projects', 'wals', 'sessions', 'history.jsonl', 'transcripts', 'archived_sessions'}
-                if any(p in names or p.startswith('history') for p in [posixpath.normpath(shown).split('/')[0].casefold()]):
-                    hit = 'a relative log path after a cd the guard could not resolve'
-            for r in c.protected:
-                under = len(segs) >= len(r) and all(fnmatch.fnmatchcase(segs[k], r[k]) for k in range(len(r)))
-                if under or (any(ch in path for ch in '*?[') and seg_match(segs, r)):
-                    hit = hit or 'a protected log location'
-                    break
-            if not hit and allow_ancestor:
-                for a in c.ancestors:
-                    if (segs == a) or (any(ch in path for ch in '*?[') and seg_match(segs, a) and len(segs) <= len(a)):
-                        hit = hit or 'a parent directory of protected logs'
-                        break
-                    if any(ch in path for ch in '*?[') and len(segs) < len(a) + 4 and seg_match(segs, a) and len(segs) <= len(a) + 1:
-                        for r in c.protected:
-                            if seg_match(segs, r):
-                                hit = hit or 'a glob that expands to a protected log location'
-                                break
-            if not hit:
-                for rx in c.wal_regexes:
-                    if rx.search(path):
-                        hit = 'a work-directory WAL'
-                        break
-            if not hit:
-                try:
-                    if os.path.lexists(path) and len(path) < 1024:
-                        real = os.path.realpath(path).casefold()
-                        if real != path:
-                            rsegs = Compiled._segs(real)
-                            for r in c.protected:
-                                if len(rsegs) >= len(r) and rsegs[:len(r)] == r:
-                                    hit = 'a symlink into a protected log location'
-                                    break
-                except (OSError, ValueError):
-                    pass
-        if hit is None:
-            return
-        glob_or_dynamic = dynamic or any(ch in path for ch in '*?[')
-        if not glob_or_dynamic and ctx.marker is not None and ctx.marker(path):
-            return
-        ctx.add(LOG_DELETE, 'log-delete',
-                '%s: %s. Claude/Codex logs and WALs are never deleted without a verified backup (target is %s)' % (what, hit, posixpath.basename(path) or path)[:300],
-                'back up to Dropbox (rclone copy), then `command_guard.py approve-delete --path P --remote REMOTE`, then delete the literal path' + ('; spell out the literal path, globs and variables cannot be approved' if glob_or_dynamic else ''))
+        for alt in word.alts[:32]:
+            if norm_path(alt, ctx).casefold() in ctx.c.state_files:
+                ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or its key directly',
+                        'use command_guard.py approve-delete after the Dropbox backup is verified')
+                return True
+        return False
 
     def destructive(self, name, args, texts):
         ctx = self.ctx
         nd = _nondash(args)
         if name in RM_CMDS:
             if ctx.ps:
-                nd = [a for a in args if not a.text.startswith('-') or True]
-                nd = [a for a in nd if not re.match(r'^-[A-Za-z]+$', a.text)]
+                nd = [a for a in args if not re.match(r'^-[A-Za-z]+$', a.text)]
             for w in nd:
-                self.protected_target(name, w)
+                self.refuse(name, w)
         elif name in MV_CMDS:
             dest, sources = None, nd
             if '-t' in texts or '--target-directory' in texts:
@@ -1956,85 +2267,110 @@ class Analyzer:
             elif len(nd) >= 2:
                 dest, sources = nd[-1], nd[:-1]
             for w in sources:
-                self.protected_target(name, w)
-            if dest is not None:
-                self.exact_protected(dest, name)
-                self.state_dest(dest)
+                self.refuse(name + ' (moves it away)', w)
+            if dest is not None and not self.state_dest(dest):
+                self.overwrite_dest(name, dest)
         elif name == 'truncate':
-            for w in nd:
-                if re.fullmatch(r'[+-<>/%]?[0-9]+[KMGTPEZY]?B?', w.text, re.I):
+            skip = False
+            for i, w in enumerate(args):
+                if skip:
+                    skip = False
                     continue
-                self.protected_target('truncate', w)
+                if w.text in ('-s', '--size', '-r', '--reference'):
+                    skip = True
+                    continue
+                if w.text.startswith('-'):
+                    continue
+                self.refuse('truncate', w, tiers=('log', 'root', 'unknown'), need_existing=True)
         elif name in ('tee', 'out-file', 'set-content'):
-            if not (_flag_letters(args) & {'a'} or '--append' in texts or any(t.lower() == '-append' for t in texts)):
-                for w in nd:
-                    self.protected_target(name + ' (overwrites)', w)
+            appending = _flag_letters(args) & {'a'} or '--append' in texts or any(t.lower() == '-append' for t in texts)
             for w in nd:
-                self.state_dest(w)
+                if self.state_dest(w):
+                    continue
+                if not appending:
+                    self.refuse(name + ' (overwrites)', w, tiers=('log', 'root', 'unknown'), need_existing=True)
         elif name == 'dd':
             for a in args:
                 if a.text.startswith('of='):
                     fake = Word()
-                    fake.alts = [a.text[3:]]
-                    self.protected_target('dd of=', fake)
-                    self.state_dest(fake)
+                    fake.alts = [x[3:] for x in a.alts]
+                    fake.dynamic, fake.subs, fake.vars = a.dynamic, a.subs, a.vars
+                    if not self.state_dest(fake):
+                        self.refuse('dd of=', fake, tiers=('log', 'root', 'unknown'), need_existing=True)
         elif name in ('cp', 'copy-item', 'cpi', 'copy', 'install', 'ln'):
-            if nd:
-                self.exact_protected(nd[-1], name)
-                self.state_dest(nd[-1])
+            if len(nd) >= 2 or (nd and name == 'ln'):
+                dest = nd[-1]
+                if self.state_dest(dest):
+                    return
+                sources = [a.text for a in nd[:-1]]
+                if any(s in ('/dev/null', '/dev/zero') for s in sources):
+                    self.refuse(name + ' from /dev/null (truncates)', dest, tiers=('log', 'root', 'unknown'),
+                                need_existing=True)
+                else:
+                    self.overwrite_dest(name, dest)
         elif name in ('sed', 'perl'):
             if _flag_letters(args) & {'i'} or any(t.startswith('-i') or t.startswith('--in-place') for t in texts):
-                for w in nd[1:] if name == 'sed' and nd else nd:
-                    self.protected_target(name + ' -i', w)
-                    self.state_dest(w)
+                for w in (nd[1:] if name == 'sed' and nd else nd):
+                    if not self.state_dest(w):
+                        self.refuse(name + ' -i (rewrites in place)', w, tiers=('log', 'unknown'))
         elif name == 'rsync':
-            if any(t.startswith('--delete') or t == '--remove-source-files' for t in texts) or '--del' in texts:
-                pos = [a for a in nd]
-                if any(t.startswith('--delete') or t == '--del' for t in texts) and pos:
-                    self.protected_target('rsync --delete (destination)', pos[-1])
-                if '--remove-source-files' in texts:
-                    for w in pos[:-1]:
-                        self.protected_target('rsync --remove-source-files (source)', w)
+            if any(t.startswith('--delete') or t.startswith('--del') or t == '--remove-source-files'
+                   or t == '--remove-sent-files' for t in texts):
+                pos = [a for a in nd if not self._remote_spec(a.text)]
+                if any(t.startswith('--del') for t in texts) and nd and not self._remote_spec(nd[-1].text):
+                    self.refuse('rsync --delete (destination)', nd[-1])
+                if '--remove-source-files' in texts or '--remove-sent-files' in texts:
+                    for w in pos[:-1] if pos and pos[-1] is nd[-1] else pos:
+                        self.refuse('rsync --remove-source-files (source)', w)
         elif name == 'rclone':
-            sub = [a for a in nd if True]
-            subs = [a.text.casefold() for a in sub]
+            subs = [a.text.casefold() for a in nd]
             for i, s in enumerate(subs):
                 if s in ('move', 'moveto'):
-                    for w in sub[i + 1:i + 2]:
-                        self.protected_target('rclone %s (deletes the source after copy)' % s, w)
+                    for w in nd[i + 1:i + 2]:
+                        self.refuse('rclone %s (deletes the source after copy)' % s, w)
                     break
-                if s in ('sync', 'copy', 'copyto'):
-                    if s == 'sync':
-                        for w in sub[i + 2:i + 3]:
-                            self.protected_target('rclone sync (deletes extra files in the destination)', w)
+                if s in ('sync', 'bisync'):
+                    for w in nd[i + 1:i + 3] if s == 'bisync' else nd[i + 2:i + 3]:
+                        self.refuse('rclone %s (deletes files in the destination)' % s, w)
+                    break
+                if s in ('copy', 'copyto', 'check', 'ls', 'lsf', 'lsd', 'lsjson', 'size', 'about'):
                     break
                 if s in ('delete', 'deletefile', 'purge', 'rmdir', 'rmdirs', 'cleanup'):
-                    for w in sub[i + 1:i + 2]:
-                        self.protected_target('rclone %s' % s, w)
+                    for w in nd[i + 1:i + 2]:
+                        self.refuse('rclone %s' % s, w)
                     break
-        elif name in ('tar', 'zip'):
+        elif name in ('tar', 'zip', 'bsdtar', 'gtar'):
             if '--remove-files' in texts or (name == 'zip' and (_flag_letters(args) & {'m'} or '--move' in texts)):
                 for w in nd:
-                    self.protected_target(name + ' (removes source files)', w)
+                    self.refuse(name + ' (removes source files)', w)
+
+    @staticmethod
+    def _remote_spec(text):
+        return bool(re.match(r'^[A-Za-z0-9_.@-]+:(?!/)', text)) or bool(re.match(r'^[A-Za-z0-9_.@-]+::', text)) \
+            or bool(re.match(r'^[A-Za-z0-9_.@-]+:/', text) and not text.startswith('/'))
+
+    def overwrite_dest(self, what, word):
+        """cp/mv/ln/install onto an existing Tier A file (or into a protected dir by glob/variable)."""
+        cls, path, literal = self.target_class(word)
+        if cls == 'log' and literal and os.path.isdir(path):
+            return  # copying into a log directory adds a file; it does not replace one
+        if cls in ('log', 'unknown') or cls == 'ancestor' and literal and not os.path.isdir(path):
+            self.refuse(what + ' (overwrites)', word, tiers=('log', 'unknown', 'ancestor'), need_existing=True)
 
     def exact_protected(self, word, what):
-        ctx = self.ctx
-        for alt in word.alts[:32]:
-            path = norm_path(alt, ctx)
-            segs = Compiled._segs(path)
-            for r in ctx.c.protected:
-                if segs == r and ctx.marker is None or segs == r and not ctx.marker(path):
-                    ctx.add(LOG_DELETE, 'log-overwrite', '%s overwrites a protected log location' % what,
-                            'back up first and use command_guard.py approve-delete')
-                    return
+        self.overwrite_dest(what, word)
 
-    def state_dest(self, word):
-        ctx = self.ctx
-        for alt in word.alts[:32]:
-            if norm_path(alt, ctx) in ctx.c.state_files:
-                ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or its key directly',
-                        'use command_guard.py approve-delete after the Dropbox backup is verified')
-                return
+    def git_clean(self, args, texts, cwd_word):
+        """git clean -f inside a protected tree removes untracked logs and state."""
+        letters = _flag_letters(args)
+        if not ('f' in letters or '--force' in texts) or 'n' in letters or '--dry-run' in texts:
+            return
+        target = cwd_word
+        if target is None:
+            fake = Word()
+            fake.alts = [self.ctx.cwd]
+            target = fake
+        self.refuse('git clean', target)
 
     # ---- kills
     def kill_cmd(self, name, args, texts):
