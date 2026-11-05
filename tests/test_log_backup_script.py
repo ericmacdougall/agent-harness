@@ -38,6 +38,8 @@ if argv and argv[0] == "copy":
             sys.stderr.write(os.environ.get("FAKE_ERR", ""))
             sys.exit(1)
     forced = os.environ.get("FAKE_EXIT")
+    if forced and os.environ.get("FAKE_EXIT_MATCH") and os.environ["FAKE_EXIT_MATCH"] not in argv:
+        forced = None
     if forced:
         sys.exit(int(forced))
     match = os.environ.get("FAKE_FAIL_MATCH")
@@ -544,7 +546,7 @@ class Failure(Case):
         link_target.mkdir()
         link = self.tmp / "stagelink"
         os.symlink(link_target, link)
-        bad = ["relative/stage", "-x", str(self.home), str(self.home / ".claude/projects/stg"),
+        bad = ["relative/stage", "-x", "/", "//", "/tmp/elsewhere", str(self.home), str(self.home / ".claude/projects/stg"),
                str(self.home / ".claude"), str(self.home / ".agent-harness/work/stg"),
                str(self.home / ".agent-harness"), str(self.tmp / "a" / ".." / "b"), str(link)]
         mode_before = link_target.stat().st_mode
@@ -588,6 +590,40 @@ class Failure(Case):
             n_sources = len(self.copies())
             self.assertGreater(n_sources, 0)
             self.assertEqual(len({tuple(c[-2:]) for c in self.copies()}), n_sources)  # one attempt per source, no retry
+
+    def test_bulk_only_budget_exit_withholds_only_the_bulk_marker(self):
+        done = self.run_script(FAKE_EXIT="10", FAKE_EXIT_MATCH="--min-age")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertTrue(self.last_ok().exists())     # transcripts completed
+        self.assertFalse(self.bulk_ok().exists())    # the bulk gap is not hidden
+
+    def test_non_numeric_budget_or_retry_settings_are_refused_before_any_copy(self):
+        for name in ("LOG_BACKUP_BUDGET_SECONDS", "LOG_BACKUP_RETRIES", "LOG_BACKUP_RETRY_SLEEP"):
+            for value in ("1.5", "abc", "-1", "999999", "x[$(id)]", " 5"):
+                if self.calls.exists():
+                    self.calls.unlink()
+                done = self.run_script(**{name: value})
+                self.assertEqual(done.returncode, 2, (name, value))
+                self.assertEqual(self.copies(), [], (name, value))
+                self.assertFalse(self.last_ok().exists() or self.bulk_ok().exists())
+
+    def test_hostile_work_directory_names_never_cause_a_wrong_exclusion(self):
+        base = ".agent-harness/work/t1"
+        names = ["a\\b", "br{ace}", "star*", "new\nline", "foo"]
+        for n in names[:4]:
+            self.put(f"{base}/{n}/.git", b"gitdir: x")
+            self.put(f"{base}/{n}/src.txt", b"code")
+        self.put(f"{base}/x\nfoo/.git", b"gitdir: x")                  # would excise every dir named foo if mis-split
+        self.put(f"{base}/keep/foo/state.json", b"{}")
+        self.put(f"{base}/deep/1/2/3/4/5/6/7/wt/.git", b"gitdir: x")  # deeper than the old depth limit
+        self.put(f"{base}/deep/1/2/3/4/5/6/7/wt/code.py", b"code")
+        self.put(".agent-harness/work/.git/HEAD", b"ref")                  # the work root is itself a checkout
+        done = self.local_run()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        files = self.remote_files()
+        self.assertIn(f"{base}/keep/foo/state.json", files)               # a plain dir named foo survives
+        self.assertNotIn(f"{base}/deep/1/2/3/4/5/6/7/wt/code.py", files)
+        self.assertFalse([f for f in files if f.startswith(".agent-harness/work/.git/")])
 
     def test_used_up_time_budget_skips_the_remaining_sources_and_stays_non_fresh(self):
         done = self.run_script(LOG_BACKUP_BUDGET_SECONDS="0")
