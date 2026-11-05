@@ -454,6 +454,27 @@ class CredentialScriptTests(Base):
             rc = cg.hook_main('exit2', stdin_bytes=payload, compiled=compiled, marker=False)
         self.assertEqual(rc, 2, (err.getvalue() + out.getvalue())[:200])
 
+    def test_a_slow_read_does_not_skip_the_second_shell_reading(self):
+        """`>!` is judged once per shell reading, and the second reading is skipped when the first took too long to repeat
+        (goodqa#14657). The credential check's own read time must not count toward that: here only the bash reading runs
+        the dangerous file on disk, so skipping it would turn main's block into a warning."""
+        slow_py = self.write('x/slow.py', b'print("hello")\n')
+        ondisk = self.write('x/ondisk.sh', b'#!/bin/bash\nrm -rf ~/.claude/projects\n')
+        command = 'python3 %s; echo hi >! %s; bash %s' % (slow_py, ondisk, ondisk)
+        self.assertFalse(cg.raw_sensitive(command))
+        compiled = cg.Compiled(cg.load_policy(), cwd=str(self.home))
+        self.assertEqual(cg.decide(command, compiled, cwd=str(self.home))[0], 'block')
+        real = cg._read_prefix
+        for delay in (1.6, 2.0, 2.4):
+            def slow(path, limit, delay=delay):
+                if str(path).endswith('slow.py'):
+                    time.sleep(delay)
+                return real(path, limit)
+
+            with mock.patch.object(cg, '_read_prefix', side_effect=slow):
+                verdict, message = cg.decide(command, compiled, cwd=str(self.home))[:2]
+            self.assertEqual(verdict, 'block', '%s: %s' % (delay, message))
+
     def test_a_fifo_is_never_read(self):
         """A file swapped for a FIFO after the existence check must not hang the guard until its alarm."""
         fifo = self.home / 'x/swapped.sh'

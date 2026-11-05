@@ -1612,10 +1612,13 @@ class Analyzer:
         start = ctx.state()
         mark = len(ctx.findings)
         count, began = ctx.budget.count, time.monotonic()
+        read_before = getattr(self, 'credential_seconds', 0.0)
         self._run_tokens(zsh_tokens, depth)
         # a second reading that cannot finish would stop the analysis and lose every later command, so skip it instead;
-        # analyze() then treats the command as unanalysable
-        if not ctx.budget.has_room(2 * (ctx.budget.count - count) + len(text), 2 * (time.monotonic() - began)):
+        # analyze() then treats the command as unanalysable. The credential check's reads are left out of the estimate:
+        # they extend the deadline themselves, and counting them here would let a slow file skip the reading main judges.
+        spent = time.monotonic() - began - (getattr(self, 'credential_seconds', 0.0) - read_before)
+        if not ctx.budget.has_room(2 * (ctx.budget.count - count) + len(text), 2 * max(0.0, spent)):
             ctx.readings_capped = True
             return
         after_zsh = ctx.state()
