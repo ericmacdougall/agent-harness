@@ -6693,6 +6693,289 @@
    ]
   },
   {
+   "cmd": "python3.12 -c \"import os; os.kill(4004,9)\"",
+   "expect": "block",
+   "id": "P-rt2-2-py312",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "python3.11 -c \"import os; os.system('pkill foo')\"",
+   "expect": "block",
+   "id": "P-rt2-2-py311-system",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "/usr/bin/python3.12 -c \"import os; os.kill(4004,9)\"",
+   "expect": "block",
+   "id": "P-rt2-2-abs-py",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "python3.12 - <<EOF\nimport os\nos.kill(4004, 9)\nEOF",
+   "expect": "block",
+   "id": "P-rt2-2-py-heredoc",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "uv run python -c \"import os; os.kill(4004,9)\"",
+   "expect": "block",
+   "id": "P-rt2-2-uv-run",
+   "tags": [
+    "interpreter",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "poetry run python -c \"import os; os.kill(4004,9)\"",
+   "expect": "block",
+   "id": "P-rt2-2-poetry",
+   "tags": [
+    "interpreter",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "npx node -e 'process.kill(4004)'",
+   "expect": "block",
+   "id": "P-rt2-2-npx-node",
+   "tags": [
+    "interpreter",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "sudo python3.12 -c \"import os; os.kill(4004,9)\"",
+   "expect": "block",
+   "id": "P-rt2-2-sudo-py",
+   "tags": [
+    "interpreter",
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "sudo sh <<< 'pkill foo'",
+   "expect": "block",
+   "id": "P-rt2-3-sudo-sh-here",
+   "tags": [
+    "wrapper",
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "nohup sh <<< 'kill 4004'",
+   "expect": "block",
+   "id": "P-rt2-3-nohup-sh-here",
+   "tags": [
+    "wrapper",
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "timeout 5 sh <<< 'pkill foo'",
+   "expect": "block",
+   "id": "P-rt2-3-timeout-sh-here",
+   "tags": [
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "env bash <<< 'pkill foo'",
+   "expect": "block",
+   "id": "P-rt2-3-env-bash-here",
+   "tags": [
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "xargs sh <<< 'pkill foo'",
+   "expect": "block",
+   "id": "P-rt2-3-xargs-sh-here",
+   "tags": [
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "ssh host <<< 'pkill foo'",
+   "expect": "block",
+   "id": "P-rt2-3-ssh-here",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "ssh host bash <<< 'kill 4004'",
+   "expect": "block",
+   "id": "P-rt2-3-ssh-bash-here",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "docker exec -i c sh <<< 'pkill foo'",
+   "expect": "block",
+   "id": "P-rt2-3-docker-sh-here",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "kubectl exec -i pod -- sh <<< 'pkill foo'",
+   "expect": "block",
+   "id": "P-rt2-3-kubectl-sh-here",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "docker exec -i c sh <<'EOF'\npkill foo\nEOF",
+   "expect": "block",
+   "id": "P-rt2-3-docker-heredoc",
+   "tags": [
+    "ssh"
+   ]
+  },
+  {
+   "cmd": "tmux new -d sh -c 'pkill foo'",
+   "expect": "block",
+   "id": "P-rt2-4-tmux-sh-c",
+   "tags": [
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "tmux new-session -d bash -lc 'pkill foo'",
+   "expect": "block",
+   "id": "P-rt2-4-tmux-bash-lc",
+   "tags": [
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "screen -dmS x sh -c 'pkill foo'",
+   "expect": "block",
+   "id": "P-rt2-4-screen-sh-c",
+   "tags": [
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "tmux new-window sh -c 'kill 4004'",
+   "expect": "block",
+   "id": "P-rt2-4-tmux-window",
+   "tags": [
+    "wrapper",
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "parallel sh -c 'kill {}' ::: 4004",
+   "expect": "block",
+   "id": "P-rt2-5-parallel-sh-c",
+   "tags": [
+    "wrapper",
+    "pidfeed"
+   ]
+  },
+  {
+   "cmd": "parallel bash -c 'pkill {}' ::: foo",
+   "expect": "block",
+   "id": "P-rt2-5-parallel-bash-c",
+   "tags": [
+    "wrapper"
+   ]
+  },
+  {
+   "cmd": "$x kill 4004",
+   "expect": "block",
+   "id": "P-rt2-6-x-kill",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "$EMPTY kill 4004",
+   "expect": "block",
+   "id": "P-rt2-6-empty-kill",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "export x=kill; $x 4004",
+   "expect": "block",
+   "id": "P-rt2-6-export",
+   "tags": [
+    "obfuscation",
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "declare x=kill; $x 4004",
+   "expect": "block",
+   "id": "P-rt2-6-declare",
+   "tags": [
+    "obfuscation",
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "readonly x=kill; $x 4004",
+   "expect": "block",
+   "id": "P-rt2-6-readonly",
+   "tags": [
+    "obfuscation",
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "set -- kill 4004; \"$@\"",
+   "expect": "block",
+   "id": "P-rt2-6-set-dashdash",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "f() { \"$@\"; }; f kill 4004",
+   "expect": "block",
+   "id": "P-rt2-6-func-forward",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "g() { sudo \"$@\"; }; g kill 4004",
+   "expect": "block",
+   "id": "P-rt2-6-func-sudo",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "kill -{0,9} 4004",
+   "expect": "block",
+   "id": "P-rt2-10-brace-sig",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
+   "cmd": "kill -s {0,9} 4004",
+   "expect": "block",
+   "id": "P-rt2-10-brace-s",
+   "tags": [
+    "ownership"
+   ]
+  },
+  {
    "cmd": "grep -n \"pkill -f pytest\" notes.md",
    "expect": "allow",
    "id": "N-text00-grep",
@@ -8826,6 +9109,134 @@
    "id": "N-rt22-py-killing-ok",
    "tags": [
     "interpreter"
+   ]
+  },
+  {
+   "cmd": "timeout 300 npx vitest run -t 'kill stale workers'",
+   "expect": "allow",
+   "id": "N-rt2-8-vitest",
+   "tags": [
+    "text"
+   ]
+  },
+  {
+   "cmd": "nohup ./scripts/watch.sh --label 'kill switch test' &",
+   "expect": "allow",
+   "id": "N-rt2-8-nohup-label",
+   "tags": [
+    "text"
+   ]
+  },
+  {
+   "cmd": "nice -n 10 npm run build -- --message 'kill unused code; keep rest'",
+   "expect": "allow",
+   "id": "N-rt2-8-nice-build",
+   "tags": [
+    "text"
+   ]
+  },
+  {
+   "cmd": "python3 -m pytest -k killed",
+   "expect": "allow",
+   "id": "N-rt2-8-pytest-k",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "python3 -c 'print(\"killed\")'",
+   "expect": "allow",
+   "id": "N-rt2-8-py-print-killed",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "perl -pe 's/killed/stopped/' f",
+   "expect": "allow",
+   "id": "N-rt2-8-perl-killed",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "node -e 'console.log(\"killed\")'",
+   "expect": "allow",
+   "id": "N-rt2-8-node-killed",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "python3 - <<EOF\n# the job was killed by OOM\nprint(1)\nEOF",
+   "expect": "allow",
+   "id": "N-rt2-8-py-heredoc-oom",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "python3 -c 'import os; os.kill(os.getpid(), 0)'",
+   "expect": "allow",
+   "id": "N-rt2-8-liveness-expr",
+   "tags": [
+    "interpreter"
+   ]
+  },
+  {
+   "cmd": "uv run python -m pytest -q",
+   "expect": "allow",
+   "id": "N-rt2-2-uv-pytest",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "sudo sh <<< 'ls'",
+   "expect": "allow",
+   "id": "N-rt2-3-sudo-sh-ls",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "tmux new -d sh -c 'ls'",
+   "expect": "allow",
+   "id": "N-rt2-4-tmux-sh-c-ls",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "parallel sh -c 'echo {}' ::: a",
+   "expect": "allow",
+   "id": "N-rt2-5-parallel-sh-echo",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "$x run 4004",
+   "expect": "allow",
+   "id": "N-rt2-6-dynamic-ok",
+   "tags": [
+    "obfuscation"
+   ]
+  },
+  {
+   "cmd": "export x=ls; $x",
+   "expect": "allow",
+   "id": "N-rt2-6-export-ok",
+   "tags": [
+    "plain"
+   ]
+  },
+  {
+   "cmd": "kill -s 0 4001",
+   "expect": "allow",
+   "id": "N-rt2-10-brace-sig-ok",
+   "tags": [
+    "signal0"
    ]
   },
   {

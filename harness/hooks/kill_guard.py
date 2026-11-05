@@ -57,9 +57,10 @@ WRAPPER_NAMES = {'sudo', 'doas', 'env', 'nohup', 'timeout', 'nice', 'ionice', 't
                  'setsid', 'stdbuf', 'chrt', 'taskset', 'unbuffer', 'strace', 'ltrace', 'runuser', 'su', 'sg', 'chroot',
                  'nsenter', 'flock', 'unshare', 'watch', 'xargs', 'parallel', 'systemd-run', 'caffeinate', 'gosu',
                  'firejail', 'tmux', 'screen', 'at', 'batch', 'uv', 'uvx', 'pipx', 'npx', 'bunx', 'pnpx', 'dtruss', 'script',
-                 'arch', 'start', 'call', 'busybox', 'toybox'}
+                 'arch', 'start', 'call', 'busybox', 'toybox', 'poetry', 'pipenv', 'conda', 'pdm', 'rye', 'hatch'}
 REMOTE_WRAPPERS = {'docker-compose', 'oc', 'wsl', 'limactl', 'multipass', 'vagrant', 'colima', 'orb', 'adb', 'gcloud',
                    'aws', 'podman-compose', 'lxc', 'incus', 'ctr', 'crictl'}
+REMOTE_EXEC = {'ssh', 'mosh', 'docker', 'podman', 'kubectl', 'nerdctl', 'oc'}
 GNU_PREFIXED = {'timeout', 'xargs', 'find', 'nohup', 'env', 'nice', 'stdbuf', 'time', 'sudo', 'parallel', 'kill'}
 STOP_COMMANDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'echo', 'printf', 'cat', 'git', 'gh', 'ls', 'sed', 'awk', 'head',
                  'tail', 'less', 'more', 'man', 'which', 'type', 'whereis', 'apt', 'apt-get', 'brew', 'pip', 'pip3',
@@ -74,7 +75,7 @@ DEFAULT_POLICY = {
     'windows_verbs': ['taskkill', 'stop-process', 'spps', 'wmic'],
     'service_kill': {'systemctl': ['kill'], 'launchctl': ['kill'], 'tmux': ['kill-server'], 'pm2': ['kill'],
                      'loginctl': ['kill-session', 'kill-user', 'terminate-user', 'terminate-session']},
-    'script_kill_pattern': r'(?i)(?<![a-z])(?:p|f|posix_)?kill|terminate\(|send_signal|taskkill|invoke-cimmethod|getprocessbyid',
+    'script_kill_pattern': r'(?i)(?<![a-z])(?:p|f|posix_)?kill(?![a-z])|killpg|terminate\(|send_signal|taskkill|killall|invoke-cimmethod|getprocessbyid',
     'pid_finders': ['pgrep', 'pidof', 'ps', 'lsof', 'fuser', 'pstree', 'cat', 'awk', 'grep'],
     'ledger_max_lines': 2000,
     'child_timeout_seconds': 10,
@@ -87,6 +88,9 @@ LIST_FLAGS = {'-l', '-L', '--list', '-t', '--table', '-Ll', '-lL'}
 SIGNAL_NAME = re.compile(r'-(?:sig)?([A-Za-z0-9+]+)', re.I)
 FUNCTION_KW = re.compile(r'\bfunction\s+([A-Za-z_][\w.:-]*)\s*(?:\(\s*\))?\s*\{')
 COPROC_KW = re.compile(r'\bcoproc\s+(?:[A-Za-z_]\w*\s*)?\{')
+INTERPRETER_NAME = re.compile(r'(?:python|pypy)[0-9.]*|node(?:js)?[0-9]*|ruby[0-9.]*|perl[0-9.]*|php[0-9.]*|deno|bun|lua[0-9.]*')
+RUN_OPTS = {'-c', '-s', '-i', '-e', '-lc', '-ic', '--command', '-l', '-S'}  # options that take a command to run
+LAUNCHERS = {'tmux', 'screen', 'at', 'batch', 'watch'}
 PID_OPT_VALUE = re.compile(r'[0-9]+(?:,[0-9]+)*')
 
 
@@ -601,6 +605,12 @@ def make_analyzer_class(cg):
             if name in ('command', 'builtin', 'type', 'which', 'whereis', 'hash') and (
                     name in ('type', 'which', 'whereis', 'hash') or any(a.text in ('-v', '-V') for a in args)):
                 return None  # asks where a program is; runs nothing
+            if name in ('export', 'declare', 'local', 'readonly', 'typeset'):
+                for a in args:
+                    if '=' in a.text and not a.dynamic and not a.text.startswith('-'):
+                        key, _, value = a.text.partition('=')
+                        self.ctx.vars[key] = value
+                        self.ctx.tainted.discard(key)
             head_text = words[0].text.strip()
             if ' ' in head_text and not head_text.startswith('-'):
                 self.script(head_text + ' ' + ' '.join(cg._quote_for_rebuild(a.text) for a in args), depth + 1)
@@ -633,11 +643,17 @@ def make_analyzer_class(cg):
                         if remote:
                             self.remote -= 1
                     return
-                if not remote and (n in STOP_COMMANDS or n in cg.SHELLS or n in cg.INTERPRETERS):
+                if INTERPRETER_NAME.fullmatch(n) or n in cg.SHELLS:
+                    self.inner_words(args[i:], depth, pl, idx, via_xargs=via_xargs)  # uv run python -c ..., tmux new sh -c ...
+                    return
+                if not remote and n in STOP_COMMANDS:
                     return
                 if w.text.startswith(('--split-string=', '-S')) and len(w.text) > 2 and name == 'env':
                     self.script(w.text.split('=', 1)[1] if '=' in w.text else w.text[2:], depth + 1)
-                if (' ' in w.text.strip() or ';' in w.text) and not w.text.startswith('-') and name not in ('xargs', 'parallel'):
+                prev = args[i - 1].text if i else ''
+                value_of_other_option = prev.startswith('-') and prev not in RUN_OPTS and name not in LAUNCHERS
+                if (' ' in w.text.strip() or ';' in w.text) and not w.text.startswith('-') \
+                        and name not in ('xargs', 'parallel') and not value_of_other_option:
                     if remote:
                         self.remote += 1
                     try:
@@ -659,12 +675,16 @@ def make_analyzer_class(cg):
             args = words[1:]
             texts = [a.text for a in args]
             head = words[0]
+            if re.fullmatch(r'\$[@*0-9]', head.text) and KILLISH.search(norm_raw(self.raw)):
+                self.block('dynamic-head', 'positional parameters run a command and the input mentions kill')
             if head.dynamic:
                 hints = ' '.join(self.ctx.var_hints.values()) + ' ' + ' '.join(head.subs)
                 try:
                     hints += ' ' + cg.decode_ansi(hints)
                 except Exception:  # noqa: BLE001
                     pass
+                if args and any(cg.norm_name(a.text) in (self.broad | self.windows | {'kill'}) for a in args[:2]):
+                    self.block('dynamic-head', 'a command name built at run time is followed by a kill verb')  # $x kill 4242
                 spliced = re.sub('[\ue000-\uf8ff]', '', cg.VAR_MARKER.sub('', head.text))
                 elided = any(cg.norm_name(spliced[:p] + spliced[e:]) in (self.broad | self.windows | {'kill'})
                              for p in range(len(spliced)) if spliced[p] == '$'
@@ -702,19 +722,35 @@ def make_analyzer_class(cg):
                 rest = [a for a in args if not a.text.startswith('-')][:1]
                 if rest:
                     self.inner_words(args[args.index(rest[0]):], depth, pl, idx)
-            elif name in cg.INTERPRETERS:
+            elif name in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name):
                 self.check_interpreter(name, texts, cmd)
             self.check_spawn(name, args, texts, depth, pl, idx)
             self.check_text_runners(name, args, texts, cmd, depth)
 
         def check_text_runners(self, name, args, texts, cmd, depth):
             """Commands that run a text argument or here-string as shell code, which the base does not follow."""
-            if name in cg.SHELLS or name in ('at', 'batch'):
-                for redir in getattr(cmd, 'redirs', []):
-                    if redir.op == '<<<' and redir.target is not None:
-                        self.script(redir.target.text, depth + 1)
-                    elif redir.op == '<' and redir.target is not None and name in cg.SHELLS:
-                        self.script_file(redir.target, depth)
+            runs_stdin = name in cg.SHELLS or name in ('at', 'batch') or (
+                (name in WRAPPER_NAMES or name in REMOTE_WRAPPERS or name in REMOTE_EXEC) and any(
+                    cg.norm_name(a.text) in cg.SHELLS or cg.norm_name(a.text) in ('at', 'batch') for a in args))
+            if name in ('ssh', 'mosh'):
+                runs_stdin = True
+            if runs_stdin:
+                remote = name in REMOTE_EXEC or name in REMOTE_WRAPPERS
+                self.remote += 1 if remote else 0
+                try:
+                    for redir in getattr(cmd, 'redirs', []):
+                        if redir.op == '<<<' and redir.target is not None:
+                            self.script(redir.target.text, depth + 1)
+                        elif redir.op == '<' and redir.target is not None:
+                            self.script_file(redir.target, depth)
+                        elif redir.body and redir.op.startswith('<<'):
+                            self.script(redir.body, depth + 1)
+                finally:
+                    self.remote -= 1 if remote else 0
+            if name in ('at', 'batch'):
+                for i, t in enumerate(texts):
+                    if t == '-f' and i + 1 < len(args):
+                        self.script_file(args[i + 1], depth)
             elif name == 'watch':
                 i = 0
                 while i < len(texts) and texts[i].startswith('-'):
@@ -766,7 +802,7 @@ def make_analyzer_class(cg):
                 elif redir.op == '<<<' and redir.target is not None:
                     body += '\n' + redir.target.text
             body = body.replace('kill_guard', '')
-            body = re.sub(r'\b(?:os|process)\.kill\(\s*[\w.]+\s*,\s*0\s*\)', '', body)  # liveness probe
+            body = re.sub(r'\b(?:os|process)\.kill\(\s*[\w.]+(?:\(\))?\s*,\s*0\s*\)', '', body)  # liveness probe
             if self.script_kill is not None and self.script_kill.search(body):
                 self.block('script-kill', 'interpreter code signals processes the guard cannot check')
 
@@ -846,10 +882,11 @@ def make_analyzer_class(cg):
                         continue
                 targets.append(w)
                 i += 1
-            if last_sig == '0':
-                return
-            if any(len(a.alts) >= 32 or (len(a.alts) > 1 and any(x.startswith('-') for x in a.alts)) for a in args):
+            if any(len(a.alts) >= 32 or (len(a.alts) > 1 and (any(x.startswith('-') for x in a.alts) or (
+                    k and args[k - 1].text in ('-s', '-n', '--signal')))) for k, a in enumerate(args)):
                 self.block('unprovable-target', 'a brace expansion is too large or hides an option')
+                return
+            if last_sig == '0':
                 return
             if self.xargs:
                 self.block('pidfeed', 'kill through xargs takes its targets from another command, so none can be '
