@@ -35,6 +35,7 @@ if argv and argv[0] == "copy":
         seen = int(open(counter).read()) if os.path.exists(counter) else 0
         open(counter, "w").write(str(seen + 1))
         if seen < first:
+            sys.stderr.write(os.environ.get("FAKE_ERR", ""))
             sys.exit(1)
     match = os.environ.get("FAKE_FAIL_MATCH")
     if match and any(match in a for a in argv):
@@ -123,7 +124,9 @@ class Case(unittest.TestCase):
         return self.logs / "log-backup.last-ok"
 
 
-ALLOWED_FLAGS = {"--tpslimit", "--transfers", "--contimeout", "--timeout", "--log-file", "--log-level", "--exclude-from", "--backup-dir", "--ignore-case"}
+ALLOWED_FLAGS = {"--tpslimit", "--transfers", "--contimeout", "--timeout", "--log-file", "--log-level", "--exclude-from", "--backup-dir", "--ignore-case",
+                 "--dropbox-batch-mode", "--dropbox-batch-size", "--checkers", "--retries", "--retries-sleep",
+                 "--low-level-retries"}
 
 
 def assert_copy_only(test, calls):
@@ -222,7 +225,7 @@ class CopyOnly(Case):
 
     def test_control_variant_with_a_delete_flag_or_moveto_fails_the_checker(self):
         text = SCRIPT.read_text()
-        for needle, repl in (("args=(copy ", "args=(moveto "), ("--tpslimit 4", "--delete-after --tpslimit 4")):
+        for needle, repl in (("args=(copy ", "args=(moveto "), ("--tpslimit 2", "--delete-after --tpslimit 2")):
             variant = self.tmp / "variant.sh"
             variant.write_text(text.replace(needle, repl))
             (self.tmp / "log-backup.excludes").write_text("*.secret\n")
@@ -374,6 +377,35 @@ class Failure(Case):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertTrue(self.last_ok().exists())
         self.assertIn("retry 1", (self.logs / "log-backup.log").read_text())
+
+    def test_rate_limit_failure_keeps_run_non_fresh_then_succeeds_on_retry(self):
+        err = "ERROR : upload failed: batch upload failed: too_many_write_operations\n"
+        done = self.run_script(FAKE_FAIL_FIRST="1", FAKE_ERR=err, LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)  # no retry budget: a rate-limited source fails the run
+        self.assertFalse(self.last_ok().exists())
+        if self.calls.exists():
+            self.calls.unlink()
+        (self.tmp / "calls.jsonl.count").unlink()
+        done = self.run_script(FAKE_FAIL_FIRST="1", FAKE_ERR=err)  # default retries absorb it
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(self.last_ok().exists())
+
+    def test_rate_limit_settings_match_the_reviewed_live_script(self):
+        self.run_script()
+        argv = self.copies()[0]
+        want = {"--transfers": "2", "--tpslimit": "2", "--checkers": "4", "--dropbox-batch-mode": "sync",
+                "--dropbox-batch-size": "100", "--retries": "10", "--retries-sleep": "30s", "--low-level-retries": "20"}
+        for flag, value in want.items():
+            self.assertEqual(argv[argv.index(flag) + 1], value, flag)
+
+    def test_build_outputs_and_images_never_appear_in_the_remote(self):
+        for d in ("node_modules/x", ".next/x", "dist/x", "build/x", "target/x", ".venv/x", "venv/x", ".gradle/x", ".cache/x"):
+            self.put(f".agent-harness/work/t1/{d}/f.js", b"junk")
+        for name in ("a.vma", "a.vma.zst", "a.qcow2", "a.iso", "work-ledger.key"):
+            self.put(f".agent-harness/work/t1/{name}", b"junk")
+        done = self.local_run()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.remote_files(), set(ORDINARY))
 
     def test_persistent_failure_exhausts_retries_and_is_not_fresh(self):
         done = self.run_script(FAKE_FAIL_FIRST="1000", LOG_BACKUP_RETRIES="1")
