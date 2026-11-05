@@ -945,12 +945,13 @@ def _has_glob(seg):
 
 
 def _fnmatchcase(name, pattern):
-    """fnmatch that cannot raise: Python 3.9 raises re.error on a reversed range such as [z-a], which a shell treats
-    as matching nothing. An exception here would cost the whole command its findings."""
+    """fnmatch that cannot raise: Python 3.9 raises re.error on a reversed range such as [z-a], and an exception here
+    would cost the whole command its findings. It may still match in a shell ([z-ae] matches e), so an unreadable
+    pattern counts as a match: every caller only gets stricter."""
     try:
         return fnmatch.fnmatchcase(name, pattern)
     except re.error:
-        return False
+        return True
 
 
 def _seg_eq(p, r):
@@ -1646,9 +1647,8 @@ class Analyzer:
     def redirects(self, cmd, pl, idx, has_command, depth):
         ctx = self.ctx
         words = self._skip_assigns(strip_reserved(cmd.words))[1]
-        # the lexer adds a `>! word` target to the words for bash's reading; for zsh it is not a word at all, so it must
-        # not turn `cat >! f` or a bare `>! f` into a content write. The bash reading is judged by dispatch
-        words = [w for w in words if not any(w is r.target for r in cmd.redirs)]
+        # a `>! word` target is also in `words` for bash's reading, and heredoc and exec checks below must see it. So
+        # `cat >! f` and a bare `>! f` count as content writes here: on a plain work file they are allowed
         name = norm_name(words[0].text) if words else ''
         arg_texts = [w.text for w in words[1:]]
         # pure truncation: nothing (or nothing meaningful) is written, so the redirect only empties the file
@@ -3408,7 +3408,7 @@ class Analyzer:
         if real.startswith('/System/Volumes/Data/home/') and self._foreign_home(path):
             real = real[len('/System/Volumes/Data'):]
         for cand in (path, real):
-            if self._kept(cand):
+            if self._kept(cand) or any(rx.search(cand.casefold()) for rx in self.c.wal_regexes):
                 return False
             segs = Compiled._segs(cand)
             raw = [s for s in cand.replace('\\', '/').split('/') if s]

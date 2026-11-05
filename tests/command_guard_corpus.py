@@ -901,14 +901,11 @@ OVERWRITE_EXISTING = [
     ('echo x > @HOME@/.claude/NEW-*.txt', 'allow'),
     ('echo x >! @TASK@/existing.log >>! @HOME@/.claude/wals/s/main.jsonl', 'allow'),
     # re-review of 94937f5. N1: a redirect glob must not cost the rest of the command its findings, nor walk disk
-    # outside the protected roots. N2: the word copied for bash does not make `cat >! f` a content write
+    # outside the protected roots
     ("echo x > $'/tmp/a\\x00b/*'; rm -rf @HOME@", 'block'),
     ("echo x > $'@HOME@/.claude/a\\x00b/*'", 'block'),
     ('echo x > /tmp/nope-?/*/*; rm -rf @HOME@/.claude', 'block'),
     ('ls > /tmp/nope-?/*/*', 'allow'),
-    ('cat >! @TASK@/existing.log', 'block'),
-    ('echo >! @TASK@/existing.log', 'block'),
-    ('printf >! @TASK@/existing.log', 'block'),
     ('echo x > "@HOME@/.claude/settings.jso?"', 'allow'),
     # another host's /home/<user> tree: literal plain files only; the file cannot be checked from here
     ('echo x > /home/other/.agent-harness/work/S/T/x.log', 'allow'),
@@ -929,18 +926,50 @@ OVERWRITE_EXISTING = [
     ('echo x > /home/other/.claude/projects/p/s.jsonl', 'block'),
     ('echo x > /home/other/.codex/sessions/2026/r.jsonl', 'block'),
     ('echo x > /root/.agent-harness/work/S/T/x.log', 'block'),
-    # code inspection of fab0cad. WAL-shaped names are tier A on every home form; a bare `>! f` empties the file like
-    # `> f`; a reversed glob range must not raise and lose the rest of the command (Python 3.9)
+    # code inspection of fab0cad. WAL-shaped names are tier A on every home form; a reversed glob range must not raise
+    # and lose the rest of the command (Python 3.9)
     ('echo x > /home/other/.agent-harness/work/S/T/wal/x.log', 'block'),
     ('echo x > /home/other/.agent-harness/work/S/T/wal-1/x.out', 'block'),
     ('echo x > /home/other/.agent-harness/work/S/T/wal_a.log', 'block'),
     ('echo x > /home/other/.agent-harness/work/S/T/wal.1', 'block'),
     ('echo x > /home/other/.agent-harness/work/S/T/walker/x.log', 'allow'),
-    ('>! @TASK@/existing.log', 'block'),
-    ('&>! @TASK@/existing.log', 'block'),
-    ('>&! @TASK@/existing.log', 'block'),
-    ('echo x > @HOME@/.claude/[z-a]', 'allow'),
     ('echo x > /tmp/[z-a]; rm -rf @HOME@/.claude', 'block'),
+    # code inspection of 20d4d6a. The `>!` word stays a word for bash's reading: heredoc and exec checks must see it
+    (">! bash <<'EOF'\nrm -rf @HOME@/.claude/projects\nEOF", 'block'),
+    (">>! bash <<'EOF'\nrm -rf @HOME@/.claude/projects\nEOF", 'block'),
+    ("&>! bash <<'EOF'\nrm -rf @HOME@/.claude/projects\nEOF", 'block'),
+    (">! python3 - <<'PY'\nimport shutil\nshutil.rmtree('@HOME@/.claude/projects')\nPY", 'block'),
+    (">! ssh host <<'EOF'\nrm -rf /home/other/.claude/projects\nEOF", 'block'),
+    ("sudo >! bash <<'EOF'\nrm -rf @HOME@/.claude/projects\nEOF", 'block'),
+    (">! source /dev/stdin <<'EOF'\nrm -rf @HOME@/.claude/projects\nEOF", 'block'),
+    ('>! exec 3<> @HOME@/.claude/wals/s/main.jsonl; echo x >&3', 'block'),
+    ("cat >! @TASK@/NEW-b1.txt <<'E'\nplain words\nE", 'allow'),
+    # a reversed range with a valid member still matches in a shell, and now on every Python
+    ('echo x > @HOME@/.claude/proj[z-ae]cts/p/s.jsonl', 'block'),
+    # accepted (coordinator ruling, goodqa#14634): `>! f` with no content on a plain work file counts as an overwrite
+    ('cat >! @TASK@/existing.log', 'allow'),
+    ('echo >! @TASK@/existing.log', 'allow'),
+    ('printf >! @TASK@/existing.log', 'allow'),
+    ('>! @TASK@/existing.log', 'allow'),
+    ('&>! @TASK@/existing.log', 'allow'),
+    ('>&! @TASK@/existing.log', 'allow'),
+    # the same forms stay refused on tier A and on tier B outside work and scratch
+    ('cat >! @HOME@/.claude/wals/s/main.jsonl', 'block'),
+    ('echo >! @HOME@/.claude/projects/p/s.jsonl', 'block'),
+    ('printf >! @HOME@/.codex/sessions/2026/r.jsonl', 'block'),
+    ('>! @HOME@/.claude/wals/s/main.jsonl', 'block'),
+    ('&>! @HOME@/.claude/projects/p/s.jsonl', 'block'),
+    ('>&! @HOME@/.codex/sessions/2026/r.jsonl', 'block'),
+    ('cat >! @HOME@/.claude/settings.json', 'block'),
+    ('echo >! @HOME@/.claude/hooks/hook.py', 'block'),
+    ('printf >! @HOME@/.agent-harness/bin/tool', 'block'),
+    ('>! @HOME@/.claude/settings.json', 'block'),
+    ('&>! @HOME@/.claude/hooks/hook.py', 'block'),
+    ('>&! @HOME@/.agent-harness/bin/tool', 'block'),
+    ('cat >! @TASK@/receipt.json', 'block'),
+    ('>! @TASK@/kept/evidence.log', 'block'),
+    ('cat >! /home/other/.claude/wals/s/main.jsonl', 'block'),
+    ('>! /home/other/.agent-harness/bin/tool', 'block'),
 ]
 # (target row, words the refusal must carry so the owner knows what to do instead)
 OVERWRITE_HINTS = [

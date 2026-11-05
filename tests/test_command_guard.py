@@ -606,7 +606,7 @@ class OverwriteExistingTests(Fixture):
         (self.home / '.agent-harness/work/S/T/hooklink').symlink_to(self.home / '.claude/hooks')
         failures = [(cmd, want, got) for cmd, want in corpus.OVERWRITE_EXISTING
                     for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
-        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 97)
+        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 122)
         self.assertEqual(failures, [])
 
     def test_other_user_home_link_out_of_the_tree_is_refused(self):
@@ -618,6 +618,8 @@ class OverwriteExistingTests(Fixture):
         self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], 'allow')
         try:
             os.path.realpath = lambda p, **k: settings if p == target else real(p, **k)
+            self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], 'block')
+            os.path.realpath = lambda p, **k: '/home/alice/.agent-harness/work/a/b/wal-1' if p == target else real(p, **k)
             self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], 'block')
             os.path.realpath = lambda p, **k: '/System/Volumes/Data' + target if p == target else real(p, **k)
             self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], 'allow')
