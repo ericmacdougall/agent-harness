@@ -1125,6 +1125,28 @@ BANG_READINGS = [
 ]
 # (row, verdict, working directory): one reading's `cd` must not move the other, and a directory they disagree on counts
 BANG_READINGS_CWD = [
+    # review of 9bd9dde: nested readings that disagree on what a later command uses. A merged value protects only a path
+    # operand, so these depend on the unanalysable outcome
+    ("R='rm -rf'; eval '>! x R=ls'; $R @HOME@/.claude/projects", 'block', '@HOME@/proj'),
+    ("A=-delete; eval '>! x A=-print'; find @HOME@/.claude/projects $A", 'block', '@HOME@/proj'),
+    ("F=b.sh; echo 'rm -rf @HOME@/.claude/projects' > b.sh; eval '>! x F=a.sh'; bash $F", 'block', '@HOME@/proj'),
+    ('echo \'rm -rf @HOME@/.claude/projects\' > run.sh; eval \'>! run.sh printf "cat <<E"\'; bash run.sh', 'block', '@HOME@/proj'),
+    ("cd @HOME@/proj; eval '>! x cd /tmp'; rm -rf ../.claude/projects", 'block', '@HOME@/proj'),
+    ("cd @HOME@; eval '>! x cd /tmp'; rm -rf .c*/projects", 'block', '@HOME@/proj'),
+    ("cd @HOME@; eval '>! x cd /tmp'; rm -rf *", 'block', '@HOME@/proj'),
+    ("cd @HOME@; bash -c '>! x cd /tmp'; rm -rf .c*/projects", 'block', '@HOME@/proj'),
+    ("alias r='rm -rf'; eval '>! x alias r=ls'\nr @HOME@/.claude/hooks", 'block', '@HOME@/proj'),
+    ("cd @HOME@; eval '>! x cd \"$Y\"'; rm -rf .c*/projects", 'block', '@HOME@/proj'),
+    ("R=$(echo rm); eval '>! x R=$(echo ls)'; $R -rf @HOME@/.claude/hooks", 'block', '@HOME@/proj'),
+    ("ln -s @HOME@/.claude/hooks l; eval '>! l ln -s /tmp/plain m'; rm -rf l/x", 'block', '@HOME@/proj'),
+    # no protected text and no code execution next to a delete: the same dispute warns, it does not pass as clean
+    ("cd @HOME@; ssh h '>! x cd /tmp'; rm -rf .c*/projects", 'warn', '@HOME@/proj'),
+    ("cd @HOME@; x=$(>! y cd /tmp); rm -rf .c*/projects", 'warn', '@HOME@/proj'),
+    # both readings agree, or it is the top level where each saw its own later commands: not a dispute
+    ("T=/tmp/a; eval 'echo hi >! out.txt'; echo $T", 'allow', '@HOME@/proj'),
+    ("ssh h 'echo hi >! out.txt'; ls", 'allow', '@HOME@/proj'),
+    ('>! x T=/tmp/a; echo $T', 'allow', '@HOME@/proj'),
+    ('>! x cd /tmp; ls', 'allow', '@HOME@/proj'),
     ('>! x cd /tmp; rm -rf hooks', 'block', '@HOME@/.claude'),
     ('>! cd @HOME@/.claude; rm -rf hooks', 'block', '@HOME@/proj'),
     ('cd @HOME@/.claude >! out.log; rm -rf hooks', 'block', '@HOME@/proj'),
@@ -1132,7 +1154,9 @@ BANG_READINGS_CWD = [
     ("eval '>! T=@HOME@/.claude/hooks'; rm -rf $T", 'block', '@HOME@/proj'),
     ("eval '>! x T=@HOME@/.claude/hooks'; rm -rf $T", 'block', '@HOME@/proj'),
     ("eval '>! x cd @HOME@/.claude'; rm -rf hooks", 'block', '@HOME@/proj'),
-    ("eval '>! cd /var/empty'; rm -rf plain", 'allow', '@HOME@/proj'),
+    # the readings disagree on the directory, and `eval` next to a destructive verb counts as sensitive: a false refusal of
+    # a spelling no real command in the replay uses, accepted so that a dispute is never judged as clean
+    ("eval '>! cd /var/empty'; rm -rf plain", 'block', '@HOME@/proj'),
     ('>! x cd /var/empty; rm -rf plain', 'allow', '@HOME@/proj'),
     ('cd @HOME@/proj >! out.log; rm -rf plain', 'allow', '@HOME@/proj'),
     ("cat > run.py <<'E'\nimport shutil\nshutil.rmtree('.claude/tmp')\nE\npython3 run.py", 'allow', '@HOME@/proj'),

@@ -736,8 +736,82 @@ class OverwriteExistingTests(Fixture):
         self._seed_bang_rows()
         text = "ssh host 'echo x >! /tmp/y; " + 'word ' * 50000 + "'"
         self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'warn')
+        # the skip is what lets the command after it be read: a stop here would never reach it
+        hide = 'rm -rf ~/.c*/projects'
+        self.assertFalse(cg.raw_sensitive(hide))
+        self.assertEqual(self.decide(text + '; ' + hide, cwd='@HOME@/proj')[0], 'block')
         # text that names a protected location fails closed when both readings cannot be judged
         self.assertEqual(self.decide(text + '; ls @HOME@/.claude', cwd='@HOME@/proj')[0], 'block')
+
+    def test_nesting_too_deep_for_python_keeps_what_was_already_refused(self):
+        self._seed_bang_rows()
+        hide = 'rm -rf ~/.c*/projects'
+        deep = 'sudo ' * 5000 + 'ls'
+        self.assertEqual(self.decide(deep, cwd='@HOME@/proj')[0], 'warn')  # it does stop
+        self.assertEqual(self.decide(hide + '; ' + deep, cwd='@HOME@/proj')[0], 'block')
+
+    def test_any_exception_keeps_what_was_already_refused(self):
+        # the hook's alarm raises TimeoutError part way through, and raw text cannot see every finding
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))
+
+        def run(analyzer, command):
+            analyzer.ctx.add(cg.LOG_DELETE, 'r', 'seen before the alarm', 'a')
+            raise TimeoutError('alarm')
+        real = cg.Analyzer.run
+        cg.Analyzer.run = run
+        try:
+            verdict = cg.decide('echo plain', comp)
+        finally:
+            cg.Analyzer.run = real
+        self.assertEqual(verdict[0], 'block')
+        self.assertIn('seen before the alarm', verdict[1])
+        self.assertEqual(cg.decide('echo plain', comp)[0], 'allow')
+
+    def _existing_script(self, name, *lines):
+        self._seed_bang_rows()
+        (self.home / 'proj' / name).write_text('#!/bin/bash\n' + '\n'.join(lines) + '\n')
+        return self.decide('bash ' + name, cwd='@HOME@/proj')[0]
+
+    def test_an_existing_script_past_the_cap_is_not_clean(self):
+        nest = 'plain'
+        for name in 'dcba':
+            nest = 'echo $(>! %s %s)' % (name, nest)
+        self.assertEqual(self._existing_script('deep.sh', nest), 'warn')
+
+    def test_a_stop_in_an_existing_script_keeps_only_what_its_filter_keeps(self):
+        nest = 'plain'
+        for _ in range(10):
+            nest = 'echo $(%s)' % nest
+        # a secret lookup is routine in a repository's own script, so it does not turn the stop into a refusal
+        self.assertEqual(self._existing_script('nest.sh', nest), 'warn')
+        self.assertEqual(self._existing_script('lookup.sh', 'printenv', nest), 'warn')
+        self.assertEqual(self._existing_script('ok.sh', 'printenv', 'echo plain'), 'allow')
+
+    def test_disputes_lists_only_what_a_merge_cannot_keep(self):
+        comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))
+        ctx = cg.Ctx(comp, '/tmp/start')
+        ctx.written['/same'] = 'text'
+        self.assertFalse(ctx.disputes(ctx.state()))
+        changes = (('vars', {'A': '1'}), ('var_hints', {'A': '1'}), ('aliases', {'a': 'b'}), ('links', {'/l': '/t'}),
+                   ('cwd', '/tmp/other'), ('cwd_unknown', True), ('written', {'/same': 'other text'}))
+        for name, value in changes:
+            other = ctx.state()
+            other[name] = value
+            self.assertTrue(ctx.disputes(other), name)
+        # one reading alone wrote a file, or added to a set: a merge keeps both
+        other = ctx.state()
+        other['written'] = {'/same': 'text', '/new': 'x'}
+        other['created'] = {'/new'}
+        other['secret_seen'] = 3
+        self.assertFalse(ctx.disputes(other))
+
+    def test_written_rule_reads_the_real_home_not_a_variable_named_home(self):
+        code = "%s\nshutil.rmtree(%s)\n"
+        for target in ("home / '.claude'", "os.path.join(home, '.claude')"):
+            self.assertFalse(cg.written_code_destroys_root(code % ('home = tmp', target), str(self.home)), target)
+        for target in ("Path.home() / '.claude'", "os.environ['HOME'] + '/.claude'", "os.environ.get('HOME') + '/.claude'",
+                       "os.getenv('HOME') + '/.claude'", "'$HOME/.claude'", "'${HOME}/.claude'", "'~/.claude'"):
+            self.assertTrue(cg.written_code_destroys_root(code % ('', target), str(self.home)), target)
 
     def test_readings_merge_keeps_what_either_one_knows(self):
         comp = cg.Compiled(cg.load_policy(str(self.home / 'none.json')), home=str(self.home))
@@ -801,11 +875,14 @@ class OverwriteExistingTests(Fixture):
         self.assertTrue(ctx.cwd_protected_unknown)
 
     def test_root_text_stays_linear(self):
-        for tail in (' ', '/ ', ' ,', ' + '):
-            text = 'x = home' + tail * 50000 + 'y'
-            started = time.monotonic()
-            self.assertFalse(cg.written_code_destroys_root(text, str(self.home)))
-            self.assertLess(time.monotonic() - started, 1.0, repr(tail))
+        # _scan_text collapses runs of spaces and commas, so these tails are the ones that reach the regex as written.
+        # The short run comes first: a backtracking regex then fails here instead of hanging on the long one
+        for size in (16, 50000):
+            for tail in ('/ ', ' + ', '\\\\ ', ' / '):
+                text = 'x = ~' + tail * size + 'y'
+                started = time.monotonic()
+                self.assertFalse(cg.written_code_destroys_root(text, str(self.home)))
+                self.assertLess(time.monotonic() - started, 1.0, repr((tail, size)))
 
     def test_other_user_home_link_out_of_the_tree_is_refused(self):
         # a real /home/<user> on this machine cannot be made in a test, so its realpath is what is simulated

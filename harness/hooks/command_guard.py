@@ -1268,8 +1268,9 @@ ROOT_DELETE_VERB = re.compile(r'\b(?:rm|rmdir|unlink|shred|truncate|rmtree|remov
 
 def _root_text(home):
     start = r'(?<![\w./-])'  # the start of a path or a name: /tmp/fake/home/.claude and /tmp/root/.claude are not homes
-    anchor = (r'(?:' + start + r'(?:~|home\b|/users/[^/\s]+|/home/[^/\s]+|/root\b|' + re.escape(home.casefold().rstrip('/'))
-              + r')|\.home\b)')
+    # the real home's spellings. A bare `home` is a variable, often a test's temp dir, and variables are not followed
+    anchor = (r'(?:' + start + r'(?:~|/users/[^/\s]+|/home/[^/\s]+|/root\b|' + re.escape(home.casefold().rstrip('/'))
+              + r')|\.home\b|(?:\$\s*|\benviron(?:\.get)?\s+|\bgetenv\s+)home\b)')
     return re.compile(anchor + _ROOT_SEP + r'\.(?:(?:claude|codex)(?![\w-])|agent-harness(?![\w-])(?!' + _ROOT_SEP
                       + r'(?:work|scratch)(?![\w.-])))')
 
@@ -1333,7 +1334,7 @@ class Ctx:
         self.marker = marker  # callable(path) -> bool, injectable for tests
         self.fixed_cwd = None
         self.fork_depth = 0  # readings of `>!` being analysed around the current script (Analyzer._both_readings)
-        self.readings_capped = False  # a script got one reading of `>!`: too deeply nested, or no budget left for two
+        self.readings_capped = False  # `>!` could not be judged both ways: too deep, no budget, or the readings disagree
 
     def cwd_value(self):
         return self.cwd
@@ -1350,6 +1351,12 @@ class Ctx:
             delattr(self, k)
         for k, v in saved.items():
             setattr(self, k, v.copy() if isinstance(v, (set, dict, list)) else v)
+
+    def disputes(self, other):
+        """Can a later command depend on which reading was right? Sets and flags combine without loss. These values do
+        not: a merged variable is only a hint on a path operand, and is lost as a command name, an option or a script."""
+        return (any(getattr(self, k) != other[k] for k in ('vars', 'var_hints', 'aliases', 'links', 'cwd', 'cwd_unknown'))
+                or any(other['written'].get(path, text) != text for path, text in self.written.items()))
 
     def merge(self, other):
         """Combine another reading's end state into this one for the commands that follow. Either reading may be the
@@ -1467,6 +1474,9 @@ class Analyzer:
         self._run_tokens(Lexer(ctx, ctx.ps, bang_operators=False).lex(text), depth)
         seen = {(f.category, f.rule, f.reason) for f in ctx.findings[mark:mid]}
         ctx.findings[mid:] = [f for f in ctx.findings[mid:] if (f.category, f.rule, f.reason) not in seen]
+        # at the top level each reading has already seen its own later commands; nested text has more to come
+        if depth > 0 and ctx.disputes(after_zsh):
+            ctx.readings_capped = True
         ctx.merge(after_zsh)
 
     # ---- visibility of a stage's stdout
@@ -2140,13 +2150,13 @@ class Analyzer:
         # It also runs as its own process, so its cd, variables and recorded files do not carry into this command.
         before = len(ctx.findings)
         keep = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
-                if k not in ('findings', 'budget', 'c', 'marker', 'files_read', 'unterminated')}
+                if k not in ('findings', 'budget', 'c', 'marker', 'files_read', 'unterminated', 'readings_capped')}
         try:
             self.script(text, depth + 1, tail_visible=True)
         finally:
             for k, v in keep.items():
                 setattr(ctx, k, v)
-        ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
+            ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
 
     def launcher(self, name, args, depth, pl, idx):
         """Commands that run another command given as text or as trailing words. True when handled."""
@@ -3899,7 +3909,7 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
     analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=marker)
     try:
         findings = analyzer.run(command)
-    except (Blocked, RecursionError) as stop:
+    except Exception as stop:  # noqa: BLE001 - re-raised: a budget stop, the hook's alarm or a bug
         stop.findings = list(analyzer.ctx.findings)  # what the guard already refused still counts (decide)
         raise
     if analyzer.ctx.unterminated and not any(f.category in ALWAYS_ENFORCED for f in findings):
@@ -3913,10 +3923,12 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
     if analyzer.ctx.readings_capped and not any(f.category in ALWAYS_ENFORCED for f in findings):
         if raw_sensitive(command, compiled, cwd=cwd):
             findings.append(Finding(LOG_DELETE if PROTECTED_TEXT.search(command) else SECRET_DUMP, 'unanalysable',
-                                    '`>!` is too large or too deeply nested to judge under both shell readings and the '
-                                    'command names a protected location or secret', 'split the command, or use `>|`'))
+                                    '`>!` cannot be judged under both shell readings (too large, too deeply nested, or '
+                                    'they disagree on what a later command uses) and the command names a protected '
+                                    'location or secret', 'split the command, or use `>|`'))
         else:
-            findings.append(Finding(PARSE, 'readings-capped', '`>!` is too large or too deeply nested to judge under both shell readings',
+            findings.append(Finding(PARSE, 'readings-capped', '`>!` cannot be judged under both shell readings (too large, too '
+                                    'deeply nested, or they disagree on what a later command uses)',
                                     'split the command, or use `>|`'))
     return findings
 
@@ -3966,6 +3978,9 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
                                                  'or secret', 'split it into smaller commands or put it in a script file'))
         return 'warn', format_block(Finding(PARSE, 'unanalysable', reason, 'split it into smaller commands'), warn=True)
     except Exception as error:  # noqa: BLE001 - fail closed for sensitive-looking text, open for the rest
+        already = [f for f in getattr(error, 'findings', []) if modes.get(f.category) == 'enforce']
+        if already:
+            return 'block', format_block(already[0], more=len(already) - 1)
         try:
             text = command if isinstance(command, str) else ' '.join(map(str, command))
             raw = [f for f in fallback_scan(text, compiled) if modes.get(f.category) == 'enforce']
