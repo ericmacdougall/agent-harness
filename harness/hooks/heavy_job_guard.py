@@ -54,12 +54,13 @@ from __future__ import annotations
 import os
 import re
 import stat
+import time
 import sys
 
 MAX_COMMAND_CHARS = 1_000_000
 MAX_SCAN_CHARS = 256 * 1024  # command text left after heredoc bodies are removed; ~0.3 s worst case, linear
 MAX_SEGMENT_WORDS = 8192  # words in one shell command; bounds the quadratic wrapper-slicing paths
-MAX_NESTED_WORK = 400_000  # work units per decision (about 0.3 s): words re-sliced per probe, text re-scanned per nested scan
+MAX_NESTED_SECONDS = 0.4  # wall-clock budget per decision for nested scans and uncertain-wrapper probes
 MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enforce",
                  "build": "enforce", "media": "warn", "fan-out": "warn", "oversize": "enforce"}
@@ -350,11 +351,14 @@ class Ctx:
         # eval, env -S ...) share the parent's caches and ONE work budget, so nesting cannot multiply the cost.
         self._disk = parent._disk if parent else {}
         self._hits = parent._hits if parent else {}
-        self.budget = parent.budget if parent else [MAX_NESTED_WORK]
+        self.deadline = parent.deadline if parent else time.monotonic() + MAX_NESTED_SECONDS
 
-    def spend(self, units=1):
-        self.budget[0] -= units
-        if self.budget[0] < 0:
+    def spend(self, _units=1):
+        """Checked once per nested scan and per uncertain-wrapper probe (each costs at most milliseconds).
+
+        A wall-clock budget bounds every superlinear shape without weighting units per command name: ordinary
+        commands never come near it, so only pathological input is denied (fail closed)."""
+        if time.monotonic() > self.deadline:
             raise WorkBudgetExceeded()
 
     def search(self, pattern, text):

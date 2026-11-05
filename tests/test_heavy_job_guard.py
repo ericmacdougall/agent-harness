@@ -616,6 +616,11 @@ class PathologicalInput(unittest.TestCase):
         self.fast("'\\n'.join('nice -5 cp f%d /tmp/x' % i for i in range(4000))", "allow")
         self.fast("'\\n'.join('bash -c \"echo %d\"' % i for i in range(11000))", "allow")
 
+    def test_i1_wrappers_with_unknown_flags_and_long_ordinary_argument_lists_are_allowed(self):
+        self.fast("'nice -19 git add ' + ' '.join('src/f%d.py' % i for i in range(2000))", "allow")
+        self.fast("'sudo -iu bob rm ' + ' '.join('f%d' % i for i in range(3000))", "allow")
+        self.fast("'caffeinate -dims ' + ' '.join('a%d' % i for i in range(2000))", "allow")
+
     def test_g3_nested_commands_share_the_script_cache(self):
         with tempfile.TemporaryDirectory() as cwd:
             Path(cwd, "big.py").write_text("x = 1\n" * 300000)
