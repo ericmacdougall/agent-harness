@@ -900,5 +900,41 @@ OVERWRITE_EXISTING = [
     ('echo x > @TASK@/existing.lo?', 'allow'),
     ('echo x > @HOME@/.claude/NEW-*.txt', 'allow'),
     ('echo x >! @TASK@/existing.log >>! @HOME@/.claude/wals/s/main.jsonl', 'allow'),
+    # re-review of 94937f5. N1: a redirect glob must not cost the rest of the command its findings, nor walk disk
+    # outside the protected roots. N2: the word copied for bash does not make `cat >! f` a content write
+    ("echo x > $'/tmp/a\\x00b/*'; rm -rf @HOME@", 'block'),
+    ("echo x > $'@HOME@/.claude/a\\x00b/*'", 'block'),
+    ('echo x > /tmp/nope-?/*/*; rm -rf @HOME@/.claude', 'block'),
+    ('ls > /tmp/nope-?/*/*', 'allow'),
+    ('cat >! @TASK@/existing.log', 'block'),
+    ('echo >! @TASK@/existing.log', 'block'),
+    ('printf >! @TASK@/existing.log', 'block'),
+    ('echo x > "@HOME@/.claude/settings.jso?"', 'allow'),
+    # another host's /home/<user> tree: literal plain files only; the file cannot be checked from here
+    ('echo x > /home/other/.agent-harness/work/S/T/x.log', 'allow'),
+    ('make &> /home/other/.agent-harness/scratch/c/x.log', 'allow'),
+    ('ssh other "echo x > /home/other/.agent-harness/work/S/T/x.out"', 'allow'),
+    ('echo x > /home/other/.agent-harness/work/S/T/receipt.json', 'block'),
+    ('echo x > /home/other/.agent-harness/work/S/T/journal.jsonl', 'block'),
+    ('echo x > /home/other/.agent-harness/work/S/T/state/x.out', 'block'),
+    ('echo x > /home/other/.agent-harness/work/x.log', 'block'),
+    ('echo x > /home/other/.agent-harness/scratch/x.log', 'block'),
+    ('echo x > /home/other/.agent-harness/work/S/T/a/../x.log', 'block'),
+    ('echo x > /home/other/.agent-harness/work/S/T/../../../../.claude/settings.json', 'block'),
+    ('echo x > /home/other/.agent-harness/work/S/$X/x.log', 'block'),
+    ('echo x > /home/other/.agent-harness/work/S/T/x.lo?', 'block'),
+    ('echo x > /home/other/.agent-harness/bin/tool', 'block'),
+    ('echo x > /home/other/.claude/settings.json', 'block'),
+    ('echo x > /home/other/.claude/wals/s/main.jsonl', 'block'),
+    ('echo x > /home/other/.claude/projects/p/s.jsonl', 'block'),
+    ('echo x > /home/other/.codex/sessions/2026/r.jsonl', 'block'),
+    ('echo x > /root/.agent-harness/work/S/T/x.log', 'block'),
+]
+# (target row, words the refusal must carry so the owner knows what to do instead)
+OVERWRITE_HINTS = [
+    ('echo x > @TASK@/state/run.txt', 'differently named folder'),
+    ('echo x > /home/other/.agent-harness/work/S/T/state/x.out', 'differently named folder'),
+    ('echo x > @HOME@/.agent-harness/scratch/top.txt', 'subfolder'),
+    ('echo x > @HOME@/.agent-harness/work/top.log', 'subfolder'),
 ]
 SEED = 14471

@@ -1636,7 +1636,9 @@ class Analyzer:
         ctx = self.ctx
         words = self._skip_assigns(strip_reserved(cmd.words))[1]
         name = norm_name(words[0].text) if words else ''
-        arg_texts = [w.text for w in words[1:]]
+        # the lexer adds a `>! word` target to the words for bash's reading; for zsh it is not an argument, so it must
+        # not turn `cat >! f` into a content write
+        arg_texts = [w.text for w in words[1:] if not any(w is r.target for r in cmd.redirs)]
         # pure truncation: nothing (or nothing meaningful) is written, so the redirect only empties the file
         # `cat > f <<EOF` writes content; an empty heredoc writes nothing, so that stays a pure truncation
         has_body = any(r.op == '<<<' or r.op in ('<<', '<<-') and r.body.strip('\n') for r in cmd.redirs)
@@ -3256,7 +3258,7 @@ class Analyzer:
                     return True
         return False
 
-    def refuse(self, what, word, tiers=('log', 'root', 'ancestor', 'unknown'), need_existing=False):
+    def refuse(self, what, word, tiers=('log', 'root', 'ancestor', 'unknown'), need_existing=False, instead=None):
         """Add a log_delete finding when `word` resolves into one of `tiers`. Returns True when it did."""
         ctx = self.ctx
         cls, path, literal = self.target_class(word)
@@ -3275,9 +3277,9 @@ class Analyzer:
         ctx.add(LOG_DELETE, 'log-delete',
                 ('%s targets %s (%s). Claude/Codex/harness logs and state are never deleted, moved or truncated '
                  'without a verified backup' % (what, label, name[:60]))[:300],
-                'back up to Dropbox (rclone copy), then `command_guard.py approve-delete --path P --remote REMOTE`, '
-                'then delete the literal path' + ('' if literal else '; spell out the literal path, globs and '
-                                                  'variables cannot be approved'))
+                instead or 'back up to Dropbox (rclone copy), then `command_guard.py approve-delete --path P --remote '
+                'REMOTE`, then delete the literal path' + ('' if literal else '; spell out the literal path, globs and '
+                                                           'variables cannot be approved'))
         return True
 
     def _foreign_home(self, path):
@@ -3302,20 +3304,25 @@ class Analyzer:
             # `echo x > existing` replaces the file's content just as `: >` empties it, so an existing literal file
             # under a protected root is refused like `tee` is; new files and `>>` appends stay allowed. A dynamic
             # target keeps the narrower tiers: its existence cannot be checked, and new-file writes are common.
-            cls, path, literal = self.target_class(target_word)
-            literal = pure or literal
+            cls, path, exact = self.target_class(target_word)
+            literal = pure or exact
             tiers = ('log', 'root', 'unknown') if literal else ('log', 'unknown')
+            # another host's home: nothing can be checked from here, so only a fully literal path may be narrowed
+            foreign = cls == 'root' and self._foreign_home(path)
+            if foreign and not exact:
+                tiers = ('log', 'root', 'unknown')
             # `link/../x`: the shell resolves `..` after following the link, so check that path as well
             physical = self._physical_dotdot(target_word.text) if not target_word.dynamic else None
             # zsh multios: `> {a,b}` writes every expansion, so each one must be a plain work file
             every = [norm_path(a, self.ctx) for a in (target_word.all_alts() or target_word.alts)]
+            dotted = any('..' in a.replace('\\', '/').split('/') for a in (target_word.all_alts() or target_word.alts))
             if not pure and cls == 'root' and self._plain_work_file(path) and all(map(self._plain_work_file, every)) \
-                    and (physical is None or self._plain_work_file(physical)):
+                    and (physical is None or self._plain_work_file(physical)) and not (foreign and (dotted or not exact)):
                 # owners routinely rerun `cmd > <task dir>/x.log`; only receipts (*.json) and .keep-marked
                 # directories under the work dir keep the overwrite refusal (replay over real transcripts)
                 tiers = ('log', 'unknown')
             what = 'truncation by redirect' if pure else 'overwrite by redirect'
-            done = self.refuse(what, target_word, tiers=tiers, need_existing=True)
+            done = self.refuse(what, target_word, tiers=tiers, need_existing=True, instead=self._overwrite_hint(path))
             raw_alts = target_word.all_alts() or target_word.alts
             if not done and len(raw_alts) > 1:
                 # refuse() checks existence only for the strongest alt it shows; multios writes all of them,
@@ -3328,12 +3335,16 @@ class Analyzer:
                     if self.refuse(what, one, tiers=tiers, need_existing=True):
                         done = True
                         break
-            if not done and not target_word.dynamic and any(ch in target_word.text for ch in GLOB_CHARS):
+            if not done and cls is not None and target_word.glob and not target_word.dynamic:
                 # `> ~/.claude/settings.jso?`: bash and zsh expand a redirect glob that matches one file, so judge
-                # the files it matches now as literal targets (delta review F4)
-                import glob as _glob
+                # the files it matches now as literal targets (delta review F4). Only below a protected root, and
+                # through the budgeted walker: an exception or a stall here would lose every other finding in the
+                # command, because the launcher then falls back to its raw-text check (re-review N1)
                 pattern = norm_path(target_word.text, self.ctx)
-                for hit in sorted(_glob.glob(pattern))[:64] if pattern.startswith('/') else []:
+                hits = self._glob_with_hidden(pattern, 256) if pattern.startswith('/') and '\x00' not in pattern else None
+                if hits is None:  # too many matches, unreadable or not expandable: its targets are not known
+                    done = self.refuse(what, target_word, tiers=('log', 'root', 'unknown'))
+                for hit in hits or []:
                     one = Word()
                     one.alts = [hit]
                     hit_tiers = ('log', 'unknown') if not pure and self._plain_work_file(hit) \
@@ -3347,25 +3358,46 @@ class Analyzer:
                 self.refuse(what, real, tiers=tiers, need_existing=True)  # the file the shell really opens
         self.note_created(target_word)
 
+    def _work_base(self, segs):
+        """Segment count of the ~/.agent-harness/work or /scratch prefix of `segs`, for this machine's homes and for
+        /home/<user> on another host (`ssh dev2 'cmd > /home/eric/...'`), else None."""
+        other = ['/'.join(segs[:2])] if len(segs) > 2 and segs[0] == 'home' else []
+        for h in list(self.c.homes) + other:
+            for top in ('work', 'scratch'):
+                base = Compiled._segs(h) + ['.agent-harness', top]
+                if len(segs) > len(base) and segs[:len(base)] == base:
+                    return len(base)
+        return None
+
+    def _overwrite_hint(self, path):
+        """What to do instead when a redirect is refused for a layout reason under work or scratch, else None."""
+        segs = Compiled._segs(path)
+        base_len = self._work_base(segs)
+        if base_len is None:
+            return None
+        rest = segs[base_len:]
+        if len(rest) == 1:
+            return 'write to a subfolder of it instead; files directly in the work or scratch dir are not replaced'
+        if any(s in self.c.keep_segments for s in rest[:-1]):
+            return 'write to a differently named folder instead; files under a folder named state are kept'
+        return None
+
     def _plain_work_file(self, path):
-        """A plain file at least two levels below this machine's ~/.agent-harness/work or ~/.agent-harness/scratch,
-        both as typed and where it really leads (symlinks): not a JSON receipt, not a kept name (kit.json, *.jsonl,
-        state), and no `.keep` in any directory between it and the work or scratch dir."""
+        """A plain file at least two levels below ~/.agent-harness/work or ~/.agent-harness/scratch, both as typed
+        and where it really leads (symlinks): not a JSON receipt, not a kept name (kit.json, *.jsonl, state), and no
+        `.keep` in any directory between it and the work or scratch dir. Also true for another host's
+        /home/<user>/.agent-harness tree, where the `.keep` and symlink checks can only see this machine's disk."""
         try:
             real = os.path.realpath(path)
         except (OSError, ValueError):
             return False
-        for cand in (path, real):
+        # another host's path says nothing about this machine's links (macOS even makes /home itself a symlink)
+        for cand in (path,) if self._foreign_home(path) else (path, real):
             if self._kept(cand):
                 return False
             segs = Compiled._segs(cand)
             raw = [s for s in cand.replace('\\', '/').split('/') if s]
-            base_len = None
-            for h in self.c.homes:
-                for top in ('work', 'scratch'):
-                    base = Compiled._segs(h) + ['.agent-harness', top]
-                    if len(segs) > len(base) and segs[:len(base)] == base:
-                        base_len = len(base)
+            base_len = self._work_base(segs)
             if base_len is None or len(raw) != len(segs):
                 return False
             rest = segs[base_len:]

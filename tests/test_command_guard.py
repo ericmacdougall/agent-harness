@@ -599,15 +599,36 @@ class OverwriteExistingTests(Fixture):
                     '.agent-harness/work/top.log', '.agent-harness/work/S/T/existing.log',
                     '.agent-harness/work/S/T/journal.jsonl', '.agent-harness/work/S/T/state/run.txt',
                     '.agent-harness/scratch/c/u/s/scratchpad/run.log',
-                    '.agent-harness/scratch/c/u/s/scratchpad/out.jsonl'):
+                    '.agent-harness/scratch/c/u/s/scratchpad/out.jsonl', '.agent-harness/scratch/top.txt'):
             p = self.home / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text('keep\n')
         (self.home / '.agent-harness/work/S/T/hooklink').symlink_to(self.home / '.claude/hooks')
         failures = [(cmd, want, got) for cmd, want in corpus.OVERWRITE_EXISTING
                     for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
-        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 61)
+        self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 87)
         self.assertEqual(failures, [])
+
+    def test_layout_refusals_say_what_to_do_instead(self):
+        for rel in ('.agent-harness/work/S/T/state/run.txt', '.agent-harness/scratch/top.txt',
+                    '.agent-harness/work/top.log'):
+            p = self.home / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('keep\n')
+        self.assertGreaterEqual(len(corpus.OVERWRITE_HINTS), 4)
+        for cmd, words in corpus.OVERWRITE_HINTS:
+            verdict, message = self.decide(cmd, cwd='@TASK@')[:2]
+            self.assertEqual(verdict, 'block', cmd)
+            self.assertIn(words, message, cmd)
+            self.assertNotIn('approve-delete', message, cmd)
+
+    def test_redirect_glob_with_too_many_matches_is_refused_without_a_full_walk(self):
+        many = self.home / '.claude/many'
+        many.mkdir(parents=True)
+        for i in range(300):
+            (many / ('f%d' % i)).write_text('keep\n')
+        self.assertEqual(self.decide('echo x > @HOME@/.claude/many/*', cwd='@TASK@')[0], 'block')
+        self.assertEqual(self.decide('echo x > @HOME@/.claude/many/nomatch-*', cwd='@TASK@')[0], 'allow')
 
 
 class GuardCompositionTests(unittest.TestCase):
