@@ -353,7 +353,7 @@ class Ctx:
         self._hits = parent._hits if parent else {}
         self.deadline = parent.deadline if parent else time.monotonic() + MAX_NESTED_SECONDS
 
-    def spend(self, _units=1):
+    def spend(self):
         """Checked once per nested scan and per uncertain-wrapper probe (each costs at most milliseconds).
 
         A wall-clock budget bounds every superlinear shape without weighting units per command name: ordinary
@@ -391,7 +391,8 @@ def script_sources(script, ctx):
     sources = list(ctx.heredocs)
     disk = None
     if script and script != "-":
-        key = resolve(script, ctx.cwd)
+        ctx.spend()  # reading a script is the other repeatable cost, so the top-level scan honours the deadline too
+        key = os.path.realpath(resolve(script, ctx.cwd))  # `./x`, `.//x` and symlinks are one file, read once
         if key not in ctx._disk:
             ctx._disk[key] = read_script(script, ctx.cwd)
         disk = ctx._disk[key]
@@ -546,7 +547,7 @@ def classify_build_tool(low, args):
 def scan_words(words, ctx, depth):
     """Uncertain wrapper parse: judge every remaining word as if it started the command; first heavy finding wins."""
     for j, word in enumerate(words):
-        ctx.spend(1 + len(words) - j)  # each probe slices and re-classifies the remaining words
+        ctx.spend()  # each probe slices and re-classifies the remaining words
         if word.startswith("-") or ASSIGN.match(word):
             continue
         result = classify_text(word, ctx, depth + 1) if re.search(r"\s", word) else None
@@ -892,7 +893,7 @@ def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
 
 def classify_text(text, ctx, depth):
     """Classify a nested `bash -c` string with the parent's cwd."""
-    ctx.spend(1 + len(text) // 4)  # a nested scan re-tokenises and re-classifies the whole text
+    ctx.spend()  # a nested scan re-tokenises and re-classifies the whole text
     _hatch, findings = scan_state(text, ctx.cwd, depth, ctx)
     if findings:
         rule, detail, capped, _segment = findings[0]
@@ -943,8 +944,9 @@ def decide(command: str, cwd: str = None, modes=None):
         hatch, findings = scan_state(command, cwd)
     except (WorkBudgetExceeded, RecursionError):
         # GoodQA #14505: too tangled (or too deeply nested) to judge in bounded time. Fail CLOSED, never open.
-        hatch, findings = None, [("oversize", "nested wrappers/eval are too deeply nested or tangled to analyse",
-                                  False, "")]
+        hatch, findings = None, [("oversize", "analysis time or depth budget exceeded: nested wrappers/eval/scripts "
+                                  "are too tangled to analyse (a very large command on a loaded host can also "
+                                  "trip this; retry, or write it to a script file)", False, "")]
     best = {"action": "allow"}
     for rule, detail, capped, _segment in findings:
         mode = modes.get(rule, "enforce")
