@@ -54,6 +54,9 @@ type processTree struct {
 	stopCh     chan struct{}
 	stopOnExit func() bool
 
+	settled  chan struct{}
+	setOnce  sync.Once
+	verdict  atomic.Int32 // 0 none, 1 stop, 2 leave
 	exitSeen atomic.Bool
 	exited   chan struct{} // leader exit observed
 	done     chan struct{} // leader reaped, Err valid
@@ -121,7 +124,7 @@ func startProcessTreeWith(cmd *exec.Cmd, stopOnExit func() bool, opt processTree
 		cmd: cmd, stdout: reader, signal: signal, release: release,
 		drain: opt.Drain, consume: opt.ConsumeGrace, pr: pr, pw: pw,
 		consumed: make(chan struct{}), stopCh: make(chan struct{}), stopOnExit: stopOnExit,
-		exited: make(chan struct{}), done: make(chan struct{}),
+		exited: make(chan struct{}), done: make(chan struct{}), settled: make(chan struct{}),
 	}
 	go t.pump()
 	go t.wait()
@@ -172,15 +175,35 @@ func (t *processTree) wait() {
 	_ = t.stdout.SetReadDeadline(time.Now().Add(t.drain)) // unblock a pending read
 	close(t.exited)
 	if pinned {
+		// With a stopOnExit policy the stream being consumed triggers the
+		// decision. Without one the caller must say, through Release, what to do
+		// after it has weighed what it read; an explicit stop also triggers it.
+		consumed := t.consumed
+		if t.stopOnExit == nil {
+			consumed = nil
+		}
 		timer := time.NewTimer(t.consume)
+		expired := false
 		select {
-		case <-t.consumed:
+		case <-consumed:
+		case <-t.settled:
 		case <-t.stopCh:
 		case <-timer.C:
+			expired = true
 		}
 		timer.Stop()
+		_ = expired
 	}
-	stop := t.stopOnExit != nil && t.stopOnExit()
+	var stop bool
+	switch t.verdict.Load() {
+	case 1:
+		stop = true
+	case 2:
+		stop = false
+	default:
+		// No verdict: a tree nobody decided for has lost supervision, so stop it.
+		stop = t.stopOnExit == nil || t.stopOnExit()
+	}
 	t.mu.Lock()
 	if t.stopped || stop {
 		_ = t.signal(pid, true)
@@ -228,6 +251,23 @@ func (t *processTree) Err() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.waitErr
+}
+
+// Release is the caller's verdict once it has finished with the stream: stop the
+// group (supervision was lost with no final) or leave background work alone (a
+// true final was recorded). The pump keeps emptying the pipe so the child never
+// blocks. The first verdict wins.
+func (t *processTree) Release(stop bool) {
+	t.setOnce.Do(func() {
+		if stop {
+			t.verdict.Store(1)
+		} else {
+			t.verdict.Store(2)
+		}
+		close(t.settled)
+	})
+	_ = t.pr.CloseWithError(io.ErrClosedPipe)
+	t.consOnce.Do(func() { close(t.consumed) })
 }
 
 // Reaped reports whether signals are no longer permitted.

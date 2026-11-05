@@ -160,3 +160,34 @@ exit 0
 	}
 	t.Fatal("final turn did not finish")
 }
+
+// A6: a descendant that keeps Claude's stdout open must not hide the leader's
+// death. The console has to notice, stop the tree and release the session within
+// the drain bound, not when the descendant eventually exits.
+func TestClaudeLeaderExitSeenWhileDescendantHoldsStdout(t *testing.T) {
+	childFile := filepath.Join(t.TempDir(), "child")
+	a, s := claudeProcessFixture(t, `sh -c 'echo $$ > "`+childFile+`"; exec sleep 60' &
+until [ -s "`+childFile+`" ]; do sleep 0.01; done
+read line
+exit 0
+`)
+	if err := a.sendClaude(s, "A", "bounded", s.CWD, ""); err != nil {
+		t.Fatal(err)
+	}
+	childPID := recordedPID(t, childFile)
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		claude := s.claude
+		a.mu.Unlock()
+		if claude == nil {
+			if !waitForExit(childPID) {
+				t.Fatalf("descendant %d survived the unfinished exit", childPID)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("console kept the run attached for 8 s behind a descendant holding stdout")
+}

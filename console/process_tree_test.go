@@ -136,7 +136,7 @@ func killPID(pid int) { _ = syscall.Kill(pid, syscall.SIGKILL) }
 // A5: once the tree decided, nothing may be signalled.
 func TestTreeNoSignalAfterReap(t *testing.T) {
 	rec := &signalRecorder{}
-	tree := shellTree(t, "exit 0", nil, rec, 100*time.Millisecond)
+	tree := shellTree(t, "exit 0", func() bool { return false }, rec, 100*time.Millisecond)
 	discardStream(tree)
 	select {
 	case <-tree.Done():

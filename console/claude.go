@@ -14,6 +14,7 @@ import (
 
 type claudeRun struct {
 	command     *exec.Cmd
+	tree        *processTree
 	input       io.WriteCloser
 	writeOnce   sync.Once
 	writer      *inputWriter
@@ -34,7 +35,11 @@ func (r *claudeRun) cancel() {
 	r.cancelOnce.Do(func() {
 		r.writeOnce.Do(func() { r.writer = newInputWriter(r.input) })
 		r.writer.close()
-		terminateProcess(r.command)
+		if r.tree != nil {
+			r.tree.Terminate(100 * time.Millisecond)
+		} else {
+			terminateProcess(r.command)
+		}
 	})
 }
 func (r *claudeRun) write(value any) error { return r.writeContext(context.Background(), value) }
@@ -213,20 +218,19 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 		if err != nil {
 			return err
 		}
-		output, err := command.StdoutPipe()
-		if err != nil {
-			return err
-		}
 		command.Stderr = &cappedBuffer{limit: 32768}
-		if err = command.Start(); err != nil {
+		tree, err := startProcessTree(command, nil)
+		if err != nil {
 			a.unknownSend(current, requestID, err)
 			return err
 		}
-		run = &claudeRun{command: command, input: input, done: make(chan struct{}), cwd: cwd, runtimeHash: fingerprint, conversationIdentity: identity, policy: policy, authAdmit: a.authAdmission("claude", profile, authGeneration)}
+		output := tree.Stdout()
+		run = &claudeRun{command: command, tree: tree, input: input, done: make(chan struct{}), cwd: cwd, runtimeHash: fingerprint, conversationIdentity: identity, policy: policy, authAdmit: a.authAdmission("claude", profile, authGeneration)}
 		if err = a.attachStartedClaudeRun(current, run, profile, authGeneration, taskID, revision); err != nil {
 			// Start succeeded, so every later failure must reap the child even when
 			// the generation fence refused publication before the session saw it.
-			_ = command.Wait()
+			run.cancel()
+			<-tree.Done()
 			close(run.done)
 			a.unknownSend(current, requestID, err)
 			return err
@@ -240,9 +244,13 @@ func (a *app) sendClaude(current *session, requestID, prompt, cwd, profile strin
 			final := current.requests[run.requestID] == "final"
 			a.mu.Unlock()
 			if !final {
-				terminateProcess(command)
+				tree.Release(true)
+				tree.Terminate(100 * time.Millisecond)
+			} else {
+				tree.Release(false)
 			}
-			err := command.Wait()
+			<-tree.Done()
+			err := tree.Err()
 			run.writeOnce.Do(func() { run.writer = newInputWriter(run.input) })
 			run.writer.close()
 			close(run.done)
