@@ -2009,3 +2009,32 @@ h1 {
   pointer-events: none
 }
 .ledger-tooltip[hidden] { display: none }
+
+/* Asks / Owners / Requirements view */
+.asks-dialog { width:min(960px,calc(100vw - 24px)); max-height:calc(100vh - 24px); padding:16px; overflow:auto }
+.asks-tabs { display:flex; gap:4px; flex-wrap:wrap; border-bottom:1px solid var(--border); margin-bottom:12px }
+.asks-tab { background:transparent; border:1px solid transparent; border-bottom:0; border-radius:8px 8px 0 0; padding:10px 14px; min-height:44px; color:var(--muted) }
+.asks-tab[aria-selected="true"] { background:var(--surface); border-color:var(--border); color:var(--text); font-weight:600 }
+.asks-filters { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:10px }
+.asks-field { display:flex; flex-direction:column; gap:4px }
+.asks-field label { color:var(--muted); font-size:12px }
+.asks-field select,.asks-field input { min-height:40px; background:var(--surface); color:var(--text); border-radius:8px; padding:6px 8px }
+.asks-statusbar { display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap }
+.asks-status,.asks-summary { color:var(--muted); margin:6px 0 }
+.asks-error { color:var(--danger); border:1px solid var(--danger); border-radius:8px; padding:10px }
+.asks-empty { color:var(--muted); padding:16px 0 }
+.asks-list { list-style:none; margin:0; padding:0; display:grid; gap:8px }
+.asks-row { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px; min-width:0 }
+.asks-row-head { display:flex; gap:8px; align-items:center; flex-wrap:wrap }
+.asks-id { color:var(--muted); overflow-wrap:anywhere }
+.asks-age { margin-left:auto; color:var(--muted) }
+.asks-text { margin:8px 0; overflow-wrap:anywhere; white-space:pre-wrap }
+.asks-meta { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:4px 16px; margin:0 }
+.asks-meta div { min-width:0 }
+.asks-meta dt { color:var(--muted); font-size:12px }
+.asks-meta dd { margin:0; overflow-wrap:anywhere }
+.asks-badge { border:1px solid var(--border); border-radius:999px; padding:1px 9px; font-size:12px; font-weight:600; background:var(--raised) }
+.asks-state-blocked,.asks-state-DROPPED,.asks-state-SILENT { border-color:var(--danger); color:var(--danger) }
+.asks-state-stale,.asks-state-waiting-on-user,.asks-state-assumption,.asks-state-quiet { border-color:var(--amber); color:var(--amber) }
+.asks-state-open,.asks-state-live { border-color:var(--accent); color:var(--accent) }
+@media (max-width:520px) { .asks-dialog { width:100vw; max-height:100vh; padding:12px; border-radius:0 } .asks-tab { flex:1 1 auto; padding:10px 8px } }
