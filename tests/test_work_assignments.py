@@ -1458,6 +1458,12 @@ class StoreTest(Base):
             self.assertIn(msg["id"], out)
             self.assertNotIn("refactor the billing", out)
             self.assertIn("refactor the billing", self.cli("status", "--session", SID)[1])
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": SID}):  # adversarial v11 F2: a decision's text stays in its session
+            self.assertEqual(self.cli("decision", "ask", "--text", "pick the billing vendor")[0], 0)
+            self.assertIn("pick the billing vendor", self.cli("status")[1])
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": other}):
+            self.assertNotIn("pick the billing vendor", self.cli("status")[1])
+            self.assertIn("DECISION", self.cli("status")[1])
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": other}):  # acceptance v11 V5: the digest's hints lead to --json
             self.assertNotIn("refactor the billing", self.cli("status", "--json")[1])
             self.assertIn("refactor the billing", self.cli("status", "--json", "--all")[1])
@@ -1539,6 +1545,7 @@ class GuardTest(Base):
         parent = str(Path(store).parent)
         elsewhere = Path(self.tmp.name) / "repo"
         elsewhere.mkdir(exist_ok=True)
+        Path(store).mkdir(parents=True, exist_ok=True)  # a `;`-joined cd is checked against the real directory
         for cmd in (f"mv {store} {store}.old", f"rm -rf {store}", f"rm -rf {store}/", f"cd {parent} && rm -r {Path(store).name}",
                     f"rmdir {store}", f"rm -rf {parent}", f"sudo rm -rf {store}", f"cd {store} && rm -rf ./*",
                     f"cd {store} && rm -rf *", f"cd {store}; rm -rf .", f"pushd {parent} && rm -rf {Path(store).name}"):
@@ -1586,6 +1593,8 @@ class GuardTest(Base):
         user = Path(self.tmp.name) / "u"
         store = user / ".agent-harness"
         (store / "work" / "task").mkdir(parents=True, exist_ok=True)
+        (user / "repos" / "proj").mkdir(parents=True, exist_ok=True)  # a `;`-joined cd is checked against the real directory
+        (Path(self.tmp.name) / "elsewhere").mkdir(exist_ok=True)
         patch = mock.patch.dict(os.environ, {"HOME": str(user), "AGENT_HARNESS_HOME": str(store)})
         patch.start()
         self.addCleanup(patch.stop)
@@ -1608,7 +1617,8 @@ class GuardTest(Base):
         leak = re.compile(r"/Users/|/home/|\b\d{1,3}(?:\.\d{1,3}){3}\b|[\w.+-]+@[\w-]+\.\w+|\b[\w-]+\.(?:com|net|org|io|ai|dev|app)\b", re.I)
         user, store = self.corpus_home()
         # a temp HOME can sit under /tmp (dev2), and then /tmp really is an ancestor of the store; rows mean "elsewhere"
-        fill = lambda text: text.replace("/tmp", "/opt/elsewhere").replace("@STORE@", str(store)).replace("@HOME@", str(user))
+        elsewhere = str(Path(self.tmp.name) / "elsewhere")
+        fill = lambda text: text.replace("/tmp", elsewhere).replace("@STORE@", str(store)).replace("@HOME@", str(user))
         wrong, seen = {"allow": [], "deny": []}, collections.Counter()
         for row in rows:
             for text in (row["cmd"], row["cwd"]):
@@ -1622,6 +1632,15 @@ class GuardTest(Base):
             self.assertGreaterEqual(sum(n for key, n in seen.items() if key[0] == expect), least)
         self.assertFalse(wrong["allow"] or wrong["deny"], f"{len(wrong['allow'])} allow rows denied, {len(wrong['deny'])} deny rows allowed, of {len(rows)}: {wrong}")
         self.assertEqual(wa.pending_failures(), [])  # a crash fails open, so it would otherwise pass every allow row
+
+    def test_a_failed_cd_is_judged_from_where_the_shell_stays(self):
+        """Adversarial v11 F4: `cd missing; rm -rf *` from the store ran the rm in the store."""
+        user, store = self.corpus_home()
+        decide = lambda cmd, cwd: self.bash_guard(cmd, str(cwd)).get("hookSpecificOutput", {}).get("permissionDecision", "allow")
+        for cmd in ("cd missing-dir; rm -rf *", "cd /opt/no-such-dir; rm -rf ./*", "cd missing-dir\nrm -rf *"):
+            self.assertEqual(decide(cmd, store), "deny", cmd)
+        self.assertEqual(decide("cd missing-dir && rm -rf *", store), "allow")  # && stops at the failure, as the shell does
+        self.assertEqual(decide("cd work; rm -rf *", store), "allow")  # it exists, so the cd worked
 
     def test_tool_paths_under_a_work_assignments_directory_are_not_the_store(self):
         """Acceptance v11 V1: a task or work directory named work-assignments was denied by name."""
@@ -1972,6 +1991,41 @@ class ImportTest(Base):
 
 
 class LatencyTest(Base):
+    def test_guard_stays_under_its_limit_on_one_long_token(self):
+        """Adversarial v11 F1: 64 KB took 28 s. Checked live on Claude Code 2.1.318: past the hook timeout the tool RUNS, so
+        this was a bypass of the guard, not a slowdown. Well under the 6 s internal abort, on a loaded host too."""
+        env = {**os.environ, "PYTHONPATH": str(HOOKS)}
+        for size in (64 * 1024, 512 * 1024):
+            for text in ("A" * size, f"rm -rf {wa.base()} " + "A" * size):
+                payload = {"session_id": SID, "tool_name": "Bash", "tool_input": {"command": text}, "cwd": self.tmp.name}
+                started = time.monotonic()
+                run = subprocess.run([sys.executable, str(HOOKS / "work_assignments.py"), "hook", "guard"],
+                                     input=json.dumps(payload).encode(), capture_output=True, env=env, timeout=20)
+                took = time.monotonic() - started
+                print(f"[latency] guard on a {size // 1024} KiB token {took * 1000:.0f} ms")
+                self.assertEqual(run.returncode, 0)
+                self.assertLess(took, 3.0, size)
+                self.assertEqual(b'"deny"' in run.stdout, text.startswith("rm"), size)
+
+    def run_with_stuck_hook(self, name, policy):
+        """The real run_hook with its timer shortened and the hook stuck: the timer's own exit path, in a real process."""
+        pol = Path(self.tmp.name) / "stuck-policy.json"
+        pol.write_text(json.dumps({"schema": 1, **policy}))
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import work_assignments as w; from pathlib import Path\n"
+                "w.HOOK_SECONDS = 0.2; w.POLICY_FILE = Path(sys.argv[2]); w.HOOKS[sys.argv[3]] = lambda p, r: time.sleep(30)\n"
+                "w.run_hook(sys.argv[3], 'claude')\n")
+        started = time.monotonic()
+        run = subprocess.run([sys.executable, "-c", code, str(HOOKS), str(pol), name], input=b"{}", capture_output=True, timeout=20)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run.stdout
+
+    def test_guard_timeout_denies_in_enforce_and_other_hooks_stay_open(self):
+        """Owner decision from the live check: the guard's own abort denies; a ledger hook's abort must not block the turn."""
+        self.assertIn(b'"deny"', self.run_with_stuck_hook("guard", {"guard": "enforce"}))
+        self.assertNotIn(b'"deny"', self.run_with_stuck_hook("guard", {"guard": "warn"}))
+        self.assertEqual(self.run_with_stuck_hook("stop", {"guard": "enforce"}), b"")
+
     def test_hook_latency_with_600_asks(self):
         """AC-10: budget 250 ms per hook process (timeout is 10 s); measured in a real subprocess on schema 2."""
         with wa.transaction() as data:
@@ -1980,7 +2034,8 @@ class LatencyTest(Base):
                 wa.new_ask(data, description=f"synthetic ask number {i}", owner="main", who=who,
                            origin_actor=wa.actor("harness", "other", label="x"), source={"kind": "file", "ref": "t", "why": "latency"})
         env = {**os.environ, "PYTHONPATH": str(HOOKS)}
-        payloads = {"prompt": self.payload("latency probe"),
+        bash = {"session_id": SID, "tool_name": "Bash", "tool_input": {"command": "cd repo && grep -n TODO src/app.py | head"}, "cwd": self.tmp.name}
+        payloads = {"prompt": self.payload("latency probe"), "guard-bash": bash,
                     "stop": {"session_id": SID, "transcript_path": str(self.transcript)},
                     "session": {"session_id": SID, "transcript_path": str(self.transcript)},
                     "guard": {"session_id": SID, "tool_name": "Read", "tool_input": {"file_path": str(self.transcript)},
@@ -1996,7 +2051,7 @@ class LatencyTest(Base):
                 subprocess.run(control, capture_output=True, env=env, timeout=20, check=True)
                 control_runs.append(time.monotonic() - started)
                 started = time.monotonic()
-                run = subprocess.run([sys.executable, str(HOOKS / "work_assignments.py"), "hook", name],
+                run = subprocess.run([sys.executable, str(HOOKS / "work_assignments.py"), "hook", name.split("-")[0]],
                                      input=json.dumps(payload).encode(), capture_output=True, env=env, timeout=20)
                 timings.append(time.monotonic() - started)
                 self.assertEqual(run.returncode, 0, run.stderr)

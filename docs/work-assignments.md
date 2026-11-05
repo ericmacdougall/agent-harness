@@ -200,7 +200,8 @@ counters) are outside the fold by design. The first-touch sync window is the las
 - On Codex with `--ledger-mode warn`, the Codex guard only warns, including over the shared store and policy files. Claude's guard still denies.
 - Past the 128 MiB event-log bound, cancel, remove and recover refuse until rotation exists (GoodQA 1ae27b6b#14605).
 - Hooks cost about 280 ms on a loaded dev2; the hard gate is a 1 s ceiling and the profile target is tracked in its own ticket.
-- `DECISION` lines show their agent-written summary to every session: decisions record no session id yet.
+- A decision recorded with no session (older records, or Codex, which has no caller id) shows its agent-written summary to every session.
+- Claude Code runs the tool if a hook passes its timeout (checked on 2.1.318). The guard therefore denies at its own 6 s abort in enforce mode, and it is not installed with `onFailure: block`, because a broken install would then block every tool call. A hook that hangs in C code past the 10 s limit would still let the command through.
 
 ## dev2 sync (proposal, not built)
 

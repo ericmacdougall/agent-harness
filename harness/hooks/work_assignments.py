@@ -73,6 +73,7 @@ PROTECTED = re.compile(r"work-(?:assign|ledger)[A-Za-z0-9._*?-]*|work_assignment
 SAFE_CLI = re.compile(r"^\s*python3\s+(?:~|\$HOME|/[^\s;&|<>`$]*)?[^\s;&|<>`$]*/work_assignments\.py\s+[A-Za-z-]+(?:\s+[^;&|<>`$\n]*)?$")
 KEY_FILE = re.compile(r"(?i)work-ledger\.key")
 GLOB_TOKEN = re.compile(r"[^\s'\"=;&|<>()`]*[*?\[][^\s'\"=;&|<>()`]*")
+SHELL_WORD = re.compile(r"[^\s'\"=;&|<>()`]+")  # findall with GLOB_TOKEN was quadratic on one long token: 64 KB took 28 s
 HOOK_CALL = re.compile(r"\bhook\s+(?:prompt|stop|session|compact|ask-answer|guard|subagent-start)\b")
 INPROCESS = re.compile(r"\b(?:import|from)\s+work_assignments\b|__import__\(\s*['\"]work_assignments|\bcapture_key\b|"
                        r"\bhook_prompt\s*\(|\bhook_ask_answer\s*\(|\bbuild_capture\s*\(|\battest\s*\(")
@@ -172,7 +173,10 @@ def protected_hit(text: str, cwd=None) -> bool:
             continue
         if places is None:
             places = shell_places(text, cwd)
-        if in_store_root(re.search(r"[^\s'\"=;&|<>()`:,{]*$", text[:m.start()]).group(), places):
+        begin = m.start()
+        while begin and text[begin - 1] not in " \t\n'\"=;&|<>()`:,{":
+            begin -= 1
+        if in_store_root(text[begin:m.start()], places):
             return True
     return False
 
@@ -198,7 +202,7 @@ def names_key(tool_input, tool: str = "") -> bool:
     paths, command = guard_targets(tool_input, tool)
     if any(KEY_FILE.search(v) or (GLOB_TOKEN.fullmatch(v) and glob_could_name_key(v)) for v in paths):
         return True
-    return bool(KEY_FILE.search(command)) or any(glob_could_name_key(t) for t in GLOB_TOKEN.findall(command))
+    return bool(KEY_FILE.search(command)) or any(glob_could_name_key(t) for t in SHELL_WORD.findall(command) if "*" in t or "?" in t or "[" in t)
 
 
 def searches_store(tool: str, tool_input, cwd=None) -> bool:
@@ -303,10 +307,10 @@ FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprin
 
 class ShellCommand:
     """One simple command, or with `body` one ( subshell ). `op` joins it to the next command: | or & or ; (also && and ||)."""
-    __slots__ = ("words", "subs", "op", "stdin", "heredoc", "body")
+    __slots__ = ("words", "subs", "op", "stdin", "heredoc", "body", "chained")
 
     def __init__(self):
-        self.words, self.subs, self.op, self.stdin, self.heredoc, self.body = [], [], ";", False, None, None
+        self.words, self.subs, self.op, self.stdin, self.heredoc, self.body, self.chained = [], [], ";", False, None, None, False
 
 
 def parse_shell(text: str, start: int = 0, closer=None, depth: int = 0) -> tuple:
@@ -451,6 +455,8 @@ def parse_shell(text: str, start: int = 0, closer=None, depth: int = 0) -> tuple
             two = text[i:i + 2]
             token = two if two in ("&&", "||", ";;", "|&") else ch
             end_command("|" if token in ("|", "|&") else "&" if token == "&" else ";")
+            if token == "&&" and commands:
+                commands[-1].chained = True  # what follows runs only if this succeeded
             i += len(token)
         elif ch == "(":
             if word is not None and "".join(word).endswith("="):  # an array assignment, not a subshell
@@ -508,7 +514,7 @@ class ShellState:
             if match:
                 self.variables[match.group(1)] = self.expand(match.group(2))
 
-    def change_dir(self, prog: str, args: list) -> None:
+    def change_dir(self, prog: str, args: list, chained: bool = True) -> None:
         """Follow cd, pushd and popd. A target that cannot be resolved leaves the last known directory in place."""
         args = [a for a in args if a not in ("-L", "-P", "-e", "-@", "--")]
         if prog == "popd":
@@ -531,6 +537,8 @@ class ShellState:
         if path is None or path.startswith(("~", "+", "-")) or re.search(r"[*?\[]", path):
             self.unknown_cd = True
             return
+        if not chained and not os.path.isdir(os.path.join(self.here, path)):
+            return  # `cd missing; rm -rf *`: the cd fails and the next command still runs here
         if prog == "pushd":
             self.stack.append(self.here)
         self.unknown_cd = self.unknown_cd and not path.startswith("/")
@@ -612,7 +620,7 @@ def walk_shell(commands: list, state: ShellState, fed: bool, depth: int):
             state.assign(cmd.words)
         elif prog in ("cd", "pushd", "popd"):
             if not isolated:
-                state.change_dir(prog, argv[1:])
+                state.change_dir(prog, argv[1:], cmd.chained)
         elif prog in DECLARERS:
             state.assign(argv[1:])
         elif prog == "eval":
@@ -2178,7 +2186,9 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
     if len(ordered) > limit:
         lines.append(f"  ... {len(ordered) - limit} more: run `work_assignments.py status`")
     for d in ix["openDecisions"][:5]:
-        lines.append(f"  DECISION {d['id']} [{d['state']}]: {prov.clip(d['compressed'], 80)}")
+        asked_in = data["decisions"].get(d["id"], {}).get("origin", {}).get("actor", {}).get("sessionId")
+        lines.append(f"  DECISION {d['id']} [{d['state']}]: " + (prov.clip(d["compressed"], 80) if asked_in is None or mine(asked_in)
+                     else f"(session {asked_in[:8]}; text shown only in its own session)"))
     pending = pending_supersessions(data, limit=10 ** 6)
     for ask in pending[:8]:
         repl = supersede_target(data, ask)
@@ -2462,6 +2472,10 @@ def run_hook(name: str, runtime: str) -> int:
             except OSError as error:
                 record_failure(f"{name}:timeout-spool", error)
         record_failure(f"{name}:timeout", TimeoutError(f"hook exceeded {HOOK_SECONDS:.0f}s"))
+        if name == "guard" and load_policy()["guard"] == "enforce":  # checked live: at the runtime's limit the tool would run
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason":
+                  f"The work-assignments guard did not finish in {HOOK_SECONDS:.0f}s, so this call was not checked. Shorten the command "
+                  "(for example, move long text into a file) and retry."}}), flush=True)
         os._exit(0)
 
     timer = threading.Timer(HOOK_SECONDS, timeout)
@@ -3179,6 +3193,9 @@ def cmd_prereq(args):
 
 def cmd_decision(args):
     who = cli_actor(args.actor)
+    caller = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    if re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", caller):
+        who["sessionId"] = caller
     with transaction() as data:
         if args.action == "ask":
             did = mint(data, "D")
