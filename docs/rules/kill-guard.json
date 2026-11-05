@@ -1,0 +1,14 @@
+{
+  "_doc": "Entry for the future rules registry (matrix G08). Same keys as docs/rules/merge-gate.json: id, rule, mechanism, test (Class.method inside test_file, resolved by Wiring.test_rules_registry_entry), source, enforcement.",
+  "rules": [
+    {
+      "id": "kill-guard",
+      "rule": "No agent runs pkill, killall, fuser -k, taskkill, Stop-Process, a pgrep-fed kill (xargs, command substitution, loops), interpreter code that signals processes, or a plain kill of a PID it cannot prove it owns (cwd or program inside its own git worktree, or a spawn-ledger entry). Kills inside ssh, mosh, docker exec and kubectl exec are blocked except `netwatch orphans --kill --pid N`. kill -0, kill -l and process listing stay allowed. Every block is one line naming `netwatch orphans --kill --pid <pid>`.",
+      "mechanism": "PreToolUse hook harness/hooks/kill_guard.py (Claude Code: Bash and PowerShell, onFailure block; Codex: PreToolUse, no matcher). Runs the analysis in a child process and fails closed for kill-looking input. Policy in kill_guard_policy.json (mode enforce). Audit log and spawn ledger under ~/.agent-harness/state/kill-guard/.",
+      "enforcement": "ENFORCED",
+      "test": "Corpus.test_positive_rows_blocked",
+      "test_file": "tests/test_kill_guard.py",
+      "source": "ticket:GoodQA goodqa#14506 (matrix X05, G08); incident: pgrep -f into xargs kill and pkill -f stopped other owners' test runs, coordinator relay 2026-11-04"
+    }
+  ]
+}
