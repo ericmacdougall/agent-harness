@@ -45,6 +45,15 @@ def env_session() -> str:
     return os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID") or ""
 
 
+def _bounded(path, limit: int = 64 << 20) -> bytes:
+    """Whole small file, or InputRejected: regular files only, never more than limit bytes (safe_input)."""
+    import safe_input
+    try:
+        return safe_input.read_bounded(str(path), limit)
+    except safe_input.InputRejected as e:  # callers already treat OSError as "missing or unusable"
+        raise OSError(e.code) from None
+
+
 def home_dir() -> Path:
     return Path(os.environ.get("AH_HOME") or Path.home())
 
@@ -159,7 +168,7 @@ def newest_session(home: Path):
 def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
     cache = index_dir / ("wal-" + hashlib.sha256(str(path).encode()).hexdigest()[:16] + ".json")
     try:
-        summary = json.loads(cache.read_text())
+        summary = json.loads(_bounded(cache))
     except (OSError, ValueError):
         summary = {}
     if summary.get("schema", 1) > SCHEMA:
@@ -237,7 +246,7 @@ def discover_agents(home: Path, session: str, wal: Path) -> dict:
                             info = found.setdefault(agent, {})
                             try:  # the meta file only: transcript content is never read here
                                 if e.stat().st_size <= 65536:
-                                    meta = json.loads(Path(e.path).read_text())
+                                    meta = json.loads(_bounded(Path(e.path), 65536))
                                     info.update(type=meta.get("agentType"), description=meta.get("description"),
                                                 parent=meta.get("parentAgentId"), finished=bool(meta.get("finished")))
                             except (OSError, ValueError):
@@ -372,7 +381,7 @@ def index_transcript(home: Path, session: str) -> dict:
     path = find_transcript(home, session)
     cache = state_dir(home, "ah-index", "transcripts") / (session + ".json")
     try:
-        idx = json.loads(cache.read_text())
+        idx = json.loads(_bounded(cache))
     except (OSError, ValueError):
         idx = {}
     if idx.get("schema", 1) > SCHEMA:
@@ -520,7 +529,7 @@ def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limi
 
 def load_adapter(home: Path | None = None):
     import ticket_adapters
-    cfg = json.loads(Path(__file__).with_name("commit_policy.json").read_text())["ticket_systems"]["goodqa"]
+    cfg = json.loads(_bounded(Path(__file__).with_name("commit_policy.json")))["ticket_systems"]["goodqa"]
     if os.environ.get("AH_GOODQA_ENDPOINT"):  # loopback endpoints only (tests); the adapter enforces the scheme
         cfg = dict(cfg, endpoint=os.environ["AH_GOODQA_ENDPOINT"])
     if os.environ.get("AH_GOODQA_KEY_FILE"):
@@ -847,7 +856,7 @@ def spool_drain(home: Path, only_opid: str | None = None, limit: int | None = No
             if (limit is not None and n_ >= limit) or (stop_at_ and time.monotonic() > stop_at_):
                 break
             try:
-                job = json.loads(f.read_text())
+                job = json.loads(_bounded(f))
                 post_comment(job["ticket"], job["body"], job["operation_id"])
             except AhError as e:
                 if e.code == "not_found":
@@ -880,7 +889,7 @@ def _wal_append(home: Path, path: Path, record: dict) -> None:
         with open(path, "rb") as handle:
             handle.seek(0, 2)
             handle.seek(max(0, handle.tell() - 262144))
-            if (b'"id":"%s"' % record["id"].encode()) in handle.read():
+            if (b'"id":"%s"' % record["id"].encode()) in handle.read(262144):  # input-ok: tail window only
                 return
     except OSError:
         pass
@@ -1125,7 +1134,7 @@ def doctor() -> dict:
     for name in ("ah.py", "liveness.py", "provenance.py", "commit_policy.json"):
         f = here / name
         try:
-            checks.append({"check": f"file {name}", "ok": True, "sha256": hashlib.sha256(f.read_bytes()).hexdigest()[:16]})
+            checks.append({"check": f"file {name}", "ok": True, "sha256": hashlib.sha256(_bounded(f, 16 << 20)).hexdigest()[:16]})
         except OSError:
             checks.append({"check": f"file {name}", "ok": False})
     return {"ok": all(c["ok"] for c in checks), "checks": checks}
