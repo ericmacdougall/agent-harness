@@ -151,6 +151,7 @@ LAUNCH = re.compile(r'(^|[\s;&|(/`\'"=])(claude|codex|rescue\.py|peer_review\.py
 SHELL_STRING_HOSTS = ('bash', 'sh', 'zsh', 'dash', 'ksh', 'su', 'sudo')
 ENV_MODEL = re.compile(r'(?:^|\s)(?:export\s+)?(?:ANTHROPIC_MODEL|CLAUDE_MODEL)=([^\s;&|]+)')
 MAX_NESTING = 2
+MAX_LAUNCH_LINE = 64 * 1024  # bytes; larger launch-bearing lines are refused, never parsed
 PURE_SHELLS = ('bash', 'sh', 'zsh', 'dash', 'ksh')
 WRAPPER_VALUE_OPTIONS = {'sudo': ('-u', '-g', '-C', '-h', '-p', '-U', '-r', '-t', '-T'), 'nice': ('-n',), 'timeout': ('-s', '-k'),
                          'env': ('-u', '-C', '-S'), 'nohup': (), 'time': (), 'command': (), 'exec': ()}
@@ -284,6 +285,10 @@ def decide_bash(data, policy, ledger, depth=0, env_model=None):
     command = str(tool_input.get('command') or '')
     if not LAUNCH.search(command):
         return 'allow', None, None, {}
+    if depth == 0 and len(command) > MAX_LAUNCH_LINE:
+        # The hook has a 10 s budget under onFailure block: a launch-bearing line this large is refused
+        # instead of parsed (split it, or put the script in a file and run that).
+        return 'deny', 'launch line too large to check (%d bytes > %d): split it or run it from a file' % (len(command), MAX_LAUNCH_LINE), None, {'oversize': len(command)}
     results = []
     segments, seps = split_segments_with_seps(command)
     for number, segment in enumerate(segments):

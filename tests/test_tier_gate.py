@@ -293,6 +293,17 @@ class BashAdvisory(GateFixture):
             self.assertEqual(self.bash(line)[0], 'allow', line)
         self.assertEqual(self.bash('codex exec -m gpt-6-astra -')[0], 'deny')
 
+    def test_oversize_launch_lines_are_refused_quickly_not_parsed(self):
+        import time
+        filler = "echo 'x'; " * 7000  # about 70 KiB of harmless segments
+        start = time.monotonic()
+        decision, reason, _, facts = self.bash(filler + 'claude -p --model sonnet --task k9 x')
+        self.assertEqual(decision, 'deny'); self.assertIn('too large', reason); self.assertLess(time.monotonic() - start, 1.0)
+        just_under = "echo 'x'; " * 6000 + 'claude -p --model sonnet --task k9 x'  # about 60 KiB: parsed within budget
+        start = time.monotonic()
+        self.assertEqual(self.bash(just_under)[0], 'allow'); self.assertLess(time.monotonic() - start, 3.0)
+        self.assertEqual(self.bash("echo 'y'; " * 8000)[0], 'allow')  # no launch token: untouched whatever the size
+
     def test_piped_script_behind_a_wrapper_is_still_checked(self):
         for line in ("echo 'claude -p --model fable x' | sudo bash", "echo 'claude -p --model fable x' | env -i sh",
                      "echo 'claude -p --model fable x' | nice -n 5 bash", "echo 'claude -p --model fable x' | sudo -u eric /bin/bash",
