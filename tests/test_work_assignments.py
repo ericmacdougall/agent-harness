@@ -363,6 +363,24 @@ class TriageTest(Base):
             self.assertNotIn(text.split()[-1], json.dumps(ref))
         self.assertEqual(wa.text_ref("ship the release today")["excerpt"], "ship the release today")
 
+    def test_excerpt_and_hook_bounded_on_one_huge_token(self):
+        """PR review P1: redact() saw a 65k window, and a quadratic redactor stalled the prompt hook for 5.7 s."""
+        start = time.perf_counter()
+        ref = wa.text_ref("a" * 65000)
+        self.assertLess(time.perf_counter() - start, 0.5)
+        self.assertLessEqual(len(ref["excerpt"]), 160)
+        calls = []
+        with mock.patch.object(wa, "redact", lambda text: calls.append(len(text)) or text):
+            wa.text_ref("b" * 65000 + " more words " * 2000)
+            wa.short("c" * 65000)
+        self.assertTrue(calls and max(calls) <= 15 * wa.EXCERPT_WORD_CHARS + 14 + 600, calls)
+
+    def test_more_secret_shapes_are_withheld(self):
+        """PR review P5."""
+        for text in ("the ssh key is AAAAB3NzaC1yc2E ok", "my passcode is 1234", "pw is hunter2", "login bob hunter2",
+                     "token sk-abc123", "here is AKIAIOSFODNN7EXAMPLE"):
+            self.assertEqual(wa.text_ref(text)["excerpt"], "[excerpt withheld: may contain a secret]", text)
+
     def test_legacy_no_ask_without_cues_falls_back_to_excerpt(self):
         msg = self.capture("could you remove the old cron job")
         self.cli("no-ask", "--msg", msg["id"], "--reason", "handled elsewhere already")
@@ -692,6 +710,16 @@ class RemovalTest(Base):
         self.assertEqual(wa.verify_events(), [])
         self.check_schema()
 
+    def test_message_with_pending_binding_is_not_pruned(self):
+        """PR review P10: pruning a message sync had not bound yet let sync re-capture it later."""
+        thanks = self.capture("thanks a lot")
+        with wa.transaction() as data:
+            data["messages"][thanks["id"]]["origin"]["binding"] = {"status": "pending", "attempts": 0}
+        self.cli("no-ask", "--msg", thanks["id"], "--reason", "pure thanks, nothing to do")
+        CLOCK[0] += 40 * 86400
+        self.cli("prune", "--apply")
+        self.assertIn(thanks["id"], self.data()["messages"])
+
     def test_cancel_with_genuine_proof_then_removal_after_24h(self):
         aid, uid, line = self.setup_cancel()
         self.assertEqual(self.cli(*self.cancel_args(aid, uid, line))[0], 0)
@@ -712,10 +740,23 @@ class RemovalTest(Base):
         self.assertEqual(code, 2)
         self.assertEqual(self.asks()[aid]["state"], "open")
 
-    def test_superseded_ask_stays_in_digest_until_replacement_done(self):
-        """Native review F4: superseding by any open ask hid the old one."""
+    def split2(self, text, first, second):
+        msg = self.capture(text)
+        self.assertEqual(self.cli("split", "--msg", msg["id"], "--item", first, "--item", second)[0], 0)
+        a, b = sorted(self.asks())[-2:]
+        return a, b
+
+    def test_supersede_across_requests_is_refused(self):
+        """PR review P3: any unrelated open ask could supersede, and so drop, a request."""
         _, old = self.split("old", "deploy the billing migration")
         _, new = self.split("new", "unrelated cleanup chore")
+        self.cli("relate", old, "superseded_by", new)
+        self.assertEqual(self.cli("update", old, "--state", "superseded")[0], 2)
+        self.assertEqual(self.asks()[old]["state"], "open")
+
+    def test_superseded_ask_stays_in_digest_until_replacement_done(self):
+        """Native review F4: superseding by any open ask hid the old one."""
+        old, new = self.split2("do the billing work", "deploy the billing migration", "deploy billing migration in two steps")
         self.cli("relate", old, "superseded_by", new)
         self.assertEqual(self.cli("update", old, "--state", "superseded")[0], 0)
         out = self.cli("status")[1]
@@ -724,8 +765,7 @@ class RemovalTest(Base):
         self.assertNotIn("SUPERSEDED", self.cli("status")[1])
 
     def test_superseded_ask_is_removable_only_after_the_superseding_ask_closes(self):
-        _, old = self.split("old thing", "the old approach to exporting")
-        _, new = self.split("new thing", "the new approach to exporting")
+        old, new = self.split2("exporting", "the old approach to exporting", "the new approach to exporting")
         self.assertEqual(self.cli("update", old, "--state", "superseded")[0], 2)  # needs a superseded_by relation first
         self.cli("relate", old, "superseded_by", new)
         self.assertEqual(self.cli("update", old, "--state", "superseded")[0], 0)
@@ -785,17 +825,34 @@ class RemovalTest(Base):
         args = self.cancel_args(aid, uid, 1, "add a dark mode toggle to the settings page", "same_message_retraction")
         self.assertEqual(self.cli(*args)[0], 2)
 
+    def ask_decision(self, aid, text):
+        self.assertEqual(self.cli("decision", "ask", "--text", text, "--tool", "AskUserQuestion", "--ask", aid)[0], 0)
+        CLOCK[0] += 5
+        return sorted(self.data()["decisions"])[-1]
+
     def test_decision_answer_binding(self):
-        aid, uid, line = self.setup_cancel(ask_text="refactor the billing exporter module")
-        self.assertEqual(self.cli("decision", "ask", "--text", "Cancel the billing refactor?", "--tool", "AskUserQuestion", "--ask", aid)[0], 0)
-        did = sorted(self.data()["decisions"])[-1]
-        self.cli("sync")
-        mid = next(m["id"] for m in self.data()["messages"].values() if m["origin"]["log"].get("messageUuid") == uid)
-        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", mid)[0], 0)
-        self.assertEqual(self.data()["decisions"][did]["state"], "answered")
-        args = self.cancel_args(aid, uid, line, "cancel that whole thing please", "answer_to_decision", "--decision", did)
+        _, aid = self.split("start something", "refactor the billing exporter module")
+        did = self.ask_decision(aid, "Cancel the billing exporter refactor?")
+        msg = self.capture("yes, cancel that whole thing please")
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", msg["id"])[0], 0)
+        uid = self.data()["messages"][msg["id"]]["origin"]["log"]["messageUuid"]
+        args = self.cancel_args(aid, uid, 2, "yes, cancel that whole thing please", "answer_to_decision", "--decision", did)
         self.assertEqual(self.cli(*args)[0], 0)
         self.check_schema()
+
+    def test_unrelated_message_cannot_answer_a_decision_or_cancel(self):
+        """PR review P2: any human message containing "don't" answered a decision and cancelled the ask."""
+        _, aid = self.split("start", "fix the login redirect bug in staging")
+        did = self.ask_decision(aid, "Should I keep going on the login redirect bug in staging?")
+        first = self.capture("yes keep going on it")
+        CLOCK[0] += 5
+        snacks = self.capture("don't forget to bring snacks to the standup tomorrow")
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", snacks["id"])[0], 2)  # not the first reply
+        self.assertEqual(self.cli("decision", "answer", "--id", did, "--msg", first["id"])[0], 0)
+        uid = self.data()["messages"][first["id"]]["origin"]["log"]["messageUuid"]
+        args = self.cancel_args(aid, uid, 2, "yes keep going on it", "answer_to_decision", "--decision", did)
+        self.assertEqual(self.cli(*args)[0], 2)  # an answer that does not retract, to a question that is not about cancelling
+        self.assertEqual(self.asks()[aid]["state"], "open")
 
     def test_cancel_proof_that_is_an_agent_message_is_refused(self):
         """NEG-2."""
@@ -1063,6 +1120,20 @@ class AttestGuardTest(Base):
         self.assertEqual(out.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
         self.assertEqual(self.guard("Bash", {"command": "python3 ~/.claude/hooks/work_assignments.py status"}), {})
 
+    def test_guard_denies_common_bypass_forms(self):
+        """PR review P4: globs, in-process imports, recursive reads and obfuscated hook calls all got through."""
+        home = str(wa.base())
+        for cmd in ('python3 -c "import work_assignments as w; print(w.capture_key().hex())"',
+                    f"cat {home}/work-ledger.ke?", f"cat {home}/work-led*", f"cat {home}/[w]ork-ledger.key",
+                    f"grep -r . {home}", f"tar czf /tmp/x.tgz {home}",
+                    "python3 ~/.claude/hooks/work_assign[m]ents.py hook prompt claude < x.json",
+                    "python3 -c 'from work_assignments import hook_prompt; hook_prompt({}, \"claude\")'"):
+            out = self.guard("Bash", {"command": cmd})
+            self.assertEqual(out.get("hookSpecificOutput", {}).get("permissionDecision"), "deny", cmd)
+        for cmd in (f"ls {home}", f"grep -r TODO {home}/work", "python3 -m unittest tests.test_work_assignments",
+                    "git diff harness/hooks/work_assignments.py", "cat docs/work-assignments.md"):
+            self.assertEqual(self.guard("Bash", {"command": cmd}), {}, cmd)
+
 
 class SpoolTest(Base):
     def test_malformed_spool_line_is_skipped_and_recorded(self):
@@ -1075,6 +1146,53 @@ class SpoolTest(Base):
         with wa.transaction():
             pass
         self.assertTrue(any(f["event"] == "spool:malformed" for f in wa.pending_failures()))
+
+    def test_wrong_typed_spool_line_does_not_wedge_transactions(self):
+        """PR review P6: "session": 123 raised TypeError in every later transaction."""
+        wa.private_dir()
+        bad = {"runtime": "claude", "session": 123, "pasted": False, "source": "prompt", "method": "claude_user_turn",
+               "tref": {"sha256": "a" * 64}, "spoolId": "x1"}
+        with open(wa.files()["spool"], "a") as handle:
+            handle.write(json.dumps(bad) + "\n")
+        for _ in range(2):
+            with wa.transaction():
+                pass
+        self.capture("still captured after the bad line")
+        self.assertEqual(len(self.data()["messages"]), 1)
+
+    def test_ask_answer_timeout_spools_the_answer(self):
+        """PR review P8."""
+        exits = []
+        payload = {"session_id": SID, "transcript_path": str(self.transcript), "tool_name": "AskUserQuestion",
+                   "tool_use_id": "toolu_1", "tool_response": {"answers": {"q": "go with option B"}}}
+        class Killed(BaseException):
+            """Stands in for the process dying at os._exit: nothing after the stall runs."""
+
+        def stalled(*a, **k):
+            time.sleep(0.6)
+            raise Killed()
+        with mock.patch.object(wa, "HOOK_SECONDS", 0.2), mock.patch.object(wa.os, "_exit", lambda code: exits.append(code)), \
+                mock.patch.object(wa, "transaction", stalled), \
+                mock.patch.object(wa.safe_input, "read_stdin_bounded", lambda n: json.dumps(payload).encode()):
+            with self.assertRaises(Killed):
+                wa.run_hook("ask-answer", "claude")
+        self.assertEqual(exits, [0])
+        with wa.transaction():
+            pass
+        msgs = [m for m in self.data()["messages"].values() if m["humanCheck"]["method"] == "claude_ask_answer"]
+        self.assertEqual(len(msgs), 1)
+        self.assertTrue(wa.verified_human(msgs[0]))
+
+    def test_key_created_without_hard_links(self):
+        """PR review P11."""
+        def nolink(*a, **k):
+            raise OSError(1, "Operation not permitted")
+        with mock.patch.object(wa.os, "link", nolink):
+            wa._KEY_CACHE.clear()
+            key = wa.capture_key()
+        self.assertEqual(len(key), 32)
+        wa._KEY_CACHE.clear()
+        self.assertEqual(wa.capture_key(), key)
 
     def test_short_writes_are_completed(self):
         """F8: commit ignored a short os.write."""

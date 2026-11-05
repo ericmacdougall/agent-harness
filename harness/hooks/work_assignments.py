@@ -68,8 +68,38 @@ DEFAULT_POLICY = {"schema": 1, "capture": "enforce", "stop": "enforce", "guard":
 PROTECTED = re.compile(r"work-(?:assign|ledger)[A-Za-z0-9._*?-]*|work_assignments_policy[A-Za-z0-9._*?-]*|"
                        r"work_assign[a-z]*[*?]|work-[a-z]+[*?]|\bhive\.json\b")
 SAFE_CLI = re.compile(r"^\s*python3\s+(?:~|\$HOME|/[^\s;&|<>`$]*)?[^\s;&|<>`$]*/work_assignments\.py\s+[A-Za-z-]+(?:\s+[^;&|<>`$\n]*)?$")
-KEY_FILE = re.compile(r"work-ledger\.key|work-ledger\.k[*?]|work-ledger\.\*")
-HOOK_CALL = re.compile(r"work_assignments(?:\.py)?['\"]?\s+hook\b|agent-harness/work_assignments\.py['\"]?\s+hook\b")
+KEY_FILE = re.compile(r"work-ledger\.key")
+GLOB_TOKEN = re.compile(r"[^\s'\"=;&|<>()`]*[*?\[][^\s'\"=;&|<>()`]*")
+HOOK_CALL = re.compile(r"\bhook\s+(?:prompt|stop|session|compact|ask-answer|guard|subagent-start)\b")
+INPROCESS = re.compile(r"\b(?:import|from)\s+work_assignments\b|__import__\(\s*['\"]work_assignments|\bcapture_key\b|"
+                       r"\bhook_prompt\s*\(|\bhook_ask_answer\s*\(|\bbuild_capture\s*\(|\battest\s*\(")
+RECURSIVE = re.compile(r"\b(?:grep|egrep|rg|ag|ack)\b[^|;&]*\s-[A-Za-z]*[rR]|\brg\b|\bfind\b|\btar\b|\bzip\b|\brsync\b|"
+                       r"\bcp\s+-[A-Za-z]*[rR]|\bstrings\b|\bxxd\b|\bod\b")
+
+
+def names_key(blob: str) -> bool:
+    """The key's name, or a glob that could expand to it (work-led*, work-ledger.ke?, [w]ork-ledger.key)."""
+    if KEY_FILE.search(blob):
+        return True
+    import fnmatch
+    for token in GLOB_TOKEN.findall(blob):
+        name = token.rstrip("/").rsplit("/", 1)[-1]
+        if name and fnmatch.fnmatchcase("work-ledger.key", name):
+            return True
+    return False
+
+
+def reads_store_recursively(command: str) -> bool:
+    """A recursive reader pointed at the store directory itself (not a subdirectory such as work/)."""
+    if not RECURSIVE.search(command):
+        return False
+    home = str(base()).rstrip("/")
+    targets = {home, home.replace(str(Path.home()), "~", 1), home.replace(str(Path.home()), "$HOME", 1),
+               "$AGENT_HARNESS_HOME", "${AGENT_HARNESS_HOME}"}
+    for token in re.split(r"[\s'\"=;&|<>()]+", command):
+        if token.rstrip("/") in targets or token.rstrip("/*") in targets and token.endswith("*"):
+            return True
+    return False
 WRITEISH = re.compile(r"(?:>|\btee\b|\brm\b|\bmv\b|\bcp\b|sed\s+-i|\btruncate\b|\bpython3?\b|\bperl\b|\bruby\b|\bnode\b|"
                       r"\bdd\b|\bln\b|\bchmod\b|\binstall\b|\bgit\s+(?:checkout|restore|stash)\b)")
 
@@ -197,13 +227,29 @@ def capture_key() -> bytes:
             os.link(tmp, path)  # fails if another process won the race; then its key is used
         except FileExistsError:
             pass
+        except OSError:  # no hard links here: exclusive create, then readers retry until the bytes are complete
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                pass
+            else:
+                try:
+                    write_all(fd, prov.read_small(tmp, 256))
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
         finally:
             os.unlink(tmp)
     st = os.lstat(path)
     if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077 or st.st_uid != os.getuid():
         raise WAError("capture key must be a private regular file owned by this user (chmod 600)")
-    raw = prov.read_small(path, 256).strip()
-    if not re.fullmatch(rb"[0-9a-f]{64}", raw):
+    raw = b""
+    for _ in range(20):  # a racing creator without hard links may not have finished writing
+        raw = prov.read_small(path, 256).strip()
+        if re.fullmatch(rb"[0-9a-f]{64}", raw):
+            break
+        time.sleep(0.05)
+    else:
         raise WAError("capture key is malformed")
     _KEY_CACHE[str(path)] = key = bytes.fromhex(raw.decode())
     return key
@@ -388,7 +434,7 @@ def span_of(rec: dict, span_id: str):
 
 
 def apply_event(data: dict, ev: dict) -> None:
-    """The only way the snapshot changes. Deterministic: events folded in (at, hive, seq) order give the same state."""
+    """The only way the snapshot changes. Deterministic: events folded in (hiveId, seq) order give the same state."""
     op, data_, tgt = ev["op"], ev["data"], ev["target"]
     kind = {"ask": "asks", "decision": "decisions", "message": "messages"}.get(tgt["type"])
     rec = data[kind].get(tgt["id"]) if kind else None
@@ -734,9 +780,15 @@ def drain_spool(data: dict) -> None:
             continue
         if not isinstance(rec, dict) or not line.strip():
             continue
-        missing = [k for k in ("runtime", "session", "pasted", "source", "method", "tref", "spoolId") if k not in rec]
-        if missing or not isinstance(rec["tref"], dict) or "sha256" not in rec["tref"]:
-            record_failure("spool:malformed", ValueError("spool record lacks " + ",".join(missing or ["tref.sha256"])))
+        types = {"runtime": str, "session": str, "pasted": bool, "source": str, "method": str, "tref": dict, "spoolId": str}
+        bad = [k for k, t in types.items() if not isinstance(rec.get(k), t)]
+        if not bad and not (isinstance(rec["tref"].get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", rec["tref"]["sha256"])):
+            bad = ["tref.sha256"]
+        if not bad and not (rec.get("item") is None or isinstance(rec["item"], str)) or \
+                not bad and not (rec.get("transcript") is None or isinstance(rec["transcript"], str)):
+            bad = ["item/transcript"]
+        if bad:
+            record_failure("spool:malformed", ValueError("spool record has a missing or wrong-typed " + ",".join(bad)))
             continue
         key = rec.get("item") or f"spool:{rec['spoolId']}"
         if key in seen:
@@ -746,8 +798,11 @@ def drain_spool(data: dict) -> None:
         want = capture_claims(rec["session"], rec["tref"], rec["pasted"], rec["method"], rec.get("item"), rec["spoolId"])
         if not (attestation_valid(att) and att["claims"] == want):
             att = None  # a hand-written or altered spool line is captured, but never as a verified human turn
-        build_capture(data, rec["runtime"], rec["session"], rec.get("transcript"), "", rec["pasted"], rec["source"],
-                      via="spool", method=rec["method"], provider_item=key, tref=rec["tref"], attestation=att)
+        try:
+            build_capture(data, rec["runtime"], rec["session"], rec.get("transcript"), "", rec["pasted"], rec["source"],
+                          via="spool", method=rec["method"], provider_item=key, tref=rec["tref"], attestation=att)
+        except (KeyError, TypeError, ValueError, AttributeError) as error:  # one bad line must not wedge every transaction
+            record_failure("spool:malformed", error)
     data["_unlink_draining"] = True
 
 
@@ -764,15 +819,20 @@ def redact(text: str) -> str:
 
 
 def short(text, limit=300) -> str:
-    return prov.clip(redact(str(text)), limit)
+    # The redactor is superlinear on long unbroken tokens; it only ever sees a bounded prefix.
+    return prov.clip(redact(str(text)[: limit * 2]), limit)
 
 
-SECRET_HINT = re.compile(r"(?i)pass(?:word|wd|phrase)?\b|\bpwd\b|secret|token|api[_ -]?key|private key|credential|\bpin\b|\botp\b|2fa")
+# Heuristic: an excerpt whose words look secret-adjacent is withheld outright rather than redacted.
+SECRET_HINT = re.compile(r"(?i)pass\w*|\bpwd\b|\bpw\b|secret|token|\bkeys?\b|api[_ -]?key|credential|\bpin\b|\botp\b|2fa|"
+                         r"\blogin\b|\bssh\b|\bauth\w*|bearer|cookie|session[_ -]?id|\bAKIA|\bsk-|\bghp_|-----BEGIN")
+EXCERPT_WORD_CHARS = 40
 
 
 def excerpt_of(text: str) -> str:
     """15 redacted words; withheld entirely when they mention a secret (the redactor misses "password is X")."""
-    window = " ".join(text[:65536].split()[:15])
+    words = [w[:EXCERPT_WORD_CHARS] for w in text[:65536].split()[:15]]  # bounded: at most 15 x 40 characters
+    window = " ".join(words)
     if SECRET_HINT.search(window):
         return "[excerpt withheld: may contain a secret]"
     return prov.clip(redact(window), 160)
@@ -1160,11 +1220,14 @@ def digest(data: dict, policy: dict, session=None, limit: int = 20) -> str:
         lines.append(f"  ... {len(ordered) - limit} more: run `work_assignments.py status`")
     for d in ix["openDecisions"][:5]:
         lines.append(f"  DECISION {d['id']} [{d['state']}]: {prov.clip(d['compressed'], 80)}")
-    for ask in pending_supersessions(data):
+    pending = pending_supersessions(data, limit=10 ** 6)
+    for ask in pending[:8]:
         target = next(r["target"] for r in ask["related"] if r["kind"] == "superseded_by")
         repl = data["asks"].get(target)
         lines.append(f"  SUPERSEDED {ask['id']} -> {target} [{repl['state'] if repl else 'missing'}]: "
                      f"{prov.clip(ask['request']['compressed'], 60)} (shown until {target} is done)")
+    if len(pending) > 8:
+        lines.append(f"  ... {len(pending) - 8} more superseded ask(s) waiting on their replacement: `work_assignments.py status --json`")
     shown = min(8, limit)
     lines.extend(no_ask_line(row) for row in no_asks[:shown])
     if len(no_asks) > shown:
@@ -1305,6 +1368,8 @@ def hook_ask_answer(payload: dict, runtime: str) -> dict:
     key = f"ask:{payload.get('tool_use_id') or sha(text)[:16]}"
     fields = {"runtime": runtime, "session": session, "transcript": transcript, "text": text, "pasted": False,
               "source": "ask-answer", "method": "claude_ask_answer", "item": key}
+    pending = spoolable(fields)
+    _PENDING["prompt"] = pending  # spooled by the timeout handler; deduped on the item key
     try:
         with transaction() as data:
             session_record(data, session, runtime, transcript)
@@ -1312,8 +1377,10 @@ def hook_ask_answer(payload: dict, runtime: str) -> dict:
                 build_capture(data, runtime, session, transcript, text, False, "ask-answer", via="hook_post_tool",
                               method="claude_ask_answer", provider_item=key)
     except Exception:
-        spool_message(spoolable(fields))
+        spool_message(pending)
         raise
+    finally:
+        _PENDING.pop("prompt", None)
     return {}
 
 
@@ -1375,10 +1442,14 @@ def hook_guard(payload: dict, runtime: str) -> dict:
     if isinstance(command, list):
         command = " ".join(str(part) for part in command)
     reason = None
-    if KEY_FILE.search(blob):
+    if names_key(blob):
         reason = "The capture key is read and written only by work_assignments.py; tools may not touch it."
-    elif isinstance(command, str) and HOOK_CALL.search(command):
+    elif isinstance(command, str) and HOOK_CALL.search(command) and re.search(r"work.?assign|\[|\*|\?", command):
         reason = "Hooks take their input from the harness; agents may not run `work_assignments.py hook`."
+    elif isinstance(command, str) and INPROCESS.search(command) and not SAFE_CLI.match(command):
+        reason = "work_assignments is used only through its CLI (`python3 .../work_assignments.py <command>`), not imported."
+    elif isinstance(command, str) and reads_store_recursively(command):
+        reason = "Recursive reads of the agent-harness store would expose the capture key; read a named file instead."
     if reason:
         if mode == "enforce":
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
@@ -1561,6 +1632,41 @@ RETRACTION = re.compile(r"(?i)cancel|never ?mind|forget|scrap|\bdrop|\bstop|no w
 AFFIRM = re.compile(r"(?i)^\W*(?:yes|yep|yeah|y|ok(?:ay)?|sure|correct|confirmed?|do it|go ahead|please do)\b")
 
 
+def captured_after(mid: str, did: str, asked_at: float) -> bool:
+    """Records on one hive share a sequence, so a message minted after the decision has a higher number."""
+    m_hive, m_seq = mid.split("-", 1)[1].rsplit("-", 1)
+    d_hive, d_seq = did.split("-", 1)[1].rsplit("-", 1)
+    if m_hive == d_hive:
+        return int(m_seq) > int(d_seq)
+    return False  # another hive's message cannot answer this hive's question
+
+
+def answer_problem(data: dict, dec: dict, msg: dict):
+    """The answer to a decision is not the agent's pick of any human message: it is the AskUserQuestion answer, or
+    the first verified human message in the asking session after the question was asked."""
+    if not verified_human(msg):
+        return "the answer must be a hook-captured human message"
+    asked_at = parse_ts(dec.get("createdAt") or dec["stateSince"])
+    if not captured_after(msg["id"], dec["id"], asked_at):
+        return "the answer was captured before the question was asked"
+    if msg["humanCheck"]["method"] == "claude_ask_answer":
+        return None
+    session = (dec.get("question", {}).get("actor") or {}).get("sessionId") or dec.get("origin", {}).get("actor", {}).get("sessionId")
+    later = sorted((m for m in data["messages"].values()
+                    if m["sessionId"] == msg["sessionId"] and verified_human(m) and captured_after(m["id"], dec["id"], asked_at)),
+                   key=lambda m: (m["origin"]["at"], m["id"]))
+    if session and msg["sessionId"] != session:
+        return "the answer must come from the session that asked the question"
+    if not later or later[0]["id"] != msg["id"]:
+        return "the answer must be the first human message after the question was asked"
+    return None
+
+
+def names_ask(ask: dict, text: str) -> bool:
+    ref = {ask["id"].lower(), (ask.get("migratedFrom", {}).get("id") or "").lower()} - {""}
+    return any(r in text.lower() for r in ref) or len(words_of(text) & words_of(ask["request"]["compressed"])) >= 3
+
+
 def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, decision_id=None) -> None:
     """The proving turn must relate to THIS ask: its own origin message, a quote that names it, or the answer to a
     decision tied to it. A stranger's human message cannot cancel an unrelated ask."""
@@ -1570,8 +1676,7 @@ def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, de
         if not RETRACTION.search(quote):
             raise WAError("same_message_retraction: the quote must be the retracting words")
     elif binding == "explicit_reference":
-        ref = {ask["id"].lower(), (ask.get("migratedFrom", {}).get("id") or "").lower()} - {""}
-        if not (any(r in quote.lower() for r in ref) or len(words_of(quote) & words_of(ask["request"]["compressed"])) >= 3):
+        if not names_ask(ask, quote):
             raise WAError("explicit_reference: the quote must name the ask id or share 3+ words with its request")
         if not RETRACTION.search(quote):
             raise WAError("explicit_reference: the quote must say to cancel, drop or stop it, not just mention it")
@@ -1582,8 +1687,18 @@ def check_binding(data: dict, ask: dict, msg: dict, binding: str, quote: str, de
         if not any(r["target"] == ask["id"] for r in dec.get("related", [])):
             raise WAError(f"{binding}: decision {decision_id} is not related to {ask['id']}")
         asked = json.dumps(dec.get("question", {}), ensure_ascii=False)
-        if not (RETRACTION.search(quote) or (RETRACTION.search(asked) and AFFIRM.search(quote))):
-            raise WAError(f"{binding}: the answer must retract the ask, or say yes to a question about cancelling it")
+        if parse_ts(msg["origin"]["at"]) < parse_ts(dec.get("createdAt") or dec.get("stateSince") or msg["origin"]["at"]) - 1:
+            raise WAError(f"{binding}: the answer predates the decision")
+        if dec["answer"]["messageId"] != msg["id"]:
+            raise WAError(f"{binding}: the proof must be the message that answered decision {decision_id}")
+        why = answer_problem(data, dec, msg)
+        if why:
+            raise WAError(f"{binding}: {why}")
+        names_it = names_ask(ask, quote)
+        cancel_question = bool(RETRACTION.search(asked)) and names_ask(ask, asked)
+        if not ((RETRACTION.search(quote) and (names_it or cancel_question)) or (cancel_question and AFFIRM.search(quote))):
+            raise WAError(f"{binding}: the answer must retract this ask by name or words, or say yes to a question "
+                          f"that asks about cancelling this ask")
     else:
         raise WAError("unknown binding " + str(binding))
 
@@ -1800,10 +1915,15 @@ def cmd_update(args):
         aid = ask["id"]
         if args.state == "cancelled":
             raise WAError("use `cancel` with user proof to cancel an ask")
-        if args.state == "superseded" and not any(
-                r["kind"] == "superseded_by" and r["target"] in data["asks"] and data["asks"][r["target"]]["state"] not in CLOSED
-                for r in ask["related"]):
-            raise WAError("superseding needs `relate A superseded_by B` where B exists and is not closed")
+        if args.state == "superseded":
+            targets = [data["asks"][r["target"]] for r in ask["related"]
+                       if r["kind"] == "superseded_by" and r["target"] in data["asks"] and data["asks"][r["target"]]["state"] not in CLOSED]
+            if not targets:
+                raise WAError("superseding needs `relate A superseded_by B` where B exists and is not closed")
+            origin = ask["origin"].get("messageId")
+            if not origin or not any(b["origin"].get("messageId") == origin for b in targets):
+                raise WAError("an ask can be superseded only by an ask split from the same human message; for a request "
+                              "the user replaced, `cancel` it with their words as proof")
         for text in args.evidence or ():
             item = parse_evidence(text, who, args.repo)
             item["id"] = f"V-{len(ask['evidence']) + 1}"
@@ -1921,8 +2041,8 @@ def message_prunable(data: dict, msg: dict, ts: float) -> bool:
     and not referenced by a live cancel proof or decision answer."""
     age = ts - parse_ts(msg["capturedAt"])
     triage = msg["triage"]
-    if triage["status"] == "untriaged":
-        return False
+    if triage["status"] == "untriaged" or msg["origin"].get("binding", {}).get("status") == "pending":
+        return False  # a pending binding means sync may still read its line; a tombstone without the uuid cannot stop re-capture
     if triage["status"] == "no_ask":
         if age < PRUNE_NO_ASK_DAYS * 86400:
             return False
@@ -2033,6 +2153,9 @@ def cmd_decision(args):
                 raise WAError("decision not found or already closed")
             if not verified_human(msg) or msg["origin"]["binding"]["status"] != "bound":
                 raise WAError("an answer needs a hook-captured human message bound to a transcript line (run `sync`)")
+            why = answer_problem(data, dec, msg)
+            if why:
+                raise WAError(why)
             answer = {"actor": msg["origin"]["actor"], "at": msg["origin"]["at"], "messageId": msg["id"], "log": msg["origin"]["log"],
                       "binding": msg["origin"]["binding"], "text": msg["text"]}
             emit(data, "answered", "decision", dec["id"], {"answer": answer}, msg["origin"]["actor"])

@@ -48,8 +48,13 @@ outside `~/.agent-harness/work`). Turns caught up from a transcript or Codex rol
 hook loses nothing, but with `verified: false`. They show in the digest as `[unverified: transcript only]`, and an ask
 split from one has source kind `inferred`, not `user`. A cancel proof, a decision answer and `--reopen-by` all need a
 verified message. A cancel proof also records the captured event id and its MAC, and both are re-checked against the
-event log at removal. A transcript line alone never proves anything. The guard refuses any tool call that names the
-key, and any agent call of `work_assignments.py hook`.
+event log at removal. A transcript line alone never proves anything. A decision answer must be the AskUserQuestion
+answer or the first hook-captured message in that session after the question, never an agent's pick. An
+`answer_to_decision` cancel needs retraction words plus the ask named (id or 3+ shared words), or a yes or a
+retraction to a question that is itself about cancelling that ask. Superseding is allowed only between asks split
+from the same human message; a request the user replaced is cancelled with their words as proof. The guard
+refuses tool calls that name the key or a glob that could expand to it, recursive reads of the store directory,
+in-process use (`import work_assignments`, `capture_key`, `hook_prompt(`) and agent calls of `work_assignments.py hook`.
 
 ## CLI
 
@@ -105,18 +110,25 @@ beside `~/.agent-harness/work`, not inside it, so a backup of the work directory
 in the source list of `~/.agent-harness/bin/log-backup.sh`, which runs every 15 minutes and copies them to Dropbox.
 That job only copies: it never deletes the remote copy, and it keeps changed files under `versions/`. install.py
 does not set up this job; a hive without it has no backup of the ledger. The event log is the source of truth, so
-restoring `work-ledger.events.jsonl` and running `work_assignments.py recover` rebuilds the snapshot.
+restoring `work-ledger.events.jsonl` and running `work_assignments.py recover` rebuilds the snapshot. The capture key
+is deliberately not backed up (a copy in Dropbox would let anyone with the copy forge captures). Restoring onto a new
+machine therefore mints a new key: earlier messages stop verifying, so asks cancelled but not yet removed fail their
+removal check and need a fresh proof, and old messages cannot answer decisions. This fails safe: nothing is removed
+early.
 
 ## Known limits
 
-A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt and no request cues, and an excerpt whose words mention a password, secret,
-token, key, credential, PIN or OTP is withheld entirely, because the redactor is a heuristic. Request cues are English keyword heuristics: they miss requests phrased without them and flag some messages that are not requests. A superseded ask is removable only when its replacement, a different ask, is done with verified evidence.
+A verified commit proves the commit exists (and still resolves at removal), not that it fixes this ask; main's sign-off covers relevance. The event hash chain is unkeyed: it detects accidents and edits by anyone who does not also recompute it, and the guard covers agent edits. Pasted-only messages keep no excerpt and no request cues, and an excerpt whose first 15 words look secret-adjacent
+(pass..., pw, key, token, secret, credential, login, ssh, auth..., PIN, OTP, common key prefixes) is withheld entirely.
+That check is a keyword heuristic too: a secret with none of those words nearby can still reach the excerpt, the
+event log and its backup. Request cues are English keyword heuristics: they miss requests phrased without them and flag some messages that are not requests. A superseded ask is removable only when its replacement, a different ask, is done with verified evidence.
 
-Agents run as the same Unix user as the hooks. A forged transcript line, a hand-written spool line or event, and a
-copied or invented attestation are all refused. An agent that deliberately evades the guard (for example by building
-the key path from pieces) can still read the key or run the hook entry point with forged input. The attestation turns
-forging from appending one line into deliberately getting around a control, but it is not a cryptographic boundary;
-that needs a separate Unix user or a key the OS holds. The guard is best effort against shell tricks (a safety net for careless edits, not a sandbox); the event chain has
+Agents run as the same Unix user as the hooks. A forged transcript line, a hand-written spool line and an invented or
+altered attestation are refused. A hand-written event that copies a real attestation is accepted only for the same
+session and text, so it can only duplicate a message the human really sent. The guard deters accidental reads and
+casual forging only: an agent that writes a script file and runs it, or otherwise works around a pattern match, can
+read the key or call the hook code with forged input. The attestation is not a cryptographic boundary; that needs a
+separate Unix user or a key the OS holds. The guard is best effort against shell tricks (a safety net for careless edits, not a sandbox); the event chain has
 no external anchor; a payload over 8 MB is rejected and recorded as a failure; `prune` archives a triaged message (with a tombstone that refuses re-capture) once its asks and decisions are gone and
 24 hours have passed, or after 30 days for a no-ask; decisions have no removal path yet; session caches (sync offsets, stop-block
 counters) are outside the fold by design. The first-touch sync window is the last 64 KB.
