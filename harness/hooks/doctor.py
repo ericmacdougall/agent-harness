@@ -31,8 +31,17 @@ RULES = HERE / "rules.json"
 WIRED, MISSING, SCRIPT_MISSING, PENDING, CANARY_FAIL = "WIRED", "MISSING", "SCRIPT_MISSING", "PENDING", "CANARY_FAIL"
 
 
+MAX_JSON_BYTES = 4_000_000
+
+
 def load_json(path: Path):
-    return json.loads(path.read_text())
+    """Bounded read of a regular file (settings, manifest, rules); anything oversized or not a regular file is a ValueError."""
+    sys.path.insert(0, str(HERE))
+    import safe_input
+    try:
+        return safe_input.safe_json_loads(safe_input.read_bounded(path, MAX_JSON_BYTES))
+    except safe_input.InputRejected as exc:
+        raise ValueError(f"{path}: {exc.message}") from None
 
 
 def flatten(handler: dict) -> list[str]:
