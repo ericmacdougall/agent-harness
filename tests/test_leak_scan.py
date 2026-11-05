@@ -483,5 +483,80 @@ class RoundThreeFindings(unittest.TestCase):
             self.assertEqual(target.read_text(), before)
 
 
+class RoundFourFindings(unittest.TestCase):
+    """B1 delimiter smuggling, B2 non-dict projects, L5 migration route filter."""
+
+    def test_x01_byte_in_message_or_author_does_not_hide_metadata(self):
+        home = "/Users/" + "realperson/x"
+        for where in ("message", "author"):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo, g = make_git(tmp, {"a.txt": "ok\n"})
+                (repo / "a.txt").write_text("two\n")
+                env = dict(os.environ, GIT_AUTHOR_EMAIL="t@example.invalid", GIT_COMMITTER_EMAIL="t@example.invalid",
+                           GIT_COMMITTER_NAME="t", GIT_AUTHOR_NAME="t")
+                msg = "subject"
+                if where == "message":
+                    msg = "subject\x01 " + home
+                else:
+                    env["GIT_AUTHOR_NAME"] = "n\x01 " + home
+                subprocess.run(["git", "-C", str(repo), "commit", "-qam", msg], check=True, capture_output=True, env=env)
+                code, out = scan_repo(repo, tmp, "--history", "--range", "HEAD~1..HEAD")
+                self.assertEqual(code, 1, (where, out))
+                self.assertNotIn("realperson", out)
+
+    def test_non_dict_projects_is_value_error_in_both_loaders(self):
+        import commit_policy as cp
+        import spec_flow as sf
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "commit_policy.json"
+            base.write_text((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
+            sbase = Path(tmp) / "spec_policy.json"
+            sbase.write_text((ROOT / "harness" / "hooks" / "spec_policy.json").read_text())
+            for bad in (["x"], "x", 7):
+                (Path(tmp) / "commit_policy.local.json").write_text(json.dumps({"ticket_systems": {"goodqa": {"projects": bad}}}))
+                (Path(tmp) / "spec_policy.local.json").write_text(json.dumps({"projects": bad}))
+                with mock.patch.dict(os.environ):
+                    os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
+                    with self.assertRaises(ValueError):
+                        cp.load_policy(base)
+                with self.assertRaises(ValueError):
+                    sf.load_spec_policy(sbase)
+
+    def test_hook_exits_2_on_non_dict_projects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hooks = Path(tmp) / ".claude" / "hooks"
+            hooks.mkdir(parents=True)
+            for name in ("commit_policy.py", "commit_policy.json", "safe_input.py", "ticket_adapters.py", "spec_flow.py",
+                         "spec_policy.json", "provenance.py", "wal.py", "redact.py"):
+                src = ROOT / "harness" / "hooks" / name
+                if src.exists():
+                    (hooks / name).write_text(src.read_text())
+            (hooks / "spec_policy.local.json").write_text(json.dumps({"projects": ["x"]}))
+            code = ("import sys; sys.path.insert(0, %r); import spec_flow as sf\n"
+                    "try:\n    sf.load_spec_policy(); print('LOADED')\nexcept ValueError:\n    print('VALUEERROR')" % str(hooks))
+            done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=dict(os.environ, HOME=tmp))
+            self.assertEqual(done.stdout.strip(), "VALUEERROR", done.stdout + done.stderr)
+
+    def test_migration_filters_route_keys_so_the_loader_accepts_the_result(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        import commit_policy as cp
+        with tempfile.TemporaryDirectory() as tmp:
+            claude = Path(tmp) / ".claude"
+            (claude / "hooks").mkdir(parents=True)
+            (claude / "hooks" / "commit_policy.json").write_text(json.dumps({"ticket_systems": {"goodqa": {
+                "repos": ["example\\.invalid/"], "org_id": "o",
+                "projects": {"p": {"project_id": "1", "org_id": "o", "endpoint": "https://x.invalid/", "note": "n"}}}}}))
+            install.migrate_local_profiles(claude)
+            data = json.loads((claude / "hooks" / "commit_policy.local.json").read_text())
+            self.assertEqual(set(data["ticket_systems"]["goodqa"]["projects"]["p"]), {"project_id", "org_id"})
+            base = Path(tmp) / "commit_policy.json"
+            base.write_text((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
+            (Path(tmp) / "commit_policy.local.json").write_text((claude / "hooks" / "commit_policy.local.json").read_text())
+            with mock.patch.dict(os.environ):
+                os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
+                cp.load_policy(base)  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

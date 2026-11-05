@@ -763,12 +763,20 @@ def migrate_local_profiles(claude: Path) -> list[str]:
         keys = ("repos", "org_id", "key_file", "key_secret", "default_project", "projects", "unreachable_projects", "unreachable_reason")
         systems = {n: {k: v for k, v in e.items() if k in keys and v not in ([], {}, "", None)}
                    for n, e in (policy.get("ticket_systems") or {}).items() if isinstance(e, dict)}
+        for e in systems.values():  # the loader accepts only these route keys; an old extra key would break commits
+            if isinstance(e.get("projects"), dict):
+                e["projects"] = {s: {k: v for k, v in r.items() if k in ("project_id", "org_id", "key_file")}
+                                 for s, r in e["projects"].items() if isinstance(r, dict)}
         systems = {n: e for n, e in systems.items() if e.get("repos") or e.get("org_id")}
         if systems:
             out["ticket_systems"] = systems
         return out
     def spec(policy):
-        return {k: policy[k] for k in ("projects", "enforced_projects") if policy.get(k)}
+        out = {k: policy[k] for k in ("projects", "enforced_projects") if policy.get(k)}
+        if isinstance(out.get("projects"), dict):
+            out["projects"] = {s: {k: v for k, v in r.items() if k in ("project_id", "org_id", "key_file")}
+                               for s, r in out["projects"].items() if isinstance(r, dict)}
+        return out
     keep("commit_policy.json", commit)
     keep("spec_policy.json", spec)
     return notes

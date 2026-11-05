@@ -125,7 +125,10 @@ def load_policy(path: Path = POLICY_FILE) -> dict:
             bad = sorted(k for k in entry if k not in LOCAL_TICKET_KEYS and not k.startswith("_"))
             if bad:
                 raise ValueError(f"{local}: ticket_systems.{name} may only set {sorted(LOCAL_TICKET_KEYS)}, not {bad}")
-            for slug, route in (entry.get("projects") or {}).items():  # a route must not redirect the endpoint
+            routes = entry.get("projects") or {}
+            if not isinstance(routes, dict):
+                raise ValueError(f"{local}: ticket_systems.{name}.projects must be an object")
+            for slug, route in routes.items():  # a route must not redirect the endpoint
                 if not isinstance(route, dict) or set(route) - {"project_id", "org_id", "key_file"}:
                     raise ValueError(f"{local}: project route {slug!r} may only set project_id, org_id, key_file")
         policy = _deep_merge(policy, overlay)

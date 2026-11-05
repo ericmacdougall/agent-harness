@@ -153,9 +153,11 @@ def scan_history(repo: Path, denylist, rev_range: str | None = None):
     allow = load_allow(repo)
     log = git(repo, "-c", "core.quotePath=false", "log", *([rev_range] if rev_range else ["--all"]), "-p", "-U0",
               "--diff-merges=first-parent", "--no-color", "-a", "--no-textconv", "--format=\x01%h", "--no-ext-diff")
-    meta = git(repo, "log", *([rev_range] if rev_range else ["--all"]), "--format=%h%x00%an %ae %cn %ce%n%B%x01")
-    for entry in meta.decode("utf-8", "replace").split("\x01"):
-        sha, _, text = entry.lstrip("\n").partition("\x00")
+    # -z ends each record with NUL, a byte git cannot store in a message or name; any printable or control
+    # delimiter (the previous \x01) could be smuggled inside a message to hide the text after it.
+    meta = git(repo, "log", *([rev_range] if rev_range else ["--all"]), "-z", "--format=%h%n%an %ae %cn %ce%n%B")
+    for entry in meta.decode("utf-8", "replace").split("\0"):
+        sha, _, text = entry.lstrip("\n").partition("\n")
         for line in text.split("\n"):
             findings += [(f"{sha}:commit-message", rule) for rule in check_line(line, denylist, True)]
     commit = path = ""

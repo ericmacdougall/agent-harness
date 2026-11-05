@@ -89,7 +89,10 @@ def load_spec_policy(path: Path = POLICY_FILE) -> dict:
         forbidden = sorted(k for k in overlay if k not in SPEC_LOCAL_KEYS and not k.startswith("_"))
         if forbidden:
             raise ValueError(f"{local} may only set {list(SPEC_LOCAL_KEYS)}, not {forbidden}")
-        for slug, route in (overlay.get("projects") or {}).items():
+        routes = overlay.get("projects") or {}
+        if not isinstance(routes, dict) or not isinstance(overlay.get("enforced_projects", []), list):
+            raise ValueError(f"{local}: projects must be an object and enforced_projects a list")
+        for slug, route in routes.items():
             if not isinstance(route, dict) or set(route) - {"project_id", "org_id", "key_file"}:
                 raise ValueError(f"{local}: project route {slug!r} may only set project_id, org_id, key_file")
         policy = {**policy, **{k: v for k, v in overlay.items() if k in SPEC_LOCAL_KEYS}}
