@@ -58,7 +58,8 @@ import sys
 
 MAX_COMMAND_CHARS = 1_000_000
 MAX_SCAN_CHARS = 256 * 1024  # command text left after heredoc bodies are removed; ~0.3 s worst case, linear
-MAX_SEGMENT_WORDS = 2048  # words in one shell command; bounds the quadratic wrapper-slicing paths
+MAX_SEGMENT_WORDS = 8192  # words in one shell command; bounds the quadratic wrapper-slicing paths
+MAX_NESTED_WORK = 10000  # nested re-scans plus uncertain-wrapper word probes allowed per decision
 MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enforce",
                  "build": "enforce", "media": "warn", "fan-out": "warn", "oversize": "enforce"}
@@ -336,12 +337,25 @@ def xargs_inner(args):
 MAX_WRAPPER_DEPTH = 12
 
 
+class WorkBudgetExceeded(Exception):
+    """Nested scanning used its whole work budget: the command is too tangled to judge, so it fails closed."""
+
+
 class Ctx:
-    def __init__(self, cwd, heredocs):
+    def __init__(self, cwd, heredocs, parent=None):
         self.cwd = cwd or os.getcwd()
         self.heredocs = heredocs
         self.capped = False
-        self._disk, self._hits = {}, {}  # GoodQA #14505: repeat invocations must not re-read or re-regex big sources
+        # GoodQA #14505: repeat invocations must not re-read or re-regex big sources, and nested scans (bash -c,
+        # eval, env -S ...) share the parent's caches and ONE work budget, so nesting cannot multiply the cost.
+        self._disk = parent._disk if parent else {}
+        self._hits = parent._hits if parent else {}
+        self.budget = parent.budget if parent else [MAX_NESTED_WORK]
+
+    def spend(self):
+        self.budget[0] -= 1
+        if self.budget[0] < 0:
+            raise WorkBudgetExceeded()
 
     def search(self, pattern, text):
         """pattern.search(text) is not None, memoised per source text (str hashes are cached by CPython)."""
@@ -528,6 +542,7 @@ def classify_build_tool(low, args):
 def scan_words(words, ctx, depth):
     """Uncertain wrapper parse: judge every remaining word as if it started the command; first heavy finding wins."""
     for j, word in enumerate(words):
+        ctx.spend()
         if word.startswith("-") or ASSIGN.match(word):
             continue
         result = classify_text(word, ctx, depth + 1) if re.search(r"\s", word) else None
@@ -601,7 +616,10 @@ def classify(argv, ctx, depth=0):
     """Classify one command's argv. Returns (rule, detail) or None."""
     _assigns, argv = split_assignments(argv)
     while argv and argv[0] in SHELL_KEYWORDS:
-        argv = argv[1:]
+        k = 1
+        while k < len(argv) and argv[k] in SHELL_KEYWORDS:  # skip a run of keywords without re-slicing per word
+            k += 1
+        argv = argv[k:]
         _assigns, argv = split_assignments(argv)
     if not argv:
         return None
@@ -627,10 +645,10 @@ def classify(argv, ctx, depth=0):
     if low in WRAPPERS:
         return unwrap(low, list(args), ctx, depth)
     if low == "xcrun":  # xcrun [--sdk X] [--toolchain Y] [-v...] <tool> args
-        rest = list(args)
-        while rest and rest[0].startswith("-"):
-            rest = rest[2:] if rest[0] in ("--sdk", "-sdk", "--toolchain", "-toolchain") else rest[1:]
-        return classify(rest, ctx, depth + 1)
+        i = 0  # index walk, not repeated slicing (quadratic on thousands of flags; GoodQA #14505)
+        while i < len(args) and args[i].startswith("-"):
+            i += 2 if args[i] in ("--sdk", "-sdk", "--toolchain", "-toolchain") else 1
+        return classify(args[i:], ctx, depth + 1)
     if low == "script":  # macOS `script [-q] file cmd...`; Linux `script -c 'cmd' file`
         if "-c" in args and args.index("-c") + 1 < len(args):
             return classify_text(args[args.index("-c") + 1], ctx, depth + 1)
@@ -639,10 +657,10 @@ def classify(argv, ctx, depth=0):
     if low == "eval":
         return classify_text(" ".join(args), ctx, depth + 1)
     if low in ("timeout", "gtimeout"):
-        rest = list(args)
-        while rest and rest[0].startswith("-"):
-            rest = rest[2:] if rest[0] in ("-s", "-k") else rest[1:]
-        return classify(rest[1:], ctx, depth + 1)
+        i = 0
+        while i < len(args) and args[i].startswith("-"):
+            i += 2 if args[i] in ("-s", "-k") else 1
+        return classify(args[i + 1:], ctx, depth + 1)
     if low in ("bash", "sh", "zsh", "dash", "ksh"):
         for i, a in enumerate(args):
             if re.match(r"^-[a-zA-Z]*c[a-zA-Z]*$", a) and i + 1 < len(args):
@@ -654,10 +672,10 @@ def classify(argv, ctx, depth=0):
             return ("adversarial", "shell script reads /dev/zero|urandom or makes a FIFO")
         return None
     if low in ("uv", "poetry", "pipenv", "pdm", "hatch", "rye") and "run" in args:
-        rest = args[args.index("run") + 1:]
-        while rest and rest[0].startswith("-"):
-            rest = rest[2:] if rest[0] in ("--with", "--extra", "--python", "-p", "--project", "--directory") else rest[1:]
-        return classify(rest, ctx, depth + 1)
+        i = args.index("run") + 1
+        while i < len(args) and args[i].startswith("-"):
+            i += 2 if args[i] in ("--with", "--extra", "--python", "-p", "--project", "--directory") else 1
+        return classify(args[i:], ctx, depth + 1)
     if low in ("uvx", "npx", "pipx", "bunx"):
         out, skip = [], False
         for a in (a for a in args if not (low == "pipx" and a == "run")):
@@ -829,14 +847,14 @@ def classify(argv, ctx, depth=0):
     return None
 
 
-def scan_state(command: str, cwd: str):
+def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
     """Walk every segment. Returns (hatch_reason_or_None, [(rule, detail, capped, segment)])."""
     text, heredocs = extract_heredocs(command[:MAX_COMMAND_CHARS])
     oversize = len(command) > MAX_COMMAND_CHARS or len(text) > MAX_SCAN_CHARS
     if oversize:
         log_event({"event": "truncated-command", "chars": len(command)})  # logged, not silent
         text = text[:MAX_SCAN_CHARS]
-    ctx = Ctx(cwd, heredocs)
+    ctx = Ctx(cwd, heredocs, parent)
     hatch, findings = None, []
     if oversize:
         # GoodQA #14505 NEG-1: the tail past the cap is never scanned, so fail closed instead of allowing it.
@@ -862,7 +880,7 @@ def scan_state(command: str, cwd: str):
                 ctx.cwd = os.path.normpath(target)
             continue
         ctx.capped = False
-        result = classify(argv, ctx)
+        result = classify(argv, ctx, depth)
         if result:
             findings.append((result[0], result[1], ctx.capped, segment))
     return hatch, findings
@@ -870,7 +888,8 @@ def scan_state(command: str, cwd: str):
 
 def classify_text(text, ctx, depth):
     """Classify a nested `bash -c` string with the parent's cwd."""
-    _hatch, findings = scan_state(text, ctx.cwd)
+    ctx.spend()
+    _hatch, findings = scan_state(text, ctx.cwd, depth, ctx)
     if findings:
         rule, detail, capped, _segment = findings[0]
         ctx.capped = ctx.capped or capped
@@ -916,7 +935,12 @@ def decide(command: str, cwd: str = None, modes=None):
     if not command:
         return {"action": "allow"}
     modes = modes or load_modes()
-    hatch, findings = scan_state(command, cwd)
+    try:
+        hatch, findings = scan_state(command, cwd)
+    except (WorkBudgetExceeded, RecursionError):
+        # GoodQA #14505: too tangled (or too deeply nested) to judge in bounded time. Fail CLOSED, never open.
+        hatch, findings = None, [("oversize", "nested wrappers/eval are too deeply nested or tangled to analyse",
+                                  False, "")]
     best = {"action": "allow"}
     for rule, detail, capped, _segment in findings:
         mode = modes.get(rule, "enforce")

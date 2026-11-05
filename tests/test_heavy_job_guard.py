@@ -562,14 +562,15 @@ class PathologicalInput(unittest.TestCase):
         self.fast("'ls; ' * 65536 + 'x'", "deny")  # one more
 
     def test_word_cap_boundary_is_exact(self):
-        self.fast("'echo ' + 'a ' * 2047", "allow")  # 2048 words
-        self.fast("'echo ' + 'a ' * 2048", "deny")
+        self.fast("'echo ' + 'a ' * 8191", "allow")  # 8192 words
+        self.fast("'echo ' + 'a ' * 8192", "deny")
+        self.fast("'rm ' + 'file.txt ' * 3000", "allow")  # an ordinary long argument list is not an attack
 
     def test_neg1_heavy_invocation_past_the_cap_is_not_silently_allowed_even_with_the_hatch(self):
         self.fast("'echo ' + 'a' * 300000 + '; pytest'", "deny")
         # The tail may hold a browser/media/fan-out job that needs the resource cap, so the hatch cannot waive it.
         self.fast("'HARNESS_LOCAL_OK=needs-the-mac echo ' + 'a' * 300000 + '; chromium --headless'", "deny")
-        self.fast("'HARNESS_LOCAL_OK=needs-the-mac echo ' + 'a ' * 3000", "deny")
+        self.fast("'HARNESS_LOCAL_OK=needs-the-mac echo ' + 'a ' * 9000", "deny")
 
     def test_neg1_long_heredoc_body_does_not_count_toward_the_cap(self):
         self.fast("'cat > big.txt <<EOF\\n' + 'x' * 400000 + '\\nEOF\\nls'", "allow")
@@ -593,6 +594,20 @@ class PathologicalInput(unittest.TestCase):
         for expression in ("'env -Z ' + 'a ' * 80000", "'do ' * 80000 + 'ls'", "'xcrun ' + '-v ' * 80000 + 'ls'",
                            "'timeout ' + '-x ' * 80000 + '1 ls'"):
             self.fast(expression, "deny")
+
+    def test_g1_deep_eval_chain_is_denied_not_failed_open(self):
+        # At base this raised RecursionError inside the hook, which failed open and allowed the heavy command.
+        self.fast("'eval ' * 2000 + 'pytest'", "deny", rule=None)
+        self.fast("'bash -c \\'' * 1 + 'eval ' * 2000 + 'pytest' + \"'\"", "deny", rule=None)
+
+    def test_g2_nested_uncertain_wrappers_are_not_exponential(self):
+        self.fast("'env -Z ' + ('eval env -Z ' + 'a ' * 20) * 12", "deny", rule=None)
+        self.fast("'env -Z ' + ('eval env -Z ' + 'a ' * 20) * 16", "deny", rule=None)
+
+    def test_g3_nested_commands_share_the_script_cache(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            Path(cwd, "big.py").write_text("x = 1\n" * 300000)
+            self.fast("'bash -c \"python3 big.py\"\\n' * 300", "allow", cwd=cwd)
 
     def test_ac2_linear_split_matches_shlex_on_seeded_random_input(self):
         import random
