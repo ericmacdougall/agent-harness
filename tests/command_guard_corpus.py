@@ -828,4 +828,30 @@ HEREDOC_PLAIN_ALLOW = [
     "cat > notes.md <<'EOF'\nThe guard protects ~/.claude/projects.\nEOF",
     "cat > clean.sh <<'EOF'\nrm -rf build\nEOF",
 ]
+# GoodQA #14589: a fresh mktemp name is the command's own scratch, even when cwd is inside a protected root
+# (an owner's task folder under ~/.agent-harness/work). Judged with cwd = @TASK@; scripts run as `bash FILE`.
+MKTEMP_SCRIPTS = [
+    ('LOGS=$(mktemp -d "${TMPDIR:-/tmp}/hermetic-check.XXXXXX")\nprintf "(deny default)\\n" > "$LOGS/deny.sb"\n'
+     'python3 -m unittest > "$LOGS/suite.log" 2>&1 || true\nrm -rf "$LOGS"\n', 'allow'),
+    ('D=$(mktemp -d)\necho x > "$D/a"\nrm -rf "$D"\n', 'allow'),
+    ('D=`mktemp -d`\n: > "$D/a"\nrm -r "$D"\n', 'allow'),
+    ('D=$(mktemp -d tmp.XXXX)\nrm -rf "${D}/sub"\n', 'allow'),
+    ('D=@HOME@/.claude/projects\nrm -rf "$D"\n', 'block'),
+    ('D=$(mktemp -d)\nD=@HOME@/.claude\nrm -rf "$D"\n', 'block'),
+    ('D=$(mktemp -d)\nD+=/..\nrm -rf "$D"\n', 'block'),
+    ('D=$(mktemp -d)\nunset D\nrm -rf "$D/projects"\n', 'block'),
+    ('D=$(mktemp -d)\nread D\nrm -rf "$D"\n', 'block'),
+    ('D=$(mktemp -d @HOME@/.claude/x.XXXX)\nrm -rf "$D/.."\n', 'block'),
+    ('D=$(mktemp -d -p @HOME@/.codex)\nrm -rf "$D"/../sessions\n', 'block'),
+    ('D=$(mktemp -d)\nrm -rf "$D"* @HOME@/.claude/projects\n', 'block'),
+    ('D=$(mktemp -d; echo @HOME@/.claude)\nrm -rf "$D"\n', 'block'),
+    ('D=$(mktemp -u @HOME@/.claude/projects)\nrm -rf "$D"\n', 'block'),
+    ('D="$1"\nrm -rf "$D"\n', 'block'),
+    ('rm -rf existing.log\n', 'block'),
+]
+MKTEMP_INLINE = [
+    ('D=$(mktemp -d); echo x > "$D/a"; rm -rf "$D"', 'allow'),
+    ('printf x > new-report.md', 'allow'),
+    ('D=$(mktemp -d); rm -rf "$D" ~/.claude/projects', 'block'),
+]
 SEED = 14471

@@ -38,6 +38,7 @@ import os
 import posixpath
 import re
 import secrets as _secrets
+import shlex
 import signal
 import subprocess
 import sys
@@ -1253,6 +1254,7 @@ class Ctx:
         self.cwd_unknown = False
         self.cwd_protected_unknown = False  # cd to an unresolved path whose text names a protected location
         self.var_hints = {}  # raw text of dynamic assignments, for variables the guard cannot resolve
+        self.temp_vars = set()  # NAME=$(mktemp ...): a name the command itself just created (GoodQA #14589)
         self.created = set()  # case-folded paths written earlier in this command (count as existing)
         self.links = {}  # symlinks created earlier in this command: link path -> target path
         self.written = {}  # case-folded path -> text written to it earlier in this command (echo/printf/heredoc)
@@ -1588,6 +1590,7 @@ class Analyzer:
                     self.ctx.flow_vars = set()
                 self.ctx.flow_vars.add(name)
             self.ctx.vars[name] = chosen.text
+            self.ctx.temp_vars.discard(name)
             self.ctx.tainted.discard(name)
             # `for t in "$GH_TOKEN"`: the loop variable carries whatever secret its items expand to
             if any(self.c.secret_name(v.lstrip('!')) or v in self.ctx.tainted for item in items for v in item.vars):
@@ -1602,7 +1605,9 @@ class Analyzer:
         for a in assigns:
             text = a.text
             name, _, value = text.partition('=')
+            appended = name.endswith('+')
             name = name.rstrip('+')
+            ctx.temp_vars.discard(name)  # any reassignment ends the fresh-temp guarantee
             before = ctx.secret_seen
             self.subs(a, depth, visible=False)
             tainted = ctx.secret_seen > before or any(ctx.c.secret_name(v.lstrip('!')) or v in ctx.tainted for v in a.vars)
@@ -1616,6 +1621,59 @@ class Analyzer:
                 ctx.vars.pop(name, None)
                 ctx.var_hints[name] = (value + ' ' + ' '.join(a.subs) + ' ' + ' '.join(
                     ctx.var_hints.get(v, '') for v in a.vars))[:4096]
+                if not tainted and not appended and self._fresh_mktemp(value, a):
+                    ctx.temp_vars.add(name)
+
+    MKTEMP_FLAGS = {'-d', '-q', '-u', '-t', '--directory', '--quiet', '--dry-run'}
+
+    @classmethod
+    def _fresh_mktemp(cls, value, word):
+        """NAME=$(mktemp [-d] [-t] [-p DIR] [TEMPLATE]) and nothing else: the value is a name mktemp just made
+        unique (and, without -u, created). Its own contents cannot be pre-existing logs or state."""
+        if len(word.subs) != 1 or value.replace('"', '') != SUB_MARK:
+            return False
+        inner = word.subs[0].strip()
+        if inner.startswith('`') and inner.endswith('`'):
+            inner = inner[1:-1].strip()
+        if any(ch in inner for ch in ';|&<>`\n') or '$(' in inner:
+            return False
+        try:
+            argv = shlex.split(inner)
+        except ValueError:
+            return False
+        if not argv or posixpath.basename(argv[0]) != 'mktemp':
+            return False
+        rest, positional = argv[1:], []
+        i = 0
+        while i < len(rest):
+            item = rest[i]
+            if item in cls.MKTEMP_FLAGS or item.startswith(('--suffix=', '--tmpdir=')):
+                pass
+            elif item in ('-p', '--tmpdir'):
+                i += 1
+                if i < len(rest) and '..' in rest[i].split('/'):
+                    return False
+            elif re.fullmatch(r'-[dqut]+', item):
+                pass
+            elif item.startswith('-'):
+                return False
+            else:
+                positional.append(item)
+            i += 1
+        # a template without XXX can come back unchanged (an existing name), so it does not count as fresh
+        return len(positional) <= 1 and all('XXX' in p and '..' not in p.split('/') for p in positional)
+
+    def _fresh_temp_path(self, alt):
+        """"$NAME" or "$NAME/rel" for a fresh mktemp name: no `..`, no glob, nothing before the variable."""
+        ctx = self.ctx
+        if not ctx.temp_vars:
+            return False
+        m = re.match(r'\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?(/.*)?$', alt)
+        if not m or m.group(1) not in ctx.temp_vars or m.group(1) in ctx.tainted:
+            return False
+        rest = m.group(2) or ''
+        return '..' not in rest.split('/') and not any(ch in rest for ch in GLOB_CHARS) and '$' not in rest \
+            and SUB_MARK not in rest and ARITH_MARK not in rest
 
     # ---- redirections and heredocs
     def redirects(self, cmd, pl, idx, has_command, depth):
@@ -1825,6 +1883,9 @@ class Analyzer:
         if name in ('cd', 'pushd', 'set-location', 'sl', 'chdir'):
             self.chdir(args)
             return
+        if name in ('unset', 'export', 'declare', 'typeset', 'local', 'readonly'):
+            for a in args:  # rebinding or unsetting ends the fresh-mktemp guarantee (#14589)
+                ctx.temp_vars.discard(a.text.split('=', 1)[0])
         if name in ('read', 'mapfile', 'readarray'):
             # `... | while read f`: the variable holds whatever the upstream stage printed
             if not hasattr(ctx, 'flow_vars'):
@@ -1833,6 +1894,7 @@ class Analyzer:
                 if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', a.text):
                     ctx.flow_vars.add(a.text)
                     ctx.vars.pop(a.text, None)
+                    ctx.temp_vars.discard(a.text)
             return
         if name in ('popd', 'pop-location'):
             ctx.cwd_unknown = True
@@ -3164,6 +3226,9 @@ class Analyzer:
                 return 'unknown', word.alts[0], False
             alts = word.alts[:32]
         for alt in alts:
+            if self._fresh_temp_path(alt):
+                literal = False
+                continue
             path = norm_path(alt, ctx)
             dynamic = is_dynamic_path(alt) or word.dynamic
             cls = self._path_class(path)

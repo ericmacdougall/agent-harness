@@ -588,6 +588,28 @@ class LauncherTests(unittest.TestCase):
         self.assertLessEqual(mods, {'json', 'os', 're', 'subprocess', 'sys'})
 
 
+class MktempScratchTests(Fixture):
+    """GoodQA #14589: an owner's own mktemp scratch is not protected, even with cwd in its task folder."""
+
+    def test_scripts_writing_and_removing_their_own_mktemp_dir(self):
+        task = fill('@TASK@', self.home)
+        (Path(task) / 'existing.log').write_text('keep\n')
+        failures = []
+        for i, (body, want) in enumerate(corpus.MKTEMP_SCRIPTS):
+            script = Path(task) / 'scripts' / ('s%02d.sh' % i)
+            script.parent.mkdir(exist_ok=True)
+            script.write_text('#!/bin/bash\n' + fill(body, self.home))
+            got = self.decide('bash ' + str(script), cwd='@TASK@')[0]
+            if got != want:
+                failures.append('%d want %s got %s: %r' % (i, want, got, body[:80]))
+        self.assertGreaterEqual(len(corpus.MKTEMP_SCRIPTS), 12)
+        self.assertEqual(failures, [])
+
+    def test_inline_commands(self):
+        for cmd, want in corpus.MKTEMP_INLINE:
+            self.assertEqual(self.decide(cmd, cwd='@TASK@')[0], want, cmd)
+
+
 class GuardCompositionTests(unittest.TestCase):
     """The command guard and the heavy-job guard (#53) both classify Bash commands. They are separate hook groups
     and decide independently: neither one's allow, hatch or crash policy can override the other's block."""
@@ -689,6 +711,19 @@ class InstallTests(unittest.TestCase):
         merged = self.install_codex.merge_hooks(legacy, codex)
         commands = [h['command'] for g in merged['hooks']['PreToolUse'] for h in g['hooks']]
         self.assertEqual([c for c in commands if 'command_guard_hook.py' in c], [guard])
+
+    def test_codex_guard_is_last_so_existing_trust_keys_keep_their_hooks(self):
+        # Codex trust is keyed by "<hooks.json>:pre_tool_use:<group>:<handler>" (GoodQA #14590)
+        codex = self.home / '.codex'
+        user = {'hooks': {'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': 'my-hook'}]}]}}
+        without = self.install_codex.merge_hooks(user, codex, command_guard=False)['hooks']['PreToolUse']
+        with_guard = self.install_codex.merge_hooks(user, codex)['hooks']['PreToolUse']
+        self.assertEqual(with_guard[:len(without)], without)
+        self.assertEqual(len(with_guard), len(without) + 1)
+        self.assertEqual(with_guard[-1]['hooks'][0]['command'], self.install_codex.guard_command(codex))
+        self.assertNotIn('matcher', with_guard[-1])
+        again = self.install_codex.merge_hooks({'hooks': {'PreToolUse': with_guard}}, codex)['hooks']['PreToolUse']
+        self.assertEqual(again, with_guard)  # idempotent: a reinstall keeps every index
 
     def test_old_claude_version_warns(self):
         self.assertIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.200 (Claude Code)'))
