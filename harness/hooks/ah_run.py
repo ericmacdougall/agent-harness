@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
+import fnmatch
 import functools
 import fcntl
 import hashlib
@@ -202,11 +204,19 @@ def user_bus_answers():
         return False
 
 
+LAUNCH_SHELLS = frozenset(('bash', 'zsh'))
+BASH_PATHS = ('/bin/bash', '/usr/bin/bash', '/opt/homebrew/bin/bash', '/usr/local/bin/bash')
+
+
 def shell_for_command():
-    """The shell Claude Code uses, with its snapshot sourced when one is named."""
-    shell = os.environ.get('CLAUDE_CODE_SHELL') or os.environ.get('SHELL') or '/bin/bash'
-    if not os.path.isabs(shell) or not os.access(shell, os.X_OK):
-        shell = '/bin/bash' if os.access('/bin/bash', os.X_OK) else '/bin/sh'
+    """The shell Claude Code uses, with its snapshot sourced when one is named. Only bash or zsh, by basename: the hook's
+    claim about a command is checked against what those two read, and an arbitrary $SHELL (fish, ksh, a wrapper script) would
+    run text the claim never covered. Anything else falls back to the first bash found, then /bin/sh."""
+    for shell in (os.environ.get('CLAUDE_CODE_SHELL'), os.environ.get('SHELL')):
+        if shell and os.path.isabs(shell) and os.access(shell, os.X_OK) and shell.rsplit('/', 1)[-1] in LAUNCH_SHELLS:
+            break
+    else:
+        shell = next((path for path in BASH_PATHS if os.access(path, os.X_OK)), '/bin/sh')
     snapshot = os.environ.get('CLAUDE_CODE_SHELL_SNAPSHOT')
     prelude = ''
     if snapshot and os.path.isfile(snapshot):
@@ -707,162 +717,774 @@ INLINE_LIMIT = 64 * 1024
 PAYLOAD_CAP = 1 << 20
 AH_RUN_RULE = re.compile(r'(?:^|[\s/*])(?:ah-run|ah_run\.py)(?:$|[\s:*])')
 ASSIGNMENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
-ENV_PREFIX = re.compile(r'''^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|\S*)\s+)+''')
-WRAPPER_PREFIX = re.compile(r'^(?:timeout\s+(?:-\S+\s+)*\d\S*|nice(?:\s+-n\s*\d+|\s+-\d+)?|nohup|time|command|builtin|env)\s+')
-KEYWORD_PREFIX = re.compile(r'^(?:then|do|else|elif|if|while|until|!|\{)\s+')
+ENV_PREFIX = re.compile(r'''^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|[^ \t\n]*)[ \t\n]+)+''')
+WRAPPER_PREFIX = re.compile(r'^(?:timeout[ \t\n]+(?:-[^ \t\n]+[ \t\n]+)*[0-9][^ \t\n]*|nice(?:[ \t\n]+-n[ \t\n]*[0-9]+|[ \t\n]+-[0-9]+)?|nohup|time|command|builtin|env)[ \t\n]+')
+KEYWORD_PREFIX = re.compile(r'^(?:then|do|else|elif|if|while|until|!|\{)[ \t\n]+')
 ESCAPE_NAMES = frozenset(('nohup', 'setsid', 'disown', 'screen', 'tmux', 'at', 'batch', 'crontab', 'osascript', 'coproc'))
 LAUNCHCTL_ESCAPES = frozenset(('submit', 'bootstrap', 'load', 'kickstart'))
 TASK_TOKEN = re.compile(r'\[task:([A-Za-z0-9][A-Za-z0-9._:/#-]{0,127})\]')
-AH_PREFIX = re.compile(r'^\s*(?:(?:\S*/)?python3?(?:\.\d+)?(?:\s+-[A-Za-z]+)*\s+)?\S*(?:ah_run\.py|ah-run)(?=\s)')
+AH_PREFIX = re.compile(r'^[ \t\n]*(?:(?:[^ \t\n]*/)?python3?(?:\.[0-9]+)?(?:[ \t]+-[A-Za-z]+)*[ \t]+)?[^ \t\n]*(?:ah_run\.py|ah-run)(?=[ \t\n])')
 RECOVERY_SCRIPTS = frozenset(('reserve.py', 'reclaim.py'))
 POLICY_SELFCHECK_FIX = 'python3 harness/install.py --apply --role ROLE'
+SCAN_CAP = 64 * 1024  # bytes of the whole command; above it nothing is scanned (docs/operations.md, ah-run hook)
+HOOK_DEADLINE = 8.0  # seconds; the hook refuses rather than be killed by Claude Code's hook timeout
 
 
-WORD_BREAK = ' \t\n;&|(`'
-COMMENT_GLUE = '()<>'
-QUOTE_CHARS = '\'"'
-CASE_WORD = re.compile(r'case(?=[ \t\n])')
+# -- the one lexer: "certain" is a closed claim ----------------------------------------------------------------
+#
+# A command is certain only when _Lexer finished without recording a reason. The grammar it accepts is the part of
+# bash 3.2, bash 5.x, zsh, sh, dash and ksh that reads alike in all of them; every other character, token or construct
+# records a named reason and the lexer carries on best effort, so an uncertain command still yields segments to check.
+# Every other reader below (parse_command, heredoc_scan, join_continuations, inner_commands, script_bodies, physical_parts'
+# ANSI decoding, the classifier and rewrite_ssh) consumes this output and decides nothing about quoting, blanks or comments
+# itself. Python's str.strip, str.split and \s treat characters as blanks that no shell does, so they never decide here.
+#
+# Why named bad lists for the program word rather than a list of good programs: real commands run thousands of different
+# programs and a positive list would make most of them uncertain. The lists below name only what changes how later text
+# parses or runs quoted text as code. What they miss is stated in docs/operations.md under the limits of the claim.
+
+HEREDOC_NONE, HEREDOC_CERTAIN, HEREDOC_UNCERTAIN = 'none', 'certain', 'uncertain'
+HEREDOC_OPENER = re.compile(r"""<<(-?)[ \t]*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|\\?([A-Za-z_][A-Za-z0-9_]*))(?=[ \t\n;&|)<>]|$)""")
+HEREDOC_MARKER = re.compile(r'<<__HD(\d+)__')
+SIMPLE_BRACE = re.compile(r'\$\{[A-Za-z_][A-Za-z0-9_]*\}')
+MAX_GROUP_DEPTH = 16
+WORD_END = ' \t\n;&|()<>'
+WORD_RUN = re.compile(r"[A-Za-z0-9_./:,+=@%^~*?!\]-]+")
+DQ_RUN = re.compile(r'[^"\\`$]+')
+REDIRECT_OP = re.compile(r'&>>|&>|<<<|<<-?|<>|<&|>>|>&|>\||<|>')
+SAFE_PARAM = re.compile(r'\$\{(?:#?[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?]'
+                        r'|(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+)(?::-|:=|:\+|:\?|-|=|\+|\?|##?|%%?|//?)'
+                        r'(?:[A-Za-z0-9_./:,+=@%^~*?-]*|\$[A-Za-z_][A-Za-z0-9_]*))\}')
+ANSI_ESCAPES = frozenset('abeEfnrtv\\"?01234567xuU')
+ARITH_CHARS = frozenset('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_ \t+-*/%<>=!&|^~,?:$')
+DOLLAR_SPECIALS = frozenset('#?!-_*@$0123456789')
+ASSIGN_WORD = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*\+?=')
+SUBSCRIPT_CODE = re.compile(r'(?<=[A-Za-z0-9_])\[[^\[\]]*(?:\$\(|`)')
+SET_FLAGS = re.compile(r'[-+][eux]*o?')
+SHELL_C = re.compile(r'-[A-Za-z]*c[A-Za-z]*')
+KEYWORDS = frozenset(('if', 'then', 'elif', 'else', 'fi', 'for', 'while', 'until', 'do', 'done', '{', '}', '!'))
+KEYWORD_AFTER = {'then': ('if',), 'elif': ('then',), 'else': ('then',), 'fi': ('then', 'else'), 'do': ('while', 'for'),
+                 'done': ('do',), '}': ('{',)}
+STATE_VARS = frozenset(('PS1 PS2 PS3 PS4 PROMPT PROMPT2 PROMPT3 PROMPT4 RPROMPT PROMPT_COMMAND histchars BASH_ENV ENV ZDOTDIR '
+                        'SHELLOPTS BASHOPTS POSIXLY_CORRECT PATH path FPATH fpath').split(' '))
+PARSE_CHANGING = frozenset(('function alias unalias shopt setopt unsetopt emulate enable disable hash bindkey bind zmodload '
+                            'autoload repeat noglob nocorrect - foreach select coproc case esac declare typeset readonly '
+                            'sched').split(' '))
+QUOTED_CODE = frozenset('trap eval let mapfile readarray compgen complete compctl fc print'.split(' '))
+UNPEELED_WRAPPERS = frozenset(('busybox stdbuf flock script arch caffeinate ionice chronic watch xargs parallel nsenter chroot '
+                               'unshare setpriv taskset numactl unbuffer rlwrap su doas pkexec runuser fakeroot strace ltrace '
+                               'dtruss').split(' '))
+SHELL_NAMES = frozenset('bash sh zsh dash ksh ash mksh ksh93 rbash fish csh tcsh'.split(' '))
+FIND_RUNNERS = frozenset(('-exec', '-execdir', '-ok', '-okdir'))
+# ssh, scp and sftp run these option values as local shell code (r6 N22): a quoted-code host like find -exec. A config file
+# named by -F that sets them is a limit (operations.md).
+SSH_O_CLUSTER = re.compile(r'-[46AaCfGgKkMNnqsTtVvXxYy]*o')
+SSH_OPTION_CODE = re.compile(r'(?i)(proxycommand|knownhostscommand|localcommand|match)([ \t=]|$)')
+
+Word = collections.namedtuple('Word', 'raw value dynamic')  # raw: normalized text; value: quotes removed, a group is X
+Command = collections.namedtuple('Command', 'text words operator closer')  # words exclude keywords, redirects and targets
 
 
-def _walk_groups(text, i=0, stack=None):
-    """(index, certain). Walks shell text from i with the open contexts in stack: '(' for $(, <(, >(, (( and a parenthesis
-    inside one, '`', '[' for $[, '"' and '{' for ${. With a starting stack it stops just past the close of that group;
-    from the top level it reads to the end.
+class _WordBuf:
+    __slots__ = ('raw', 'value', 'dynamic')
 
-    The certainty rule: shells disagree about quoting that nests inside a group, so any quote character (' " or $') in a
-    backtick group, $(...), <(...), >(...), ${...}, ((...)), $((...)) or $[...] makes the text uncertain, escaped or not;
-    certainty is claimed only for groups that hold no quote at all. Only the end of an uncertain group is a best effort,
-    and callers then check every physical line. Also uncertain: a word-start # in a group, a \\` inside backticks, a `case`
-    in a group (its patterns hold unbalanced parentheses), a # glued to ( ) < > or after an escaped blank, a $'...' holding
-    \\' (a shell without $'...', such as dash, ends the string there), and an unterminated quote or group."""
-    stack = list(stack or [])
-    grouped, certain, n = bool(stack), True, len(text)
-    while i < n:
-        top, ch = (stack[-1] if stack else None), text[i]
-        at_word = i == 0 or text[i - 1] in WORD_BREAK
-        if top == '`':  # raw up to the next unescaped backtick, whatever it holds: no shell nests or quotes in here
-            if ch == '\\':
-                certain = certain and text[i + 1:i + 2] not in ('`', "'", '"')
-                i += 2
-            elif ch == '`':
-                stack.pop(); i += 1
+    def __init__(self):
+        self.raw, self.value, self.dynamic = [], [], False
+
+    def add(self, raw, value=None):
+        self.raw.append(raw); self.value.append(raw if value is None else value)
+
+
+class _ListState:
+    """One command list: the top level, a subshell or a substitution body."""
+    __slots__ = ('closer', 'depth', 'group', 'commands', 'cur', 'words', 'stack', 'after_close', 'need_command', 'prev_op',
+                 'here_string', 'for_header', 'redirected', 'amp_redirect')
+
+    def __init__(self, closer, depth, group, commands):
+        self.closer, self.depth, self.group, self.commands = closer, depth, group, commands
+        self.cur, self.words, self.stack = [], [], []
+        self.after_close = self.need_command = self.here_string = self.for_header = False
+        self.redirected = self.amp_redirect = False
+        self.prev_op = None
+
+
+class _Lexer:
+    """One pass over one command. `reasons` names everything outside the grammar and is empty only for a certain command.
+    `whole` reads `<<` as a plain redirect, so an uncertain command's body lines stay in the output as commands."""
+
+    def __init__(self, text, whole=False):
+        self.text, self.n, self.whole = text, len(text), whole
+        self.reasons = {}
+        self.commands, self.groups, self.group_texts = [], [], []
+        self.bodies, self.openers, self.opener_spans, self.spans, self.pending = [], [], [], [], []
+        self.continuations = []
+        self.newline = self.pipeline = self.substitution = self.saw_nesting = self.stopped = False
+        self.first = self.n - len(text.lstrip(' \t\n'))
+        self.last = len(text.rstrip(' \t\n'))
+
+    def reason(self, name):
+        self.reasons.setdefault(name, None)
+
+    def run(self):
+        if '\0' in self.text:
+            self.reason('nul')
+        try:
+            self._list(0, None, 0, False, self.commands)
+        except RecursionError:
+            self.reason('nesting')
+        if self.pending:
+            self.reason('heredoc-unterminated')
+            self.pending = []
+        if self.openers and self.saw_nesting:
+            self.reason('heredoc-with-group')  # a body's start depends on where the nested text ends
+        if _quoted_continuation(''.join(_cut_bodies(self.text, self.spans))):
+            self.reason('quoted-continuation')
+        return self
+
+    # -- lists -------------------------------------------------------------------------------------------------
+
+    def _list(self, i, closer, depth, group, commands):
+        if depth > MAX_GROUP_DEPTH:
+            self.reason('nesting')
+            self.stopped = True
+            return self.n
+        st, text, n = _ListState(closer, depth, group, commands), self.text, self.n
+        while i < n and not self.stopped:
+            ch = text[i]
+            if ch in ' \t':
+                st.cur.append(ch); i += 1
+            elif ch == '\n':
+                i = self._newline(i, st)
+            elif ch == '\\' and text[i + 1:i + 2] == '\n':
+                self._continuation(i); i += 2
+            elif ch == '#':
+                i = self._comment(i, st)
+            elif ch in '<>' or text.startswith('&>', i):
+                i = self._redirect(i, st)
+            elif ch in ';&|':
+                i = self._operator(i, st)
+            elif ch == '(':
+                i = self._subshell(i, st)
+            elif ch == ')':
+                if closer == ')':
+                    self._close_list(st)
+                    return i + 1
+                self.reason('stray-paren')
+                self._cut(st, ')'); i += 1
             else:
-                certain = certain and ch not in QUOTE_CHARS and not (at_word and (ch == '#' or CASE_WORD.match(text, i)))
-                i += 1
-        elif top == '"':
-            if ch == '\\':
-                i += 2
-            elif ch == '"':
-                stack.pop(); i += 1
-            elif ch == '`':
-                stack.append('`'); i += 1
-            elif text.startswith('$(', i):
-                stack.append('('); i += 2
-            elif text.startswith('$[', i):
-                stack.append('['); i += 2
-            elif text.startswith('${', i):
-                stack.append('{'); i += 2
+                i = self._word_into(i, st)
+        self._close_list(st)
+        if closer and not self.stopped:
+            self.reason('unterminated')
+        return n
+
+    def _close_list(self, st):
+        self._cut(st, None)
+        if st.stack:
+            self.reason('unclosed-keyword')
+        if st.need_command:
+            self.reason('dangling-operator')
+
+    def _cut(self, st, operator):
+        text, words, closer = ''.join(st.cur).strip(' \t\n'), st.words, st.after_close
+        st.cur, st.words = [], []
+        if st.for_header:
+            self._check_for_header(words)
+            st.for_header, words = False, []
+        elif words:
+            self._check_command(words, st.prev_op, st.here_string)
+        if text or words or closer:
+            st.commands.append(Command(text, tuple(words), operator, closer))
+        st.after_close = st.here_string = st.redirected = st.amp_redirect = False
+
+    def _newline(self, i, st):
+        self._cut(st, '\n')
+        if not st.need_command:
+            st.prev_op = '\n'
+        j = self._read_bodies(i + 1) if self.pending else i + 1
+        if not st.group and self.first < i and j < self.last:
+            self.newline = True
+        return j
+
+    def _continuation(self, i):
+        if self.pending:
+            self.reason('continuation-after-opener')
+        self.continuations.append(i)
+
+    def _comment(self, i, st):
+        text = self.text
+        if text[max(i - 2, 0):i] == '\\\n':
+            self.reason('hash-after-continuation')
+        elif i and text[i - 1] in '()<>':
+            self.reason('hash-glued')
+        if st.group:
+            self.reason('comment-in-group')
+        end = text.find('\n', i)
+        end = self.n if end < 0 else end
+        if '<<' in text[i:end]:
+            self.reason('heredoc-lookalike')
+        return end
+
+    def _operator(self, i, st):
+        text = self.text
+        two = text[i:i + 2]
+        if two in (';;', ';&', ';|'):
+            self.reason('case-operator')
+        elif two == '|&':
+            self.reason('pipe-amp')
+        elif two in ('&|', '&!'):
+            self.reason('zsh-disown')
+        size = 2 if two in (';;', ';&', ';|', '|&', '&|', '&!', '&&', '||') else 1
+        operator = {'|&': '|', '&|': '&', '&!': '&'}.get(two, text[i:i + size])
+        if not (st.words or st.after_close or st.redirected or st.for_header):
+            self.reason('empty-command')
+        self._cut(st, operator)
+        st.need_command, st.prev_op = operator in ('&&', '||', '|'), operator
+        if not st.group and operator in ('|', '&'):
+            self.pipeline = True
+        self._split_operator(i + size)
+        return i + size
+
+    def _split_operator(self, j):
+        if self.text.startswith('\\\n', j) and self.text[j + 2:j + 3] and self.text[j + 2] in ';&|<>':
+            self.reason('split-operator')
+
+    def _subshell(self, i, st):
+        if self.text.startswith('((', i):
+            self.reason('arith-command')
+        if st.words or st.redirected or st.after_close or st.for_header or st.stack[-1:] == ['for']:
+            self.reason('attached-paren')
+        self._cut(st, '(')
+        st.need_command = False
+        end = self._list(i + 1, ')', st.depth + 1, st.group, st.commands)
+        st.after_close = True
+        return end
+
+    # -- redirects and heredocs ----------------------------------------------------------------------------------
+
+    def _redirect(self, i, st):
+        text, n = self.text, self.n
+        op = REDIRECT_OP.match(text, i).group()
+        st.need_command = False
+        if op in ('<', '>') and text[i + 1:i + 2] == '(':
+            return self._process_substitution(i, st)
+        if op in ('<<', '<<-') and not self.whole:
+            return self._opener(i, op, st)
+        j = i + len(op)
+        if op == '<<<':
+            st.here_string = True
+            if text[j:j + 1] == '<':
+                self.reason('heredoc-lookalike')
+        elif op in ('&>', '&>>'):
+            st.amp_redirect = True
+        self._split_operator(j)
+        st.cur.append(op)
+        st.redirected = True
+        while j < n and (text[j] in ' \t' or text.startswith('\\\n', j)):
+            if text[j] == '\\':
+                self._continuation(j); j += 2
             else:
-                i += 1
-        elif ch == '\\':
-            certain = certain and not (stack and text[i + 1:i + 2] in ('`', "'", '"'))
-            i += 2
-        elif text.startswith("$'", i):
-            try:
-                end = _decode_ansi_c(text, i + 2)[1]
-            except ValueError:
-                return n, False
-            certain = certain and not stack and "\\'" not in text[i:end]
-            i = end
-        elif ch in QUOTE_CHARS:
-            certain = certain and not stack
-            if top == '{' and len(stack) > 1 and stack[-2] == '"':
-                i += 1
-            elif ch == '"':
-                stack.append('"'); i += 1
-            else:
-                end = text.find("'", i + 1)
-                if end < 0:
-                    return n, False
-                i = end + 1
-        elif ch == '`':
-            stack.append('`'); i += 1
-        elif text.startswith(('$(', '<(', '>('), i):
-            stack.append('('); i += 2
-        elif text.startswith('$[', i):
-            stack.append('['); i += 2
-        elif text.startswith('${', i):
-            stack.append('{'); i += 2
-        elif not stack and text.startswith('((', i):
-            stack.extend('(('); i += 2
-        elif ch == '(' and stack and top != '{':
-            stack.append('('); i += 1
-        elif ch == ')' and top == '(':
-            stack.pop(); i += 1
-        elif ch == '[' and top == '[':
-            stack.append('['); i += 1
-        elif ch == ']' and top == '[':
-            stack.pop(); i += 1
-        elif ch == '}' and top == '{':
-            stack.pop(); i += 1
-        elif ch == '#' and top != '{' and (at_word or text[i - 1] in COMMENT_GLUE):
-            if stack or not at_word or (i >= 1 and text[i - 1] == '(') or (i >= 2 and text[i - 2] == '\\'):
-                certain = False; i += 1
-            else:
-                end = text.find('\n', i)
-                i = n if end < 0 else end
-        elif stack and top != '{' and at_word and CASE_WORD.match(text, i):
-            certain = False; i += 4
+                st.cur.append(text[j]); j += 1
+        if j >= n or text[j] in WORD_END:
+            self.reason('redirect-target')
+            return j
+        if text[j] == '#':
+            self.reason('hash-glued')
+            return self._comment(j, st)
+        word, j = self._word(j, st)
+        st.cur.append(word.raw)
+        return j
+
+    def _process_substitution(self, i, st):
+        if i and self.text[i - 1] not in ' \t\n;&|(':
+            self.reason('attached-procsub')
+        end = self._group(i + 1, _WordBuf(), st)
+        if end < self.n and self.text[end] not in WORD_END:
+            self.reason('attached-procsub')
+        st.cur.append('X')
+        st.words.append(Word('X', 'X', True))
+        return end
+
+    def _opener(self, i, op, st):
+        text = self.text
+        found = HEREDOC_OPENER.match(text, i)
+        if st.group:
+            self.reason('heredoc-in-group')
+        if not found:
+            self.reason('heredoc-opener')
+            st.cur.append(op)
+            return i + len(op)
+        delimiter = found.group(2) or found.group(3) or found.group(4)
+        quoted = bool(found.group(2) or found.group(3)) or text[found.end() - len(delimiter) - 1] == '\\'
+        self.pending.append((delimiter, quoted, bool(found.group(1))))
+        self.openers.append(found.group())
+        self.opener_spans.append((i, found.end()))
+        st.cur.append('<<__HD%d__' % (len(self.openers) - 1))
+        st.redirected = True
+        return found.end()
+
+    def _read_bodies(self, i):
+        """The bodies of the pending openers from the line at i. A body ends only on a line holding exactly its delimiter
+        (tabs stripped first for <<-). An unquoted body that a shell would read differently records a reason."""
+        text, n, position = self.text, self.n, i
+        for delimiter, quoted, strip_tabs in self.pending:
+            body = []
+            while True:
+                if position > n:
+                    self.reason('heredoc-unterminated')
+                    self.pending = []
+                    return i
+                end = text.find('\n', position)
+                end = n if end < 0 else end
+                line = text[position:end]
+                position = end + 1
+                compared = line.lstrip('\t') if strip_tabs else line
+                if compared == delimiter:
+                    break
+                if not quoted and _body_line_runs_code(line):
+                    self.reason('heredoc-body')
+                body.append(compared)
+            self.bodies.append(('\n'.join(body) + '\n', quoted))
+        self.pending = []
+        self.spans.append((i, position))
+        return min(position, n)
+
+    # -- words ---------------------------------------------------------------------------------------------------
+
+    def _word_into(self, i, st):
+        text, n = self.text, self.n
+        word, j = self._word(i, st)
+        st.cur.append(word.raw)
+        if j < n and text[j] in '<>' and word.raw.isdigit():
+            return j  # a file descriptor, part of the redirect that follows
+        st.need_command = False
+        if st.after_close:
+            self.reason('word-after-close')
+        if st.amp_redirect:
+            self.reason('amp-redirect-words')  # sh and dash read `a &>f b` as `a &` then `>f b`, which runs b
+        if not st.words and not st.for_header and not st.redirected and not st.after_close and self._keyword(word, st):
+            return j
+        if word.raw in ('{', '}'):
+            self.reason('lone-brace')  # zsh closes a group on a bare }; bash passes it as an argument
+        st.words.append(word)
+        return j
+
+    def _keyword(self, word, st):
+        name, stack = word.raw, st.stack
+        top = stack[-1] if stack else None
+        if top == 'for' and name != 'do':
+            self.reason('keyword-order')
+        if name not in KEYWORDS:
+            return False
+        if name == '!':
+            return True
+        if name in ('if', 'while', 'until', '{', 'for'):
+            stack.append('while' if name == 'until' else name)
+            st.for_header = name == 'for'
+            return True
+        closes = name in ('fi', 'done', '}')
+        if top not in KEYWORD_AFTER[name]:
+            self.reason('keyword-order')
+            st.after_close = closes
+            return True
+        if closes:
+            stack.pop()
+            st.after_close = True
         else:
+            stack[-1] = {'then': 'then', 'elif': 'if', 'else': 'else', 'do': 'do'}[name]
+        return True
+
+    def _check_for_header(self, words):
+        ok = bool(words) and bool(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', words[0].raw)) and (len(words) == 1 or words[1].raw == 'in')
+        if not ok:
+            self.reason('for-header')
+
+    def _word(self, i, st):
+        text, n, w = self.text, self.n, _WordBuf()
+        while i < n and not self.stopped:
+            run = WORD_RUN.match(text, i)
+            if run:
+                piece = run.group()
+                w.add(piece)
+                w.dynamic = w.dynamic or '*' in piece or '?' in piece
+                i = run.end()
+                continue
+            ch = text[i]
+            if ch in WORD_END:
+                break
+            if ch == "'":
+                i = self._single(i, w, st)
+            elif ch == '"':
+                i = self._double(i, w, st)
+            elif ch == '\\':
+                i = self._escape(i, w, st)
+            elif ch == '`':
+                i = self._backtick(i, w, st)
+            elif ch == '$':
+                i = self._dollar(i, w, st)
+            elif ch == '#':
+                if text[max(i - 2, 0):i] in ('\\ ', '\\\t'):
+                    self.reason('hash-after-escaped-blank')
+                w.add(ch); i += 1
+            elif ch in '{}':
+                w.dynamic = w.dynamic or ch == '{'
+                w.add(ch); i += 1
+            elif ch == '[':
+                i = self._bracket(i, w)
+            else:
+                self.reason('character')  # a control or non-ASCII character outside quotes, comments and bodies
+                w.add(ch); i += 1
+        return Word(''.join(w.raw), ''.join(w.value), w.dynamic), i
+
+    def _bracket(self, i, w):
+        text = self.text
+        if not w.raw and text.startswith('[[', i):
+            self.reason('dbracket')  # bash, zsh and ksh parse inside it; sh and dash run a program named [[
+            w.add('[[')
+            return i + 2
+        following = text[i + 1:i + 2]
+        if w.raw or (following and following not in WORD_END):
+            self.reason('bracket-in-word')  # a glob in some shells, a subscript that holds blanks and code in others
+            w.dynamic = True
+        w.add('[')
+        return i + 1
+
+    def _escape(self, i, w, st):
+        text, n = self.text, self.n
+        following = text[i + 1:i + 2]
+        if not following:
+            self.reason('trailing-backslash')
+            w.add('\\', '')
+            return n
+        if following == '\n':
+            self._continuation(i)
+            if i + 2 < n and text[i + 2] not in WORD_END:
+                self.reason('split-word')  # best effort: the two pieces read as one word
+            return i + 2
+        if following in '<>':
+            self.reason('escaped-redirect')
+        elif st.group and following in '\'"`':
+            self.reason('quote-in-group')
+        elif following not in ' \t' and not ' ' <= following <= '~':
+            self.reason('character')
+        w.add(text[i:i + 2], following)
+        return i + 2
+
+    def _single(self, i, w, st):
+        text = self.text
+        if st.group:
+            self.reason('quote-in-group')
+        end = text.find("'", i + 1)
+        if end < 0:
+            self.reason('unterminated')
+            w.add(text[i:], text[i + 1:])
+            return self.n
+        body = text[i + 1:end]
+        self._check_quoted(body)
+        w.add(text[i:end + 1], body)
+        return end + 1
+
+    def _check_quoted(self, body):
+        if '<<' in body:
+            self.reason('heredoc-lookalike')
+        if self.pending and '\n' in body:
+            self.reason('heredoc-quoted-newline')
+
+    def _double(self, i, w, st):
+        text, n, start = self.text, self.n, i
+        if st.group:
+            self.reason('quote-in-group')
+        w.raw.append('"')
+        i += 1
+        while i < n and not self.stopped:
+            run = DQ_RUN.match(text, i)
+            if run:
+                w.add(run.group())
+                i = run.end()
+                continue
+            ch = text[i]
+            if ch == '"':
+                self._check_quoted(text[start:i])
+                w.raw.append('"')
+                return i + 1
+            if ch == '\\':
+                following = text[i + 1:i + 2]
+                if following == '\n':
+                    self._continuation(i)
+                else:
+                    w.add(text[i:i + 2], following if following in '"\\$`' else text[i:i + 2])
+                i += 2
+            elif ch == '`':
+                i = self._backtick(i, w, st)
+            else:
+                i = self._dollar(i, w, st, quoted=True)
+        self.reason('unterminated')
+        return n
+
+    def _dollar(self, i, w, st, quoted=False):
+        text = self.text
+        following = text[i + 1:i + 2]
+        if not quoted and following == "'":
+            return self._ansi(i, w, st)
+        w.dynamic = True
+        if following == '(':
+            if text[i + 2:i + 3] == '(':
+                end = self._arithmetic(i)
+                if end is not None:
+                    self.substitution = self.saw_nesting = True
+                    w.add('X')
+                    return end
+                self.reason('arith')  # bash reads $(( that is not arithmetic as a command substitution
+            return self._group(i + 1, w, st)
+        if following == '{':
+            return self._parameter(i, w)
+        if following == '[':
+            self.reason('old-arith')
+            end = text.find(']', i)
+            end = self.n if end < 0 else end + 1
+            w.add(text[i:end])
+            return end
+        if not quoted and following == '"':
+            w.add('$', '')
+            return self._double(i + 1, w, st)
+        if following and following in DOLLAR_SPECIALS:
+            w.add(text[i:i + 2])
+            after = text[i + 2:i + 3]
+            if not quoted and after and after in '\'"(':
+                self.reason('dollar-special-quote')
+            return i + 2
+        w.add('$')
+        return i + 1
+
+    def _ansi(self, i, w, st):
+        text, n = self.text, self.n
+        self.saw_nesting = True
+        if st.group:
+            self.reason('quote-in-group')
+        j, clean = i + 2, True
+        while j < n and text[j] != "'":
+            if text[j] == '\\':
+                clean = clean and text[j + 1:j + 2] in ANSI_ESCAPES
+                j += 2
+            else:
+                j += 1
+        if j >= n:
+            self.reason('unterminated')
+            w.add(text[i:])
+            return n
+        end = j + 1
+        if not clean or "\\'" in text[i:end]:  # \c, or a shell without $'...' (dash) ends the string at that quote
+            self.reason('ansi-c')
+        try:
+            value = _decode_ansi_c(text, i + 2)[0]
+        except ValueError:
+            self.reason('ansi-c')
+            value = text[i + 2:j]
+        self._check_quoted(text[i:end])
+        w.add(shell_quote(value), value)
+        return end
+
+    def _arithmetic(self, i):
+        """The index past the `))` of the plain arithmetic at text[i:], or None. A `)` that closes nothing opened inside and is
+        not followed by another `)` makes bash read the whole thing as a command substitution."""
+        text, n, j, depth = self.text, self.n, i + 3, 0
+        while j < n:
+            ch = text[j]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                if not depth:
+                    return j + 2 if text[j + 1:j + 2] == ')' else None
+                depth -= 1
+            elif ch not in ARITH_CHARS or text.startswith('<<', j) or (ch == '$' and text[j + 1:j + 2] in ('(', '[', '{', "'", '"', '`')):
+                return None
+            j += 1
+        return None
+
+    def _parameter(self, i, w):
+        safe = SAFE_PARAM.match(self.text, i)
+        if safe:
+            if not SIMPLE_BRACE.fullmatch(safe.group()):
+                self.saw_nesting = True
+            w.add(safe.group())
+            return safe.end()
+        self.reason('param-expansion')  # ${ cmd; }, a blank or # inside, a quote, a nested group: shells disagree on all of them
+        self.saw_nesting = True
+        end = self._parameter_end(i + 2)
+        w.add(self.text[i:end])
+        return end
+
+    def _parameter_end(self, i):
+        text, n, depth = self.text, self.n, 1
+        while i < n:
+            ch = text[i]
+            if ch == '\\':
+                i += 2
+                continue
+            depth += ch == '{'
+            depth -= ch == '}'
             i += 1
-        if grouped and not stack:
-            return i, certain
-    return n, certain and not stack
+            if not depth:
+                return i
+        self.reason('unterminated')
+        return n
+
+    def _group(self, i, w, st):
+        """The substitution whose `(` is at text[i]. It appears as X in the word; its commands are kept in self.groups."""
+        text = self.text
+        self.substitution = self.saw_nesting = True
+        commands, index = [], len(self.groups)
+        self.groups.append(commands)
+        self.group_texts.append('')
+        end = self._list(i + 1, ')', st.depth + 1, True, commands)
+        self.group_texts[index] = text[i + 1:end - 1] if text[end - 1:end] == ')' else text[i + 1:end]
+        w.add('X')
+        w.dynamic = True
+        return end
+
+    def _backtick(self, i, w, st):
+        text, n, j = self.text, self.n, i + 1
+        self.substitution = self.saw_nesting = True
+        w.dynamic = True
+        while j < n and text[j] != '`':
+            if text[j] == '\\':
+                self.reason('backslash-in-backtick')
+                j += 2
+            else:
+                j += 1
+        if j >= n:
+            self.reason('unterminated')
+            w.add('X')
+            return n
+        sub, commands = _Lexer(text[i + 1:j], self.whole), []
+        sub.reasons, sub.groups, sub.group_texts = self.reasons, self.groups, self.group_texts
+        self.groups.append(commands)
+        self.group_texts.append(sub.text)
+        sub._list(0, None, st.depth + 1, True, commands)
+        self.stopped = self.stopped or sub.stopped
+        if sub.pending:
+            self.reason('heredoc-unterminated')
+        w.add('X')
+        return j + 1
+
+    # -- the program word ------------------------------------------------------------------------------------------
+
+    def _check_command(self, words, prev_op, here_string):
+        """The closed checks on one simple command: anything that changes how later text parses, or runs quoted text as
+        code, makes the command uncertain. Wrappers are looked through by the same step peel_wrapper uses."""
+        values, raws, k, count = [w.value for w in words], [w.raw for w in words], 0, len(words)
+        for value in values:
+            if SUBSCRIPT_CODE.search(value):
+                self.reason('subscript-code')
+        for _ in range(12):
+            while k < count and ASSIGN_WORD.match(raws[k]):
+                if raws[k].split('=', 1)[0].rstrip('+') in STATE_VARS:
+                    self.reason('state-variable')
+                k += 1
+            if k >= count:
+                return
+            word = words[k]
+            if word.dynamic or word.value.startswith('='):
+                self.reason('dynamic-program-word')  # the shell picks the program after expansion; zsh runs =cmd too
+                return
+            base = word.value.rsplit('/', 1)[-1]
+            step = _wrapper_step(base, values, raws, k + 1)
+            if step is None:
+                self._check_program(base, words[k + 1:], prev_op, here_string)
+                return
+            if step < 0:
+                self.reason('quoted-code:env-S')
+                return
+            if base == 'exec' and step >= count:
+                self.reason('exec-redirect')  # later commands read and write through whatever it opened
+            if base in ('env', 'sudo'):
+                for j in range(k + 1, step):
+                    if ASSIGN_WORD.match(raws[j]) and raws[j].split('=', 1)[0].rstrip('+') in STATE_VARS:
+                        self.reason('state-variable')
+            k = step
+        self.reason('wrapper-depth')
+
+    def _check_program(self, base, args, prev_op, here_string):
+        values = [word.value for word in args]
+        if base in PARSE_CHANGING:
+            self.reason('parse-word:' + base)
+        elif base in QUOTED_CODE:
+            self.reason('quoted-code:' + base)
+        elif base in UNPEELED_WRAPPERS:
+            self.reason('wrapper:' + base)
+        elif base in SHELL_NAMES:
+            if any(SHELL_C.fullmatch(value) for value in values):
+                self.reason('quoted-code:shell-c')
+            elif here_string:
+                self.reason('quoted-code:shell-here-string')
+            elif any(word.dynamic for word in args):
+                self.reason('shell-dynamic-arg')
+            elif prev_op == '|':
+                self.reason('pipe-into-shell')
+        elif base == 'set':
+            self._check_set(values)
+        elif base == 'find':
+            if any(value in FIND_RUNNERS for value in values):
+                self.reason('find-exec')
+        elif base == 'git':
+            if any(value == '-c' and following.lower().startswith('alias.') for value, following in zip(values, values[1:])):
+                self.reason('git-alias')
+        elif base in ('ssh', 'scp', 'sftp'):
+            for i, value in enumerate(values):
+                cluster = SSH_O_CLUSTER.match(value)
+                if cluster:
+                    option = value[cluster.end():] or (values[i + 1] if i + 1 < len(values) else '')
+                    if SSH_OPTION_CODE.match(option):
+                        self.reason('quoted-code:ssh-option')
+                        return
+        elif base in ('source', '.'):
+            if any(value.startswith('/dev/') for value in values):
+                self.reason('source-dev')  # runs a body an earlier `exec 3<<E` saved
+        elif base == 'export':
+            if any(value.split('=', 1)[0] in STATE_VARS for value in values):
+                self.reason('state-variable')
+
+    def _check_set(self, values):
+        """`set` is certain only for -e, -u, -x, -o pipefail, their + forms, -- and positional words."""
+        i = 0
+        while i < len(values):
+            value = values[i]
+            if value == '--' or value[:1] not in ('-', '+'):
+                return
+            if len(value) < 2 or not SET_FLAGS.fullmatch(value):
+                self.reason('set-option')
+                return
+            if value.endswith('o'):
+                if values[i + 1:i + 2] != ['pipefail']:
+                    self.reason('set-option')
+                    return
+                i += 1
+            i += 1
 
 
-def _skip_group(text, i):
-    """Index just past the ')' that closes the group whose '(' is at text[i]; len(text) when it never closes."""
-    return _walk_groups(text, i + 1, ['('])[0]
+def _body_line_runs_code(line):
+    """True when a shell reading an unquoted heredoc line can run or join something: a trailing backslash, $(...), a
+    backtick, $[...], or ${...} other than ${NAME}."""
+    if line.endswith('\\') or '$(' in line or '`' in line or '$[' in line:
+        return True
+    at = line.find('${')
+    while at >= 0:
+        found = SIMPLE_BRACE.match(line, at)
+        if not found:
+            return True
+        at = line.find('${', found.end())
+    return False
 
 
-def _backtick_end(text, i):
-    """Index just past the '`' that closes the one at text[i]; len(text) when it never closes."""
-    return _walk_groups(text, i + 1, ['`'])[0]
-
-
-def join_continuations(text):
-    """Backslash-newline removed where the shell removes it (not in single quotes, $'...' or a comment), so a word split
-    or a comment after a continuation reads as the shell reads it."""
-    if '\\\n' not in text:
-        return text
-    out, i, n, quote = [], 0, len(text), None
-    while i < n:
-        ch = text[i]
-        if quote == "'":
-            out.append(ch); i += 1
-            quote = None if ch == "'" else quote
-        elif ch == '\\':
-            if text[i + 1:i + 2] != '\n':
-                out.append(text[i:i + 2])
-            i += 2
-        elif quote == '"':
-            out.append(ch); i += 1
-            quote = None if ch == '"' else quote
-        elif text.startswith("$'", i):
-            try:
-                end = _decode_ansi_c(text, i + 2)[1]
-            except ValueError:
-                return text
-            out.append(text[i:end]); i = end
-        elif ch in '\'"':
-            quote = ch; out.append(ch); i += 1
-        elif ch == '#' and (not out or out[-1][-1] in ' \t\n;&|()'):
-            end = text.find('\n', i)
-            end = n if end < 0 else end
-            out.append(text[i:end]); i = end
-        else:
-            out.append(ch); i += 1
-    return ''.join(out)
+def lex(command):
+    """The lexed command. When an uncertain command holds an opener, its text is read again with `<<` as a plain redirect:
+    a body cannot be told from commands then, so its lines stay in the output as commands."""
+    first = _Lexer(command).run()
+    if not (first.reasons and first.openers):
+        return first
+    second = _Lexer(command, whole=True).run()
+    second.reasons = first.reasons
+    return second
 
 
 CONTINUED_LINE = re.compile(r'(?<!\\)\n')
@@ -877,170 +1499,6 @@ def _quoted_continuation(text):
     return any('\\\n' in fragment and ("'" in fragment or '"' in fragment) for fragment in CONTINUED_LINE.split(text))
 
 
-def inner_commands(text):
-    """Bodies of $(...), `...`, <(...) and >(...) outside single quotes (inside double quotes too)."""
-    found, i, n, quote = [], 0, len(text), None
-    while i < n:
-        ch = text[i]
-        if quote == "'":
-            quote = None if ch == "'" else quote
-            i += 1
-        elif ch == '\\':
-            i += 2
-        elif ch == "'" and quote is None:
-            quote = "'"; i += 1
-        elif ch == '"':
-            quote = None if quote == '"' else '"'; i += 1
-        elif quote is None and ch == '#' and (i == 0 or text[i - 1] in WORD_BREAK):
-            end = text.find('\n', i)  # a comment's apostrophe opens nothing
-            i = n if end < 0 else end
-        elif ch == '`':
-            end = _backtick_end(text, i)
-            found.append(text[i + 1:end - 1]); i = end
-        elif text.startswith('$(', i) or (quote is None and text[i:i + 2] in ('<(', '>(')):
-            end = _skip_group(text, i + 1)
-            found.append(text[i + 2:end - 1]); i = end
-        else:
-            i += 1
-    return found
-
-
-HEREDOC_NONE, HEREDOC_CERTAIN, HEREDOC_UNCERTAIN = 'none', 'certain', 'uncertain'
-HEREDOC_OPENER = re.compile(r"""<<(-?)[ \t]*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|\\?([A-Za-z_][A-Za-z0-9_]*))(?=[ \t\n;&|)<>]|$)""")
-SIMPLE_BRACE = re.compile(r'\$\{[A-Za-z_][A-Za-z0-9_]*\}')
-HEREDOC_BREAK = ' \t\n;&|'
-
-
-def _double_quote_end(command, i):
-    """Index of the '"' closing the string whose body starts at i, or None when it is unterminated or holds an expansion
-    that can nest other quoting (a plain $NAME or ${NAME} cannot)."""
-    while i < len(command):
-        if command[i] == '\\':
-            i += 2
-        elif command[i] == '"':
-            return i
-        elif command[i] == '`' or command.startswith(('$(', '$['), i):
-            return None
-        elif command.startswith('${', i):
-            found = SIMPLE_BRACE.match(command, i)
-            if not found:
-                return None
-            i = found.end()
-        else:
-            i += 1
-    return None
-
-
-def _heredoc_bodies(command, i, pending, bodies):
-    """Read the bodies of the pending openers from the line starting at i. (next index, True) or (i, False) when a body
-    is unterminated or the shell could read it differently: in an unquoted body a backslash-newline joins lines before
-    the terminator test, and a $(...) or backtick runs a command."""
-    position, n = i, len(command)
-    for delimiter, quoted, strip_tabs in pending:
-        body = []
-        while True:
-            if position > n:
-                return i, False
-            end = command.find('\n', position)
-            end = n if end < 0 else end
-            line = command[position:end]
-            position = end + 1
-            if (line.lstrip('\t') if strip_tabs else line) == delimiter:
-                break
-            if not quoted and (line.endswith('\\') or '$(' in line or '`' in line):
-                return i, False
-            body.append(line.lstrip('\t') if strip_tabs else line)
-        bodies.append(('\n'.join(body) + '\n', quoted))
-    return position, True
-
-
-def heredoc_scan(command, openers=None, spans=None):
-    """(status, text, bodies): the single rule for what may be hidden from the matcher and the escape classifier.
-
-    Removing a body hides its lines, so a body is removed only when the shell cannot read the command another way.
-    The result is `certain` (markers replace the bodies; bodies are (text, quoted) pairs) only when all of these hold:
-    - every `<<` outside a body is an operator in plain unquoted text, not in quotes, a comment or `<<<`, and is
-      followed by a delimiter that is an identifier, optionally wholly quoted ('EOF', "EOF", \\EOF), and then a word end;
-    - every body ends on a line holding exactly the delimiter (tabs stripped first for `<<-`), and an unquoted body holds
-      no backslash at a line end, `$(` or backtick;
-    - no text outside the bodies holds anything that nests other quoting or changes what `<<` means: $(...), backtick,
-      ${...} other than ${NAME}, $[...], $'...', ((...)), [[...]], or a `(` attached to a word (<(, =(, @(, f().
-    A command with no `<<` is `none`. Anything else is `uncertain`, with the text left whole: callers then check every
-    physical line and never answer allow. A false uncertain costs a prompt; a false certain hides a command.
-    `openers`, when given, receives each opener's text in marker order; `spans`, on a certain scan, each (start, end) of the
-    typed command that holds bodies, terminators included, so a caller can keep those bytes exactly as typed."""
-    if '<<' not in command:
-        return HEREDOC_NONE, command, []
-    uncertain = (HEREDOC_UNCERTAIN, command, [])
-    if '\0' in command:
-        return uncertain
-    out, bodies, pending, i, n, after_escape, found_spans = [], [], [], 0, len(command), -1, []
-    while i < n:
-        ch = command[i]
-        at_break = i == 0 or (command[i - 1] in HEREDOC_BREAK and i != after_escape)
-        if ch == '\\':
-            if command[i + 1:i + 2] == '<':
-                return uncertain
-            out.append(command[i:i + 2]); i += 2; after_escape = i
-        elif ch == "'":
-            end = command.find("'", i + 1)
-            if end < 0 or '<<' in command[i:end]:
-                return uncertain
-            out.append(command[i:end + 1]); i = end + 1
-        elif ch == '"':
-            end = _double_quote_end(command, i + 1)
-            if end is None or '<<' in command[i:end]:
-                return uncertain
-            out.append(command[i:end + 1]); i = end + 1
-        elif ch == '#' and (at_break or i == after_escape or command[i - 1] in '<>()'):
-            end = command.find('\n', i)
-            end = n if end < 0 else end
-            if not at_break or '<<' in command[i:end]:  # a comment only the shell can place, or an opener in a comment
-                return uncertain
-            out.append(command[i:end]); i = end
-        elif command.startswith('<<<', i):
-            if command[i + 3:i + 4] == '<':
-                return uncertain
-            out.append('<<<'); i += 3
-        elif command.startswith('<<', i):
-            found = HEREDOC_OPENER.match(command, i)
-            if not found:
-                return uncertain
-            delimiter = found.group(2) or found.group(3) or found.group(4)
-            quoted = bool(found.group(2) or found.group(3)) or command[found.end() - len(delimiter) - 1] == '\\'
-            pending.append((delimiter, quoted, bool(found.group(1))))
-            if openers is not None:
-                openers.append(found.group())
-            out.append('<<__HD%d__' % (len(bodies) + len(pending) - 1)); i = found.end()
-        elif ch == '\n':
-            out.append(ch); i += 1
-            if pending:
-                start = i
-                i, ok = _heredoc_bodies(command, i, pending, bodies)
-                if not ok:
-                    return uncertain
-                found_spans.append((start, i))
-                pending = []
-        elif ch == '`' or command.startswith(('$(', '$[', "$'", '[['), i):
-            return uncertain
-        elif command.startswith('${', i):
-            found = SIMPLE_BRACE.match(command, i)
-            if not found:
-                return uncertain
-            out.append(found.group()); i = found.end()
-        elif ch == '(' and (command[i + 1:i + 2] == '(' or not at_break and command[i - 1] != '('):
-            return uncertain
-        else:
-            out.append(ch); i += 1
-    if pending:
-        return uncertain
-    if not bodies:
-        return HEREDOC_NONE, command, []
-    if spans is not None:
-        spans.extend(found_spans)
-    return HEREDOC_CERTAIN, ''.join(out), bodies
-
-
 def _cut_bodies(command, spans):
     """The typed text around the body spans, as a list: outside, outside, ..., one more item than spans."""
     pieces, at = [], 0
@@ -1050,101 +1508,116 @@ def _cut_bodies(command, spans):
     return pieces
 
 
-def _prepare_text(command):
-    """(text, heredoc bodies, uncertain). Bodies are removed only under heredoc_scan's rule; continuations are joined and
-    the rest normalized by deansi. The command is uncertain when the scan is, when deansi cannot tokenize it, when a quote
-    sits in a continuation-joined fragment, or when _walk_groups' rule fails. An uncertain result keeps every line in the
-    text and is never allowed."""
-    spans = []
-    status, text, bodies = heredoc_scan(command, spans=spans)
-    joined = join_continuations(text).strip()  # join first: a trailing backslash-newline must not leave a lone backslash
-    normalized, ok = deansi(joined)
-    uncertain = (status == HEREDOC_UNCERTAIN or not ok or _quoted_continuation(''.join(_cut_bodies(command, spans)))
-                 or not _walk_groups(joined)[1])
-    return normalized, bodies, uncertain
+def _replace_spans(command, cuts):
+    out, at = [], 0
+    for start, end, text in sorted(cuts):
+        out.append(command[at:start]); out.append(text)
+        at = end
+    out.append(command[at:])
+    return ''.join(out)
+
+
+def _masked_text(command, lexed, join):
+    """The typed text with each body swapped for a placeholder and, when `join`, the lexer's continuations removed."""
+    cuts = [(start, end, '\0%d\0' % index) for index, (start, end) in enumerate(lexed.spans)]
+    if join:
+        cuts.extend((at, at + 2, '') for at in lexed.continuations)
+    return _replace_spans(command, cuts)
+
+
+def join_continuations(text):
+    """Backslash-newline removed where the lexer found one (not in single quotes, $'...', a comment or a body)."""
+    if '\\\n' not in text:
+        return text
+    return _replace_spans(text, [(at, at + 2, '') for at in lex(text).continuations])
+
+
+def inner_commands(text):
+    """The text of every $(...), `...`, <(...) and >(...), nested ones included, outer before inner."""
+    return list(lex(text).group_texts)
+
+
+def heredoc_scan(command, openers=None, spans=None):
+    """(status, text, bodies): `certain` (markers replace the bodies; bodies are (text, quoted) pairs) when the lexer recorded
+    no reason and read a body; `uncertain`, with the text left whole, when it recorded a reason and the text holds `<<`;
+    `none` otherwise. `openers` receives each opener's text in marker order; `spans`, each (start, end) of the typed command
+    that holds bodies, terminators included."""
+    lexed = lex(command)
+    if lexed.reasons:
+        return (HEREDOC_UNCERTAIN if '<<' in command else HEREDOC_NONE), command, []
+    if not lexed.bodies:
+        return HEREDOC_NONE, command, []
+    if openers is not None:
+        openers.extend(lexed.openers)
+    if spans is not None:
+        spans.extend(lexed.spans)
+    cuts = [(start, end, '<<__HD%d__' % index) for index, (start, end) in enumerate(lexed.opener_spans)]
+    cuts.extend((start, end, '') for start, end in lexed.spans)
+    return HEREDOC_CERTAIN, _replace_spans(command, cuts), lexed.bodies
 
 
 HEREDOC_HINT = ("Text in a heredoc inside $(...) is checked line by line as commands. Use a top-level quoted heredoc: "
                 "`git commit -F - <<'EOF'` for a commit message, `gh pr create --body-file - <<'EOF'` for a PR body.")
-SCRIPT_SPLIT = re.compile(r'[;&|()`\n]|\$\(')
 PHYSICAL_SPLIT = re.compile(r'[;&|()`\n\r<>]|\$\(')  # a redirect can touch the word before it (`touch<<E`)
-BACKGROUND_AMP = re.compile(r'(?<![&<>])&(?=\s|$)')
-LATER_WAIT = re.compile(r'(?:^|[\s;&|(])wait(?=[\s;&|)]|$)')
+BACKGROUND_AMP = re.compile(r'(?<![&<>])&(?=[ \t\n]|$)')
+LATER_WAIT = re.compile(r'(?:^|[ \t\n;&|(])wait(?=[ \t\n;&|)]|$)')
+SCRIPT_HOSTS = frozenset(('bash', 'sh', 'zsh', 'dash', 'ksh', 'source', '.'))
+SHELL_LINE_BLANKS = re.compile(r'[ \t\n]+')
+ANSI_IN_FRAGMENT = re.compile(r"\$'")
 
 
-SCRIPT_HOSTS = frozenset(('bash', 'sh', 'zsh', 'dash', 'ksh', 'source', '.', 'eval'))
-HEREDOC_MARKER = re.compile(r'<<__HD(\d+)__')
-OPENER_WITH_FD = re.compile(r'(?:(?<![^\s])\d+)?<<__HD\d+__')
-COMPOUND_CLOSE = frozenset(('}', ')', 'fi', 'done', 'esac'))
-FUNCTION_DEF = re.compile(r'(?:^|(?<=[\s;&|(]))(?:function\s+([^\s;&|()]+)|([^\s;&|()]+)\s*\(\s*\))')
-SSH_ON_LINE = re.compile(r'(?:^|[\s;&|(/])ssh\s')
+def _blank_split(text):
+    """Words at the blanks a shell splits on."""
+    return [word for word in SHELL_LINE_BLANKS.split(text) if word]
 
 
 def _reads_script(fragment):
-    """True when this simple command runs its stdin or a heredoc as shell text: a shell, source, `.` or eval (through any
-    wrapper), or ssh with no remote command or a shell in it."""
+    """True when this simple command runs its stdin or a heredoc as shell text: a shell, source or `.` (through any wrapper),
+    or ssh with no remote command or a shell in it."""
     for form in match_candidates(fragment):
         try:
             words = [word[1] for word in raw_words(HEREDOC_MARKER.sub('', form))]
         except ValueError:
-            words = form.split()
+            words = _blank_split(form)
         name = words[0].rsplit('/', 1)[-1] if words else ''
-        if name in SCRIPT_HOSTS or (name == 'xargs' and any(word.rsplit('/', 1)[-1] in SCRIPT_HOSTS for word in words[1:])):
+        if name in SCRIPT_HOSTS:
             return True
         if name == 'ssh':
             call = host_table.parse_ssh(words[1:])
-            if call and (not call.remote or any(word.rsplit('/', 1)[-1] in SCRIPT_HOSTS for word in ' '.join(call.remote).split())):
+            if call and (not call.remote or any(word.rsplit('/', 1)[-1] in SCRIPT_HOSTS for word in _blank_split(' '.join(call.remote)))):
                 return True
     return False
 
 
-def _hidden_reader(fragment, functions):
-    """True when the heredoc on this fragment may reach a shell that the text does not name: on a compound command's close
-    (`{ bash; } <<E`, `done <<E`, a subshell's `)` already cut by the split), on `exec 3<<E`, or read by a variable or a
-    function defined in this command. A false answer only widens a deny or escape check on a shape that rarely holds prose."""
-    for form in match_candidates(fragment):
-        try:
-            words = [word[1] for word in raw_words(form)]
-        except ValueError:
-            continue  # the quote-blind split cut a quoted word (`python3 -c 'a;b' <<E`): not a command word
-        if not words or words == ['exec'] or words[0] in COMPOUND_CLOSE or words[0].startswith('$') or words[0] in functions:
-            return True
-    return False
-
-
-def _runs_a_saved_body(fragment):
-    """True for what can run a body read earlier: eval, or source or `.` of a /dev file (`exec 3<<E; . /dev/fd/3`)."""
-    for form in match_candidates(fragment):
-        words = form.split()
-        name = words[0].rsplit('/', 1)[-1] if words else ''
-        if name == 'eval' or (name in ('source', '.') and len(words) > 1 and words[1].startswith('/dev/')):
-            return True
-    return False
-
-
-def script_bodies(text, bodies):
-    """The heredoc bodies a shell will run: read by a shell directly or through xargs, from a pipeline that holds a shell,
-    on a compound command, a variable or a function, or saved and run by eval or source. Any other reader (cat, python3 -)
-    keeps its body as data."""
-    if not bodies:
-        return []
-    fragments = SCRIPT_SPLIT.split(text)
-    if ('eval' in text or '/dev/' in text) and any(_runs_a_saved_body(fragment) for fragment in fragments):
-        return [body for body, _quoted in bodies]
-    piped = '|' in text and any(_reads_script(fragment) for fragment in fragments)
-    functions = {left or right for left, right in FUNCTION_DEF.findall(text)}
+def script_bodies(lexed):
+    """The heredoc bodies of a certain command that a shell will run: read by a shell directly or on a compound command's
+    close (`{ bash; } <<E`, `done <<E`, a subshell's `)`). Every shape that hides the reader further (a pipeline into a shell,
+    a variable, a function, xargs, eval, `exec 3<<E`) is uncertain already. Any other reader (cat, python3 -) keeps its body
+    as data."""
     found = []
-    for line in text.split('\n'):
-        # the split ignores quotes, so a quoted remote command (`ssh h 'cd x && sh' <<E`) is judged on its whole line
-        remote_shell = SSH_ON_LINE.search(line) and any(word.strip('\'"').rsplit('/', 1)[-1] in SCRIPT_HOSTS for word in line.split())
-        for fragment in SCRIPT_SPLIT.split(line):
-            numbers = [int(number) for number in HEREDOC_MARKER.findall(fragment)]
-            if not numbers:
-                continue
-            command = OPENER_WITH_FD.sub('', fragment)  # without the numbered markers the same command hits the cache
-            if piped or remote_shell or _reads_script(command) or _hidden_reader(command, functions):
-                found.extend(bodies[number][0] for number in numbers if number < len(bodies))
+    for command in lexed.commands:
+        numbers = [int(number) for number in HEREDOC_MARKER.findall(command.text)]
+        if numbers and (not command.words or command.closer or _reads_script(' '.join(word.raw for word in command.words))):
+            found.extend(lexed.bodies[number][0] for number in numbers if number < len(lexed.bodies))
     return found
+
+
+def _decoded_ansi(fragment):
+    """The fragment with each $'...' it holds decoded, or None when none can be."""
+    out, at, changed = [], 0, False
+    for found in ANSI_IN_FRAGMENT.finditer(fragment):
+        if found.start() < at:
+            continue
+        try:
+            value, end = _decode_ansi_c(fragment, found.end())
+        except ValueError:
+            continue
+        out.append(fragment[at:found.start()]); out.append(shell_quote(value))
+        at, changed = end, True
+    if not changed:
+        return None
+    out.append(fragment[at:])
+    return ''.join(out)
 
 
 def physical_parts(command):
@@ -1155,54 +1628,120 @@ def physical_parts(command):
     parts = []
     text = command + '\n' + command.replace('\\\n', '') if '\\\n' in command else command
     for fragment in PHYSICAL_SPLIT.split(text):
-        fragment = fragment.strip()
+        fragment = fragment.strip(' \t\n\r\f\v')
         bare = fragment.strip('\'"$ \t')
         for form in (fragment, bare):
             if form and form not in parts[-2:]:
                 parts.append(form)
         if "$'" in fragment:
-            decoded, ok = deansi(fragment)
-            if ok:
+            decoded = _decoded_ansi(fragment)
+            if decoded:
                 parts.append(decoded)
     return parts
 
 
+# The bypass rule for uncertain text. Bypass makes no decision of its own, so without this an uncertain command runs unless one
+# of its guessed fragments matched a deny rule. It reads the text with quoting ignored: a rule's literal prefix (or an escape
+# name) at a word start anywhere refuses the command. This is the only place that decides it. Python's wider \s is kept on
+# purpose here: it only ever widens a refusal, and a Unicode blank before a denied word should count as a word start.
+LITERAL_START = r'(?:^|(?<=[\s;&|()<>{}`/!=]))=*'  # after = too: option and variable values that programs run (r6 N22)
+LITERAL_STOP = r'(?=$|[\s;&|()<>`}$])'
+QUOTE_CHARACTERS = re.compile(r'''['"]''')
+LITERAL_BLANKS = re.compile(r'[ \t]+')
+# English words that appear in every prose heredoc; docs/operations.md gives the measured reason they are left out.
+LITERAL_ESCAPE_NAMES = ESCAPE_NAMES - frozenset(('at', 'batch', 'screen'))
+
+
+def literal_views(command):
+    """The text as a shell might read it once its quoting is in doubt: continuations gone, then quotes removed, quotes as
+    blanks (`alias e='cmd'`, `trap 'cmd'`), and quotes and backslashes removed (`to\\uch` reads as `touch`)."""
+    text = command.replace('\\\n', '')
+    plain = QUOTE_CHARACTERS.sub('', text)
+    views = (plain, QUOTE_CHARACTERS.sub(' ', text), plain.replace('\\', ''))
+    return tuple(dict.fromkeys(LITERAL_BLANKS.sub(' ', view) for view in views))
+
+
+@functools.lru_cache(maxsize=256)
+def _literal_pattern(head, stop):
+    return re.compile(LITERAL_START + re.escape(head) + (LITERAL_STOP if stop else ''))
+
+
+def literal_match(spec, views):
+    """True when spec's literal text appears at a word start in any view. `prefix:*` and an exact spec need a word end after
+    it; a glob needs its first literal at a word start and its later literals after it, in order."""
+    spec = LITERAL_BLANKS.sub(' ', spec)
+    if spec.endswith(':*'):
+        parts, stop = [spec[:-2]], True
+    elif '*' in spec:
+        parts, stop = spec.split('*'), False
+    else:
+        parts, stop = [spec], True
+    pattern = _literal_pattern(parts[0], stop)
+    for view in views:
+        found = pattern.search(view)
+        if not found:
+            continue
+        at = found.end()
+        for part in parts[1:]:
+            at = view.find(part, at)
+            if at < 0:
+                break
+            at += len(part)
+        else:
+            return True
+    return False
+
+
+GLOB_CHARS = re.compile(r'[*?\[]')
+
+
+def _glob_matches(name, glob):
+    """fnmatch, failing closed: a glob Python cannot compile (`[z-a]`) counts as a match, since the shell's reading is unknown."""
+    try:
+        return fnmatch.fnmatchcase(name, glob)
+    except re.error:
+        return True
+
+
+def _glob_programs(lexed):
+    """The program words that are globs (`/bin/tou?h`): the shell picks the program by matching file names."""
+    found = []
+    for commands in [lexed.commands] + list(lexed.groups):
+        for item in commands:
+            program = next((word for word in item.words if not ASSIGN_WORD.match(word.raw)), None)
+            if program is not None and GLOB_CHARS.search(program.value):
+                found.append(program.value.rsplit('/', 1)[-1])
+    return found
+
+
+def denied_as_literal(command, rules, lexed=None):
+    """The first deny rule whose literal text appears at a word start in this uncertain command, or whose program a glob
+    program word could name, or None."""
+    views = literal_views(command)
+    globs = _glob_programs(lexed) if lexed is not None else []
+    for rule in rules:
+        if rule.spec is None or rule.spec == '*' or literal_match(rule.spec, views):
+            return rule
+        program = LITERAL_BLANKS.split(rule.spec.strip(' \t'), 1)[0].split('*', 1)[0].rsplit(':', 1)[0]
+        if program and any(_glob_matches(program, glob) for glob in globs):
+            return rule
+    return None
+
+
+def literal_escape_names(command):
+    views = literal_views(command)
+    return [name for name in sorted(LITERAL_ESCAPE_NAMES) if literal_match(name, views)]
+
+
 def _classify_physical_lines(command, reasons, depth):
-    """The escape check for an uncertain command: the classifier over every fragment of every line."""
+    """The escape check for an uncertain command: the classifier over every fragment of every line, plus the literal names."""
     found = []
     for part in physical_parts(command):
-        words = [word.strip('\'"') for word in part.split()]
-        _classify_words(words, found, [], depth)
+        _classify_words([word.strip('\'"') for word in _blank_split(part)], found, [], depth)
     if BACKGROUND_AMP.search(command) and not LATER_WAIT.search(command):
         found.append('background & without a later wait')
+    found.extend('%s detaches a process from tracking' % name for name in literal_escape_names(command))
     reasons.extend('a line of a command the hook cannot parse with certainty: ' + reason for reason in found)
-
-
-def _tokens(text):
-    import commit_policy
-    return commit_policy.tokenize(text)
-
-
-def _mask_redirect_amps(text):
-    """Turn the '&' of >&, <&, &> and &>> into \\x01 outside quotes so it is not read as a background operator."""
-    out, i, n, quote = [], 0, len(text), None
-    while i < n:
-        ch = text[i]
-        if quote == "'":
-            quote = None if ch == "'" else quote
-        elif quote == '"':
-            if ch == '\\' and i + 1 < n:
-                out.append(ch); i += 1; ch = text[i]
-            elif ch == '"':
-                quote = None
-        elif ch == '\\' and i + 1 < n:
-            out.append(ch); i += 1; ch = text[i]
-        elif ch in '\'"':
-            quote = ch
-        elif ch == '&' and ((i > 0 and text[i - 1] in '<>') or text[i + 1:i + 2] == '>'):
-            ch = '\x01'
-        out.append(ch); i += 1
-    return ''.join(out)
 
 
 ANSI_SIMPLE = {'a': '\a', 'b': '\b', 'e': '\x1b', 'E': '\x1b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t', 'v': '\v',
@@ -1211,7 +1750,8 @@ ANSI_SIMPLE = {'a': '\a', 'b': '\b', 'e': '\x1b', 'E': '\x1b', 'f': '\f', 'n': '
 
 def _decode_ansi_c(text, i):
     """(value, index after the closing quote) for the $'...' string whose body starts at text[i]; ValueError when it is
-    unterminated or its value cannot be modelled (NUL ends a shell string early)."""
+    unterminated or its value cannot be modelled (NUL ends a shell string early). `\\c'` does not hide its closing quote:
+    shells find the end of the string before they decode it."""
     out, n = [], len(text)
     while i < n:
         ch = text[i]
@@ -1224,21 +1764,21 @@ def _decode_ansi_c(text, i):
         if nxt in ANSI_SIMPLE:
             out.append(ANSI_SIMPLE[nxt]); i += 2
         elif nxt in '01234567':
-            digits = re.match(r'[0-7]{1,3}', text[i + 1:]).group()
+            digits = re.match(r'[0-7]{1,3}', text[i + 1:i + 4]).group()
             value = int(digits, 8) & 0xFF
             if value == 0:
                 raise ValueError('NUL in an ANSI-C string')
             out.append(chr(value)); i += 1 + len(digits)
         elif nxt in 'xuU':
-            digits = re.match(r'[0-9a-fA-F]{1,%d}' % {'x': 2, 'u': 4, 'U': 8}[nxt], text[i + 2:])
+            digits = re.match(r'[0-9a-fA-F]{1,%d}' % {'x': 2, 'u': 4, 'U': 8}[nxt], text[i + 2:i + 10])
             if not digits:
                 out.append('\\' + nxt); i += 2
                 continue
             value = int(digits.group(), 16)
-            if value == 0:
+            if value == 0 or value > 0x10FFFF:
                 raise ValueError('NUL in an ANSI-C string')
             out.append(chr(value)); i += 2 + len(digits.group())
-        elif nxt == 'c' and i + 2 < n:
+        elif nxt == 'c' and i + 2 < n and text[i + 2] != "'":
             if ord(text[i + 2]) & 0x1f == 0:
                 raise ValueError('NUL in an ANSI-C string')
             out.append(chr(ord(text[i + 2]) & 0x1f)); i += 3
@@ -1247,144 +1787,37 @@ def _decode_ansi_c(text, i):
     raise ValueError('unterminated $\'')
 
 
-MAX_GROUP_DEPTH = 16
-
-
-def _deansi_group(text, i, out, depth):
-    """Copy the substitution or process substitution at text[i] into out, normalizing its body; return the next index."""
-    if text[i] == '`':
-        end = _backtick_end(text, i)
-        if end <= i + 1 or text[end - 1] != '`':
-            raise ValueError('unterminated backtick')
-        body, ok = deansi(text[i + 1:end - 1], depth + 1)
-        if not ok:
-            raise ValueError('inner quoting')
-        out.append('`' + body + '`')
-        return end
-    end = _skip_group(text, i + 1)
-    if end > len(text) or text[end - 1] != ')':
-        raise ValueError('unterminated substitution')
-    body, ok = deansi(text[i + 2:end - 1], depth + 1)
-    if not ok:
-        raise ValueError('inner quoting')
-    out.append(text[i:i + 2] + body + ')')
-    return end
-
-
-def deansi(text, depth=0):
-    """(text, ok): every $'...' word rewritten as an equivalent single-quoted word, so the splitter, the matcher and
-    the classifier all read what the shell reads. ok is False for any quoting that cannot be tokenized with certainty
-    (unterminated quotes, substitutions or ANSI-C strings, NUL escapes, groups nested past MAX_GROUP_DEPTH); callers then
-    never answer allow."""
-    if depth > MAX_GROUP_DEPTH:
-        return text, False
-    out, i, n, quote = [], 0, len(text), None
-    try:
-        while i < n:
-            ch = text[i]
-            if quote == "'":
-                out.append(ch); i += 1
-                quote = None if ch == "'" else quote
-            elif ch == '\\':
-                out.append(text[i:i + 2]); i += 2
-            elif quote == '"':
-                if ch == '"':
-                    quote = None; out.append(ch); i += 1
-                elif ch == '`' or text.startswith('$(', i):
-                    i = _deansi_group(text, i, out, depth)
-                else:
-                    out.append(ch); i += 1
-            elif ch in '\'"':
-                quote = ch; out.append(ch); i += 1
-            elif text.startswith("$'", i):
-                value, i = _decode_ansi_c(text, i + 2)
-                out.append(shell_quote(value))
-            elif ch == '#' and (i == 0 or text[i - 1] in ' \t\n'):
-                end = text.find('\n', i)
-                end = n if end < 0 else end
-                out.append(text[i:end]); i = end
-            elif ch == '`' or text.startswith('$(', i) or text[i:i + 2] in ('<(', '>('):
-                i = _deansi_group(text, i, out, depth)
-            else:
-                out.append(ch); i += 1
-    except ValueError:
-        return text, False
-    return ''.join(out), quote is None
-
-
 class Parsed:
     def __init__(self):
         self.segments, self.inner, self.substitution, self.newline = [], [], False, False
-        self.uncertain, self.pipeline = False, False  # quoting not modelled with certainty; a `|` or `&` joins commands
-        self.heredoc = HEREDOC_NONE
+        self.uncertain, self.pipeline = False, False  # the lexer recorded a reason; a `|` or `&` joins commands
+        self.heredoc, self.reasons, self.lexed = HEREDOC_NONE, [], None
 
 
 def parse_command(command, depth=0):
-    """Split into simple-command strings (quote, heredoc and comment aware) and flag substitutions and newlines."""
-    parsed = Parsed()
-    text, bodies, parsed.uncertain = _prepare_text(command)
-    parsed.heredoc = heredoc_scan(command)[0]
-    parsed.substitution = any(not quoted and re.search(r'\$\(|`', body) for body, quoted in bodies)
-    cur, i, n, quote = [], 0, len(text), None
-
-    def cut():
-        segment = ''.join(cur).strip()
-        del cur[:]
-        if segment:
-            parsed.segments.append(segment)
-
-    while i < n:
-        ch = text[i]
-        if quote == "'":
-            cur.append(ch); quote = None if ch == "'" else quote; i += 1
-        elif quote == '"':
-            if ch == '\\':
-                cur.append(text[i:i + 2]); i += 2; continue
-            if ch == '`' or text.startswith('$(', i):
-                parsed.substitution = True
-                cur.append('X')
-                i = _backtick_end(text, i) if ch == '`' else _skip_group(text, i + 1)
-                continue
-            cur.append(ch); quote = None if ch == '"' else quote; i += 1
-        elif ch == '\\':
-            cur.append(text[i:i + 2]); i += 2
-        elif ch in '\'"':
-            quote = ch; cur.append(ch); i += 1
-        elif ch == '#' and (not cur or cur[-1] in ' \t'):
-            while i < n and text[i] != '\n':
-                i += 1
-        elif ch == '`' or text.startswith('$(', i) or text[i:i + 2] in ('<(', '>('):
-            parsed.substitution = True
-            cur.append('X')
-            i = _backtick_end(text, i) if ch == '`' else _skip_group(text, i + 1)
-        elif ch == '\n':
-            parsed.newline = True; cut(); i += 1
-        elif ch in ';()':
-            cut(); i += 1
-        elif ch == '&' and ((i > 0 and text[i - 1] in '<>') or text[i + 1:i + 2] == '>'):
-            cur.append(ch); i += 1
-        elif ch in '&|':
-            if text[i:i + 2] not in ('&&', '||'):
-                parsed.pipeline = True
-            cut(); i += 2 if text[i + 1:i + 2] in ('&', '|') else 1
-        else:
-            cur.append(ch); i += 1
-    cut()
-    if quote:
-        parsed.uncertain = True
-    for body in script_bodies(text, bodies):
+    """The lexer's output as the decision reads it: simple-command strings, the ones inside substitutions and script bodies,
+    and the flags that stop an allow."""
+    parsed, lexed = Parsed(), lex(command)
+    parsed.lexed, parsed.reasons, parsed.uncertain = lexed, list(lexed.reasons), bool(lexed.reasons)
+    if lexed.reasons:
+        parsed.heredoc = HEREDOC_UNCERTAIN if '<<' in command else HEREDOC_NONE
+    else:
+        parsed.heredoc = HEREDOC_CERTAIN if lexed.bodies else HEREDOC_NONE
+    parsed.segments = [item.text for item in lexed.commands if item.text]
+    parsed.inner = [item.text for group in lexed.groups for item in group if item.text]
+    parsed.substitution, parsed.newline, parsed.pipeline = lexed.substitution, lexed.newline, lexed.pipeline
+    if parsed.uncertain:
+        return parsed
+    for body in script_bodies(lexed):
         parsed.substitution = True  # never allow-eligible; its lines reach the deny check through inner
         if depth < 4:
             sub = parse_command(body, depth + 1)
             parsed.inner.extend(sub.segments + sub.inner)
             parsed.uncertain = parsed.uncertain or sub.uncertain
+            parsed.reasons.extend(sub.reasons)
         else:
             parsed.uncertain = True
-    if depth < 4:
-        for body in inner_commands(text):
-            sub = parse_command(body, depth + 1)
-            parsed.inner.extend(sub.segments + sub.inner)
-            parsed.uncertain = parsed.uncertain or sub.uncertain
+            parsed.reasons.append('nesting')
     return parsed
 
 
@@ -1392,7 +1825,7 @@ def normalize_segment(segment):
     while True:
         stripped = KEYWORD_PREFIX.sub('', segment, count=1)
         if stripped == segment:
-            return segment.strip()
+            return segment.strip(' \t\n')
         segment = stripped
 
 
@@ -1436,69 +1869,84 @@ def _unquote_program(text):
         _raw, value, dynamic = raw_words(raw)[0]
     except (ValueError, IndexError):
         return None
-    if dynamic or value == raw or not value or re.search(r'\s', value):
+    if dynamic or value == raw or not value or re.search(r'[ \t\n]', value):
         return None
     return value + text[spans[0][1]:]
 
 
+def _wrapper_step(base, values, raws, k):
+    """The index of the word a wrapper named `base` would run, where k is the index just past the wrapper: None when `base`
+    is no wrapper, and -(i + 1) when it is `env -S` at index i, whose next word is quoted code. Wrappers read: exec, command,
+    builtin, time, nohup, nice, sudo with options, timeout with options and duration, env with options."""
+    count = len(values)
+    if base in ('exec', 'command', 'builtin', 'time', 'nohup'):
+        while k < count and values[k].startswith('-'):
+            k += 2 if values[k] == '-a' else 1
+    elif base == 'nice':
+        if k < count and values[k] == '-n':
+            k += 2
+        elif k < count and (re.fullmatch(r'-[0-9]+', values[k]) or values[k].startswith('--adjustment')):
+            k += 1
+    elif base == 'sudo':
+        while k < count and values[k].startswith('-'):
+            option = values[k]
+            k += 2 if option in SUDO_ARG_OPTS else 1
+            if option == '--':
+                break
+    elif base == 'timeout':
+        while k < count and values[k].startswith('-'):
+            k += 2 if values[k] in ('-s', '-k') else 1
+        k += 1
+    elif base == 'env':
+        while k < count:
+            word = values[k]
+            if word.startswith(('-S', '--split-string')):
+                return -(k + 1)
+            if ASSIGNMENT.match(raws[k]):
+                k += 1
+            elif word in ('-u', '-C', '--unset', '--chdir'):
+                k += 2
+            elif word.startswith('-') and len(word) > 1:
+                k += 1
+            else:
+                break
+    else:
+        return None
+    return k
+
+
 def peel_wrapper(text):
-    """The command with its first wrapper removed (an env assignment, exec/command/builtin/time/nohup, nice, sudo with
-    options, timeout with options and duration, env with options), or None when it starts with no wrapper."""
+    """The command with its first wrapper removed (an env assignment or anything _wrapper_step reads), or None when it starts
+    with no wrapper. `env -S` gives back its split string as the command."""
     try:
         spans = _spans(text)
         if not spans:
             return None
-
-        def val(k):
-            return raw_words(text[spans[k][0]:spans[k][1]])[0][1]
-        first = text[spans[0][0]:spans[0][1]]
-        base, k, count = val(0).rsplit('/', 1)[-1], 1, len(spans)
-        if ASSIGNMENT.match(first):
-            pass
-        elif base in ('exec', 'command', 'builtin', 'time', 'nohup'):
-            while k < count and val(k).startswith('-'):
-                k += 2 if val(k) == '-a' else 1
-        elif base == 'nice':
-            if k < count and val(k) == '-n':
-                k += 2
-            elif k < count and (re.fullmatch(r'-\d+', val(k)) or val(k).startswith('--adjustment')):
-                k += 1
-        elif base == 'sudo':
-            while k < count and val(k).startswith('-'):
-                option = val(k)
-                k += 2 if option in SUDO_ARG_OPTS else 1
-                if option == '--':
-                    break
-        elif base == 'timeout':
-            while k < count and val(k).startswith('-'):
-                k += 2 if val(k) in ('-s', '-k') else 1
-            k += 1
-        elif base == 'env':
-            while k < count:
-                word = val(k)
-                if word in ('-S', '--split-string') and k + 1 < count:
-                    rest = text[spans[k + 2][0]:] if k + 2 < count else ''
-                    return (val(k + 1) + ' ' + rest).strip()
-                if ASSIGNMENT.match(text[spans[k][0]:spans[k][1]]):
-                    k += 1
-                elif word in ('-u', '-C', '--unset', '--chdir'):
-                    k += 2
-                elif word.startswith('-') and len(word) > 1:
-                    k += 1
-                else:
-                    break
+        raws = [text[start:end] for start, end in spans]
+        values = [raw_words(raw)[0][1] for raw in raws]
+        count = len(spans)
+        if ASSIGNMENT.match(raws[0]):
+            k = 1
         else:
-            return None
+            k = _wrapper_step(values[0].rsplit('/', 1)[-1], values, raws, 1)
+            if k is None:
+                return None
+            if k < 0:
+                at = -k - 1
+                if values[at] not in ('-S', '--split-string') or at + 1 >= count:
+                    return None
+                rest = text[spans[at + 2][0]:] if at + 2 < count else ''
+                return (values[at + 1] + ' ' + rest).strip(' \t\n')
         return text[spans[k][0]:] if k < count else None
     except (ValueError, IndexError):
         return None
 
 
 BLANKS = re.compile(r'[ \t]+')
-REDIRECT_ANYWHERE = re.compile(r'(?:(?<![^\s])\d+)?(?:&>>|&>|<<<|<<-?|<>|>>|>&|<&|>\||>|<)[ \t]*[^\s<>&|;]*')
+REDIRECT_ANYWHERE = re.compile(r'(?:(?<![^ \t\n])[0-9]+)?(?:&>>|&>|<<<|<<-?|<>|>>|>&|<&|>\||>|<)[ \t]*[^ \t\n<>&|;]*')
 VARIABLE = re.compile(r'\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\}')
 EMPTY_HEAD = re.compile(r'^(?:\$""|=)+|^(?:"?(?:X|\$\([^()]*\)|`[^`]*`)"?[ \t]+)+')
-BRACE_HEAD = re.compile(r'^\{[^{}\s]*,[^{}\s]*\}')
+BRACE_HEAD = re.compile(r'^\{[^{} \t\n]*,[^{} \t\n]*\}')
 THROUGH_HINT = re.compile(r'[<>$=X{`]')
 
 
@@ -1510,10 +1958,10 @@ def _read_through(form):
     if not THROUGH_HINT.search(form):
         return form
     text = REDIRECT_ANYWHERE.sub(' ', form).replace('${IFS}', ' ').replace('$IFS', ' ')
-    text = VARIABLE.sub('', text).strip()
+    text = VARIABLE.sub('', text).strip(' \t\n')
     if BRACE_HEAD.match(text):
         return BRACE_HEAD.sub(lambda found: found.group()[1:-1].replace(',', ' '), text)
-    return EMPTY_HEAD.sub('', text).replace('$"', '"', 1).strip() if text.startswith(('$', '=', 'X', '"', '`')) else text
+    return EMPTY_HEAD.sub('', text).replace('$"', '"', 1).strip(' \t\n') if text.startswith(('$', '=', 'X', '"', '`')) else text
 
 
 def _peeled_forms(segment):
@@ -1535,16 +1983,34 @@ def _peeled_forms(segment):
     return forms
 
 
+def _bare_forms(form):
+    """The form with its quoting removed, and with the program's directory removed too."""
+    try:
+        words = raw_words(form)
+    except ValueError:
+        return []
+    if not words:
+        return []
+    values = [word[1] for word in words]
+    found = [' '.join(values)]
+    if '/' in values[0] and not words[0][2]:
+        found.append(' '.join([values[0].rsplit('/', 1)[-1]] + values[1:]))
+    return found
+
+
 @functools.lru_cache(maxsize=4096)
 def match_candidates(segment):
     """The segment as typed plus every form with env assignments, wrappers (exec, command, time, nohup, nice, sudo,
-    timeout, env) and the quoting of the program word removed, and those with _read_through's words gone, as a tuple. A deny
-    or ask rule matching any form applies. Cached because one command asks for the same segment up to four times."""
+    timeout, env) and the quoting of the program word removed, those with _read_through's words gone, and each with all
+    its quoting or the program's directory removed, as a tuple. A deny or ask rule matching any form applies. Cached because
+    one command asks for the same segment up to four times."""
     forms = _peeled_forms(segment)
     for form in list(forms):
         through = _read_through(form)
         if through != form and through:
             forms.extend(extra for extra in _peeled_forms(through) if extra not in forms)
+    for form in list(forms):
+        forms.extend(extra for extra in _bare_forms(form) if extra not in forms)
     # a run of blanks is one separator to the shell. Only these forms get it, not allow, so it can only widen a deny or ask.
     forms.extend(collapsed for collapsed in dict.fromkeys(BLANKS.sub(' ', form) for form in forms) if collapsed not in forms)
     return tuple(forms)
@@ -1780,8 +2246,8 @@ def _classify_ssh(args, reasons, notes, depth):
     if 'f' in call.flags:
         reasons.append('ssh -f backgrounds the connection')
     for value in call.o_values:
-        key, setting = (re.split(r'\s*=\s*|\s+', value.strip(), maxsplit=1) + [''])[:2]  # ssh takes =, blanks or tabs
-        key, setting = key.lower(), setting.strip()
+        key, setting = (re.split(r'[ \t]*=[ \t]*|[ \t]+', value.strip(' \t'), maxsplit=1) + [''])[:2]  # ssh takes =, blanks or tabs
+        key, setting = key.lower(), setting.strip(' \t')
         if key == 'forkafterauthentication' and setting.lower() != 'no':
             reasons.append('ssh -o ForkAfterAuthentication backgrounds the connection')
         elif key == 'controlpersist' and setting.lower() != 'no':
@@ -1802,37 +2268,36 @@ def _classify_text(command, reasons, notes, depth, prefix=''):
     reasons.extend(prefix + reason for reason in sub_reasons)
 
 
+def _classify_list(commands, reasons, notes, depth, uncertain):
+    """The classifier over one command list. On uncertain text it also reads through what may be empty or a redirect."""
+    entries = [[word.value for word in item.words] for item in commands]
+    last_wait = max((position for position, words in enumerate(entries) if _command_word(words) == 'wait'), default=-1)
+    for position, (item, words) in enumerate(zip(commands, entries)):
+        _classify_words(words, reasons, notes, depth)
+        if uncertain:
+            through = _blank_split(_read_through(' '.join(words)))
+            if through[:1] != words[:1]:  # only when another program runs: the words after it are quote-removed text
+                _classify_words(through, reasons, notes, depth)
+        if item.operator == '&' and (words or item.closer) and position >= last_wait:
+            reasons.append('background & without a later wait')
+
+
 def _classify_command(command, reasons, notes, depth):
-    uncertain, entries, inner, scripts = False, [], [], []
-    try:
-        text, bodies, uncertain = _prepare_text(command)
-        scripts = script_bodies(text, bodies)
-        for words, operator in _simple(_tokens(_mask_redirect_amps(text))):
-            entries.append(([w[1].replace('\x01', '&') for w in words if w[0] == 'word'], operator))
-        inner = inner_commands(text)
-    except Exception as error:  # noqa: BLE001 - any parse failure is a verdict, never a crash
-        if not (uncertain and '<<' in command):  # there the physical-line check below is the verdict
-            reasons.append('parse failure: %s' % (str(error)[:60] or type(error).__name__))
-            return
+    lexed = lex(command)
+    uncertain = bool(lexed.reasons)
+    if 'unterminated' in lexed.reasons and '<<' not in command:
+        reasons.append('parse failure: an unterminated quote or group')
+        return
     if uncertain:
         _classify_physical_lines(command, reasons, depth)
-    last_wait = max((position for position, (words, _op) in enumerate(entries) if _command_word(words) == 'wait'), default=-1)
-    for position, (words, operator) in enumerate(entries):
-        _classify_words(words, reasons, notes, depth)
-        through = _read_through(' '.join(words)).split()
-        if through[:1] != words[:1]:  # only when another program runs: the words after it are quote-removed text
-            _classify_words(through, reasons, notes, depth)
-        if operator == '&' and words and position >= last_wait:
-            reasons.append('background & without a later wait')
-    for body in inner:
-        _classify_text(body, reasons, notes, depth + 1, 'substitution: ')
-    for body in scripts:
-        _classify_text(body, reasons, notes, depth + 1, 'heredoc script: ')
-
-
-def _simple(tokens):
-    import commit_policy
-    return commit_policy.simple_commands(tokens)
+    _classify_list(lexed.commands, reasons, notes, depth, uncertain)
+    for group in lexed.groups:
+        found = []
+        _classify_list(group, found, notes, depth + 1, uncertain)
+        reasons.extend('substitution: ' + reason for reason in found)
+    if not uncertain:
+        for body in script_bodies(lexed):
+            _classify_text(body, reasons, notes, depth + 1, 'heredoc script: ')
 
 
 def _command_word(words):
@@ -1958,7 +2423,7 @@ def strip_ah_run_prefix(command):
 # -- ssh: host table, remote rewrite (AC-4 ssh rows, AC-19 --readonly travel) ---------------------------------
 
 REVIEW_TYPES = frozenset(('red-team', 'click-tester', 'reviewer', 'Explore', 'Plan'))
-SSH_WORD = re.compile(r'^(?:\S*/)?ssh(?=\s)')
+SSH_WORD = re.compile(r'^(?:[^ \t\n]*/)?ssh(?=[ \t\n])')
 REDIRECT = re.compile(r'^(?:\d*|&)(?:<<<|<<-?|<>|>>|>&|<&|>\||>|<)(.*)$', re.S)
 REMOTE_PATH = re.compile(r'^[A-Za-z0-9_./~-]+$')
 QUOTED_TEXT = re.compile(r'\\.|\'[^\']*\'|"(?:\\.|[^"\\])*"', re.S)
@@ -2031,6 +2496,21 @@ def _ssh_form(segment):
     return None
 
 
+def _quoted_ssh_target(segment):
+    """The target of an ssh whose program word is quoted or escaped (`"ssh" h ls`, `s\\sh h ls`). Such a line cannot be
+    rewritten in place, so it runs unwrapped and is recorded."""
+    for form in match_candidates(segment):
+        if not SSH_WORD.match(form):
+            continue
+        try:
+            call = host_table.parse_ssh([word[1] for word in raw_words(form)[1:]])
+        except ValueError:
+            continue
+        if call is not None and (call.remote or HEREDOC_MARKER.search(form)):
+            return call.target
+    return None
+
+
 def rewrite_ssh(command, parsed, payload, env, home, context):
     """(command, remote): each `ssh HOST CMD` simple command whose resolved host has `ah_run: "<path>"` in the
     table becomes `ssh HOST python3 <path> run ... --token via-hook-ssh [--readonly] --cmd-b64 B64` (stdin stays
@@ -2045,25 +2525,19 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
     line is left unwrapped and recorded. The result is re-parsed: a replacement that changed any other command is undone."""
     segments = [s for s in dict.fromkeys(parsed.segments)]
     candidates = [(s, _ssh_form(s)) for s in segments]
+    hidden = next((target for s, form in candidates if not form for target in [_quoted_ssh_target(s)] if target), None)
+    remote = ('remote-unattributed', digest(hidden)) if hidden else None
     if not any(form for _s, form in candidates):
-        return command, None
-    typed_command, spans, openers = command, [], []
-    heredoc_scan(command, openers, spans)
-    pieces = _cut_bodies(command, spans)
-    bodies = [command[start:end] for start, end in spans]
-    work = []
-    for index, piece in enumerate(pieces):
-        work.append(piece if parsed.uncertain else join_continuations(piece))
-        if index < len(spans):
-            work.append('\0%d\0' % index)
-    command = ''.join(work)
+        return command, remote
+    typed_command, lexed = command, parsed.lexed
+    openers, bodies = lexed.openers, [command[start:end] for start, end in lexed.spans]
+    command = _masked_text(command, lexed, join=not parsed.uncertain)
     rewritten = []
 
     def with_openers(text):
         return HEREDOC_MARKER.sub(lambda m: openers[int(m.group(1))] if int(m.group(1)) < len(openers) else m.group(), text)
     policy = host_table.policy_path(home, env)
     table = host_table.load(policy)
-    remote = None
     for segment, found in candidates:
         if not found:
             continue
@@ -2125,11 +2599,7 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
             # the local shell expands this text before ssh sees it: build the base64 from the same words at run time
             b64 = '"$(set -- %s; printf %%s "$*" | base64 | tr -d \'\\n\')"' % ' '.join(remote_raw)
         else:
-            text = strip_ah_run_prefix(' '.join(w[1] for w in remote_words))
-            if len(text.encode('utf-8')) > INLINE_LIMIT:
-                raise ValueError('the remote command is %d bytes; the ssh limit is %d bytes (64 KiB). scp or rsync the payload '
-                                 'to the host, then run a short remote command (for example `ssh HOST bash /path/script.sh`)'
-                                 % (len(text.encode('utf-8')), INLINE_LIMIT))
+            text = strip_ah_run_prefix(' '.join(w[1] for w in remote_words))  # within SCAN_CAP: decide refused anything longer
             b64 = base64.b64encode(text.encode('utf-8')).decode('ascii')
         tail = ['python3', '-I', path] if path.endswith('.py') else [path]
         entry_env = cls.entry.get('remote_env')  # AGENT_HARNESS_* only: the rig points the remote reserve at a private dir
@@ -2147,7 +2617,7 @@ def rewrite_ssh(command, parsed, payload, env, home, context):
         tail += ['--cmd-b64', b64]
         new_form = with_openers(' '.join([args[0][0], *raws[:before_remote], *tail, *redirects]))
         typed = with_openers(segment)
-        lone_line = len(parsed.segments) == 1 and typed == command.strip() and not any(w[2] for w in remote_words)
+        lone_line = len(parsed.segments) == 1 and typed == command.strip(' \t\n') and not any(w[2] for w in remote_words)
         if command.count(typed) != parsed.segments.count(segment) or (parsed.uncertain and not lone_line):
             remote = remote or ('remote-unwrapped', digest(who))
             context.append('ah-run: an ssh line could not be rewritten safely (its text repeats inside another command, or the quoting around it is uncertain); it runs unwrapped')
@@ -2298,6 +2768,31 @@ def build_rewrite(command, payload, env, notes, context, remote=None):
     return ' '.join(shlex.quote(part) for part in parts)
 
 
+def command_bytes(command):
+    """The size the cap measures: bytes, not characters, so a multibyte command cannot slip under it."""
+    return len(command.encode('utf-8', 'surrogatepass'))
+
+
+def _over_scan_cap(command, size, mode, payload, env):
+    """A command over SCAN_CAP is not scanned at all. A mode that cannot ask refuses it, since nothing else would stop it;
+    any other mode asks, so a person sees it. The hook never allows it and never lets it pass silently."""
+    text = ('ah-run: the command is %d bytes and the hook does not scan text over %d bytes (64 KiB). Write it to a script file '
+            'and run the file, or scp or rsync the payload to the host and run a short command (for example '
+            '`ssh HOST bash /path/script.sh`).' % (size, SCAN_CAP))
+    try:
+        check_payload_cap(command)  # over 1 MiB keeps its own refusal in every mode: ah-run cannot carry it
+    except ValueError as error:
+        return _out('deny', 'ah-run: %s' % error)
+    if mode in ('bypassPermissions', 'dontAsk'):
+        return _out('deny', text)
+    context = ['ah-run: this command was not scanned: no deny rule, escape check or ssh rewrite was applied']
+    try:
+        wrapped = build_rewrite(strip_ah_run_prefix(command), payload, env, [], context)
+    except ValueError as error:
+        return _out('deny', 'ah-run: %s' % error)
+    return _out('ask', text, {**(payload.get('tool_input') or {}), 'command': wrapped}, '\n'.join(context))
+
+
 def decide(payload, home=None, env=None, ancestors=None):
     """The hook decision for one PreToolUse payload (a dict); returns the JSON object to print."""
     home = home or str(Path.home())
@@ -2306,13 +2801,12 @@ def decide(payload, home=None, env=None, ancestors=None):
         return {}
     original = (payload.get('tool_input') or {}).get('command')
     mode = payload.get('permission_mode') or 'default'
-    if not isinstance(original, str) or not original.strip() or mode == 'plan':
+    if not isinstance(original, str) or not original.strip(' \t\n') or mode == 'plan':
         return {}
+    size = command_bytes(original)
+    if size > SCAN_CAP:  # first: no parse, no rule, no analysis above the cap
+        return _over_scan_cap(original, size, mode, payload, env)
     command = strip_ah_run_prefix(original)
-    try:
-        check_payload_cap(command)  # first: a command that will be refused should not cost a full analysis
-    except ValueError as error:
-        return _out('deny', 'ah-run: %s' % error)
     cwd = payload.get('cwd') or os.getcwd()
     cli = settings_from_ancestors(ancestors() if ancestors else ancestor_commands())
     rules = load_rules(cwd, home, cli)
@@ -2328,6 +2822,12 @@ def decide(payload, home=None, env=None, ancestors=None):
             if any(rule.matches(form) for form in forms):
                 hint = ' %s' % HEREDOC_HINT if parsed.heredoc == HEREDOC_UNCERTAIN else ''
                 return _out('deny', 'denied by permission rule %s%s' % (rule.label(), hint))
+    if parsed.uncertain:
+        rule = denied_as_literal(command, rules['deny'], parsed.lexed)
+        if rule:
+            hint = ' %s' % HEREDOC_HINT if parsed.heredoc == HEREDOC_UNCERTAIN else ''
+            return _out('deny', 'denied by permission rule %s: the hook cannot parse this command with certainty (%s) and the '
+                                "rule's text appears in it at a word start%s" % (rule.label(), ', '.join(parsed.reasons), hint))
 
     asked = any(rule.matches(form) for part in parsed.segments + parsed.inner for rule in rules['ask'] for form in match_candidates(part))
     if (parsed.segments and not parsed.substitution and not parsed.newline and not parsed.uncertain and not parsed.pipeline
@@ -2342,10 +2842,10 @@ def decide(payload, home=None, env=None, ancestors=None):
             return _out('deny', 'no allow rule matches this recovery command and permission mode dontAsk refuses to ask')
         return _out('ask', 'recovery command: no allow rule matches (run through its installed path or add a narrow rule)')
 
-    if parsed.heredoc == HEREDOC_UNCERTAIN:
-        context.append('heredoc: uncertain (every line was checked against the deny rules; this command is never auto-allowed)')
-    elif parsed.uncertain:
-        context.append('quoting: uncertain (every line was checked against the deny rules; this command is never auto-allowed)')
+    if parsed.uncertain:
+        checked_text = ('(%s; the deny rules saw its guessed commands, every line, and their own text at any word start; a '
+                        'command built at run time can still pass them; this command is never auto-allowed)' % ', '.join(parsed.reasons))
+        context.append(('heredoc: uncertain ' if parsed.heredoc == HEREDOC_UNCERTAIN else 'quoting: uncertain ') + checked_text)
     reasons, notes = analyze_escapes(command)
     if reasons:
         text = 'command escapes tracking: %s. Run it through `ah-run` or keep it in the foreground (use `wait`).' % '; '.join(reasons)
@@ -2369,7 +2869,7 @@ def decide(payload, home=None, env=None, ancestors=None):
 
     committed = any(rule.source == 'project' for rule in ignored)  # F75: a committed ah-run rule degrades to ask
     eligible = (bool(parsed.segments) and not committed and not parsed.substitution and not parsed.newline and not asked
-                and not parsed.uncertain and all(part.split(None, 1)[0] != 'eval' for part in parsed.segments)
+                and not parsed.uncertain
                 and all(any(rule.matches(normalize_segment(part)) for rule in allows) for part in parsed.segments))
     if mode == 'bypassPermissions':
         decision = None
@@ -2402,20 +2902,75 @@ def decide(payload, home=None, env=None, ancestors=None):
     return _out('ask', why, updated, extra)
 
 
+class _HookDeadline(BaseException):
+    """The hook's own time limit passed. BaseException, so no broad handler on the way out turns it into a result."""
+
+
+def _deadline_verdict(payload):
+    text = ('ah-run hook: the analysis passed its %d second limit, so nothing about this command was decided. Write it to a '
+            'script file and run the file.' % HOOK_DEADLINE)
+    mode = payload.get('permission_mode') if isinstance(payload, dict) else None
+    return _out('deny' if mode in ('bypassPermissions', 'dontAsk') else 'ask', text)
+
+
+class _Deadline:
+    """The hook's own timer. The handler raises only while armed, so a signal that lands after disarm() does nothing."""
+
+    def __init__(self):
+        self.armed, self.previous = False, None
+
+    def expire(self, _number, _frame):
+        if self.armed:
+            self.armed = False
+            raise _HookDeadline()
+
+    def arm(self, seconds):
+        """True when the timer is armed. The signal exists only on the main thread; off it the hook has no limit of its own."""
+        try:
+            self.previous = signal.signal(signal.SIGALRM, self.expire)
+            self.armed = True
+            signal.setitimer(signal.ITIMER_REAL, seconds)
+            return True
+        except (ValueError, OSError):
+            self.armed = False
+            return False
+
+    def disarm(self):
+        if not self.armed and self.previous is None:
+            return
+        self.armed = False
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, self.previous if self.previous is not None else signal.SIG_DFL)
+        except (ValueError, OSError, TypeError):
+            pass
+        self.previous = None
+
+
 def hook_main(stdin=None, stdout=None):
-    """Entry point for `ah_run.py hook`: always exit 0; any internal error is an `ask` with the reason."""
+    """Entry point for `ah_run.py hook`: always exit 0; any internal error is an `ask` with the reason, and passing the time
+    limit (HOOK_DEADLINE) refuses in a mode that cannot ask and asks in any other."""
     stdin, stdout = stdin or sys.stdin, stdout or sys.stdout
+    payload, deadline = None, _Deadline()
     try:
-        raw = stdin.read((8 << 20) + 1)
-        if len(raw) > (8 << 20):
-            result = _out('ask', 'ah-run hook: input over 8 MiB')
-        else:
-            payload = json.loads(raw)
-            if not isinstance(payload, dict):
-                raise ValueError('hook input is not an object')
-            result = decide(payload)
-    except Exception as error:  # noqa: BLE001 - never a silent allow, never a crash
-        result = _out('ask', 'ah-run hook internal error: %s: %s' % (type(error).__name__, str(error)[:120]))
+        try:
+            raw = stdin.read((8 << 20) + 1)
+            if len(raw) > (8 << 20):
+                result = _out('ask', 'ah-run hook: input over 8 MiB')
+            else:
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    raise ValueError('hook input is not an object')
+                deadline.arm(HOOK_DEADLINE)
+                result = decide(payload)
+                deadline.disarm()
+        except Exception as error:  # noqa: BLE001 - never a silent allow, never a crash
+            deadline.disarm()
+            result = _out('ask', 'ah-run hook internal error: %s: %s' % (type(error).__name__, str(error)[:120]))
+    except _HookDeadline:  # outside the handler above, so the timer cannot escape it either
+        result = _deadline_verdict(payload)
+    finally:
+        deadline.disarm()
     stdout.write(json.dumps(result)); stdout.write('\n'); stdout.flush()
     return 0
 
