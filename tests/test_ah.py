@@ -50,6 +50,14 @@ class FakeGoodQA(http.server.BaseHTTPRequestHandler):
         name, a = body["params"]["name"], body["params"]["arguments"]
         st["calls"].append(name)
         issue = {"id": "iss-1", "number": 77, "projectId": "p", "title": "t", "status": "triage"}
+        if name == "get_issue_by_number" and a.get("projectSlug") != "goodqa":
+            err = json.dumps({"data": {"error": {"code": "project_not_found"}}})
+            out = json.dumps({"result": {"isError": True, "content": [{"text": err}]}}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(out)
+            return
         if name == "get_issue_by_number":
             data = {"issue": issue}
         elif name == "get_issue":
@@ -810,6 +818,81 @@ class WriterReview(WriteTests):
             self.assertTrue(ah.spool_drain(self.home).get("busy"))
         finally:
             os.close(fd)
+
+
+class TicketRefTests(GoodQABase):
+    """goodqa#14658: ref forms, refusal before spooling, per-job spool errors, spool ack."""
+
+    def spool_files(self, sub=""):
+        d = self.home / ".agent-harness" / "state" / "ah" / "store" / "spool" / sub
+        return sorted(d.glob("*.json")) if d.exists() else []
+
+    def test_every_ref_form_owners_use_posts_to_the_same_ticket(self):
+        for n, ref in enumerate(("goodqa#77", "GoodQA goodqa#77", "GoodQA 1ae27b6b#77", "GoodQA #77", "#77", "77")):
+            r = ah.write(self.home, "ticket.comment", {"ticket": ref, "body": f"form {n}"}, SESSION, f"ref-form-key-{n}")
+            self.assertEqual((r["result"], r["comment"]), ("applied", "posted"), ref)
+        self.assertEqual(len(FakeGoodQA.state["posted"]), 6)
+
+    def test_equivalent_refs_share_one_idempotency_key(self):
+        a = ah.write(self.home, "ticket.comment", {"ticket": "goodqa#77", "body": "same"}, SESSION)
+        b = ah.write(self.home, "ticket.comment", {"ticket": "GoodQA 1ae27b6b#77", "body": "same"}, SESSION)
+        self.assertEqual((a["result"], b["result"]), ("applied", "duplicate"))
+
+    def test_invalid_or_unknown_ref_is_refused_before_anything_is_spooled(self):
+        for ref, code in (("GoodQA deadbeef#77", "bad_request"), ("nonsense", "bad_request"),
+                          ("GoodQA nosuchproj#77", "ticket_out_of_scope")):
+            with self.assertRaises(ah.AhError) as c:
+                ah.write(self.home, "ticket.comment", {"ticket": ref, "body": "x"}, SESSION, "bad-ref-key-" + code[:4])
+            self.assertEqual(c.exception.code, code, ref)
+        self.assertEqual(self.spool_files(), [])
+        self.assertEqual(FakeGoodQA.state["posted"], {})
+
+    def test_stale_spool_job_never_fails_a_later_correct_post(self):
+        ah._spool_comment(self.home, {"ticket": "GoodQA nosuchproj#77", "body": "stale", "operation_id": "ah:stale-1"})
+        r = ah.write(self.home, "ticket.comment", {"ticket": "GoodQA goodqa#77", "body": "good"}, SESSION, "later-key-0001")
+        self.assertEqual((r["result"], r["comment"]), ("applied", "posted"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = ah.main(["ticket", "comment", "GoodQA goodqa#77", "--body", "good 2", "--key", "later-key-0002"])
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertEqual(len(self.spool_files("dead")), 1)  # the stale job is dead, not a recurring error
+        self.assertEqual(self.spool_files(), [])
+
+    def test_a_crashing_drain_cannot_fail_the_caller(self):
+        with mock.patch.object(ah, "spool_drain", side_effect=RuntimeError("boom")):
+            r = ah.write(self.home, "ticket.comment", {"ticket": "goodqa#77", "body": "x"}, SESSION, "boom-key-00001")
+        self.assertEqual((r["result"], r["comment"]), ("applied", "pending"))  # queued, still applied
+
+    def test_one_unexpected_job_error_does_not_stop_the_drain(self):
+        for n in (1, 2):
+            ah._spool_comment(self.home, {"ticket": "GoodQA goodqa#77", "body": f"j{n}", "operation_id": f"ah:job-{n}"})
+        calls = []
+
+        def flaky(ref, body, opid):
+            calls.append(body)
+            if body == "j1":
+                raise RuntimeError("unexpected")
+        with mock.patch.object(ah, "post_comment", flaky):
+            r = ah.spool_drain(self.home)
+        self.assertEqual((r["drained"], r["pending"], sorted(calls)), (1, 1, ["j1", "j2"]))
+
+    def test_spool_ack_moves_delivered_jobs_aside_and_audits(self):
+        FakeGoodQA.state["down"] = True
+        ah.write(self.home, "ticket.comment", {"ticket": "goodqa#77", "body": "delivered elsewhere"}, SESSION, "ack-key-00001")
+        FakeGoodQA.state["down"] = False
+        (job,) = self.spool_files()
+        with self.assertRaises(ah.AhError) as c:
+            ah.spool_ack(self.home, [job.name], "short")
+        self.assertEqual(c.exception.code, "evidence")
+        with self.assertRaises(ah.AhError):
+            ah.spool_ack(self.home, ["../../outside.json"], "long enough evidence")
+        absent = "1793866419170-aaaaaaaaaaaaaaaa.json"
+        r = ah.spool_ack(self.home, [job.name, absent], "comment confirmed on the ticket by main")
+        self.assertEqual((r["acked"], r["not_found"]), ([job.name], [absent]))
+        self.assertEqual((self.spool_files(), len(self.spool_files("delivered"))), ([], 1))
+        audit = (self.home / ".agent-harness" / "state" / "ah" / "store" / "audit.jsonl").read_text()
+        self.assertIn('"op":"spool.ack"', audit)
+        self.assertEqual(FakeGoodQA.state["posted"], {})  # acked, not posted
 
 
 if __name__ == "__main__":

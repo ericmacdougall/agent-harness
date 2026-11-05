@@ -28,6 +28,10 @@ import liveness  # noqa: E402
 SECRET_NAMES = re.compile(r"(\.secret$|^\.env(\..*)?$|^member\.key$|^credentials(\..*)?$|\.pem$|^id_(rsa|ed25519|ecdsa)$)", re.I)
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 TICKET_RE = re.compile(r"^GoodQA\s+(?:([a-z0-9][a-z0-9-]{0,62})\s*)?#([1-9]\d{0,9})$")
+# The forms owners actually write: goodqa#N, GoodQA goodqa#N, GoodQA 1ae27b6b#N (project id prefix), GoodQA #N, #N, N.
+_REF_FORMS = re.compile(r"(?:(?i:goodqa)(?:\s+([A-Za-z0-9][A-Za-z0-9-]{0,62}))?\s*)?#?([1-9]\d{0,9})")
+PROJECT_ID_PREFIXES = {"1ae27b6b": "goodqa"}  # GoodQA project id (first 8 hex) -> slug
+DEFAULT_PROJECT = "goodqa"
 KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 WRAPPER = re.compile(r"^\s*<[A-Za-z][\w-]*[\s>/]")
 MAX_REQUEST = 256 * 1024
@@ -537,16 +541,43 @@ def load_adapter(home: Path | None = None):
     return ticket_adapters.adapter_for(dict(cfg, max_comment_pages=1000, total_deadline_seconds=120)), ticket_adapters
 
 
-def ticket_ref(value: str, project: str = "goodqa"):
-    m = re.fullmatch(r"(?:GoodQA\s+(?:([a-z0-9-]+)\s*)?)?#?(\d{1,10})", value.strip())
+def ticket_ref(value: str, project: str = DEFAULT_PROJECT):
+    """(slug, number) for any ref form owners use; an unknown or malformed ref is refused here, never spooled."""
+    m = _REF_FORMS.fullmatch(value.strip()) if isinstance(value, str) else None
     if not m:
-        raise AhError("bad_request", "ticket must be N, #N or 'GoodQA <project>#N'")
-    return (m.group(1) or project), int(m.group(2))
+        raise AhError("bad_request", "ticket must be N, #N, goodqa#N or 'GoodQA <project>#N'")
+    slug = (m.group(1) or project).lower()
+    if slug in PROJECT_ID_PREFIXES:
+        slug = PROJECT_ID_PREFIXES[slug]
+    elif re.fullmatch(r"[0-9a-f]{8}", slug):
+        raise AhError("bad_request", f"{slug!r} looks like a project id, not a slug; write the slug (for example 'GoodQA goodqa#N')")
+    return slug, int(m.group(2))
+
+
+def canonical_ref(value: str) -> str:
+    slug, number = ticket_ref(value)
+    return f"GoodQA {slug}#{number}"
+
+
+def check_ticket_exists(ref: str) -> None:
+    """Refuse a ticket GoodQA says is missing or out of scope before anything is queued. Offline: nothing to check."""
+    adapter, mod = load_adapter()
+    slug, number = ticket_ref(ref)
+    try:
+        ticket = adapter.lookup(slug, number)
+    except mod.TicketOutOfScope:
+        raise AhError("ticket_out_of_scope", f"project {slug!r} is not visible to this credential; use its slug", 2) from None
+    except mod.TicketSystemUnavailable:
+        return  # cannot tell; the comment is queued and the drain settles it
+    if ticket is None:
+        raise AhError("not_found", f"ticket {slug}#{number} does not exist", 2)
 
 
 def ticket_issue(adapter, mod, project, number):
     try:
         ticket = adapter.lookup(project, number)
+    except mod.TicketOutOfScope:
+        raise AhError("ticket_out_of_scope", f"project {project!r} is not visible to this credential", 2) from None
     except mod.TicketSystemUnavailable as e:
         raise AhError("ticket_unavailable", str(e), 3)
     if ticket is None:
@@ -729,16 +760,15 @@ def precheck(op: str, args: dict) -> None:
                 raise AhError("bad_request", f"{op}: {n} is required")
     if op == "task.register":
         need("task", "owner_agent", "session", "scope", "source")
-        if not TICKET_RE.match(args.get("ticket") or ""):
-            raise AhError("bad_request", "task.register: ticket must look like 'GoodQA <project>#<n>'")
+        ticket_ref(args.get("ticket") or "")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", args["session"]):
             raise AhError("bad_request", "task.register: session id is malformed")
         if not re.fullmatch(r"[A-Za-z0-9]{1,40}|main", args["owner_agent"]):
             raise AhError("bad_request", "task.register: owner_agent must be an agent id or 'main'")
     elif op == "task.status":
         need("task", "stage", "note")
-        if args.get("ticket") and not TICKET_RE.match(args["ticket"]):
-            raise AhError("bad_request", "task.status: ticket must look like 'GoodQA <project>#<n>'")
+        if args.get("ticket"):
+            ticket_ref(args["ticket"])
     elif op == "task.done":
         need("task")
         ev = args.get("evidence")
@@ -752,8 +782,7 @@ def precheck(op: str, args: dict) -> None:
                 raise AhError("evidence", "each evidence item is {really_tested, wal} or {commit, repo}")
     elif op == "ticket.comment":
         need("body")
-        if not TICKET_RE.match(args.get("ticket") or ""):
-            raise AhError("bad_request", "ticket.comment: ticket must look like 'GoodQA <project>#<n>'")
+        ticket_ref(args.get("ticket") or "")
     else:
         raise AhError("unknown_op", f"unknown op {op}")
     if len(canonical(args).encode()) > MAX_REQUEST:
@@ -846,6 +875,8 @@ def post_comment(ref: str, body: str, operation_id: str) -> None:
     ticket = ticket_issue(adapter, mod, project, number)
     try:
         adapter.comment(ticket, redact.redact(body), operation_id)
+    except mod.TicketOutOfScope:
+        raise AhError("ticket_out_of_scope", f"project {project!r} is not visible to this credential", 2) from None
     except mod.TicketSystemUnavailable as e:
         raise AhError("ticket_unavailable", str(e), 3)
 
@@ -870,14 +901,14 @@ def spool_drain(home: Path, only_opid: str | None = None, limit: int | None = No
                 job = json.loads(_bounded(f))
                 post_comment(job["ticket"], job["body"], job["operation_id"])
             except AhError as e:
-                if e.code == "not_found":
+                if e.code in ("not_found", "ticket_out_of_scope", "bad_request"):  # permanent: retrying cannot help
                     (spool / "dead").mkdir(exist_ok=True, mode=0o700)
                     os.replace(f, spool / "dead" / f.name)
                     dead += 1
                 else:
                     failed += 1
                 continue
-            except (OSError, ValueError, KeyError):
+            except Exception:  # one bad job must never change another caller's result
                 failed += 1
                 continue
             f.unlink(missing_ok=True)
@@ -886,6 +917,44 @@ def spool_drain(home: Path, only_opid: str | None = None, limit: int | None = No
             _append_line(store_dir(home) / "audit.jsonl", {"at": iso(time.time()), "op": "spool.drain",
                                                            "result": "drained", "drained": done, "dead": dead})
         return {"ok": True, "drained": done, "pending": failed, "dead": dead}
+    finally:
+        os.close(lockfd)
+
+
+JOB_NAME = re.compile(r"\d{13}-[0-9a-f]{16}\.json")
+
+
+def spool_ack(home: Path, jobs: list, evidence: str | None) -> dict:
+    """Settle spool jobs that were delivered some other way: move them to spool/delivered/ (never deleted) and audit."""
+    import fcntl
+    if not jobs:
+        raise AhError("bad_request", "spool ack needs one or more job file names")
+    if not evidence or len(evidence.strip()) < 10:
+        raise AhError("evidence", "spool ack needs --evidence (10+ characters): how you know the comment was delivered")
+    for name in jobs:
+        if not JOB_NAME.fullmatch(name):
+            raise AhError("bad_request", f"{name[:40]!r} is not a spool job file name")
+    spool = store_dir(home) / "spool"
+    lockfd = os.open(store_dir(home) / "spool.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise AhError("lock_timeout", "a spool drain is running; retry", 3) from None
+        moved, absent = [], []
+        (spool / "delivered").mkdir(exist_ok=True, mode=0o700)
+        for name in jobs:
+            src = spool / name
+            if src.is_file() and not src.is_symlink():
+                os.replace(src, spool / "delivered" / name)
+                moved.append(name)
+            else:
+                absent.append(name)
+        if moved:
+            _append_line(store_dir(home) / "audit.jsonl", {"at": iso(time.time()), "op": "spool.ack", "result": "acked",
+                                                           "jobs": moved, "evidence": evidence.strip()[:500],
+                                                           "actor": actor(None)})
+        return {"ok": True, "acked": moved, "not_found": absent}
     finally:
         os.close(lockfd)
 
@@ -1043,6 +1112,10 @@ def task_list(home: Path, open_only: bool = False) -> dict:
 
 def write(home: Path, op: str, args: dict, session: str, key: str | None = None) -> dict:
     precheck(op, args)
+    if args.get("ticket"):
+        args = dict(args, ticket=canonical_ref(args["ticket"]))  # one spelling in the key, the ledger and the spool
+        if op in ("ticket.comment", "task.register"):
+            check_ticket_exists(args["ticket"])
     import redact
     if isinstance(args.get("source"), str):
         import wal_note
@@ -1091,7 +1164,10 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
     reply.update(out)
     if out.get("comment") == "pending":  # post now, outside the lock; on failure it stays spooled for the next drain
         opid = operation_id(key)
-        spool_drain(home, only_opid=opid)  # only this write's job: other queued jobs never delay or colour this reply
+        try:
+            spool_drain(home, only_opid=opid)  # only this write's job: other queued jobs never delay or colour this reply
+        except Exception:
+            pass  # the job stays spooled and the reply says pending; the write itself is applied
         tag = hashlib.sha256(opid.encode()).hexdigest()[:16]
         spool = store_dir(home) / "spool"
         if list(spool.glob(f"*-{tag}.json")):
@@ -1100,7 +1176,10 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
             reply["comment"] = "dead"  # the ticket does not exist; nothing was posted
         else:
             reply["comment"] = "posted"
-        spool_drain(home, limit=2, budget_s=10.0)  # a little of the backlog, bounded; ahd drains the rest
+        try:
+            spool_drain(home, limit=2, budget_s=10.0)  # a little of the backlog, bounded; ahd drains the rest
+        except Exception:  # best effort: it must never turn this caller's applied write into a failure
+            pass
     return reply
 
 
@@ -1207,7 +1286,9 @@ def build_parser():
         x.add_argument("--key", help="idempotency key (default: derived from the request)")
     sub.add_parser("doctor", help="check the import chain and file hashes of this install")
     sp = sub.add_parser("spool")
-    sp.add_argument("action", choices=["drain"])
+    sp.add_argument("action", choices=["drain", "ack"])
+    sp.add_argument("jobs", nargs="*", help="ack: spool job file names (<ms>-<hash>.json)")
+    sp.add_argument("--evidence", help="ack: why these jobs are settled (the delivered comment, the ticket); 10+ characters")
     w = sub.add_parser("write")
     ws = w.add_subparsers(dest="sub", required=True)
     wr = ws.add_parser("result")
@@ -1262,6 +1343,8 @@ def run(args, home: Path) -> dict:
     if cmd == "doctor":
         return doctor()
     if cmd == "spool":
+        if args.action == "ack":
+            return spool_ack(home, args.jobs, args.evidence)
         return spool_drain(home)
     if cmd == "write":
         for row in _ledger(home):
