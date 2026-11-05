@@ -27,6 +27,8 @@ Alert keys:
 - `ask:<id>:stale` and `ask:<id>:no-evidence`: warning.
 - `wal:unsafe:<session8>`: high; see Unsafe WALs below.
 
+An active alert whose text no longer matches, or whose severity has fallen, is raised again with `detail.updated`. Changed words and lower severity wait at least 5 minutes since the last write; number-only changes wait an hour. Rises are immediate. ahd keeps no state, so every raise carries hashes of its raw text (`detail.text_sha`, `detail.text_shape`) and the rule in `liveness.ring_text_stale` compares those, because the ring's own text may be redacted or cut. A slot that overflowed has lost them and refreshes at most hourly, even when its text never changes: up to 24 rows a day for that key. The marks add about 62 bytes to each row, so a 300-character message with roughly 46 or more non-ASCII characters overflows its slot and loses its `detail`. A severity that flaps every tick costs up to 20 rows an hour, where ops-watch, which holds a downgrade for two runs, writes about none. A refresh posts no ticket comment. Only rows that `ah owners` marks as owners raise anything, so helpers never alert.
+
 If ahd cannot read a session's owners, it does not clear that session's liveness alerts. A missing `ah` verb is skipped for 10 min and logged once.
 
 **Clock.** Each tick compares the wall-clock delta with the monotonic delta. If they differ by more than 5 min, ahd logs `clock:jump` and holds liveness transitions for 1 tick. Clears still go through.
