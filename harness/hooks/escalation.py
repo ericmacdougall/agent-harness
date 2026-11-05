@@ -533,7 +533,7 @@ def verify_ask_pair(wal, ask_id, task, allow_env_root=False):
     The wals root is the installed one unless the caller's ledger is itself non-default (allow_env_root),
     so an agent cannot point the installed ledger at a WAL of its own through the environment."""
     override = os.environ.get('AGENT_HARNESS_WALS_DIR') if allow_env_root else None
-    wals_root = Path(override or Path.home() / '.claude' / 'wals').resolve()
+    wals_root = Path(override or installed_home() / '.claude' / 'wals').resolve()
     resolved_wal = Path(wal).resolve()
     if wals_root not in resolved_wal.parents or resolved_wal.name != 'main.jsonl':
         raise LedgerError('unclassifiable_evidence', 'permission must come from a session main WAL under ' + str(wals_root))

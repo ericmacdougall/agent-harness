@@ -179,8 +179,15 @@ def decide_bash(data, policy, ledger):
     facts = {'model': model, 'effort': effort, 'task': task}
     basenames = [w.rsplit('/', 1)[-1] for w in words]
     if 'peer_review.py' in basenames:
-        # A review launch: the reviewer rung follows from the author rung; a permission rung needs the
-        # installed ledger's record, checked here so a forged state dir in the helper's env cannot stand in.
+        # A review launch: the reviewer rung follows from the author rung (the installed ledger's rung for a
+        # --task-only line); a permission rung needs the installed ledger's record, checked here so a forged
+        # state dir in the helper's env cannot stand in. The line then falls through: a review token never
+        # exempts another launch on the same line.
+        if author_rung is None and task is not None:
+            try:
+                author_rung = ledger.status(task)['rung']
+            except (esc.LedgerError, tiers.TierError) as error:
+                facts['ladder_error'] = getattr(error, 'code', 'error')
         selection = tiers.reviewer_for(policy, author_rung, author_harness, {'openai': True, 'claude': True})
         if selection.get('rung') and policy['rungs'][selection['rung']]['needs_user_permission']:
             permission = None
@@ -191,7 +198,6 @@ def decide_bash(data, policy, ledger):
                     facts['ladder_error'] = getattr(error, 'code', 'error')
             if not permission:
                 return 'deny', 'review at %s needs recorded user permission for task %s' % (selection['rung'], task or '(none)'), None, facts
-        return 'allow', None, None, facts
     if model is None:
         return 'allow', None, None, facts
     requested = tiers.classify(model, effort, policy)

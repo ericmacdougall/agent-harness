@@ -228,6 +228,11 @@ class BashAdvisory(GateFixture):
         self.assertEqual(self.bash('python3 ~/.claude/hooks/peer_review.py code-inspection --repo r --packet p --output o --author-rung R5 --author-harness claude')[0], 'deny')
         self.assertEqual(self.bash('python3 ~/.claude/hooks/peer_review.py code-inspection --repo r --packet p --output o --task k9 --author-rung R2')[0], 'allow')
         self.assertEqual(self.bash('python3 ~/.claude/hooks/peer_review.py pr --repo r --packet p --output o --task k9 --author-rung R5')[0], 'deny')
+        # A review token never exempts the rest of the line, in either order.
+        self.assertEqual(self.bash('python3 ~/.claude/hooks/peer_review.py pr --repo r --packet p --output o --task k9 --author-rung R0; claude -p --model fable x')[0], 'deny')
+        self.assertEqual(self.bash('claude -p --model fable x; python3 ~/.claude/hooks/peer_review.py pr --repo r --packet p --output o --task k9 --author-rung R0')[0], 'deny')
+        # A --task-only review line takes the author rung from the installed ledger (k9 is at R1 here: an R2 reviewer, no permission).
+        self.assertEqual(self.bash('python3 ~/.claude/hooks/peer_review.py pr --repo r --packet p --output o --task k9')[0], 'allow')
         self.assertEqual(self.bash('python3 rescue.py --repo r --packet p --output o --model opus --effort high')[0], 'allow')
 
 
