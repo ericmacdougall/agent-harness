@@ -11,6 +11,7 @@
 #   LOG_BACKUP_RCLONE       rclone executable (default: rclone)
 #   LOG_BACKUP_HOST         host label, letters digits . _ - only (default: hostname -s)
 #   LOG_BACKUP_EXCLUDES     exclude file (default: log-backup.excludes next to this script)
+#   LOG_BACKUP_RETRIES      extra attempts per source (default 2) and LOG_BACKUP_RETRY_SLEEP seconds between them (30)
 #   LOG_BACKUP_VERSIONS     exactly 0 turns off versions/STAMP (loud warning); anything else keeps them
 # Freshness contract: log-backup.last-ok is written (atomically, with the run START time) only after every source
 # copied cleanly and at least one primary source (.claude/projects or .codex/sessions) was copied. A run skipped
@@ -45,7 +46,7 @@ file_age() { # seconds since modification of $1; BSD stat on Darwin, GNU stat el
 
 holder_alive() { # pid $1 is running and is a log-backup run (a recycled pid belongs to something else)
   kill -0 "$1" 2>/dev/null || return 1
-  ps -p "$1" -o command= 2>/dev/null | grep -q 'log-backup'
+  ps -p "$1" -o command= 2>/dev/null | grep -q 'log-backup\.sh'
 }
 
 acquire_lock() {
@@ -62,6 +63,11 @@ acquire_lock() {
   say "taking over stale lock (holder=${holder:-none} age=${age}s)"
   local gone="$LOCKD.stale.$$"
   mv "$LOCKD" "$gone" 2>/dev/null || return 1
+  if [ "$(cat "$gone/pid" 2>/dev/null)" != "$holder" ]; then
+    # We moved a lock that another run took over between our check and our rename: put it back and skip.
+    mv "$gone" "$LOCKD" 2>/dev/null
+    return 1
+  fi
   rm -f "$gone/pid"; rmdir "$gone" 2>/dev/null
   mkdir "$LOCKD" 2>/dev/null || return 1
   echo $$ > "$LOCKD/pid"
@@ -76,6 +82,9 @@ trap 'rm -f "$LOCKD/pid"; rmdir "$LOCKD" 2>/dev/null' EXIT
 
 command -v "$RCLONE" >/dev/null 2>&1 || fail "rclone not found (set LOG_BACKUP_RCLONE or fix PATH)" 127
 [ -r "$EXCLUDES" ] || fail "exclude file missing: $EXCLUDES (refusing to run without credential excludes)" 2
+for anchor in auth.json rclone.conf member.key '*.secret' '.env'; do
+  grep -qxF -- "$anchor" "$EXCLUDES" || fail "exclude file lacks required pattern $anchor (refusing to run)" 2
+done
 case "$HOST" in ''|*[!A-Za-z0-9._-]*|-*) fail "invalid host label" 2 ;; esac
 
 remotes=$("$RCLONE" listremotes --long --ask-password=false </dev/null 2>/dev/null)
@@ -96,7 +105,8 @@ case "$BASE" in
     esac
     name=${BASE%%:*}
     case "$BASE" in *:*) ;; *) fail "LOG_BACKUP_REMOTE must be NAME:path" 3 ;; esac
-    printf '%s\n' "$remotes" | awk -v n="$name:" '$1==n {f=1} END {exit !f}' || fail "remote $name: is not configured" 3
+    printf '%s\n' "$remotes" | awk -v n="$name:" '$1==n && ($2=="dropbox" || $2=="crypt") {f=1} END {exit !f}' \
+      || fail "remote $name: is not a configured dropbox or crypt remote" 3
     # Pin the remote so a changed rclone setup cannot silently split the backup history across accounts.
     pin="$LOGDIR/log-backup.remote"
     if [ -e "$pin" ]; then
@@ -114,13 +124,23 @@ for src in .claude/projects .claude/wals .claude/history.jsonl .codex/sessions .
     .agent-harness/work-ledger.archive.jsonl .agent-harness/work-ledger.failures.jsonl .agent-harness/work-ledger.spool.jsonl; do
   [ -e "$HOME/$src" ] || continue
   if [ -d "$HOME/$src" ]; then dst="$R/$src"; else dst="$R/$(dirname "$src")"; fi
-  args=(copy --tpslimit 4 --transfers 4 --log-file "$LOG" --log-level NOTICE --exclude-from "$EXCLUDES")
+  args=(copy --tpslimit 4 --transfers 4 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE --exclude-from "$EXCLUDES")
   if [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ]; then args+=(--backup-dir "$R/versions/$STAMP/$src"); fi
-  if "$RCLONE" "${args[@]}" -- "$HOME/$src" "$dst" </dev/null; then
+  # Actively written files (live transcripts, WALs) can change mid-upload and Dropbox can rate-limit: retry the
+  # source with a pause before calling it a failure. A source that still fails makes the whole run non-fresh.
+  attempt=0 copied=0
+  while :; do
+    if "$RCLONE" "${args[@]}" -- "$HOME/$src" "$dst" </dev/null; then copied=1; break; fi
+    attempt=$((attempt + 1))
+    [ $attempt -le "${LOG_BACKUP_RETRIES:-2}" ] || break
+    say "copy of $src failed; retry $attempt after ${LOG_BACKUP_RETRY_SLEEP:-30}s (file changed mid-copy or rate limit)"
+    sleep "${LOG_BACKUP_RETRY_SLEEP:-30}"
+  done
+  if [ $copied -eq 1 ]; then
     found=$((found + 1))
     case "$src" in .claude/projects|.codex/sessions) primary=$((primary + 1)) ;; esac
   else
-    say "copy failed: $src"; ok=1
+    say "copy failed after $attempt attempts: $src"; ok=1
   fi
 done
 [ $primary -gt 0 ] || { say "no primary source (.claude/projects or .codex/sessions) was copied"; ok=1; }
