@@ -435,20 +435,27 @@ def _unpushed_repos(path: Path, max_depth: int = 3, budget_s: float = 20.0) -> l
     found, deadline = [], time.monotonic() + budget_s
     base_depth = len(Path(path).parts)
     for root, dirs, _files in os.walk(path):
-        if len(Path(root).parts) - base_depth >= max_depth:
-            dirs[:] = []
-        if ".git" in dirs or os.path.isfile(os.path.join(root, ".git")):
+        is_repo = ".git" in dirs or os.path.isfile(os.path.join(root, ".git"))  # a worktree has a .git file
+        if is_repo:
             dirs[:] = [d for d in dirs if d != ".git"]
             if time.monotonic() > deadline:
                 found.append({"repo": root, "reason": "budget exhausted: treated as unpushed"})
                 continue
+            env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
             try:
-                r = subprocess.run(["git", "-C", root, "log", "--branches", "--not", "--remotes", "--oneline", "-1"],
-                                   capture_output=True, text=True, timeout=10, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
-                if r.returncode != 0 or r.stdout.strip():
-                    found.append({"repo": root, "reason": "unpushed commits" if r.returncode == 0 else f"git exit {r.returncode}"})
+                # every ref (branches, tags, stash) and a detached HEAD, minus what any remote has
+                checks = [["git", "-C", root, "rev-list", "--all", "--not", "--remotes", "-1"],
+                          ["git", "-C", root, "rev-list", "HEAD", "--not", "--remotes", "-1"]]
+                for argv in checks:
+                    r = subprocess.run(argv, capture_output=True, text=True, timeout=10, env=env)
+                    if r.returncode != 0 or r.stdout.strip():
+                        found.append({"repo": root, "reason": "unpushed commits" if r.returncode == 0 else f"git exit {r.returncode}"})
+                        break
             except (OSError, subprocess.SubprocessError):
                 found.append({"repo": root, "reason": "git unavailable: treated as unpushed"})
+        elif len(Path(root).parts) - base_depth >= max_depth and dirs:
+            found.append({"repo": root, "reason": "depth overrun: unexamined subtree treated as unpushed"})
+            dirs[:] = []
     return found
 
 

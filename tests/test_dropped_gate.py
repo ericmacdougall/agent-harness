@@ -41,7 +41,7 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)
-        p = mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home)})
+        p = mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home), "AH_NOW": str(NOW)})  # server-side stamps on the fixture clock
         p.start()
         self.addCleanup(p.stop)
         w = self.home / ".claude" / "wals" / SESSION
