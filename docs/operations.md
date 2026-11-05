@@ -448,7 +448,7 @@ Process ancestry is deliberately not a proof: subagents share the CLI process, s
 
 ### Kill grammar
 
-Once the shared command parser has handed the guard a `kill` command, the guard accepts it only if every word fits a closed grammar, checked against the word's exact source text so a form the lexer does not understand cannot pass as a literal (`kill_guard.py`, `parse_kill_words`). This covers the kill words only. A kill the parser never presents to the guard is not judged at all; those gaps are listed under Known limits below and tracked in goodqa#14654:
+Once the shared command parser has handed the guard a `kill` command, the guard accepts it only if every word fits a closed grammar, checked against the word's exact source text so a form the lexer does not understand cannot pass as a literal (`kill_guard.py`, `parse_kill_words`). This covers the kill words only. A kill the parser never presents to the guard is not judged at all; those gaps are listed under Known limits below and tracked in goodqa#14654 (items 1-14) and goodqa#14677 (item 16):
 
 - option, first word only and unquoted: `-SIG`, `-s SIG`, `-n SIG`, `--signal SIG`, `--signal=SIG`, then an optional `--`; or `-l`, `-L`, `--list`, `-t`, `--table` with plain signal values;
 - target: a literal integer, a job spec `%N`, `%%`, `%+`, `%-` or `%name` matching `[A-Za-z_][A-Za-z0-9_.-]*`, unquoted or wholly inside one pair of quotes;
@@ -490,6 +490,8 @@ The registered command is `kill_guard.py hook`, a launcher that runs the analysi
 | 12 | local stdin shells | `source /dev/stdin <<< 'kill ...'` |
 | 13 | a literal PID rewritten at parse time | `alias -g 4001=4004; eval "kill -9 4001"` |
 | 14 | wrappers and remote tools the guard does not list | `xcrun kill`, `tailscale ssh`, `pdsh`, `ansible -a`, `fd -x` |
+| 15 | `alias` is not followed, so a name aliased to kill is not judged | `alias K=kill` then `K -9 4004` on a new line |
+| 16 | interpreter code in a remote heredoc is read as shell (goodqa#14677, the goodqa#14617 route) | `ssh dev2 python3 - <<PY` with `os.kill(4004, 9)` in the body |
 | 15 | an alias of the kill verb, because `_alias()` in `command_guard.py` does nothing | `alias K=kill` then `K -9 4004` on the next line |
 | 16 | interpreter code in a heredoc given to a remote command; the body is read as shell, not as interpreter code (a local `python3 - <<PY` is blocked) | `ssh dev2 python3 - <<'PY'` with `os.kill(4004, 9)` in the body |
 
