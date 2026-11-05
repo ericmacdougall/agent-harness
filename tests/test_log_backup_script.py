@@ -110,6 +110,8 @@ class Case(unittest.TestCase):
     def local_run(self, **extra):
         """Real rclone, local directory as the remote."""
         if not REAL_RCLONE:
+            if os.environ.get("LOG_BACKUP_REQUIRE_RCLONE") == "1":  # the gate sets this: fail, never skip
+                self.fail("rclone is required on this host (LOG_BACKUP_REQUIRE_RCLONE=1) but was not found")
             self.skipTest("rclone not installed")
         return self.run_script(FAKE_DELEGATE=REAL_RCLONE, LOG_BACKUP_REMOTE=str(self.remote),
                                LOG_BACKUP_ALLOW_LOCAL="1", **extra)
@@ -217,6 +219,28 @@ class Exclusion(Case):
         for path in (self.remote / "testhost").rglob("*"):
             if path.is_file():
                 self.assertNotIn(b"SECRET-MARKER", path.read_bytes(), path)
+
+    def test_a_plain_directory_named_like_a_credential_is_staged_but_the_credential_file_is_not(self):
+        # F3: rsync patterns match directories too; an ordinary file under a directory named token must still be staged
+        for name in ("token", "key", "pem", "credentials-dir"):
+            self.put(f".claude/projects/p1/{name}/ordinary.jsonl", b"ordinary")
+        self.put(".claude/projects/p1/sub/token", b"SECRET-MARKER")  # the credential-named FILE
+        done = self.local_run()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        stage = self.home / ".agent-harness/backup-stage/.claude/projects/p1"
+        for name in ("token", "key", "pem", "credentials-dir"):
+            self.assertTrue((stage / name / "ordinary.jsonl").exists(), name)
+        self.assertFalse((stage / "sub" / "token").exists())
+        remote = self.remote / "testhost/.claude/projects/p1"
+        self.assertTrue((remote / "token/ordinary.jsonl").exists())
+        self.assertFalse((remote / "sub/token").exists())
+
+    def test_log_over_ten_megabytes_is_rotated_once_per_run(self):
+        self.logs.mkdir(parents=True)
+        (self.logs / "log-backup.log").write_bytes(b"x" * (10 * 1024 * 1024 + 10))
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertEqual((self.logs / "log-backup.log.1").stat().st_size, 10 * 1024 * 1024 + 10)
+        self.assertLess((self.logs / "log-backup.log").stat().st_size, 100000)
 
     def test_vm_dumps_never_appear_in_the_remote(self):
         for name in ("dump.vma", "dump.vma.zst"):
