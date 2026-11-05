@@ -90,6 +90,9 @@ class AskResolvedSourcing(base.Env):
         self.assertIn("--source", doc.get("problem", ""))
         rc, doc = self.note("--event", "ask_resolved", "--ref", ask["id"], "--note", "user said go", "--source", "whatever I say")
         self.assertEqual(rc, 2, doc)  # M1: a garbage source is refused, not stored
+        rc, doc = self.note("--event", "ask_resolved", "--ref", ask["id"], "--note", "I assume yes",
+                            "--source", "inferred: from ticket:GoodQA goodqa#14791 -- my guess")
+        self.assertEqual(rc, 2, doc)  # M3: an ask is never closed on the agent's own assumption
         rc, doc = self.note("--event", "ask_resolved", "--ref", ask["id"], "--note", "user said go", "--source", src)
         self.assertEqual(rc, 0, doc)
         rows = [json.loads(l) for l in (self.wals / "main.jsonl").read_text().splitlines()]
@@ -134,11 +137,20 @@ class Quarantine(Base):
         self.assertNotIn("decision", ph.quarantine_block(SESSION, active, now=now))
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}):
             self.assertEqual(ph.quarantine_block(SESSION, payload, now=now), {})  # headless sessions are not gated
-        # M3: a tool-written row (by set) is never quarantined
+        # M3/M1: an allowlisted tool row is never quarantined; a self-claimed `by` is
         with open(self.wal, "a") as fh:
             fh.write(json.dumps({"at": iso(now - 3600), "event": "decision", "id": "wquar0000009", "note": "LADDER tool row",
                                  "unsourced": True, "by": "escalation"}) + "\n")
-        self.assertNotIn("wquar0000009", [r["id"] for r in ph.quarantined_entries(SESSION, now, 600)])
+            fh.write(json.dumps({"at": iso(now - 3600), "event": "decision", "id": "wquar000000a", "note": "my own claim",
+                                 "unsourced": True, "by": "me"}) + "\n")
+        ids = [r["id"] for r in ph.quarantined_entries(SESSION, now, 600)]
+        self.assertNotIn("wquar0000009", ids)
+        self.assertIn("wquar000000a", ids)
+        # M2: a re-cite whose own source is rejected does not clear the original
+        with open(self.wal, "a") as fh:
+            fh.write(json.dumps({"at": iso(now - 60), "event": "decision", "id": "wquar000000b", "note": "[re-cites wquar0000001] x",
+                                 "source": "whatever I say", "unsourced": True, "recites": "wquar0000001"}) + "\n")
+        self.assertIn("wquar0000001", [r["id"] for r in ph.quarantined_entries(SESSION, now, 600)])
 
 
 class NoteSourceAuto(base.Env):
@@ -190,6 +202,24 @@ class NoteSourceAuto(base.Env):
         payload = {"session_id": SESSION, "hook_event_name": "Stop", "stop_hook_active": False}
         self.assertEqual(ph.quarantined_entries(SESSION, now + 3600, 0), [])
         self.assertEqual(ph.quarantine_block(SESSION, payload, now=now + 3600), {})
+
+    def test_by_is_an_allowlist(self):
+        env = dict(os.environ, HOME=str(self.home))
+        p = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wal), "--event", "decision", "--note", "x", "--by", "me"],
+                           capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("allowlist", p.stderr)
+
+    def test_note_reports_a_quarantined_write_as_not_ok(self):
+        """M2: when the chosen source cannot be backed here, `ah note` must not say ok."""
+        now = time.time()
+        with open(self.wal, "a") as fh:
+            fh.write(json.dumps({"at": iso(now - 600), "event": "scope", "id": "wsrc00000002", "note": "ticket-only ancestor",
+                                 "source": "ticket:GoodQA goodqa#99999999"}) + "\n")
+        rc, done = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--note", "follow-up")
+        self.assertEqual(rc, 3, done)
+        self.assertFalse(done["ok"])
+        self.assertTrue(done.get("quarantined"))
 
     def test_no_ancestor_is_refused_not_guessed(self):
         rc, plan = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--dry-run", "--note", "orphan decision")
