@@ -117,6 +117,7 @@ type Ledger struct {
 	warn    []string
 
 	cacheSecret []byte // this HOME's view-cache key; nil until loaded, empty when unavailable
+	reviewing   bool   // WriterReview reads a trusted writer's full ops, not its reviewed prefix
 }
 
 // Warnings collected while opening or writing (printed by the CLI on stderr).
@@ -381,6 +382,7 @@ func (l *Ledger) classes() (classes map[string]string, mirrored map[string]strin
 			}
 		}
 	}
+	l.applyTrust(out)
 	return out, mirrored, mirror, nil
 }
 
@@ -513,6 +515,17 @@ func (l *Ledger) readAll(s *snapshot) (fold.Input, error) {
 					continue
 				}
 				ops = append(ops, o)
+			}
+		}
+		if dup == "" && in.Class(w) == fold.ClassTrusted && !l.reviewing {
+			if n, ok := l.trustPrefix(w, ops); !ok {
+				in.Classes[w] = fold.ClassUnverified // the reviewed prefix changed: not trusted
+			} else if n < len(ops) {
+				if in.Held == nil {
+					in.Held = map[string]int{}
+				}
+				in.Held[w] = len(ops) - n // appended since the review: held back until reviewed again
+				ops = ops[:n]
 			}
 		}
 		if dup != "" {

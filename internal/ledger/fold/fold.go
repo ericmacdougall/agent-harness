@@ -21,6 +21,9 @@ type Input struct {
 	Project string
 	Refs    []Ref
 	Classes map[string]string // writer -> class; missing means unverified
+	// Held counts, per trusted writer, the ops it appended after its reviewed prefix. They are not in Refs
+	// and never folded; it only feeds the "excluded" counts of the GoodQA import document.
+	Held map[string]int
 }
 
 // Class returns the class of writer w.
