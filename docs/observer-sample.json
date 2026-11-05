@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "host": "dev2",
+  "at": "2026-11-05T04:00:00+00:00",
+  "volumes": [
+    {"fsid": "0x1a2b3c4d", "mounts": ["/"], "total_bytes": 5939000000000, "free_bytes": 495000000000,
+     "growth_bytes_per_hour": 42949672960,
+     "top_growing_dirs": [
+       {"path": "/home/eric/.local/share/gorunner", "growth_bytes_per_hour": 32212254720},
+       {"path": "/home/eric/.agent-harness/work", "growth_bytes_per_hour": 5368709120}
+     ]},
+    {"fsid": "0x9e8f7a6b", "mounts": ["/System/Volumes/Data", "/"], "total_bytes": 494384795648, "free_bytes": 13958643712,
+     "growth_bytes_per_hour": 0, "top_growing_dirs": []}
+  ],
+  "top_writers": [
+    {"pid": 270890, "disk_write_bytes_delta": 30064771072,
+     "attribution": {"state": "attributed", "task": "gorunner-service", "agent": "main", "ticket": "none",
+                     "session": "none", "run_id": "0f0e0d0c0b0a09080706050403020100", "via": "ancestry"}}
+  ],
+  "samples": [
+    {"schema": 1, "host": "dev2", "at": "2026-11-05T04:00:00+00:00", "pid": 270890, "ppid": 1, "pgid": 270890,
+     "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/gorunner.service", "uid": 1000,
+     "start_token": "proc:123456789", "rss_bytes": 734003200, "cpu_seconds": 8123.5,
+     "disk_write_bytes": 453234567890, "disk_read_bytes": 1234567890, "net_tx_bytes": 123456, "net_rx_bytes": 654321,
+     "argv_masked": "/home/eric/repos/gorunner/gorunner serve --token ****",
+     "attribution": {"state": "attributed", "task": "gorunner-service", "agent": "main", "ticket": "none",
+                     "session": "none", "run_id": "0f0e0d0c0b0a09080706050403020100", "via": "ancestry"}},
+    {"schema": 1, "host": "dev2", "at": "2026-11-05T04:00:00+00:00", "pid": 3862222, "ppid": 3862100, "pgid": 3862222,
+     "cgroup": null, "uid": 1000, "start_token": "proc:987654321", "rss_bytes": 52428800, "cpu_seconds": 1.25,
+     "disk_write_bytes": 4096, "disk_read_bytes": 0, "net_tx_bytes": null, "net_rx_bytes": null,
+     "argv_masked": "python3 -m unittest discover -s tests",
+     "attribution": {"state": "attributed", "task": "harness-reliability-pr1", "agent": "a0e07708172d8b693",
+                     "ticket": "GoodQA goodqa#14525", "session": "baab765b-d85c-46b4-b7b9-588eb912c770",
+                     "run_id": "a0f2762de96f28a2ec7a539f18188b91", "via": "both"}},
+    {"schema": 1, "host": "dev2", "at": "2026-11-05T04:00:00+00:00", "pid": 4100, "ppid": 1, "pgid": 4100,
+     "cgroup": null, "uid": 1000, "start_token": "proc:11111", "rss_bytes": 10485760, "cpu_seconds": 0.1,
+     "disk_write_bytes": 0, "disk_read_bytes": 0, "net_tx_bytes": 0, "net_rx_bytes": 0,
+     "argv_masked": "redis-server *:6379", "attribution": {"state": "unattributed"}},
+    {"schema": 1, "host": "dev2", "at": "2026-11-05T04:00:00+00:00", "pid": 5200, "ppid": 5100, "pgid": 5100,
+     "cgroup": null, "uid": 1000, "start_token": "proc:22222", "rss_bytes": 20971520, "cpu_seconds": 3.0,
+     "disk_write_bytes": 1048576, "disk_read_bytes": 0, "net_tx_bytes": null, "net_rx_bytes": null,
+     "argv_masked": "node build.js",
+     "attribution": {"state": "conflict",
+                     "env": {"task": "pp-416", "agent": "a1", "ticket": "none", "session": "s1", "run_id": "11111111111111111111111111111111"},
+                     "ancestry": {"task": "pp-420", "agent": "a2", "ticket": "none", "session": "s1", "run_id": "22222222222222222222222222222222"}}},
+    {"schema": 1, "host": "dev2", "at": "2026-11-05T04:00:00+00:00", "pid": 6300, "ppid": 6200, "pgid": 6300,
+     "cgroup": null, "uid": 1000, "start_token": "proc:33333", "rss_bytes": 8388608, "cpu_seconds": 0.5,
+     "disk_write_bytes": 0, "disk_read_bytes": 0, "net_tx_bytes": null, "net_rx_bytes": null,
+     "argv_masked": "/home/eric/.agent-harness/bin/ah-run --task pp-416 --agent a1 --token **** -- npm test",
+     "attribution": {"state": "hook-ssh", "task": "pp-416", "agent": "a1", "ticket": "none", "session": "s1",
+                     "run_id": "33333333333333333333333333333333", "via": "env"}}
+  ]
+}
