@@ -392,6 +392,14 @@ PLAIN_SSH_OPTIONS = {'batchmode', 'connecttimeout', 'loglevel', 'serveraliveinte
                      'connectionattempts'}
 
 
+PLACEHOLDER = re.compile('[-]')  # the parser stands a substitution in for a private-use character
+
+
+def _unliteral(word):
+    """A word whose value is not known from the text: variable, substitution, glob, or a parser placeholder."""
+    return bool(word.dynamic or word.subs or word.glob or PLACEHOLDER.search(word.text or ''))
+
+
 def plain_ssh_hop(texts, host):
     """True when every ssh option before the host word is one that cannot change where the connection goes.
     `-o HostName=`, `-J`/ProxyJump, `-F`, `-W`, `-S`, ProxyCommand and anything unknown make the hop non-literal,
@@ -1032,10 +1040,11 @@ def make_analyzer_class(cg):
             self.remote += 1
             # OpenSSH keeps reading options after the destination (`ssh dev2 -o HostName=prod kill 4242` reroutes),
             # so an option word right after the host (anything but `--`) also makes the hop non-literal (review round 2).
-            after = texts[host + 1] if host is not None and host + 1 < len(texts) else ''
-            literal = (host is not None and not (args[host].dynamic or args[host].subs or args[host].glob)
-                       and not any(a.dynamic or a.subs or a.glob for a in args[:host]) and plain_ssh_hop(texts, host)
-                       and not (after.startswith('-') and after != '--'))
+            after = args[host + 1] if host is not None and host + 1 < len(args) else None
+            literal = (host is not None and not _unliteral(args[host]) and not any(_unliteral(a) for a in args[:host])
+                       and plain_ssh_hop(texts, host)
+                       and not (after is not None and (_unliteral(after)  # `$(echo -o)` expands to an option word
+                                                       or (after.text.startswith('-') and after.text != '--'))))
             self.remote_hosts.append(texts[host] if literal else None)
             try:
                 result = super().ssh(args, depth)

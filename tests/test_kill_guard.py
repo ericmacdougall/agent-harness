@@ -785,7 +785,11 @@ class RemoteSpawn(unittest.TestCase):
                    'variable option': 'ssh -o $OPT dev2 kill 4242', 'unknown flag': 'ssh -A dev2 kill 4242',
                    # OpenSSH parses options after the destination too (review round 2)
                    'option after host': 'ssh dev2 -o HostName=prod kill 4242', 'config after host': 'ssh dev2 -F evil.cfg kill 4242',
-                   'jump after host': 'ssh dev2 -J gw kill 4242', 'socket after host': 'ssh dev2 -S ctl kill 4242'}
+                   'jump after host': 'ssh dev2 -J gw kill 4242', 'socket after host': 'ssh dev2 -S ctl kill 4242',
+                   'variable after host': 'ssh dev2 $OPT HostName=prod kill 4242'}
+        # Known pre-existing gap, not this route's: an unquoted `$(...)` word inside an ssh command makes the base
+        # analyzer drop the remote kill entirely (`ssh dev2 $(echo x) kill 4242` is 'allow' on main too); tracked on
+        # GoodQA goodqa#14927 as a base-analyzer finding.
         for label, cmd in refused.items():
             with self.subTest(label):
                 self.assertEqual(self.decide(cmd, same)[0], 'block', cmd)
