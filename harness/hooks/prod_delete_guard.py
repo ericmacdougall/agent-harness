@@ -98,6 +98,7 @@ MAX_TTL = 3600
 MAX_SOURCE_AGE = 86400
 MIN_TARGET = 3
 MAX_GRANTS = 64
+GRANTS_MAX_BYTES = 256 * 1024
 SOURCE_RE = re.compile(r"^(user|answer):([A-Za-z0-9._-]{1,120})/([0-9a-fA-F-]{8,64})$")
 
 
@@ -174,15 +175,16 @@ def grants_path(home=None) -> Path:
 
 
 def load_grants(home=None) -> list:
+    import safe_input  # noqa: PLC0415 - only a matched command reads the grant file
     path = grants_path(home)
-    try:
-        raw = path.read_bytes()
-    except FileNotFoundError:
+    if not os.path.lexists(path):
         return []
-    except OSError as exc:
-        raise Unreachable("grant file %s could not be read (%s)" % (path, type(exc).__name__)) from exc
     try:
-        data = json.loads(raw.decode("utf-8"))
+        raw = safe_input.read_bounded(path, GRANTS_MAX_BYTES)
+    except safe_input.InputRejected as exc:
+        raise Unreachable("grant file %s could not be read (%s)" % (path, exc.code)) from exc
+    try:
+        data = safe_input.safe_json_loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise Unreachable("grant file %s is not valid JSON" % path) from exc
     grants = data.get("grants") if isinstance(data, dict) else None
@@ -350,8 +352,10 @@ def evaluate(ev, home=None, now=None, resolver=None):
 
 def hook_main() -> int:
     try:
-        ev = json.loads(sys.stdin.read() or "{}")
-    except (ValueError, UnicodeDecodeError, RecursionError):
+        import safe_input  # noqa: PLC0415
+        # Bounded: a payload over the stdin limit cannot be judged and allows, like any pre-match error.
+        ev = safe_input.safe_json_loads(safe_input.read_stdin_bounded().decode("utf-8", "replace") or "{}")
+    except Exception:  # noqa: BLE001 - before a match every error allows
         return 0
     result = evaluate(ev)
     if result:

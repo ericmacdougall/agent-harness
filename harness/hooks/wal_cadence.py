@@ -49,6 +49,7 @@ HUMAN_EVENTS = {"intent", "scope", "decision", "risk", "check", "commit", "block
 WAL_TAIL_BYTES = 2 * 1024 * 1024
 MAX_AGENT_WORKTREES = 12
 MAX_ASKED = 400
+STATE_MAX_BYTES = 256 * 1024
 GIT_TIMEOUT = 8
 SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
 
@@ -108,10 +109,8 @@ def pending_source_diff(cwd):
     for f in files:
         h.update(f.encode("utf-8", "replace"))
         if f in untracked:
-            try:
-                with open(os.path.join(top, f), "rb") as fh:
-                    data = fh.read(2 << 20)
-            except OSError:
+            data = _read_prefix(os.path.join(top, f), 2 << 20)
+            if data is None:
                 continue
             h.update(data)
             changed += data.count(b"\n")
@@ -144,13 +143,12 @@ def wal_path(session: str, agent: str) -> Path:
 
 def last_human_entry_age(path: Path, now: float):
     """Seconds since the newest human-readable entry, or None when there is none in the readable tail."""
+    import safe_input  # noqa: PLC0415
+    if not os.path.lexists(path):
+        return None
     try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - WAL_TAIL_BYTES))
-            tail = fh.read(WAL_TAIL_BYTES)
-    except OSError:
+        tail = safe_input.read_tail(path, WAL_TAIL_BYTES)
+    except safe_input.InputRejected:
         return None
     newest = None
     for line in tail.splitlines():
@@ -174,22 +172,42 @@ def state_file(session: str) -> Path:
     return home() / ".agent-harness" / "state" / "wal-cadence" / ("%s.json" % safe_id(session))
 
 
-def already_asked(session: str, key: str) -> bool:
+def _read_prefix(path, limit: int):
+    """Up to `limit` bytes of a regular file (never a FIFO, device or a symlink to one), or None."""
+    import safe_input  # noqa: PLC0415
     try:
-        data = json.loads(state_file(session).read_text())
-    except (OSError, ValueError):
-        return False
-    return isinstance(data, dict) and key in (data.get("asked") or {})
+        fd = safe_input.open_regular_file(path)
+    except safe_input.InputRejected:
+        return None
+    try:
+        return os.read(fd, limit)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _load_state(session: str) -> dict:
+    import safe_input  # noqa: PLC0415
+    path = state_file(session)
+    if not os.path.lexists(path):
+        return {}
+    try:
+        data = safe_input.safe_json_loads(safe_input.read_bounded(path, STATE_MAX_BYTES).decode("utf-8", "replace"))
+    except (ValueError, safe_input.InputRejected):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def already_asked(session: str, key: str) -> bool:
+    return key in (_load_state(session).get("asked") or {})
 
 
 def remember(session: str, key: str, now: float) -> None:
     path = state_file(session)
     try:
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            data = {}
-        asked = data.get("asked") if isinstance(data, dict) and isinstance(data.get("asked"), dict) else {}
+        data = _load_state(session)
+        asked = data.get("asked") if isinstance(data.get("asked"), dict) else {}
         asked[key] = int(now)
         if len(asked) > MAX_ASKED:
             asked = dict(sorted(asked.items(), key=lambda kv: kv[1])[-MAX_ASKED:])
@@ -258,7 +276,8 @@ def evaluate(ev, now=None):
 
 def main() -> int:
     try:
-        ev = json.loads(sys.stdin.read() or "{}")
+        import safe_input  # noqa: PLC0415
+        ev = safe_input.safe_json_loads(safe_input.read_stdin_bounded().decode("utf-8", "replace") or "{}")
         result = evaluate(ev)
         if not result:
             return 0

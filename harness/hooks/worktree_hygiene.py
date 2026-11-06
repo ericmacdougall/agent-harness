@@ -92,6 +92,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python3 -I drops the script dir
+import safe_input  # noqa: E402
+
 STATE_HOME = os.path.join(os.path.expanduser("~"), ".agent-harness")
 STATE_DIR = os.path.join(STATE_HOME, "state", "worktree-hygiene")
 CONFIG_PATH = os.path.join(STATE_HOME, "state", "worktree-hygiene.json")
@@ -151,11 +154,12 @@ def _env(suffix: str) -> str:
 
 
 def _config() -> dict:
+    if not os.path.lexists(CONFIG_PATH):
+        return {}
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
-            cfg = json.load(fh)
+        cfg = safe_input.safe_json_loads(safe_input.read_bounded(CONFIG_PATH, 65536).decode("utf-8", "replace"))
         return cfg if isinstance(cfg, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, safe_input.InputRejected):
         return {}
 
 
@@ -278,9 +282,8 @@ def linked_worktree_of(path: str) -> "tuple[str, str] | None":
 
 def _read_linked(top: str, dotgit: str) -> "tuple[str, str] | None":
     try:
-        with open(dotgit, "r", encoding="utf-8", errors="replace") as fh:
-            first = fh.readline().strip()
-    except OSError:
+        first = (safe_input.read_bounded(dotgit, 4096).decode("utf-8", "replace").splitlines() or [""])[0].strip()
+    except (OSError, safe_input.InputRejected):
         return None
     if not first.startswith("gitdir:"):
         return None
@@ -288,9 +291,9 @@ def _read_linked(top: str, dotgit: str) -> "tuple[str, str] | None":
     if not os.path.isabs(gd):
         gd = os.path.normpath(os.path.join(top, gd))
     try:
-        with open(os.path.join(gd, "commondir"), "r", encoding="utf-8", errors="replace") as fh:
-            cd = fh.readline().strip()
-    except OSError:
+        raw = safe_input.read_bounded(os.path.join(gd, "commondir"), 4096).decode("utf-8", "replace")
+        cd = (raw.splitlines() or [""])[0].strip()
+    except (OSError, safe_input.InputRejected):
         return None                    # a submodule, not a linked worktree
     common = cd if os.path.isabs(cd) else os.path.normpath(os.path.join(gd, cd))
     main = os.path.dirname(common) if os.path.basename(common) == ".git" else common
@@ -1385,11 +1388,11 @@ def run(ev: dict, budget: Budget) -> "tuple[int, str, str]":
 def main() -> int:
     budget = Budget(budget_seconds())
     try:
-        raw = sys.stdin.read() if not sys.stdin.isatty() else ""
-        ev = json.loads(raw) if raw.strip() else {}
+        raw = safe_input.read_stdin_bounded().decode("utf-8", "replace") if not sys.stdin.isatty() else ""
+        ev = safe_input.safe_json_loads(raw) if raw.strip() else {}
         if not isinstance(ev, dict):
             return 0
-    except (OSError, ValueError):
+    except (OSError, ValueError, safe_input.InputRejected):
         return 0
     try:
         code, err, out = run(ev, budget)

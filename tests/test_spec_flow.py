@@ -1287,7 +1287,9 @@ class Install(unittest.TestCase):
         # The model ladder (tier_gate.py stop) is a second, separate SubagentStop hook; each must appear once.
         ladder = [h for h in stops if (h.get("args") or [""])[0].endswith("tier_gate.py")]
         dropped = [h for h in stops if (h.get("args") or [""])[0].endswith("dropped_gate.py")]  # goodqa#14791 I7
-        stops = [h for h in stops if h not in ladder and h not in dropped]
+        ported = [h for h in stops if (h.get("args") or [""])[0].endswith(("wal_cadence.py", "worktree_hygiene.py"))]
+        self.assertEqual(len(ported), 2)  # Hawkeye ports, goodqa#14908: one each
+        stops = [h for h in stops if h not in ladder and h not in dropped and h not in ported]
         self.assertEqual(len(ladder), 1)
         self.assertEqual(len(dropped), 1)
         self.assertEqual(len(pre), 1)
