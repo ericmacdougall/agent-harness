@@ -534,7 +534,7 @@
   "checkable": "YES",
   "checkable_reason": "A destructive verb plus an identifiable prod target (D1 --remote, connection string, DB client host/db flag, D1/hyperdrive MCP tool).",
   "proposed_event": "PreToolUse Bash and DB MCP tools",
-  "proposed_check": "Deny unless a live, HMAC-signed grant in ~/.agent-harness/state/prod-delete-grants.json names each exact production target the command reaches and its user source still resolves from the pinned ~/.claude.",
+  "proposed_check": "Deny unless a live, HMAC-signed grant in ~/.agent-harness/state/prod-delete-grants.json names each exact production target the command reaches, funded by an AskUserQuestion answer whose selected option names that target, and whose source still resolves from the pinned ~/.claude.",
   "on_failure": "deny after a match (including an unreadable, unsigned or corrupt grant store, and an unreadable SQL file); allow before one",
   "failing_first_test": "psql --host=prod-db... TRUNCATE denied with no grant; allowed with a live grant for that host; localhost DROP allowed.",
   "priority": "P1",

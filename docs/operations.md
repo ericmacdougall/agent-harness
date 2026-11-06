@@ -624,28 +624,38 @@ Install with `install.py --apply` and `install_codex.py --apply`; both register 
 
 ### What it matches
 
-A call matches only when it carries a destructive statement together with an identifiable production target. The destructive statements are `DELETE FROM`, `DROP TABLE|DATABASE|INDEX|SCHEMA`, `TRUNCATE`, and `UPDATE ... SET` with no `WHERE` in the same statement. They are matched after `/* */` comments and shell quote characters are removed, so `DEL""ETE` and `DELETE/**/FROM` still match.
+A call matches only when it carries a destructive statement together with an identifiable production target. The destructive statements are `DELETE FROM`, `DROP TABLE|DATABASE|INDEX|SCHEMA`, `TRUNCATE`, `UPDATE ... SET` with no `WHERE` in the same statement, `dropdb` and `mysqladmin ... drop`. They are matched after `/* */` comments, backslashes (with `\x20`, `\t` and `\n` escapes read as whitespace) and shell quote characters are removed, and again with `--` line comments removed, so `DEL""ETE`, `DELETE/**/FROM`, `DELETE\ FROM` and `DELETE--x` + newline + `FROM` still match.
 
 Each production target yields the exact name a grant must give:
 
 | Target | Grant names |
 |---|---|
-| `wrangler d1 execute <db> ... --remote` | `<db>` |
-| a connection string (`postgres://`, `mysql://`, `mongodb://`, `redis://`, and similar) naming `prod` or `production` as a name segment | its host or its database (either covers it) |
+| `wrangler d1 execute <db> ... --remote` (value-taking flags such as `--env production`, `-c <config>`, `--persist-to`, `--command` and `--file` are skipped with their values) | `<db>` |
+| a connection string (`postgres://`, `mysql://`, `mongodb://`, `redis://`, and similar) naming `prod` or `production` as a name segment | its host when the host names prod; otherwise its host or its database (either covers it) |
 | a database client (`psql`, `mysql`, `mongosh`, `sqlite3`, and others) whose `-h`, `--host`, `-d`, `--dbname`, `--database` or `--db` value names one (attached forms such as `-hprod-db` included), or whose positional database argument names one | that value |
 | `PGHOST=`, `PGDATABASE=`, `DATABASE_URL=` or `MYSQL_HOST=` in the command, or the same variable in the hook's environment when the command references it or relies on it (no `-h` for `PGHOST`, no `-d` for `PGDATABASE`) | the host, or the connection string's host or database |
 | `ssh <prod-host>` running a database client or `wrangler` | the host |
 | `docker exec <prod-container>` running a database client | the container |
 | a tool that is production by construction: `mcp__*__d1_database_query` or `mcp__*__hyperdrive_*` | its `database_id` (or similar) field; with no such field the call is denied, because no grant can name it |
 
-The guard also reads the SQL in `--file`, `psql -f`, `< file` and `$(< file)` inputs, the arguments of `cat`, and psql `\i`/`\ir`, sqlite `.read` and mysql `source`, up to 200,000 bytes each and only as regular files (a FIFO cannot hang it). Relative paths resolve against the event's cwd, and `~` is expanded. A prod-targeted command is denied when one of its SQL files cannot be judged at hook time: missing, not a regular file, unreadable, or a path the same command writes (`>`, `tee`, `cp`, `mv`, `sed -i` and similar), because that file would be read in its old state. Commands over 64 KiB are tokenized by whitespace instead of shlex, so the hook decides well inside its 30 s timeout.
+The guard also reads the SQL in these inputs, up to 200,000 bytes each and only as regular files (a FIFO cannot hang it):
+- `--file`, and `psql -f` including grouped short flags (`-1f`, `-Xf`) and `--fi=`/`--fil=` prefixes;
+- `< file`, `$(< file)`, and `$(cat file)` inside `-c`, `-e` or a here-string;
+- `cat file | client`;
+- psql `\i`, `\ir`, `\include` and `\include_relative`, mysql `source` and `\.`, sqlite `.read` and `-init`, with or without quotes around the file.
+
+A client fed through a pipe by anything other than `cat`, `echo` or `printf` (for example `head`, `sed` or `curl`), with no `-c`, `-e` or `-f` of its own, reads SQL the guard cannot see. A prod-targeted command is denied when it has such a pipe, or when one of its SQL files cannot be judged at hook time: the file is missing, is not a regular file, is unreadable or is larger than 200,000 bytes. It is also denied when the command has any other step besides a pipeline (`;`, `&&`, `||`, `&`, a newline, `cd` or `pushd`): another step could write or swap the file first, and no list of writers is complete. Write the file in an earlier command, then run it. Relative paths resolve against the event's cwd, and `~` is expanded.
+
+Commands over 64 KiB are split on whitespace instead of shlex. Every word naming prod after a client then counts as a target. Every client scan is bounded (at most 512 characters per scan, 256 words after a client and 64 clients), and a command too long to judge its database is denied when it carries a destructive statement. Adversarial 100 KB shapes decide in under 1 s on the Mac.
 
 Out of scope, disclosed:
 - SQL built at run time (`base64 -d | psql`, a variable holding the statement, a script run by name);
 - a default host that is not in the hook's environment, and `PGSERVICE`;
 - deletes that are not SQL (API calls, removing a data directory);
 - statements the destructive list does not cover: MySQL multi-table `DELETE t FROM t`, mongosh `deleteMany` or `drop`, and redis-cli `FLUSHALL`, `FLUSHDB` or `DEL`;
-- database MCP tools such as `mcp__*__execute_sql` whose text does not name prod.
+- database MCP tools such as `mcp__*__execute_sql` whose text does not name prod;
+- a libpq conninfo string (`psql "host=prod-db dbname=app"`), long-option prefixes for the host (`--hos=prod-db`), unlisted clients (`usql`, inline Python drivers), and other `$'...'` escapes than `\x20`, `\t` and `\n`;
+- a statement past the first 200,000 bytes of a command's own text is still read, but a file over that size is denied rather than read in part.
 
 It judges `Bash` commands, the fields of `mcp__hawkeye__run`, and the `sql`, `query` and `statement` fields of database MCP tools.
 
@@ -670,18 +680,18 @@ python3 ~/.claude/hooks/prod_delete_guard.py grant --user-source answer:<session
 python3 ~/.claude/hooks/prod_delete_guard.py list
 ```
 
-- `--user-source` must be a `user:` or `answer:` id. `ah user-msg` finds one.
-- `provenance.py` must resolve the source to a human turn at most 1 hour old.
-- The human must have seen the exact target: it must appear as a whole name in their turn's text or in the AskUserQuestion they answered. Ask with AskUserQuestion naming the target, then cite that answer. A generic "looks good" funds no grant.
+- `--user-source` must be an `answer:` id: an AskUserQuestion answer. A typed `user:` turn is refused, because "do NOT touch prod-db" cannot be told apart from an approval. `ah user-msg` finds the id.
+- `provenance.py` must resolve the source to a real answer at most 1 hour old when the grant is made. At check time the bound is on `granted - source`, so a grant made near the end of that hour works for its TTL after it.
+- The user's own selected answer must name the target as a whole name: ask with an option label such as "Approve DELETE on <target>", then cite the answer. The agent's question text never counts. An answer that names the target inside a host, port or path (`prod-db.example.com:5432`, `/srv/prod-db/x`) does not name `prod-db`, and an answer with no, not, don't, never, keep, cancel, skip, stop, leave, hold, wait, later or instead funds nothing.
 - The source is resolved from the pinned `~/.claude` of the guard's home. `CLAUDE_CONFIG_DIR` is ignored.
-- `--target` must equal, case-folded, a target name the guard extracts from the command. It is never a substring match. SQL keywords, client names, names starting with `-`, and names with spaces, quotes or wildcards are refused. A command with several production targets needs a grant for each. A connection string's host and database are alternatives, so a grant on a generic database name such as `app` or `postgres` covers that database on every prod host (disclosed).
+- `--target` must equal, case-folded, a target name the guard extracts from the command. It is never a substring match. SQL keywords, client names, bare `prod` and `production`, names starting with `-`, and names with spaces, quotes or wildcards are refused. A command with several production targets needs a grant for each. A connection string to a prod host is covered only by a grant naming that host; a database-only grant (`app`) covers a connection string only when its host does not name prod.
 - The TTL defaults to 900 seconds and cannot exceed 3600. A grant can be reused until it expires.
 - The grant is written to the WAL first, through `wal_note.py`. Then it is stored, HMAC-signed, in `~/.agent-harness/state/prod-delete-grants.json` (mode 0600). The key is `~/.agent-harness/state/prod-delete.key` (32 random bytes, mode 0600, created on first use). Writes run under a lock, and expired or unsigned grants are pruned on each write.
 - Each check verifies the signature, the scope, the expiry, the TTL bound and the source-age bound again, and resolves the grant's source again. A grant whose turn no longer resolves, or whose timestamp has changed, stops working.
 - `command_guard` refuses shell writes to the grant file and the key, as it does for the log-delete marker.
 
 Residuals, disclosed:
-- Provenance proves that the cited turn is a real human turn. It does not prove that the turn approves this particular delete. The WAL record and the exact-target binding keep that claim narrow and auditable.
+- Provenance proves that the cited answer is a real AskUserQuestion answer, and the guard checks that the selected answer names the target and does not decline. It cannot prove what the user believed the option meant; the WAL record and the exact-target binding keep that claim narrow and auditable.
 - The key is used only when it is a regular file with mode 0600, owned by the caller, with one link, and it is opened without following a symlink. The store is replaced through an `O_EXCL|O_NOFOLLOW` temp file.
 - A same-user process, or the Write and Edit tools (command_guard judges Bash only), can read or plant the key and so sign a grant. That skips only the WAL record, because the `grant` command is itself agent-runnable. The key protects the audit trail against hand-edited JSON, not against an agent that sets out to forge one.
 

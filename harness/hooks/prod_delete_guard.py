@@ -24,14 +24,17 @@ What counts as a production TARGET (each yields the exact target value a grant m
   - ssh <prod-host> running a DB client or wrangler        -> the host
   - docker exec <prod-container> running a DB client        -> the container
   - mcp__*__d1_database_query / hyperdrive_* (production by construction) -> the database id field
-The SQL is read from the command and, with a DB client in it, from --file / psql -f files, `< file`
-redirects, `$(< file)`, the arguments of `cat`, and psql `\i`/`\ir`, sqlite `.read` and mysql `source`.
-Relative paths resolve against the event's cwd, and ~ is expanded. Files are opened as regular files only
-(a FIFO or device cannot hang the hook). A prod-targeted command is denied when one of its SQL files cannot
-be judged at hook time: missing, not a regular file, unreadable, more than 8 files, or a path the same
-command writes (>, >>, tee, cp/mv/install/ln/rsync destination, sed -i), which would be read in its old
-state. Commands over 64 KiB are split on whitespace instead of shlex, so the hook decides well inside its
-30 s budget.
+The SQL is read from the command and, with a DB client in it, from --file / psql -f files (also -1f,
+-Xf, --fi=), `< file`, `$(< file)`, `$(cat file)` inside -c/-e or a here-string, `cat file | client`, psql
+`\i`/`\ir`/`\include`/`\include_relative`, mysql `source`/`\.`, and sqlite `.read`/`-init`. Relative paths
+resolve against the event's cwd, and ~ is expanded. Files are opened as regular files only (a FIFO or device
+cannot hang the hook). A prod-targeted command is denied when one of its SQL files cannot be judged at hook
+time: missing, not a regular file, unreadable, over 200,000 bytes, more than 8 files, written by the same
+command, or the command has any other step besides a pipeline (; && || & newline cd pushd), which could
+change the file first. A client fed by a pipe from anything but cat/echo/printf, with no -c/-e/-f of its
+own, is denied the same way. Commands over 64 KiB are split on whitespace; every prod-looking word after a
+client is then a target. Scans are bounded (512 characters, 256 words after a client, 64 clients), and a
+command too long to judge its database is denied when it carries a destructive statement.
 Prose that merely mentions these words does not count; a heredoc that runs psql against a prod host
 does (Hawkeye's accepted over-refusal, H-2). Out of scope, disclosed: SQL built at run time
 (`base64 -d | psql`, variables holding the statement, scripts run by name), unnamed targets
@@ -48,15 +51,14 @@ Grants
   prod_delete_guard.py grant --user-source answer:<session>/<uuid> --target <exact host or db> --wal <WAL>
                              [--ttl SECONDS] [--note TEXT]
   prod_delete_guard.py list
-- --user-source must be a user:<session>/<uuid> or answer:<session>/<uuid> id (ah user-msg finds one)
-  that provenance.py resolves, from the pinned ~/.claude, to a human turn at most 1 hour old. The human
-  must have seen the exact target: it must appear as a whole name in their turn's text, or in the
-  AskUserQuestion they answered. A generic "looks good" funds no grant.
+- --user-source must be an answer:<session>/<uuid> id (an AskUserQuestion answer; ah user-msg finds
+  it) that provenance.py resolves, from the pinned ~/.claude, at most 1 hour old. The user's own selected
+  answer must name the target as a whole name ("Approve DELETE on <target>") and must not decline (no,
+  not, keep, cancel, ...). The agent's question text never counts; typed user: turns are refused.
 - --target must equal, case-folded, one of the target values the guard extracts from the command
   (for example `prod-db.example.com`, or `app_production`). It is never a substring match. SQL
-  words, client names and names starting with "-" are refused as targets. A connection string's host
-  and database are alternatives, so a grant on a generic database name (`app`, `postgres`) covers that
-  database on every prod host (disclosed). A command with several
+  words, client names, bare prod/production and names starting with "-" are refused as targets. A
+  connection string to a prod host is covered only by a grant on that host. A command with several
   prod targets needs a grant for each one.
 - The TTL defaults to 900 seconds and cannot exceed 3600. The grant can be reused until it expires.
 - Each grant is HMAC-signed with ~/.agent-harness/state/prod-delete.key (0600, created on first
@@ -66,7 +68,7 @@ Grants
   opened without following a symlink, and the store is replaced through an O_EXCL|O_NOFOLLOW temp file.
   Residual, disclosed: a same-user process, or the Write and Edit tools (command_guard judges Bash only),
   can read or plant the key and so sign a grant, skipping only the WAL record; provenance proves
-  the cited turn is a real human turn, not that it approves this particular delete. The WAL record
+  the cited answer is real and names the target, not what the user believed the option meant. The WAL record
   and the exact-target binding keep the claim auditable and narrow.
 
 Contract (https://code.claude.com/docs/en/hooks): stdin carries {"tool_name", "tool_input", "cwd", ...}.
@@ -97,11 +99,15 @@ if str(HERE) not in sys.path:  # python3 -I does not put the script's directory 
 # ---- detection ----------------------------------------------------------------------------------
 DESTRUCTIVE = re.compile(
     r"\b(DELETE\s+FROM|DROP\s+(?:TABLE|DATABASE|INDEX|SCHEMA)|TRUNCATE)\b"
-    r"|\bUPDATE\s+[\w.\"`\[\]]+\s+SET\b(?![^;]*\bWHERE\b)", re.I)
+    r"|\bUPDATE\s+[\w.\"`\[\]]+\s+SET\b(?![^;]*\bWHERE\b)"
+    r"|\bdropdb\b|\bmysqladmin\b[^\n|;&]{0,512}?\bdrop\b", re.I)
 SQL_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+LINE_COMMENT = re.compile(r"--[^\n]*")
+SHELL_ESCAPE = re.compile(r"\\(?:x20|x09|x0a|040|t|n)", re.I)
 PROD_TOKEN = re.compile(r"(?:^|[\s_.\-/=@\"'])(prod|production)(?:$|[\s_.\-/:?#\"'])", re.I)
-D1_EXECUTE = re.compile(r"\bwrangler\b[^\n|;&]*\bd1\b\s+execute\s+(?:--?[\w-]+(?:=\S*)?\s+)*([^\s;|&-][^\s;|&]*)?",
-                        re.I)
+D1_EXECUTE = re.compile(r"\bwrangler\b[^\n|;&]{0,512}?\bd1\b\s+execute\s+"
+                        r"(?:(?:--(?:env|config|persist-to|command|file)|-[ec])(?:=\S*|\s+(?:'[^']*'|\"[^\"]*\"|\S+))\s+"
+                        r"|--?[\w-]+(?:=\S*)?\s+)*([^\s;|&-][^\s;|&]*)?", re.I)
 REMOTE_FLAG = re.compile(r"--remote\b")
 FILE_FLAG = re.compile(r"--file[=\s]+(\S+)")
 DB_CLIENT = re.compile(
@@ -110,17 +116,24 @@ DB_CLIENT = re.compile(
 DB_TARGET_FLAG = re.compile(r"(?:(?:--dbname|--database|--db|--host)[=\s]+|(?<![\w-])-[hd](?:\s+|(?=[^\s-])))(\S+)", re.I)
 CLIENT_NAMES = {"psql", "pg_dump", "pg_restore", "dropdb", "createdb", "mysql", "mysqldump", "mysqladmin", "mariadb",
                 "mongo", "mongosh", "mongodump", "mongorestore", "redis-cli", "sqlite3"}
-PSQL_FILE_FLAG = re.compile(r"\bpsql\b[^\n|;&]*?(?<![\w-])-f\s*(\S+)", re.I)
+# -f, grouped short flags ending in f (-1f, -Xf), and getopt_long prefixes of --file (--fi, --fil)
+PSQL_FILE_FLAG = re.compile(r"\bpsql\b[^\n|;&]{0,512}?(?<![\w-])(?:-[A-Za-z0-9]*f|--fil?e?(?==))[=\s]*([^\s;|&]+)")
+SQLITE_INIT = re.compile(r"\bsqlite3\b[^\n|;&]{0,512}?\s-init\s+([^\s;|&]+)")
 REDIRECT_IN = re.compile(r"(?<![<\d])<\s*(?![<(])([^\s;|&<>]+)")
-CAT_ARGS = re.compile(r"(?:^|[\s;&|(`])cat\s+((?:[^\s|;&<>()`]+[ \t]*)+)")
+# cat counts as SQL input only inside a client's -c/-e or a here-string; a cat that pipes into a client is
+# handled by the pipe check (N1: other cat calls are not SQL input)
+SUBST_CAT = re.compile(r"(?:-[ce]|--command|--execute|<<<)\s*[\"']?\$\(\s*cat\s+([^\s)]+)")
+PIPE_CLIENT = re.compile(r"^\s*(?:\w+=\S*\s+)*(?:\S*/)?(psql|mysql|mariadb|sqlite3|mongosh|mongo|redis-cli)\b", re.I)
+SCRIPT_FLAG = re.compile(r"(?<![\w-])(?:-[ce]|--command|--execute|-f|--file|-cmd|-init|--eval)\b|(?<![<\d])<\s*\S")
 SUBST_IN = re.compile(r"\$\(\s*<\s*([^\s)]+)\s*\)")
-CLIENT_INCLUDE = re.compile(r"(?:\\ir?|(?<![\w$])\.read)\s+([^\s;'\"]+)")
-MYSQL_SOURCE = re.compile(r"\b(?:mysql|mariadb)\b[^\n|&]*?\bsource\s+([^\s;'\"]+)", re.I)
+# psql \i \ir \include \include_relative, mysql \. and source, sqlite .read; a quoted argument is accepted
+CLIENT_INCLUDE = re.compile(r"(?:\\(?:include_relative|include|ir|i|\.)|(?<![\w$])\.read)\s+['\"]?([^\s;'\"]+)")
+MYSQL_SOURCE = re.compile(r"\b(?:mysql|mariadb)\b[^\n|&]{0,512}?\bsource\s+['\"]?([^\s;'\"]+)", re.I)
 WRITE_DEST = (
     re.compile(r"(?<![<\d&])>{1,2}\|?\s*([^\s;|&<>]+)"),
     re.compile(r"\btee\s+(?:-[a-z]+\s+)*([^\s;|&<>]+)"),
-    re.compile(r"\b(?:cp|mv|install|ln|rsync)\s+[^;|&\n]*?\s([^\s;|&<>]+)[ \t]*(?=$|[;|&\n])"),
-    re.compile(r"\bsed\s+(?:-[a-zA-Z]*i[a-zA-Z]*|--in-place)\b[^;|&\n]*\s([^\s;|&<>]+)[ \t]*(?=$|[;|&\n])"),
+    re.compile(r"\b(?:cp|mv|install|ln|rsync)\s+[^;|&\n]{0,4096}?\s([^\s;|&<>]+)[ \t]*(?=$|[;|&\n])"),
+    re.compile(r"\bsed\s+(?:-[a-zA-Z]*i[a-zA-Z]*|--in-place)\b[^;|&\n]{0,4096}?\s([^\s;|&<>]+)[ \t]*(?=$|[;|&\n])"),
 )
 SHLEX_LIMIT = 64 * 1024
 CONN_STRING = re.compile(r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis)://\S+", re.I)
@@ -129,8 +142,9 @@ ENV_NAMES = ("PGHOST", "PGDATABASE", "DATABASE_URL", "MYSQL_HOST")
 SSH_OPTS_WITH_VALUE = set("bcDEeFIiJLlmOopQRSWw")
 DOCKER_EXEC_OPTS_WITH_VALUE = {"-e", "--env", "-u", "--user", "-w", "--workdir", "--env-file", "--detach-keys"}
 CLIENT_OPTS_WITH_VALUE = {"-c", "-e", "-f", "-U", "-u", "-p", "-P", "--command", "--execute", "--file", "--user",
-                          "--username", "--port", "-v", "--set", "--eval", "-o", "--output"}
-RESERVED_TARGETS = {"delete", "drop", "truncate", "update", "table", "database", "schema",
+                          "--username", "--port", "-v", "--set", "--eval", "-o", "--output", "-h", "-d", "--host",
+                          "--dbname", "-cmd", "-init"}
+RESERVED_TARGETS = {"prod", "production", "delete", "drop", "truncate", "update", "table", "database", "schema",
                     "index", "from", "set", "where", "remote", "execute", "d1", "wrangler", "ssh", "docker", "exec"}
 
 TOOL_COMMAND_FIELDS = (
@@ -156,12 +170,17 @@ CLOCK_SLACK = 60
 MIN_TARGET = 3
 MAX_GRANTS = 64
 GRANTS_MAX_BYTES = 256 * 1024
+DECLINE = re.compile(r"\b(?:no|not|don'?t|never|keep|cancel|skip|stop|leave|hold|wait|later|instead)\b", re.I)
 SOURCE_RE = re.compile(r"^(user|answer):([A-Za-z0-9._-]{1,120})/([0-9a-fA-F-]{8,64})$")
 
 
 def destructive_match(sql: str):
-    """The destructive statement in `sql`, after SQL comments and shell quote characters are removed."""
-    return DESTRUCTIVE.search(SQL_COMMENT.sub(" ", sql).replace('"', "").replace("'", ""))
+    """The destructive statement in `sql`, after SQL comments, shell escapes and quote characters are removed. The
+    text is also checked with `--` line comments removed, so a comment cannot split a verb (`DELETE--x\nFROM`)."""
+    text = SHELL_ESCAPE.sub(lambda m: "\n" if m.group(0).lower() in ("\\n", "\\x0a") else " ",
+                            SQL_COMMENT.sub(" ", sql))
+    text = text.replace("\\", "").replace('"', "").replace("'", "")
+    return DESTRUCTIVE.search(text) or DESTRUCTIVE.search(LINE_COMMENT.sub(" ", text))
 
 
 def _resolve_path(raw: str, cwd) -> str:
@@ -181,7 +200,10 @@ def _read_sql_file(path: str):
         return None
     try:
         with os.fdopen(fd, "rb") as fh:
-            return fh.read(FILE_READ_LIMIT).decode("utf-8", "replace")
+            body = fh.read(FILE_READ_LIMIT + 1)
+        if len(body) > FILE_READ_LIMIT:
+            return None  # only part could be read: the rest is unjudged
+        return body.decode("utf-8", "replace")
     except (OSError, ValueError):
         return None
 
@@ -191,7 +213,7 @@ def _written_paths(command: str, cwd=None) -> set:
     out = set()
     for rx in WRITE_DEST:
         for m in rx.finditer(command):
-            out.add(os.path.normpath(_resolve_path(m.group(1), cwd)))
+            out.add(os.path.realpath(_resolve_path(m.group(1), cwd)))
     return out
 
 
@@ -200,19 +222,29 @@ def sql_text_for(command: str, cwd=None, unread=None) -> str:
     Paths that could not be read are appended to `unread` when a list is given."""
     paths = [m.group(1) for m in FILE_FLAG.finditer(command)]
     paths += [m.group(1) for m in PSQL_FILE_FLAG.finditer(command)]
+    piped = []
     if DB_CLIENT.search(command) or D1_EXECUTE.search(command):
         paths += [m.group(1) for m in REDIRECT_IN.finditer(command)]
         paths += [m.group(1) for m in SUBST_IN.finditer(command)]
+        paths += [m.group(1) for m in SUBST_CAT.finditer(command)]
         paths += [m.group(1) for m in CLIENT_INCLUDE.finditer(command)]
         paths += [m.group(1) for m in MYSQL_SOURCE.finditer(command)]
-        for m in CAT_ARGS.finditer(command):
-            paths += [w for w in m.group(1).split() if not w.startswith("-")]
+        paths += [m.group(1) for m in SQLITE_INIT.finditer(command)]
+        paths += _piped_inputs(command, piped)
+    if unread is not None:
+        unread.extend(piped)
+    # File inputs are judged as they are now. Any other step in the same command (a write by any tool, a cd, a
+    # download) could change them first, and no list of writers is complete: then they cannot be judged at all.
+    if paths and _multi_step(command):
+        if unread is not None:
+            unread.extend("%s (the same command has other steps)" % p for p in paths[:8])
+        return command
     written = _written_paths(command, cwd) if paths else set()
     text = command
     for raw in paths[:8]:
         resolved = _resolve_path(raw, cwd)
         # a file this same command writes is judged in its old state at hook time, so it cannot be judged at all
-        body = None if os.path.normpath(resolved) in written else _read_sql_file(resolved)
+        body = None if os.path.realpath(resolved) in written else _read_sql_file(resolved)
         if body is None:
             if unread is not None:
                 unread.append(raw)
@@ -221,6 +253,34 @@ def sql_text_for(command: str, cwd=None, unread=None) -> str:
     if unread is not None and len(paths) > 8:
         unread.extend(paths[8:])
     return text
+
+
+def _multi_step(command: str) -> bool:
+    """True when the command has more than one step besides a pipeline: ; && || & or a newline outside quotes,
+    or a cd/pushd."""
+    bare = re.sub(r"'[^']*'|\"[^\"]*\"", " ", command[:SHLEX_LIMIT])
+    bare = re.sub(r"\d?[<>]&\d?-?", " ", bare)
+    return bool(re.search(r"[;&\n]|(?:^|\s)(?:cd|pushd)(?:\s|$)", bare)) or len(command) > SHLEX_LIMIT
+
+
+def _piped_inputs(command: str, unjudged: list) -> list:
+    """Files fed by `cat file | client`. A client fed by any other producer (head, sed, curl, a script) with no
+    -c/-e/-f of its own reads SQL the guard cannot see, so that stdin is listed in `unjudged`; echo and printf
+    text is in the command itself."""
+    paths = []
+    segments = re.split(r"(?<!\|)\|(?!\|)", command[:SHLEX_LIMIT])
+    for i in range(1, min(len(segments), 64)):
+        seg = segments[i]
+        if not PIPE_CLIENT.match(seg) or SCRIPT_FLAG.search(seg):
+            continue
+        bare = re.sub(r"'[^']*'|\"[^\"]*\"", " Q ", segments[i - 1])  # quoted text is data, not a separator
+        producer = re.split(r"[;&\n]", bare)[-1].split()
+        name = producer[0].rsplit("/", 1)[-1] if producer else ""
+        if name == "cat":
+            paths += [w for w in producer[1:] if not w.startswith("-")]
+        elif name not in ("echo", "printf"):
+            unjudged.append("stdin from %s" % (name or "a pipe"))
+    return paths
 
 
 def _words(command: str) -> list:
@@ -246,12 +306,22 @@ def _conn_parts(conn: str) -> list:
     return [p for p in (m.group(1), (m.group(2) or "").strip("/")) if p]
 
 
+AFTER_SCAN = 256  # words _after looks at; past it the result is TOO_MANY_OPTIONS
+TOO_MANY_OPTIONS = "\0too-many-options"
+
+
 def _after(words: list, index: int, opts_with_value) -> str:
-    """The first non-option word after words[index], skipping options and their values."""
+    """The first non-option word after words[index], skipping options and their values. Bounded: after
+    AFTER_SCAN option words it returns TOO_MANY_OPTIONS, and the caller fails closed."""
     i = index + 1
     while i < len(words):
+        if i - index > AFTER_SCAN:
+            return TOO_MANY_OPTIONS
         w = words[i]
         if w.startswith("-") and len(w) > 1:
+            if w in opts_with_value:
+                i += 2
+                continue
             flag = w if w.startswith("--") else w[:2]
             if (flag in opts_with_value or (not w.startswith("--") and w[1:2] in opts_with_value)) and len(w) <= 2 \
                     and "=" not in w:
@@ -282,7 +352,10 @@ def targets_production(command: str, env=None):
     for m in CONN_STRING.finditer(command):
         conn = m.group(0).rstrip("'\"")
         if _prod(conn):
-            add("a connection string naming a prod/production database", _conn_parts(conn))
+            parts = _conn_parts(conn)
+            if parts and _prod(parts[0]):
+                parts = parts[:1]  # a database-only grant ("app") never covers a prod host
+            add("a connection string naming a prod/production database", parts)
     assigned = {}
     for m in ENV_ASSIGN.finditer(command):
         assigned[m.group(1)] = m.group(2).strip("'\"")
@@ -293,11 +366,24 @@ def targets_production(command: str, env=None):
             value = m.group(1).strip("'\"")
             if _prod(value):
                 add("a %s target (%s) naming prod/production" % (client.group(1), value), [value])
+        clients = 0
         for i, w in enumerate(words):
             if w[w.rfind("/") + 1:].casefold() in CLIENT_NAMES:  # a set lookup: commands can hold 600k words
-                pos = _after(words, i, CLIENT_OPTS_WITH_VALUE)
+                clients += 1
+                pos = _after(words, i, CLIENT_OPTS_WITH_VALUE) if clients <= 64 else TOO_MANY_OPTIONS
+                if pos == TOO_MANY_OPTIONS:
+                    # cannot tell which database a client uses: a destructive match then denies (no exact target)
+                    add("a %s command too long to judge its database" % w, [])
+                    break
                 if pos and not pos.startswith("-") and _prod(pos) and "://" not in pos and " " not in pos:
                     add("a %s positional database (%s) naming prod/production" % (w, pos), [pos])
+        if len(command) > SHLEX_LIMIT:
+            for w in words:
+                if "prod" in w.casefold():
+                    v = w.strip("'\"();,")
+                    if v and _prod(v) and "://" not in v:
+                        add("a word naming prod/production in an oversized %s command (%s)" % (client.group(1), v),
+                            [v])
         for name in ENV_NAMES:
             referenced = ("$" + name) in command or ("${" + name) in command
             # The hook's own environment counts when the command references the variable, or when psql would
@@ -448,43 +534,16 @@ def resolve_user_source(source: str, home=None) -> dict:
         turn = (provenance.user_turn if kind == "user" else provenance.answer_turn)(session, uid, claude)
     except provenance.Problem as exc:
         raise ValueError("%s: %s" % (exc.code, exc)) from exc
-    turn = dict(turn, kind=kind, question="")
-    if kind == "answer":
-        try:
-            path = provenance.find_transcript(session, claude)
-            turn["question"] = _askuser_question(provenance, path, provenance.load_record(path, "uuid", uid))
-        except Exception:  # noqa: BLE001 - no question found: the answer must then name the target itself
-            pass
-    return turn
-
-
-def _askuser_question(provenance, path, record) -> str:
-    """JSON of the input of the main-conversation AskUserQuestion that `record` answers, or ''."""
-    blocks = (record.get("message") or {}).get("content") if isinstance(record, dict) else None
-    use_id = blocks[0].get("tool_use_id") if isinstance(blocks, list) and blocks and isinstance(blocks[0], dict) \
-        else None
-    if not isinstance(use_id, str) or not use_id:
-        return ""
-    for line in provenance._lines_containing(path, use_id.encode()):
-        if line is None:
-            continue
-        try:
-            rec = provenance.loads_line(line)
-        except ValueError:
-            continue
-        if not isinstance(rec, dict) or rec.get("type") != "assistant" or rec.get("isSidechain"):
-            continue
-        for block in (rec.get("message") or {}).get("content") or []:
-            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id") == use_id \
-                    and block.get("name") == "AskUserQuestion":
-                return json.dumps(block.get("input"), ensure_ascii=False)
-    return ""
+    return dict(turn, kind=kind)
 
 
 def names_target(turn: dict, target: str) -> bool:
-    """The human saw the exact target: it is in their own turn's text, or in the AskUserQuestion they answered."""
-    seen = "%s\n%s" % (turn.get("text") or "", turn.get("question") or "")
-    return bool(re.search(r"(?<![\w.-])%s(?![\w-])" % re.escape(target.casefold()), seen.casefold()))
+    """The user's own selected answer names the exact target as a whole name (not inside a host, port or path),
+    and does not decline. The agent's question text never counts: it is not the user's words."""
+    said = str(turn.get("text") or "")
+    if DECLINE.search(said):
+        return False
+    return bool(re.search(r"(?<![\w.:/@-])%s(?![\w-]|[.:/@]\w)" % re.escape(target.casefold()), said.casefold()))
 
 
 def _epoch(ts) -> float:
@@ -589,10 +648,14 @@ def grant(user_source: str, target: str, wal, ttl: int = DEFAULT_TTL, note: str 
         raise ValueError(problem)
     if not 1 <= int(ttl) <= MAX_TTL:
         raise ValueError("--ttl must be between 1 and %d seconds" % MAX_TTL)
+    if not str(user_source or "").startswith("answer:"):
+        raise ValueError("--user-source must be an AskUserQuestion answer (answer:<session>/<uuid>): a typed turn "
+                         "cannot be told apart from a refusal")
     turn = resolver(user_source, home)
     if not names_target(turn, target):
-        raise ValueError("the cited turn does not name %s: ask the user with AskUserQuestion naming the exact target, "
-                         "then cite that answer" % target)
+        raise ValueError("the cited answer does not name %s (or it declines): ask with AskUserQuestion and an option "
+                         "label naming the exact target, such as 'Approve DELETE on %s', then cite that answer"
+                         % (target, target))
     source_ts = _epoch(turn.get("timestamp"))
     if now - source_ts > MAX_SOURCE_AGE or source_ts > now + CLOCK_SLACK:
         raise ValueError("the user source is older than %d hours (or in the future); ask again" % (MAX_SOURCE_AGE // 3600))
