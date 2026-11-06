@@ -118,6 +118,22 @@ class HarnessDefaults(unittest.TestCase):
         self.assertIn("UNPUSHED: %s" % self.wt, msg)
         self.assertIn("deliver.py prepare", msg)
 
+    def test_detached_head_commit_on_no_branch_blocks_by_default(self):
+        # native review F9 (goodqa#14908): a commit made on a detached HEAD is on no branch, so git gc
+        # can drop it once the tree moves; report-only is not enough there
+        self.git(self.wt, "switch", "-q", "--detach")
+        self.commit_work()
+        r = self.hook()
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("detached HEAD", r.stderr)
+        self.assertIn("switch -c", r.stderr)
+        self.assertNotIn("push -u", r.stderr)
+        self.assertNotIn("UNPUSHED", self.sysmsg(r))
+        self.git(self.wt, "switch", "-q", "-c", "feat/named")
+        r = self.hook()
+        self.assertEqual(r.returncode, 0, r.stderr)  # named: back to report-only
+        self.assertIn("UNPUSHED: %s" % self.wt, self.sysmsg(r))
+
     def test_block_unpushed_config_and_env_restore_hawkeye_semantics(self):
         self.commit_work()
         cfg = self.home / ".agent-harness/state/worktree-hygiene.json"

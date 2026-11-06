@@ -10,7 +10,8 @@ rule S18 (goodqa#14908), so T2 and the Mac keep the dev2 protection after dev2 i
   - committed-but-unpushed work is REPORTED, not blocked, unless block_unpushed is set (config key, or
     HARNESS_WORKTREE_HYGIENE_BLOCK_UNPUSHED=1). Harness owners commit locally and publish through
     deliver.py / publish_feature.py after review, so a stop block that says "git push" would route around
-    the identity-checked publication path. Uncommitted work always blocks (once per state);
+    the identity-checked publication path. Uncommitted work always blocks (once per state), and so do
+    commits on a detached HEAD (on no branch, so git gc can drop them): the block asks for `switch -c`;
   - the suggested commit uses the commit policy (commit -F after commit_policy.py check-message), not a
     per-handle identity.
 Hawkeye's original text follows.
@@ -1128,6 +1129,11 @@ def blocking_text(blockers: list, push: bool = True) -> str:
             out.append("      python3 ~/.claude/hooks/commit_policy.py check-message --file <message file>")
             out.append("      git -C %s commit -F <message file>" % q(t.top))
         if not push:
+            if t.disk_only and not t.branch:
+                out.append("    commits on a detached HEAD at %s are on no branch: git gc can drop them once"
+                           % t.head[:12])
+                out.append("    this tree moves, so name the work before you stop:")
+                out.append("      git -C %s switch -c <new-branch>" % q(t.top))
             continue
         br = t.branch
         if not br:
@@ -1260,7 +1266,8 @@ whatever is only here.
 BLOCK_HEADER_COMMIT = """WORK THAT EXISTS ONLY ON THIS DISK -- commit it before you stop.
 
 Rule S18 (worktree and branch hygiene): you may not end your turn while any
-worktree you created or worked in has uncommitted changes. Commit coherent,
+worktree you created or worked in has uncommitted changes, or commits on a
+detached HEAD that no branch holds. Commit coherent,
 recoverable increments; a session limit or a crash loses whatever is only in
 the working tree. (Committed work is published later through deliver.py.)
 """
@@ -1337,14 +1344,15 @@ def run(ev: dict, budget: Budget) -> "tuple[int, str, str]":
         if inspect_tree(t, budget):
             live.append(t)
     push = block_unpushed()
-    blockers = [t for t in live if t.status or (push and t.disk_only)]
+    # a detached HEAD's commits are on no branch (gc can drop them), so they block even in report-only mode
+    blockers = [t for t in live if t.status or (t.disk_only and (push or not t.branch))]
     for t in live:
         if t not in blockers:
             t.merged = branch_has_merged_work(t, budget)
     owned_tops = {t.top for t in owned}
     rep = report_lines(live, budget, duplicates(live, budget, owned_tops))
     for t in live:
-        if t.disk_only and not t.status and not push:
+        if t.disk_only and not t.status and not push and t.branch:
             where = ("branch %s" % t.branch) if t.branch else ("detached HEAD at %s" % t.head[:12])
             rep.insert(0, "  UNPUSHED: %s  [%s, HEAD %s is on no %s branch]; publish it through deliver.py prepare "
                           "(or publish_feature.py) once reviewed" % (t.top, where, t.head[:12],

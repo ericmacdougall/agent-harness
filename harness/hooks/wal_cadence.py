@@ -10,9 +10,9 @@ entry at each turn end, whichever tool produced the diff.
 
 What it checks. The agent's work counts when it is a git worktree with at least MIN_CHANGED_LINES
 uncommitted SOURCE lines, tracked or untracked, outside docs/, plans/ and similar journal paths.
-That worktree is the cwd (at Stop only when the cwd is a linked worktree; the primary checkout is
-the user's), or for a subagent, a worktree under its own work folder
-~/.agent-harness/work/<session>/agent-<id>/. If that agent's WAL (main.jsonl, or
+At Stop that worktree is the cwd, and only when the cwd is a linked worktree (the primary checkout
+is the user's). For a subagent it is only a worktree under its own work folder
+~/.agent-harness/work/<session>/agent-<id>/, never its cwd. If that agent's WAL (main.jsonl, or
 agent-<id>.jsonl) has no human entry (a wal_note.py row with a note) in the last WAL_STALE_S
 seconds, the hook blocks once with exit 2 and tells the agent what to record.
 
@@ -252,7 +252,9 @@ def evaluate(ev, now=None):
     cwd = ev.get("cwd") or os.getcwd()
     candidates = []
     if event == "SubagentStop":
-        candidates = agent_worktrees(session, agent) + [cwd]
+        # only trees under this agent's own work folder: a subagent's cwd is often main's checkout or
+        # another owner's tree, and blocking it there would be for work it does not own (goodqa#14908 F5)
+        candidates = agent_worktrees(session, agent)
     elif is_linked_worktree(cwd):
         candidates = [cwd]
     seen = set()

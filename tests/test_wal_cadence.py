@@ -147,10 +147,15 @@ class SubagentStop(Case):
         self.note(wal.name)
         self.assertQuiet(self.hook("SubagentStop", cwd=self.home, agent_id=AGENT))
 
-    def test_subagent_cwd_worktree_also_counts_and_main_state_is_separate(self):
-        self.work()  # in self.wt, the subagent's cwd
-        self.assertNudged(self.hook("SubagentStop", agent_id=AGENT))
-        self.assertNudged(self.hook("Stop"))  # main's nudge for the same diff is its own
+    def test_subagent_checks_only_its_own_worktrees_never_its_cwd(self):
+        # native review F5 (goodqa#14908): a subagent that inherits main's cwd (or sits in another
+        # owner's tree) must not be blocked for work it does not own
+        self.work()  # in self.wt, not under this agent's work folder
+        self.assertQuiet(self.hook("SubagentStop", agent_id=AGENT))
+        self.assertQuiet(self.hook("SubagentStop", cwd=self.primary, agent_id=AGENT))
+        self.assertNudged(self.hook("Stop"))  # the tree is still main's to account for
+        self.work(self.agent_wt)
+        self.assertNudged(self.hook("SubagentStop", agent_id=AGENT), str(self.agent_wt))
 
     def test_subagent_without_id_is_quiet(self):
         self.work(self.agent_wt)
