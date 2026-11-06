@@ -1358,6 +1358,13 @@ def build_parser():
     cc = ts.add_parser("comment")
     cc.add_argument("ticket", help="GoodQA <project>#N")
     cc.add_argument("--body", required=True)
+    tc = ts.add_parser("create", help="file a GoodQA ticket (idempotent on --key)")
+    tc.add_argument("--project", required=True)
+    tc.add_argument("--title", required=True)
+    tc.add_argument("--body-file", required=True)
+    tc.add_argument("--type", default="task")
+    tc.add_argument("--priority")
+    tc.add_argument("--key", help="idempotency key (default: hash of project, title and body)")
     for x in (g, c):
         x.add_argument("--project", default="goodqa")
     d = sub.add_parser("disk")
@@ -1438,6 +1445,12 @@ def run(args, home: Path) -> dict:
     if cmd == "disk":
         return disk(args.host, args.root, args.count, args.budget, not args.no_top)
     if cmd == "ticket":
+        if args.sub == "create":
+            import ah_ticket
+            try:
+                return ah_ticket.create(args.project, args.title, args.body_file, args.type, args.priority, args.key, home)
+            except ah_ticket.TicketCreateError as e:
+                raise AhError(e.code, str(e), e.exit_code)
         if args.sub == "get":
             return ticket_get(args.number, args.project)
         if args.sub == "comments":
