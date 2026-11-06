@@ -2449,9 +2449,9 @@ class NativeReviewR9(HookFixture):
     can wait for the job: the shell's own `wait` (no directory, no fold), run unconditionally in the current shell after the
     job (not in a later subshell, a pipeline, an `&&`/`||` branch or another branch or loop of a compound), with no argument,
     or `$!` for the latest job in its own list."""
-    PLUS = ('A+=1 rm -rf /tmp/zz', 'A+=1 B=2 RM -rf /tmp/zz', 'A+=1 nice rm -rf /tmp/zz', 'env A+=1 rm -rf /tmp/zz',
-            'env A-B=1 rm -rf /tmp/zz', "env 'A=1' rm -rf /tmp/zz", 'env "a b=1" rm -rf /tmp/zz', 'ENV A.B=1 RM -rf /tmp/zz',
-            'sudo A-B=1 rm -rf /tmp/zz')
+    # env/sudo words that only env reads as assignments (`env A-B=1`, `env 'A=1'`, `sudo A-B=1`) were reverted in r9c with
+    # the zsh `=cmd` regression they caused; they are goodqa#14891.
+    PLUS = ('A+=1 rm -rf /tmp/zz', 'A+=1 B=2 RM -rf /tmp/zz', 'A+=1 nice rm -rf /tmp/zz', 'env A+=1 rm -rf /tmp/zz')
     WAITS_THAT_CANNOT = ('sleep 1 & /usr/bin/wait', 'sleep 1 & ./wait', 'sleep 1 & (wait)', 'sleep 1 & true | wait',
                          'sleep 1 & wait | cat', 'sleep 1 & wait 1', 'sleep 1 & wait -n', 'sleep 1 & wait %1',
                          'sleep 1 & false && wait', 'sleep 1 & true || wait', 'sleep 1 & wait &', 'sleep 1 & { wait; } | cat',
@@ -2484,14 +2484,13 @@ class NativeReviewR9(HookFixture):
         for command in self.PLUS + ('A=1 rm -rf /tmp/zz',):
             self.assertEqual(self.decision(command, 'bypassPermissions', deny=['Bash(rm:*)']), 'deny', command)
             self.assertEqual(self.decision(command, 'default', ask=['Bash(rm:*)'], allow=['Bash(*)']), 'ask', command)
-        for command in ('A+=1 setsid sleep 1', 'env A+=1 setsid sleep 1', 'env A-B=1 setsid sleep 1', 'A+=1 B=2 nohup sleep 1',
-                        "env 'A=1' nohup sleep 1", 'A+=1 NOHUP sleep 1', 'sudo A=1 setsid sleep 1', 'time A=1 setsid sleep 1',
-                        'sudo A-B=1 nohup sleep 1', 'nice A=1 B+=2 setsid sleep 1'):
+        for command in ('A+=1 setsid sleep 1', 'env A+=1 setsid sleep 1', 'A+=1 B=2 nohup sleep 1',
+                        'A+=1 NOHUP sleep 1', 'sudo A=1 setsid sleep 1', 'time A=1 setsid sleep 1',
+                        'nice A=1 B+=2 setsid sleep 1'):
             self.assertTrue(ah_run.classify_escapes(command), command)
         self.assertEqual(ah_run.peel_wrapper('A+=1 rm x'), 'rm x')
-        self.assertEqual(ah_run.peel_wrapper('env A-B=1 rm x'), 'rm x')
         self.assertTrue(ah_run.parse_command('env "$v" rm x').uncertain)  # an expanded word may be a program or an option
-        self.assertIn('state-variable', ah_run.lex("env 'PATH=/tmp/x' ls").reasons)  # env sets PATH, quoted or not
+        # a quoted `env 'PATH=/tmp/x'` was reverted in r9c with the env word extension: goodqa#14891
         # the deny forms' fallback strip reads the same grammar (r9b mutant N1-env-prefix-no-plus survived without this)
         self.assertEqual(ah_run.ENV_PREFIX.sub('', "A+=1 B='x y' C+=\"z\" rm x", count=1), 'rm x')
 
@@ -3366,6 +3365,60 @@ class SshRewrite(HookFixture):
             self.assertFalse(self.nohup_row_refused())
             self.assertFalse(self.ssh("ssh dev2 'sleep 30 &'").get('permissionDecision') == 'deny')
 
+
+
+class NativeReviewR9c(unittest.TestCase):
+    """r9c (Opus max delta review of 9344704, goodqa#14548): D1 zsh `=cmd` after env/sudo is the program; D2 (N1) assignment
+    words never use up the wrapper bound in the deny forms, _reads_script or the ssh form; D3 a lex costs O(1) memory per
+    command whatever the keyword depth. Each check failed at 7170ea4 (g10/fixes6/runs/probe9c-at-7170ea4.out)."""
+
+    def tearDown(self):
+        ah_run.match_candidates.cache_clear()
+
+    def reaches(self, command, program):
+        ah_run.match_candidates.cache_clear()
+        return program in ah_run.match_candidates(command)
+
+    def test_d2_assignment_words_do_not_use_up_the_wrapper_bound(self):
+        for command in ('A+=1 ' * 12 + 'rm -rf /tmp/zz', 'A=1 ' * 13 + 'rm -rf /tmp/zz', 'A+=1 ' * 40 + 'rm -rf /tmp/zz',
+                        'A=1 ' * 11 + 'nice rm -rf /tmp/zz', ('A=1 ' * 12 + 'nice ') * 11 + 'rm -rf /tmp/zz',
+                        'A=1 ' * 2000 + 'rm -rf /tmp/zz'):
+            with self.subTest(command=command[:40]):
+                self.assertTrue(self.reaches(command, 'rm -rf /tmp/zz'))
+                self.assertFalse(ah_run.lex(command).reasons)
+        self.assertTrue(ah_run._reads_script('A=1 ' * 12 + 'bash'))
+        self.assertTrue(ah_run._reads_script('A=1 ' * 11 + 'nice bash'))
+        form = ah_run._ssh_form('A=1 ' * 12 + 'ssh host ls')
+        self.assertIsNotNone(form)
+        self.assertEqual(form[1], 'ssh host ls')
+
+    def test_d2_neg_wrapper_bound_data_and_form_count(self):
+        self.assertIn('wrapper-depth', ah_run.lex('nice ' * ah_run.WRAPPER_DEPTH + 'true').reasons)
+        self.assertFalse(self.reaches('echo ' + 'A=1 ' * 20 + 'rm -rf /tmp/zz', 'rm -rf /tmp/zz'))
+        self.assertLessEqual(len(ah_run._peeled_forms('A=1 ' * 4000 + 'rm x')), 6 * ah_run.WRAPPER_DEPTH)
+        ah_run.match_candidates.cache_clear()
+        forms = ah_run.match_candidates('A=1 B=2 C=3 rm x')
+        for form in ('B=2 C=3 rm x', 'C=3 rm x', 'rm x'):   # the one-word steps of 9e4d15b are still there
+            self.assertIn(form, forms)
+
+    def test_d1_zsh_equals_command_after_env_or_sudo_is_the_program(self):
+        for command, program in (('env =rm /tmp/zz', 'rm /tmp/zz'), ('sudo =rm /tmp/zz', 'rm /tmp/zz'),
+                                 ('env A=1 =rm /tmp/zz', 'rm /tmp/zz'),
+                                 ('env =git push --force origin main', 'git push --force origin main')):
+            with self.subTest(command=command):
+                self.assertTrue(self.reaches(command, program))
+                self.assertIn('dynamic-program-word', ah_run.lex(command).reasons)
+
+    def test_d3_lex_memory_does_not_grow_with_keyword_depth(self):
+        import tracemalloc
+        tracemalloc.start()
+        try:
+            lexed = ah_run.lex('{ ' * 4096 + 'a; ' * 4096)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertGreater(len(lexed.commands), 0)
+        self.assertLess(peak, 32 * 2 ** 20, 'peak %.1f MiB' % (peak / 2 ** 20))
 
 if __name__ == '__main__':
     unittest.main()

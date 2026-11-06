@@ -815,10 +815,11 @@ SSH_O_CLUSTER = re.compile(r'-[46AaCfGgKkMNnqsTtVvXxYy]*o')
 SSH_OPTION_CODE = re.compile(r'(?i)(proxycommand|knownhostscommand|localcommand|match)([ \t=]|$)')
 
 Word = collections.namedtuple('Word', 'raw value dynamic')  # raw: normalized text; value: quotes removed, a group is X
-# words exclude keywords, redirects and targets. path: the scopes the command runs in, outermost first: the list's root (0),
-# each subshell and each branch or loop body of a keyword compound, as ids unique within one lexer (r9b N3). prev: the
+# words exclude keywords, redirects and targets. scope: the innermost scope the command runs in (r9b N3), an id unique within
+# one lex: 0 for its list's root, a new id for each subshell and for each branch or loop body of a keyword compound. The lex's
+# `parents` list gives the scope around each id (None for 0), so a command costs one id whatever its depth (r9c). prev: the
 # operator before it in its own list (None first).
-Command = collections.namedtuple('Command', 'text words operator closer path prev', defaults=((0,), None))
+Command = collections.namedtuple('Command', 'text words operator closer scope prev', defaults=(0, None))
 
 
 class _WordBuf:
@@ -834,15 +835,19 @@ class _WordBuf:
 class _ListState:
     """One command list: the top level, a subshell or a substitution body."""
     __slots__ = ('closer', 'depth', 'group', 'commands', 'cur', 'words', 'stack', 'after_close', 'need_command', 'prev_op',
-                 'here_string', 'for_header', 'redirected', 'amp_redirect', 'path', 'frames')
+                 'here_string', 'for_header', 'redirected', 'amp_redirect', 'scope', 'frames')
 
-    def __init__(self, closer, depth, group, commands, path=(0,)):
+    def __init__(self, closer, depth, group, commands, scope=0):
         self.closer, self.depth, self.group, self.commands = closer, depth, group, commands
         self.cur, self.words, self.stack = [], [], []
-        self.path, self.frames = path, []  # frames: one scope id per open keyword compound, beside stack (r9b N3)
+        self.scope, self.frames = scope, []  # frames: one scope id per open keyword compound, beside stack (r9b N3)
         self.after_close = self.need_command = self.here_string = self.for_header = False
         self.redirected = self.amp_redirect = False
         self.prev_op = None
+
+    def here(self):
+        """The innermost scope: the open keyword compound's branch or body, else the list's own."""
+        return self.frames[-1] if self.frames else self.scope
 
 
 class _Lexer:
@@ -856,7 +861,7 @@ class _Lexer:
         self.bodies, self.openers, self.opener_spans, self.spans, self.pending = [], [], [], [], []
         self.continuations, self.body_lines = [], 0  # body_lines: lines the body reader read, for the R7-Q bound
         self.newline = self.pipeline = self.substitution = self.saw_nesting = self.stopped = self.ran_off_end = False
-        self.scopes = 0  # the last scope id given out (Command.path)
+        self.parents = [None]  # parents[id]: the scope around scope id (Command.scope); 0, a list's root, has none
         self.first = self.n - len(text.lstrip(' \t\n'))
         self.last = len(text.rstrip(' \t\n'))
 
@@ -881,12 +886,12 @@ class _Lexer:
 
     # -- lists -------------------------------------------------------------------------------------------------
 
-    def _list(self, i, closer, depth, group, commands, path=(0,)):
+    def _list(self, i, closer, depth, group, commands, scope=0):
         if depth > MAX_GROUP_DEPTH:
             self.reason('nesting')
             self.stopped = True
             return self.n
-        st, text, n = _ListState(closer, depth, group, commands, path), self.text, self.n
+        st, text, n = _ListState(closer, depth, group, commands, scope), self.text, self.n
         while i < n and not self.stopped:
             ch = text[i]
             if ch in ' \t':
@@ -932,7 +937,7 @@ class _Lexer:
         elif words:
             self._check_command(words, st.prev_op, st.here_string)
         if text or words or closer:
-            st.commands.append(Command(text, tuple(words), operator, closer, st.path + tuple(st.frames), st.prev_op))
+            st.commands.append(Command(text, tuple(words), operator, closer, st.here(), st.prev_op))
         st.after_close = st.here_string = st.redirected = st.amp_redirect = False
 
     def _newline(self, i, st):
@@ -994,7 +999,7 @@ class _Lexer:
             self.reason('attached-paren')
         self._cut(st, '(')
         st.need_command = False
-        end = self._list(i + 1, ')', st.depth + 1, st.group, st.commands, st.path + tuple(st.frames) + (self._scope(),))
+        end = self._list(i + 1, ')', st.depth + 1, st.group, st.commands, self._scope(st.here()))
         st.after_close = True
         return end
 
@@ -1122,7 +1127,7 @@ class _Lexer:
             return True
         if name in ('if', 'while', 'until', '{', 'for'):
             stack.append('while' if name == 'until' else name)
-            st.frames.append(self._scope())
+            st.frames.append(self._scope(st.here()))
             st.for_header = name == 'for'
             return True
         closes = name in ('fi', 'done', '}')
@@ -1136,12 +1141,14 @@ class _Lexer:
             st.after_close = True
         else:
             stack[-1] = {'then': 'then', 'elif': 'if', 'else': 'else', 'do': 'do'}[name]
-            st.frames[-1] = self._scope()  # each branch and loop body is its own scope: it may run zero times
+            # each branch and loop body is its own scope, in the same scope as the one it follows: it may run zero times
+            st.frames[-1] = self._scope(self.parents[st.frames[-1]])
         return True
 
-    def _scope(self):
-        self.scopes += 1
-        return self.scopes
+    def _scope(self, parent):
+        """A new scope id inside `parent`."""
+        self.parents.append(parent)
+        return len(self.parents) - 1
 
     def _check_for_header(self, words):
         ok = bool(words) and bool(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', words[0].raw)) and (len(words) == 1 or words[1].raw == 'in')
@@ -1408,7 +1415,7 @@ class _Lexer:
             w.add('X')
             return n
         sub, commands = _Lexer(text[i + 1:j], self.whole), []
-        sub.reasons, sub.groups, sub.group_texts = self.reasons, self.groups, self.group_texts
+        sub.reasons, sub.groups, sub.group_texts, sub.parents = self.reasons, self.groups, self.group_texts, self.parents
         self.groups.append(commands)
         self.group_texts.append(sub.text)
         sub._list(0, None, st.depth + 1, True, commands)
@@ -1458,8 +1465,8 @@ class _Lexer:
             if base == 'exec' and step >= count and not unknown:
                 self.reason('exec-redirect')  # later commands read and write through whatever it opened
             if base in ('env', 'sudo'):
-                for j in range(k + 1, step):  # the words env reads as NAME=VALUE, quoted too (r9b N1)
-                    if '=' in values[j] and values[j].split('=', 1)[0].rstrip('+') in STATE_VARS:
+                for j in range(k + 1, step):
+                    if ASSIGN_WORD.match(raws[j]) and raws[j].split('=', 1)[0].rstrip('+') in STATE_VARS:
                         self.reason('state-variable')
             k = step
         self.reason('wrapper-depth')
@@ -2110,11 +2117,9 @@ def _wrapper_scan(base, values, raws, k, dynamic=None):
             k += 1
         else:
             unknown, k = True, k + 1
-    elif base in ('env', 'sudo'):
-        # env's own grammar (GNU and BSD), and sudo's VAR=value: every word holding `=` before the program is an assignment,
-        # `A-B=1` and `'A=1'` too (r9b N1); an expanded word may be one, or the program
-        while k < count and (expands(k) or '=' in values[k]):
-            unknown, k = unknown or expands(k), k + 1
+    elif base == 'env':
+        while k < count and ASSIGNMENT.match(raws[k]):
+            k += 1
     return k, unknown
 
 
@@ -2123,10 +2128,10 @@ def _wrapper_step(base, values, raws, k):
     return _wrapper_scan(base, values, raws, k)[0]
 
 
-def peel_wrapper(text, fold=True):
+def peel_wrapper(text, fold=True, run=False):
     """The command with its first wrapper removed (an env assignment or anything _wrapper_step reads), or None when it starts
     with no wrapper. `env -S` gives back its split string as the command. The wrapper's name is read folded unless fold is
-    False."""
+    False. With run, a leading assignment word goes together with every assignment word after it (r9c N1)."""
     try:
         spans = _spans(text)
         if not spans:
@@ -2136,6 +2141,8 @@ def peel_wrapper(text, fold=True):
         count = len(spans)
         if ASSIGNMENT.match(raws[0]):
             k = 1
+            while run and k < count and ASSIGNMENT.match(raws[k]):
+                k += 1
         else:
             name = values[0].rsplit('/', 1)[-1]
             k = _wrapper_step(fold_name(name) if fold else name, values, raws, 1)
@@ -2175,10 +2182,15 @@ def _read_through(form):
 
 
 def _peeled_forms(segment, fold=True):
+    """The segment and each form left as its front is peeled, one wrapper or assignment word per step, each with its program
+    word unquoted and folded. Only wrappers count toward WRAPPER_DEPTH (r9c N1): the lexer and the escape classifier read
+    any number of assignment words free, so the forms reach the same program (`A=1 ` twelve times before rm used to use up
+    the bound). The first WRAPPER_DEPTH steps peel one word each, as before; after them a run of assignment words goes in one
+    step, so a list stays O(WRAPPER_DEPTH) forms long whatever the number of assignments. A step is free only when the form
+    starts with an assignment as typed (not one the unquoting made) and the step shortened it, so the loop ends."""
     forms, seen, current = [], set(), normalize_segment(segment)
-    for _ in range(WRAPPER_DEPTH):
-        if current in seen:
-            break
+    steps = wrappers = 0
+    while wrappers < WRAPPER_DEPTH and current not in seen:
         seen.add(current); forms.append(current)
         bare = _unquote_program(current)
         if bare and bare not in seen:
@@ -2187,11 +2199,14 @@ def _peeled_forms(segment, fold=True):
         folded = _fold_program(base) if fold else base
         if folded not in seen:  # `RM -rf`, `/BIN/RM -rf`: the program as the file system finds it (r9 F1)
             seen.add(folded); forms.append(folded)
-        nxt = peel_wrapper(base, fold)
+        nxt = peel_wrapper(base, fold, run=steps >= WRAPPER_DEPTH)
         if nxt is None:
             nxt = ENV_PREFIX.sub('', base, count=1)
             if nxt == base:
                 nxt = WRAPPER_PREFIX.sub('', folded, count=1)
+        steps += 1
+        if not (ASSIGNMENT.match(current) and len(nxt) < len(current)):
+            wrappers += 1
         current = normalize_segment(nxt)
     return forms
 
@@ -2487,8 +2502,9 @@ def _classify_text(command, reasons, notes, depth, prefix=''):
     reasons.extend(prefix + reason for reason in sub_reasons)
 
 
-def _classify_list(commands, reasons, notes, depth, uncertain):
-    """The classifier over one command list. On uncertain text it also reads through what may be empty or a redirect."""
+def _classify_list(commands, reasons, notes, depth, uncertain, parents):
+    """The classifier over one command list. On uncertain text it also reads through what may be empty or a redirect.
+    parents: the lex's scope map (Command.scope)."""
     entries = [[word.value for word in item.words] for item in commands]
     for item, words in zip(commands, entries):
         _classify_words(words, reasons, notes, depth)
@@ -2496,7 +2512,7 @@ def _classify_list(commands, reasons, notes, depth, uncertain):
             through = _blank_split(_read_through(' '.join(words)))
             if through[:1] != words[:1]:  # only when another program runs: the words after it are quote-removed text
                 _classify_words(through, reasons, notes, depth)
-    if _uncovered_job(commands, entries):
+    if _uncovered_job(commands, entries, parents):
         reasons.append('background & without a later wait')
 
 
@@ -2513,30 +2529,32 @@ def _counted_wait(item, words):
     return 'last' if words[1:] == ['$!'] else None
 
 
-def _uncovered_job(commands, entries):
+def _uncovered_job(commands, entries, parents):
     """True when a background job has no later wait that waits for it (r9b N3). A bare wait covers the jobs started
-    before it in its own scope or one nested in it (Command.path): `(sleep 5 &) ; wait` (spec), a loop's jobs after `done`;
-    not a job outside it (`sleep 1 & (wait)`, `if c; then sleep 1 & else wait; fi`). `wait $!` covers only the latest job,
-    and only in its own scope. One backward pass: `waits` holds the scopes with a later bare wait, `covered` the scopes
-    already shown to have one at or above them (it only grows, as waits does), so each scope is walked once."""
+    before it in its own scope or one nested in it (Command.scope, walked out through parents): `(sleep 5 &) ; wait` (a spec
+    allowance), a loop's jobs after `done`; not a job outside it (`sleep 1 & (wait)`, `if c; then sleep 1 & else wait;
+    fi`). `wait $!` covers only the latest job, and only in its own scope. One backward pass: `waits` holds the scopes with a
+    later bare wait, `covered` the scopes already shown to have one at or around them (it only grows, as waits does), so
+    each scope is walked once."""
     waits, covered, latest = set(), set(), None  # latest: the scope of a later `wait $!` that no job has met yet
     for item, words in zip(reversed(commands), reversed(entries)):
         kind = _counted_wait(item, words)
         if kind == 'all':
-            waits.add(item.path[-1])
+            waits.add(item.scope)
         elif kind == 'last':
-            latest = item.path
+            latest = item.scope
         if item.operator != '&' or not (words or item.closer):
             continue
         bang, latest = latest, None  # `$!` names this job, the latest one, whatever its scope
-        if bang == item.path:
+        if bang == item.scope:
             continue
-        walked = []
-        for scope in reversed(item.path):
+        walked, scope = [], item.scope
+        while scope is not None:
             if scope in waits or scope in covered:
                 covered.update(walked)
                 break
             walked.append(scope)
+            scope = parents[scope]
         else:
             return True
     return False
@@ -2550,10 +2568,10 @@ def _classify_command(command, reasons, notes, depth):
         return
     if uncertain:
         _classify_physical_lines(command, reasons, depth)
-    _classify_list(lexed.commands, reasons, notes, depth, uncertain)
+    _classify_list(lexed.commands, reasons, notes, depth, uncertain, lexed.parents)
     for group in lexed.groups:
         found = []
-        _classify_list(group, found, notes, depth + 1, uncertain)
+        _classify_list(group, found, notes, depth + 1, uncertain, lexed.parents)
         reasons.extend('substitution: ' + reason for reason in found)
     if not uncertain:
         for body in script_bodies(lexed):

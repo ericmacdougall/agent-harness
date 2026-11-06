@@ -201,8 +201,7 @@ NEW_ROWS = [  # (group, name, shape, kind); kind `limit` names what the hook doe
     ('r8-limit', 'unknown-launcher', 'prlimit --nofile=64 %s', 'limit'),  # GoodQA goodqa#14793: a launcher outside the grammar
     # r9 native review (Opus max): `NAME+=v` is an assignment to bash, zsh and ksh, and env reads any word holding `=` as one
     ('r9-N1', 'plus-assign', 'A+=1 %s', 'hidden'),
-    ('r9-N1', 'env-any-equals', 'env A-B=1 %s', 'hidden'),
-    ('r9-N1', 'env-quoted-assign', "env 'A=1' %s", 'hidden'),
+    # env-any-equals and env-quoted-assign were reverted in r9c (the zsh `=cmd` regression): goodqa#14891
 ]
 RULE = 'Bash(echo HIDDEN-LINE:*)'
 SSH_STUB = '#!/bin/sh\n[ "$1" = "-G" ] && { for last; do :; done; printf "hostname %s\\nport 22\\n" "$last"; exit 0; }\ncat\n'

@@ -6185,42 +6185,6 @@
 "shape": "A+=1 %s",
 "unstable": [],
 "verdict": "certain"
-},
-{
-"deny": true,
-"group": "r9-N1",
-"kind": "hidden",
-"name": "env-any-equals",
-"ran": [
-"bash3",
-"bash5",
-"dash",
-"ksh",
-"sh",
-"zsh"
-],
-"rewritten": "none",
-"shape": "env A-B=1 %s",
-"unstable": [],
-"verdict": "certain"
-},
-{
-"deny": true,
-"group": "r9-N1",
-"kind": "hidden",
-"name": "env-quoted-assign",
-"ran": [
-"bash3",
-"bash5",
-"dash",
-"ksh",
-"sh",
-"zsh"
-],
-"rewritten": "none",
-"shape": "env 'A=1' %s",
-"unstable": [],
-"verdict": "certain"
 }
 ]
 }
