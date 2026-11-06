@@ -829,6 +829,20 @@ def precheck(op: str, args: dict) -> None:
         need("agent", "session", "at")
         if not OWNER_ID_RE.match(args["agent"]) or parse_ts(args["at"]) is None:
             raise AhError("bad_request", "task.pending: agent id and ISO at are required")
+    elif op in ("alert.raise", "alert.clear"):
+        need("alert_key", "source")
+        if not ALERT_KEY_RE.match(args["alert_key"]) or not ALERT_SOURCE_RE.match(args["source"]):
+            raise AhError("bad_request", f"{op}: alert_key is 1-200 characters, no spaces or control characters; source is "
+                                         "lower-case [a-z0-9_.-], up to 32")
+        if op == "alert.raise":
+            need("message")
+            if args.get("severity") not in ALERT_SEVERITIES:
+                raise AhError("bad_request", f"alert.raise: severity is one of {', '.join(ALERT_SEVERITIES)}")
+            if len(args["message"]) > 1000:
+                raise AhError("bad_request", "alert.raise: message is at most 1000 characters")
+            detail = args.get("detail", {})
+            if not isinstance(detail, dict) or len(canonical(detail)) > 4096:
+                raise AhError("bad_request", "alert.raise: detail is a JSON object of at most 4 KiB")
     elif op == "ticket.comment":
         need("body")
         if not TICKET_RE.match(args.get("ticket") or ""):
@@ -1091,6 +1105,14 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             _wal_append(home, wal, {"at": now, "event": "pending_stop", "id": wid, "by": "dropped_gate",
                                     "note": "stopped with pending work and no armed waiter (goodqa#14791 I7)"})
         out["wal"] = wid
+    elif op in ("alert.raise", "alert.clear"):
+        import ops_watch  # noqa: PLC0415 - installed beside ah; the ring's one writer implementation
+        raising = op == "alert.raise"
+        out["ring_seq"] = ops_watch.emit({
+            "host": ring_host(), "source": args["source"], "event": "raise" if raising else "clear",
+            "severity": args["severity"] if raising else "info", "key": args["alert_key"],
+            "message": args["message"] if raising else "cleared", "detail": args.get("detail") or {}},
+            path=home / ".agent-harness" / "state" / "alerts.jsonl")
     elif op == "ticket.comment":
         comment(args["ticket"], args["body"])
     elif op == "task.dispose":
@@ -1304,6 +1326,81 @@ def doctor() -> dict:
     return {"ok": all(c["ok"] for c in checks), "checks": checks}
 
 
+# ------------------------------------------------------------------ the verbs ahd calls (goodqa#14848)
+
+ALERT_SEVERITIES = ("info", "warning", "high", "critical")  # ops_watch.SEVERITIES
+ALERT_KEY_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,200}$")  # ahd keys embed task names; no spaces or controls
+ALERT_SOURCE_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,31}$")
+SERVICE_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
+BATCH_MAX_BYTES = 1024 * 1024
+BATCH_MAX_LINES = 500
+BATCH_OPS = ("alert.raise", "alert.clear")  # apply is ahd's batching path for ring transitions, nothing else
+
+
+def ring_host() -> str:
+    """The host name ahd uses for its ring rows (ahd.host()); one definition so ring_state matches."""
+    return socket.gethostname().split(".")[0]
+
+
+def heartbeat(home: Path, service: str, key: str) -> dict:
+    """Atomically replace ~/.agent-harness/state/<service>/heartbeat.json (the file `ah doctor` reads). A beat is
+    state, not history: no ledger row, so a beat a minute never grows the ledger. A symlink at the target is
+    replaced, never followed."""
+    if not SERVICE_RE.match(service or ""):
+        raise AhError("bad_request", "heartbeat: --service is lower-case [a-z0-9-], 2-32 characters")
+    if not KEY_RE.match(key or ""):
+        raise AhError("bad_request", "heartbeat: --key must be 8-128 chars of [A-Za-z0-9._:-]")
+    d = home / ".agent-harness" / "state" / service
+    for p in (home / ".agent-harness", home / ".agent-harness" / "state", d):
+        if p.is_symlink():
+            raise AhError("bad_request", f"heartbeat: {p} is a symlink; refusing to write through it", 3)
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    at = iso(time.time())
+    data = (json.dumps({"service": service, "host": ring_host(), "at": at, "key": key}) + "\n").encode()
+    tmp = d / f".heartbeat.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, d / "heartbeat.json")
+    return {"ok": True, "result": "beat", "service": service, "at": at}
+
+
+def apply_batch(home: Path, text: str, session: str) -> dict:
+    """`ah apply --batch -`: JSON lines {op, key, args}, alert ops only. Every line is validated before any is
+    applied; then each goes through write() (its own key, ledger row and audit). A failure part way reports the
+    results so far with ok false; ahd then resends one by one, and the applied keys come back as duplicates."""
+    if len(text.encode()) > BATCH_MAX_BYTES:
+        raise AhError("too_large", f"apply: a batch is at most {BATCH_MAX_BYTES} bytes")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines or len(lines) > BATCH_MAX_LINES:
+        raise AhError("bad_request", f"apply: 1 to {BATCH_MAX_LINES} lines")
+    items = []
+    for n, ln in enumerate(lines, 1):
+        try:
+            row = json.loads(ln)
+        except ValueError:
+            raise AhError("bad_request", f"apply: line {n} is not JSON")
+        if not isinstance(row, dict) or row.get("op") not in BATCH_OPS or not isinstance(row.get("args"), dict) \
+                or not KEY_RE.match(str(row.get("key") or "")):
+            raise AhError("bad_request", f"apply: line {n} must be {{op: {'|'.join(BATCH_OPS)}, key, args}}")
+        if any(r["key"] == row["key"] for r in items):
+            raise AhError("bad_request", f"apply: line {n} repeats key {row['key']}")
+        precheck(row["op"], row["args"])
+        items.append(row)
+    results = []
+    for row in items:
+        try:
+            r = write(home, row["op"], row["args"], session, row["key"])
+            results.append({"key": row["key"], "result": r.get("result"), "seq": r.get("seq")})
+        except AhError as e:
+            results.append({"key": row["key"], "result": "rejected", "code": e.code})
+            return {"ok": False, "results": results}
+    return {"ok": True, "results": results}
+
+
 def ahd_running_check(home: Path, now: float | None = None, max_beat_age: float = 300.0) -> dict:
     """ahd is the deterministic manager (goodqa#14791): doctor fails while it is not running on this host. Running =
     its lock is held (a non-blocking flock attempt fails) or its heartbeat is fresher than max_beat_age."""
@@ -1397,6 +1494,22 @@ def build_parser():
         x.add_argument("--session")
         x.add_argument("--key", help="idempotency key (default: derived from the request)")
     sub.add_parser("doctor", help="check the import chain and file hashes of this install")
+    hb = sub.add_parser("heartbeat", help="record a service heartbeat (the file `ah doctor` reads)")
+    hb.add_argument("action", choices=["beat"])
+    hb.add_argument("--service", required=True)
+    hb.add_argument("--key", required=True)
+    al = sub.add_parser("alert", help="raise or clear an alert in the ops ring (an audited write)")
+    al.add_argument("action", choices=["raise", "clear"])
+    al.add_argument("--alert-key", dest="alert_key", required=True)
+    al.add_argument("--source", required=True)
+    al.add_argument("--key", required=True, help="idempotency key: a repeat returns duplicate")
+    al.add_argument("--severity", help="raise: info, warning, high or critical")
+    al.add_argument("--message", help="raise: the alert text")
+    al.add_argument("--detail", help="raise: a JSON object")
+    al.add_argument("--session")
+    ap = sub.add_parser("apply", help="apply a batch of alert ops from stdin (JSON lines {op, key, args})")
+    ap.add_argument("--batch", required=True, choices=["-"])
+    ap.add_argument("--session")
     sp = sub.add_parser("spool")
     sp.add_argument("action", choices=["drain"])
     w = sub.add_parser("write")
@@ -1456,6 +1569,20 @@ def run(args, home: Path) -> dict:
         ev = [{"really_tested": i, "wal": args.wal or ""} for i in args.really_tested]
         ev += [{"commit": c, "repo": args.repo or ""} for c in args.commit]
         return write(home, "task.done", {"task": args.task, "evidence": ev}, s, args.key)
+    if cmd == "heartbeat":
+        return heartbeat(home, args.service, args.key)
+    if cmd == "alert":
+        a = {"alert_key": args.alert_key, "source": args.source}
+        if args.action == "raise":
+            try:
+                detail = json.loads(args.detail) if args.detail else {}
+            except ValueError:
+                raise AhError("bad_request", "alert raise: --detail must be a JSON object")
+            a.update(severity=args.severity, message=args.message or "", detail=detail)
+        return write(home, f"alert.{args.action}", a, session_of(args, home) or "", args.key)
+    if cmd == "apply":
+        text = sys.stdin.read(BATCH_MAX_BYTES + 1)  # bounded: one character past the cap is enough to refuse
+        return apply_batch(home, text, session_of(args, home) or "")
     if cmd == "doctor":
         return doctor()
     if cmd == "spool":
