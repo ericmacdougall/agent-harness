@@ -3942,6 +3942,11 @@ class Analyzer:
             if '-d' in texts and texts.index('-d') + 1 < len(args) and ('-o' in texts or '-of' in texts):
                 self.refuse('unzip -o (overwrites files)', args[texts.index('-d') + 1], tiers=('log', 'unknown'))
         elif name in ('cp', 'copy-item', 'cpi', 'copy', 'install', 'ln'):
+            if name == 'ln' and _flag_letters(args) & {'s'} and nd and \
+                    transcript_write(ctx.c, norm_path(nd[0].text, ctx).casefold()):
+                ctx.add(LOG_DELETE, 'transcript-forgery', 'links to ~/.claude/projects, an alias Bash could write '
+                        'transcripts through', 'only Claude Code writes transcripts')
+                return
             if name == 'ln' and _flag_letters(args) & {'s'} and len(nd) >= 2:
                 target_path = norm_path(nd[0].text, ctx)
                 link = norm_path(nd[-1].text, ctx)
@@ -4866,7 +4871,10 @@ NO_BACKUP_KIND = 'no-backup'
 IMAGE_FILE_SUFFIXES = ('.sparseimage', '.dmg')
 IMAGE_DIR_SUFFIXES = ('.sparsebundle',)
 NO_BACKUP_SOURCE_RE = re.compile(r'^answer:([A-Za-z0-9._-]{1,80})/([0-9a-fA-F-]{8,64})$')
-APPROVE_WORDS = re.compile(r'^\s*Delete\b', re.I)  # the selected option must start with "Delete"
+# the selected option must be exactly this label: "Delete after a backup" and similar must never approve a
+# no-backup delete
+NO_BACKUP_LABEL = re.compile(r'^Delete, no backup(?: \(Recommended\))?$')
+APPROVE_WORDS = NO_BACKUP_LABEL
 # "Delete, no backup" is an approval, so a bare "no" is not a decline word
 DECLINE_WORDS = re.compile(r"\b(?:not|don'?t|keep|leave|cancel|nothing|never|later|yet|skip|hold|wait|instead)\b",
                            re.I)
@@ -4877,7 +4885,8 @@ DEFAULT_REMOTE_HOSTS = ('github.com', 't2-dev')
 # custom ssh command, credential helper or pager, and no prompt.
 _SAFE_GIT = ['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.ext.allow=never',
              '-c', 'protocol.file.allow=never', '-c', 'core.sshCommand=/usr/bin/ssh', '-c', 'credential.helper=',
-             '-c', 'core.pager=cat', '-c', 'core.untrackedCache=false', '-c', 'core.attributesFile=/dev/null']
+             '-c', 'core.pager=cat', '-c', 'core.untrackedCache=false', '-c', 'core.attributesFile=/dev/null',
+             '-c', 'core.checkStat=default', '-c', 'core.trustctime=true', '-c', 'core.ignoreStat=false']
 # git is run by an absolute system path, never looked up on the caller's PATH
 _GIT_BIN_CANDIDATES = ('/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git')
 
@@ -5031,9 +5040,9 @@ def _remote_host(url):
 
 
 def _check_git_pushed(real, ls_remote=None, hosts=DEFAULT_REMOTE_HOSTS):
-    """Every commit reachable from HEAD or any local ref (tracking refs excluded) is reachable from a live head or
-    tag of an allowlisted network remote, listed now by ls-remote from outside the repository (no repository
-    insteadOf or config applies). Local remote-tracking refs never count: they can be stale or hand-set.
+    """Every commit reachable from HEAD or any ref (tracking refs included) is reachable from a live head or tag
+    of an allowlisted network remote, listed now by ls-remote from outside the repository (no repository insteadOf
+    or config applies). Local remote-tracking refs are never proof: they can be stale or hand-set.
     Raises ValueError otherwise."""
     allowed = {h.casefold() for h in hosts}
     code, urls = _git(real, 'config', '--get-regexp', r'^remote\..*\.url$')
@@ -5060,13 +5069,14 @@ def _check_git_pushed(real, ls_remote=None, hosts=DEFAULT_REMOTE_HOSTS):
                          + '\n')
         present = [line.split()[0] for line in out.splitlines() if line.endswith((' commit', ' tag'))]
     missing = len(live) - len(present)
-    code, extra = _git(real, 'rev-list', '--max-count=1', '--exclude=refs/remotes/*', '--all', 'HEAD', '--stdin',
+    # every ref counts, tracking refs too: a commit only a stale tracking ref still holds exists nowhere else
+    code, extra = _git(real, 'rev-list', '--max-count=1', '--all', 'HEAD', '--stdin',
                        stdin=''.join('^%s\n' % s for s in present))
     if code != 0 or extra.strip():
-        raise ValueError('a commit on HEAD or a local branch, tag or other ref is on no live ref of an allowlisted '
-                         'network remote (%s)%s' % (', '.join('%s@%s' % a for a in answered[:3]),
-                                                     '; %d live refs are not in this clone: fetch first' % missing
-                                                     if missing else ''))
+        raise ValueError('a commit on HEAD or a branch, tag, tracking or other ref is on no live ref of an '
+                         'allowlisted network remote (%s); run `git fetch --prune`, or push it%s' % (
+                             ', '.join('%s@%s' % a for a in answered[:3]),
+                             '; %d live refs are not in this clone: fetch first' % missing if missing else ''))
     return {'remote': answered[0][0], 'url_host': answered[0][1][:60], 'live_refs': len(live)}
 
 
@@ -5309,7 +5319,8 @@ def approve_delete_no_backup(path, user_source, wal, ttl=None, home=None, policy
         if problem:
             raise ValueError('the AskUserQuestion this answer answers %s; ask the user again naming it' % problem)
         if not APPROVE_WORDS.search(turn.get('text') or '') or DECLINE_WORDS.search(turn.get('text') or ''):
-            raise ValueError('the selected answer does not say delete (or it declines); ask the user again')
+            raise ValueError('the selected answer does not say delete (or it declines): the option must be exactly '
+                             '"Delete, no backup" (optionally "(Recommended)"); ask the user again')
         target = _target_kind(real, home=user_home)
         state = _no_backup_state(real, target, home, attached=attached)
         where = _check_git_pushed(real, ls_remote=ls_remote, hosts=limits.get('no_backup_remote_hosts')

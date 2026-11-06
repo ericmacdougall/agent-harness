@@ -1097,5 +1097,130 @@ class Round3N8Wal(NoBackupCase):
         self.refused(self.image(), 'predate', wal=str(notes))
 
 
+def case_insensitive_fs(path):
+    """True when `path`'s file system folds case (macOS APFS by default)."""
+    probe = Path(path) / 'CaseProbe'
+    probe.write_text('x')
+    try:
+        return (Path(path) / 'caseprobe').exists()
+    finally:
+        probe.unlink()
+
+
+class Round4(NoBackupCase):
+    """Native re-review of a583e7d (nb-r3-a583e7d.md): R-A, R-B, R-C, R-D and the surviving reviewer mutants."""
+
+    def real(self, path, **kw):
+        uid = transcript(self.home / '.claude', kw.pop('session', 'sess-1'), kw.pop('path_text', str(path)), **kw)
+        return uid
+
+    def test_ra_commit_held_only_by_a_stale_tracking_ref_refused(self):
+        path = self.clone()
+        run('git', 'checkout', '-q', '-b', 'feat', cwd=path)
+        (path / 'f').write_text('feature\n')
+        run('git', 'add', 'f', cwd=path)
+        run('git', 'commit', '-q', '-m', 'feat', cwd=path)
+        sha = run('git', 'rev-parse', 'HEAD', cwd=path).strip()
+        run('git', 'push', '-q', str(self.remote), 'feat', cwd=path)
+        run('git', 'update-ref', 'refs/remotes/origin/feat', sha, cwd=path)
+        run('git', 'checkout', '-q', 'main', cwd=path)
+        run('git', 'branch', '-q', '-D', 'feat', cwd=path)  # the normal tidy-up after a push
+        self.assertEqual(self.approve(path)['target'], 'git')  # still live on the remote: fine
+        self.tearDown()
+        self.setUp()
+        path = self.clone()
+        run('git', 'checkout', '-q', '-b', 'feat', cwd=path)
+        (path / 'f').write_text('feature\n')
+        run('git', 'add', 'f', cwd=path)
+        run('git', 'commit', '-q', '-m', 'feat', cwd=path)
+        sha = run('git', 'rev-parse', 'HEAD', cwd=path).strip()
+        run('git', 'push', '-q', str(self.remote), 'feat', cwd=path)
+        run('git', 'update-ref', 'refs/remotes/origin/feat', sha, cwd=path)
+        run('git', 'checkout', '-q', 'main', cwd=path)
+        run('git', 'branch', '-q', '-D', 'feat', cwd=path)
+        run('git', '--git-dir', str(self.remote), 'branch', '-q', '-D', 'feat')  # gone remotely; never pruned here
+        self.refused(path, 'fetch --prune')
+
+    def test_rb_only_the_exact_no_backup_label_approves(self):
+        for label in ('Delete after backing up to Dropbox', 'Delete once the Dropbox copy is verified',
+                      'Delete only if a backup exists', 'Delete with a backup first', 'Delete (back up first)',
+                      'Delete? No, back it up', 'Delete', 'Delete it, no backup please'):
+            with self.subTest(label=label):
+                path = self.image('rb-%d.dmg' % abs(hash(label)))
+                uid = self.real(path, answer=label, options=(label, 'Leave them'))
+                self.refused(path, 'Delete, no backup', source='answer:sess-1/%s' % uid, resolver=None)
+        for label in ('Delete, no backup', 'Delete, no backup (Recommended)'):
+            with self.subTest(label=label):
+                path = self.image('ok-%d.dmg' % len(label))
+                uid = self.real(path, answer=label, options=(label, 'Leave them'))
+                self.assertEqual(self.approve(path, source='answer:sess-1/%s' % uid, resolver=None)['target'],
+                                 'image')
+
+    def test_rc_stat_config_cannot_hide_a_same_size_edit(self):
+        path = self.clone()
+        run('git', 'config', 'core.checkStat', 'minimal', cwd=path)
+        run('git', 'config', 'core.trustctime', 'false', cwd=path)
+        run('git', 'update-index', '--refresh', cwd=path)
+        st = os.stat(path / 'README')
+        (path / 'README').write_text('yo\n')  # same size as 'hi\n'
+        os.utime(path / 'README', ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.refused(path, 'untracked or ignored')
+
+    def test_rd_symlink_alias_of_projects_blocked(self):
+        c = cg.Compiled(self.policy, home=str(self.home))
+        p = '%s/.claude/projects' % self.home
+        for cmd in ('ln -s %s /tmp/al' % p, 'ln -sf %s/p /tmp/al2' % p):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(cg.decide(cmd, c)[0], 'block')
+
+    # R-F: each check alone
+    def test_rf_transcript_case_check_alone(self):
+        if not case_insensitive_fs(self.home):
+            self.skipTest('case-sensitive file system: the variant cannot resolve at all')
+        path = self.image()
+        uid = self.real(path)
+        with self.assertRaises(ValueError) as caught:
+            cg.resolve_user_source('answer:SESS-1/%s' % uid, max_age=86400, home=str(self.home))
+        self.assertIn('exact name', str(caught.exception))
+
+    def test_rf_wal_session_exact_entry_alone(self):
+        if not case_insensitive_fs(self.home):
+            self.skipTest('case-sensitive file system: the variant path does not exist')
+        path = self.image()
+        uid = self.real(path, session='SESS-2')
+        (self.home / '.claude/wals/sess-2').mkdir(parents=True)
+        hook_wal(str(self.home / '.claude/wals/sess-2/main.jsonl'), time.time() - 600)
+        self.refused(path, 'exact name', source='answer:SESS-2/%s' % uid, resolver=None,
+                     wal=str(self.home / '.claude/wals/SESS-2/main.jsonl'))
+
+    def test_rf_symlinked_projects_store_refused(self):
+        path = self.image()
+        projects = self.home / '.claude/projects'
+        os.rename(str(projects), str(self.home / '.claude/projects-real'))
+        os.symlink(str(self.home / '.claude/projects-real'), str(projects))
+        uid = self.real(path)
+        self.refused(path, 'transcript store', source='answer:sess-1/%s' % uid, resolver=None)
+
+    def test_rf_wal_path_must_be_literal(self):
+        path = self.image()
+        detour = str(self.home / '.claude/wals/sess-1/../sess-1/agent-nb.jsonl')
+        self.refused(path, 'existing, real WAL', wal=detour)
+
+    def test_rf_answer_must_key_the_question(self):
+        path = self.image()
+        uid = transcript(self.home / '.claude', 'sess-1', str(path),
+                         answers={'Some other question?': 'Delete, no backup (Recommended)'})
+        self.refused(path, 'does not key', source='answer:sess-1/%s' % uid, resolver=None)
+
+    def test_rf_two_operand_rm_blocked(self):
+        path = self.clone()
+        self.approve(path)
+        c = cg.Compiled(self.policy, home=str(self.home))
+        other = self.home / 'scratch.txt'
+        other.write_text('x')
+        self.assertEqual(cg.decide('rm -rf %s %s' % (path, other), c, marker=self.approvals())[0], 'block')
+        self.assertEqual(cg.decide('rm -f %s' % other, c)[0], 'allow')  # the second operand alone is fine
+
+
 if __name__ == '__main__':
     unittest.main()
