@@ -907,8 +907,11 @@ def make_analyzer_class(cg):
                 if w.text.startswith(('--split-string=', '-S')) and len(w.text) > 2 and name == 'env':
                     self.script(w.text.split('=', 1)[1] if '=' in w.text else w.text[2:], depth + 1)
                 prev = args[i - 1].text if i else ''
-                value_of_other_option = prev.startswith('-') and prev not in RUN_OPTS and name not in LAUNCHERS \
-                    and not re.fullmatch(r'-[A-Za-z]*c', prev)
+                # `--command` runs a command only for su and runuser; `wrangler d1 execute --command "SELECT count(*)"`
+                # takes SQL. A value that mentions a kill verb is still re-read as a command line.
+                sql_like = prev == '--command' and name not in ('su', 'runuser') and not KILLISH.search(w.text)
+                value_of_other_option = prev.startswith('-') and (prev not in RUN_OPTS or sql_like) \
+                    and name not in LAUNCHERS and not re.fullmatch(r'-[A-Za-z]*c', prev)
                 if (' ' in w.text.strip() or ';' in w.text) and not w.text.startswith('-') \
                         and name not in ('xargs', 'parallel') and not value_of_other_option:
                     if remote:
@@ -1362,8 +1365,10 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
         return 'allow', '', '', ()
     rule, reason, pids = findings[0]
     message = block_message(rule, reason)
-    if len(findings) > 1:
-        message = one_line(message + ' (%d more)' % (len(findings) - 1), 520)
+    if len(findings) > 1:  # name every finding, so the blocked command can be fixed in one pass
+        also = '; '.join('[%s] %s' % (r, one_line(t, 160)) for r, t, _p in findings[1:9])
+        more = ' (+%d more)' % (len(findings) - 9) if len(findings) > 9 else ''
+        message = one_line(message + ' Also found: ' + also + more, 1600)
     if policy['mode'] == 'warn':
         return 'warn', rule, message.replace('BLOCKED', 'WARNING'), pids
     audit(rule, raw, pids, home)

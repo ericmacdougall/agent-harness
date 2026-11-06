@@ -85,5 +85,42 @@ class DataArgs(unittest.TestCase):
                 self.assertEqual(self.verdict(cmd), "block")
 
 
+class WranglerSql(unittest.TestCase):
+    """npx wrangler d1 execute --command "SELECT count(*) ..." was blocked: the SQL was re-read as a shell line and its
+    (*) became a command-position glob that can match pkill (goodqa#14506)."""
+
+    def decide(self, cmd):
+        with tempfile.TemporaryDirectory() as tmp:
+            return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp)
+
+    def test_sql_in_command_option_passes(self):
+        for cmd in (
+            'npx wrangler d1 execute DB --remote --command "SELECT count(*) FROM users WHERE lower(email)=\'a@b.com\'"',
+            'npx wrangler d1 execute DB --command "SELECT count(*) FROM users" --json',
+            'pnpm exec wrangler d1 execute DB --command "SELECT count(*) FROM users"',
+            'env CF=1 npx wrangler d1 execute DB --command "SELECT max(id), count(*) FROM t"',
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.decide(cmd)[0], "allow")
+
+    def test_real_commands_in_command_option_still_block(self):
+        for cmd in (
+            "su -c 'pkill -f x' bob", "su --command 'pkill -f x' bob", "runuser --command 'kill 1' bob",
+            'npx runner --command "pkill -f vite"', 'npx runner --command "echo a; kill 4242"',
+            'env X=1 sh -c "SELECT count(*) FROM t"',  # a shell really would run the glob
+            "env x 'SELECT count(*) FROM users'",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.decide(cmd)[0], "block")
+
+    def test_block_message_names_every_finding(self):
+        verdict, _rule, message, _pids = self.decide("pkill -f a; killall node; skill -9 b")
+        self.assertEqual(verdict, "block")
+        self.assertNotRegex(message, r"\(\d+ more\)")
+        for word in ("pkill", "killall", "skill"):
+            self.assertIn(word, message)
+        self.assertIn("Also found", message)
+
+
 if __name__ == "__main__":
     unittest.main()
