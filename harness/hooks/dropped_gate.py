@@ -9,9 +9,11 @@ after the bound, and on a repeated Stop (`stop_hook_active`), it lets the turn e
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -54,13 +56,58 @@ def message(undisposed: list, rows: dict) -> str:
         r = rows.get(agent) or {}
         idle = r.get("idle_s")
         age = f"{int(idle // 3600)}h{int(idle % 3600 // 60):02d}m" if isinstance(idle, (int, float)) else "?"
+        if agent.startswith("dl") and not r:  # a missed deadline (goodqa#14791 G3)
+            lines.append(f"  - deadline {agent} missed: run `ah deadline done --id {agent} --note <what happened>` when it is met, or\n"
+                         f"      ah task dispose --agent {agent} --kind waiting --ref <ask id or GoodQA ticket> --until <ISO>  (it slipped for a named reason)")
+            continue
+        if "handoff-unacked" in (r.get("flags") or []):  # I9: a handoff nobody took
+            lines.append(f"  - {agent} handed off {age} ago and nobody acknowledged it: main (not the owner) records\n"
+                         f"      ah task dispose --agent {agent} --kind resumed      (someone picked it up)\n"
+                         f"      ah task dispose --agent {agent} --kind reassigned --ref <new agent id>\n"
+                         f"      ah task dispose --agent {agent} --kind closed --reason <what you verified> --deployed <deploy WAL id> "
+                     f"--live-test <live REALLY_TESTED id>\n"
+                     f"      ah task dispose --agent {agent} --kind superseded|wontdo --ref <GoodQA ticket> --reason <why>")
+            continue
         lines.append(f"  - {agent} DROPPED {age} ticket {r.get('ticket') or 'none'}: run one of\n"
                      f"      ah task dispose --agent {agent} --kind resumed   (after you resume or re-spawn it)\n"
                      f"      ah task dispose --agent {agent} --kind reassigned --ref <new agent id>\n"
                      f"      ah task dispose --agent {agent} --kind waiting --ref <ask id or GoodQA ticket> --until <ISO>\n"
-                     f"      ah task dispose --agent {agent} --kind closed --reason <why> --evidence <ticket|WAL id|sha>")
+                     f"      ah task dispose --agent {agent} --kind closed --reason <what you verified> --deployed <deploy WAL id> "
+                     f"--live-test <live REALLY_TESTED id>\n"
+                     f"      ah task dispose --agent {agent} --kind superseded|wontdo --ref <GoodQA ticket> --reason <why>")
     return ("Dropped owners need a decision before this turn ends (goodqa#14791):\n" + "\n".join(lines) +
             "\nA dropped owner is a defect: resume it, reassign it, name what it waits on, or close it with evidence.")
+
+
+GRANDFATHER_MAX = 50  # legacy rows one Stop may write
+
+
+def grandfather(session: str, data: dict, now=None) -> list:
+    """One-time grandfather (main's request, goodqa#14791): an undisposed owner whose last activity predates this
+    host's gate install time is recorded as `legacy` through ah, which re-checks the epoch and writes the audit row.
+    Owners that went quiet after the install are never touched. Returns the ids recorded."""
+    try:
+        import ah  # noqa: PLC0415
+        home = Path(os.environ.get("AH_HOME") or Path.home())
+        epoch = ah.gate_epoch(home)
+    except Exception:  # noqa: BLE001
+        return []
+    if not epoch:
+        return []
+    rows = {r["agent_id"]: r for r in data.get("owners") or []}
+    done = []
+    scope = getattr(ah, "owner_view_scope", None)  # a half-updated install falls back to one view per owner
+    with (scope(home, session, data) if scope else contextlib.nullcontext()):  # ah re-checks each owner, view read once
+        for agent in list(data.get("undisposed") or [])[:GRANDFATHER_MAX]:
+            last = ah.parse_ts((rows.get(agent) or {}).get("last_activity"))
+            if not last or last >= epoch:
+                continue
+            try:
+                ah.write(home, "task.dispose", {"agent": agent, "session": session, "kind": "legacy"}, session)
+                done.append(agent)
+            except Exception:  # noqa: BLE001 - a refused legacy row leaves the owner gated, which is the safe side
+                continue
+    return done
 
 
 def cmd_stop(payload: dict, now: float | None = None) -> dict:
@@ -75,8 +122,18 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
     except Exception:  # noqa: BLE001 - no WAL, a partial install or an ah bug: fail open, never trap the turn
         return {}
     undisposed = list(data.get("undisposed") or [])
+    legacy = grandfather(session, data, now)
+    if legacy:
+        try:
+            data = ah.owners(Path(os.environ.get("AH_HOME") or Path.home()), session, now=now)
+        except Exception:  # noqa: BLE001
+            return {}
+        undisposed = list(data.get("undisposed") or [])
+    note = (f"dropped-owner gate: {len(legacy)} owner(s) quiet since before the gate was installed were recorded as "
+            "unverified-legacy (each has an audit row; `ah owners` lists them until someone follows up): "
+            + ", ".join(legacy)) if legacy else ""
     if not undisposed:
-        return {}
+        return {"systemMessage": note} if note else {}
     rows = {r["agent_id"]: r for r in data.get("owners") or []}
     text = message(undisposed, rows)
     sig = hashlib.sha256(",".join(undisposed).encode()).hexdigest()[:16]
@@ -99,7 +156,7 @@ def pending_work(home: Path, session: str, agent: str) -> str | None:
     """Why the agent's own WAL says its work is unfinished, or None (handoff/result/named wait/empty)."""
     import ah  # noqa: PLC0415
     import liveness  # noqa: PLC0415
-    path = home / ".claude" / "wals" / session / f"agent-{agent}.jsonl"
+    path = ah.session_dir(home, session) / f"agent-{agent}.jsonl"  # either WAL root
     if not path.is_file():
         return None
     last = None
@@ -177,16 +234,137 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
     return {"systemMessage": "dropped-owner gate: " + text + " It is now DROPPED and needs a disposition."}
 
 
-def main(argv=None) -> int:
+ACK_KINDS = ("resumed", "reassigned", "closed", "legacy", "superseded", "wontdo")
+PRETOOL_MAX = 100_000  # larger commands are judged by a cheap substring test (round 5, minor 2: no regex backtracking)
+_HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_WRAPPERS = {"env", "nice", "command", "exec", "time", "nohup", "timeout", "sudo", "stdbuf", "builtin"}
+_SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
+_RUNS_TEXT = re.compile(r"(?:^|[\s;&|(])(?:(?:ba|z|da|k)?sh|fish|python[0-9.]*|eval|source|\.)(?:\s|$)")
+_SHELL_C = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")  # a short-option cluster that carries -c
+_BACKTICK = re.compile(r"`([^`]*)`")
+_KIND_WORD = re.compile(r"\b(?:" + "|".join(ACK_KINDS) + r")\b")
+
+
+def _strip_heredocs(cmd: str) -> str:
+    """Drop heredoc bodies: text fed to cat or a file is data, not a command (round 5, minor 3)."""
+    out, pos, at = [], 0, 0
+    for _ in range(64):
+        m = _HEREDOC.search(cmd, at)
+        if not m:
+            break
+        at = m.end()
+        head = cmd[cmd.rfind("\n", 0, m.start()) + 1:m.start()]
+        if _RUNS_TEXT.search(head):  # `bash <<EOF` runs its body: keep it
+            continue
+        body = cmd.find("\n", m.end())
+        if body < 0:
+            break
+        out.append(cmd[pos:body + 1])
+        end = re.compile(r"^[ \t]*" + re.escape(m.group(2)) + r"[ \t]*$", re.M).search(cmd, body + 1)
+        pos = at = end.end() if end else len(cmd)
+    out.append(cmd[pos:])
+    return "".join(out)
+
+
+def _segments(cmd: str):
+    """Shell words split into simple commands at ; & | && || ( ) and newlines. None when it does not tokenize."""
+    import shlex  # noqa: PLC0415
+    lex = shlex.shlex(cmd.replace("\\\n", " ").replace("\n", " ; "), posix=True, punctuation_chars=";&|()<>")
+    lex.whitespace_split = True
+    lex.commenters = ""
+    segs, cur = [], []
     try:
-        import safe_input  # noqa: PLC0415
-        payload = safe_input.safe_json_loads(safe_input.read_stdin_bounded(1 << 20).decode("utf-8", "replace"))
-    except Exception:  # noqa: BLE001 - oversized or malformed hook input: gate nothing, never block on garbage
-        payload = {}
+        for tok in lex:
+            if tok and set(tok) <= set(";&|()"):
+                segs.append(cur)
+                cur = []
+            else:
+                cur.append(tok)
+    except ValueError:  # an unbalanced quote
+        return None
+    segs.append(cur)
+    return segs
+
+
+def _acks(seg: list, depth: int = 0) -> bool:
+    """Whether one simple command is `[wrappers] [python] .../ah[.py] [global opts] task dispose ... --kind <ack>`."""
+    i = 0
+    while i < len(seg) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[i]) or seg[i] in _WRAPPERS
+                            or (i and seg[i - 1] in _WRAPPERS and (seg[i].startswith("-") or seg[i].isdigit()))
+                            or (i and seg[i - 1] in ("-n", "-u") and seg[i].lstrip("-").isdigit())):
+        i += 1
+    flag = None
+    if i < len(seg) and os.path.basename(seg[i]) in _SHELLS:  # `bash -c`, and clusters: `bash -lc`, `sh -ec` (24a786c F2)
+        flag = next((j for j in range(i + 1, len(seg)) if _SHELL_C.match(seg[j])), None)
+    if i < len(seg) and (seg[i] == "eval" or flag is not None):
+        code = " ".join(seg[flag + 1:] if flag is not None else seg[i + 1:])
+        return acknowledges(code, depth + 1) if depth < 3 else ("dispose" in code and bool(_KIND_WORD.search(code)))
+    if i < len(seg) and os.path.basename(seg[i]).startswith("python"):
+        rest = seg[i + 1:]
+        if "-c" in rest:  # inline code: judged by what it says
+            code = " ".join(rest[rest.index("-c") + 1:])
+            return "dispose" in code and bool(_KIND_WORD.search(code))
+        i += 1
+        while i < len(seg) and seg[i].startswith("-"):
+            i += 1
+    if i >= len(seg) or os.path.basename(seg[i]) not in ("ah", "ah.py"):
+        return False
+    rest = [t for t in seg[i + 1:]]
+    words = [t for t in rest if not t.startswith("-")]
+    if words[:2] != ["task", "dispose"]:
+        return False
+    for j, tok in enumerate(rest):
+        name, eq, val = tok.partition("=")
+        if len(name) >= 3 and "--kind".startswith(name) and name.startswith("--"):
+            value = val if eq else (rest[j + 1] if j + 1 < len(rest) else "")
+            if value in ACK_KINDS or "$" in value or "`" in value:  # an expansion cannot be judged: deny
+                return True
+    return False
+
+
+def acknowledges(cmd: str, depth: int = 0) -> bool:
+    """Whether a Bash command runs an `ah task dispose` that resumes, reassigns, closes, supersedes, wontdoes or legacies
+    an owner."""
+    if len(cmd) > PRETOOL_MAX:
+        return "dispose" in cmd and bool(_KIND_WORD.search(cmd))
+    text = _strip_heredocs(cmd)
+    if depth < 3 and any(acknowledges(m.group(1), depth + 1) for m in _BACKTICK.finditer(text)):
+        return True  # `ah task dispose ...` in backticks runs too (24a786c F2); judged as its own command line
+    segs = _segments(text)
+    if segs is None:
+        return "dispose" in cmd and bool(_KIND_WORD.search(cmd))
+    return any(_acks(s, depth) for s in segs if s)
+
+
+def cmd_pretool(payload: dict) -> dict:
+    """PreToolUse(Bash): a sub-agent (the payload carries its agent_id) may not resume, reassign or close an owner;
+    main records those. A wait (`--kind waiting`) stays open to everyone. The identity is the hook's, not the
+    shell's: main's shell carries the same environment as a sub-agent's (review round 3, B1). The text match is
+    advisory against an agent that hides the call; the dispose guard's evidence and burst rules do not rely on it."""
+    if not payload.get("agent_id") or payload.get("tool_name") != "Bash":
+        return {}
+    tool_input = payload.get("tool_input")
+    cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
+    if not acknowledges(cmd):
+        return {}
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": "dropped-owner gate (goodqa#14791): a sub-agent cannot "
+                                   "resume, reassign or close an owner, its own or another's; main records that. "
+                                   "Record what you wait on with `ah task dispose --kind waiting`, or write a handoff."}}
+
+
+def main(argv=None) -> int:
     mode = (argv or sys.argv[1:] or ["stop"])[0]
     try:
+        import safe_input  # noqa: PLC0415
+        limit = (16 << 20) if mode == "pretool" else (1 << 20)  # a 2 MB command must not skip the pretool check
+        payload = safe_input.safe_json_loads(safe_input.read_stdin_bounded(limit).decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 - oversized or malformed hook input: gate nothing, never block on garbage
+        payload = {}
+    try:
         payload = payload if isinstance(payload, dict) else {}
-        out = cmd_subagent_stop(payload) if mode == "subagent-stop" else cmd_stop(payload)
+        out = (cmd_subagent_stop(payload) if mode == "subagent-stop" else cmd_pretool(payload) if mode == "pretool"
+               else cmd_stop(payload))
     except Exception as exc:  # noqa: BLE001 - a gate crash must not block the turn silently
         out = {"systemMessage": f"dropped-owner gate failed open ({type(exc).__name__})"}
     if out:

@@ -409,6 +409,22 @@ def ask_alerts(asks: list, policy: dict, ts: float) -> dict:
     return out
 
 
+def deadline_alerts(owner_docs: dict, ts: float) -> dict:
+    """G3: deadline:<id>:due (warning, within 1 h) and deadline:<id>:missed (high, stop_block) from `ah owners`."""
+    out = {}
+    for session, doc in sorted(owner_docs.items()):
+        for d in (doc or {}).get("deadlines") or []:
+            if not isinstance(d, dict) or d.get("state") not in ("due", "missed"):
+                continue
+            sev = "high" if d["state"] == "missed" else "warning"
+            out[f"deadline:{d['id']}:{d['state']}"] = {
+                "severity": sev, "class": "deadline", "kind": "deadline", "subject": d["id"], "since": int(d.get("due") or ts),
+                "message": f"deadline {d['state']} {d.get('due_iso')} for {d.get('ref')} (owner {d.get('owner')}): {str(d.get('note') or '')[:120]}",
+                "detail": {"session": session[:8], "deadline": d["id"], "ref": d.get("ref"), "owner": d.get("owner"),
+                           "stop_block": d["state"] == "missed"}}
+    return out
+
+
 def wal_ask_alerts(pending: list, ts: float) -> dict:
     """P16 (goodqa#14791 I16): open WAL asks escalate on the bounded schedule in ask_reminders: stage 0 info,
     stage 1 warning, stage 2+ high, so the ring (transitions on severity rise), the prompt context and the digest
@@ -640,6 +656,7 @@ class Daemon:
         ask_flags = dict(ask_alerts(asks, self.policy, ts))
         ask_flags.update(wal_ask_alerts(pending, ts))
         desired.update(ask_digest(ask_flags, current_sessions(sessions, self.policy, ts), ts, self.policy))
+        desired.update(deadline_alerts(docs, ts))
         desired.update(ring_wrap_alert(events, ts, self.host))
         desired.update(wal_unsafe_alerts(blocked, ts))
         ring = ring_state(events, SOURCE, self.host)

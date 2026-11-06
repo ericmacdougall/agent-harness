@@ -48,6 +48,28 @@ class DirectoryPublicationError(OSError):
     """An exclusive directory publish could not be completed safely."""
 
 
+def record_gate_epoch(home: Path, prior_mtime=None, now=None) -> bool:
+    """Write ~/.agent-harness/state/dropped-gate/installed_at.json once: the earlier of now and an already-installed
+    gate's mtime. Never rewritten, so a later install cannot move it (ah also pins the earliest epoch it used)."""
+    now = datetime.now(timezone.utc).timestamp() if now is None else now
+    at = min(now, prior_mtime) if prior_mtime else now
+    d = home / ".agent-harness" / "state" / "dropped-gate"
+    try:
+        for p in (home / ".agent-harness", home / ".agent-harness" / "state", d):
+            if p.is_symlink():
+                return False
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(d / "installed_at.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return False
+    try:
+        stamp = datetime.fromtimestamp(at, timezone.utc).isoformat()
+        os.write(fd, (json.dumps({"at": stamp, "by": "install.py"}) + "\n").encode())
+    finally:
+        os.close(fd)
+    return True
+
+
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
@@ -187,6 +209,10 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "subagent-stop"],
         "timeout": 15}]})
+    # The caller's identity for acknowledgements comes from the hook payload (review round 3, B1).
+    managed.setdefault("PreToolUse", []).append({"matcher": "Bash", "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "pretool"],
+        "timeout": 5}]})
     # Local-ledger reminder (docs/ledger.md): rate limited and dismissible; fails open, so no onFailure.
     reminder = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "ledger_reminder.py")], "timeout": 3}
     for event in ("SessionStart", "UserPromptSubmit"):
@@ -722,6 +748,11 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
                         pins.create(backups.joinpath(*rel.parts[:i]))
                 atomic_write(saved, originals[path][0], pinned_parent=pins.fd(saved.parent),
                              expected_target=None)
+        gate_file = claude / "hooks" / "dropped_gate.py"
+        try:  # the earlier of now and the gate already installed here: the epoch legacy is measured against
+            prior_gate = os.lstat(gate_file).st_mtime if gate_file.is_file() and not gate_file.is_symlink() else None
+        except OSError:
+            prior_gate = None
         installed = {}
         payload_by_path = dict(payloads)
         try:
@@ -754,6 +785,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
                 raise RuntimeError(f"Installation failed; rollback incomplete for {', '.join(failures)}; "
                                    f"restore from {backups}") from error
             raise
+        if record_gate_epoch(claude.parent, prior_gate):
+            changes.append("recorded the dropped-owner gate install time")
         if services and not apply:
             changes.extend("would run service: " + " ".join(argv[1:]) for argv in service_commands(claude))
         if apply and services:  # host services last, after every file is in place (goodqa#14791 S1d)

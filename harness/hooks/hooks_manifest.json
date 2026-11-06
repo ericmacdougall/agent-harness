@@ -528,6 +528,22 @@
    ]
   },
   {
+   "id": "dropped-gate:pretool",
+   "script": "dropped_gate.py",
+   "arg": "pretool",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
+  },
+  {
    "id": "dropped-gate:subagent-stop",
    "script": "dropped_gate.py",
    "arg": "subagent-stop",

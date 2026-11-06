@@ -22,7 +22,9 @@ Exit 0 means the gate is clear. Exit 1 lists every undisposed DROPPED owner (sub
 - Resume it: `SendMessage` to its agent id with the last state and next step, or spawn a fresh owner at the ladder rung, then `ah task dispose --agent <id> --kind resumed`. The disposition stays live only while activity follows.
 - Hand it to another owner: `ah task dispose --agent <id> --kind reassigned --ref <new agent id>`. It holds while that owner is live; if that owner has stopped, only its own live named wait, closure or further reassignment carries over (and expires with it), not a stale `resumed`.
 - It really waits on the user or a ticket: `ah task dispose --agent <id> --kind waiting --ref <ask id or GoodQA proj#N> --until <ISO>`. A wait must name an ask id that exists or a ticket; it expires at `--until`.
-- It is finished or superseded: `ah task dispose --agent <id> --kind closed --reason <why> --evidence <ticket | WAL id | commit sha>`.
+- It is done, meaning deployed to live and tested: `ah task dispose --agent <id> --kind closed --reason <what you verified> --deployed <deploy WAL id> --live-test <REALLY_TESTED id>`. Both records must name this owner. A merge or commit alone is not done.
+- It will not ship: `ah task dispose --agent <id> --kind superseded|wontdo --ref <GoodQA proj#N> --reason <why>`. This is not done, and it says so in reports.
+- Verify each owner on its own. Closing several owners in a burst is refused and alerted as a possible bulk close, and so is reusing one reason or one shared record.
 
 ## 3. Report
 
