@@ -151,6 +151,7 @@ def pure_data_python(code):
     allowlist over the syntax tree: sys.modules, exec*/spawn*, getattr, dunders, every other module and every module
     member outside PY_SAFE_MEMBERS (re.enum.sys...) are out."""
     import ast
+    import builtins
     try:
         tree = ast.parse(code)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
@@ -173,12 +174,34 @@ def pure_data_python(code):
                 if path not in PY_SAFE_PREFIXES:
                     return False
                 aliases[a.asname or a.name] = path
+    # A builtin or module is only ever safe as the thing being called or the head of a vetted attribute chain. In
+    # value position (key=eval, print = eval, repl=exec) a data program could hand code to a pure helper.
+    called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    heads = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Attribute):
+            h = n.value
+            while isinstance(h, ast.Attribute):
+                h = h.value
+            heads.add(id(h))
+    stored = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
             if node.id.startswith('_'):
                 return False
-            if isinstance(node.ctx, ast.Store) and node.id in aliases:
-                return False  # rebinding an imported name could hide a different object
+            if isinstance(node.ctx, ast.Store):
+                if node.id in aliases or hasattr(builtins, node.id):
+                    return False  # rebinding print/eval/an imported name could hide a different object
+            elif node.id in aliases:
+                if id(node) not in called and id(node) not in heads:
+                    return False
+            elif node.id in stored:
+                pass  # the program's own variable, only ever bound to vetted expressions
+            elif node.id in PY_SAFE_CALLS:
+                if id(node) not in called:
+                    return False
+            else:
+                return False  # any other builtin or unknown name (eval, exec, open, getattr, vars ...)
         elif isinstance(node, ast.Attribute):
             if node.attr.startswith('_'):
                 return False

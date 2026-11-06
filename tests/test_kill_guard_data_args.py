@@ -77,6 +77,13 @@ BLOCK = [
     "python3 -c \"from re import enum; enum.sys.modules['os'].system('pkill -f node')\"",
     "python3 -c \"import re as r; r.enum.sys.modules['os'].system('pkill -f node')\"",
     "python3 -c \"import re; re = 1; print('kill')\"",
+    # review of d896d75: builtins handed to a pure helper or rebound
+    "python3 -c 'sorted([\"__import__(\\\"os\\\").kill(4242,9)\"], key=eval)'",
+    "python3 -c 'print = eval; print(\"__import__(\\\"os\\\").kill(4242,9)\")'",
+    "python3 -c 'max([\"__import__(\\\"os\\\").kill(4242,9)\"], key=exec)'",
+    "python3 -c 'import json; json.loads(\"1\", object_hook=eval); print(\"kill\")'",
+    "python3 -c 'f = eval; f(\"1\"); print(\"kill\")'",
+    "python3 -c 'print(vars(), \"kill\")'",
     CLI + "ah.py --text kill --pid 4242 --reason x --foreign",
     CLI + "ah.py -- kill --pid 4242",
     CLI + "ah.py --te kill --pid 4242 --reason x",
@@ -99,6 +106,19 @@ class DataArgs(unittest.TestCase):
         for cmd in BLOCK:
             with self.subTest(cmd=cmd):
                 self.assertEqual(self.verdict(cmd), "block")
+
+    def test_no_builtin_is_usable_as_a_value_or_rebindable(self):
+        """Systematic check for the pure-data exemption: each allowed builtin passed as a value, or rebound, and
+        eval/exec/compile/open/getattr/vars in any position, must leave the exemption."""
+        self.assertTrue(kg.pure_data_python("print(len('a'), sorted(['b', 'a']))"))  # non-vacuous control
+        for name in sorted(kg.PY_SAFE_CALLS):
+            for prog in ("sorted(['x'], key=%s)" % name, "%s = len" % name, "f = %s\nf('x')" % name):
+                with self.subTest(prog=prog):
+                    self.assertFalse(kg.pure_data_python(prog))
+        for name in ("eval", "exec", "compile", "open", "getattr", "vars", "globals", "input", "__import__"):
+            for prog in ("%s('1')" % name, "sorted(['1'], key=%s)" % name, "x = %s" % name):
+                with self.subTest(prog=prog):
+                    self.assertFalse(kg.pure_data_python(prog))
 
 
 class WranglerSql(unittest.TestCase):
