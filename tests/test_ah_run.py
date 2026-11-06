@@ -3464,5 +3464,56 @@ class NativeReviewR9d(unittest.TestCase):
         self.assertIn('wrapper-depth', ah_run.lex('nice ' * ah_run.WRAPPER_DEPTH + 'true').reasons)
 
 
+
+class NativeReviewR9e(HookFixture):
+    """r9e (Opus high review of fea9f7e, goodqa#14548): F4 match_candidates re-peeled every _read_through form with its own
+    PEEL_STEPS, about 36 x 36 steps, each re-reading the whole text: at SCAN_CAP 'A=$x ! ' * 9361 + 'rm x' took 24.5 s
+    (9e4d15b: 3.1 s), over the 10 s hook timeout. One step budget is now shared by the peel and every re-peel; when it
+    runs out the forms are marked truncated and the deny check falls back to the literal rule scan. F5 pins the 35-step
+    worst case of N1 reach. Inputs: each shape repeated to just under SCAN_CAP (65536 bytes)."""
+
+    BOUND_S = 4.0  # well under the 10 s hook timeout
+
+    @staticmethod
+    def at_cap(unit, tail='rm x'):
+        return unit * ((ah_run.SCAN_CAP - len(tail) - 1) // len(unit)) + tail
+
+    def tearDown(self):
+        ah_run.match_candidates.cache_clear()
+        super().tearDown()
+
+    def test_f4_match_candidates_at_scan_cap_stays_under_the_bound(self):
+        for unit in ('A=$x ! ', 'A=1 ! '):
+            with self.subTest(unit=unit):
+                command = self.at_cap(unit)
+                self.assertLessEqual(len(command), ah_run.SCAN_CAP)
+                self.assertGreater(len(command), ah_run.SCAN_CAP - 16)
+                ah_run.match_candidates.cache_clear()
+                started = time.monotonic()
+                forms = ah_run.match_candidates(command)
+                elapsed = time.monotonic() - started
+                self.assertGreater(len(forms), 0)
+                self.assertLess(elapsed, self.BOUND_S, '%.2f s for %d bytes' % (elapsed, len(command)))
+
+    def test_f4_hook_decision_at_scan_cap_stays_under_the_bound_and_denies(self):
+        self.settings('user', deny=['Bash(rm:*)'])
+        command = self.at_cap('A=$x ! ', 'rm -rf /tmp/zz')
+        started = time.monotonic()
+        out = self.decide(command)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2 * self.BOUND_S, '%.2f s' % elapsed)
+        self.assertEqual(out.get('permissionDecision'), 'deny', out)
+
+    def test_f4_neg_small_inputs_are_not_truncated(self):
+        for command in ('A=$x rm -rf /tmp/zz', '$x sudo env A=1 nice rm -rf /tmp/zz', 'A=1 ' * 30 + 'rm x'):
+            with self.subTest(command=command):
+                ah_run.match_candidates.cache_clear()
+                self.assertFalse(ah_run.match_candidates(command).truncated)
+
+    def test_f5_n1_worst_case_reach_fits_the_cap(self):
+        forms = ah_run._peeled_forms('A=1 ' * 13 + 'sudo A=1 ' * 11 + 'rm x')
+        self.assertIn('rm x', forms)
+
+
 if __name__ == '__main__':
     unittest.main()

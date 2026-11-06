@@ -751,6 +751,7 @@ SIMPLE_BRACE = re.compile(r'\$\{[A-Za-z_][A-Za-z0-9_]*\}')
 MAX_GROUP_DEPTH = 16
 WRAPPER_DEPTH = 12  # wrappers the lexer, the deny forms and the escape classifier read through (r9b N2); past it, a reason
 PEEL_STEPS = 3 * WRAPPER_DEPTH  # every peel step of the deny forms, free assignment steps included (r9d F1)
+PEEL_BUDGET = 2 * PEEL_STEPS  # peel steps of one match_candidates call, its _read_through re-peels included (r9e F4)
 WORD_END = ' \t\n;&|()<>'
 WORD_RUN = re.compile(r"[A-Za-z0-9_./:,+=@%^~*?!\]-]+")
 DQ_RUN = re.compile(r'[^"\\`$]+')
@@ -2182,7 +2183,7 @@ def _read_through(form):
     return EMPTY_HEAD.sub('', text).replace('$"', '"', 1).strip(' \t\n') if text.startswith(('$', '=', 'X', '"', '`')) else text
 
 
-def _peeled_forms(segment, fold=True):
+def _peeled_forms(segment, fold=True, budget=None):
     """The segment and each form left as its front is peeled, one wrapper or assignment word per step, each with its program
     word unquoted and folded. Only wrappers count toward WRAPPER_DEPTH (r9c N1): the lexer and the escape classifier read
     any number of assignment words free, so the forms reach the same program (`A=1 ` twelve times before rm used to use up
@@ -2190,10 +2191,17 @@ def _peeled_forms(segment, fold=True):
     step, so a list stays O(WRAPPER_DEPTH) forms long whatever the number of assignments. A step is free only when the form
     starts with an assignment as typed (not one the unquoting made) and the step shortened it, so the loop ends. All steps
     together stop at PEEL_STEPS (r9d F1): a keyword between assignment words (`A=1 ! A=1 ! ... rm x`) is stripped by
-    normalize_segment, so every step stayed free and the list grew with the input."""
+    normalize_segment, so every step stayed free and the list grew with the input. A budget (a one-item list) is the
+    step allowance shared with the caller's other peels (r9e F4): budget[0] counts the steps left, and budget[1] is set
+    when a peel stopped for want of steps (its own PEEL_STEPS or the shared budget) rather than at its end."""
     forms, seen, current = [], set(), normalize_segment(segment)
     steps = wrappers = 0
     while wrappers < WRAPPER_DEPTH and steps < PEEL_STEPS and current not in seen:
+        if budget is not None:
+            if budget[0] <= 0:
+                budget[1] = True
+                break
+            budget[0] -= 1
         seen.add(current); forms.append(current)
         bare = _unquote_program(current)
         if bare and bare not in seen:
@@ -2211,6 +2219,8 @@ def _peeled_forms(segment, fold=True):
         if not (ASSIGNMENT.match(current) and len(nxt) < len(current)):
             wrappers += 1
         current = normalize_segment(nxt)
+    if budget is not None and steps >= PEEL_STEPS and wrappers < WRAPPER_DEPTH and current not in seen:
+        budget[1] = True  # cut by the step cap, not by the end of the wrappers (r9e F4)
     return forms
 
 
@@ -2229,23 +2239,39 @@ def _bare_forms(form):
     return found
 
 
+class Forms(tuple):
+    """match_candidates' forms; truncated when the shared peel budget ran out, so some forms may be missing (r9e F4)."""
+    truncated = False
+
+
 @functools.lru_cache(maxsize=4096)
 def match_candidates(segment, fold=True):
     """The segment as typed plus every form with env assignments, wrappers (exec, command, time, nohup, nice, sudo,
     timeout, env) and the quoting of the program word removed, those with _read_through's words gone, and each with all
     its quoting or the program's directory removed, as a tuple. With fold (r9 F1), each program word is also folded
     (fold_name) and wrapper names are read folded; the ssh rewrite asks without it. A deny or ask rule matching any form
-    applies. Cached because one command asks for the same segment up to four times."""
-    forms = _peeled_forms(segment, fold)
+    applies. Cached because one command asks for the same segment up to four times. All peels of one call share
+    PEEL_BUDGET steps (r9e F4: each re-peel had its own PEEL_STEPS, about 36 x 36 steps over the whole text); a result
+    cut short by the budget is marked truncated, and the deny check then also scans the rule text literally."""
+    budget = [PEEL_BUDGET, False]
+    forms = _peeled_forms(segment, fold, budget)
+    known, repeeled = set(forms), set()
     for form in list(forms):
         through = _read_through(form)
-        if through != form and through:
-            forms.extend(extra for extra in _peeled_forms(through, fold) if extra not in forms)
+        if through != form and through and through not in repeeled and budget[0] > 0:
+            repeeled.add(through)
+            for extra in _peeled_forms(through, fold, budget):
+                if extra not in known:
+                    known.add(extra); forms.append(extra)
+        elif through != form and through and through not in repeeled and through not in known:
+            budget[1] = True  # a re-peel the budget no longer allows
     for form in list(forms):
         forms.extend(extra for extra in _bare_forms(form) if extra not in forms)
     # a run of blanks is one separator to the shell. Only these forms get it, not allow, so it can only widen a deny or ask.
     forms.extend(collapsed for collapsed in dict.fromkeys(BLANKS.sub(' ', form) for form in forms) if collapsed not in forms)
-    return tuple(forms)
+    out = Forms(forms)
+    out.truncated = budget[1]
+    return out
 
 
 class Rule:
@@ -3091,12 +3117,19 @@ def decide(payload, home=None, env=None, ancestors=None):
     checked = parsed.segments + parsed.inner
     if parsed.uncertain and rules['deny']:
         checked = checked + physical_parts(command)  # what the parse may have swallowed as string or heredoc text
-    for part in checked:
+    truncated = False
+    for part in checked if deny_rules else ():  # no deny rule: the forms are not needed (r9e F4)
         forms = match_candidates(part)
+        truncated = truncated or forms.truncated
         for rule in deny_rules:
             if any(rule.matches(form) for form in forms):
                 hint = ' %s' % HEREDOC_HINT if parsed.heredoc == HEREDOC_UNCERTAIN else ''
                 return _out('deny', 'denied by permission rule %s%s' % (rule.label(), hint))
+    if truncated and not parsed.uncertain:  # the forms were cut short: the rule text anywhere at a word start denies
+        rule = denied_as_literal(command, rules['deny'], parsed.lexed)
+        if rule:
+            return _out('deny', 'denied by permission rule %s: the command is too long to read every form of it, and the '
+                                "rule's text appears in it at a word start" % rule.label())
     if parsed.uncertain:
         rule = denied_as_literal(command, rules['deny'], parsed.lexed)
         if rule:
@@ -3104,7 +3137,8 @@ def decide(payload, home=None, env=None, ancestors=None):
             return _out('deny', 'denied by permission rule %s: the hook cannot parse this command with certainty (%s) and the '
                                 "rule's text appears in it at a word start%s" % (rule.label(), ', '.join(parsed.reasons), hint))
 
-    asked = any(rule.matches(form) for part in parsed.segments + parsed.inner for rule in ask_rules for form in match_candidates(part))
+    asked = bool(ask_rules) and any(rule.matches(form) for part in parsed.segments + parsed.inner for rule in ask_rules
+                                    for form in match_candidates(part))
     if (parsed.segments and not parsed.substitution and not parsed.newline and not parsed.uncertain and not parsed.pipeline
             and all(plain_recovery(segment, home) for segment in parsed.segments)):
         # exempt from the rewrite (and from the floor and heavy-command guards elsewhere), never from the allow rules
